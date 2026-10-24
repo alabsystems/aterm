@@ -395,7 +395,9 @@ impl Tool {
                 format!("`{}` {does} into this user's cache", when.command())
             }
             Provider::ReleaseHost => {
-                "a release host carries it (`targo --unverified ship provision` audits one)".into()
+                "a release host carries it (`targo --unverified ship provision --id <machine-id> \
+                 --check` audits one)"
+                    .into()
             }
             Provider::Guest => {
                 "the Linux guest provides it: `targo --unverified verify linux` runs this there"

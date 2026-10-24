@@ -247,7 +247,12 @@ impl TrickFlash {
         for c in word.chars() {
             // The grid keeps a zero-width scalar on the previous cell, so it can
             // never be found as a cell of its own.
-            if aterm_grapheme::char_width(c) == 0 {
+            let zero_width = if c.is_ascii() {
+                c.is_ascii_control()
+            } else {
+                aterm_grapheme::char_width(c) == 0
+            };
+            if zero_width {
                 continue;
             }
             if len == MAX_CHARS {
@@ -255,7 +260,7 @@ impl TrickFlash {
             }
             chars[len] = c;
             len += 1;
-            rtl |= is_strong_rtl(c);
+            rtl |= !c.is_ascii() && is_strong_rtl(c);
         }
         if len == 0 {
             return;
@@ -621,7 +626,11 @@ fn legible_strength(fg: u32, bg: u32, sat: f32, val: f32) -> f32 {
 /// or any no-space-script scalar.
 #[inline]
 fn is_word_char(c: char) -> bool {
-    is_token_char(c) || is_no_space_script(c)
+    if c.is_ascii() {
+        c.is_ascii_alphanumeric() || c == '_'
+    } else {
+        is_token_char(c) || is_no_space_script(c)
+    }
 }
 
 /// Strong right-to-left scalars: Hebrew, Arabic and neighbours in the BMP, the

@@ -3,6 +3,11 @@
 
 # aterm-effects: spec recovery from its 3027 unit tests
 
+> 2026-10-23: `aos-lease-refines-model` (§1) is the M5b worker-lease ledger's refinement of
+> `aterm_models_aos::aos_worker_lease_model`, with its eight Tier-1 tests in
+> `src/aos_momentum/lease_conformance_tests.rs` (§2). The counts elsewhere in this file were taken
+> before it.
+
 > 2026-10-19: `tests/the_owners_composer_gaps/shipping_present.rs` exercises the shared
 > `EffectsPipeline::cursor_step`; its finite F1–F5 laws are ordinary deterministic tests.
 > Established-hand repaint proofs compare prior/retained row content and exact ordered unpaid
@@ -953,6 +958,7 @@ soft-wrap-rejects-left-rewrite	contract	custody::CursorGlow::soft_wrapped_caret	
 refused-presses-are-forgotten	invariant	custody::forget_typed_credits; seam::{echo_anchor_pass,spawn_judged}; CursorGlow::{note_typed_expected,clear_typed_keeping_hand,note_motion}	After a forgetting refusal no press banked before it ever pays for anything; later moves are licensed only by later presses or gestures, and a navigation key licenses its own hop.	0,1,2,5,7,10	1
 own-glyph-echo-lights	contract	seam::{echo_anchor_pass,spawn,sweep_born}; CursorGlow::{tick,note_typed_expected,note_return}	A one-cell anchored advance witnessed with the press's own glyph (or on the caret row, or hidden, or glyph-less) within TYPE_HINT_FRESH is licensed and lays exactly that cell, born within 100 ms; Enter takes the hand off its row.	0,1,2,3,4,5,7	2
 torn-lay-recall	contract	seam::CursorGlow::recall_torn_lay; torn_lay tracking; rainbow_kitty Event::Rewrite	A torn lay printed off its row, with the hand elsewhere and only its own cells right of the caret, is recalled once the caret has rested TORN_REST_S (a Rewrite back to the caret, the hand restored, one recall record); a key press or a caret resting right of the lay never triggers it; recalled ink is gone within about 330 ms.	0,1,2,3,5,7,10	2
+aos-lease-refines-model	refinement	aos_momentum::lease::Ledger::{join,hello,begin,assign,lease,result,progress,tick,lost,cancelled,void,finish,outcome,job,worker,counts,awaiting,next_deadline}; aterm_models_aos::aos_worker_lease_model	The M5b worker-lease ledger with one open job, two workers and max_attempts = MaxAttempts in {2, 1} refines AosWorkerLease (design §11.5, §11.7): the projection of the opened search (job state and attempts; each worker's state, lease epoch and Gone reason; the accepted claim and the late claim awaiting it as truth or lie; the outcome; the frames in flight, the one resend and the duplicate/stale/post-void/ignored ghosts kept by the harness) is the model's Init, and every real call is a model transition the model admits by the action's own name: lease and assign to an Idle worker; result as accept, compare, late result or drop; tick at a holder's deadline as ExpireX (the job Pending, or Exhausted and voided at the limit, or NoWorkers voided when no other worker is left) and at a drain's end as DrainTimeoutX; lost as LoseX; cancelled as AckX; void(Interrupted) as Cancel; finish as Finish. Each such call kills exactly the workers the model makes Gone and sends Cancel to exactly the holders it drains. The calls the model rules out leave the projection and the counters unchanged: a lease the model has no LeaseX for (a worker not Idle, no job Pending, a settled search), assign when it has neither, a tick before every deadline, a second void, an earlier now, and finish before completion. Every transition of the bounded space (1456 at MaxAttempts 2, 349 at 1) is taken this way, and each Buggy dial 1-6 is caught: the additive dial 1's step is refused by the real tick, and each of dials 2-6 makes the real step one the mutant does not admit while the mutant's own step breaks its law.	0,1,2,3,7,10,12	8
 ```
 
 ## 2. Test → spec map (TSV)
@@ -3107,6 +3113,14 @@ tests/zsh_isearch_band.rs	torn_reads_leave_no_band_on_the_match_row	parked-caret
 tests/zsh_isearch_band.rs	torn_reads_lay_no_band_on_the_match_row	parked-caret-row-ownership
 tests/zsh_isearch_band.rs	typeahead_into_the_minibuffer_lays_nothing	minibuffer-gate	
 tests/zsh_isearch_band.rs	whole_reads_lay_no_band_on_the_match_row_or_under_zle_s_fake_cursor	minibuffer-gate	
+src/aos_momentum/lease_conformance_tests.rs	the_real_ledger_follows_the_lease_model_in_lock_step	aos-lease-refines-model	
+src/aos_momentum/lease_conformance_tests.rs	every_transition_of_the_lease_model_is_a_real_step	aos-lease-refines-model	
+src/aos_momentum/lease_conformance_tests.rs	negative_control_expire_keeps_lease_the_real_tick_releases_the_job	aos-lease-refines-model	
+src/aos_momentum/lease_conformance_tests.rs	negative_control_duplicate_an_equal_resend_is_counted_not_accepted	aos-lease-refines-model	
+src/aos_momentum/lease_conformance_tests.rs	negative_control_stale_a_late_result_for_an_open_job_waits_for_its_claim	aos-lease-refines-model	
+src/aos_momentum/lease_conformance_tests.rs	negative_control_post_an_interrupt_drains_the_holder_and_drops_its_result	aos-lease-refines-model	
+src/aos_momentum/lease_conformance_tests.rs	negative_control_ignored_every_differing_claim_is_compared_and_voids	aos-lease-refines-model	
+src/aos_momentum/lease_conformance_tests.rs	negative_control_attempts_the_last_expiry_exhausts_the_job	aos-lease-refines-model	
 ```
 
 
@@ -3304,3 +3318,86 @@ then the small state machines, and the large engines last.
    settle ladder, `settle_gaze`) would move `reduced-motion-static`, `settle-ladder`,
    `idle-frame-laws` and `sleeper-gaze-brakes` into step 3. The bounded host-seam sweeps can hold at
    Trusted grade under a bounded model checker over the compiled code before any Clean proof exists.
+
+## 7. Added 2026-10-23: the distributed search (aos M5b)
+
+`aos_momentum::dist` (the wire, the claim check and the coordinator core) and `m4::Distributed`
+(the fold over claims) are new since the recovery, and their tests are read the same way as §1.
+Design of record: `docs/DESIGN-aos-hosted-execution-2026-10-21.md` §11. The ledger
+(`aos_momentum::lease`) has its call table here as `aos-lease-calls` and its refinement of the
+model as `aos-lease-refines-model` (§1).
+*Local* means judged by this process's `Evaluator`; a *claim* is a worker's reply, which is never
+evidence.
+
+```tsv
+id	kind	functions	statement	blocking_gaps	primary_tests
+aos-dist-wire	contract	dist::{Msg::encode,Msg::decode,ExecIdentity::{encode,decode,digest,first_difference},RawClaim::{encode,decode,shaped},Claim::shaped,job_id,claim_digest}	∀ m: Msg with sender s: Msg::decode(m.encode(), s) = Ok(m); ExecIdentity and RawClaim round-trip the same way. Msg::decode(b, s) is Ok(m) only when m.encode() = b; otherwise it is Err by a named FrameFault (Magic, Format, Tag, Direction, Wire, NonCanonical, Kind) and it never panics, a row count over MAX_ROWS included. job_id(exec, kind, plan) = Digest::of(JOB_DOMAIN, [exec, kind, plan.encode()]); claim_digest(job, c) = Digest::of(CLAIM_DOMAIN, [job, c.encode()]), so it covers the job, the kind, the count and every row field, and not a Result's declared stepped and judge_ns. first_difference(a, b) = None ⇔ a.digest() = b.digest(), else it names the first differing field. Claim::shaped refuses, by ShapeFault variant, a kind that disagrees with its last row, a count over the items or not ending at the first refusal, and a row whose item pin is not the split's.	0,1,3,5,7	2
+aos-dist-outcome-local	contract	dist::{Coordinator::{new,join,begin,on,tick,void,take_claims},run_job,Claim::{totals,ticks,check}}; m4::{Evaluator::distributed,Distributed::{jobs,claim,finish,finish_noting}}	No claimed row reaches a Selection or a bundle: a claim is read only through kind, len, totals, ticks and check, and every row a Selection carries is judged locally. Distributed::finish(spread), once every job holds one claim: (1) every refused claim is re-judged locally on its prefix and the claimed best in full, and under CheckLevel::All every claim in full; any disagreement is DistNoOutcome::Contradicted { slot, item, field } before any held-out read, and a job with no claim or a second claim is Unclaimed or Misplaced; (2) under Dominance the other admitted claims are judged in descending claimed T until the local partial ΣT exceeds the winner's, and the rest are dominated; (3) round-0 feedback is built in proposal order from those results and rounds 1.. are asked with it, any proposal giving Adaptive with no held-out read; (4) only then NoneAdmitted or NoGain, and the held-out split is read at most once, never after a void. The mode is Distributed exactly under Dominance (stats.admitted may rest on dominated claims) and Search under All. The coordinator voids a search on any lie it can see (a differing resend or stale result: Differs; a broken stream: Frame, its sender killed; a shape, an unasked or unheld result, no progress), after which it issues no lease; a transport fault from a worker already gone is dropped unread. run_job reads no held-out item and stops at its flag.	0,1,2,3,4,5,7,13	19
+aos-lease-calls	contract	lease::Ledger::{join,hello,begin,assign,lease,progress,result,cancelled,lost,tick,void,finish,outcome,counts,next_deadline}	The call table of design §11.5 over Reach(Ledger) with a non-decreasing clock: an earlier now is ClockBackwards with the state unchanged; a join past max_workers is refused with no worker made; begin and assign lease the lowest Pending jobs to Idle workers, one lease per worker; a lease lives until its deadline and is released at it (Busy → Draining Expired, Cancel sent); progress must strictly increase its k (any k < 17 first, None at lease), so a lease outlives at most 18 windows and a repeat or a k ≥ 17 is NoProgress; a draining worker is held to the same k rule and one answered result; a Cancelled answer retires its worker; the first Result for a held lease claims its job and an equal resend or stale result is counted, a differing one is Differs; a frame for a token the worker does not hold is NotHeld, an unasked one Unasked, a frame before hello or a second hello voids, a foreign hello refuses that worker alone; EOF, hello timeout or a drain past grace makes the worker Gone and returns its job to Pending, the third lost lease Exhausts it, and no live worker left with a job open is NoWorkers; the sender of every voiding frame is killed and never drained, and a void cancels every other holder; every move to Gone emits one Kill; frames from a Gone worker are dropped; finish completes only a search whose every job is Claimed with no worker Draining.	0,1,2,3,5,7	35
+aos-dist-equals-local	equivalence	m4::{Evaluator::{select,select_spread,distributed},Distributed::finish}; dist::Coordinator::on; Spread	For honest claims (each equal to run_job of its plan on this evaluator) in any completion order and over any spread, Distributed::finish gives the Selection that Evaluator::select gives for the same proposer, mode and timings aside; select_spread equals select for every spread that runs each index once, and finish equals serial for a spread that skips jobs (the rest run in place), at both check levels; completion order never reaches the proposer, which sees feedback in proposal order.	0,1,2,3,5,7,11,13	5
+```
+
+```tsv
+file	test	primary	also
+src/aos_momentum/lease_tests.rs	a_different_late_result_voids	aos-lease-calls	aos-lease-refines-model
+src/aos_momentum/lease_tests.rs	a_different_resend_voids	aos-lease-calls	aos-lease-refines-model
+src/aos_momentum/lease_tests.rs	a_drain_past_grace_is_lost_and_killed	aos-lease-calls	aos-lease-refines-model
+src/aos_momentum/lease_tests.rs	a_draining_worker_cannot_flood	aos-lease-calls	aos-lease-refines-model
+src/aos_momentum/lease_tests.rs	a_foreign_hello_refuses_that_worker_alone	aos-lease-calls	aos-lease-refines-model
+src/aos_momentum/lease_tests.rs	a_frame_before_hello_and_a_second_hello_void	aos-lease-calls	aos-lease-refines-model
+src/aos_momentum/lease_tests.rs	a_lease_cannot_outlive_eighteen_windows	aos-lease-calls	aos-lease-refines-model
+src/aos_momentum/lease_tests.rs	a_lease_lives_until_its_deadline_and_not_at_it	aos-lease-calls	aos-lease-refines-model
+src/aos_momentum/lease_tests.rs	a_replayed_token_is_not_held	aos-lease-calls	aos-lease-refines-model
+src/aos_momentum/lease_tests.rs	a_resend_after_its_search_ended_is_a_duplicate	aos-lease-calls	aos-lease-refines-model
+src/aos_momentum/lease_tests.rs	a_result_crossing_a_cancel_then_its_ack_retires	aos-lease-calls	aos-lease-refines-model
+src/aos_momentum/lease_tests.rs	a_search_completes_and_the_pool_serves_the_next	aos-lease-calls	aos-lease-refines-model
+src/aos_momentum/lease_tests.rs	a_second_resend_is_unasked	aos-lease-calls	aos-lease-refines-model
+src/aos_momentum/lease_tests.rs	an_ack_retires_the_worker	aos-lease-calls	aos-lease-refines-model
+src/aos_momentum/lease_tests.rs	an_equal_late_result_is_counted_stale	aos-lease-calls	aos-lease-refines-model
+src/aos_momentum/lease_tests.rs	an_equal_resend_changes_nothing	aos-lease-calls	aos-lease-refines-model
+src/aos_momentum/lease_tests.rs	an_expired_lease_is_released_at_once	aos-lease-calls	aos-lease-refines-model
+src/aos_momentum/lease_tests.rs	an_unasked_cancelled_voids	aos-lease-calls	aos-lease-refines-model
+src/aos_momentum/lease_tests.rs	another_workers_token_is_not_held	aos-lease-calls	aos-lease-refines-model
+src/aos_momentum/lease_tests.rs	begin_leases_the_lowest_jobs_to_idle_workers	aos-lease-calls	aos-lease-refines-model
+src/aos_momentum/lease_tests.rs	cancel_all_drains_every_holder	aos-lease-calls	aos-lease-refines-model
+src/aos_momentum/lease_tests.rs	eof_mid_job_reopens_it_and_keeps_the_workers_claims	aos-lease-calls	aos-lease-refines-model
+src/aos_momentum/lease_tests.rs	finish_completes_only_a_claimed_quiet_search	aos-lease-calls	aos-lease-refines-model
+src/aos_momentum/lease_tests.rs	frames_from_a_gone_worker_are_dropped	aos-lease-calls	aos-lease-refines-model
+src/aos_momentum/lease_tests.rs	hello_timeout_is_lost	aos-lease-calls	aos-lease-refines-model
+src/aos_momentum/lease_tests.rs	limits_v1_are_the_designs	aos-lease-calls	aos-lease-refines-model
+src/aos_momentum/lease_tests.rs	no_more_than_max_workers_join	aos-lease-calls	aos-lease-refines-model
+src/aos_momentum/lease_tests.rs	no_workers_left_voids	aos-lease-calls	aos-lease-refines-model
+src/aos_momentum/lease_tests.rs	progress_after_expiry_is_dropped	aos-lease-calls	aos-lease-refines-model
+src/aos_momentum/lease_tests.rs	progress_for_a_claimed_lease_is_unasked	aos-lease-calls	aos-lease-refines-model
+src/aos_momentum/lease_tests.rs	progress_that_does_not_advance_voids	aos-lease-calls	aos-lease-refines-model
+src/aos_momentum/lease_tests.rs	step_five_waits_for_every_drain	aos-lease-calls	aos-lease-refines-model
+src/aos_momentum/lease_tests.rs	the_sender_of_a_voiding_frame_is_killed_not_drained	aos-lease-calls	aos-lease-refines-model
+src/aos_momentum/lease_tests.rs	the_third_lost_lease_exhausts_the_job_and_voids	aos-lease-calls	aos-lease-refines-model
+src/aos_momentum/lease_tests.rs	time_never_runs_backwards	aos-lease-calls	aos-lease-refines-model
+src/aos_momentum/dist_tests.rs	every_message_round_trips_and_every_fault_is_named	aos-dist-wire	
+src/aos_momentum/dist_tests.rs	ids_and_digests_name_what_they_cover	aos-dist-wire	
+src/aos_momentum/dist_tests.rs	a_refusal_claimed_for_an_admitted_plan_is_contradicted	aos-dist-outcome-local	
+src/aos_momentum/dist_tests.rs	a_forged_best_is_contradicted_before_any_held_out_read	aos-dist-outcome-local	
+src/aos_momentum/dist_tests.rs	an_inflated_winner_is_found_by_the_dominance_check	aos-dist-outcome-local	
+src/aos_momentum/dist_tests.rs	a_dominated_claim_stops_at_the_winners_sum	aos-dist-outcome-local	
+src/aos_momentum/dist_tests.rs	check_all_judges_every_admitted_claim_and_records_search	aos-dist-outcome-local	aos-dist-equals-local
+src/aos_momentum/dist_tests.rs	claims_never_fill_the_grid_cache	aos-dist-outcome-local	
+src/aos_momentum/dist_tests.rs	a_distributed_bundle_is_checked_and_declared	aos-dist-outcome-local	
+src/aos_momentum/dist_tests.rs	a_proposal_after_round_zero_is_adaptive	aos-dist-outcome-local	
+src/aos_momentum/dist_tests.rs	claims_must_fill_every_job_once	aos-dist-outcome-local	
+src/aos_momentum/dist_tests.rs	every_refusal_held_is_none_admitted	aos-dist-outcome-local	
+src/aos_momentum/dist_tests.rs	each_shape_fault_is_refused_by_name	aos-dist-outcome-local	aos-dist-wire
+src/aos_momentum/dist_tests.rs	run_job_reads_no_held_out_item_and_stops_when_told	aos-dist-outcome-local	
+src/aos_momentum/dist_tests.rs	lies_are_contradicted_or_refused_by_shape	aos-dist-outcome-local	
+src/aos_momentum/dist_tests.rs	garbage_another_job_id_and_a_foreign_hello	aos-dist-outcome-local	aos-dist-wire
+src/aos_momentum/dist_tests.rs	resends_and_frames_from_the_gone	aos-dist-outcome-local	
+src/aos_momentum/dist_tests.rs	the_held_out_split_is_read_once_under_every_fault	aos-dist-outcome-local	
+src/aos_momentum/dist_tests.rs	a_broken_stream_voids_and_kills_its_sender	aos-dist-outcome-local	
+src/aos_momentum/dist_tests.rs	a_broken_tail_from_a_gone_worker_is_dropped	aos-dist-outcome-local	
+src/aos_momentum/dist_tests.rs	a_claims_rows_stay_private_to_dist	aos-dist-outcome-local	
+src/aos_momentum/dist_tests.rs	honest_claims_in_any_completion_order_give_the_local_selection	aos-dist-equals-local	
+src/aos_momentum/dist_tests.rs	select_spread_equals_select	aos-dist-equals-local	
+src/aos_momentum/dist_tests.rs	finish_with_a_skipping_spread_equals_serial	aos-dist-equals-local	
+src/aos_momentum/dist_tests.rs	completion_order_never_reaches_the_proposer	aos-dist-equals-local	
+src/aos_momentum/dist_tests.rs	an_honest_pool_gives_the_local_selection	aos-dist-equals-local	aos-dist-outcome-local
+```

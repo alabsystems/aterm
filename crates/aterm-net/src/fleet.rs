@@ -501,7 +501,8 @@ impl FleetError {
         }
     }
 
-    /// The same failure again, for each dial that shares one handshake.
+    /// The same failure again, for each dial that shares one handshake (the Unix member's).
+    #[cfg(unix)]
     pub(crate) fn copied(&self) -> Self {
         match self {
             Self::ListenerWrongSecret => Self::ListenerWrongSecret,
@@ -523,6 +524,7 @@ impl FleetError {
 }
 
 /// `e` again: its OS error where it carries one, else its kind and text.
+#[cfg(unix)]
 pub(crate) fn copied_io(e: &io::Error) -> io::Error {
     e.raw_os_error().map_or_else(
         || io::Error::new(e.kind(), e.to_string()),

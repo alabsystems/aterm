@@ -206,6 +206,11 @@ struct Fake {
     fish_answers: String,
     fish_error: Option<&'static str>,
     fish_panics: bool,
+    built_bash: Vec<u8>,
+    bash_answers: String,
+    patched: RefCell<Vec<u8>>,
+    /// The `y.tab.c` the fake `make bash` compiled.
+    parser: RefCell<Vec<u8>>,
     bindgen_answers: String,
     zip_files: Vec<(&'static str, Vec<u8>)>,
     zip_links: Vec<(&'static str, PathBuf)>,
@@ -226,6 +231,12 @@ impl Fake {
             fish_answers: "fish, version 4.9.3\n".into(),
             fish_error: None,
             fish_panics: false,
+            built_bash: macho(&[LIBSYSTEM, "/usr/lib/libncurses.5.4.dylib"], b""),
+            bash_answers: "GNU bash, version 5.3.20(1)-release (aarch64-apple-darwin27.0.0)\n\
+                           Copyright (C) 2025 Free Software Foundation, Inc.\n"
+                .into(),
+            patched: RefCell::default(),
+            parser: RefCell::default(),
             bindgen_answers: format!("wasm-bindgen {}\n", crate::wasm_glue::BINDGEN),
             zip_files: vec![(
                 "chrome-headless-shell-mac-arm64/chrome-headless-shell",
@@ -322,6 +333,58 @@ impl Host for Fake {
                 std::fs::write(root.join("bin/wasm-bindgen"), "#!/bin/false\n").unwrap();
                 Ok(String::new())
             }
+            ["-p0", "-s", "-f", "-i", patch] if program == bash::PATCH => {
+                let body = std::fs::read(patch).map_err(|e| e.to_string())?;
+                if body.windows(6).any(|w| w == b"REJECT") {
+                    return Err(format!("{program} exited Some(1): 1 out of 1 hunks failed"));
+                }
+                self.patched.borrow_mut().extend_from_slice(&body);
+                // A `+++ <file>` line changes that file, in the patch's order.
+                for line in String::from_utf8_lossy(&body).lines() {
+                    if let Some(file) = line.strip_prefix("+++ ") {
+                        std::fs::write(spawn.cwd.join(file), &body).map_err(|e| e.to_string())?;
+                    }
+                }
+                Ok(String::new())
+            }
+            ["./configure", ..] if program == bash::SH => {
+                let time = |name: &str| {
+                    std::fs::metadata(spawn.cwd.join(name))
+                        .and_then(|m| m.modified())
+                        .unwrap()
+                };
+                if ["configure.ac", "aclocal.m4"]
+                    .iter()
+                    .any(|from| time("configure") < time(from))
+                {
+                    return Err(
+                        "make would remake configure with autoconf, which no Mac has".into(),
+                    );
+                }
+                std::fs::write(spawn.cwd.join("Makefile"), "bash:\n").map_err(|e| e.to_string())?;
+                Ok(String::new())
+            }
+            ["bash"] if program == bash::MAKE => {
+                assert!(spawn.cwd.join("Makefile").is_file(), "configure ran first");
+                // `y.tab.c: parse.y`, as the Command Line Tools' make 3.81 judges it: by
+                // whole seconds, a `parse.y` newer than `y.tab.c` is run through bison.
+                let (parser, grammar) = (spawn.cwd.join("y.tab.c"), spawn.cwd.join("parse.y"));
+                let secs = |file: &Path| {
+                    std::fs::metadata(file)
+                        .and_then(|m| m.modified())
+                        .unwrap()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs()
+                };
+                if secs(&grammar) > secs(&parser) {
+                    std::fs::copy(&grammar, &parser).unwrap();
+                }
+                *self.parser.borrow_mut() = std::fs::read(&parser).unwrap();
+                std::fs::write(spawn.cwd.join("bash"), &self.built_bash).unwrap();
+                Ok(String::new())
+            }
+            ["--version"] if program.ends_with("bin/bash") => Ok(self.bash_answers.clone()),
             ["--version"] if program.ends_with("bin/fish") => {
                 assert!(!self.fish_panics, "the injected version probe unwinds");
                 if let Some(e) = self.fish_error {
@@ -895,6 +958,253 @@ fn the_fish_build_is_the_rows_argv_and_environment() {
     assert_eq!(envs.get("PATH"), None, "the rest is inherited untouched");
 }
 
+const BASH_URL: &str = "https://fixture.invalid/bash-5.3.tar.gz";
+
+/// A bash source whose archive lays `configure` before the `aclocal.m4` it is made from,
+/// as GNU's bash-5.3.tar.gz does.
+fn bash_source() -> Vec<u8> {
+    gzip(&tar(&[
+        ("bash-5.3/", Member::Dir),
+        ("bash-5.3/configure", Member::File(b"#!/bin/sh\n", 0o755)),
+        ("bash-5.3/configure.ac", Member::File(b"AC_INIT\n", 0o644)),
+        ("bash-5.3/aclocal.m4", Member::File(b"dnl\n", 0o644)),
+        ("bash-5.3/y.tab.c", Member::File(b"/* bison */\n", 0o644)),
+        ("bash-5.3/parse.y", Member::File(b"%%\n", 0o644)),
+        ("bash-5.3/COPYING", Member::File(b"GPLv3", 0o644)),
+    ]))
+}
+
+fn bash_patch(n: usize) -> (String, Vec<u8>) {
+    bash_patch_of(n, &[])
+}
+
+/// Patch `n`, which changes `files` in their order.
+fn bash_patch_of(n: usize, files: &[&str]) -> (String, Vec<u8>) {
+    let changes: String = files.iter().map(|f| format!("+++ {f}\n")).collect();
+    (
+        format!("https://fixture.invalid/bash53-{n:03}"),
+        format!("*** patch {n}\n{changes}").into_bytes(),
+    )
+}
+
+/// The bash row over `source` and `patches`, each pinned to its own bytes unless
+/// `pinned` gives another patch body.
+fn bash_row(source: &[u8], patches: &[(String, Vec<u8>)], pinned: Option<&[u8]>) -> Row {
+    let patches: Vec<Archive> = patches
+        .iter()
+        .map(|(url, body)| Archive {
+            platform: "source",
+            url: leak(url.clone()),
+            sha256: leak(sha256(pinned.unwrap_or(body))),
+            bytes: body.len() as u64,
+        })
+        .collect();
+    Row {
+        name: "bash",
+        tool: Some("bash-5.3"),
+        install: Install::Configure {
+            source: Archive {
+                platform: "source",
+                url: BASH_URL,
+                sha256: leak(sha256(source)),
+                bytes: source.len() as u64,
+            },
+            patches: Box::leak(patches.into_boxed_slice()),
+        },
+    }
+}
+
+fn bash_host(source: &[u8], patches: &[(String, Vec<u8>)]) -> Fake {
+    patches.iter().fold(
+        Fake::new().serve(BASH_URL, source.to_vec()),
+        |host, (url, body)| host.serve(url, body.clone()),
+    )
+}
+
+#[test]
+fn bash_is_built_from_its_source_and_each_patch_in_order_where_the_tests_resolve_it() {
+    let home = aterm_tempfile::tempdir().unwrap();
+    let m = machine(home.path());
+    let source = bash_source();
+    let patches = [bash_patch(1), bash_patch(2)];
+    let host = bash_host(&source, &patches);
+    let dir = m.tooling.join("bash-5.3.20");
+    assert_eq!(
+        provide(&bash_row(&source, &patches, None), &m, &host, &mut |_| {}),
+        State::Placed(dir.join("bin/bash"))
+    );
+    assert_eq!(
+        aterm_uds::host::tool("bash-5.3").pinned_in(&m.tooling),
+        Some(dir.join("bin/bash")),
+        "where the bash 5.3 tests resolve it"
+    );
+    assert_eq!(
+        *host.fetched.borrow(),
+        [BASH_URL, patches[0].0.as_str(), patches[1].0.as_str()]
+    );
+
+    let applied = host.spawned(bash::PATCH);
+    assert_eq!(applied.len(), 2, "{applied:#?}");
+    let src = &applied[0].cwd;
+    assert!(
+        src.ends_with("src") && src.starts_with(&m.tooling),
+        "{src:?}"
+    );
+    assert_eq!(
+        *host.patched.borrow(),
+        [&patches[0].1[..], &patches[1].1[..]].concat(),
+        "every patch, in the row's order"
+    );
+    let configure = host.spawned(bash::SH);
+    assert_eq!(configure.len(), 1, "{configure:#?}");
+    let mut prefix = OsString::from("--prefix=");
+    prefix.push(&dir);
+    assert_eq!(
+        configure[0].args,
+        [
+            "./configure".into(),
+            prefix,
+            "--without-bash-malloc".into(),
+            "--disable-nls".into()
+        ],
+        "no translations: configure would link a libintl it finds on the compiler's own path"
+    );
+    let make = host.spawned(bash::MAKE);
+    assert_eq!(make.len(), 1, "{make:#?}");
+    for step in applied.iter().chain(&configure).chain(&make) {
+        assert_eq!(&step.cwd, src);
+        assert_eq!(
+            step.set,
+            [("PATH".to_string(), OsString::from(bash::BUILD_PATH))]
+        );
+        for gone in [
+            "CC",
+            "CFLAGS",
+            "CPPFLAGS",
+            "LDFLAGS",
+            "CPATH",
+            "LIBRARY_PATH",
+        ] {
+            assert!(step.remove.iter().any(|k| k == gone), "{gone}: {step:?}");
+        }
+    }
+
+    let stamp = place::read_stamp(&dir).unwrap();
+    assert_eq!(stamp.row, "bash");
+    assert_eq!(stamp.version, "5.3.20");
+    assert_eq!(stamp.sha256.as_deref(), Some(sha256(&source).as_str()));
+    assert_eq!(
+        stamp.reports.as_deref(),
+        Some("GNU bash, version 5.3.20(1)-release (aarch64-apple-darwin27.0.0)")
+    );
+    assert_eq!(mode(&dir.join("bin/bash")), 0o755);
+    assert_eq!(
+        std::fs::read(dir.join("bin/bash")).unwrap(),
+        host.built_bash
+    );
+    assert!(dir.join("COPYING").is_file());
+    assert_eq!(names(&m.tooling), ["bash-5.3.20"], "no scratch left");
+    assert!(matches!(
+        check(&bash_row(&source, &patches, None), &m, &Fake::new()),
+        State::Present(_)
+    ));
+}
+
+#[test]
+fn a_patch_to_a_generated_files_source_reaches_the_build_and_autoconf_never_runs() {
+    let home = aterm_tempfile::tempdir().unwrap();
+    let m = machine(home.path());
+    let source = bash_source();
+    // bash52-018 changed `parse.y` alone; bash53-016 changes `configure.ac`, then `configure`.
+    let patches = [
+        bash_patch_of(1, &["parse.y"]),
+        bash_patch_of(2, &["configure.ac", "configure"]),
+    ];
+    let host = bash_host(&source, &patches);
+    let state = provide(&bash_row(&source, &patches, None), &m, &host, &mut |_| {});
+    assert!(matches!(state, State::Placed(_)), "{state:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&host.parser.borrow()),
+        String::from_utf8_lossy(&patches[0].1),
+        "make ran the patched parse.y through bison"
+    );
+}
+
+#[test]
+fn a_bash_patch_off_its_pin_or_that_does_not_apply_refuses_the_row() {
+    let source = bash_source();
+    let patches = [bash_patch(1), bash_patch(2)];
+    let rejected = [bash_patch(1), (bash_patch(2).0, b"*** REJECT\n".to_vec())];
+    for (row, served, why) in [
+        (
+            bash_row(&source, &patches, Some(&b"another patch"[..])),
+            &patches,
+            "the archive changed under its version",
+        ),
+        (
+            bash_row(&source, &rejected, None),
+            &rejected,
+            "bash53-002 did not apply",
+        ),
+    ] {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let m = machine(home.path());
+        let host = bash_host(&source, served);
+        match provide(&row, &m, &host, &mut |_| {}) {
+            State::Failed(said) => assert!(said.contains(why), "{said}"),
+            other => panic!("{why}: {other:?}"),
+        }
+        assert!(host.spawned(bash::SH).is_empty(), "nothing was configured");
+        assert_eq!(
+            names(&m.tooling),
+            Vec::<String>::new(),
+            "nothing left behind"
+        );
+    }
+}
+
+#[test]
+fn a_bash_build_that_is_not_the_pin_is_refused() {
+    let source = bash_source();
+    let patches = [bash_patch(1)];
+    for (answers, built, why) in [
+        (
+            "GNU bash, version 5.3.19(1)-release (aarch64-apple-darwin27.0.0)\n",
+            None,
+            "not version 5.3.20",
+        ),
+        (
+            "GNU bash, version 5.3.200(1)-release (aarch64-apple-darwin27.0.0)\n",
+            None,
+            "not version 5.3.20",
+        ),
+        (
+            "GNU bash, version 5.3.20(1)-release (aarch64-apple-darwin27.0.0)\n",
+            Some(macho(
+                &[LIBSYSTEM, "/opt/homebrew/lib/libintl.8.dylib"],
+                b"",
+            )),
+            "/opt/homebrew/lib/libintl.8.dylib from outside /usr/lib and /System",
+        ),
+    ] {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let m = machine(home.path());
+        let mut host = bash_host(&source, &patches);
+        host.bash_answers = answers.into();
+        if let Some(built) = built {
+            host.built_bash = built;
+        }
+        match provide(&bash_row(&source, &patches, None), &m, &host, &mut |_| {}) {
+            State::Failed(said) => assert!(said.contains(why), "{said}"),
+            other => panic!("{answers}: {other:?}"),
+        }
+        assert!(
+            !m.tooling.join("bash-5.3.20").exists(),
+            "nothing was placed"
+        );
+    }
+}
+
 fn all_in_place(m: &Machine) {
     for row in select(&Options::default()) {
         let Some(t) = target(row, m) else {
@@ -1249,6 +1559,7 @@ fn the_command_line_names_rows_and_flags_only() {
         [
             "rustup",
             "fish",
+            "bash",
             "pwsh",
             "binaryen",
             "chrome-headless-shell",
@@ -1267,11 +1578,44 @@ fn each_row_places_what_its_tool_row_resolves() {
         if let Some(pin) = tool.pin {
             for platform in ["macos-aarch64", "macos-x86_64"] {
                 if let Some(a) = row.archive_for(platform) {
-                    assert!(a.url_at(pin.version).contains(pin.version), "{}", a.url);
+                    let named = match row.install {
+                        Install::Configure { .. } => pin.version.rsplit_once('.').unwrap().0,
+                        _ => pin.version,
+                    };
+                    assert!(a.url_at(pin.version).contains(named), "{}", a.url);
                     assert_eq!(a.sha256.len(), 64);
                 }
             }
             match row.install {
+                Install::Configure { source, patches } => {
+                    let (release, level) = pin.version.rsplit_once('.').unwrap();
+                    assert_eq!(
+                        patches.len().to_string(),
+                        level,
+                        "{}: the version's last part counts the patches",
+                        row.name
+                    );
+                    let flat: String = release.chars().filter(|c| *c != '.').collect();
+                    for (n, patch) in patches.iter().enumerate() {
+                        assert!(
+                            patch.url.ends_with(&format!(
+                                "/bash-{release}-patches/bash{flat}-{:03}",
+                                n + 1
+                            )),
+                            "{}: patch {} is {}",
+                            row.name,
+                            n + 1,
+                            patch.url
+                        );
+                        assert_eq!(patch.sha256.len(), 64);
+                        assert_eq!(patch.platform, "source");
+                    }
+                    assert!(source.url.ends_with(&format!("/bash-{release}.tar.gz")));
+                    for host in pin.hosts {
+                        assert!(row.archive_for(host).is_some(), "{} on {host}", row.name);
+                    }
+                    assert!(row.archive_for("linux-riscv64").is_none());
+                }
                 Install::Unpack { archives, .. } => {
                     let mut hosts: Vec<&str> = archives.iter().map(|a| a.platform).collect();
                     hosts.sort_unstable();

@@ -61,6 +61,10 @@ Vendor `codex` is shown, not supervised; `codex-alab` supervises itself.
 
 USAGE:
     aterm harness usage [--json]                 this session's tokens per model and usage-tap windows
+    aterm harness usage --agy [--json]           agy's quota: each model group's weekly and 5-hour limits
+    aterm harness agy [quota] [--refresh] [--json]
+                                                 agy's quota per pool, kept and tracked: standing, burn, refill
+    aterm harness agy pick [<model>] [--json]    the model an agy launch runs after quota rotation
     aterm harness limits [@<sid>] [--json]       wall and painted /usage windows on the session's screen
     aterm harness disk [<build-dir> ...] [--apply <class>] [--json]
                                                  report or reclaim stale build directories and caches
@@ -118,11 +122,30 @@ OPTIONS:
     --due               accounts renew: renew every due or expired login on this machine
     --on <host>,...     accounts renew: machines to renew next over ssh (`host` or `host:/abs/aterm`)
     --here              accounts renew: renew this machine's logins only
+    --agy               usage: read agy's model quota (`agy -p /usage`)
+    --refresh           agy: ask agy now instead of the kept reading
     --auto              accounts use: clear the pin
     --machine <mN>      accounts sync, serve: override machine id (`m8`, `m14`, \u{2026})
     --bind <addr:port>  accounts serve: listen address (default `127.0.0.1:8741`)
     --json              emit JSON
     -h, --help, help    print help (`aterm harness <verb> --help` for one verb)
+";
+
+const HELP_AGY: &str = "\
+`agy` reads agy's model quota with `agy -p /usage --output-format json`, which runs no model
+turn. agy's models sit in pools (Gemini; Claude and GPT), each with its own weekly and 5-hour
+limit; a pool is `open`, `low` (a limit at or under `[harness.agy] low`, default 10%) or
+`spent` (a limit at 0 that applies). The reading is kept under the harness state
+(`agy-quota/home.json`, 15 minutes current, 5 while a pool is low or spent, until a spent
+limit's refill passes) and every read adds a line to `agy-quota/home.jsonl`, from which each
+limit's burn per hour and the moment it runs out at that rate are reckoned.
+  - `agy pick [<model>]`: the model a launch of `<model>` (agy's default when none) runs. A
+    spent pool rotates any launch to the first `[harness.agy] order` model in an open pool,
+    else in the low pool with the most left, else it waits (exit 3) until the earliest refill;
+    a low pool rotates agy's default, and keeps a named model. `aterm ctl spawn agent=agy`
+    workers launch on this pick.
+  - `[harness.agy]` in aterm.toml: `rotate = false` turns rotation off; `low = 0.1` (or `10`);
+    `order = [\"claude-opus-5-5-medium\", \"gemini-4-argon-high\", ...]`.
 ";
 
 const HELP_USAGE: &str = "\
@@ -136,6 +159,10 @@ const HELP_USAGE: &str = "\
   - Under a Codex tool (`CODEX_THREAD_ID`, no Claude session named): the root thread's
     rollout and its subagent rollouts under `CODEX_HOME` (else `~/.codex`), forked prefixes
     skipped, priced at list `usd` (\u{2248}$, never a bill).
+  - Under agy's tools (`ANTIGRAVITY_CONVERSATION_ID`, no Claude session or Codex thread), or
+    with `--agy` anywhere: agy's model quota from `agy -p /usage --output-format json`, each
+    model group (Gemini; Claude and GPT) with its own weekly and 5-hour limit left, its refill
+    time, and `SPENT` on a group a limit blocks.
   - Anywhere else: the newest transcript in `<claude dir>/projects/<cwd>/*.jsonl`
     (`CLAUDE_CONFIG_DIR`, else `~/.claude`). A relative `CLAUDE_CONFIG_DIR` or `CODEX_HOME`
     folds nothing.
@@ -427,6 +454,8 @@ pub struct Env {
     pub codex_thread: Option<String>,
     /// `CODEX_HOME` as this command's environment sets it, raw: the Codex home is it, else `$HOME/.codex`, and a relative one names none ([`crate::harness::codex_rollout::codex_home`]).
     pub codex_home: Option<String>,
+    /// The agy conversation this command runs under: `ANTIGRAVITY_CONVERSATION_ID`, which agy sets for the commands its tools run. aterm strips `ANTIGRAVITY_*` from the shells it spawns, so only agy's own tools carry it.
+    pub agy_conversation: Option<String>,
     /// Unix seconds.
     pub now: i64,
     /// The aterm session id (`$ATERM_PARENT_SESSION_ID`), or empty.
@@ -498,6 +527,9 @@ impl Env {
                 .ok()
                 .filter(|id| super::codex_rollout::is_thread_id(id)),
             codex_home: std::env::var("CODEX_HOME").ok(),
+            agy_conversation: std::env::var("ANTIGRAVITY_CONVERSATION_ID")
+                .ok()
+                .filter(|id| !id.trim().is_empty()),
             now,
             sid: std::env::var("ATERM_PARENT_SESSION_ID").unwrap_or_default(),
             sock: None,
@@ -506,6 +538,15 @@ impl Env {
             claude_running: None,
             tz_s: 0,
         })
+    }
+
+    /// Runs under agy's tools and under no Claude Code session or Codex thread, so `usage` reads agy's quota.
+    #[must_use]
+    pub fn under_agy(&self) -> bool {
+        self.agy_conversation.is_some()
+            && self.claude_session.is_none()
+            && self.claude_pid.is_none()
+            && self.codex_thread.is_none()
     }
 
     /// The Claude Code directory: [`Env::claude_dir`], else `$HOME/.claude`, but none when `CLAUDE_CONFIG_DIR` is set and unusable ([`Env::claude_config_unusable`]).
@@ -662,6 +703,17 @@ pub enum Cmd {
     Usage {
         /// The JSON form.
         json: bool,
+        /// `--agy`: agy's model quota ([`super::agy_quota`]) wherever this runs.
+        agy: bool,
+    },
+    /// agy's model quota, kept and tracked, and the model rotation picks ([`run_agy`]).
+    Agy {
+        /// Quota or pick.
+        what: AgyWhat,
+        /// `--refresh`: ask agy now, whatever was kept.
+        refresh: bool,
+        /// The JSON form.
+        json: bool,
     },
     /// The wall and the painted `/usage` windows on one session's screen (design §5.8).
     Limits {
@@ -746,6 +798,8 @@ pub enum HelpPage {
     Versions,
     /// `tap --help`: the usage tap.
     Tap,
+    /// `agy --help`: agy's quota pools, their tracking, and model rotation.
+    Agy,
 }
 
 fn help_reset(takes: impl Fn(ResetKind) -> bool, anchors: &[Anchor]) -> String {
@@ -843,6 +897,7 @@ pub fn help_page(page: HelpPage) -> String {
     let (verb, status_only, paras): (&str, bool, &[&str]) = match page {
         HelpPage::Verbs => return USAGE.to_string(),
         HelpPage::Usage => ("usage", false, &[HELP_USAGE]),
+        HelpPage::Agy => ("agy", false, &[HELP_AGY]),
         HelpPage::Limits => ("limits", false, &[HELP_LIMITS]),
         HelpPage::Disk => ("disk", false, &[HELP_DISK]),
         HelpPage::Ledger => ("ledger", false, &[HELP_LEDGER]),
@@ -922,6 +977,8 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
     let mut auto = false;
     let mut due = false;
     let mut here = false;
+    let mut agy = false;
+    let mut refresh = false;
     let mut email: Option<String> = None;
     let mut browser: Option<String> = None;
     let mut machine: Option<String> = None;
@@ -944,6 +1001,8 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
             "--auto" => auto = true,
             "--due" => due = true,
             "--here" => here = true,
+            "--agy" => agy = true,
+            "--refresh" => refresh = true,
             "--email" => {
                 email = Some(value(i, "--email")?);
                 i += 1;
@@ -1012,6 +1071,7 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
     if help {
         let page = match rest.first().copied() {
             Some("usage") => HelpPage::Usage,
+            Some("agy") => HelpPage::Agy,
             Some("limits") => HelpPage::Limits,
             Some("disk") => HelpPage::Disk,
             Some("ledger") => HelpPage::Ledger,
@@ -1046,8 +1106,22 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
             if rest.len() > 1 {
                 return Err(format!("usage takes no operand, not {:?}", &rest[1..]));
             }
-            Cmd::Usage { json }
+            Cmd::Usage { json, agy }
         }
+        "agy" => Cmd::Agy {
+            what: match &rest[1..] {
+                [] | ["quota"] => AgyWhat::Quota,
+                ["pick"] => AgyWhat::Pick(None),
+                ["pick", model] if !model.is_empty() => AgyWhat::Pick(Some((*model).to_owned())),
+                other => {
+                    return Err(format!(
+                        "agy takes `quota` or `pick [<model>]`, not {other:?}"
+                    ));
+                }
+            },
+            refresh,
+            json,
+        },
         "versions" | "version" => {
             if rest.len() > 1 {
                 return Err(format!("{verb} takes no operand, not {:?}", &rest[1..]));
@@ -1618,6 +1692,194 @@ fn run_usage(env: &Env, process: &dyn ClaudeProcess, json: bool, out: &mut dyn W
         total.assistant_rows,
     );
     ExitCode::SUCCESS
+}
+
+/// What `aterm harness agy` shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgyWhat {
+    /// Every pool's limits, standing and burn.
+    Quota,
+    /// The model a launch of `<model>` (or agy's default) runs after rotation.
+    Pick(Option<String>),
+}
+
+fn agy_store(env: &Env) -> super::agy_quota_store::Store {
+    super::agy_quota_store::Store::new(&env.state, &super::agy_quota_store::launch_key(None, &[]))
+}
+
+fn run_agy(
+    env: &Env,
+    what: &AgyWhat,
+    refresh: bool,
+    json: bool,
+    source: &dyn super::agy_quota_store::Source,
+    out: &mut dyn Write,
+) -> ExitCode {
+    use super::agy_quota::{self, Pick};
+    use super::agy_quota_store as store;
+    let (rotation, notes) = agy_quota::Rotation::from_path(env.config.as_deref());
+    let st = agy_store(env);
+    let current = store::current(&st, source, env.now, rotation.low, refresh);
+    let (reading, got) = match current {
+        Ok(r) => r,
+        Err(why) => {
+            if json {
+                let mut o = Map::new();
+                o.insert("schema".to_owned(), Value::from(1u64));
+                o.insert("kind".to_owned(), Value::from("agy-quota"));
+                o.insert("source".to_owned(), Value::from("agy -p /usage"));
+                o.insert("error".to_owned(), Value::from(why));
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    aterm_json::to_string(&Value::Object(o)).unwrap_or_default()
+                );
+            } else {
+                let _ = writeln!(out, "agy quota unread: {why}");
+            }
+            return ExitCode::FAILURE;
+        }
+    };
+    let age = env.now.saturating_sub(reading.as_of);
+    let history = st.history();
+    match what {
+        AgyWhat::Quota => {
+            if json {
+                let mut v = agy_quota::to_json(&reading.quota, env.now);
+                if let Some(o) = v.as_object_mut() {
+                    o.insert(
+                        "as_of".to_owned(),
+                        Value::from(super::usage::rfc3339_utc(reading.as_of)),
+                    );
+                    o.insert("got".to_owned(), Value::from(got.word()));
+                    o.insert("low".to_owned(), Value::from(rotation.low));
+                    if let Some(id) = &env.agy_conversation {
+                        o.insert("agy_conversation".to_owned(), Value::from(id.clone()));
+                    }
+                    if let Some(groups) = o.get_mut("groups").and_then(Value::as_array_mut) {
+                        for (g, q) in groups.iter_mut().zip(&reading.quota.groups) {
+                            let Some(g) = g.as_object_mut() else { continue };
+                            g.insert(
+                                "standing".to_owned(),
+                                Value::from(q.standing(rotation.low).word()),
+                            );
+                            if let Some(buckets) =
+                                g.get_mut("buckets").and_then(Value::as_array_mut)
+                            {
+                                for (b, qb) in buckets.iter_mut().zip(&q.buckets) {
+                                    let Some(b) = b.as_object_mut() else { continue };
+                                    let burn = store::burn(&history, &qb.id);
+                                    b.insert(
+                                        "burn_per_hour".to_owned(),
+                                        Value::from(burn.map(|x| x.per_hour)),
+                                    );
+                                    b.insert(
+                                        "empty_at".to_owned(),
+                                        Value::from(burn.and_then(|x| x.empty_at)),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    if !notes.is_empty() {
+                        o.insert("config_notes".to_owned(), Value::from(notes));
+                    }
+                }
+                let _ = writeln!(out, "{}", aterm_json::to_string(&v).unwrap_or_default());
+                return ExitCode::SUCCESS;
+            }
+            let _ = writeln!(
+                out,
+                "{}  [source=agy -p /usage, {} {}]",
+                agy_quota::hud_line(&reading.quota, env.now),
+                got.word(),
+                if age < 60 {
+                    "now".to_owned()
+                } else {
+                    format!("{} ago", agy_quota::span(age))
+                }
+            );
+            for g in &reading.quota.groups {
+                let standing = g.standing(rotation.low);
+                let mut line = format!("  {}: {}", g.name, standing.word());
+                if let Some(models) = &g.models {
+                    line.push_str(&format!(" \u{b7} {models}"));
+                }
+                for b in &g.buckets {
+                    if let Some(burn) = store::burn(&history, &b.id).filter(|x| x.per_hour > 0.0) {
+                        line.push_str(&format!(
+                            " \u{b7} {} burns {}/h",
+                            b.window.word(),
+                            agy_quota::percent(burn.per_hour)
+                        ));
+                        if let Some(at) = burn.empty_at {
+                            line.push_str(&format!(", out in {}", agy_quota::span(at - env.now)));
+                        }
+                    }
+                }
+                let _ = writeln!(out, "{line}");
+            }
+            for note in notes {
+                let _ = writeln!(out, "  aterm.toml: {note}");
+            }
+            ExitCode::SUCCESS
+        }
+        AgyWhat::Pick(asked) => {
+            let (model, named) = match asked {
+                Some(m) => (m.clone(), true),
+                None => match source.default_model() {
+                    Ok(m) => (m, false),
+                    Err(why) => {
+                        let _ = writeln!(out, "agy pick: agy's default model is unread: {why}");
+                        return ExitCode::FAILURE;
+                    }
+                },
+            };
+            let pick = agy_quota::pick(&reading.quota, &model, named, &rotation);
+            if json {
+                let mut o = Map::new();
+                o.insert("schema".to_owned(), Value::from(1u64));
+                o.insert("kind".to_owned(), Value::from("agy-pick"));
+                o.insert("asked".to_owned(), Value::from(model.clone()));
+                o.insert("named".to_owned(), Value::from(named));
+                o.insert("rotate".to_owned(), Value::from(rotation.enabled));
+                o.insert("got".to_owned(), Value::from(got.word()));
+                let (word, until) = match &pick {
+                    Pick::Keep { .. } => ("keep", None),
+                    Pick::Rotate { .. } => ("rotate", None),
+                    Pick::Wait { until, .. } => ("wait", *until),
+                    Pick::Unknown { .. } => ("unknown", None),
+                };
+                o.insert("pick".to_owned(), Value::from(word));
+                o.insert(
+                    "model".to_owned(),
+                    Value::from(pick.model().map(str::to_owned)),
+                );
+                o.insert("until".to_owned(), Value::from(until));
+                o.insert("why".to_owned(), Value::from(pick.describe()));
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    aterm_json::to_string(&Value::Object(o)).unwrap_or_default()
+                );
+            } else {
+                match pick.model() {
+                    Some(m) => {
+                        let _ = writeln!(out, "{m}");
+                    }
+                    None => {
+                        let _ = writeln!(out, "-");
+                    }
+                }
+                let _ = writeln!(out, "  {}", pick.describe());
+            }
+            if pick.model().is_some() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(3)
+            }
+        }
+    }
 }
 
 const USAGE_CODEX_ACCOUNT: &str = "codex";
@@ -6548,7 +6810,31 @@ pub fn run(cmd: &Cmd, env: &Env, out: &mut dyn Write, err: &mut dyn Write) -> Ex
         }
         Cmd::Retired => run_retired(),
         Cmd::Tap => run_tap(out),
-        Cmd::Usage { json } => run_usage(env, &LiveClaude, *json, out),
+        Cmd::Agy {
+            what,
+            refresh,
+            json,
+        } => run_agy(
+            env,
+            what,
+            *refresh,
+            *json,
+            &super::agy_quota_store::Agy::on_path(),
+            out,
+        ),
+        Cmd::Usage { json, agy } => {
+            if *agy || env.under_agy() {
+                return run_agy(
+                    env,
+                    &AgyWhat::Quota,
+                    false,
+                    *json,
+                    &super::agy_quota_store::Agy::on_path(),
+                    out,
+                );
+            }
+            run_usage(env, &LiveClaude, *json, out)
+        }
         Cmd::Limits { sid, json } => run_limits(env, sid.as_deref(), *json, out, err),
         Cmd::Disk {
             targets,

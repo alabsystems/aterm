@@ -65,6 +65,7 @@ impl CursorGlow {
                 0.0
             };
             let n1 = (b.pts.len() - 1).max(1) as f32;
+            let inv_n1 = 1.0 / n1;
             let burn = |p: f32, c: u8| -> u8 {
                 ((c as f32) * ((p - k_burn) / 0.20).clamp(0.0, 1.0)) as u8
             };
@@ -73,16 +74,17 @@ impl CursorGlow {
             let resample = dark && !b.crackle;
             for (i, w) in b.pts.windows(2).enumerate() {
                 let ((x0, y0), (x1, y1)) = (w[0], w[1]);
-                let len = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt();
                 let n = if resample {
+                    let len = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt();
                     (len / step).ceil().max(1.0) as usize
                 } else {
                     1
                 };
+                let inv_n = 1.0 / n as f32;
                 for k in 0..n {
-                    let f = k as f32 / n as f32;
+                    let f = k as f32 * inv_n;
                     let (x, y) = (x0 + (x1 - x0) * f, y0 + (y1 - y0) * f);
-                    channel.push((x, y, (i as f32 + f) / n1, held && over_text(x, y)));
+                    channel.push((x, y, (i as f32 + f) * inv_n1, held && over_text(x, y)));
                 }
             }
             if let Some(&(x, y)) = b.pts.last() {

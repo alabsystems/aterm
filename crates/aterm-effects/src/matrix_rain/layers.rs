@@ -101,11 +101,16 @@ impl RainLayers {
                 continue;
             }
             let row = r as u16;
-            let kept = held
-                .iter()
-                .position(|h| h.row == row && h.version == version && h.cells == *row_cells);
-            let entry = match kept {
-                Some(i) => held.swap_remove(i),
+            let entry = match held.iter().position(|h| h.row == row) {
+                Some(i) => {
+                    let mut prev = held.swap_remove(i);
+                    if prev.version != version || prev.cells != *row_cells {
+                        prev.version = version;
+                        prev.cells.clone_from(row_cells);
+                        prev.content = Arc::new(row_content(row_cells, tiles));
+                    }
+                    prev
+                }
                 None => Row {
                     row,
                     version,

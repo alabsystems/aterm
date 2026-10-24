@@ -96,7 +96,10 @@ fn pending_and_withdrawn_access_never_publish_an_old_confirmation() {
     assert!(app.consent_card.begin_deciding(now));
     assert!(app.consent_card.on_decided(&Verdict::Offer, now));
     app.tick_macos_access_card(now);
-    assert!(access_row(&app), "the question is up");
+    assert!(
+        !access_row(&app),
+        "the question posts nothing: System State holds it"
+    );
     assert_eq!(app.consent_card.phase(), CardPhase::Watching { since: now });
 
     app.consent = ConsentState::with_cached_probe_for_test(FdaProbe::refused(ProbeLabel::Pending));
@@ -106,7 +109,7 @@ fn pending_and_withdrawn_access_never_publish_an_old_confirmation() {
         !grant_recorded(&app),
         "expired evidence cannot confirm access"
     );
-    assert!(access_row(&app), "and the question stays up");
+    assert!(!access_row(&app), "and still posts nothing");
 
     app.consent = ConsentState::with_cached_probe_for_test(denied());
     app.tick_macos_access_card(now + Duration::from_secs(2));
@@ -145,12 +148,11 @@ fn disabling_checks_clears_a_pending_answer_and_its_route_row() {
     app.decide_macos_access_card(crate::consent_card::PendingDecision::launch(Some(
         Marker::Opened,
     )));
-    app.raise_fda_need(&super::consent_card::NeedWords::sample(), now);
-    assert!(access_row(&app));
     let id = app.post_message(super::message_reporters::file_access_question(
         &super::consent_card::NeedWords::sample(),
     ));
     app.consent_card_message = Some(id);
+    assert!(access_row(&app));
     assert!(app.messages.restate(
         id,
         aterm_messages::Restatement {
@@ -184,7 +186,7 @@ fn refresh_deadlines_are_future_only_and_stop_when_the_watch_settles() {
     assert!(app.consent_card.begin_deciding(now));
     assert!(app.consent_card.on_decided(&Verdict::Offer, now));
     app.tick_macos_access_card(now);
-    assert!(access_row(&app));
+    assert!(!access_row(&app), "the watch posts nothing");
     for interval in [0, 250, 5000] {
         app.config.privacy = Some(super::app_config::PrivacyConfig {
             probe_interval_ms: Some(interval),
@@ -264,6 +266,11 @@ fn new_mac() -> App {
         live: true,
         ..LaunchReach::inert()
     });
+    // The approved setup revision whose steps the window runs.
+    app.observe_initial_setup_permissions(Some(crate::InitialSetupPermissionPolicy {
+        revision: 1,
+        allowed: true,
+    }));
     app
 }
 
@@ -272,23 +279,39 @@ fn quiet(_app: &App, _now: Instant) -> bool {
     true
 }
 
-/// A moment that is never quiet: the owner is typing.
-fn never_quiet(_app: &App, _now: Instant) -> bool {
-    false
-}
-
+/// WHILE NO APPROVED REVISION ADMITS PERMISSIONS (a setup decision held, or none made)
+/// the launch check still reads — it puts nothing on screen — but the window's own pages
+/// wait for a revision: the Full Disk Access hand-over stays queued at its moment and a
+/// late `spctl` run's Developer Tools page is held. The owner's own press still opens.
 #[test]
 fn setup_permission_hold_defers_queued_launch_decisions_and_automatic_page_effects() {
     use crate::devtools_helper::{HandOver, Origin, test_arms};
     let now = Instant::now();
     let mut app = new_mac();
-    test_arms::stand_in(&mut app, test_arms::opening());
     app.hold_initial_setup_permissions();
+    assert_eq!(
+        app.access_revision(),
+        None,
+        "a held decision admits no step"
+    );
     assert!(app.consent_card.begin_deciding(now));
     let decision = crate::consent_card::PendingDecision::launch(None);
+    let fda_opens = test_arms::fda_counts().0;
     app.decide_macos_access_card(decision);
-    assert_eq!(app.consent_card_host.pending, Some(decision));
-    assert_eq!(app.consent_card.phase(), CardPhase::Deciding { since: now });
+    assert_eq!(
+        app.consent_card.phase(),
+        CardPhase::Settled,
+        "it only reads"
+    );
+    assert_eq!(app.devtools_helper.fda_queued(), Some(Origin::Automatic));
+    app.look_for_fda_moment(now, quiet);
+    assert_eq!(
+        app.devtools_helper.fda_queued(),
+        Some(Origin::Automatic),
+        "held for an approved revision"
+    );
+    assert_eq!(test_arms::fda_counts().0, fda_opens, "nothing opens");
+    test_arms::stand_in(&mut app, test_arms::opening());
     let opens = test_arms::opens();
     assert_eq!(
         app.devtools_hand_over_after_listing(Origin::Automatic, Ok(()), now),
@@ -398,23 +421,6 @@ fn a_pending_read_at_the_quiet_moment_waits_rather_than_refuses() {
     app.look_for_fda_moment(later, quiet);
     assert_eq!(test_arms::fda_counts().0, opens + 1);
     assert!(app.fda_panel_up());
-}
-
-/// Switching the Full Disk Access question off after the launch check answers the
-/// waiting hand-over for this process: nothing opens, and the warm-up stops waiting.
-#[test]
-fn a_question_switched_off_drops_the_waiting_hand_over() {
-    use crate::consent_launch::FdaLaunch;
-    use crate::devtools_helper::test_arms;
-    let now = Instant::now();
-    let mut app = launched(now);
-    app.config = aterm_toml::from_str("[privacy]\nnotice = false\n").expect("config");
-    let (opens, _, _) = test_arms::fda_counts();
-    app.tick_devtools_hand_over(now);
-    app.look_for_fda_moment(Instant::now(), quiet);
-    assert_eq!(app.devtools_helper.fda_queued(), None);
-    assert_eq!(app.consent_launch.fda(), FdaLaunch::NotAsked);
-    assert_eq!(test_arms::fda_counts().0, opens);
 }
 
 /// The owner's "I've switched it on" ends the panel as the owner's act: the access
@@ -793,37 +799,6 @@ fn another_terminals_grant_is_never_recorded_as_aterms() {
     assert!(!grant_recorded(&waiting));
 }
 
-/// 0.104's only answer to the Full Disk Access question was its Dismiss in "To look at":
-/// inside that span the window's own page stays down, as after the panel's Not now.
-#[test]
-fn a_dismissed_full_disk_access_question_holds_the_launch_page_back() {
-    use crate::consent_card::{NeedCause, NeedWords};
-    use crate::consent_launch::FdaLaunch;
-    let now = Instant::now();
-    let mut app = new_mac();
-    app.except(&crate::message_reporters::file_access_entry(&NeedWords {
-        cause: NeedCause::ProtectedRead { session: None },
-        tab_number: None,
-        regressed: false,
-    }));
-    let id = app
-        .messages
-        .digest()
-        .entries
-        .iter()
-        .find(|entry| entry.key.starts_with("privacy.fda."))
-        .expect("the question is open")
-        .id;
-    assert!(
-        app.messages
-            .file_digest_one(id, crate::messages_host::wall_stamp_now(), now)
-    );
-    assert!(app.consent_card.begin_deciding(now));
-    app.decide_macos_access_card(crate::consent_card::PendingDecision::launch(None));
-    assert_eq!(app.devtools_helper.fda_queued(), None);
-    assert_eq!(app.consent_launch.fda(), FdaLaunch::NotAsked);
-}
-
 /// The owner's config directory (`~/.config/aterm`) on the Mac where 0.105.0 prompted for Downloads access.
 const OWNER_CONFIG_0_105: &[&str] = &[
     "connections-first-use",
@@ -936,7 +911,7 @@ fn main_as_the_successor_of_0_105_0_on_the_owners_mac_hands_full_disk_access_ove
     assert_eq!(probe.state, FdaState::Denied);
     let dr = classify_dr(DEVELOPER_ID_DR);
     assert!(dr.grant_stable());
-    let fda_word = format!("{}@{BUNDLE}@{HERE}", aterm_types::version::app_version());
+    let fda_word = format!("{}@{BUNDLE}@{HERE}", atpkg::devtools::revision_key(1));
     assert_eq!(
         DEVELOPER_TOOLS.last_opened_in(&state),
         Some(("0.105.0".to_owned(), opened))
@@ -953,7 +928,7 @@ fn main_as_the_successor_of_0_105_0_on_the_owners_mac_hands_full_disk_access_ove
         devtools_recent: DEVELOPER_TOOLS
             .opened_within_in(&state, REOPEN_AFTER_S, now)
             .is_some(),
-        shown_this_version: FULL_DISK_ACCESS
+        shown_this_revision: FULL_DISK_ACCESS
             .last_opened_in(&state)
             .is_some_and(|(word, _)| word == fda_word),
         own,
@@ -1112,61 +1087,39 @@ fn a_fork_lane_successor_gets_the_page_once_its_reading_is_its_own() {
     assert!(app.fda_panel_up());
 }
 
+/// The setup revision the window admits in these tests.
+const REVISION: u64 = 7;
+
 /// One alert as the stand-in was asked it: title, body and proceed button.
 type Alert = (String, String, String);
 
 thread_local! {
-    /// The debugger-access alerts the stand-in alert was asked, whole.
+    /// Every alert the stand-in alert was asked, whole: System State's debugger
+    /// step raises none.
     static DEBUGGER_ALERTS: std::cell::RefCell<Vec<Alert>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// The change workers the stand-in start started.
+    static WORKERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The frames the stand-in System State window has presented.
+    static FRAMES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 fn debugger_alerts() -> Vec<Alert> {
     DEBUGGER_ALERTS.with(|alerts| alerts.borrow().clone())
 }
 
-fn debugger_alert(title: &str, body: &str, proceed: &str) {
+fn workers() -> usize {
+    WORKERS.with(std::cell::Cell::get)
+}
+
+/// The stand-in alert: it notes what it was asked and answers yes. Nothing is
+/// shown, and nothing on the step's path may ask it.
+fn alert_says_yes(title: &str, body: &str, proceed: &str) -> Option<bool> {
     DEBUGGER_ALERTS.with(|alerts| {
         alerts
             .borrow_mut()
             .push((title.to_owned(), body.to_owned(), proceed.to_owned()));
     });
-}
-
-/// The alert the launch ask raises on `app`'s stand-in Mac: the Security page's
-/// debugger-access alert in its launch words, over the facts that Mac publishes,
-/// and not the press's.
-fn launch_alert(app: &mut App) -> Alert {
-    use crate::native_settings::{DebuggerAlertFrom, debugger_access_alert};
-    use aterm_containment::consent::DebuggerChange;
-    let facts = app.debugger_access_facts();
-    let alert = |from| {
-        let (title, body, proceed) = debugger_access_alert(
-            DebuggerChange::On,
-            &facts,
-            aterm_containment::SpikeEvidence::MEASURED,
-            from,
-        );
-        (title, body, proceed.to_owned())
-    };
-    let launch = alert(DebuggerAlertFrom::Launch);
-    assert_ne!(
-        launch,
-        alert(DebuggerAlertFrom::Press),
-        "the launch words, not the press's"
-    );
-    launch
-}
-
-/// The stand-in alert when the owner says no.
-fn owner_says_no(title: &str, body: &str, proceed: &str) -> Option<bool> {
-    debugger_alert(title, body, proceed);
-    Some(false)
-}
-
-/// The stand-in alert when the owner says yes.
-fn owner_says_yes(title: &str, body: &str, proceed: &str) -> Option<bool> {
-    debugger_alert(title, body, proceed);
     Some(true)
 }
 
@@ -1175,14 +1128,53 @@ fn owner_says_yes(title: &str, body: &str, proceed: &str) -> Option<bool> {
 fn worker_started(
     _job: crate::debugger_access::DevtoolsJob,
 ) -> crate::debugger_access::DevtoolsSpawn {
+    WORKERS.with(|count| count.set(count.get() + 1));
     crate::debugger_access::DevtoolsSpawn::Started
+}
+
+/// System State is the visible view of the focused window (window 1), which has
+/// presented a frame since the last look, and no other macOS dialog is up.
+fn page_up(_app: &App) -> crate::debugger_access::StepMoment {
+    let frames = FRAMES.with(|frames| {
+        frames.set(frames.get() + 1);
+        frames.get()
+    });
+    crate::debugger_access::StepMoment {
+        page: Some((crate::WindowId(1), frames)),
+        dialog_up: false,
+    }
+}
+
+/// The same page, with no frame presented since the last look.
+fn page_still(_app: &App) -> crate::debugger_access::StepMoment {
+    crate::debugger_access::StepMoment {
+        page: Some((crate::WindowId(1), FRAMES.with(std::cell::Cell::get))),
+        dialog_up: false,
+    }
+}
+
+/// System State is not the visible view of the focused window: the person is in
+/// a terminal tab, another app, or another window.
+fn page_away(_app: &App) -> crate::debugger_access::StepMoment {
+    crate::debugger_access::StepMoment {
+        page: None,
+        dialog_up: false,
+    }
+}
+
+/// System State frontmost, and another macOS dialog of aterm's up.
+fn other_dialog(app: &App) -> crate::debugger_access::StepMoment {
+    crate::debugger_access::StepMoment {
+        dialog_up: true,
+        ..page_up(app)
+    }
 }
 
 /// The debugger probe's answer on this stand-in Mac: debugger access off, the
 /// account an admin, this aterm hardened — the facts under which aterm asks.
-fn debugger_reads_off(app: &mut App) {
+fn debugger_reads_off_as(app: &mut App, hardened: aterm_containment::consent::SelfHardening) {
     use aterm_containment::consent::{
-        DebuggerMember, DebuggerMode, DebuggerProbe, DebuggerProbeLabel, SelfHardening,
+        DebuggerMember, DebuggerMode, DebuggerProbe, DebuggerProbeLabel,
     };
     app.consent.publish_debugger_for_test(
         DebuggerProbe {
@@ -1190,32 +1182,65 @@ fn debugger_reads_off(app: &mut App) {
             member: DebuggerMember::Admin,
             label: DebuggerProbeLabel::StatusOk,
         },
-        SelfHardening::Hardened,
+        hardened,
     );
 }
 
-/// Queue the launch ask on a test App as a windowed macOS instance does: a scratch
-/// config folder (`dir`) for its record, the shared debugger records read, this Mac
-/// named `host`, and the stand-in alert `confirm` and worker start.
-fn queue_debugger_ask(
-    app: &mut App,
-    dir: &std::path::Path,
-    host: fn() -> Option<&'static str>,
-    confirm: fn(&str, &str, &str) -> Option<bool>,
-) {
-    use crate::debugger_access::{DebuggerChangeLane, LaunchAskQueue, RecordsRead};
+/// Debugger access off, an admin, this aterm hardened: the facts under which the step starts.
+fn debugger_reads_off(app: &mut App) {
+    debugger_reads_off_as(app, aterm_containment::consent::SelfHardening::Hardened);
+}
+
+fn plan(revision: u64) -> Option<crate::InitialSetupPermissionPolicy> {
+    Some(crate::InitialSetupPermissionPolicy {
+        revision,
+        allowed: true,
+    })
+}
+
+/// THE WINDOW'S OWN ADMISSION of setup revision `revision`, as the page's automatic answer to
+/// the startup offer takes it.
+fn window_admits(app: &mut App, revision: u64) {
+    app.hold_initial_setup_permissions();
+    app.note_system_state_apply(crate::system_state::Admission::Automatic);
+    app.accepted_initial_setup_apply();
+    app.observe_initial_setup_permissions(plan(revision));
+    assert!(app.admitted_access().is_some(), "the standing yes");
+}
+
+/// The same plan admitted by a control client's Apply (`aterm ctl app act`), whose gesture
+/// reached the page before the Apply was taken.
+fn controller_admits(app: &mut App, revision: u64) {
+    app.hold_initial_setup_permissions();
+    app.with_gesture_source(true, App::note_system_state_touch);
+    app.note_system_state_apply(crate::system_state::Admission::Automatic);
+    app.accepted_initial_setup_apply();
+    app.observe_initial_setup_permissions(plan(revision));
+    assert!(app.admitted_access().is_none(), "no standing yes");
+}
+
+/// Queue the debugger step on a test App as a windowed macOS instance does, giving neither the
+/// admission ([`window_admits`]) nor the probe ([`debugger_reads_off`]).
+fn queue_debugger_step(app: &mut App, dir: &std::path::Path, host: fn() -> Option<&'static str>) {
+    use crate::debugger_access::{DebuggerChangeLane, DebuggerStepQueue, RecordsRead};
     app.consent_card_config = Some(dir.join("aterm.toml"));
     app.debugger_change = DebuggerChangeLane::with_liveness(|_| false);
     app.debugger_change.settle_records(RecordsRead::default());
     app.debugger_change.poll(1);
-    app.debugger_launch = LaunchAskQueue::queued_for_test(host);
+    app.debugger_launch =
+        DebuggerStepQueue::queued_for_test(host).recording_in(Some(dir.to_path_buf()));
     app.consent_gestures =
-        crate::native_settings::ConsentGestures::for_test_with(confirm, worker_started);
+        crate::native_settings::ConsentGestures::for_test_with(alert_says_yes, worker_started);
 }
 
 /// A new Mac where both launch pages are over (Full Disk Access not offered, the
 /// Developer Tools list read) and the ask is queued and may ask.
-fn ready_to_ask(dir: &std::path::Path, confirm: fn(&str, &str, &str) -> Option<bool>) -> App {
+fn ready_to_start(dir: &std::path::Path) -> App {
+    ready_to_start_at(dir, REVISION)
+}
+
+/// [`ready_to_start`] with the window's admission of setup revision `revision`.
+fn ready_to_start_at(dir: &std::path::Path, revision: u64) -> App {
     use crate::devtools_helper::test_arms;
     let mut app = new_mac();
     app.consent_launch
@@ -1227,7 +1252,8 @@ fn ready_to_ask(dir: &std::path::Path, confirm: fn(&str, &str, &str) -> Option<b
         ),
         Instant::now(),
     );
-    queue_debugger_ask(&mut app, dir, || Some("READY-MAC"), confirm);
+    queue_debugger_step(&mut app, dir, || Some("READY-MAC"));
+    window_admits(&mut app, revision);
     debugger_reads_off(&mut app);
     app
 }
@@ -1235,41 +1261,78 @@ fn ready_to_ask(dir: &std::path::Path, confirm: fn(&str, &str, &str) -> Option<b
 /// A named change to a test App.
 type AppCase = (&'static str, fn(&mut App));
 
-/// The next look's moment: past any look an earlier one put off.
+/// The next look's moment: past any look an earlier one put off, and past
+/// [`crate::debugger_access::ANNOUNCE_FOR`].
 fn later(at: &mut Instant) -> Instant {
     *at += crate::devtools_helper::RECHECK_EVERY + Duration::from_secs(1);
+    assert!(
+        crate::devtools_helper::RECHECK_EVERY + Duration::from_secs(1)
+            >= crate::debugger_access::ANNOUNCE_FOR
+    );
     *at
+}
+
+/// Two looks with System State up: the page names macOS's dialog, then the
+/// change starts.
+fn two_looks(app: &mut App, at: &mut Instant) {
+    app.look_for_debugger_moment(later(at), page_up);
+    app.look_for_debugger_moment(later(at), page_up);
+}
+
+/// The debugger row's latest outcome in the access record for `revision`, once
+/// every line `app` asked for is written (off the UI thread).
+fn access_outcome(
+    app: &App,
+    dir: &std::path::Path,
+    revision: u64,
+) -> Option<aterm_types::macos_setup::AccessOutcome> {
+    app.debugger_launch.record_written_for_test();
+    aterm_types::macos_setup::access_record::latest(
+        dir,
+        revision,
+        aterm_types::macos_setup::Access::Debugger,
+    )
+}
+
+/// A lane step that ends the change with `outcome`, as the park's re-probe does.
+fn ended(outcome: crate::debugger_access::Outcome) -> crate::debugger_access::LaneStep {
+    crate::debugger_access::LaneStep {
+        outcome: Some(outcome),
+        ..crate::debugger_access::LaneStep::default()
+    }
 }
 
 /// The first launch on a new Mac opens the Full Disk Access page, then the Developer Tools page, then the debugger-access alert, then the folder warm-up.
 #[test]
-fn a_new_mac_asks_for_debugger_access_after_both_pages_and_before_the_folders() {
+fn a_new_mac_turns_debugger_access_on_after_both_pages_and_before_the_folders() {
     use crate::consent_launch::FdaLaunch;
     use crate::devtools_helper::{Moment, Origin, PanelEvent, test_arms};
+    use aterm_types::macos_setup::{Access, AccessOutcome};
     let root = crate::test_scratch::outlived_dir("aterm-access-");
     let now = Instant::now();
     let mut t = now;
     let mut app = launched(now);
-    queue_debugger_ask(&mut app, root.path(), || Some("NEW-MAC"), owner_says_no);
+    queue_debugger_step(&mut app, root.path(), || Some("NEW-MAC"));
+    window_admits(&mut app, REVISION);
     debugger_reads_off(&mut app);
     let config = root.path().join("aterm.toml");
 
     assert_eq!(app.consent_launch.fda(), FdaLaunch::Waiting);
-    app.look_for_debugger_moment(later(&mut t), quiet);
-    assert!(debugger_alerts().is_empty() && app.debugger_launch.queued());
+    app.look_for_debugger_moment(later(&mut t), page_up);
+    assert!(workers() == 0 && app.debugger_launch.queued());
     assert!(app.debugger_launch.next_deadline().is_some_and(|at| at > t));
     app.look_for_fda_moment(Instant::now(), quiet);
     assert!(app.fda_panel_up());
-    app.look_for_debugger_moment(later(&mut t), quiet);
-    assert!(debugger_alerts().is_empty());
+    app.look_for_debugger_moment(later(&mut t), page_up);
+    assert_eq!(workers(), 0);
     app.devtools_helper.press_for_test(PanelEvent::NotNow);
     app.tick_devtools_hand_over(now);
     assert_eq!(
         app.consent_launch.fda(),
         FdaLaunch::Ended { owner_acted: false }
     );
-    app.look_for_debugger_moment(later(&mut t), quiet);
-    assert!(debugger_alerts().is_empty() && app.debugger_launch.queued());
+    app.look_for_debugger_moment(later(&mut t), page_up);
+    assert!(workers() == 0 && app.debugger_launch.queued());
     app.devtools_helper.note_reading(
         test_arms::reading(
             aterm_containment::DevToolGrant::NotGranted,
@@ -1278,9 +1341,23 @@ fn a_new_mac_asks_for_debugger_access_after_both_pages_and_before_the_folders() 
         Instant::now(),
     );
     app.devtools_helper.queue(Origin::Automatic, Instant::now());
-    app.look_for_debugger_moment(later(&mut t), quiet);
-    assert!(debugger_alerts().is_empty());
+    app.look_for_debugger_moment(later(&mut t), page_up);
+    assert_eq!(workers(), 0);
+    // Full Disk Access still reads off: the Developer Tools page waits for it.
     let opens = test_arms::opens();
+    let (origin, listed) = app
+        .devtools_helper
+        .take_queued(Instant::now(), true)
+        .expect("the Developer Tools hand-over at its moment");
+    let _ = app.devtools_hand_over_carrying(origin, Moment::Quiet, listed);
+    assert_eq!(
+        test_arms::opens(),
+        opens,
+        "no Developer Tools page before Full Disk Access reads on"
+    );
+    // Full Disk Access reads on: the Developer Tools page and its panel.
+    app.consent = ConsentState::with_cached_probe_for_test(granted());
+    app.devtools_helper.queue(Origin::Automatic, Instant::now());
     let (origin, listed) = app
         .devtools_helper
         .take_queued(Instant::now(), true)
@@ -1288,8 +1365,13 @@ fn a_new_mac_asks_for_debugger_access_after_both_pages_and_before_the_folders() 
     let _ = app.devtools_hand_over_carrying(origin, Moment::Quiet, listed);
     assert_eq!(test_arms::opens(), opens + 1, "the Developer Tools page");
     assert!(app.devtools_helper.panel().is_some());
-    app.look_for_debugger_moment(later(&mut t), quiet);
-    assert!(debugger_alerts().is_empty(), "not over the panel");
+    app.look_for_debugger_moment(later(&mut t), page_up);
+    assert_eq!(workers(), 0, "not over the panel");
+    assert_eq!(
+        app.system_state_access_step(),
+        Some(Access::DeveloperTools),
+        "the page names the panel that is up, not the debugger"
+    );
     app.devtools_helper.press_for_test(PanelEvent::NotNow);
     app.tick_devtools_hand_over(now);
     assert!(app.devtools_helper.panel().is_none());
@@ -1299,24 +1381,62 @@ fn a_new_mac_asks_for_debugger_access_after_both_pages_and_before_the_folders() 
     app.launch_warmup_look(later(&mut t), quiet);
     assert!(
         !app.consent_launch.walking(),
-        "the folders wait for the alert"
+        "the folders wait for the step"
     );
     assert!(app.consent_launch.next_deadline().is_some());
 
-    app.look_for_debugger_moment(later(&mut t), quiet);
-    assert_eq!(debugger_alerts(), [launch_alert(&mut app)]);
+    assert_eq!(app.published_system_state_access_step(), None);
+    app.look_for_debugger_moment(later(&mut t), page_up);
+    assert_eq!(
+        app.system_state_access_step(),
+        Some(Access::Debugger),
+        "the headline names macOS's password dialog"
+    );
+    assert_eq!(
+        app.published_system_state_access_step(),
+        Some(Access::Debugger),
+        "published at once: the next frame carries the words, not the next poll's"
+    );
+    assert_eq!(workers(), 0, "not before a frame showed it");
+    assert!(
+        !crate::debugger_access::read_asked(&config, "NEW-MAC"),
+        "nothing recorded yet"
+    );
+    // Then the change, once, with this Mac recorded first.
+    app.look_for_debugger_moment(later(&mut t), page_up);
+    assert_eq!(workers(), 1, "the change started");
     assert!(crate::debugger_access::read_asked(&config, "NEW-MAC"));
-    assert!(
-        !app.debugger_launch.queued(),
-        "asked: over for this process"
+    assert!(app.debugger_change.under_way());
+    assert!(!app.debugger_launch.queued(), "over for this process");
+    assert_eq!(
+        app.system_state_access_step(),
+        Some(Access::Debugger),
+        "named while macOS's dialog may be up"
     );
-    assert!(
-        !app.debugger_change.under_way(),
-        "the owner said no: nothing runs"
+    assert_eq!(
+        access_outcome(&app, root.path(), REVISION),
+        Some(AccessOutcome::Handed)
     );
-    app.look_for_debugger_moment(later(&mut t), quiet);
-    assert_eq!(debugger_alerts().len(), 1, "once");
+    assert!(debugger_alerts().is_empty(), "no alert of aterm's");
+    assert_eq!(app.debugger_access_facts().refusal, None);
+    app.look_for_debugger_moment(later(&mut t), page_up);
+    assert_eq!(workers(), 1, "once");
 
+    // No folder dialog over macOS's; once the change is over the folders walk.
+    app.launch_warmup_look(later(&mut t), quiet);
+    assert!(
+        !app.consent_launch.walking(),
+        "no folder dialog over macOS's"
+    );
+    let step = app.debugger_change.not_started();
+    app.apply_debugger_step(step);
+    assert!(!app.debugger_change.under_way());
+    assert_eq!(app.system_state_access_step(), None, "the step is over");
+    assert_eq!(
+        app.published_system_state_access_step(),
+        None,
+        "and the page says so at once"
+    );
     app.launch_warmup_look(later(&mut t), quiet);
     assert!(
         app.consent_launch.walking(),
@@ -1330,47 +1450,410 @@ fn a_new_mac_asks_for_debugger_access_after_both_pages_and_before_the_folders() 
     );
 }
 
-/// The owner's yes starts the change a press starts — the same lane, the App's one
+/// THE PAGE NAMES THE DIALOG FOR A PRESENTED FRAME FIRST: the change starts only
 /// start through its injected worker arm — and a press queued behind the alert does
 /// not ask again.
 #[test]
-fn a_yes_at_launch_starts_the_change_and_the_folders_wait_for_it() {
+fn the_page_names_macos_dialog_for_a_presented_frame_before_the_change() {
+    use aterm_containment::consent::DebuggerChange;
+    use aterm_types::macos_setup::{Access, AccessOutcome};
     let root = crate::test_scratch::outlived_dir("aterm-access-");
-    let now = Instant::now();
-    let mut t = now;
-    let mut app = ready_to_ask(root.path(), owner_says_yes);
-    app.look_for_debugger_moment(later(&mut t), quiet);
-    assert_eq!(debugger_alerts().len(), 1);
-    assert!(
-        app.debugger_change.under_way(),
-        "the worker re-reads the rule"
+    let config = root.path().join("aterm.toml");
+    let mut t = Instant::now();
+    let mut app = ready_to_start(root.path());
+    app.look_for_debugger_moment(later(&mut t), page_up);
+    assert_eq!(app.system_state_access_step(), Some(Access::Debugger));
+    for _ in 0..3 {
+        app.look_for_debugger_moment(later(&mut t), page_still);
+        assert_eq!(workers(), 0, "no frame has shown it");
+        assert!(
+            app.debugger_launch
+                .next_deadline()
+                .is_some_and(|at| at > t && at <= t + crate::devtools_helper::PANEL_TICK),
+            "looked at again soon"
+        );
+    }
+    app.look_for_debugger_moment(later(&mut t), page_away);
+    assert_eq!(app.system_state_access_step(), None, "the words go");
+    assert_eq!(app.published_system_state_access_step(), None, "at once");
+    assert_eq!(workers(), 0);
+    assert!(app.debugger_launch.queued());
+    assert!(!crate::debugger_access::read_asked(&config, "READY-MAC"));
+    app.look_for_debugger_moment(later(&mut t), page_up);
+    assert_eq!(workers(), 0, "named again first");
+    assert_eq!(app.system_state_access_step(), Some(Access::Debugger));
+    app.look_for_debugger_moment(later(&mut t), page_up);
+    assert_eq!(workers(), 1);
+    assert_eq!(app.system_state_access_step(), Some(Access::Debugger));
+    app.apply_debugger_step(ended(crate::debugger_access::Outcome::Changed(
+        DebuggerChange::On,
+    )));
+    assert_eq!(
+        access_outcome(&app, root.path(), REVISION),
+        Some(AccessOutcome::Granted)
     );
-    assert_eq!(app.debugger_access_facts().refusal, None);
-    assert!(
-        app.owner_quiet.lock().unwrap().has_confirmed_for_test(),
-        "a press behind the alert does not ask again"
-    );
-    assert!(app.owner_quiet.lock().unwrap().debugger_answered());
-    app.launch_warmup_look(later(&mut t), quiet);
-    assert!(
-        !app.consent_launch.walking(),
-        "no folder dialog over macOS's"
+    assert!(debugger_alerts().is_empty());
+}
+
+/// CANCEL IN MACOS'S DIALOG SETTLES THE ROW: declined in the access record for the
+/// revision, never retried in this process, and — ASKED_RECORD naming this Mac —
+/// never started by a later launch on it either.
+#[test]
+fn cancel_in_macos_dialog_settles_the_row_and_is_never_retried() {
+    use aterm_containment::consent::DebuggerChange;
+    use aterm_types::macos_setup::AccessOutcome;
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
+    let mut t = Instant::now();
+    let mut app = ready_to_start(root.path());
+    two_looks(&mut app, &mut t);
+    assert_eq!(workers(), 1);
+    app.apply_debugger_step(ended(crate::debugger_access::Outcome::NotChanged(
+        DebuggerChange::On,
+    )));
+    assert_eq!(
+        access_outcome(&app, root.path(), REVISION),
+        Some(AccessOutcome::Declined)
     );
     let step = app.debugger_change.not_started();
     app.apply_debugger_step(step);
-    assert!(!app.debugger_change.under_way());
-    app.launch_warmup_look(later(&mut t), quiet);
-    assert!(app.consent_launch.walking());
+    two_looks(&mut app, &mut t);
+    assert_eq!(workers(), 1, "never retried");
+    let mut next = ready_to_start(root.path());
+    two_looks(&mut next, &mut t);
+    assert_eq!(workers(), 1, "nor at the next launch");
+    assert!(!next.debugger_launch.queued());
+    assert!(debugger_alerts().is_empty());
 }
 
-/// The alert never comes while anything goes before it: the Full Disk Access decision
+/// A LATER REVISION ON A MAC WHOSE STEP IS OVER STILL SETTLES ITS ROW (design §6:
+/// the Permissions stage completes when every row is in place, not needed, or
+/// handed, declined or triggered in this revision). Cancelled in macOS's dialog at
+/// revision R, the next launch's admission of R + 1 starts nothing — once per Mac —
+/// and records the row declined for R + 1, so that revision's stage never waits on
+/// it for good. R's line stays.
 /// not made or its page waiting, the Developer Tools list unread, a hand-over waiting,
 /// a panel up, a moment that is not quiet, or the owner's recent decline.
 #[test]
-fn the_debugger_alert_waits_behind_every_page_panel_and_moment() {
+fn a_later_revision_after_a_cancel_records_the_row_declined() {
+    use aterm_containment::consent::DebuggerChange;
+    use aterm_types::macos_setup::AccessOutcome;
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
+    let mut t = Instant::now();
+    let mut app = ready_to_start(root.path());
+    two_looks(&mut app, &mut t);
+    assert_eq!(workers(), 1);
+    app.apply_debugger_step(ended(crate::debugger_access::Outcome::NotChanged(
+        DebuggerChange::On,
+    )));
+    assert_eq!(
+        access_outcome(&app, root.path(), REVISION),
+        Some(AccessOutcome::Declined)
+    );
+
+    let mut next = ready_to_start_at(root.path(), REVISION + 1);
+    two_looks(&mut next, &mut t);
+    assert_eq!(workers(), 1, "never retried");
+    assert!(!next.debugger_launch.queued(), "over on this Mac");
+    assert_eq!(
+        access_outcome(&next, root.path(), REVISION + 1),
+        Some(AccessOutcome::Declined),
+        "the later revision's row is settled"
+    );
+    assert_eq!(
+        access_outcome(&next, root.path(), REVISION),
+        Some(AccessOutcome::Declined),
+        "the earlier revision's line stays"
+    );
+    assert!(debugger_alerts().is_empty());
+}
+
+/// A LATER REVISION IN THIS PROCESS SETTLES THE ROW TOO, with no relaunch (design
+/// §6: a new approval asks again; the debugger once per Mac). Cancelled in macOS's
+/// dialog at revision R, the window's own admission of R again (a change to another
+/// group keeps it) queues nothing, so R's outcome stands; its admission of R + 1
+/// queues the step again, which reads the record again, finds this Mac in it, starts
+/// nothing and records the row declined for R + 1, as the next launch would.
+#[test]
+fn a_later_revision_in_this_process_settles_the_row_with_no_second_dialog() {
+    use aterm_containment::consent::DebuggerChange;
+    use aterm_types::macos_setup::AccessOutcome;
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
+    let mut t = Instant::now();
+    let mut app = ready_to_start(root.path());
+    two_looks(&mut app, &mut t);
+    assert_eq!(workers(), 1);
+    app.apply_debugger_step(ended(crate::debugger_access::Outcome::NotChanged(
+        DebuggerChange::On,
+    )));
+    let step = app.debugger_change.not_started();
+    app.apply_debugger_step(step);
+    assert_eq!(
+        access_outcome(&app, root.path(), REVISION),
+        Some(AccessOutcome::Declined)
+    );
+
+    window_admits(&mut app, REVISION);
+    assert!(
+        !app.debugger_launch.queued(),
+        "the same revision: its outcome stands"
+    );
+    window_admits(&mut app, REVISION + 1);
+    assert!(app.debugger_launch.queued(), "a new approval looks again");
+    two_looks(&mut app, &mut t);
+    assert_eq!(workers(), 1, "no second dialog");
+    assert!(!app.debugger_launch.queued(), "over for that revision");
+    assert_eq!(
+        access_outcome(&app, root.path(), REVISION + 1),
+        Some(AccessOutcome::Declined),
+        "the later revision's row is settled in this process"
+    );
+    assert_eq!(
+        access_outcome(&app, root.path(), REVISION),
+        Some(AccessOutcome::Declined),
+        "the earlier revision's line stays"
+    );
+    assert!(debugger_alerts().is_empty());
+}
+
+/// The `[privacy]` switches turned off one at a time, each with a probe planted
+/// for an hour (as [`new_mac`] plants it), and all of them on.
+type Switches = (&'static str, fn() -> super::app_config::PrivacyConfig);
+const SWITCHES_OFF: [Switches; 3] = [
+    ("notice off", || super::app_config::PrivacyConfig {
+        probe_interval_ms: Some(3_600_000),
+        notice: Some(false),
+        ..Default::default()
+    }),
+    ("checks off", || super::app_config::PrivacyConfig {
+        probe_interval_ms: Some(3_600_000),
+        check: Some(false),
+        ..Default::default()
+    }),
+    ("privacy off", || super::app_config::PrivacyConfig {
+        probe_interval_ms: Some(3_600_000),
+        enabled: Some(false),
+        ..Default::default()
+    }),
+];
+
+fn switches_on() -> super::app_config::PrivacyConfig {
+    super::app_config::PrivacyConfig {
+        probe_interval_ms: Some(3_600_000),
+        ..Default::default()
+    }
+}
+
+/// A `[privacy]` SWITCH OFF IS A PAUSE, NEVER AN ANSWER (design §4, §6): with
+/// `notice`, `check` or `enabled` off the step starts nothing and records
+/// nothing — neither this Mac in the once-per-Mac record nor the admitted
+/// revision's row, which reads as the person's choice from the published opt-out
+/// while the switch is off — and once every switch is on again it goes on for the
+/// same revision, with no new approval: macOS's dialog comes. With no admission
+/// yet the step parks; the admission that comes while a switch is off pauses it
+/// the same way.
+#[test]
+fn a_privacy_switch_off_pauses_the_debugger_step_and_records_nothing() {
+    for (name, privacy) in SWITCHES_OFF {
+        let root = crate::test_scratch::outlived_dir("aterm-access-");
+        let config = root.path().join("aterm.toml");
+        let mut t = Instant::now();
+        let mut app = ready_to_start(root.path());
+        app.config.privacy = Some(privacy());
+        let before = workers();
+        two_looks(&mut app, &mut t);
+        two_looks(&mut app, &mut t);
+        assert_eq!(workers(), before, "{name}: nothing started");
+        assert!(app.debugger_launch.paused(), "{name}: paused");
+        assert_eq!(
+            access_outcome(&app, root.path(), REVISION),
+            None,
+            "{name}: no answer recorded for the revision"
+        );
+        assert!(
+            !crate::debugger_access::read_asked(&config, "READY-MAC"),
+            "{name}: this Mac never answered"
+        );
+        app.config.privacy = Some(switches_on());
+        debugger_reads_off(&mut app);
+        two_looks(&mut app, &mut t);
+        assert_eq!(
+            workers(),
+            before + 1,
+            "{name}: on again, the step goes on: macOS's dialog"
+        );
+        assert!(!app.debugger_launch.paused(), "{name}");
+
+        // No admission yet: parked; the admission that comes pauses it.
+        let root = crate::test_scratch::outlived_dir("aterm-access-");
+        let mut app = new_mac();
+        app.consent_launch
+            .set_fda(crate::consent_launch::FdaLaunch::NotAsked);
+        app.devtools_helper.note_reading(
+            crate::devtools_helper::test_arms::reading(
+                aterm_containment::DevToolGrant::NotGranted,
+                crate::devtools_helper::test_arms::absent(2),
+            ),
+            Instant::now(),
+        );
+        queue_debugger_step(&mut app, root.path(), || Some("READY-MAC"));
+        app.config.privacy = Some(privacy());
+        let before = workers();
+        two_looks(&mut app, &mut t);
+        assert!(app.debugger_launch.parked(), "{name}: parked");
+        window_admits(&mut app, REVISION);
+        two_looks(&mut app, &mut t);
+        assert!(app.debugger_launch.paused(), "{name}: admitted, and paused");
+        assert_eq!(access_outcome(&app, root.path(), REVISION), None, "{name}");
+        assert_eq!(workers(), before, "{name}: nothing started");
+        app.config.privacy = Some(switches_on());
+        debugger_reads_off(&mut app);
+        two_looks(&mut app, &mut t);
+        assert_eq!(workers(), before + 1, "{name}: on again, it starts");
+    }
+    assert!(debugger_alerts().is_empty());
+}
+
+/// A SWITCH TURNED OFF WHILE A KEPT ANSWER WAITS PAUSES THE STEP: the start's disk
+/// half recorded this Mac and its answer is kept (System State went away before
+/// the change started); the person then turns `notice`, `check` or `enabled` off.
+/// The look that would spend the answer reads the switches again, as admission
+/// does: nothing starts and nothing answers the revision, the answer stays kept,
+/// and once every switch is on again the change starts on it.
+#[test]
+fn a_switch_turned_off_while_a_kept_answer_waits_pauses_the_step() {
+    use aterm_types::macos_setup::AccessOutcome;
+    for (name, privacy) in SWITCHES_OFF {
+        let mut t = Instant::now();
+        let root = crate::test_scratch::outlived_dir("aterm-access-");
+        let mut app = ready_to_start(root.path());
+        let before = workers();
+        let at = recorded_mid_start(&mut app, &mut t);
+        app.look_for_debugger_moment(at, page_away);
+        assert!(app.debugger_launch.starting(), "PRECONDITION: kept");
+        assert_eq!(workers(), before, "PRECONDITION: nothing started yet");
+        app.config.privacy = Some(privacy());
+        debugger_reads_off(&mut app);
+        two_looks(&mut app, &mut t);
+        two_looks(&mut app, &mut t);
+        assert_eq!(workers(), before, "{name}: the kept answer starts nothing");
+        assert!(app.debugger_launch.paused(), "{name}: paused");
+        assert!(app.debugger_launch.starting(), "{name}: its answer kept");
+        assert_ne!(
+            access_outcome(&app, root.path(), REVISION),
+            Some(AccessOutcome::Declined),
+            "{name}: nothing answers the revision"
+        );
+        app.config.privacy = Some(switches_on());
+        debugger_reads_off(&mut app);
+        two_looks(&mut app, &mut t);
+        assert_eq!(
+            workers(),
+            before + 1,
+            "{name}: on again, the kept answer starts the change"
+        );
+    }
+}
+
+/// DEBUGGER ACCESS TURNED OFF WHILE A KEPT ANSWER WAITS IS THE ROW'S WANTED STATE
+/// (design §4, `TurnedOff`): the look that spends the answer reads the rule and
+/// the record again, finds debugger access off by the person's choice (the
+/// observed record says it was allowed), starts nothing and settles the
+/// revision's row declined. CONTROL: with no such record the same look starts
+/// the change.
+#[test]
+fn debugger_access_turned_off_while_a_kept_answer_waits_starts_nothing() {
+    use crate::debugger_access::{DebuggerChangeLane, ObservedMarker, Origin, RecordsRead};
+    use aterm_containment::consent::DebuggerMode;
+    use aterm_types::macos_setup::AccessOutcome;
+    for turned_off in [true, false] {
+        let mut t = Instant::now();
+        let root = crate::test_scratch::outlived_dir("aterm-access-");
+        let mut app = ready_to_start(root.path());
+        let before = workers();
+        let at = recorded_mid_start(&mut app, &mut t);
+        app.look_for_debugger_moment(at, page_away);
+        assert!(app.debugger_launch.starting(), "PRECONDITION: kept");
+        // The shared record, read again: it was allowed, and it reads off now.
+        app.debugger_change = DebuggerChangeLane::with_liveness(|_| false);
+        app.debugger_change.settle_records(RecordsRead {
+            observed: turned_off.then_some(ObservedMarker {
+                mode: DebuggerMode::Enabled,
+                since: 1_790_000_000,
+                origin: Origin::Outside,
+            }),
+            ..RecordsRead::default()
+        });
+        app.debugger_change.poll(1);
+        debugger_reads_off(&mut app);
+        two_looks(&mut app, &mut t);
+        if turned_off {
+            assert_eq!(workers(), before, "turned off: nothing started");
+            assert!(!app.debugger_launch.queued() && !app.debugger_launch.starting());
+            assert_eq!(
+                access_outcome(&app, root.path(), REVISION),
+                Some(AccessOutcome::Declined),
+                "turned off: the row's wanted state"
+            );
+        } else {
+            assert_eq!(workers(), before + 1, "control: the change starts");
+        }
+    }
+}
+
+/// A NEW APPROVAL WHILE THE STEP'S CHANGE IS UNDER WAY JOINS IT (the checker's
+/// case): the window's own admission of R + 1 while R's change runs, macOS's
+/// dialog still up, is handed at once — never declined before anyone answered
+/// the dialog — starts nothing more, and takes the change's outcome when it
+/// ends: Cancel declines both revisions, and on grants both.
+#[test]
+fn a_new_revision_while_the_change_runs_takes_its_outcome() {
+    use aterm_containment::consent::DebuggerChange;
+    use aterm_types::macos_setup::AccessOutcome;
+    let cases = [
+        (
+            crate::debugger_access::Outcome::NotChanged(DebuggerChange::On),
+            AccessOutcome::Declined,
+        ),
+        (
+            crate::debugger_access::Outcome::Changed(DebuggerChange::On),
+            AccessOutcome::Granted,
+        ),
+    ];
+    for (ended_with, outcome) in cases {
+        let root = crate::test_scratch::outlived_dir("aterm-access-");
+        let mut t = Instant::now();
+        let mut app = ready_to_start(root.path());
+        let before = workers();
+        two_looks(&mut app, &mut t);
+        assert_eq!(workers(), before + 1);
+        assert!(app.debugger_change.under_way());
+        window_admits(&mut app, REVISION + 1);
+        two_looks(&mut app, &mut t);
+        assert_eq!(workers(), before + 1, "{outcome:?}: no second dialog");
+        assert_eq!(
+            access_outcome(&app, root.path(), REVISION + 1),
+            Some(AccessOutcome::Handed),
+            "{outcome:?}: R + 1 waits on the dialog that is up"
+        );
+        window_admits(&mut app, REVISION + 1);
+        app.apply_debugger_step(ended(ended_with));
+        for revision in [REVISION, REVISION + 1] {
+            assert_eq!(
+                access_outcome(&app, root.path(), revision),
+                Some(outcome),
+                "{outcome:?}: revision {revision}"
+            );
+        }
+    }
+    assert!(debugger_alerts().is_empty());
+}
+
+/// The step never starts while anything goes before it: the Full Disk Access decision
+#[test]
+fn the_debugger_step_waits_behind_every_page_panel_and_moment() {
     use crate::consent_launch::FdaLaunch;
     use crate::devtools_helper::Origin;
-    let blockers: [AppCase; 8] = [
+    let blockers: [AppCase; 9] = [
         ("full disk access undecided", |app| {
             app.consent_launch.set_fda(FdaLaunch::Undecided);
         }),
@@ -1401,21 +1884,28 @@ fn the_debugger_alert_waits_behind_every_page_panel_and_moment() {
         ("the owner's recent decline", |app| {
             app.owner_quiet.lock().unwrap().note_decline();
         }),
-        ("not quiet", |_| {}),
+        ("System State not frontmost", |_| {}),
+        ("another macOS dialog up", |_| {}),
     ];
     for (name, block) in blockers {
         let root = crate::test_scratch::outlived_dir("aterm-access-");
         let mut t = Instant::now();
-        let mut app = ready_to_ask(root.path(), owner_says_no);
+        let mut app = ready_to_start(root.path());
         block(&mut app);
-        let moment: fn(&App, Instant) -> bool = if name == "not quiet" {
-            |_, _| false
-        } else {
-            quiet
+        let moment: fn(&App) -> crate::debugger_access::StepMoment = match name {
+            "System State not frontmost" => page_away,
+            "another macOS dialog up" => other_dialog,
+            _ => page_up,
         };
-        let before = debugger_alerts().len();
+        let before = workers();
         app.look_for_debugger_moment(later(&mut t), moment);
-        assert_eq!(debugger_alerts().len(), before, "{name}: no alert");
+        app.look_for_debugger_moment(later(&mut t), moment);
+        assert_eq!(workers(), before, "{name}: nothing started");
+        assert_ne!(
+            app.system_state_access_step(),
+            Some(aterm_types::macos_setup::Access::Debugger),
+            "{name}: the debugger is not named"
+        );
         assert!(app.debugger_launch.queued(), "{name}: still to come");
         assert!(
             app.debugger_launch.next_deadline().is_some_and(|at| at > t),
@@ -1428,10 +1918,11 @@ fn the_debugger_alert_waits_behind_every_page_panel_and_moment() {
     }
     let root = crate::test_scratch::outlived_dir("aterm-access-");
     let mut t = Instant::now();
-    let mut app = ready_to_ask(root.path(), owner_says_no);
-    let before = debugger_alerts().len();
-    app.look_for_debugger_moment(later(&mut t), quiet);
-    assert_eq!(debugger_alerts().len(), before + 1, "unblocked: asked");
+    let mut app = ready_to_start(root.path());
+    let before = workers();
+    two_looks(&mut app, &mut t);
+    assert_eq!(workers(), before + 1, "unblocked: started");
+    assert!(debugger_alerts().is_empty());
 }
 
 /// The owner's own Open Settings for Full Disk Access, over a grant that reads held,
@@ -1452,7 +1943,8 @@ fn a_full_disk_access_hand_over_gone_with_no_panel_holds_nothing() {
         ),
         Instant::now(),
     );
-    queue_debugger_ask(&mut app, root.path(), || Some("OWNER-MAC"), owner_says_no);
+    queue_debugger_step(&mut app, root.path(), || Some("OWNER-MAC"));
+    window_admits(&mut app, REVISION);
     app.consent = ConsentState::with_cached_probe_for_test(granted());
     debugger_reads_off(&mut app);
     #[expect(
@@ -1465,32 +1957,28 @@ fn a_full_disk_access_hand_over_gone_with_no_panel_holds_nothing() {
         app.consent_launch.fda(),
         FdaLaunch::Ended { owner_acted: true }
     );
-    let before = debugger_alerts().len();
-    app.look_for_debugger_moment(later(&mut t), quiet);
-    assert_eq!(debugger_alerts().len(), before + 1, "asked");
+    let before = workers();
+    two_looks(&mut app, &mut t);
+    assert_eq!(workers(), before + 1, "started");
 
     let root = crate::test_scratch::outlived_dir("aterm-access-");
-    let mut app = ready_to_ask(root.path(), owner_says_no);
+    let mut app = ready_to_start(root.path());
     app.consent_launch.set_fda(FdaLaunch::Waiting);
-    let before = debugger_alerts().len();
-    app.look_for_debugger_moment(later(&mut t), quiet);
-    assert_eq!(
-        debugger_alerts().len(),
-        before + 1,
-        "waiting on nothing holds nothing"
-    );
+    let before = workers();
+    two_looks(&mut app, &mut t);
+    assert_eq!(workers(), before + 1, "waiting on nothing holds nothing");
 }
 
-/// An answer older than [`crate::debugger_access::ASK_PROBE_FRESH`] is retired at the quiet moment and read again before any alert.
+/// The change starts only on a fresh reading of the rule.
 #[test]
-fn the_debugger_alert_waits_for_a_fresh_reading_of_the_rule() {
+fn the_debugger_step_waits_for_a_fresh_reading_of_the_rule() {
     use crate::debugger_access::ASK_PROBE_FRESH;
     use aterm_containment::consent::{
         DebuggerMember, DebuggerMode, DebuggerProbe, DebuggerProbeLabel, SelfHardening,
     };
     let root = crate::test_scratch::outlived_dir("aterm-access-");
     let mut t = Instant::now();
-    let mut app = ready_to_ask(root.path(), owner_says_yes);
+    let mut app = ready_to_start(root.path());
     let old = Duration::from_secs(120);
     app.consent.publish_debugger_aged_for_test(
         DebuggerProbe {
@@ -1502,9 +1990,8 @@ fn the_debugger_alert_waits_for_a_fresh_reading_of_the_rule() {
         old,
     );
     let gate = app.config.privacy_probe_gate();
-    let before = debugger_alerts().len();
-    app.look_for_debugger_moment(later(&mut t), |_, _| false);
-    assert_eq!(debugger_alerts().len(), before);
+    app.look_for_debugger_moment(later(&mut t), page_away);
+    assert_eq!(workers(), 0);
     assert!(
         !app.consent.debugger_in_flight_for_test(),
         "a wait starts no probe"
@@ -1517,12 +2004,11 @@ fn the_debugger_alert_waits_for_a_fresh_reading_of_the_rule() {
         "nor retires the answer it waits on"
     );
 
-    app.look_for_debugger_moment(later(&mut t), quiet);
-    assert_eq!(
-        debugger_alerts().len(),
-        before,
-        "no alert on an old reading"
-    );
+    // One look at the moment: the probe it dispatches ends on its own thread,
+    // so a second look at once would race it (this App's arm answers
+    // `refused_disabled`, which drops the step).
+    app.look_for_debugger_moment(later(&mut t), page_up);
+    assert_eq!(workers(), 0, "nothing starts on an old reading");
     assert!(app.debugger_launch.queued(), "it looks again");
     assert!(
         app.consent
@@ -1530,6 +2016,16 @@ fn the_debugger_alert_waits_for_a_fresh_reading_of_the_rule() {
             .is_none_or(|row| row.probe_age().is_none_or(|age| age < ASK_PROBE_FRESH)),
         "the old answer is retired and the rule read again"
     );
+
+    // The fresh reading the next look admits on, once that probe has ended.
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the debugger probe the look dispatched ends",
+        || (!app.consent.debugger_in_flight_for_test()).then_some(()),
+    );
+    debugger_reads_off(&mut app);
+    two_looks(&mut app, &mut t);
+    assert_eq!(workers(), 1, "a fresh reading starts it");
 }
 
 /// A change on disk this lane never settles — here a peer's change lock held for good
@@ -1537,34 +2033,36 @@ fn the_debugger_alert_waits_for_a_fresh_reading_of_the_rule() {
 /// for [`crate::debugger_access::REFUSED_FOR`] from the first refusal.
 #[cfg(unix)]
 #[test]
-fn a_change_on_disk_holds_the_ask_and_the_folders_for_a_bounded_span() {
+fn a_change_on_disk_holds_the_step_and_the_folders_for_a_bounded_span() {
     use crate::debugger_access::{LockTry, REFUSED_FOR, read_asked, take_change_lock};
     let root = crate::test_scratch::outlived_dir("aterm-access-");
     let config = root.path().join("aterm.toml");
     let mut t = Instant::now();
-    let mut app = ready_to_ask(root.path(), owner_says_yes);
+    let mut app = ready_to_start(root.path());
     let LockTry::Held(_peer) = take_change_lock(&config, Duration::ZERO) else {
         panic!("the scratch lock is free");
     };
-    let before = debugger_alerts().len();
+    app.look_for_debugger_moment(later(&mut t), page_up);
     let first = later(&mut t);
-    app.look_for_debugger_moment(first, quiet);
+    app.look_for_debugger_moment(first, page_up);
     assert!(app.debugger_launch.queued(), "refused: looked at again");
     assert!(
         app.debugger_launch
             .next_deadline()
             .is_some_and(|at| at > first)
     );
+    assert_eq!(app.system_state_access_step(), None, "nothing named");
     app.launch_warmup_look(first, quiet);
     assert!(
         !app.consent_launch.walking(),
-        "the folders wait for the ask"
+        "the folders wait for the step"
     );
 
-    let over = first + REFUSED_FOR;
-    app.look_for_debugger_moment(over, quiet);
+    let mut over = first + REFUSED_FOR;
+    app.look_for_debugger_moment(over, page_up);
+    app.look_for_debugger_moment(later(&mut over), page_up);
     assert!(!app.debugger_launch.queued(), "over for this process");
-    assert_eq!(debugger_alerts().len(), before, "nobody asked");
+    assert_eq!(workers(), 0, "nothing started");
     assert!(!read_asked(&config, "READY-MAC"), "nothing recorded");
     app.launch_warmup_look(over + Duration::from_secs(10), quiet);
     assert!(app.consent_launch.walking(), "the folders are asked for");
@@ -1594,14 +2092,14 @@ fn cold_then_ended() -> Option<&'static str> {
 fn a_host_read_ending_mid_look_is_not_a_mac_without_a_name() {
     let root = crate::test_scratch::outlived_dir("aterm-access-");
     let mut t = Instant::now();
-    let mut app = ready_to_ask(root.path(), owner_says_no);
+    let mut app = ready_to_start(root.path());
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     HOST_READ.with(|slot| *slot.borrow_mut() = Some(std::sync::Arc::clone(&done)));
     app.debugger_launch =
-        crate::debugger_access::LaunchAskQueue::reading_host_for_test(cold_then_ended, done);
-    app.look_for_debugger_moment(later(&mut t), quiet);
+        crate::debugger_access::DebuggerStepQueue::reading_host_for_test(cold_then_ended, done);
+    app.look_for_debugger_moment(later(&mut t), page_up);
     assert!(app.debugger_launch.queued(), "a cold key waits");
-    app.look_for_debugger_moment(later(&mut t), quiet);
+    app.look_for_debugger_moment(later(&mut t), page_up);
     assert!(
         !app.debugger_launch.queued(),
         "ended with no key: no host to record"
@@ -1611,16 +2109,15 @@ fn a_host_read_ending_mid_look_is_not_a_mac_without_a_name() {
 
 /// On launch, an unread Mac line in the record starts its read on a background thread and acts on the result at the next look.
 #[test]
-fn the_launch_asks_record_is_read_off_the_event_loop() {
+fn the_debugger_steps_record_is_read_off_the_event_loop() {
     let root = crate::test_scratch::outlived_dir("aterm-access-");
     let config = root.path().join("aterm.toml");
     crate::debugger_access::note_asked(&config, "READY-MAC", 1).expect("this Mac recorded");
     let mut t = Instant::now();
-    let mut app = ready_to_ask(root.path(), owner_says_no);
+    let mut app = ready_to_start(root.path());
     app.debugger_launch =
-        crate::debugger_access::LaunchAskQueue::reading_record_for_test(|| Some("READY-MAC"));
-    let before = debugger_alerts().len();
-    app.look_for_debugger_moment(later(&mut t), quiet);
+        crate::debugger_access::DebuggerStepQueue::reading_record_for_test(|| Some("READY-MAC"));
+    app.look_for_debugger_moment(later(&mut t), page_up);
     assert!(app.debugger_launch.queued(), "the look waits for the read");
     let began = Instant::now();
     while app.debugger_launch.asked("READY-MAC").is_none() {
@@ -1630,56 +2127,58 @@ fn the_launch_asks_record_is_read_off_the_event_loop() {
         );
         std::thread::sleep(Duration::from_millis(1));
     }
-    app.look_for_debugger_moment(later(&mut t), quiet);
+    app.look_for_debugger_moment(later(&mut t), page_up);
     assert!(
         !app.debugger_launch.queued(),
-        "asked on this Mac already: dropped"
+        "started on this Mac already: dropped"
     );
-    assert_eq!(debugger_alerts().len(), before, "no alert");
+    assert_eq!(workers(), 0, "nothing started");
 }
 
-/// THE OFFER WRITES THIS MAC OFF THE EVENT LOOP, AND ITS ALERT FOLLOWS AT THE NEXT LOOK.
+/// THE START WRITES THIS MAC OFF THE EVENT LOOP: on a launch, the look that would start
 #[test]
-fn the_launch_asks_record_is_written_off_the_event_loop() {
+fn the_debugger_steps_start_writes_this_mac_off_the_event_loop() {
+    use crate::debugger_access::DebuggerStepQueue;
     use aterm_durable::{Flush, seam::Recording};
+    use aterm_types::macos_setup::AccessOutcome;
     let flushes = Recording::start();
     let mut t = Instant::now();
     let root = crate::test_scratch::outlived_dir("aterm-access-");
     let config = root.path().join("aterm.toml");
-    let mut app = ready_to_ask(root.path(), owner_says_no);
-    app.debugger_launch =
-        crate::debugger_access::LaunchAskQueue::reading_record_for_test(|| Some("READY-MAC"));
-    let before = debugger_alerts().len();
+    let mut app = ready_to_start(root.path());
+    app.debugger_launch = DebuggerStepQueue::reading_record_for_test(|| Some("READY-MAC"))
+        .recording_in(Some(root.path().to_path_buf()));
     let _ = flushes.take();
-    app.look_for_debugger_moment(later(&mut t), quiet);
+    app.look_for_debugger_moment(later(&mut t), page_up);
     aterm_spec::wait::until_within(
         aterm_spec::wait::MUST_HAPPEN,
         "the record's read ends",
         || app.debugger_launch.asked("READY-MAC").map(|_| ()),
     );
     debugger_reads_off(&mut app);
-    let asking = later(&mut t);
-    app.look_for_debugger_moment(asking, quiet);
-    assert!(app.debugger_launch.queued(), "the look waits for the write");
-    assert_eq!(
-        debugger_alerts().len(),
-        before,
-        "no alert before the record"
+    app.look_for_debugger_moment(later(&mut t), page_up);
+    assert!(
+        app.debugger_launch.announced(),
+        "PRECONDITION: the page names the dialog"
     );
+    let starting = later(&mut t);
+    app.look_for_debugger_moment(starting, page_up);
+    assert!(app.debugger_launch.queued(), "the look waits for the write");
+    assert!(app.debugger_launch.starting(), "its disk half is out");
+    assert_eq!(workers(), 0, "nothing started before the record");
     aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the disk half ends", || {
-        app.debugger_launch.due(asking).then_some(())
+        app.debugger_launch.due(starting).then_some(())
     });
     assert!(crate::debugger_access::read_asked(&config, "READY-MAC"));
-    app.look_for_debugger_moment(asking, never_quiet);
-    assert_eq!(
-        debugger_alerts().len(),
-        before + 1,
-        "asked, once, quiet or not"
-    );
-    assert_eq!(debugger_alerts().last(), Some(&launch_alert(&mut app)));
+    app.look_for_debugger_moment(starting, page_up);
+    assert_eq!(workers(), 1, "started, once, for the Mac it recorded");
     assert!(
         !app.debugger_launch.queued(),
-        "asked: over for this process"
+        "started: over for this process"
+    );
+    assert_eq!(
+        access_outcome(&app, root.path(), REVISION),
+        Some(AccessOutcome::Handed)
     );
     assert!(
         !flushes.take().contains(&Flush::Durable),
@@ -1687,14 +2186,10 @@ fn the_launch_asks_record_is_written_off_the_event_loop() {
     );
 
     let root = crate::test_scratch::outlived_dir("aterm-access-");
-    let mut inline = ready_to_ask(root.path(), owner_says_no);
+    let mut inline = ready_to_start(root.path());
     let _ = flushes.take();
-    inline.look_for_debugger_moment(later(&mut t), quiet);
-    assert_eq!(
-        debugger_alerts().len(),
-        before + 2,
-        "in the look: asked at once"
-    );
+    two_looks(&mut inline, &mut t);
+    assert_eq!(workers(), 2, "in the look: started at once");
     assert!(
         flushes.take().contains(&Flush::Durable),
         "in the look: synced on this thread"
@@ -1702,35 +2197,35 @@ fn the_launch_asks_record_is_written_off_the_event_loop() {
 
     let root = crate::test_scratch::outlived_dir("aterm-access-");
     let config = root.path().join("aterm.toml");
-    let mut app = ready_to_ask(root.path(), owner_says_yes);
-    app.debugger_launch =
-        crate::debugger_access::LaunchAskQueue::reading_record_for_test(|| Some("READY-MAC"));
+    let mut app = ready_to_start(root.path());
+    app.debugger_launch = DebuggerStepQueue::reading_record_for_test(|| Some("READY-MAC"))
+        .recording_in(Some(root.path().to_path_buf()));
     app.owner_quiet.lock().unwrap().note_debugger_answered();
     let _ = flushes.take();
-    app.look_for_debugger_moment(later(&mut t), quiet);
+    app.look_for_debugger_moment(later(&mut t), page_up);
     aterm_spec::wait::until_within(
         aterm_spec::wait::MUST_HAPPEN,
         "the record's read ends",
         || app.debugger_launch.asked("READY-MAC").map(|_| ()),
     );
-    app.look_for_debugger_moment(later(&mut t), quiet);
+    app.look_for_debugger_moment(later(&mut t), page_up);
     assert!(!app.debugger_launch.queued(), "answered: settled");
     aterm_spec::wait::until_within(
         aterm_spec::wait::MUST_HAPPEN,
         "the settle's record lands",
         || crate::debugger_access::read_asked(&config, "READY-MAC").then_some(()),
     );
-    assert_eq!(debugger_alerts().len(), before + 2, "no alert");
+    assert_eq!(workers(), 2, "the settle starts nothing");
     assert!(
         !flushes.take().contains(&Flush::Durable),
         "the settle synced nothing on the window's thread"
     );
 
     let root = crate::test_scratch::outlived_dir("aterm-access-");
-    let mut inline = ready_to_ask(root.path(), owner_says_yes);
+    let mut inline = ready_to_start(root.path());
     inline.owner_quiet.lock().unwrap().note_debugger_answered();
     let _ = flushes.take();
-    inline.look_for_debugger_moment(later(&mut t), quiet);
+    inline.look_for_debugger_moment(later(&mut t), page_up);
     assert!(!inline.debugger_launch.queued(), "in the look: settled");
     assert!(
         flushes.take().contains(&Flush::Durable),
@@ -1738,152 +2233,163 @@ fn the_launch_asks_record_is_written_off_the_event_loop() {
     );
 }
 
-/// While the offer's disk half is out, the ask waits and spends the recorded answer before judging again.
+/// An app whose start's disk half has just recorded this Mac: the page named macOS's
+fn recorded_mid_start(app: &mut App, t: &mut Instant) -> Instant {
+    app.look_for_debugger_moment(later(t), page_up);
+    assert!(
+        app.debugger_launch.announced(),
+        "PRECONDITION: the page names the dialog"
+    );
+    let read = app.debugger_access_facts();
+    let slot = app.debugger_launch.start_prepare(read).expect("none out");
+    let at = later(t);
+    app.look_for_debugger_moment(at, page_up);
+    assert!(
+        app.debugger_launch.preparing(),
+        "PRECONDITION: the look waits"
+    );
+    let _ = slot.set(crate::debugger_access::StartPrep::Recorded);
+    at
+}
+
+/// WHILE THE START'S DISK HALF IS OUT, THE STEP ONLY WAITS: a look then ends nothing, and once
+/// the answer is in it is spent before anything is judged again.
 #[test]
-fn the_launch_ask_waits_out_its_disk_half_and_spends_it_first() {
-    use crate::debugger_access::OfferPrep;
+fn the_debugger_step_waits_out_its_disk_half_and_spends_it_first() {
     let mut t = Instant::now();
     let root = crate::test_scratch::outlived_dir("aterm-access-");
-    let mut dropped = ready_to_ask(root.path(), owner_says_no);
+    let mut dropped = ready_to_start(root.path());
     dropped.consent_card_config = None;
-    dropped.look_for_debugger_moment(later(&mut t), quiet);
+    dropped.look_for_debugger_moment(later(&mut t), page_up);
     assert!(
         !dropped.debugger_launch.queued(),
         "no config folder: dropped"
     );
 
     let root = crate::test_scratch::outlived_dir("aterm-access-");
-    let mut app = ready_to_ask(root.path(), owner_says_no);
+    let mut app = ready_to_start(root.path());
+    app.look_for_debugger_moment(later(&mut t), page_up);
     let read = app.debugger_access_facts();
     let slot = app.debugger_launch.start_prepare(read).expect("none out");
     app.consent_card_config = None;
-    let before = debugger_alerts().len();
+    let before = workers();
     let waiting = later(&mut t);
-    app.look_for_debugger_moment(waiting, quiet);
+    app.look_for_debugger_moment(waiting, page_up);
     assert!(
         app.debugger_launch.queued(),
         "a write may still land: nothing ends"
     );
     assert!(app.debugger_launch.preparing());
-    assert_eq!(debugger_alerts().len(), before);
-    let _ = slot.set(OfferPrep::Recorded);
-    app.look_for_debugger_moment(waiting, quiet);
-    assert_eq!(
-        debugger_alerts().len(),
-        before + 1,
-        "the recorded Mac is asked"
-    );
+    assert_eq!(workers(), before);
+    let _ = slot.set(crate::debugger_access::StartPrep::Recorded);
+    app.look_for_debugger_moment(waiting, page_up);
+    assert_eq!(workers(), before + 1, "the recorded Mac gets its change");
     assert!(
         !app.debugger_launch.queued(),
-        "asked: over for this process"
+        "started: over for this process"
     );
 }
 
 /// First-launch setup holds the debugger ask until its permissions choice is applied.
 #[test]
-fn a_held_first_launch_setup_holds_the_debugger_ask() {
+fn a_held_first_launch_setup_holds_the_debugger_step() {
     use crate::InitialSetupPermissionPolicy as Policy;
     let mut t = Instant::now();
     let root = crate::test_scratch::outlived_dir("aterm-access-");
     let config = root.path().join("aterm.toml");
-    let mut app = ready_to_ask(root.path(), owner_says_no);
+    let mut app = ready_to_start(root.path());
     app.hold_initial_setup_permissions();
-    let before = debugger_alerts().len();
-    app.look_for_debugger_moment(later(&mut t), quiet);
+    app.look_for_debugger_moment(later(&mut t), page_up);
     assert!(app.debugger_launch.queued(), "held: still to come");
-    assert_eq!(debugger_alerts().len(), before, "held: no alert");
+    assert!(
+        !app.debugger_launch.announced(),
+        "held: the page names nothing"
+    );
+    assert_eq!(workers(), 0, "held: nothing started");
     assert!(
         !crate::debugger_access::read_asked(&config, "READY-MAC"),
         "held: no record"
     );
     app.accepted_initial_setup_apply();
     app.observe_initial_setup_permissions(Some(Policy {
-        revision: 1,
+        revision: REVISION + 1,
         allowed: false,
     }));
-    app.look_for_debugger_moment(later(&mut t), quiet);
-    assert_eq!(
-        debugger_alerts().len(),
-        before,
-        "the choice unchecked: held"
-    );
+    two_looks(&mut app, &mut t);
+    assert_eq!(workers(), 0, "the choice unchecked: held");
     assert!(app.debugger_launch.queued());
-    app.accepted_initial_setup_apply();
-    app.observe_initial_setup_permissions(Some(Policy {
-        revision: 2,
-        allowed: true,
-    }));
-    app.look_for_debugger_moment(later(&mut t), quiet);
-    assert_eq!(debugger_alerts().len(), before + 1, "applied: asked");
+    window_admits(&mut app, REVISION + 2);
+    two_looks(&mut app, &mut t);
+    assert_eq!(workers(), 1, "admitted: started");
     assert!(crate::debugger_access::read_asked(&config, "READY-MAC"));
 }
 
-/// An app whose offer's disk half has just recorded this Mac: the look that
-/// started it waited, and its answer is in.
-fn recorded_mid_offer(app: &mut App, t: &mut Instant) -> Instant {
-    let read = app.debugger_access_facts();
-    let slot = app.debugger_launch.start_prepare(read).expect("none out");
-    let at = later(t);
-    app.look_for_debugger_moment(at, quiet);
-    assert!(
-        app.debugger_launch.preparing(),
-        "PRECONDITION: the look waits"
-    );
-    let _ = slot.set(crate::debugger_access::OfferPrep::Recorded);
-    at
-}
-
-/// An answer given while the offer records settles the ask without a second alert.
+/// AN ANSWER GIVEN WHILE THE START RECORDS SETTLES THE STEP: the owner answered
 #[test]
-fn an_answer_given_while_the_offer_records_settles_the_ask() {
+fn an_answer_given_while_the_start_records_settles_the_step() {
+    use aterm_types::macos_setup::AccessOutcome;
     let mut t = Instant::now();
     let root = crate::test_scratch::outlived_dir("aterm-access-");
-    let mut app = ready_to_ask(root.path(), owner_says_no);
-    let at = recorded_mid_offer(&mut app, &mut t);
+    let mut app = ready_to_start(root.path());
+    let at = recorded_mid_start(&mut app, &mut t);
     app.owner_quiet.lock().unwrap().note_debugger_answered();
-    let before = debugger_alerts().len();
-    app.look_for_debugger_moment(at, quiet);
-    assert_eq!(debugger_alerts().len(), before, "answered: no second alert");
+    app.look_for_debugger_moment(at, page_up);
+    assert_eq!(workers(), 0, "answered: nothing started");
     assert!(!app.debugger_launch.queued(), "answered: settled");
+    assert_eq!(
+        access_outcome(&app, root.path(), REVISION),
+        Some(AccessOutcome::Declined)
+    );
 
     let root = crate::test_scratch::outlived_dir("aterm-access-");
-    let mut unanswered = ready_to_ask(root.path(), owner_says_no);
-    let at = recorded_mid_offer(&mut unanswered, &mut t);
-    unanswered.look_for_debugger_moment(at, quiet);
-    assert_eq!(debugger_alerts().len(), before + 1, "unanswered: asked");
+    let mut unanswered = ready_to_start(root.path());
+    let at = recorded_mid_start(&mut unanswered, &mut t);
+    unanswered.look_for_debugger_moment(at, page_up);
+    assert_eq!(workers(), 1, "unanswered: started");
 }
 
-/// A decline quiet that began while the offer records defers the alert until the quiet has passed.
+/// A wait that began while the start records defers the change, never drops it.
 #[test]
-fn a_decline_quiet_while_the_offer_records_defers_its_alert() {
-    use crate::debugger_access::AskWait;
+fn a_wait_while_the_start_records_defers_its_change() {
+    use crate::debugger_access::StepWait;
+    use aterm_types::macos_setup::AccessOutcome;
     let mut t = Instant::now();
     let root = crate::test_scratch::outlived_dir("aterm-access-");
-    let mut app = ready_to_ask(root.path(), owner_says_no);
-    let at = recorded_mid_offer(&mut app, &mut t);
+    let mut app = ready_to_start(root.path());
+    let at = recorded_mid_start(&mut app, &mut t);
     app.owner_quiet.lock().unwrap().note_decline();
-    let before = debugger_alerts().len();
-    app.look_for_debugger_moment(at, quiet);
-    assert_eq!(debugger_alerts().len(), before, "quieted: no alert yet");
+    app.look_for_debugger_moment(at, page_up);
+    assert_eq!(workers(), 0, "quieted: nothing started yet");
     assert!(app.debugger_launch.queued(), "quieted: still to come");
-    assert!(app.debugger_launch.offering(), "the answer is kept");
+    assert!(
+        app.debugger_launch.starting() && !app.debugger_launch.preparing(),
+        "the answer is kept"
+    );
+    assert!(
+        !app.debugger_launch.announced(),
+        "the page's words taken back"
+    );
     assert!(
         !app.debugger_launch.due(at),
         "a kept answer waits for its time"
     );
-    let next = app.debugger_launch.next_deadline().expect("a later look");
-    assert_eq!(next, at + AskWait::OwnerQuiet.look_again());
-    *app.owner_quiet.lock().unwrap() = crate::native_settings::OwnerQuiet::default();
-    app.look_for_debugger_moment(next, never_quiet);
     assert_eq!(
-        debugger_alerts().len(),
-        before + 1,
-        "the quiet passed: asked"
+        app.debugger_launch.next_deadline(),
+        Some(at + StepWait::OwnerQuiet.look_again())
     );
-    assert_eq!(debugger_alerts().last(), Some(&launch_alert(&mut app)));
+    *app.owner_quiet.lock().unwrap() = crate::native_settings::OwnerQuiet::default();
+    app.look_for_debugger_moment(later(&mut t), page_away);
+    assert_eq!(workers(), 0, "not frontmost: nothing started yet");
+    assert!(app.debugger_launch.starting(), "still kept");
+    two_looks(&mut app, &mut t);
+    assert_eq!(workers(), 1, "the wait passed: started");
     assert!(
         !app.debugger_launch.queued(),
-        "asked: over for this process"
+        "started: over for this process"
+    );
+    assert_eq!(
+        access_outcome(&app, root.path(), REVISION),
+        Some(AccessOutcome::Handed)
     );
 }
 
@@ -1959,10 +2465,10 @@ fn kept_on_an_aging_reading(
 ) -> Instant {
     use crate::debugger_access::ASK_PROBE_FRESH;
     use aterm_containment::consent::{DebuggerMode, SelfHardening};
-    let at = recorded_mid_offer(app, t);
+    let at = recorded_mid_start(app, t);
     app.owner_quiet.lock().unwrap().note_decline();
-    app.look_for_debugger_moment(at, quiet);
-    assert!(app.debugger_launch.offering(), "PRECONDITION: kept");
+    app.look_for_debugger_moment(at, page_up);
+    assert!(app.debugger_launch.starting(), "PRECONDITION: kept");
     *app.owner_quiet.lock().unwrap() = crate::native_settings::OwnerQuiet::default();
     app.consent.publish_debugger_aged_for_test(
         rule_reads(DebuggerMode::Disabled),
@@ -1989,31 +2495,42 @@ fn read_again_lands(app: &mut App) -> Instant {
             return Some(());
         }
         let next = app.debugger_launch.next_deadline()?;
-        app.look_for_debugger_moment(next, quiet);
+        app.look_for_debugger_moment(next, page_up);
         None
     });
     app.debugger_launch.next_deadline().expect("a later look")
 }
 
-/// Once the decline quiet has passed, a reading older than [`crate::debugger_access::ASK_PROBE_FRESH`] is retired and read again before any alert.
+/// Looks at the step's own deadlines from `next`, System State up, until it is over: the page names macOS's dialog, then the change starts.
+fn looks_from(app: &mut App, next: Instant) {
+    let mut next = Some(next);
+    for _ in 0..2 {
+        let Some(at) = next else { return };
+        app.look_for_debugger_moment(at, page_up);
+        next = app.debugger_launch.next_deadline();
+    }
+}
+
+/// A KEPT ANSWER IS SPENT ON A FRESH READING OF THE RULE: once the decline quiet has
 #[test]
 fn a_kept_answer_is_spent_on_a_fresh_reading_of_the_rule() {
     use crate::debugger_access::ASK_PROBE_FRESH;
+    use aterm_types::macos_setup::AccessOutcome;
     type ReadAgain =
         fn(aterm_containment::consent::ProbeGate) -> aterm_containment::consent::DebuggerProbe;
-    for (read_again, asked) in [(rule_reads_on as ReadAgain, 0), (rule_reads_off, 1)] {
+    let cases = [
+        (rule_reads_on as ReadAgain, 0, AccessOutcome::Granted),
+        (rule_reads_off, 1, AccessOutcome::Handed),
+    ];
+    for (read_again, started, outcome) in cases {
         let mut t = Instant::now();
         let root = crate::test_scratch::outlived_dir("aterm-access-");
-        let mut app = ready_to_ask(root.path(), owner_says_no);
+        let mut app = ready_to_start(root.path());
+        let before = workers();
         let next = kept_on_an_aging_reading(&mut app, &mut t, read_again);
-        let before = debugger_alerts().len();
-        app.look_for_debugger_moment(next, quiet);
-        assert_eq!(
-            debugger_alerts().len(),
-            before,
-            "no alert on an old reading"
-        );
-        assert!(app.debugger_launch.offering(), "kept for the fresh reading");
+        app.look_for_debugger_moment(next, page_up);
+        assert_eq!(workers(), before, "nothing starts on an old reading");
+        assert!(app.debugger_launch.starting(), "kept for the fresh reading");
         let gate = app.config.privacy_probe_gate();
         assert!(
             app.consent
@@ -2022,15 +2539,20 @@ fn a_kept_answer_is_spent_on_a_fresh_reading_of_the_rule() {
             "the old reading is retired"
         );
         let next = read_again_lands(&mut app);
-        app.look_for_debugger_moment(next, quiet);
+        looks_from(&mut app, next);
         assert_eq!(
-            debugger_alerts().len(),
-            before + asked,
-            "asked only over a rule still off"
+            workers(),
+            before + started,
+            "started only over a rule still off"
         );
         assert!(
             !app.debugger_launch.queued(),
             "over for this process either way"
+        );
+        assert_eq!(
+            access_outcome(&app, root.path(), REVISION),
+            Some(outcome),
+            "the row says how it stands"
         );
     }
 }
@@ -2043,23 +2565,22 @@ fn a_failed_read_of_the_rule_at_the_spend_is_read_again() {
     type ReadAgain =
         fn(aterm_containment::consent::ProbeGate) -> aterm_containment::consent::DebuggerProbe;
     let mut t = Instant::now();
-    let before = debugger_alerts().len();
-    let mut asked = before;
     for fails in [
         rule_read_times_out as ReadAgain,
         rule_read_does_not_start,
         rule_read_unclaimed,
     ] {
         let root = crate::test_scratch::outlived_dir("aterm-access-");
-        let mut app = ready_to_ask(root.path(), owner_says_no);
+        let mut app = ready_to_start(root.path());
+        let before = workers();
         let next = kept_on_an_aging_reading(&mut app, &mut t, fails);
-        app.look_for_debugger_moment(next, quiet);
+        app.look_for_debugger_moment(next, page_up);
         let failed_at = read_again_lands(&mut app);
-        app.look_for_debugger_moment(failed_at, quiet);
+        app.look_for_debugger_moment(failed_at, page_up);
         let label = fails(app.config.privacy_probe_gate()).label;
-        assert_eq!(debugger_alerts().len(), asked, "{label:?}: no alert");
+        assert_eq!(workers(), before, "{label:?}: nothing started");
         assert!(
-            app.debugger_launch.queued() && app.debugger_launch.offering(),
+            app.debugger_launch.queued() && app.debugger_launch.starting(),
             "{label:?}: the answer is kept"
         );
         assert_eq!(
@@ -2074,77 +2595,80 @@ fn a_failed_read_of_the_rule_at_the_spend_is_read_again() {
         );
         app.consent.probes_for_test().debugger = rule_reads_off;
         let next = app.debugger_launch.next_deadline().expect("a later look");
-        app.look_for_debugger_moment(next, quiet);
+        app.look_for_debugger_moment(next, page_up);
         assert_eq!(
-            debugger_alerts().len(),
-            asked,
-            "{label:?}: no alert before the rule is read"
+            workers(),
+            before,
+            "{label:?}: nothing started before the rule is read"
         );
         let next = read_again_lands(&mut app);
-        app.look_for_debugger_moment(next, quiet);
-        asked += 1;
-        assert_eq!(debugger_alerts().len(), asked, "{label:?}: read off, asked");
+        looks_from(&mut app, next);
+        assert_eq!(workers(), before + 1, "{label:?}: read off, started");
         assert!(
             !app.debugger_launch.queued(),
-            "{label:?}: asked, over for this process"
+            "{label:?}: started, over for this process"
         );
     }
 
     assert_eq!(UNREAD_READS, 3, "the case below fails three reads");
     let root = crate::test_scratch::outlived_dir("aterm-access-");
-    let mut app = ready_to_ask(root.path(), owner_says_no);
+    let mut app = ready_to_start(root.path());
+    let before = workers();
     let next = kept_on_an_aging_reading(&mut app, &mut t, rule_read_times_out);
-    app.look_for_debugger_moment(next, quiet);
+    app.look_for_debugger_moment(next, page_up);
     let first = read_again_lands(&mut app);
-    app.look_for_debugger_moment(first, quiet);
+    app.look_for_debugger_moment(first, page_up);
     assert!(app.debugger_launch.queued(), "the first failure: kept");
-    app.look_for_debugger_moment(first + REFUSED_FOR, quiet);
+    app.look_for_debugger_moment(first + REFUSED_FOR, page_up);
     let next = read_again_lands(&mut app);
-    app.look_for_debugger_moment(next, quiet);
+    app.look_for_debugger_moment(next, page_up);
     assert!(
-        app.debugger_launch.queued() && app.debugger_launch.offering(),
+        app.debugger_launch.queued() && app.debugger_launch.starting(),
         "two failures, the second after an absence: kept"
     );
     let next = app.debugger_launch.next_deadline().expect("a later look");
-    app.look_for_debugger_moment(next, quiet);
+    app.look_for_debugger_moment(next, page_up);
     let next = read_again_lands(&mut app);
-    app.look_for_debugger_moment(next, quiet);
-    assert_eq!(debugger_alerts().len(), asked, "failures held: no alert");
+    app.look_for_debugger_moment(next, page_up);
+    assert_eq!(workers(), before, "failures held: nothing started");
     assert!(
         !app.debugger_launch.queued(),
         "failures held for the span: over for this process"
     );
 
     let root = crate::test_scratch::outlived_dir("aterm-access-");
-    let mut app = ready_to_ask(root.path(), owner_says_no);
+    let mut app = ready_to_start(root.path());
+    let before = workers();
     let next = kept_on_an_aging_reading(&mut app, &mut t, rule_reads_unrecognized);
-    app.look_for_debugger_moment(next, quiet);
+    app.look_for_debugger_moment(next, page_up);
     let next = read_again_lands(&mut app);
-    app.look_for_debugger_moment(next, quiet);
-    assert_eq!(debugger_alerts().len(), asked, "unknown state: no alert");
+    app.look_for_debugger_moment(next, page_up);
+    assert_eq!(workers(), before, "unknown state: nothing started");
     assert!(
         !app.debugger_launch.queued(),
         "unknown state: the lane refuses, over for this process"
     );
 
     let root = crate::test_scratch::outlived_dir("aterm-access-");
-    let mut app = ready_to_ask(root.path(), owner_says_no);
+    let mut app = ready_to_start(root.path());
+    let before = workers();
     let next = kept_on_an_aging_reading(&mut app, &mut t, rule_reads_off);
     app.config.privacy = Some(super::app_config::PrivacyConfig {
         check: Some(false),
         ..Default::default()
     });
-    app.look_for_debugger_moment(next, quiet);
-    assert_eq!(debugger_alerts().len(), asked, "the gate closed: no alert");
+    app.look_for_debugger_moment(next, page_up);
+    assert_eq!(workers(), before, "the gate closed: nothing started");
     assert!(
-        !app.debugger_launch.queued(),
-        "the gate closed: over for this process"
+        app.debugger_launch.paused() && app.debugger_launch.starting(),
+        "the gate closed: a pause, the answer kept"
     );
 }
 
-/// First-launch setup's hold does not strand an offer admitted before it armed.
+/// First-launch setup's hold does not strand a start it caught mid-record.
 #[test]
-fn a_setup_hold_armed_while_the_offer_records_does_not_strand_it() {
+fn a_setup_hold_armed_while_the_start_records_does_not_strand_it() {
+    use aterm_types::macos_setup::AccessOutcome;
     let fold = |app: &App, now: Instant| {
         let (mut deadline, mut owner) = (None, crate::deadline_heal::DeadlineFold::default());
         app.fold_consent_lane_deadlines(now, &mut deadline, &mut owner);
@@ -2162,59 +2686,74 @@ fn a_setup_hold_armed_while_the_offer_records_does_not_strand_it() {
     };
     let mut t = Instant::now();
     let root = crate::test_scratch::outlived_dir("aterm-access-");
-    let mut held = ready_to_ask(root.path(), owner_says_no);
+    let mut held = ready_to_start(root.path());
     focus(&mut held);
     held.hold_initial_setup_permissions();
-    let before = debugger_alerts().len();
     let at = later(&mut t);
-    held.look_for_debugger_moment(at, quiet);
-    assert_eq!(debugger_alerts().len(), before, "held: no alert");
+    held.look_for_debugger_moment(at, page_up);
+    assert_eq!(workers(), 0, "held: nothing started");
     assert!(held.debugger_launch.queued(), "held: still to come");
     let look = at + Duration::from_secs(1);
     held.debugger_launch.look_later(look);
     assert_ne!(
         fold(&held, at),
         Some(look),
-        "held, nothing offered: no look folded for the ask"
+        "held, nothing started: no look folded for the step"
     );
 
     let root = crate::test_scratch::outlived_dir("aterm-access-");
-    let mut app = ready_to_ask(root.path(), owner_says_no);
+    let config = root.path().join("aterm.toml");
+    let mut app = ready_to_start(root.path());
     focus(&mut app);
+    app.look_for_debugger_moment(later(&mut t), page_up);
     let read = app.debugger_access_facts();
     let slot = app.debugger_launch.start_prepare(read).expect("none out");
     let at = later(&mut t);
-    app.look_for_debugger_moment(at, quiet);
+    app.look_for_debugger_moment(at, page_up);
     app.hold_initial_setup_permissions();
     let backstop = app.debugger_launch.next_deadline().expect("a later look");
     assert_eq!(fold(&app, at), Some(backstop), "held: the look still wakes");
-    let _ = slot.set(crate::debugger_access::OfferPrep::Recorded);
-    app.look_for_debugger_moment(at, quiet);
+    // The disk half recorded this Mac, as `StartDisk::prepare` does.
+    crate::debugger_access::note_asked(&config, "READY-MAC", 1).expect("this Mac recorded");
+    let _ = slot.set(crate::debugger_access::StartPrep::Recorded);
+    app.look_for_debugger_moment(at, page_up);
+    assert_eq!(workers(), 0, "held: no admission to spend");
+    assert!(
+        app.debugger_launch.parked() && app.debugger_launch.starting(),
+        "parked, its answer kept"
+    );
     assert_eq!(
-        debugger_alerts().len(),
-        before + 1,
-        "held, but recorded already: asked"
+        app.debugger_launch.next_deadline(),
+        None,
+        "parked: no look to wake"
+    );
+    window_admits(&mut app, REVISION + 1);
+    two_looks(&mut app, &mut t);
+    assert_eq!(
+        workers(),
+        1,
+        "admitted again: the recorded Mac gets its change"
     );
     assert!(
         !app.debugger_launch.queued(),
-        "asked: over for this process"
+        "started: over for this process"
+    );
+    assert_eq!(
+        access_outcome(&app, root.path(), REVISION + 1),
+        Some(AccessOutcome::Handed)
     );
 
     let root = crate::test_scratch::outlived_dir("aterm-access-");
-    let mut kept = ready_to_ask(root.path(), owner_says_no);
+    let mut kept = ready_to_start(root.path());
     focus(&mut kept);
-    let at = recorded_mid_offer(&mut kept, &mut t);
+    let at = recorded_mid_start(&mut kept, &mut t);
     kept.owner_quiet.lock().unwrap().note_decline();
-    kept.look_for_debugger_moment(at, quiet);
+    kept.look_for_debugger_moment(at, page_up);
     assert!(
-        kept.debugger_launch.offering() && !kept.debugger_launch.preparing(),
+        kept.debugger_launch.starting() && !kept.debugger_launch.preparing(),
         "PRECONDITION: kept, not out"
     );
     kept.hold_initial_setup_permissions();
-    assert!(
-        kept.debugger_launch.next_deadline().is_some(),
-        "a later look"
-    );
     let next = at + Duration::from_secs(1);
     kept.debugger_launch.look_later(next);
     assert_eq!(
@@ -2222,34 +2761,24 @@ fn a_setup_hold_armed_while_the_offer_records_does_not_strand_it() {
         Some(next),
         "held: the kept look still wakes"
     );
-    *kept.owner_quiet.lock().unwrap() = crate::native_settings::OwnerQuiet::default();
-    kept.look_for_debugger_moment(next, quiet);
-    assert_eq!(
-        debugger_alerts().len(),
-        before + 2,
-        "held, kept, the quiet passed: asked"
-    );
 }
 
-/// A headless instance never queues the ask, and one queued on it by hand drops at its
+/// A headless instance never queues the step, and one queued on it by hand drops at
 /// first look, before any read: no probe dispatched, no record, no alert.
 #[test]
-fn a_headless_app_never_asks_or_probes() {
+fn a_headless_app_never_starts_or_probes() {
     let root = crate::test_scratch::outlived_dir("aterm-access-");
     let mut app = App::headless_for_test();
     assert!(!app.debugger_launch.queued(), "never queued headless");
     app.tick_consent_lanes(Instant::now());
-    assert!(debugger_alerts().is_empty());
-    assert!(!crate::debugger_access::LaunchAskQueue::new(false).queued());
+    assert_eq!(workers(), 0);
+    assert!(!crate::debugger_access::DebuggerStepQueue::new(false).queued());
     app.consent = ConsentState::with_cached_probe_for_test(denied());
-    app.consent_card_config = Some(root.path().join("aterm.toml"));
-    app.debugger_launch =
-        crate::debugger_access::LaunchAskQueue::queued_for_test(|| Some("HEADLESS"));
-    app.consent_gestures =
-        crate::native_settings::ConsentGestures::for_test_with(owner_says_yes, worker_started);
-    app.look_for_debugger_moment(Instant::now(), quiet);
+    queue_debugger_step(&mut app, root.path(), || Some("HEADLESS"));
+    window_admits(&mut app, REVISION);
+    app.look_for_debugger_moment(Instant::now(), page_up);
     assert!(!app.debugger_launch.queued(), "dropped");
-    assert!(debugger_alerts().is_empty(), "nobody asked");
+    assert_eq!(workers(), 0, "nothing started");
     assert!(app.consent.debugger_slot_idle_for_test(), "nothing probed");
     assert!(
         !root
@@ -2258,91 +2787,333 @@ fn a_headless_app_never_asks_or_probes() {
             .exists(),
         "nothing recorded"
     );
+    assert!(
+        !app.turn_on_debugger_from_system_state(true),
+        "no window, no change"
+    );
+    assert_eq!(workers(), 0);
 }
 
-/// ONCE PER MAC: a second launch on the same config folder asks nothing and reads no
+/// ONCE PER MAC: a second launch on the same config folder starts nothing and reads
 /// probe for it; another Mac sharing that folder (a synced config) is asked once.
 #[test]
-fn a_second_launch_on_the_same_mac_asks_nothing() {
+fn a_second_launch_on_the_same_mac_starts_nothing() {
     let root = crate::test_scratch::outlived_dir("aterm-access-");
     let mut t = Instant::now();
-    let mut first = ready_to_ask(root.path(), owner_says_no);
-    first.look_for_debugger_moment(later(&mut t), quiet);
-    assert_eq!(debugger_alerts().len(), 1);
+    let mut first = ready_to_start(root.path());
+    two_looks(&mut first, &mut t);
+    assert_eq!(workers(), 1);
 
     let mut second = new_mac();
     second
         .consent_launch
         .set_fda(crate::consent_launch::FdaLaunch::NotAsked);
-    queue_debugger_ask(
-        &mut second,
-        root.path(),
-        || Some("READY-MAC"),
-        owner_says_yes,
-    );
-    second.look_for_debugger_moment(later(&mut t), quiet);
-    assert_eq!(debugger_alerts().len(), 1, "asked on this Mac already");
+    queue_debugger_step(&mut second, root.path(), || Some("READY-MAC"));
+    window_admits(&mut second, REVISION);
+    two_looks(&mut second, &mut t);
+    assert_eq!(workers(), 1, "started on this Mac already");
     assert!(!second.debugger_launch.queued());
     assert!(
         second.consent.debugger_slot_idle_for_test(),
         "the record decides before any probe"
     );
 
-    let mut other = ready_to_ask(root.path(), owner_says_no);
+    let mut other = ready_to_start(root.path());
     other.debugger_launch =
-        crate::debugger_access::LaunchAskQueue::queued_for_test(|| Some("OTHER-MAC"));
-    other.look_for_debugger_moment(later(&mut t), quiet);
-    assert_eq!(debugger_alerts().len(), 2, "another Mac on a synced config");
+        crate::debugger_access::DebuggerStepQueue::queued_for_test(|| Some("OTHER-MAC"))
+            .recording_in(Some(root.path().to_path_buf()));
+    two_looks(&mut other, &mut t);
+    assert_eq!(workers(), 2, "another Mac on a synced config");
+    assert!(debugger_alerts().is_empty());
 }
 
 /// Already on, seen go off (the shared record says it was on, and it reads off
 /// now), or answered on the Settings page in this process: the question is answered
 /// on this Mac.
 #[test]
-fn an_answered_question_settles_without_an_alert() {
+fn an_answered_question_settles_without_a_start() {
     use aterm_containment::consent::{
         DebuggerMember, DebuggerMode, DebuggerProbe, DebuggerProbeLabel, SelfHardening,
     };
-    let cases: [AppCase; 3] = [
-        ("already on", |app| {
-            app.consent.publish_debugger_for_test(
-                DebuggerProbe {
-                    mode: DebuggerMode::Enabled,
-                    member: DebuggerMember::Admin,
-                    label: DebuggerProbeLabel::StatusOk,
-                },
-                SelfHardening::Hardened,
-            );
-        }),
-        ("answered on the page", |app| {
-            app.owner_quiet.lock().unwrap().note_debugger_answered();
-        }),
-        ("seen go off", |app| {
-            use crate::debugger_access::{DebuggerChangeLane, ObservedMarker, Origin, RecordsRead};
-            app.debugger_change = DebuggerChangeLane::with_liveness(|_| false);
-            app.debugger_change.settle_records(RecordsRead {
-                observed: Some(ObservedMarker {
-                    mode: DebuggerMode::Enabled,
-                    since: 1_790_000_000,
-                    origin: Origin::Outside,
-                }),
-                ..RecordsRead::default()
-            });
-            app.debugger_change.poll(1);
-        }),
+    use aterm_types::macos_setup::AccessOutcome;
+    /// A named case: its name, the change, and what the access record says.
+    type Case = (&'static str, fn(&mut App), Option<AccessOutcome>);
+    let cases: [Case; 3] = [
+        (
+            "already on",
+            |app| {
+                app.consent.publish_debugger_for_test(
+                    DebuggerProbe {
+                        mode: DebuggerMode::Enabled,
+                        member: DebuggerMember::Admin,
+                        label: DebuggerProbeLabel::StatusOk,
+                    },
+                    SelfHardening::Hardened,
+                );
+            },
+            Some(AccessOutcome::Granted),
+        ),
+        (
+            "answered on the page",
+            |app| {
+                app.owner_quiet.lock().unwrap().note_debugger_answered();
+            },
+            Some(AccessOutcome::Declined),
+        ),
+        (
+            "turned off",
+            |app| {
+                use crate::debugger_access::{
+                    DebuggerChangeLane, ObservedMarker, Origin, RecordsRead,
+                };
+                app.debugger_change = DebuggerChangeLane::with_liveness(|_| false);
+                app.debugger_change.settle_records(RecordsRead {
+                    observed: Some(ObservedMarker {
+                        mode: DebuggerMode::Enabled,
+                        since: 1_790_000_000,
+                        origin: Origin::Outside,
+                    }),
+                    ..RecordsRead::default()
+                });
+                app.debugger_change.poll(1);
+            },
+            Some(AccessOutcome::Declined),
+        ),
     ];
-    for (name, answered) in cases {
+    for (name, answered, outcome) in cases {
         let root = crate::test_scratch::outlived_dir("aterm-access-");
         let mut t = Instant::now();
-        let mut app = ready_to_ask(root.path(), owner_says_yes);
+        let mut app = ready_to_start(root.path());
         answered(&mut app);
-        let before = debugger_alerts().len();
-        app.look_for_debugger_moment(later(&mut t), quiet);
-        assert_eq!(debugger_alerts().len(), before, "{name}: no alert");
+        let before = workers();
+        two_looks(&mut app, &mut t);
+        assert_eq!(workers(), before, "{name}: nothing started");
         assert!(!app.debugger_launch.queued(), "{name}: settled");
         assert!(
             crate::debugger_access::read_asked(&root.path().join("aterm.toml"), "READY-MAC"),
             "{name}: recorded"
         );
+        assert_eq!(
+            access_outcome(&app, root.path(), REVISION),
+            outcome,
+            "{name}"
+        );
     }
+    assert!(debugger_alerts().is_empty());
+}
+
+/// NEVER FROM A CONTROL CLIENT: a plan admitted by a control client's Apply (`aterm
+/// ctl app act`), or one only a status names (a poll, a record edited by hand), is no
+/// standing yes — the step parks with nothing read, written or started, and the
+/// folders do not wait on it — and a control client's `Turn On…` is no person's press.
+/// POSITIVE CONTROL: the window's own admission of a later plan unparks it, and it
+/// starts.
+#[test]
+fn a_control_clients_act_never_starts_the_change() {
+    use crate::workstation_setup::PagePress;
+    use aterm_types::macos_setup::{Access, AccessOutcome};
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
+    let config = root.path().join("aterm.toml");
+    let mut t = Instant::now();
+    let mut app = new_mac();
+    app.consent_launch
+        .set_fda(crate::consent_launch::FdaLaunch::NotAsked);
+    app.devtools_helper.note_reading(
+        crate::devtools_helper::test_arms::reading(
+            aterm_containment::DevToolGrant::NotGranted,
+            crate::devtools_helper::test_arms::absent(2),
+        ),
+        Instant::now(),
+    );
+    queue_debugger_step(&mut app, root.path(), || Some("READY-MAC"));
+    debugger_reads_off(&mut app);
+    controller_admits(&mut app, REVISION);
+    two_looks(&mut app, &mut t);
+    assert!(app.debugger_launch.parked(), "parked");
+    assert!(
+        !app.debugger_launch.queued(),
+        "the folders do not wait on it"
+    );
+    assert_eq!(workers(), 0, "nothing started");
+    assert!(!crate::debugger_access::read_asked(&config, "READY-MAC"));
+    assert_eq!(app.system_state_access_step(), None);
+
+    // A control client's Turn On…: its press is taken, and it is no person's.
+    let by_person = app.with_gesture_source(true, |app| {
+        app.note_system_state_touch();
+        app.take_system_state_press() == PagePress::Person
+    });
+    assert!(!by_person);
+    assert!(!app.open_access_from_system_state(Access::Debugger, by_person));
+    assert_eq!(workers(), 0);
+
+    // A status alone — a poll, a record edited by hand — admits nothing either.
+    app.observe_initial_setup_permissions(plan(REVISION + 1));
+    assert!(app.admitted_access().is_none() && app.debugger_launch.parked());
+    two_looks(&mut app, &mut t);
+    assert_eq!(workers(), 0);
+
+    // The window's own admission of a later plan: unparked, and started.
+    window_admits(&mut app, REVISION + 2);
+    assert!(app.debugger_launch.queued() && !app.debugger_launch.parked());
+    two_looks(&mut app, &mut t);
+    assert_eq!(workers(), 1, "the window's own admission starts it");
+    assert_eq!(
+        access_outcome(&app, root.path(), REVISION + 2),
+        Some(AccessOutcome::Handed)
+    );
+    assert_eq!(access_outcome(&app, root.path(), REVISION), None);
+    assert!(debugger_alerts().is_empty());
+}
+
+/// NOT NEEDED ON A BUILD THAT IS NOT HARDENED (design §6): the step drops with
+/// nothing recorded or started, and a person's `Turn On…` starts nothing either.
+#[test]
+fn a_build_that_is_not_hardened_never_starts_it() {
+    use aterm_containment::consent::SelfHardening;
+    for hardening in [SelfHardening::NotHardened, SelfHardening::Unknown] {
+        let root = crate::test_scratch::outlived_dir("aterm-access-");
+        let mut t = Instant::now();
+        let mut app = ready_to_start(root.path());
+        debugger_reads_off_as(&mut app, hardening);
+        two_looks(&mut app, &mut t);
+        assert!(!app.debugger_launch.queued(), "{hardening:?}: dropped");
+        assert!(
+            !crate::debugger_access::read_asked(&root.path().join("aterm.toml"), "READY-MAC"),
+            "{hardening:?}: nothing recorded"
+        );
+        assert!(
+            !app.turn_on_debugger_from_system_state(true),
+            "{hardening:?}: not needed"
+        );
+        assert_eq!(workers(), 0, "{hardening:?}: nothing started");
+        assert_eq!(access_outcome(&app, root.path(), REVISION), None);
+    }
+}
+
+/// A PERSON'S `Turn On…` on the Debugger row (design §3.4): their press on the page,
+/// while a plan with its Permissions group stands, is the yes — no alert of aterm's,
+/// whatever the once-per-Mac record says — and the page names macOS's dialog while
+/// the change is under way. One change at a time; nothing without an admitted plan.
+#[test]
+fn a_persons_turn_on_starts_the_change_with_no_alert() {
+    use crate::workstation_setup::PagePress;
+    use aterm_types::macos_setup::{Access, AccessOutcome};
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
+    let config = root.path().join("aterm.toml");
+    crate::debugger_access::note_asked(&config, "READY-MAC", 1).expect("this Mac recorded");
+    let mut app = ready_to_start(root.path());
+    app.note_system_state_touch();
+    let by_person = app.take_system_state_press() == PagePress::Person;
+    assert!(by_person, "a person's touch, no control client's");
+    assert!(app.open_access_from_system_state(Access::Debugger, by_person));
+    assert_eq!(workers(), 1);
+    assert!(app.debugger_change.under_way());
+    assert_eq!(app.system_state_access_step(), Some(Access::Debugger));
+    assert_eq!(
+        access_outcome(&app, root.path(), REVISION),
+        Some(AccessOutcome::Handed)
+    );
+    assert!(
+        !app.turn_on_debugger_from_system_state(true),
+        "one change at a time"
+    );
+    assert_eq!(workers(), 1);
+    assert!(debugger_alerts().is_empty(), "no alert of aterm's");
+
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
+    let mut unadmitted = new_mac();
+    // `new_mac` stands a plan for the access steps; this Mac has none.
+    unadmitted.observe_initial_setup_permissions(None);
+    queue_debugger_step(&mut unadmitted, root.path(), || Some("READY-MAC"));
+    debugger_reads_off(&mut unadmitted);
+    assert!(
+        !unadmitted.turn_on_debugger_from_system_state(true),
+        "no plan admitted"
+    );
+    assert_eq!(workers(), 1);
+}
+
+/// A PERSON'S `Turn On…` ANSWERS THE ONCE-PER-MAC QUESTION (design §6): their press
+/// writes this Mac into `ASKED_RECORD` and ends the launch step, parked or queued, as
+/// the step's own start does — so a Cancel in macOS's dialog is never followed by a
+/// second dialog: not from the window's admission later in this process (once the
+/// decline's quiet spell is over), not from a step already queued, and not at the next
+/// launch. A parked step, unpressed, is the
+/// control: the window's admission would start it (`a_control_clients_act_never_starts_the_change`).
+#[test]
+fn a_persons_turn_on_answers_the_question_so_a_cancel_brings_no_second_dialog() {
+    use crate::workstation_setup::PagePress;
+    use aterm_containment::consent::DebuggerChange;
+    use aterm_types::macos_setup::Access;
+    /// The person presses `Turn On…` and cancels macOS's dialog; macOS still reads
+    /// off afterwards, freshly, so nothing waits on a stale reading.
+    fn press_then_cancel(app: &mut App) {
+        let before = workers();
+        app.note_system_state_touch();
+        let by_person = app.take_system_state_press() == PagePress::Person;
+        assert!(by_person, "a person's touch");
+        assert!(app.open_access_from_system_state(Access::Debugger, by_person));
+        assert_eq!(workers(), before + 1, "the press starts the change");
+        app.apply_debugger_step(ended(crate::debugger_access::Outcome::NotChanged(
+            DebuggerChange::On,
+        )));
+        let step = app.debugger_change.not_started();
+        app.apply_debugger_step(step);
+        debugger_reads_off(app);
+        // The quiet a decline buys is a bounded wait, not an answer: let it be over.
+        *app.owner_quiet.lock().unwrap() = crate::native_settings::OwnerQuiet::default();
+    }
+    let mut t = Instant::now();
+
+    // Parked: the window has admitted nothing of its own yet.
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
+    let config = root.path().join("aterm.toml");
+    let mut app = new_mac();
+    app.consent_launch
+        .set_fda(crate::consent_launch::FdaLaunch::NotAsked);
+    app.devtools_helper.note_reading(
+        crate::devtools_helper::test_arms::reading(
+            aterm_containment::DevToolGrant::NotGranted,
+            crate::devtools_helper::test_arms::absent(2),
+        ),
+        Instant::now(),
+    );
+    queue_debugger_step(&mut app, root.path(), || Some("READY-MAC"));
+    debugger_reads_off(&mut app);
+    two_looks(&mut app, &mut t);
+    assert!(
+        app.debugger_launch.parked(),
+        "parked for want of a standing yes"
+    );
+    press_then_cancel(&mut app);
+    window_admits(&mut app, REVISION);
+    two_looks(&mut app, &mut t);
+    assert_eq!(workers(), 1, "no second dialog in this process");
+    assert!(
+        !app.debugger_launch.parked() && !app.debugger_launch.queued(),
+        "the step is over for this process"
+    );
+    assert!(
+        crate::debugger_access::read_asked(&config, "READY-MAC"),
+        "the press answered the question for this Mac"
+    );
+    let mut next = ready_to_start(root.path());
+    two_looks(&mut next, &mut t);
+    assert_eq!(workers(), 1, "nor at the next launch");
+    assert!(!next.debugger_launch.queued());
+
+    // Queued: the window admitted, the step not started yet.
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
+    let mut app = ready_to_start(root.path());
+    assert!(app.debugger_launch.queued());
+    press_then_cancel(&mut app);
+    two_looks(&mut app, &mut t);
+    assert_eq!(workers(), 2, "the queued step starts no second dialog");
+    assert!(!app.debugger_launch.queued());
+    assert!(crate::debugger_access::read_asked(
+        &root.path().join("aterm.toml"),
+        "READY-MAC"
+    ));
+    assert!(debugger_alerts().is_empty(), "no alert of aterm's");
 }

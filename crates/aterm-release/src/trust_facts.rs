@@ -3692,15 +3692,34 @@ pub enum TrustCmd {
         update: bool,
         reason: Option<String>,
     },
+    /// `credit <record.ndjson>…`: the D27 gate's "proved (calculus)" counter over those
+    /// `trust.obligations.v1` records, against the working credit epoch
+    /// ([`crate::trust_credit`]).
+    Credit(Vec<PathBuf>),
 }
 
 /// Parses CLI arguments for the `trust` subcommand.
 pub fn parse_cmd<'a>(
     it: &mut impl Iterator<Item = &'a str>,
 ) -> std::result::Result<TrustCmd, String> {
-    let verb = it.next().ok_or("trust needs a verb: run or judge")?;
+    let verb = it
+        .next()
+        .ok_or("trust needs a verb: run, judge or credit")?;
     if verb == "run" {
         return crate::trust_lane::parse(it).map(TrustCmd::Run);
+    }
+    if verb == "credit" {
+        let records: Vec<PathBuf> = it.map(PathBuf::from).collect();
+        if records.is_empty()
+            || records
+                .iter()
+                .any(|r| r.as_os_str().to_string_lossy().starts_with('-'))
+        {
+            return Err(
+                "trust credit takes the trust.obligations.v1 records to count, and no flag".into(),
+            );
+        }
+        return Ok(TrustCmd::Credit(records));
     }
     if verb != "judge" {
         return Err(format!("unknown trust verb {verb:?}"));
@@ -3769,6 +3788,7 @@ pub fn pending_for(
 pub fn run_cmd(repo: &Path, cmd: TrustCmd) -> i32 {
     let git = crate::ledger::GitCli::new(repo);
     match cmd {
+        TrustCmd::Credit(records) => crate::trust_credit::run_cmd(repo, &records),
         TrustCmd::Run(mut cfg) => {
             cfg.repo = repo.to_path_buf();
             crate::trust_lane::run(&cfg, &mut std::io::stdout()).exit()

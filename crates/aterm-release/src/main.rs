@@ -58,6 +58,7 @@ mod snapshot;
 
 mod transforms;
 
+mod trust_credit;
 mod trust_facts;
 
 mod trust_lane;

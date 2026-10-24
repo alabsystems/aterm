@@ -694,6 +694,7 @@ fn zsh_record(local_id: u64, sid: &str) -> SessionRecord {
         task: None,
         status_seen: None,
         autopilot_end: None,
+        wakes: None,
     }
 }
 
@@ -3679,6 +3680,93 @@ fn a_workers_task_record_crosses_the_real_wire() {
         (seeded.rev, seeded.state, seeded.why, seeded.result_bytes),
         (3, TaskState::Done, Some("marker"), 12)
     );
+
+    drop(ready);
+    for fd in [ready_read, commit_read, commit_write] {
+        aterm_pty::close_fd(fd);
+    }
+    staged.teardown();
+}
+
+/// A SESSION'S BOOK OF DECLARED WAKES CROSSES THE REAL WIRE (the occupancy slice-2 plan's 2.5):
+/// the record's `wakes` row rides its own session through the successor's intake, and the
+/// adopted session's carried rows seed it into the successor's book, open where its agent lives.
+/// NEGATIVE CONTROL: the session that carried no row seeds no book.
+#[test]
+#[cfg(unix)]
+fn a_sessions_wake_book_crosses_the_real_wire() {
+    use crate::occupancy_wakes::ProcTree as _;
+    use aterm_agent::supervise::occupancy::declarer::AgentId;
+    let Some(_env) = env_alone() else { return };
+    let _restore = restore_env();
+    let staged = stage_outgoing_handoff("wakewire", 2, None);
+    let body = std::fs::read_to_string(&staged.manifest_path).expect("read manifest");
+    let (file_nonce, toml) = body.split_once('\n').expect("nonce header");
+    let mut published = SessionHandoff::from_toml(toml).expect("parse the manifest");
+    let me = crate::occupancy_wakes::Kernel
+        .link(std::process::id())
+        .expect("this process's own record");
+    let agent = AgentId {
+        pid: me.pid,
+        birth_us: me.birth_us,
+    };
+    let parent_sid = "s-000000000000000000ef";
+    crate::occupancy_wakes::book_for_test(
+        parent_sid,
+        0,
+        agent,
+        "label=t when=in:1h",
+        crate::harness_screen::unix_ms_now(),
+    );
+    let row = crate::occupancy_wakes::carry_row(parent_sid).expect("a book to carry");
+    crate::occupancy_wakes::forget(parent_sid);
+    published.sessions[0].wakes = Some(row.clone());
+    std::fs::write(
+        &staged.manifest_path,
+        format!("{file_nonce}\n{}", published.to_toml().expect("toml")),
+    )
+    .expect("republish");
+
+    let (ready_read, ready_write) = pipe_pair("ready");
+    let (commit_read, commit_write) = pipe_pair("commit");
+    staged.publish_env(
+        ready_write,
+        commit_read,
+        Some(encode_target_identity(
+            crate::build_info::build_number()
+                .parse::<u64>()
+                .unwrap_or(0),
+            crate::build_info::git_commit(),
+        )),
+    );
+    let incoming = take_incoming_as(ReceiverShape::Current);
+    let ((proof, ready, _), adopted) =
+        child_proof_from(incoming).expect("the child adopts and proves");
+    assert_eq!(proof, staged.expected, "the book is in no digest");
+    let rows: Vec<Option<&str>> = adopted.iter().map(|a| a.wakes.as_deref()).collect();
+    assert_eq!(
+        rows,
+        [Some(row.as_str()), None],
+        "the book rides its own session"
+    );
+    for a in &adopted {
+        let handle = crate::session_store::test_handle(a.local_id);
+        crate::spawn::seed_adopted_rows(
+            &handle.ctx,
+            a.local_id,
+            a.task.as_deref(),
+            a.autopilot_end.as_deref(),
+            a.wakes.as_deref(),
+        );
+        let fields = crate::occupancy_wakes::status_fields(Some(handle.ctx.self_id.as_str()));
+        let want = if a.wakes.is_some() {
+            "waits=1 waits_ready=0"
+        } else {
+            "waits=0 waits_ready=0"
+        };
+        assert_eq!(fields, want, "session {}", a.local_id);
+        crate::occupancy_wakes::forget(handle.ctx.self_id.as_str());
+    }
 
     drop(ready);
     for fd in [ready_read, commit_read, commit_write] {

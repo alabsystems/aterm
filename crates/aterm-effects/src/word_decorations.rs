@@ -6640,8 +6640,16 @@ fn emit_rainbow_ink(
     let cols = &base_cols[occ.ink_base..occ.ink_base + occ.ink_cells as usize];
     let fgs = &base_fg[occ.ink_base..occ.ink_base + occ.ink_cells as usize];
     for (i, (&col, &fg_rgb)) in cols.iter().zip(fgs).enumerate() {
-        let u = i as f32 / denom;
-        let mut color = mix_rgb(rgb3_to_u32(fg_rgb), hue_at(u), strength);
+        let target = if cols.len() == 4 {
+            guard_hues[i]
+        } else if i == 0 {
+            guard_hues[0]
+        } else if i + 1 == cols.len() {
+            guard_hues[3]
+        } else {
+            hue_at(i as f32 / denom)
+        };
+        let mut color = mix_rgb(rgb3_to_u32(fg_rgb), target, strength);
         if fx.lift > 0.0 {
             color = mix_rgb(color, lift_target, lift_t);
         }

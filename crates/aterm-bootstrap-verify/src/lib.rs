@@ -65,6 +65,7 @@ impl fmt::Display for Refusal {
 pub type Verdict<T> = Result<T, Refusal>;
 
 /// Refuse with `why` unless `condition` holds.
+#[cfg(unix)]
 pub(crate) fn require(condition: bool, why: &str) -> Verdict<()> {
     if condition {
         Ok(())

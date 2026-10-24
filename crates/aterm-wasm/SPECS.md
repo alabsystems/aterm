@@ -313,7 +313,6 @@ src/scrollback_tiers_api_tests.rs	ingest_stages_and_render_promotes	tiered-ctor-
 src/scrollback_tiers_api_tests.rs	a_flood_between_frames_leaves_one_marker	flood-one-marker	
 src/scrollback_tiers_api_tests.rs	set_scrollback_limit_caps_the_total_across_tiers	scrollback-retention-limit	
 src/scrollback_tiers_api_tests.rs	pane_budget_evicts_and_reports	scrollback-budget	
-src/scrollback_tiers_api_tests.rs	global_budget_caps_the_effective_share	scrollback-budget	
 src/scrollback_tiers_api_tests.rs	truncation_and_pressure_are_observable_out_of_band	scrollback-budget	
 src/scrollback_tiers_api.rs	tier_capabilities_json_pins_the_wire_contract	tier-capabilities-json	
 src/theme_api.rs	catalog_json_lists_builtins_then_registered	web-theme-register	
@@ -375,10 +374,11 @@ No other test is a pure regression with no general property; each is an instance
    computes exactly the negation of `render()`'s gate from the same fields, so `needs_frame() = ¬Gated`
    holds exactly. Either the doc is stale or there is an unstated race through `damage_epoch` latching;
    `needs-frame-is-gate` states the exact form and its proof settles which.
-8. `scrollback_tiers_api::global_budget_caps_the_effective_share` mutates a process-global budget other
-   parallel tests share, serialized by a test-only RwLock, and weakens its assertions to `<=` because
-   the live-pane divisor depends on which tests run at once. The exact share
-   `min(configured, global/live_panes)` is never checked; `scrollback-budget` states it.
+8. `scrollback_tiers_api::global_budget_caps_the_effective_share` was deleted (2026-10-23): it set the
+   process-global budget to 8 KiB while the binary's other tests rendered, which evicted their history
+   (`never_pumped_host_completes_via_the_render_grace_net` failed in a loaded run), and checked only
+   `<=`. The exact share `min(configured, global/live_panes)` is aterm-core's
+   `conformance_shared_budget`, in a binary of its own; `scrollback-budget` states it here.
 9. `effects_api.rs`'s test module (`#[cfg(all(test, not(target_arch = "wasm32")))]`) is covered by
    `streak-polarity`.
 

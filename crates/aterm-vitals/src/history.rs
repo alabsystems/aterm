@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The disk's 24 h free history and its rates (`docs/DESIGN-stats-deck-v2-2026-10-20.md` §7.2).
+//! The disk's 24 h free history and its rates (`docs/DESIGN-stats-deck-v2-2026-10-20.md` §7.2),
+//! kept across relaunches ([`FreeHistory::saved`], [`FreeHistory::restored`]).
 
 use std::collections::VecDeque;
 
@@ -31,14 +32,39 @@ pub struct FreeBucket {
     pub n: u32,
 }
 
+/// Which volume a free history reads: where it is mounted and its size.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VolumeId {
+    /// Its mount point.
+    pub mount: String,
+    /// Its size, bytes.
+    pub total: u64,
+}
+
+/// One kept free-history bucket: its start (unix ms), the least free bytes read in it, and how many readings.
+pub type FreeRow = (i64, u64, u32);
+
+/// A free history as the host writes it ([`FreeHistory::saved`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SavedFree {
+    /// The volume it read.
+    pub volume: VolumeId,
+    /// Its read buckets, oldest first.
+    pub rows: Vec<FreeRow>,
+}
+
 /// The last 24 hours of free space, in 10-minute minima.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FreeHistory {
     /// The key (unix minute ÷ 10) of `b[0]`.
     first_k: i64,
     b: VecDeque<FreeBucket>,
-    /// When the newest reading was taken, unix ms.
+    /// When the newest reading was taken, unix ms (a restored history's newest bucket's start).
     last_ms: i64,
+    /// The volume of the newest reading ([`Self::note_on`]).
+    volume: Option<VolumeId>,
+    /// Restored from an earlier run and not read on since ([`Self::restored`]).
+    restored: bool,
 }
 
 impl FreeHistory {
@@ -46,6 +72,32 @@ impl FreeHistory {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record `free` bytes of the volume mounted at `mount`, `total` bytes in size, read at `at_unix_ms`.
+    ///
+    /// A volume at another mount point starts the history afresh. A history restored from an
+    /// earlier run ([`Self::restored`]) is also started afresh by the same mount point at
+    /// another size; once read on, a size that moves (as ZFS reports one) keeps it.
+    pub fn note_on(&mut self, mount: &str, total: u64, at_unix_ms: i64, free: u64) {
+        let other = self
+            .volume
+            .as_ref()
+            .is_some_and(|v| v.mount != mount || (self.restored && v.total != total));
+        if other {
+            *self = Self::default();
+        }
+        self.restored = false;
+        match self.volume.as_mut() {
+            Some(v) => v.total = total,
+            None => {
+                self.volume = Some(VolumeId {
+                    mount: mount.to_owned(),
+                    total,
+                });
+            }
+        }
+        self.note(at_unix_ms, free);
     }
 
     /// Record `free` bytes read at `at_unix_ms`.
@@ -103,6 +155,60 @@ impl FreeHistory {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.b.is_empty()
+    }
+
+    /// The volume its readings are of; `None` before [`Self::note_on`].
+    #[must_use]
+    pub fn volume(&self) -> Option<&VolumeId> {
+        self.volume.as_ref()
+    }
+
+    /// Its volume and read buckets, for the host to write; `None` with no volume or nothing read.
+    #[must_use]
+    pub fn saved(&self) -> Option<SavedFree> {
+        let volume = self.volume.clone()?;
+        let rows: Vec<FreeRow> = (self.first_k..)
+            .zip(&self.b)
+            .filter(|(_, b)| b.n > 0)
+            .map(|(k, b)| (k.saturating_mul(FREE_BUCKET_S * 1000), b.min, b.n))
+            .collect();
+        (!rows.is_empty()).then_some(SavedFree { volume, rows })
+    }
+
+    /// A history from what [`Self::saved`] gave, holding only the rows in the 24 hours ending at
+    /// `now_unix_ms`; its first reading keeps it only on the same volume ([`Self::note_on`]).
+    #[must_use]
+    pub fn restored(saved: &SavedFree, now_unix_ms: i64) -> Self {
+        let now_k = now_unix_ms.div_euclid(FREE_BUCKET_S * 1000);
+        let oldest = now_k.saturating_sub(FREE_BUCKETS as i64 - 1);
+        let mut rows: Vec<(i64, FreeBucket)> = saved
+            .rows
+            .iter()
+            .filter(|&&(_, _, n)| n > 0)
+            .map(|&(at, min, n)| (at.div_euclid(FREE_BUCKET_S * 1000), FreeBucket { min, n }))
+            .filter(|(k, _)| (oldest..=now_k).contains(k))
+            .collect();
+        rows.sort_by_key(|&(k, _)| k);
+        let (Some(&(first_k, _)), Some(&(last_k, _))) = (rows.first(), rows.last()) else {
+            return Self::default();
+        };
+        let mut b = VecDeque::from(vec![FreeBucket::default(); (last_k - first_k + 1) as usize]);
+        for (k, row) in rows {
+            let slot = &mut b[(k - first_k) as usize];
+            slot.min = if slot.n == 0 {
+                row.min
+            } else {
+                slot.min.min(row.min)
+            };
+            slot.n = slot.n.saturating_add(row.n);
+        }
+        Self {
+            first_k,
+            b,
+            last_ms: last_k.saturating_mul(FREE_BUCKET_S * 1000),
+            volume: Some(saved.volume.clone()),
+            restored: true,
+        }
     }
 
     /// The 24 hours ending at `now_unix_ms`.
@@ -257,6 +363,156 @@ mod tests {
             &h.window(now - 20 * MIN)[FREE_BUCKETS - 2..],
             &[Some(2), Some(1)]
         );
+    }
+
+    const DATA: &str = "/System/Volumes/Data";
+    const SIZE: u64 = 1_000_000_000_000;
+    const TEN: i64 = FREE_BUCKET_S * 1000;
+
+    fn data() -> VolumeId {
+        VolumeId {
+            mount: DATA.into(),
+            total: SIZE,
+        }
+    }
+
+    fn read(h: &FreeHistory, now: i64) -> Vec<u64> {
+        h.window(now).into_iter().flatten().collect()
+    }
+
+    #[test]
+    fn the_free_history_round_trips_through_its_rows() {
+        let mut h = FreeHistory::new();
+        assert_eq!(h.saved(), None, "nothing read, nothing to write");
+        for m in 0..3 * 60 {
+            h.note_on(DATA, SIZE, T0 + m * MIN + 7_000, 900_000_000_000 - m as u64);
+        }
+        let now = T0 + (3 * 60 - 1) * MIN + 7_000;
+        let saved = h.saved().expect("three hours read");
+        assert_eq!(saved.volume, data());
+        assert_eq!(saved.rows.len(), 18, "one row per ten minutes");
+        assert_eq!(
+            saved.rows[0],
+            (T0, 900_000_000_000 - 9, 10),
+            "stamped at its start"
+        );
+        assert!(saved.rows.windows(2).all(|p| p[1].0 - p[0].0 == TEN));
+        let back = FreeHistory::restored(&saved, now + 5 * MIN);
+        assert_eq!(back.window(now), h.window(now), "the same day");
+        assert_eq!(back.saved(), Some(saved.clone()));
+        assert_eq!(back.volume(), Some(&data()));
+
+        let mut on = back.clone();
+        on.note_on(DATA, SIZE, now + 11 * MIN, 5);
+        let w = on.window(now + 11 * MIN);
+        assert_eq!(
+            w.last().copied().flatten(),
+            Some(5),
+            "the relaunch reads on"
+        );
+        assert_eq!(read(&on, now + 11 * MIN).len(), 19, "after the 18 kept");
+
+        let big = SavedFree {
+            volume: data(),
+            rows: vec![(T0, u64::MAX, u32::MAX)],
+        };
+        let back = FreeHistory::restored(&big, T0);
+        assert_eq!(back.saved(), Some(big));
+        assert_eq!(read(&back, T0), [u64::MAX]);
+        let mut edge = FreeHistory::new();
+        edge.note_on(DATA, SIZE, i64::MIN, 4);
+        let saved = edge.saved().expect("read");
+        assert_eq!(
+            read(&FreeHistory::restored(&saved, i64::MIN), i64::MIN),
+            [4]
+        );
+    }
+
+    #[test]
+    fn a_restored_history_keeps_only_the_last_24_hours() {
+        let saved = SavedFree {
+            volume: data(),
+            rows: (0..150)
+                .map(|i| (T0 + i * TEN, 1_000 + i as u64, 1))
+                .collect(),
+        };
+        let now = T0 + 149 * TEN + 3 * MIN;
+        let h = FreeHistory::restored(&saved, now);
+        assert_eq!(
+            h.len(),
+            FREE_BUCKETS,
+            "the oldest six are over 24 hours old"
+        );
+        assert_eq!(read(&h, now), (1_006..1_150).collect::<Vec<u64>>());
+        let later = now + 20 * TEN;
+        let h = FreeHistory::restored(&saved, later);
+        assert_eq!(read(&h, later), (1_026..1_150).collect::<Vec<u64>>());
+        assert_eq!(
+            FreeHistory::restored(&saved, now + 150 * TEN),
+            FreeHistory::default(),
+            "a day and more since the last write: empty"
+        );
+        let early = T0 + 100 * TEN;
+        let h = FreeHistory::restored(&saved, early);
+        assert_eq!(
+            read(&h, early),
+            (1_000..=1_100).collect::<Vec<u64>>(),
+            "rows after the clock's now are dropped"
+        );
+        let damaged = SavedFree {
+            volume: data(),
+            rows: vec![
+                (T0 + 2 * TEN + 59_000, 7, 3),
+                (T0, 9, 1),
+                (T0 + 2 * TEN, 4, 2),
+                (T0 + TEN, 1, 0),
+            ],
+        };
+        let h = FreeHistory::restored(&damaged, T0 + 2 * TEN);
+        assert_eq!(
+            h.window(T0 + 2 * TEN)[FREE_BUCKETS - 3..],
+            [Some(9), None, Some(4)],
+            "sorted, an unread row dropped, one bucket's rows merged"
+        );
+        assert_eq!(h.saved().expect("kept").rows[1], (T0 + 2 * TEN, 4, 5));
+    }
+
+    #[test]
+    fn a_restored_history_is_dropped_by_another_volume() {
+        let saved = SavedFree {
+            volume: data(),
+            rows: (0..6).map(|i| (T0 + i * TEN, 500 - i as u64, 60)).collect(),
+        };
+        let now = T0 + 6 * TEN;
+        let restored = FreeHistory::restored(&saved, now);
+
+        let mut h = restored.clone();
+        h.note_on("/Volumes/Backup", SIZE, now, 7);
+        assert_eq!(read(&h, now), [7], "another mount point");
+        assert_eq!(
+            h.volume().map(|v| v.mount.as_str()),
+            Some("/Volumes/Backup")
+        );
+        let mut h = restored.clone();
+        h.note_on(DATA, 2 * SIZE, now, 7);
+        assert_eq!(read(&h, now), [7], "the same mount point at another size");
+        let mut h = restored.clone();
+        h.note_on(DATA, SIZE, now, 7);
+        assert_eq!(read(&h, now), [500, 499, 498, 497, 496, 495, 7], "control");
+
+        h.note_on(DATA, SIZE - 4_096, now + MIN, 6);
+        assert_eq!(
+            read(&h, now + MIN).len(),
+            7,
+            "read on, a size that moves keeps it"
+        );
+        assert_eq!(h.volume().map(|v| v.total), Some(SIZE - 4_096));
+        h.note_on("/Volumes/Backup", SIZE, now + 2 * MIN, 3);
+        assert_eq!(read(&h, now + 2 * MIN), [3], "another mount point in a run");
+        let mut fresh = FreeHistory::new();
+        fresh.note(now, 8);
+        fresh.note_on(DATA, SIZE, now + MIN, 9);
+        assert_eq!(read(&fresh, now + MIN), [8], "no volume yet: kept");
     }
 
     fn filling_ring(minutes: i64, per_s: f64) -> BucketRing {

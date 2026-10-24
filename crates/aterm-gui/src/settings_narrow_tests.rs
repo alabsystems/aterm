@@ -3531,9 +3531,14 @@ fn follow_systems_name_goes_over_its_switch_before_it_breaks_a_word() {
     });
 }
 
+/// The chooser's Dracula row with 2× text, walked from a 30-column window narrower by 4pt steps
+/// (less than the check's room, its 16pt and gap) to the first width whose name in use wraps
+/// beside its check: there the name not in use gives up the empty slot and is whole in its room.
+/// The face decides where that width falls (Helvetica Neue's at 178pt, Segoe UI's narrower), so
+/// the walk finds it on every face, and a face where the name never wraps fails the walk.
 #[test]
 fn a_theme_not_in_use_gives_its_name_the_check_slot() {
-    let row = |source: &str| {
+    let row = |source: &str, width: f32| {
         let (mut runtime, instance, view) = setup();
         replace_settings_source(&mut runtime, view, source.to_string());
         go_to_route(&mut runtime, instance, view, SettingsRoute::Themes);
@@ -3554,7 +3559,7 @@ fn a_theme_not_in_use_gives_its_name_the_check_slot() {
             &mut runtime,
             instance,
             view,
-            &view_cx_at(178.0, 516.0),
+            &view_cx_at(width, 516.0),
             |screen, _| {
                 let drawn = screen
                     .paint
@@ -3578,16 +3583,41 @@ fn a_theme_not_in_use_gives_its_name_the_check_slot() {
         (lines, check)
     };
     at_each_text_scale(&[2.0], "chooser check slot", |_| {
-        let (used, check) = row("theme = \"Dracula\"\n");
-        assert_eq!(check.as_deref(), Some("\u{2713}"), "{used:?}");
-        let (lines, check) = row("theme = \"Default\"\n");
-        assert_eq!(lines, ["Dracula"], "the name whole");
-        // Where the name beside a check is not whole (the face decides), the
-        // name not in use takes the check's room.
-        assert_eq!(
-            check.is_none(),
-            used != ["Dracula"],
-            "the empty slot is given up where the name needs it: {used:?} {check:?}"
+        const FROM: f32 = 234.0;
+        let mut width = FROM;
+        loop {
+            assert!(
+                width >= 100.0,
+                "the name in use never wraps beside its check (whole from {FROM}pt down to {}pt)",
+                width + 4.0
+            );
+            let (used, check) = row("theme = \"Dracula\"\n", width);
+            assert_eq!(check.as_deref(), Some("\u{2713}"), "{width}pt: {used:?}");
+            let (lines, check) = row("theme = \"Default\"\n", width);
+            if used == ["Dracula"] {
+                assert_eq!(
+                    lines,
+                    ["Dracula"],
+                    "{width}pt: the name whole beside its slot"
+                );
+                assert_eq!(check.as_deref(), Some(""), "{width}pt: the slot kept");
+            } else {
+                assert_eq!(
+                    check, None,
+                    "{width}pt: the empty slot is given up where the name in use wraps: {used:?}"
+                );
+                assert_eq!(
+                    lines,
+                    ["Dracula"],
+                    "{width}pt: the slot's room makes the name whole"
+                );
+                break;
+            }
+            width -= 4.0;
+        }
+        assert!(
+            width < FROM,
+            "the walk begins where the name is whole beside its check: it wraps at {width}pt"
         );
     });
 }

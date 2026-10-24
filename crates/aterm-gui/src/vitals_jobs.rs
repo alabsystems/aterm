@@ -16,7 +16,7 @@ use aterm_sysprobe::volumes::Table;
 use aterm_vitals::jobs::{
     Block, Class, Consumer, Demand, Fd, FdKind, HeldProc, JobCounters, JobKind, JobProc, JobRow,
     JobTab, JobTick, Jobs, JobsView, Knote, KnoteFilter, LanesSeen, Machine, ProcState, Standing,
-    SweepProc, TcpState, ThreadState, TtyMode,
+    StartWait, SweepProc, TcpState, ThreadState, TtyMode,
 };
 use aterm_vitals::model::TabRoot;
 
@@ -24,7 +24,7 @@ use aterm_vitals::model::TabRoot;
 /// 2 Hz lens does not double the detailed reads.
 const FAST_MS: u64 = 2_000;
 
-/// The most CPU a process outside every job may have used for the pass to read its start: a held one has about 2 ms, the fork child's work before its exec (leftover M4), so its counters cannot tell it from an idle one and only the thread call decides.
+/// The most CPU a process outside every job may have used for the pass to read its start: a held one has about 2 ms, the fork child's work before its exec (leftover M4), so its counters cannot tell it from an idle one and only the thread call decides. The development build's stand-in is read whatever its CPU: it stands for the kernel's answer, not for the choice of whom to ask.
 pub(crate) const HELD_CPU_NS: u64 = 20_000_000;
 
 /// The readers the pass asks of this user's processes outside every job, and the held stand-in it reads (`KERNEL` live, `INERT` in unit tests): none reads a process's arguments or environment, which can hang on a program held mid-start (leftover M29).
@@ -137,26 +137,17 @@ impl JobsPass {
             .collect();
         let readers = self.held;
         let stand_in = (readers.stand_in)();
-        let procs: Vec<JobProc> = self
-            .reader
-            .read_all(&reqs)
-            .iter()
-            .map(|p| job_proc(p, stand_in))
-            .collect();
+        let read = self.reader.read_all(&reqs);
+        let procs: Vec<JobProc> = read.iter().map(|p| job_proc(p, stand_in)).collect();
         let read_ms = read_ms();
         let mounts = OnceCell::new();
         let ours = OnceCell::new();
         let held = held_list(
             readings,
-            &procs,
+            &read,
             self_uid,
-            |pid| {
-                if stand_in == Some(pid) {
-                    Some(AtStart::Held)
-                } else {
-                    (readers.start)(pid, &mounts)
-                }
-            },
+            stand_in,
+            |pid| (readers.start)(pid, &mounts),
             readers.exec,
             |pid| {
                 let ours = *ours.get_or_init(|| (readers.coalition)(self_pid));
@@ -190,11 +181,13 @@ impl JobsPass {
     }
 }
 
-/// THIS USER'S PROGRAMS HELD AT MACOS'S PROGRAM CHECK, members of a job or not (leftover §5.1): a member of `members` (the pass's detailed readings, each judged from its own thread list) where it reads held; every other row of `sweep` of `self_uid` that is no zombie and has used at most [`HELD_CPU_NS`], where `start` reads it held. Each is keyed by its pid version (`exec`, else its start, so an exec starts a new held time), named by its executable (a member's own reading, else `exe_name`, else its short name) and is aterm's when it is a member or `in_aterm` says so (aterm's coalition: words only). `start` is asked of nothing else, `exe_name` of the held rows outside every job alone.
+/// THIS USER'S PROGRAMS THAT HAVE NOT STARTED, members of a job or not (leftover §4.2, §5.1): a member of `members` (the pass's detailed readings, each judged from its own thread list, [`member_start`]) where it reads held, translating or unstarted; every other row of `sweep` of `self_uid` that is no zombie and has used at most [`HELD_CPU_NS`] (or is `stand_in`'s, which reads held whatever its CPU), where `start` reads it so. Each carries what keeps it ([`StartWait`]), is keyed by its pid version (`exec`, else its start, so an exec starts a new held time), named by its executable (a member's own reading, else `exe_name`, else its short name) and is aterm's when it is a member or `in_aterm` says so (aterm's coalition: words only). `start` is asked of nothing else, `exec` of the rows the list names alone, and `exe_name` of those outside every job alone.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn held_list(
     sweep: &[ProcessReading],
-    members: &[JobProc],
+    members: &[ProcFacts],
     self_uid: Option<u32>,
+    stand_in: Option<u32>,
     mut start: impl FnMut(u32) -> Option<AtStart>,
     exec: impl Fn(u32) -> Option<u64>,
     in_aterm: impl Fn(u32) -> bool,
@@ -206,43 +199,77 @@ pub(crate) fn held_list(
     let read: BTreeSet<u32> = members.iter().map(|m| m.pid).collect();
     let mut held: Vec<HeldProc> = members
         .iter()
-        .filter(|m| m.program_check && m.uid == Some(uid))
-        .map(|m| HeldProc {
-            pid: m.pid,
-            exec: exec(m.pid).or(m.start).unwrap_or(0),
-            name: m.exe.clone().unwrap_or_else(|| m.name.clone()),
-            aterm: true,
+        .filter(|m| m.uid == Some(uid))
+        .filter_map(|m| {
+            let wait = start_wait(member_start(m, stand_in)?)?;
+            Some(HeldProc {
+                pid: m.pid,
+                exec: exec(m.pid).or(m.start).unwrap_or(0),
+                name: m.exe.clone().unwrap_or_else(|| m.name.clone()),
+                aterm: true,
+                wait,
+            })
         })
         .collect();
     for p in sweep.iter().filter(|p| {
         p.uid == Some(uid)
             && p.state != probe::RunState::Zombie
-            && p.cpu_ns.is_some_and(|c| c <= HELD_CPU_NS)
+            && (p.cpu_ns.is_some_and(|c| c <= HELD_CPU_NS) || stand_in == Some(p.pid))
             && !read.contains(&p.pid)
     }) {
-        if start(p.pid) == Some(AtStart::Held) {
+        let at = if stand_in == Some(p.pid) {
+            Some(AtStart::Held)
+        } else {
+            start(p.pid)
+        };
+        if let Some(wait) = at.and_then(start_wait) {
             held.push(HeldProc {
                 pid: p.pid,
                 exec: exec(p.pid).or(p.start).unwrap_or(0),
                 name: exe_name(p.pid).unwrap_or_else(|| p.name.clone()),
                 aterm: in_aterm(p.pid),
+                wait,
             });
         }
     }
     held
 }
 
+/// What keeps a process that stands `at` its start from starting, as the engine names it; `None` for one that started.
+const fn start_wait(at: AtStart) -> Option<StartWait> {
+    match at {
+        AtStart::Started => None,
+        AtStart::Held => Some(StartWait::ProgramCheck),
+        AtStart::Translating => Some(StartWait::Translating),
+        AtStart::Unstarted => Some(StartWait::NotStarted),
+    }
+}
+
+/// Where member reading `p` stands at its start ([`ProcFacts::program_check`]); `stand_in` (a development build's `program-check held <pid>`) reads held where the reading judged a start, as the kernel's own held reading needs (no zombie, none of another user's: their thread list is not read).
+fn member_start(p: &ProcFacts, stand_in: Option<u32>) -> Option<AtStart> {
+    let judged = p.program_check();
+    if stand_in == Some(p.pid) && judged.is_some() {
+        Some(AtStart::Held)
+    } else {
+        judged
+    }
+}
+
 /// How old the board's view may be and still speak for the canary ([`JobsBoard::evidence`]).
 pub(crate) const JOBS_FRESH: Duration = Duration::from_secs(60);
 
-/// WHETHER A JOBS VIEW `age` OLD SPEAKS FOR NOW: one at most [`JOBS_FRESH`] old does; so does a PARKED one (its demand idle: every live job waits only for the person, or none is live; and no program waits at macOS's program check, [`holds_a_wait`]) of any age while its reader runs (`reader`), because a parked engine is read again only on an edge (output that moves a screen, a parked screen's redraw at most once a floor, a session's fork, `exec` or exit the kernel watch hears, the disk watch's look; design §6.1), so no reading since says nothing changed that drew or that the kernel told of. A held program's start raises no such edge, and a view that holds a wait is read again on a timer instead, so past [`JOBS_FRESH`] its reader has stopped delivering.
+/// WHETHER A JOBS VIEW `age` OLD SPEAKS FOR NOW: one at most [`JOBS_FRESH`] old does; so does a PARKED one (its demand idle: every live job waits only for the person, or none is live; and no program has not started, [`holds_a_wait`]) of any age while its reader runs (`reader`), because a parked engine is read again only on an edge (output that moves a screen, a parked screen's redraw at most once a floor, a session's fork, `exec` or exit the kernel watch hears, the disk watch's look; design §6.1), so no reading since says nothing changed that drew or that the kernel told of. A held program's start raises no such edge, and a view that holds a wait is read again on a timer instead, so past [`JOBS_FRESH`] its reader has stopped delivering.
 pub(crate) fn speaks_for_now(view: &JobsView, age: Duration, reader: bool) -> bool {
     age <= JOBS_FRESH || (reader && view.demand == Demand::Idle && !holds_a_wait(view))
 }
 
-/// Whether `view` names a program of this user that macOS's program check holds, or stands in a backed-up episode that has not had its closing reading (leftover §5.1): it is read again after 30 s at the latest, whatever its demand (`vitals_host::job_demand_after`).
+/// Whether `view` names a program of this user that has not started (macOS's program check holds it, Rosetta translates it, or its volume is not proven local), or stands in a backed-up episode that has not had its closing reading (leftover §5.1): it is read again after 30 s at the latest, whatever its demand (`vitals_host::job_demand_after`), since a start raises no edge.
 pub(crate) fn holds_a_wait(view: &JobsView) -> bool {
-    !view.findings.program_check.is_empty() || view.findings.program_check_episode.is_some()
+    let f = &view.findings;
+    !f.program_check.is_empty()
+        || !f.translating.is_empty()
+        || !f.not_started.is_empty()
+        || f.program_check_episode.is_some()
 }
 
 /// `privacy`'s `program_check=` from `view`, `age` old: how many of this user's programs macOS's program check holds, a lower bound (`Findings::program_check`, aterm's and others'), and the longest held to now, ms (its first sighting's age plus the view's); `None` when the view does not speak for now ([`speaks_for_now`], its reader running `reader`).
@@ -785,12 +812,14 @@ fn fd(f: &probe::FdReading) -> Fd {
             dev,
             ino,
             lf_tail,
+            fresh_dylib,
         } => FdKind::File {
             regular: *regular,
             size: *size,
             dev: *dev,
             ino: *ino,
             lf_tail: *lf_tail,
+            fresh_dylib: *fresh_dylib,
         },
         probe::FdKind::Device { tty } => FdKind::Device { tty: *tty },
         probe::FdKind::Pipe {
@@ -835,7 +864,7 @@ fn fd(f: &probe::FdReading) -> Fd {
     Fd { fd: f.fd, kind }
 }
 
-/// The engine's reading of `p`; `stand_in` (a development build's `program-check held <pid>`) reads as held where the reading judged a start, as the kernel's own held reading needs (no zombie, none of another user's: their thread list is not read).
+/// The engine's reading of `p`, held at macOS's program check where [`member_start`] reads it so (`stand_in` included).
 fn job_proc(p: &ProcFacts, stand_in: Option<u32>) -> JobProc {
     JobProc {
         pid: p.pid,
@@ -871,8 +900,7 @@ fn job_proc(p: &ProcFacts, stand_in: Option<u32>) -> JobProc {
         }),
         wchan: p.wchan.clone(),
         fds: p.fds.as_ref().map(|fs| fs.iter().map(fd).collect()),
-        program_check: p.program_check() == Some(AtStart::Held)
-            || (stand_in == Some(p.pid) && p.start_facts.is_some()),
+        program_check: member_start(p, stand_in) == Some(AtStart::Held),
     }
 }
 
@@ -1448,11 +1476,11 @@ pub(crate) mod tests {
         assert!(!Arc::ptr_eq(&first, &edge), "an edge's reading looks");
     }
 
-    /// THE PASS COUNTS THIS USER'S HELD PROGRAMS, MEMBERS OR NOT: a member held
-    /// by its own reading, and of the rest only this user's live rows with at
-    /// most 20 ms of CPU are asked for their start (a held one has about 2 ms);
-    /// each held row is keyed by its pid version, and an orphan is aterm's by
-    /// its coalition.
+    /// THE PASS COUNTS THIS USER'S PROGRAMS THAT HAVE NOT STARTED, MEMBERS OR NOT: a member
+    /// held or translating by its own reading, and of the rest only this user's live rows with
+    /// at most 20 ms of CPU are asked for their start (a held one has about 2 ms), each with
+    /// what keeps it; the stand-in's pid reads held whatever its CPU, and is never asked; each
+    /// row is keyed by its pid version, and an orphan is aterm's by its coalition.
     #[test]
     fn the_jobs_pass_counts_this_users_held_programs_members_or_not() {
         use std::cell::RefCell;
@@ -1474,32 +1502,46 @@ pub(crate) mod tests {
             row(40, 0, 2, probe::RunState::Sleeping),
             row(50, ME, 0, probe::RunState::Zombie),
         ];
+        let unstarted = |translated| probe::StartFacts {
+            lone_zero: true,
+            translated,
+            local: Some(true),
+            age_ms: Some(probe::PROGRAM_CHECK_AGE_MS),
+            ..probe::StartFacts::default()
+        };
+        let member = |pid, name: &str, exe: Option<&str>, facts| ProcFacts {
+            pid,
+            uid: Some(ME),
+            name: name.into(),
+            exe: exe.map(str::to_owned),
+            start_facts: Some(facts),
+            ..ProcFacts::default()
+        };
         let members = [
-            JobProc {
-                pid: 10,
-                uid: Some(ME),
-                name: "zsh".into(),
-                exe: Some("gh".into()),
-                program_check: true,
-                ..JobProc::default()
-            },
-            JobProc {
-                pid: 22,
-                uid: Some(ME),
-                name: "sleep".into(),
-                ..JobProc::default()
-            },
+            member(10, "zsh", Some("gh"), unstarted(false)),
+            member(22, "sleep", None, probe::StartFacts::default()),
+            member(23, "x86tool", None, unstarted(true)),
         ];
+        let sweep = [&sweep[..], &[row(23, ME, 2, probe::RunState::Sleeping)][..]].concat();
         let asked = RefCell::new(Vec::new());
+        let versions = RefCell::new(Vec::new());
         let held = held_list(
             &sweep,
             &members,
             Some(ME),
+            Some(30),
             |pid| {
                 asked.borrow_mut().push(pid);
-                Some(AtStart::Held)
+                Some(if pid == 21 {
+                    AtStart::Unstarted
+                } else {
+                    AtStart::Held
+                })
             },
-            |pid| Some(u64::from(pid) * 100 + 7),
+            |pid| {
+                versions.borrow_mut().push(pid);
+                Some(u64::from(pid) * 100 + 7)
+            },
             |pid| pid == 20,
             |pid| (pid == 20).then(|| "codex-command-runner".to_owned()),
         );
@@ -1507,26 +1549,43 @@ pub(crate) mod tests {
             asked.into_inner(),
             [20, 21],
             "only this user's live rows outside every job with at most 20 ms of CPU are asked: \
-             never the 30 ms row, another user's, a zombie or a member"
+             never the 30 ms row (the stand-in's, read held unasked), another user's, a zombie \
+             or a member"
         );
-        let got: Vec<(u32, u64, &str, bool)> = held
+        assert_eq!(
+            versions.into_inner(),
+            [10, 23, 20, 21, 30],
+            "the pid version is read of the rows the list names alone: never of member 22, \
+             which started"
+        );
+        let got: Vec<(u32, u64, &str, bool, StartWait)> = held
             .iter()
-            .map(|h| (h.pid, h.exec, h.name.as_str(), h.aterm))
+            .map(|h| (h.pid, h.exec, h.name.as_str(), h.aterm, h.wait))
             .collect();
         assert_eq!(
             got,
             [
-                (10, 1007, "gh", true),
-                (20, 2007, "codex-command-runner", true),
-                (21, 2107, "p21", false)
+                (10, 1007, "gh", true, StartWait::ProgramCheck),
+                (23, 2307, "x86tool", true, StartWait::Translating),
+                (
+                    20,
+                    2007,
+                    "codex-command-runner",
+                    true,
+                    StartWait::ProgramCheck
+                ),
+                (21, 2107, "p21", false, StartWait::NotStarted),
+                (30, 3007, "p30", false, StartWait::ProgramCheck),
             ],
-            "each named by its executable where one reads, never by p_comm's 16 bytes"
+            "each named by its executable where one reads, never by p_comm's 16 bytes, with what \
+             keeps it; the stand-in's 30 ms row counted"
         );
         assert!(
             held_list(
                 &sweep,
                 &members,
                 None,
+                Some(30),
                 |_| Some(AtStart::Held),
                 |_| None,
                 |_| true,
@@ -1537,10 +1596,11 @@ pub(crate) mod tests {
         );
     }
 
-    /// THE PASS HANDS THE ENGINE ITS HELD LIST: over a sweep with no tab,
-    /// the rows its start reader reads held, and the pid the stand-in names,
-    /// reach the view's program-check findings with their executables' names,
-    /// and only the ones in this process's coalition count as aterm's.
+    /// THE PASS HANDS THE ENGINE ITS HELD LIST: over a sweep with no tab, the rows its start
+    /// reader reads held, and the pid the stand-in names (a row with 400 ms of CPU, which the
+    /// pass would never ask), reach the view's program-check findings with their executables'
+    /// names, a row it reads translating its `translating` findings, and only the held ones in
+    /// this process's coalition count as aterm's.
     #[test]
     fn the_pass_hands_the_engine_this_users_held_programs_and_the_stand_in() {
         const ME: u32 = 501;
@@ -1555,16 +1615,16 @@ pub(crate) mod tests {
         let mut pass = JobsPass::new();
         pass.held = HeldReaders {
             start: |pid, _| {
-                Some(if matches!(pid, 20 | 23) {
-                    AtStart::Held
-                } else {
-                    AtStart::Started
+                Some(match pid {
+                    20 | 23 => AtStart::Held,
+                    22 => AtStart::Translating,
+                    _ => AtStart::Started,
                 })
             },
             exec: |pid| Some(u64::from(pid)),
             coalition: |pid| Some(if pid == 23 { 8 } else { 7 }),
             exe_name: |pid| (pid == 20).then(|| "codex-command-runner".to_owned()),
-            stand_in: || Some(21),
+            stand_in: || Some(10),
         };
         let view = pass
             .tick(
@@ -1588,11 +1648,20 @@ pub(crate) mod tests {
         assert_eq!(
             held,
             [
+                (10, "p10", None),
                 (20, "codex-command-runner", None),
-                (21, "p21", None),
                 (23, "p23", None)
             ],
             "the reader's held rows and the stand-in's, outside every tab"
+        );
+        assert_eq!(
+            view.findings
+                .translating
+                .iter()
+                .map(|n| n.pid)
+                .collect::<Vec<_>>(),
+            [22],
+            "the translating row under its own kind"
         );
         assert_eq!(
             view.findings.program_check_aterm,
@@ -1634,10 +1703,10 @@ pub(crate) mod tests {
         assert!(job_proc(&held, Some(30)).program_check, "the kernel's own");
     }
 
-    /// A view speaks for now for a minute; a PARKED one (demand idle, nothing waiting at
-    /// macOS's program check) for as long as its reader runs. One that names a held program or
-    /// stands in a backed-up episode is read again every 30 s whatever its demand, and a held
-    /// program's start raises no edge, so past the minute it does not speak.
+    /// A view speaks for now for a minute; a PARKED one (demand idle, no program that has not
+    /// started) for as long as its reader runs. One that names a held, translating or unstarted
+    /// program or stands in a backed-up episode is read again every 30 s whatever its demand,
+    /// and a start raises no edge, so past the minute it does not speak.
     #[test]
     fn a_parked_view_speaks_for_now_while_its_reader_runs() {
         use aterm_vitals::jobs::{Findings, HeldEpisode, Named};
@@ -1671,7 +1740,21 @@ pub(crate) mod tests {
             },
             ..JobsView::default()
         };
-        for view in [&held, &episode] {
+        let translating = JobsView {
+            findings: Findings {
+                translating: held.findings.program_check.clone(),
+                ..Findings::default()
+            },
+            ..JobsView::default()
+        };
+        let unstarted = JobsView {
+            findings: Findings {
+                not_started: held.findings.program_check.clone(),
+                ..Findings::default()
+            },
+            ..JobsView::default()
+        };
+        for view in [&held, &episode, &translating, &unstarted] {
             assert_eq!(view.demand, Demand::Idle);
             assert!(speaks_for_now(view, JOBS_FRESH, true), "{view:?}");
             assert!(

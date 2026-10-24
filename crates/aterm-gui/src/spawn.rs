@@ -1183,17 +1183,23 @@ pub(crate) struct Adopted {
     pub task: Option<String>,
     /// The record's Autopilot end row (`SessionRecord::autopilot_end`), unparsed.
     pub autopilot_end: Option<String>,
+    /// The record's book of declared wakes (`SessionRecord::wakes`), unparsed.
+    pub wakes: Option<String>,
 }
 
-/// A seamless update's carried end onto an adopted session's timeline, before the session is registered (`docs/DESIGN-harness-autopilot-2026-10-15.md` §11.2.3, item 8).
+/// A seamless update's carried end, or a proven self-claim's carried face, onto an adopted session's timeline, before the session is registered (`docs/DESIGN-harness-autopilot-2026-10-15.md` §11.2.3, item 8).
 pub(crate) fn seed_adopted_end(
     timeline: &std::sync::Mutex<crate::session_timeline::SessionTimeline>,
     row: Option<&str>,
 ) {
     let Some(told) = row
         .and_then(crate::harness_end_carry::EndCarry::parse)
-        .and_then(|carry| carry.end)
-        .map(crate::harness_end_carry::CarriedEnd::told)
+        .and_then(|carry| {
+            carry
+                .end
+                .map(crate::harness_end_carry::CarriedEnd::told)
+                .or(carry.face)
+        })
     else {
         return;
     };
@@ -1201,6 +1207,20 @@ pub(crate) fn seed_adopted_end(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .seed_task_face_held(told.0, told.1);
+}
+
+/// A seamless update's carried rows onto adopted session `id`, before it is registered: its task
+/// record, its Autopilot end and its book of declared wakes.
+pub(crate) fn seed_adopted_rows(
+    ctx: &SessionCtx,
+    id: u64,
+    task: Option<&str>,
+    end: Option<&str>,
+    wakes: Option<&str>,
+) {
+    crate::task_record::seed_carried(ctx, task);
+    seed_adopted_end(&ctx.timeline, end);
+    crate::occupancy_wakes::seed_carried(id, ctx.self_id.as_str(), wakes);
 }
 
 /// Mark an adopted session's timeline, cast and temporal recorder as starting at the handoff ([`crate::session_timeline::HandoffGap`]), since none of them crosses the update.
@@ -1513,6 +1533,7 @@ pub(crate) fn spawn_session(
     let adopt_end: Option<String> = adopt
         .as_ref()
         .and_then(|adopted| adopted.autopilot_end.clone());
+    let adopt_wakes: Option<String> = adopt.as_ref().and_then(|adopted| adopted.wakes.clone());
     let substitute = records_shell_start(adopt.is_some(), factory.exec_command.as_deref())
         .then(|| {
             substitute_shell(
@@ -1814,8 +1835,13 @@ pub(crate) fn spawn_session(
         &adopt_attention,
         crate::metrics::now_us(),
     );
-    crate::task_record::seed_carried(&ctx, adopt_task.as_deref());
-    seed_adopted_end(&ctx.timeline, adopt_end.as_deref());
+    seed_adopted_rows(
+        &ctx,
+        id,
+        adopt_task.as_deref(),
+        adopt_end.as_deref(),
+        adopt_wakes.as_deref(),
+    );
 
     if adopt_checkpoint.is_some() || adopted {
         hydrate_adopted_engine(

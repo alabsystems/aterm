@@ -1918,8 +1918,21 @@ pub(crate) struct ReplyWire(Arc<(Mutex<WireLatch>, std::sync::Condvar)>);
 #[derive(Debug, Default)]
 struct WireLatch {
     released: bool,
+    /// The reply reached the peer's socket whole, written and flushed ([`ReplyWritten::delivered`]).
+    delivered: bool,
+    /// What runs once the latch is released ([`ReplyWire::on_release`]).
+    on_release: Option<OnRelease>,
     #[cfg(test)]
     awaited: bool,
+}
+
+/// A hook a reply's latch runs once released, told whether the reply was delivered.
+struct OnRelease(Box<dyn FnOnce(bool) + Send>);
+
+impl std::fmt::Debug for OnRelease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("OnRelease")
+    }
 }
 
 /// The connection thread's half of a [`ReplyWire`].
@@ -1932,6 +1945,23 @@ impl ReplyWire {
     pub(crate) fn new() -> (Self, ReplyWritten) {
         let wire = Self::default();
         (wire.clone(), ReplyWritten(wire))
+    }
+
+    /// Run `hook` once the latch is released, with whether the reply was delivered (written and
+    /// flushed whole): at once where it is released already. A verb whose state must follow its
+    /// reply's fate (an `await wake` answer, told only once it is on the wire) hangs it here.
+    pub(crate) fn on_release(&self, hook: impl FnOnce(bool) + Send + 'static) {
+        let (latch, _) = &*self.0;
+        let mut latch = latch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if latch.released {
+            let delivered = latch.delivered;
+            drop(latch);
+            hook(delivered);
+            return;
+        }
+        latch.on_release = Some(OnRelease(Box::new(hook)));
     }
 
     /// Whether the reply is written (or never will be).
@@ -1995,14 +2025,32 @@ impl ReplyWritten {
     }
 }
 
-impl Drop for ReplyWritten {
-    fn drop(&mut self) {
-        let (latch, changed) = &*(self.0).0;
+impl ReplyWritten {
+    /// The reply is on the peer's socket whole, written and flushed: the latch's hook, when it is
+    /// released, is told it was delivered ([`ReplyWire::on_release`]).
+    pub(crate) fn delivered(&self) {
+        let (latch, _) = &*(self.0).0;
         latch
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .released = true;
+            .delivered = true;
+    }
+}
+
+impl Drop for ReplyWritten {
+    fn drop(&mut self) {
+        let (latch, changed) = &*(self.0).0;
+        let (hook, delivered) = {
+            let mut latch = latch
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            latch.released = true;
+            (latch.on_release.take(), latch.delivered)
+        };
         changed.notify_all();
+        if let Some(OnRelease(hook)) = hook {
+            hook(delivered);
+        }
     }
 }
 
@@ -5474,6 +5522,23 @@ fn under_fence<T>(
     Ok(write())
 }
 
+/// One write of a `turn` under its `if-supervisor=` fence: `Ok` once `deliver` delivered it;
+/// `Err(Some(line))` when it was refused whole, nothing of it written (the fence, or the
+/// session's input queue full), `line` the `ERR busy …` reply `send` gives in that state;
+/// `Err(None)` for any other outcome, which may have written part of it.
+fn turn_write(
+    ctx: &SessionCtx,
+    if_supervisor: Option<&str>,
+    deliver: impl FnOnce() -> Result<InputOutcome, String>,
+) -> Result<(), Option<String>> {
+    match under_fence(ctx, if_supervisor, deliver) {
+        Ok(Ok(InputOutcome::Ok)) => Ok(()),
+        Ok(Ok(InputOutcome::QueueFull)) => Err(Some(INPUT_QUEUE_FULL.to_string())),
+        Ok(_) => Err(None),
+        Err(fence) => Err(Some(fence)),
+    }
+}
+
 /// Marks the connection this lane serves as a DIRECT local one until dropped ([`SERVING_DIRECT`]).
 #[cfg(unix)]
 pub(crate) struct DirectPeer(bool);
@@ -7532,7 +7597,7 @@ where
     };
     let wake = || ctx.watchers.ring_watchers();
     let response =
-        crate::pty_idem::guarded_waking(&ctx, route.scope, verb, idem_key, &wake, || {
+        crate::pty_idem::guarded_waking(&ctx, route.scope, verb, idem_key, &wake, |_| {
             let event = if paste {
                 InputEvent::Paste(
                     String::from_utf8_lossy(&payload).into_owned(),
@@ -8612,6 +8677,11 @@ fn input_words(
     let cause = leading
         .map(|raw| cause_of(scope, verb, raw, ctx))
         .transpose()?;
+    // The key name is the request's own word: refused here, before the `id=` claim,
+    // it consumes no sequence (refused inside it, the claim would stand in doubt).
+    if verb == "key" && parse_key(rest).is_none() {
+        return Err(control_input::KEY_USAGE.to_string());
+    }
     if verb != "turn" {
         return Ok(InputWords { epoch, cause });
     }
@@ -8751,8 +8821,6 @@ fn serve_session_verb(
     let idem_key = leading.idem;
     let as_person = leading.as_person;
     let if_supervisor = leading.if_supervisor.as_deref();
-    let fenced_phase =
-        |write: &dyn Fn() -> bool| under_fence(ctx, if_supervisor, write).unwrap_or(false);
 
     let fenced_write = leading.guard.is_some()
         || leading.if_gen.is_some()
@@ -8840,7 +8908,7 @@ fn serve_session_verb(
     let completion = || input_mark.as_ref().map(|mark| mark.completion());
     let log_wake = || ctx.watchers.ring_watchers();
     let idem = idem_key.as_deref();
-    let resp = crate::pty_idem::guarded_waking(ctx, scope, verb, idem, &log_wake, || match verb {
+    let resp = crate::pty_idem::guarded_waking(ctx, scope, verb, idem, &log_wake, |w| match verb {
         "text" => match control_query::text_args(rest) {
             Ok(args) => control_query::cmd_text_opt(term, &ctx.frame, args),
             Err(err) => err,
@@ -8892,6 +8960,12 @@ fn serve_session_verb(
         "await" if rest.split_whitespace().next() == Some("edit") => {
             crate::control_edit::await_edit(proxy, scope, rest)
         }
+        "await" if rest.split_whitespace().next() == Some("wake") => {
+            crate::occupancy_wakes::cmd_await_wake(store, session, rest)
+                .into_body_retaining(reply_retention)
+        }
+        "wake" => crate::occupancy_wakes::cmd_wake(store, session, rest),
+        "waits" => crate::occupancy_wakes::cmd_waits(store, session, rest),
         "await" => control_session::cmd_await(term, store, session, ctx, rest),
         "task" => crate::task_record::cmd_task(ctx, session, scope, rest),
         "result" => crate::task_record::cmd_result(ctx, session, rest),
@@ -8919,16 +8993,14 @@ fn serve_session_verb(
             )
             .within_epoch(input_log_epoch)
             .typed_by(ctx, serving_caller(scope, ctx));
+            let refused = std::cell::RefCell::new(None);
             let applied = |ev: InputEvent| {
-                let ev = std::cell::Cell::new(Some(ev));
-                fenced_phase(&|| {
-                    ev.take().is_some_and(|ev| {
-                        matches!(
-                            deliver(route, class, front, term, ctx, ev, Some(mark.completion())),
-                            Ok(InputOutcome::Ok)
-                        )
-                    })
-                })
+                let wrote = turn_write(ctx, if_supervisor, || {
+                    deliver(route, class, front, term, ctx, ev, Some(mark.completion()))
+                });
+                let delivered = wrote.is_ok();
+                *refused.borrow_mut() = wrote.err().flatten();
+                delivered
             };
             let paste = |text: &str| {
                 applied(InputEvent::Paste(
@@ -8953,6 +9025,8 @@ fn serve_session_verb(
                     actor,
                     cause,
                     mark: Some(&mark),
+                    witness: Some(w),
+                    refused: &|| refused.take(),
                 },
             )
         }

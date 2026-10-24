@@ -1067,6 +1067,23 @@ pub(crate) fn fill_glow_span(span: &mut [u32], i0: u32, qw: u32, c0: FxInk, c1: 
         fill_flat(span, c0.color, c0.alpha);
         return;
     }
+    if c0.alpha == 0 && c1.alpha == 0 {
+        for (k, p) in span.iter_mut().enumerate() {
+            let i = i0 + k as u32;
+            let c = glow_lerp_rgb(c0.color, c1.color, i, qw);
+            *p = add_sat(*p, c);
+        }
+        return;
+    }
+    if c0.alpha == c1.alpha {
+        let a = c0.alpha;
+        for (k, p) in span.iter_mut().enumerate() {
+            let i = i0 + k as u32;
+            let c = glow_lerp_rgb(c0.color, c1.color, i, qw);
+            *p = over_premul(*p, c, a);
+        }
+        return;
+    }
     let (a0, a1) = (u32::from(c0.alpha), u32::from(c1.alpha));
     for (k, p) in span.iter_mut().enumerate() {
         let i = i0 + k as u32;

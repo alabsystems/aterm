@@ -2,6 +2,13 @@
 // Copyright 2026 Andrew Yates
 
 //! Owner debugger-access change.
+//!
+//! A press on Settings ▸ Security raises aterm's `confirm_owner` alert. System State's
+//! debugger step starts the same change once per Mac on the window's own admission of a
+//! setup plan with its Permissions group (`docs/DESIGN-system-state-2026-10-21.md` §6),
+//! with no alert of aterm's: macOS's administrator dialog is the one gesture left. A
+//! control client's gesture on System State is never a person's press
+//! (`App::take_system_state_press`).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -11,6 +18,8 @@ use aterm_containment::consent::{
     DebuggerChange, DebuggerMember, DebuggerMode, DebuggerProbe, DebuggerProbeLabel,
     DevtoolsChangeRun, DevtoolsChild, ProbeGate, ProcessBirth, SelfHardening,
 };
+use aterm_types::MutexExt as _;
+use aterm_types::macos_setup::AccessOutcome;
 
 /// How often the park re-reads the shared result slot while a change is under way.
 pub(crate) const RESULT_RECHECK: Duration = Duration::from_secs(5);
@@ -857,7 +866,7 @@ impl ChangeSlot {
     }
 }
 
-/// One confirmed change: the direction, its job number and the owner's yes.
+/// One confirmed change: the direction, its job number and the yes (the owner's in aterm's alert, or the window's own admission).
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ChangeTicket {
     change: DebuggerChange,
@@ -939,12 +948,18 @@ pub(crate) fn inert_run_devtools(_job: DevtoolsJob) -> DevtoolsSpawn {
     DevtoolsSpawn::Inert
 }
 
-/// The live arm: one detached `consent-devtools` worker whose handle is dropped.
+/// The live arm: one detached `consent-devtools` worker whose handle is dropped; while it lives it counts as an up macOS dialog ([`aterm_types::macos_setup::MacosDialog`]).
 pub(crate) fn spawn_devtools_worker(job: DevtoolsJob) -> DevtoolsSpawn {
+    // Up from before this returns — so the UI thread's next look at
+    // `macos_dialog_up` already counts it, before the worker's first statement
+    // — until the worker is gone, however it ends (a panic drops it too). A
+    // thread that cannot start drops it with the closure.
+    let dialog = aterm_types::macos_setup::MacosDialog::up();
     let spawned = crate::qos::spawn_lane_thread(
         "consent-devtools",
         crate::qos::Role::Responsive,
         move || {
+            let _dialog = dialog;
             run_devtools_job(job, |change, gate, on_spawn| {
                 aterm_containment::consent::run_devtools_change(change, gate, on_spawn)
             });
@@ -1346,8 +1361,7 @@ impl DebuggerChangeLane {
         *self.ask_records().lock().unwrap_or_else(|p| p.into_inner()) = Some(read);
     }
 
-    /// Record why the last confirmed change — a press, or the launch ask's yes —
-    /// started nothing (the page shows it until the next one starts).
+    /// Record why the last confirmed change started nothing.
     pub(crate) const fn note_refusal(&mut self, refusal: Option<Refusal>) {
         self.refusal = refusal;
     }
@@ -1386,7 +1400,17 @@ impl DebuggerChangeLane {
         self.flow.phase() != Phase::Idle
     }
 
-    /// The owner's press and their answer in aterm's alert (`menu::confirm_owner`, which only the owner's press and the once-per-Mac launch ask reach, the latter through [`Self::offer`]), and on a yes only, a new job armed in the slot.
+    /// Why a press for `change` would be refused now ([`Self::begin`]'s first gate), or `None`.
+    pub(crate) fn press_refusal(&self, change: DebuggerChange) -> Option<Refusal> {
+        self.flow.press_refusal(change)
+    }
+
+    /// Whether debugger access reading off is the person's choice, from what this lane holds on record ([`off_is_chosen`]).
+    pub(crate) fn off_is_chosen(&self) -> bool {
+        off_is_chosen(self.drift.drift_since().is_some(), self.drift.recorded())
+    }
+
+    /// The owner's press and their answer (aterm's alert on Settings ▸ Security, or the window's own admission spent by [`Self::start_from_plan`] or a `Turn On…` press), and on a yes only, a new job armed in the slot.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -1675,7 +1699,7 @@ impl DebuggerChangeLane {
     }
 }
 
-/// The record beside `aterm.toml` of the Macs on which aterm has asked, by itself, whether to allow debugger access.
+/// The record beside `aterm.toml` of the Macs on which aterm has started the debugger step by itself, or found the question answered: one `<host-uuid> <secs>` line per Mac.
 pub(crate) const ASKED_RECORD: &str = "privacy-debugger-asked";
 
 /// The Macs the asked record keeps.
@@ -1746,7 +1770,7 @@ pub(crate) fn read_host_record(config_path: &Path, record: &str, host: &str) -> 
     }
 }
 
-/// Write `host` into the asked record, AHEAD of the alert it stands for ([`Flush::Durable`](crate::durable::Flush::Durable): once the alert is up, a crash, quit or update must never ask again, and this record is all that remembers it).
+/// Write `host` into the asked record, AHEAD of the change it stands for.
 pub(crate) fn note_asked(config_path: &Path, host: &str, now: u64) -> std::io::Result<()> {
     note_host_record(config_path, ASKED_RECORD, host, now)
 }
@@ -1855,9 +1879,9 @@ pub(crate) fn forget_host_record(
     )
 }
 
-/// What the disk half of a launch offer found, and did ([`OfferDisk::prepare`]).
+/// What the disk half of the debugger step's start found, and did ([`StartDisk::prepare`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum OfferPrep {
+pub(crate) enum StartPrep {
     Recorded,
     Change { read_records: bool },
     NoLock,
@@ -1865,16 +1889,16 @@ pub(crate) enum OfferPrep {
     NotRecorded,
 }
 
-/// What the disk half of a launch offer needs from the lane, copied so it can run off the event loop.
+/// What the disk half of the debugger step's start needs from the lane, copied so it can run off the event loop.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct OfferDisk {
+pub(crate) struct StartDisk {
     followed: [Option<DevtoolsChild>; 4],
     alive: fn(&DevtoolsChild) -> bool,
 }
 
-impl OfferDisk {
-    /// THE DISK HALF OF A LAUNCH OFFER.
-    pub(crate) fn prepare(self, config_path: &Path, host: &str, now: u64) -> OfferPrep {
+impl StartDisk {
+    /// THE DISK HALF OF THE DEBUGGER STEP'S START: take the change lock, judge the marker, read the record and write this Mac into it durably, ahead of the change.
+    pub(crate) fn prepare(self, config_path: &Path, host: &str, now: u64) -> StartPrep {
         // A first launch may have no config directory yet. The record writer
         // already creates it; the lock must be able to precede that write.
         if let Some(parent) = config_path.parent() {
@@ -1882,10 +1906,10 @@ impl OfferDisk {
         }
         let claim = match take_change_lock(config_path, Duration::ZERO) {
             LockTry::Held(claim) => claim,
-            LockTry::Busy => return OfferPrep::Change { read_records: true },
+            LockTry::Busy => return StartPrep::Change { read_records: true },
             LockTry::Unavailable(error) => {
-                aterm_log::warn!("debugger launch ask: the change lock cannot be taken: {error}");
-                return OfferPrep::NoLock;
+                aterm_log::warn!("debugger step: the change lock cannot be taken: {error}");
+                return StartPrep::NoLock;
             }
         };
         let marker = read_debugger_marker(config_path, CHANGE_MARKER)
@@ -1893,24 +1917,24 @@ impl OfferDisk {
         if let Some(marker) = marker {
             let followed = self.followed.contains(&Some(marker.child));
             if !followed || (self.alive)(&marker.child) {
-                return OfferPrep::Change {
+                return StartPrep::Change {
                     read_records: !followed,
                 };
             }
         }
         if read_asked(config_path, host) {
-            return OfferPrep::Asked;
+            return StartPrep::Asked;
         }
         if let Err(error) = note_asked(config_path, host, now) {
-            aterm_log::warn!("debugger launch ask: this Mac could not be recorded: {error}");
-            return OfferPrep::NotRecorded;
+            aterm_log::warn!("debugger step: this Mac could not be recorded: {error}");
+            return StartPrep::NotRecorded;
         }
         drop(claim);
-        OfferPrep::Recorded
+        StartPrep::Recorded
     }
 }
 
-/// This Mac in the asked record, as the launch ask reads it.
+/// This Mac in the asked record, as the debugger step reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HostAsked {
     Cold,
@@ -1919,24 +1943,30 @@ pub(crate) enum HostAsked {
     NotAsked,
 }
 
-/// What the launch ask is judged on (design §3.4 step 0).
+/// What System State's debugger step is judged on (`docs/DESIGN-system-state-2026-10-21.md` §6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct LaunchAskFacts {
+pub(crate) struct DebuggerStepFacts {
     /// A windowed instance.
     pub(crate) windowed: bool,
     pub(crate) macos: bool,
     /// `[privacy] enabled && check`.
     pub(crate) privacy: bool,
-    /// `[privacy] notice`, the switch that silences aterm's launch questions.
+    /// `[privacy] notice`: off pauses the step, and no key starts it.
     pub(crate) notice: bool,
-    /// A config folder to keep the record in: without one nothing would remember the answer, and every launch would ask again.
+    /// A config folder to keep the record in: without one nothing would remember the step, and every launch would start it again.
     pub(crate) config: bool,
+    /// THE STANDING YES in hand (`App::admitted_access`): the window's own
+    /// admission of a setup plan with its Permissions group — its automatic
+    /// answer to the startup offer, or a person's press on the page — and that
+    /// plan still the one in force. Without it the step parks until one comes
+    /// ([`StepVerdict::Park`]).
+    pub(crate) admitted: bool,
     pub(crate) host: HostAsked,
     /// The shared debugger records (a predecessor's change, the observed mode) are read.
     pub(crate) records_read: bool,
     /// A change under way ([`DebuggerChangeLane::under_way`]), this process's or an inherited one.
     pub(crate) under_way: bool,
-    /// The owner answered a debugger-access alert in this process, yes or no (`OwnerQuiet::debugger_answered`).
+    /// The owner answered Settings ▸ Security's debugger-access alert in this process, yes or no (`OwnerQuiet::debugger_answered`).
     pub(crate) answered: bool,
     /// The cached probe, `None` until the look reads it.
     pub(crate) probe: Option<DebuggerProbe>,
@@ -1956,28 +1986,36 @@ pub(crate) struct LaunchAskFacts {
     pub(crate) page: bool,
     /// The folder warm-up is walking (a macOS folder dialog may be up).
     pub(crate) warmup: bool,
-    /// The quiet moment (`App::devtools_moment_is_quiet`).
-    pub(crate) quiet: bool,
+    /// System State is the visible, active view of a focused window with no overlay (`App::system_state_frontmost`).
+    pub(crate) frontmost: bool,
+    /// A macOS dialog or page this process put up is up ([`aterm_types::macos_setup::macos_dialog_up`]).
+    pub(crate) dialog_up: bool,
     /// The owner declined a Security gesture recently (`OwnerQuiet`).
     pub(crate) owner_quiet: bool,
 }
 
-/// What the launch ask does now ([`admit_launch_ask`]).
+/// What the debugger step does now ([`admit_debugger_step`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum LaunchAsk {
-    Ask,
-    Wait(AskWait),
-    Settle(AskSettle),
-    Drop(AskDrop),
+pub(crate) enum StepVerdict {
+    /// Name macOS's dialog on the page, then write the record and start the change.
+    Start,
+    /// No standing yes: nothing written, and no look until the window's own admission comes.
+    Park,
+    /// A `[privacy]` switch is off: a pause, never an answer; nothing written or recorded.
+    Pause(StepPause),
+    Wait(StepWait),
+    /// Write the record and start nothing: the question is answered on this Mac.
+    Settle(StepSettle),
+    /// Nothing more this process, and no record of this Mac written.
+    Drop(StepDrop),
 }
 
-/// Why the launch ask asks nothing this process and writes nothing.
+/// Why the debugger step starts nothing this process and writes no record of
+/// this Mac.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AskDrop {
+pub(crate) enum StepDrop {
     Headless,
     NotMacos,
-    PrivacyOff,
-    NoticeOff,
     NoConfig,
     NoHost,
     Asked,
@@ -1987,13 +2025,35 @@ pub(crate) enum AskDrop {
     NotHardened,
 }
 
-impl AskDrop {
+impl StepDrop {
+    /// What the drop says of the row for the revision whose admission is in
+    /// hand, where it settles the row: this Mac's once-per-Mac step is over
+    /// (`Asked`: an earlier revision's, perhaps cancelled in macOS's dialog).
+    /// `None` says nothing: a build that is not hardened and an account in
+    /// neither group read *not needed* on the row itself, a rule the probe
+    /// cannot read or Apple's tool does not recognise is read again, and the
+    /// rest have no window or record to settle it in. A `[privacy]` switch off
+    /// is no drop at all but a pause ([`StepVerdict::Pause`]), which records
+    /// nothing: the row reads as the person's choice from the published
+    /// opt-out while the switch is off, and is still to do once it is on.
+    pub(crate) const fn outcome(self) -> Option<AccessOutcome> {
+        match self {
+            Self::Asked => Some(AccessOutcome::Declined),
+            Self::Headless
+            | Self::NotMacos
+            | Self::NoConfig
+            | Self::NoHost
+            | Self::Unrecognized
+            | Self::Unread
+            | Self::NotMember
+            | Self::NotHardened => None,
+        }
+    }
+
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Headless => "headless",
             Self::NotMacos => "not_macos",
-            Self::PrivacyOff => "privacy_off",
-            Self::NoticeOff => "notice_off",
             Self::NoConfig => "no_config",
             Self::NoHost => "no_host",
             Self::Asked => "asked",
@@ -2005,9 +2065,27 @@ impl AskDrop {
     }
 }
 
-/// Why the launch ask looks again later.
+/// Which `[privacy]` switch pauses the debugger step ([`StepVerdict::Pause`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AskWait {
+pub(crate) enum StepPause {
+    /// `[privacy] enabled` or `check` is off.
+    PrivacyOff,
+    /// `[privacy] notice` is off.
+    NoticeOff,
+}
+
+impl StepPause {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::PrivacyOff => "privacy_off",
+            Self::NoticeOff => "notice_off",
+        }
+    }
+}
+
+/// Why the debugger step looks again later.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StepWait {
     HostCold,
     RecordsUnread,
     ProbePending,
@@ -2015,17 +2093,19 @@ pub(crate) enum AskWait {
     BehindDeveloperTools,
     BehindPage,
     BehindWarmup,
-    NotQuiet,
+    DialogUp,
+    NotFrontmost,
     OwnerQuiet,
     ProbeStale,
     ProbeUnread,
+    Announced,
     Recording,
 }
 
-/// How old a probe the launch ask raises its alert on may be.
+/// How old a probe the debugger step starts the change on may be.
 pub(crate) const ASK_PROBE_FRESH: Duration = Duration::from_secs(5);
 
-impl AskWait {
+impl StepWait {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::HostCold => "host_cold",
@@ -2035,10 +2115,12 @@ impl AskWait {
             Self::BehindDeveloperTools => "behind_developer_tools",
             Self::BehindPage => "behind_page",
             Self::BehindWarmup => "behind_warmup",
-            Self::NotQuiet => "not_quiet",
+            Self::DialogUp => "dialog_up",
+            Self::NotFrontmost => "not_frontmost",
             Self::OwnerQuiet => "owner_quiet",
             Self::ProbeStale => "probe_stale",
             Self::ProbeUnread => "probe_unread",
+            Self::Announced => "announced",
             Self::Recording => "recording",
         }
     }
@@ -2046,24 +2128,40 @@ impl AskWait {
     /// How long until the next look.
     pub(crate) const fn look_again(self) -> Duration {
         match self {
-            Self::HostCold | Self::ProbePending | Self::ProbeStale | Self::Recording => {
-                crate::devtools_helper::PANEL_TICK
-            }
+            Self::HostCold
+            | Self::ProbePending
+            | Self::ProbeStale
+            | Self::Announced
+            | Self::Recording
+            | Self::NotFrontmost
+            | Self::DialogUp => crate::devtools_helper::PANEL_TICK,
             _ => crate::devtools_helper::RECHECK_EVERY,
         }
     }
 }
 
-/// Why the launch ask settles: the question is answered on this Mac, and the record says so with no alert.
+/// Why the debugger step settles: the question is answered on this Mac, and the record says so with nothing started.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AskSettle {
+pub(crate) enum StepSettle {
     Underway,
     Answered,
     AlreadyOn,
     TurnedOff,
 }
 
-impl AskSettle {
+impl StepSettle {
+    /// What the settle says of the row for the revision whose admission is in
+    /// hand: a change under way was handed to macOS's dialog, the rule on is
+    /// granted, and an answer on the Security page or an explicit opt-out is
+    /// declined.
+    pub(crate) const fn outcome(self) -> AccessOutcome {
+        match self {
+            Self::Underway => AccessOutcome::Handed,
+            Self::AlreadyOn => AccessOutcome::Granted,
+            Self::Answered | Self::TurnedOff => AccessOutcome::Declined,
+        }
+    }
+
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Underway => "under_way",
@@ -2074,183 +2172,190 @@ impl AskSettle {
     }
 }
 
-/// THE LAUNCH ASK'S ADMISSION.
-pub(crate) fn admit_launch_ask(facts: &LaunchAskFacts) -> LaunchAsk {
+/// Whether debugger access reading off is the person's choice: this process saw it go off (`drift`), or the observed record says it was allowed or that aterm or something else turned it off. Pure, so every launch judges it the same way.
+pub(crate) fn off_is_chosen(drift: bool, recorded: Option<ObservedMarker>) -> bool {
+    drift
+        || recorded
+            .is_some_and(|was| was.mode == DebuggerMode::Enabled || was.origin != Origin::Unknown)
+}
+
+/// THE DEBUGGER STEP'S ADMISSION (`docs/DESIGN-system-state-2026-10-21.md` §6). Pure, and the order is the contract: the instance's gates, the standing yes, the `[privacy]` switches, the record, the reads, the question answered here, whether the change can help, the moment, and a fresh probe.
+pub(crate) fn admit_debugger_step(facts: &DebuggerStepFacts) -> StepVerdict {
     let gates = [
-        (facts.windowed, AskDrop::Headless),
-        (facts.macos, AskDrop::NotMacos),
-        (facts.privacy, AskDrop::PrivacyOff),
-        (facts.notice, AskDrop::NoticeOff),
-        (facts.config, AskDrop::NoConfig),
+        (facts.windowed, StepDrop::Headless),
+        (facts.macos, StepDrop::NotMacos),
+        (facts.config, StepDrop::NoConfig),
     ];
     if let Some(&(_, why)) = gates.iter().find(|(open, _)| !*open) {
-        return LaunchAsk::Drop(why);
+        return StepVerdict::Drop(why);
+    }
+    if !facts.admitted {
+        return StepVerdict::Park;
+    }
+    // The `[privacy]` switches after the admission, before anything is read:
+    // off, the step pauses with nothing written or recorded, and goes on for
+    // the revision in force once they are on again.
+    let switches = [
+        (facts.privacy, StepPause::PrivacyOff),
+        (facts.notice, StepPause::NoticeOff),
+    ];
+    if let Some(&(_, why)) = switches.iter().find(|(open, _)| !*open) {
+        return StepVerdict::Pause(why);
     }
     match facts.host {
-        HostAsked::Cold => return LaunchAsk::Wait(AskWait::HostCold),
-        HostAsked::Unnamed => return LaunchAsk::Drop(AskDrop::NoHost),
-        HostAsked::Asked => return LaunchAsk::Drop(AskDrop::Asked),
+        HostAsked::Cold => return StepVerdict::Wait(StepWait::HostCold),
+        HostAsked::Unnamed => return StepVerdict::Drop(StepDrop::NoHost),
+        HostAsked::Asked => return StepVerdict::Drop(StepDrop::Asked),
         HostAsked::NotAsked => {}
     }
     if !facts.records_read {
-        return LaunchAsk::Wait(AskWait::RecordsUnread);
+        return StepVerdict::Wait(StepWait::RecordsUnread);
     }
     let Some(probe) = facts
         .probe
         .filter(|probe| probe.label != DebuggerProbeLabel::Pending)
     else {
-        return LaunchAsk::Wait(AskWait::ProbePending);
+        return StepVerdict::Wait(StepWait::ProbePending);
     };
     if facts.under_way {
-        return LaunchAsk::Settle(AskSettle::Underway);
+        return StepVerdict::Settle(StepSettle::Underway);
     }
     if facts.answered {
-        return LaunchAsk::Settle(AskSettle::Answered);
+        return StepVerdict::Settle(StepSettle::Answered);
     }
     match probe.mode {
-        DebuggerMode::Enabled => return LaunchAsk::Settle(AskSettle::AlreadyOn),
-        DebuggerMode::Disabled
-            if facts.drift
-                || facts.recorded.is_some_and(|was| {
-                    was.mode == DebuggerMode::Enabled || was.origin != Origin::Unknown
-                }) =>
-        {
-            return LaunchAsk::Settle(AskSettle::TurnedOff);
+        DebuggerMode::Enabled => return StepVerdict::Settle(StepSettle::AlreadyOn),
+        DebuggerMode::Disabled if off_is_chosen(facts.drift, facts.recorded) => {
+            return StepVerdict::Settle(StepSettle::TurnedOff);
         }
         DebuggerMode::Disabled => {}
-        DebuggerMode::Unrecognized => return LaunchAsk::Drop(AskDrop::Unrecognized),
-        DebuggerMode::Unknown => return LaunchAsk::Drop(AskDrop::Unread),
+        DebuggerMode::Unrecognized => return StepVerdict::Drop(StepDrop::Unrecognized),
+        DebuggerMode::Unknown => return StepVerdict::Drop(StepDrop::Unread),
     }
     if !matches!(
         probe.member,
         DebuggerMember::Admin | DebuggerMember::Developer
     ) {
-        return LaunchAsk::Drop(AskDrop::NotMember);
+        return StepVerdict::Drop(StepDrop::NotMember);
     }
     if facts.self_hardened != SelfHardening::Hardened {
-        return LaunchAsk::Drop(AskDrop::NotHardened);
+        return StepVerdict::Drop(StepDrop::NotHardened);
     }
     let waits = [
-        (!facts.fda_decided, AskWait::BehindFullDiskAccess),
-        (!facts.devtools_decided, AskWait::BehindDeveloperTools),
-        (facts.page, AskWait::BehindPage),
-        (facts.warmup, AskWait::BehindWarmup),
-        (!facts.quiet, AskWait::NotQuiet),
-        (facts.owner_quiet, AskWait::OwnerQuiet),
-        (!facts.probe_fresh, AskWait::ProbeStale),
+        (!facts.fda_decided, StepWait::BehindFullDiskAccess),
+        (!facts.devtools_decided, StepWait::BehindDeveloperTools),
+        (facts.page, StepWait::BehindPage),
+        (facts.warmup, StepWait::BehindWarmup),
+        (facts.dialog_up, StepWait::DialogUp),
+        (!facts.frontmost, StepWait::NotFrontmost),
+        (facts.owner_quiet, StepWait::OwnerQuiet),
+        (!facts.probe_fresh, StepWait::ProbeStale),
     ];
     waits
         .iter()
         .find(|(holds, _)| *holds)
-        .map_or(LaunchAsk::Ask, |&(_, why)| LaunchAsk::Wait(why))
+        .map_or(StepVerdict::Start, |&(_, why)| StepVerdict::Wait(why))
 }
 
-/// Why [`DebuggerChangeLane::offer`] gave no ticket.
+/// Why [`DebuggerChangeLane::start_from_plan`] gave no ticket. The admission
+/// it was handed is spent either way.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum OfferEnd {
+pub(crate) enum StartEnd {
     Refused(Refusal),
     NoLock,
     Asked,
     NotRecorded,
-    Declined,
-    NotAsked,
 }
 
-impl OfferEnd {
+impl StartEnd {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Refused(_) => "refused",
             Self::NoLock => "no_lock",
             Self::Asked => "asked",
             Self::NotRecorded => "not_recorded",
-            Self::Declined => "declined",
-            Self::NotAsked => "not_asked",
         }
     }
 }
 
 impl DebuggerChangeLane {
-    /// THE LAUNCH ASK'S ALERT AND ANSWER.
+    /// THE STANDING YES SPENT: for a Mac the start's disk half has just written into [`ASKED_RECORD`], take `admitted`, the window's own admission of a setup plan with its Permissions group, as the yes a press takes ([`Self::begin`] with `OwnerYes::from_admitted`). No alert: macOS's administrator dialog is the one gesture left. Only On.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
             machine = "DebuggerAccessChange",
-            action = "Offer",
+            action = "PlanConsent",
             project = "aterm_gui::debugger_access::conformance::project"
         )
     )]
-    pub(crate) fn offer(
+    pub(crate) fn start_from_plan(
         &mut self,
-        prepared: OfferPrep,
+        prepared: StartPrep,
         now_wall: u64,
-        confirm: impl FnOnce() -> crate::native_settings::OwnerAnswer,
-    ) -> Result<ChangeTicket, OfferEnd> {
-        self.offer_prepared(prepared, now_wall)?;
-        self.offer_confirm(confirm)
+        admitted: crate::workstation_setup::AdmittedAccess,
+    ) -> Result<ChangeTicket, StartEnd> {
+        use crate::native_settings::{OwnerAnswer, OwnerYes};
+        self.start_prepared(prepared, now_wall)?;
+        // The press may have become one the lane refuses while the disk half
+        // ran (a person's own press, say): the record stands, nothing starts.
+        if let Some(refusal) = self.start_refusal() {
+            return Err(StartEnd::Refused(refusal));
+        }
+        self.begin(
+            DebuggerChange::On,
+            OwnerAnswer::Yes(OwnerYes::from_admitted(admitted)),
+        )
+        .map_err(StartEnd::Refused)
     }
 
-    /// [`Self::offer`] with its disk half run here, as the App runs the three steps apart.
+    /// [`Self::start_from_plan`] with its disk half run here, as the App runs the three steps apart.
     #[cfg(test)]
-    pub(crate) fn offer_now(
+    pub(crate) fn start_now(
         &mut self,
         config_path: &Path,
         host: &str,
-        confirm: impl FnOnce() -> crate::native_settings::OwnerAnswer,
-    ) -> Result<ChangeTicket, OfferEnd> {
-        if let Some(refusal) = self.offer_refusal() {
-            return Err(OfferEnd::Refused(refusal));
+        admitted: crate::workstation_setup::AdmittedAccess,
+    ) -> Result<ChangeTicket, StartEnd> {
+        if let Some(refusal) = self.start_refusal() {
+            return Err(StartEnd::Refused(refusal));
         }
-        let prepared = self.offer_disk().prepare(config_path, host, now_secs());
-        self.offer(prepared, now_secs(), confirm)
+        let prepared = self.start_disk().prepare(config_path, host, now_secs());
+        self.start_from_plan(prepared, now_secs(), admitted)
     }
 
-    /// Why the press [`Self::offer`] stands for would be refused now, taking nothing.
-    pub(crate) fn offer_refusal(&self) -> Option<Refusal> {
+    /// Why the press [`Self::start_from_plan`] stands for would be refused now, taking nothing.
+    pub(crate) fn start_refusal(&self) -> Option<Refusal> {
         self.flow.press_refusal(DebuggerChange::On)
     }
 
-    /// What the disk half of [`Self::offer`] needs from this lane, copied, so it can run off the event loop ([`OfferDisk::prepare`]).
-    pub(crate) fn offer_disk(&self) -> OfferDisk {
-        OfferDisk {
+    /// What the disk half of [`Self::start_from_plan`] needs from this lane, copied, so it can run off the event loop ([`StartDisk::prepare`]).
+    pub(crate) fn start_disk(&self) -> StartDisk {
+        StartDisk {
             followed: self.followed(),
             alive: self.alive,
         }
     }
 
-    const fn offer_prepared(&mut self, prepared: OfferPrep, now_wall: u64) -> Result<(), OfferEnd> {
+    pub(crate) fn start_prepared(
+        &mut self,
+        prepared: StartPrep,
+        now_wall: u64,
+    ) -> Result<(), StartEnd> {
         match prepared {
-            OfferPrep::Recorded => Ok(()),
-            OfferPrep::Change { read_records } => {
+            StartPrep::Recorded => Ok(()),
+            StartPrep::Change { read_records } => {
                 if read_records && !self.records_out && self.records_again_at.is_none() {
                     self.records_again_at = Some(now_wall);
                 }
-                Err(OfferEnd::Refused(Refusal::InFlight))
+                Err(StartEnd::Refused(Refusal::InFlight))
             }
-            OfferPrep::NoLock => Err(OfferEnd::NoLock),
-            OfferPrep::Asked => Err(OfferEnd::Asked),
-            OfferPrep::NotRecorded => Err(OfferEnd::NotRecorded),
+            StartPrep::NoLock => Err(StartEnd::NoLock),
+            StartPrep::Asked => Err(StartEnd::Asked),
+            StartPrep::NotRecorded => Err(StartEnd::NotRecorded),
         }
     }
 
-    fn offer_confirm(
-        &mut self,
-        confirm: impl FnOnce() -> crate::native_settings::OwnerAnswer,
-    ) -> Result<ChangeTicket, OfferEnd> {
-        use crate::native_settings::OwnerAnswer;
-        if let Some(refusal) = self.offer_refusal() {
-            return Err(OfferEnd::Refused(refusal));
-        }
-        let answer = confirm();
-        let declined = answer == OwnerAnswer::No;
-        self.begin(DebuggerChange::On, answer)
-            .map_err(|refusal| match refusal {
-                Refusal::NotConfirmed if declined => OfferEnd::Declined,
-                Refusal::NotConfirmed => OfferEnd::NotAsked,
-                other => OfferEnd::Refused(other),
-            })
-    }
-
-    /// THE LAUNCH ASK SETTLED: write this Mac into [`ASKED_RECORD`] and nothing else.
+    /// THE DEBUGGER STEP SETTLED: write this Mac into [`ASKED_RECORD`] and nothing else.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -2270,29 +2375,153 @@ impl DebuggerChangeLane {
     }
 }
 
-/// The App's launch ask: queued on a windowed macOS instance until it asks, settles or drops, with the park's next look.
+/// The App's debugger step: queued on a windowed macOS instance until it starts, settles or drops, with the park's next look; parked while no standing yes is in hand.
 #[derive(Debug)]
-pub(crate) struct LaunchAskQueue {
+pub(crate) struct DebuggerStepQueue {
     queued: bool,
+    /// A windowed macOS instance's step: only it is ever queued again.
+    windowed: bool,
+    /// Parked for want of a standing yes: not queued, and queued again by
+    /// [`Self::unpark`] when the window's own admission comes.
+    parked: bool,
+    /// Paused while a `[privacy]` switch is off ([`StepVerdict::Pause`]): not
+    /// queued, and queued again by [`Self::resume`] once every switch is on.
+    paused: bool,
+    /// The setup revision the step last came for: the window's own admission of
+    /// it, or the one a person's `Turn On…` spent ([`Self::note_started`]).
+    revision: Option<u64>,
+    /// The page's headline names macOS's dialog ([`Self::announce`]).
+    announced: Option<Announced>,
+    /// The change System State started (this step, or a person's `Turn On…`
+    /// on the page) and the setup revision it spent: its outcome is the access
+    /// record's for that revision.
+    started: Option<u64>,
+    /// The revisions the window admitted while that change was under way
+    /// ([`Self::join_started`]): the change in flight answers them too.
+    joined: Vec<u64>,
+    /// Where the access record goes (`aterm_types::dirs::state_dir()` for a
+    /// launch, [`Self::recording_in`]); `None` writes none.
+    access_dir: Option<PathBuf>,
+    /// Appends the debugger row's outcomes off the UI thread, in order.
+    access_writer: AccessWriter,
     next_look: Option<Instant>,
     host: fn() -> Option<&'static str>,
     host_read: Option<Arc<std::sync::atomic::AtomicBool>>,
     asked: Option<(&'static str, Arc<std::sync::OnceLock<bool>>)>,
-    prepared: Option<(Arc<std::sync::OnceLock<OfferPrep>>, DebuggerFacts)>,
+    prepared: Option<(Arc<std::sync::OnceLock<StartPrep>>, DebuggerFacts)>,
     record_read: RecordRead,
-    waiting: Option<AskWait>,
+    waiting: Option<StepWait>,
     refused_since: Option<Instant>,
     unread_since: Option<Instant>,
     unread_reads: u32,
 }
 
-/// How long offers refused before anything was written (a change on disk, the lane busy) may keep the launch ask queued, from the first refusal.
+/// THE ACCESS RECORD'S WRITER: the debugger row's outcomes for System State's Permissions stage (`aterm_types::macos_setup::access_record`), appended in order on a thread of its own, never in the UI thread's turn. A line whose write fails is lost with a warning, and the stage judges that row again.
+#[derive(Debug, Default)]
+struct AccessWriter {
+    queue: Arc<Mutex<AccessQueue>>,
+}
+
+/// The lines [`AccessWriter`] has yet to write, and whether a drain runs.
+#[derive(Debug, Default)]
+struct AccessQueue {
+    lines: std::collections::VecDeque<(PathBuf, u64, AccessOutcome)>,
+    draining: bool,
+}
+
+impl AccessWriter {
+    /// Queue one line; start the drain if none runs.
+    fn append(&self, dir: PathBuf, revision: u64, outcome: AccessOutcome) {
+        let start = {
+            let mut queue = self.queue.lock_or_recover();
+            queue.lines.push_back((dir, revision, outcome));
+            !std::mem::replace(&mut queue.draining, true)
+        };
+        if !start {
+            return;
+        }
+        let queue = Arc::clone(&self.queue);
+        let spawned = crate::qos::spawn_lane_thread(
+            "aterm-access-record",
+            crate::qos::Role::Background,
+            move || {
+                loop {
+                    // Taken and released per line: the UI thread never waits for a write.
+                    let next = {
+                        let mut queue = queue.lock_or_recover();
+                        let next = queue.lines.pop_front();
+                        if next.is_none() {
+                            queue.draining = false;
+                        }
+                        next
+                    };
+                    let Some((dir, revision, outcome)) = next else {
+                        return;
+                    };
+                    if let Err(error) = aterm_types::macos_setup::access_record::append(
+                        &dir,
+                        revision,
+                        aterm_types::macos_setup::Access::Debugger,
+                        outcome,
+                    ) {
+                        aterm_log::warn!(
+                            "debugger access: the access record could not be written ({}): {error}",
+                            outcome.word()
+                        );
+                    }
+                }
+            },
+        );
+        if let Err(error) = spawned {
+            let mut queue = self.queue.lock_or_recover();
+            let lost = queue.lines.len();
+            queue.lines.clear();
+            queue.draining = false;
+            aterm_log::warn!("debugger access: {lost} access record line(s) not written: {error}");
+        }
+    }
+
+    /// Wait until the queue is empty and no drain runs.
+    #[cfg(test)]
+    fn drained_for_test(&self) {
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the access record's lines are written",
+            || {
+                let queue = self.queue.lock_or_recover();
+                (queue.lines.is_empty() && !queue.draining).then_some(())
+            },
+        );
+    }
+}
+
+/// The page's announcement of macOS's dialog: the window whose System State view names it, that window's presented-frame count then, and when.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Announced {
+    window: crate::WindowId,
+    presented: u64,
+    at: Instant,
+}
+
+/// Where System State stands for the debugger step at a look (the App's `debugger_step_moment`; a test's stand-in).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StepMoment {
+    /// The focused window whose visible, active view is System State with no overlay, and how many frames it has presented. `None`: System State is not frontmost.
+    pub(crate) page: Option<(crate::WindowId, u64)>,
+    /// A macOS dialog or page this process put up is up.
+    pub(crate) dialog_up: bool,
+}
+
+/// How long the page names macOS's dialog before the change puts it up, at the least: long enough to read, and to outlast the page's status poll.
+pub(crate) const ANNOUNCE_FOR: Duration = Duration::from_secs(2);
+
+/// How long starts refused before anything was written (a change on disk, the lane busy) may keep the debugger step queued, from the first refusal.
 pub(crate) const REFUSED_FOR: Duration = Duration::from_secs(5 * 60);
 
-/// How many reads of the rule that read nothing a recorded launch ask meets before [`REFUSED_FOR`] from the first can end it ([`LaunchAskQueue::unread`]).
+/// How many reads of the rule that read nothing a recorded debugger step meets before [`REFUSED_FOR`] from the first can end it ([`DebuggerStepQueue::unread`]).
 pub(crate) const UNREAD_READS: u32 = 3;
 
-/// Where [`LaunchAskQueue`] does its disk work.
+/// Where [`DebuggerStepQueue`] does its disk work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RecordRead {
     Thread,
@@ -2300,11 +2529,21 @@ pub(crate) enum RecordRead {
     Inline,
 }
 
-impl LaunchAskQueue {
-    /// Queued when `queued` (a windowed macOS instance), with the live host key.
+impl DebuggerStepQueue {
+    /// Queued when `queued` (a windowed macOS instance), with the live host key
+    /// and no access record ([`Self::recording_in`] names its folder).
     pub(crate) fn new(queued: bool) -> Self {
         Self {
             queued,
+            windowed: queued,
+            parked: false,
+            paused: false,
+            revision: None,
+            announced: None,
+            started: None,
+            joined: Vec::new(),
+            access_dir: None,
+            access_writer: AccessWriter::default(),
             next_look: None,
             host: aterm_containment::consent::host_uuid_if_warm,
             host_read: None,
@@ -2318,7 +2557,7 @@ impl LaunchAskQueue {
         }
     }
 
-    /// A queued ask with a stand-in host key whose read has ended, its record read on the asking thread.
+    /// A queued step with a stand-in host key whose read has ended, its record read on the asking thread.
     #[cfg(test)]
     pub(crate) fn queued_for_test(host: fn() -> Option<&'static str>) -> Self {
         Self {
@@ -2329,7 +2568,7 @@ impl LaunchAskQueue {
         }
     }
 
-    /// A queued ask with a stand-in host key whose read is out, ended once `done` is set, its record read on the asking thread.
+    /// A queued step with a stand-in host key whose read is out, ended once `done` is set, its record read on the asking thread.
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn reading_host_for_test(
         host: fn() -> Option<&'static str>,
@@ -2343,7 +2582,7 @@ impl LaunchAskQueue {
         }
     }
 
-    /// A queued ask with a stand-in host key whose read has ended, its record read off the asking thread as a launch's is.
+    /// A queued step with a stand-in host key whose read has ended, its record read off the asking thread as a launch's is.
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn reading_record_for_test(host: fn() -> Option<&'static str>) -> Self {
         Self {
@@ -2352,16 +2591,212 @@ impl LaunchAskQueue {
         }
     }
 
-    /// Whether the ask is still to come this process.
+    /// The access record goes to `dir` (a launch's: `aterm_types::dirs::state_dir()`).
+    pub(crate) fn recording_in(mut self, dir: Option<PathBuf>) -> Self {
+        self.access_dir = dir;
+        self
+    }
+
+    /// Whether the step is still to come this process (and not parked).
     pub(crate) const fn queued(&self) -> bool {
         self.queued
+    }
+
+    /// No standing yes: stop looking, with nothing written, until
+    /// [`Self::unpark`]. The folder warm-up, which waits while the step is
+    /// queued, does not wait on a parked one.
+    pub(crate) fn park(&mut self) {
+        self.parked = true;
+        self.announced = None;
+        self.end();
+    }
+
+    /// A `[privacy]` switch is off ([`StepVerdict::Pause`]): stop looking, with
+    /// nothing written or recorded, until [`Self::resume`]. A start's disk half
+    /// answered and kept ([`Self::keep_prepared`]) stays kept, for the look
+    /// after the resume to spend. A switch off is a pause, never an answer.
+    pub(crate) fn pause(&mut self) {
+        self.paused = true;
+        self.end();
+    }
+
+    /// Every `[privacy]` switch is on again: a paused step looks again at the
+    /// next park, for the revision then in force, as if it had never paused.
+    /// Nothing for a step that is not paused.
+    pub(crate) fn resume(&mut self) {
+        if std::mem::take(&mut self.paused) {
+            self.queued = true;
+            self.next_look = None;
+            self.waiting = None;
+        }
+    }
+
+    /// Whether the step is paused for a `[privacy]` switch that is off.
+    pub(crate) const fn paused(&self) -> bool {
+        self.paused
+    }
+
+    /// The window's own admission of setup revision `revision` came: a parked
+    /// step looks again at the next park. So does one over for an earlier
+    /// revision, as a later launch's would (design §6: a new approval asks
+    /// again), its record read again first: the step's own start and a
+    /// person's `Turn On…` write this Mac into it, so on a Mac that answered,
+    /// the look settles the new revision's row ([`StepDrop::Asked`]) with no
+    /// second dialog. Nothing for a step still queued, an admission of the
+    /// revision it came for (a change to another group keeps it, and its
+    /// outcome stands), or an instance that never queues it.
+    pub(crate) fn unpark(&mut self, revision: u64) {
+        let again = self
+            .revision
+            .replace(revision)
+            .is_some_and(|before| before != revision)
+            && self.windowed
+            && !self.queued;
+        if again {
+            self.asked = None;
+            self.waiting = None;
+            self.refused_since = None;
+            self.unread_since = None;
+            self.unread_reads = 0;
+        }
+        if std::mem::take(&mut self.parked) || again {
+            self.queued = true;
+            self.next_look = None;
+        }
+    }
+
+    /// Whether the step is parked for want of a standing yes.
+    #[cfg(test)]
+    pub(crate) const fn parked(&self) -> bool {
+        self.parked
+    }
+
+    /// A person's `Turn On…` answered the once-per-Mac question here
+    /// (`App::turn_on_debugger_from_system_state`): the step is over for this
+    /// revision, parked, paused or queued, and neither an admission of it nor
+    /// the `[privacy]` switches coming back on queues it again; one
+    /// of a later revision finds this Mac in the record ([`Self::unpark`]), so
+    /// a Cancel in macOS's dialog is never followed by the step's own.
+    pub(crate) fn answered_by_press(&mut self) {
+        self.parked = false;
+        self.paused = false;
+        // A start's disk half answered for the step is let go with it: the
+        // press records this Mac itself.
+        self.prepared = None;
+        self.end();
+    }
+
+    /// The page names macOS's dialog in `window`, which has presented
+    /// `presented` frames, from `now`: `true` when that is news (a first
+    /// announcement, or one moved to another window), which restarts the
+    /// count.
+    pub(crate) fn announce(
+        &mut self,
+        window: crate::WindowId,
+        presented: u64,
+        now: Instant,
+    ) -> bool {
+        if self
+            .announced
+            .is_some_and(|announced| announced.window == window)
+        {
+            return false;
+        }
+        self.announced = Some(Announced {
+            window,
+            presented,
+            at: now,
+        });
+        true
+    }
+
+    /// Whether the announcement has been on screen: `window` is the one that
+    /// names the dialog, it has presented a frame since, and [`ANNOUNCE_FOR`]
+    /// has passed by `now`.
+    pub(crate) fn shown(&self, window: crate::WindowId, presented: u64, now: Instant) -> bool {
+        self.announced.is_some_and(|announced| {
+            announced.window == window
+                && presented != announced.presented
+                && now.saturating_duration_since(announced.at) >= ANNOUNCE_FOR
+        })
+    }
+
+    /// The page no longer names the dialog (the step waits, or is over).
+    pub(crate) fn withdraw(&mut self) {
+        self.announced = None;
+    }
+
+    /// Whether the page names macOS's dialog now.
+    pub(crate) const fn announced(&self) -> bool {
+        self.announced.is_some()
+    }
+
+    /// System State started a change spending setup revision `revision`: its
+    /// outcome is that revision's access record ([`Self::finish`]), and the
+    /// step has come for that revision ([`Self::unpark`]).
+    pub(crate) fn note_started(&mut self, revision: u64) {
+        self.started = Some(revision);
+        self.revision = Some(revision);
+    }
+
+    /// The setup revision of the change System State started, while it is
+    /// under way.
+    pub(crate) const fn started(&self) -> Option<u64> {
+        self.started
+    }
+
+    /// The window's own admission of setup revision `revision` came while the
+    /// change System State started is under way, macOS's dialog perhaps still
+    /// up: that change answers it, so the step is not queued again for it (a
+    /// look would find this Mac in the record and decline the revision before
+    /// anyone answered the dialog). The revision is handed now, as the one that
+    /// started the change was, and the change's outcome is its outcome too
+    /// ([`Self::finish`]). The admission of a revision the step came for
+    /// already changes nothing.
+    pub(crate) fn join_started(&mut self, revision: u64) {
+        if self.revision.replace(revision) == Some(revision)
+            || self.started == Some(revision)
+            || self.joined.contains(&revision)
+        {
+            return;
+        }
+        self.joined.push(revision);
+        self.record(revision, AccessOutcome::Handed);
+    }
+
+    /// The change System State started has ended: its revision and every one
+    /// admitted while it ran ([`Self::join_started`]), in order, once.
+    pub(crate) fn finish(&mut self) -> Vec<u64> {
+        self.started
+            .take()
+            .into_iter()
+            .chain(std::mem::take(&mut self.joined))
+            .collect()
+    }
+
+    /// Append the debugger row's `outcome` for setup revision `revision` to
+    /// the access record (`aterm_types::macos_setup::access_record`), which
+    /// System State's Permissions stage reads so a row waiting on a person is
+    /// never retried. Off the UI thread, after every line asked for before it
+    /// ([`AccessWriter`]); nothing where no folder is named.
+    pub(crate) fn record(&self, revision: u64, outcome: AccessOutcome) {
+        if let Some(dir) = &self.access_dir {
+            self.access_writer.append(dir.clone(), revision, outcome);
+        }
+    }
+
+    /// Wait until every line [`Self::record`] took is written, or its write
+    /// failed: a test's read of the record. A one-minute hang detector.
+    #[cfg(test)]
+    pub(crate) fn record_written_for_test(&self) {
+        self.access_writer.drained_for_test();
     }
 
     /// Whether a look is due at `now`.
     pub(crate) fn due(&self, now: Instant) -> bool {
         self.queued
             && (self.next_look.is_none_or(|at| now >= at)
-                || (self.waiting == Some(AskWait::Recording)
+                || (self.waiting == Some(StepWait::Recording)
                     && self
                         .prepared
                         .as_ref()
@@ -2374,12 +2809,12 @@ impl LaunchAskQueue {
     }
 
     /// The look waits on `why`: look again at `at`.
-    pub(crate) fn wait(&mut self, why: AskWait, at: Instant) -> bool {
+    pub(crate) fn wait(&mut self, why: StepWait, at: Instant) -> bool {
         self.look_later(at);
         self.waiting.replace(why) != Some(why)
     }
 
-    /// The offer at `now` was refused before anything was written or asked ([`OfferEnd::Refused`]).
+    /// The start at `now` was refused before anything was written or started ([`StartEnd::Refused`]).
     pub(crate) fn refused(&mut self, now: Instant) -> bool {
         let since = *self.refused_since.get_or_insert(now);
         if now.saturating_duration_since(since) >= REFUSED_FOR {
@@ -2390,7 +2825,7 @@ impl LaunchAskQueue {
         true
     }
 
-    /// The spend's fresh reading did not read the rule (a `-status` that timed out, did not start or answered what the classifier does not claim, [`DebuggerMode::Unknown`] with an age) after the disk half recorded this Mac.
+    /// The spend's fresh reading did not read the rule after the disk half recorded this Mac (a `-status` that timed out, did not start or answered what the classifier does not claim: [`DebuggerMode::Unknown`] with an age). `true`: it is read again; `false`, the step over and the record standing, once [`UNREAD_READS`] such reads have lasted [`REFUSED_FOR`] from the first. The span is never restarted.
     pub(crate) fn unread(&mut self, now: Instant) -> bool {
         let since = *self.unread_since.get_or_insert(now);
         self.unread_reads = self.unread_reads.saturating_add(1);
@@ -2402,7 +2837,7 @@ impl LaunchAskQueue {
         true
     }
 
-    /// The park's deadline: the next look, while the ask is queued.
+    /// The park's deadline: the next look, while the step is queued.
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
         self.next_look.filter(|_| self.queued)
     }
@@ -2454,16 +2889,16 @@ impl LaunchAskQueue {
         Some((slot, self.record_read))
     }
 
-    /// Where this queue does its disk work: the record's read, the offer's disk half and a settle's record.
+    /// Where this queue does its disk work: the record's read, the start's disk half and a settle's record.
     pub(crate) const fn record_read(&self) -> RecordRead {
         self.record_read
     }
 
-    /// The offer's disk half, once per offer, for an alert that will state `read`: `Some(slot)` when none is out or untaken.
+    /// The start's disk half, once per start, for a change that will start on `read`: `Some(slot)` when none is out or untaken.
     pub(crate) fn start_prepare(
         &mut self,
         read: DebuggerFacts,
-    ) -> Option<Arc<std::sync::OnceLock<OfferPrep>>> {
+    ) -> Option<Arc<std::sync::OnceLock<StartPrep>>> {
         if self.prepared.is_some() {
             return None;
         }
@@ -2472,37 +2907,43 @@ impl LaunchAskQueue {
         Some(slot)
     }
 
-    /// Whether the offer's disk half is out: started and not ended.
+    /// Whether the start's disk half is out: started and not ended.
     pub(crate) fn preparing(&self) -> bool {
         self.prepared
             .as_ref()
             .is_some_and(|(slot, _)| slot.get().is_none())
     }
 
-    /// The disk half's answer once it has ended, with the reading its alert states, taken: the next offer starts another.
-    pub(crate) fn take_prepared(&mut self) -> Option<(OfferPrep, DebuggerFacts)> {
+    /// The disk half's answer once it has ended, with the reading its change starts on, taken: the next start starts another.
+    pub(crate) fn take_prepared(&mut self) -> Option<(StartPrep, DebuggerFacts)> {
         let (slot, read) = self.prepared.as_ref()?;
         let answer = (*slot.get()?, *read);
         self.prepared = None;
         Some(answer)
     }
 
-    /// The disk half's answer, taken by a look that could not spend it yet (a recent decline quiets every Security alert), put back.
-    pub(crate) fn keep_prepared(&mut self, prepared: OfferPrep, read: DebuggerFacts) {
+    /// The disk half's answer, taken by a look that could not spend it yet, put back.
+    pub(crate) fn keep_prepared(&mut self, prepared: StartPrep, read: DebuggerFacts) {
         let slot = Arc::new(std::sync::OnceLock::new());
         let _ = slot.set(prepared);
         self.prepared = Some((slot, read));
+        // No longer the disk half's wait: a kept answer is due at its time
+        // ([`Self::due`]), never at every wake.
+        if self.waiting == Some(StepWait::Recording) {
+            self.waiting = None;
+        }
     }
 
-    /// Whether an offer's disk half is out, or its answer waits to be spent.
-    pub(crate) const fn offering(&self) -> bool {
+    /// Whether a start's disk half is out, or its answer waits to be spent.
+    pub(crate) const fn starting(&self) -> bool {
         self.prepared.is_some()
     }
 
-    /// The ask is over for this process.
+    /// The step is over for this process (or parked, [`Self::park`]).
     pub(crate) const fn end(&mut self) {
         self.queued = false;
         self.next_look = None;
+        self.announced = None;
     }
 }
 
@@ -2535,7 +2976,7 @@ pub(crate) struct DebuggerFacts {
     pub(crate) drift_since: Option<u64>,
     /// What the last change in this process came to.
     pub(crate) last_outcome: Option<Outcome>,
-    /// Why the last confirmed change (a press, or the launch ask's yes) started nothing.
+    /// Why the last confirmed change (a press, or System State's standing yes) started nothing.
     pub(crate) refusal: Option<Refusal>,
 }
 
@@ -3935,13 +4376,14 @@ mod tests {
         );
     }
 
-    fn ready() -> LaunchAskFacts {
-        LaunchAskFacts {
+    fn ready() -> DebuggerStepFacts {
+        DebuggerStepFacts {
             windowed: true,
             macos: true,
             privacy: true,
             notice: true,
             config: true,
+            admitted: true,
             host: HostAsked::NotAsked,
             records_read: true,
             under_way: false,
@@ -3955,7 +4397,8 @@ mod tests {
             devtools_decided: true,
             page: false,
             warmup: false,
-            quiet: true,
+            frontmost: true,
+            dialog_up: false,
             owner_quiet: false,
         }
     }
@@ -3976,186 +4419,206 @@ mod tests {
     }
 
     #[test]
-    fn the_launch_ask_names_every_outcome_in_its_order() {
-        use LaunchAsk::{Ask, Drop, Settle, Wait};
-        type Row = (&'static str, fn(&mut LaunchAskFacts), LaunchAsk);
-        assert_eq!(admit_launch_ask(&ready()), Ask);
+    fn the_debugger_step_names_every_outcome_in_its_order() {
+        use StepVerdict::{Drop, Park, Pause, Settle, Start, Wait};
+        type Row = (&'static str, fn(&mut DebuggerStepFacts), StepVerdict);
+        assert_eq!(admit_debugger_step(&ready()), Start);
         let rows: &[Row] = &[
-            ("headless", |f| f.windowed = false, Drop(AskDrop::Headless)),
-            ("not macOS", |f| f.macos = false, Drop(AskDrop::NotMacos)),
+            ("no standing yes", |f| f.admitted = false, Park),
+            ("headless", |f| f.windowed = false, Drop(StepDrop::Headless)),
+            ("not macOS", |f| f.macos = false, Drop(StepDrop::NotMacos)),
             (
                 "privacy off",
                 |f| f.privacy = false,
-                Drop(AskDrop::PrivacyOff),
+                Pause(StepPause::PrivacyOff),
             ),
-            ("notice off", |f| f.notice = false, Drop(AskDrop::NoticeOff)),
+            (
+                "notice off",
+                |f| f.notice = false,
+                Pause(StepPause::NoticeOff),
+            ),
             (
                 "no config folder",
                 |f| f.config = false,
-                Drop(AskDrop::NoConfig),
+                Drop(StepDrop::NoConfig),
             ),
             (
                 "host cold",
                 |f| f.host = HostAsked::Cold,
-                Wait(AskWait::HostCold),
+                Wait(StepWait::HostCold),
             ),
             (
                 "no host",
                 |f| f.host = HostAsked::Unnamed,
-                Drop(AskDrop::NoHost),
+                Drop(StepDrop::NoHost),
             ),
-            ("asked", |f| f.host = HostAsked::Asked, Drop(AskDrop::Asked)),
+            (
+                "asked",
+                |f| f.host = HostAsked::Asked,
+                Drop(StepDrop::Asked),
+            ),
             (
                 "records unread",
                 |f| f.records_read = false,
-                Wait(AskWait::RecordsUnread),
+                Wait(StepWait::RecordsUnread),
             ),
             (
                 "probe unread",
                 |f| f.probe = None,
-                Wait(AskWait::ProbePending),
+                Wait(StepWait::ProbePending),
             ),
             (
                 "probe pending",
                 |f| f.probe = Some(DebuggerProbe::pending()),
-                Wait(AskWait::ProbePending),
+                Wait(StepWait::ProbePending),
             ),
             (
                 "under way",
                 |f| f.under_way = true,
-                Settle(AskSettle::Underway),
+                Settle(StepSettle::Underway),
             ),
             (
                 "answered",
                 |f| f.answered = true,
-                Settle(AskSettle::Answered),
+                Settle(StepSettle::Answered),
             ),
             (
                 "enabled",
                 |f| f.probe = Some(probe(DebuggerMode::Enabled)),
-                Settle(AskSettle::AlreadyOn),
+                Settle(StepSettle::AlreadyOn),
             ),
-            ("drift", |f| f.drift = true, Settle(AskSettle::TurnedOff)),
+            ("drift", |f| f.drift = true, Settle(StepSettle::TurnedOff)),
             (
                 "recorded on",
                 |f| f.recorded = recorded(DebuggerMode::Enabled, Origin::Outside),
-                Settle(AskSettle::TurnedOff),
+                Settle(StepSettle::TurnedOff),
             ),
             (
                 "turned off by aterm",
                 |f| f.recorded = recorded(DebuggerMode::Disabled, Origin::Aterm),
-                Settle(AskSettle::TurnedOff),
+                Settle(StepSettle::TurnedOff),
             ),
             (
                 "seen turned off outside aterm",
                 |f| f.recorded = recorded(DebuggerMode::Disabled, Origin::Outside),
-                Settle(AskSettle::TurnedOff),
+                Settle(StepSettle::TurnedOff),
             ),
             (
                 "unrecognized",
                 |f| f.probe = Some(probe(DebuggerMode::Unrecognized)),
-                Drop(AskDrop::Unrecognized),
+                Drop(StepDrop::Unrecognized),
             ),
             (
                 "status unread",
                 |f| f.probe = Some(probe(DebuggerMode::Unknown)),
-                Drop(AskDrop::Unread),
+                Drop(StepDrop::Unread),
             ),
             (
                 "probe timed out",
                 |f| f.probe = Some(DebuggerProbe::refused(DebuggerProbeLabel::TimedOut)),
-                Drop(AskDrop::Unread),
+                Drop(StepDrop::Unread),
             ),
             (
                 "not a member",
                 |f| f.probe = off_as(DebuggerMember::NotMember),
-                Drop(AskDrop::NotMember),
+                Drop(StepDrop::NotMember),
             ),
             (
                 "membership unknown",
                 |f| f.probe = off_as(DebuggerMember::Unknown),
-                Drop(AskDrop::NotMember),
+                Drop(StepDrop::NotMember),
             ),
             (
                 "not hardened",
                 |f| f.self_hardened = SelfHardening::NotHardened,
-                Drop(AskDrop::NotHardened),
+                Drop(StepDrop::NotHardened),
             ),
             (
                 "hardening unknown",
                 |f| f.self_hardened = SelfHardening::Unknown,
-                Drop(AskDrop::NotHardened),
+                Drop(StepDrop::NotHardened),
             ),
             (
                 "full disk access undecided",
                 |f| f.fda_decided = false,
-                Wait(AskWait::BehindFullDiskAccess),
+                Wait(StepWait::BehindFullDiskAccess),
             ),
             (
                 "developer tools unread",
                 |f| f.devtools_decided = false,
-                Wait(AskWait::BehindDeveloperTools),
+                Wait(StepWait::BehindDeveloperTools),
             ),
-            ("a page", |f| f.page = true, Wait(AskWait::BehindPage)),
+            ("a page", |f| f.page = true, Wait(StepWait::BehindPage)),
             (
                 "the warm-up",
                 |f| f.warmup = true,
-                Wait(AskWait::BehindWarmup),
+                Wait(StepWait::BehindWarmup),
             ),
-            ("not quiet", |f| f.quiet = false, Wait(AskWait::NotQuiet)),
+            (
+                "a macOS dialog up",
+                |f| f.dialog_up = true,
+                Wait(StepWait::DialogUp),
+            ),
+            (
+                "System State not frontmost",
+                |f| f.frontmost = false,
+                Wait(StepWait::NotFrontmost),
+            ),
             (
                 "owner quiet",
                 |f| f.owner_quiet = true,
-                Wait(AskWait::OwnerQuiet),
+                Wait(StepWait::OwnerQuiet),
             ),
             (
                 "the probe stale at the moment",
                 |f| f.probe_fresh = false,
-                Wait(AskWait::ProbeStale),
+                Wait(StepWait::ProbeStale),
             ),
             (
                 "first sight off",
                 |f| f.recorded = recorded(DebuggerMode::Disabled, Origin::Unknown),
-                Ask,
+                Start,
             ),
             (
                 "a developer",
                 |f| f.probe = off_as(DebuggerMember::Developer),
-                Ask,
+                Start,
             ),
         ];
         for (name, change, expected) in rows {
             let mut facts = ready();
             change(&mut facts);
-            assert_eq!(admit_launch_ask(&facts), *expected, "{name}");
+            assert_eq!(admit_debugger_step(&facts), *expected, "{name}");
         }
         let every = [
-            Ask,
-            Drop(AskDrop::Headless),
-            Drop(AskDrop::NotMacos),
-            Drop(AskDrop::PrivacyOff),
-            Drop(AskDrop::NoticeOff),
-            Drop(AskDrop::NoConfig),
-            Drop(AskDrop::NoHost),
-            Drop(AskDrop::Asked),
-            Drop(AskDrop::Unrecognized),
-            Drop(AskDrop::Unread),
-            Drop(AskDrop::NotMember),
-            Drop(AskDrop::NotHardened),
-            Wait(AskWait::HostCold),
-            Wait(AskWait::RecordsUnread),
-            Wait(AskWait::ProbePending),
-            Wait(AskWait::BehindFullDiskAccess),
-            Wait(AskWait::BehindDeveloperTools),
-            Wait(AskWait::BehindPage),
-            Wait(AskWait::BehindWarmup),
-            Wait(AskWait::NotQuiet),
-            Wait(AskWait::OwnerQuiet),
-            Wait(AskWait::ProbeStale),
-            Settle(AskSettle::Underway),
-            Settle(AskSettle::Answered),
-            Settle(AskSettle::AlreadyOn),
-            Settle(AskSettle::TurnedOff),
+            Start,
+            Park,
+            Drop(StepDrop::Headless),
+            Drop(StepDrop::NotMacos),
+            Pause(StepPause::PrivacyOff),
+            Pause(StepPause::NoticeOff),
+            Drop(StepDrop::NoConfig),
+            Drop(StepDrop::NoHost),
+            Drop(StepDrop::Asked),
+            Drop(StepDrop::Unrecognized),
+            Drop(StepDrop::Unread),
+            Drop(StepDrop::NotMember),
+            Drop(StepDrop::NotHardened),
+            Wait(StepWait::HostCold),
+            Wait(StepWait::RecordsUnread),
+            Wait(StepWait::ProbePending),
+            Wait(StepWait::BehindFullDiskAccess),
+            Wait(StepWait::BehindDeveloperTools),
+            Wait(StepWait::BehindPage),
+            Wait(StepWait::BehindWarmup),
+            Wait(StepWait::DialogUp),
+            Wait(StepWait::NotFrontmost),
+            Wait(StepWait::OwnerQuiet),
+            Wait(StepWait::ProbeStale),
+            Settle(StepSettle::Underway),
+            Settle(StepSettle::Answered),
+            Settle(StepSettle::AlreadyOn),
+            Settle(StepSettle::TurnedOff),
         ];
         for outcome in every {
             assert!(
@@ -4166,8 +4629,10 @@ mod tests {
         let mut words = std::collections::BTreeSet::new();
         for outcome in every {
             let word = match outcome {
-                Ask => "ask",
+                Start => "start",
+                Park => "park",
                 Drop(why) => why.as_str(),
+                Pause(why) => why.as_str(),
                 Wait(why) => why.as_str(),
                 Settle(why) => why.as_str(),
             };
@@ -4176,12 +4641,65 @@ mod tests {
 
         let order: &[Row] = &[
             (
-                "a gate before the host",
+                "a gate before the standing yes",
+                |f| {
+                    f.windowed = false;
+                    f.admitted = false;
+                },
+                Drop(StepDrop::Headless),
+            ),
+            // A switch off pauses only a step that has its admission.
+            (
+                "the standing yes before a switch",
+                |f| {
+                    f.notice = false;
+                    f.admitted = false;
+                },
+                Park,
+            ),
+            // Nothing is read, and nothing settled or written, without one.
+            (
+                "the standing yes before the host",
+                |f| {
+                    f.admitted = false;
+                    f.host = HostAsked::Cold;
+                    f.under_way = true;
+                },
+                Park,
+            ),
+            (
+                "the standing yes before a settle",
+                |f| {
+                    f.admitted = false;
+                    f.probe = Some(probe(DebuggerMode::Enabled));
+                },
+                Park,
+            ),
+            (
+                "a switch before the host",
                 |f| {
                     f.notice = false;
                     f.host = HostAsked::Cold;
                 },
-                Drop(AskDrop::NoticeOff),
+                Pause(StepPause::NoticeOff),
+            ),
+            // A pause answers nothing: a Mac the record names, or debugger
+            // access already on, is judged once the switches are on again.
+            (
+                "a switch before the record",
+                |f| {
+                    f.privacy = false;
+                    f.host = HostAsked::Asked;
+                },
+                Pause(StepPause::PrivacyOff),
+            ),
+            (
+                "a switch before a settle",
+                |f| {
+                    f.notice = false;
+                    f.probe = Some(probe(DebuggerMode::Enabled));
+                },
+                Pause(StepPause::NoticeOff),
             ),
             (
                 "the config before the host",
@@ -4189,7 +4707,7 @@ mod tests {
                     f.config = false;
                     f.host = HostAsked::Cold;
                 },
-                Drop(AskDrop::NoConfig),
+                Drop(StepDrop::NoConfig),
             ),
             (
                 "the record before the reads",
@@ -4198,7 +4716,7 @@ mod tests {
                     f.records_read = false;
                     f.probe = None;
                 },
-                Drop(AskDrop::Asked),
+                Drop(StepDrop::Asked),
             ),
             (
                 "the records before the probe",
@@ -4207,7 +4725,7 @@ mod tests {
                     f.probe = None;
                     f.under_way = true;
                 },
-                Wait(AskWait::RecordsUnread),
+                Wait(StepWait::RecordsUnread),
             ),
             (
                 "the probe before a settle",
@@ -4215,7 +4733,7 @@ mod tests {
                     f.probe = Some(DebuggerProbe::pending());
                     f.under_way = true;
                 },
-                Wait(AskWait::ProbePending),
+                Wait(StepWait::ProbePending),
             ),
             (
                 "under way before the rule",
@@ -4223,7 +4741,7 @@ mod tests {
                     f.under_way = true;
                     f.probe = Some(probe(DebuggerMode::Unrecognized));
                 },
-                Settle(AskSettle::Underway),
+                Settle(StepSettle::Underway),
             ),
             (
                 "under way before answered",
@@ -4231,7 +4749,7 @@ mod tests {
                     f.under_way = true;
                     f.answered = true;
                 },
-                Settle(AskSettle::Underway),
+                Settle(StepSettle::Underway),
             ),
             (
                 "the probe before answered",
@@ -4239,7 +4757,7 @@ mod tests {
                     f.answered = true;
                     f.probe = Some(DebuggerProbe::pending());
                 },
-                Wait(AskWait::ProbePending),
+                Wait(StepWait::ProbePending),
             ),
             (
                 "answered before an unrecognized rule",
@@ -4247,7 +4765,7 @@ mod tests {
                     f.answered = true;
                     f.probe = Some(probe(DebuggerMode::Unrecognized));
                 },
-                Settle(AskSettle::Answered),
+                Settle(StepSettle::Answered),
             ),
             (
                 "answered before an unread rule",
@@ -4255,7 +4773,7 @@ mod tests {
                     f.answered = true;
                     f.probe = Some(probe(DebuggerMode::Unknown));
                 },
-                Settle(AskSettle::Answered),
+                Settle(StepSettle::Answered),
             ),
             (
                 "answered before the account",
@@ -4263,7 +4781,7 @@ mod tests {
                     f.answered = true;
                     f.probe = off_as(DebuggerMember::NotMember);
                 },
-                Settle(AskSettle::Answered),
+                Settle(StepSettle::Answered),
             ),
             (
                 "answered before aterm's hardening",
@@ -4271,7 +4789,7 @@ mod tests {
                     f.answered = true;
                     f.self_hardened = SelfHardening::NotHardened;
                 },
-                Settle(AskSettle::Answered),
+                Settle(StepSettle::Answered),
             ),
             (
                 "answered before on",
@@ -4279,7 +4797,7 @@ mod tests {
                     f.answered = true;
                     f.probe = Some(probe(DebuggerMode::Enabled));
                 },
-                Settle(AskSettle::Answered),
+                Settle(StepSettle::Answered),
             ),
             (
                 "on before aterm's hardening",
@@ -4287,7 +4805,7 @@ mod tests {
                     f.probe = Some(probe(DebuggerMode::Enabled));
                     f.self_hardened = SelfHardening::NotHardened;
                 },
-                Settle(AskSettle::AlreadyOn),
+                Settle(StepSettle::AlreadyOn),
             ),
             (
                 "turned off before the account",
@@ -4298,7 +4816,7 @@ mod tests {
                         ..probe(DebuggerMode::Disabled)
                     });
                 },
-                Settle(AskSettle::TurnedOff),
+                Settle(StepSettle::TurnedOff),
             ),
             (
                 "the account before the hardening",
@@ -4306,7 +4824,7 @@ mod tests {
                     f.probe = off_as(DebuggerMember::NotMember);
                     f.self_hardened = SelfHardening::Unknown;
                 },
-                Drop(AskDrop::NotMember),
+                Drop(StepDrop::NotMember),
             ),
             (
                 "a drop before the pages",
@@ -4314,7 +4832,7 @@ mod tests {
                     f.self_hardened = SelfHardening::NotHardened;
                     f.fda_decided = false;
                 },
-                Drop(AskDrop::NotHardened),
+                Drop(StepDrop::NotHardened),
             ),
             (
                 "full disk access before developer tools",
@@ -4323,23 +4841,32 @@ mod tests {
                     f.devtools_decided = false;
                     f.page = true;
                 },
-                Wait(AskWait::BehindFullDiskAccess),
+                Wait(StepWait::BehindFullDiskAccess),
             ),
             (
                 "the pages before the moment",
                 |f| {
                     f.page = true;
-                    f.quiet = false;
+                    f.frontmost = false;
+                    f.dialog_up = true;
                 },
-                Wait(AskWait::BehindPage),
+                Wait(StepWait::BehindPage),
+            ),
+            (
+                "another macOS dialog before the page",
+                |f| {
+                    f.dialog_up = true;
+                    f.frontmost = false;
+                },
+                Wait(StepWait::DialogUp),
             ),
             (
                 "the moment before the owner's quiet",
                 |f| {
-                    f.quiet = false;
+                    f.frontmost = false;
                     f.owner_quiet = true;
                 },
-                Wait(AskWait::NotQuiet),
+                Wait(StepWait::NotFrontmost),
             ),
             (
                 "the moment before a stale probe",
@@ -4347,7 +4874,7 @@ mod tests {
                     f.owner_quiet = true;
                     f.probe_fresh = false;
                 },
-                Wait(AskWait::OwnerQuiet),
+                Wait(StepWait::OwnerQuiet),
             ),
             (
                 "a stale reading of on settles",
@@ -4355,24 +4882,63 @@ mod tests {
                     f.probe = Some(probe(DebuggerMode::Enabled));
                     f.probe_fresh = false;
                 },
-                Settle(AskSettle::AlreadyOn),
+                Settle(StepSettle::AlreadyOn),
             ),
         ];
         for (name, change, expected) in order {
             let mut facts = ready();
             change(&mut facts);
-            assert_eq!(admit_launch_ask(&facts), *expected, "{name}");
+            assert_eq!(admit_debugger_step(&facts), *expected, "{name}");
+        }
+    }
+
+    /// EVERY WAY THE STEP ENDS WITH AN ADMISSION IN HAND SETTLES THE ROW FOR ITS
+    /// REVISION, OR SAYS WHY THE ROW SPEAKS FOR ITSELF (design §6: the
+    /// Permissions stage completes when every row is in place, not needed, or
+    /// handed, declined or triggered in this revision). A later revision on a
+    /// Mac whose step is over — cancelled in macOS's dialog once — is declined,
+    /// so its stage never waits on the row for good. A `[privacy]` switch off is
+    /// a pause, which records nothing (the published opt-out is the row's wanted
+    /// state while it is off). Not needed (a build that is not hardened, an
+    /// account in neither group) is the row's own reading, and a rule read
+    /// again later says nothing yet.
+    #[test]
+    fn every_end_with_an_admission_says_what_the_row_is() {
+        use AccessOutcome::{Declined, Granted, Handed};
+        for (why, outcome) in [
+            (StepSettle::Underway, Handed),
+            (StepSettle::Answered, Declined),
+            (StepSettle::AlreadyOn, Granted),
+            (StepSettle::TurnedOff, Declined),
+        ] {
+            assert_eq!(why.outcome(), outcome, "{why:?}");
+        }
+        for (why, outcome) in [
+            (StepDrop::Asked, Some(Declined)),
+            (StepDrop::Headless, None),
+            (StepDrop::NotMacos, None),
+            (StepDrop::NoConfig, None),
+            (StepDrop::NoHost, None),
+            (StepDrop::Unrecognized, None),
+            (StepDrop::Unread, None),
+            (StepDrop::NotMember, None),
+            (StepDrop::NotHardened, None),
+        ] {
+            assert_eq!(why.outcome(), outcome, "{why:?}");
         }
     }
 
     #[test]
-    fn a_waiting_launch_ask_looks_again_soon_only_for_a_read() {
+    fn a_waiting_step_looks_again_soon_only_for_a_read_or_a_moment() {
         use crate::devtools_helper::{PANEL_TICK, RECHECK_EVERY};
         let soon = [
-            AskWait::HostCold,
-            AskWait::ProbePending,
-            AskWait::ProbeStale,
-            AskWait::Recording,
+            StepWait::HostCold,
+            StepWait::ProbePending,
+            StepWait::ProbeStale,
+            StepWait::Announced,
+            StepWait::Recording,
+            StepWait::NotFrontmost,
+            StepWait::DialogUp,
         ];
         for why in soon {
             assert_eq!(why.look_again(), PANEL_TICK, "{why:?}");
@@ -4382,14 +4948,13 @@ mod tests {
             "the reading a stale probe waits for is fresh at the next look"
         );
         let later = [
-            AskWait::RecordsUnread,
-            AskWait::BehindFullDiskAccess,
-            AskWait::BehindDeveloperTools,
-            AskWait::BehindPage,
-            AskWait::BehindWarmup,
-            AskWait::NotQuiet,
-            AskWait::OwnerQuiet,
-            AskWait::ProbeUnread,
+            StepWait::RecordsUnread,
+            StepWait::BehindFullDiskAccess,
+            StepWait::BehindDeveloperTools,
+            StepWait::BehindPage,
+            StepWait::BehindWarmup,
+            StepWait::OwnerQuiet,
+            StepWait::ProbeUnread,
         ];
         for why in later {
             assert_eq!(why.look_again(), RECHECK_EVERY, "{why:?}");
@@ -4547,23 +5112,22 @@ mod tests {
         lane
     }
 
+    /// The window's own admission, as a test stands one in.
     #[cfg(unix)]
-    fn never_confirmed() -> OwnerAnswer {
-        panic!("no alert may be raised here")
+    fn admitted() -> crate::workstation_setup::AdmittedAccess {
+        crate::workstation_setup::AdmittedAccess::for_test(1)
     }
 
     #[cfg(unix)]
     #[test]
-    fn the_launch_offer_writes_ahead_and_takes_the_answer_as_a_press() {
+    fn the_standing_yes_writes_ahead_and_starts_what_a_press_starts() {
         let dir = scratch("offer");
         let config = dir.join("aterm.toml");
         let mut lane = askable();
         let ticket = lane
-            .offer_now(&config, "MAC-A", || {
-                assert!(read_asked(&config, "MAC-A"), "written before the alert");
-                OwnerAnswer::yes_for_test()
-            })
-            .expect("a yes gives the ticket");
+            .start_now(&config, "MAC-A", admitted())
+            .expect("the standing yes gives the ticket");
+        assert!(read_asked(&config, "MAC-A"), "written ahead of the change");
         let mut pressed = askable();
         let press = pressed
             .begin(DebuggerChange::On, OwnerAnswer::yes_for_test())
@@ -4577,58 +5141,39 @@ mod tests {
             "the worker's job is armed"
         );
         assert_eq!(
-            askable().offer_now(&config, "MAC-A", never_confirmed),
-            Err(OfferEnd::Asked),
-            "a relaunch on the same config asks nothing"
+            askable().start_now(&config, "MAC-A", admitted()),
+            Err(StartEnd::Asked),
+            "a relaunch on the same config starts nothing"
         );
-
-        for (host, answer, end) in [
-            ("MAC-B", OwnerAnswer::No, OfferEnd::Declined),
-            ("MAC-C", OwnerAnswer::NotAsked, OfferEnd::NotAsked),
-            ("MAC-D", OwnerAnswer::Quiet, OfferEnd::NotAsked),
-        ] {
-            let mut lane = askable();
-            assert_eq!(
-                lane.offer_now(&config, host, move || answer),
-                Err(end),
-                "{host}"
-            );
-            assert_eq!(
-                lane.flow().phase(),
-                Phase::Idle,
-                "{host}: nothing under way"
-            );
-            assert!(read_asked(&config, host), "{host}: recorded all the same");
-            assert_eq!(
-                lane.offer_now(&config, host, never_confirmed),
-                Err(OfferEnd::Asked),
-                "{host}: asked once"
-            );
-            assert_eq!(
-                askable().offer_now(&config, host, never_confirmed),
-                Err(OfferEnd::Asked),
-                "{host}: and not after a relaunch"
-            );
-        }
+        let mut other = askable();
+        assert!(
+            other.start_now(&config, "MAC-B", admitted()).is_ok(),
+            "another Mac on a synced config"
+        );
+        assert_eq!(
+            askable().start_now(&config, "MAC-B", admitted()),
+            Err(StartEnd::Asked),
+            "once"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
     #[test]
-    fn a_refused_launch_offer_writes_nothing_and_forgo_writes_only_the_record() {
+    fn a_refused_start_writes_nothing_and_forgo_writes_only_the_record() {
         let dir = scratch("offer-refused");
         let config = dir.join("aterm.toml");
         let unwritten = |dir: &Path| !dir.join(ASKED_RECORD).exists();
         let unread = &mut DebuggerChangeLane::with_liveness(|_| false);
         assert_eq!(
-            unread.offer_now(&config, "MAC-A", never_confirmed),
-            Err(OfferEnd::Refused(Refusal::RecordsUnread))
+            unread.start_now(&config, "MAC-A", admitted()),
+            Err(StartEnd::Refused(Refusal::RecordsUnread))
         );
         let mut on = askable();
         on.observe(probe(DebuggerMode::Enabled), 3);
         assert_eq!(
-            on.offer_now(&config, "MAC-A", never_confirmed),
-            Err(OfferEnd::Refused(Refusal::State(
+            on.start_now(&config, "MAC-A", admitted()),
+            Err(StartEnd::Refused(Refusal::State(
                 DebuggerChange::On,
                 DebuggerMode::Enabled
             )))
@@ -4637,24 +5182,24 @@ mod tests {
         busy.begin(DebuggerChange::On, OwnerAnswer::yes_for_test())
             .unwrap();
         assert_eq!(
-            busy.offer_now(&config, "MAC-A", never_confirmed),
-            Err(OfferEnd::Refused(Refusal::InFlight))
+            busy.start_now(&config, "MAC-A", admitted()),
+            Err(StartEnd::Refused(Refusal::InFlight))
         );
         {
             let LockTry::Held(_peer) = take_change_lock(&config, Duration::ZERO) else {
                 panic!("the scratch lock is free");
             };
             assert_eq!(
-                askable().offer_now(&config, "MAC-A", never_confirmed),
-                Err(OfferEnd::Refused(Refusal::InFlight)),
+                askable().start_now(&config, "MAC-A", admitted()),
+                Err(StartEnd::Refused(Refusal::InFlight)),
                 "a peer's worker holds the lock"
             );
         }
         let marker = ChangeMarker::new(DebuggerChange::On, child(4242), 7).unwrap();
         std::fs::write(dir.join(CHANGE_MARKER), marker.encode()).unwrap();
         assert_eq!(
-            askable().offer_now(&config, "MAC-A", never_confirmed),
-            Err(OfferEnd::Refused(Refusal::InFlight)),
+            askable().start_now(&config, "MAC-A", admitted()),
+            Err(StartEnd::Refused(Refusal::InFlight)),
             "a change marker on disk"
         );
         std::fs::remove_file(dir.join(CHANGE_MARKER)).unwrap();
@@ -4669,8 +5214,8 @@ mod tests {
         let beyond = locked.join("sub").join("aterm.toml");
         assert!(!read_asked(&beyond, "MAC-A"), "absent");
         assert_eq!(
-            askable().offer_now(&beyond, "MAC-A", never_confirmed),
-            Err(OfferEnd::NoLock)
+            askable().start_now(&beyond, "MAC-A", admitted()),
+            Err(StartEnd::NoLock)
         );
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -4689,8 +5234,8 @@ mod tests {
             std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o500)).unwrap();
         }
         assert_eq!(
-            askable().offer_now(&sealed_config, "MAC-A", never_confirmed),
-            Err(OfferEnd::NotRecorded)
+            askable().start_now(&sealed_config, "MAC-A", admitted()),
+            Err(StartEnd::NotRecorded)
         );
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -4707,19 +5252,19 @@ mod tests {
         assert!(read_asked(&config, "MAC-A"));
         assert!(!dir.join(CHANGE_MARKER).exists(), "the record alone");
         assert_eq!(
-            askable().offer_now(&config, "MAC-A", never_confirmed),
-            Err(OfferEnd::Asked),
-            "settled: never asked after"
+            askable().start_now(&config, "MAC-A", admitted()),
+            Err(StartEnd::Asked),
+            "settled: never started after"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn the_launch_ask_queue_looks_when_due_and_reads_the_record_once() {
-        let idle = LaunchAskQueue::new(false);
+    fn the_step_queue_looks_when_due_and_reads_the_record_once() {
+        let idle = DebuggerStepQueue::new(false);
         assert!(!idle.queued() && !idle.due(Instant::now()));
         assert_eq!(idle.next_deadline(), None);
-        let mut queue = LaunchAskQueue::queued_for_test(|| Some("MAC-A"));
+        let mut queue = DebuggerStepQueue::queued_for_test(|| Some("MAC-A"));
         let now = Instant::now();
         assert!(queue.due(now) && queue.host_read_ended());
         assert_eq!(
@@ -4729,16 +5274,16 @@ mod tests {
         );
         assert_eq!(queue.start_host_read().map(|_| ()), None, "read already");
         assert!(
-            queue.wait(AskWait::NotQuiet, now + RESULT_RECHECK),
+            queue.wait(StepWait::NotFrontmost, now + RESULT_RECHECK),
             "a new wait"
         );
         assert!(
-            !queue.wait(AskWait::NotQuiet, now + RESULT_RECHECK),
+            !queue.wait(StepWait::NotFrontmost, now + RESULT_RECHECK),
             "the same wait is not logged twice"
         );
         assert!(!queue.due(now) && queue.due(now + RESULT_RECHECK));
         assert_eq!(queue.next_deadline(), Some(now + RESULT_RECHECK));
-        assert!(queue.wait(AskWait::BehindPage, now + RESULT_RECHECK));
+        assert!(queue.wait(StepWait::BehindPage, now + RESULT_RECHECK));
         let dir = scratch("queue");
         let config = dir.join("aterm.toml");
         assert_eq!(queue.asked("MAC-A"), None, "not read yet");
@@ -4757,7 +5302,7 @@ mod tests {
         );
         assert!(queue.start_record_read("MAC-B").is_some());
         assert_eq!(
-            LaunchAskQueue::new(true)
+            DebuggerStepQueue::new(true)
                 .start_record_read("MAC-A")
                 .map(|(_, read)| read),
             Some(RecordRead::Thread),
@@ -4765,28 +5310,36 @@ mod tests {
         );
         let read = DebuggerFacts::default();
         assert_eq!(queue.take_prepared(), None, "none started");
-        assert!(!queue.preparing());
+        assert!(!queue.preparing() && !queue.starting());
         let prepared = queue.start_prepare(read).expect("the first time");
-        assert!(queue.preparing(), "out");
+        assert!(queue.preparing() && queue.starting(), "out");
         assert!(queue.start_prepare(read).is_none(), "out already");
         let at = now + RESULT_RECHECK + RESULT_RECHECK;
-        queue.wait(AskWait::Recording, at);
+        queue.wait(StepWait::Recording, at);
         assert!(!queue.due(now) && queue.take_prepared().is_none(), "out");
-        let _ = prepared.set(OfferPrep::Recorded);
-        assert!(!queue.preparing(), "ended");
+        let _ = prepared.set(StartPrep::Recorded);
+        assert!(!queue.preparing() && queue.starting(), "ended, not taken");
         assert!(queue.due(now), "its end is the next look");
         assert!(queue.start_prepare(read).is_none(), "not taken yet");
-        assert_eq!(queue.take_prepared(), Some((OfferPrep::Recorded, read)));
+        assert_eq!(queue.take_prepared(), Some((StartPrep::Recorded, read)));
         assert_eq!(queue.take_prepared(), None, "taken once");
-        assert!(!queue.due(now), "taken: the look's own time again");
+        assert!(
+            !queue.due(now) && !queue.starting(),
+            "taken: the look's own time again"
+        );
+        // Put back, it waits for its time, then is taken first.
+        queue.keep_prepared(StartPrep::Recorded, read);
+        assert!(queue.starting() && !queue.preparing());
+        assert!(!queue.due(now), "a kept answer waits for its time");
+        assert_eq!(queue.take_prepared(), Some((StartPrep::Recorded, read)));
         assert!(
             queue.start_prepare(read).is_some(),
-            "the next offer starts another"
+            "the next start starts another"
         );
         queue.end();
         assert!(!queue.queued() && !queue.due(now + RESULT_RECHECK));
         assert_eq!(queue.next_deadline(), None);
-        let mut cold = LaunchAskQueue::new(true);
+        let mut cold = DebuggerStepQueue::new(true);
         let done = cold.start_host_read().expect("the first time");
         assert!(cold.start_host_read().is_none() && !cold.host_read_ended());
         done.store(true, std::sync::atomic::Ordering::Release);
@@ -4795,9 +5348,142 @@ mod tests {
     }
 
     #[test]
-    fn refused_offers_hold_the_launch_ask_for_a_bounded_span() {
+    fn a_step_parks_without_a_standing_yes_and_comes_back_with_one() {
+        let mut queue = DebuggerStepQueue::queued_for_test(|| Some("MAC-A"));
+        let now = Instant::now();
+        queue.unpark(1);
+        assert!(queue.queued() && !queue.parked(), "nothing to unpark");
+        queue.wait(StepWait::NotFrontmost, now + RESULT_RECHECK);
+        queue.park();
+        assert!(!queue.queued() && queue.parked());
+        assert!(!queue.due(now + RESULT_RECHECK) && queue.next_deadline().is_none());
+        queue.unpark(1);
+        assert!(queue.queued() && !queue.parked() && queue.due(now));
+        let (slot, _) = queue.start_record_read("MAC-A").expect("the first read");
+        let _ = slot.set(false);
+        assert_eq!(queue.asked("MAC-A"), Some(false));
+        queue.end();
+        queue.unpark(1);
+        assert!(
+            !queue.queued(),
+            "an ended step stays ended for its revision"
+        );
+        queue.unpark(2);
+        assert!(
+            queue.queued() && queue.due(now),
+            "a new approval asks again"
+        );
+        assert_eq!(queue.asked("MAC-A"), None, "its record is read again");
+        assert!(queue.start_record_read("MAC-A").is_some());
+        queue.unpark(2);
+        assert!(queue.queued(), "still queued: nothing changes");
+        queue.note_started(3);
+        queue.end();
+        queue.unpark(3);
+        assert!(!queue.queued(), "a press spent that revision");
+        let mut idle = DebuggerStepQueue::new(false);
+        idle.unpark(1);
+        idle.unpark(2);
+        assert!(!idle.queued(), "never queued headless");
+        // A start's disk half answered before a park is spent after it: a Mac
+        // it recorded is never left without its change.
+        let mut kept = DebuggerStepQueue::queued_for_test(|| Some("MAC-A"));
+        kept.keep_prepared(StartPrep::Recorded, DebuggerFacts::default());
+        kept.park();
+        assert!(kept.starting(), "kept through the park");
+        kept.unpark(1);
+        assert!(kept.due(now) && kept.take_prepared().is_some());
+        // A person's Turn On… answers the question: nothing kept is spent.
+        kept.keep_prepared(StartPrep::Recorded, DebuggerFacts::default());
+        kept.answered_by_press();
+        assert!(!kept.starting() && !kept.queued());
+    }
+
+    #[test]
+    fn a_privacy_switch_off_pauses_the_step_and_on_again_resumes_it() {
+        let now = Instant::now();
+        let mut queue = DebuggerStepQueue::queued_for_test(|| Some("MAC-A"));
+        queue.resume();
+        assert!(queue.queued() && !queue.paused(), "nothing to resume");
+        queue.keep_prepared(StartPrep::Recorded, DebuggerFacts::default());
+        queue.wait(StepWait::NotFrontmost, now + RESULT_RECHECK);
+        queue.pause();
+        assert!(!queue.queued() && queue.paused());
+        assert!(!queue.due(now + RESULT_RECHECK) && queue.next_deadline().is_none());
+        assert!(queue.starting(), "a kept answer stays kept");
+        queue.resume();
+        assert!(queue.queued() && !queue.paused() && queue.due(now));
+        assert!(queue.take_prepared().is_some());
+        queue.pause();
+        queue.answered_by_press();
+        queue.resume();
+        assert!(!queue.queued(), "a press ended it for good");
+    }
+
+    #[test]
+    fn a_new_approval_while_the_change_runs_joins_it() {
+        use aterm_types::macos_setup::{Access, access_record};
+        let root = crate::test_scratch::outlived_dir("aterm-access-");
+        let mut queue = DebuggerStepQueue::queued_for_test(|| Some("MAC-A"))
+            .recording_in(Some(root.path().to_path_buf()));
+        queue.unpark(3);
+        queue.note_started(3);
+        queue.end();
+        for revision in [3, 4, 4, 5, 4] {
+            queue.join_started(revision);
+        }
+        assert!(!queue.queued(), "the change answers them: no step");
+        queue.record_written_for_test();
+        let latest = |revision| access_record::latest(root.path(), revision, Access::Debugger);
+        assert_eq!(latest(3), None, "the start records its own hand-over");
+        assert_eq!(latest(4), Some(AccessOutcome::Handed));
+        assert_eq!(latest(5), Some(AccessOutcome::Handed));
+        assert_eq!(queue.finish(), [3, 4, 5], "the change's outcome is theirs");
+        assert!(queue.finish().is_empty(), "once");
+        queue.unpark(6);
+        assert!(
+            queue.queued(),
+            "after the change, a new approval is the step's"
+        );
+    }
+
+    #[test]
+    fn the_page_names_the_dialog_for_a_presented_frame_before_the_change() {
+        let mut queue = DebuggerStepQueue::queued_for_test(|| Some("MAC-A"));
+        let (one, two) = (crate::WindowId(1), crate::WindowId(2));
+        let at = Instant::now();
+        let later = at + ANNOUNCE_FOR;
+        assert!(!queue.announced() && !queue.shown(one, 9, later));
+        assert!(queue.announce(one, 4, at), "news");
+        assert!(queue.announced());
+        assert!(
+            !queue.announce(one, 5, at + ANNOUNCE_FOR),
+            "the same window"
+        );
+        assert!(!queue.shown(one, 4, later + ANNOUNCE_FOR), "no frame since");
+        assert!(!queue.shown(one, 5, at), "not for long enough");
+        assert!(!queue.shown(two, 5, later), "another window");
+        assert!(queue.shown(one, 5, later));
+        assert!(queue.announce(two, 7, later), "moved: the count restarts");
+        assert!(!queue.shown(one, 9, later + ANNOUNCE_FOR));
+        assert!(!queue.shown(two, 8, later), "not for long enough there");
+        assert!(queue.shown(two, 8, later + ANNOUNCE_FOR));
+        queue.withdraw();
+        assert!(!queue.announced() && !queue.shown(two, 9, later + ANNOUNCE_FOR));
+        assert!(queue.announce(one, 1, at));
+        queue.park();
+        assert!(!queue.announced(), "a parked step names nothing");
+        assert_eq!(queue.started(), None);
+        queue.note_started(3);
+        assert_eq!(queue.started(), Some(3));
+        assert_eq!(queue.finish(), [3]);
+        assert!(queue.finish().is_empty(), "once");
+    }
+
+    #[test]
+    fn refused_starts_hold_the_step_for_a_bounded_span() {
         use crate::devtools_helper::RECHECK_EVERY;
-        let mut queue = LaunchAskQueue::queued_for_test(|| Some("MAC-A"));
+        let mut queue = DebuggerStepQueue::queued_for_test(|| Some("MAC-A"));
         let first = Instant::now();
         assert!(queue.refused(first), "the first refusal looks again");
         assert!(queue.queued() && !queue.due(first));
@@ -4806,7 +5492,7 @@ mod tests {
         while at + RECHECK_EVERY < first + REFUSED_FOR {
             at += RECHECK_EVERY;
             assert!(queue.due(at));
-            queue.wait(AskWait::NotQuiet, at + RECHECK_EVERY);
+            queue.wait(StepWait::NotFrontmost, at + RECHECK_EVERY);
             assert!(queue.refused(at), "still within the span");
         }
         assert!(!queue.refused(first + REFUSED_FOR), "the span is over");
@@ -4814,21 +5500,21 @@ mod tests {
     }
 
     #[test]
-    fn reads_that_read_nothing_hold_a_recorded_launch_ask_for_a_bounded_span() {
+    fn reads_that_read_nothing_hold_a_recorded_step_for_a_bounded_span() {
         use crate::devtools_helper::RECHECK_EVERY;
-        let mut queue = LaunchAskQueue::queued_for_test(|| Some("MAC-A"));
+        let mut queue = DebuggerStepQueue::queued_for_test(|| Some("MAC-A"));
         let first = Instant::now();
         assert!(queue.unread(first), "the first read again");
         let mut at = first;
         while at + RECHECK_EVERY < first + REFUSED_FOR {
             at += RECHECK_EVERY;
-            queue.wait(AskWait::ProbeUnread, at + RECHECK_EVERY);
+            queue.wait(StepWait::ProbeUnread, at + RECHECK_EVERY);
             assert!(queue.unread(at), "still within the span");
         }
         assert!(!queue.unread(first + REFUSED_FOR), "the span is over");
         assert!(!queue.queued() && queue.next_deadline().is_none());
 
-        let mut queue = LaunchAskQueue::queued_for_test(|| Some("MAC-A"));
+        let mut queue = DebuggerStepQueue::queued_for_test(|| Some("MAC-A"));
         assert!(queue.unread(first), "the first read again");
         let back = first + REFUSED_FOR + RECHECK_EVERY;
         for read in 2..UNREAD_READS {
@@ -4844,14 +5530,13 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn the_launch_offer_judges_the_disk_as_the_worker_does() {
+    fn the_start_judges_the_disk_as_the_worker_does() {
         let root = aterm_tempfile::TempDir::new().expect("owned offer-disk fixture");
         let dir = root.path();
         let config = dir.join("aterm.toml");
         let marker_at = dir.join(CHANGE_MARKER);
         let lock_at = dir.join(CHANGE_LOCK);
         let asked = |host| read_asked(&config, host);
-        let yes = || OwnerAnswer::yes_for_test();
         let mut contender = askable();
         contender.settle_records(read_records(&config, |_| false));
         contender.poll(3);
@@ -4863,9 +5548,9 @@ mod tests {
             panic!("a fresh lock can be taken");
         };
         assert_eq!(
-            contender.offer_now(&config, "MAC-CLAIM", never_confirmed),
-            Err(OfferEnd::Refused(Refusal::InFlight)),
-            "another lane cannot ask before the claimed record is written"
+            contender.start_now(&config, "MAC-CLAIM", admitted()),
+            Err(StartEnd::Refused(Refusal::InFlight)),
+            "another lane cannot start before the claimed record is written"
         );
         assert!(!asked("MAC-CLAIM"), "the refused contender wrote nothing");
         assert!(
@@ -4882,10 +5567,14 @@ mod tests {
         );
         std::fs::remove_file(&marker_at).unwrap();
         drop(claim);
-        assert!(askable().offer_now(&config, "MAC-CLAIM", yes).is_ok());
+        assert!(
+            askable()
+                .start_now(&config, "MAC-CLAIM", admitted())
+                .is_ok()
+        );
         assert_eq!(
-            askable().offer_now(&config, "MAC-CLAIM", never_confirmed),
-            Err(OfferEnd::Asked),
+            askable().start_now(&config, "MAC-CLAIM", admitted()),
+            Err(StartEnd::Asked),
             "the durable claim is visible after the lock is released"
         );
         type Plant = fn(&Path);
@@ -4905,7 +5594,7 @@ mod tests {
             plant(&marker_at);
             let mut lane = askable();
             assert!(
-                lane.offer_now(&config, host, yes).is_ok(),
+                lane.start_now(&config, host, admitted()).is_ok(),
                 "{name} at the marker's path is no change"
             );
             assert!(asked(host), "{name}: asked");
@@ -4926,8 +5615,8 @@ mod tests {
         let gone = ChangeMarker::new(DebuggerChange::On, child(4242), 7).unwrap();
         std::fs::write(&marker_at, gone.encode()).unwrap();
         assert_eq!(
-            lane.offer_now(&config, "MAC-E", never_confirmed),
-            Err(OfferEnd::Refused(Refusal::InFlight))
+            lane.start_now(&config, "MAC-E", admitted()),
+            Err(StartEnd::Refused(Refusal::InFlight))
         );
         assert!(!asked("MAC-E"), "nothing written");
         assert!(lane.records_due(now_secs()), "the park reads the records");
@@ -4937,7 +5626,7 @@ mod tests {
         let mut released = askable();
         released.released = Some(child(4242));
         assert!(
-            released.offer_now(&config, "MAC-E", yes).is_ok(),
+            released.start_now(&config, "MAC-E", admitted()).is_ok(),
             "a gone child this lane follows is no change"
         );
         std::fs::remove_file(&marker_at).unwrap();
@@ -4945,8 +5634,8 @@ mod tests {
         std::fs::remove_file(&lock_at).unwrap();
         std::os::unix::fs::symlink("/dev/null", &lock_at).unwrap();
         assert_eq!(
-            askable().offer_now(&config, "MAC-F", never_confirmed),
-            Err(OfferEnd::NoLock)
+            askable().start_now(&config, "MAC-F", admitted()),
+            Err(StartEnd::NoLock)
         );
         assert!(!asked("MAC-F"), "nothing written");
         std::fs::remove_file(&lock_at).unwrap();
@@ -5046,6 +5735,9 @@ pub(crate) mod conformance {
         misadopted: i64,
         reasked: i64,
         overlapped: i64,
+        /// The debugger step took a yes with no admission from the window's
+        /// gate (`workstation_setup::gate_admission_for_test` gave none).
+        unadmitted: i64,
     }
 
     /// The projection's inputs besides the lane.
@@ -5156,24 +5848,27 @@ pub(crate) mod conformance {
     )]
     #[aterm_spec_anchor::spec_unmodeled(
         machine = "DebuggerAccessChange",
-        action = "OfferAgain",
-        reason = "Buggy = 2 mutant: offer reads the asked record before it writes it, and \
-                  writes it before the alert; the negative control offers over a record it \
-                  never reads, and the harness fails."
+        action = "PlanConsentAgain",
+        reason = "Buggy = 2 mutant: start_from_plan reads the asked record before it writes \
+                  it, and writes it before the yes is spent; the negative control starts over \
+                  a record it never reads, and the harness fails on AtMostOneOffer."
     )]
     #[aterm_spec_anchor::spec_unmodeled(
         machine = "DebuggerAccessChange",
-        action = "OfferWhileInFlight",
-        reason = "Buggy = 2 mutant: offer is refused while a change is under way (the press's \
-                  own refusal, then a change marker or held lock on disk); the negative \
-                  control raises the alert over our running child, and the harness fails."
+        action = "PlanConsentWhileInFlight",
+        reason = "Buggy = 2 mutant: start_from_plan is refused while a change is under way \
+                  (the press's own refusal, then a change marker or held lock on disk); the \
+                  negative control starts over our running child, and the harness fails on \
+                  NoOfferOverAChange."
     )]
     #[aterm_spec_anchor::spec_unmodeled(
         machine = "DebuggerAccessChange",
-        action = "OfferRunsUnasked",
-        reason = "Buggy = 2 mutant: offer takes its answer only from the alert it raises, \
-                  through begin; the negative control answers yes without raising one, and the \
-                  harness fails (a launch no alert was answered for)."
+        action = "ConsentUnadmitted",
+        reason = "Buggy = 2 mutant: start_from_plan takes its yes only from an AdmittedAccess, \
+                  which only the window's PermissionGate makes for its own admission; the \
+                  negative control starts the change in the Admitted = 0 scenario (a control \
+                  client's act, a status poll, a hand-edited record), and the harness fails on \
+                  ConsentOnlyWhenAdmitted."
     )]
     pub(crate) fn project(lane: &DebuggerChangeLane, observed: &Observed<'_>) -> State {
         let flow = &lane.flow;
@@ -5209,6 +5904,7 @@ pub(crate) mod conformance {
         state.insert("asked", observed.asked);
         state.insert("reasked", observed.seen.reasked);
         state.insert("overlapped", observed.seen.overlapped);
+        state.insert("unadmitted", observed.seen.unadmitted);
         state
     }
 
@@ -5231,9 +5927,17 @@ pub(crate) mod conformance {
         DropPollInFlight,
         RetryAfterCancel,
         AdoptLive,
-        OfferAgain,
-        OfferWhileInFlight,
-        OfferRunsUnasked,
+        PlanConsentAgain,
+        PlanConsentWhileInFlight,
+        ConsentUnadmitted,
+    }
+
+    /// What the debugger step came to in the rig.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Plan {
+        Started,
+        Parked,
+        End(StartEnd),
     }
 
     struct Worker {
@@ -5346,6 +6050,24 @@ pub(crate) mod conformance {
             rig
         }
 
+        /// A fresh lane in a process whose window holds no admission of a setup
+        /// plan (the model's `Admitted = 0` scenario: a control client's act, a
+        /// status poll or a hand-edited record admitted it, or nothing did).
+        fn unadmitted(change: DebuggerChange, world: DebuggerMode, fault: Fault) -> Self {
+            let mut rig = Self::new(change, world, fault);
+            rig.model = aterm_spec::interp::with_consts(&rig.model, &[("Admitted", 0)]);
+            rig
+        }
+
+        /// The model's `Admitted`: whether this window holds its own admission.
+        fn admitted(&self) -> bool {
+            self.model
+                .consts
+                .iter()
+                .find(|(name, _)| *name == "Admitted")
+                .is_some_and(|&(_, value)| value == 1)
+        }
+
         fn inherited(change: DebuggerChange, world: DebuggerMode) -> Self {
             let mut rig = Self::bare(change, world, Fault::None);
             let child = stand_in();
@@ -5386,7 +6108,8 @@ pub(crate) mod conformance {
             let mut lane = DebuggerChangeLane::with_liveness(alive);
             lane.flow.direction = self.change;
             let mut rig = Self {
-                model: debugger_access_change_model(),
+                // The same scenario: the model's constants carry over.
+                model: self.model.clone(),
                 lane,
                 change: self.change,
                 fault: self.fault,
@@ -5803,47 +6526,64 @@ pub(crate) mod conformance {
             self.check_invariants();
         }
 
-        fn offer(&mut self, answer: OwnerAnswer) -> Option<OfferEnd> {
+        /// System State's debugger step at its moment, in one step: the window's admission from a real `PermissionGate`, spent as the yes by `DebuggerChangeLane::start_now`.
+        fn plan_consent(&mut self) -> Plan {
             assert_eq!(
                 self.change,
                 DebuggerChange::On,
-                "aterm never asks by itself to turn debugger access off"
+                "aterm never turns debugger access off by itself"
             );
             let pre = self.now();
             assert_eq!(
                 pre, self.state,
-                "offer: the projection drifted from the model"
+                "plan consent: the projection drifted from the model"
             );
-            let offer_enabled = self.model.action_enabled("Offer", &pre);
-            let answered_yes = matches!(answer, OwnerAnswer::Yes(_));
-            let answer_label = format!("{answer:?}");
+            let enabled = self.model.action_enabled("PlanConsent", &pre);
+            let admission = crate::workstation_setup::gate_admission_for_test(self.admitted());
+            assert_eq!(
+                admission.is_some(),
+                self.admitted(),
+                "the gate holds the admission the scenario names"
+            );
+            let unadmitted = admission.is_none();
             let fault = self.fault;
-            let mut reached = false;
-            let offered = match fault {
-                Fault::OfferWhileInFlight
+            let mut forced = false;
+            let started = match (fault, admission) {
+                (Fault::PlanConsentWhileInFlight, Some(_))
                     if matches!(self.lane.flow.phase(), Phase::InFlight { .. }) =>
                 {
+                    forced = true;
                     note_asked(&self.config, RIG_HOST, now_secs()).expect("the scratch record");
-                    reached = true;
                     self.lane
-                        .begin(DebuggerChange::On, answer)
-                        .map_err(OfferEnd::Refused)
+                        .begin(DebuggerChange::On, OwnerAnswer::yes_for_test())
+                        .map_err(StartEnd::Refused)
                 }
-                _ => {
-                    if fault == Fault::OfferAgain {
+                (Fault::ConsentUnadmitted, None) => {
+                    forced = true;
+                    note_asked(&self.config, RIG_HOST, now_secs()).expect("the scratch record");
+                    self.lane
+                        .begin(DebuggerChange::On, OwnerAnswer::yes_for_test())
+                        .map_err(StartEnd::Refused)
+                }
+                (_, None) => {
+                    assert!(
+                        !enabled,
+                        "PlanConsent: the model starts what no admission allows"
+                    );
+                    assert_eq!(self.now(), pre, "a parked step changed nothing");
+                    return Plan::Parked;
+                }
+                (_, Some(admitted)) => {
+                    if fault == Fault::PlanConsentAgain {
                         let _ = std::fs::remove_file(self.dir.join(ASKED_RECORD));
                     }
-                    let confirm = || {
-                        reached = true;
-                        if fault == Fault::OfferRunsUnasked {
-                            OwnerAnswer::yes_for_test()
-                        } else {
-                            answer
-                        }
-                    };
-                    self.lane.offer_now(&self.config, RIG_HOST, confirm)
+                    self.lane.start_now(&self.config, RIG_HOST, admitted)
                 }
             };
+            // Whether the step went past its gates: its record written and a
+            // yes spent, or (the in-flight fault) its record written over a
+            // change under way.
+            let reached = started.is_ok() || forced;
             if reached {
                 if pre["asked"] == 1 {
                     self.seen.reasked = 1;
@@ -5851,51 +6591,61 @@ pub(crate) mod conformance {
                 if pre["phase"] != 0 || pre["lock"] != 0 || pre["inflight"] != 0 {
                     self.seen.overlapped = 1;
                 }
+                if unadmitted {
+                    self.seen.unadmitted = 1;
+                }
+            }
+            if started.is_ok() {
+                // A ticket is minted only for a yes: the step took one.
+                self.seen.fresh = 1;
+            }
+            if reached && !enabled {
+                // A step the model forbids is named by the law it breaks.
+                let post = self.now();
+                for invariant in &self.model.invariants {
+                    assert!(
+                        self.model.check_invariant(invariant.name, &post),
+                        "PlanConsent broke {}: {pre:?} -> {post:?}",
+                        invariant.name
+                    );
+                }
             }
             assert_eq!(
                 reached,
-                offer_enabled,
-                "Offer: the composition {} what the model {}: {pre:?}",
+                enabled,
+                "PlanConsent: the composition {} what the model {}: {pre:?}",
                 if reached { "took" } else { "refused" },
-                if offer_enabled { "allows" } else { "forbids" },
+                if enabled { "allows" } else { "forbids" },
             );
-            let (end, targets) = match offered {
-                Ok(ticket) => {
-                    if fault != Fault::OfferRunsUnasked {
-                        assert!(answered_yes, "a ticket only on a yes");
-                        self.seen.fresh = 1;
-                    }
-                    self.start_worker(ticket);
-                    let launched = self
-                        .worker
-                        .as_ref()
-                        .is_some_and(|w| w.env.stage.load(Ordering::SeqCst) == 1);
-                    let step = self.lane.poll(now_secs());
-                    self.apply(step);
-                    self.account();
-                    let targets = if launched {
-                        self.chain(&pre, &["Offer", "Consent", "Recheck", "Launch"])
-                    } else {
-                        self.chain(&pre, &["Offer", "Consent", "Recheck"])
-                    };
-                    (None, targets)
-                }
-                Err(end @ (OfferEnd::Declined | OfferEnd::NotAsked)) => {
-                    (Some(end), self.chain(&pre, &["Offer", "Decline"]))
-                }
+            let ticket = match started {
+                Ok(ticket) => ticket,
                 Err(end) => {
-                    assert_eq!(self.now(), pre, "a refused offer ({end:?}) changed nothing");
-                    return Some(end);
+                    assert_eq!(self.now(), pre, "a refused start ({end:?}) changed nothing");
+                    return Plan::End(end);
                 }
+            };
+            self.start_worker(ticket);
+            let launched = self
+                .worker
+                .as_ref()
+                .is_some_and(|w| w.env.stage.load(Ordering::SeqCst) == 1);
+            // The park reads the spawned child, or why none started.
+            let step = self.lane.poll(now_secs());
+            self.apply(step);
+            self.account();
+            let targets = if launched {
+                self.chain(&pre, &["PlanConsent", "Recheck", "Launch"])
+            } else {
+                self.chain(&pre, &["PlanConsent", "Recheck"])
             };
             let post = self.now();
             assert!(
                 targets.contains(&post),
-                "offer ({answer_label}): {pre:?} -> {post:?} is none of {targets:?}"
+                "plan consent: {pre:?} -> {post:?} is none of {targets:?}"
             );
             self.state = post;
             self.check_invariants();
-            end
+            Plan::Started
         }
 
         fn forgo(&mut self) {
@@ -6201,25 +6951,26 @@ pub(crate) mod conformance {
             rig.probe();
             assert_eq!(rig.lane.flow.last(), Some(Outcome::Changed(change)));
         }
-        launch_ask_scenarios(fault);
+        debugger_step_scenarios(fault);
     }
 
-    fn launch_ask_scenarios(fault: Fault) {
+    fn debugger_step_scenarios(fault: Fault) {
         let on = DebuggerChange::On;
         let yes = OwnerAnswer::yes_for_test;
-        let unread = Some(OfferEnd::Refused(Refusal::State(on, DebuggerMode::Unknown)));
-        let in_flight = Some(OfferEnd::Refused(Refusal::InFlight));
+        let unread = Plan::End(StartEnd::Refused(Refusal::State(on, DebuggerMode::Unknown)));
+        let in_flight = Plan::End(StartEnd::Refused(Refusal::InFlight));
+        let asked = Plan::End(StartEnd::Asked);
 
         let mut rig = Rig::new(on, DebuggerMode::Disabled, fault);
         assert_eq!(
-            rig.offer(yes()),
+            rig.plan_consent(),
             unread,
-            "nothing is asked before the probe"
+            "nothing is started before the probe"
         );
         assert_eq!(rig.state["asked"], 0, "and nothing is recorded");
         rig.probe();
-        assert_eq!(rig.offer(yes()), None);
-        assert_eq!(rig.offer(yes()), in_flight);
+        assert_eq!(rig.plan_consent(), Plan::Started);
+        assert_eq!(rig.plan_consent(), in_flight);
         rig.exit("ChildApplied");
         rig.notice();
         rig.probe();
@@ -6232,78 +6983,79 @@ pub(crate) mod conformance {
         rig.environment("Drift", 0);
         rig.probe();
         assert_eq!(
-            rig.offer(yes()),
-            Some(OfferEnd::Asked),
-            "asked once per Mac"
+            rig.plan_consent(),
+            asked,
+            "once per Mac: drift never re-enables"
         );
         rig.forgo();
 
+        // Cancel in macOS's dialog: settled for good, and the button is the
+        // owner's still.
         let mut rig = Rig::new(on, DebuggerMode::Disabled, fault);
         rig.probe();
-        assert_eq!(rig.offer(OwnerAnswer::No), Some(OfferEnd::Declined));
-        assert_eq!(rig.offer(yes()), Some(OfferEnd::Asked));
-        let mut rig = rig.relaunch();
-        assert_eq!(rig.offer(yes()), unread);
-        rig.probe();
-        assert_eq!(
-            rig.offer(yes()),
-            Some(OfferEnd::Asked),
-            "the next launch asks nothing"
-        );
-        rig.press(yes());
+        assert_eq!(rig.plan_consent(), Plan::Started);
         rig.exit("ChildUnchanged");
         rig.notice();
         rig.probe();
         assert_eq!(rig.lane.flow.last(), Some(Outcome::NotChanged(on)));
-        assert_eq!(rig.seen.launches, 1, "the button is the owner's still");
-
-        for answer in [OwnerAnswer::NotAsked, OwnerAnswer::Quiet] {
-            let mut rig = Rig::new(on, DebuggerMode::Disabled, fault);
-            rig.probe();
-            assert_eq!(rig.offer(answer), Some(OfferEnd::NotAsked));
-            assert_eq!(rig.offer(yes()), Some(OfferEnd::Asked), "the record stands");
-            assert_eq!(rig.seen.launches, 0);
-        }
+        assert_eq!(rig.plan_consent(), asked, "never retried");
+        let mut rig = rig.relaunch();
+        assert_eq!(rig.plan_consent(), unread);
+        rig.probe();
+        assert_eq!(rig.plan_consent(), asked, "the next launch starts nothing");
+        rig.press(yes());
+        rig.exit("ChildUnchanged");
+        rig.notice();
+        rig.probe();
+        assert_eq!(rig.seen.launches, 2, "the button is the owner's still");
 
         let mut rig = Rig::new(on, DebuggerMode::Disabled, fault);
         rig.probe();
         rig.peer_launch();
         assert_eq!(
-            rig.offer(yes()),
+            rig.plan_consent(),
             in_flight,
             "a peer's change holds the lock"
         );
         rig.peer_exit();
         assert_eq!(
-            rig.offer(yes()),
+            rig.plan_consent(),
             in_flight,
             "its marker waits for that peer"
         );
         rig.peer_settle();
-        assert_eq!(rig.offer(OwnerAnswer::No), Some(OfferEnd::Declined));
+        assert_eq!(rig.plan_consent(), Plan::Started);
 
         let mut rig = Rig::new(on, DebuggerMode::Disabled, fault);
         rig.probe();
         rig.press(yes());
-        assert_eq!(rig.offer(yes()), in_flight, "our own child is in flight");
+        assert_eq!(rig.plan_consent(), in_flight, "our own child is in flight");
         rig.forgo();
         rig.exit("ChildUnchanged");
         rig.notice();
         rig.probe();
-        assert_eq!(rig.offer(yes()), Some(OfferEnd::Asked), "settled under way");
+        assert_eq!(rig.plan_consent(), asked, "settled under way");
 
         let mut rig = Rig::new(on, DebuggerMode::Disabled, fault);
         rig.forgo();
         rig.probe();
-        assert_eq!(
-            rig.offer(yes()),
-            Some(OfferEnd::Asked),
-            "settled, never asked"
-        );
+        assert_eq!(rig.plan_consent(), asked, "settled, never started");
 
         let mut rig = Rig::inherited(on, DebuggerMode::Disabled);
-        assert_eq!(rig.offer(yes()), in_flight, "a predecessor's child runs");
+        assert_eq!(rig.plan_consent(), in_flight, "a predecessor's child runs");
         rig.forgo();
+
+        // No admission of the window's own: parked, nothing written; the
+        // owner's press is theirs still.
+        let mut rig = Rig::unadmitted(on, DebuggerMode::Disabled, fault);
+        rig.probe();
+        assert_eq!(rig.plan_consent(), Plan::Parked);
+        assert_eq!(rig.state["asked"], 0, "nothing recorded");
+        rig.press(yes());
+        rig.exit("ChildApplied");
+        rig.notice();
+        rig.probe();
+        assert_eq!(rig.lane.flow.last(), Some(Outcome::Changed(on)));
     }
 
     #[cfg(unix)]
@@ -6325,9 +7077,9 @@ pub(crate) mod conformance {
             Fault::DropPollInFlight,
             Fault::RetryAfterCancel,
             Fault::AdoptLive,
-            Fault::OfferAgain,
-            Fault::OfferWhileInFlight,
-            Fault::OfferRunsUnasked,
+            Fault::PlanConsentAgain,
+            Fault::PlanConsentWhileInFlight,
+            Fault::ConsentUnadmitted,
         ] {
             let caught = std::panic::catch_unwind(|| match fault {
                 Fault::PressWhileInFlight => {
@@ -6344,32 +7096,35 @@ pub(crate) mod conformance {
                     rig.notice();
                     rig.probe();
                 }
-                Fault::OfferAgain => {
+                Fault::PlanConsentAgain => {
                     let mut rig = Rig::new(DebuggerChange::On, DebuggerMode::Disabled, fault);
                     rig.probe();
-                    rig.offer(OwnerAnswer::No);
+                    rig.plan_consent();
+                    rig.exit("ChildUnchanged");
+                    rig.notice();
+                    rig.probe();
                     let mut rig = rig.relaunch();
                     rig.probe();
-                    rig.offer(OwnerAnswer::No);
+                    rig.plan_consent();
                 }
-                Fault::OfferWhileInFlight => {
+                Fault::PlanConsentWhileInFlight => {
                     let mut rig = Rig::new(DebuggerChange::On, DebuggerMode::Disabled, fault);
                     rig.probe();
                     rig.press(OwnerAnswer::yes_for_test());
-                    rig.offer(OwnerAnswer::No);
+                    rig.plan_consent();
                 }
-                Fault::OfferRunsUnasked => {
-                    let mut rig = Rig::new(DebuggerChange::On, DebuggerMode::Disabled, fault);
+                Fault::ConsentUnadmitted => {
+                    let mut rig =
+                        Rig::unadmitted(DebuggerChange::On, DebuggerMode::Disabled, fault);
                     rig.probe();
-                    rig.offer(OwnerAnswer::No);
+                    rig.plan_consent();
                 }
                 _ => scenarios(fault),
             });
             let caught_by = match fault {
-                Fault::OfferAgain | Fault::OfferWhileInFlight => {
-                    Some("Offer: the composition took what the model forbids")
-                }
-                Fault::OfferRunsUnasked => Some("offer (No): "),
+                Fault::PlanConsentAgain => Some("PlanConsent broke AtMostOneOffer"),
+                Fault::PlanConsentWhileInFlight => Some("PlanConsent broke NoOfferOverAChange"),
+                Fault::ConsentUnadmitted => Some("PlanConsent broke ConsentOnlyWhenAdmitted"),
                 _ => None,
             };
             match (caught, caught_by) {
@@ -6488,24 +7243,27 @@ pub(crate) mod conformance {
 )]
 #[aterm_spec_anchor::spec_unmodeled(
     machine = "DebuggerAccessChange",
-    action = "OfferAgain",
-    reason = "Buggy = 2 mutant: offer reads the asked record before it writes it, and \
-              writes it before the alert; the negative control offers over a record it \
-              never reads, and the harness fails."
+    action = "PlanConsentAgain",
+    reason = "Buggy = 2 mutant: start_from_plan reads the asked record before it writes \
+              it, and writes it before the yes is spent; the negative control starts over \
+              a record it never reads, and the harness fails on AtMostOneOffer."
 )]
 #[aterm_spec_anchor::spec_unmodeled(
     machine = "DebuggerAccessChange",
-    action = "OfferWhileInFlight",
-    reason = "Buggy = 2 mutant: offer is refused while a change is under way (the press's \
-              own refusal, then a change marker or held lock on disk); the negative \
-              control raises the alert over our running child, and the harness fails."
+    action = "PlanConsentWhileInFlight",
+    reason = "Buggy = 2 mutant: start_from_plan is refused while a change is under way \
+              (the press's own refusal, then a change marker or held lock on disk); the \
+              negative control starts over our running child, and the harness fails on \
+              NoOfferOverAChange."
 )]
 #[aterm_spec_anchor::spec_unmodeled(
     machine = "DebuggerAccessChange",
-    action = "OfferRunsUnasked",
-    reason = "Buggy = 2 mutant: offer takes its answer only from the alert it raises, \
-              through begin; the negative control answers yes without raising one, and the \
-              harness fails (a launch no alert was answered for)."
+    action = "ConsentUnadmitted",
+    reason = "Buggy = 2 mutant: start_from_plan takes its yes only from an AdmittedAccess, \
+              which only the window's PermissionGate makes for its own admission; the \
+              negative control starts the change in the Admitted = 0 scenario (a control \
+              client's act, a status poll, a hand-edited record), and the harness fails on \
+              ConsentOnlyWhenAdmitted."
 )]
 #[allow(
     dead_code,

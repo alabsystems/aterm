@@ -140,6 +140,22 @@ pub const TOOLS: &[Tool] = &[
         "a shell aterm integrates: macOS's 3.2 is what people run, so the bash integration's tests \
          run it; on Windows, Git for Windows' bash, the one Claude Code's Bash tool runs",
     ),
+    workspace(
+        "bash-5.3",
+        When::Always,
+        Some(Pin {
+            package: "bash",
+            version: "5.3.20",
+            exe: "bin/bash",
+            built: true,
+            hosts: MACOS_HOSTS,
+        }),
+        &[],
+        "the bash integration's 5.3 paths (the `${ ...; }` reads, PS0's file-free hook) run only \
+         on a bash 5.3 or later, the bash people install beside macOS's 3.2, which never takes \
+         them: only a 5.3 can judge them. On macOS `verify provision` builds GNU's 5.3 with its \
+         official patches from source",
+    ),
     guest(
         "bash-3.2",
         &["/usr/local/bin/bash-3.2", "/bin/bash"],
@@ -387,6 +403,11 @@ pub const TOOLS: &[Tool] = &[
         &["/usr/bin/tar"],
         "install.sh unpacks the Linux release archive; `verify provision` rewrites fish's .tar.xz \
          source as a plain tar for atpkg's tar reader",
+    ),
+    os(
+        "patch",
+        &["/usr/bin/patch"],
+        "`verify provision` applies GNU's official patches to the pinned bash's source",
     ),
     os(
         "zipinfo",
@@ -722,6 +743,11 @@ pub const TOOLS: &[Tool] = &[
         ],
         "the change cone, the forge, the release and every checkout; CLT's git also holds the \
          GitHub credential through its osxkeychain helper (row 22)",
+    ),
+    clt(
+        "make",
+        &["/usr/bin/make"],
+        "`verify provision` builds the pinned bash by its own Makefile",
     ),
     clt(
         "lipo",

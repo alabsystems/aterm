@@ -5556,6 +5556,7 @@ fn take_incoming_from_as(env: &mut HandoffEnv, shape: ReceiverShape) -> Incoming
                         .and_then(crate::session_store::parse_journal_key),
                     task: rec.task.clone(),
                     autopilot_end: rec.autopilot_end.clone(),
+                    wakes: rec.wakes.clone(),
                 },
             })
         })

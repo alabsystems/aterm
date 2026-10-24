@@ -3,6 +3,7 @@
 
 //! Rustup minimal-profile and `rust-docs` cleanup to keep toolchains out of Spotlight.
 
+use crate::init_observe::{LastReading, Reading};
 use crate::items::{Ctx, Item};
 use crate::model::{Probe, User};
 use crate::port::{Cmd, System};
@@ -36,7 +37,7 @@ pub fn items(ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
     };
     Ok(vec![
         Box::new(Profile(rustup.clone())),
-        Box::new(NoDocs(rustup)),
+        Box::new(NoDocs(rustup, LastReading::default())),
         Box::new(BuildNoindex::new(user.clone(), home.to_path_buf())),
     ])
 }
@@ -53,6 +54,8 @@ struct BuildNoindex {
     home: PathBuf,
     /// The folders the last apply named for the person to move.
     aside: Mutex<Option<StoodAside>>,
+    /// The last probe's reading, which is System State's.
+    reading: LastReading,
 }
 
 impl BuildNoindex {
@@ -61,6 +64,7 @@ impl BuildNoindex {
             user,
             home,
             aside: Mutex::new(None),
+            reading: LastReading::default(),
         }
     }
 
@@ -270,6 +274,7 @@ impl Item for BuildNoindex {
     }
 
     fn probe(&self, sys: &dyn System, _ctx: &Ctx) -> Probe {
+        self.reading.set(None);
         let has_caches = match Self::dir_present(sys, &self.caches_parent()) {
             Ok(v) => v,
             Err(why) => return Probe::Unusable { why },
@@ -307,12 +312,14 @@ impl Item for BuildNoindex {
                             .into(),
                 }
             } else {
+                self.reading.set(Some(Reading::BuildsIndexed));
                 Probe::Person {
                     step: "spotlight.build-folders".into(),
                     how: Self::for_the_person(&folders),
                 }
             };
         }
+        self.reading.set(Some(Reading::BuildsIndexed));
         let mut from: Vec<String> = missing
             .iter()
             .filter_map(|dir| dir.file_name())
@@ -328,6 +335,10 @@ impl Item for BuildNoindex {
             from: from.join("; "),
             to,
         }
+    }
+
+    fn detail(&self, _sys: &dyn System, _ctx: &Ctx) -> Option<String> {
+        self.reading.detail()
     }
 
     /// Make the missing caches; name the folders Spotlight indexes for the person and stand
@@ -470,9 +481,10 @@ impl Item for Profile {
     }
 }
 
-/// No toolchain rustup installed carries `rust-docs`.
+/// No toolchain rustup installed carries `rust-docs`; the last probe's reading is
+/// System State's.
 #[derive(Debug)]
-struct NoDocs(Rustup);
+struct NoDocs(Rustup, LastReading);
 
 impl Item for NoDocs {
     fn id(&self) -> String {
@@ -488,6 +500,7 @@ impl Item for NoDocs {
     }
 
     fn probe(&self, sys: &dyn System, _ctx: &Ctx) -> Probe {
+        self.1.set(None);
         match self.0.absent(sys) {
             Ok(Some(why)) => return Probe::NotApplicable { why },
             Ok(None) => {}
@@ -498,11 +511,18 @@ impl Item for NoDocs {
             Ok(docs) if docs.is_empty() => Probe::Ok {
                 now: "no rustup toolchain carries rust-docs".into(),
             },
-            Ok(docs) => Probe::Change {
-                from: format!("rust-docs installed in {}", docs.join(", ")),
-                to: "removed".into(),
-            },
+            Ok(docs) => {
+                self.1.set(Some(Reading::DocsInstalled));
+                Probe::Change {
+                    from: format!("rust-docs installed in {}", docs.join(", ")),
+                    to: "removed".into(),
+                }
+            }
         }
+    }
+
+    fn detail(&self, _sys: &dyn System, _ctx: &Ctx) -> Option<String> {
+        self.1.detail()
     }
 
     fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
@@ -551,8 +571,10 @@ mod tests {
             cargo_home: "/Users//alice/.cargo".into(),
             rustup_home: "/Users//alice/.rustup".into(),
         };
-        let items: Vec<Box<dyn Item>> =
-            vec![Box::new(Profile(rustup.clone())), Box::new(NoDocs(rustup))];
+        let items: Vec<Box<dyn Item>> = vec![
+            Box::new(Profile(rustup.clone())),
+            Box::new(NoDocs(rustup, LastReading::default())),
+        ];
         engine::run(&items, mode, sys, &context(), &mut NoJournal)
     }
 
@@ -584,6 +606,7 @@ mod tests {
             rows[1].from.as_deref(),
             Some("rust-docs installed in stable-aarch64-apple-darwin")
         );
+        assert_eq!(Reading::of(&rows[1]), Some(Reading::DocsInstalled));
         assert!(
             !sys.calls()
                 .iter()
@@ -679,6 +702,7 @@ mod tests {
         let items: Vec<Box<dyn Item>> = vec![Box::new(item)];
         let planned = engine::run(&items, Mode::Plan, &sys, &context(), &mut NoJournal);
         assert_eq!(planned[0].outcome, Outcome::Planned, "{planned:?}");
+        assert_eq!(Reading::of(&planned[0]), Some(Reading::BuildsIndexed));
         assert!(
             planned[0]
                 .from
@@ -830,6 +854,7 @@ mod tests {
         let items: Vec<Box<dyn Item>> = vec![Box::new(item)];
         let planned = engine::run(&items, Mode::Plan, &sys, &context(), &mut NoJournal);
         assert_eq!(planned[0].outcome, Outcome::Person, "{planned:?}");
+        assert_eq!(Reading::of(&planned[0]), Some(Reading::BuildsIndexed));
         assert!(
             planned[0]
                 .why

@@ -42,6 +42,10 @@ pub mod corpus;
 #[cfg(test)]
 mod corpus_tests;
 #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
+pub mod dist;
+#[cfg(test)]
+mod dist_tests;
+#[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
 pub mod fidelity;
 #[cfg(test)]
 mod fidelity_tests;
@@ -50,6 +54,12 @@ mod host_tests;
 pub mod lane;
 #[cfg(test)]
 mod lane_tests;
+#[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
+pub mod lease;
+#[cfg(test)]
+mod lease_conformance_tests;
+#[cfg(test)]
+mod lease_tests;
 #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
 pub mod m4;
 #[cfg(test)]

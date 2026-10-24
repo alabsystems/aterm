@@ -52,6 +52,20 @@
 [target.'cfg(trust_verify)']
 rustflags = ["-Zthreads=4"]
 
+# EVERY WINDOWS EXECUTABLE RUNS AS ITS INVOKER. Windows' installer detection
+# asks elevation of an unmanifested executable whose name says `update`,
+# `install`, `setup` or `patch` (os error 740, "The requested operation requires
+# elevation"), and a test binary takes its crate's or its file's name
+# (`aterm_update_core-<hash>.exe`, `install_sh-<hash>.exe`,
+# `installed_trust-<hash>.exe`), so cargo could not start it. An embedded
+# manifest that requests `asInvoker` opts an executable out whatever its name;
+# aterm.exe's own manifest is merged into it (`/MANIFESTINPUT`,
+# crates/aterm/build.rs). Stock Rust builds these targets (STOCK EXCEPTION:
+# Trust has no Windows std), so the table reaches them; on a Windows host
+# building for itself it reaches build scripts and proc macros too.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-Clink-arg=/MANIFEST:EMBED", "-Clink-arg=/MANIFESTUAC:level='asInvoker'"]
+
 # STOCK EXCEPTION: Trust has no x86_64-pc-windows-gnu std, so the Windows cfg
 # check is `cargo +stable build --target x86_64-pc-windows-gnu`.
 [target.x86_64-pc-windows-gnu]

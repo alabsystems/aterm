@@ -167,14 +167,14 @@ fn cursor_row_empty(term: &Terminal) -> bool {
 #[inline]
 fn draws_ink(cell: &aterm_core::grid::Cell) -> bool {
     use aterm_core::grid::CellFlags;
-    let flags = cell.flags();
-    let shows_on_a_space = CellFlags::INVERSE
+    const SHOWS_ON_A_SPACE: CellFlags = CellFlags::COMPLEX
+        .union(CellFlags::INVERSE)
         .union(CellFlags::ALL_UNDERLINES)
         .union(CellFlags::STRIKETHROUGH);
+    let flags = cell.flags();
     cell.char_data() != u16::from(b' ')
-        || flags.contains(CellFlags::COMPLEX)
         || !cell.colors().bg_is_default()
-        || flags.intersects(shows_on_a_space)
+        || flags.intersects(SHOWS_ON_A_SPACE)
         || flags.contains(CellFlags::OVERLINE)
 }
 

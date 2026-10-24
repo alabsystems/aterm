@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use atpkg::extract::{Container, ExtractOptions, SymlinkPolicy};
 
-use super::{Host, Refused, Spawn, Stamp};
+use super::{Host, Refused, Spawn, Stamp, Target};
 
 /// The prefix of every row's scratch under a cache root.
 pub const SCRATCH_PREFIX: &str = aterm_uds::host::TOOLING_SCRATCH;
@@ -158,10 +158,11 @@ pub(super) fn fetch_checked(
 ) -> Result<PathBuf, Refused> {
     let dir = scratch.fresh_numbered("download")?;
     let file = dir.join(file_name(url));
-    say(&format!(
-        "downloading {url} ({:.1} MB)",
-        bytes as f64 / 1_000_000.0
-    ));
+    say(&if bytes < 100_000 {
+        format!("downloading {url} ({:.1} kB)", bytes as f64 / 1_000.0)
+    } else {
+        format!("downloading {url} ({:.1} MB)", bytes as f64 / 1_000_000.0)
+    });
     host.fetch(url, &file, bytes)
         .map_err(|e| match aterm_vz::pins::archived(url, &e) {
             Some(words) => Refused::CouldNotRun(words),
@@ -245,6 +246,125 @@ pub(super) fn plain_tar(
     })
     .map_err(|e| format!("bsdtar could not rewrite {}: {e}", archive.display()))?;
     Ok(out)
+}
+
+/// Give every file under `tree` one modification time, a minute ago. atpkg's extractor
+/// stamps each file with the moment it wrote it, in the archive's order, so a source tree's
+/// generated files can come out older than what they are generated from (bash's
+/// `configure` than its `aclocal.m4`, `y.tab.c` than `parse.y`), and `make` would then run
+/// autoconf and bison to remake them. To `make` equal times are up to date, as the
+/// archive's own were. The minute keeps a file a later step writes (a patch) newer even to
+/// the Command Line Tools' make 3.81, which compares whole seconds.
+pub(super) fn settle_times(tree: &Path) -> Result<(), String> {
+    let settled = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+    let mut dirs = vec![tree.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let entries = std::fs::read_dir(&dir)
+            .map_err(|e| format!("could not list {}: {e}", dir.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("could not list {}: {e}", dir.display()))?;
+            let path = entry.path();
+            let kind = entry
+                .file_type()
+                .map_err(|e| format!("could not read {}: {e}", path.display()))?;
+            if kind.is_dir() {
+                dirs.push(path);
+            } else if kind.is_file() {
+                std::fs::File::open(&path)
+                    .and_then(|file| file.set_modified(settled))
+                    .map_err(|e| format!("could not set {}'s time: {e}", path.display()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// What a source build left, for [`lay_built`].
+pub(super) struct Built<'a> {
+    /// The row, as the stamp and every message name it.
+    pub row: &'static str,
+    /// The source it was built from, for the stamp.
+    pub url: String,
+    /// The program the build left.
+    pub program: &'a Path,
+    /// The source's licence, kept beside the program where the source has one.
+    pub licence: &'a Path,
+    /// Whether the first line the program's `--version` prints is the pin's.
+    pub answers: &'a dyn Fn(&str) -> bool,
+}
+
+/// Lay `built`'s program at the row's place in a new tree of `scratch`, with the source's
+/// licence; refuse a program that loads a library from outside the OS; ask the copy its
+/// `--version`, which must be the pin's; then stamp the tree and [`place`] it.
+pub(super) fn lay_built(
+    scratch: Scratch,
+    host: &dyn Host,
+    t: &Target,
+    built: Built<'_>,
+) -> Result<PathBuf, String> {
+    let Built {
+        row,
+        url,
+        program,
+        licence,
+        answers,
+    } = built;
+    if !program.is_file() {
+        return Err(format!("the build left no {}", program.display()));
+    }
+    let tree = scratch.fresh("tree")?;
+    let exe = tree.join(&t.exe);
+    if let Some(dir) = exe.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+    }
+    std::fs::copy(program, &exe).map_err(|e| format!("could not copy the build: {e}"))?;
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("chmod {}: {e}", exe.display()))?;
+    }
+    if let Some(name) = licence.file_name().filter(|_| licence.is_file()) {
+        std::fs::copy(licence, tree.join(name))
+            .map_err(|e| format!("could not keep {}: {e}", licence.display()))?;
+    }
+    let foreign = atpkg::macho::foreign_dylibs(&exe)
+        .map_err(|e| format!("the built {row} cannot be read: {e}"))?;
+    if !foreign.is_empty() {
+        return Err(format!(
+            "the built {row} loads {} from outside /usr/lib and /System: refused (the pin is a \
+             {row} that runs on any Mac, with no library from Homebrew)",
+            foreign.join(", ")
+        ));
+    }
+    let home = scratch.fresh("home")?;
+    let probe = Spawn {
+        program: exe,
+        args: vec!["--version".into()],
+        cwd: scratch.path().to_path_buf(),
+        set: ["HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"]
+            .iter()
+            .map(|k| ((*k).to_string(), home.clone().into_os_string()))
+            .collect(),
+        remove: Vec::new(),
+    };
+    let (scratch, said) = scratch
+        .run_copied(host, &probe)
+        .map_err(|e| format!("the built {row} did not answer --version: {e}"))?;
+    let first = said
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .to_string();
+    if !answers(&first) {
+        return Err(format!(
+            "the built {row} answers `{first}`, not version {}",
+            t.version
+        ));
+    }
+    write_stamp(&tree, &t.stamp(row, Some(url), "sha256", Some(first)))?;
+    place(&scratch, &tree, &t.dir, &|| super::complete(t))?;
+    Ok(t.dir.join(&t.exe))
 }
 
 /// The OS's tar (bsdtar on macOS), by absolute path.
@@ -403,5 +523,30 @@ mod tests {
             container_of("a.tar.xz").is_err(),
             "xz goes through plain_tar"
         );
+    }
+
+    #[test]
+    fn a_settled_tree_has_one_time_for_every_file() {
+        let tree = aterm_tempfile::tempdir().unwrap();
+        let deep = tree.path().join("lib/sh");
+        std::fs::create_dir_all(&deep).unwrap();
+        let files = [
+            tree.path().join("configure"),
+            tree.path().join("aclocal.m4"),
+            deep.join("anonfile.c"),
+        ];
+        let epoch = std::time::SystemTime::UNIX_EPOCH;
+        for (n, file) in files.iter().enumerate() {
+            std::fs::write(file, "x").unwrap();
+            let at = epoch + std::time::Duration::from_secs(1_000_000 * (n as u64 + 1));
+            std::fs::File::open(file).unwrap().set_modified(at).unwrap();
+        }
+        let time = |file: &Path| std::fs::metadata(file).unwrap().modified().unwrap();
+        assert!(
+            time(&files[0]) < time(&files[1]),
+            "the control: configure is older"
+        );
+        settle_times(tree.path()).unwrap();
+        assert!(files.iter().all(|file| time(file) == time(&files[0])));
     }
 }

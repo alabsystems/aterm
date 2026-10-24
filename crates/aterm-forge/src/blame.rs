@@ -269,8 +269,9 @@ fn liveness_block(
             the feature or dependency that drags the second major in;\n    \
          2. move the fork forward — re-fork `{name}` at the other major under vendor/ so\n       \
             patched copy satisfies both requirements, then re-run `targo --unverified forge attest`;\n    \
-         3. record it — add the exemption, with the reason and a re-review date, to\n       \
-            vendor/forge.toml, which `targo --unverified forge check` reads.\n  \
+         3. or, for a first-party patch, patch that major too — give it its own renamed\n       \
+            `[patch.crates-io]` row (as `windows-sys-052` is) at a first-party crate under\n       \
+            crates/; `targo --unverified forge check` scores a renamed row on its own major only.\n  \
          `targo --unverified forge check` is the gate that FAILS on this; blame only reports it."
     );
 }

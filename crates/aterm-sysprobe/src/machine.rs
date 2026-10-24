@@ -619,6 +619,107 @@ pub fn gpu() -> Option<GpuReading> {
     }
 }
 
+/// One GPU user client: a process's connection to the accelerator, with the GPU time its queues
+/// ran.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GpuClient {
+    /// The client's registry entry id, unique for the boot.
+    pub entry: u64,
+    /// The process that opened it (`IOUserClientCreator`).
+    pub pid: u32,
+    /// That process's short name as the creator string gives it (`p_comm`, 16 bytes at most).
+    pub name: String,
+    /// GPU time its queues ran, summed, ns (`AppUsage[].accumulatedGPUTime`): cumulative while the
+    /// client lives.
+    pub gpu_ns: u64,
+}
+
+/// Every GPU user client the accelerator holds, read together ([`gpu_clients`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GpuClients {
+    /// The clients whose creator and `AppUsage` parsed.
+    pub rows: Vec<GpuClient>,
+    /// Every child whose registry entry id was read, including children whose properties did
+    /// not parse as a client. A later counter read from one of these is no newly born client.
+    pub entries: Vec<u64>,
+    /// The accelerator's children walked.
+    pub children: u32,
+    /// Whether the walk stopped at [`MAX_GPU_CLIENTS`].
+    pub truncated: bool,
+    /// Whether every child's entry id was read: not truncated, no identity read failed, and no
+    /// client came or went under the iterator. Missing counter properties do not establish that
+    /// a child was absent; its identity remains in [`Self::entries`].
+    pub complete: bool,
+}
+
+impl GpuClients {
+    /// Keep a walked child's identity even when its properties do not yield a counter row.
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn record(
+        &mut self,
+        entry: u64,
+        creator: Option<&str>,
+        usage: Option<&[Option<u64>]>,
+    ) {
+        self.entries.push(entry);
+        if let Some(client) = client_of(entry, creator, usage) {
+            self.rows.push(client);
+        }
+    }
+}
+
+/// The most accelerator children one [`gpu_clients`] read walks.
+pub const MAX_GPU_CLIENTS: usize = 4096;
+
+/// An `IOUserClientCreator` string, `"pid N, name"`, as `(pid, name)`; `None` for pid 0 (the
+/// kernel) or any other shape. The name is everything after the first `", "`, commas included.
+#[must_use]
+pub fn creator_of(text: &str) -> Option<(u32, &str)> {
+    let (pid, name) = text.strip_prefix("pid ")?.split_once(", ")?;
+    if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let pid = pid.parse::<u32>().ok().filter(|p| *p > 0)?;
+    Some((pid, name))
+}
+
+/// One client from its registry properties: `creator` its `IOUserClientCreator`, `usage` its
+/// `AppUsage` array's `accumulatedGPUTime` per queue (`None` for a queue without one), or `None`
+/// where `AppUsage` is absent or no array. A queue without the key adds nothing; the sum saturates.
+#[cfg(any(target_os = "macos", test))]
+#[must_use]
+pub(crate) fn client_of(
+    entry: u64,
+    creator: Option<&str>,
+    usage: Option<&[Option<u64>]>,
+) -> Option<GpuClient> {
+    let (pid, name) = creator_of(creator?)?;
+    let gpu_ns = usage?
+        .iter()
+        .flatten()
+        .fold(0u64, |sum, ns| sum.saturating_add(*ns));
+    Some(GpuClient {
+        entry,
+        pid,
+        name: name.to_owned(),
+        gpu_ns,
+    })
+}
+
+/// Read every GPU user client's creator and cumulative GPU time, or `None` where no accelerator
+/// answers (every OS but macOS). Registry reads only: no client is opened and no GPU device made.
+#[must_use]
+pub fn gpu_clients() -> Option<GpuClients> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos::gpu_clients()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 /// Capacity and mount metadata for a filesystem volume.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VolumeReading {

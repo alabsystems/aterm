@@ -16,11 +16,11 @@ pub(super) struct FnLine<'a> {
     pub(super) in_test: bool,
 }
 
-fn fn_name(code: &str) -> Option<&str> {
+pub(super) fn fn_name(code: &str) -> Option<&str> {
     super::hits(code, "fn", Bound::Word).find_map(|at| fn_name_at(&code[at..]))
 }
 
-fn fn_name_at(s: &str) -> Option<&str> {
+pub(super) fn fn_name_at(s: &str) -> Option<&str> {
     let rest = s.strip_prefix("fn")?;
     let name = rest.trim_start_matches([' ', '\t']);
     if name.len() == rest.len() {

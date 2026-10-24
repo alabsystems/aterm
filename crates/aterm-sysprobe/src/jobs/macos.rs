@@ -321,7 +321,8 @@ fn fd_info(pid: c_int, fd: i32, flavor: i32, buf: &mut [u8]) -> Option<usize> {
     usize::try_from(n).ok().filter(|n| *n > 0)
 }
 
-fn vnode_kind(pid: c_int, fd: i32) -> FdKind {
+/// What vnode descriptor `fd` of `pid`, a process started at `start_us`, holds.
+fn vnode_kind(pid: c_int, fd: i32, start_us: Option<u64>) -> FdKind {
     let mut buf = vec![0u8; darwin::VNODE_PATH_SIZE];
     match fd_info(pid, fd, darwin::PROC_PIDFDVNODEPATHINFO, &mut buf).and(darwin::vnode(&buf)) {
         Some(v) if v.char_device() => FdKind::Device { tty: v.terminal() },
@@ -331,6 +332,7 @@ fn vnode_kind(pid: c_int, fd: i32) -> FdKind {
             dev: u64::from(v.dev),
             ino: v.ino,
             lf_tail: None,
+            fresh_dylib: v.regular() && super::fresh_dylib(&v.path, v.mtime_s, start_us),
         },
         None => FdKind::Other,
     }
@@ -403,7 +405,12 @@ fn knotes_of(pid: c_int, fd: i32) -> Option<Vec<Knote>> {
     )
 }
 
-fn fds(pid: c_int, nfiles: u32, lanes: Lanes) -> Option<(Vec<FdReading>, bool)> {
+fn fds(
+    pid: c_int,
+    nfiles: u32,
+    lanes: Lanes,
+    start_us: Option<u64>,
+) -> Option<(Vec<FdReading>, bool)> {
     let (list, mut truncated) = fd_list(pid, nfiles)?;
     let mut out = Vec::with_capacity(list.len());
     let mut details = 0usize;
@@ -413,7 +420,7 @@ fn fds(pid: c_int, nfiles: u32, lanes: Lanes) -> Option<(Vec<FdReading>, bool)> 
             *details <= MAX_FD_DETAILS
         };
         let kind = match i32::try_from(f.proc_fdtype).unwrap_or(-1) {
-            libc::PROX_FDTYPE_VNODE if detail(&mut details) => vnode_kind(pid, f.proc_fd),
+            libc::PROX_FDTYPE_VNODE if detail(&mut details) => vnode_kind(pid, f.proc_fd, start_us),
             libc::PROX_FDTYPE_PIPE if detail(&mut details) => pipe_kind(pid, f.proc_fd),
             libc::PROX_FDTYPE_SOCKET if detail(&mut details) => socket_kind(pid, f.proc_fd),
             libc::PROX_FDTYPE_KQUEUE if detail(&mut details) => kqueue_kind(pid, f.proc_fd, lanes),
@@ -497,7 +504,7 @@ pub(super) fn read(
     }
     if want_fds {
         let nfiles = all.as_ref().map_or(64, |a| a.pbsd.pbi_nfiles);
-        if let Some((list, cut)) = fds(p, nfiles, lanes) {
+        if let Some((list, cut)) = fds(p, nfiles, lanes, facts.start) {
             facts.fds = Some(list);
             facts.fds_truncated = cut;
         }

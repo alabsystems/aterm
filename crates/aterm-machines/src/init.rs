@@ -616,6 +616,8 @@ pub fn run_workstation_selected(
 pub struct Workstation {
     ctx: Ctx,
     items: Vec<Box<dyn Item>>,
+    /// Each item's id and the setting it was built for ([`workstation_items_selected`]).
+    settings: Vec<(String, Setting)>,
     /// Each item's before-images, or why they could not be taken; `None` until taken.
     snapshots: Option<Vec<Result<PreferenceSnapshot, String>>>,
     /// The items this pass leaves alone ([`Workstation::hold`]), by id.
@@ -642,6 +644,30 @@ pub struct WorkstationRun {
     pub attempts: Vec<Attempt>,
     /// The items that left keys in another app's container alone for want of Full Disk Access ([`Item::withheld`]), by id, held or not.
     pub withheld: Vec<String>,
+    /// Each item's id and the setting it was built for.
+    pub settings: Vec<(String, Setting)>,
+}
+
+impl WorkstationRun {
+    /// Each row with the setting its item was built for, in run order.
+    #[must_use]
+    pub fn tagged(&self) -> Vec<(Setting, &ItemReport)> {
+        tag(&self.settings, &self.rows)
+    }
+}
+
+fn tag<'a>(
+    settings: &[(String, Setting)],
+    rows: &'a [ItemReport],
+) -> Vec<(Setting, &'a ItemReport)> {
+    rows.iter()
+        .filter_map(|row| {
+            settings
+                .iter()
+                .find(|(id, _)| *id == row.id)
+                .map(|(_, setting)| (*setting, row))
+        })
+        .collect()
 }
 
 /// One item whose apply or refresh this pass ran.
@@ -703,6 +729,23 @@ impl Workstation {
         Ok(self.run_recording(sys, mode)?.rows)
     }
 
+    /// Run the shared engine and give each row the setting its item was built for.
+    ///
+    /// # Errors
+    /// The journal cannot be resolved or the items' dependency order is invalid.
+    pub fn run_tagged(
+        self,
+        sys: &dyn System,
+        mode: Mode,
+    ) -> Result<Vec<(Setting, ItemReport)>, String> {
+        let run = self.run_recording(sys, mode)?;
+        Ok(run
+            .tagged()
+            .into_iter()
+            .map(|(setting, row)| (setting, row.clone()))
+            .collect())
+    }
+
     /// Run the shared engine and retain exactly which snapshotted items reached mutation, including a write that failed after partially taking effect.
     ///
     /// # Errors
@@ -732,6 +775,7 @@ impl Workstation {
             },
             items,
             snapshots: None,
+            settings: Vec::new(),
             held: Vec::new(),
         }
     }
@@ -801,6 +845,7 @@ impl Workstation {
         Ok(WorkstationRun {
             rows,
             attempts,
+            settings: self.settings,
             withheld,
         })
     }
@@ -985,6 +1030,7 @@ pub fn prepare_workstation_selected(
                 disrupt: true,
             },
             items: Vec::new(),
+            settings: Vec::new(),
             snapshots: None,
             held: Vec::new(),
         });
@@ -993,10 +1039,14 @@ pub fn prepare_workstation_selected(
     if ctx.console.is_none() {
         return Err("run as the user currently logged in at this Mac's console".into());
     }
-    let items = workstation_items_selected(&ctx, group, selected)?;
+    let (settings, items) = workstation_items_selected(&ctx, group, selected)?
+        .into_iter()
+        .map(|(setting, item)| ((item.id(), setting), item))
+        .unzip();
     Ok(Workstation {
         ctx,
         items,
+        settings,
         snapshots: None,
         held: Vec::new(),
     })
@@ -1026,6 +1076,7 @@ pub fn run_initial_spotlight(
     Workstation {
         ctx: ctx.clone(),
         items: crate::init_spotlight::items(ctx)?,
+        settings: Vec::new(),
         snapshots: None,
         held: Vec::new(),
     }
@@ -1090,37 +1141,71 @@ pub fn run_initial_secrets_with(
     rows
 }
 
+/// Workstation items, each with the setting whose System State row it reports to.
+type TaggedItems = Vec<(Setting, Box<dyn Item>)>;
+
+/// The selected workstation items, each tagged when it is built with the setting
+/// whose System State row it reports to: ids and families are never parsed for it
+/// (`trackpad` is shared by two settings, and both sign-outs are family `init`).
 fn workstation_items_selected(
     ctx: &Ctx,
     group: WorkstationGroup,
     selected: Selection,
-) -> Result<Vec<Box<dyn Item>>, String> {
-    let mut items = Vec::new();
+) -> Result<TaggedItems, String> {
+    let mut items: TaggedItems = Vec::new();
+    let mut add = |setting: Setting, built: Vec<Box<dyn Item>>| {
+        items.extend(built.into_iter().map(|item| (setting, item)));
+    };
+    let only = |setting: Setting| {
+        let mut one = Selection::none();
+        one.set(setting, selected.contains(setting));
+        one
+    };
+    let accounts = |add: &mut dyn FnMut(Setting, Vec<Box<dyn Item>>)| {
+        for setting in [Setting::Messages, Setting::FaceTime] {
+            if selected.contains(setting) {
+                add(
+                    setting,
+                    crate::init_accounts::selected_items(ctx, only(setting))?,
+                );
+            }
+        }
+        Ok::<_, String>(())
+    };
     match group {
         WorkstationGroup::Withheld => {
             items.extend(crate::init_preferences::withheld_items(ctx, selected)?);
         }
         WorkstationGroup::All | WorkstationGroup::Preferences => {
-            items.extend(crate::init_preferences::selected_items(ctx, selected)?);
+            // One call for the whole selection, each item tagged as it is built: the
+            // widget, desktop and Dock items of a pass share its one relaunch
+            // ([`crate::init_preferences::selected_tagged_items`]).
+            for (setting, item) in crate::init_preferences::selected_tagged_items(ctx, selected)? {
+                add(setting, vec![item]);
+            }
             if selected.contains(Setting::NaturalScrolling) {
-                items.extend(crate::init_trackpad::items(ctx)?);
+                add(Setting::NaturalScrolling, crate::init_trackpad::items(ctx)?);
             }
             if selected.contains(Setting::TrackpadScrolling) {
-                items.extend(crate::init_trackpad::behavior_items(ctx)?);
+                add(
+                    Setting::TrackpadScrolling,
+                    crate::init_trackpad::behavior_items(ctx)?,
+                );
             }
             if group == WorkstationGroup::All {
-                items.extend(crate::init_accounts::selected_items(ctx, selected)?);
+                accounts(&mut add)?;
             }
         }
-        WorkstationGroup::Accounts => {
-            items.extend(crate::init_accounts::selected_items(ctx, selected)?)
-        }
+        WorkstationGroup::Accounts => accounts(&mut add)?,
         WorkstationGroup::InputActivation => {
             if selected.contains(Setting::CapsLock) {
-                items.extend(crate::init_preferences::attached_keyboard_items(ctx)?);
+                add(
+                    Setting::CapsLock,
+                    crate::init_preferences::attached_keyboard_items(ctx)?,
+                );
             }
             if selected.contains(Setting::NaturalScrolling) {
-                items.extend(crate::init_trackpad::items(ctx)?);
+                add(Setting::NaturalScrolling, crate::init_trackpad::items(ctx)?);
             }
         }
     }
@@ -1478,6 +1563,61 @@ mod tests {
         );
     }
 
+    /// The widget, desktop and Dock items setup builds for one pass, each tagged with its
+    /// setting, share the pass's one relaunch: one `DesktopActivation`, as one
+    /// `init_preferences::selected_tagged_items` call makes it, among every item of the
+    /// whole selection. Negative control: one `selected_items` call per setting (the
+    /// System State merge) builds three activations with one id.
+    #[test]
+    fn the_desktop_items_of_one_pass_share_one_activation() {
+        let who = user("alice", 501);
+        let context = ctx(&[who]);
+        let items =
+            workstation_items_selected(&context, WorkstationGroup::All, Selection::all()).unwrap();
+        let mut order: Vec<Setting> = items.iter().map(|(setting, _)| *setting).collect();
+        order.dedup();
+        assert_eq!(
+            order,
+            [
+                Setting::CapsLock,
+                Setting::Widgets,
+                Setting::Desktop,
+                Setting::Dock,
+                Setting::NaturalScrolling,
+                Setting::TrackpadScrolling,
+                Setting::Messages,
+                Setting::FaceTime,
+            ]
+        );
+        assert!(
+            items
+                .iter()
+                .filter(|(setting, _)| *setting == Setting::CapsLock)
+                .all(|(_, item)| item.family() == "keyboard"),
+        );
+        let (settings, activations): (Vec<Setting>, Vec<_>) = items
+            .iter()
+            .filter_map(|(setting, item)| Some((*setting, item.activation()?)))
+            .unzip();
+        assert_eq!(
+            settings,
+            [
+                Setting::Widgets,
+                Setting::Widgets,
+                Setting::Widgets,
+                Setting::Desktop,
+                Setting::Dock
+            ]
+        );
+        let ids: Vec<String> = activations.iter().map(|a| a.id()).collect();
+        assert!(
+            activations
+                .windows(2)
+                .all(|w| std::sync::Arc::ptr_eq(&w[0], &w[1])),
+            "one DesktopActivation per pass, not one per setting (ids {ids:?})"
+        );
+    }
+
     #[test]
     fn selected_widgets_do_not_read_keyboard_dock_trackpad_or_accounts() {
         let who = user("alice", 501);
@@ -1497,7 +1637,7 @@ mod tests {
             selected.set(Setting::Widgets, true);
             let items =
                 workstation_items_selected(&context, WorkstationGroup::All, selected).unwrap();
-            let ids: Vec<String> = items.iter().map(|item| item.id()).collect();
+            let ids: Vec<String> = items.iter().map(|(_, item)| item.id()).collect();
             assert_eq!(
                 ids,
                 [
@@ -1506,12 +1646,17 @@ mod tests {
                     "consumer.widgets.notification-center@alice"
                 ]
             );
+            assert!(
+                items
+                    .iter()
+                    .all(|(setting, _)| *setting == Setting::Widgets)
+            );
             let mut snapshots = 0;
-            for item in &items {
+            for (_, item) in &items {
                 snapshots += item.preference_changes(&sys, &context).unwrap().len();
             }
             assert_eq!(snapshots, keys, "{full_disk_access:?}");
-            for item in &items[..2] {
+            for (_, item) in &items[..2] {
                 assert!(matches!(
                     item.probe(&sys, &context),
                     Probe::Change { .. } | Probe::Deferred { .. }
@@ -1833,6 +1978,7 @@ mod tests {
             ],
             ctx: ctx(&[user("alice", 501)]),
             snapshots: None,
+            settings: Vec::new(),
             held: Vec::new(),
         };
         let rows = pass.run_recording(&sys, Mode::Apply).unwrap().rows;
@@ -1954,6 +2100,7 @@ mod tests {
             ],
             ctx: ctx(std::slice::from_ref(&alice)),
             snapshots: None,
+            settings: Vec::new(),
             held: Vec::new(),
         };
         pass.hold(&[("init.test.dock".into(), Hold::Back("held".into()))]);
@@ -2005,6 +2152,7 @@ mod tests {
         let mut pass = Workstation {
             items: vec![cleared, unusable, widgets],
             ctx: ctx(std::slice::from_ref(&alice)),
+            settings: Vec::new(),
             snapshots: None,
             held: Vec::new(),
         };
@@ -2073,6 +2221,7 @@ mod tests {
             ],
             ctx: ctx(&[user("alice", 501)]),
             snapshots: None,
+            settings: Vec::new(),
             held: Vec::new(),
         };
         pass.hold(&[
@@ -2144,6 +2293,7 @@ mod tests {
             items: vec![aside, fails],
             ctx: ctx(&[user("alice", 501)]),
             snapshots: None,
+            settings: Vec::new(),
             held: Vec::new(),
         };
         let run = pass.run_recording(&sys, Mode::Apply).unwrap();
@@ -2418,6 +2568,7 @@ mod tests {
             let mut pass = Workstation {
                 items: crate::init_trackpad::items(&ctx).unwrap(),
                 ctx,
+                settings: Vec::new(),
                 snapshots: None,
                 held: Vec::new(),
             };
@@ -2459,6 +2610,7 @@ mod tests {
         let mut pass = Workstation {
             items: crate::init_trackpad::items(&ctx).unwrap(),
             ctx,
+            settings: Vec::new(),
             snapshots: None,
             held: Vec::new(),
         };
@@ -2497,6 +2649,7 @@ mod tests {
         let mut pass = Workstation {
             ctx,
             items,
+            settings: Vec::new(),
             snapshots: None,
             held: Vec::new(),
         };

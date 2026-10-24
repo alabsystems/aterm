@@ -662,6 +662,13 @@ fn each_lens_shows_its_sections() {
     let gpu = heard(&snap, pinned(Instrument::Gpu));
     assert!(well(&gpu, "Details").contains("no per-app GPU figure on macOS"));
     assert!(well(&gpu, "Details").contains("not read"));
+    let mut clients = snap.clone();
+    clients.resources[Resource::Gpu.index()].aterm.missing = None;
+    let held = heard(&clients, pinned(Instrument::Gpu));
+    assert!(
+        !well(&held, "Details").contains("no per-app GPU figure"),
+        "the client lane holds a figure"
+    );
     let counter = |count, event| {
         let mut observed = snap.clone();
         observed.facts.gpu.as_mut().expect("GPU sample").recoveries = Some(count);

@@ -4072,7 +4072,7 @@ impl App {
         #[cfg(target_os = "macos")]
         if self.workstation_setup.pending() {
             return Err(crate::UpdateHandoffStartError::activity(
-                "the Mac setup countdown is still open",
+                "the Mac setup offer is still open",
             ));
         }
         #[cfg(target_os = "macos")]
@@ -4081,6 +4081,12 @@ impl App {
                 "a sudo password prompt is still open",
             ));
         }
+        // A System State Stop whose save has not landed would die with the
+        // handoff's `_exit`: it gets the bounded wait a quit gives it, here,
+        // before the screen is frozen, and again at the Commit for one clicked
+        // meanwhile (`answer_at_commit_claim`, `finish_proven_handoff`).
+        #[cfg(target_os = "macos")]
+        self.settle_system_state_before_handoff();
         self.retire_spare("update", None);
         if !self.tab_spawns.is_empty() {
             #[cfg(unix)]
@@ -4683,7 +4689,7 @@ impl App {
             }
         };
         let manifest = handed_sessions_only(manifest, &live);
-        let carried_claims = carried_claims_of(&manifest);
+        let carried_claims = self.carried_claims_of(&manifest);
         let Ok((owned_masters, adoption)) = reserve_child_only_masters(&live) else {
             return Err(crate::UpdateHandoffStartError::failed(
                 "could not reserve child-only PTY descriptors",
@@ -6322,7 +6328,7 @@ impl App {
             }
         };
         let manifest = handed_sessions_only(manifest, &live);
-        let carried_claims = carried_claims_of(&manifest);
+        let carried_claims = self.carried_claims_of(&manifest);
         let (owned_masters, adoption) = match reserve_child_only_masters(&live) {
             Ok(reserved) => reserved,
             Err(error) => {
@@ -6675,6 +6681,22 @@ impl App {
             .fold(0, u64::wrapping_add)
     }
 
+    /// The [`crate::session_store::CarriedClaims`] of each session `manifest` hands, each with the self-claim face its `autopilot_end` row carries (`App::self_claim_face`).
+    #[cfg(unix)]
+    fn carried_claims_of(
+        &self,
+        manifest: &crate::session_store::SessionHandoff,
+    ) -> Vec<crate::session_store::CarriedClaims> {
+        manifest
+            .sessions
+            .iter()
+            .map(|record| {
+                crate::session_store::CarriedClaims::of_record(record)
+                    .with_self_face(self.self_claim_face(record.local_id))
+            })
+            .collect()
+    }
+
     /// Return whether every handed session's [`crate::session_store::CarriedClaims`] still holds.
     #[cfg(unix)]
     pub(crate) fn carried_claims_held(
@@ -6690,7 +6712,9 @@ impl App {
                     &session.ctx,
                     now_us,
                     &own_holder,
-                ) == *claims
+                )
+                .with_self_face(self.self_claim_face(claims.local_id))
+                    == *claims
             })
         })
     }
@@ -6777,9 +6801,9 @@ impl App {
         let claims_held = self.carried_claims_held(&pending_carried_claims);
         if !claims_held {
             aterm_log::warn!(
-                "update apply: a session's topics, escalations or supervisor claim moved since \
-                 the handoff manifest was drawn; standing the Commit down so the next attempt \
-                 carries them"
+                "update apply: a session's topics, escalations, supervisor claim or self-claim \
+                 task face moved since the handoff manifest was drawn; standing the Commit down \
+                 so the next attempt carries them"
             );
         }
         let exact_activity = self.update_handoff_activity_epoch == pending_activity_epoch
@@ -7085,6 +7109,8 @@ impl App {
             && publications_settled
             && let (Some(commit_fd), Some(proof)) = (commit_fd.as_ref(), proof)
         {
+            #[cfg(target_os = "macos")]
+            self.settle_system_state_before_handoff();
             let closed = self.close_uncarried_messages();
             if (claimed || closed > 0)
                 && !matches!(
@@ -7313,6 +7339,8 @@ impl App {
                 video.unwritten
             );
         }
+        #[cfg(target_os = "macos")]
+        self.settle_system_state_before_handoff();
         if !matches!(
             self.pending_update_handoff
                 .as_ref()
@@ -8396,17 +8424,6 @@ pub(crate) fn lane_carry_refusal(
         }
         ApplyLane::Cold | ApplyLane::Seamless => None,
     }
-}
-
-#[cfg(unix)]
-fn carried_claims_of(
-    manifest: &crate::session_store::SessionHandoff,
-) -> Vec<crate::session_store::CarriedClaims> {
-    manifest
-        .sessions
-        .iter()
-        .map(crate::session_store::CarriedClaims::of_record)
-        .collect()
 }
 
 #[cfg(unix)]

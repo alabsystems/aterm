@@ -15350,22 +15350,21 @@ fn a_worker_measures_the_default_route_only_and_reads_it_once_per_agent() {
     idle.kept.lock().unwrap().snapshot = Some(snapshot(4444));
     assert_eq!(idle.reach(), Reach::Unknown);
     switches.set(&on(), false);
-    let codex = host(Program::Codex);
-    codex.kept.lock().unwrap().snapshot = Some(snapshot(4545));
-    assert_eq!(codex.reach(), Reach::Unknown);
-    assert_eq!(*routes.lock().unwrap(), [4242, 4343, 4343]);
     for (agent, pid) in [
+        (Program::Codex, 4545),
         (Program::Agy, 4646),
         (Program::Muse, 4747),
         (Program::Gemini, 4848),
+        (Program::Generic, 4949),
     ] {
         let h = host(agent);
         h.kept.lock().unwrap().snapshot = Some(snapshot(pid));
-        assert!(matches!(h.reach(), Reach::Down { .. }), "{agent:?}");
+        assert_eq!(h.reach(), Reach::Unknown, "{agent:?}");
     }
     assert_eq!(
         *routes.lock().unwrap(),
-        [4242, 4343, 4343, 4646, 4747, 4848]
+        [4242, 4343, 4343],
+        "unsupported agents must not read Claude settings or borrow its reach"
     );
     net.stop();
 }
@@ -15546,7 +15545,7 @@ fn a_fact_lines_pace_is_refused_where_the_worker_takes_no_step() {
 
 /// THE GUI'S OWN GATE ON THE TASK DOOR (the occupancy design's manager door, plan 2.4): a
 /// worker's fact word reaches its session's task record only while the owner's mode in force here
-/// is `prompt`; under `observe` and `off` the worker answers `Closed` and the act is never called,
+/// is `prompt`; under `observe` and `off` the worker answers `Fenced` and the act is never called,
 /// whatever word the loop asked with. NEGATIVE CONTROL: under `prompt` the same call reaches the
 /// act, with the session's own sid and the word as asked.
 #[test]
@@ -15572,8 +15571,8 @@ fn a_workers_task_fact_is_refused_unless_the_owners_mode_here_is_prompt() {
     assert!(word.is_some());
     for mode in [Occupancy::Observe, Occupancy::Off] {
         crate::occupancy_host::set_mode(mode);
-        assert_eq!(idle.task_fact(word), NoteOutcome::Closed, "{mode:?}");
-        assert_eq!(idle.task_fact(None), NoteOutcome::Closed, "{mode:?}");
+        assert_eq!(idle.task_fact(word), NoteOutcome::Fenced, "{mode:?}");
+        assert_eq!(idle.task_fact(None), NoteOutcome::Fenced, "{mode:?}");
     }
     assert!(
         asked.lock().unwrap().is_empty(),
@@ -15595,6 +15594,7 @@ fn a_workers_task_fact_is_refused_unless_the_owners_mode_here_is_prompt() {
 /// record.
 #[test]
 fn the_live_task_fact_marks_the_session_with_that_sid_alone() {
+    crate::occupancy_host::set_mode(aterm_agent::supervise::Occupancy::Prompt);
     use crate::task_record::{TaskMark, TaskState, mark_session_task};
     use aterm_agent::supervise::occupancy::{FactWord, NoteOutcome, RuleId};
     let store = crate::session_store::new_store();
@@ -15618,6 +15618,9 @@ fn the_live_task_fact_marks_the_session_with_that_sid_alone() {
     assert_eq!(task_fact_live(&store, &sid, word), NoteOutcome::Noted);
     assert_eq!(fact(), (word, 1));
     assert_eq!(task_fact_live(&store, &sid, None), NoteOutcome::Cleared);
+    assert_eq!(fact(), (None, 2));
+    crate::occupancy_host::set_mode(aterm_agent::supervise::Occupancy::Observe);
+    assert_eq!(task_fact_live(&store, &sid, word), NoteOutcome::Fenced);
     assert_eq!(fact(), (None, 2));
 }
 
@@ -28291,6 +28294,8 @@ enum Marked {
     Moved,
     /// No mark; the stall's attention taken down.
     Over,
+    /// No mark; the startup stall's attention names this hold now.
+    Restated(StartupHold),
 }
 
 /// The startup deadline's fakes.
@@ -28320,6 +28325,7 @@ impl StartupWorld {
                     StartupMark::Held { read, .. } => Marked::Held(read.word.clone()),
                     StartupMark::Moved => Marked::Moved,
                     StartupMark::Over => Marked::Over,
+                    StartupMark::Restated { hold } => Marked::Restated((*hold).clone()),
                 };
                 m.marks.lock().unwrap().push((sid.to_string(), marked));
             }),
@@ -28353,6 +28359,7 @@ fn startup(sid: &str, state: StartupState, since: Instant, seen: StartupSeen) ->
         since,
         seen,
         held,
+        standing: None,
     }
 }
 
@@ -28379,6 +28386,7 @@ fn held_worker(sid: &str, state: StartupState, read: HeldRead) -> Startup {
         since: Instant::now(),
         seen: StartupSeen::Unread,
         held: Some(read),
+        standing: None,
     }
 }
 
@@ -30085,10 +30093,10 @@ fn an_unclaimed_codex_worker_is_never_started_by_its_screen() {
     });
     assert_eq!(
         (
-            unclaimed(StartupSeen::Started, Some(Program::Codex), true),
-            unclaimed(StartupSeen::Started, Some(Program::Claude), true),
-            unclaimed(StartupSeen::Started, None, true),
-            unclaimed(trust.clone(), Some(Program::Codex), true),
+            unclaimed(StartupSeen::Started, Some(Program::Codex), true, None),
+            unclaimed(StartupSeen::Started, Some(Program::Claude), true, None),
+            unclaimed(StartupSeen::Started, None, true, None),
+            unclaimed(trust.clone(), Some(Program::Codex), true, None),
         ),
         (
             StartupSeen::Holds(StartupHold::NoComposer {
@@ -30101,11 +30109,269 @@ fn an_unclaimed_codex_worker_is_never_started_by_its_screen() {
     );
     assert_eq!(
         (
-            unclaimed(trust.clone(), Some(Program::Codex), false),
-            unclaimed(StartupSeen::Started, Some(Program::Claude), false),
+            unclaimed(trust.clone(), Some(Program::Codex), false, None),
+            unclaimed(StartupSeen::Started, Some(Program::Claude), false, None),
         ),
         (StartupSeen::Unread, StartupSeen::Started),
         "a halt or Autopilot off: no codex start judged, every other worker's as read"
+    );
+}
+
+/// A STARTUP STALL FOLLOWS CODEX-ALAB'S WORDS: codex-alab takes its attention down once
+/// its screen's step is done (a sign-in completed, the onboarding going on) while the stall
+/// stands, so a stall quoting it names what holds the screen now ([`restates`],
+/// `StartupMark::Restated`), on a record still `stalled why=startup` under the stall's own
+/// attention. NEGATIVE CONTROLS: a quote that still holds, a stall that never quoted
+/// codex-alab, a person's or another writer's entry, and a record moved on are left alone.
+#[test]
+fn a_startup_stall_restates_codex_alabs_words_as_they_move() {
+    use crate::session_timeline::{MetaEdit, write_attention_owned};
+    use crate::task_record::{TaskMark, TaskState};
+    let asked = StartupHold::Asked {
+        text: "login: signed out; codex's sign-in screen waits for a person".to_string(),
+    };
+    let bare = StartupHold::NoComposer {
+        agent: Program::Codex,
+    };
+    let trust = StartupHold::Trust {
+        agent: Program::Codex,
+    };
+    let quote = asked.attention();
+    assert!(restates(Some(&quote), &bare), "codex-alab's words went");
+    assert!(restates(Some(&bare.attention()), &asked), "they came");
+    assert!(!restates(Some(&quote), &asked), "CONTROL: the quote holds");
+    assert!(
+        !restates(Some(&trust.attention()), &bare),
+        "CONTROL: a stall that never quoted codex-alab keeps its words"
+    );
+    assert!(
+        !restates(None, &bare),
+        "CONTROL: nothing of the stall's stands"
+    );
+
+    let w = Arc::new(StartupWorld::default());
+    let hooks = w.hooks();
+    let none = OffSessions::default();
+    let mut books = Startups::default();
+    let at = |standing: &str| Startup {
+        standing: Some(standing.to_string()),
+        ..startup(
+            "s-a",
+            StartupState::StalledAtStartup,
+            Instant::now(),
+            StartupSeen::Holds(bare.clone()),
+        )
+    };
+    w.set(vec![at(&quote)]);
+    look_at_startups(&mut books, Instant::now(), true, &none, &hooks);
+    assert_eq!(
+        w.marks(),
+        [("s-a".to_string(), Marked::Restated(bare.clone()))]
+    );
+    w.set(vec![at(&bare.attention())]);
+    look_at_startups(&mut books, Instant::now(), true, &none, &hooks);
+    assert!(w.marks().is_empty(), "CONTROL: the words already hold");
+
+    let store = crate::session_store::new_store();
+    let h = crate::session_store::test_handle(6);
+    store.write().unwrap().register(h.clone());
+    let sid = h.sid.as_str().to_string();
+    let set = |state: TaskState, why: Option<&'static str>, standing: &str| {
+        let mut m = TaskMark::new(state);
+        m.why = why;
+        h.ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .mark_task(&m, false, Instant::now(), 0);
+        write_attention_owned(
+            &h.ctx,
+            ATTENTION_OWNER,
+            MetaEdit::Set(standing),
+            aterm_slog::Actor::Harness,
+        )
+        .expect("written");
+    };
+    let standing = || {
+        h.ctx
+            .meta
+            .lock()
+            .unwrap()
+            .attention_owners
+            .get(ATTENTION_OWNER)
+            .map(str::to_string)
+    };
+    let restated = StartupMark::Restated { hold: &bare };
+    set(TaskState::Stalled, Some("startup"), &quote);
+    let (_, marked) = startup_mark_with(&store, &sid, &restated).expect("restated");
+    assert!(marked.attention_moved);
+    assert_eq!(standing(), Some(bare.attention()));
+    let record = marked.record.expect("the record");
+    assert_eq!(
+        (record.state, record.why),
+        (TaskState::Stalled, Some("startup")),
+        "no mark"
+    );
+    for (state, why, entry) in [
+        (TaskState::Working, None, quote.as_str()),
+        (TaskState::Stalled, Some("startup"), "a person's own words"),
+    ] {
+        set(state, why, entry);
+        assert!(startup_mark_with(&store, &sid, &restated).is_none());
+        assert_eq!(standing().as_deref(), Some(entry), "CONTROL: left alone");
+    }
+}
+
+/// A CODEX-ALAB STARTUP SCREEN THAT WAITS FOR A PERSON IS NAMED BY ITS OWN ATTENTION:
+/// over a screen codex holds (its folder-trust dialog, a box, no composer, or a composer
+/// no claim carries), codex-alab's standing attention is what holds the worker
+/// ([`StartupHold::Asked`]), and its stall's attention, newer than codex-alab's and so
+/// the one aterm shows, quotes codex-alab's words within an entry's cap. NEGATIVE
+/// CONTROLS: a shell in front (codex-alab gone, its attention stale), a codex-alab that
+/// may not claim and any other worker read as before.
+#[test]
+fn a_codex_alab_startup_screen_is_named_by_its_own_attention() {
+    use crate::session_timeline::{MetaEdit, write_attention_owned};
+    use crate::task_record::{SELF_CLAIM_ATTENTION_OWNER, TaskMark, TaskState};
+    let asked = "trust: /Users/_owner/app is not trusted yet; codex's folder-trust screen \
+                 waits for a person (why=hold)";
+    let named = StartupSeen::Holds(StartupHold::Asked {
+        text: asked.to_string(),
+    });
+    let trust = StartupSeen::Holds(StartupHold::Trust {
+        agent: Program::Codex,
+    });
+    for seen in [
+        StartupSeen::Started,
+        trust.clone(),
+        StartupSeen::Holds(StartupHold::NoComposer {
+            agent: Program::Codex,
+        }),
+        StartupSeen::Holds(StartupHold::Box {
+            agent: Program::Codex,
+            title: "Resume paused goal?".to_string(),
+        }),
+    ] {
+        assert_eq!(
+            unclaimed(seen.clone(), Some(Program::Codex), true, Some(asked)),
+            named,
+            "{seen:?}"
+        );
+    }
+    let shell = StartupSeen::Holds(StartupHold::NoAgent {
+        agent: Program::Codex,
+        program: Some("zsh".to_string()),
+    });
+    let claude_trust = StartupSeen::Holds(StartupHold::Trust {
+        agent: Program::Claude,
+    });
+    assert_eq!(
+        unclaimed(
+            claude_trust.clone(),
+            Some(Program::Codex),
+            true,
+            Some(asked)
+        ),
+        claude_trust,
+        "CONTROL: another agent's screen is its own"
+    );
+    assert_eq!(
+        (
+            unclaimed(shell.clone(), Some(Program::Codex), true, Some(asked)),
+            unclaimed(trust.clone(), Some(Program::Codex), false, Some(asked)),
+            unclaimed(
+                StartupSeen::Started,
+                Some(Program::Claude),
+                true,
+                Some(asked)
+            ),
+        ),
+        (shell, StartupSeen::Unread, StartupSeen::Started),
+        "CONTROLS: codex-alab gone, codex-alab may not claim, another worker"
+    );
+    let long = format!("{asked} {}", "and more ".repeat(30));
+    for text in [asked, long.as_str()] {
+        let said = StartupHold::Asked {
+            text: text.to_string(),
+        }
+        .attention();
+        assert!(
+            said.len() <= crate::session_timeline::META_ATTENTION_KEYED_MAX
+                && deadline_attention_stands(Some(&said))
+                && said.contains("codex-alab asks: trust: /Users/_owner/app is not trusted yet"),
+            "{said}"
+        );
+    }
+
+    let store = crate::session_store::new_store();
+    let worker = crate::session_store::test_handle(5);
+    {
+        let mut tl = worker.ctx.timeline.lock().unwrap();
+        tl.mark_task(&TaskMark::new(TaskState::Working), false, Instant::now(), 0);
+        tl.set_task_worker(Program::Codex, None);
+        tl.note_foreground_group(78);
+        tl.set_program(78, Some("codex".into()));
+    }
+    let composer = [
+        "╭───────────────────────────────────────╮",
+        "│ >_ OpenAI Codex (v0.164.0)            │",
+        "╰───────────────────────────────────────╯",
+        "",
+        "› Ask Codex to do anything",
+    ]
+    .join("\r\n");
+    worker
+        .term
+        .lock()
+        .unwrap()
+        .process(format!("\x1b[H\x1b[2J{composer}").as_bytes());
+    store.write().unwrap().register(worker.clone());
+    let seen = || {
+        startups_of(&store, &std::collections::HashSet::new())
+            .into_iter()
+            .next()
+            .expect("the worker's read")
+            .seen
+    };
+    assert_eq!(
+        seen(),
+        StartupSeen::Holds(StartupHold::NoComposer {
+            agent: Program::Codex
+        }),
+        "CONTROL: nothing asked, a composer no claim carries"
+    );
+    write_attention_owned(
+        &worker.ctx,
+        SELF_CLAIM_ATTENTION_OWNER,
+        MetaEdit::Set(asked),
+        aterm_slog::Actor::Ctl,
+    )
+    .expect("written");
+    let StartupSeen::Holds(hold) = seen() else {
+        panic!("a hold");
+    };
+    assert_eq!(StartupSeen::Holds(hold.clone()), named);
+    let (_, marked) = startup_mark_with(
+        &store,
+        worker.sid.as_str(),
+        &StartupMark::Stalled { hold: &hold },
+    )
+    .expect("marked");
+    let record = marked.record.expect("the record");
+    assert_eq!(
+        (record.state, record.why, record.attention),
+        (TaskState::Stalled, Some("startup"), true)
+    );
+    let meta = worker.ctx.meta.lock().unwrap();
+    assert_eq!(
+        (
+            meta.attention_owners
+                .get(ATTENTION_OWNER)
+                .map(str::to_string),
+            meta.attention_owners.get(SELF_CLAIM_ATTENTION_OWNER),
+        ),
+        (Some(hold.attention()), Some(asked)),
+        "the stall's attention, the one aterm shows, names codex-alab's own words"
     );
 }
 

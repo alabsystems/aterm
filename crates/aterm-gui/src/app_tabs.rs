@@ -936,9 +936,7 @@ impl App {
             self.install_new_native_tab(
                 wid,
                 crate::native_app::NativeApp::SystemState(Box::new(
-                    crate::system_state::SystemStateApp::new(
-                        aterm_types::macos_setup::Plan::default(),
-                    ),
+                    crate::system_state::SystemStateApp::opened(),
                 )),
                 state,
                 presentation,
@@ -2547,7 +2545,7 @@ impl App {
         }
     }
 
-    /// Each session's Autopilot end and its task's work, as the rows a seamless update's park stamps on its manifest (`SessionRecord::autopilot_end`, `app_update_handoff::stamp_autopilot_end`; §11.2.3, item 8): the end standing on the glass.
+    /// Each session's Autopilot end and its task's work, as the rows a seamless update's park stamps on its manifest (`SessionRecord::autopilot_end`, `app_update_handoff::stamp_autopilot_end`; §11.2.3, item 8): the end standing on the glass, or, with none there, the face of a proven self-claim, which no loop restates at the successor ([`Self::self_claim_face`]).
     #[cfg(unix)]
     pub(crate) fn end_carry_rows(&self) -> Vec<(u64, String)> {
         let now = crate::turn_ledger::now_ms();
@@ -2572,14 +2570,39 @@ impl App {
                             seen: !end.unseen(),
                         })
                     });
+                let face = end.is_none().then(|| self.self_claim_face(id)).flatten();
                 crate::harness_end_carry::EndCarry {
                     end,
+                    face,
                     worked_ms: self.harness_screen.ab.worked(id, now),
                 }
                 .row()
                 .map(|row| (id, row))
             })
             .collect()
+    }
+
+    /// THE FACE A SEAMLESS UPDATE CARRIES FOR A PROVEN SELF-CLAIM on session `session`, which no loop restates at the successor ([`Self::end_carry_rows`]; the Commit stands down where it moved since the park drew it, `App::carried_claims_held`): beside the claim, or in the gap of its own re-exec, the face shown (Task facts are dropped there, so it is the claim's); and the face an earlier update carried here while nothing has told one since, so a second update before the claim is proven again carries it on. `None` for every other session.
+    #[cfg(unix)]
+    pub(crate) fn self_claim_face(
+        &self,
+        session: u64,
+    ) -> Option<(aterm_agent::harness::acts::TaskFace, i64)> {
+        let self_claimed =
+            self.beside_proven_self_claim(session) || self.in_self_claim_reexec(session);
+        let timeline = self
+            .pool
+            .get(session)?
+            .ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let carried = timeline.carried_task_face();
+        if self_claimed {
+            timeline.task_face().or(carried)
+        } else {
+            carried
+        }
     }
 
     /// What the status item knows of each session, as the rows a seamless update's park stamps on its manifest (`SessionRecord::status_seen`, `app_update_handoff::stamp_status_seen`).
@@ -2718,6 +2741,7 @@ impl App {
             .collect();
         glance.alerts = self.config.desktop_alerts_or_default();
         glance.voice = crate::notify::own_voice();
+        glance.system_state = self.system_state_menu_line();
         glance
     }
 
@@ -3121,6 +3145,9 @@ impl App {
             }
             StatusAction::OpenLocalNetwork => {
                 let _ = self.apprt.open_url(crate::fleet_glance::LOCAL_NETWORK_PANE);
+            }
+            StatusAction::OpenSystemState => {
+                let _ = self.open_system_state_from_status_item();
             }
             StatusAction::PeerRead(pick)
             | StatusAction::PeerScreen(pick)
@@ -4219,14 +4246,6 @@ impl App {
         scope: crate::native_app::CloseScope,
         visibility: ClosePreflightVisibility,
     ) -> Result<bool, String> {
-        if matches!(
-            scope,
-            crate::native_app::CloseScope::Relaunch
-                | crate::native_app::CloseScope::CarriedRelaunch
-        ) && self.system_state_cancel_pending()
-        {
-            return Ok(false);
-        }
         let windows = self.windows.keys().copied().collect::<Vec<_>>();
         for wid in windows {
             if !self.prepare_window_native_shutdown_with(wid, scope, visibility)? {
@@ -5726,6 +5745,7 @@ impl App {
         self.spare_poke();
         if let Some(stable) = stable {
             self.resume_stories.remove(stable.as_str());
+            crate::occupancy_wakes::forget(stable.as_str());
             self.end_occupancy_lines_of(stable.as_str());
             if tasked {
                 crate::task_launch::retire_task_file(&stable);
@@ -5744,7 +5764,6 @@ mod system_state_runtime_tests {
     fn edit_review(app: &mut App, wid: WindowId, view: crate::tab_model::ViewId) {
         use crate::native_app::{ActionInvocation, AppEvent, SemanticInput};
         for (key, value) in [
-            ("system-state/setting/0", SemanticInput::Bool(false)),
             (
                 "system-state/url",
                 SemanticInput::Text("http://draft.local/v1/team".into()),
@@ -5769,15 +5788,15 @@ mod system_state_runtime_tests {
     fn assert_review(app: &mut App, wid: WindowId) {
         use crate::native_ui::{SemanticValue, UiKey};
         assert!(app.open_system_state_tab_in_window(wid));
-        let (instance, view) = app.active_native_view(wid).unwrap();
+        let (_, view) = app.active_native_view(wid).unwrap();
         assert!(app.commit_glassless_native_frame(wid));
         let ui = &app.windows[&wid].leaf_render_cache[&view]
             .native
             .as_ref()
             .unwrap()
             .compiled;
+        // The vault's fields show once the draft is open to edit.
         for (key, value) in [
-            ("system-state/setting/0", SemanticValue::Bool(false)),
             (
                 "system-state/url",
                 SemanticValue::Text("http://draft.local/v1/team".into()),
@@ -5786,13 +5805,6 @@ mod system_state_runtime_tests {
         ] {
             assert_eq!(ui.semantic(&UiKey::new(key)).unwrap().value, value);
         }
-        assert!(
-            app.native_runtime
-                .presentation(instance, view)
-                .unwrap()
-                .indicators
-                .dirty
-        );
     }
 
     #[test]
@@ -5870,18 +5882,21 @@ mod system_state_runtime_tests {
             assert!(receive.try_recv().is_err());
             assert_review(&mut app, first_window);
             assert!(app.structural_invariants_ok());
-            let expected = if window_close {
+            // Closing never cancels setup (design §3.5): the offer is let go
+            // either way, and setup resumes at the next launch.
+            if window_close {
                 assert!(
                     app.prepare_window_native_shutdown(first_window, CloseScope::Window)
                         .unwrap()
                 );
                 app.close_window_logical(first_window);
-                WorkstationSetupDecision::Unavailable
             } else {
                 app.close_active_native_tab(first_window).unwrap();
-                WorkstationSetupDecision::Cancel
-            };
-            assert_eq!(receive.try_recv().unwrap().decision, expected);
+            }
+            assert_eq!(
+                receive.try_recv().unwrap().decision,
+                WorkstationSetupDecision::Unavailable
+            );
             assert!(!request.pending());
             assert!(app.native_runtime.app(instance).is_none());
         }

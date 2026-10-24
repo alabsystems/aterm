@@ -1,4 +1,4 @@
-# The trust lane's cost-history SEED: the fallback a clone with no history of its own reads (a library its git directory's aterm-release/trust-costs.tsv has no row for takes its row here). `targo --unverified ship trust run --update-ratchet` rewrites it with floors.tsv and memory.tsv. A library in neither file runs first, as heavy.
+# The trust lane's cost-history SEED: the fallback a clone with no history of its own reads (a library its git directory's aterm-release/trust-costs.tsv has no row for takes its row here). `targo --unverified ship trust run -p <crate>… --update-ratchet` rewrites it with floors.tsv and memory.tsv. A library in neither file runs first, as heavy.
 # trust lane cost history: <name> <CPU s> <wall s> <largest process's peak RSS bytes> <when>; the slots take the longest first, a library with no row first of all
 amacs	723	759	8131362816	2026-10-20T22:24:50Z
 amacs-files	240	220	2146713600	2026-10-20T22:21:37Z

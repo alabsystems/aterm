@@ -441,3 +441,81 @@ fn the_outgoing_commit_writes_the_persons_stamps_at_its_write() {
         assert!(!path.exists(), "the Commit returned: taken back");
     }
 }
+
+#[cfg(target_os = "macos")]
+thread_local! {
+    /// What the Commit did, in order: System State's settles and the write.
+    static COMMIT_STEPS: std::cell::RefCell<Vec<&'static str>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Whether each settle waits a fence grain, as one does for a Stop's save.
+    static SETTLE_WAITS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `parked`'s System State as a test reads it: each settle noted in
+/// [`COMMIT_STEPS`], and the write noted there too.
+#[cfg(target_os = "macos")]
+fn note_settles_and_the_write(parked: &mut Parked) {
+    parked
+        .app
+        .set_system_state_handlers_for_test(crate::InitialSetupHandlers {
+            apply: |_, _, _, _| false,
+            check: |_| crate::CheckStarted::default(),
+            restore: || false,
+            status: crate::SetupStatus::default,
+            observe: |_| false,
+            stop: || {},
+            settle: || {
+                if SETTLE_WAITS.get() {
+                    std::thread::sleep(super::HANDOFF_INPUT_DRAIN_YIELD);
+                }
+                COMMIT_STEPS.with(|steps| steps.borrow_mut().push("settle"));
+            },
+            sync_on: || false,
+        });
+    parked.app.handoff_before_egress_fence = Some(Box::new(|| {
+        COMMIT_STEPS.with(|steps| steps.borrow_mut().push("write"));
+    }));
+}
+
+/// A SYSTEM STATE STOP CLICKED WHILE THE HANDOFF DRAINS INPUT: the window
+/// handles input from the handoff's start to the Commit's claim, so a Stop
+/// clicked in between may still owe the records its save (or a plan it stops,
+/// still being admitted). The Commit settles it among what its claim answers,
+/// and again right before its write, as a quit does (design §3.3): bounded,
+/// and at once when nothing is owed. Without those settles nothing comes
+/// before the write here, since this attempt never passed the handoff's start.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_commit_settles_a_system_state_stop_before_its_write() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let mut parked = Parked::new(b"");
+    note_settles_and_the_write(&mut parked);
+    let completion = parked.proof_ready();
+    assert_eq!(parked.run_to_verdict(completion), WRITTEN);
+    assert_eq!(
+        COMMIT_STEPS.with(|steps| steps.take()),
+        ["settle", "settle", "write"]
+    );
+}
+
+/// A settle that waited (a Stop's save still landing) held the main thread,
+/// and keys typed meanwhile would die with the `_exit`: the claim is held
+/// through one more input fence before the write, as for any answer that took
+/// a fence grain, and the write's own settle still comes right before it.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_system_state_settle_that_waits_holds_the_commit_through_one_more_fence() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let mut parked = Parked::new(b"");
+    note_settles_and_the_write(&mut parked);
+    SETTLE_WAITS.set(true);
+    let completion = parked.proof_ready();
+    let mut reposted = parked.pass(completion);
+    assert!(parked.app.handoff_rejections.is_empty());
+    assert_eq!(reposted.len(), 1, "the claim goes through the fence again");
+    assert_eq!(COMMIT_STEPS.with(|steps| steps.take()), ["settle"]);
+    let held = reposted.pop().expect("the held claim's pass");
+    assert_eq!(parked.run_to_verdict(held), WRITTEN);
+    assert_eq!(COMMIT_STEPS.with(|steps| steps.take()), ["settle", "write"]);
+    SETTLE_WAITS.set(false);
+}

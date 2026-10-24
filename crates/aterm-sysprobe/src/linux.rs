@@ -434,6 +434,7 @@ fn sys_link(dir: &mut PathBuf, row: NetDev) -> LinkReading {
 const NET_TCP_CAP: usize = 512 * 1024;
 
 /// TCP connection state counts under `root` ([`crate::tcp_counts_into`] on Linux, with root `/`).
+/// A clipped table is unread, even if the other protocol table was complete.
 #[must_use]
 pub fn tcp_counts_under_into(root: &Path, scratch: &mut Vec<u8>) -> Option<TcpCounts> {
     if scratch.len() < NET_TCP_CAP {
@@ -443,7 +444,10 @@ pub fn tcp_counts_under_into(root: &Path, scratch: &mut Vec<u8>) -> Option<TcpCo
     let mut counts = TcpCounts::default();
     let mut any = false;
     for (rel, v6) in [("proc/net/tcp", false), ("proc/net/tcp6", true)] {
-        if let Ok((n, _)) = crate::read_into(&root.join(rel), buf) {
+        if let Ok((n, clipped)) = crate::read_into(&root.join(rel), buf) {
+            if clipped {
+                return None;
+            }
             any = true;
             for row in crate::jobs::linux::parse_net_tcp(crate::utf8_prefix(&buf[..n]), v6) {
                 counts.record(row.state);

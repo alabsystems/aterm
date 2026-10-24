@@ -20,11 +20,30 @@ fn interned_test_shell(
     .as_deref()
 }
 
-/// Bash for the live tests.
+/// The pinned bash 5.3 (the `bash-5.3` row, which `verify provision` builds on a Mac), when
+/// this host has one that answers `BASH_VERSINFO` 5.3 or later; else why not.
 #[cfg(unix)]
-fn bash_shell() -> &'static str {
-    static BASH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    interned_test_shell(&BASH, "bash").unwrap_or("bash")
+fn bash_5_3() -> Result<&'static str, &'static str> {
+    static BASH: std::sync::OnceLock<Result<String, String>> = std::sync::OnceLock::new();
+    let found = BASH.get_or_init(|| {
+        let row = aterm_spec::host::tool("bash-5.3");
+        let bash = aterm_spec::host::test_shell(row.name)
+            .map(|path| path.to_string_lossy().into_owned())
+            .ok_or_else(|| row.refusal())?;
+        let out = shell_command(&bash)
+            .args(["-c", "echo $((BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1]))"])
+            .output()
+            .map_err(|error| format!("{bash} -c: {error}"))?;
+        let level = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        match level.parse::<u32>() {
+            Ok(level) if level >= 503 => Ok(bash),
+            _ => Err(format!(
+                "{bash} is no bash 5.3 (BASH_VERSINFO {level:?}): {}",
+                row.remedy()
+            )),
+        }
+    });
+    found.as_deref().map_err(String::as_str)
 }
 
 /// Absolute path to a `zsh` binary, or `None` where the host has none ([`interned_test_shell`]).
@@ -166,15 +185,21 @@ type PosixLane = (
     &'static str,
 );
 
-/// The two POSIX lanes the script-level tests drive.
+/// The POSIX lanes the script-level tests drive: every bash ([`ShellLanes::bashes`]) and zsh.
 #[cfg(unix)]
 fn posix_lanes(shells: &mut ShellLanes) -> Vec<PosixLane> {
-    let mut lanes = vec![(
-        bash_shell(),
-        &["--noprofile", "--norc", "-i"][..],
-        "aterm_shell_integration.bash",
-        "__aterm_in_prompt_cmd=1; trap - DEBUG 2>/dev/null || true; PROMPT_COMMAND=",
-    )];
+    let mut lanes: Vec<PosixLane> = shells
+        .bashes()
+        .into_iter()
+        .map(|bash| {
+            (
+                bash,
+                &["--noprofile", "--norc", "-i"][..],
+                "aterm_shell_integration.bash",
+                "__aterm_in_prompt_cmd=1; trap - DEBUG 2>/dev/null || true; PROMPT_COMMAND=",
+            )
+        })
+        .collect();
     if let Some(zsh) = shells.zsh() {
         lanes.push((
             zsh,
@@ -187,15 +212,58 @@ fn posix_lanes(shells: &mut ShellLanes) -> Vec<PosixLane> {
     lanes
 }
 
-/// The optional shells (zsh, fish) of a test that drives more than one.
+/// The shells a test drives: the bashes, and the optional zsh and fish. A shell this host
+/// lacks is noted, and once the test has run every lane it has, it ends COULD NOT RUN
+/// naming each missing one.
 #[cfg(unix)]
 #[derive(Default)]
 struct ShellLanes {
-    absent: Vec<&'static str>,
+    /// What each missing shell's refusal says.
+    absent: Vec<String>,
 }
 
 #[cfg(unix)]
 impl ShellLanes {
+    /// Every bash the bash tests run on: the OS's (`$ATERM_TEST_BASH`, else the `bash` row:
+    /// macOS's 3.2, a Linux host's own), then the pinned 5.3 ([`bash_5_3`]), whose
+    /// `${ ...; }` reads and PS0 hook the OS's 3.2 never takes. A missing 5.3 is noted where
+    /// the tree pins one for this host (`verify provision` builds it on a Mac). A bash test
+    /// gets its bash here and nowhere else, so each one runs on both.
+    fn bashes(&mut self) -> Vec<&'static str> {
+        static OS: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        let os = interned_test_shell(&OS, "bash").unwrap_or("bash");
+        let mut bashes = vec![os];
+        match bash_5_3() {
+            Ok(pinned) if pinned != os => bashes.push(pinned),
+            Ok(_) => {}
+            Err(why) => {
+                let host = aterm_uds::host::host_platform();
+                let pinned_here = aterm_spec::host::tool("bash-5.3")
+                    .pin
+                    .is_some_and(|pin| pin.pinned_for(&host));
+                if pinned_here {
+                    self.missing(why.to_owned());
+                }
+            }
+        }
+        bashes
+    }
+
+    /// Each lane of `dialects` (`bash`, `zsh`, `fish`) on this host, as `(dialect, program)`:
+    /// every bash ([`ShellLanes::bashes`]), zsh and fish where found.
+    fn lanes(&mut self, dialects: &[&'static str]) -> Vec<(&'static str, &'static str)> {
+        let mut lanes = Vec::new();
+        for &dialect in dialects {
+            match dialect {
+                "bash" => lanes.extend(self.bashes().into_iter().map(|bash| ("bash", bash))),
+                "zsh" => lanes.extend(self.zsh().map(|zsh| ("zsh", zsh))),
+                "fish" => lanes.extend(self.fish().map(|fish| ("fish", fish))),
+                other => panic!("no lane for {other}"),
+            }
+        }
+        lanes
+    }
+
     /// [`zsh_shell`], noting a missing one.
     fn zsh(&mut self) -> Option<&'static str> {
         self.note("zsh", zsh_shell())
@@ -207,18 +275,27 @@ impl ShellLanes {
     }
 
     fn note(&mut self, name: &'static str, found: Option<&'static str>) -> Option<&'static str> {
-        if found.is_none() && !self.absent.contains(&name) {
-            self.absent.push(name);
+        if found.is_none() {
+            self.missing(aterm_spec::host::tool(name).refusal());
         }
         found
+    }
+
+    fn missing(&mut self, why: String) {
+        if !self.absent.contains(&why) {
+            self.absent.push(why);
+        }
     }
 }
 
 #[cfg(unix)]
 impl Drop for ShellLanes {
     fn drop(&mut self) {
-        if !std::thread::panicking() {
-            aterm_spec::host::could_not_run_without(&self.absent);
+        if !std::thread::panicking() && !self.absent.is_empty() {
+            aterm_spec::host::could_not_run(format!(
+                "that lane did not run: {}",
+                self.absent.join("; ")
+            ));
         }
     }
 }
@@ -364,13 +441,19 @@ fn test_reroute_and_agents_dirs_lead_path_in_each_shell() {
 fn test_an_unmanaged_aterm_bin_is_never_put_on_path() {
     use std::os::unix::fs::PermissionsExt as _;
     let mut shells = ShellLanes::default();
-    let mut lanes: Vec<(&str, Vec<&str>, &str, &str, bool)> = vec![(
-        bash_shell(),
-        vec!["--noprofile", "--norc", "-i", "-c"],
-        "aterm_shell_integration.bash",
-        "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; printf 'PATH=%s\\n' \"$PATH\"",
-        true,
-    )];
+    let mut lanes: Vec<(&str, Vec<&str>, &str, &str, bool)> = shells
+        .bashes()
+        .into_iter()
+        .map(|bash| {
+            (
+                bash,
+                vec!["--noprofile", "--norc", "-i", "-c"],
+                "aterm_shell_integration.bash",
+                "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; printf 'PATH=%s\\n' \"$PATH\"",
+                true,
+            )
+        })
+        .collect();
     if let Some(zsh) = shells.zsh() {
         lanes.push((
             zsh,
@@ -488,13 +571,19 @@ fn test_encoders_answer_in_reply_and_keep_the_users() {
                      add-zsh-hook -d preexec __aterm_preexec 2>/dev/null || true";
     let bash_quiet = "__aterm_in_prompt_cmd=1; trap - DEBUG 2>/dev/null || true; PROMPT_COMMAND=";
     let mut shells = ShellLanes::default();
-    let mut runs: Vec<(&str, &[&str], String, &str, &str)> = vec![(
-        bash_shell(),
-        &["--noprofile", "--norc", "-i"],
-        bash_quiet.to_owned(),
-        "aterm_shell_integration.bash",
-        "",
-    )];
+    let mut runs: Vec<(&str, &[&str], String, &str, &str)> = shells
+        .bashes()
+        .into_iter()
+        .map(|bash| {
+            (
+                bash,
+                &["--noprofile", "--norc", "-i"][..],
+                bash_quiet.to_owned(),
+                "aterm_shell_integration.bash",
+                "",
+            )
+        })
+        .collect();
     if let Some(zsh) = shells.zsh() {
         for options in ["", "setopt ksh_arrays"] {
             runs.push((
@@ -839,75 +928,88 @@ fn test_bash_on_msys_and_cygwin_reports_the_windows_drive_form() {
     );
     let dir = aterm_tempfile::tempdir().expect("tempdir");
     let calls = dir.path().join("cygpath-calls");
-    let run = |ostype: &str, pwds: &[&str]| -> Vec<String> {
-        let mut command = format!(
-            "OSTYPE={ostype}; source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; \
-             __aterm_in_prompt_cmd=1; trap - DEBUG 2>/dev/null || true; PROMPT_COMMAND=; \
-             cygpath() {{ printf x >>\"$ATERM_TEST_CALLS\"; \
-               case \"$3\" in /cygdrive/c/*) printf 'C:/%s\\n' \"${{3#/cygdrive/c/}}\" ;; \
-               *) printf 'C:/Program Files/Git%s\\n' \"$3\" ;; esac; }}; "
+    let mut shells = ShellLanes::default();
+    for bash in shells.bashes() {
+        let _ = std::fs::remove_file(&calls);
+        let run = |ostype: &str, pwds: &[&str]| -> Vec<String> {
+            let mut command = format!(
+                "OSTYPE={ostype}; source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; \
+                 __aterm_in_prompt_cmd=1; trap - DEBUG 2>/dev/null || true; PROMPT_COMMAND=; \
+                 cygpath() {{ printf x >>\"$ATERM_TEST_CALLS\"; \
+                   case \"$3\" in /cygdrive/c/*) printf 'C:/%s\\n' \"${{3#/cygdrive/c/}}\" ;; \
+                   *) printf 'C:/Program Files/Git%s\\n' \"$3\" ;; esac; }}; "
+            );
+            for pwd in pwds {
+                command.push_str(&format!("PWD='{pwd}'; __aterm_report_cwd; printf '|'; "));
+            }
+            let output = shell_command(bash)
+                .args(["--noprofile", "--norc", "-i", "-c", &command])
+                .env("ATERM_TEST_SCRIPT", &script)
+                .env("ATERM_TEST_CALLS", &calls)
+                .env("HOSTNAME", "aterm.test")
+                .output()
+                .unwrap_or_else(|error| panic!("spawn {bash} for MSYS cwd test: {error}"));
+            assert!(
+                output.status.success(),
+                "{bash} should report OSC 7 as {ostype}; stderr: {:?}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout)
+                .split('|')
+                .filter(|s| !s.is_empty())
+                .map(|osc| {
+                    osc.strip_prefix("\u{1b}]7;file://aterm.test")
+                        .and_then(|s| s.strip_suffix('\u{7}'))
+                        .unwrap_or_else(|| panic!("not an OSC 7 report: {osc:?}"))
+                        .to_owned()
+                })
+                .collect()
+        };
+        let calls_made = || std::fs::read(&calls).map_or(0, |b| b.len());
+
+        let reported = run(
+            "msys",
+            &[
+                "/c/Windows/Temp",
+                "/d",
+                "/C/Users//me/My Dir",
+                "/usr/bin",
+                "/usr/bin",
+                "/cmd",
+            ],
         );
-        for pwd in pwds {
-            command.push_str(&format!("PWD='{pwd}'; __aterm_report_cwd; printf '|'; "));
-        }
-        let output = shell_command(bash_shell())
-            .args(["--noprofile", "--norc", "-i", "-c", &command])
-            .env("ATERM_TEST_SCRIPT", &script)
-            .env("ATERM_TEST_CALLS", &calls)
-            .env("HOSTNAME", "aterm.test")
-            .output()
-            .unwrap_or_else(|error| panic!("spawn bash for MSYS cwd test: {error}"));
-        assert!(
-            output.status.success(),
-            "bash should report OSC 7 as {ostype}; stderr: {:?}",
-            String::from_utf8_lossy(&output.stderr)
+        assert_eq!(
+            reported,
+            [
+                "/C%3A/Windows/Temp",
+                "/D%3A",
+                "/C%3A/Users//me/My%20Dir",
+                "/C%3A/Program%20Files/Git/usr/bin",
+                "/C%3A/Program%20Files/Git/usr/bin",
+                "/C%3A/Program%20Files/Git/cmd",
+            ],
+            "{bash}"
         );
-        String::from_utf8_lossy(&output.stdout)
-            .split('|')
-            .filter(|s| !s.is_empty())
-            .map(|osc| {
-                osc.strip_prefix("\u{1b}]7;file://aterm.test")
-                    .and_then(|s| s.strip_suffix('\u{7}'))
-                    .unwrap_or_else(|| panic!("not an OSC 7 report: {osc:?}"))
-                    .to_owned()
-            })
-            .collect()
-    };
-    let calls_made = || std::fs::read(&calls).map_or(0, |b| b.len());
+        assert_eq!(
+            calls_made(),
+            2,
+            "{bash}: cygpath runs once per non-drive directory"
+        );
 
-    let reported = run(
-        "msys",
-        &[
-            "/c/Windows/Temp",
-            "/d",
-            "/C/Users//me/My Dir",
-            "/usr/bin",
-            "/usr/bin",
-            "/cmd",
-        ],
-    );
-    assert_eq!(
-        reported,
-        [
-            "/C%3A/Windows/Temp",
-            "/D%3A",
-            "/C%3A/Users//me/My%20Dir",
-            "/C%3A/Program%20Files/Git/usr/bin",
-            "/C%3A/Program%20Files/Git/usr/bin",
-            "/C%3A/Program%20Files/Git/cmd",
-        ]
-    );
-    assert_eq!(calls_made(), 2, "cygpath runs once per non-drive directory");
+        let _ = std::fs::remove_file(&calls);
+        let reported = run("cygwin", &["/cygdrive/c/Users", "/c"]);
+        assert_eq!(
+            reported,
+            ["/C%3A/Users", "/C%3A/Program%20Files/Git/c"],
+            "{bash}"
+        );
+        assert_eq!(calls_made(), 2, "{bash}");
 
-    let _ = std::fs::remove_file(&calls);
-    let reported = run("cygwin", &["/cygdrive/c/Users", "/c"]);
-    assert_eq!(reported, ["/C%3A/Users", "/C%3A/Program%20Files/Git/c"]);
-    assert_eq!(calls_made(), 2);
-
-    let _ = std::fs::remove_file(&calls);
-    let reported = run("darwin24", &["/c/Windows/Temp"]);
-    assert_eq!(reported, ["/c/Windows/Temp"]);
-    assert_eq!(calls_made(), 0);
+        let _ = std::fs::remove_file(&calls);
+        let reported = run("darwin24", &["/c/Windows/Temp"]);
+        assert_eq!(reported, ["/c/Windows/Temp"], "{bash}");
+        assert_eq!(calls_made(), 0, "{bash}");
+    }
 }
 
 #[cfg(unix)]
@@ -929,37 +1031,42 @@ __aterm_prompt_end\n\
 __aterm_test_marker() { printf '===CYCLE-DONE==='; }\n\
 __aterm_test_marker\n\
 echo real-command\n";
-    let output = shell_command(bash_shell())
-        .args(["--noprofile", "--norc", "-i", "-c", command])
-        .env("ATERM_TEST_SCRIPT", &script)
-        .output()
-        .unwrap_or_else(|error| panic!("spawn bash for preexec array test: {error}"));
-    assert!(
-        output.status.success(),
-        "bash preexec array cycle should succeed; stdout: {:?}; stderr: {:?}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let (prompt_cycle, after) = stdout
-        .split_once("===CYCLE-DONE===")
-        .expect("marker should appear in stdout");
-    assert!(
-        !prompt_cycle.contains("633;E"),
-        "a sibling PROMPT_COMMAND element must not be captured as a user command: {prompt_cycle:?}"
-    );
-    assert!(
-        !prompt_cycle.contains("\u{1b}]133;C"),
-        "no command-start mark may fire during the prompt cycle: {prompt_cycle:?}"
-    );
-    assert!(
-        after.contains("\u{1b}]633;E;echo\\x20real-command\u{7}"),
-        "the real command must still be captured (633;E): {after:?}"
-    );
-    assert!(
-        after.contains("\u{1b}]133;C\u{7}"),
-        "the real command must emit the 133;C command start, unsigned with no nonce: {after:?}"
-    );
+    let mut shells = ShellLanes::default();
+    for bash in shells.bashes() {
+        let output = shell_command(bash)
+            .args(["--noprofile", "--norc", "-i", "-c", command])
+            .env("ATERM_TEST_SCRIPT", &script)
+            .output()
+            .unwrap_or_else(|error| panic!("spawn {bash} for preexec array test: {error}"));
+        assert!(
+            output.status.success(),
+            "{bash}: the preexec array cycle should succeed; stdout: {:?}; stderr: {:?}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let (prompt_cycle, after) = stdout
+            .split_once("===CYCLE-DONE===")
+            .expect("marker should appear in stdout");
+        assert!(
+            !prompt_cycle.contains("633;E"),
+            "{bash}: a sibling PROMPT_COMMAND element must not be captured as a user command: \
+             {prompt_cycle:?}"
+        );
+        assert!(
+            !prompt_cycle.contains("\u{1b}]133;C"),
+            "{bash}: no command-start mark may fire during the prompt cycle: {prompt_cycle:?}"
+        );
+        assert!(
+            after.contains("\u{1b}]633;E;echo\\x20real-command\u{7}"),
+            "{bash}: the real command must still be captured (633;E): {after:?}"
+        );
+        assert!(
+            after.contains("\u{1b}]133;C\u{7}"),
+            "{bash}: the real command must emit the 133;C command start, unsigned with no nonce: \
+             {after:?}"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -976,26 +1083,29 @@ source \"$ATERM_TEST_SCRIPT\"\n\
 printf '[n=%s first=%s]' \"${#PROMPT_COMMAND[@]}\" \"${PROMPT_COMMAND[0]}\"\n\
 eval \"$PROMPT_COMMAND\"\n\
 eval \"$PROMPT_COMMAND\"\n";
-    let output = shell_command(bash_shell())
-        .args(["--noprofile", "--norc", "-i", "-c", command])
-        .env("ATERM_TEST_SCRIPT", &script)
-        .output()
-        .unwrap_or_else(|error| panic!("spawn bash for the one-element array test: {error}"));
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    assert!(
-        output.status.success(),
-        "stdout: {stdout:?}; stderr: {:?}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        stdout.contains("[n=1 first=__aterm_prompt_command]"),
-        "ours takes element 0 and adds none: {stdout:?}"
-    );
-    assert_eq!(
-        stdout.matches("[user-precmd]").count(),
-        2,
-        "the user's element runs once a prompt, two prompts: {stdout:?}"
-    );
+    let mut shells = ShellLanes::default();
+    for bash in shells.bashes() {
+        let output = shell_command(bash)
+            .args(["--noprofile", "--norc", "-i", "-c", command])
+            .env("ATERM_TEST_SCRIPT", &script)
+            .output()
+            .unwrap_or_else(|error| panic!("spawn {bash} for the one-element array test: {error}"));
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            output.status.success(),
+            "{bash}: stdout: {stdout:?}; stderr: {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("[n=1 first=__aterm_prompt_command]"),
+            "{bash}: ours takes element 0 and adds none: {stdout:?}"
+        );
+        assert_eq!(
+            stdout.matches("[user-precmd]").count(),
+            2,
+            "{bash}: the user's element runs once a prompt, two prompts: {stdout:?}"
+        );
+    }
 }
 
 #[test]
@@ -1050,12 +1160,18 @@ fn test_cwd_tab_title_strips_control_chars() {
         );
         assert_clean(fish, stdout.as_bytes());
     }
-    let mut lanes = vec![(
-        bash_shell(),
-        vec!["--noprofile", "--norc", "-i"],
-        "aterm_shell_integration.bash",
-        "__aterm_prompt_command",
-    )];
+    let mut lanes: Vec<_> = shells
+        .bashes()
+        .into_iter()
+        .map(|bash| {
+            (
+                bash,
+                vec!["--noprofile", "--norc", "-i"],
+                "aterm_shell_integration.bash",
+                "__aterm_prompt_command",
+            )
+        })
+        .collect();
     if let Some(zsh) = shells.zsh() {
         lanes.push((
             zsh,
@@ -1388,32 +1504,35 @@ env >\"$HOME/child-env-1\"\n\
 export PS1\n\
 __aterm_prompt_command >/dev/null 2>&1\n\
 env >\"$HOME/child-env-2\"\n";
-    let mut cmd = shell_command(bash_shell());
-    cmd.args(["--noprofile", "--norc", "-i", "-c", command])
-        .env("ATERM_TEST_SCRIPT", &script)
-        .env("ATERM_SHELL_NONCE", nonce)
-        .env("PS1", "inherited$ ");
-    let output = cmd
-        .output()
-        .unwrap_or_else(|error| panic!("spawn bash for PS1 nonce test: {error}"));
-    assert!(
-        output.status.success(),
-        "bash PS1 nonce probe should succeed (96: PS1 never carried the nonce); \
-         status: {:?}; stderr: {:?}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
-    );
-    for probe in ["child-env-1", "child-env-2"] {
-        let env = std::fs::read_to_string(cmd.home().join(probe))
-            .unwrap_or_else(|error| panic!("read {probe}: {error}"));
+    let mut shells = ShellLanes::default();
+    for bash in shells.bashes() {
+        let mut cmd = shell_command(bash);
+        cmd.args(["--noprofile", "--norc", "-i", "-c", command])
+            .env("ATERM_TEST_SCRIPT", &script)
+            .env("ATERM_SHELL_NONCE", nonce)
+            .env("PS1", "inherited$ ");
+        let output = cmd
+            .output()
+            .unwrap_or_else(|error| panic!("spawn {bash} for PS1 nonce test: {error}"));
         assert!(
-            env.contains("ATERM_TEST_SCRIPT="),
-            "{probe} must hold the child's environment: {env:?}"
+            output.status.success(),
+            "{bash}: the PS1 nonce probe should succeed (96: PS1 never carried the nonce); \
+             status: {:?}; stderr: {:?}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
         );
-        assert!(
-            !env.contains(nonce),
-            "a child of an integrated bash must not inherit the nonce ({probe}): {env:?}"
-        );
+        for probe in ["child-env-1", "child-env-2"] {
+            let env = std::fs::read_to_string(cmd.home().join(probe))
+                .unwrap_or_else(|error| panic!("read {probe}: {error}"));
+            assert!(
+                env.contains("ATERM_TEST_SCRIPT="),
+                "{bash}: {probe} must hold the child's environment: {env:?}"
+            );
+            assert!(
+                !env.contains(nonce),
+                "{bash}: a child of an integrated bash must not inherit the nonce ({probe}): {env:?}"
+            );
+        }
     }
 }
 
@@ -2185,15 +2304,21 @@ fn test_each_shell_marks_a_multiplexer_pane_and_clears_a_stale_marker() {
         ),
     ];
     let mut shells = ShellLanes::default();
-    let mut lanes = vec![(
-        bash_shell(),
-        &["--noprofile", "--norc", "-i"][..],
-        "aterm_shell_integration.bash",
-        "source \"$ATERM_TEST_SCRIPT\" >/dev/null; \
-         __aterm_in_prompt_cmd=1; trap - DEBUG 2>/dev/null || true; PROMPT_COMMAND=; \
-         printf 'mux=%s outer=%s base=%s' \"${ATERM_MUX-UNSET}\" \
-         \"${ATERM_MUX_OUTER_SESSION_ID-UNSET}\" \"${ATERM_MUX_BASE-UNSET}\"",
-    )];
+    let mut lanes: Vec<_> = shells
+        .bashes()
+        .into_iter()
+        .map(|bash| {
+            (
+                bash,
+                &["--noprofile", "--norc", "-i"][..],
+                "aterm_shell_integration.bash",
+                "source \"$ATERM_TEST_SCRIPT\" >/dev/null; \
+                 __aterm_in_prompt_cmd=1; trap - DEBUG 2>/dev/null || true; PROMPT_COMMAND=; \
+                 printf 'mux=%s outer=%s base=%s' \"${ATERM_MUX-UNSET}\" \
+                 \"${ATERM_MUX_OUTER_SESSION_ID-UNSET}\" \"${ATERM_MUX_BASE-UNSET}\"",
+            )
+        })
+        .collect();
     if let Some(zsh) = shells.zsh() {
         lanes.push((
             zsh,
@@ -2513,10 +2638,17 @@ impl LiveShell {
 
     /// What every live shell starts with ([`Self::spawn`], [`Self::spawn_on_pty`]): nothing
     /// of this process, the default SIGINT and SIGQUIT, and a fish's completions made
-    /// ([`mark_fish_completions_made`]).
+    /// ([`mark_fish_completions_made`]). Its argv goes to the test's captured output, which a
+    /// failure prints, so a test that runs more than one bash says which one failed.
     fn defaults(cmd: &mut Command) {
         use aterm_uds::spawnfd::InheritNothing as _;
         use std::os::unix::process::CommandExt as _;
+        eprintln!(
+            "live shell: {:?}",
+            std::iter::once(cmd.get_program())
+                .chain(cmd.get_args())
+                .collect::<Vec<_>>()
+        );
         cmd.inherit_nothing();
         // SAFETY: between fork and exec, `signal` alone, which is
         // async-signal-safe: no allocation, no lock.
@@ -2626,6 +2758,8 @@ impl LiveShell {
         String::from_utf8_lossy(&err).into_owned()
     }
 
+    /// What the shell wrote, under the shell's label (a bash's is its path, so a failure
+    /// says which bash it was).
     fn transcript(&self) -> String {
         let out = self
             .stdout
@@ -2636,7 +2770,8 @@ impl LiveShell {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         format!(
-            "--- stdout ---\n{}\n--- stderr ---\n{}",
+            "--- {} stdout ---\n{}\n--- stderr ---\n{}",
+            self.label,
             String::from_utf8_lossy(&out),
             String::from_utf8_lossy(&err)
         )
@@ -2940,9 +3075,14 @@ fn spawn_live_zsh(
     LiveShell::spawn("zsh", &mut cmd).holding(cmd.into_home())
 }
 
-/// An interactive bash through the crate's own `--rcfile` wrapper.
+/// An interactive `bash` through the crate's own `--rcfile` wrapper.
 #[cfg(unix)]
-fn spawn_live_bash(fx: &LiveFixture, rc_prelude: &str, extra: &[(&str, &str)]) -> LiveShell {
+fn spawn_live_bash(
+    bash: &str,
+    fx: &LiveFixture,
+    rc_prelude: &str,
+    extra: &[(&str, &str)],
+) -> LiveShell {
     std::fs::write(
         fx.home.join(".bashrc"),
         format!(
@@ -2958,7 +3098,7 @@ fn spawn_live_bash(fx: &LiveFixture, rc_prelude: &str, extra: &[(&str, &str)]) -
         .expect("prepare")
         .expect("bash injection");
     let argv = argv_override.expect("bash uses --rcfile");
-    let mut cmd = shell_command(bash_shell());
+    let mut cmd = shell_command(bash);
     cmd.args(&argv[1..])
         .arg("-i")
         .env("HOME", &fx.home)
@@ -2971,7 +3111,7 @@ fn spawn_live_bash(fx: &LiveFixture, rc_prelude: &str, extra: &[(&str, &str)]) -
     for (key, value) in extra {
         cmd.env(key, value);
     }
-    LiveShell::spawn("bash", &mut cmd).holding(cmd.into_home())
+    LiveShell::spawn(bash, &mut cmd).holding(cmd.into_home())
 }
 
 /// A home shaped like Ubuntu's `/etc/skel`.
@@ -2986,9 +3126,9 @@ fn skel_shaped_home(fx: &LiveFixture) {
     }
 }
 
-/// Bash as aterm starts it with `shell_args` = `args` ([`merge_shell_args`]).
+/// `bash` as aterm starts it with `shell_args` = `args` ([`merge_shell_args`]).
 #[cfg(all(unix, not(target_os = "macos")))]
-fn spawn_bash_with_shell_args(fx: &LiveFixture, args: &[&str]) -> LiveShell {
+fn spawn_bash_with_shell_args(bash: &str, fx: &LiveFixture, args: &[&str]) -> LiveShell {
     let mut injection = prepare_into(ShellType::Bash, &fx.base)
         .expect("prepare")
         .expect("bash injection");
@@ -3000,7 +3140,7 @@ fn spawn_bash_with_shell_args(fx: &LiveFixture, args: &[&str]) -> LiveShell {
         ArgsMerge::Integrated
     );
     let argv = injection.argv_override.expect("bash's argv");
-    let mut cmd = shell_command(bash_shell());
+    let mut cmd = shell_command(bash);
     cmd.args(&argv[1..])
         .env("HOME", &fx.home)
         .env("PATH", "/usr/bin:/bin")
@@ -3011,7 +3151,7 @@ fn spawn_bash_with_shell_args(fx: &LiveFixture, args: &[&str]) -> LiveShell {
     for (key, value) in injection.env_add {
         cmd.env(key, value);
     }
-    LiveShell::spawn("bash", &mut cmd).holding(cmd.into_home())
+    LiveShell::spawn(bash, &mut cmd).holding(cmd.into_home())
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -3023,45 +3163,60 @@ fn bash_reads_each_startup_file_once_non_login_and_login() {
     let count =
         |sh: &LiveShell, at: usize, what: &str| stdout_between(sh, 0, at).matches(what).count();
 
-    let fx = LiveFixture::new();
-    skel_shaped_home(&fx);
-    let mut sh = spawn_bash_with_shell_args(&fx, &["-i"]);
-    sh.send(probe);
-    let at = sh.wait_for_after("MARK42", 0);
-    assert_eq!(count(&sh, at, "RAN-BASHRC"), 1, "{}", sh.transcript());
-    assert_eq!(count(&sh, at, "RAN-PROFILE"), 0, "{}", sh.transcript());
-    assert_eq!(sh.value_before("LOGIN=", at), "n POSIX=n HOOKED=y");
-    sh.finish();
+    let mut shells = ShellLanes::default();
+    for bash in shells.bashes() {
+        let fx = LiveFixture::new();
+        skel_shaped_home(&fx);
+        let mut sh = spawn_bash_with_shell_args(bash, &fx, &["-i"]);
+        sh.send(probe);
+        let at = sh.wait_for_after("MARK42", 0);
+        assert_eq!(count(&sh, at, "RAN-BASHRC"), 1, "{}", sh.transcript());
+        assert_eq!(count(&sh, at, "RAN-PROFILE"), 0, "{}", sh.transcript());
+        assert_eq!(
+            sh.value_before("LOGIN=", at),
+            "n POSIX=n HOOKED=y",
+            "{bash}"
+        );
+        sh.finish();
 
-    let fx = LiveFixture::new();
-    skel_shaped_home(&fx);
-    let mut sh = spawn_bash_with_shell_args(&fx, &["-l", "-i"]);
-    sh.send(probe);
-    let at = sh.wait_for_after("MARK42", 0);
-    assert_eq!(count(&sh, at, "RAN-BASHRC"), 1, "{}", sh.transcript());
-    assert_eq!(count(&sh, at, "RAN-PROFILE"), 1, "{}", sh.transcript());
-    assert_eq!(sh.value_before("LOGIN=", at), "y POSIX=n HOOKED=y");
-    sh.send("logout");
-    sh.wait_exit_status("`logout` did not end the login shell");
-    assert_eq!(
-        std::fs::read_to_string(fx.home.join("logout-mark"))
-            .ok()
-            .as_deref(),
-        Some("LOGGED-OUT\n"),
-        "~/.bash_logout ran\n{}",
-        sh.transcript()
-    );
+        let fx = LiveFixture::new();
+        skel_shaped_home(&fx);
+        let mut sh = spawn_bash_with_shell_args(bash, &fx, &["-l", "-i"]);
+        sh.send(probe);
+        let at = sh.wait_for_after("MARK42", 0);
+        assert_eq!(count(&sh, at, "RAN-BASHRC"), 1, "{}", sh.transcript());
+        assert_eq!(count(&sh, at, "RAN-PROFILE"), 1, "{}", sh.transcript());
+        assert_eq!(
+            sh.value_before("LOGIN=", at),
+            "y POSIX=n HOOKED=y",
+            "{bash}"
+        );
+        sh.send("logout");
+        sh.wait_exit_status("`logout` did not end the login shell");
+        assert_eq!(
+            std::fs::read_to_string(fx.home.join("logout-mark"))
+                .ok()
+                .as_deref(),
+            Some("LOGGED-OUT\n"),
+            "~/.bash_logout ran\n{}",
+            sh.transcript()
+        );
 
-    let fx = LiveFixture::new();
-    skel_shaped_home(&fx);
-    std::fs::write(fx.home.join(".myrc"), "echo RAN-MYRC\n").expect(".myrc");
-    let mut sh = spawn_bash_with_shell_args(&fx, &["--rcfile", "~/.myrc", "-i"]);
-    sh.send(probe);
-    let at = sh.wait_for_after("MARK42", 0);
-    assert_eq!(count(&sh, at, "RAN-MYRC"), 1, "{}", sh.transcript());
-    assert_eq!(count(&sh, at, "RAN-BASHRC"), 0, "{}", sh.transcript());
-    assert_eq!(sh.value_before("LOGIN=", at), "n POSIX=n HOOKED=y");
-    sh.finish();
+        let fx = LiveFixture::new();
+        skel_shaped_home(&fx);
+        std::fs::write(fx.home.join(".myrc"), "echo RAN-MYRC\n").expect(".myrc");
+        let mut sh = spawn_bash_with_shell_args(bash, &fx, &["--rcfile", "~/.myrc", "-i"]);
+        sh.send(probe);
+        let at = sh.wait_for_after("MARK42", 0);
+        assert_eq!(count(&sh, at, "RAN-MYRC"), 1, "{}", sh.transcript());
+        assert_eq!(count(&sh, at, "RAN-BASHRC"), 0, "{}", sh.transcript());
+        assert_eq!(
+            sh.value_before("LOGIN=", at),
+            "n POSIX=n HOOKED=y",
+            "{bash}"
+        );
+        sh.finish();
+    }
 }
 
 #[cfg(unix)]
@@ -3171,27 +3326,33 @@ fn pty_command(argv: &[&str]) -> Command {
     cmd
 }
 
-/// A shell [`LiveShell::spawn_on_pty`] starts has the pty as its controlling terminal on all
-/// three of its standard descriptors, leading its process group: `/dev/tty` opens, and `ps`
-/// names the pty as its terminal. A non-interactive `sh`, which opens no terminal of its own
-/// (an interactive one does, and a session leader's open takes the terminal), opens
-/// `/dev/tty` too: the spawn made it the controlling terminal. On Linux that guards the
+/// A shell [`LiveShell::spawn_on_pty`] starts has the pty for all three of its standard
+/// descriptors and for its controlling terminal, leading its process group: each descriptor
+/// is a terminal, what it writes to its stderr and to `/dev/tty` reaches the pty's master
+/// (as the probe it reads from its stdin came from it), and `ps` puts it in its own process
+/// group. A non-interactive `sh`, which opens no terminal of its own (an interactive one
+/// does, and a session leader's open takes the terminal), reaches the master through
+/// `/dev/tty` too: the spawn made the pty its controlling terminal. On Linux that guards the
 /// spawn's `TIOCSCTTY`, since Linux hands a session a terminal only on that ioctl or an open;
 /// on macOS the session has the pty without it (the probe passes with the ioctl removed).
-/// It runs in a scratch `HOME` ([`shell_command`]), so the history an interactive `sh`
-/// writes at its exit (macOS's `~/.bash_history`) lands there. NEGATIVE CONTROL: the same
-/// shell [`LiveShell::spawn`] starts on pipes has no terminal at all.
+/// The probe never names the terminal: macOS's `ttyname` (`tty`) and `ps -o tty` find a name
+/// by walking `/dev`, and a walk while other tests' ptys come and go can miss this one (a
+/// loaded `verify test --all` printed "not a tty" for the stdin the next `tty <&1` named).
+/// Its markers are computed (`$((…))`) because the pty echoes the probe as typed. It runs in
+/// a scratch `HOME` ([`shell_command`]), so the history an interactive `sh` writes at its
+/// exit (macOS's `~/.bash_history`) lands there. NEGATIVE CONTROL: the same shell
+/// [`LiveShell::spawn`] starts on pipes has no terminal at all.
 #[cfg(unix)]
 #[test]
 fn a_shell_on_its_pty_has_it_for_its_terminal() {
-    const PROBE: &str = "tty; tty <&1; tty <&2; /bin/ps -o pid= -o pgid= -o tty= -p $$; \
-        if : 3</dev/tty; then echo CTTY=yes; else echo CTTY=no; fi; \
-        echo \"HOME=$HOME\"; echo MARK$((40+2))";
+    const TERMINALS: &str = "[ -t 0 ] && [ -t 1 ] && [ -t 2 ] && echo TERMINALS=$((1+2))";
+    const PROBE: &str = "echo STDERR=$((1+1)) >&2; echo CTTY=$((0+1)) >/dev/tty; \
+        /bin/ps -o pid= -o pgid= -p $$; echo \"HOME=$HOME\"; echo MARK$((40+2))";
     let mut cmd = shell_command("/bin/sh");
     cmd.arg("-i");
     let home = cmd.home().to_path_buf();
     let mut on_pty = LiveShell::spawn_on_pty("sh", &mut cmd).holding(cmd.into_home());
-    on_pty.send(PROBE);
+    on_pty.send(&format!("{TERMINALS}; {PROBE}"));
     let at = on_pty.wait_for_after("MARK42", 0);
     let seen = {
         let text = on_pty
@@ -3200,27 +3361,21 @@ fn a_shell_on_its_pty_has_it_for_its_terminal() {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         String::from_utf8_lossy(&text[..at]).into_owned()
     };
-    let terminals: Vec<&str> = seen
-        .lines()
-        .map(str::trim)
-        .filter(|l| l.starts_with("/dev/"))
-        .collect();
-    assert_eq!(terminals.len(), 3, "{seen}");
-    assert!(terminals.iter().all(|t| *t == terminals[0]), "{seen}");
-    // `ps`'s `tty` is the process's CONTROLLING terminal (`ttys004`, `pts/3`), which a
-    // descriptor open on a pty is not by itself.
-    let pid = on_pty.child.id().to_string();
-    let controlling = terminals[0].trim_start_matches("/dev/");
+    let printed = |line: &str| seen.lines().any(|l| l.trim() == line);
     assert!(
-        seen.lines().any(|l| {
-            l.split_whitespace().collect::<Vec<_>>() == [pid.as_str(), pid.as_str(), controlling]
-        }),
-        "the shell leads its process group, on the pty it controls\n{seen}"
+        printed("TERMINALS=3"),
+        "fds 0, 1 and 2 are terminals\n{seen}"
     );
-    assert!(seen.contains("CTTY=yes"), "its /dev/tty is the pty\n{seen}");
+    assert!(printed("STDERR=2"), "its stderr is the pty\n{seen}");
+    assert!(printed("CTTY=1"), "its /dev/tty is the pty\n{seen}");
+    let pid = on_pty.child.id().to_string();
     assert!(
         seen.lines()
-            .any(|l| l.trim() == format!("HOME={}", home.display())),
+            .any(|l| l.split_whitespace().collect::<Vec<_>>() == [pid.as_str(), pid.as_str()]),
+        "the shell leads its process group\n{seen}"
+    );
+    assert!(
+        printed(&format!("HOME={}", home.display())),
         "the shell's HOME is the scratch one\n{seen}"
     );
     assert_ne!(
@@ -3232,7 +3387,7 @@ fn a_shell_on_its_pty_has_it_for_its_terminal() {
     let mut cmd = shell_command("/bin/sh");
     cmd.args([
         "-c",
-        "if : 3</dev/tty; then echo CTTY=yes; else echo CTTY=no; fi; echo MARK$((40+2)); read line",
+        "echo CTTY=$((0+1)) >/dev/tty; echo MARK$((40+2)); read line",
     ]);
     let mut quiet = LiveShell::spawn_on_pty("sh -c", &mut cmd).holding(cmd.into_home());
     let at = quiet.wait_for_after("MARK42", 0);
@@ -3244,13 +3399,16 @@ fn a_shell_on_its_pty_has_it_for_its_terminal() {
         String::from_utf8_lossy(&text[..at]).into_owned()
     };
     assert!(
-        seen.contains("CTTY=yes"),
+        seen.lines().any(|l| l.trim() == "CTTY=1"),
         "a shell that opens no terminal has the pty for its own\n{seen}"
     );
     quiet.finish();
+    // On pipes the shell keeps this process's session, so it writes nowhere near `/dev/tty`.
     let mut cmd = shell_command("/bin/sh");
     let mut on_pipes = LiveShell::spawn("sh", &mut cmd).holding(cmd.into_home());
-    on_pipes.send("tty; echo MARK$((40+2))");
+    on_pipes.send(&format!(
+        "{TERMINALS} || echo TERMINALS=0; echo MARK$((40+2))"
+    ));
     let at = on_pipes.wait_for_after("MARK42", 0);
     let seen = {
         let text = on_pipes
@@ -3259,7 +3417,7 @@ fn a_shell_on_its_pty_has_it_for_its_terminal() {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         String::from_utf8_lossy(&text[..at]).into_owned()
     };
-    assert!(seen.contains("not a tty"), "{seen}");
+    assert!(seen.lines().any(|l| l.trim() == "TERMINALS=0"), "{seen}");
     on_pipes.finish();
 }
 
@@ -3293,22 +3451,18 @@ fn need_fish() -> &'static str {
     })
 }
 
-/// A live `label` shell ("bash", "zsh" or "fish") inside a session, with no rc prelude.
+/// A live `program` of `dialect` ("bash", "zsh" or "fish": a lane of [`ShellLanes::lanes`])
+/// inside a session, with no rc prelude, and the line that prints its PATH.
 #[cfg(unix)]
 fn spawn_live(
-    label: &str,
+    (dialect, program): (&str, &str),
     fx: &LiveFixture,
     extra: &[(&str, &str)],
-    shells: &mut ShellLanes,
-) -> Option<(LiveShell, &'static str)> {
-    match label {
-        "bash" => Some((spawn_live_bash(fx, "", extra), BASH_PRINT_PATH)),
-        "zsh" => shells
-            .zsh()
-            .map(|zsh| (spawn_live_zsh(zsh, fx, "", extra), ZSH_PRINT_PATH)),
-        _ => shells
-            .fish()
-            .map(|fish| (spawn_live_fish(fish, fx, extra), FISH_PRINT_PATH)),
+) -> (LiveShell, &'static str) {
+    match dialect {
+        "bash" => (spawn_live_bash(program, fx, "", extra), BASH_PRINT_PATH),
+        "zsh" => (spawn_live_zsh(program, fx, "", extra), ZSH_PRINT_PATH),
+        _ => (spawn_live_fish(program, fx, extra), FISH_PRINT_PATH),
     }
 }
 
@@ -3404,22 +3558,25 @@ fn test_zsh_already_running_session_shell_picks_up_the_managed_dirs_live() {
 #[cfg(unix)]
 #[test]
 fn test_bash_live_pickup_holds_under_set_u() {
-    let fx = LiveFixture::new();
-    let mut sh = spawn_live_bash(&fx, "set -u\n", &[]);
-    posix_owner_scenario("bash", &mut sh, &fx, BASH_PRINT_PATH);
-    let err = sh.stderr_text();
-    assert!(
-        !err.contains("unbound variable"),
-        "bash: the integration must be nounset-clean at load and at every prompt:\n{err}"
-    );
-    sh.finish();
+    let mut shells = ShellLanes::default();
+    for bash in shells.bashes() {
+        let fx = LiveFixture::new();
+        let mut sh = spawn_live_bash(bash, &fx, "set -u\n", &[]);
+        posix_owner_scenario("bash", &mut sh, &fx, BASH_PRINT_PATH);
+        let err = sh.stderr_text();
+        assert!(
+            !err.contains("unbound variable"),
+            "{bash}: the integration must be nounset-clean at load and at every prompt:\n{err}"
+        );
+        sh.finish();
+    }
 }
 
 #[cfg(unix)]
 #[test]
 fn test_reroute_stubs_survive_a_prompt_time_prepend_with_no_hook() {
     let mut shells = ShellLanes::default();
-    for label in ["bash", "zsh", "fish"] {
+    for lane @ (label, program) in shells.lanes(&["bash", "zsh", "fish"]) {
         let fx = LiveFixture::new();
         fx.lay_reroute_stub("cargo", "stub-cargo");
         write_executable(&fx.foreign.join("cargo"), "#!/bin/sh\necho foreign-cargo\n");
@@ -3430,9 +3587,7 @@ fn test_reroute_stubs_survive_a_prompt_time_prepend_with_no_hook() {
             ("ATERM_REROUTE_DIR", reroute),
             ("PATH", path.as_str()),
         ];
-        let Some((mut sh, print)) = spawn_live(label, &fx, &env, &mut shells) else {
-            continue;
-        };
+        let (mut sh, print) = spawn_live(lane, &fx, &env);
         let (prepend, idle) = if label == "fish" {
             (
                 format!("set -gx PATH \"{}\" $PATH", fx.foreign.display()),
@@ -3459,12 +3614,12 @@ fn test_reroute_stubs_survive_a_prompt_time_prepend_with_no_hook() {
         let path = sh.value_before("LIVEPATH=", at);
         assert!(
             path.starts_with(&format!("{reroute}:")),
-            "{label}: the reroute dir must lead PATH after the prepend: {path:?}"
+            "{program}: the reroute dir must lead PATH after the prepend: {path:?}"
         );
         assert!(
             path.split(':')
                 .any(|e| e == fx.foreign.to_str().expect("UTF-8")),
-            "{label}: the prepended dir is demoted, not removed: {path:?}"
+            "{program}: the prepended dir is demoted, not removed: {path:?}"
         );
         sh.finish();
     }
@@ -3474,31 +3629,28 @@ fn test_reroute_stubs_survive_a_prompt_time_prepend_with_no_hook() {
 #[test]
 fn test_twin_landing_in_an_agents_dir_already_leading_path_is_run_live() {
     let mut shells = ShellLanes::default();
-    let mut lanes = vec![("bash", None)];
-    if let Some(zsh) = shells.zsh() {
-        lanes.push(("zsh", Some(zsh)));
-    }
-    for (label, zsh) in lanes {
+    for (label, program) in shells.lanes(&["bash", "zsh"]) {
         let fx = LiveFixture::new();
         fx.lay_dirs();
         fx.lay_hook(label, ATPKG_HOOK_POSIX_GOLDEN);
         let foreign = fx.foreign.join("claude");
-        let (mut sh, hash_foreign, print) = match zsh {
-            Some(zsh) => (
+        let (mut sh, hash_foreign, print) = if label == "zsh" {
+            (
                 spawn_live_zsh(
-                    zsh,
+                    program,
                     &fx,
                     "setopt ksh_arrays warn_create_global\n",
                     &[("ATERM_CHILD", "1")],
                 ),
                 format!("hash zzz={}", foreign.display()),
                 ZSH_PRINT_PATH,
-            ),
-            None => (
-                spawn_live_bash(&fx, "", &[]),
+            )
+        } else {
+            (
+                spawn_live_bash(program, &fx, "", &[]),
                 format!("hash -p {} zzz", foreign.display()),
                 BASH_PRINT_PATH,
-            ),
+            )
         };
         sh.send("claude");
         let at = sh.wait_for_after("foreign", 0);
@@ -3516,11 +3668,11 @@ fn test_twin_landing_in_an_agents_dir_already_leading_path_is_run_live() {
         fx.lay_twin("managed 2");
         sh.send("claude");
         let at = sh.wait_for_after("managed 2", at);
-        assert_live_path(label, &mut sh, &fx, at, print);
+        assert_live_path(program, &mut sh, &fx, at, print);
         let err = sh.stderr_text();
         assert!(
             !err.contains("created globally"),
-            "{label}: sourcing the hook from the hot path must not trip warn_create_global:\n{err}"
+            "{program}: sourcing the hook from the hot path must not trip warn_create_global:\n{err}"
         );
         sh.finish();
     }
@@ -3530,13 +3682,10 @@ fn test_twin_landing_in_an_agents_dir_already_leading_path_is_run_live() {
 #[test]
 fn test_hook_naming_an_agents_dir_that_appears_later_is_fronted_live() {
     let mut shells = ShellLanes::default();
-    for label in ["bash", "zsh"] {
+    for lane @ (label, program) in shells.lanes(&["bash", "zsh"]) {
         let fx = LiveFixture::new();
         fx.lay_hook(label, ATPKG_HOOK_POSIX_GOLDEN);
-        let Some((mut sh, print)) = spawn_live(label, &fx, &[("ATERM_CHILD", "1")], &mut shells)
-        else {
-            continue;
-        };
+        let (mut sh, print) = spawn_live(lane, &fx, &[("ATERM_CHILD", "1")]);
         sh.send("claude");
         let at = sh.wait_for_after("foreign", 0);
         sh.send("echo IDLE-$((1+0))");
@@ -3546,7 +3695,7 @@ fn test_hook_naming_an_agents_dir_that_appears_later_is_fronted_live() {
         fx.lay_twin("managed 1");
         sh.send("claude");
         let at = sh.wait_for_after("managed 1", at);
-        assert_live_path(label, &mut sh, &fx, at, print);
+        assert_live_path(program, &mut sh, &fx, at, print);
         sh.finish();
     }
 }
@@ -3647,7 +3796,7 @@ fn deliver(path: &Path, line: &str) {
 #[test]
 fn a_live_shell_takes_a_rekey_at_its_next_prompt() {
     let mut shells = ShellLanes::default();
-    for label in ["bash", "zsh", "fish"] {
+    for lane @ (label, program) in shells.lanes(&["bash", "zsh", "fish"]) {
         let fx = LiveFixture::new();
         let file = fx.home.join(format!("rekey-{label}"));
         let path = file.to_str().unwrap().to_string();
@@ -3655,14 +3804,16 @@ fn a_live_shell_takes_a_rekey_at_its_next_prompt() {
             ("ATERM_SHELL_NONCE", REKEY_OLD),
             ("ATERM_REKEY_PATH", path.as_str()),
         ];
-        let Some((mut sh, _)) = spawn_live(label, &fx, &extra, &mut shells) else {
-            continue;
-        };
+        let (mut sh, _) = spawn_live(lane, &fx, &extra);
         let (line, marker) = rekey_probe(label, 1);
         sh.send(&line);
         let at = sh.wait_for_after(&marker, 0);
-        assert_eq!(sh.value_before("NONCE=", at), REKEY_OLD, "{label}: spawned");
-        assert_eq!(sh.value_before("ENV=", at), "", "{label}: path scrubbed");
+        assert_eq!(
+            sh.value_before("NONCE=", at),
+            REKEY_OLD,
+            "{program}: spawned"
+        );
+        assert_eq!(sh.value_before("ENV=", at), "", "{program}: path scrubbed");
 
         deliver(&file, "NOT-A-KEY");
         sh.send("true");
@@ -3672,9 +3823,9 @@ fn a_live_shell_takes_a_rekey_at_its_next_prompt() {
         assert_eq!(
             sh.value_before("NONCE=", at),
             REKEY_OLD,
-            "{label}: a bad key changes nothing"
+            "{program}: a bad key changes nothing"
         );
-        assert!(!file.exists(), "{label}: a bad key is consumed");
+        assert!(!file.exists(), "{program}: a bad key is consumed");
 
         deliver(&file, REKEY_NEW);
         sh.send("true");
@@ -3684,14 +3835,17 @@ fn a_live_shell_takes_a_rekey_at_its_next_prompt() {
         assert_eq!(
             sh.value_before("NONCE=", at),
             REKEY_NEW,
-            "{label}: re-keyed"
+            "{program}: re-keyed"
         );
         assert_eq!(
             sh.value_before("SUFFIX=", at),
             format!(";id={REKEY_NEW}"),
-            "{label}"
+            "{program}"
         );
-        assert!(!file.exists(), "{label}: the key file is removed once read");
+        assert!(
+            !file.exists(),
+            "{program}: the key file is removed once read"
+        );
         let (line, marker) = rekey_probe(label, 4);
         sh.send(&line);
         let end = sh.wait_for_after(&marker, at);
@@ -3702,7 +3856,7 @@ fn a_live_shell_takes_a_rekey_at_its_next_prompt() {
         assert!(
             tail.contains(&format!("133;A;id={REKEY_NEW}"))
                 || tail.contains(&format!("133;C;id={REKEY_NEW}")),
-            "{label}: marks carry the new key: {tail:?}"
+            "{program}: marks carry the new key: {tail:?}"
         );
         sh.finish();
     }
@@ -3717,32 +3871,36 @@ fn a_live_bash_prompt_carries_one_133b_however_many_prompts() {
         "C.UTF-8"
     };
     let older = format!("PS1='\\u \\$ \\[\\033]133;B;id={REKEY_OLD}\\a\\]'\n");
-    for rc in ["", concat!(r"PS1=$'\xc9\\u \\$ '", "\n"), older.as_str()] {
-        let fx = LiveFixture::new();
-        let mut sh = spawn_live_bash(
-            &fx,
-            rc,
-            &[("ATERM_SHELL_NONCE", REKEY_OLD), ("LC_ALL", utf8)],
-        );
-        let mut at = 0;
-        for n in 1..=3u32 {
-            sh.send(&format!(
-                "printf 'PS1=%s\\n' \"$PS1\"; echo PS$((500 + {n}))"
-            ));
-            at = sh.wait_for_after(&format!("PS{}", 500 + n), at);
-            let ps1 = sh.value_before("PS1=", at);
-            assert_eq!(
-                (
-                    ps1.matches("133;B").count(),
-                    ps1.contains(r"\u \$ ") || rc.is_empty(),
-                    ps1.contains(&format!("133;B;id={REKEY_OLD};aterm_input=start\\a")),
-                ),
-                (1, true, true),
-                "rc {rc:?}, prompt {n}: {ps1:?}\n{}",
-                sh.transcript()
+    let mut shells = ShellLanes::default();
+    for bash in shells.bashes() {
+        for rc in ["", concat!(r"PS1=$'\xc9\\u \\$ '", "\n"), older.as_str()] {
+            let fx = LiveFixture::new();
+            let mut sh = spawn_live_bash(
+                bash,
+                &fx,
+                rc,
+                &[("ATERM_SHELL_NONCE", REKEY_OLD), ("LC_ALL", utf8)],
             );
+            let mut at = 0;
+            for n in 1..=3u32 {
+                sh.send(&format!(
+                    "printf 'PS1=%s\\n' \"$PS1\"; echo PS$((500 + {n}))"
+                ));
+                at = sh.wait_for_after(&format!("PS{}", 500 + n), at);
+                let ps1 = sh.value_before("PS1=", at);
+                assert_eq!(
+                    (
+                        ps1.matches("133;B").count(),
+                        ps1.contains(r"\u \$ ") || rc.is_empty(),
+                        ps1.contains(&format!("133;B;id={REKEY_OLD};aterm_input=start\\a")),
+                    ),
+                    (1, true, true),
+                    "{bash}: rc {rc:?}, prompt {n}: {ps1:?}\n{}",
+                    sh.transcript()
+                );
+            }
+            sh.finish();
         }
-        sh.finish();
     }
 }
 
@@ -3774,22 +3932,25 @@ fn posix_quoted(path: &Path) -> String {
 #[test]
 fn a_live_shell_without_the_channel_takes_a_typed_rekey() {
     let mut shells = ShellLanes::default();
-    for (label, shell) in [("bash", ShellType::Bash), ("zsh", ShellType::Zsh)] {
+    for lane @ (label, program) in shells.lanes(&["bash", "zsh"]) {
+        let shell = ShellType::detect(label);
         let fx = LiveFixture::new();
         let extra = [("ATERM_SHELL_NONCE", REKEY_OLD)];
-        let Some((mut sh, _)) = spawn_live(label, &fx, &extra, &mut shells) else {
-            continue;
-        };
+        let (mut sh, _) = spawn_live(lane, &fx, &extra);
         let file = fx.home.join("re key's");
         std::fs::write(&file, format!("{REKEY_NEW}\n")).unwrap();
         sh.send("true");
         let (line, marker) = rekey_probe(label, 1);
         sh.send(&line);
         let at = sh.wait_for_after(&marker, 0);
-        assert_eq!(sh.value_before("NONCE=", at), REKEY_OLD, "{label}: before");
+        assert_eq!(
+            sh.value_before("NONCE=", at),
+            REKEY_OLD,
+            "{program}: before"
+        );
         assert!(
             file.exists(),
-            "{label}: no prompt of its own reads the file"
+            "{program}: no prompt of its own reads the file"
         );
 
         let typed = typed_rekey(shell, &posix_quoted(&file)).expect("scripted");
@@ -3798,13 +3959,13 @@ fn a_live_shell_without_the_channel_takes_a_typed_rekey() {
         let (line, marker) = rekey_probe(label, 2);
         sh.send(&line);
         let at = sh.wait_for_after(&marker, at);
-        assert_eq!(sh.value_before("NONCE=", at), REKEY_NEW, "{label}: taken");
+        assert_eq!(sh.value_before("NONCE=", at), REKEY_NEW, "{program}: taken");
         assert_eq!(
             sh.value_before("SUFFIX=", at),
             format!(";id={REKEY_NEW}"),
-            "{label}"
+            "{program}"
         );
-        assert!(!file.exists(), "{label}: the one-use file is gone");
+        assert!(!file.exists(), "{program}: the one-use file is gone");
         let (line, marker) = rekey_probe(label, 3);
         sh.send(&line);
         let end = sh.wait_for_after(&marker, at);
@@ -3815,7 +3976,7 @@ fn a_live_shell_without_the_channel_takes_a_typed_rekey() {
         assert!(
             tail.contains(&format!("133;A;id={REKEY_NEW}"))
                 && tail.contains(&format!("133;C;id={REKEY_NEW}")),
-            "{label}: the next prompt's marks carry the new key: {tail:?}"
+            "{program}: the next prompt's marks carry the new key: {tail:?}"
         );
 
         let gone = fx.home.join("withdrawn");
@@ -3828,10 +3989,10 @@ fn a_live_shell_without_the_channel_takes_a_typed_rekey() {
         assert_eq!(
             sh.value_before("NONCE=", at),
             REKEY_NEW,
-            "{label}: a missing file changes nothing"
+            "{program}: a missing file changes nothing"
         );
         let err = sh.stderr_text().to_lowercase();
-        assert!(!err.contains("no such file"), "{label}: quiet: {err}");
+        assert!(!err.contains("no such file"), "{program}: quiet: {err}");
         sh.finish();
     }
 }

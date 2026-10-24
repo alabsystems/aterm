@@ -533,12 +533,12 @@ fn a_write_in_doubt_is_marked_by_its_verb_and_wakes_its_watchers() {
     });
     let key = |seq: u32| format!("{}:4:{seq}", h.ctx.nonce.to_hex());
     let owner = crate::control::Scope::Owner;
-    let ok = crate::pty_idem::guarded_waking(&h.ctx, owner, "send", Some(&key(1)), &wake, || {
+    let ok = crate::pty_idem::guarded_waking(&h.ctx, owner, "send", Some(&key(1)), &wake, |_| {
         "OK 3 bytes\n".to_string()
     });
     assert_eq!((ok.as_str(), woke.get()), ("OK 3 bytes\n", 0));
     let failed =
-        crate::pty_idem::guarded_waking(&h.ctx, owner, "send", Some(&key(2)), &wake, || {
+        crate::pty_idem::guarded_waking(&h.ctx, owner, "send", Some(&key(2)), &wake, |_| {
             "ERR write SENTINEL-REPLY failed\n".to_string()
         });
     assert!(failed.starts_with("ERR write"), "{failed}");
@@ -548,12 +548,12 @@ fn a_write_in_doubt_is_marked_by_its_verb_and_wakes_its_watchers() {
         .expect("the parked await returns on the guard's wake");
     assert!(reply.contains(" mark - in-doubt verb=send "), "{reply}");
     let replay =
-        crate::pty_idem::guarded_waking(&h.ctx, owner, "send", Some(&key(2)), &wake, || {
+        crate::pty_idem::guarded_waking(&h.ctx, owner, "send", Some(&key(2)), &wake, |_| {
             unreachable!("an in-doubt sequence is never replayed")
         });
     assert!(replay.starts_with("ERR in-doubt"), "{replay}");
     assert_eq!(woke.get(), 1, "a replay wakes nobody");
-    let _ = crate::pty_idem::guarded_waking(&h.ctx, owner, "frob", Some(&key(3)), &wake, || {
+    let _ = crate::pty_idem::guarded_waking(&h.ctx, owner, "frob", Some(&key(3)), &wake, |_| {
         "ERR write failed\n".to_string()
     });
     let got = content_lines(&h.ctx.timeline);

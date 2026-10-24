@@ -2,9 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Export file [`Selection`] and text [`rewrite`] transforms for publication content guards.
+//! Export file [`Selection`] and text [`rewrite`] transforms for publication content guards,
+//! and the [`plaintext`] the engine reads of a compressed or BOM'd file.
 
 use aterm_regex::Regex;
+
+pub mod plaintext;
 
 /// The export's allowlist, relative to the checkout.
 pub const MANIFEST: &str = "publish/manifest.txt";
@@ -22,20 +25,21 @@ pub struct Selection {
 #[derive(Debug)]
 enum Spec {
     Root,
-    Literal(String),
+    /// A path, and whether a trailing `/` holds it to what is under it.
+    Literal(String, bool),
     Glob(Regex),
 }
 
 impl Spec {
+    /// `text` as the engine hands it to git, which normalizes it: an empty or
+    /// `.` component drops, `..` climbs one, and a spec ending in `/` (or a `.`
+    /// or `..` component) names only what is under it, so `README.md/` selects
+    /// no file and `crates//x` the files under `crates/x`.
     fn new(text: &str) -> Result<Self, String> {
         if text.starts_with('/') {
             return Err(format!(
                 "{text:?} is an absolute pathspec; spell `.` for the checkout root"
             ));
-        }
-        let text = text.trim_start_matches("./").trim_end_matches('/');
-        if text.is_empty() || text == "." {
-            return Ok(Self::Root);
         }
         if text.contains(['[', '\\']) || text.starts_with(':') {
             return Err(format!(
@@ -43,11 +47,29 @@ impl Spec {
                  git magic), so it cannot say what the export selects"
             ));
         }
-        if !text.contains(['*', '?']) {
-            return Ok(Self::Literal(text.to_string()));
+        let parts: Vec<&str> = text.split('/').collect();
+        let mut kept: Vec<&str> = Vec::new();
+        for part in &parts {
+            match *part {
+                "" | "." => {}
+                ".." => {
+                    kept.pop().ok_or_else(|| {
+                        format!("{text:?} climbs out of the checkout, which git refuses")
+                    })?;
+                }
+                part => kept.push(part),
+            }
+        }
+        if kept.is_empty() {
+            return Ok(Self::Root);
+        }
+        let dir = matches!(parts.last(), Some(&("" | "." | "..")));
+        let path = kept.join("/");
+        if !path.contains(['*', '?']) {
+            return Ok(Self::Literal(path, dir));
         }
         let mut pattern = String::from("(?s)^");
-        for c in text.chars() {
+        for c in path.chars().chain(dir.then_some('/')) {
             match c {
                 '*' => pattern.push_str(".*"),
                 '?' => pattern.push('.'),
@@ -63,16 +85,12 @@ impl Spec {
     fn matches(&self, rel: &str) -> bool {
         match self {
             Self::Root => true,
-            Self::Literal(spec) => under(rel, spec),
+            Self::Literal(spec, dir) => rel
+                .strip_prefix(spec.as_str())
+                .is_some_and(|rest| (rest.is_empty() && !dir) || rest.starts_with('/')),
             Self::Glob(re) => re.is_match(rel),
         }
     }
-}
-
-/// Whether `rel` is the literal path `spec` or under it.
-fn under(rel: &str, spec: &str) -> bool {
-    rel.strip_prefix(spec)
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 impl Selection {
@@ -81,13 +99,13 @@ impl Selection {
     /// engine refuses.
     ///
     /// # Errors
-    /// A line holding an absolute path, class, escape or git magic, or nothing
-    /// once its `./` is stripped.
+    /// A line holding an absolute path, class, escape or git magic, a `..` that
+    /// climbs out of the checkout, or nothing once its `./` is stripped.
     pub fn parse(manifest: &str) -> Result<Self, (usize, String)> {
         let mut include = Vec::new();
         let mut exclude: Vec<Spec> = CENTRAL_DENY
             .iter()
-            .map(|d| Spec::Literal((*d).to_string()))
+            .map(|d| Spec::Literal((*d).to_string(), false))
             .collect();
         for (i, raw) in manifest.lines().enumerate() {
             let line = raw.split('#').next().unwrap_or("").trim();
@@ -108,7 +126,7 @@ impl Selection {
                     ),
                 ));
             }
-            let spec = Spec::new(text).map_err(|why| (i + 1, why))?;
+            let spec = Spec::new(spec).map_err(|why| (i + 1, why))?;
             if excluding {
                 exclude.push(spec);
             } else {
@@ -273,6 +291,43 @@ mod tests {
         );
     }
 
+    /// What `git ls-files -- <spec>` (git 2.54.0) lists of a checkout holding
+    /// `README.md`, `crates/x/a.txt` and `crates/xy/b.txt`, measured once per
+    /// spec; an exclusion is `git ls-files -- . ':(exclude)<spec>'`.
+    #[test]
+    fn a_spelling_git_normalizes_selects_what_git_lists() {
+        const FILES: [&str; 3] = ["README.md", "crates/x/a.txt", "crates/xy/b.txt"];
+        let (readme, x, xy) = (&FILES[..1], &FILES[1..2], &FILES[2..]);
+        for (spec, listed) in [
+            ("crates//x", x),
+            ("crates/./x", x),
+            ("crates/x/.", x),
+            ("crates/x//", x),
+            ("./crates/./x", x),
+            ("crates/x/../xy", xy),
+            ("crates/x/..", &FILES[1..]),
+            ("crates//*.txt", &FILES[1..]),
+            ("crates/..", &FILES[..]),
+            ("cr*/../README.md", readme),
+            ("crates/x/../../README.md", readme),
+            ("././README.md", readme),
+            ("README.md/", &[]),
+            ("README.md/.", &[]),
+            ("crates/x/a.txt/", &[]),
+            ("crates/x/..//README.md", &[]),
+            ("crates/*/", &[]),
+            ("cr*/", &[]),
+        ] {
+            let included = Selection::parse(spec).expect(spec);
+            let excluded = Selection::parse(&format!(".\n!{spec}\n")).expect(spec);
+            for rel in FILES {
+                let want = listed.contains(&rel);
+                assert_eq!(included.selects(rel), want, "{spec}: {rel}");
+                assert_eq!(excluded.selects(rel), !want, "!{spec}: {rel}");
+            }
+        }
+    }
+
     #[test]
     fn a_line_the_engine_refuses_is_refused() {
         for (manifest, line) in [
@@ -281,6 +336,11 @@ mod tests {
             ("crates\n!./\n", 2),
             ("crates\n! ./ # the root\n", 2),
             ("./\n", 1),
+            (".//\n", 1),
+            ("..\n", 1),
+            ("../x\n", 1),
+            ("crates/../..\n", 1),
+            ("crates\n!crates/x/../../..\n", 2),
         ] {
             assert_eq!(
                 Selection::parse(manifest).map(|_| ()).unwrap_err().0,

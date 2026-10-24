@@ -125,6 +125,15 @@ fn tapped<'a>(m: &'a mut Mock, ledger: Option<PathBuf>) -> Session<'a, Mock> {
     s
 }
 
+/// [`tapped`] on a virtual clock: the monotonic and wall clocks and every row's stamp start at [`TEST_NOW`] and move only on the loop's sleeps.
+fn tapped_virtual<'a>(m: &'a mut Mock, ledger: Option<PathBuf>) -> Session<'a, Mock> {
+    let mut s = tapped(m, ledger);
+    s.set_fx(Fx::over(ClockSource::Virtual(Arc::new(
+        crate::supervise::fx::VirtualClock::new(Instant::now(), TEST_NOW * 1000),
+    ))));
+    s
+}
+
 fn opts_with(host: &Arc<TapHost>) -> SuperviseOpts {
     SuperviseOpts {
         idle_host: Some(Arc::clone(host) as Arc<dyn IdleHost>),
@@ -531,7 +540,7 @@ fn a_left_walls_wait_is_retimed_by_the_tap_read_while_it_waits() {
         };
         let mut out: Vec<u8> = Vec::new();
         let (notice, limit) = {
-            let mut s = tapped(&mut m, Some(ledger.clone()));
+            let mut s = tapped_virtual(&mut m, Some(ledger.clone()));
             let _ = s.watch(&opts, &mut out);
             (
                 s.wall_reset.as_ref().and_then(|(_, u)| *u),
@@ -553,7 +562,7 @@ fn a_left_walls_wait_is_retimed_by_the_tap_read_while_it_waits() {
             ..opts_with(&quiet)
         };
         {
-            let mut s = tapped(&mut m, Some(ledger.clone()));
+            let mut s = tapped_virtual(&mut m, Some(ledger.clone()));
             let _ = s.watch(&opts, &mut out);
         }
         let next = journal(&path);

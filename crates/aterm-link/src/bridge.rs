@@ -50,6 +50,10 @@ const LINK_REFRESH: Duration = Duration::from_secs(2);
 
 const LINK_MOVE_GAP: Duration = Duration::from_millis(250);
 
+/// How long a failed redial [`Bridge::dial_failed`] keeps quiet (its reason was said
+/// already) before it says the outage again, with the redials it stood for.
+const LINK_DOWN_RETELL: Duration = Duration::from_secs(30);
+
 const REFILL_FLOOR_SPAN: u64 = 4096;
 
 const ROSTER_REFRESH: Duration = Duration::from_millis(2_000);
@@ -600,6 +604,13 @@ impl LinkReport {
     }
 }
 
+/// The failed redials [`Bridge::dial_failed`] has kept quiet since it last said the link down.
+#[derive(Debug, Clone, Copy, Default)]
+struct QuietDials {
+    said_at: Option<Instant>,
+    kept: u64,
+}
+
 fn link_reason(e: &io::Error, other: &'static str) -> &'static str {
     use astream_broker::proto::{ERR_PROTOCOL, ERR_RECORD_REFUSED, ERR_TOO_MANY_CONNS};
     use io::ErrorKind as K;
@@ -1063,6 +1074,7 @@ pub struct Bridge {
     deadline_due: Instant,
     closers: Vec<(Source, Arc<BusCloser>)>,
     link: LinkReport,
+    quiet_dials: QuietDials,
     attaching: bool,
     attach_rtt: Option<Duration>,
     bye: Option<Bye>,
@@ -1325,6 +1337,7 @@ impl Bridge {
             moved_at_start: 0,
             closers: Vec::new(),
             link: LinkReport::new(),
+            quiet_dials: QuietDials::default(),
             attaching: false,
             attach_rtt: None,
             bye: None,
@@ -1797,6 +1810,28 @@ impl Bridge {
         let reason = link_reason(e, "attach");
         if self.link.down_wants_report(reason) {
             eprintln!("aterm-link: the broker link is down ({reason}): {e}");
+        } else {
+            // A BROKER THAT STAYS DOWN FOR ONE REASON IS SAID AGAIN: said once, a
+            // minute of redials that all failed alike reads as one failed redial.
+            let now = self.fx.now();
+            self.quiet_dials.kept += 1;
+            let quiet = self
+                .quiet_dials
+                .said_at
+                .or(self.link.reported_at)
+                .map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
+            if quiet >= LINK_DOWN_RETELL {
+                eprintln!(
+                    "aterm-link: the broker link is still down ({reason}): {} more redials \
+                     failed in {}s, the last: {e}",
+                    self.quiet_dials.kept,
+                    quiet.as_secs()
+                );
+                self.quiet_dials = QuietDials {
+                    said_at: Some(now),
+                    kept: 0,
+                };
+            }
         }
         self.link_down(reason);
     }
@@ -1808,6 +1843,7 @@ impl Bridge {
         self.link.up = false;
         self.link.reason = reason;
         self.link.reported_at = Some(self.fx.now());
+        self.quiet_dials = QuietDials::default();
         self.report_link(&format!("link down reason={reason}"));
     }
 
@@ -7766,8 +7802,8 @@ fn node_for(state: &StateDir, caps: &[Cap]) -> io::Result<String> {
     let refuse = |msg: String| io::Error::new(io::ErrorKind::InvalidInput, msg);
     match state.node() {
         Some(node) if !crate::enable::is_node_id(&node) => Err(refuse(format!(
-            "{dir}/node holds `{}`, which is not a node id (`n-` and [a-z0-9-]): a node's \
-             identity is provisioned by `aterm fabric on`",
+            "{dir}/node holds `{}`, which is not a node id (`n-` and [a-z0-9-]): move it aside \
+             and run `aterm fabric on` to provision one",
             crate::render::safe(&node, 64)
         ))),
         Some(node) if bound.is_empty() || bound.contains(&node) => Ok(node),

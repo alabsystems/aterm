@@ -128,14 +128,14 @@ impl TypedKittySummon {
         } = self;
         lexicon.scan_into_with_scratch(&buf[start..], opts, chars, matches, scratch);
         let end = self.chars.len();
-        let hit =
-            self.matches
-                .iter()
-                .filter(|m| m.end == end)
-                .fold(None::<Class>, |acc, m| match (acc, m.class) {
-                    (Some(Class::Profanity), _) | (_, Class::Profanity) => Some(Class::Profanity),
-                    (_, class) => Some(class),
-                });
+        let mut hit = None;
+        for m in self.matches.iter().filter(|m| m.end == end) {
+            if m.class == Class::Profanity {
+                hit = Some(Class::Profanity);
+                break;
+            }
+            hit = Some(m.class);
+        }
         let Some(class) = hit else {
             return TypedHit::default();
         };
@@ -167,6 +167,30 @@ impl TypedKittySummon {
     }
 
     fn trailing_scan_start(buf: &str, last: char) -> usize {
+        if buf.is_ascii() {
+            let bytes = buf.as_bytes();
+            if bytes.is_empty() {
+                return 0;
+            }
+            let is_tok = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+            let mut k = bytes.len() - 1;
+            while k > 0 {
+                let b = bytes[k - 1];
+                if is_tok(b) {
+                    k -= 1;
+                } else if b == b'\'' || b == b'-' {
+                    k -= 1;
+                    if k > 0 && is_tok(bytes[k - 1]) {
+                        k -= 1;
+                    } else {
+                        return k.saturating_sub(1);
+                    }
+                } else {
+                    break;
+                }
+            }
+            return k.saturating_sub(2);
+        }
         let mut rev = buf.char_indices().rev().peekable();
         if rev.next().is_none() {
             return 0;

@@ -116,28 +116,112 @@ pub fn session_bus() -> Result<Vec<Address>> {
     )))
 }
 
-/// Connects a unix-socket address.
+/// Connects a unix-socket address by `deadline` (`None` waits as long as it takes).
 ///
 /// # Errors
 /// [`Error::Unsupported`] for another transport or a unix address without `path=`
-/// (or, on Linux, `abstract=`); [`Error::Io`] when the connect fails.
+/// (or, on Linux, `abstract=`); [`Error::Timeout`] once `deadline` passes (on Linux a full
+/// backlog holds the connect); [`Error::Io`] when the connect fails.
 #[cfg(unix)]
-pub fn connect(address: &Address) -> Result<aterm_uds::CtlStream> {
+pub fn connect(
+    address: &Address,
+    deadline: Option<std::time::Instant>,
+) -> Result<aterm_uds::CtlStream> {
     if address.transport != "unix" {
         return Err(Error::Unsupported("a transport other than unix"));
     }
+    #[cfg(target_os = "linux")]
     if let Some(path) = address.get("path") {
+        return connect_until(path.as_bytes(), false, deadline);
+    }
+    #[cfg(not(target_os = "linux"))]
+    if let Some(path) = address.get("path") {
+        // Darwin refuses a full backlog at once; only a spent deadline is left to check.
+        crate::conn::time_left(deadline)?;
         return Ok(aterm_uds::CtlStream::connect(path)?);
     }
     #[cfg(target_os = "linux")]
     if let Some(name) = address.get("abstract") {
-        use std::os::linux::net::SocketAddrExt as _;
-        let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())?;
-        return Ok(aterm_uds::CtlStream::connect_addr(&addr)?);
+        return connect_until(name.as_bytes(), true, deadline);
     }
     Err(Error::Unsupported(
         "a unix address without path= (abstract= is Linux-only)",
     ))
+}
+
+/// A blocking connect to a path or abstract `name`, its wait on a full backlog ended at `deadline` by `SO_SNDTIMEO`.
+#[cfg(target_os = "linux")]
+// Skip: bottoms out at the socket(2), setsockopt(2) and connect(2) FFI calls.
+#[cfg_attr(trust_verify, trust::skip)]
+#[expect(
+    unsafe_code,
+    reason = "socket(2), setsockopt(2) and connect(2) on the one descriptor this function owns"
+)]
+fn connect_until(
+    name: &[u8],
+    abstract_name: bool,
+    deadline: Option<std::time::Instant>,
+) -> Result<aterm_uds::CtlStream> {
+    use std::io::{Error as IoError, ErrorKind};
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+
+    let mut addr = libc::sockaddr_un {
+        sun_family: libc::AF_UNIX as libc::sa_family_t,
+        sun_path: [0; 108],
+    };
+    if name.len() >= addr.sun_path.len() || (!abstract_name && name.contains(&0)) {
+        return Err(Error::Io(IoError::new(
+            ErrorKind::InvalidInput,
+            "socket name too long for sun_path, or a path with a NUL",
+        )));
+    }
+    let start = usize::from(abstract_name);
+    for (slot, byte) in addr.sun_path.iter_mut().skip(start).zip(name) {
+        *slot = libc::c_char::from_ne_bytes([*byte]);
+    }
+    let len =
+        (std::mem::offset_of!(libc::sockaddr_un, sun_path) + name.len() + 1) as libc::socklen_t;
+    // SAFETY: socket(2) reads no memory; the descriptor it returns is owned at once below.
+    let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if raw < 0 {
+        return Err(Error::Io(IoError::last_os_error()));
+    }
+    // SAFETY: `raw` is the open descriptor socket(2) just returned, and nothing else owns it.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    loop {
+        if let Some(left) = crate::conn::time_left(deadline)? {
+            let micros = left.as_micros().max(1);
+            let limit = libc::timeval {
+                tv_sec: libc::time_t::try_from(micros / 1_000_000).unwrap_or(libc::time_t::MAX),
+                tv_usec: libc::suseconds_t::try_from(micros % 1_000_000).unwrap_or_default(),
+            };
+            // SAFETY: `limit` is a live timeval of the length passed, and the call only reads it.
+            let set = unsafe {
+                libc::setsockopt(
+                    fd.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDTIMEO,
+                    (&raw const limit).cast(),
+                    size_of::<libc::timeval>() as libc::socklen_t,
+                )
+            };
+            if set != 0 {
+                return Err(Error::Io(IoError::last_os_error()));
+            }
+        }
+        // SAFETY: `addr` is an initialized sockaddr_un; `len`, within it as `name` is shorter
+        // than `sun_path`, covers the family, the name and its one NUL (a path's last byte, an
+        // abstract name's first).
+        if unsafe { libc::connect(fd.as_raw_fd(), (&raw const addr).cast(), len) } == 0 {
+            return Ok(aterm_uds::CtlStream::from(fd));
+        }
+        let error = IoError::last_os_error();
+        match error.kind() {
+            ErrorKind::Interrupted => {}
+            ErrorKind::WouldBlock => return Err(Error::Timeout),
+            _ => return Err(Error::Io(error)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -175,6 +259,19 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_abstract_name_connects() {
+        use std::os::linux::net::SocketAddrExt as _;
+        use std::os::unix::net::{SocketAddr, UnixListener};
+        let name = format!("aterm-dbus-abstract-{}", std::process::id());
+        let at = SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+        let listener = UnixListener::bind_addr(&at).unwrap();
+        let address = &parse(&format!("unix:abstract={name}")).unwrap()[0];
+        connect(address, None).unwrap();
+        listener.accept().unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn only_client_unix_keys_connect() {
@@ -186,7 +283,7 @@ mod tests {
         ] {
             let address = &parse(listen_only).unwrap()[0];
             assert!(
-                matches!(connect(address), Err(Error::Unsupported(_))),
+                matches!(connect(address, None), Err(Error::Unsupported(_))),
                 "{listen_only}"
             );
         }

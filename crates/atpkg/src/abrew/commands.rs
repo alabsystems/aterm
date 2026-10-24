@@ -1322,7 +1322,7 @@ fn desc_search(api: &Api, rest: &[String], field: DescField) -> ExitCode {
             Ok(re) => SearchQuery::Regex(re),
             Err(_) => return failed(&format!("abrew: {joined} is not a valid regex.")),
         },
-        None => SearchQuery::text(&joined),
+        None => SearchQuery::text(super::api::canonical_cask_token(&joined)),
     };
     let want_cask = has_flag(rest, "--cask", "");
     let want_formula = has_flag(rest, "--formula", "");
@@ -3111,7 +3111,9 @@ pub(super) fn cmd_unpin(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode
         }
         let pinned = prefix.pinned_version(short).is_some() || prefix.pin_link_dangling_ours(short);
         let installed = prefix.installed_one(Kind::Formula, short).is_some()
-            || prefix.installed_one(Kind::Cask, short).is_some();
+            || prefix
+                .installed_one(Kind::Cask, super::api::canonical_cask_token(short))
+                .is_some();
         let unknown =
             !pinned && !installed && package_definitively_unknown(prefix, api, short, true, true);
         match unpin_outcome(pinned, installed, unknown) {
@@ -4698,7 +4700,9 @@ fn bundle_file(
                 }
             }
             bundle::BrewfileEntry::Cask(n) => {
-                let have = prefix.installed_one(Kind::Cask, n).is_some();
+                let have = prefix
+                    .installed_one(Kind::Cask, super::api::canonical_cask_token(n))
+                    .is_some();
                 if dry {
                     missing |= !have;
                     println!("cask {n}: {}", if have { "present" } else { "missing" });
@@ -6154,6 +6158,20 @@ mod tests {
         assert!(!package_definitively_unknown(
             &p, &api, "caffiene", false, true
         ));
+        assert_eq!(
+            cmd_unpin(&p, &api, &[String::from("caffiene")]),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            bundle_file(
+                &p,
+                &api,
+                &[String::from("bundle"), String::from("check")],
+                &[bundle::BrewfileEntry::Cask(String::from("caffiene"))],
+                "check"
+            ),
+            ExitCode::SUCCESS
+        );
         assert_eq!(
             cmd_cleanup(&p, &api, &[String::from("caffiene")]),
             ExitCode::SUCCESS

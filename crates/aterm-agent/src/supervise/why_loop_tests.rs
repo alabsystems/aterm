@@ -323,7 +323,9 @@ fn a_policy_key_the_header_lacks_is_named_as_supplied_by_this_build() {
 #[test]
 fn a_turn_end_cut_short_leaves_no_steps_in_the_next_ones_trace() {
     let mut m = script();
-    m.by_index.insert(15, closed());
+    // The first busy wait's `status` (the session log's head) moves every later request one
+    // on: request 16 is the one the turn end at 104 loses.
+    m.by_index.insert(16, closed());
     let run = record_watch(&mut m, &auto(30), |_| {});
     let header = run.header.encode();
     let items = recover(&run.tape.reframed(&header)).items;

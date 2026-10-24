@@ -49,6 +49,12 @@ pub(crate) struct AgentsState {
     pub(crate) long_hold_walks: u32,
     /// THE GESTURE BEING DISPATCHED IS A CONTROL CLIENT'S: a `key`, `text` or `pointer` verb driving an open overlay (the palette, Overview, the tab menu).
     pub(crate) controller_gesture: bool,
+    /// How many control-client gestures were dispatched in this process
+    /// ([`App::with_gesture_source`] with `controller` set), anywhere. System
+    /// State reads it when it takes a page action, so no control client's
+    /// gesture passes for a person's press there
+    /// (`docs/DESIGN-system-state-2026-10-21.md` §6).
+    pub(crate) controller_gestures: u64,
     /// The words the last [`App::hand_long_holds`] answer stated, one per long hold, so an unchanged answer is not stated again.
     pub(crate) long_holds_named: Option<Vec<LongHoldWords>>,
     /// Where Next That Needs You last landed: the need's `(session, key)`.
@@ -625,15 +631,28 @@ impl App {
         })
     }
 
-    /// `hwkey`'s main-thread hop (`Wake::HwKeyTarget`): the front window's AppKit number (`0` with none), or a REFUSAL while a gateway card is open there ([`Self::gateway_card_open`]).
+    /// Whether System State is the active view of `wid`: its buttons hold the
+    /// person's own acts — an Apply that admits a setup plan as the window's
+    /// own, and the Permissions rows' `Turn On…` — which only a person's press
+    /// may take (`docs/DESIGN-system-state-2026-10-21.md` §6, the standing yes).
+    pub(crate) fn system_state_active_in(&self, wid: WindowId) -> bool {
+        self.active_native_view(wid).is_some_and(|(instance, _)| {
+            matches!(
+                self.native_runtime.app(instance),
+                Some(crate::native_app::NativeApp::SystemState(_))
+            )
+        })
+    }
+
+    /// `hwkey`'s main-thread hop (`Wake::HwKeyTarget`): the front window's AppKit number (`0` with none), or a REFUSAL while a gateway card is open there ([`Self::gateway_card_open`]) or System State is its active view ([`Self::system_state_active_in`]), where a real key event would pass for the person's press.
+    /// The hop publishes the answer ([`Self::publish_hwkey_front`]) a running burst reads before each key (`hwkey::run_burst`).
     pub(crate) fn hwkey_target(&self) -> Result<(i64, bool), &'static str> {
+        self.publish_hwkey_front();
         let Some(wid) = self.frontmost_window else {
             return Ok((0, false));
         };
-        if self.gateway_card_open(wid) {
-            return Err(
-                "a palette, Overview or tab menu is open: its rows are the person's (close it)",
-            );
+        if let Some(refusal) = self.hwkey_front_refusal() {
+            return Err(refusal);
         }
         Ok(self
             .windows
@@ -645,6 +664,30 @@ impl App {
                     crate::platform::appkit_window_is_key_in_active_app(w),
                 )
             }))
+    }
+
+    /// Why `hwkey` may post nothing into the front window now: a gateway card
+    /// open there ([`Self::gateway_card_open`]), or System State its active view
+    /// ([`Self::system_state_active_in`]). `None` where it may.
+    pub(crate) fn hwkey_front_refusal(&self) -> Option<&'static str> {
+        let wid = self.frontmost_window?;
+        if self.gateway_card_open(wid) {
+            return Some(
+                "a palette, Overview or tab menu is open: its rows are the person's (close it)",
+            );
+        }
+        self.system_state_active_in(wid).then_some(
+            "System State is in front: its buttons are the person's (press them in the window)",
+        )
+    }
+
+    /// Tell a running `hwkey` burst whether the front window holds the person's
+    /// own buttons ([`Self::hwkey_front_refusal`]); it reads that before every
+    /// key (`hwkey::run_burst`). One atomic store: the park calls it each turn,
+    /// so a page or card that came to the front in a turn stops the burst
+    /// before the loop sleeps.
+    pub(crate) fn publish_hwkey_front(&self) {
+        crate::hwkey::publish_persons_front(self.hwkey_front_refusal().is_some());
     }
 
     /// A CONTROL CLIENT'S TAB-MENU CHORD UNDER A HOLD OPENS NO CARD (the in-grid strip's Menu key, Windows and Linux): the card is `invoke`'s rows behind a key, so it opens for a control client only where `open tab-menu` would ([`crate::fabric::open_halt_refusal`]); the person's own chord always opens it.
@@ -660,6 +703,9 @@ impl App {
         controller: bool,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
+        if controller {
+            self.agents.controller_gestures = self.agents.controller_gestures.wrapping_add(1);
+        }
         let prior = std::mem::replace(&mut self.agents.controller_gesture, controller);
         let out = f(self);
         self.agents.controller_gesture = prior;
@@ -2076,6 +2122,30 @@ mod tests {
         assert!(
             !app.controller_card_refused(),
             "the person's own chord opens it"
+        );
+    }
+
+    /// `hwkey` CANNOT PRESS SYSTEM STATE'S BUTTONS (design §6, the standing
+    /// yes). Its keys take the person's unmarked key path, so on the page they
+    /// would count as a person's press — an Apply admitting a setup plan as
+    /// the window's own, or a row's `Turn On…` — which no control client may
+    /// make: its hop refuses while System State is the front window's active
+    /// view. CONTROL: with the terminal tab in front again it answers the
+    /// window's number (`0` headless).
+    #[test]
+    fn hwkey_is_refused_while_system_state_is_in_front() {
+        let (mut app, wid, _sid, _ctx) = app_with_stub();
+        assert_eq!(app.hwkey_target(), Ok((0, false)), "a terminal in front");
+        assert!(app.open_system_state_tab());
+        assert!(app.system_state_active_in(wid));
+        let refusal = app.hwkey_target().expect_err("System State in front");
+        assert!(refusal.contains("System State"), "{refusal}");
+        app.switch_tab_in(wid, 0);
+        assert!(!app.system_state_active_in(wid));
+        assert_eq!(
+            app.hwkey_target(),
+            Ok((0, false)),
+            "the terminal tab in front again"
         );
     }
 

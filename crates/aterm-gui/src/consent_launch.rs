@@ -24,7 +24,7 @@ pub(crate) enum FdaLaunch {
         owner_acted: bool,
     },
     /// Not offered this process: the grant reads held or unknown, the owner declined, it
-    /// was shown already for this version, the build's grant would not survive the next
+    /// was shown already for this revision, the build's grant would not survive the next
     /// one, or the Full Disk Access question is switched off.
     NotAsked,
 }
@@ -97,7 +97,8 @@ pub(crate) struct WarmupFacts {
 /// Why the launch warm-up does not walk this process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Skip {
-    /// `[privacy] enabled = false`, or `warmup` is not `"automatic"`.
+    /// `[privacy] warmup` is not `"automatic"`. (`enabled` or `check` off is a
+    /// pause: the warm-up waits for them.)
     Off,
     /// The owner acted on the Full Disk Access page: a grant made now may not reach this
     /// process (design §7 S1), and folder dialogs on top of it would ask for what they

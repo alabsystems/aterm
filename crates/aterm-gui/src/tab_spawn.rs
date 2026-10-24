@@ -781,10 +781,9 @@ fn run(job: TabSpawnJob, park_wait: Duration) {
         completion,
         adopt,
     } = job;
-    if completion.cancelled() {
+    if !start_picked(&completion, Instant::now()) {
         return;
     }
-    completion.note_picked(Instant::now());
     let mut resolved = None;
     if let Some(adopt) = adopt {
         let AdoptSpare {
@@ -862,6 +861,15 @@ fn run(job: TabSpawnJob, park_wait: Duration) {
         },
         |wake| proxy.send_event(wake).is_ok(),
     );
+}
+
+/// Whether [`run`] goes on with a job at `at`: not when cancelled; else the pick is noted, so the hold on the tab's keys runs from it.
+fn start_picked(completion: &TabSpawnCompletion, at: Instant) -> bool {
+    if completion.cancelled() {
+        return false;
+    }
+    completion.note_picked(at);
+    true
 }
 
 fn state_answers() -> std::io::Result<()> {
@@ -3610,6 +3618,33 @@ pub(crate) mod tests {
         assert!(said_dropped(&app, "retype the last 2 keys"));
         assert_eq!(app.tab_spawns.hold_target(wid, over), None);
         assert!(drain(&old_pty).is_empty());
+    }
+
+    #[test]
+    fn the_spawners_start_times_the_hold_on_a_tabs_keys() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let id = book(&mut app, wid, TabSpawnThen::Nothing);
+        let asked = app.tab_spawns.in_flight[0].asked;
+        let completion = Arc::clone(&app.tab_spawns.in_flight[0].completion);
+        let picked = asked + Duration::from_secs(100);
+        let later = asked + SPAWN_HOLD + Duration::from_secs(1);
+        assert_eq!(
+            app.tab_spawns.hold_target(wid, later),
+            None,
+            "before the start, the hold from the ask has run out"
+        );
+        assert!(start_picked(&completion, picked), "a job to run");
+        assert_eq!(completion.picked(), Some(picked));
+        assert_eq!(
+            app.tab_spawns.hold_target(wid, later),
+            Some((wid, picked + SPAWN_HOLD, id)),
+            "held from the spawner's start"
+        );
+        let cancelled = TabSpawnCompletion::default();
+        cancelled.cancel();
+        assert!(!start_picked(&cancelled, picked), "a cancelled job");
+        assert_eq!(cancelled.picked(), None);
     }
 
     #[test]

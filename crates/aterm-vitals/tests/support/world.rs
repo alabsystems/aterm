@@ -56,8 +56,10 @@ pub struct Proc {
     pub wchan: Option<String>,
     /// A thread in an uninterruptible wait.
     pub d_state: bool,
-    /// Held at macOS's program check (one thread that never ran).
+    /// Its one thread never ran past 20 s: `wait` says what keeps it.
     pub held: bool,
+    /// What keeps a `held` process from starting: macOS's program check unless set.
+    pub wait: aterm_vitals::jobs::StartWait,
     /// Which program the pid runs (the host reads its pid version, which moves on exec).
     pub exec: u64,
     /// Started under aterm though no tab's tree holds it (its resource coalition).
@@ -102,6 +104,7 @@ impl Proc {
             wchan: None,
             d_state: false,
             held: false,
+            wait: aterm_vitals::jobs::StartWait::ProgramCheck,
             exec: 1,
             aterm: false,
         }
@@ -474,6 +477,7 @@ impl World {
                             dev: file.0,
                             ino: file.1,
                             lf_tail,
+                            fresh_dylib: false,
                         },
                     });
                 }
@@ -508,12 +512,14 @@ impl World {
             }),
             wchan: p.wchan.clone(),
             fds: (want_fds && !zombie).then_some(fds),
-            program_check: p.held && !zombie,
+            program_check: p.held
+                && p.wait == aterm_vitals::jobs::StartWait::ProgramCheck
+                && !zombie,
         }
     }
 
-    /// Held processes owned by `UID`; one is aterm's when it descends from pid 100 or is a
-    /// coalition member.
+    /// Processes owned by `UID` that have not started, each with what keeps it; one is aterm's
+    /// when it descends from pid 100 or is a coalition member.
     fn held(&self) -> Vec<aterm_vitals::jobs::HeldProc> {
         self.procs
             .values()
@@ -523,6 +529,7 @@ impl World {
                 exec: p.exec,
                 name: p.exe.clone().unwrap_or_else(|| p.name.clone()),
                 aterm: p.aterm || self.descends_from(p.pid, 100),
+                wait: p.wait,
             })
             .collect()
     }

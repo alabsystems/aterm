@@ -87,6 +87,77 @@ pub fn log_path(home: &Path, job: Job) -> PathBuf {
     secrets_dir(home).join(format!("{}.log", job.label()))
 }
 
+/// The record that the person turned this login's subscriber off:
+/// `~/.config/aterm/secrets/subscriber-off`. `aterm secrets agent off` writes it, and so does
+/// a `join` or `create` with `--no-agent` where no subscriber runs; every install of the
+/// subscriber removes it ([`install`]), `agent on` among them. aterm's System State reads it
+/// as the person's choice: its Secrets vault row reads Sync off and is no change to make, and
+/// setup installs no subscriber over it.
+pub fn subscriber_off_path(home: &Path) -> PathBuf {
+    secrets_dir(home).join("subscriber-off")
+}
+
+/// Whether the person turned this login's subscriber off ([`subscriber_off_path`]). A record
+/// that cannot be read is no record.
+pub fn subscriber_turned_off(home: &Path) -> bool {
+    crate::fsx::kind(&subscriber_off_path(home)).is_ok_and(|kind| kind != crate::fsx::Kind::Missing)
+}
+
+/// Record that the person turned this login's subscriber off ([`subscriber_off_path`]), in
+/// the 0700 `~/.config/aterm/secrets`.
+pub fn record_subscriber_off(home: &Path) -> crate::Result<()> {
+    crate::fsx::ensure_private_dir(&secrets_dir(home))?;
+    crate::fsx::write_atomic(
+        &subscriber_off_path(home),
+        b"the subscriber was turned off by choice; aterm secrets agent on turns it back on\n",
+        0o600,
+    )
+}
+
+/// launchd's restart window: a `KeepAlive` job that ended is started again within
+/// its throttle interval (10 s by default), so a subscriber read as installed but
+/// not running may only be between two runs until it has stayed down past this.
+pub const RESTART_WINDOW: Duration = Duration::from_secs(11);
+
+/// How often a job read as not running is read again within [`RESTART_WINDOW`].
+pub const RESTART_POLL: Duration = Duration::from_millis(500);
+
+/// Whether a job read as not running runs again within launchd's restart window:
+/// `running` is read every [`RESTART_POLL`] until it says so, or until
+/// [`RESTART_WINDOW`] has passed since `down_since`, when the job was first seen
+/// down (`now`, when unset). `down_since` keeps that moment for a later read, so a
+/// job already down past the window is not waited on again.
+/// # Errors
+/// A read of `running` failed.
+pub fn back_within_restart_window<E>(
+    down_since: &mut Option<Instant>,
+    now: &mut dyn FnMut() -> Instant,
+    running: &mut dyn FnMut() -> Result<bool, E>,
+    pause: &mut dyn FnMut(Duration),
+) -> Result<bool, E> {
+    let until = *down_since.get_or_insert_with(&mut *now) + RESTART_WINDOW;
+    loop {
+        let at = now();
+        if at >= until {
+            return Ok(false);
+        }
+        pause(RESTART_POLL.min(until - at));
+        if running()? {
+            return Ok(true);
+        }
+    }
+}
+
+/// Remove the person's record that the subscriber is off: it is on again.
+fn clear_subscriber_off(home: &Path) -> crate::Result<()> {
+    let path = subscriber_off_path(home);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(Error::new(format!("{}: {e}", path.display()))),
+    }
+}
+
 /// `~/.config/aterm/secrets`.
 fn secrets_dir(home: &Path) -> PathBuf {
     home.join(".config").join("aterm").join("secrets")
@@ -600,7 +671,23 @@ fn check_own_home(home: &Path) -> crate::Result<()> {
 }
 
 /// Install and start `job` under `home` ([`own_home`], [`plist_path`], [`unit_path`]).
+///
+/// The subscriber installed is on again: the person's record that it was turned off
+/// ([`subscriber_off_path`]) goes.
 pub fn install(home: &Path, job: Job, program: &Path, args: &[String]) -> crate::Result<String> {
+    let line = install_job(home, job, program, args)?;
+    if job != Job::Subscriber {
+        return Ok(line);
+    }
+    // The job runs either way: a record left behind says less than the job that runs.
+    Ok(match clear_subscriber_off(home) {
+        Ok(()) => line,
+        Err(e) => format!("{line}; the record that it was turned off stays ({e})"),
+    })
+}
+
+/// [`install`]'s job, without the person's record.
+fn install_job(home: &Path, job: Job, program: &Path, args: &[String]) -> crate::Result<String> {
     check_own_home(home)?;
     #[cfg(target_os = "macos")]
     {
@@ -764,6 +851,35 @@ mod tests {
                 State::Absent
             ));
         }
+    }
+
+    /// THE PERSON'S RECORD THAT THE SUBSCRIBER IS OFF lies beside the vault's other
+    /// per-login state, private, and goes once it is on again; removing one that is not
+    /// there is no error. A home with none has none.
+    #[cfg(unix)]
+    #[test]
+    fn the_record_that_the_subscriber_was_turned_off_is_kept_until_it_is_on_again() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let scratch = aterm_tempfile::tempdir().expect("tempdir");
+        let home = scratch.path();
+        assert!(!subscriber_turned_off(home));
+        record_subscriber_off(home).expect("recorded");
+        assert!(subscriber_turned_off(home));
+        let path = subscriber_off_path(home);
+        assert_eq!(path, secrets_dir(home).join("subscriber-off"));
+        let mode = |path: &Path| {
+            std::fs::metadata(path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(&secrets_dir(home)), 0o700);
+        record_subscriber_off(home).expect("again");
+        clear_subscriber_off(home).expect("cleared");
+        assert!(!subscriber_turned_off(home));
+        clear_subscriber_off(home).expect("nothing to clear");
     }
 
     #[test]
@@ -1179,5 +1295,67 @@ mod tests {
         assert!(refuse(&program, &words(&["a\nb"])).0.contains("control"));
         assert!(refuse(home, &[]).0.contains("not a file"));
         assert!(!plist_path(home, Job::Subscriber).exists());
+    }
+
+    /// A RESTART GAP IS NO CHANGE TO MAKE: a subscriber read installed but not
+    /// running is read again until it runs, within launchd's restart window from
+    /// when it was first seen down; past it, it is stopped, and a later read that
+    /// finds it still down past the window takes it so at once. NEGATIVE CONTROL:
+    /// one that never comes back is read stopped once the window has passed.
+    #[test]
+    fn a_subscriber_down_for_launchds_restart_gap_is_not_stopped() {
+        use std::cell::Cell;
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let clock = Cell::new(t0);
+        let reads = Cell::new(0);
+        let read = |back_after: Option<u32>| {
+            let reads = &reads;
+            move || -> Result<bool, String> {
+                reads.set(reads.get() + 1);
+                Ok(back_after.is_some_and(|after| reads.get() >= after))
+            }
+        };
+        let mut now = || clock.get();
+        let mut pause = |d: Duration| clock.set(clock.get() + d);
+        // Back on the third read again: running, and nothing more is read.
+        let mut since = None;
+        assert_eq!(
+            back_within_restart_window(&mut since, &mut now, &mut read(Some(3)), &mut pause),
+            Ok(true)
+        );
+        assert_eq!(reads.get(), 3);
+        assert!(clock.get() - t0 < RESTART_WINDOW);
+        // Never back: stopped once the window has passed since first seen down.
+        reads.set(0);
+        clock.set(t0);
+        let mut since = None;
+        assert_eq!(
+            back_within_restart_window(&mut since, &mut now, &mut read(None), &mut pause),
+            Ok(false)
+        );
+        assert_eq!(since, Some(t0), "first seen down");
+        assert_eq!(
+            clock.get(),
+            t0 + RESTART_WINDOW,
+            "waited the window, no more"
+        );
+        let waited = reads.get();
+        assert!(waited >= 2, "read again within it: {waited}");
+        // A later read still down past the window: stopped at once.
+        assert_eq!(
+            back_within_restart_window(&mut since, &mut now, &mut read(None), &mut pause),
+            Ok(false)
+        );
+        assert_eq!(reads.get(), waited, "no read, no wait");
+        assert_eq!(clock.get(), t0 + RESTART_WINDOW);
+        // A read within the window of the first waits only what is left of it.
+        clock.set(t0 + RESTART_WINDOW / 2);
+        let mut since = Some(t0);
+        assert_eq!(
+            back_within_restart_window(&mut since, &mut now, &mut read(None), &mut pause),
+            Ok(false)
+        );
+        assert_eq!(clock.get(), t0 + RESTART_WINDOW);
     }
 }

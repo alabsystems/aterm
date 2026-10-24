@@ -2474,14 +2474,15 @@ impl FooterFacts {
                 .as_deref()
                 .is_none_or(|v| v == c.version.as_str())
         }) {
-            if self.model_open && model.is_none() {
+            let same_model = model == Some(card.model.as_str());
+            if self.model_open {
                 model = Some(&card.model);
             }
-            if self.effort_open
-                && effort.is_none()
-                && self.effort_for.as_ref().is_none_or(|to| *to == card.model)
-            {
-                effort = card.effort.as_deref();
+            if self.effort_open && self.effort_for.as_ref().is_none_or(|to| *to == card.model) {
+                effort = card
+                    .effort
+                    .as_deref()
+                    .or_else(|| same_model.then_some(effort).flatten());
             }
         }
         (model, effort)

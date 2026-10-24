@@ -1677,3 +1677,89 @@ fn a_planted_attention_or_title_never_reaches_fact() {
         assert_eq!(facts(&row), ["fact=hold-room@v1#1", "fact_rev=1"], "{row}");
     }
 }
+
+/// A write that passed the worker's Prompt gate may wait behind an update fence.
+/// Its live authority must be read again after the wait, for notes and clears alike.
+#[cfg(unix)]
+fn task_fact_after_fenced_mode_change(prompt: bool, clear: bool) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let handle = crate::session_store::test_handle(331);
+    let ctx = Arc::clone(&handle.ctx);
+    mark_session_task(&ctx, 331, &TaskMark::new(TaskState::Working)).expect("unfenced");
+    if clear {
+        assert_eq!(
+            mark_session_task_fact(&ctx, 331, hold_room(1), Duration::ZERO),
+            NoteOutcome::Noted
+        );
+    }
+    let before = ctx.timeline.lock().unwrap().task().cloned().unwrap();
+    let event_count = ctx.timeline.lock().unwrap().since(None).count();
+    let _ = crate::presence::take_task_wakes();
+    ctx.fabric.fence_hold(true);
+    let blocked = ctx.fabric.fence_waits();
+    let mode = Arc::new(AtomicBool::new(true));
+    let writer = {
+        let ctx = Arc::clone(&ctx);
+        let mode = Arc::clone(&mode);
+        std::thread::spawn(move || {
+            let word = if clear { None } else { hold_room(1) };
+            let outcome =
+                mark_session_task_fact_if(&ctx, 331, word, aterm_spec::wait::MUST_HAPPEN, || {
+                    mode.load(Ordering::Acquire)
+                });
+            (outcome, crate::presence::take_task_wakes())
+        })
+    };
+    crate::fabric::assert_parked_on_the_fence(
+        &ctx.fabric,
+        blocked,
+        || writer.is_finished(),
+        "the task fact write waits on the update fence",
+    );
+    mode.store(prompt, Ordering::Release);
+    ctx.fabric.lift_hold_fence();
+    let (outcome, wakes) = writer.join().unwrap();
+    let timeline = ctx.timeline.lock().unwrap();
+    let after = timeline.task().cloned().unwrap();
+    if prompt {
+        assert_eq!(
+            outcome,
+            if clear {
+                NoteOutcome::Cleared
+            } else {
+                NoteOutcome::Noted
+            }
+        );
+        assert_eq!(wakes, [331]);
+        assert_eq!(after.fact, if clear { None } else { hold_room(1) });
+        assert_eq!(after.fact_rev, before.fact_rev + 1);
+        assert_eq!(after.rev, before.rev);
+        assert_eq!(timeline.since(None).count(), event_count + 1);
+    } else {
+        assert_eq!(outcome, NoteOutcome::Fenced, "clear={clear}");
+        assert!(wakes.is_empty(), "a withdrawn write posts no task wake");
+        assert_eq!(after, before, "the fact and both revisions stay unchanged");
+        assert_eq!(timeline.since(None).count(), event_count);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_task_fact_write_refuses_mode_withdrawn_while_fenced() {
+    task_fact_after_fenced_mode_change(false, false);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_task_fact_clear_refuses_mode_withdrawn_while_fenced() {
+    task_fact_after_fenced_mode_change(false, true);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_task_fact_write_keeps_live_prompt_authority_after_the_fence() {
+    task_fact_after_fenced_mode_change(true, false);
+    task_fact_after_fenced_mode_change(true, true);
+}

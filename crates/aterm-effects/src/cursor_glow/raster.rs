@@ -367,12 +367,14 @@ pub(super) const FRESH_INK_GLYPH_MIN_DELTA: i32 = 24;
 pub(super) const FRESH_INK_GLYPH_BISECT: usize = 24;
 
 /// WCAG relative luminance of a `0x00RRGGBB` colour, with the piecewise sRGB transfer (linear toe below 0.03928, 2.4 power above); a plain power law differs enough near black to move a ratio across the AA line.
+#[cfg(test)]
 #[inline]
 pub(super) fn rel_luminance(c: u32) -> f32 {
     crate::color_math::relative_luminance(c)
 }
 
 /// WCAG contrast ratio between two `0x00RRGGBB` colours.
+#[cfg(test)]
 #[inline]
 pub(super) fn wcag_ratio(a: u32, b: u32) -> f32 {
     let (x, y) = (rel_luminance(a), rel_luminance(b));
@@ -448,11 +450,16 @@ pub(super) fn glyph_ink_bound(fg: u32, bg: u32) -> Option<(GlyphInkSide, f32)> {
     if fg > 0x00FF_FFFF || bg > 0x00FF_FFFF || fg == bg {
         return None;
     }
-    let theme = wcag_ratio(fg, bg);
+    let table = crate::color_math::relative_luminance_table();
+    let (lfg, lbg) = (
+        crate::color_math::relative_luminance_with(table, fg),
+        crate::color_math::relative_luminance_with(table, bg),
+    );
+    let (hi, lo) = if lfg > lbg { (lfg, lbg) } else { (lbg, lfg) };
+    let theme = (hi + 0.05) / (lo + 0.05);
     if !theme.is_finite() || theme < FRESH_INK_GLYPH_MIN_THEME_RATIO {
         return None;
     }
-    let (lfg, lbg) = (rel_luminance(fg), rel_luminance(bg));
     if lfg < lbg {
         let aa = (lbg + 0.05) / FRESH_INK_GLYPH_TARGET_RATIO - 0.05;
         Some((GlyphInkSide::Dark, aa.max(lfg)))
@@ -512,19 +519,27 @@ pub(super) fn fresh_ink_glyph_ink(band: u32, fg: u32, side: GlyphInkSide, cap: f
     if ok(c1) {
         return Some(pack(c1));
     }
-    if !ok(cand_rgb(0.0)) {
+    let c0 = cand_rgb(0.0);
+    if !ok(c0) {
         return None;
     }
     let (mut lo_k, mut hi_k) = (0.0f32, 1.0f32);
+    let (mut lo_rgb, mut hi_rgb) = (c0, c1);
     for _ in 0..FRESH_INK_GLYPH_BISECT {
         let mid = 0.5 * (lo_k + hi_k);
-        if ok(cand_rgb(mid)) {
-            lo_k = mid
+        let mid_rgb = cand_rgb(mid);
+        if ok(mid_rgb) {
+            lo_k = mid;
+            lo_rgb = mid_rgb;
         } else {
-            hi_k = mid
+            hi_k = mid;
+            hi_rgb = mid_rgb;
+        }
+        if lo_rgb == hi_rgb {
+            break;
         }
     }
-    Some(pack(cand_rgb(lo_k)))
+    Some(pack(lo_rgb))
 }
 
 /// One memoized fresh-ink glyph palette: the `(theme_fg, theme_bg)` key and the seven band inks, or `None` for a memoized refusal (see [`fresh_ink_glyph_palette`]).

@@ -738,6 +738,7 @@ mod tests {
             state: ProcState::Run,
             scope,
             refused: false,
+            gpu: None,
         };
         let mut s1 = snap(1, 1);
         s1.aterm = Some(ScopeView::default());

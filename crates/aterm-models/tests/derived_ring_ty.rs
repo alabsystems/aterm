@@ -949,6 +949,7 @@ fn derived_transcript_join_proves_and_catches_each_law() {
             "TxCloseTakesWall",
             "RefuteLeavesSettle",
             "PartialCloses",
+            "EarlyEndClosesCont",
         ],
     );
 

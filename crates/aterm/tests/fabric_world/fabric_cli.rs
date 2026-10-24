@@ -180,14 +180,15 @@ impl Broker {
             }
         });
         let lines = line_reader(broker.child.stdout.take().expect("stdout"));
-        let first = lines
-            .recv_timeout(DEADLINE)
-            .expect("the broker prints its readiness line");
-        assert_eq!(first, format!("listening {sock}"));
-        Self {
+        let broker = Self {
             child: broker.child,
             _lifeline: broker.lifeline,
-        }
+        };
+        let first = harness::recv_within(&lines, Instant::now(), broker.pid(), || {
+            "the broker prints its readiness line".to_owned()
+        });
+        assert_eq!(first, format!("listening {sock}"));
+        broker
     }
 
     fn pid(&self) -> u32 {
@@ -197,8 +198,7 @@ impl Broker {
 
 impl Drop for Broker {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        aterm_uds::deadline::kill_within(&mut self.child, DEADLINE);
     }
 }
 
@@ -235,7 +235,7 @@ fn a_broker_whose_stdout_reader_left_keeps_serving() {
         },
     );
     let err = broker.child.stderr.take().expect("stderr");
-    let _broker = Broker {
+    let broker = Broker {
         child: broker.child,
         _lifeline: broker.lifeline,
     };
@@ -247,12 +247,15 @@ fn a_broker_whose_stdout_reader_left_keeps_serving() {
         }
     });
     let mut seen = Vec::new();
+    let since = Instant::now();
     loop {
-        match rx.recv_timeout(DEADLINE) {
-            Ok(line) if line.starts_with("aterm link broker: unix socket on") => break,
-            Ok(line) => seen.push(line),
-            Err(e) => panic!("no broker banner ({e:?}); stderr: {seen:?}"),
+        let line = harness::recv_within(&rx, since, broker.pid(), || {
+            format!("no broker banner; stderr: {seen:?}")
+        });
+        if line.starts_with("aterm link broker: unix socket on") {
+            break;
         }
+        seen.push(line);
     }
     let offsets = publish(
         &s.sock(),
@@ -1129,16 +1132,16 @@ fn a_fleet_halt_on_the_bus_is_a_warning() {
     assert!(out.contains("h-andrew"), "{out}");
 }
 
-/// Read `tail` lines until `n` record rows (they start `@`) have arrived.
-fn tail_rows(lines: &mpsc::Receiver<String>, n: usize) -> Vec<String> {
+/// Read `tail`'s lines until `n` record rows (they start `@`) have arrived.
+fn tail_rows(tail: &Tail, n: usize) -> Vec<String> {
     let start = Instant::now();
     let mut rows = Vec::new();
     while rows.len() < n {
-        let left = DEADLINE.saturating_sub(start.elapsed());
-        match lines.recv_timeout(left) {
-            Ok(line) if line.starts_with('@') => rows.push(line),
-            Ok(_) => {}
-            Err(_) => panic!("only {} of {n} tail rows arrived: {rows:#?}", rows.len()),
+        let line = harness::recv_within(&tail.lines, start, tail.child.id(), || {
+            format!("only {} of {n} tail rows arrived: {rows:#?}", rows.len())
+        });
+        if line.starts_with('@') {
+            rows.push(line);
         }
     }
     rows
@@ -1161,12 +1164,18 @@ impl Tail {
         let lines = line_reader(child.stdout.take().expect("stdout"));
         Self { child, lines }
     }
+
+    /// `tail`'s next line, within [`DEADLINE`] (`what` names it).
+    fn line(&self, what: &str) -> String {
+        harness::recv_within(&self.lines, Instant::now(), self.child.id(), || {
+            what.to_owned()
+        })
+    }
 }
 
 impl Drop for Tail {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        harness::kill_reaped(&mut self.child);
     }
 }
 
@@ -1188,7 +1197,7 @@ fn tail_replays_from_an_offset_hides_bodies_and_follows_live() {
     );
 
     let all = Tail::spawn(&s, &["tail", "--from", "0"]);
-    let rows = tail_rows(&all.lines, 3);
+    let rows = tail_rows(&all, 3);
     for (row, (off, kind)) in rows.iter().zip(offs.iter().zip(["task", "note", "ask"])) {
         let cols: Vec<&str> = row.split_whitespace().collect();
         assert_eq!(cols[0], format!("@{off}"), "{row}");
@@ -1204,22 +1213,19 @@ fn tail_replays_from_an_offset_hides_bodies_and_follows_live() {
 
     let from = offs[1].to_string();
     let bodies = Tail::spawn(&s, &["tail", "--bodies", "--from", &from]);
-    let rows = tail_rows(&bodies.lines, 2);
+    let rows = tail_rows(&bodies, 2);
     assert!(rows[0].starts_with(&format!("@{}", offs[1])), "{rows:#?}");
     assert!(rows[0].ends_with("text=beta secret"), "{rows:#?}");
     assert!(rows[1].ends_with("text=gamma secret"), "{rows:#?}");
 
     let live = Tail::spawn(&s, &["tail"]);
-    let header = live
-        .lines
-        .recv_timeout(DEADLINE)
-        .expect("tail prints its column header once it is subscribed");
+    let header = live.line("tail prints its column header once it is subscribed");
     assert!(header.starts_with("OFFSET"), "{header}");
     let new = publish(
         &s.sock(),
         &[msg(node, "s-a", "h-andrew", "report", "delta")],
     );
-    let rows = tail_rows(&live.lines, 1);
+    let rows = tail_rows(&live, 1);
     assert!(rows[0].starts_with(&format!("@{}", new[0])), "{rows:#?}");
     assert!(rows[0].contains(" report "), "{rows:#?}");
 }
@@ -1262,10 +1268,7 @@ fn a_filter_the_broker_would_refuse_is_a_usage_error_before_the_dial() {
     }
 
     let whole = Tail::spawn(&s, &["tail", "--filter", "/f/t1/>"]);
-    let header = whole
-        .lines
-        .recv_timeout(DEADLINE)
-        .expect("a filter with `>` last is followed");
+    let header = whole.line("a filter with `>` last is followed");
     assert!(header.starts_with("OFFSET"), "{header}");
 }
 

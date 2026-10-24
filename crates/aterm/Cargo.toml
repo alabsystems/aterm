@@ -155,8 +155,13 @@ aterm-slog = { workspace = true }
 # `fabric status --json` is asserted as JSON, not as substrings: aterm-json is a
 # [dependencies] row (the doctor's `--json`), which the tests reach too.
 # The spare suite asks which system files the host's zsh reads before aterm's
-# parked hold (`pre_hold_files`). Already in the graph through aterm-gui.
+# parked hold (`pre_hold_files`), and a scratch world's teardown releases the spares
+# its killed instances left (`spare_fifo::sweep_dead`). Already in the graph through
+# aterm-gui.
 aterm-shell-integration = { workspace = true }
+# The spare suite reads whether a spare's shell waits in the kernel (its run state).
+# Already in the graph through aterm-gui.
+aterm-sysprobe = { workspace = true }
 
 # The fabric worlds (`tests/fabric_world`): an in-process guarded broker and the
 # caps minted for it.

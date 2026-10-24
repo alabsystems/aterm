@@ -22,6 +22,24 @@ fn main() {
     println!("core_ticks   {:?}", probe.core_ticks());
     println!("memory       {:?}", aterm_sysprobe::memory_detail());
     println!("gpu          {:?}", aterm_sysprobe::gpu());
+    match aterm_sysprobe::gpu_clients() {
+        Some(c) => {
+            println!(
+                "gpu_clients  {} of {} children parsed, truncated={} complete={}",
+                c.rows.len(),
+                c.children,
+                c.truncated,
+                c.complete
+            );
+            for r in &c.rows {
+                println!(
+                    "  entry={:#x} pid={} name={} gpu_ns={}",
+                    r.entry, r.pid, r.name, r.gpu_ns
+                );
+            }
+        }
+        None => println!("gpu_clients  None"),
+    }
     println!("throttle     {:?}", probe.throttle());
     println!("withdrawn    {:?}", aterm_sysprobe::withdrawn_cores());
     println!("capacity     {:?}", aterm_sysprobe::capacity());
@@ -55,6 +73,7 @@ fn main() {
     report("cpu_layout", cost(calls, aterm_sysprobe::cpu_layout));
     report("memory_detail", cost(calls, aterm_sysprobe::memory_detail));
     report("gpu", cost(calls, aterm_sysprobe::gpu));
+    report("gpu_clients", cost(calls, aterm_sysprobe::gpu_clients));
     report("throttle", cost(calls, || probe.throttle()));
     report("withdrawn", cost(calls, aterm_sysprobe::withdrawn_cores));
     report("capacity", cost(calls, aterm_sysprobe::capacity));

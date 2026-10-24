@@ -809,8 +809,8 @@ pub(crate) fn paint_rainbow_kitty_village_architecture(
                     width: 1.0,
                     color: rgba(BLOB_MARIGOLD, 0xD8),
                 });
-                let puff_phase = (((phase_ms % 86_400_000) as f64 * 0.004 + i as f64 * 0.31)
-                    .rem_euclid(1.0) as f32)
+                let puff_phase = ((phase_ms as f64 * 0.004 + i as f64 * 0.31).rem_euclid(1.0)
+                    as f32)
                     .clamp(0.0, 1.0);
                 let puff_y = (hy - 2.0 - puff_phase * 6.0).max(y + 2.5);
                 let puff_a = ((1.0 - puff_phase) * 210.0) as u8;
@@ -871,7 +871,7 @@ pub(crate) fn paint_rainbow_kitty_village_kitties(
     let kitty_speed = if busy { 0.052_f64 } else { 0.018_f64 };
     let path_w = (w - 36.0).max(24.0);
     let path_w64 = f64::from(path_w);
-    let phase_f64 = (phase_ms % 604_800_000) as f64;
+    let phase_f64 = phase_ms as f64;
     for (k, &kcol) in kitty_colors.iter().enumerate() {
         let kf = k as f64;
         // Gentle garden-sniffing pause modulation as kitties stroll between village houses.
@@ -1138,6 +1138,69 @@ mod tests {
             if let DrawPrim::Dot { cx, cy, r, .. } = p {
                 assert!(cx.is_finite() && cy.is_finite() && r.is_finite());
             }
+        }
+    }
+
+    fn assert_village_kitties_cross_a_week_smoothly(busy: bool) {
+        let bodies = |phase_ms| {
+            let mut prims = Vec::new();
+            paint_rainbow_kitty_village_kitties(&mut prims, 10.0, 320.0, 50.0, phase_ms, busy);
+            prims
+                .into_iter()
+                .filter_map(|prim| match prim {
+                    DrawPrim::Panel { x, y, .. } => Some((x, y)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = bodies(604_799_999);
+        let after = bodies(604_800_000);
+        assert_eq!(before.len(), 4, "each kitty has a body");
+        assert_eq!(after.len(), before.len());
+        for (kitty, ((x0, y0), (x1, y1))) in before.into_iter().zip(after).enumerate() {
+            // At either speed, one millisecond advances the stroll by less than
+            // 0.066 px and the hop by less than 0.066 px.
+            assert!(
+                (x1 - x0).abs() < 0.1 && (y1 - y0).abs() < 0.1,
+                "kitty {kitty}: ({x0}, {y0}) jumped to ({x1}, {y1})"
+            );
+        }
+    }
+
+    #[test]
+    fn rainbow_kitty_village_idle_motion_crosses_a_week_smoothly() {
+        assert_village_kitties_cross_a_week_smoothly(false);
+    }
+
+    #[test]
+    fn rainbow_kitty_village_busy_motion_crosses_a_week_smoothly() {
+        assert_village_kitties_cross_a_week_smoothly(true);
+    }
+
+    #[test]
+    fn rainbow_kitty_village_architecture_is_invariant_across_phase_ms_when_stations_are_stable() {
+        let states = ['G', 'G', 'G', 'D', 'E', '_', 'G', 'G'];
+        let arch = |phase_ms| {
+            let mut prims = Vec::new();
+            paint_rainbow_kitty_village_architecture(
+                &mut prims,
+                10.0,
+                10.0,
+                320.0,
+                50.0,
+                [24, 24, 32],
+                [60, 60, 72],
+                phase_ms,
+                false,
+                5,
+                8,
+                &states,
+            );
+            format!("{prims:?}")
+        };
+        let baseline = arch(0);
+        for phase in [1, 500, 86_399_999, 86_400_000, 604_800_000, u64::MAX] {
+            assert_eq!(arch(phase), baseline, "phase_ms={phase}");
         }
     }
 }

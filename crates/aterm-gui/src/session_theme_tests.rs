@@ -141,6 +141,53 @@ fn a_session_theme_that_does_not_draw_is_refused() {
 }
 
 #[test]
+fn a_pack_theme_the_themes_folder_lacks_is_refused_until_installed() {
+    let id = aterm_theme_pack::themes()
+        .iter()
+        .find(|theme| aterm_types::scheme::builtin_theme(theme.id).is_none())
+        .expect("the pack holds a theme that is not a built-in")
+        .id;
+    let mut app = two_sessions("");
+    let before = bg(&app, 1);
+    assert_eq!(
+        app.theme_preview_unavailable(id),
+        None,
+        "a preview draws it"
+    );
+    for selector in [
+        id.to_string(),
+        format!("dark:{id},light:Aterm Day"),
+        format!("dark:Aterm Night,light:{id}"),
+    ] {
+        let error =
+            set(&mut app, 1, &selector).expect_err("a session cannot draw it on both sides");
+        assert!(
+            error.starts_with(&format!("theme session {selector:?}: unavailable (")),
+            "{error}"
+        );
+        assert!(app.pool.theme(1).is_none(), "{selector}: nothing kept");
+        assert_eq!(bg(&app, 1), before, "{selector}: nothing drawn");
+        let error = app
+            .spawn_theme(Some(selector.clone()))
+            .expect_err("spawn refuses it too");
+        assert!(
+            error.starts_with(&format!("theme {selector:?}: unavailable (")),
+            "{error}"
+        );
+    }
+
+    let (_, package) = crate::app_config::pack_package(id).expect("the pack parses");
+    app.reload_theme_catalog(ThemeCatalog::from_schemes([(
+        id.to_string(),
+        package.colors.clone(),
+    )]));
+    let line = set(&mut app, 1, id).expect("installed, it draws");
+    assert_eq!(field(&line, "source").as_deref(), Some("file"), "{line}");
+    assert_eq!(field(&line, "miss").as_deref(), Some("-"), "{line}");
+    assert_eq!(bg(&app, 1), package.colors.background);
+}
+
+#[test]
 fn preview_does_not_reach_pinned_sessions() {
     let mut app = two_sessions("");
     set(&mut app, 1, "Aterm Day").expect("pinned");

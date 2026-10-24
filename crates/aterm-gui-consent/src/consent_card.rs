@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The macOS access card: one question that stands in for macOS's many per-folder dialogs.
+//! The macOS access card's decisions; it posts nothing, as the need is System State's Full Disk Access row.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -43,18 +43,9 @@ pub const NEED_DEBOUNCE: Duration = Duration::from_secs(60);
 /// At most one `aterm.log` line per this interval says that macOS asked.
 pub const NEED_LOG_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 
-/// The pre-digest ROW's title (R15): the ASK — a question, so it claims nothing.
+/// The retired row's title (R15): the ask, a question, so it claims nothing.
 #[cfg_attr(not(test), allow(dead_code))]
 pub const FDA_TITLE: &str = "Turn on Full Disk Access?";
-
-/// The entry's `what` in the exceptions digest (glass-title form, cap 48).
-pub const FDA_WHAT: &str = "macOS keeps asking for access";
-
-/// The entry's `what` when no prompt was seen.
-pub const FDA_WHAT_DENIED: &str = "macOS refused aterm a protected read";
-
-/// The entry's `what` when a grant aterm had verified reads off again (`NeedWords::regressed`).
-pub const FDA_WHAT_REGRESSED: &str = "Full Disk Access reads off again";
 
 /// Why the owner is needed: an Allow is forgotten when aterm updates.
 pub const FDA_WHY: &str = "macOS forgets an Allow when aterm updates";
@@ -178,7 +169,7 @@ impl NeedWords {
 /// What the marker records.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Marker {
-    /// *Not now* was pressed: the card is not offered again for the life of the config directory.
+    /// *Not now* was pressed by an older aterm: System State spends it as the Not now of the first approved setup revision it meets, then retires it ([`retire_not_now`]).
     NotNow,
     /// *Open Settings* was pressed and the outcome is not yet known.
     Opened,
@@ -254,6 +245,23 @@ pub fn clear_opened(config_path: Option<&Path>) -> std::io::Result<()> {
     if crate::config_marker::read_marker(&path, MAX_MARKER_BYTES)
         .and_then(|text| Marker::parse(&text))
         != Some(Marker::Opened)
+    {
+        return Ok(());
+    }
+    crate::config_marker::remove_marker(&path)
+}
+
+/// Retire a `not-now` marker once System State has spent it as an approved
+/// setup revision's Not now: removed only while it still reads `not-now`, so an
+/// `opened` (or anything else) is left as found. Worker thread only.
+pub fn retire_not_now(config_path: Option<&Path>) -> std::io::Result<()> {
+    let _serial = MARKER_WRITES.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(path) = marker_path(config_path) else {
+        return Ok(());
+    };
+    if crate::config_marker::read_marker(&path, MAX_MARKER_BYTES)
+        .and_then(|text| Marker::parse(&text))
+        != Some(Marker::NotNow)
     {
         return Ok(());
     }
@@ -507,6 +515,11 @@ pub struct CardHost {
     pub need_logged: Option<Instant>,
     /// A kept need must not be decided again before this ([`NotDue::Settling`]).
     pub settle_retry_at: Option<Instant>,
+    /// A `[privacy]` switch settled the card while its launch check was still
+    /// owed (no verdict yet: off at launch, or turned off while the worker
+    /// read). A switch off is a pause, never an answer: once every switch is
+    /// on, the host runs the check again ([`CardState::rearm_launch`]).
+    pub launch_held: bool,
 }
 
 /// The `state=` token of the `access_card` line of `aterm ctl privacy`.
@@ -855,7 +868,7 @@ impl CardState {
         }
     }
 
-    /// Admit one lifecycle step against the current settings, including a pending worker verdict or a raised question.
+    /// Admit one lifecycle step against the current settings, including a pending worker verdict or a raised question. A launch check it settled before its verdict came runs again once every switch is on ([`Self::rearm_launch`]).
     pub const fn admit_current_policy(&mut self, enabled: bool, notice: bool) -> bool {
         if enabled && notice {
             true
@@ -864,6 +877,21 @@ impl CardState {
             self.pending_need = false;
             false
         }
+    }
+
+    /// A `[privacy]` switch settled the card before its launch check gave a
+    /// verdict (off at launch, or turned off while the worker read), and every
+    /// switch is on again: back to [`CardPhase::Idle`] with a fresh attempt
+    /// budget and a clean episode, so the next step runs the launch check as a
+    /// launch would. A switch off is a pause, never an answer. Only from
+    /// [`CardPhase::Settled`]; `true` when re-armed. The host knows whether the
+    /// launch check gave its verdict; the machine does not.
+    pub fn rearm_launch(&mut self) -> bool {
+        if self.phase != CardPhase::Settled {
+            return false;
+        }
+        *self = Self::new();
+        true
     }
 
     /// The launch one-shot fired: a worker is deciding.
@@ -1004,7 +1032,7 @@ mod tests {
         NeedCause, NeedFacts, NeedVerdict, NeedWords, NotDue, OWNER_ACTED_HOLD, RECORD,
         RENEW_AFTER, Verdict, WATCH_FOR, clear_opened, decide_launch, decide_need,
         is_prompt_while_granted, marker_path, read_marker, read_record, record_marker, record_path,
-        report_state, should_reassert, write_record, write_verified_host,
+        report_state, retire_not_now, should_reassert, write_record, write_verified_host,
     };
     use aterm_containment::consent::{DrClass, FdaState, Folder};
 
@@ -1741,6 +1769,21 @@ mod tests {
             Some(Marker::NotNow),
             "an answer is the owner's and is never cleared"
         );
+        // System State spent it on an approved revision: retired, and only it.
+        retire_not_now(Some(&config)).unwrap();
+        assert_eq!(read_marker(Some(&config)), None, "not-now is retired");
+        assert!(!dir.join(MARKER).exists());
+        record_marker(Some(&config), Marker::Opened).unwrap();
+        retire_not_now(Some(&config)).unwrap();
+        assert_eq!(
+            read_marker(Some(&config)),
+            Some(Marker::Opened),
+            "an opened is not an answer to retire"
+        );
+        clear_opened(Some(&config)).unwrap();
+        assert!(retire_not_now(Some(&config)).is_ok(), "nothing to retire");
+        assert!(retire_not_now(None).is_ok());
+        record_marker(Some(&config), Marker::NotNow).unwrap();
         for marker in [Marker::NotNow, Marker::Opened] {
             assert!(marker.as_str().len() <= MAX_MARKER_BYTES);
             assert_eq!(Marker::parse(marker.as_str()), Some(marker));
@@ -2244,6 +2287,53 @@ mod tests {
             }
         }
         assert_eq!(lapses.phase(), CardPhase::Settled);
+    }
+
+    /// A LAUNCH CHECK A SWITCH HELD RUNS AGAIN: a card the current policy
+    /// settled (off at launch, or turned off while its worker read) re-arms to
+    /// `Idle` with a fresh attempt budget, so the launch check starts from the
+    /// beginning; a card in any other phase is left as it is.
+    #[test]
+    fn a_launch_check_a_switch_held_rearms_from_settled_only() {
+        let t0 = Instant::now();
+        let mut held = CardState::new();
+        assert!(
+            !held.admit_current_policy(true, false),
+            "notice off at launch"
+        );
+        assert_eq!(held.phase(), CardPhase::Settled);
+        assert!(held.rearm_launch());
+        assert_eq!(held.phase(), CardPhase::Idle);
+        assert!(held.begin_deciding(t0), "the launch check runs again");
+
+        let mut mid_read = CardState::new();
+        assert!(mid_read.begin_deciding(t0));
+        assert!(!mid_read.admit_current_policy(false, true), "probe off");
+        assert!(mid_read.rearm_launch());
+        for attempt in 1..=DECIDE_ATTEMPTS {
+            assert!(mid_read.begin_deciding(t0), "attempt {attempt} starts");
+            assert!(mid_read.deciding_lapsed(t0 + DECIDE_TIMEOUT));
+            assert_eq!(
+                mid_read.reopen_deciding(),
+                attempt < DECIDE_ATTEMPTS,
+                "a fresh budget: attempt {attempt} of {DECIDE_ATTEMPTS}"
+            );
+        }
+
+        for mut busy in [CardState::new(), {
+            let mut deciding = CardState::new();
+            assert!(deciding.begin_deciding(t0));
+            deciding
+        }] {
+            let phase = busy.phase();
+            assert!(!busy.rearm_launch(), "{phase:?}: nothing to run again");
+            assert_eq!(busy.phase(), phase);
+        }
+        let mut due = CardState::new();
+        assert!(due.begin_deciding(t0));
+        assert!(due.on_decided(&Verdict::Offer, t0));
+        assert!(!due.rearm_launch(), "a due card keeps its question");
+        assert_eq!(due.phase(), CardPhase::Due);
     }
 
     #[test]

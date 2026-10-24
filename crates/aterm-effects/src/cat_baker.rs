@@ -233,10 +233,15 @@ impl CatBaker {
         h: u16,
     ) -> Option<CatTile> {
         let (wu, hu) = (usize::from(w), usize::from(h));
-        let mut data = Vec::with_capacity(wu * hu * 4);
-        for row in src.chunks_exact(tw * 4).take(hu) {
-            data.extend_from_slice(&row[..wu * 4]);
-        }
+        let data = if tw == wu {
+            src[..wu * hu * 4].to_vec()
+        } else {
+            let mut data = Vec::with_capacity(wu * hu * 4);
+            for row in src.chunks_exact(tw * 4).take(hu) {
+                data.extend_from_slice(&row[..wu * 4]);
+            }
+            data
+        };
         let art = aterm_render::fx::bitmap(FxTexels::Rgba8Straight, w, h, data)?;
         self.slots[i] = Some(Slot {
             key,
@@ -1184,8 +1189,10 @@ fn paint_variant_onto(
             mask_scratch,
         );
     }
-    let r = f32::from(PATCH_STRIP) * 0.5;
-    tile.disc(w as f32 + r, r, r.max(1.0), rgb(CATCH_LIGHT), 1.0);
+    if tile.width() > w {
+        let r = f32::from(PATCH_STRIP) * 0.5;
+        tile.disc(w as f32 + r, r, r.max(1.0), rgb(CATCH_LIGHT), 1.0);
+    }
 }
 
 /// Bake one authored glyph variant to an exact-size RGBA [`Tile`].
@@ -1260,8 +1267,7 @@ impl BakeKeyV4 {
     ) -> &'a Tile {
         let w = u32::from(self.w);
         let h = u32::from(self.h);
-        let tw = w + u32::from(PATCH_STRIP);
-        let tile = prepare_scratch_tile(scratch, tw, h);
+        let tile = prepare_scratch_tile(scratch, w, h);
         paint_variant_onto(
             tile,
             self.variant,

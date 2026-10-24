@@ -913,8 +913,19 @@ fn agy_agent_row(
     }
     let activity_text = crate::text::trim_end(&row[tail..activity_end]);
     if !activity_text.is_empty() {
-        task.activity = Some(cols.span(tail, tail + activity_text.len()));
-        task.activity_hash = text_hash(activity_text);
+        let span = cols.span(tail, tail + activity_text.len());
+        let clean_activity = activity_text.strip_suffix("...").unwrap_or(activity_text);
+        task.activity = Some(span);
+        task.activity_hash = text_hash(clean_activity);
+        if crate::agy::is_subagent_idle_state(clean_activity) {
+            task.elapsed = Some((span, Elapsed::Idle));
+        } else if crate::agy::is_subagent_approval_state(clean_activity) {
+            task.elapsed = Some((span, Elapsed::AwaitingApproval));
+        } else if crate::agy::is_subagent_model_state(clean_activity)
+            && let Some((_, Elapsed::Clock { ms, .. })) = task.elapsed
+        {
+            task.activity_hash ^= (ms / 10_000).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        }
     }
     Some(task)
 }

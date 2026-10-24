@@ -1192,6 +1192,165 @@ fn the_gpu_reads_on_this_host_in_whole_percent() {
     }
 }
 
+/// An `IOUserClientCreator` string reads as its pid and name: the kernel's
+/// pid 0, an overflowing or signed pid and a string of any other shape read
+/// as nothing; a name keeps its commas.
+#[test]
+fn a_gpu_clients_creator_reads_as_pid_and_name() {
+    for (text, want) in [
+        ("pid 601, WindowServer", Some((601, "WindowServer"))),
+        (
+            "pid 1083, iconservicesagen",
+            Some((1083, "iconservicesagen")),
+        ),
+        ("pid 77, a, b, c", Some((77, "a, b, c"))),
+        ("pid 4294967295, max", Some((u32::MAX, "max"))),
+        ("pid 0, kernel_task", None),
+        ("pid 4294967296, over", None),
+        ("pid +5, signed", None),
+        ("pid -5, signed", None),
+        ("pid , empty", None),
+        ("pid 601 WindowServer", None),
+        ("pid 601,WindowServer", None),
+        ("601, WindowServer", None),
+        ("", None),
+    ] {
+        assert_eq!(machine::creator_of(text), want, "{text:?}");
+    }
+}
+
+/// A client's GPU time is its queues' summed: a queue without the key adds
+/// nothing, the sum saturates, an empty `AppUsage` reads 0, and a client
+/// whose `AppUsage` is absent or no array, or whose creator does not parse,
+/// is no client.
+#[test]
+fn a_gpu_client_sums_its_queues() {
+    let of = |usage: Option<&[Option<u64>]>| machine::client_of(9, Some("pid 7, mtl"), usage);
+    let c = of(Some(&[Some(5), None, Some(7)])).expect("a client");
+    assert_eq!(
+        c,
+        GpuClient {
+            entry: 9,
+            pid: 7,
+            name: "mtl".into(),
+            gpu_ns: 12
+        }
+    );
+    assert_eq!(of(Some(&[])).map(|c| c.gpu_ns), Some(0));
+    assert_eq!(of(Some(&[None, None])).map(|c| c.gpu_ns), Some(0));
+    assert_eq!(
+        of(Some(&[Some(u64::MAX), Some(3)])).map(|c| c.gpu_ns),
+        Some(u64::MAX)
+    );
+    assert_eq!(of(None), None);
+    assert_eq!(machine::client_of(9, None, Some(&[Some(1)])), None);
+    assert_eq!(
+        machine::client_of(9, Some("pid 0, kernel_task"), Some(&[Some(1)])),
+        None
+    );
+
+    // A valid iterator can visit an ordinary non-GPU child, an unread client, and a client
+    // whose creator does not parse. Their presence is known even without a counter row.
+    let mut walked = GpuClients {
+        children: 4,
+        complete: true,
+        ..GpuClients::default()
+    };
+    walked.record(1, None, None);
+    walked.record(2, Some("pid 88, WindowServer"), None);
+    walked.record(3, None, Some(&[Some(900)]));
+    walked.record(4, Some("pid 7, mtl"), Some(&[Some(5), Some(7)]));
+    assert_eq!(walked.entries, [1, 2, 3, 4]);
+    assert_eq!(walked.rows.len(), 1);
+    assert_eq!((walked.rows[0].entry, walked.rows[0].gpu_ns), (4, 12));
+    assert!(
+        walked.complete,
+        "absent properties do not invalidate a walk"
+    );
+}
+
+/// Live: the GPU's user clients on this Mac, held to `ioreg` read after
+/// ours. Every entry both list has the same creator. A client's time can
+/// fall between two reads (a released queue leaves `AppUsage`, which GPU
+/// tests running beside this one do all the time), so the time is held to
+/// `ioreg`'s on WindowServer's busiest client only, whose queues live as
+/// long as the session: ours is at most `ioreg`'s and more than half of it
+/// (the same field in the same unit, not mach ticks or a timestamp).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn the_gpu_clients_read_as_ioreg_lists_them() {
+    use std::collections::BTreeMap;
+    let ours = crate::gpu_clients().expect("an Apple silicon GPU's clients");
+    assert!(!ours.truncated, "{} children", ours.children);
+    assert!(
+        !ours.rows.is_empty() && ours.rows.len() <= ours.children as usize,
+        "{ours:?}"
+    );
+    let mut cmd = aterm_uds::spawnfd::command("/usr/sbin/ioreg");
+    cmd.args([
+        "-r",
+        "-c",
+        "AGXDeviceUserClient",
+        "-d",
+        "1",
+        "-w",
+        "0",
+        "-l",
+    ]);
+    let out = aterm_uds::deadline::output_within(&mut cmd, std::time::Duration::from_secs(60))
+        .expect("ioreg ends");
+    assert!(out.status.success(), "{out:?}");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut theirs: BTreeMap<u64, (String, u64)> = BTreeMap::new();
+    let mut at = None;
+    for l in text.lines() {
+        if let Some(id) = l.split(", id 0x").nth(1) {
+            let hex = id
+                .split(|c: char| !c.is_ascii_hexdigit())
+                .next()
+                .unwrap_or("");
+            at = u64::from_str_radix(hex, 16).ok();
+            if let Some(e) = at {
+                theirs.insert(e, (String::new(), 0));
+            }
+        } else if let (Some(e), Some(v)) = (at, l.split("\"IOUserClientCreator\" = \"").nth(1)) {
+            theirs.entry(e).or_default().0 = v.trim_end_matches('"').to_owned();
+        } else if let (Some(e), true) = (at, l.contains("\"AppUsage\" = ")) {
+            let sum = l
+                .split("\"accumulatedGPUTime\"=")
+                .skip(1)
+                .filter_map(|v| {
+                    v.split(|c: char| !c.is_ascii_digit())
+                        .next()?
+                        .parse::<u64>()
+                        .ok()
+                })
+                .sum();
+            theirs.entry(e).or_default().1 = sum;
+        }
+    }
+    for r in &ours.rows {
+        if let Some((creator, _)) = theirs.get(&r.entry) {
+            assert_eq!(
+                machine::creator_of(creator),
+                Some((r.pid, r.name.as_str())),
+                "{r:?}"
+            );
+        }
+    }
+    let (busiest, ns) = ours
+        .rows
+        .iter()
+        .filter(|r| r.name == "WindowServer")
+        .filter_map(|r| Some((r, theirs.get(&r.entry)?.1)))
+        .max_by_key(|(_, ns)| *ns)
+        .unwrap_or_else(|| panic!("no WindowServer client in both: {ours:?}, {theirs:?}"));
+    assert!(
+        ns > 0 && busiest.gpu_ns <= ns && ns - busiest.gpu_ns <= ns / 2,
+        "{busiest:?} against ioreg's {ns}"
+    );
+}
+
 /// NVML's return codes as the vitals say them: not supported is
 /// `unsupported`, no permission names NVML's gate, and every other failure
 /// (uninitialised, not found, GPU lost, a library behind its kernel module)

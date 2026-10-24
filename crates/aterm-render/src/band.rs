@@ -214,29 +214,18 @@ fn give_seam_to_rails(
     cell_w: usize,
 ) {
     let cw = cell_w.max(1);
-    let railed: Vec<(usize, Vec<usize>)> = rasters
-        .iter()
-        .filter(|m| !m.rail.is_empty())
-        .map(|m| {
-            let lit = (0..cols)
-                .filter(|&c| {
-                    let x0 = pad + c * cw;
-                    let on = (x0..x0 + cw)
-                        .filter(|&x| m.rail.get(x).is_some_and(|&v| v != ChromeRaster::KEEP))
-                        .count();
-                    on * 2 >= cw
-                })
-                .collect();
-            (usize::from(m.row), lit)
-        })
-        .collect();
-    for (r, lit) in railed {
-        if let Some(row) = cells.get_mut(r) {
-            for c in lit {
-                if let Some(cell) = row.get_mut(c) {
-                    cell.underline = UnderlineStyle::None;
-                    cell.underline_color = None;
-                }
+    for m in rasters.iter().filter(|m| !m.rail.is_empty()) {
+        let Some(row) = cells.get_mut(usize::from(m.row)) else {
+            continue;
+        };
+        for (c, cell) in row.iter_mut().take(cols).enumerate() {
+            let x0 = pad + c * cw;
+            let on = (x0..x0 + cw)
+                .filter(|&x| m.rail.get(x).is_some_and(|&v| v != ChromeRaster::KEEP))
+                .count();
+            if on * 2 >= cw {
+                cell.underline = UnderlineStyle::None;
+                cell.underline_color = None;
             }
         }
     }

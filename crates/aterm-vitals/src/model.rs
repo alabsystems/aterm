@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::history::{self, Filling, FreeHistory, Rates};
-use crate::peaks::{DailyMax, NET_LEARN_S, Peaks, TOKENS_LEARN_S};
+use crate::peaks::{DailyMax, NET_LEARN_S, PEAK_DAYS, Peaks, PlanDay, PlanWeek, TOKENS_LEARN_S};
 use crate::ring::{BUCKET_MS, BucketRing, Cell, NOW_WINDOW_MS, Recent, columns_of};
 use crate::trend::{History, Trend, TrendView};
 
@@ -676,6 +676,17 @@ pub struct PlanFact {
     pub account: AccountIx,
 }
 
+/// One account a tab's footer read: its weekly plan figure, where it has one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WeekFact {
+    /// The account's key (`c-<12 hex>`).
+    pub account: String,
+    /// Whether a pane of the front tab runs under it.
+    pub front: bool,
+    /// The footer's weekly figure, on the local day it was read.
+    pub reading: Option<PlanDay>,
+}
+
 /// One sample of everything, from the host's probe thread.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Sample {
@@ -689,6 +700,8 @@ pub struct Sample {
     pub mem: Option<MemSample>,
     /// The GPU; `None` where unreadable.
     pub gpu: Option<GpuSample>,
+    /// Every GPU user client's GPU time, where the host read them this sample (not every one).
+    pub gpu_clients: Option<crate::gpu_clients::GpuClientsSample>,
     /// The volume the focused tab works on; `None` where unreadable.
     pub volume: Option<VolumeSample>,
     /// One process sweep; `None` when the host skipped it.
@@ -727,6 +740,10 @@ pub struct Sample {
     pub tokens: Vec<TabTokens>,
     /// The front tab's account's plan usage, while current.
     pub plan: Option<PlanFact>,
+    /// Every account the tabs' footers read, each once.
+    pub weeks: Vec<WeekFact>,
+    /// The day of [`Self::at_unix_ms`], unix days in the local zone.
+    pub local_day: u32,
     /// The thermal state, where read.
     pub thermal: Option<Thermal>,
     /// The 1, 5 and 15 minute load averages, where read.
@@ -797,6 +814,8 @@ pub struct GpuView {
     pub history: Vec<Option<f32>>,
     /// The sample's figures as read.
     pub sample: GpuSample,
+    /// Client time by owner, while client shares are held and the sweep ran.
+    pub split: Option<crate::gpu_clients::GpuSplit>,
 }
 
 /// Memory.
@@ -843,6 +862,8 @@ pub struct ScopeView {
     pub write_bps: Option<f64>,
     /// Members whose CPU time the OS refused.
     pub refused: u32,
+    /// The members' GPU share of the device (`1.0` the whole GPU), while client shares are held.
+    pub gpu: Option<f32>,
 }
 
 impl ScopeView {
@@ -920,6 +941,8 @@ pub struct ProcView {
     pub scope: RowScope,
     /// Whether the OS refused its CPU time (another user's process).
     pub refused: bool,
+    /// Its GPU share of the device (`1.0` the whole GPU), while client shares are held.
+    pub gpu: Option<f32>,
 }
 
 /// Breakdown of busy CPU cores across `aterm`, other user processes, and system/unattributed services.
@@ -1135,7 +1158,7 @@ impl CapBasis {
 /// Why a scope has no figure, where that is not "not read yet".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoFigure {
-    /// The OS keeps no per-app figure (GPU, network).
+    /// The OS keeps no per-app figure (network; GPU while no client read is held).
     NotPerApp,
     /// The sweep read no process's counter (writes on Linux).
     NotReadHere,
@@ -1367,10 +1390,25 @@ pub struct RowFacts {
     pub tokens_read_s: u32,
     /// Tokens: the plan's usage, while current.
     pub plan: Option<PlanFact>,
+    /// Tokens: the weekly plan figure's run, where an account's week is kept.
+    pub plan_week: Option<PlanRun>,
     /// Processes: running on the machine and as this user.
     pub pid_counts: (Option<u64>, Option<u64>),
     /// Processes: the limits.
     pub proc_limits: ProcLimits,
+}
+
+/// ONE ACCOUNT'S WEEKLY PLAN FIGURE over the [`PEAK_DAYS`] days ending today, a point a day:
+/// the front tab's account's where a pane of it runs under one, else the account read most
+/// recently. A day with no row was not read; the day the week reset has two rows.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PlanRun {
+    /// The account's rows of those days ([`PlanWeek`]).
+    pub week: PlanWeek,
+    /// Whether it is the front tab's account.
+    pub front: bool,
+    /// Today, unix days in the local zone: the run's right end.
+    pub today: u32,
 }
 
 /// Validated build-slot occupancy from the host's slot reader.
@@ -1576,6 +1614,7 @@ impl ScopeState {
             wait: acc.wait,
             write_bps: acc.writes,
             refused: acc.refused,
+            gpu: acc.gpu,
         }
     }
 }
@@ -1592,10 +1631,15 @@ struct ScopeAcc {
     wait: Option<f32>,
     /// Members whose CPU time the OS refused.
     refused: u32,
+    /// GPU share of the device across members, while client shares are held.
+    gpu: Option<f32>,
 }
 
 impl ScopeAcc {
     fn add(&mut self, p: &ProcSample, r: &ProcRates) {
+        if let Some(g) = r.gpu {
+            self.gpu = Some(self.gpu.unwrap_or(0.0) + g);
+        }
         let cores = r.cores.unwrap_or(0.0);
         self.cores += cores;
         if let Some(f) = p.footprint {
@@ -1623,6 +1667,7 @@ struct ProcRates {
     cores: Option<f32>,
     wait: Option<f32>,
     write_bps: Option<f64>,
+    gpu: Option<f32>,
 }
 
 /// When a reading was taken, on both clocks, and the cadence then.
@@ -1748,6 +1793,8 @@ struct ProcPass {
     rows: Vec<ProcView>,
     /// `(aterm_cores, user_other_cores, cpu_unreadable_count)` for [`Split`].
     split_parts: Option<(f32, f32, u32)>,
+    /// `(aterm, others, services)` GPU shares for [`crate::gpu_clients::GpuSplit`].
+    gpu_parts: Option<(f32, f32, f32)>,
     /// The sweep's window, ns.
     window_ns: Option<u64>,
     /// Cached [`attribute_delegated`] result for [`crate::explain`].
@@ -1792,6 +1839,8 @@ struct Rows {
     /// The GPU's reset count at the first reading, and when it first rose.
     gpu_recoveries: Option<u64>,
     gpu_rose_at: Option<i64>,
+    /// Each process's GPU share from the client reads.
+    gpu_clients: crate::gpu_clients::GpuShares,
 }
 
 /// One scope's hour rings in [`Resource::ALL`] order; a row's ring exists once the scope read it.
@@ -1861,6 +1910,17 @@ impl Vitals {
         self.rows.peaks = peaks;
     }
 
+    /// The disk's free history, for the host to persist.
+    #[must_use]
+    pub fn free_history(&self) -> &FreeHistory {
+        &self.rows.free
+    }
+
+    /// Take the free history the host persisted in an earlier run ([`FreeHistory::restored`]).
+    pub fn restore_free_history(&mut self, history: FreeHistory) {
+        self.rows.free = history;
+    }
+
     /// How many samples it has absorbed.
     #[must_use]
     pub fn seq(&self) -> u64 {
@@ -1878,6 +1938,9 @@ impl Vitals {
     /// Absorb one sample and return the snapshot it makes.
     pub fn absorb(&mut self, s: &Sample) -> Snapshot {
         self.seq += 1;
+        self.rows
+            .gpu_clients
+            .absorb(s.gpu_clients.as_ref(), s.at_ns);
         let stamp = Stamp::of(s);
         let cores_dt = match s.cores.as_deref() {
             Some(c) if !c.is_empty() => stamp.rate_dt(self.rows.cores_at.replace(stamp)),
@@ -1906,7 +1969,7 @@ impl Vitals {
             self.busy_history.push_at(None, s.at_ns);
         }
 
-        let gpu = match s.gpu.as_ref() {
+        let mut gpu = match s.gpu.as_ref() {
             Some(g) if g.device_pct.is_some() => {
                 let pct = f32::from(g.device_pct.unwrap_or(0).min(100)) / 100.0;
                 self.gpu.push(pct, interval_s(self.last_gpu_at, s.at_ns));
@@ -1918,6 +1981,7 @@ impl Vitals {
                     name: g.name.clone(),
                     history: self.gpu_history.to_vec(),
                     sample: g.clone(),
+                    split: None,
                 })
             }
             _ => {
@@ -1978,6 +2042,18 @@ impl Vitals {
             .map(|c| f64::from(c.busy.raw));
         let figs = pass.figs.as_ref().filter(|_| !s.machine_only);
         let (resources, facts, net) = self.rows.absorb(s, stamp, busy, figs, sweep_dt);
+        if let (Some(g), Some((aterm, others, services)), Some(clients)) = (
+            gpu.as_mut(),
+            pass.gpu_parts,
+            self.rows.gpu_clients.clients(),
+        ) {
+            g.split = Some(crate::gpu_clients::GpuSplit {
+                clients,
+                aterm,
+                others,
+                services: services.max(clients - aterm - others),
+            });
+        }
         let split = match (cpu.as_ref(), pass.split_parts) {
             (Some(c), Some((aterm, others, unread))) => {
                 let rest = c.busy.raw - aterm - others;
@@ -2118,6 +2194,7 @@ impl Vitals {
         for p in procs {
             let mut r = ProcRates {
                 write_bps: writes.get(&p.pid).copied(),
+                gpu: self.rows.gpu_clients.share(p.pid, &p.name),
                 ..ProcRates::default()
             };
             let wall_ns = match (p.at_ns, self.last_read_at.get(&p.pid)) {
@@ -2168,6 +2245,7 @@ impl Vitals {
         let mut global_acc = ScopeAcc::default();
         let mut tab_acc: Vec<ScopeAcc> = vec![ScopeAcc::default(); s.tabs.len()];
         let mut others = 0.0f32;
+        let (mut others_gpu, mut services_gpu) = (0.0f32, 0.0f32);
         let mut ownership_known = s.self_uid.is_some();
         let mut rows: Vec<ProcView> = Vec::with_capacity(procs.len());
         let mut job_acc: Vec<ScopeAcc> = vec![ScopeAcc::default(); s.delegated.len()];
@@ -2263,8 +2341,13 @@ impl Vitals {
                     }
                 }
             };
-            if row_scope == RowScope::Others {
-                others += cores;
+            match row_scope {
+                RowScope::Others => {
+                    others += cores;
+                    others_gpu += r.gpu.unwrap_or(0.0);
+                }
+                RowScope::Services | RowScope::Unknown => services_gpu += r.gpu.unwrap_or(0.0),
+                _ => {}
             }
             rows.push(ProcView {
                 pid: p.pid,
@@ -2279,12 +2362,14 @@ impl Vitals {
                 state: p.state,
                 scope: row_scope,
                 refused: p.cpu_ns.is_none(),
+                gpu: r.gpu,
             });
         }
         global.top = global_acc.top.clone();
         global.wait = global_acc.wait;
         global.write_bps = global_acc.writes;
         global.refused = global_acc.refused;
+        global.gpu = global_acc.gpu;
         writers.sort_by(|a, b| b.bytes_per_s.total_cmp(&a.bytes_per_s));
         writers.truncate(TOP_WRITERS);
         let busiest = groups
@@ -2292,6 +2377,7 @@ impl Vitals {
             .reduce(|a, b| if b.cores > a.cores { b } else { a });
 
         let aterm_cores = aterm_acc.cores;
+        let gpu_parts = aterm_acc.gpu.map(|aterm| (aterm, others_gpu, services_gpu));
         let aterm = self.aterm.absorb(&aterm_acc, dt_s, s.at_ns);
         let named = front_names(procs, &s.tabs);
         let mut live = std::collections::HashSet::with_capacity(s.tabs.len());
@@ -2343,6 +2429,7 @@ impl Vitals {
             }),
             rows: keep_rows(rows),
             split_parts: ownership_known.then_some((aterm_cores, others, global_acc.refused)),
+            gpu_parts,
             window_ns: Some(wall_ns),
             attribution: Some((membership, delegated_members)),
         }
@@ -2382,7 +2469,9 @@ fn keep_rows(rows: Vec<ProcView>) -> Vec<ProcView> {
     let mut kept: Vec<ProcView> = rest.iter().take(TOP_ROWS).cloned().collect();
     let mut by_foot: Vec<&ProcView> = rest.iter().skip(TOP_ROWS).collect();
     by_foot.sort_by_key(|p| std::cmp::Reverse(p.footprint.unwrap_or(0)));
-    kept.extend(by_foot.into_iter().take(TOP_ROWS).cloned());
+    let mut by_foot = by_foot.into_iter();
+    kept.extend(by_foot.by_ref().take(TOP_ROWS).cloned());
+    kept.extend(by_foot.filter(|p| p.gpu.is_some_and(|g| g > 0.0)).cloned());
     mine.extend(kept);
     mine.sort_by(busiest_first);
     mine
@@ -2451,7 +2540,7 @@ impl Rows {
         let vol = s.volume.as_ref().filter(|v| v.total > 0);
         if let Some(v) = vol {
             self.caps[Disk.index()] = Some(v.total as f64);
-            self.free.note(now, v.available);
+            self.free.note_on(&v.mount, v.total, now, v.available);
         }
         self.rings[Disk.index()].push(now, vol.map(|v| v.used() as f64), false);
         if let Some(v) = vol {
@@ -2479,6 +2568,13 @@ impl Rows {
             &mut self.peaks.net_rx,
         );
         note_peak(&self.net_tx, closed_tx, &mut self.peaks.net_tx);
+
+        for week in &s.weeks {
+            if let Some(reading) = week.reading {
+                self.peaks.note_plan(&week.account, reading);
+            }
+        }
+        facts.plan_week = plan_run(&self.peaks, &s.weeks, s.local_day);
 
         let tokens = self.absorb_tokens(&s.tokens, stamp);
         let closed = self.rings[Tokens.index()].push(now, tokens.out, false);
@@ -2514,6 +2610,10 @@ impl Rows {
             let vals = |acc: &ScopeAcc, tokens: Option<f64>| -> [Option<f64>; 7] {
                 let mut v = [None; 7];
                 v[Cpu.index()] = sweep_dt.map(|_| f64::from(acc.cores));
+                // Held at the device's reading so each 10 s cell keeps tab <= all tabs <= Mac.
+                v[Gpu.index()] = acc.gpu.map(|g| {
+                    gpu_pct.map_or(f64::from(g) * 100.0, |mac| (f64::from(g) * 100.0).min(mac))
+                });
                 v[Memory.index()] = acc.footprint.map(|b| b as f64);
                 v[Disk.index()] = sweep_dt.and(acc.writes);
                 v[Tokens.index()] = tokens;
@@ -2528,9 +2628,11 @@ impl Rows {
             facts.writers = f.writers.clone();
             facts.busiest = f.busiest.clone();
         }
+        let gpu_held = self.gpu_clients.held();
         let missing = |res: Resource, agent: bool| -> Option<NoFigure> {
             match res {
-                Gpu | Network => Some(NoFigure::NotPerApp),
+                Gpu if !gpu_held => Some(NoFigure::NotPerApp),
+                Network => Some(NoFigure::NotPerApp),
                 Disk if figs.is_some_and(|f| !f.writes_read) => Some(NoFigure::NotReadHere),
                 Tokens if !agent => Some(NoFigure::NoAgent),
                 _ => None,
@@ -2595,6 +2697,15 @@ impl Rows {
                     (t.key, fig(self.tabs.get(&t.key), res, agent))
                 })
                 .collect();
+            if res == Gpu
+                && let Some(mac) = view.now
+            {
+                for f in
+                    std::iter::once(&mut view.aterm).chain(view.tabs.iter_mut().map(|t| &mut t.1))
+                {
+                    f.now = f.now.map(|v| v.min(mac));
+                }
+            }
             view
         });
         (resources, facts, net)
@@ -2833,6 +2944,33 @@ fn net_capacity(
         _ if learned => (CapBasis::Peak, None, None),
         _ => (CapBasis::Learning, None, None),
     }
+}
+
+/// The [`PlanRun`] of `peaks`' weeks on `today`: the front tab's account's week
+/// ([`WeekFact::front`]) where one is kept, else the week read most recently.
+fn plan_run(peaks: &Peaks, weeks: &[WeekFact], today: u32) -> Option<PlanRun> {
+    let front = weeks
+        .iter()
+        .filter(|w| w.front)
+        .find_map(|w| peaks.plan.iter().find(|kept| kept.account == w.account));
+    let (week, front) = match front {
+        Some(week) => (week, true),
+        None => (peaks.plan.iter().max_by_key(|week| week.read_at())?, false),
+    };
+    let days: Vec<PlanDay> = week
+        .days
+        .iter()
+        .filter(|d| today.checked_sub(d.day).is_some_and(|age| age < PEAK_DAYS))
+        .copied()
+        .collect();
+    (!days.is_empty()).then(|| PlanRun {
+        week: PlanWeek {
+            account: week.account.clone(),
+            days,
+        },
+        front,
+        today,
+    })
 }
 
 fn disk_state(facts: Option<&DiskFacts>, filling: Option<&Filling>) -> Option<State> {
@@ -3878,6 +4016,7 @@ mod tests {
             net_rx: learned(50e6, NET_LEARN_S),
             net_tx: learned(1e6, NET_LEARN_S),
             tokens: learned(72_000.0, TOKENS_LEARN_S),
+            ..Peaks::default()
         });
         let mut s = Snapshot::default();
         for t in 0..6 {
@@ -4083,6 +4222,92 @@ mod tests {
             let r = s.resource(res, Some(7));
             assert_eq!(r.aterm.missing, Some(NoFigure::NotPerApp));
             assert_eq!(r.tab.missing, Some(NoFigure::NotPerApp));
+        }
+    }
+
+    /// GPU per scope from two client reads 2 s apart: aterm's own client (pid 100) and the tab's
+    /// cargo (201) count in their scopes, another user's WindowServer in services, and a client
+    /// whose name is not the swept process's (pid 200 reused) in no process's, its time left to
+    /// services as unclaimed. The rows' figures hold
+    /// this tab ≤ all tabs ≤ the Mac's, the device read in whole percent included (0 while the
+    /// clients read above it), and say "not per app" only while no client read is held.
+    #[test]
+    fn gpu_time_per_scope_comes_from_the_client_reads() {
+        use crate::gpu_clients::{GpuClientRow, GpuClientsSample};
+        const MS: u64 = 1_000_000;
+        let row = |entry: u64, pid: u32, name: &str, gpu_ms: u64| GpuClientRow {
+            entry,
+            pid,
+            name: name.into(),
+            gpu_ns: gpu_ms * MS,
+        };
+        let reading = |t_ms: u64, device: u8, ran: Option<u64>| {
+            let mut s = at(t_ms, 1000);
+            s.gpu.as_mut().expect("GPU").device_pct = Some(device);
+            s.procs.as_mut().expect("sweep").push(ProcSample {
+                uid: Some(88),
+                ..proc(601, 1, 0, 400, "WindowServer")
+            });
+            s.gpu_clients = ran.map(|k| GpuClientsSample {
+                at_ns: s.at_ns,
+                complete: true,
+                entries: vec![1, 2, 3, 4],
+                rows: vec![
+                    row(1, 100, "aterm", 200 * k),
+                    row(2, 201, "cargo", 100 * k),
+                    row(3, 601, "WindowServer", 40 * k),
+                    row(4, 200, "bash", 1000 * k),
+                ],
+            });
+            s
+        };
+        for device in [12u8, 0] {
+            let mut v = Vitals::new();
+            let first = v.absorb(&reading(1000, device, Some(0)));
+            let r = first.resource(Gpu, Some(7));
+            assert_eq!(
+                r.aterm.missing,
+                Some(NoFigure::NotPerApp),
+                "a baseline only"
+            );
+            assert_eq!(first.aterm.as_ref().and_then(|a| a.gpu), None);
+            let _ = v.absorb(&reading(2000, device, None));
+            let s = v.absorb(&reading(3000, device, Some(1)));
+            let gpu_of = |pid: u32| s.procs.iter().find(|p| p.pid == pid).and_then(|p| p.gpu);
+            let near = |a: Option<f32>, b: f32| a.is_some_and(|a| (a - b).abs() < 1e-5);
+            assert!(near(gpu_of(100), 0.10), "{:?}", s.procs);
+            assert!(near(gpu_of(201), 0.05));
+            assert!(near(gpu_of(601), 0.02));
+            assert_eq!(gpu_of(200), Some(0.0), "a reused pid takes no GPU time");
+            assert!(near(s.aterm.as_ref().and_then(|a| a.gpu), 0.15));
+            assert!(near(s.tab(7).and_then(|t| t.scope.gpu), 0.05));
+            let split = s.gpu.as_ref().and_then(|g| g.split).expect("a split");
+            assert!((split.clients - 0.67).abs() < 1e-5, "{split:?}");
+            assert!((split.aterm - 0.15).abs() < 1e-5, "{split:?}");
+            // WindowServer's 0.02 and the reused pid's unclaimed 0.5.
+            assert!(split.others.abs() < 1e-6 && (split.services - 0.52).abs() < 1e-5);
+
+            let r = s.resource(Gpu, Some(7));
+            assert_eq!((r.aterm.missing, r.tab.missing), (None, None));
+            let (mac, all, tab) = (r.now.expect("Mac"), r.aterm.now.expect("all"), r.tab.now);
+            let tab = tab.expect("tab");
+            assert!(tab <= all && all <= mac, "{tab} ≤ {all} ≤ {mac}");
+            assert!(close(Some(all), f64::from(device).min(15.0)), "{all}");
+            assert!(close(Some(tab), f64::from(device).min(5.0)), "{tab}");
+
+            let last = |run: &[Cell]| run.last().and_then(|c| c.mean).expect("a cell");
+            let (mac_run, all_run) = (last(&r.ring), last(&r.aterm.run));
+            let tab_run = last(&r.tab.run);
+            assert!(
+                tab_run <= all_run && all_run <= mac_run,
+                "each scope's 10 s cell: {tab_run} ≤ {all_run} ≤ {mac_run}"
+            );
+
+            let max_ms = crate::explain::WINDOW_MAX_NS / MS;
+            let later = v.absorb(&reading(3000 + max_ms + 1000, device, None));
+            let r = later.resource(Gpu, Some(7));
+            assert_eq!(r.aterm.missing, Some(NoFigure::NotPerApp), "expired");
+            assert_eq!(later.aterm.as_ref().and_then(|a| a.gpu), None);
         }
     }
 
@@ -4581,6 +4806,39 @@ mod tests {
     }
 
     #[test]
+    fn a_restored_free_history_reads_on_only_from_its_volume() {
+        let mut before = Vitals::new();
+        for i in 0..120 {
+            let _ = before.absorb(&disk_reading(i, 400_000_000_000 - i as u64, None));
+        }
+        let saved = before.free_history().saved().expect("20 minutes read");
+        assert_eq!(saved.volume.mount, "/");
+        let after = disk_reading(200, 1, None);
+        let read = |s: &Snapshot| {
+            s.free_history
+                .window(s.at_unix_ms)
+                .into_iter()
+                .flatten()
+                .count()
+        };
+
+        let mut v = Vitals::new();
+        v.restore_free_history(FreeHistory::restored(&saved, after.at_unix_ms));
+        assert_eq!(
+            read(&v.absorb(&after)),
+            3,
+            "two kept ten minutes and the new one"
+        );
+        let mut moved = after.clone();
+        if let Some(vol) = moved.volume.as_mut() {
+            vol.mount = "/Volumes/Backup".into();
+        }
+        let mut v = Vitals::new();
+        v.restore_free_history(FreeHistory::restored(&saved, after.at_unix_ms));
+        assert_eq!(read(&v.absorb(&moved)), 1, "another volume starts afresh");
+    }
+
+    #[test]
     fn over_is_a_queue_on_the_cores_or_heavy_swapping() {
         let run = |load1: f64, busy_half: bool, swap_kib_per_s: u64| {
             let mut v = Vitals::new();
@@ -4697,5 +4955,106 @@ mod tests {
             t += 1;
         }
         assert_eq!(read(t, vec![wired(e + 10_000_000)]).0, "en7");
+    }
+
+    #[test]
+    fn the_plan_week_survives_a_restart() {
+        const DAY: u32 = 20_740;
+        let at_s = |day: u32, hour: i64| i64::from(day) * 86_400 + hour * 3_600;
+        let reading = |day: u32, hour: i64, used_x10: u16| {
+            Some(PlanDay {
+                day,
+                used_x10,
+                resets_at: at_s(DAY + 4, 0),
+                at: at_s(day, hour),
+            })
+        };
+        let week = |account: &str, front: bool, reading: Option<PlanDay>| WeekFact {
+            account: account.into(),
+            front,
+            reading,
+        };
+        let sample = |i: i64, today: u32, weeks: Vec<WeekFact>| Sample {
+            at_unix_ms: T0 + i * 1000,
+            mono_ms: u64::try_from(i).expect("a reading") * 1000,
+            cadence_ms: 1000,
+            local_day: today,
+            weeks,
+            ..Sample::default()
+        };
+        let used = |run: &PlanRun| -> (String, bool, Vec<u16>) {
+            let used = run.week.days.iter().map(|d| d.used_x10).collect();
+            (run.week.account.clone(), run.front, used)
+        };
+
+        let mut a = Vitals::new();
+        let first = a.absorb(&sample(
+            0,
+            DAY,
+            vec![week("c-b", false, reading(DAY, 10, 500))],
+        ));
+        assert_eq!(
+            first.facts.plan_week.as_ref().map(used),
+            Some(("c-b".into(), false, vec![500])),
+            "no front account: the one read last"
+        );
+        let _ = a.absorb(&sample(
+            1,
+            DAY,
+            vec![
+                week("c-a", true, reading(DAY, 11, 100)),
+                week("c-b", false, reading(DAY, 10, 500)),
+            ],
+        ));
+        let s = a.absorb(&sample(
+            2,
+            DAY + 1,
+            vec![
+                week("c-b", false, reading(DAY + 1, 10, 600)),
+                week("c-a", true, reading(DAY + 1, 11, 150)),
+            ],
+        ));
+        let run = s.facts.plan_week.expect("a run");
+        assert_eq!(used(&run), ("c-a".into(), true, vec![100, 150]));
+        assert_eq!(run.today, DAY + 1);
+        let held = a.peaks().clone();
+        let _ = a.absorb(&sample(
+            3,
+            DAY + 1,
+            vec![week("c-a", true, reading(DAY + 1, 11, 150))],
+        ));
+        assert_eq!(
+            *a.peaks(),
+            held,
+            "the same figure again leaves nothing to write"
+        );
+
+        let mut b = Vitals::new();
+        b.restore_peaks(a.peaks().clone());
+        let s = b.absorb(&sample(0, DAY + 1, Vec::new()));
+        assert_eq!(
+            s.facts.plan_week.as_ref().map(used),
+            Some(("c-a".into(), false, vec![100, 150])),
+            "after a restart, the kept week of the account read last"
+        );
+        let s = b.absorb(&sample(
+            1,
+            DAY + 1,
+            vec![week("c-a", false, None), week("c-b", true, None)],
+        ));
+        assert_eq!(
+            s.facts.plan_week.as_ref().map(used),
+            Some(("c-b".into(), true, vec![500, 600])),
+            "the front tab's account, though its footer has no figure now"
+        );
+        let s = b.absorb(&sample(2, DAY + 7, vec![week("c-b", true, None)]));
+        assert_eq!(
+            s.facts.plan_week.as_ref().map(used),
+            Some(("c-b".into(), true, vec![600])),
+            "the run is the 7 days ending today"
+        );
+        let s = b.absorb(&sample(3, DAY + 8, vec![week("c-b", true, None)]));
+        assert_eq!(s.facts.plan_week, None, "nothing read in the last 7 days");
+        assert_eq!(*b.peaks(), held, "a reading with no figure keeps nothing");
     }
 }

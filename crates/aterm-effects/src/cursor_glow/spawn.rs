@@ -367,7 +367,7 @@ impl CursorGlow {
                 if typing_run {
                     hue_advances = self.path_scratch.len() as f32;
                 }
-                let n = self.path_scratch.len() as f32;
+                let inv_n = 1.0 / (self.path_scratch.len() as f32);
                 for i in 0..self.path_scratch.len() {
                     let (r, c) = self.path_scratch[i];
                     if r < 0 || c < 0 || r as usize >= geom.rows || c as usize >= geom.cols {
@@ -376,7 +376,7 @@ impl CursorGlow {
                     let pos = if typing_run {
                         1.0
                     } else {
-                        (i as f32 + 1.0) / n
+                        (i as f32 + 1.0) * inv_n
                     };
                     let born_cov = match cfg.style {
                         GlowStyle::Laser => ((205.0 + 50.0 * pos) * boost).min(255.0) as u8,
@@ -902,14 +902,12 @@ impl CursorGlow {
             return;
         }
         let rounds = if big { 4 } else { 2 };
-        let (mut pts, mut next) = std::mem::take(&mut self.bolt_jag);
-        pts.clear();
+        let (mut pts, mut next) = (BoltPts::default(), BoltPts::default());
         pts.push(from);
         pts.push(to);
         let mut amp = (len * 0.16).clamp(cell * 0.35, cell * 2.6);
         for _ in 0..rounds {
-            next.clear();
-            next.reserve(pts.len() * 2 - 1);
+            next.len = 0;
             for w in pts.windows(2) {
                 let (a, b) = (w[0], w[1]);
                 let (sx, sy) = (b.0 - a.0, b.1 - a.1);
@@ -945,7 +943,7 @@ impl CursorGlow {
                     (root.1 + tip.1) * 0.5 + (tip.0 - root.0) / blen * kick,
                 );
                 let bolt = Bolt {
-                    pts: vec![root, mid, tip],
+                    pts: BoltPts::from_3(root, mid, tip),
                     born: now,
                     life: Self::FORK_LIFE_S + self.frand() * Self::STRIKE_LIFE_SPREAD_S,
                     branch: true,
@@ -960,13 +958,12 @@ impl CursorGlow {
             0.14 + self.frand() * 0.08
         };
         self.push_bolt(Bolt {
-            pts: pts.clone(),
+            pts,
             born: now,
             life,
             branch: !big,
             crackle: !big,
         });
-        self.bolt_jag = (pts, next);
     }
 
     /// Append a bolt, evicting the oldest once [`Self::MAX_BOLTS`] are live.

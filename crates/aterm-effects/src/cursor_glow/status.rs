@@ -398,8 +398,10 @@ impl TrailStatus<'_> {
             self.ribbon_segments,
             self.ribbon_hue_bands,
             self.ribbon_drawn,
-            self.ribbon_curtain_ms
-                .map_or_else(|| "none".to_string(), |ms| ms.to_string()),
+            std::fmt::from_fn(|f| match self.ribbon_curtain_ms {
+                Some(ms) => write!(f, "{ms}"),
+                None => f.write_str("none"),
+            }),
             self.field,
             self.sparks,
             self.momentum,
@@ -412,23 +414,28 @@ impl TrailStatus<'_> {
             self.pet_active,
             self.cat_active,
             self.block_fill.map_or("none", |b| b.owner.label()),
-            self.block_fill
-                .map_or_else(|| "none".to_string(), |b| format!("{:06x}", b.fill)),
-            self.block_fill
-                .and_then(|b| b.base)
-                .map_or_else(|| "none".to_string(), |base| format!("{base:06x}")),
+            std::fmt::from_fn(|f| match self.block_fill {
+                Some(b) => write!(f, "{:06x}", b.fill),
+                None => f.write_str("none"),
+            }),
+            std::fmt::from_fn(|f| match self.block_fill.and_then(|b| b.base) {
+                Some(base) => write!(f, "{base:06x}"),
+                None => f.write_str("none"),
+            }),
             self.block_fill.map_or("none", |b| b.base_from().label()),
             self.pet_action,
             self.pet_content,
             self.pet_pending,
-            self.pet_body.map_or_else(
-                || "none".to_string(),
-                |(x0, x1, y0, y1)| format!("{x0},{x1},{y0},{y1}"),
-            ),
+            std::fmt::from_fn(|f| match self.pet_body {
+                Some((x0, x1, y0, y1)) => write!(f, "{x0},{x1},{y0},{y1}"),
+                None => f.write_str("none"),
+            }),
             self.pet_focus,
             self.pet_reason,
-            self.pet_anchor
-                .map_or_else(|| "none".to_string(), |id| id.to_string()),
+            std::fmt::from_fn(|f| match self.pet_anchor {
+                Some(id) => write!(f, "{id}"),
+                None => f.write_str("none"),
+            }),
             self.pet_event_seq,
             self.pet_pose,
             self.inserts.delivered,

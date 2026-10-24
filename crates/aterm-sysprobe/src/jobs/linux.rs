@@ -532,6 +532,7 @@ fn fds(dir: &Path, sleeping: Option<bool>) -> Option<(Vec<FdReading>, bool)> {
                     dev: 0,
                     ino: i.ino.unwrap_or(0),
                     lf_tail: None,
+                    fresh_dylib: false,
                 }
             }
             FdLink::Other => FdKind::Other,

@@ -163,15 +163,13 @@ impl RainBaker {
                 for &(wy, row) in src_row {
                     let mut row_wx: u32 = 0;
                     for &(mx, wx) in seg {
-                        if (row >> mx) & 1 == 1 {
-                            row_wx += wx;
-                        }
+                        row_wx += wx * ((row >> mx) & 1);
                     }
                     num += row_wx * wy;
                 }
-                let alpha = ((num * 255 + DEN / 2) / DEN) as u8;
-                let idx = (y * cw + x) * 4;
-                rgba[idx..idx + 4].copy_from_slice(&[255, 255, 255, alpha]);
+                if num > 0 {
+                    rgba[(y * cw + x) * 4 + 3] = ((num * 255 + DEN / 2) / DEN) as u8;
+                }
             }
         }
         self.tiles[tile] =

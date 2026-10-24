@@ -456,6 +456,75 @@ fn coloured_cells_the_cursors_row_and_a_selection_keep_claudes_look() {
     let halos = light(&app, wid);
     assert!(!halos.iter().any(|h| usize::from(h.row) == strip + SECOND));
     assert!(halos.iter().any(|h| usize::from(h.row) == strip + FIRST));
+
+    probe::bytes(
+        &app,
+        session,
+        format!(
+            "\x1b[{};3H{}⏺\x1b[0m\x1b[{};3H",
+            FIRST + 1,
+            sgr(GREEN),
+            BOTTOM
+        )
+        .as_bytes(),
+    );
+    frame(&mut app, wid);
+    assert!(
+        ink_on(&app, wid, FIRST).is_empty(),
+        "Claude's colored viewed-agent bullet keeps its settled status and blue name"
+    );
+    assert!(
+        !light(&app, wid)
+            .iter()
+            .any(|h| usize::from(h.row) == strip + FIRST),
+        "the settled viewed agent has no running halo"
+    );
+
+    let rule = "─".repeat(usize::from(COLS));
+    let agy_rows = vec![
+        rule.clone(),
+        "> ".into(),
+        rule.clone(),
+        "  ● Agent(self: Probe)  Working · 1s".into(),
+        rule,
+        "? for shortcuts".into(),
+    ];
+    let mut bytes = String::from("\x1b[2J");
+    for (row, text) in agy_rows.iter().enumerate() {
+        let painted = if row == 3 {
+            format!(
+                "  {}● {}Agent(self: Probe){}  Working · 1s",
+                sgr(GREEN),
+                sgr(BLUE),
+                sgr(GREY)
+            )
+        } else {
+            text.clone()
+        };
+        bytes.push_str(&format!("\x1b[{};1H{painted}\x1b[0m", row + 1));
+    }
+    probe::bytes(&app, session, bytes.as_bytes());
+    probe::refill(&mut app, wid);
+    let scratch = &app.windows[&wid].input_scratch;
+    let read = read_panel(
+        session,
+        &agy_rows,
+        2,
+        scratch,
+        PaneGeom {
+            strip,
+            row_off: 0,
+            col_off: 0,
+            rows: usize::from(ROWS),
+            cols: usize::from(COLS),
+        },
+        scratch.implicit_blank,
+    )
+    .expect("actual ANSI cells of the AGY agent panel");
+    assert_eq!(read.panel.rows().len(), 1);
+    assert_eq!(read.tints[0], Tint::Plain);
+    assert!(read.ink[0].bullet.is_some() && read.ink[0].name.is_some());
+
     feed(&app, session, START, Inks::default());
     probe::bytes(&app, session, format!("\x1b[{};40H", FIRST + 1).as_bytes());
     frame(&mut app, wid);

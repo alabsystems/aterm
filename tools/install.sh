@@ -120,13 +120,24 @@
 # `ship site` publishes it); piped, it installs from alabsystems/aterm. The
 # same file at the public main's tip:
 #   curl -fsSL https://raw.githubusercontent.com/alabsystems/aterm/HEAD/tools/install.sh | bash
+# `sh install.sh` runs bash in POSIX mode (macOS's /bin/sh is bash 3.2), where
+# a command substitution keeps set -e: a check run in one ends at its first
+# failing command, before it prints what failed, and its caller reads the
+# empty answer as "nothing failed". This script is written for bash's own
+# mode, so it leaves POSIX mode before anything runs (bash 4.4 and later keep
+# inherit_errexit on after that). dash stops at `set -o pipefail` below.
+if [ -n "${BASH_VERSION:-}" ]; then
+	set +o posix
+	shopt -u inherit_errexit 2>/dev/null || :
+fi
 set -euo pipefail
 
 # Ordinary exported command functions must not override root's fixed OS tools.
 # This begins after Bash startup; it does not establish custody of the shell
 # interpreter, BASH_ENV, or a replacement of the builtin dispatcher itself.
-# The list comes in as a here-string: `sh install.sh` runs bash in POSIX
-# mode, where bash 3.2 (macOS's sh) does not parse a process substitution.
+# The list comes in as a here-string: bash 3.2 in POSIX mode (macOS's sh)
+# parses no process substitution, and `sh -n install.sh` parses the whole file
+# in that mode, since it runs nothing to leave it.
 discard_inherited_functions() {
 	builtin local inherited
 	while builtin read -r inherited; do
@@ -144,14 +155,23 @@ fi
 # fixtures replace this seam; production never asks an inherited PATH's id.
 installer_uid() { printf '%s\n' "$EUID"; }
 
+# The OS's own program folders, which sudo itself comes from.
+ROOT_SYSTEM_PATH=/usr/bin:/bin:/usr/sbin:/sbin
+
 # Root's bootstrap utilities come from fixed OS folders. Keep the caller's
 # PATH for reading candidate locations, never for running metadata programs.
 # A host without these standard utilities can install as its account instead.
+# Root's temporary folders go in /tmp, whatever TMPDIR said: `sudo -E`, doas's
+# keepenv or a musl sudo keeps an account's own TMPDIR, where that account
+# could rename the folder mktemp made for root and put one of its own in its
+# place, between root checking a download and running it; /tmp's sticky bit
+# lets no account rename root's.
 root_metadata_path() {
 	unset ROOT_LOOKUP_PATH
 	[[ "$(installer_uid)" == 0 ]] || return 0
 	ROOT_LOOKUP_PATH="$PATH"
-	PATH=/usr/bin:/bin:/usr/sbin:/sbin
+	PATH="$ROOT_SYSTEM_PATH"
+	export TMPDIR=/tmp
 	local tool
 	for tool in id uname ls find awk sed head dirname readlink env; do
 		if ! builtin type -P -- "$tool" >/dev/null 2>&1; then
@@ -159,6 +179,14 @@ root_metadata_path() {
 			return 1
 		fi
 	done
+	# Without getfacl, root cannot tell an entry with an ACL from one without,
+	# so each check of what root may run or build from refuses, and says
+	# another account can change it. The signed binary's verifier reads ACLs
+	# itself, so that half still installs: a note, not a refusal.
+	if [[ "$(uname -s)" == Linux ]] && ! linux_acl_tool >/dev/null; then
+		tool="$(linux_acl_tools)"
+		echo "install.sh: NOTE: root reads ACLs with getfacl, which this system lacks (${tool//$'\n'/ }), so it takes each file and folder it checks for one another account can change, and runs or builds from none — install the acl package (apt-get install acl, dnf install acl, apk add acl), or run install.sh as your account, without sudo" >&2
+	fi
 }
 
 # Looking up a candidate executes nothing. Root still judges its absolute
@@ -862,11 +890,12 @@ require_free_space() { # <dir> <bytes-needed> <what-for>
 
 # Whether `mkdir -p <dir> && [[ -w <dir> ]]` would succeed, without doing it:
 # judged at the nearest existing path component, which must be a writable
-# directory. Only --dry-run consults this; the real pre-flight keeps `mkdir -p`
-# itself as the probe.
+# directory. A link that leads nowhere is such a component: `mkdir -p` cannot
+# make a folder where it stands, nor below it. Only --dry-run consults this;
+# the real pre-flight keeps `mkdir -p` itself as the probe.
 would_create_writable() {
 	local d="$1"
-	while [[ -n "$d" && ! -e "$d" ]]; do
+	while [[ -n "$d" && ! -e "$d" && ! -L "$d" ]]; do
 		case "$d" in
 		*/*) d="${d%/*}" ;;
 		*) return 1 ;; # relative with no existing component: nothing to anchor to
@@ -885,17 +914,28 @@ would_create_writable() {
 # group and other write added. Ubuntu's user-private-group umask (002) would
 # otherwise leave ~/.local, ~/.local/lib … 0775, a chain the Linux lane's own
 # verifier (check_install_path) and the updater then judge as writable by
-# others. Read bits stay the caller's, so a shared system store
-# (ATERM_STORE_DIR=/opt/aterm) stays readable by the users who run it.
+# others. Under a folder with a default ACL, Linux gives what mkdir makes the
+# modes that ACL passes on, whatever the umask, so each folder it made then
+# loses group and other write (chmod lowers the ACL's mask with them). Read
+# bits stay the caller's, so a shared system store (ATERM_STORE_DIR=/opt/aterm)
+# stays readable by the users who run it.
 ensure_dirs_writable() { # <dir>...
-	local d
+	local d made=()
 	if [[ "${DRY_RUN:-0}" -eq 1 ]]; then
 		for d in "$@"; do
 			would_create_writable "$d" || return 1
 		done
 		return 0
 	fi
+	for d in "$@"; do
+		while [[ -n "$d" && ! -e "$d" && ! -L "$d" ]]; do
+			made+=("$d")
+			[[ "$d" == */* ]] || break
+			d="${d%/*}"
+		done
+	done
 	(umask "$(printf '%04o' $((8#$(umask) | 8#022)))" && mkdir -p "$@") 2>/dev/null || return 1
+	[[ ${#made[@]} -eq 0 ]] || chmod -- go-w "${made[@]}" 2>/dev/null || return 1
 	for d in "$@"; do
 		[[ -w "$d" ]] || return 1
 	done
@@ -1101,15 +1141,20 @@ home_owner_uid() {
 	ls_entry -ndL -- "$(home_anchor)" 2>/dev/null | awk '{print $3}' || true
 }
 
-# HOME, or when it does not exist yet the nearest folder above it that does
-# (mkdir -p's anchor): the files land under it, so a HOME still to be made in
-# an account's own home is judged as that account's.
-home_anchor() {
-	local h="$HOME"
-	while [[ "$h" == */* && ! -e "$h" ]]; do
-		h="${h%/*}"
+# <path>, or when it does not exist yet the nearest folder above it that does
+# (mkdir -p's anchor).
+existing_anchor() { # <path>
+	local p="$1"
+	while [[ "$p" == */* && ! -e "$p" ]]; do
+		p="${p%/*}"
 	done
-	echo "${h:-/}"
+	echo "${p:-/}"
+}
+
+# HOME's existing_anchor: the files land under it, so a HOME still to be made
+# in an account's own home is judged as that account's.
+home_anchor() {
+	existing_anchor "$HOME"
 }
 
 # `ls` by its fixed path, which PATH cannot shadow, else PATH's where there is
@@ -1463,10 +1508,13 @@ folders_not_owned_in() { # <uid> <dir> <sub>...
 # environment names. So it happens only when no other account can change what
 # it reads or where it finds programs: the checkout, every .cargo/ above it,
 # the git dir and common dir a .git file names, and cargo's home (while it
-# does not exist, the folder it would be made in) pass root_tree_failing; the
-# folder of the lane's cargo, which the build puts first on PATH, passes
-# root_bin_dir (root_build_path keeps the rest of PATH to such folders, and
-# ROOT_GIT_ENV keeps git, from 2.32 on, to the checkout's own config). Of the
+# does not exist, the folder it would be made in) pass root_tree_failing (a
+# walk that ends without an answer refuses, naming the path it walked); on
+# macOS, the developer folder and SDK that /usr/bin's cc and git run from pass
+# root_xcode_judged; the folder of the lane's cargo, which the build puts
+# first on PATH, passes root_bin_dir (root_build_path keeps the rest of PATH
+# to such folders, and ROOT_GIT_ENV keeps git, from 2.32 on, to the
+# checkout's own config). Of the
 # programs root's own environment names, those that run in place of the
 # compiler the toolchain refusal judges are asked too: each rustc wrapper,
 # and on rustup's lane, which does not scrub them, RUSTC and
@@ -1479,29 +1527,32 @@ root_build_preflight() {
 	local here d v w o="" home="${CARGO_HOME:-$HOME/.cargo}"
 	local -a vars=(RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER CARGO_BUILD_RUSTC_WRAPPER CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER)
 	here="$(cd -P -- "$ROOT" 2>/dev/null && pwd)" || here=""
-	o="$(root_tree_failing "$ROOT")"
+	o="$(root_tree_failing "$ROOT")" || o="${o:-$ROOT}"
 	if [[ -z "$o" && -f "$here/.git" ]]; then
 		d="$(sed -n 's/^gitdir: //p' "$here/.git" 2>/dev/null | head -n 1)"
 		[[ "$d" == /* ]] || d="$here/$d"
-		o="$(root_tree_failing "$d")"
+		o="$(root_tree_failing "$d")" || o="${o:-$d}"
 		if [[ -z "$o" && -f "$d/commondir" ]]; then
 			v="$(head -n 1 "$d/commondir" 2>/dev/null)"
 			[[ "$v" == /* ]] || v="$d/$v"
-			o="$(root_tree_failing "$v")"
+			o="$(root_tree_failing "$v")" || o="${o:-$v}"
 		fi
 	fi
 	d="$here"
 	while [[ -z "$o" && -n "$here" ]]; do
 		if [[ -e "$d/.cargo" || -L "$d/.cargo" ]]; then
-			o="$(root_tree_failing "$d/.cargo")"
+			o="$(root_tree_failing "$d/.cargo")" || o="${o:-$d/.cargo}"
 		fi
 		[[ -n "$d" && "$d" != / ]] || break
 		d="${d%/*}"
 	done
 	[[ -z "$o" ]] || { root_build_refusal "$o" checkout; return 1; }
 	[[ "$home" == /* ]] || home="$here/$home"
-	o="$(root_tree_failing "$home")"
+	o="$(root_tree_failing "$home")" || o="${o:-$home}"
 	[[ -z "$o" ]] || { root_build_refusal "$o" "cargo home"; return 1; }
+	if [[ "$(uname -s)" == Darwin ]]; then
+		root_xcode_judged || return 1
+	fi
 	d="$(dirname "$CARGO_BIN")"
 	if ! root_bin_dir "$d"; then
 		CARGO_RESOLVE_REASON="root does not run a toolchain another account can change, and $d, which the build puts first on PATH, holds a program another account can change — run install.sh as the account whose toolchain it is, without sudo"
@@ -1522,6 +1573,97 @@ root_build_preflight() {
 		esac
 		root_may_run_toolchain "$w" || return 1
 	done
+}
+
+# On macOS, /usr/bin's cc, ld, ar, as, git and the rest of Apple's developer
+# programs are one xcrun, which runs the program of that name from the active
+# developer folder or from its SDK: the folder DEVELOPER_DIR names (for an
+# Xcode.app, its Contents/Developer), else the first of xcode_dirs that is
+# there (the link `xcode-select -s` makes, Xcode's, the Command Line Tools'),
+# and the SDK SDKROOT names, else that folder's macOS one (an SDKROOT that
+# names an SDK as xcrun can, `macosx`, names no folder to judge, and refuses).
+# With no SDK named,
+# xcrun also hands the compiler /usr/local/include and the linker
+# /usr/local/lib, which Homebrew under /usr/local gives an admin. So a root
+# build runs them only when the way to each folder, and everything in it (for
+# a developer folder that is a bundle's Contents/Developer, as an Xcode.app's
+# is, in the bundle, whatever its name, since its tools load its
+# SharedFrameworks too), are root's alone (root_entries_offender; their links
+# root made, and lead where root chose, as a program a config of root's names
+# does): ROOT_DEVELOPER_DIR
+# and ROOT_SDKROOT are then where each ends, which the build pins
+# (root_build_env). Else CARGO_RESOLVE_REASON names what fails, and status 1.
+root_xcode_judged() {
+	local dev sdk d e="" o r walked="" what=developer how
+	dev="${DEVELOPER_DIR:-}"
+	if [[ -z "$dev" ]]; then
+		while IFS= read -r d; do
+			dev="$d"
+			[[ ! -e "$d" ]] || break
+		done <<<"$(xcode_dirs)"
+	fi
+	[[ ! -d "$dev/Contents/Developer" ]] || dev="$dev/Contents/Developer"
+	sdk="${SDKROOT:-}"
+	if [[ -n "$sdk" && "$sdk" != */* ]]; then
+		CARGO_RESOLVE_REASON="root runs no compiler another account can change, and SDKROOT=$sdk names an SDK, not its folder, so root cannot judge it — set SDKROOT to the SDK's folder (xcrun --show-sdk-path prints it) or unset it, or run install.sh as your account, without sudo"
+		return 1
+	fi
+	if [[ -z "$sdk" ]]; then
+		sdk="$dev/SDKs/MacOSX.sdk"
+		[[ -e "$sdk" ]] || sdk="$dev/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+	fi
+	ROOT_DEVELOPER_DIR="" ROOT_SDKROOT=""
+	for d in "$dev" "$sdk"; do
+		o="$(folder_failing sealed_entry "$d")"
+		[[ -n "$o" ]] || e="$(cd -P -- "$d" 2>/dev/null && pwd)" || o="$d"
+		r="$e"
+		[[ "$r" != */Contents/Developer ]] || r="${r%/Contents/Developer}"
+		if [[ -z "$o" ]] && ! { [[ -n "$walked" ]] && in_folder "$e" "$walked"; }; then
+			o="$(root_entries_offender "$r")"
+			walked="$r"
+		fi
+		if [[ -n "$o" ]]; then
+			if [[ "$what" == SDK ]]; then
+				how="/usr/bin's cc and ld build against $d, the SDK"
+			else
+				how="/usr/bin's cc, ld and git run from $d, the developer folder"
+			fi
+			if [[ "$what" == SDK && -n "${SDKROOT:-}" ]]; then
+				how="$how SDKROOT names — unset SDKROOT, or set it to one only root can change"
+			elif [[ -n "${DEVELOPER_DIR:-}" ]]; then
+				[[ "$what" != SDK ]] || how="$how of the developer folder"
+				how="$how DEVELOPER_DIR names — unset DEVELOPER_DIR, or set it to one only root can change"
+			else
+				how="$how — for this run, put DEVELOPER_DIR=/Library/Developer/CommandLineTools after sudo; for every account, sudo xcode-select -s /Library/Developer/CommandLineTools (either once the Command Line Tools are installed)"
+			fi
+			CARGO_RESOLVE_REASON="root runs no compiler another account can change, and $o is such (it is not there, or not root's alone): $how, or run install.sh as your account, without sudo"
+			ROOT_DEVELOPER_DIR=""
+			return 1
+		fi
+		if [[ -z "$ROOT_DEVELOPER_DIR" ]]; then
+			ROOT_DEVELOPER_DIR="$e" what=SDK
+		else
+			ROOT_SDKROOT="$e"
+		fi
+	done
+}
+
+# The developer folders xcrun takes when DEVELOPER_DIR names none, in its
+# order (a test replaces it).
+xcode_dirs() {
+	printf '%s\n' /var/db/xcode_select_link /Applications/Xcode.app/Contents/Developer \
+		/Library/Developer/CommandLineTools
+}
+
+# The environment a root build and its git run in beside PATH, as env's
+# operands (ROOT_BUILD_ENV): ROOT_GIT_ENV's, and on macOS the developer folder
+# and SDK root_xcode_judged found root's, pinned, with TOOLCHAINS, which picks
+# xcrun another toolchain, unset. Status 1 when there are none to pin.
+root_build_env() {
+	ROOT_BUILD_ENV=("${ROOT_GIT_ENV[@]}")
+	[[ "$(uname -s)" == Darwin ]] || return 0
+	[[ -n "${ROOT_DEVELOPER_DIR:-}" ]] || root_xcode_judged || return 1
+	ROOT_BUILD_ENV=(-u TOOLCHAINS "${ROOT_GIT_ENV[@]}" "DEVELOPER_DIR=$ROOT_DEVELOPER_DIR" "SDKROOT=$ROOT_SDKROOT")
 }
 
 # root_build_preflight's refusal of <path>, part of what the build reads that
@@ -2081,8 +2223,8 @@ cargo_honours_pin() {
 # CARGO_UNVERIFIED_LANE with them) from host units. Under root, PATH after the
 # lane's own folders keeps only those root_build_path allows: the build runs
 # cc, ar and ld from it, and a root run's PATH may be the account's that ran
-# sudo; and the build's git, aterm's build script's among them, runs under
-# ROOT_GIT_ENV.
+# sudo; and the build, its git (aterm's build script's among them) and on
+# macOS its cc, run in root_build_env's environment.
 CARGO_UNVERIFIED_LANE="target.'cfg(trust_verify)'.rustflags=[\"-Ztrust-verify=off\"]"
 cargo_build_pinned() { # <root>
 	local rest=":$PATH"
@@ -2090,7 +2232,8 @@ cargo_build_pinned() { # <root>
 	if [[ "$(installer_uid)" == 0 ]]; then
 		rest="$(root_build_path)"
 		rest="${rest:+:$rest}"
-		genv=("${ROOT_GIT_ENV[@]}")
+		root_build_env || return 1
+		genv=("${ROOT_BUILD_ENV[@]}")
 	fi
 	if [[ "${CARGO_LANE:-}" == store ]]; then
 		(cd "$1" && env -u CARGO_BUILD_TARGET -u RUSTUP_TOOLCHAIN -u RUSTC -u CARGO_BUILD_RUSTC ${genv[@]+"${genv[@]}"} PATH="$(build_path_lead)$rest" "$CARGO_BIN" --unverified build --release -p aterm --target-dir "$1/target")
@@ -2122,10 +2265,13 @@ build_path_lead() {
 # GIT_CONFIG_NOSYSTEM from its system config (a git found on PATH looks for
 # one under its own prefix).
 ROOT_GIT_ENV=(GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1)
+# What root_xcode_judged found, never what the environment says.
+unset ROOT_DEVELOPER_DIR ROOT_SDKROOT ROOT_BUILD_ENV
 
 # git over the checkout, as the build runs it: under root, the first git in
-# root_build_path's folders, run under ROOT_GIT_ENV, and none when there are
-# no such folders; as the account, PATH's.
+# root_build_path's folders, run in root_build_env's environment, and none
+# when there are no such folders or no such environment; as the account,
+# PATH's.
 checkout_git() { # <arg>...
 	local d
 	if [[ "$(installer_uid)" != 0 ]]; then
@@ -2133,8 +2279,8 @@ checkout_git() { # <arg>...
 		return
 	fi
 	d="$(root_build_path)"
-	[[ -n "$d" ]] || return 1
-	env "${ROOT_GIT_ENV[@]}" PATH="$d" git "$@"
+	[[ -n "$d" ]] && root_build_env || return 1
+	env "${ROOT_BUILD_ENV[@]}" PATH="$d" git "$@"
 }
 
 # Does <name> parse as a rustup dist toolchain, one `rustup toolchain install`
@@ -3061,9 +3207,60 @@ app_dest_verdict() { # <app-dir>
 # are another matter: they could replace the app in any case, and
 # /Applications is admin's to write on purpose (own_bundle_as_root). A <dest>
 # that is a link is judged by the folder it leads to, which the staging and
-# the swap write.
+# the swap write. A <dest> a dry run has not made yet is judged as `mkdir -p`
+# would make it: by the entries its existing_anchor passes on (acl_passed_on).
+# Whether, under root on macOS, the volume <dest> is on (while it does not
+# exist, the one mkdir -p makes it on) ignores ownership: `mount` lists it
+# noowners, as for an exFAT or FAT volume and an external one with "Ignore
+# ownership on this volume" on. Every entry there reads as the mount's owner,
+# and an exFAT or FAT one keeps no ACL either, so stage_bundle cannot make its
+# staging folder root's alone, and would refuse only after the download. A
+# volume df or mount does not name is not judged.
+root_dest_keeps_no_owner() { # <dest>
+	[[ "$(installer_uid)" == 0 && "$(uname -s)" == Darwin ]] || return 1
+	local dev
+	dev="$(df -P -- "$(existing_anchor "$1")" 2>/dev/null | awk 'NR == 2 { print $1 }')"
+	[[ -n "$dev" ]] || return 1
+	mount 2>/dev/null | awk -v d="$dev on " 'index($0, d) == 1 && /[(,] *noowners *[,)]/ { found = 1 } END { exit !found }'
+}
+
 root_dest_acl_open() { # <dest>
-	[[ "$(installer_uid)" == 0 ]] && ! entry_without_acl "$1/"
+	[[ "$(installer_uid)" == 0 ]] || return 1
+	if [[ "${DRY_RUN:-0}" -eq 1 && ! -e "$1" ]]; then
+		local dest="${1%"${1##*[!/]}"}" parent
+		parent="${dest%/*}"
+		[[ "$dest" == */* ]] || parent=.
+		if [[ -e "${parent:-/}" ]]; then
+			acl_passed_on "$(existing_anchor "$dest")" 1
+		else
+			acl_passed_on "$(existing_anchor "$dest")" 2
+		fi
+		return
+	fi
+	! entry_without_acl "$1/"
+}
+
+# Whether a folder `mkdir -p` makes <depth> levels below folder <dir> starts
+# with an ACL: it inherits each entry of <dir>'s that folders inherit
+# (directory_inherit), but one that reaches only <dir>'s own children
+# (limit_inherit) when <depth> is more than 1. macOS's ls lists these; the app
+# half that asks installs on macOS alone. A listing that cannot be read
+# proves nothing, so it counts as one that passes an entry on.
+acl_passed_on() { # <dir> <depth>
+	local listing
+	listing="$(ls_entry -ndle -- "$1/" 2>/dev/null)" || return 0
+	[[ -n "$listing" ]] || return 0
+	printf '%s\n' "$listing" | awk -v deep="$(($2 > 1))" '
+		/^[[:blank:]]+[0-9]+:/ {
+			n = split($NF, flag, ",")
+			inherits = limited = 0
+			for (i = 1; i <= n; i++) {
+				if (flag[i] == "directory_inherit") inherits = 1
+				if (flag[i] == "limit_inherit") limited = 1
+			}
+			if (inherits && !(deep && limited)) found = 1
+		}
+		END { exit !found }'
 }
 
 # Whether <bundle> and everything in it is root's, with no file in it that a
@@ -3304,45 +3501,252 @@ bin_aterm_verdict() { # <path> <store-dir>
 # there (~/.local/bin/aterm, ~/Applications/aterm.app).
 may_run() { # <program>
 	[[ "$(installer_uid)" == 0 ]] || return 0
-	local p="$1" t hops=0
+	local p="$1"
 	[[ "$p" == /* ]] || p="$PWD/$p"
-	while :; do
-		[[ -z "$(folder_failing sealed_entry "${p%/*}")" ]] || return 1
-		[[ -L "$p" ]] || break
-		hops=$((hops + 1))
-		[[ "$hops" -le 40 ]] || return 1
-		t="$(readlink "$p")" || return 1
-		[[ "$t" == /* ]] || t="${p%/*}/$t"
-		p="$t"
+	p="$(sealed_end "$p")" && [[ -f "$p" ]] && sealed_entry "$p"
+}
+
+# Where <path> ends, by the way the kernel takes: each name looked up in turn
+# from / (from the working folder, for a relative path), and each link met
+# anywhere on the way, at most 40 in all, followed, the rest of the way then
+# taken from where it leads. Each folder a name is looked up in must pass
+# <test>, but those in <tree>, a physical folder the way to which and all it
+# holds were already found root's, and the folders above it. On Linux a
+# link's own owner and mode change nothing: no account rewrites a link in
+# place, nor removes it but through its folder. On macOS its owner can give
+# the link an ACL that lets them remove it, so there each link met must pass
+# <test> too, but those in <tree>. Prints the end, which need not exist when
+# the folder that would hold it does. Status 2, printing the first that fails
+# <test>, or, read once the way is taken, the first folder on it (or the end)
+# foreign_mount_among names; status 3, printing nothing, when a 41st link
+# stands on the way, every folder before it having passed, a way the kernel
+# follows to no end (it stops at 40 links, macOS's at 32); status 1, printing
+# nothing, when the way does not resolve: a name on it that does not exist
+# with more of the way after it, since an account can be the one to make it
+# (any account that attaches a disk image gets a folder made for it in
+# /Volumes, as udisks makes one in /media), or a newline in <path>, in the
+# working folder's (for a relative one) or in a link's target (a command
+# substitution drops a trailing one, and with it the name the kernel takes).
+way_end() { # <test> <path> [<tree>]
+	local rest="$2" cur="" c t hops=0 seen=()
+	[[ "$rest" != *$'\n'* ]] || return 1
+	if [[ "$rest" != /* ]]; then
+		c="$(pwd -P && printf x)" || return 1
+		c="${c%$'\n'x}"
+		[[ "$c" != *$'\n'* ]] || return 1
+		rest="$c/$rest"
+	fi
+	if [[ -n "${3:-}" && "$rest" == "$3"/* ]]; then
+		cur="$3"
+		rest="${rest#"$3"/}"
+	fi
+	while [[ -n "$rest" ]]; do
+		c="${rest%%/*}"
+		if [[ "$rest" == */* ]]; then rest="${rest#*/}"; else rest=""; fi
+		case "$c" in
+		"" | .) continue ;;
+		..)
+			cur="${cur%/*}"
+			continue
+			;;
+		esac
+		seen+=("${cur:-/}")
+		way_passes "$1" "${cur:-/}" "${3:-}" || { printf '%s\n' "${cur:-/}"; return 2; }
+		cur="$cur/$c"
+		if [[ -L "$cur" ]]; then
+			[[ "$OSTYPE" != darwin* ]] || way_passes "$1" "$cur" "${3:-}" || {
+				printf '%s\n' "$cur"
+				return 2
+			}
+			hops=$((hops + 1))
+			[[ "$hops" -le 40 ]] || return 3
+			t="$(readlink -n "$cur" && printf x)" || return 1
+			t="${t%x}"
+			[[ -n "$t" && "$t" != *$'\n'* ]] || return 1
+			if [[ "$t" == /* ]]; then cur=""; else cur="${cur%/*}"; fi
+			rest="$t${rest:+/$rest}"
+		elif [[ ! -e "$cur" && -n "${rest//\//}" ]]; then
+			return 1
+		fi
 	done
-	[[ -f "$p" ]] && sealed_entry "$p"
+	[[ ! -e "${cur:-/}" ]] || seen+=("${cur:-/}")
+	if [[ ${#seen[@]} -gt 0 ]]; then
+		c="$(foreign_mount_among "${seen[@]}")"
+		if [[ -n "$c" ]]; then
+			printf '%s\n' "$c"
+			return 2
+		fi
+	fi
+	printf '%s\n' "${cur:-/}"
 }
 
-# Whether <dir> and each folder above it are root_entry ones, as written and as
-# cd -P resolves it.
-root_folders() { # <dir>
-	[[ -z "$(folder_failing root_entry "$1")" ]]
-}
-
-# The first of <dir> and each folder above it, as written and then as cd -P
-# resolves it, that fails <test>, or <dir> when it does not resolve; nothing
-# when each one passes.
-folder_failing() { # <test> <dir>
-	local d
-	for d in "${2:-/}" "$(cd -P -- "${2:-/}" 2>/dev/null && pwd)"; do
-		if [[ -z "$d" ]]; then
-			printf '%s\n' "${2:-/}"
+# The first of <path>... (physical paths, each one a walk found) that is gone
+# now, or where a filesystem is mounted whose owners and modes do not say who
+# may change what it holds, so a walk through it proves nothing: on Linux a
+# network or FUSE one (remote_filesystem_type), where a server, or the daemon
+# of whichever account mounted it, decides that and shows what owners it
+# likes; on macOS one that is not local, or that an account mounted (`mount`
+# says "mounted by"), which that account can take away and attach another in
+# place of, and which shows root the owners its image carries. Read after the
+# walk, so a volume attached while it ran is read with the rest, and one taken
+# away has left a folder gone. Nothing when there is none; the first path when
+# the mount table cannot be read.
+foreign_mount_among() { # <path>...
+	local f g os table rest t
+	os="$(uname -s)"
+	if [[ "$os" == Darwin ]]; then
+		table="$(macos_mounts 2>/dev/null)" || table=""
+	else
+		table="$(linux_mount_points 2>/dev/null)" || table=""
+	fi
+	if [[ -z "$table" ]]; then
+		printf '%s\n' "$1"
+		return 0
+	fi
+	table=$'\n'"$table"$'\n'
+	for f in "$@"; do
+		if [[ ! -e "$f" ]]; then
+			printf '%s\n' "$f"
 			return 0
 		fi
-		while :; do
-			if ! "$1" "${d:-/}"; then
-				printf '%s\n' "${d:-/}"
-				return 0
-			fi
-			[[ -n "$d" && "$d" != / ]] || break
-			d="${d%/*}"
-		done
+		if [[ "$os" == Darwin ]]; then
+			# `<device> on <folder> (<type>, <flag>, …)`, the folder as the
+			# kernel keeps it, which for one a firmlink reaches may be its
+			# path in the data volume; each line naming it, as one mounted
+			# over another is listed after it.
+			for g in "$f" "/System/Volumes/Data${f%/}"; do
+				rest="$table"
+				while [[ "$rest" == *" on $g ("* ]]; do
+					rest="${rest#*" on $g ("}"
+					macos_mount_foreign "${rest%%$'\n'*}" || continue
+					printf '%s\n' "$f"
+					return 0
+				done
+			done
+		elif [[ "$table" == *$'\n'"$f"$'\n'* ]]; then
+			t="$(stat -f -c %t -- "$f" 2>/dev/null)" || t=""
+			remote_filesystem_type "$t" || continue
+			printf '%s\n' "$f"
+			return 0
+		fi
 	done
+}
+
+# Whether <flags>, what a macOS mount line holds after its folder's
+# `<folder> (`, are a volume's that is not local or that an account mounted.
+macos_mount_foreign() { # <flags>
+	local flags=", ${1%)*},"
+	[[ "$flags" != *", local,"* || "$flags" == *", mounted by "* ]]
+}
+
+# The first folder below folder <dir> (a physical path) where a filesystem is
+# mounted that foreign_mount_among names, a walk of what <dir> holds going
+# into it; nothing when there is none.
+foreign_mount_in() { # <dir>
+	local table rest p m below="${1%/}/" inside=()
+	if [[ "$(uname -s)" == Darwin ]]; then
+		table="$(macos_mounts 2>/dev/null)" || table=""
+	else
+		table="$(linux_mount_points 2>/dev/null)" || table=""
+	fi
+	if [[ -z "$table" ]]; then
+		printf '%s\n' "$1"
+		return 0
+	fi
+	if [[ "$(uname -s)" == Darwin ]]; then
+		# Each folder after an ` on <dir>/` (or its path in the data
+		# volume), to the last ` (` of its line; one that a device's name
+		# made up is not there, which foreign_mount_among names.
+		for p in "$below" "/System/Volumes/Data$below"; do
+			rest="$table"
+			while [[ "$rest" == *" on $p"* ]]; do
+				rest="${rest#*" on $p"}"
+				m="${rest%%$'\n'*}"
+				m="$p${m% (*}"
+				[[ "$m" == "$1" ]] || inside+=("$m")
+			done
+		done
+	else
+		while IFS= read -r m; do
+			[[ "$m" != "$1" && "$m" == "$below"* ]] && inside+=("$m")
+		done <<<"$table"
+	fi
+	[[ ${#inside[@]} -eq 0 ]] || foreign_mount_among "${inside[@]}"
+}
+
+# macOS's mounts, as /sbin/mount (by its fixed path, which PATH cannot
+# shadow) lists them (a test replaces it).
+macos_mounts() {
+	/sbin/mount
+}
+
+# The folders Linux has a filesystem mounted at, one per line, from the
+# kernel's own table (a test replaces it).
+linux_mount_points() {
+	awk '{ p = $5; gsub(/\\040/, " ", p); gsub(/\\011/, "\t", p); gsub(/\\012/, "\n", p); gsub(/\\134/, "\\", p); print p }' \
+		/proc/self/mountinfo
+}
+
+# Whether statfs type <hex> (stat -f -c %t's) is a network or FUSE
+# filesystem's: NFS, SMB/CIFS (two), Ceph, AFS (two), 9P, Lustre, GPFS and
+# FUSE, the types crates/aterm-uds/src/shared_write.rs REMOTE_FILESYSTEMS
+# lists, which the Linux verifiers hold a store to; one stat could not read
+# counts as such.
+remote_filesystem_type() { # <hex>
+	case "$1" in
+	6969 | ff534d42 | fe534d42 | c36400 | 6b414653 | 5346414f | 1021997 | bd00bd0 | 47504653 | 65735546) return 0 ;;
+	"" | *[!0-9a-f]*) return 0 ;;
+	esac
+	return 1
+}
+
+# Whether <folder>, on a way way_end takes, passes <test>, as one in <tree>,
+# or a folder above it, does.
+way_passes() { # <test> <folder> <tree>
+	[[ -n "$3" && ( "$2" == "$3" || "$2" == "$3"/* || "$2" == / || "$3" == "$2"/* ) ]] ||
+		"$1" "$2"
+}
+
+# Where <path> ends (way_end's), when no account but root can change the way
+# there: each folder on it passes sealed_entry. Status 3 for a way of more
+# than 40 links through folders that passed (way_end's), else 1, and nothing
+# printed, otherwise.
+sealed_end() { # <path> [<tree>]
+	local e s=0
+	e="$(way_end sealed_entry "$1" "${2:-}")" || s=$?
+	case "$s" in
+	0) printf '%s\n' "$e" ;;
+	3) return 3 ;;
+	*) return 1 ;;
+	esac
+}
+
+# The first folder on the way to folder <dir> (way_end's), or where that way
+# ends, that fails <test>, or <dir> when the way does not resolve;
+# nothing when each one passes.
+folder_failing() { # <test> <dir>
+	local o s=0
+	o="$(way_end "$1" "${2:-/}")" || s=$?
+	case "$s" in
+	0) "$1" "$o" || printf '%s\n' "$o" ;;
+	2) printf '%s\n' "$o" ;;
+	*) printf '%s\n' "${2:-/}" ;;
+	esac
+}
+
+# folder_failing's, for a folder <dir> root may yet make: while it does not
+# exist, the folder that would hold it is the end that must pass (way_end
+# judged it), so a name missing with more of the way after it, which an
+# account can be the one to make, fails as <dir>; a link that leads nowhere
+# at its name fails as where it leads, where `mkdir -p` makes nothing.
+to_make_failing() { # <test> <dir>
+	local o s=0
+	o="$(way_end "$1" "${2:-/}")" || s=$?
+	case "$s" in
+	0) [[ ! -e "$o" && ! -L "${2:-/}" ]] || "$1" "$o" || printf '%s\n' "$o" ;;
+	2) printf '%s\n' "$o" ;;
+	*) printf '%s\n' "${2:-/}" ;;
+	esac
 }
 
 # Whether <path> is root's and, unless it is a link, no account but root can
@@ -3386,12 +3790,25 @@ entry_without_acl() { # <path>
 # hides default ACLs, so it is removed for this one read.
 linux_acl_query() { # <getfacl-arg>...
 	local tool
-	for tool in /usr/bin/getfacl /bin/getfacl; do
+	tool="$(linux_acl_tool)" || return 1
+	env -u POSIXLY_CORRECT "$tool" "$@"
+}
+
+# The fixed OS folders' getfacl, the first of linux_acl_tools that runs.
+linux_acl_tool() {
+	local tool
+	while IFS= read -r tool; do
 		[[ -x "$tool" ]] || continue
-		env -u POSIXLY_CORRECT "$tool" "$@"
-		return
-	done
+		printf '%s\n' "$tool"
+		return 0
+	done <<<"$(linux_acl_tools)"
 	return 1
+}
+
+# Where a Linux system keeps getfacl (the acl package's), in the order root
+# asks (a test replaces it).
+linux_acl_tools() {
+	printf '%s\n' /usr/bin/getfacl /bin/getfacl
 }
 
 linux_acl_clear() { # <getfacl-arg>...
@@ -3409,12 +3826,13 @@ linux_acl_clear() { # <getfacl-arg>...
 
 # The first entry at or below folder <dir> (a physical path) that another
 # account could change: one, a link aside, that is not root's, or that every
-# account or a group but root's can write; else the first link in it that
-# leads anywhere but into <dir>, or nowhere; nothing when there is none. A
-# name with a newline, which would read as two paths, is named by the folder
+# account or a group but root's can write, or <dir> when an ACL is on any or
+# the ACLs cannot be read whole, or a folder in it with a filesystem mounted
+# whose owners say nothing (foreign_mount_in's); nothing when there is none.
+# A name with a newline, which would read as two paths, is named by the folder
 # that holds it.
-root_tree_offender() { # <dir>
-	local f l t
+root_entries_offender() { # <dir>
+	local f
 	f="$(find "$1" \( -name "*"$'\n'"*" -prune -exec dirname {} \; \) -o \
 		\( ! -type l \( ! -user 0 -o -perm -002 -o \( -perm -020 ! -group 0 \) \) -print \) 2>/dev/null |
 		head -n 1)"
@@ -3428,13 +3846,30 @@ root_tree_offender() { # <dir>
 		acl_listing_clear -lneRA -- "$1"
 	else
 		linux_acl_clear -RcpnP -- "$1"
-	fi || { printf '%s\n' "$1"; return 0; }
+	fi || {
+		printf '%s\n' "$1"
+		return 0
+	}
+	foreign_mount_in "$1"
+}
+
+# root_entries_offender's of folder <dir> (a physical path), else the first
+# link in it that leads anywhere but into <dir>, or nowhere, or on its way
+# passes a folder sealed_end refuses; nothing when there is none.
+root_tree_offender() { # <dir>
+	local f l t
+	f="$(root_entries_offender "$1")"
+	if [[ -n "$f" ]]; then
+		printf '%s\n' "$f"
+		return 0
+	fi
 	while IFS= read -r l; do
 		[[ -n "$l" ]] || continue
-		if [[ -d "$l" ]]; then
-			t="$(cd -P -- "$l" 2>/dev/null && pwd)" || t=""
-		elif t="$(gate_physical_path "$l")"; then
-			t="${t%/*}"
+		t="$(sealed_end "$l" "$1")" || t=""
+		if [[ -d "$t" ]]; then
+			t="$(cd -P -- "$t" 2>/dev/null && pwd)" || t=""
+		elif [[ -e "$t" ]]; then
+			t="$(cd -P -- "${t%/*}/" 2>/dev/null && pwd)" || t=""
 		else
 			t=""
 		fi
@@ -3446,19 +3881,16 @@ root_tree_offender() { # <dir>
 
 # What a root source build asks of <path>, a folder it reads (or, while it
 # does not exist, would make): the first folder on its way from / that is not
-# sealed_entry's (the one it would be made in, while it does not exist), else
-# the first root_tree_offender in it; nothing when there is none.
+# sealed_entry's (to_make_failing's), else the first root_tree_offender in
+# it; nothing when there is none.
 root_tree_failing() { # <path>
-	local p="$1" o
-	while [[ ! -e "$p" && ! -L "$p" && "$p" == */* ]]; do
-		p="${p%/*}"
-	done
-	o="$(folder_failing sealed_entry "${p:-/}")"
-	if [[ -n "$o" || "$p" != "$1" ]]; then
+	local p o
+	o="$(to_make_failing sealed_entry "$1")"
+	if [[ -n "$o" || ! -e "$1" ]]; then
 		[[ -z "$o" ]] || printf '%s\n' "$o"
 		return 0
 	fi
-	p="$(cd -P -- "$p" 2>/dev/null && pwd)" || p=""
+	p="$(cd -P -- "$1" 2>/dev/null && pwd)" || p=""
 	if [[ -z "$p" ]]; then
 		printf '%s\n' "$1"
 		return 0
@@ -3467,27 +3899,43 @@ root_tree_failing() { # <path>
 }
 
 # Whether root may take programs from folder <dir> by name, as a build takes
-# cc, ar, ld or git from PATH: sealed ancestry prevents replacing an entry
-# after this walk, files have root's modes and no ACL, and file aliases pass
-# the same ancestry check through their targets.
+# cc, ar, ld or git from PATH: one of ROOT_SYSTEM_PATH's, which root already
+# runs its own tools from (macOS's sealed /usr/bin and /usr/sbin hold files of
+# system accounts, _uucp's cu and uucico, that no account can change on that
+# read-only volume, and a build without them has no cc or git; their cc, ld
+# and git run the developer folder's, which root_xcode_judged asks of); else
+# sealed ancestry prevents replacing an entry after this walk, files have
+# root's modes and no ACL, no filesystem foreign_mount_in names is mounted in
+# it (on Linux one can be on a file, and shows find its own owners), and
+# every link, whatever it leads to now, passes
+# sealed_end on its way to where it ends, a file there sealed_entry's (a link
+# that leads to nothing yet in a folder another account can write would run
+# what that account puts there); a link of more than 40 hops that only root
+# can change, which leads the kernel nowhere, is passed over, so the walks of
+# the files follow no link (GNU and BusyBox find -L fail on such a loop).
 root_bin_dir() { # <dir>
-	local found links link
+	local found links link s p
+	case ":$ROOT_SYSTEM_PATH:" in *":${1%"${1##*[!/]}"}:"*) return 0 ;; esac
 	[[ "$1" == /* && -z "$(folder_failing sealed_entry "$1")" ]] || return 1
-	found="$(find -L "$1/" -mindepth 1 -maxdepth 1 \( -name "*"$'\n'"*" -print -prune \) -o \
+	found="$(find "$1/" -mindepth 1 -maxdepth 1 \( -name "*"$'\n'"*" -print -prune \) -o \
 		\( -type f \( ! -user 0 -o -perm -002 -o \( -perm -020 ! -group 0 \) \) -print \) 2>/dev/null)" || return 1
 	[[ -z "$found" ]] || return 1
 	if [[ "$(uname -s)" == Darwin ]]; then
-		acl_listing_clear -lneAL -- "$1"
+		acl_listing_clear -lneAH -- "$1"
 	else
 		# A trailing slash resolves an admitted /bin-style directory alias;
 		# -P still avoids following links found inside the directory.
 		linux_acl_clear -RcpnP -- "$1/"
 	fi || return 1
-	# A file alias also depends on every folder its target passes through.
+	p="$(cd -P -- "$1/" 2>/dev/null && pwd)" && [[ -z "$(foreign_mount_in "$p")" ]] || return 1
 	links="$(find "$1/" -mindepth 1 -maxdepth 1 -type l -print 2>/dev/null)" || return 1
 	while IFS= read -r link; do
-		[[ -n "$link" && -f "$link" ]] || continue
-		may_run "$link" || return 1
+		[[ -n "$link" ]] || continue
+		s=0
+		link="$(sealed_end "$link")" || s=$?
+		[[ "$s" -ne 3 ]] || continue
+		[[ "$s" -eq 0 ]] || return 1
+		[[ ! -f "$link" ]] || sealed_entry "$link" || return 1
 	done <<<"$links"
 }
 
@@ -3560,7 +4008,7 @@ bin_aterm_plan() { # <path> <store-dir>
 find_bundle_cli() {
 	[[ "$(uname -s)" == "Darwin" ]] || return 0
 	local c m b ok
-	for c in ${DEST:+"$DEST"} ${ATERM_INSTALL_DIR:+"$ATERM_INSTALL_DIR"} /Applications "$HOME/Applications"; do
+	while IFS= read -r c; do
 		m="$c/aterm.app/Contents/MacOS"
 		if [[ -x "$m/aterm" ]] && first_line_bounded "$m/aterm" --version | grep -q '^aterm '; then
 			echo "$m/aterm"
@@ -3574,8 +4022,61 @@ find_bundle_cli() {
 			echo "$m/aterm-cli"
 			return 0
 		fi
-	done
+	done <<<"$(bundle_dirs)"
 	return 0
+}
+
+# The folders find_bundle_cli asks for an aterm.app, in its order.
+bundle_dirs() {
+	printf '%s\n' ${DEST:+"$DEST"} ${ATERM_INSTALL_DIR:+"$ATERM_INSTALL_DIR"} /Applications "$HOME/Applications"
+}
+
+# Under root on macOS, the first folder another account can change on the way
+# to every aterm.app find_bundle_cli asks, in its order, so that may_run lets
+# root run none of them: for the app this run installs in <dest>, <dest> (or,
+# while it does not exist, the folder that would hold it: to_make_failing's),
+# whose group and group write the new bundle's folders take
+# (own_bundle_as_root); for an installed one, its Contents/MacOS.
+# /Applications, which the admin group writes, is such a folder. Nothing when
+# one passes, none is there, or this is not such a run.
+root_bundle_unsealed() { # [<dest>]
+	[[ "$(installer_uid)" == 0 && "$(uname -s)" == Darwin ]] || return 0
+	local c m o first=""
+	while IFS= read -r c; do
+		m="$c/aterm.app/Contents/MacOS"
+		if [[ -n "${1:-}" && "$c" == "$1" ]]; then
+			o="$(to_make_failing sealed_entry "$c")"
+		elif [[ -x "$m/aterm" || -x "$m/aterm-cli" ]]; then
+			o="$(folder_failing sealed_entry "$m")"
+		else
+			continue
+		fi
+		[[ -n "$o" ]] || return 0
+		first="${first:-$o}"
+	done <<<"$(bundle_dirs)"
+	[[ -z "$first" ]] || printf '%s\n' "$first"
+}
+
+# Why a root run links no app's aterm, root_bundle_unsealed having named
+# <folder>; with <remedy> 1, what to do instead.
+root_bundle_refusal() { # <folder> [<remedy>]
+	printf '%s' "root runs no aterm another account can change, and $1, on the way to the app's, is such (it is not root's, a group but root's or every account can write it, it carries an ACL, or it is on a volume an account mounted or that is not local)"
+	[[ "${2:-0}" -ne 1 ]] || printf '%s' " — install the CLI as your account (tools/install.sh --no-app, without sudo), or set ATERM_INSTALL_DIR to a folder only root can write"
+	printf '\n'
+}
+
+# The aterm install_toolchain drives, as `run <path>`: the `aterm` in BIN_DIR,
+# else an installed bundle's; or, as `skip <reason>`, why it drives none.
+toolset_driver() {
+	local a="$BIN_DIR/aterm"
+	[[ -x "$a" ]] || a="$(find_bundle_cli)"
+	if [[ -z "$a" || ! -x "$a" ]]; then
+		echo "skip no installed \`aterm\` to drive it"
+	elif ! may_run "$a"; then
+		echo "skip another account can change $a (or a folder or link on its way), so root does not run it — run the install as that account, or set ATERM_BIN_DIR and ATERM_STORE_DIR to folders root owns"
+	else
+		echo "run $a"
+	fi
 }
 
 # Earlier installs (and the pre-one-command layout) exposed `aterm-ctl` on
@@ -3906,12 +4407,23 @@ print_install_plan() {
 		echo "  install:  aterm.app -> $DEST/aterm.app (staged swap; an existing copy is replaced)"
 	fi
 
+	# Under root, where root may run no app's aterm (root_bundle_unsealed, judged
+	# as install_cli will judge it once the app half has run), the CLI is the
+	# source build, or nothing; with nothing placed, the toolset and PATH halves
+	# drive what is already installed, as install_toolchain and wire_shell_path
+	# will.
+	local into="" unsealed="" cli_none=0 driver
+	[[ "$DO_APP" -eq 0 || -n "$APP_SKIP" || -n "$APP_ALREADY" || "$LINUX_RELEASE" -eq 1 ]] || into="$DEST"
 	if [[ "$DO_CLI" -eq 0 ]]; then
 		echo "install.sh: cli: excluded (--no-cli)"
 	elif [[ -n "$CLI_SKIP" ]]; then
 		echo "install.sh: cli: would be SKIPPED: $CLI_SKIP"
+	elif unsealed="$(root_bundle_unsealed "$into")" && [[ -n "$unsealed" && -n "$CLI_CARGO_SKIP" ]]; then
+		cli_none=1
+		echo "install.sh: cli: would be SKIPPED: $(root_bundle_refusal "$unsealed" 1), and $CLI_CARGO_SKIP"
 	else
 		bin_aterm_plan "$BIN_DIR/aterm" "$STORE_DIR"
+		[[ -z "$unsealed" ]] || echo "  bundle:   not linked: $(root_bundle_refusal "$unsealed"); the CLI is the source build below"
 		# The skip first: every refusal found after a cargo was (no rustup
 		# behind it, the pinned toolchain absent, a cargo that ignores the
 		# pin, a rustc beside it that is not the proxy, an unwritable store,
@@ -3939,6 +4451,9 @@ print_install_plan() {
 		# Root, for someone not at this Mac's console: never seeded as root
 		# (toolset_deferral).
 		echo "install.sh: toolset: $ROOT_TOOLSET_LINE"
+	elif [[ "$cli_none" -eq 1 && "${TOOLCHAIN_DEFERRED:-0}" -ne 1 && "${CONTAINER_KIND:-}" != zip ]] &&
+		driver="$(toolset_driver)" && [[ "$driver" != "run "* ]]; then
+		echo "install.sh: toolset: would be SKIPPED: ${driver#skip }"
 	elif [[ "${TOOLSET_NO_WINDOW:-0}" -eq 1 ]]; then
 		# A lean install nobody at this Mac's console will open: no window
 		# follows, so the toolset installs here (toolset_deferral).
@@ -3962,6 +4477,8 @@ print_install_plan() {
 
 	if [[ "$DO_PATH" -eq 0 ]]; then
 		echo "install.sh: PATH: excluded (--no-path / ATERM_NO_PATH=1)"
+	elif [[ "$cli_none" -eq 1 && -z "$(setup_aterm shell-setup "$BIN_DIR" "$STORE_DIR" ${DEST:+"$DEST"})" ]]; then
+		echo "install.sh: PATH: would be SKIPPED: no installed aterm can wire your shell profile — run \`aterm pkg shell-setup --path\` once one is installed"
 	else
 		echo "install.sh: PATH: the installed aterm appends at most ONE marker-fenced block to your shell profile — the toolset hook + $BIN_DIR (\`aterm pkg shell-setup --path --dry-run\` names the file; skip with --no-path or ATERM_NO_PATH=1)"
 	fi
@@ -4246,7 +4763,13 @@ if [[ "$DO_APP" -eq 1 ]]; then
 			if ! ensure_dirs_writable "$DEST"; then
 				APP_SKIP="cannot create/write $DEST (set ATERM_INSTALL_DIR to a writable dir)"
 			elif root_dest_acl_open "$DEST"; then
-				APP_SKIP="$DEST carries an ACL, which may let an account other than root change what is in it, so a root run does not install aterm.app there (that account could put a folder of its own in the app's place as it is swapped in) — ls -led '$DEST/' lists the entries; remove them (sudo chmod -N '$DEST'), or set ATERM_INSTALL_DIR to a folder without one"
+				if [[ -e "$DEST" ]]; then
+					APP_SKIP="$DEST carries an ACL, which may let an account other than root change what is in it, so a root run does not install aterm.app there (that account could put a folder of its own in the app's place as it is swapped in) — ls -led '$DEST/' lists the entries; remove them (sudo chmod -N '$DEST'), or set ATERM_INSTALL_DIR to a folder without one"
+				else
+					APP_SKIP="$DEST would be made with the ACL $(existing_anchor "$DEST") passes on to the folders made in it, which may let an account other than root change what is in it, so a root run would not install aterm.app there (that account could put a folder of its own in the app's place as it is swapped in) — ls -led '$(existing_anchor "$DEST")/' lists the entries; make $DEST without them (sudo mkdir -p '$DEST' && sudo chmod -N '$DEST'), or set ATERM_INSTALL_DIR to a folder without one"
+				fi
+			elif root_dest_keeps_no_owner "$DEST"; then
+				APP_SKIP="$DEST is on a volume that ignores ownership (mount lists it noowners, as for an exFAT or FAT volume, or an external one with \"Ignore ownership on this volume\" on), so a root run cannot keep aterm.app's folders root's alone there — set ATERM_INSTALL_DIR to a folder on a volume that keeps owners, or install as your account, without sudo"
 			elif APP_DEST_VERDICT="$(app_dest_verdict "$DEST/aterm.app")" &&
 				[[ "$APP_DEST_VERDICT" == foreign* ]]; then
 				# Ownership, the uninstaller's own test: a bundle that is not
@@ -4744,7 +5267,7 @@ install_linux_app() {
 # source, and the link tracks app updates at the same path.
 
 install_cli() {
-	local target=""
+	local target="" o
 	[[ "$LINUX_APP_INSTALLED" -eq 1 ]] || target="$(find_bundle_cli)"
 	if [[ "$LINUX_APP_INSTALLED" -eq 1 ]]; then
 		# The app half already landed the released Linux binary in the store and
@@ -4764,7 +5287,10 @@ install_cli() {
 		# Neither source is available here: no installed bundle ships the
 		# toolset (older release, or no app), and the build fallback is
 		# impossible for the pre-flighted reason.
-		if [[ "$(uname -s)" == Darwin ]]; then
+		o="$(root_bundle_unsealed)"
+		if [[ -n "$o" ]]; then
+			echo "install.sh: SKIPPED the CLI (aterm): $(root_bundle_refusal "$o" 1), and $CLI_CARGO_SKIP" >&2
+		elif [[ "$(uname -s)" == Darwin ]]; then
 			echo "install.sh: SKIPPED the CLI (aterm): no installed aterm.app ships the toolset (newer releases do — update or reinstall the app first), and $CLI_CARGO_SKIP" >&2
 		else
 			# No bundle exists off macOS: the released binary is the app half's,
@@ -4773,6 +5299,8 @@ install_cli() {
 		fi
 		return 0
 	else
+		o="$(root_bundle_unsealed)"
+		[[ -z "$o" ]] || echo "install.sh: the CLI is built from source: $(root_bundle_refusal "$o")"
 		install_cli_from_source
 	fi
 	retire_exposed_siblings
@@ -4992,18 +5520,12 @@ cli_path_hint() {
 # says so.
 install_toolchain() {
 	local aterm_bin
-	aterm_bin="$BIN_DIR/aterm"
-	if [[ ! -x "$aterm_bin" ]]; then
-		aterm_bin="$(find_bundle_cli)"
-	fi
-	if [[ -z "$aterm_bin" || ! -x "$aterm_bin" ]]; then
-		echo "install.sh: SKIPPED the ALab toolset: no installed \`aterm\` to drive it" >&2
+	aterm_bin="$(toolset_driver)"
+	if [[ "$aterm_bin" != "run "* ]]; then
+		echo "install.sh: SKIPPED the ALab toolset: ${aterm_bin#skip }" >&2
 		return 0
 	fi
-	if ! may_run "$aterm_bin"; then
-		echo "install.sh: SKIPPED the ALab toolset: another account can change $aterm_bin (or a folder or link on its way), so root does not run it — run the install as that account, or set ATERM_BIN_DIR and ATERM_STORE_DIR to folders root owns" >&2
-		return 0
-	fi
+	aterm_bin="${aterm_bin#run }"
 
 	# One line on every lane: where the builds come from (a pinned pre-v0.63
 	# app's sealed payload, else the signed network index) and whether this

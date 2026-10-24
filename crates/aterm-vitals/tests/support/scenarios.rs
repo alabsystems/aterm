@@ -295,6 +295,7 @@ pub fn follow_fds() -> Vec<Fd> {
                 dev: 1,
                 ino: 777,
                 lf_tail: None,
+                fresh_dylib: false,
             },
         },
         Fd {

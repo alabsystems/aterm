@@ -352,24 +352,6 @@ impl CliHarness {
     #[must_use]
     pub fn for_name(name: &str) -> Option<Self> {
         let trimmed = crate::text::trim(name);
-        if trimmed.eq_ignore_ascii_case("claude code") {
-            return Some(CliHarness::ClaudeCode);
-        }
-        if trimmed.eq_ignore_ascii_case("antigravity cli") {
-            return Some(CliHarness::Agy);
-        }
-        if trimmed.eq_ignore_ascii_case("kimi code") {
-            return Some(CliHarness::Kimi);
-        }
-        if trimmed.eq_ignore_ascii_case("muse code") {
-            return Some(CliHarness::Muse);
-        }
-        if trimmed.eq_ignore_ascii_case("gemini cli") {
-            return Some(CliHarness::Gemini);
-        }
-        if trimmed.eq_ignore_ascii_case("grok build") {
-            return Some(CliHarness::Grok);
-        }
         let first = trimmed.split_whitespace().next().unwrap_or("");
         let base = first.rsplit(['/', '\\']).next().unwrap_or(first);
         let word = base.trim_start_matches('-').to_ascii_lowercase();
@@ -440,6 +422,15 @@ mod tests {
             assert_eq!(CliHarness::for_name(harness.product()), Some(harness));
             assert_eq!(harness_version_of(id), Some(ver));
             assert_eq!(harness_version_str_of(id), Some(text));
+        }
+
+        for (name, harness) in [
+            ("grok build", CliHarness::Grok),
+            (" \tGrOk BuIlD\n", CliHarness::Grok),
+            ("gemini cli", CliHarness::Gemini),
+            ("\nGeMiNi ClI\t ", CliHarness::Gemini),
+        ] {
+            assert_eq!(CliHarness::for_name(name), Some(harness), "{name:?}");
         }
 
         for harness in CliHarness::ALL {

@@ -8,6 +8,7 @@
 use std::io::{BufRead, BufReader};
 use std::time::{Duration, Instant};
 
+use crate::live_ctl::Ctl;
 use crate::{child_output, headless_boot};
 
 use headless_boot::{
@@ -338,6 +339,83 @@ fn a_refused_act_types_nothing() {
         log.lines()
             .any(|l| l.contains(" mark - input verb=key act=approve by=ctl ")),
         "{log}"
+    );
+}
+
+/// A keyed `turn` whose `if-gen=` fence finds the box swapped writes nothing, so the `turn` arm
+/// of the control dispatch hands the turn its claim's witness and the sequence goes back: the
+/// retry with the same `id=` types, exactly once, and its repeat is a duplicate.
+#[test]
+fn a_keyed_turn_its_fence_skipped_gives_its_id_to_the_retry() {
+    let inst = boot("t");
+    let (_local, sid) = boot_session(&inst);
+    let script = inst.tmp.join("fake.sh");
+    let go = inst.tmp.join("go");
+    let keylog = inst.tmp.join("keys.log");
+    std::fs::write(&script, FAKE_WORKER).expect("write the fake worker");
+    type_line(
+        &inst,
+        &sid,
+        &format!(
+            "/bin/sh {} {} {}",
+            script.display(),
+            go.display(),
+            keylog.display()
+        ),
+    );
+    await_match(&inst, &sid, "ls.-la./tmp/work");
+    await_match(&inst, &sid, "Esc.to.cancel");
+    let gen_a = field(&status(&inst, &sid), "gen").unwrap().to_string();
+    std::fs::write(&go, b"").expect("create the go file");
+    await_match(&inst, &sid, "rm.-rf./tmp/work");
+    await_match(&inst, &sid, "Esc.to.cancel");
+    let b = status(&inst, &sid);
+    assert_ne!(
+        field(&b, "gen"),
+        Some(gen_a.as_str()),
+        "the generation moved: {b}"
+    );
+    let sessions = ctl_ok(&inst, &["sessions"]);
+    let nonce = sessions
+        .lines()
+        .find(|l| l.split_whitespace().nth(1) == Some(sid.as_str()))
+        .and_then(|row| field(row, "nonce"))
+        .unwrap_or_else(|| panic!("no nonce= for {sid}: {sessions}"))
+        .to_string();
+
+    let mut c = Ctl::connect(&inst.sock);
+    let keyed = format!("@{sid} turn id={nonce}:4:1");
+    let (fenced, _) = c.counted(&format!(
+        "{keyed} if-gen={gen_a} submit=none idle=5 {HANG_MS} hi"
+    ));
+    assert!(
+        fenced.starts_with("OK 0 turn skipped reason=changed submitted=0 "),
+        "{fenced}"
+    );
+    let retry = format!("{keyed} submit=none idle=5 {HANG_MS} hi");
+    let (typed, _) = c.counted(&retry);
+    assert_eq!(
+        typed.split_whitespace().nth(2),
+        Some("turn"),
+        "the fenced skip gave the sequence back: {typed}"
+    );
+    let deadline = Instant::now() + HANG;
+    while Instant::now() < deadline && std::fs::read(&keylog).unwrap_or_default().len() < 2 {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        c.counted(&retry).0,
+        "OK 0 dup=1",
+        "the retry took the sequence"
+    );
+    ctl_ok(
+        &inst,
+        &[&format!("@{sid}"), "await", "idle", "200", HANG_MS],
+    );
+    assert_eq!(
+        std::fs::read(&keylog).expect("the key log"),
+        b"hi",
+        "the text went once, from the retry"
     );
 }
 

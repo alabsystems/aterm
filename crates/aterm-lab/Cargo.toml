@@ -91,6 +91,9 @@ aterm-effects = { workspace = true, features = ["aos-candidates"] }
 # lab (`aos_phase`): the replay, the code seam and the wire encoder are the Aos crate's own.
 # Not a new edge in the build graph: aterm-effects above already depends on it.
 aterm-aos = { workspace = true }
+# `aos-search --workers`' frames: astream's 12-byte header with CRC-32 (design §11.6). A
+# dependency-free leaf already in the graph through aterm-restore and aterm-codec.
+astream-wire = { path = "../../vendor/astream/crates/astream-wire" }
 # Private, exclusively created directories for lab runs and counterfeit API fixtures.
 aterm-tempfile = { workspace = true }
 # `abrew-admission` runs abrew's own admission code over Homebrew's indexes

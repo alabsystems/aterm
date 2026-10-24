@@ -399,7 +399,9 @@ impl Outbox {
     }
 
     fn drained(&mut self) {
-        drop(self.written.take());
+        if let Some(written) = self.written.take() {
+            written.delivered();
+        }
         drop(self.final_reply.take());
         match self.handoff.take() {
             Some(PendingHandoff::Acknowledged(mut ack)) => {

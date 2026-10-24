@@ -229,7 +229,7 @@ impl Drop for Reaped {
 }
 
 /// `SIGKILL` `child` and reap it within [`DEADLINE`]; one still there then is left unreaped, since whether a program macOS's program check holds takes its signal is unmeasured.
-fn kill_reaped(child: &mut Child) {
+pub fn kill_reaped(child: &mut Child) {
     let _ = child.kill();
     let _ = aterm_spec::wait::within(DEADLINE, Duration::from_millis(10), || {
         child.try_wait().ok().flatten()
@@ -238,11 +238,40 @@ fn kill_reaped(child: &mut Child) {
 
 /// The words a wait on `pid`, a child this test spawned, ends the test COULD NOT RUN with when it ran out at [`DEADLINE`] while macOS's program check holds the child ([`aterm_uds::deadline::held_words`]); asked before the child is killed, so any other silence stays the test's failure.
 fn held_at_deadline(pid: u32) -> Option<String> {
-    aterm_uds::deadline::held_words(
-        pid,
-        DEADLINE,
-        aterm_uds::process::at_program_check(i32::try_from(pid).unwrap_or(0)),
-    )
+    aterm_uds::deadline::held_words(pid, DEADLINE, program_check(pid))
+}
+
+/// The next item `rx` carries from the output of `pid`, a child this test spawned, within [`DEADLINE`] of `since`; one that never comes ends the test as [`recv_judged`] does. The child's owner ends it as the test unwinds.
+pub fn recv_within<T>(
+    rx: &std::sync::mpsc::Receiver<T>,
+    since: Instant,
+    pid: u32,
+    what: impl FnOnce() -> String,
+) -> T {
+    recv_judged(rx, since, DEADLINE, pid, program_check, what)
+}
+
+/// The next item `rx` carries within `hang` of `since`, `hang` a hang detector on `pid`, the child whose output feeds it. At the deadline it asks `held` of the child, before anything kills it: COULD NOT RUN when macOS's program check holds it ([`aterm_uds::deadline::held_words`]), else the test fails naming `what` never came.
+pub fn recv_judged<T>(
+    rx: &std::sync::mpsc::Receiver<T>,
+    since: Instant,
+    hang: Duration,
+    pid: u32,
+    held: impl FnOnce(u32) -> Option<bool>,
+    what: impl FnOnce() -> String,
+) -> T {
+    rx.recv_timeout(hang.saturating_sub(since.elapsed()))
+        .unwrap_or_else(|e| {
+            if let Some(words) = aterm_uds::deadline::held_words(pid, hang, held(pid)) {
+                aterm_uds::host::could_not_run(words);
+            }
+            panic!("{} ({e:?} after {hang:?})", what())
+        })
+}
+
+/// Whether macOS's program check holds `pid` ([`aterm_uds::process::at_program_check`]).
+fn program_check(pid: u32) -> Option<bool> {
+    aterm_uds::process::at_program_check(i32::try_from(pid).unwrap_or(0))
 }
 
 fn drain(mut pipe: impl std::io::Read + Send + 'static) -> std::sync::mpsc::Receiver<Vec<u8>> {
@@ -2103,4 +2132,47 @@ impl Node {
         });
         let _ = std::fs::remove_file(self.state.join("pid"));
     }
+}
+
+/// A WAIT THAT RUNS OUT ON A HELD CHILD ENDS COULD NOT RUN, AND ANY OTHER SILENCE FAILS: a channel
+/// nothing feeds, judged at 50 ms (the timeout branch under test, not a budget) with a reader that
+/// answers for the child's pid alone, ends COULD NOT RUN naming that pid when the reader says it is
+/// held, and fails naming what never came when it says not held or cannot tell; an item that came
+/// is returned.
+#[test]
+fn a_wait_that_runs_out_on_a_held_child_ends_could_not_run_and_any_other_silence_fails() {
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let pid = 4242;
+    let hang = Duration::from_millis(50);
+    let ended = |held: Option<bool>| {
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            recv_judged(
+                &rx,
+                Instant::now(),
+                hang,
+                pid,
+                |p| held.filter(|_| p == pid),
+                || "the child's readiness line".to_owned(),
+            )
+        }));
+        let why = out.expect_err("nothing came");
+        why.downcast_ref::<String>().cloned().unwrap_or_default()
+    };
+    let held = ended(Some(true));
+    assert!(
+        held.starts_with(aterm_uds::host::COULD_NOT_RUN) && held.contains("(pid 4242)"),
+        "expected COULD NOT RUN, got: {held}"
+    );
+    for not in [Some(false), None] {
+        let failed = ended(not);
+        assert!(
+            failed.starts_with("the child's readiness line"),
+            "{not:?}: {failed}"
+        );
+    }
+    tx.send("listening".into()).expect("the channel is open");
+    assert_eq!(
+        recv_judged(&rx, Instant::now(), hang, pid, |_| Some(true), String::new),
+        "listening"
+    );
 }

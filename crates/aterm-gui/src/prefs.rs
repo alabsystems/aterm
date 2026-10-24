@@ -3284,7 +3284,7 @@ pub(crate) const AI_FLEET_NOTE: &str = "One document for every machine: a file, 
      https:// URL fetched every six hours and checked against the signer's key.";
 /// What the fleet signer's key is.
 pub(crate) const AI_FLEET_KEY_NOTE: &str = "The key the fleet document must be signed with \
-     (aterm ai fleet keygen prints one); a URL's document needs it.";
+     (aterm ai fleet keygen <secret-key-file> prints one); a URL's document needs it.";
 /// What a CLI's own switch does, after the last of them.
 pub(crate) const AI_USE_NOTE: &str = "Off, aterm never signs that CLI in here, never asks \
      it for a review and says nothing about it.";

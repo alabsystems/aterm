@@ -2,10 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! Hardware-path key injection, for measuring keystroke latency.
-//!
-//! Thread safety: events are posted from the control thread. `-[NSApplication
-//! postEvent:atStart:]` is one of the few `NSApplication` methods Apple documents as safe from
-//! any thread.
+
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// A parsed hardware-key injection request.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,6 +33,64 @@ const FLAG_FUNCTION: u64 = 1 << 23;
 const MAX_COUNT: u32 = 5000;
 const MAX_INTERVAL_MS: u64 = 1000;
 const DEFAULT_INTERVAL_MS: u64 = 40;
+
+/// WHILE THE PERSON'S BUTTONS ARE IN FRONT. The main thread sets it
+/// ([`publish_persons_front`], from `App::publish_hwkey_front` at every park and at `hwkey`'s
+/// own hop) while the front window holds acts only a person may take: System State as its
+/// active view (an Apply that admits a setup plan as the window's own, a row's `Turn On…`;
+/// `docs/DESIGN-system-state-2026-10-21.md` §6), or a gateway card (Take Over and Hand Back
+/// behind a key). `hwkey`'s keys take the person's own unmarked key path, so a burst reads it
+/// before EVERY key and stops once it is set ([`run_burst`]). A burst that was already running
+/// when the page or a card came to the front posts nothing more on it.
+static PERSONS_FRONT: AtomicBool = AtomicBool::new(false);
+
+/// Every key a burst has posted in this process, counted BEFORE the post, so the key's dispatch
+/// always finds the count moved. System State reads it beside the control clients' gesture count
+/// (`App::take_system_state_press`). A key that reached the page before its burst saw
+/// [`PERSONS_FRONT`] (one already queued as the page came to the front) is then still never a
+/// person's press.
+static POSTED: AtomicU64 = AtomicU64::new(0);
+
+/// The main thread's word on the front window: `true` while System State or a gateway card is
+/// in front there ([`PERSONS_FRONT`]).
+pub(crate) fn publish_persons_front(front: bool) {
+    PERSONS_FRONT.store(front, Ordering::Release);
+}
+
+/// How many keys `hwkey` bursts have posted in this process ([`POSTED`]).
+pub(crate) fn posted_keys() -> u64 {
+    POSTED.load(Ordering::Acquire)
+}
+
+/// One burst: `count` presses `interval_ms` apart, each posted by `post_one`, with the gate read
+/// before every key. Once `front` is set the burst stops with nothing more posted, and its `Err`
+/// says how many were. Each key is counted into `posted` before `post_one` runs. A `post_one`
+/// error ends the burst with that error.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+pub(crate) fn run_burst(
+    count: u32,
+    interval_ms: u64,
+    front: &AtomicBool,
+    posted: &AtomicU64,
+    mut post_one: impl FnMut() -> Result<(), String>,
+) -> Result<u32, String> {
+    let mut sent = 0u32;
+    for i in 0..count {
+        if i > 0 && interval_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+        }
+        if front.load(Ordering::Acquire) {
+            return Err(format!(
+                "ERR hwkey: stopped after posted={sent}: System State, a palette, the Overview or \
+                 a tab menu came to the front, and its buttons are the person's\n"
+            ));
+        }
+        posted.fetch_add(1, Ordering::AcqRel);
+        post_one()?;
+        sent += 1;
+    }
+    Ok(sent)
+}
 
 const NAMED: &[(&str, u16, &str)] = &[
     ("enter", 36, "\r"),
@@ -323,87 +379,84 @@ pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> 
         return Err("ERR hwkey: no shared NSApplication\n".to_string());
     }
 
-    let mut posted = 0u32;
-    for i in 0..spec.count {
-        if i > 0 && spec.interval_ms > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(spec.interval_ms));
-        }
-        let _posting = crate::askpass::PROMPT_INPUT
-            .posting_permit()
-            .map_err(|()| "ERR hwkey: a sudo password sheet is up\n".to_string())?;
-        autoreleasepool(|_| {
-            // SAFETY: `+processInfo` is `-(id)`, an immortal singleton, and `-systemUptime` is `-(NSTimeInterval)`, a plain scalar getter.
-            let ts = unsafe {
-                let info = appkit::send_id(class(c"NSProcessInfo").as_id(), sel!(processInfo));
-                if info.is_null() {
-                    return Err("ERR hwkey: no NSProcessInfo\n".to_string());
+    // The pacing, the count and the gate before every key are `run_burst`'s.
+    run_burst(
+        spec.count,
+        spec.interval_ms,
+        &PERSONS_FRONT,
+        &POSTED,
+        || {
+            let _posting = crate::askpass::PROMPT_INPUT
+                .posting_permit()
+                .map_err(|()| "ERR hwkey: a sudo password sheet is up\n".to_string())?;
+            autoreleasepool(|_| {
+                // SAFETY: `+processInfo` is `-(id)`, an immortal singleton, and `-systemUptime` is `-(NSTimeInterval)`, a plain scalar getter.
+                let ts = unsafe {
+                    let info = appkit::send_id(class(c"NSProcessInfo").as_id(), sel!(processInfo));
+                    if info.is_null() {
+                        return Err("ERR hwkey: no NSProcessInfo\n".to_string());
+                    }
+                    appkit::send_f64(info, sel!(systemUptime))
+                };
+                // SAFETY: the AppKit event factory with a non-nil characters pair (winit dereferences both unconditionally) and a nil graphics context, exactly as upstream winit's `replace_event` builds a synthetic key event (aterm-window no longer carries it).
+                let built = |kind: usize| unsafe {
+                    let make: unsafe extern "C-unwind" fn(
+                        Id,
+                        Sel,
+                        usize,
+                        CGPoint,
+                        usize,
+                        f64,
+                        isize,
+                        Id,
+                        Id,
+                        Id,
+                        Bool,
+                        u16,
+                    ) -> Id = aterm_objc::checked_msg();
+                    make(
+                        class(c"NSEvent").as_id(),
+                        sel!(
+                            keyEventWithType:location:modifierFlags:timestamp:windowNumber:
+                            context:characters:charactersIgnoringModifiers:isARepeat:keyCode:
+                        ),
+                        kind,
+                        CGPoint { x: 0.0, y: 0.0 },
+                        flags,
+                        ts,
+                        window_number as isize,
+                        Id::NIL,
+                        chars.id(),
+                        ignoring.id(),
+                        Bool::NO,
+                        spec.keycode,
+                    )
+                };
+                let key_event = |kind: usize| {
+                    if spec.press {
+                        press_event(spec.keycode, kind == NS_EVENT_TYPE_KEY_DOWN, spec.flags)
+                    } else {
+                        built(kind)
+                    }
+                };
+                let down = key_event(NS_EVENT_TYPE_KEY_DOWN);
+                if down.is_null() {
+                    return Err("ERR hwkey: NSEvent construction failed\n".to_string());
                 }
-                appkit::send_f64(info, sel!(systemUptime))
-            };
-            // SAFETY: the AppKit event factory with a non-nil characters pair (winit
-            // dereferences both unconditionally) and a nil graphics context, exactly as
-            // upstream winit's `replace_event` builds a synthetic key event (aterm-window
-            // no longer carries it). The returned event is AUTORELEASED into this per-key
-            // pool. `postEvent:atStart:` is documented thread-safe.
-            let built = |kind: usize| unsafe {
-                let make: unsafe extern "C-unwind" fn(
-                    Id,
-                    Sel,
-                    usize,
-                    CGPoint,
-                    usize,
-                    f64,
-                    isize,
-                    Id,
-                    Id,
-                    Id,
-                    Bool,
-                    u16,
-                ) -> Id = aterm_objc::checked_msg();
-                make(
-                    class(c"NSEvent").as_id(),
-                    sel!(
-                        keyEventWithType:location:modifierFlags:timestamp:windowNumber:
-                        context:characters:charactersIgnoringModifiers:isARepeat:keyCode:
-                    ),
-                    kind,
-                    CGPoint { x: 0.0, y: 0.0 },
-                    flags,
-                    ts,
-                    window_number as isize,
-                    Id::NIL,
-                    chars.id(),
-                    ignoring.id(),
-                    Bool::NO,
-                    spec.keycode,
-                )
-            };
-            let key_event = |kind: usize| {
-                if spec.press {
-                    press_event(spec.keycode, kind == NS_EVENT_TYPE_KEY_DOWN, spec.flags)
-                } else {
-                    built(kind)
+                // SAFETY: `-postEvent:atStart:` is `-(void)(NSEvent *, BOOL)` on the shared application with a live event; see the thread-safety note.
+                unsafe {
+                    let post: unsafe extern "C-unwind" fn(Id, Sel, Id, Bool) =
+                        aterm_objc::checked_msg();
+                    post(app, sel!(postEvent:atStart:), down, Bool::NO);
+                    let up = key_event(NS_EVENT_TYPE_KEY_UP);
+                    if !up.is_null() {
+                        post(app, sel!(postEvent:atStart:), up, Bool::NO);
+                    }
                 }
-            };
-            let down = key_event(NS_EVENT_TYPE_KEY_DOWN);
-            if down.is_null() {
-                return Err("ERR hwkey: NSEvent construction failed\n".to_string());
-            }
-            // SAFETY: `-postEvent:atStart:` is `-(void)(NSEvent *, BOOL)` on the shared application with a live event; see the thread-safety note.
-            unsafe {
-                let post: unsafe extern "C-unwind" fn(Id, Sel, Id, Bool) =
-                    aterm_objc::checked_msg();
-                post(app, sel!(postEvent:atStart:), down, Bool::NO);
-                let up = key_event(NS_EVENT_TYPE_KEY_UP);
-                if !up.is_null() {
-                    post(app, sel!(postEvent:atStart:), up, Bool::NO);
-                }
-            }
-            Ok(())
-        })?;
-        posted += 1;
-    }
-    Ok(posted)
+                Ok(())
+            })
+        },
+    )
 }
 
 /// A key-down (`down`) or key-up `NSEvent` built as a key press is: a CoreGraphics
@@ -456,7 +509,50 @@ pub(crate) fn post(_spec: &HwKeySpec, _window_number: i64) -> Result<u32, String
 
 #[cfg(test)]
 mod tests {
-    use super::{FLAG_CONTROL, FLAG_FUNCTION, FLAG_SHIFT, MAX_COUNT, parse_hwkey};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    use super::{FLAG_CONTROL, FLAG_FUNCTION, FLAG_SHIFT, MAX_COUNT, parse_hwkey, run_burst};
+
+    /// A BURST ALREADY RUNNING STOPS AT THE PERSON'S BUTTONS: System State (or a
+    /// gateway card) comes to the front after the second key of five, and the
+    /// burst posts nothing more, saying how many it did post. Every posted key
+    /// was counted before its post. CONTROL: with nothing of the person's in
+    /// front all five post, and a front already up posts none.
+    #[test]
+    fn a_running_burst_stops_once_the_persons_buttons_come_to_the_front() {
+        let front = AtomicBool::new(false);
+        let posted = AtomicU64::new(0);
+        let mut sent = 0;
+        let out = run_burst(5, 0, &front, &posted, || {
+            sent += 1;
+            if sent == 2 {
+                // The page came to the front: the main thread's word.
+                front.store(true, Ordering::Release);
+            }
+            Ok(())
+        });
+        let refusal = out.expect_err("stopped at the page");
+        assert!(refusal.contains("posted=2"), "{refusal}");
+        assert_eq!(sent, 2, "nothing posted after it came to the front");
+        assert_eq!(posted.load(Ordering::Acquire), 2);
+
+        let quiet = AtomicBool::new(false);
+        let mut sent = 0;
+        let all = run_burst(5, 0, &quiet, &posted, || {
+            sent += 1;
+            Ok(())
+        });
+        assert_eq!(all, Ok(5));
+        assert_eq!(posted.load(Ordering::Acquire), 7);
+
+        let mut sent = 0;
+        let none = run_burst(5, 0, &front, &posted, || {
+            sent += 1;
+            Ok(())
+        });
+        assert!(none.is_err_and(|e| e.contains("posted=0")));
+        assert_eq!(sent, 0);
+    }
 
     #[test]
     fn a_plain_letter_is_its_unshifted_physical_key() {

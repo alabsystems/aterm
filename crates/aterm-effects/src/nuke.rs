@@ -170,11 +170,11 @@ pub fn paint_nuke(tile: &mut Tile, part: NukePart) {
                 NUKE_A * 0.70,
             );
             let ramp_top = (0.70 * hf) as u32;
-            let span = (h.saturating_sub(ramp_top)).max(1) as f32;
+            let inv_span = 1.0 / (h.saturating_sub(ramp_top)).max(1) as f32;
             let row_bytes = w as usize * 4;
             let px = tile.pixels_mut();
             for y in ramp_top..h {
-                let scale = 1.0 - 0.58 * ((y - ramp_top) as f32 / span);
+                let scale = 1.0 - 0.58 * ((y - ramp_top) as f32 * inv_span);
                 let row_start = y as usize * row_bytes;
                 for p in px[row_start..row_start + row_bytes].as_chunks_mut::<4>().0 {
                     if p[3] != 0 {

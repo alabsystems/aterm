@@ -3,6 +3,7 @@
 
 //! The local `aterm init` desktop preferences.
 
+use crate::init_observe::{LastReading, Reading};
 use crate::items::catalog::{CATALOG, CatalogRow, Lit};
 use crate::items::defaults::{self, Target};
 use crate::items::{Activation, Ctx, Item, keyboard, widgets};
@@ -30,6 +31,8 @@ const DOCK_APPS: [(&str, &str, &str); 3] = [
     ("/Applications/Safari.app", "com.apple.Safari", "Safari"),
 ];
 
+type PreferenceItem = (Setting, Box<dyn Item>);
+
 /// The preferred keyboard, widget and Dock settings for the resolved local user.
 /// # Errors
 /// An absent or ambiguous user, or an invalid keyboard model.
@@ -41,12 +44,30 @@ pub fn items(ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
 /// # Errors
 /// An absent or ambiguous user, or an invalid selected keyboard model.
 pub fn selected_items(ctx: &Ctx, selected: Selection) -> Result<Vec<Box<dyn Item>>, String> {
+    Ok(selected_tagged_items(ctx, selected)?
+        .into_iter()
+        .map(|(_, item)| item)
+        .collect())
+}
+
+/// [`selected_items`], each item with the setting whose System State row it reports to.
+/// A pass builds all of its preference items with one call: the widget, desktop and Dock
+/// items of that call share one [`DesktopActivation`], and a second call would build a
+/// second one with the same id, whose families the engine never relaunches (it settles
+/// an id once, with the last item's activation).
+///
+/// # Errors
+/// An absent or ambiguous user, or an invalid selected keyboard model.
+pub fn selected_tagged_items(
+    ctx: &Ctx,
+    selected: Selection,
+) -> Result<Vec<PreferenceItem>, String> {
     let [user] = ctx.users.as_slice() else {
         return Err("aterm init preferences require exactly one local user".into());
     };
-    let mut items = Vec::new();
+    let mut items: Vec<PreferenceItem> = Vec::new();
     if selected.contains(Setting::CapsLock) {
-        items.extend(keyboard::expand(
+        let persistent = keyboard::expand(
             &keyboard::Table {
                 caps_lock: Some("control".into()),
                 models: if ctx.facts.arch == "arm64" {
@@ -56,8 +77,13 @@ pub fn selected_items(ctx: &Ctx, selected: Selection) -> Result<Vec<Box<dyn Item
                 },
             },
             ctx,
-        )?);
-        items.extend(attached_keyboard_items(ctx)?);
+        )?;
+        items.extend(
+            persistent
+                .into_iter()
+                .chain(attached_keyboard_items(ctx)?)
+                .map(|item| (Setting::CapsLock, item)),
+        );
     }
     let activation = Arc::new(DesktopActivation::new(
         user,
@@ -65,7 +91,7 @@ pub fn selected_items(ctx: &Ctx, selected: Selection) -> Result<Vec<Box<dyn Item
     ));
     for (setting, kind) in desktop() {
         if selected.contains(setting) {
-            items.push(Box::new(Desktop::new(user, kind, &activation)));
+            items.push((setting, Box::new(Desktop::new(user, kind, &activation))));
         }
     }
     Ok(items)
@@ -109,10 +135,11 @@ fn desktop() -> impl Iterator<Item = (Setting, DesktopKind)> {
         ])
 }
 
-/// The follow-up of a pass that left keys in another app's container alone ([`Item::withheld`]).
+/// The follow-up of a pass that left keys in another app's container alone ([`Item::withheld`]),
+/// each item with its setting ([`selected_tagged_items`]).
 /// # Errors
 /// An absent or ambiguous user.
-pub fn withheld_items(ctx: &Ctx, selected: Selection) -> Result<Vec<Box<dyn Item>>, String> {
+pub fn withheld_items(ctx: &Ctx, selected: Selection) -> Result<Vec<PreferenceItem>, String> {
     let [user] = ctx.users.as_slice() else {
         return Err("aterm init preferences require exactly one local user".into());
     };
@@ -131,7 +158,10 @@ pub fn withheld_items(ctx: &Ctx, selected: Selection) -> Result<Vec<Box<dyn Item
                     .iter()
                     .any(|(domain, _, _)| defaults::contained(domain))
         })
-        .map(|(_, kind)| Box::new(Desktop::new(user, kind, &activation)) as Box<dyn Item>)
+        .map(|(setting, kind)| {
+            let item: Box<dyn Item> = Box::new(Desktop::new(user, kind, &activation));
+            (setting, item)
+        })
         .collect())
 }
 
@@ -158,6 +188,7 @@ pub fn attached_keyboard_items(ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> 
         items.push(Box::new(AttachedKeyboard {
             model,
             user: user.clone(),
+            reading: LastReading::default(),
         }));
     }
     Ok(items)
@@ -177,6 +208,8 @@ fn run(sys: &dyn System, cmd: &Cmd) -> Result<String, String> {
 struct AttachedKeyboard {
     model: keyboard::Model,
     user: User,
+    /// Whether the last probe found Caps Lock unmapped, for System State.
+    reading: LastReading,
 }
 
 impl AttachedKeyboard {
@@ -225,6 +258,7 @@ pub(crate) fn clear_attached_caps_lock(
     let item = AttachedKeyboard {
         model,
         user: user.clone(),
+        reading: LastReading::default(),
     };
     let maps = item.mappings(sys)?;
     let want = common_other_mappings(&maps)?;
@@ -259,16 +293,35 @@ impl Item for AttachedKeyboard {
     }
 
     fn probe(&self, sys: &dyn System, _ctx: &Ctx) -> Probe {
-        match self.mappings(sys).and_then(|maps| merged_mapping(&maps)) {
+        self.reading.set(None);
+        let maps = match self.mappings(sys) {
+            Ok(maps) => maps,
+            Err(why) => return Probe::Unusable { why },
+        };
+        match merged_mapping(&maps) {
             Err(why) => Probe::Unusable { why },
             Ok(None) => Probe::Ok {
                 now: "Caps Lock acts as Control on every attached service".into(),
             },
-            Ok(Some(_)) => Probe::Change {
-                from: "Caps Lock is not Control on every attached service".into(),
-                to: "Caps Lock acts as Control immediately".into(),
-            },
+            Ok(Some(_)) => {
+                // No service maps Caps Lock at all: the key still does Caps Lock,
+                // the one reading System State names (`init_observe`).
+                self.reading.set(
+                    maps.iter()
+                        .flatten()
+                        .all(|(source, _)| *source != keyboard::CAPS_LOCK)
+                        .then_some(Reading::CapsLock),
+                );
+                Probe::Change {
+                    from: "Caps Lock is not Control on every attached service".into(),
+                    to: "Caps Lock acts as Control immediately".into(),
+                }
+            }
         }
+    }
+
+    fn detail(&self, _sys: &dyn System, _ctx: &Ctx) -> Option<String> {
+        self.reading.detail()
     }
 
     fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
@@ -606,9 +659,63 @@ struct Desktop {
     before: Mutex<Vec<(Target, Read<PValue>)>>,
     /// The pass's one relaunch of what the desktop items write ([`DesktopActivation`]).
     activation: Arc<DesktopActivation>,
+    /// What the last probe read, for System State.
+    reading: LastReading,
 }
 
 type Changes = Vec<(Target, Read<PValue>, PValue)>;
+
+impl DesktopKind {
+    /// What the pending changes read, for System State's words (design §3.3), from
+    /// the values themselves: an absent key holds macOS's default, which is not read.
+    fn reading(self, changes: &Changes) -> Option<Reading> {
+        let reads = |key: &str, value: bool| {
+            changes.iter().any(|(target, read, _)| {
+                target.key == key
+                    && matches!(read, Read::Value(now) if now.same(&PValue::Bool(value)))
+            })
+        };
+        match self {
+            Self::Desktop => {
+                if reads("CreateDesktop", false)
+                    || reads("StandardHideDesktopIcons", true)
+                    || reads("StageManagerHideDesktopIcons", true)
+                {
+                    Some(Reading::IconsHidden)
+                } else if reads("EnableStandardClickToShowDesktop", true) {
+                    Some(Reading::ClickReveals)
+                } else {
+                    None
+                }
+            }
+            Self::Widget(_) => {
+                let listed = changes.iter().any(|(target, read, _)| {
+                    target.key == "widgets"
+                        && matches!(read, Read::Value(PValue::Dict(fields))
+                            if fields.iter().any(|(key, value)| key == "instances"
+                                && matches!(value, PValue::Array(list) if !list.is_empty())))
+                });
+                (listed
+                    || reads("StandardHideWidgets", false)
+                    || reads("StageManagerHideWidgets", false))
+                .then_some(Reading::WidgetsShown)
+            }
+            Self::Dock => changes
+                .iter()
+                .find_map(|(target, read, want)| match (read, want) {
+                    (Read::Value(PValue::Array(pins)), PValue::Array(wanted))
+                        if target.key == "persistent-apps" =>
+                    {
+                        Some(Reading::Apps {
+                            pinned: pins.len(),
+                            wanted: wanted.len(),
+                        })
+                    }
+                    _ => None,
+                }),
+        }
+    }
+}
 
 impl Desktop {
     fn new(user: &User, kind: DesktopKind, activation: &Arc<DesktopActivation>) -> Self {
@@ -617,6 +724,7 @@ impl Desktop {
             kind,
             before: Mutex::new(Vec::new()),
             activation: Arc::clone(activation),
+            reading: LastReading::default(),
         }
     }
 
@@ -945,6 +1053,7 @@ impl Item for Desktop {
     }
 
     fn probe(&self, sys: &dyn System, ctx: &Ctx) -> Probe {
+        self.reading.set(None);
         let pending = match self.pending(sys) {
             Ok(pending) => pending,
             Err(why) => return Probe::Unusable { why },
@@ -955,6 +1064,7 @@ impl Item for Desktop {
                 now: self.summary(),
             },
             Ok(changes) => {
+                self.reading.set(self.kind.reading(&changes));
                 let from = if changes.is_empty() {
                     "stored preferences await activation after an earlier write".into()
                 } else {
@@ -1009,6 +1119,10 @@ impl Item for Desktop {
 
     fn effect(&self) -> Effect {
         Effect::Relaunch
+    }
+
+    fn detail(&self, _sys: &dyn System, _ctx: &Ctx) -> Option<String> {
+        self.reading.detail()
     }
 
     fn withheld(&self) -> Option<String> {
@@ -1313,6 +1427,7 @@ mod tests {
                 product: 598,
             },
             user: who.clone(),
+            reading: LastReading::default(),
         };
         let sys = Fake::root();
         let get = item.command().args(["--get", "UserKeyMapping"]).display();
@@ -1321,11 +1436,14 @@ mod tests {
         sys.on(&set, Ran::ok(""));
         let c = ctx(&[who]);
         assert!(matches!(item.probe(&sys, &c), Probe::Change { .. }));
+        // No service maps Caps Lock yet: System State reads the key as Caps Lock.
+        assert_eq!(item.detail(&sys, &c), Some(Reading::CapsLock.token()));
         item.apply(&sys, &c).unwrap();
         assert!(sys.calls().contains(&set));
         sys.on(&get, Ran::ok("RegistryID Key Value\n10002160e UserKeyMapping ( { HIDKeyboardModifierMappingSrc = 30064771129; HIDKeyboardModifierMappingDst = 30064771296; } )\n100021604 UserKeyMapping ( { HIDKeyboardModifierMappingDst = 30064771296; HIDKeyboardModifierMappingSrc = 30064771129; } )\n"));
         let _ = item.mappings(&sys).unwrap();
         assert!(matches!(item.probe(&sys, &c), Probe::Ok { .. }));
+        assert_eq!(item.detail(&sys, &c), None);
 
         let before = "RegistryID Key Value\n10002160e UserKeyMapping ( { HIDKeyboardModifierMappingSrc = 123; HIDKeyboardModifierMappingDst = 456; }, { HIDKeyboardModifierMappingSrc = 30064771129; HIDKeyboardModifierMappingDst = 30064771296; } )\n100021604 UserKeyMapping ( { HIDKeyboardModifierMappingSrc = 123; HIDKeyboardModifierMappingDst = 456; }, { HIDKeyboardModifierMappingSrc = 30064771129; HIDKeyboardModifierMappingDst = 30064771296; } )\n";
         let after = "RegistryID Key Value\n10002160e UserKeyMapping ( { HIDKeyboardModifierMappingSrc = 123; HIDKeyboardModifierMappingDst = 456; } )\n100021604 UserKeyMapping ( { HIDKeyboardModifierMappingSrc = 123; HIDKeyboardModifierMappingDst = 456; } )\n";
@@ -1374,6 +1492,7 @@ mod tests {
                 product: 598,
             },
             user: who.clone(),
+            reading: LastReading::default(),
         };
         let sys = Fake::root();
         let get = item.command().args(["--get", "UserKeyMapping"]).display();
@@ -1685,6 +1804,56 @@ mod tests {
             undo.lines()
                 .all(|line| line.contains("/usr/bin/defaults delete") && line.contains("  # "))
         );
+    }
+
+    #[test]
+    fn a_desktop_reading_names_only_values_it_read_and_three_other_apps_are_not_the_three() {
+        let who = user("alice", 501);
+        let target = |domain: &str, key: &str| Target::user(domain, key, &who);
+        let pin = || PValue::Dict(Vec::new());
+        let dock = |pins: usize| -> Changes {
+            vec![(
+                target("com.apple.dock", "persistent-apps"),
+                Read::Value(PValue::Array(vec![pin(); pins])),
+                dock_apps(&usual_dock_apps()),
+            )]
+        };
+        let PValue::Array(wanted) = dock_apps(&usual_dock_apps()) else {
+            panic!("the Dock's pins are a list");
+        };
+        assert_eq!(
+            DesktopKind::Dock.reading(&dock(wanted.len())),
+            Some(Reading::Apps {
+                pinned: wanted.len(),
+                wanted: wanted.len()
+            })
+        );
+        assert_eq!(
+            Reading::Apps {
+                pinned: wanted.len(),
+                wanted: wanted.len()
+            }
+            .word()
+            .as_deref(),
+            Some("Other apps")
+        );
+        let hidden: Changes = vec![(
+            target("com.apple.finder", "CreateDesktop"),
+            Read::Value(PValue::Bool(false)),
+            PValue::Bool(true),
+        )];
+        assert_eq!(
+            DesktopKind::Desktop.reading(&hidden),
+            Some(Reading::IconsHidden)
+        );
+        // An absent key holds macOS's default, which this does not read.
+        let absent: Changes = vec![(
+            target("com.apple.finder", "CreateDesktop"),
+            Read::Absent,
+            PValue::Bool(true),
+        )];
+        assert_eq!(DesktopKind::Desktop.reading(&absent), None);
+        assert_eq!(DesktopKind::Dock.reading(&absent), None);
     }
 
     #[test]
@@ -2429,6 +2598,96 @@ mod tests {
         );
     }
 
+    /// `sys` answering as `who`, logged in at this Mac's console, the way
+    /// `init::prepare_workstation_selected` resolves the account.
+    fn at_console(sys: &Fake, who: &User) {
+        sys.on("/usr/bin/id -un", Ran::ok(&format!("{}\n", who.name)));
+        sys.on(
+            "/usr/bin/dscl . -read /Groups/admin GroupMembership",
+            Ran::ok(&format!("GroupMembership: {}\n", who.name)),
+        );
+        sys.on(
+            &format!(
+                "/usr/bin/dscl . -read /Users/{} UniqueID PrimaryGroupID NFSHomeDirectory UserShell",
+                who.name
+            ),
+            Ran::ok(&format!(
+                "UniqueID: {}\nPrimaryGroupID: {}\nNFSHomeDirectory: {}\nUserShell: {}\n",
+                who.uid, who.gid, who.home, who.shell
+            )),
+        );
+        sys.stat_of(
+            "/dev/console",
+            Stat {
+                uid: who.uid,
+                gid: who.gid,
+                mode: 0o600,
+                dir: false,
+                symlink: false,
+                len: 0,
+            },
+        );
+        sys.on("/usr/bin/uname -m", Ran::ok("arm64\n"));
+        sys.on("/usr/bin/sw_vers -productVersion", Ran::ok("27.0\n"));
+    }
+
+    /// One pass of setup's Workstation stage and of the doctor, as both build and run it
+    /// (`init::prepare_workstation_selected`, whose items carry the setting each reports
+    /// to, then the before-images and the apply), with the widgets, desktop and Dock all
+    /// to change: each reader relaunches once and every item reads back changed, tagged
+    /// with its own setting.
+    #[test]
+    fn a_tagged_pass_relaunches_each_reader_once() {
+        let who = user("alice", 501);
+        let settings = [Setting::Widgets, Setting::Desktop, Setting::Dock];
+        let mut selected = Selection::none();
+        for setting in settings {
+            selected.set(setting, true);
+        }
+        let (mut sys, desk) = desktop_of(&who, Desk::before());
+        // With Full Disk Access, as the control's items have it: without it the widgets
+        // item leaves Notification Center alone.
+        sys.full_disk_access = Some(true);
+        at_console(&sys, &who);
+        let mut prepared = crate::init::prepare_workstation_selected(
+            &sys,
+            crate::init::WorkstationGroup::All,
+            selected,
+        )
+        .unwrap();
+        prepared.preference_changes(&sys).unwrap();
+        let run = prepared.run_recording(&sys, Mode::Apply).unwrap();
+        assert_eq!(
+            outcomes(&run),
+            DESKTOP_IDS.map(|id| (id, Outcome::Changed)),
+            "{:?}",
+            run.rows
+        );
+        assert!(run.attempts.iter().all(|attempt| attempt.verified));
+        let tagged: Vec<(Setting, &str)> = run
+            .tagged()
+            .into_iter()
+            .map(|(setting, row)| (setting, row.id.as_str()))
+            .collect();
+        let mut want = vec![Setting::Widgets; WIDGET_IDS.len()];
+        want.extend([Setting::Desktop, Setting::Dock]);
+        assert_eq!(
+            tagged,
+            want.into_iter().zip(DESKTOP_IDS).collect::<Vec<_>>()
+        );
+        let desk = desk.lock().unwrap();
+        assert_eq!(
+            (
+                desk.count("kill Dock"),
+                desk.count("kill Finder"),
+                desk.count("kill NotificationCenter")
+            ),
+            (1, 1, 1),
+            "{:?}",
+            desk.events
+        );
+    }
+
     #[test]
     fn the_read_back_waits_until_the_relaunched_dock_is_past_its_start() {
         let who = user("alice", 501);
@@ -2966,7 +3225,11 @@ mod tests {
         }
         let mut context = ctx(std::slice::from_ref(who));
         context.facts.full_disk_access = full_disk_access;
-        withheld_items(&context, selected).unwrap()
+        withheld_items(&context, selected)
+            .unwrap()
+            .into_iter()
+            .map(|(_, item)| item)
+            .collect()
     }
 
     #[test]

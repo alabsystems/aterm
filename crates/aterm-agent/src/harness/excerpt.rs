@@ -474,7 +474,11 @@ fn prompt_words(content: Option<&Value>) -> Option<String> {
             .join("\n"),
         _ => return None,
     };
-    let words = super::upgrade::typed_words(&text);
+    clean_prompt_words(&text)
+}
+
+fn clean_prompt_words(text: &str) -> Option<String> {
+    let words = super::upgrade::typed_words(text);
     if words.is_empty()
         || words.starts_with("[aterm harness]")
         || words.starts_with("[Request interrupted")
@@ -486,6 +490,228 @@ fn prompt_words(content: Option<&Value>) -> Option<String> {
         return Some(format!("! {}", command.trim()));
     }
     (!words.starts_with('<')).then(|| words.to_owned())
+}
+
+fn agy_user_input_words(content: &str) -> Option<String> {
+    let body = content
+        .split_once("<USER_REQUEST>")
+        .and_then(|(_, rest)| rest.split_once("</USER_REQUEST>").map(|(inner, _)| inner))
+        .unwrap_or(content);
+    clean_prompt_words(body)
+}
+
+fn push_prompt(prompts: &mut Vec<Prompt>, words: &str) {
+    if prompts.len() >= PROMPTS_KEPT {
+        return;
+    }
+    let key = prompt_key(words);
+    if prompts.iter().any(|p| p.key == key) {
+        return;
+    }
+    prompts.push(Prompt {
+        text: cap(&fold(words), EXCERPT_BYTES),
+        key,
+    });
+}
+
+/// Extracts [`Excerpts`] (`prompts`, `said`, `said_end`, `doing`) from the tail
+/// of an `agy` conversation's `transcript.jsonl` and `<config>/history.jsonl`.
+#[must_use]
+pub fn agy_excerpts_from(
+    transcript_tail: &[u8],
+    history_tail: Option<&[u8]>,
+    conversation: &str,
+) -> Excerpts {
+    let mut prompts: Vec<Prompt> = Vec::new();
+    let mut said: Option<(String, String)> = None;
+    let mut doing: Option<String> = None;
+    let mut saw_planner = false;
+    let mut saw_user = false;
+    let mut generic_since_planner = 0usize;
+
+    let transcript_text = String::from_utf8_lossy(transcript_tail);
+    for line in transcript_text.lines().rev() {
+        let Ok(row) = aterm_json::from_str::<Value>(line) else {
+            continue;
+        };
+        match row.get("type").and_then(Value::as_str) {
+            Some("PLANNER_RESPONSE") => {
+                if said.is_none()
+                    && let Some(content) = row.get("content").and_then(Value::as_str)
+                {
+                    let text = fold(&without_finished_lines(content));
+                    if !text.is_empty() {
+                        said = Some((cap(&text, EXCERPT_BYTES), cap_end(&text, EXCERPT_BYTES)));
+                    }
+                }
+                if !saw_planner && !saw_user {
+                    if let Some(calls) = row.get("tool_calls").and_then(Value::as_array)
+                        && let Some(call) = calls.get(generic_since_planner)
+                        && let Some(name) = call.get("name").and_then(Value::as_str)
+                    {
+                        let tn = tool_name(name);
+                        if !tn.is_empty() {
+                            doing = Some(tn);
+                        }
+                    }
+                    saw_planner = true;
+                }
+            }
+            Some("GENERIC") => {
+                if !saw_planner && !saw_user {
+                    generic_since_planner = generic_since_planner.saturating_add(1);
+                }
+            }
+            Some("USER_INPUT") => {
+                saw_user = true;
+                if prompts.len() < PROMPTS_KEPT
+                    && let Some(content) = row.get("content").and_then(Value::as_str)
+                    && let Some(words) = agy_user_input_words(content)
+                {
+                    push_prompt(&mut prompts, &words);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if prompts.len() < PROMPTS_KEPT
+        && let Some(history_bytes) = history_tail
+    {
+        let history_text = String::from_utf8_lossy(history_bytes);
+        for line in history_text.lines().rev() {
+            if prompts.len() >= PROMPTS_KEPT {
+                break;
+            }
+            let Ok(row) = aterm_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if row.get("conversationId").and_then(Value::as_str) != Some(conversation) {
+                continue;
+            }
+            if let Some(display) = row.get("display").and_then(Value::as_str)
+                && let Some(words) = clean_prompt_words(display)
+            {
+                push_prompt(&mut prompts, &words);
+            }
+        }
+    }
+
+    let (said, said_end) = said.unzip();
+    Excerpts {
+        prompts,
+        said,
+        said_end,
+        doing,
+    }
+}
+
+fn muse_records_in_line(line: &str) -> Vec<Value> {
+    let Ok(v) = aterm_json::from_str::<Value>(line.trim()) else {
+        return Vec::new();
+    };
+    match v.get("children").and_then(Value::as_array) {
+        Some(children) if v.get("retained_frame").is_some() => children
+            .iter()
+            .filter_map(|c| c.get("record_json")?.as_str())
+            .filter_map(|r| aterm_json::from_str(r).ok())
+            .collect(),
+        _ => vec![v],
+    }
+}
+
+/// Extracts [`Excerpts`] (`prompts`, `said`, `said_end`, `doing`) from the tail
+/// of a Muse Code session's `session.jsonl`.
+#[must_use]
+pub fn muse_excerpts_from(session_tail: &[u8]) -> Excerpts {
+    let mut prompts: Vec<Prompt> = Vec::new();
+    let mut said: Option<(String, String)> = None;
+    let mut doing: Option<String> = None;
+
+    let text = String::from_utf8_lossy(session_tail);
+    for line in text.lines() {
+        for r in muse_records_in_line(line) {
+            let Some(payload_type) = r.get("payload_type").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(payload) = r.get("payload") else {
+                continue;
+            };
+            let is_task = match payload_type {
+                "runtime.session" => payload.get("kind").and_then(Value::as_str) == Some("task"),
+                "runtime.session.task" => true,
+                _ => false,
+            };
+            if is_task {
+                if let Some(event) = payload.get("event") {
+                    match event.get("kind").and_then(Value::as_str) {
+                        Some("proposed") => {
+                            if let Some(tk) = event.get("task_kind").and_then(Value::as_str)
+                                && tk != "session_name.allocate"
+                            {
+                                let tn = tool_name(tk.strip_prefix("tool.").unwrap_or(tk));
+                                if !tn.is_empty() {
+                                    doing = Some(tn);
+                                }
+                            }
+                        }
+                        Some("completed" | "cancelled" | "failed" | "rejected") => {
+                            doing = None;
+                        }
+                        _ => {}
+                    }
+                }
+                continue;
+            }
+            if payload_type == "runtime.session"
+                && payload.get("kind").and_then(Value::as_str) == Some("run")
+                && let Some(event) = payload.get("event")
+            {
+                match event.get("kind").and_then(Value::as_str) {
+                    Some("started") => {
+                        doing = None;
+                        if let Some(prompt) = event.get("prompt").and_then(Value::as_str)
+                            && let Some(words) = clean_prompt_words(prompt)
+                        {
+                            let key = prompt_key(&words);
+                            prompts.retain(|p| p.key != key);
+                            prompts.insert(
+                                0,
+                                Prompt {
+                                    text: cap(&fold(&words), EXCERPT_BYTES),
+                                    key,
+                                },
+                            );
+                            prompts.truncate(PROMPTS_KEPT);
+                        }
+                    }
+                    Some("assistant_message_committed") => {
+                        if let Some(msg) = event.get("text").and_then(Value::as_str) {
+                            let clean = fold(&without_finished_lines(msg));
+                            if !clean.is_empty() {
+                                said = Some((
+                                    cap(&clean, EXCERPT_BYTES),
+                                    cap_end(&clean, EXCERPT_BYTES),
+                                ));
+                            }
+                        }
+                    }
+                    Some("terminal") => {
+                        doing = None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let (said, said_end) = said.unzip();
+    Excerpts {
+        prompts,
+        said,
+        said_end,
+        doing,
+    }
 }
 
 fn newest_text(parts: &[Value]) -> Option<String> {

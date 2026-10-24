@@ -239,10 +239,18 @@ pub(super) fn admit_home(sys: &dyn System, user: &User) -> Result<(), String> {
     if !home.is_absolute() || !stat.dir || stat.symlink || stat.uid != user.uid {
         return Err("repository destination must be this user's own home directory".into());
     }
-    if !sys.stat(Path::new(GIT)).is_ok_and(|stat| !stat.dir) {
-        return Err("Command Line Tools git is not installed; no repositories changed".into());
+    if !git_installed(sys) {
+        return Err(NO_GIT.into());
     }
     Ok(())
+}
+
+/// Why [`admit_home`] refuses a Mac without Command Line Tools git.
+pub(super) const NO_GIT: &str = "Command Line Tools git is not installed; no repositories changed";
+
+/// Whether Command Line Tools git, which every clone runs, is installed.
+pub(super) fn git_installed(sys: &dyn System) -> bool {
+    sys.stat(Path::new(GIT)).is_ok_and(|stat| !stat.dir)
 }
 
 #[derive(Clone, Debug)]
@@ -323,7 +331,7 @@ fn enumerate(
         )
     };
     enumerate_pages(&base, Some(&config.owner), |endpoint| {
-        get(sys, user, token, endpoint)
+        get(sys, user, token, endpoint).map_err(String::from)
     })
 }
 

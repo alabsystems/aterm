@@ -16,6 +16,11 @@ pub fn fold(s: &str) -> String {
 #[inline]
 pub fn fold_into(s: &str, out: &mut String) {
     out.clear();
+    if s.is_ascii() {
+        out.push_str(s);
+        out.make_ascii_lowercase();
+        return;
+    }
     out.reserve(s.len().saturating_sub(out.len()).min(4096));
     for c in s.chars() {
         if is_strippable_mark(c) {
@@ -78,14 +83,15 @@ const fn base_letter(c: char) -> Option<char> {
 #[inline]
 #[must_use]
 pub fn has_foldable_marks(s: &str) -> bool {
-    s.chars().any(|c| {
-        if c.is_ascii() {
-            return false;
-        }
-        is_strippable_mark(c)
-            || c.to_lowercase()
-                .any(|lc| is_strippable_mark(lc) || base_letter(lc).is_some())
-    })
+    !s.is_ascii()
+        && s.chars().any(|c| {
+            if c.is_ascii() {
+                return false;
+            }
+            is_strippable_mark(c)
+                || c.to_lowercase()
+                    .any(|lc| is_strippable_mark(lc) || base_letter(lc).is_some())
+        })
 }
 
 /// [`is_strippable_mark`]'s ranges, as one pattern.

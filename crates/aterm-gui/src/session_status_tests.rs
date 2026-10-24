@@ -1647,7 +1647,7 @@ fn the_status_record_keeps_one_field_set_on_both_arms_body() {
              session_theme theme_origin{conpty} integration input input_bytes input_wait_ms fg_rss_mb \
              disk disk_free_mb disk_room_mb disk_age_ms job job_quiet_ms syspolicyd \
              syspolicyd_workers syspolicyd_full_ms occupancy occupancy_hold ready slots \
-             idle_ready_min supervisor supervisor_proven autopilot \
+             idle_ready_min waits waits_ready supervisor supervisor_proven autopilot \
              human_ms human_seq launch launch_seq path_evidence copy upgrade history_lost \
              journal journal_off integration_rev born render \
              resizes flaps land_at task pause land_held land_nudges land_since end end_seen \

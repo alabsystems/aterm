@@ -17,13 +17,19 @@ const MODE: u32 = 0o644;
 
 /// Record in `home`, just before a program under it starts, that it has not shown it ran:
 /// [`EXEC_STAMP`] with the awake-clock reading, and no [`RAN`]. Both are readable by all.
+/// An earlier uninstall's mark ([`crate::agent::reclaim::KEPT`]) goes too: the folder is in
+/// use again, so its reclaim job leaves it, unless the job read the mark just before and is
+/// emptying the folder now.
 ///
 /// # Errors
-/// The stamp cannot be written; the program should not start.
+/// The stamp cannot be written, or a proof or mark cannot be removed; the program should not
+/// start.
 pub fn stamp(sys: &dyn System, home: &Path) -> std::io::Result<()> {
-    match sys.remove(&home.join(RAN)) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
-        _ => {}
+    for stale in [RAN, crate::agent::reclaim::KEPT] {
+        match sys.remove(&home.join(stale)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
     }
     let at = sys.awake_ms().map(|ms| ms.to_string()).unwrap_or_default();
     sys.write_file(&home.join(EXEC_STAMP), at.as_bytes(), MODE)
@@ -229,6 +235,18 @@ mod tests {
             Some(FIRST_EXEC_HANG),
             "a new start takes back the old proof"
         );
+    }
+
+    #[test]
+    fn a_new_start_takes_its_folder_back_from_an_earlier_uninstalls_reclaim_job() {
+        let sys = Fake::root();
+        let home = Path::new("/A/state/aterm.app-first-run");
+        let mark = home.join(crate::agent::reclaim::KEPT);
+        sys.file(&mark.to_string_lossy(), b"1-9");
+        sys.awake_at(5_000_000);
+        stamp(&sys, home).unwrap();
+        assert!(sys.written(&mark.to_string_lossy()).is_none());
+        assert_eq!(hold_left(&sys, home), Some(FIRST_EXEC_HANG));
     }
 
     #[test]

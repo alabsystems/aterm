@@ -2685,13 +2685,6 @@ impl NativeRuntime {
         }
     }
 
-    pub(crate) fn take_system_state_cancel(&mut self, instance: AppInstanceId) -> bool {
-        match self.instances.get_mut(&instance) {
-            Some(NativeApp::SystemState(state)) => state.take_queued_cancel(),
-            _ => false,
-        }
-    }
-
     pub(crate) fn app(&self, instance: AppInstanceId) -> Option<&NativeApp> {
         self.instances.get(&instance)
     }
@@ -2749,8 +2742,8 @@ impl NativeRuntime {
         changed
     }
 
-    pub(crate) fn tick_system_state(&mut self, now: std::time::Instant, active: bool) -> bool {
-        self.update_system_state(|state| state.tick(now, active))
+    pub(crate) fn tick_system_state(&mut self, active: bool) -> bool {
+        self.update_system_state(|state| state.tick(active))
     }
 
     pub(crate) fn offer_system_state(
@@ -2781,24 +2774,16 @@ impl NativeRuntime {
         changed
     }
 
-    pub(crate) fn preset_system_state_vault_sync(&mut self) -> bool {
-        let preset =
-            self.update_system_state(crate::system_state::SystemStateApp::preset_vault_sync);
-        if preset {
-            self.retire_system_state_review();
-        }
-        preset
-    }
-
-    pub(crate) fn system_state_shows_vault_sync(&self) -> bool {
-        self.instances.values().any(|app| match app {
-            NativeApp::SystemState(state) => state.shows_vault_sync(),
-            _ => false,
-        })
-    }
-
     pub(crate) fn accept_system_state_apply(&mut self, plan: aterm_types::macos_setup::Plan) {
         if self.update_system_state(|state| state.apply_accepted(plan)) {
+            self.retire_system_state_review();
+        }
+    }
+
+    /// The plan System State sent did not start: its groups go back to the
+    /// plan the worker holds.
+    pub(crate) fn refuse_system_state_apply(&mut self) {
+        if self.update_system_state(crate::system_state::SystemStateApp::apply_refused) {
             self.retire_system_state_review();
         }
     }
@@ -2833,16 +2818,15 @@ impl NativeRuntime {
         })
     }
 
-    /// Stop an automatic offer immediately without replacing the presented pointer target between a mouse press and its release.
-    pub(crate) fn system_state_interact(&mut self) -> bool {
-        let Some(state) = self.instances.values_mut().find_map(|app| match app {
+    /// Note whose gesture System State handles next (a person's, or a control
+    /// client's). It changes nothing the page shows, so no view repaints.
+    pub(crate) fn system_state_gesture(&mut self, by_person: bool) {
+        if let Some(state) = self.instances.values_mut().find_map(|app| match app {
             NativeApp::SystemState(state) => Some(state.as_mut()),
             _ => None,
-        }) else {
-            return false;
-        };
-        state.interact();
-        true
+        }) {
+            state.gesture(by_person);
+        }
     }
 
     pub(crate) fn document_id(&self, instance: AppInstanceId) -> Option<DocumentId> {

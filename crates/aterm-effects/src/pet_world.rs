@@ -764,6 +764,8 @@ impl PetWorld {
                 self.letters[row_base + c] = line == LineSize::SingleWidth
                     && if cell.wide {
                         c > 0 && self.letters[row_base + c - 1]
+                    } else if cell.ch.is_ascii() {
+                        cell.ch.is_ascii_alphanumeric()
                     } else {
                         cell.ch.is_alphanumeric()
                     };

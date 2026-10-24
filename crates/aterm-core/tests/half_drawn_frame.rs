@@ -210,7 +210,7 @@ fn ungated_kernel_latches_on_the_half_frame(cap: &Capture, busy: &'static dyn Ro
 
     let mut mutant = WatcherSet::default();
     let id = mutant.arm(spec(), at(base, 2_000)).expect("arm");
-    mutant.observe_screen(seq, false, 0, false, at(base, 2_000), &half, Frame::CLOSED);
+    mutant.observe_screen(seq, false, 0, 0, at(base, 2_000), &half, Frame::CLOSED);
     assert!(
         mutant.poll(id).is_some(),
         "MUTANT: a kernel that reads the half frame as whole latches gone"
@@ -224,10 +224,10 @@ fn ungated_kernel_latches_on_the_half_frame(cap: &Capture, busy: &'static dyn Ro
     };
     let mut gated = WatcherSet::default();
     let id = gated.arm(spec(), at(base, 2_000)).expect("arm");
-    gated.observe_screen(seq, false, 0, false, at(base, 2_000), &half, open);
+    gated.observe_screen(seq, false, 0, 0, at(base, 2_000), &half, open);
     assert!(gated.poll(id).is_none(), "the gate holds the half frame");
     assert_eq!(gated.row_scan_hull(false, half.len()), Some((10, 49)));
-    gated.observe_screen(seq, false, 0, false, at(base, 2_100), &half, Frame::CLOSED);
+    gated.observe_screen(seq, false, 0, 0, at(base, 2_100), &half, Frame::CLOSED);
     assert!(gated.poll(id).is_some(), "owed scan ran on the whole pass");
 }
 
@@ -536,8 +536,8 @@ fn mutant_gemini_cli_half_redraw_reads_gone_without_the_settle() {
     };
     let mut mutant = WatcherSet::default();
     let id = mutant.arm(spec(), at(base, 0)).expect("arm");
-    mutant.observe_screen(1, false, 0, false, at(base, 0), &busy_rows, Frame::CLOSED);
-    mutant.observe_screen(2, false, 0, false, at(base, 8_662), &half, Frame::CLOSED);
+    mutant.observe_screen(1, false, 0, 0, at(base, 0), &busy_rows, Frame::CLOSED);
+    mutant.observe_screen(2, false, 0, 0, at(base, 8_662), &half, Frame::CLOSED);
     assert!(
         mutant.poll(id).is_some(),
         "MUTANT: a kernel that believes the half redraw latches gone"
@@ -546,16 +546,8 @@ fn mutant_gemini_cli_half_redraw_reads_gone_without_the_settle() {
     let unbracketed = |off| Frame::unbracketed(Some(at(base, off)));
     let mut settled = WatcherSet::default();
     let id = settled.arm(spec(), at(base, 0)).expect("arm");
-    settled.observe_screen(1, false, 0, false, at(base, 0), &busy_rows, unbracketed(0));
-    settled.observe_screen(
-        2,
-        false,
-        0,
-        false,
-        at(base, 8_662),
-        &half,
-        unbracketed(8_662),
-    );
+    settled.observe_screen(1, false, 0, 0, at(base, 0), &busy_rows, unbracketed(0));
+    settled.observe_screen(2, false, 0, 0, at(base, 8_662), &half, unbracketed(8_662));
     assert!(
         settled.poll(id).is_none(),
         "the settle holds the half redraw"
@@ -564,7 +556,7 @@ fn mutant_gemini_cli_half_redraw_reads_gone_without_the_settle() {
         3,
         false,
         0,
-        false,
+        0,
         at(base, 9_078),
         &busy_rows,
         unbracketed(9_078),

@@ -1701,6 +1701,7 @@ pub struct Ribbon {
     ink_quads: usize,
     ember_at: Option<Instant>,
     rearm: Option<(Instant, f32)>,
+    translated_at: Option<Instant>,
     reduced: bool,
     pane: Option<(u16, u16)>,
     pane_rows: Option<(u16, u16)>,
@@ -3861,6 +3862,29 @@ impl Ribbon {
         let last = far
             .unwrap_or(col)
             .max(col.saturating_add(min_cells.saturating_sub(1)));
+        let mut right_latest: Option<Instant> = None;
+        for cell in &mut self.cells {
+            if cell.row != row
+                || cell.col <= last
+                || followed.contains(&(cell.row, cell.col, cell.born))
+            {
+                continue;
+            }
+            if let Some(prev) = cell.retract_at {
+                let capped = if prev > at {
+                    cell.retract_at = Some(at);
+                    at
+                } else {
+                    prev
+                };
+                if at.saturating_duration_since(capped).as_secs_f32() < RETRACT_FADE_S {
+                    right_latest = Some(right_latest.map_or(capped, |m| m.max(capped)));
+                }
+            }
+        }
+        let base_at = right_latest
+            .and_then(|t| t.checked_add(std::time::Duration::from_millis(16)))
+            .map_or(at, |t| at.max(t));
         let n = f32::from(last - col + 1);
         let step = span_s / n;
         for cell in &mut self.cells {
@@ -3873,7 +3897,9 @@ impl Ribbon {
                 continue;
             }
             let rank = f32::from(last - cell.col);
-            cell.retract_at = at.checked_add(std::time::Duration::from_secs_f32(rank * step));
+            cell.retract_at = at
+                .checked_add(std::time::Duration::from_secs_f32(rank * step))
+                .map(|t| t.max(base_at));
         }
     }
 
@@ -5741,6 +5767,10 @@ impl Ribbon {
             || (!self.reduced && self.seam.is_some() && !self.cells.is_empty())
             || self.cells.iter().any(|c| ramping(c.attack_at))
             || self.rearm.is_some_and(|(at, _)| ramping(at))
+            || self.translated_at.is_some_and(|at| {
+                now.saturating_duration_since(at)
+                    < super::witness::TWIN_MIN + std::time::Duration::from_millis(16)
+            })
             || (!self.reduced
                 && self
                     .cohorts
@@ -6107,8 +6137,11 @@ impl Ribbon {
                 coh.phase = Phase::Laying;
             }
         }
-        if !away && self.seam.is_some_and(|s| s.row == new_row) {
-            self.seam = None;
+        if !away {
+            self.translated_at = Some(at);
+            if self.seam.is_some_and(|s| s.row == new_row) {
+                self.seam = None;
+            }
         }
         // A run carries its own prior shape, including across multiple hops
         // in this batch. Never mutate another run's prior row state here.
@@ -14499,5 +14532,71 @@ mod tests {
             laid.attack_at < laid.born,
             "typed cell at translated attach must inherit spent attack"
         );
+    }
+
+    #[test]
+    fn chained_word_kills_retract_right_to_left_without_a_gap() {
+        let t0 = Instant::now();
+        let c = cfg(true, true);
+        let g = geom();
+        let mut rib = Ribbon::new();
+        let row = 5u16;
+        let text = "so that when you fix ";
+        let mut col = 2u16;
+        let mut t = t0;
+        for ch in text.chars() {
+            t += Duration::from_millis(40);
+            col += 1;
+            let cx = ctx_in(t, &c, (row, col), 0.7, g);
+            let ev = if ch == ' ' { typed_space() } else { typed() };
+            rib.on_event(&ev, t, &cx);
+            rib.plan(&cx);
+        }
+        let kills = [4u16, 4, 5, 5, 3];
+        for cells in kills {
+            for step_ms in (16..=160).step_by(16) {
+                let frame_t = t + Duration::from_millis(step_ms);
+                let cx = ctx_in(frame_t, &c, (row, col), 0.7, g);
+                rib.plan(&cx);
+                let mut lit_cols: Vec<u16> = rib
+                    .lit_segments()
+                    .map(|s| (s.x / g.cw as f32).floor() as u16)
+                    .collect();
+                lit_cols.sort_unstable();
+                lit_cols.dedup();
+                if let (Some(&lo), Some(&hi)) = (lit_cols.first(), lit_cols.last()) {
+                    for check_col in lo..=hi {
+                        assert!(
+                            lit_cols.binary_search(&check_col).is_ok(),
+                            "chained word-kill left an unlit gap at col {check_col} inside {lo}..={hi} ({lit_cols:?})"
+                        );
+                    }
+                }
+            }
+            t += Duration::from_millis(165);
+            let from = (row, col);
+            col -= cells;
+            let to = (row, col);
+            let cx_before = ctx_in(t, &c, from, 0.7, g);
+            rib.on_event(
+                &Event::Kill {
+                    cells,
+                    scope: super::super::KillScope::Word,
+                },
+                t,
+                &cx_before,
+            );
+            let cx_after = ctx_in(t, &c, to, 0.7, g);
+            rib.on_event(
+                &Event::Move {
+                    from,
+                    to,
+                    licence: Licence::Typed,
+                    dir: Dir::of(-i32::from(cells), 0),
+                },
+                t,
+                &cx_after,
+            );
+        }
     }
 }

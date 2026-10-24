@@ -2045,7 +2045,7 @@ fn a_decline_quiets_every_view_and_doubles_in_a_row() {
             state.navigate(SettingsRoute::Security);
             state.replace_macos_access(access.clone());
             state.arm_consent_gestures(ConsentGestures {
-                confirm: counting_no,
+                confirm: ConfirmArm::StandIn(counting_no),
                 ..ConsentGestures::inert()
             });
             state.arm_owner_quiet(std::sync::Arc::clone(&shared));
@@ -2392,7 +2392,7 @@ fn the_trash_alert_escapes_planted_names_and_counts_its_copies() {
         state.navigate(SettingsRoute::Security);
         state.replace_macos_access(access.clone());
         state.arm_consent_gestures(ConsentGestures {
-            confirm: record_no,
+            confirm: ConfirmArm::StandIn(record_no),
             ..ConsentGestures::inert()
         });
     }
@@ -2516,7 +2516,7 @@ fn a_press_behind_a_confirmed_alert_asks_nothing() {
             state.navigate(SettingsRoute::Security);
             state.replace_macos_access(access.clone());
             state.arm_consent_gestures(ConsentGestures {
-                confirm: counting_yes,
+                confirm: ConfirmArm::StandIn(counting_yes),
                 ..ConsentGestures::inert()
             });
             state.arm_owner_quiet(std::sync::Arc::clone(&shared));
@@ -2949,7 +2949,7 @@ fn a_confirmed_debugger_press_records_one_change_for_the_park() {
                 state.navigate(SettingsRoute::Security);
                 state.replace_macos_access(access.clone());
                 state.arm_consent_gestures(ConsentGestures {
-                    confirm: counting_yes,
+                    confirm: ConfirmArm::StandIn(counting_yes),
                     ..ConsentGestures::inert()
                 });
                 state.arm_owner_quiet(std::sync::Arc::clone(&shared));
@@ -3083,7 +3083,7 @@ fn a_debugger_press_the_row_does_not_offer_asks_nothing() {
                 state.replace_macos_access(debugger_access(facts));
             }
             state.arm_consent_gestures(ConsentGestures {
-                confirm: counting_yes,
+                confirm: ConfirmArm::StandIn(counting_yes),
                 ..ConsentGestures::inert()
             });
         }
@@ -3112,7 +3112,7 @@ fn a_debugger_press_the_row_does_not_offer_asks_nothing() {
 }
 
 #[test]
-fn the_debugger_alert_says_the_press_words_in_both_callers() {
+fn the_debugger_alert_says_what_the_press_changes() {
     use aterm_containment::consent::{
         DEBUGGER_ACCESS_REVERT, DebuggerChange, DebuggerMember, DebuggerMode, SelfHardening,
     };
@@ -3152,125 +3152,80 @@ fn the_debugger_alert_says_the_press_words_in_both_callers() {
     for hardening in hardenings {
         for evidence in [SpikeEvidence::UNMEASURED, measured] {
             let off = facts_for(DebuggerMode::Disabled, hardening);
-            let (press_title, press, press_proceed) =
-                debugger_access_alert(DebuggerChange::On, &off, evidence, DebuggerAlertFrom::Press);
-            let (launch_title, launch, launch_proceed) = debugger_access_alert(
-                DebuggerChange::On,
-                &off,
-                evidence,
-                DebuggerAlertFrom::Launch,
-            );
+            let (_, body, _) = debugger_access_alert(DebuggerChange::On, &off, evidence);
             let case = format!(
                 "{hardening:?} measured={}",
                 evidence.devtools_enable_measured
             );
-            assert_eq!(
-                (&press_title, press_proceed),
-                (&launch_title, launch_proceed),
-                "{case}: one title and one proceed button"
-            );
-            let (opening, rest) = launch.split_once("\n\n").expect("paragraphs");
+            let (_, undo) = body.rsplit_once("\n\n").expect("paragraphs");
             assert!(
-                !opening.contains('\n') && !press.contains(opening),
-                "{case}: the launch alert opens with why it is up, in one line of its own"
-            );
-            let (press_core, press_undo) = press.rsplit_once("\n\n").expect("paragraphs");
-            let (launch_core, launch_undo) = rest.rsplit_once("\n\n").expect("paragraphs");
-            assert_eq!(
-                launch_core, press_core,
-                "{case}: every other paragraph is the press's"
-            );
-            assert!(
-                launch_undo != press_undo && launch_undo.contains("Settings \u{25b8} Security"),
-                "{case}: the undo is sent to the Security page"
+                undo.contains(DEBUGGER_ACCESS_REVERT),
+                "{case}: the undo carries the revert line"
             );
             let bullet = debugger_alert_not_hardened_bullet(hardening);
-            for (body, undo) in [(&press, press_undo), (&launch, launch_undo)] {
-                assert!(
-                    undo.contains(DEBUGGER_ACCESS_REVERT),
-                    "{case}: the undo carries the revert line"
-                );
-                assert_eq!(
-                    bullet.is_some_and(|bullet| body.split('\n').any(|line| line == bullet)),
-                    off.not_hardened(),
-                    "{case}: what an unhardened aterm exposes, exactly when it is one"
-                );
-                assert_eq!(
-                    body.split('\n')
-                        .filter(|line| line.contains("this aterm"))
-                        .count(),
-                    1,
-                    "{case}: one line speaks of this aterm, so none contradicts it"
-                );
-                assert!(
-                    body.contains("SamplingTools"),
-                    "{case}: the dialog's name, before it asks"
-                );
-            }
+            assert_eq!(
+                bullet.is_some_and(|bullet| body.split('\n').any(|line| line == bullet)),
+                off.not_hardened(),
+                "{case}: what an unhardened aterm exposes, exactly when it is one"
+            );
+            assert_eq!(
+                body.split('\n')
+                    .filter(|line| line.contains("this aterm"))
+                    .count(),
+                1,
+                "{case}: one line speaks of this aterm, so none contradicts it"
+            );
+            assert!(
+                body.contains("SamplingTools"),
+                "{case}: the dialog's name, before it asks"
+            );
         }
-        for from in [DebuggerAlertFrom::Press, DebuggerAlertFrom::Launch] {
-            let off = facts_for(DebuggerMode::Disabled, hardening);
-            let on = facts_for(DebuggerMode::Enabled, hardening);
-            assert_ne!(
-                debugger_access_alert(DebuggerChange::On, &off, SpikeEvidence::UNMEASURED, from),
-                debugger_access_alert(DebuggerChange::On, &off, measured, from),
-                "{from:?}: the measured evidence changes the On words"
-            );
-            assert_ne!(
-                debugger_access_alert(DebuggerChange::Off, &on, SpikeEvidence::UNMEASURED, from),
-                debugger_access_alert(DebuggerChange::Off, &on, measured, from),
-                "{from:?}: and the Off words"
-            );
-            for evidence in [SpikeEvidence::UNMEASURED, measured] {
-                assert_eq!(
-                    debugger_access_alert(
-                        DebuggerChange::Off,
-                        &on,
-                        evidence,
-                        DebuggerAlertFrom::Launch
-                    ),
-                    debugger_access_alert(
-                        DebuggerChange::Off,
-                        &on,
-                        evidence,
-                        DebuggerAlertFrom::Press
-                    ),
-                    "Off reads the same for both"
-                );
-                for change in [DebuggerChange::On, DebuggerChange::Off] {
-                    let mode = if change == DebuggerChange::On {
-                        DebuggerMode::Disabled
-                    } else {
-                        DebuggerMode::Enabled
-                    };
-                    for member in [
-                        DebuggerMember::Admin,
-                        DebuggerMember::Developer,
-                        DebuggerMember::NotMember,
-                        DebuggerMember::Unknown,
-                    ] {
-                        let facts = debugger_facts(mode, member, hardening);
-                        if !facts.offers(change) {
-                            continue;
-                        }
-                        let (_, body, _) = debugger_access_alert(change, &facts, evidence, from);
-                        let case = format!(
-                            "{from:?} {change:?} {member:?} {hardening:?} measured={}",
-                            evidence.devtools_enable_measured
-                        );
-                        laid_out(&case, &body);
+        let off = facts_for(DebuggerMode::Disabled, hardening);
+        let on = facts_for(DebuggerMode::Enabled, hardening);
+        assert_ne!(
+            debugger_access_alert(DebuggerChange::On, &off, SpikeEvidence::UNMEASURED),
+            debugger_access_alert(DebuggerChange::On, &off, measured),
+            "the measured evidence changes the On words"
+        );
+        assert_ne!(
+            debugger_access_alert(DebuggerChange::Off, &on, SpikeEvidence::UNMEASURED),
+            debugger_access_alert(DebuggerChange::Off, &on, measured),
+            "and the Off words"
+        );
+        for evidence in [SpikeEvidence::UNMEASURED, measured] {
+            for change in [DebuggerChange::On, DebuggerChange::Off] {
+                let mode = if change == DebuggerChange::On {
+                    DebuggerMode::Disabled
+                } else {
+                    DebuggerMode::Enabled
+                };
+                for member in [
+                    DebuggerMember::Admin,
+                    DebuggerMember::Developer,
+                    DebuggerMember::NotMember,
+                    DebuggerMember::Unknown,
+                ] {
+                    let facts = debugger_facts(mode, member, hardening);
+                    if !facts.offers(change) {
+                        continue;
+                    }
+                    let (_, body, _) = debugger_access_alert(change, &facts, evidence);
+                    let case = format!(
+                        "{change:?} {member:?} {hardening:?} measured={}",
+                        evidence.devtools_enable_measured
+                    );
+                    laid_out(&case, &body);
+                    assert!(
+                        member == DebuggerMember::Admin || !body.contains("your admin"),
+                        "{case}: an account that is not an admin is not told the admin \
+                         password is its own"
+                    );
+                    let path = "/usr/sbin/DevToolsSecurity";
+                    for (at, _) in body.match_indices(path) {
                         assert!(
-                            member == DebuggerMember::Admin || !body.contains("your admin"),
-                            "{case}: an account that is not an admin is not told the admin \
-                             password is its own"
+                            body[at + path.len()..].starts_with(" -disable"),
+                            "{case}: only the revert names the tool"
                         );
-                        let path = "/usr/sbin/DevToolsSecurity";
-                        for (at, _) in body.match_indices(path) {
-                            assert!(
-                                body[at + path.len()..].starts_with(" -disable"),
-                                "{case}: only the revert names the tool"
-                            );
-                        }
                     }
                 }
             }
@@ -3296,7 +3251,7 @@ fn owner_confirms_with_mints_a_yes_only_from_the_alert() {
     }
     type Confirm = fn(&str, &str, &str) -> Option<bool>;
     let arm = |confirm: Confirm| ConsentGestures {
-        confirm,
+        confirm: ConfirmArm::StandIn(confirm),
         ..ConsentGestures::inert()
     };
     let quiet = SharedOwnerQuiet::default();
@@ -3328,7 +3283,7 @@ fn owner_confirms_with_mints_a_yes_only_from_the_alert() {
 }
 
 #[test]
-fn a_debugger_alert_answered_on_the_page_answers_the_launch_ask() {
+fn a_debugger_alert_answered_on_the_page_settles_the_step() {
     use aterm_containment::consent::{DebuggerMember, DebuggerMode, SelfHardening};
     fn yes(_title: &str, _body: &str, _proceed: &str) -> Option<bool> {
         Some(true)
@@ -3356,7 +3311,7 @@ fn a_debugger_alert_answered_on_the_page_answers_the_launch_ask() {
                 SelfHardening::Hardened,
             )));
             state.arm_consent_gestures(ConsentGestures {
-                confirm,
+                confirm: ConfirmArm::StandIn(confirm),
                 ..ConsentGestures::inert()
             });
             state.arm_owner_quiet(std::sync::Arc::clone(&shared));
@@ -3417,7 +3372,7 @@ fn a_declined_debugger_alert_quiets_the_block_and_records_nothing() {
             unreachable!();
         };
         state.arm_consent_gestures(ConsentGestures {
-            confirm: |_, _, _| Some(false),
+            confirm: ConfirmArm::StandIn(|_, _, _| Some(false)),
             ..ConsentGestures::inert()
         });
     }
@@ -4670,7 +4625,7 @@ fn the_developer_tools_button_asks_the_host_for_the_one_hand_over() {
         ));
         state.arm_consent_gestures(ConsentGestures {
             open_settings: recording,
-            confirm: never_confirm,
+            confirm: ConfirmArm::StandIn(never_confirm),
             asks_devtools_hand_over: || true,
             ..ConsentGestures::inert()
         });

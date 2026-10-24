@@ -793,6 +793,66 @@ fn a_landing_whose_acts_outran_its_own_turns_begin_stays_landed() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// A landing whose acts outran the screen reader's first `busy` read of its own turn stays landed (the codex-alab lab's reland leg, 2026-10-23: a land turn answered in 50 ms, its `landed@v1` admitted before the host's reader saw the turn's busy screen, which then reopened it). NEGATIVE CONTROL: the same late `busy` read with no `land@v1` before the landing (no turn owed) reopens it, and so does the next turn's after an owed one.
+#[test]
+fn a_landing_whose_acts_outran_its_own_turns_busy_screen_stays_landed() {
+    let stamp = |seq: u64| crate::session_timeline::AgentStamp {
+        generation: crate::control::ScreenGen { epoch: 1, seq },
+        fp: seq,
+    };
+    let read = |tab: &Tab, word: &'static str, seq: u64| {
+        tab.ctx.timeline.lock().unwrap().publish_agent(
+            word,
+            None,
+            None,
+            Some(aterm_phase::Program::Codex),
+            stamp(seq),
+        );
+    };
+    let mut wrong = Vec::new();
+    for owed in [true, false] {
+        let mut tab = Tab::new();
+        read(&tab, "idle", 1);
+        for bytes in [IDLE, WORKING, DONE] {
+            tab.says(bytes);
+            tab.sweep();
+        }
+        if owed {
+            let wakes = tab.act("land@v1");
+            tab.apply(wakes);
+        }
+        tab.lands();
+        // The land turn's busy screen, read after its landing.
+        read(&tab, "busy", 2);
+        tab.app.reopen_self_claim_landing(tab.session);
+        tab.sweep();
+        let want = if owed {
+            TaskFace::Landed
+        } else {
+            TaskFace::Open
+        };
+        if tab.face() != Some(want) {
+            wrong.push(format!(
+                "owed {owed}: the land turn's busy screen, read after the landing: {:?}",
+                tab.face()
+            ));
+        }
+        if owed {
+            read(&tab, "idle", 3);
+            read(&tab, "busy", 4);
+            tab.app.reopen_self_claim_landing(tab.session);
+            if tab.face() != Some(TaskFace::Open) {
+                wrong.push(format!(
+                    "a turn's busy screen after the owed one: {:?}",
+                    tab.face()
+                ));
+            }
+        }
+        tab.done();
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// Non-turn acts (`mail-report@v1`, `approve-all@v1`, `answer-recommended@v1`) do not advance the landing's turn.
 #[test]
 fn an_act_that_starts_no_turn_leaves_the_landings_turn_as_it_was() {

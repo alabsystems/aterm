@@ -12914,8 +12914,16 @@ fn clt_install_aliases_are_recognized_by_atpkg_install() {
         let developer = root.join("CommandLineTools");
         std::fs::create_dir_all(&shim).unwrap();
         let cc = shim.join("cc");
-        std::fs::write(&cc, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::write(&cc, "#!/bin/sh\n[ \"$1\" = -o ] && printf x > \"$2\"\n").unwrap();
         std::fs::set_permissions(&cc, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let xcrun = shim.join("xcrun");
+        std::fs::write(
+            &xcrun,
+            format!("#!/bin/sh\necho '{}/usr/bin/cc'\n", developer.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&xcrun, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
         let host = crate::prereq::CcHost {
             shim_dir: Some(shim.clone()),
             xcode_select_link: root.join("no-link"),
@@ -12923,6 +12931,7 @@ fn clt_install_aliases_are_recognized_by_atpkg_install() {
             bound: std::time::Duration::from_secs(60),
             tmp_root: root.to_path_buf(),
         };
+        assert!(super::clt_which_line("clt", Some(shim.as_os_str()), &host).is_err());
         let clang = developer.join("usr/bin/clang");
         std::fs::create_dir_all(clang.parent().unwrap()).unwrap();
         std::fs::write(&clang, "").unwrap();

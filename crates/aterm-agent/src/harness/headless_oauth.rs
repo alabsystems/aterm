@@ -1651,13 +1651,16 @@ pub fn browser_profile_dir(store_dir: &Path, account_key: Option<&str>) -> PathB
     store_dir.join(BROWSER_PROFILES_DIR).join(key)
 }
 
+fn strip_email_subaddress(email: &str) -> Option<String> {
+    let (local, domain) = email.trim().split_once('@')?;
+    let base = local.split('+').next().unwrap_or(local);
+    (base != local && !base.is_empty()).then(|| format!("{base}@{domain}"))
+}
+
 /// Whether `store_dir` already has a persistent headless browser profile for `label` or `email`.
 #[must_use]
 pub fn has_browser_profile(store_dir: &Path, label: &str, email: Option<&str>) -> bool {
-    if browser_profile_dir(store_dir, Some(label)).is_dir() {
-        return true;
-    }
-    email.is_some_and(|em| browser_profile_dir(store_dir, Some(em)).is_dir())
+    resolve_browser_profile_dir(store_dir, Some(label), email).is_dir()
 }
 
 /// Infer the account label from `CLAUDE_CONFIG_DIR` (`<store>/logins/<label>[+<seq>]`) when set.
@@ -1677,19 +1680,36 @@ pub fn resolve_browser_profile_dir(
     label: Option<&str>,
     email: Option<&str>,
 ) -> PathBuf {
+    let base_email = email.and_then(strip_email_subaddress);
     if let Some(em) = email {
         let dir = browser_profile_dir(store_dir, Some(em));
         if dir.is_dir() {
             return dir;
         }
+        if let Some(base) = base_email.as_deref() {
+            let base_dir = browser_profile_dir(store_dir, Some(base));
+            if base_dir.is_dir() {
+                return base_dir;
+            }
+        }
     }
     if let Some(lbl) = label {
-        let dir = browser_profile_dir(store_dir, Some(lbl));
+        for candidate in [lbl.to_owned(), lbl.replace('_', "-"), lbl.replace('-', "_")] {
+            let dir = browser_profile_dir(store_dir, Some(&candidate));
+            if dir.is_dir() {
+                return dir;
+            }
+        }
+    }
+    if let Some(em) = email
+        && let Some(derived) = derive_account_label_from_email(em)
+    {
+        let dir = browser_profile_dir(store_dir, Some(&derived));
         if dir.is_dir() {
             return dir;
         }
     }
-    browser_profile_dir(store_dir, email.or(label))
+    browser_profile_dir(store_dir, base_email.as_deref().or(email).or(label))
 }
 
 /// Run authorization with a persistent store profile or an owned scratch profile.
@@ -1898,16 +1918,13 @@ pub fn extract_otps_from_email(raw_email: &str, target_email: Option<&str>) -> V
     if !prioritized.is_empty() {
         return prioritized;
     }
-    let body_section = raw_email
-        .split_once("\r\n\r\n")
-        .or_else(|| raw_email.split_once("\n\n"))
-        .map_or(raw_email, |(_, b)| b);
+    let body_section = super::open_url::split_header_body(raw_email).map_or(raw_email, |(_, b)| b);
     let qp_decoded = if is_json_with_body {
         String::new()
     } else if super::open_url::is_quoted_printable_email(raw_email) {
         super::open_url::decode_rfc2047_words(&decode_quoted_printable(body_section))
     } else {
-        super::open_url::decode_rfc2047_words(body_section)
+        super::open_url::decode_rfc2047_words(&super::open_url::decode_qp_mime_parts(body_section))
     };
     let subject_extra = if is_json_with_body {
         String::new()
@@ -2560,6 +2577,9 @@ fn fetch_imap_credential(
     seen_otps: &mut BTreeSet<String>,
 ) -> Option<MailboxCredential> {
     let imap_url = cfg.effective_imap_url(target_email)?;
+    if cleartext_refusal(&imap_url).is_some() {
+        return None;
+    }
     let parsed = parse_imap_url(&imap_url)?;
     let fallback_user = cfg.webmail_user_for(target_email);
     let user = parsed
@@ -2601,6 +2621,56 @@ fn fetch_imap_credential(
 fn authority_and_tail(rest: &str) -> (&str, &str) {
     rest.find(['/', '?', '#'])
         .map_or((rest, ""), |end| rest.split_at(end))
+}
+
+/// Whether `host` is this machine's loopback (`localhost`, `127.0.0.0/8`, `::1`).
+fn is_loopback_host(host: &str) -> bool {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    bare.eq_ignore_ascii_case("localhost")
+        || bare
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Why no credential is sent to `url`: `imap://` and `http://` carry it in cleartext, so only to a loopback host.
+fn cleartext_refusal(url: &str) -> Option<&'static str> {
+    if let Some(imap) = parse_imap_url(url) {
+        return (!imap.tls && !is_loopback_host(&imap.host)).then_some(
+            "imap:// sends its login in cleartext, so it is used only for a loopback host; \
+             name an imaps:// mailbox",
+        );
+    }
+    let (authority, _) = authority_and_tail(url.strip_prefix("http://")?);
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, hp)| hp);
+    let host = match host_port.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(v6),
+        None => host_port.rsplit_once(':').map_or(host_port, |(h, _)| h),
+    };
+    (!is_loopback_host(host)).then_some(
+        "http:// sends its password or token in cleartext, so it is used only for a loopback \
+         host; name an https:// mailbox",
+    )
+}
+
+/// Why `cfg` is not polled for `target_email`: an `imap://` login, or an `http://` password or token, to a host that is not loopback ([`cleartext_refusal`]).
+#[must_use]
+pub fn plaintext_credential_refusal(
+    cfg: &MailboxConfig,
+    target_email: Option<&str>,
+) -> Option<&'static str> {
+    if let Some(why) = cfg
+        .effective_imap_url(target_email)
+        .as_deref()
+        .and_then(cleartext_refusal)
+    {
+        return Some(why);
+    }
+    let url = cfg.http_url.as_deref()?;
+    let credentialed = url_has_embedded_userinfo(url)
+        || cfg.bearer_token.as_deref().is_some_and(|t| !t.is_empty())
+        || (cfg.webmail_user_for(target_email).is_some()
+            && cfg.password_for(target_email).is_some());
+    credentialed.then(|| cleartext_refusal(url)).flatten()
 }
 
 struct LoopbackHttpUrl<'a> {
@@ -2714,6 +2784,11 @@ fn fetch_http_url_body(
         } else {
             None
         };
+        if (credential.is_some() || url_has_embedded_userinfo(url))
+            && cleartext_refusal(url).is_some()
+        {
+            return None;
+        }
         let mut options = vec![("url", url)];
         if let Some((name, value)) = &credential {
             options.push((*name, value.as_str()));
@@ -3133,6 +3208,9 @@ pub(super) fn poll_mailbox_config_for_credential_with_seen_otps(
         }
         return Err("headless browser requires sign-in, but no mailbox is configured");
     }
+    if let Some(why) = plaintext_credential_refusal(cfg, target_email) {
+        return Err(why);
+    }
     let deadline = Instant::now() + timeout;
     let mut tried_files = BTreeSet::new();
     let mut seen_digests = load_seen_digests(cfg.seen_file.as_deref());
@@ -3452,7 +3530,7 @@ pub fn oauth_step_js(
     if (btn.disabled) continue;
     const text = btnText(btn);
     const hrefAttr = String(btn.getAttribute("href") || "");
-    const isCancel = text.includes("cancel") || text.includes("deny") || text.includes("decline") || text.includes("reject");
+    const isCancel = text.includes("cancel") || text.includes("deny") || text.includes("decline") || text.includes("reject") || text.includes("do not ") || text.includes("don't ") || text.includes("dont ") || text.includes("not allow") || text.includes("not authorize");
     if (!isCancel && (
       text === "authorize" ||
       text.startsWith("authorize ") ||
@@ -3513,7 +3591,7 @@ pub fn oauth_step_js(
     for (const btn of buttons) {{
       if (btn.disabled) continue;
       const text = btnText(btn);
-      const isCancel = text.includes("cancel") || text.includes("deny") || text.includes("decline") || text.includes("reject");
+      const isCancel = text.includes("cancel") || text.includes("deny") || text.includes("decline") || text.includes("reject") || text.includes("do not ") || text.includes("don't ") || text.includes("dont ") || text.includes("not allow") || text.includes("not authorize");
       if (!isCancel && text.startsWith("continue as ") && hasTargetEmail(text)) {{
         btn.click();
         return {{ state: "clicked_consent", url: href, target: text }};
@@ -3523,7 +3601,7 @@ pub fn oauth_step_js(
   for (const btn of buttons) {{
     if (btn.disabled) continue;
     const text = btnText(btn);
-    const isCancel = text.includes("cancel") || text.includes("deny") || text.includes("decline") || text.includes("reject");
+    const isCancel = text.includes("cancel") || text.includes("deny") || text.includes("decline") || text.includes("reject") || text.includes("do not ") || text.includes("don't ") || text.includes("dont ") || text.includes("not allow") || text.includes("not authorize");
     if (targetEmail && text.startsWith("continue as ") && emailsIn(text).length > 0 && !hasTargetEmail(text)) {{
       continue;
     }}
@@ -4495,8 +4573,11 @@ pub(super) fn authorize_with_headless_browser_config_and_credential(
 
     let _flow = MailboxFlow::new(authorize_url)?;
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let browser = find_headless_browser(home.as_deref())
-        .ok_or("no headless browser found (run `targo --unverified verify provision chrome-headless-shell`)")?;
+    let browser = find_headless_browser(home.as_deref()).ok_or(
+        "no headless browser found (install Google Chrome, name a Chromium in \
+         $ATERM_BROWSER, or in an aterm checkout run `targo --unverified verify provision \
+         chrome-headless-shell`)",
+    )?;
 
     let email = target_email
         .filter(|e| !e.trim().is_empty())

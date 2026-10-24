@@ -445,7 +445,7 @@ pub fn hold_rows_in(body: &str, sid: Option<&str>) -> Vec<(i64, RowSaid)> {
 
 /// A `fact-hold@v1` row's reason read back ([`row_reason`]); `None` for one this build did not
 /// write.
-fn row_said(reason: &str) -> Option<RowSaid> {
+pub(super) fn row_said(reason: &str) -> Option<RowSaid> {
     let mut words = reason.split(' ');
     let head = words.next()?;
     let mut held_ms = None;

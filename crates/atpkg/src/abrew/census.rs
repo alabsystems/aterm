@@ -98,12 +98,13 @@ impl Catalog for Index<'_> {
     }
 
     fn cask(&self, token: &str) -> Result<Cask, String> {
-        let short = Formula::short_name(token);
+        let raw_short = Formula::short_name(token);
+        let short = api::canonical_cask_token(raw_short);
         let record = self
             .casks
             .get(short)
-            .ok_or_else(|| format!("abrew: no such cask: {short}"))?;
-        api::cask_record(record, short)
+            .ok_or_else(|| format!("abrew: no such cask: {raw_short}"))?;
+        api::cask_record(record, token)
     }
 }
 

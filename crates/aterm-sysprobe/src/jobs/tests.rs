@@ -424,16 +424,6 @@ fn the_program_check_judge_holds_only_an_old_lone_unstarted_thread() {
     for (row, facts, want) in rows {
         assert_eq!(judge_start(&facts), want, "{row}: {facts:?}");
     }
-    assert_eq!(
-        [
-            AtStart::Started,
-            AtStart::Held,
-            AtStart::Translating,
-            AtStart::Unstarted
-        ]
-        .map(AtStart::word),
-        ["started", "program-check", "translating", "not-started"]
-    );
 }
 
 const STAT: &str = "4711 (my (odd) cmd) S 4700 4711 4600 34817 4711 4194560 900 0 3 0 \
@@ -707,7 +697,8 @@ fn the_linux_arm_reads_a_fixture_tree() {
             size: 36,
             dev: 0,
             ino: 991,
-            lf_tail: None
+            lf_tail: None,
+            fresh_dylib: false
         })
     );
     assert_eq!(kind(2), Some(FdKind::Device { tty: true }));
@@ -1109,6 +1100,111 @@ fn a_program_stopped_after_it_ran_keeps_its_thread_handles() {
     cat.kill().expect("kill");
     drop(stdin);
     cat.wait().expect("reaped");
+}
+
+/// A FRESH DYLIB is one whose name ends `.dylib` and whose data changed at most an hour
+/// before the process that holds it started, or since; a start that is unread, or a change
+/// time before the epoch, makes none fresh.
+#[test]
+fn a_fresh_dylib_is_one_written_at_most_an_hour_before_its_holder_started() {
+    let start = 1_800_000_000_000_000u64;
+    let hour = i64::try_from(FRESH_DYLIB_US / 1_000_000).expect("an hour in seconds");
+    for (row, path, mtime, start, want) in [
+        (
+            "written since",
+            &b"/t/libserde_derive-1.dylib"[..],
+            1_800_000_100,
+            Some(start),
+            true,
+        ),
+        (
+            "an hour before",
+            b"/t/libserde_derive-1.dylib",
+            1_800_000_000 - hour,
+            Some(start),
+            true,
+        ),
+        (
+            "past the hour",
+            b"/t/libserde_derive-1.dylib",
+            1_800_000_000 - hour - 1,
+            Some(start),
+            false,
+        ),
+        (
+            "no dylib",
+            b"/t/libserde_derive-1.rlib",
+            1_800_000_100,
+            Some(start),
+            false,
+        ),
+        (
+            "start unread",
+            b"/t/libserde_derive-1.dylib",
+            1_800_000_100,
+            None,
+            false,
+        ),
+        (
+            "before the epoch",
+            b"/t/libserde_derive-1.dylib",
+            -1,
+            Some(start),
+            false,
+        ),
+    ] {
+        assert_eq!(fresh_dylib(path, mtime, start), want, "{row}");
+    }
+}
+
+/// A MEMBER'S DESCRIPTORS NAME A FRESH DYLIB IT HOLDS OPEN: this process, which started
+/// before the scratch files were written, holds a `.dylib` written now (fresh), a text file
+/// written now and a `.dylib` whose change time was set a day back (neither).
+#[cfg(target_os = "macos")]
+#[test]
+fn a_members_descriptors_name_a_fresh_dylib_it_holds_open() {
+    use std::os::fd::AsRawFd as _;
+    let dir = aterm_tempfile::tempdir().expect("scratch dir");
+    let open = |name: &str| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, b"\xcf\xfa\xed\xfe").expect("write a scratch file");
+        std::fs::File::open(&path).expect("open it")
+    };
+    let fresh = open("libfresh.dylib");
+    let text = open("notes.txt");
+    let old = open("libold.dylib");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.path().join("libold.dylib"))
+        .and_then(|f| {
+            f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(86_400))
+        })
+        .expect("set its change time a day back");
+    let f = JobsReader::new()
+        .read(ReadReq {
+            pid: std::process::id(),
+            fds: true,
+        })
+        .expect("this process reads itself");
+    let fds = f.fds.as_deref().expect("its descriptors read");
+    let fresh_at = |fd: i32| {
+        fds.iter().find(|r| r.fd == fd).map(|r| {
+            matches!(
+                r.kind,
+                FdKind::File {
+                    fresh_dylib: true,
+                    ..
+                }
+            )
+        })
+    };
+    assert_eq!(
+        fresh_at(fresh.as_raw_fd()),
+        Some(true),
+        "a dylib written now: {fds:?}"
+    );
+    assert_eq!(fresh_at(text.as_raw_fd()), Some(false), "no dylib: {fds:?}");
+    assert_eq!(fresh_at(old.as_raw_fd()), Some(false), "a day old: {fds:?}");
 }
 
 /// A job member's reading carries where it stands at its start: this

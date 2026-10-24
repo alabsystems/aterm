@@ -565,6 +565,83 @@ fn the_book_is_read_only_when_private() {
     assert_eq!(read_peers(dir).unwrap(), vec![manual("m7", 7100)]);
 }
 
+const LOCK_CHILD: &str = "ATERM_NET_FLEET_LOCK_CHILD";
+
+#[test]
+fn a_leave_goes_on_unlocked_only_where_no_edit_could_lock() {
+    let state = State::new("leave-lock");
+    let dir = state.dir();
+    let lock = dir.join(PEERS_LOCK);
+    std::fs::create_dir(&lock).unwrap();
+    assert_eq!(with_book_held(dir, |_| 7), Ok(7), "a lock that is no file");
+    std::fs::remove_dir(&lock).unwrap();
+    let linked = dir.parent().unwrap().join("linked-state");
+    std::os::unix::fs::symlink(dir, &linked).unwrap();
+    assert_eq!(with_book_held(&linked, |_| 7), Ok(7), "a symlink");
+    let none = dir.join("none");
+    assert_eq!(with_book_held(&none, |_| 7), Ok(7), "no directory");
+    assert!(!none.exists(), "nor is one made");
+    mode(dir, 0o750);
+    let held = with_book_held(dir, |narrowed| {
+        let bits = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+        let other = BookLock::take(dir, Duration::ZERO).err().map(|e| e.kind());
+        (narrowed, bits, other)
+    });
+    assert_eq!(
+        held,
+        Ok((Some(0o750), 0o700, Some(io::ErrorKind::WouldBlock))),
+        "a directory open to others, narrowed as an edit narrows it, then locked"
+    );
+    let other = BookLock::take(dir, Duration::ZERO).unwrap();
+    mode(dir, 0o750);
+    let refused = with_book_held(dir, |_| ()).unwrap_err();
+    assert!(refused.contains("(750), and is 0700 now"), "{refused}");
+    drop(other);
+
+    let exe = std::env::current_exe().expect("the test binary");
+    let mut child = aterm_uds::spawnfd::command(exe);
+    child
+        .args([
+            "--exact",
+            "fleet_member::tests::leave_with_no_descriptor_free",
+            "--nocapture",
+            "--test-threads",
+            "1",
+        ])
+        .env(LOCK_CHILD, dir);
+    let out = aterm_uds::deadline::output_until(&mut child, Instant::now() + HANG)
+        .expect("the child ran");
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        said.contains("leave: refused"),
+        "a failure of the moment, which another edit may not meet: {said}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn leave_with_no_descriptor_free() {
+    use std::os::fd::AsRawFd as _;
+    let Some(dir) = std::env::var_os(LOCK_CHILD) else {
+        return;
+    };
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `getrlimit` writes the struct this frame owns.
+    let got = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
+    assert_eq!(got, 0);
+    // The lowest descriptor free, as the limit: no file opens after.
+    let lowest = std::fs::File::open("/dev/null").unwrap().as_raw_fd();
+    limit.rlim_cur = libc::rlim_t::try_from(lowest).unwrap();
+    // SAFETY: `setrlimit` reads the struct this frame owns: a soft limit under the hard one.
+    let set = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
+    assert_eq!(set, 0);
+    let ran = with_book_held(Path::new(&dir), |_| ());
+    println!("leave: {}", if ran.is_ok() { "ran" } else { "refused" });
+}
+
 #[test]
 fn the_book_is_keyed_by_node_and_never_grows_past_its_cap() {
     let mut book = vec![manual("10.0.0.7", 7100), manual("lab-mini", 7100)];
@@ -1046,6 +1123,7 @@ fn a_driver_an_old_copy_alone_binds_is_checked_against_the_issuers_book() {
     let issuing = Issuing::proving(secret(5), issuer_state.dir(), issuer(0x11), i.clone());
 
     let member = State::new("recheck-member");
+    write_key_file(member.dir(), &[5; SECRET_LEN]).unwrap();
     let me = identity(&node_of(0x77), 7);
     let issuer_at = |port, key| Peer {
         key,
@@ -1079,37 +1157,67 @@ fn a_driver_an_old_copy_alone_binds_is_checked_against_the_issuers_book() {
     let copied = || read_issuer_book(member.dir(), i.node());
 
     assert_eq!(
-        driver_as_of(as_of(&n).as_ref(), (member.dir(), &grants), young(), unread),
+        driver_as_of(
+            as_of(&n).as_ref(),
+            (member.dir(), &grants, &secret(5)),
+            young(),
+            unread
+        ),
         Ok(n.node().to_owned()),
         "a young copy admits with no read"
     );
     assert_eq!(
-        driver_as_of(as_of(&i).as_ref(), (member.dir(), &grants), old(), unread),
+        driver_as_of(
+            as_of(&i).as_ref(),
+            (member.dir(), &grants, &secret(5)),
+            old(),
+            unread
+        ),
         Ok(i.node().to_owned()),
         "the member's own issuer, however old the copy"
     );
     assert_eq!(
-        driver_as_of(as_of(&n).as_ref(), (member.dir(), &grants), old(), fetched),
+        driver_as_of(
+            as_of(&n).as_ref(),
+            (member.dir(), &grants, &secret(5)),
+            old(),
+            fetched
+        ),
         Ok(n.node().to_owned()),
         "the issuer's book still binds it"
     );
 
     write_book(issuer_state.dir(), &[]);
     assert_eq!(
-        driver_as_of(as_of(&n).as_ref(), (member.dir(), &grants), old(), fetched),
+        driver_as_of(
+            as_of(&n).as_ref(),
+            (member.dir(), &grants, &secret(5)),
+            old(),
+            fetched
+        ),
         Err(Undriven::Unproven(Unproven::Unbound(n.node().to_owned()))),
         "taken out on the issuer: refused"
     );
     assert!(copied().is_empty(), "the copy follows the issuer's book");
     assert_eq!(
-        driver_as_of(as_of(&n).as_ref(), (member.dir(), &grants), young(), unread),
+        driver_as_of(
+            as_of(&n).as_ref(),
+            (member.dir(), &grants, &secret(5)),
+            young(),
+            unread
+        ),
         Err(Undriven::Unproven(Unproven::Unbound(n.node().to_owned()))),
         "and refuses by itself from then"
     );
 
     write_issuer_book(member.dir(), i.node(), &[copy(entry.clone())]).unwrap();
     write_book(member.dir(), &[issuer_at(closed_port(), Some(i.key()))]);
-    let refused = driver_as_of(as_of(&n).as_ref(), (member.dir(), &grants), old(), fetched);
+    let refused = driver_as_of(
+        as_of(&n).as_ref(),
+        (member.dir(), &grants, &secret(5)),
+        old(),
+        fetched,
+    );
     assert!(
         matches!(&refused, Err(Undriven::Unchecked { node, .. }) if node == n.node()),
         "{refused:?}"
@@ -1121,11 +1229,31 @@ fn a_driver_an_old_copy_alone_binds_is_checked_against_the_issuers_book() {
     );
     assert_eq!(copied(), vec![copy(entry.clone())]);
     write_book(member.dir(), &[issuer_at(issuing.port, None)]);
-    let claimed = driver_as_of(as_of(&n).as_ref(), (member.dir(), &grants), old(), fetched);
+    let claimed = driver_as_of(
+        as_of(&n).as_ref(),
+        (member.dir(), &grants, &secret(5)),
+        old(),
+        fetched,
+    );
     assert!(
         matches!(&claimed, Err(Undriven::Unchecked { why, .. }) if why.contains("no key to its issuer")),
         "{claimed:?}"
     );
+
+    // A leave while the issuer's book is read: nothing of the fleet is written back.
+    write_book(member.dir(), &[issuer_at(issuing.port, Some(i.key()))]);
+    remove_private(member.dir(), KEY_FILE).unwrap();
+    let left = driver_as_of(
+        as_of(&n).as_ref(),
+        (member.dir(), &grants, &secret(5)),
+        old(),
+        fetched,
+    );
+    assert_eq!(
+        left,
+        Err(Undriven::Unproven(Unproven::Unbound(n.node().to_owned())))
+    );
+    assert_eq!(copied(), vec![copy(entry.clone())], "the copy as it was");
 }
 
 #[test]
@@ -3019,6 +3147,71 @@ fn the_issuers_book_never_waits_on_another_entrys_survey_of_it() {
 }
 
 #[test]
+fn the_issuers_book_waits_out_an_exchange_open_where_its_name_answers() {
+    const WITHIN: Duration = Duration::from_secs(1);
+    let (asked, came) = std::sync::mpsc::channel::<()>();
+    let asked = std::sync::Mutex::new(asked);
+    let state = State::new("book-waits");
+    issue(state.dir());
+    let issuing = Issuing::hooked(
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(),
+        secret(5),
+        state.dir(),
+        issuer(0x11),
+        EVERY_OP,
+        Arc::new(move |op| {
+            if op == FleetOp::Book {
+                let _ = asked.lock().unwrap().send(());
+            }
+            None
+        }),
+    );
+    let by_name = Target {
+        host: "127.0.0.1".to_owned(),
+        addr: None,
+        port: issuing.port,
+        node: Some(issuer(0x11).node),
+        key: None,
+    };
+    let held = HeldAddrs::default();
+    let Ok(theirs) = held.enter(SocketAddr::from((Ipv4Addr::LOCALHOST, issuing.port))) else {
+        panic!("an exchange open there already");
+    };
+    let read = |within: Duration| {
+        fetch_book_in(
+            &by_name,
+            (&secret(5), None),
+            (Instant::now() + within, within),
+            (Some(&held), None),
+        )
+    };
+    let waited = read(WITHIN);
+    assert!(
+        matches!(&waited, Err(BookUnread::Unreached(Unreached::Deadline(..)))),
+        "{waited:?}"
+    );
+    assert!(
+        came.try_recv().is_err(),
+        "the book was asked beside the open exchange"
+    );
+    let book = std::thread::scope(|scope| {
+        let reading = scope.spawn(|| read(HANG));
+        aterm_spec::wait::within(HANG, Duration::from_millis(5), || {
+            (Arc::strong_count(&theirs.exchange) > 2).then_some(())
+        })
+        .expect("the book waits on the open exchange");
+        drop(theirs);
+        reading.join().unwrap()
+    });
+    assert!(
+        matches!(&book, Ok(book) if book.node == issuer(0x11).node),
+        "{book:?}"
+    );
+    came.recv_timeout(HANG)
+        .expect("the book was asked once the exchange closed");
+}
+
+#[test]
 fn an_entry_refused_by_the_copys_key_is_read_again_by_the_books() {
     let (old, new) = (identity(&node_of(0xda), 1), identity(&node_of(0xda), 2));
     let (dialled, came) = std::sync::mpsc::channel::<()>();
@@ -3316,6 +3509,34 @@ fn a_failed_book_ends_the_issuers_seat_or_names_where_to_survey_it() {
     assert_eq!(answered_at(&unread(busy())), Some(at.ip()));
     assert_eq!(answered_at(&unread(refused())), None);
     assert_eq!(answered_at(&unread(cut)), None);
+}
+
+#[test]
+fn a_dial_refused_as_busy_past_a_dead_address_names_the_busy_one() {
+    let (dead, busy): (SocketAddr, SocketAddr) =
+        (([10, 0, 0, 7], 7300).into(), ([10, 0, 0, 8], 7300).into());
+    let deadline = Instant::now() + HANG;
+    let by_name: Resolver = |_, port| vec![SocketAddr::from(([10, 0, 0, 8], port))];
+    let walked = walk(
+        ("m7.local", Some(dead.ip()), dead.port()),
+        (deadline, HANG),
+        (&[], by_name),
+        |to| -> AtAddr<()> {
+            AtAddr::Passed(if to == dead {
+                Unreached::Connect(to, io::ErrorKind::ConnectionRefused.into())
+            } else {
+                Unreached::Handshake(to, FleetError::AddressBusy)
+            })
+        },
+    );
+    let Err(why) = walked else {
+        panic!("no address answered");
+    };
+    assert!(
+        matches!(&why, Unreached::Handshake(at, FleetError::AddressBusy) if *at == busy),
+        "{why:?}"
+    );
+    assert!(!ends_the_seat(&why, deadline, Instant::now()));
 }
 
 #[test]

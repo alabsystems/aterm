@@ -209,6 +209,8 @@ pub enum FdKind {
         ino: u64,
         /// Whether the bytes appended since the reader's last look hold a line feed.
         lf_tail: Option<bool>,
+        /// A dylib a build just wrote, as the host judged it (`aterm_sysprobe::jobs::fresh_dylib`).
+        fresh_dylib: bool,
     },
     /// A character device.
     Device {
@@ -300,7 +302,31 @@ pub struct JobProc {
     pub program_check: bool,
 }
 
-/// One process of aterm's user that macOS's program check holds, member of a job or not, as the host read it.
+/// What keeps a process whose one thread never ran from its first instruction past 20 s (`docs/DESIGN-leftover-processes-2026-10-16.md` §4.2), as the host judged it (`aterm_sysprobe::jobs::AtStart`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum StartWait {
+    /// macOS's program check holds it: native, its executable on a local volume.
+    #[default]
+    ProgramCheck,
+    /// An x86_64 process on an arm64 Mac: Rosetta translates it, and aterm's Developer Tools grant does not reach that.
+    Translating,
+    /// Its executable is on a volume not proven local: it has not started, and nothing read says why.
+    NotStarted,
+}
+
+impl StartWait {
+    /// The word a `finding` row's `kind=` prints: `program-check`, `translating` or `not-started`.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::ProgramCheck => "program-check",
+            Self::Translating => "translating",
+            Self::NotStarted => "not-started",
+        }
+    }
+}
+
+/// One process of aterm's user whose one thread never ran past 20 s, member of a job or not, as the host read it: held at macOS's program check, translating, or not started ([`StartWait`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HeldProc {
     /// Its pid.
@@ -311,6 +337,8 @@ pub struct HeldProc {
     pub name: String,
     /// Whether aterm started it (a tab's member, or aterm's resource coalition): words only.
     pub aterm: bool,
+    /// What keeps it from starting.
+    pub wait: StartWait,
 }
 
 /// One OSC 133 command block of a tab.
@@ -538,7 +566,7 @@ pub struct JobTick {
     pub lanes: LanesSeen,
     /// The per-user process limit (`kern.maxprocperuid`, `RLIMIT_NPROC`).
     pub process_limit: Option<u64>,
-    /// aterm's user's processes macOS's program check holds now.
+    /// aterm's user's processes that have not started now: macOS's program check holds them, Rosetta translates them, or their volume is not proven local.
     pub held: Vec<HeldProc>,
 }
 
@@ -1028,6 +1056,12 @@ pub struct Findings {
     pub program_check_episode: Option<HeldEpisode>,
     /// The episode that closed at this reading (set on that one view only).
     pub program_check_drained: Option<HeldEpisode>,
+    /// Own x86_64 processes on an arm64 Mac whose one thread never ran past 20 s, each since the first reading that saw it so: Rosetta translates them ("translating (Rosetta)"), and aterm's Developer Tools grant does not reach that.
+    pub translating: Vec<Named>,
+    /// Own processes with the same signature whose executable is not proven on a local volume, each since the first reading that saw it so: they have not started, and nothing read says why.
+    pub not_started: Vec<Named>,
+    /// Inside a backed-up episode, the job members that started but whose CPU did not move since the reading before while they hold a fresh dylib open: probably waiting for the same check, a heuristic (§5.1's dylib case; U4 is unmeasured). `for_ms` is 0.
+    pub probably_program_check: Vec<Named>,
     /// Own-uid processes, zombies included.
     pub own_procs: u64,
     /// The per-user limit.

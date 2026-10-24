@@ -12,19 +12,20 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use aterm_agent::harness::footer::FooterFacts;
-use aterm_agent::harness::profile::{AccountKey, Bucket, PlanUsage};
+use aterm_agent::harness::profile::{AccountKey, Bucket, PlanUsage, WeeklyFigure};
 use aterm_sysprobe::jobs::RunState;
 use aterm_sysprobe::volumes::VolumeKey;
-use aterm_vitals::Peaks;
 use aterm_vitals::explain::{
     CoalLane, CoalSample, CoalUsage, IdMap, IdSet, LeadIdentity, TimelineSample,
 };
+use aterm_vitals::history::{FreeHistory, SavedFree, VolumeId};
 use aterm_vitals::model::{
     AccountIx, ClusterSpec, CommitSample, DiskFacts, DiskLevel, GpuSample, Hog, LinkKind,
     LinkSample, MemCounters, MemSample, PlanFact, Pressure, ProcLimits, ProcSample, ProcState,
-    Sample, Snapshot, TabRoot, TabTokens, Thermal, Throttle, Ticks, VolumeSample,
+    Sample, Snapshot, TabRoot, TabTokens, Thermal, Throttle, Ticks, VolumeSample, WeekFact,
 };
 use aterm_vitals::sys::Machine;
+use aterm_vitals::{Peaks, PlanDay};
 
 use crate::disk_board::{Clock, DiskFactsRaw, Shelf};
 use crate::disk_where::Where;
@@ -41,7 +42,11 @@ const PEAKS_EVERY: Duration = Duration::from_secs(600);
 const PEAKS_FILE: &str = "vitals-peaks.json";
 const PEAKS_SCHEMA: u32 = 1;
 const PEAKS_MAX_BYTES: u64 = 16 * 1024;
-/// How long the quit waits for the probe thread to end and write the peaks.
+/// The disk's free history, kept beside [`PEAKS_FILE`] and written as it is; a full day on a mount
+/// point of up to 1024 bytes is under [`PEAKS_MAX_BYTES`].
+const FREE_FILE: &str = "vitals-free.json";
+const FREE_SCHEMA: u32 = 1;
+/// How long the quit waits for the probe thread to end and write the peaks and the free history.
 pub(crate) const STOP_BOUND: Duration = Duration::from_millis(500);
 
 /// A pull whose thread's last reading is older than this reads twice.
@@ -70,7 +75,7 @@ const WHY_FIXTURE_SEAM: &str = "ATERM_DEV_WHY_FIXTURE";
 /// Pulls that arm the split set (`sys why`).
 pub(crate) static SPLIT_ARMED: Arming = Arming::new();
 
-/// How soon a reading no window shows is due again after one that gave `view`: at the engine's own `Demand` while a live job stands, and at the latest after Slow's 30 s while a program of this user waits at macOS's program check or its backed-up episode has not yet had its closing reading (leftover §5.1); else `None`. The engine's `Demand` itself stays its jobs' own, so a window's bars keep its cadence.
+/// How soon a reading no window shows is due again after one that gave `view`: at the engine's own `Demand` while a live job stands, and at the latest after Slow's 30 s while a program of this user has not started (macOS's program check holds it, Rosetta translates it, or its volume is not proven local: [`holds_a_wait`](crate::vitals_jobs::holds_a_wait)), for as long as that row stands, or while the backed-up episode has not yet had its closing reading (leftover §5.1, §9); else `None`. The engine's `Demand` itself stays its jobs' own, so a window's bars keep its cadence.
 fn job_demand_after(view: &aterm_vitals::jobs::JobsView) -> Option<Duration> {
     let live = view
         .rows
@@ -104,8 +109,30 @@ pub(crate) fn held_edge(
         .map(HeldEdge::Drained)
 }
 
-fn age_ms(d: Duration) -> u64 {
-    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+/// THE PROGRAMS `after` NAMES AS NOT STARTED THAT `before` DID NOT (leftover §5.1): its `translating` and `not_started` findings whose pid `before`'s same list lacks, each with what keeps it, so a view adopted again names none and each program is told once while it stands.
+pub(crate) fn newly_not_started<'a>(
+    before: Option<&aterm_vitals::jobs::Findings>,
+    after: &'a aterm_vitals::jobs::Findings,
+) -> Vec<(aterm_vitals::jobs::StartWait, &'a aterm_vitals::jobs::Named)> {
+    use aterm_vitals::jobs::StartWait;
+    let was = |wait: StartWait, pid: u32| {
+        before.is_some_and(|b| {
+            let list = if wait == StartWait::Translating {
+                &b.translating
+            } else {
+                &b.not_started
+            };
+            list.iter().any(|n| n.pid == pid)
+        })
+    };
+    let mut fresh = Vec::new();
+    for (wait, list) in [
+        (StartWait::Translating, &after.translating),
+        (StartWait::NotStarted, &after.not_started),
+    ] {
+        fresh.extend(list.iter().filter(|n| !was(wait, n.pid)).map(|n| (wait, n)));
+    }
+    fresh
 }
 
 /// Kernel process-event edge (`NOTE_EXIT`, `NOTE_FORK`).
@@ -266,6 +293,17 @@ pub(crate) struct Request {
     pub(crate) tokens: Vec<TokenRow>,
     /// The front tab's plan usage, while current.
     pub(crate) plan: Option<PlanFact>,
+    /// Every account the panes' footers read, each once.
+    pub(crate) weeks: Vec<WeekRow>,
+}
+
+/// One account a pane's footer read, and its weekly figure where the footer shows one.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct WeekRow {
+    pub(crate) account: AccountKey,
+    /// Whether a pane of the front tab runs under it.
+    pub(crate) front: bool,
+    pub(crate) figure: Option<WeeklyFigure>,
 }
 
 /// One agent session's token totals and when the footer's resolver last read them.
@@ -526,8 +564,6 @@ pub(crate) struct VitalsHost {
     /// age from (`App::post_jobs_reading`).
     read_began: Option<Instant>,
     full_adopted_at: Option<Instant>,
-    /// The devtools Entry's live count as it was last told ([`crate::App::devtools_entry_now`]), and when; `None` when it was last told none.
-    pub(crate) live_told: Option<(u32, Instant)>,
     /// When the next reading is due: the bars' cadence while a window in view shows them.
     pub(crate) next_due: Option<Instant>,
     asked_at: Option<Instant>,
@@ -568,7 +604,6 @@ impl Default for VitalsHost {
             adopted_at: None,
             read_began: None,
             full_adopted_at: None,
-            live_told: None,
             next_due: None,
             asked_at: None,
             jobs_due: None,
@@ -773,7 +808,8 @@ impl VitalsHost {
         }
     }
 
-    /// Stops the probe thread on application exit and waits up to `bound` for peak persistence.
+    /// Stops the probe thread on application exit and waits up to `bound` for it to write the
+    /// peaks and the free history.
     pub(crate) fn stop_at_exit(&mut self, bound: Duration) -> bool {
         self.stopping.store(true, Ordering::Release);
         self.tx = None;
@@ -791,7 +827,7 @@ impl VitalsHost {
             Err(RecvTimeoutError::Timeout) => {
                 aterm_log::warn!(
                     "system vitals: the probe thread did not stop within {bound:?}; \
-                     the peaks since the last write are lost"
+                     the peaks and free history since the last write are lost"
                 );
                 false
             }
@@ -842,7 +878,8 @@ impl Source for Reader {
     }
 
     fn split_cold(&self) -> bool {
-        self.split.cold(Instant::now())
+        let now = Instant::now();
+        self.split.cold(now) || self.gpu.cold(now)
     }
 }
 
@@ -892,8 +929,11 @@ fn run(
         }
         shared
     });
+    let free = peaks.as_deref().map(|p| p.with_file_name(FREE_FILE));
     let (mut peaks, restored) = PeakFile::open(peaks, Instant::now());
     source.model().restore_peaks(restored);
+    let (mut free, kept) = FreeFile::open(free, Instant::now(), unix_ms_now());
+    source.model().restore_free_history(kept);
     let no_machine = Machine::default();
     let mut req = Request::default();
     let mut last_whole: Option<Instant> = None;
@@ -924,7 +964,6 @@ fn run(
         if !snap.machine_only {
             last_whole = Some(Instant::now());
         }
-        peaks.keep(source.model().peaks(), Instant::now(), false);
         let words = req.ttys.iter().map(TtyWord::seen).collect();
         let jobs_moved = hand_over(latest, &snap, words, began);
         if let Some(sys) = sys {
@@ -933,8 +972,11 @@ fn run(
         if (asked.read || jobs_moved) && !post() {
             break;
         }
+        peaks.keep(source.model().peaks(), Instant::now(), false);
+        free.keep(source.model().free_history(), Instant::now(), false);
     }
     peaks.keep(source.model().peaks(), Instant::now(), true);
+    free.keep(source.model().free_history(), Instant::now(), true);
 }
 
 fn pull(source: &mut impl Source, req: &Request, last_whole: Option<Instant>) -> Snapshot {
@@ -1006,6 +1048,9 @@ fn hand_over(
 
 /// The thermal level and Low Power Mode probe.
 pub(crate) type ThermalProbe = fn() -> Option<Thermal>;
+
+/// The local zone's offset from UTC at an instant, unix seconds.
+pub(crate) type OffsetProbe = fn(i64) -> Option<i64>;
 
 fn platform_thermal() -> Option<Thermal> {
     #[cfg(target_os = "macos")]
@@ -1538,6 +1583,7 @@ impl WhyFixture {
             mem: scene.mem.or(live.mem),
             thermal: scene.thermal.or(live.thermal),
             gpu: live.gpu.clone(),
+            gpu_clients: live.gpu_clients.clone(),
             volume: live.volume.clone(),
             cadence_ms: live.cadence_ms,
             machine_only: live.machine_only,
@@ -1550,6 +1596,8 @@ impl WhyFixture {
             disk: live.disk.clone(),
             tokens: live.tokens.clone(),
             plan: live.plan.clone(),
+            weeks: live.weeks.clone(),
+            local_day: live.local_day,
             ..scene
         }
     }
@@ -1586,10 +1634,13 @@ pub(crate) struct Reader {
     job_watch: aterm_vitals::events::JobWatch,
     watched: Option<Arc<aterm_vitals::jobs::JobsView>>,
     thermal: ThermalProbe,
+    offset_at: OffsetProbe,
     counter_throttle: Option<(Instant, Option<Thermal>)>,
     slots: aterm_sysprobe::slots::SlotReader,
     /// The split set's lane and what it keeps between split ticks.
     pub(crate) split: SplitReader,
+    /// The GPU client lane.
+    pub(crate) gpu: crate::vitals_gpu::GpuLane,
     fixture: Option<WhyFixture>,
     /// The machine's words, read once.
     pub(crate) machine: Machine,
@@ -1706,8 +1757,14 @@ impl Reader {
             } else {
                 platform_thermal
             },
+            offset_at: if cfg!(test) {
+                |_| Some(0)
+            } else {
+                crate::presence::local_offset_at
+            },
             counter_throttle: None,
             split,
+            gpu: crate::vitals_gpu::GpuLane::host(),
             fixture: None,
             machine: Machine {
                 cpu: words.cpu,
@@ -1791,6 +1848,14 @@ impl Reader {
             .unwrap_or_default();
         sample.procs = observed.procs;
         sample.delegated = observed.delegated;
+        sample.gpu_clients = self.gpu.read(req, now).map(|(rows, entries, complete)| {
+            aterm_vitals::GpuClientsSample {
+                at_ns: u64::try_from(self.epoch.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                rows,
+                entries,
+                complete,
+            }
+        });
         if let Some(read) = coalitions {
             self.split.fill(&mut sample, read, now);
         }
@@ -1870,6 +1935,7 @@ impl Reader {
         let shelf = &crate::disk_board::SHELF;
         let (volume, key) = home_volume(&self.home, shelf.watched());
         let load = aterm_sysprobe::load_average();
+        let at_unix_ms = unix_ms_now();
         Sample {
             at_ns: u64::try_from(since.as_nanos()).unwrap_or(u64::MAX),
             cores: self.probe.core_ticks().map(|cores| {
@@ -1884,6 +1950,7 @@ impl Reader {
             clusters: self.clusters.clone(),
             mem: aterm_sysprobe::memory_detail().map(mem_sample),
             gpu: aterm_sysprobe::gpu().map(gpu_sample),
+            gpu_clients: None,
             volume: volume.map(|v| VolumeSample {
                 total: v.total,
                 free: v.free,
@@ -1894,9 +1961,7 @@ impl Reader {
             self_pid: req.self_pid,
             tabs: req.tabs.clone(),
             delegated: Vec::new(),
-            at_unix_ms: aterm_time::unix_millis()
-                .and_then(|ms| i64::try_from(ms).ok())
-                .unwrap_or(0),
+            at_unix_ms,
             mono_ms: u64::try_from(since.as_millis()).unwrap_or(u64::MAX),
             cadence_ms: req.cadence_ms,
             machine_only: req.machine_only,
@@ -1926,6 +1991,8 @@ impl Reader {
                 })
                 .collect(),
             plan: req.plan.clone(),
+            weeks: week_facts(&req.weeks, self.offset_at),
+            local_day: local_day(at_unix_ms.div_euclid(1000), self.offset_at),
             procs_truncated: false,
             coalitions: None,
             leads: Vec::new(),
@@ -2227,6 +2294,56 @@ fn each_session_once(mut rows: Vec<TokenRow>) -> Vec<TokenRow> {
     rows
 }
 
+/// The account `facts` name, with its weekly figure where it has one.
+fn week_row(facts: &FooterFacts, front: bool) -> Option<WeekRow> {
+    let shown = facts.subscription.as_ref()?;
+    Some(WeekRow {
+        account: shown.account?,
+        front,
+        figure: shown.weekly_figure,
+    })
+}
+
+/// One row per account, in the order first read: front where any of its panes is, with
+/// the newest of its figures.
+fn each_account_once(rows: Vec<WeekRow>) -> Vec<WeekRow> {
+    let mut once: Vec<WeekRow> = Vec::with_capacity(rows.len());
+    for row in rows {
+        match once.iter_mut().find(|kept| kept.account == row.account) {
+            Some(kept) => {
+                kept.front |= row.front;
+                kept.figure = WeeklyFigure::newer(kept.figure, row.figure);
+            }
+            None => once.push(row),
+        }
+    }
+    once
+}
+
+/// The model's [`WeekFact`]s of `rows`, each figure on the local day it was read.
+fn week_facts(rows: &[WeekRow], offset_at: OffsetProbe) -> Vec<WeekFact> {
+    rows.iter()
+        .map(|row| WeekFact {
+            account: row.account.to_string(),
+            front: row.front,
+            reading: row.figure.and_then(|f| {
+                Some(PlanDay {
+                    day: local_day(f.at, offset_at),
+                    used_x10: u16::try_from(f.used_x10).ok()?,
+                    resets_at: f.resets_at,
+                    at: f.at,
+                })
+            }),
+        })
+        .collect()
+}
+
+/// The day of `unix_s`, unix days in the local zone (UTC where its offset is unread).
+fn local_day(unix_s: i64, offset_at: OffsetProbe) -> u32 {
+    let local = unix_s.saturating_add(offset_at(unix_s).unwrap_or(0));
+    u32::try_from(local.div_euclid(86_400)).unwrap_or(0)
+}
+
 fn plan_fact(plan: &PlanUsage, accounts: &[AccountKey], now: i64) -> Option<PlanFact> {
     if !plan.current_at(now) {
         return None;
@@ -2253,44 +2370,81 @@ const fn window_word(window: Bucket) -> &'static str {
     }
 }
 
-struct PeakFile {
+/// A reading the probe thread keeps in a small JSON file: read at the thread's start, then written
+/// atomically when it changed, at most once every [`PEAKS_EVERY`] and again at the thread's stop.
+struct KeptFile<T> {
     path: Option<PathBuf>,
-    held: Peaks,
+    held: T,
     at: Instant,
+    /// What the warning of a failed write calls it.
+    what: &'static str,
+    json: fn(&T) -> Option<String>,
 }
 
-impl PeakFile {
-    fn open(path: Option<PathBuf>, now: Instant) -> (Self, Peaks) {
+/// [`PEAKS_FILE`].
+type PeakFile = KeptFile<Peaks>;
+/// [`FREE_FILE`].
+type FreeFile = KeptFile<FreeHistory>;
+
+impl<T: Clone + Default + PartialEq> KeptFile<T> {
+    /// The file and what `of` reads from its text; `T::default()` when it is missing, over
+    /// [`PEAKS_MAX_BYTES`] or refused by `of`.
+    fn read(
+        path: Option<PathBuf>,
+        now: Instant,
+        what: &'static str,
+        json: fn(&T) -> Option<String>,
+        of: impl FnOnce(&str) -> Option<T>,
+    ) -> (Self, T) {
         let held = path
             .as_deref()
             .and_then(read_small)
-            .and_then(|text| peaks_of(&text))
+            .and_then(|text| of(&text))
             .unwrap_or_default();
         let file = Self {
             path,
             held: held.clone(),
             at: now,
+            what,
+            json,
         };
         (file, held)
     }
 
-    fn keep(&mut self, peaks: &Peaks, now: Instant, stopping: bool) {
-        if *peaks == self.held
-            || (!stopping && now.saturating_duration_since(self.at) < PEAKS_EVERY)
+    fn keep(&mut self, value: &T, now: Instant, stopping: bool) {
+        if (!stopping && now.saturating_duration_since(self.at) < PEAKS_EVERY)
+            || *value == self.held
         {
             return;
         }
-        let (Some(path), Some(text)) = (self.path.as_deref(), peaks_json(peaks)) else {
+        let (Some(path), Some(text)) = (self.path.as_deref(), (self.json)(value)) else {
             return;
         };
         self.at = now;
         match aterm_agent::harness::upgrade_models::write_atomic(path, &text) {
-            Ok(()) => self.held = peaks.clone(),
+            Ok(()) => self.held = value.clone(),
             Err(error) => aterm_log::warn!(
-                "system vitals: the peaks were not written to {}: {error}",
+                "system vitals: {} could not be written to {}: {error}",
+                self.what,
                 path.display()
             ),
         }
+    }
+}
+
+impl KeptFile<Peaks> {
+    fn open(path: Option<PathBuf>, now: Instant) -> (Self, Peaks) {
+        Self::read(path, now, "the peaks", peaks_json, peaks_of)
+    }
+}
+
+impl KeptFile<FreeHistory> {
+    /// The file's history of the 24 hours ending at `now_unix_ms`; empty when it is missing,
+    /// damaged or of another schema.
+    fn open(path: Option<PathBuf>, now: Instant, now_unix_ms: i64) -> (Self, FreeHistory) {
+        Self::read(path, now, "the disk's free history", free_json, |text| {
+            free_of(text, now_unix_ms)
+        })
     }
 }
 
@@ -2308,6 +2462,31 @@ fn read_small(path: &Path) -> Option<String> {
 struct PeaksDoc {
     schema: u32,
     peaks: Vec<PeakDoc>,
+    /// Absent from a file written before it; a reader that does not know it skips it.
+    #[serde(default, deserialize_with = "plan_docs")]
+    plan: Vec<PlanDoc>,
+}
+
+/// One account's [`aterm_vitals::PlanWeek`].
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct PlanDoc {
+    account: String,
+    /// `(day, used_x10, resets_at, at)`, as [`PlanDay`] names them.
+    days: Vec<(u32, u16, i64, i64)>,
+}
+
+/// The plan entries of a peaks file that read as [`PlanDoc`]s: an entry this build cannot
+/// read costs the file nothing else.
+fn plan_docs<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<PlanDoc>, D::Error> {
+    let aterm_json::Value::Array(entries) =
+        <aterm_json::Value as serde::Deserialize>::deserialize(d)?
+    else {
+        return Ok(Vec::new());
+    };
+    Ok(entries
+        .into_iter()
+        .filter_map(|entry| aterm_json::from_value(entry).ok())
+        .collect())
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -2329,6 +2508,18 @@ fn peaks_json(peaks: &Peaks) -> Option<String> {
                 days,
             })
             .collect(),
+        plan: peaks
+            .plan
+            .iter()
+            .map(|week| PlanDoc {
+                account: week.account.clone(),
+                days: week
+                    .days
+                    .iter()
+                    .map(|d| (d.day, d.used_x10, d.resets_at, d.at))
+                    .collect(),
+            })
+            .collect(),
     };
     aterm_json::to_string(&doc).ok()
 }
@@ -2336,11 +2527,72 @@ fn peaks_json(peaks: &Peaks) -> Option<String> {
 fn peaks_of(text: &str) -> Option<Peaks> {
     let doc: PeaksDoc = aterm_json::from_str(text).ok()?;
     (doc.schema == PEAKS_SCHEMA).then(|| {
-        Peaks::from_pairs(
-            doc.peaks
-                .iter()
-                .map(|p| (p.name.as_str(), p.read_s, p.days.as_slice())),
-        )
+        let plan: Vec<(&str, Vec<PlanDay>)> = doc
+            .plan
+            .iter()
+            .filter(|p| AccountKey::parse(&p.account).is_some())
+            .map(|p| {
+                let days = p
+                    .days
+                    .iter()
+                    .map(|&(day, used_x10, resets_at, at)| PlanDay {
+                        day,
+                        used_x10,
+                        resets_at,
+                        at,
+                    });
+                (p.account.as_str(), days.collect())
+            })
+            .collect();
+        Peaks {
+            plan: Peaks::plan_from_rows(plan.iter().map(|(a, days)| (*a, days.as_slice()))),
+            ..Peaks::from_pairs(
+                doc.peaks
+                    .iter()
+                    .map(|p| (p.name.as_str(), p.read_s, p.days.as_slice())),
+            )
+        }
+    })
+}
+
+/// The wall clock, unix ms; 0 where unreadable.
+fn unix_ms_now() -> i64 {
+    aterm_time::unix_millis()
+        .and_then(|ms| i64::try_from(ms).ok())
+        .unwrap_or(0)
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct FreeDoc {
+    schema: u32,
+    mount: String,
+    total: u64,
+    /// `(bucket start in unix ms, least free bytes, readings)`, oldest first.
+    buckets: Vec<(i64, u64, u32)>,
+}
+
+fn free_json(history: &FreeHistory) -> Option<String> {
+    let saved = history.saved()?;
+    let doc = FreeDoc {
+        schema: FREE_SCHEMA,
+        mount: saved.volume.mount,
+        total: saved.volume.total,
+        buckets: saved.rows,
+    };
+    aterm_json::to_string(&doc).ok()
+}
+
+fn free_of(text: &str, now_unix_ms: i64) -> Option<FreeHistory> {
+    let doc: FreeDoc = aterm_json::from_str(text).ok()?;
+    (doc.schema == FREE_SCHEMA).then(|| {
+        let saved = SavedFree {
+            volume: VolumeId {
+                mount: doc.mount,
+                total: doc.total,
+            },
+            rows: doc.buckets,
+        };
+        FreeHistory::restored(&saved, now_unix_ms)
     })
 }
 
@@ -2693,7 +2945,7 @@ impl crate::App {
         }
     }
 
-    /// WHAT THE VIEW JUST ADOPTED SAYS OF MACOS'S PROGRAM CHECK (leftover §5.1, §6.5): one `program-check.` record per episode edge it makes against `before` ([`held_edge`]); a verdict refresh an episode held back ([`Self::refresh_devtools_verdict`]) started once the view stands in none; and, while the last Developer Tools reading says aterm is not granted, the standing devtools Entry told again at once whenever its live line ([`Self::held_line`]) differs in count from the one it was last told (to a count, between counts, back to none: inside an episode as at its edges), and when only its oldest moved, at most once a [`RESTATE_QUIET`](aterm_messages::need::RESTATE_QUIET). It never raises an Entry that is not standing (§13: no second ask).
+    /// WHAT THE VIEW JUST ADOPTED SAYS OF MACOS'S PROGRAM CHECK (leftover §5.1, §6.5): one `program-check.` record per episode edge it makes against `before` ([`held_edge`]), one naming the programs it first says have not started for another reason ([`newly_not_started`]), and a verdict refresh an episode held back ([`Self::refresh_devtools_verdict`]) started once the view stands in none.
     fn note_held_episode(&mut self, before: Option<&aterm_vitals::jobs::JobsView>) {
         let Some(after) = self.vitals.snapshot.as_ref().and_then(|s| s.jobs.clone()) else {
             return;
@@ -2704,35 +2956,13 @@ impl crate::App {
                 after.findings.program_check_aterm.0,
             ));
         }
+        let fresh = newly_not_started(before.map(|v| &v.findings), &after.findings);
+        if !fresh.is_empty() {
+            let _ = self.post_message(crate::message_reporters::not_started_record(&fresh));
+        }
         if after.findings.program_check_episode.is_none() && self.devtools_watch.take_held_prime() {
             let _ = self.devtools_helper.refresh_verdict();
         }
-        let live = self.held_line().map(|l| l.count);
-        let told = self.vitals.live_told;
-        let aged = told.is_some_and(|(_, at)| at.elapsed() >= aterm_messages::need::RESTATE_QUIET);
-        let not_granted = self
-            .devtools_helper
-            .reading()
-            .is_some_and(|r| r.grant == aterm_containment::DevToolGrant::NotGranted);
-        let standing = !self
-            .messages
-            .digest_keys_under(crate::message_reporters::DEVTOOLS_KEY)
-            .is_empty();
-        if (live != told.map(|(n, _)| n) || (live.is_some() && aged))
-            && not_granted
-            && standing
-            && !self.workstation_setup.suppresses_permissions()
-        {
-            let entry = self.devtools_entry_now().restated_at_once();
-            self.except(&entry);
-        }
-    }
-
-    /// The devtools Entry at the step the last reading names, its first line the live wait's while one stands ([`Self::held_line`]); its live count noted as told ([`VitalsHost::live_told`]). Every raise builds it here.
-    pub(crate) fn devtools_entry_now(&mut self) -> aterm_messages::exceptions::Entry {
-        let live = self.held_line();
-        self.vitals.live_told = live.map(|l| (l.count, Instant::now()));
-        crate::message_reporters::devtools_entry(self.devtools_step(), live)
     }
 
     /// ASKS MACOS ABOUT ATERM AGAIN ([`crate::devtools_helper::Lane::refresh_verdict`]) unless the adopted jobs view stands in a backed-up episode of macOS's program check: the prime is itself a new program and would wait in that line (leftover §5.1, §13), so it is held until the next view that stands in none ([`Self::note_held_episode`]).
@@ -2757,19 +2987,6 @@ impl crate::App {
         let age = now.saturating_duration_since(self.vitals.adopted_at?);
         crate::vitals_jobs::speaks_for_now(view, age, self.vitals.reader_runs())
             .then_some((view, age))
-    }
-
-    /// The devtools Entry's live line: the programs aterm started that macOS's program check holds, while a backed-up episode stands in a view that speaks for now, and the longest held to now; `None` otherwise, and while only others' programs are held (aterm's grant does not reach them).
-    pub(crate) fn held_line(&self) -> Option<crate::message_reporters::HeldLine> {
-        let (view, age) = self.jobs_view_now(Instant::now())?;
-        let findings = &view.findings;
-        let (count, oldest_ms) = findings.program_check_aterm;
-        (findings.program_check_episode.is_some() && count > 0).then(|| {
-            crate::message_reporters::HeldLine {
-                count,
-                oldest_ms: oldest_ms.saturating_add(age_ms(age)),
-            }
-        })
     }
 
     fn post_jobs_reading(&self) {
@@ -2942,6 +3159,7 @@ impl crate::App {
         let mut tokens = Vec::new();
         let mut accounts: Vec<AccountKey> = Vec::new();
         let mut front_plan = None;
+        let mut weeks = Vec::new();
         let front = self.front_window();
         for (wid, ws) in &self.windows {
             let active = ws.tab_set.active_index();
@@ -2982,6 +3200,7 @@ impl crate::App {
                     let key = focused.unwrap_or(pane);
                     tokens
                         .extend(facts.and_then(|f| tab_tokens(key, f, tl.claude_footer_read_at())));
+                    weeks.extend(facts.and_then(|f| week_row(f, in_front)));
                     if let Some(p) = facts.and_then(|f| f.plan) {
                         if !accounts.contains(&p.account) {
                             accounts.push(p.account);
@@ -3051,6 +3270,7 @@ impl crate::App {
             deck: self.deck_in_view(),
             tokens: each_session_once(tokens),
             plan: front_plan.and_then(|p| plan_fact(&p, &accounts, now)),
+            weeks: each_account_once(weeks),
         }
     }
 

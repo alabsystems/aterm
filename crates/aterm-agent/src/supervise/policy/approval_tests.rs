@@ -3732,6 +3732,11 @@ fn a_bash_read_of_a_secret_is_not_read_only() {
         "find ~/.ssh -type f -exec cat {} +",
         "wc --files0-from=/Users/_owner/.ssh/id_rsa",
         "cat .env.example",
+        "cat ~/../_owner/.secrets/github-token",
+        "cat /Users/_owner/project/../.claude.json",
+        "cat ~/.ssh/../notes.txt",
+        "cat /Users/_owner/.aws/../notes.txt",
+        "cat /Users/_owner/.secrets/../notes.txt",
     ] {
         let d = on_screen(&bash_box(&[cmd], Some("Read it")), &git_host(ctx()));
         let r = reason(&d);
@@ -3823,6 +3828,81 @@ fn a_non_secret_read_beside_it_stays_read_only() {
         &git_host(ctx()),
     );
     assert_eq!(approved(&d), Some(RULE_READ_ONLY), "{d:?}");
+}
+
+/// A Windows home (`USERPROFILE`, `C:\Users\name`) keeps the home's secret rules in each of
+/// these spellings of a path under it a worker's shell writes: `~`, `$HOME` or `$USERPROFILE` with
+/// either separator after it, a drive path with either separator, Git Bash's `/c/…` (whose
+/// MSYS layer takes `\` as a separator too), a root-relative `\…` on the home's drive, a
+/// relative name, or one through a `..`, read lexically and as written. It holds on every
+/// host, as the rules are read from text.
+#[test]
+fn a_secret_under_a_windows_home_is_not_read_only() {
+    let home = PathBuf::from(r"C:\Users\_owner");
+    let windows = || ApprovalCtx {
+        secrets: default_secrets(Some(&home)),
+        home: Some(home.clone()),
+        ..git_host(ctx())
+    };
+    for cmd in [
+        "cat ~/.secrets/github-token",
+        "cat ~/.config/gh/hosts.yml",
+        "cat ~/.claude.json",
+        "cat ~/.config/aterm/secrets/key",
+        "cat $HOME/.cargo/credentials",
+        "cat C:/Users/_owner/.claude.json",
+        r"cat 'C:\Users\_owner\.secrets\t'",
+        "cat c:/users/_OWNER/.secrets/t",
+        "cat /c/Users/_owner/.secrets/t",
+        "cat ~/project/../.claude.json",
+        "cat /c/Users/_owner/../_owner/.secrets/t",
+        "cat ~/.ssh/id_rsa",
+        "cat C:/Users/_owner/.secrets/../notes.txt",
+        "cat \"$USERPROFILE\\.secrets\\github-token\"",
+        "cat \"$HOME\\.claude.json\"",
+        r"cat '/c/Users/_owner\.secrets\github-token'",
+        r"cat '.ssh\id_rsa'",
+        r"cat '\Users\_owner\.secrets\t'",
+        r"cat 'C:\Users\_owner\.ssh\..\notes.txt'",
+    ] {
+        let d = on_screen(&bash_box(&[cmd], Some("Read it")), &windows());
+        assert!(
+            reason(&d).contains("a read of a secret"),
+            "{cmd}: expected a secret refusal, got {d:?}"
+        );
+    }
+    for cmd in [
+        "cat ~/notes.txt",
+        "cat C:/Users/_owner/project/README.md",
+        "cat /c/Users/_owner/.secretsbook",
+        "cat D:/Users/_owner/.secrets/t",
+        r"cat 'C:\Users\_owner\project\notes.txt'",
+        r"cat '\Users\_owner\notes.txt'",
+    ] {
+        let d = on_screen(&bash_box(&[cmd], Some("Read it")), &windows());
+        assert_eq!(approved(&d), Some(RULE_READ_ONLY), "{cmd}: {d:?}");
+    }
+}
+
+/// A Unix home whose first component is one letter (`/h/name`) is not read as Git Bash's
+/// drive: a Read box (whose path the rules read as written) and a Bash read keep its rules.
+#[test]
+fn a_secret_under_a_one_letter_unix_home_is_not_approved() {
+    let home = PathBuf::from("/h/_owner");
+    let mut c = ApprovalCtx {
+        secrets: default_secrets(Some(&home)),
+        home: Some(home.clone()),
+        ..git_host(ctx())
+    };
+    c.set_trust_roots(&["~".to_string()], 502);
+    for path in ["~/.secrets/gh_access_token", "/h/_owner/.claude.json"] {
+        let d = on_screen(&read_box(path), &c);
+        assert!(reason(&d).contains("a Read of a secret"), "{path}: {d:?}");
+        let d = on_screen(&bash_box(&[&format!("cat {path}")], Some("Read it")), &c);
+        assert!(reason(&d).contains("a read of a secret"), "{path}: {d:?}");
+    }
+    let d = on_screen(&read_box("~/notes/todo.md"), &c);
+    assert_eq!(approved(&d), Some(RULE_READ_OUTSIDE_CWD), "{d:?}");
 }
 
 #[test]

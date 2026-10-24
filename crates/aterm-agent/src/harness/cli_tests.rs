@@ -31,6 +31,7 @@ fn env_at(tmp: &Tmp) -> Env {
         claude_session: None,
         claude_pid: None,
         codex_thread: None,
+        agy_conversation: None,
         codex_home: None,
         now: 1_758_412_800,
         sid: "s-test".to_string(),
@@ -60,8 +61,34 @@ fn words(s: &str) -> Vec<String> {
 #[test]
 fn the_grammar_parses_what_the_help_text_advertises() {
     let cases: Vec<(&str, Cmd)> = vec![
-        ("usage", Cmd::Usage { json: false }),
-        ("usage --json", Cmd::Usage { json: true }),
+        (
+            "usage",
+            Cmd::Usage {
+                json: false,
+                agy: false,
+            },
+        ),
+        (
+            "usage --json",
+            Cmd::Usage {
+                json: true,
+                agy: false,
+            },
+        ),
+        (
+            "usage --agy",
+            Cmd::Usage {
+                json: false,
+                agy: true,
+            },
+        ),
+        (
+            "usage --agy --json",
+            Cmd::Usage {
+                json: true,
+                agy: true,
+            },
+        ),
         (
             "limits",
             Cmd::Limits {
@@ -449,15 +476,33 @@ fn usage_with_a_relative_claude_config_dir_folds_nothing_and_says_so() {
 "#,
     )
     .expect("transcript");
-    let (_, out, _) = go(&Cmd::Usage { json: false }, &env);
+    let (_, out, _) = go(
+        &Cmd::Usage {
+            json: false,
+            agy: false,
+        },
+        &env,
+    );
     assert!(out.contains("other-config.jsonl"), "control: {out}");
 
     env.claude_config_unusable = Some("cfg".to_owned());
-    let (ok, out, _) = go(&Cmd::Usage { json: false }, &env);
+    let (ok, out, _) = go(
+        &Cmd::Usage {
+            json: false,
+            agy: false,
+        },
+        &env,
+    );
     assert!(ok);
     assert!(out.contains("source=none"), "{out}");
     assert!(!out.contains("other-config.jsonl"), "{out}");
-    let (_, json, _) = go(&Cmd::Usage { json: true }, &env);
+    let (_, json, _) = go(
+        &Cmd::Usage {
+            json: true,
+            agy: false,
+        },
+        &env,
+    );
     let doc: Value = aterm_json::from_str(&json).expect("json");
     assert_eq!(doc["transcript_pick"].as_str(), Some("none"), "{json}");
     assert_eq!(
@@ -477,7 +522,13 @@ fn usage_folds_the_session_claude_code_names_not_the_newest() {
         .expect("a claude dir")
         .join(footer::project_slug(&env.cwd));
     assert!(dir.starts_with(tmp.path().join("claude-config")), "{dir:?}");
-    let (ok, out, _) = go(&Cmd::Usage { json: false }, &env);
+    let (ok, out, _) = go(
+        &Cmd::Usage {
+            json: false,
+            agy: false,
+        },
+        &env,
+    );
     assert!(ok);
     assert!(
         out.contains("source=none"),
@@ -510,7 +561,13 @@ fn usage_folds_the_session_claude_code_names_not_the_newest() {
         .expect("the neighbour's mtime");
 
     env.claude_session = Some("mine-1".to_owned());
-    let (ok, json, _) = go(&Cmd::Usage { json: true }, &env);
+    let (ok, json, _) = go(
+        &Cmd::Usage {
+            json: true,
+            agy: false,
+        },
+        &env,
+    );
     assert!(ok);
     let doc: Value = aterm_json::from_str(&json).expect("json");
     assert_eq!(doc["schema"].as_u64(), Some(1));
@@ -540,7 +597,13 @@ fn usage_folds_the_session_claude_code_names_not_the_newest() {
         let locked = dir.join("mine-1").join("subagents").join("agent-b.jsonl");
         std::fs::write(&locked, row("s2", "claude-haiku-4-5", 7)).expect("subagent");
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
-        let (_, json, _) = go(&Cmd::Usage { json: true }, &env);
+        let (_, json, _) = go(
+            &Cmd::Usage {
+                json: true,
+                agy: false,
+            },
+            &env,
+        );
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o600)).expect("chmod");
         std::fs::remove_file(&locked).expect("unlock");
         assert!(json.contains("\"complete\":false"), "{json}");
@@ -548,7 +611,13 @@ fn usage_folds_the_session_claude_code_names_not_the_newest() {
     }
 
     env.claude_session = Some("not-written-yet".to_owned());
-    let (ok, out, _) = go(&Cmd::Usage { json: false }, &env);
+    let (ok, out, _) = go(
+        &Cmd::Usage {
+            json: false,
+            agy: false,
+        },
+        &env,
+    );
     assert!(ok);
     assert!(out.contains("source=none"), "{out}");
 
@@ -573,7 +642,13 @@ fn usage_folds_the_session_claude_code_names_not_the_newest() {
     );
     env.claude_pid = None;
 
-    let (_, json, _) = go(&Cmd::Usage { json: true }, &env);
+    let (_, json, _) = go(
+        &Cmd::Usage {
+            json: true,
+            agy: false,
+        },
+        &env,
+    );
     let doc: Value = aterm_json::from_str(&json).expect("json");
     assert_eq!(doc["source"].as_str(), Some("transcript-newest"), "{json}");
     assert_eq!(
@@ -820,7 +895,13 @@ fn usage_from_codex_tools_folds_its_conversation_at_list_prices() {
     env.codex_home = Some(codex.to_string_lossy().into_owned());
     env.codex_thread = Some(sub.to_owned());
 
-    let (ok, json, err) = go(&Cmd::Usage { json: true }, &env);
+    let (ok, json, err) = go(
+        &Cmd::Usage {
+            json: true,
+            agy: false,
+        },
+        &env,
+    );
     assert!(ok, "{err}");
     let doc: Value = aterm_json::from_str(&json).expect("json");
     assert_eq!(doc["source"].as_str(), Some("rollout"), "{json}");
@@ -863,7 +944,13 @@ fn usage_from_codex_tools_folds_its_conversation_at_list_prices() {
         "another conversation's: {json}"
     );
 
-    let (ok, out, _) = go(&Cmd::Usage { json: false }, &env);
+    let (ok, out, _) = go(
+        &Cmd::Usage {
+            json: false,
+            agy: false,
+        },
+        &env,
+    );
     assert!(ok);
     assert_eq!(
         out.lines().next(),
@@ -895,7 +982,13 @@ fn usage_from_codex_tools_folds_its_conversation_at_list_prices() {
     assert!(out.contains("some unpriced"), "{out}");
     let kept = std::fs::read(&root_rollout).expect("read");
     std::fs::remove_file(&root_rollout).expect("remove");
-    let (_, out, _) = go(&Cmd::Usage { json: false }, &env);
+    let (_, out, _) = go(
+        &Cmd::Usage {
+            json: false,
+            agy: false,
+        },
+        &env,
+    );
     assert!(
         out.contains(&format!(
             "SPEND folded from 2 subagent rollouts (2 turns; its TUI's thread {root} has none here)"
@@ -932,7 +1025,13 @@ fn usage_from_codex_tools_folds_its_conversation_at_list_prices() {
             .collect();
         lines.insert(lines.len() - 1, extra.trim_end_matches('\n'));
         std::fs::write(&root_rollout, lines.join("\n") + "\n").expect("rollout with events");
-        let (ok, json, err) = go(&Cmd::Usage { json: true }, &env);
+        let (ok, json, err) = go(
+            &Cmd::Usage {
+                json: true,
+                agy: false,
+            },
+            &env,
+        );
         assert!(ok, "{err}");
         let doc: Value = aterm_json::from_str(&json).expect("json");
         assert_eq!(doc["complete"].as_bool(), Some(!partial), "{json}");
@@ -948,7 +1047,13 @@ fn usage_from_codex_tools_folds_its_conversation_at_list_prices() {
             doc["usage"]["accounts"][0]["spend"], *spend,
             "valid turns before and after the skipped records still fold: {json}"
         );
-        let (ok, out, err) = go(&Cmd::Usage { json: false }, &env);
+        let (ok, out, err) = go(
+            &Cmd::Usage {
+                json: false,
+                agy: false,
+            },
+            &env,
+        );
         assert!(ok, "{err}");
         assert_eq!(out.contains("these totals are partial"), partial, "{out}");
         if partial {
@@ -964,13 +1069,26 @@ fn usage_from_codex_tools_folds_its_conversation_at_list_prices() {
 
     let plain = Env {
         codex_thread: None,
+        agy_conversation: None,
         ..env_at(&tmp)
     };
-    let (_, out, _) = go(&Cmd::Usage { json: false }, &plain);
+    let (_, out, _) = go(
+        &Cmd::Usage {
+            json: false,
+            agy: false,
+        },
+        &plain,
+    );
     assert!(out.contains("source=none"), "{out}");
     assert!(out.contains("no transcript for this directory"), "{out}");
     env.claude_session = Some("11111111-2222-4333-8444-555555555555".to_owned());
-    let (_, out, _) = go(&Cmd::Usage { json: false }, &env);
+    let (_, out, _) = go(
+        &Cmd::Usage {
+            json: false,
+            agy: false,
+        },
+        &env,
+    );
     assert!(out.contains("has written no transcript yet"), "{out}");
     assert!(!out.contains("source=rollout"), "{out}");
 }
@@ -982,24 +1100,48 @@ fn usage_from_codex_tools_with_a_relative_codex_home_folds_nothing_and_says_so()
     let home = env.home.clone().expect("home is injected");
     let [_, sub, _] = codex_home_at(&home.join(".codex"));
     env.codex_thread = Some(sub.to_owned());
-    let (_, out, _) = go(&Cmd::Usage { json: false }, &env);
+    let (_, out, _) = go(
+        &Cmd::Usage {
+            json: false,
+            agy: false,
+        },
+        &env,
+    );
     assert!(out.contains("source=rollout"), "control: {out}");
 
     env.codex_home = Some("rel/codex".to_owned());
-    let (ok, out, _) = go(&Cmd::Usage { json: false }, &env);
+    let (ok, out, _) = go(
+        &Cmd::Usage {
+            json: false,
+            agy: false,
+        },
+        &env,
+    );
     assert!(ok);
     assert!(out.contains("source=none"), "{out}");
     assert!(
         out.contains("CODEX_HOME is \"rel/codex\", not an absolute path"),
         "{out}"
     );
-    let (_, json, _) = go(&Cmd::Usage { json: true }, &env);
+    let (_, json, _) = go(
+        &Cmd::Usage {
+            json: true,
+            agy: false,
+        },
+        &env,
+    );
     let doc: Value = aterm_json::from_str(&json).expect("json");
     assert_eq!(doc["source"].as_str(), Some("none"), "{json}");
     assert_eq!(doc["codex_home_unusable"].as_str(), Some("rel/codex"));
     env.codex_home = None;
     env.codex_thread = Some("01900000-0000-7000-8000-00000000000f".to_owned());
-    let (_, out, _) = go(&Cmd::Usage { json: false }, &env);
+    let (_, out, _) = go(
+        &Cmd::Usage {
+            json: false,
+            agy: false,
+        },
+        &env,
+    );
     assert!(out.contains("has written no rollout under"), "{out}");
 }
 
@@ -6838,6 +6980,184 @@ fn a_stateful_ledger_cut_keeps_input_it_cannot_read_whole() {
     std::fs::create_dir(&side).expect("nonregular predecessor");
     assert!(!bound_ledger_cut_with_cap(&path, 1, 64, &earlier).unwrap());
     assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+const AGY_USAGE: &str = r#"{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{"name":"Gemini Models","description":"Models within this group: Gemini Flash, Gemini Pro","buckets":[{"id":"gemini-weekly","window":"weekly","remaining_fraction":0,"reset_time":"2026-10-28T00:19:03Z"},{"id":"gemini-5h","window":"5h","disabled":true,"remaining_fraction":1}]},{"name":"Claude and GPT models","description":"Models within this group: Claude Opus, Claude Sonnet, GPT-OSS","buckets":[{"id":"3p-weekly","window":"weekly","remaining_fraction":0.96,"reset_time":"2026-10-31T00:49:13Z"}]}]}}}"#;
+
+struct AgyStandIn {
+    doc: Result<&'static str, &'static str>,
+    default: &'static str,
+}
+
+impl super::super::agy_quota_store::Source for AgyStandIn {
+    fn read(&self) -> Result<String, String> {
+        self.doc.map(str::to_owned).map_err(str::to_owned)
+    }
+
+    fn default_model(&self) -> Result<String, String> {
+        Ok(self.default.to_owned())
+    }
+}
+
+fn agy_env(tag: &str) -> (Tmp, Env) {
+    let dir = tmp_dir(tag);
+    let mut env = env_at(&dir);
+    env.now = 1_792_803_313;
+    (dir, env)
+}
+
+fn agy_go(env: &Env, what: &AgyWhat, json: bool, source: &AgyStandIn) -> (ExitCode, String) {
+    let mut out = Vec::new();
+    let code = run_agy(env, what, false, json, source, &mut out);
+    (code, String::from_utf8(out).unwrap())
+}
+
+const GEMINI_DEFAULT: AgyStandIn = AgyStandIn {
+    doc: Ok(AGY_USAGE),
+    default: "gemini-4-argon-high",
+};
+
+#[test]
+fn harness_agy_reports_each_pool_and_keeps_the_reading() {
+    let (_dir, mut env) = agy_env("agy-quota");
+    assert!(!env.under_agy());
+    env.agy_conversation = Some("96671fc5-6d69-4754-a501-2bdcc6566785".to_owned());
+    assert!(env.under_agy());
+    let (code, text) = agy_go(&env, &AgyWhat::Quota, false, &GEMINI_DEFAULT);
+    assert_eq!(code, ExitCode::SUCCESS);
+    assert!(
+        text.starts_with("agy quota \u{b7} gemini SPENT: week 0% left"),
+        "{text}"
+    );
+    assert!(text.contains("| claude/gpt: week 96% left"), "{text}");
+    assert!(text.contains("[source=agy -p /usage, read now]"), "{text}");
+    assert!(text.contains("  Gemini Models: spent"), "{text}");
+    assert!(text.contains("  Claude and GPT models: open"), "{text}");
+    let (_, json) = agy_go(&env, &AgyWhat::Quota, true, &GEMINI_DEFAULT);
+    let v: Value = aterm_json::from_str(&json).unwrap();
+    assert_eq!(
+        v["got"].as_str(),
+        Some("kept"),
+        "the second look reads the kept reading"
+    );
+    assert_eq!(
+        v["agy_conversation"].as_str(),
+        Some("96671fc5-6d69-4754-a501-2bdcc6566785")
+    );
+    assert_eq!(v["groups"][0]["standing"].as_str(), Some("spent"));
+    assert_eq!(v["groups"][1]["standing"].as_str(), Some("open"));
+    env.claude_session = Some("0b8f2c1e-0000-4000-8000-000000000000".to_owned());
+    assert!(
+        !env.under_agy(),
+        "a Claude Code session's usage stays its own"
+    );
+}
+
+#[test]
+fn harness_agy_pick_rotates_off_the_spent_pool() {
+    let (_dir, env) = agy_env("agy-pick");
+    let (code, text) = agy_go(&env, &AgyWhat::Pick(None), false, &GEMINI_DEFAULT);
+    assert_eq!(code, ExitCode::SUCCESS);
+    assert_eq!(
+        text,
+        "claude-opus-5-5-medium\n  gemini-4-argon-high rotated to claude-opus-5-5-medium: \
+         gemini-4-argon-high's pool is spent, claude-opus-5-5-medium's is open\n"
+    );
+    let (_, json) = agy_go(
+        &env,
+        &AgyWhat::Pick(Some("claude-sonnet-5-5-low".to_owned())),
+        true,
+        &GEMINI_DEFAULT,
+    );
+    let v: Value = aterm_json::from_str(&json).unwrap();
+    assert_eq!(
+        (v["pick"].as_str(), v["model"].as_str()),
+        (Some("keep"), Some("claude-sonnet-5-5-low"))
+    );
+    std::fs::write(
+        env.config.as_ref().unwrap(),
+        "[harness.agy]\nrotate = false\n",
+    )
+    .unwrap();
+    let (_, json) = agy_go(&env, &AgyWhat::Pick(None), true, &GEMINI_DEFAULT);
+    let v: Value = aterm_json::from_str(&json).unwrap();
+    assert_eq!(
+        (v["pick"].as_str(), v["rotate"].as_bool()),
+        (Some("keep"), Some(false))
+    );
+}
+
+#[test]
+fn harness_agy_pick_waits_when_every_pool_is_spent() {
+    let (_dir, env) = agy_env("agy-wait");
+    let spent = AgyStandIn {
+        doc: Ok(
+            r#"{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{"name":"Gemini Models","buckets":[{"id":"gemini-weekly","window":"weekly","remaining_fraction":0,"reset_time":"2026-10-28T00:19:03Z"}]},{"name":"Claude and GPT models","buckets":[{"id":"3p-5h","window":"5h","remaining_fraction":0,"reset_time":"2026-10-24T05:49:13Z"}]}]}}}"#,
+        ),
+        default: "claude-opus-5-5-medium",
+    };
+    let (code, text) = agy_go(&env, &AgyWhat::Pick(None), false, &spent);
+    assert_eq!(code, ExitCode::from(3));
+    assert!(
+        text.starts_with("-\n") && text.contains("until 2026-10-24T05:49:13Z"),
+        "{text}"
+    );
+}
+
+#[test]
+fn an_unreadable_agy_quota_says_why_and_fails() {
+    let (_dir, env) = agy_env("agy-err");
+    let bad = AgyStandIn {
+        doc: Err("`agy -p /usage` exited 1"),
+        default: "x",
+    };
+    let (code, text) = agy_go(&env, &AgyWhat::Quota, false, &bad);
+    assert_eq!(code, ExitCode::FAILURE);
+    assert_eq!(text, "agy quota unread: `agy -p /usage` exited 1\n");
+    let (_dir2, env) = agy_env("agy-err-json");
+    let (_, json) = agy_go(
+        &env,
+        &AgyWhat::Quota,
+        true,
+        &AgyStandIn {
+            doc: Ok("not json"),
+            default: "x",
+        },
+    );
+    let v: Value = aterm_json::from_str(&json).unwrap();
+    assert!(v["error"].as_str().unwrap().contains("not JSON"), "{json}");
+}
+
+#[test]
+fn the_agy_verb_parses_its_forms() {
+    let p = |line: &str| parse(&words(line)).map(|(cmd, _)| cmd);
+    assert_eq!(
+        p("agy").unwrap(),
+        Cmd::Agy {
+            what: AgyWhat::Quota,
+            refresh: false,
+            json: false
+        }
+    );
+    assert_eq!(
+        p("agy quota --refresh --json").unwrap(),
+        Cmd::Agy {
+            what: AgyWhat::Quota,
+            refresh: true,
+            json: true
+        }
+    );
+    assert_eq!(
+        p("agy pick gemini-4-argon-high").unwrap(),
+        Cmd::Agy {
+            what: AgyWhat::Pick(Some("gemini-4-argon-high".to_owned())),
+            refresh: false,
+            json: false
+        }
+    );
+    assert!(p("agy frob").is_err());
+    assert_eq!(p("agy --help").unwrap(), Cmd::Help(HelpPage::Agy));
+    assert!(help_page(HelpPage::Agy).contains("agy pick [<model>]"));
 }
 
 #[test]

@@ -60,7 +60,7 @@ impl TargetStreams {
 /// What the client asked for at instance scope, before any authority check.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub(crate) struct RequestedInstance {
-    /// The instance lifecycle stream: `EVENT * session-created <sid>` when any session spawns and `EVENT * session-exited <sid> reason=<shell-exit|ctl-close|ui-close|window-close|app-quit|unknown>` when one closes, so a supervisor learns of siblings without polling.
+    /// The instance lifecycle stream: `EVENT * session-created <sid>` when any session spawns and `EVENT * session-exited <sid> reason=<shell-exit|ctl-close|ui-close|window-close|unknown>` when one closes, so a supervisor learns of siblings without polling.
     pub sessions: bool,
 }
 
@@ -635,6 +635,7 @@ pub(crate) fn timeline_wire_kind(kind: &str) -> Option<&'static str> {
         "render" => Some("render"),
         crate::harness_policy_verb::HARNESS_POLICY_EVENT => Some("harness-policy"),
         crate::sys_host::JOB_CHANGE => Some("job"),
+        crate::occupancy_wakes::WAKE_READY => Some("wake"),
         other => crate::fabric::fabric_event_wire_kind(other),
     }
 }

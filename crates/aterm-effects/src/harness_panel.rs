@@ -262,11 +262,14 @@ fn srgb(l: f32) -> u32 {
 #[inline]
 pub fn match_luminance(ink: u32, target: u32) -> u32 {
     let table = crate::color_math::relative_luminance_table();
-    if crate::color_math::relative_luminance_with(table, ink) <= 1e-6 {
+    let lc = crate::color_math::relative_luminance_with(table, ink);
+    if lc <= 1e-6 {
         return target & 0x00FF_FFFF;
     }
-    at_luminance(
+    at_luminance_with(
+        table,
         ink,
+        lc,
         crate::color_math::relative_luminance_with(table, target),
     )
 }
@@ -276,10 +279,18 @@ pub fn match_luminance(ink: u32, target: u32) -> u32 {
 #[inline]
 pub fn at_luminance(ink: u32, lt: f32) -> u32 {
     let table = crate::color_math::relative_luminance_table();
-    let (lc, lt) = (
-        crate::color_math::relative_luminance_with(table, ink),
-        lt.clamp(0.0, 1.0),
-    );
+    let lc = crate::color_math::relative_luminance_with(table, ink);
+    at_luminance_with(table, ink, lc, lt)
+}
+
+#[inline]
+fn at_luminance_with(
+    table: &crate::color_math::RelativeLuminanceTable,
+    ink: u32,
+    lc: f32,
+    lt: f32,
+) -> u32 {
+    let lt = lt.clamp(0.0, 1.0);
     if lc <= 1e-6 {
         let g = srgb(lt);
         return (g << 16) | (g << 8) | g;
@@ -287,6 +298,16 @@ pub fn at_luminance(ink: u32, lt: f32) -> u32 {
     let r = table.linear[((ink >> 16) & 0xff) as usize];
     let g = table.linear[((ink >> 8) & 0xff) as usize];
     let b = table.linear[(ink & 0xff) as usize];
+    at_luminance_linear(r, g, b, lc, lt)
+}
+
+#[inline]
+fn at_luminance_linear(r: f32, g: f32, b: f32, lc: f32, lt: f32) -> u32 {
+    let lt = lt.clamp(0.0, 1.0);
+    if lc <= 1e-6 {
+        let g = srgb(lt);
+        return (g << 16) | (g << 8) | g;
+    }
     if lt <= lc {
         let s = lt / lc;
         (srgb(r * s) << 16) | (srgb(g * s) << 8) | srgb(b * s)
@@ -321,7 +342,7 @@ pub fn at_luminance_hue(ink: u32, lt: f32) -> u32 {
     let table = crate::color_math::relative_luminance_table();
     let lc = crate::color_math::relative_luminance_with(table, ink);
     if lt <= lc || lc <= 1e-6 {
-        return at_luminance(ink, lt);
+        return at_luminance_with(table, ink, lc, lt);
     }
     let [l0, a0, b0] = oklab(ink);
     let at = |t: f32| oklab_to_rgb([l0 + (1.0 - l0) * t, a0 * (1.0 - t), b0 * (1.0 - t)]);
@@ -348,15 +369,17 @@ fn print_ring(fresh: u32, ground: u32, veil: u8, top: f32) -> u32 {
     let table = crate::color_math::relative_luminance_table();
     let g = over_rgb(ground, fresh, veil) & 0x00FF_FFFF;
     let lg = crate::color_math::relative_luminance_with(table, g);
-    let ring = |l: f32| at_luminance(fresh, l);
+    let lc = crate::color_math::relative_luminance_with(table, fresh);
+    let r_lin = table.linear[((fresh >> 16) & 0xff) as usize];
+    let g_lin = table.linear[((fresh >> 8) & 0xff) as usize];
+    let b_lin = table.linear[(fresh & 0xff) as usize];
+    let ring = |l: f32| at_luminance_linear(r_lin, g_lin, b_lin, lc, l);
     let holds = |l: f32| {
         let r = over_rgb(ring(l), fresh, veil) & 0x00FF_FFFF;
         let lr = crate::color_math::relative_luminance_with(table, r);
         (lr.max(lg) + 0.05) / (lr.min(lg) + 0.05) >= PRINT_RING_CONTRAST
     };
-    let top = top
-        .min(crate::color_math::relative_luminance_with(table, fresh))
-        .max(0.0);
+    let top = top.min(lc).max(0.0);
     if holds(top) {
         return ring(top);
     }

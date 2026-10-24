@@ -379,3 +379,65 @@ fn the_harnesss_own_acts_are_no_prompt() {
         "CONTROL: the owner's unmarked words"
     );
 }
+
+#[test]
+fn agy_excerpts_read_prompts_said_and_doing_from_transcript_and_history() {
+    let cid = "dfaaf1c5-98ff-4412-9226-76412af952a5";
+    let transcript = concat!(
+        r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"<USER_REQUEST>\nhi\nwhat is next?\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\ntime\n</ADDITIONAL_METADATA>"}"#,
+        "\n",
+        r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"Working on the survey excerpts.","tool_calls":[{"name":"read_file","args":{}},{"name":"run_command","args":{}}]}"#,
+        "\n",
+        r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"DONE","content":"read_file output"}"#,
+        "\n",
+    );
+    let history = concat!(
+        r#"{"display":"earlier prompt","timestamp":1,"workspace":"/w","conversationId":"dfaaf1c5-98ff-4412-9226-76412af952a5"}"#,
+        "\n",
+        r#"{"display":"[aterm harness] Autopilot is Cruise: keep going.","timestamp":2,"workspace":"/w","conversationId":"dfaaf1c5-98ff-4412-9226-76412af952a5"}"#,
+        "\n",
+    );
+    let got = agy_excerpts_from(transcript.as_bytes(), Some(history.as_bytes()), cid);
+    assert_eq!(texts(&got), ["hi what is next?", "earlier prompt"]);
+    assert_eq!(got.said.as_deref(), Some("Working on the survey excerpts."));
+    assert_eq!(got.doing.as_deref(), Some("run_command"));
+
+    let finished = format!(
+        "{transcript}{}\n",
+        r#"{"step_index":3,"source":"MODEL","type":"GENERIC","status":"DONE","content":"run_command output"}"#
+    );
+    let done = agy_excerpts_from(finished.as_bytes(), Some(history.as_bytes()), cid);
+    assert_eq!(done.doing, None);
+}
+
+#[test]
+fn muse_excerpts_read_prompts_said_and_doing_from_session_log() {
+    let session = concat!(
+        r#"{"retained_frame":"f","children":[{"record_json":"{\"payload_type\":\"runtime.session\",\"payload\":{\"kind\":\"run\",\"run_id\":\"r1\",\"event\":{\"kind\":\"started\",\"prompt\":\"write the landing report round 1\"}}}"}]}"#,
+        "\n",
+        r#"{"payload_type":"runtime.session","payload":{"kind":"run","run_id":"r1","event":{"kind":"assistant_message_committed","text":"Round 1 complete.\nAll checks passed."}}}"#,
+        "\n",
+        r#"{"payload_type":"runtime.session","payload":{"kind":"run","run_id":"r1","event":{"kind":"terminal","terminal":"completed"}}}"#,
+        "\n",
+        r#"{"payload_type":"runtime.session","payload":{"kind":"run","run_id":"r2","event":{"kind":"started","prompt":"[aterm harness] Autopilot is Cruise: keep going."}}}"#,
+        "\n",
+        r#"{"payload_type":"runtime.session","payload":{"kind":"task","run_id":"r2","task_id":"t0","event":{"kind":"proposed","task_kind":"session_name.allocate"}}}"#,
+        "\n",
+        r#"{"payload_type":"runtime.session","payload":{"kind":"task","run_id":"r2","task_id":"t1","event":{"kind":"proposed","task_kind":"tool.bash"}}}"#,
+        "\n",
+    );
+    let got = muse_excerpts_from(session.as_bytes());
+    assert_eq!(texts(&got), ["write the landing report round 1"]);
+    assert_eq!(
+        got.said.as_deref(),
+        Some("Round 1 complete. All checks passed.")
+    );
+    assert_eq!(got.doing.as_deref(), Some("bash"));
+
+    let completed = format!(
+        "{session}{}\n",
+        r#"{"payload_type":"runtime.session","payload":{"kind":"task","run_id":"r2","task_id":"t1","event":{"kind":"completed"}}}"#
+    );
+    let done = muse_excerpts_from(completed.as_bytes());
+    assert_eq!(done.doing, None);
+}

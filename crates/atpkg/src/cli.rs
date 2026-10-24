@@ -6231,7 +6231,8 @@ fn cache_plan_words(why: crate::build_cache::Unused) -> String {
         }
         Unused::Tooling { idle, after } => format!(
             "goes whole: a pinned tool nothing ran for {} (the pass takes one unused \
-             {}; `targo --unverified verify provision` lays it again)",
+             {}; `targo --unverified verify provision` lays it again, with `--linux` for the \
+             Linux lane's rows and `--record` for wasm-bindgen)",
             days(idle),
             days(after)
         ),
@@ -7234,7 +7235,10 @@ pub(crate) fn clt_which_line(
     host: &crate::prereq::CcHost,
 ) -> Result<String, String> {
     let verdict = crate::prereq::probe_with(path_var, host);
-    if !verdict.blocks_builds() {
+    if matches!(
+        &verdict,
+        crate::prereq::CcVerdict::Ready { .. } | crate::prereq::CcVerdict::NotProbed
+    ) {
         Ok(format!("{tool} → {}", verdict.line()))
     } else {
         Err(format!(
@@ -7248,14 +7252,15 @@ pub(crate) fn clt_which_line(
 fn cmd_install_clt() -> ExitCode {
     let host = crate::prereq::CcHost::this_machine();
     let verdict = crate::prereq::probe_with(std::env::var_os("PATH").as_deref(), &host);
-    if !verdict.blocks_builds() {
+    if matches!(&verdict, crate::prereq::CcVerdict::Ready { .. }) {
         println!("atpkg: clt: already ready — {}", verdict.line());
         if let Some(line) = c_toolchain_marker(&verdict) {
             emit_marker_line(&line);
         }
         return ExitCode::SUCCESS;
     }
-    if cfg!(target_os = "macos")
+    if verdict.blocks_builds()
+        && cfg!(target_os = "macos")
         && let Ok(exe) = std::env::current_exe()
         && exe.file_name().and_then(|s| s.to_str()) == Some("aterm")
     {
@@ -7784,20 +7789,20 @@ fn unlink_returns_to_alab(layout: &crate::store::Layout, program: &str) -> bool 
 fn dev_linked_line(program: &str, alab: bool) -> String {
     if alab && let Some(agent) = crate::alab::agent(program) {
         return format!(
-            "atpkg: {program} is dev-linked; run `aterm pkg unlink {program}` to return to the \
-             {} build",
+            "atpkg: {program} is dev-linked; run `aterm pkg unlink {program}`, then `aterm pkg \
+             install {program}`, to return to the {} build",
             agent.product
         );
     }
     match crate::vendor_direct::spec(program) {
         Some(spec) => format!(
-            "atpkg: {program} is dev-linked; run `aterm pkg unlink {program}` to install {}'s \
-             latest",
+            "atpkg: {program} is dev-linked; run `aterm pkg unlink {program}`, then `aterm pkg \
+             install {program}`, to install {}'s latest",
             spec.vendor
         ),
         None => format!(
-            "atpkg: {program} is dev-linked; run `aterm pkg unlink {program}` to install ALab's \
-             build"
+            "atpkg: {program} is dev-linked; run `aterm pkg unlink {program}`, then `aterm pkg \
+             install {program}`, to install ALab's build"
         ),
     }
 }
@@ -12571,6 +12576,19 @@ fn pkg_post_verify_refusal(verified: &crate::VerifiedBytes) -> Option<String> {
     }
 }
 
+/// What `pkg verify` says a vendor-direct tree was staged from: the vendor's authenticated
+/// digest, or, where no vendor document names one (`measured`), the bytes its Developer ID
+/// signature vouched for, whose digest the lane measured.
+fn staged_from(vendor: &str, measured: bool) -> String {
+    if measured {
+        format!(
+            "bytes signed with {vendor}'s Developer ID, whose digest no {vendor} document names"
+        )
+    } else {
+        format!("{vendor}'s authenticated digest")
+    }
+}
+
 fn cmd_verify(program: Option<&String>) -> ExitCode {
     let Some(layout) = layout() else {
         return ExitCode::from(1);
@@ -12592,16 +12610,23 @@ fn cmd_verify(program: Option<&String>) -> ExitCode {
             VendorRoot {
                 build,
                 vendor,
+                measured,
                 drift: None,
             } => println!(
-                "atpkg: {} OK (matches the tree staged from {vendor}'s authenticated digest)",
-                crate::vendor_direct::display_build(name, *build)
+                "atpkg: {} OK (matches the tree staged from {})",
+                crate::vendor_direct::display_build(name, *build),
+                staged_from(vendor, *measured)
             ),
-            VendorRoot { build, vendor, .. } => {
+            VendorRoot {
+                build,
+                vendor,
+                measured,
+                ..
+            } => {
                 eprintln!(
-                    "atpkg: {} DRIFT — the store tree no longer matches the tree staged from \
-                     {vendor}'s authenticated digest",
-                    crate::vendor_direct::display_build(name, *build)
+                    "atpkg: {} DRIFT — the store tree no longer matches the tree staged from {}",
+                    crate::vendor_direct::display_build(name, *build),
+                    staged_from(vendor, *measured)
                 );
             }
             Match { build } => {
@@ -12866,7 +12891,8 @@ fn cmd_unlink(program: Option<&String>) -> ExitCode {
                 }
                 Err(e) => eprintln!(
                     "atpkg:   WARNING: could not restore the installed build's shims ({e}); \
-                     run `aterm pkg install {program}` to put it back on PATH"
+                     run `aterm pkg uninstall {program}`, then `aterm pkg install {program}`, \
+                     to put its commands back on PATH"
                 ),
             }
             if program == crate::seam::SEAM_PROGRAM {

@@ -251,24 +251,72 @@ impl LetterGuard {
                 i32::from(by0).max(j.y0),
                 (i32::from(by0) + i32::from(bh)).min(j.y1),
             );
-            for y in y0..y1 {
-                for x in x0..x1 {
-                    let at = (y - j.y0) as usize * w + (x - j.x0) as usize;
-                    let c = match stream {
-                        Stream::Under => quad_at(&under[i], x, 1.0).0,
-                        Stream::Over => quad_at(&over[i], x, 1.0).0,
-                        _ => {
-                            let wt = halo_wt(&halos[i], x, y);
-                            if wt == 0 {
-                                continue;
-                            }
-                            aterm_render::premul_rgb(halos[i].color & 0x00FF_FFFF, wt)
-                        }
-                    };
-                    if stream == Stream::Under {
-                        add(&mut lu[at], c);
+            if x0 >= x1 || y0 >= y1 {
+                continue;
+            }
+            match stream {
+                Stream::Under | Stream::Over => {
+                    let q = if stream == Stream::Under {
+                        &under[i]
                     } else {
-                        add(&mut lo[at], c);
+                        &over[i]
+                    };
+                    let dst = if stream == Stream::Under {
+                        &mut lu
+                    } else {
+                        &mut lo
+                    };
+                    if (q.color ^ q.color2) & 0x00FF_FFFF == 0 {
+                        let c = q.color & 0x00FF_FFFF;
+                        if c != 0 {
+                            let (rx0, rx1) = ((x0 - j.x0) as usize, (x1 - j.x0) as usize);
+                            for y in y0..y1 {
+                                let row_off = (y - j.y0) as usize * w;
+                                for cell in &mut dst[row_off + rx0..row_off + rx1] {
+                                    add(cell, c);
+                                }
+                            }
+                        }
+                    } else {
+                        for x in x0..x1 {
+                            let c = quad_at(q, x, 1.0).0;
+                            if c != 0 {
+                                let col_off = (x - j.x0) as usize;
+                                for y in y0..y1 {
+                                    add(&mut dst[(y - j.y0) as usize * w + col_off], c);
+                                }
+                            }
+                        }
+                    }
+                }
+                Stream::HaloAdd | Stream::HaloOver => {
+                    let h = &halos[i];
+                    let color = h.color & 0x00FF_FFFF;
+                    if color == 0 {
+                        continue;
+                    }
+                    let ry2 = (i32::from(h.ry) * i32::from(h.ry)).max(1);
+                    let rx2 = (i32::from(h.rx) * i32::from(h.rx)).max(1);
+                    let cx = i32::from(h.cx);
+                    let cy = i32::from(h.cy);
+                    for y in y0..y1 {
+                        let ny = aterm_render::halo_row_ny(y - cy, ry2);
+                        if ny >= 256 {
+                            continue;
+                        }
+                        let span = ((((256 - ny) * rx2) >> 8) as u32).isqrt() as i32 + 1;
+                        let hx0 = x0.max(cx - span);
+                        let hx1 = x1.min(cx + span + 1);
+                        let row_off = (y - j.y0) as usize * w;
+                        for x in hx0..hx1 {
+                            let wt = aterm_render::halo_weight(x - cx, ny, rx2).clamp(0, 255) as u8;
+                            if wt != 0 {
+                                add(
+                                    &mut lo[row_off + (x - j.x0) as usize],
+                                    aterm_render::premul_rgb(color, wt),
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -373,16 +421,31 @@ impl LetterGuard {
         };
         let ratio = |a: f32, b: f32| (a.max(b) + 0.05) / (a.min(b) + 0.05);
         let mut holds = true;
+        let mut last_g: Option<(u32, f32)> = None;
+        let mut last_ink: Option<(u32, f32)> = None;
         'rows: for gy in 0..h {
             let row = gy * w;
             for x in 0..w {
                 let g = if additive {
-                    lift(j.ground, self.lift_under[row + x], self.lift_over[row + x])
+                    let (a, b) = (self.lift_under[row + x], self.lift_over[row + x]);
+                    if a == [0; 3] && b == [0; 3] {
+                        j.ground
+                    } else {
+                        lift(j.ground, a, b)
+                    }
                 } else {
                     let at = (j.x0 + x as i32, j.y0 + gy as i32, row + x);
                     self.composite(j.ground, at, true, s, streams)
                 };
-                lum[row + x] = crate::color_math::relative_luminance_with(table, g);
+                let lg = match last_g {
+                    Some((prev_g, prev_lum)) if prev_g == g => prev_lum,
+                    _ => {
+                        let l = crate::color_math::relative_luminance_with(table, g);
+                        last_g = Some((g, l));
+                        l
+                    }
+                };
+                lum[row + x] = lg;
             }
             for x in r..w - r {
                 let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
@@ -399,12 +462,24 @@ impl LetterGuard {
             let y = y + r;
             for x in r..w - r {
                 let ink = if additive {
-                    lift(j.ink, [0; 3], self.lift_over[y * w + x])
+                    let b = self.lift_over[y * w + x];
+                    if b == [0; 3] {
+                        j.ink
+                    } else {
+                        lift(j.ink, [0; 3], b)
+                    }
                 } else {
                     let at = (j.x0 + x as i32, j.y0 + y as i32, y * w + x);
                     self.composite(j.ink, at, false, s, streams)
                 };
-                let li = crate::color_math::relative_luminance_with(table, ink);
+                let li = match last_ink {
+                    Some((prev_ink, prev_lum)) if prev_ink == ink => prev_lum,
+                    _ => {
+                        let l = crate::color_math::relative_luminance_with(table, ink);
+                        last_ink = Some((ink, l));
+                        l
+                    }
+                };
                 let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
                 for yy in y - r..=y + r {
                     lo = lo.min(ring_lo[yy * w + x]);
@@ -521,8 +596,9 @@ fn lifted(c: u32, lift: [u32; 3]) -> u32 {
 /// way from `ink` to `ground` that reads [`SOLID_SHARE`] of the clean ratio.
 fn solid_ink(ink: u32, ground: u32, table: &crate::color_math::RelativeLuminanceTable) -> u32 {
     let lum = |c: u32| crate::color_math::relative_luminance_with(table, c);
+    let lg = lum(ground);
     let ratio = |a: u32| {
-        let (la, lg) = (lum(a), lum(ground));
+        let la = lum(a);
         (la.max(lg) + 0.05) / (la.min(lg) + 0.05)
     };
     let want = SOLID_SHARE * ratio(ink);
@@ -534,15 +610,22 @@ fn solid_ink(ink: u32, ground: u32, table: &crate::color_math::RelativeLuminance
         (ch(16) << 16) | (ch(8) << 8) | ch(0)
     };
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
+    let (mut lo_rgb, mut hi_rgb) = (ink & 0x00FF_FFFF, ground & 0x00FF_FFFF);
     for _ in 0..10 {
         let mid = 0.5 * (lo + hi);
-        if ratio(mix(mid)) >= want {
+        let mid_rgb = mix(mid);
+        if ratio(mid_rgb) >= want {
             lo = mid;
+            lo_rgb = mid_rgb;
         } else {
             hi = mid;
+            hi_rgb = mid_rgb;
+        }
+        if lo_rgb == hi_rgb {
+            break;
         }
     }
-    mix(lo)
+    lo_rgb
 }
 
 impl InkLedger {
@@ -699,7 +782,9 @@ impl CursorGlow {
             self.halo_out.as_slice(),
         );
         let mut print = 0u64;
-        let mut solid: Option<((u32, u32), u32)> = None;
+        let mut solid = None;
+        let lum = |c: u32| crate::color_math::relative_luminance_with(table, c);
+        let lum_ratio = |la: f32, lb: f32| (la.max(lb) + 0.05) / (la.min(lb) + 0.05);
         for (i, span) in text.rows.iter().enumerate() {
             let Some((first, end)) = *span else {
                 continue;
@@ -707,15 +792,23 @@ impl CursorGlow {
             let row = text.lo + i as i32;
             let (ry0, ry1) = (oy + row * ch - RING, oy + (row + 1) * ch + RING);
             guard.row.clear();
+            let (mut min_x, mut max_x) = (i32::MAX, i32::MIN);
+            let mut note_x = |x: u16, w: u16| {
+                let x0 = i32::from(x);
+                min_x = min_x.min(x0);
+                max_x = max_x.max(x0 + i32::from(w));
+            };
             let meets_y = |y: u16, h: u16| i32::from(y) < ry1 && i32::from(y) + i32::from(h) > ry0;
             let lit = |q: &GlowQuad| q.w > 0 && q.h > 0 && (q.color | q.color2) & 0x00FF_FFFF != 0;
             for (k, q) in streams.0.iter().enumerate() {
                 if lit(q) && meets_y(q.y, q.h) {
+                    note_x(q.x, q.w);
                     guard.row.push((Stream::Under, k as u32));
                 }
             }
             for (k, q) in streams.1.iter().enumerate() {
                 if lit(q) && meets_y(q.y, q.h) {
+                    note_x(q.x, q.w);
                     guard.row.push((Stream::Over, k as u32));
                 }
             }
@@ -732,6 +825,7 @@ impl CursorGlow {
                         } else {
                             Stream::HaloOver
                         };
+                        note_x(h.x, h.w);
                         guard.row.push((s, k as u32));
                     }
                 }
@@ -740,14 +834,17 @@ impl CursorGlow {
                 continue;
             }
             for col in first..end {
-                if caret == Some((row, col)) {
+                let (cx0, cx1) = (ox + col * cw - RING, ox + (col + 1) * cw + RING);
+                if max_x <= cx0 {
+                    break;
+                }
+                if min_x >= cx1 || caret == Some((row, col)) {
                     continue;
                 }
                 let Some((Some(ink), ground)) = text.pair(row, col) else {
                     continue;
                 };
                 let (ink, ground) = (ink & 0x00FF_FFFF, ground & 0x00FF_FFFF);
-                let (cx0, cx1) = (ox + col * cw - RING, ox + (col + 1) * cw + RING);
                 guard.cell.clear();
                 for &(stream, k) in &guard.row {
                     let (x, w) = match stream {
@@ -764,12 +861,18 @@ impl CursorGlow {
                 if guard.cell.is_empty() {
                     continue;
                 }
-                let ink = match solid {
-                    Some((pair, s)) if pair == (ink, ground) => s,
+                let (ink, l_ink, l_ground, bar) = match solid {
+                    Some((pair, cached)) if pair == (ink, ground) => cached,
                     _ => {
                         let s = solid_ink(ink, ground, table);
-                        solid = Some(((ink, ground), s));
-                        s
+                        let li = lum(s);
+                        let lg = lum(ground);
+                        // The bare page's reading: every light at share 0 composes
+                        // to the ground and the ink themselves.
+                        let b = letter_bar(lum_ratio(li, lg));
+                        let cached = (s, li, lg, b);
+                        solid = Some(((ink, ground), cached));
+                        cached
                     }
                 };
                 let j = Judge {
@@ -780,24 +883,16 @@ impl CursorGlow {
                     ink,
                     ground,
                 };
-                let lum = |c: u32| crate::color_math::relative_luminance_with(table, c);
-                let ratio = |a: u32, b: u32| {
-                    let (la, lb) = (lum(a), lum(b));
-                    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
-                };
-                // The bare page's reading: every light at share 0 composes
-                // to the ground and the ink themselves.
-                let bar = letter_bar(ratio(ink, ground));
                 if let Some((on_ink, all)) = guard.bound(j, streams) {
                     // Light ink on a dark page reads worst against the
                     // brightest ground the lights can make; dark ink on
                     // paper, lifted the most, against the page itself.
-                    let clear = if lum(ink) >= lum(ground) {
-                        let g = lifted(ground, all);
-                        lum(g) < lum(ink) && ratio(ink, g) >= bar
+                    let clear = if l_ink >= l_ground {
+                        let lg = lum(lifted(ground, all));
+                        lg < l_ink && lum_ratio(l_ink, lg) >= bar
                     } else {
-                        let i = lifted(ink, on_ink);
-                        lum(i) < lum(ground) && ratio(i, ground) >= bar
+                        let li = lum(lifted(ink, on_ink));
+                        li < l_ground && lum_ratio(li, l_ground) >= bar
                     };
                     if clear {
                         continue;

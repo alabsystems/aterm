@@ -165,7 +165,7 @@ fn fill_scanline(
             &mut scratch.edges,
         );
     }
-    rasterize_edges(tile, rgb, alpha, &bbox, scratch);
+    rasterize_edges(tile, rgb, alpha, &bbox, paths.len() > 1, scratch);
 }
 
 fn fill_scanline_fixed(
@@ -197,7 +197,7 @@ fn fill_scanline_fixed(
             &mut scratch.edges,
         );
     }
-    rasterize_edges(tile, rgb, alpha, &bbox, scratch);
+    rasterize_edges(tile, rgb, alpha, &bbox, paths.len() > 1, scratch);
 }
 
 fn rasterize_edges(
@@ -205,6 +205,7 @@ fn rasterize_edges(
     rgb: (f32, f32, f32),
     alpha: f32,
     bbox: &BBox,
+    multi_path: bool,
     scratch: &mut FillScratch,
 ) {
     let FillScratch {
@@ -248,7 +249,11 @@ fn rasterize_edges(
             for e in active.iter() {
                 xs.push((e.path, e.xtop + (sy - e.ytop) * e.dxdy));
             }
-            xs.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+            if multi_path {
+                xs.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+            } else {
+                xs.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
+            }
             spans.clear();
             let mut i = 0usize;
             while let (Some(a), Some(b)) = (xs.get(i), xs.get(i + 1)) {
@@ -259,7 +264,9 @@ fn rasterize_edges(
                     i += 1;
                 }
             }
-            spans.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+            if multi_path && spans.len() > 1 {
+                spans.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+            }
             let mut cur: Option<(f32, f32)> = None;
             for &(a, b) in spans.iter() {
                 if b <= a {

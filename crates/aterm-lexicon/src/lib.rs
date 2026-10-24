@@ -822,10 +822,10 @@ impl Lexicon {
                     .is_none_or(|ignore| !ignore.contains(surface.as_str()))
                 && !(class == Class::Feline
                     && !opts.allow_bare_cat
-                    && surface.chars().count() <= 3
+                    && char_count_le_3(surface)
                     && !hit.marks_required)
                 && !(class == Class::Emphasis
-                    && surface.chars().count() <= 3
+                    && char_count_le_3(surface)
                     && !self.user_surfaces.contains(surface.as_str()))
                 && !overridden(fnv1a64(surface))
         });
@@ -871,6 +871,9 @@ impl Lexicon {
                 c.form_id = c.form_id.with_variant(variant);
                 return Some(c);
             }
+        }
+        if token.as_bytes().first().is_none_or(u8::is_ascii) {
+            return None;
         }
 
         if let Some(rest) = token.strip_prefix("\u{0627}\u{0644}")
@@ -1002,13 +1005,13 @@ impl Lexicon {
         }
         if hit.class == Class::Feline
             && !opts.allow_bare_cat
-            && folded.chars().count() <= 3
+            && char_count_le_3(folded)
             && !hit.marks_required
         {
             return;
         }
         if hit.class == Class::Emphasis
-            && folded.chars().count() <= 3
+            && char_count_le_3(folded)
             && !self.user_surfaces.contains(folded.as_str())
         {
             return;
@@ -1277,7 +1280,12 @@ pub fn form_hash(surface: &str) -> u64 {
 #[inline]
 #[must_use]
 pub fn is_no_space_surface(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(fold::is_no_space_script)
+    !s.is_empty() && !s.is_ascii() && s.chars().all(fold::is_no_space_script)
+}
+
+#[inline]
+fn char_count_le_3(s: &str) -> bool {
+    s.len() <= 3 || (!s.is_ascii() && s.chars().take(4).count() <= 3)
 }
 
 /// FNV-1a over the key's UTF-8 bytes — the [`Match::form_hash`] source. Kept
@@ -1380,6 +1388,9 @@ fn right_suppresses(chars: &[char], j: usize) -> bool {
 /// Strip a trailing English possessive (`'s` / `'`) from a token, if present.
 #[inline]
 fn strip_possessive(token: &str) -> Option<(&str, u8)> {
+    if !matches!(token.as_bytes().last(), Some(b's' | b'\'' | 0x99)) {
+        return None;
+    }
     for (variant, suf) in ["'s", "\u{2019}s", "'", "\u{2019}"].into_iter().enumerate() {
         if let Some(stem) = token.strip_suffix(suf)
             && !stem.is_empty()

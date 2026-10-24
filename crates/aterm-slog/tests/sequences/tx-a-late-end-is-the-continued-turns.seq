@@ -1,0 +1,30 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# A vendor turn's end read late (6H-5's bench, 2 in 200 turns): the screen
+# closed t1 at its rest and opened t2 for the next prompt before the tap read
+# t1's end row, so t2 took t1's vendor turn on (cont=t1). The end is dated at
+# the rest, before t2 opened: it ends t1's vendor turn, amends t1, and never
+# closes t2, which stays open for its own vendor turn (vref=v2).
+bind 0
+see busy
+expect open t1 turn src=screen
+tx prompt v1
+expect amend t1 turn vref=v1
+pass 1500
+see idle
+wait 1000
+expect close t1 turn out=done src=screen
+pass 300
+see busy
+expect open t2 turn src=screen
+expect amend t2 turn cont=t1 by=vendor conf=exact
+expect tx mapped=t2
+tx end dated=1500
+expect amend t1 turn vdur_ms=4200 tok_in=900 tok_out=120 by=vendor
+expect turn=t2
+expect tx mapped=t1 ended=1
+tx prompt v2
+expect amend t2 turn vref=v2
+expect tx mapped=t2 ended=0
+see idle
+wait 1000
+expect close t2 turn out=done src=screen

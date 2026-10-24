@@ -1926,6 +1926,9 @@ pub(crate) enum HostNote {
         sid: String,
         said: aterm_agent::supervise::occupancy::OccupancySaid,
     },
+    /// The tab's wake K Entry moved: a ready wake of its book stood K looks untold, or no longer
+    /// does ([`crate::occupancy_wakes::idle_of`] says which).
+    WakeIdle { sid: String },
     /// The tab's resume loop found a point only a person can answer ([`IdleHost::exception`]).
     ResumeException {
         sid: String,
@@ -2685,6 +2688,17 @@ const fn accounts_for(agent: Program) -> bool {
     }
 }
 
+/// Whether codex-alab's own attention can name the startup screen `agent` holds: codex's
+/// alone (OpenAI's codex shares the name); another agent's screen is that agent's.
+const fn codex_alab_names_screen(agent: Program) -> bool {
+    match agent {
+        Program::Codex => true,
+        Program::Claude | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => {
+            false
+        }
+    }
+}
+
 const BACKGROUND_LOOK: Duration = Duration::from_secs(60);
 
 /// A session's note behind still to be taken.
@@ -3268,7 +3282,7 @@ impl IdleHost for WorkerIdle {
     }
 
     /// The task door's fact word on this session's record ([`Acts::task_fact`]), refused
-    /// (`Closed`) unless the owner's mode in force here is `prompt` ([`crate::occupancy_host::prompt_now`]):
+    /// (`Fenced`) unless the owner's mode in force here is `prompt` ([`crate::occupancy_host::prompt_now`]):
     /// the GUI's own gate beside the loop's grant, so no loop's word, replay or older build writes
     /// a fact under `observe` or `off`.
     fn task_fact(
@@ -3276,7 +3290,7 @@ impl IdleHost for WorkerIdle {
         word: Option<aterm_agent::supervise::occupancy::FactWord>,
     ) -> aterm_agent::supervise::occupancy::NoteOutcome {
         if !crate::occupancy_host::prompt_now() {
-            return aterm_agent::supervise::occupancy::NoteOutcome::Closed;
+            return aterm_agent::supervise::occupancy::NoteOutcome::Fenced;
         }
         (self.hooks.acts.task_fact)(&self.sid, word)
     }
@@ -3589,13 +3603,14 @@ impl IdleHost for WorkerIdle {
         resume_told(&snap)
     }
 
-    /// What the host measures of the agent's route to its API (asked only while the loop waits at a wall the network answers).
+    /// What the host measures of Claude Code's default API route. Other agents'
+    /// endpoints are not measured by the Anthropic probe.
     fn reach(&self) -> Reach {
         let probed = match self.agent {
-            Program::Claude | Program::Agy | Program::Muse | Program::Gemini => {
-                self.switches.probe_api()
+            Program::Claude => self.switches.probe_api(),
+            Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => {
+                false
             }
-            Program::Codex | Program::Generic => false,
         };
         if !probed {
             return Reach::Unknown;
@@ -10914,6 +10929,9 @@ pub(crate) struct Startup {
     pub(crate) seen: StartupSeen,
     /// What the held deadline reads of it ([`HeldRead`]).
     pub(crate) held: Option<HeldRead>,
+    /// The supervisor's attention standing on it where that is a startup stall's own
+    /// ([`STARTUP_HEAD`]): what [`restates`] compares the screen's hold with.
+    pub(crate) standing: Option<String>,
 }
 
 /// A task record's state as the deadlines judge it.
@@ -10958,10 +10976,16 @@ pub(crate) enum StartupHold {
         agent: Program,
         program: Option<String>,
     },
+    /// A codex-alab startup screen that waits for a person, as codex-alab's own attention says
+    /// (`text`, owner [`crate::task_record::SELF_CLAIM_ATTENTION_OWNER`]: a sign-in, a folder
+    /// trust its answer left, a forced model move, a hooks review), before any claim.
+    Asked { text: String },
 }
 
 impl StartupHold {
-    /// The supervisor's attention for a worker this holds past its deadline.
+    /// The supervisor's attention for a worker this holds past its deadline: for
+    /// [`Self::Asked`], codex-alab's own words after [`STARTUP_HEAD`], cut to an entry's
+    /// cap, since the supervisor's newer entry is the one aterm shows.
     #[must_use]
     pub(crate) fn attention(&self) -> String {
         let what = match self {
@@ -10997,9 +11021,43 @@ impl StartupHold {
                 agent,
                 program: None,
             } => format!("no {} started", agent.product()),
+            Self::Asked { text } => {
+                let head = format!("{STARTUP_HEAD}{ASKS}");
+                let room = crate::session_timeline::META_ATTENTION_KEYED_MAX - head.len();
+                return format!("{head}{}", cut_to(text, room));
+            }
         };
         format!("{STARTUP_HEAD}{what} (its task is marked stalled why=startup)")
     }
+}
+
+/// How a startup stall's attention quoting codex-alab begins, after [`STARTUP_HEAD`] ([`StartupHold::Asked`]).
+const ASKS: &str = "codex-alab asks: ";
+
+/// Whether a startup stall's standing attention (`standing`) is to name `hold` instead: where
+/// codex-alab's own words came or went (an [`StartupHold::Asked`] quote on either side, since
+/// codex-alab takes its attention down once its screen's step is done while the stall stands)
+/// and the words differ. Every other stall keeps the words it was raised with.
+pub(crate) fn restates(standing: Option<&str>, hold: &StartupHold) -> bool {
+    let Some(standing) = standing else {
+        return false;
+    };
+    let quoted = standing
+        .strip_prefix(STARTUP_HEAD)
+        .is_some_and(|rest| rest.starts_with(ASKS));
+    (quoted || matches!(hold, StartupHold::Asked { .. })) && standing != hold.attention()
+}
+
+/// `text` within `max` bytes: its head, ended by `…` where it is longer.
+fn cut_to(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut end = max.saturating_sub('…'.len_utf8());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
 }
 
 /// Everything that moves when a worker does, as the held deadline reads it ([`HeldRead`]).
@@ -11165,6 +11223,9 @@ pub(crate) enum StartupMark<'a> {
     Moved,
     /// No mark: the record has moved on from a deadline's stall by another writer's mark.
     Over,
+    /// No mark: a startup stall still standing names `hold` now, its attention the startup
+    /// stall's own still ([`restates`]).
+    Restated { hold: &'a StartupHold },
 }
 
 /// The held deadline's clock for one worker ([`Startups::held`]).
@@ -11322,7 +11383,11 @@ fn look_at_startups(
                 }
                 (hooks.acts.startup_mark)(&w.sid, &StartupMark::Stalled { hold });
             }
-            (StartupState::StalledAtStartup, StartupSeen::Holds(_)) => {}
+            (StartupState::StalledAtStartup, StartupSeen::Holds(hold)) => {
+                if restates(w.standing.as_deref(), hold) {
+                    (hooks.acts.startup_mark)(&w.sid, &StartupMark::Restated { hold });
+                }
+            }
         }
     }
     next
@@ -11399,11 +11464,15 @@ fn look_at_held_stall(
 /// carried it ([`StartupHold::NoComposer`]) — and, while codex-alab may not claim
 /// it (`claimable` false: a halt stands, or the session's Autopilot is off, where
 /// `harness policy` says `effective=off`), the tab is not judged yet
-/// ([`StartupSeen::Unread`]); any other worker's read is the screen's.
+/// ([`StartupSeen::Unread`]); any other worker's read is the screen's. Where codex-alab's
+/// own attention stands (`asked`) over a screen codex holds (read as codex's: `asked` is
+/// given only where no other agent is in front, `startups_of`), that is what holds it
+/// ([`StartupHold::Asked`]): codex-alab says which of its startup screens waits, and why.
 pub(crate) fn unclaimed(
     seen: StartupSeen,
     expected: Option<Program>,
     claimable: bool,
+    asked: Option<&str>,
 ) -> StartupSeen {
     match (expected, seen) {
         (
@@ -11414,6 +11483,24 @@ pub(crate) fn unclaimed(
             seen,
         ) => seen,
         (Some(Program::Codex), _) if !claimable => StartupSeen::Unread,
+        (
+            Some(Program::Codex),
+            StartupSeen::Started
+            | StartupSeen::Holds(
+                StartupHold::Trust {
+                    agent: Program::Codex,
+                }
+                | StartupHold::Box {
+                    agent: Program::Codex,
+                    ..
+                }
+                | StartupHold::NoComposer {
+                    agent: Program::Codex,
+                },
+            ),
+        ) if let Some(text) = asked => StartupSeen::Holds(StartupHold::Asked {
+            text: text.to_string(),
+        }),
         (Some(Program::Codex), StartupSeen::Started) => {
             StartupSeen::Holds(StartupHold::NoComposer {
                 agent: Program::Codex,
@@ -13829,11 +13916,14 @@ fn startups_of(store: &Store, judged: &std::collections::HashSet<String>) -> Vec
         .iter()
         .filter(|h| h.state != SessionState::Exited)
         .filter_map(|h| {
-            let (standing, carried, autopilot_off) = {
+            let (standing, asked, carried, autopilot_off) = {
                 let meta = h.ctx.meta.lock().unwrap_or_else(PoisonError::into_inner);
                 (
                     meta.attention_owners
                         .get(ATTENTION_OWNER)
+                        .map(str::to_string),
+                    meta.attention_owners
+                        .get(crate::task_record::SELF_CLAIM_ATTENTION_OWNER)
                         .map(str::to_string),
                     meta.supervisor_proven(crate::metrics::now_us()),
                     meta.autopilot_word() == Some(aterm_agent::supervise::Autopilot::Off),
@@ -13920,6 +14010,11 @@ fn startups_of(store: &Store, judged: &std::collections::HashSet<String>) -> Vec
                     startup_seen(rows, program.as_deref(), agent, record.agent),
                     record.agent,
                     claimable,
+                    // codex-alab's words name only a screen codex holds: another agent in
+                    // front (OpenAI's codex aside) is that agent's screen.
+                    asked
+                        .as_deref()
+                        .filter(|_| agent.is_none_or(codex_alab_names_screen)),
                 ),
                 _ => StartupSeen::Unread,
             };
@@ -13947,6 +14042,7 @@ fn startups_of(store: &Store, judged: &std::collections::HashSet<String>) -> Vec
                 since: record.since,
                 seen,
                 held,
+                standing: standing.filter(|s| s.starts_with(STARTUP_HEAD)),
             })
         })
         .collect()
@@ -13962,8 +14058,9 @@ fn startup_mark_live(store: &Store, sid: &str, mark: &StartupMark<'_>) {
 }
 
 /// The task door's fact word on session `sid`'s record ([`Acts::task_fact`]): `NoTask` where no
-/// session of this instance has that sid, else [`crate::task_record::mark_session_task_fact`]'s
-/// outcome, waiting on a committing update's fence for at most the fabric's own wait.
+/// session of this instance has that sid, else [`crate::task_record::mark_session_task_fact_if`]'s
+/// outcome, waiting on a committing update's fence for at most the fabric's own wait. The
+/// owner's mode is read again under the task lock immediately before the edit.
 fn task_fact_live(
     store: &Store,
     sid: &str,
@@ -13978,7 +14075,13 @@ fn task_fact_live(
         return aterm_agent::supervise::occupancy::NoteOutcome::NoTask;
     };
     let fence = h.ctx.fabric.fence_wait();
-    crate::task_record::mark_session_task_fact(&h.ctx, h.local_id, word, fence)
+    crate::task_record::mark_session_task_fact_if(
+        &h.ctx,
+        h.local_id,
+        word,
+        fence,
+        crate::occupancy_host::prompt_now,
+    )
 }
 
 /// The deadlines' marks, made in-process and conditional on the record still reading what the look read (`task_record::mark_session_task_with`, read under the locks the mark takes).
@@ -13996,7 +14099,7 @@ pub(crate) fn startup_mark_with(
         .by_sid(&aterm_session::SessionId::new(sid))
         .cloned()?;
     let said = match mark {
-        StartupMark::Stalled { hold } => hold.attention(),
+        StartupMark::Stalled { hold } | StartupMark::Restated { hold } => hold.attention(),
         StartupMark::Held { read, held_for } => held_attention(read, *held_for),
         StartupMark::Started => "started after all".to_string(),
         StartupMark::Moved => "it moved".to_string(),
@@ -14038,6 +14141,11 @@ pub(crate) fn startup_mark_with(
         StartupMark::Over => (None, take_down, |r, _| {
             !(r.state == TaskState::Stalled && matches!(r.why, Some("startup" | "held")))
         }),
+        StartupMark::Restated { .. } => (None, AttentionEdit::Raise(&said), |r, standing| {
+            r.state == TaskState::Stalled
+                && r.why == Some("startup")
+                && standing.is_some_and(|s| s.starts_with(STARTUP_HEAD))
+        }),
     };
     let fence = h.ctx.fabric.fence_wait();
     let marked = match mark_session_task_with(
@@ -14058,7 +14166,9 @@ pub(crate) fn startup_mark_with(
         (Some(m), StartupMark::Over) if m.attention_moved => {
             aterm_log::info!("harness @{sid}: task: {said}");
         }
-        (Some(_), StartupMark::Over) | (None, StartupMark::Over) => return None,
+        (Some(_), StartupMark::Over) | (None, StartupMark::Over | StartupMark::Restated { .. }) => {
+            return None;
+        }
         (Some(m), _) => {
             let (rev, state, why) = m
                 .record

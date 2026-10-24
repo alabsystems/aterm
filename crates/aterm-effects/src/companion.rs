@@ -126,7 +126,11 @@ pub fn cursor_cat_color_key(
                 && !cell.wide
                 && cell.ch != ' '
                 && cell.ch != '\0'
-                && !cell.ch.is_whitespace()
+                && !if cell.ch.is_ascii() {
+                    cell.ch.is_ascii_whitespace()
+                } else {
+                    cell.ch.is_whitespace()
+                }
             {
                 principal_fg.get_or_insert(cell.fg);
                 for (dst, src) in fg_sum.iter_mut().zip(cell.fg) {

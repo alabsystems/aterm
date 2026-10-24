@@ -178,38 +178,6 @@ fn the_pre_app_inbox_drains_into_the_center_with_its_own_stamp() {
 }
 
 #[test]
-fn finished_workstation_setup_clears_existing_and_queued_exceptions() {
-    let _lane = crate::message_inbox::lane_test_guard();
-    let _ = crate::message_inbox::take_queued();
-    let _ = crate::message_inbox::take_workstation_setup_finished();
-    let mut app = App::headless_for_test();
-    let account = crate::message_reporters::workstation_accounts_entry();
-    let settings = crate::message_reporters::workstation_setup_failure_entry();
-    let other = crate::message_reporters::devtools_entry(atpkg::devtools::Step::Add, None);
-    app.except(&account);
-    app.except(&settings);
-    app.except(&other);
-    assert!(app.owes_exception(&account.key()));
-    assert!(app.owes_exception(&settings.key()));
-    crate::report_workstation_setup();
-    crate::report_workstation_setup_failure();
-    crate::report_workstation_setup_finished();
-    app.drain_message_inbox();
-    assert!(!app.owes_exception(&account.key()));
-    assert!(!app.owes_exception(&settings.key()));
-    assert!(
-        app.owes_exception(&other.key()),
-        "unrelated privacy entries remain"
-    );
-
-    app.except(&settings);
-    assert!(app.owes_exception(&settings.key()));
-    crate::report_workstation_setup_finished();
-    app.drain_message_inbox();
-    assert!(!app.owes_exception(&settings.key()));
-}
-
-#[test]
 fn torn_fabric_state_set_aside_is_one_exceptions_entry_at_the_next_park() {
     use crate::fabric::Registry as _;
     let _lane = crate::message_inbox::lane_test_guard();
@@ -1309,35 +1277,24 @@ fn a_messages_page_that_slept_through_its_words_is_owed_its_publish_on_waking() 
 }
 
 #[test]
-fn the_developer_tools_line_opens_security_and_never_answers_the_file_access_card() {
+fn a_developer_tools_press_never_answers_the_file_access_card() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    app.except(&crate::message_reporters::devtools_entry(
-        atpkg::devtools::Step::Add,
-        None,
-    ));
-    let id = app.messages.digest().entries[0].id;
-    assert_eq!(
-        app.perform_message_act(wid, id.raw(), 1),
-        MessageActOutcome::Performed {
-            feedback: "Opened Settings \u{25b8} Security".to_string()
-        }
-    );
-    assert_eq!(
-        settings_view(&app, wid).map(|v| v.route),
-        Some(SettingsRoute::Security)
+    let press = Intent::OpenSystemPane {
+        pane: PANE_DEVELOPER_TOOLS.into(),
+    };
+    let row = app.post_message(
+        Message::new(
+            tags::PRIVACY,
+            Severity::Info,
+            "aterm is not in Developer Tools",
+        )
+        .action(press.clone()),
     );
     assert!(
-        app.messages.digest_entry(id).is_some(),
-        "a navigation leaves the line"
+        !app.perform_intent(wid, row, press),
+        "a headless arm opens no pane"
     );
-    assert_eq!(
-        app.perform_message_act(wid, id.raw(), 0),
-        MessageActOutcome::Refused {
-            feedback: "System Settings did not open".to_string()
-        }
-    );
-    assert!(app.messages.digest().is_empty(), "its one action: answered");
     assert_eq!(app.consent_card_host.marker, None, "no file-access marker");
     assert_eq!(app.consent_card_host.record.opened_at, None);
     let open_fda = Intent::OpenSystemPane {
@@ -1397,49 +1354,6 @@ fn the_developer_tools_press_is_the_one_hand_over() {
     );
     assert_eq!(app.consent_card_host.marker, None, "no file-access marker");
     assert_eq!(app.consent_card_host.record.opened_at, None);
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn a_digest_press_whose_page_does_not_open_brings_its_line_back() {
-    use crate::devtools_helper::test_arms;
-    for (reach, back) in [(test_arms::refusing(), true), (test_arms::opening(), false)] {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        test_arms::stand_in(&mut app, reach);
-        app.devtools_helper.note_reading(
-            test_arms::reading(
-                aterm_containment::DevToolGrant::NotGranted,
-                test_arms::absent(0),
-            ),
-            std::time::Instant::now(),
-        );
-        app.except(&crate::message_reporters::devtools_entry(
-            atpkg::devtools::Step::Add,
-            None,
-        ));
-        let id = app.messages.digest().entries[0].id;
-        let _ = app.perform_message_act(wid, id.raw(), 0);
-        assert!(
-            app.messages.digest().is_empty(),
-            "filed answered at the press"
-        );
-        assert!(
-            app.devtools_helper.listing().is_some(),
-            "the page waits for `spctl`"
-        );
-        let start = std::time::Instant::now();
-        while app.devtools_helper.listing().is_some() {
-            assert!(start.elapsed() < std::time::Duration::from_secs(60), "hang");
-            app.tick_devtools_hand_over(std::time::Instant::now());
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        assert_eq!(
-            !app.messages.digest().is_empty(),
-            back,
-            "back exactly when the page did not open (back={back})"
-        );
-    }
 }
 
 #[test]
@@ -4615,6 +4529,7 @@ fn an_unchanged_managed_current_is_recorded_once_and_news_again() {
         journal_key: None,
         task: None,
         autopilot_end: None,
+        wakes: None,
     }];
     assert!(
         app.post_managed_current(

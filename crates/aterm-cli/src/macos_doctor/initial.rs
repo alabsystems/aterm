@@ -6,7 +6,7 @@
 use super::*;
 use aterm_machines::init_secrets::Replaces;
 use aterm_secrets::SecretBytes;
-use aterm_types::macos_setup::Plan;
+use aterm_types::macos_setup::{Plan, Subject};
 
 mod check;
 pub use check::{check_initial_setup, check_initial_setup_observed};
@@ -14,38 +14,58 @@ mod observation;
 pub use observation::{InitialSetupObservation, InitialSetupObserved};
 mod authorization;
 pub use authorization::InitialSetupAuthorization;
+mod access;
+mod observe;
+pub use observe::observe_initial_setup;
+pub(super) use observe::{changed_at_login, forget_at_login, note_at_login};
+mod scope;
+pub use scope::{alab_mac, upgrade_provisional_setup};
 mod secrets_retry;
 use secrets_retry::Pace;
 
+/// One independently retried part of a setup run. The discriminant is the bit
+/// the progress record stores, so a stored bit keeps its meaning across versions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Stage {
-    Workstation,
-    Spotlight,
-    Permissions,
-    Secrets,
-    Repositories,
+    Workstation = 0,
+    Spotlight = 1,
+    Permissions = 2,
+    Secrets = 3,
+    Repositories = 4,
+    /// The Messages and FaceTime sign-outs and the Accessibility and Automation
+    /// they need: irreversible, so they run last (System State design §3.5).
+    Accounts = 5,
 }
 
 impl Stage {
-    const ALL: [Self; 5] = [
+    /// Run order: the sign-outs last, after Repositories.
+    const ALL: [Self; 6] = [
         Self::Workstation,
         Self::Spotlight,
         Self::Permissions,
         Self::Secrets,
         Self::Repositories,
+        Self::Accounts,
     ];
+
+    /// Every stored bit a progress record may hold.
+    const KNOWN: u16 = (1 << 6) - 1;
 
     const fn bit(self) -> u16 {
         1 << self as u8
     }
 
-    const fn selected(self, plan: &Plan) -> bool {
+    fn selected(self, plan: &Plan) -> bool {
         match self {
-            Self::Workstation => !plan.selection.workstation().is_empty(),
+            Self::Workstation => !preferences(plan.selection).is_empty(),
             Self::Spotlight => plan.selection.contains(Setting::Spotlight),
             Self::Permissions => plan.selection.contains(Setting::Permissions),
             Self::Secrets => plan.selection.contains(Setting::Secrets),
             Self::Repositories => plan.selection.contains(Setting::Repositories),
+            Self::Accounts => {
+                plan.selection.contains(Setting::Messages)
+                    || plan.selection.contains(Setting::FaceTime)
+            }
         }
     }
 
@@ -56,8 +76,75 @@ impl Stage {
             Self::Permissions => "aterm permissions",
             Self::Secrets => aterm_types::macos_setup::SECRETS_VAULT_ROW,
             Self::Repositories => "GitHub repositories",
+            Self::Accounts => "Messages and FaceTime sign-out",
         }
     }
+
+    /// The settings whose rows this stage changes, for System State's `running`.
+    const fn settings(self) -> &'static [Setting] {
+        match self {
+            Self::Workstation => &[
+                Setting::CapsLock,
+                Setting::NaturalScrolling,
+                Setting::TrackpadScrolling,
+                Setting::Desktop,
+                Setting::Widgets,
+                Setting::Dock,
+            ],
+            Self::Spotlight => &[Setting::Spotlight],
+            Self::Permissions => &[Setting::Permissions],
+            Self::Secrets => &[Setting::Secrets],
+            Self::Repositories => &[Setting::Repositories],
+            Self::Accounts => &[Setting::Messages, Setting::FaceTime],
+        }
+    }
+
+    /// The System State rows this stage's work can change, read again once it ends.
+    const fn subjects(self) -> &'static [Subject] {
+        use aterm_types::macos_setup::Access;
+        match self {
+            Self::Workstation => &[
+                Subject::Setting(Setting::CapsLock),
+                Subject::Setting(Setting::NaturalScrolling),
+                Subject::Setting(Setting::TrackpadScrolling),
+                Subject::Setting(Setting::Desktop),
+                Subject::Setting(Setting::Widgets),
+                Subject::Setting(Setting::Dock),
+            ],
+            Self::Spotlight => &[Subject::Setting(Setting::Spotlight)],
+            Self::Permissions => &[
+                Subject::Access(Access::FullDiskAccess),
+                Subject::Access(Access::DeveloperTools),
+                Subject::Access(Access::Debugger),
+                Subject::Access(Access::LocalNetwork),
+            ],
+            Self::Secrets => &[Subject::Setting(Setting::Secrets)],
+            Self::Repositories => &[Subject::Setting(Setting::Repositories)],
+            Self::Accounts => &[
+                Subject::Setting(Setting::Messages),
+                Subject::Setting(Setting::FaceTime),
+                Subject::Access(Access::Accessibility),
+            ],
+        }
+    }
+}
+
+/// The workstation preferences a plan selects: its original eight rows without
+/// the two sign-outs, which are the Accounts stage's.
+pub(super) fn preferences(selection: Selection) -> Selection {
+    let mut preferences = selection.workstation();
+    preferences.set(Setting::Messages, false);
+    preferences.set(Setting::FaceTime, false);
+    preferences
+}
+
+/// The sign-outs a plan selects.
+pub(super) fn accounts(selection: Selection) -> Selection {
+    let mut accounts = Selection::none();
+    for setting in [Setting::Messages, Setting::FaceTime] {
+        accounts.set(setting, selection.contains(setting));
+    }
+    accounts
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -68,6 +155,12 @@ struct Progress {
     running: Option<Stage>,
     plan: [u8; 32],
     revision: u64,
+    /// A person stopped this revision between stages (System State's Stop): it
+    /// ends without cancelling the plan, and a later admission runs normally.
+    stopped: bool,
+    /// The earlier revision whose admission of the Permissions group this one
+    /// continues ([`carried_access`]), or `None` when it is this revision's own.
+    access: Option<u64>,
     admitted_vault: AdmittedVault,
 }
 
@@ -92,7 +185,7 @@ impl AdmittedVault {
         let since = match self {
             Self::Unknown => false,
             Self::None => true,
-            Self::Configured(identity) => identity != configured.identity(),
+            Self::Configured(identity) => !configured.continues_identity(identity),
         };
         since
             && matches!(
@@ -140,6 +233,162 @@ impl Progress {
             ..Self::for_plan(plan)
         })
     }
+
+    /// The revision whose access steps this run's Permissions stage reads, and
+    /// the window's access lanes key their hand-overs on (System State design §6).
+    const fn access_revision(self) -> u64 {
+        match self.access {
+            Some(access) => access,
+            None => self.revision,
+        }
+    }
+
+    /// Whether a person stopped this revision: saved in the record, or asked for
+    /// in a `request` no pass has folded in yet ([`request_stop_at`]). A run
+    /// whose every stage finished is completed, not stopped: a Stop asked for
+    /// during its last stage, or after it, came too late to stop anything.
+    fn stopped_by(self, request: Option<StopRequest>) -> bool {
+        self.stopped
+            || (!self.completed && request.is_some_and(|request| request.names(self.revision)))
+    }
+}
+
+/// A person's Stop that no pass has folded into the progress record yet
+/// (System State design §3.3). It is written the moment the Stop is asked for,
+/// outside profile.lock, so a quit before the running stage ends still never
+/// resumes the run the person turned away from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StopRequest {
+    /// The Stop of this run revision.
+    Revision(u64),
+    /// A request that cannot be read stops whatever run is current: a Stop
+    /// is never read as permission to go on.
+    Unreadable,
+}
+
+impl StopRequest {
+    const fn names(self, revision: u64) -> bool {
+        match self {
+            Self::Revision(stopped) => stopped == revision,
+            Self::Unreadable => true,
+        }
+    }
+}
+
+const STOP_REQUEST: &str = "stop-request.json";
+const STOP_REQUEST_LOCK: &str = "stop-request.lock";
+
+/// Ask, durably and at once, for run `revision` to stop. The caller need not
+/// hold profile.lock: only the lock's holder writes progress, so the request is
+/// a file of its own, which every reader of the run's end honors and the next
+/// pass folds in ([`fold_stop_request`]). Its short lock serializes publication
+/// and removal; a stale process never replaces a newer revision's Stop.
+pub(super) fn request_stop_at(root: &Path, revision: u64) -> Result<(), String> {
+    request_stop_with_flush(root, revision, durable_name)
+}
+
+fn request_stop_with_flush(
+    root: &Path,
+    revision: u64,
+    flush: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> Result<(), String> {
+    let _lock = HeldLock::take_named(root, STOP_REQUEST_LOCK)?;
+    let path = root.join(STOP_REQUEST);
+    match stop_request_at(root) {
+        Some(StopRequest::Revision(current)) if current >= revision => {
+            // An earlier failed save may have published this exact name.
+            // Observing it alone cannot certify that a Stop was saved.
+            flush_record_with(&path, flush)
+        }
+        Some(StopRequest::Unreadable) => Err(
+            "the existing System State stop request cannot be read; it was left unchanged".into(),
+        ),
+        _ => write_json_with_flush(
+            &path,
+            &json!({"profile":PROFILE,"revision":revision}),
+            flush,
+        ),
+    }
+}
+
+/// The Stop no pass has folded in yet. Reads only: no durability flush, since
+/// honoring a request that was not flushed can only stop a run, never start one.
+fn stop_request_at(root: &Path) -> Option<StopRequest> {
+    let bytes = match std::fs::read(root.join(STOP_REQUEST)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => return Some(StopRequest::Unreadable),
+    };
+    let request = aterm_json::from_slice::<Value>(&bytes)
+        .ok()
+        .filter(|value| value["profile"].as_str() == Some(PROFILE))
+        .and_then(|value| value["revision"].as_u64())
+        .map_or(StopRequest::Unreadable, StopRequest::Revision);
+    Some(request)
+}
+
+/// Under profile.lock: fold a Stop no pass has taken into the run it names, so
+/// the progress record says so for every reader (an older aterm's too), then
+/// remove it. A request for any other revision is spent and only removed.
+fn fold_stop_request(root: &Path) -> Result<(), String> {
+    let Some(request) = stop_request_at(root) else {
+        return Ok(());
+    };
+    if let Some(mut progress) = progress(root)?
+        && request.names(progress.revision)
+        && !progress.stopped
+        && !progress.completed
+    {
+        progress.stopped = true;
+        progress.running = None;
+        save_progress(root, progress)?;
+    }
+    settle_stop_request(root, request)
+}
+
+/// Remove the request the caller folded, unless a newer one replaced it since.
+fn settle_stop_request(root: &Path, folded: StopRequest) -> Result<(), String> {
+    settle_stop_request_with(root, folded, || Ok(()))
+}
+
+fn settle_stop_request_with(
+    root: &Path,
+    folded: StopRequest,
+    before_remove: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let _lock = HeldLock::take_named(root, STOP_REQUEST_LOCK)?;
+    if stop_request_at(root) != Some(folded) {
+        return Ok(());
+    }
+    before_remove()?;
+    match std::fs::remove_file(root.join(STOP_REQUEST)) {
+        Ok(()) => durable_directory(root).map_err(|error| error.to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("cannot settle the System State stop: {error}")),
+    }
+}
+
+/// Ask the admitted run `revision` to stop at its next stage boundary (System
+/// State's Stop, or a choice that replaces its plan). It is durable when this
+/// returns: a relaunch reads the run as stopped even if the process ends before
+/// the running stage does. Takes only the short Stop-record lock, never the
+/// profile lock, and probes nothing.
+pub fn request_initial_setup_stop(revision: u64) -> Result<(), String> {
+    ensure_person_scope()?;
+    request_stop_at(&state_root()?, revision)
+}
+
+/// The access revision a new revision of `plan` continues, when its prior run
+/// (`previous` and its `progress`) managed Permissions too: a change to another
+/// group is not a new approval of the grants, so it hands nothing to macOS again
+/// and a Not now stays answered (System State design §3.3, §6). Turning the
+/// Permissions group off and on again is a new approval.
+fn carried_access(previous: Option<&Plan>, progress: Option<Progress>, plan: &Plan) -> Option<u64> {
+    let (previous, progress) = previous.zip(progress)?;
+    (progress.belongs_to(previous)
+        && previous.selection.contains(Setting::Permissions)
+        && plan.selection.contains(Setting::Permissions))
+    .then(|| progress.access_revision())
 }
 
 fn next_revision(revision: u64) -> Result<u64, String> {
@@ -160,11 +409,20 @@ fn progress(root: &Path) -> Result<Option<Progress>, String> {
     if value["profile"].as_str() != Some(PROFILE) {
         return Err("unrecognized initial setup profile".into());
     }
-    let done = value["done"]
+    let mut done = value["done"]
         .as_u64()
         .and_then(|bits| u16::try_from(bits).ok())
-        .filter(|bits| bits & !31 == 0)
+        .filter(|bits| bits & !Stage::KNOWN == 0)
         .ok_or("unrecognized initial setup progress")?;
+    // A record from before the sign-outs were their own stage ran them inside the
+    // Workstation stage: its finished Workstation finished them too.
+    if value.get("stages").is_none() && done & Stage::Workstation.bit() != 0 {
+        done |= Stage::Accounts.bit();
+    }
+    let stopped = match value.get("stopped") {
+        None => false,
+        Some(value) => value.as_bool().ok_or("invalid initial setup stop")?,
+    };
     let completed = match value["state"].as_str() {
         Some("pending") => false,
         Some("completed") => true,
@@ -195,6 +453,15 @@ fn progress(root: &Path) -> Result<Option<Progress>, String> {
         None => 0,
         Some(value) => value.as_u64().ok_or("invalid initial setup run revision")?,
     };
+    let access = match value.get("access_revision") {
+        None => None,
+        Some(value) => Some(
+            value
+                .as_u64()
+                .filter(|access| *access <= revision)
+                .ok_or("invalid initial setup access revision")?,
+        ),
+    };
     let admitted_vault = match value.get("admitted_vault") {
         None => AdmittedVault::Unknown,
         Some(Value::Null) => AdmittedVault::None,
@@ -214,15 +481,27 @@ fn progress(root: &Path) -> Result<Option<Progress>, String> {
         running,
         plan,
         revision,
+        stopped,
+        access,
         admitted_vault,
     }))
 }
 
 fn save_progress(root: &Path, progress: Progress) -> Result<(), String> {
-    let mut record = json!({"profile":PROFILE,"state":if progress.completed {"completed"} else {"pending"},"admitted":progress.admitted,"done":progress.done,"running":progress.running.map(Stage::bit),"plan":aterm_secrets::b64::encode_padded(&progress.plan),"revision":progress.revision});
-    if let (Some(fields), Some(vault)) = (record.as_object_mut(), progress.admitted_vault.record())
-    {
-        fields.insert("admitted_vault".into(), vault);
+    let mut record = json!({"profile":PROFILE,"state":if progress.completed {"completed"} else {"pending"},"admitted":progress.admitted,"done":progress.done,"running":progress.running.map(Stage::bit),"plan":aterm_secrets::b64::encode_padded(&progress.plan),"revision":progress.revision,"stages":Stage::ALL.len()});
+    if let Some(fields) = record.as_object_mut() {
+        if progress.stopped {
+            fields.insert("stopped".into(), Value::Bool(true));
+        }
+        if progress.access_revision() != progress.revision {
+            fields.insert(
+                "access_revision".into(),
+                Value::from(progress.access_revision()),
+            );
+        }
+        if let Some(vault) = progress.admitted_vault.record() {
+            fields.insert("admitted_vault".into(), vault);
+        }
     }
     write_json(&root.join("initial-setup.json"), &record)
 }
@@ -280,28 +559,60 @@ pub fn validate_initial_setup_plan(plan: &Plan) -> Result<(), String> {
 }
 
 fn save_plan(root: &Path, plan: &Plan) -> Result<(), String> {
-    validate_plan(plan)?;
-    write_json(
-        &root.join("automatic-plan.json"),
-        &json!({"profile":PROFILE,"selection":plan.selection.bits(),"vault_url":plan.vault_url}),
-    )
+    save_plan_as(root, plan, false)
 }
 
+/// Save `plan`; `provisional` marks one aterm chose by itself at first launch
+/// (ALab scope, System State design §3.5), which a later launch may widen. The
+/// field is written only when set: an absent field is a plan a person shaped.
+fn save_plan_as(root: &Path, plan: &Plan, provisional: bool) -> Result<(), String> {
+    validate_plan(plan)?;
+    let mut record =
+        json!({"profile":PROFILE,"selection":plan.selection.bits(),"vault_url":plan.vault_url});
+    if provisional && let Some(fields) = record.as_object_mut() {
+        fields.insert("provisional".into(), Value::Bool(true));
+    }
+    write_json(&root.join("automatic-plan.json"), &record)
+}
+
+/// Whether the saved plan is one aterm chose by itself ([`save_plan_as`]).
+fn saved_plan_provisional(root: &Path) -> Result<bool, String> {
+    let path = root.join("automatic-plan.json");
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
+    let value: Value =
+        aterm_json::from_slice(&bytes).map_err(|_| "invalid automatic setup plan")?;
+    match value.get("provisional") {
+        None => Ok(false),
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| "invalid automatic setup plan origin".into()),
+    }
+}
+
+/// `aterm doctor --apply`'s plan: the original eight rows, and aterm's own
+/// permissions too (approved by default, System State design §6) unless the
+/// person's Cancel or Restore stands, which an explicit apply supersedes only for
+/// the rows it names.
 pub(super) fn save_explicit_workstation_plan(root: &Path) -> Result<(), String> {
+    // A System State Stop asked for the run this revives is part of its record.
+    fold_stop_request(root)?;
     let stopped = stopped_at(root)?.is_some();
     let Some(mut progress) = progress(root)? else {
-        let plan = Plan::from(Selection::all().workstation());
-        if stopped {
-            return restart_in_vault(root, &plan, AdmittedVault::Unknown).map(|_| ());
-        }
-        save_workstation_authorization(root, &plan)?;
-        return save_automatic_plan(root, plan.selection);
+        let mut plan = Plan::from(Selection::all().workstation());
+        plan.selection.set(Setting::Permissions, !stopped);
+        return restart_in_vault(root, &plan, AdmittedVault::Unknown).map(|_| ());
     };
     let mut plan = saved_plan(root)?.ok_or("the initial setup plan is missing")?;
+    let (previous, prior) = (plan.clone(), progress);
     if !progress.belongs_to(&plan) {
         progress = progress.next_for_plan(&plan)?;
-    } else if stopped {
+    } else if stopped || progress.stopped {
         progress.revision = next_revision(progress.revision)?;
+        progress.stopped = false;
     }
     let admitted = progress.admitted;
     if stopped {
@@ -313,10 +624,15 @@ pub(super) fn save_explicit_workstation_plan(root: &Path) -> Result<(), String> 
             plan.selection.set(setting, true);
         }
     }
+    // aterm's own permissions are set up by default (the owner's standing
+    // approval), so an explicit profile carries them too; after a Cancel or a
+    // Restore it does not re-open the hand-overs the person stopped.
+    plan.selection.set(Setting::Permissions, !stopped);
+    progress.access = carried_access(Some(&previous), Some(prior), &plan);
     save_workstation_authorization(root, &plan)?;
     save_plan(root, &plan)?;
     progress.plan = plan_digest(&plan);
-    progress.done &= !Stage::Workstation.bit();
+    progress.done &= !(Stage::Workstation.bit() | Stage::Accounts.bit());
     progress.completed = false;
     progress.running = None;
     progress.admitted = admitted;
@@ -331,7 +647,8 @@ pub(super) fn complete_explicit_workstation_plan(root: &Path) -> Result<(), Stri
     if !progress.belongs_to(&plan) || !progress.admitted {
         return Ok(());
     }
-    progress.done |= Stage::Workstation.bit();
+    // The explicit pass signs out in the same pass as its preferences.
+    progress.done |= Stage::Workstation.bit() | Stage::Accounts.bit();
     progress.running = None;
     progress.completed = Stage::ALL
         .iter()
@@ -356,13 +673,39 @@ impl ConfiguredVault {
     }
 
     fn identity(&self) -> [u8; 32] {
+        self.identity_as(self.config.signer)
+    }
+
+    fn identity_as(&self, signer: Option<[u8; 32]>) -> [u8; 32] {
         let source = match &self.config.source {
             aterm_secrets::transport::Source::Url(url) => format!("url\0{url}"),
             aterm_secrets::transport::Source::Path(path) => {
                 format!("path\0{}", path.to_string_lossy())
             }
         };
-        aterm_digest::Sha256::digest(format!("{source}\0{}", self.config.name).as_bytes())
+        let mut bytes = format!(
+            "aterm.initial-setup.vault-authority/1\0{source}\0{}\0",
+            self.config.name
+        )
+        .into_bytes();
+        match signer {
+            Some(signer) => {
+                bytes.push(1);
+                bytes.extend_from_slice(&signer);
+            }
+            None => bytes.push(0),
+        }
+        aterm_digest::Sha256::digest(&bytes)
+    }
+
+    /// The exact admitted authority, or a predecessor the client's verified
+    /// lineage still admits. Older source-only stamps cannot prove this.
+    fn continues_identity(&self, identity: [u8; 32]) -> bool {
+        self.identity() == identity
+            || self.config.followed.iter().copied().any(|signer| {
+                aterm_secrets::client::pin_admitted(&self.config, Some(signer))
+                    && self.identity_as(Some(signer)) == identity
+            })
     }
 
     fn left_in_place(&self, plan: &Plan) -> String {
@@ -376,11 +719,11 @@ impl ConfiguredVault {
         match named {
             Some((source, name)) if source == self.config.source && name == self.config.name => {
                 format!(
-                    "this Mac joined {joined} after setup began, under another signer than the one setup names, so setup leaves it there; to join it under that signer, type the vault with its #<signer> in System State and press Apply"
+                    "This Mac is joined to {joined} under another signer. Setup keeps it. To switch, type the vault with its #<signer> and press Join."
                 )
             }
             named => format!(
-                "this Mac joined {joined} after setup began, so setup leaves it there; to move it to {}, type that vault in System State and press Apply",
+                "This Mac is joined to {joined}. Setup keeps it. To switch to {}, type that vault and press Join.",
                 named.map_or_else(
                     || "the vault setup names".into(),
                     |(source, name)| vault_label(&name, &source)
@@ -390,8 +733,14 @@ impl ConfiguredVault {
     }
 
     fn present(&self, mut plan: Plan) -> Plan {
-        let names_this = aterm_secrets::transport::parse_source(&plan.vault_url, &self.home)
-            .is_ok_and(|(source, _)| source == self.config.source);
+        let names_this = matches!(
+            aterm_machines::init_secrets::selected_vault(
+                &plan.vault_url,
+                &self.home,
+                Some(&self.config),
+            ),
+            Ok(Some(_))
+        );
         if !names_this {
             plan.vault_url = match &self.config.source {
                 aterm_secrets::transport::Source::Url(url) => url.clone(),
@@ -415,6 +764,23 @@ fn live_configured_vault() -> Result<Option<ConfiguredVault>, String> {
     ConfiguredVault::read(&paths)
 }
 
+/// Whether `configured`, the vault this Mac is in, is the one `plan` names. One that cannot
+/// be read is left to the vault item, which reads it again.
+fn in_plan_vault(plan: &Plan, configured: Result<Option<ConfiguredVault>, String>) -> bool {
+    match configured {
+        Ok(Some(vault)) => matches!(
+            aterm_machines::init_secrets::selected_vault(
+                &plan.vault_url,
+                &vault.home,
+                Some(&vault.config),
+            ),
+            Ok(Some(_))
+        ),
+        Ok(None) => false,
+        Err(_) => true,
+    }
+}
+
 fn offered_plan(
     saved: Option<(Plan, bool)>,
     configured: Result<Option<ConfiguredVault>, String>,
@@ -430,6 +796,12 @@ fn offered_plan(
             })
         }
     }
+}
+
+/// The plan in force: the saved one in the vault this Mac is configured for now
+/// ([`offered_plan`]), reading only aterm's own configuration and setup records.
+pub fn automatic_plan() -> Result<Plan, String> {
+    offered_plan(saved_plan_record(&state_root()?)?, live_configured_vault())
 }
 
 pub fn authorize_initial_setup(plan: &Plan) -> Result<Option<u64>, String> {
@@ -458,6 +830,8 @@ pub fn restart_initial_setup_observed(plan: &Plan) -> InitialSetupObserved<u64> 
 #[derive(Default)]
 pub struct InitialSetupRestart {
     started: bool,
+    /// The plan is a person's choice of groups (or a Join), never provisional.
+    chosen: bool,
     final_commit: Option<RestartCommit>,
 }
 
@@ -470,6 +844,18 @@ struct RestartCommit {
 }
 
 impl InitialSetupRestart {
+    /// A restart of a plan a person (or a control client) shaped on System
+    /// State, by a group choice or a Join: the plan is theirs from now on, even
+    /// where it equals the provisional plan aterm chose by itself, so no later
+    /// launch widens it (design §3.5). [`Self::default`] is Set up now, or the
+    /// window resuming the plan in force, which leaves a provisional plan so.
+    pub fn chosen() -> Self {
+        Self {
+            chosen: true,
+            ..Self::default()
+        }
+    }
+
     pub const fn pending(&self) -> bool {
         self.final_commit.is_some()
     }
@@ -538,7 +924,15 @@ impl InitialSetupRestart {
                 ),
                 _ => plan.clone(),
             };
-            let mut next = stage_restart(root, &admitted_plan, AdmittedVault::of(configured))?;
+            let mut next = stage_restart(
+                root,
+                &admitted_plan,
+                Restart {
+                    chosen: self.chosen,
+                    joins: self.chosen && vault_typed,
+                },
+                AdmittedVault::of(configured),
+            )?;
             let staged = observe(root)?;
             if !staged
                 .records
@@ -621,19 +1015,49 @@ fn restart_with(
     vault: AdmittedVault,
     commit: impl FnOnce(&Path, Progress) -> Result<(), String>,
 ) -> Result<u64, String> {
-    let mut next = stage_restart(root, plan, vault)?;
+    let mut next = stage_restart(root, plan, Restart::default(), vault)?;
     next.admitted = true;
     commit(root, next)?;
     Ok(next.revision)
 }
 
-fn stage_restart(root: &Path, plan: &Plan, vault: AdmittedVault) -> Result<Progress, String> {
+/// Who restarts a run ([`stage_restart`]).
+#[derive(Clone, Copy, Debug, Default)]
+struct Restart {
+    /// A person's choice of groups or a Join ([`InitialSetupRestart::chosen`]), which is
+    /// never provisional; otherwise Set up now, or a resume of the plan in force.
+    chosen: bool,
+    /// A Join: the vault typed in System State, whose steps run again.
+    joins: bool,
+}
+
+/// Stage `plan` as the next revision, kept with the vault this Mac was in (`vault`).
+fn stage_restart(
+    root: &Path,
+    plan: &Plan,
+    restart: Restart,
+    vault: AdmittedVault,
+) -> Result<Progress, String> {
+    let Restart { chosen, .. } = restart;
     validate_plan(plan)?;
-    let next = Progress {
-        admitted_vault: vault,
-        ..progress(root)?.unwrap_or_default().next_for_plan(plan)?
-    };
-    save_plan(root, plan)?;
+    // A Stop asked for the run this replaces ends it on record first: should
+    // this restart fail part-way, that run is still not resumed.
+    fold_stop_request(root)?;
+    let prior = progress(root)?;
+    let previous = saved_plan_record(root)?;
+    let mut next = prior.unwrap_or_default().next_for_plan(plan)?;
+    next.access = carried_access(previous.as_ref().map(|(plan, _)| plan), prior, plan);
+    next.admitted_vault = vault;
+    next.done = chosen_keeps(restart, previous.as_ref(), prior, plan);
+    // The same plan again by Set up now, or the window resuming the plan it
+    // offered, is not a person shaping it: a provisional plan stays one (§3.5).
+    // A group choice is, even one that returns to aterm's plan.
+    let provisional = !chosen
+        && previous
+            .as_ref()
+            .is_some_and(|(saved, modern)| *modern && saved == plan)
+        && saved_plan_provisional(root)?;
+    save_plan_as(root, plan, provisional)?;
     save_progress(root, next)?;
     for (record, what) in [
         ("automatic-attempt.json", "the automatic retry cooldown"),
@@ -646,14 +1070,61 @@ fn stage_restart(root: &Path, plan: &Plan, vault: AdmittedVault) -> Result<Progr
             Err(error) => return Err(format!("cannot reset {what}: {error}")),
         }
     }
-    save_workstation_authorization(root, plan)?;
+    if mac_settings_kept(plan, next.done) {
+        save_workstation_decision(root, true)?;
+    } else {
+        save_workstation_authorization(root, plan)?;
+    }
     Ok(next)
 }
 
+/// What a person's choice keeps of the run it replaces (System State design §3.3): a step
+/// that run finished stays finished while the choice leaves its groups and the vault as
+/// they were, so a choice runs only what it changed, and never resets the Dock or signs
+/// Messages and FaceTime out again for another group. A Join runs the vault's steps again:
+/// Secrets, and GitHub repositories, whose token the vault brings. Set up now keeps
+/// nothing. The done bits it keeps.
+fn chosen_keeps(
+    restart: Restart,
+    previous: Option<&(Plan, bool)>,
+    prior: Option<Progress>,
+    plan: &Plan,
+) -> u16 {
+    let (true, Some((previous, true)), Some(prior)) = (restart.chosen, previous, prior) else {
+        return 0;
+    };
+    if !prior.belongs_to(previous) {
+        return 0;
+    }
+    let vault_again = restart.joins || previous.vault_url != plan.vault_url;
+    Stage::ALL
+        .into_iter()
+        .filter(|stage| {
+            stage.settings().iter().all(|setting| {
+                previous.selection.contains(*setting) == plan.selection.contains(*setting)
+            })
+        })
+        .filter(|stage| !(vault_again && matches!(stage, Stage::Secrets | Stage::Repositories)))
+        .fold(0, |kept, stage| kept | (prior.done & stage.bit()))
+}
+
+/// Whether every Mac settings stage `plan` selects is in `done`: the preferences and the
+/// sign-outs a Join kept finished, or none selected.
+fn mac_settings_kept(plan: &Plan, done: u16) -> bool {
+    [Stage::Workstation, Stage::Accounts]
+        .into_iter()
+        .all(|stage| !stage.selected(plan) || done & stage.bit() != 0)
+}
+
 fn save_workstation_authorization(root: &Path, plan: &Plan) -> Result<(), String> {
+    save_workstation_decision(root, plan.selection.workstation().is_empty())
+}
+
+/// The first-run decision: `applied` for Mac settings with nothing left to do, else pending.
+fn save_workstation_decision(root: &Path, applied: bool) -> Result<(), String> {
     write_json(
         &root.join("first-run.json"),
-        &if plan.selection.workstation().is_empty() {
+        &if applied {
             json!({"profile":PROFILE,"state":"applied","accounts_verified":true})
         } else {
             json!({"profile":PROFILE,"state":"pending"})
@@ -697,6 +1168,7 @@ fn authorize_with(
     current.completed = plan.selection.is_empty();
     current.admitted = false;
     current.running = None;
+    current.access = carried_access(previous.as_ref(), prior_progress, plan);
     current.revision = revision;
     current.admitted_vault = vault;
     save_plan(root, plan)?;
@@ -723,7 +1195,7 @@ fn stopped_at(root: &Path) -> Result<Option<Stop>, String> {
 }
 
 pub(super) fn stopped(root: &Path) -> Result<bool, String> {
-    Ok(stopped_at(root)?.is_some())
+    Ok(stopped_at(root)?.is_some() || Records::read(root)?.stopped_run())
 }
 
 pub(super) fn finished_at(root: &Path) -> Result<bool, String> {
@@ -733,7 +1205,9 @@ pub(super) fn finished_at(root: &Path) -> Result<bool, String> {
 fn completed_at(root: &Path) -> Result<bool, String> {
     match progress(root)? {
         Some(progress) => Ok(saved_plan(root)?.is_some_and(|plan| {
-            progress.belongs_to(&plan) && progress.admitted && progress.completed
+            progress.belongs_to(&plan)
+                && progress.admitted
+                && (progress.completed || progress.stopped_by(stop_request_at(root)))
         })),
         None => first_run_complete(root),
     }
@@ -752,6 +1226,20 @@ pub(super) fn revision_at(root: &Path) -> Result<u64, String> {
         return Ok(0);
     };
     plan_revision(Some(progress), saved_plan(root)?.as_ref())
+}
+
+/// The revision whose access steps the current run's Permissions stage reads
+/// (`aterm_types::macos_setup::access_record`), zero with no modern run.
+pub fn initial_setup_access_revision() -> Result<u64, String> {
+    access_revision_at(&state_root()?)
+}
+
+pub(super) fn access_revision_at(root: &Path) -> Result<u64, String> {
+    let Some(progress) = progress(root)? else {
+        return Ok(0);
+    };
+    plan_revision(Some(progress), saved_plan(root)?.as_ref())?;
+    Ok(progress.access_revision())
 }
 
 fn plan_revision(progress: Option<Progress>, plan: Option<&Plan>) -> Result<u64, String> {
@@ -785,6 +1273,8 @@ fn admission_at(root: &Path) -> Result<Option<InitialSetupAdmission>, String> {
         plan: Some((plan, true)),
         progress: Some(progress),
         decision: Decision::Pending | Decision::Applied(true),
+        stop_request,
+        ..
     } = observation_at(root)
         .map_err(|error| error.to_string())?
         .records
@@ -795,7 +1285,9 @@ fn admission_at(root: &Path) -> Result<Option<InitialSetupAdmission>, String> {
         (progress.admitted && progress.belongs_to(&plan)).then_some(InitialSetupAdmission {
             plan,
             revision: progress.revision,
-            completed: progress.completed,
+            // A run a person stopped has nothing left to resume, whether its
+            // pass reached a stage boundary to save that or not.
+            completed: progress.completed || progress.stopped_by(stop_request),
         }),
     )
 }
@@ -807,6 +1299,10 @@ pub struct InitialSetupSnapshot {
     pub finished: bool,
     pub rows: Vec<Row>,
     pub revision: u64,
+    /// The revision whose admission of the Permissions group this run continues:
+    /// the window's access lanes key their once-per-approval steps on it, so a
+    /// change to another group hands nothing to macOS again (design §6).
+    pub access_revision: u64,
     pub permissions_allowed: bool,
     pub observation: InitialSetupObservation,
 }
@@ -990,6 +1486,10 @@ struct Records {
     plan: Option<(Plan, bool)>,
     progress: Option<Progress>,
     decision: Decision,
+    /// The saved plan is one aterm chose by itself ([`save_plan_as`]).
+    provisional: bool,
+    /// A person's Stop no pass has folded in yet ([`request_stop_at`]).
+    stop_request: Option<StopRequest>,
 }
 
 impl Records {
@@ -998,6 +1498,20 @@ impl Records {
             plan: saved_plan_record(root)?,
             progress: progress(root)?,
             decision: decision_at(root)?,
+            provisional: saved_plan_provisional(root)?,
+            stop_request: stop_request_at(root),
+        })
+    }
+
+    /// Whether a person stopped the admitted run of these records, on record
+    /// or by a request no pass has folded in yet.
+    fn stopped_run(&self) -> bool {
+        self.progress.is_some_and(|progress| {
+            progress.stopped_by(self.stop_request)
+                && self
+                    .plan
+                    .as_ref()
+                    .is_some_and(|(plan, _)| progress.belongs_to(plan))
         })
     }
 }
@@ -1050,8 +1564,13 @@ fn snapshot_from_observation(
         Some(_) => progress.is_some_and(|progress| progress.admitted && progress.completed),
         None => records.decision == Decision::Applied(true),
     };
-    let finished = stopped.is_some() || completed;
+    // A person's Stop ends this revision's work, its access steps included,
+    // from the moment it is asked for.
+    let run_stopped = progress
+        .is_some_and(|progress| progress.admitted && progress.stopped_by(records.stop_request));
+    let finished = stopped.is_some() || completed || run_stopped;
     let permissions_allowed = stopped.is_none()
+        && !run_stopped
         && match records.progress {
             Some(_) => {
                 records.plan.is_some()
@@ -1095,7 +1614,7 @@ fn snapshot_from_observation(
                 } else if finished && !completed {
                     "Not applied by this run.".into()
                 } else if interrupted {
-                    "Not running; Apply to retry.".into()
+                    "Not running; Set up now to retry.".into()
                 } else {
                     String::new()
                 },
@@ -1107,6 +1626,7 @@ fn snapshot_from_observation(
         finished,
         rows,
         revision: progress.map_or(0, |progress| progress.revision),
+        access_revision: progress.map_or(0, Progress::access_revision),
         permissions_allowed,
         observation,
     }
@@ -1119,9 +1639,14 @@ fn status_at(root: &Path, fallback: Plan) -> Result<(Plan, bool, Vec<Row>), Stri
 }
 
 trait InitialHost {
+    /// A legacy plan's one pass: its original workstation rows, sign-outs included.
+    fn legacy(&mut self, root: &Path) -> Result<Option<Report>, String>;
+    /// The workstation preferences, without the sign-outs ([`Stage::Accounts`]).
     fn workstation(&mut self, root: &Path) -> Result<Option<Report>, String>;
     fn spotlight(&mut self) -> Result<Vec<Row>, String>;
-    fn permissions(&mut self) -> Result<Vec<Row>, String>;
+    /// The Permissions stage of `revision`: complete once every grant is in place,
+    /// not needed, or handed to macOS in this revision (System State design §6).
+    fn permissions(&mut self, plan: &Plan, revision: u64) -> Result<Vec<Row>, String>;
     fn secrets(
         &mut self,
         plan: &Plan,
@@ -1132,21 +1657,417 @@ trait InitialHost {
     fn configured_vault(&mut self) -> Result<Option<ConfiguredVault>, String>;
     fn current_vault(&mut self, plan: &Plan) -> Result<Vec<Row>, String>;
     fn repositories(&mut self) -> Result<Vec<Row>, String>;
+    /// The Messages and FaceTime sign-outs, with the Accessibility they need.
+    /// `on_screen` is whether System State is the visible view of a focused window
+    /// ([`SetupHooks::on_screen`]): without it a sign-out that still has work waits.
+    fn accounts(&mut self, root: &Path, on_screen: bool) -> Result<Option<Report>, String>;
     fn withheld(&mut self, root: &Path) -> Result<Option<Report>, String>;
+}
+
+/// One stage of a setup pass starting or ending, for System State: the settings
+/// it changes (the page's busy rows) and the rows to read again once it ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StageEvent {
+    /// The settings whose rows the stage changes.
+    pub settings: &'static [Setting],
+    /// The System State rows the stage's work can change.
+    pub subjects: &'static [Subject],
+    /// Whether the stage is starting (`true`) or has ended (`false`).
+    pub running: bool,
+}
+
+/// What a setup pass asks between its stages.
+#[derive(Clone, Copy)]
+pub struct SetupHooks {
+    /// Whether a person asked the run of this revision to stop (System State's
+    /// Stop). Asked before every stage, and at the pass's end.
+    pub stop: fn(u64) -> bool,
+    /// A stage started or ended.
+    pub stage: fn(StageEvent),
+    /// Whether System State is the visible view of a focused window now
+    /// (`aterm_types::macos_setup::system_state_front`). The Accounts stage opens
+    /// Messages and FaceTime and may raise macOS's Accessibility and Automation
+    /// prompts, so it runs only then (design §6); otherwise it parks, and the
+    /// window wakes the run when the page comes to the front.
+    pub on_screen: fn() -> bool,
+}
+
+impl SetupHooks {
+    /// A pass nobody stops or watches, started by a person where they are (a
+    /// terminal), so nothing in it waits for a page.
+    pub const NONE: Self = Self {
+        stop: |_| false,
+        stage: |_| {},
+        on_screen: || true,
+    };
+}
+
+/// What a pass left for the next one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetupNext {
+    /// Nothing: every selected stage finished, or a person stopped the run.
+    Done,
+    /// Something changes by itself (a service starting, the network): try again.
+    Retry,
+    /// Nothing changes until a person acts or a local vault/network fact changes.
+    /// Release the setup claim and wait instead of running another pass.
+    Park,
+}
+
+impl SetupNext {
+    /// The later of two stages' needs: any retry wins over parking.
+    fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Retry, _) | (_, Self::Retry) => Self::Retry,
+            (Self::Park, _) | (_, Self::Park) => Self::Park,
+            (Self::Done, Self::Done) => Self::Done,
+        }
+    }
+
+    /// What one stage's rows leave: done when all are in place, a park when every
+    /// row left waits on a person or an absent vault (status `waiting`).
+    fn of(rows: &[Row]) -> Self {
+        if rows_ready(rows) {
+            Self::Done
+        } else if !rows.is_empty()
+            && rows
+                .iter()
+                .all(|row| matches!(row.status.as_str(), "ok" | "applied" | WAITING))
+        {
+            Self::Park
+        } else {
+            Self::Retry
+        }
+    }
+}
+
+/// A row's status when only a person, or a vault this network does not have, moves
+/// it: the pass parks instead of retrying it ([`SetupNext::Park`]).
+pub(super) const WAITING: &str = "waiting";
+
+/// Local facts that can wake a parked setup run. This is an observation, never
+/// authorization to run its stages.
+#[derive(PartialEq, Eq)]
+pub struct InitialSetupParkMark {
+    vault: Option<aterm_secrets::client::Status>,
+    interfaces: Option<Vec<aterm_secrets::network::InterfaceAddress>>,
+    retry_due: Option<u64>,
+}
+
+impl std::fmt::Debug for InitialSetupParkMark {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InitialSetupParkMark")
+            .finish_non_exhaustive()
+    }
+}
+
+impl InitialSetupParkMark {
+    /// A retryable unfinished vault try is due. A live worker consumes each
+    /// deadline once, so a pass that cannot reach Secrets cannot re-arm it.
+    pub fn retry_due(&self) -> Option<u64> {
+        self.retry_due
+    }
+}
+
+/// What a parked run waits on that moves without the window: this login's vault
+/// state and, only for admitted pending Secrets, local interface changes or an
+/// existing retry deadline. No sockets, vault request or prompt is made here.
+pub fn initial_setup_park_mark() -> InitialSetupParkMark {
+    use aterm_secrets::client::{self, Paths};
+    let vault = Paths::live()
+        .ok()
+        .and_then(|paths| client::status(&paths).ok());
+    initial_setup_park_mark_with(
+        state_root().ok().as_deref(),
+        vault,
+        secrets_retry::Reads::now(&secrets_retry::Live),
+        || aterm_secrets::network::interfaces().ok(),
+    )
+}
+
+fn initial_setup_park_mark_with(
+    root: Option<&Path>,
+    mut vault: Option<aterm_secrets::client::Status>,
+    now: u64,
+    interfaces: impl FnOnce() -> Option<Vec<aterm_secrets::network::InterfaceAddress>>,
+) -> InitialSetupParkMark {
+    if let Some(aterm_secrets::client::Status {
+        membership: aterm_secrets::client::Membership::In { heard, .. },
+        ..
+    }) = &mut vault
+    {
+        // A subscriber's heartbeat alone changes no setup answer.
+        *heard = 0;
+    }
+    let pending = root.and_then(|root| {
+        let observation = observation_at(root).ok()?;
+        let records = &observation.records;
+        let (plan, true) = records.plan.as_ref()? else {
+            return None;
+        };
+        let progress = records.progress?;
+        (progress.admitted
+            && progress.belongs_to(plan)
+            && !progress.completed
+            && !progress.stopped_by(records.stop_request)
+            && matches!(
+                records.decision,
+                Decision::Pending | Decision::Applied(true)
+            )
+            && Stage::Secrets.selected(plan)
+            && progress.done & Stage::Secrets.bit() == 0)
+            .then_some((root, progress.revision))
+    });
+    InitialSetupParkMark {
+        vault,
+        interfaces: pending.and_then(|_| interfaces()),
+        retry_due: pending
+            .and_then(|(root, revision)| secrets_retry::retry_due(root, revision, now)),
+    }
+}
+
+#[cfg(test)]
+mod parked_secrets_route_tests {
+    use super::*;
+    use aterm_secrets::client::{Membership, Status};
+    use aterm_secrets::network::InterfaceAddress;
+    use std::cell::Cell;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn plan(setting: Setting) -> Plan {
+        let mut selection = Selection::none();
+        selection.set(setting, true);
+        Plan::from(selection)
+    }
+
+    fn routes(last: u8) -> Option<Vec<InterfaceAddress>> {
+        Some(vec![InterfaceAddress {
+            name: "en0".into(),
+            address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, last)),
+            netmask: Some(IpAddr::V4(Ipv4Addr::new(255, 255, 255, 0))),
+            flags: 1,
+        }])
+    }
+
+    fn vault(membership: Membership) -> Option<Status> {
+        Some(Status {
+            config: None,
+            machine: None,
+            membership,
+            names: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn pending_secrets_wakes_for_routes_while_membership_stays_unconfigured() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        authorize_at(root.path(), &plan(Setting::Secrets)).unwrap();
+        let read = |network| {
+            initial_setup_park_mark_with(
+                Some(root.path()),
+                vault(Membership::Unconfigured),
+                1_000,
+                || routes(network),
+            )
+        };
+        let before = read(1);
+        assert_eq!(before, read(1), "an unchanged network stays parked");
+        assert_ne!(before, read(2), "a new route wakes the unfinished vault");
+        let admitted = progress(root.path()).unwrap().unwrap();
+        assert!(admitted.admitted && !admitted.completed && admitted.done == 0);
+    }
+
+    #[test]
+    fn routes_are_not_sampled_without_a_coherent_pending_secrets_admission() {
+        for state in [
+            "missing",
+            "permissions",
+            "staged",
+            "done",
+            "completed",
+            "stopped",
+            "cancelled",
+            "restored",
+            "unreadable",
+            "mismatched",
+            "missing decision",
+        ] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            if state != "missing" {
+                let selected = plan(if state == "permissions" {
+                    Setting::Permissions
+                } else {
+                    Setting::Secrets
+                });
+                authorize_at(root.path(), &selected).unwrap();
+                let mut saved = progress(root.path()).unwrap().unwrap();
+                match state {
+                    "staged" => saved.admitted = false,
+                    "done" => saved.done |= Stage::Secrets.bit(),
+                    "completed" => saved.completed = true,
+                    "stopped" => saved.stopped = true,
+                    "mismatched" => saved.plan = [0; 32],
+                    _ => {}
+                }
+                save_progress(root.path(), saved).unwrap();
+                match state {
+                    "cancelled" | "restored" => write_json(
+                        &root.path().join("first-run.json"),
+                        &json!({"profile":PROFILE,"state":state}),
+                    )
+                    .unwrap(),
+                    "missing decision" => {
+                        std::fs::remove_file(root.path().join("first-run.json")).unwrap();
+                    }
+                    "unreadable" => {
+                        std::fs::write(root.path().join("initial-setup.json"), b"not json")
+                            .unwrap();
+                    }
+                    _ => {}
+                }
+            }
+            let calls = Cell::new(0);
+            let read = |network| {
+                initial_setup_park_mark_with(
+                    Some(root.path()),
+                    vault(Membership::Unconfigured),
+                    1_000,
+                    || {
+                        calls.set(calls.get() + 1);
+                        routes(network)
+                    },
+                )
+            };
+            assert_eq!(read(1), read(2), "{state} must stay parked");
+            assert_eq!(calls.get(), 0, "{state} sampled routes");
+        }
+        let calls = Cell::new(0);
+        initial_setup_park_mark_with(None, vault(Membership::Unconfigured), 1_000, || {
+            calls.set(calls.get() + 1);
+            routes(1)
+        });
+        assert_eq!(calls.get(), 0, "an unknown root sampled routes");
+        let missing = aterm_tempfile::tempdir().unwrap().path().join("absent");
+        initial_setup_park_mark_with(
+            Some(&missing),
+            vault(Membership::Unconfigured),
+            1_000,
+            || panic!("no admitted run"),
+        );
+        assert!(!missing.exists(), "observing must not create a state root");
+    }
+
+    #[test]
+    fn membership_changes_still_wake_without_a_selected_vault() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let read = |membership| {
+            initial_setup_park_mark_with(Some(root.path()), vault(membership), 1_000, || {
+                panic!("no plan")
+            })
+        };
+        let before = read(Membership::Pending);
+        let after = read(Membership::In { seq: 1, heard: 10 });
+        assert_ne!(before, after);
+        assert_eq!(after, read(Membership::In { seq: 1, heard: 20 }));
+        assert_ne!(after, read(Membership::In { seq: 2, heard: 20 }));
+        assert_ne!(
+            read(Membership::Revoked { seq: 2 }),
+            read(Membership::Revoked { seq: 3 })
+        );
+    }
+
+    #[test]
+    fn pending_secrets_wakes_at_its_existing_retry_deadline_but_waiting_and_held_do_not() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let revision = authorize_at(root.path(), &plan(Setting::Secrets))
+            .unwrap()
+            .unwrap();
+        let read = |now| {
+            initial_setup_park_mark_with(
+                Some(root.path()),
+                vault(Membership::Unconfigured),
+                now,
+                || routes(1),
+            )
+        };
+        let pace = |now| Pace {
+            build: "test-build".into(),
+            marks: "same-network".into(),
+            now,
+        };
+        let rows = |status: &str| {
+            vec![Row {
+                name: Stage::Secrets.name().into(),
+                status: status.into(),
+                detail: "injected vault result".into(),
+            }]
+        };
+        assert_eq!(read(1_000).retry_due(), None, "no previous attempt");
+        secrets_retry::record(
+            root.path(),
+            revision,
+            &pace(1_000),
+            false,
+            &mut rows("blocked"),
+        )
+        .unwrap();
+        let paused = read(1_059);
+        assert_eq!(paused.retry_due(), None);
+        let due = read(1_060);
+        assert_ne!(paused, due, "the same route becomes retryable when due");
+        assert_eq!(due.retry_due(), Some(1_060));
+        assert_eq!(
+            read(1_061).retry_due(),
+            Some(1_060),
+            "one token until an actual try advances it"
+        );
+
+        secrets_retry::record(
+            root.path(),
+            revision,
+            &pace(1_060),
+            false,
+            &mut rows(WAITING),
+        )
+        .unwrap();
+        assert_eq!(
+            read(2_000).retry_due(),
+            None,
+            "a person or approval has no timer"
+        );
+        secrets_retry::record(
+            root.path(),
+            revision,
+            &pace(2_000),
+            false,
+            &mut rows("error"),
+        )
+        .unwrap();
+        secrets_retry::record(
+            root.path(),
+            revision,
+            &pace(3_000),
+            false,
+            &mut rows("error"),
+        )
+        .unwrap();
+        assert_eq!(
+            read(4_000).retry_due(),
+            None,
+            "two failed changes stay held"
+        );
+    }
 }
 
 struct LiveInitial<R> {
     reads: R,
-    spotlight_result: Option<Result<Vec<Row>, String>>,
-    permissions_result: Option<Result<Vec<Row>, String>>,
 }
 
 impl LiveInitial<secrets_retry::Live> {
     const fn live() -> Self {
         Self {
             reads: secrets_retry::Live,
-            spotlight_result: None,
-            permissions_result: None,
         }
     }
 }
@@ -1167,20 +2088,36 @@ fn secrets_rows(rows: Vec<aterm_machines::model::ItemReport>) -> Vec<Row> {
         .collect()
 }
 
-fn item_rows(rows: Vec<aterm_machines::model::ItemReport>) -> Vec<Row> {
+/// A setup row's status for one engine result. A row only a person moves (a
+/// switch in System Settings, a dialog) is [`WAITING`]: no pass retries it.
+pub(super) fn row_status(row: &aterm_machines::model::ItemReport) -> &'static str {
+    use aterm_converge::StoodAside;
     use aterm_machines::model::Outcome;
+    match row.outcome {
+        Outcome::Ok | Outcome::NotApplicable => "ok",
+        Outcome::Changed => "applied",
+        Outcome::Planned => "drift",
+        Outcome::Person => WAITING,
+        // Waits on a person, or on an admin Mac approving this Mac's join: no pass moves it.
+        Outcome::Blocked
+            if matches!(
+                row.stood_aside,
+                Some(StoodAside::Permission(_) | StoodAside::Waiting(_))
+            ) =>
+        {
+            WAITING
+        }
+        Outcome::Blocked | Outcome::Deferred => "blocked",
+        Outcome::Unknown => "unverified",
+        Outcome::Failed => "error",
+    }
+}
+
+fn item_rows(rows: Vec<aterm_machines::model::ItemReport>) -> Vec<Row> {
     rows.into_iter()
         .map(|row| Row {
-            name: row.title,
-            status: match row.outcome {
-                Outcome::Ok | Outcome::NotApplicable => "ok",
-                Outcome::Changed => "applied",
-                Outcome::Planned => "drift",
-                Outcome::Person | Outcome::Blocked | Outcome::Deferred => "blocked",
-                Outcome::Unknown => "unverified",
-                Outcome::Failed => "error",
-            }
-            .into(),
+            name: row.title.clone(),
+            status: row_status(&row).into(),
             detail: row
                 .why
                 .or_else(|| match (row.from, row.to) {
@@ -1194,154 +2131,20 @@ fn item_rows(rows: Vec<aterm_machines::model::ItemReport>) -> Vec<Row> {
         .collect()
 }
 
-pub(super) fn read_permissions_live(apply: bool) -> Result<Vec<Row>, String> {
-    use crate::{DebuggerMember, DebuggerMode, FdaState, Mark};
-    use aterm_machines::port::System as _;
-    use atpkg::prereq::CcVerdict;
-    let (privacy, debugger, devtools, clt, ax) = std::thread::scope(|s| {
-        let privacy = s.spawn(crate::privacy_facts);
-        let debugger = s.spawn(crate::debugger_facts);
-        let devtools = s.spawn(atpkg::devtools::facts);
-        let clt = s.spawn(|| {
-            let verdict = atpkg::prereq::probe(std::env::var_os("PATH").as_deref());
-            if apply
-                && matches!(verdict, CcVerdict::NoDeveloperDir | CcVerdict::NoDriver)
-                && let Ok(exe) = std::env::current_exe().and_then(|e| e.canonicalize())
-            {
-                let sys = aterm_machines::port::Live::new();
-                if sys.has_tty()
-                    && let Ok(ctx) = aterm_machines::init::initial_setup_context(&sys)
-                {
-                    let item = aterm_machines::init_clt::CommandLineTools::new(
-                        Box::new(|_| aterm_machines::init_clt::Found::Missing("missing".into())),
-                        exe,
-                    );
-                    let _ = aterm_machines::items::Item::apply(&item, &sys, &ctx);
-                    return atpkg::prereq::probe(std::env::var_os("PATH").as_deref());
-                }
-            }
-            verdict
-        });
-        let ax = s.spawn(|| {
-            let sys = aterm_machines::port::Live::new();
-            let ready = aterm_machines::init_accounts::accessibility_ready(&sys).unwrap_or(false);
-            if ready {
-                return (true, "granted".to_owned());
-            }
-            let needed = aterm_machines::init_accounts::accessibility_needed(&sys)
-                .unwrap_or(false);
-            if apply {
-                let _ = aterm_machines::init_accounts::request_accessibility(&sys);
-                if aterm_machines::init_accounts::accessibility_ready(&sys).unwrap_or(false) {
-                    return (true, "granted".to_owned());
-                }
-            }
-            if !needed {
-                (
-                    true,
-                    "needed only to sign out of Messages or FaceTime (nothing to sign out now) or to press an alert's button by remote control".to_owned(),
-                )
-            } else {
-                (
-                    false,
-                    "not granted: turn aterm on in System Settings > Privacy & Security > Accessibility".to_owned(),
-                )
-            }
-        });
-        (
-            privacy.join().expect("privacy_facts thread"),
-            debugger.join().expect("debugger_facts thread"),
-            devtools.join().expect("devtools::facts thread"),
-            clt.join().expect("prereq::probe thread"),
-            ax.join().expect("accessibility thread"),
-        )
-    });
-    let (debugger_mark, debugger_detail) = crate::debugger_row(&debugger);
-    let devtools_ready = devtools
-        .as_ref()
-        .is_some_and(|facts| facts.grant() == aterm_containment::consent::DevToolGrant::Granted);
-    let clt_ready = matches!(clt, CcVerdict::Ready { .. });
-    let clt_detail = match &clt {
-        CcVerdict::Ready { driver } => format!("{} builds a C program", driver.display()),
-        _ => clt.line(),
-    };
-    Ok(vec![
-        readiness_row("Command Line Tools", clt_ready, clt_detail),
-        readiness_row(
-            "Full Disk Access",
-            privacy.fda == FdaState::Granted,
-            crate::privacy_row(&privacy).1,
-        ),
-        readiness_row(
-            "Debugger access",
-            debugger.probe.mode == DebuggerMode::Enabled
-                && debugger_mark == Mark::Ok
-                && matches!(
-                    debugger.probe.member,
-                    DebuggerMember::Admin | DebuggerMember::Developer
-                ),
-            debugger_detail,
-        ),
-        readiness_row(
-            "Developer Tools",
-            devtools_ready,
-            devtools
-                .as_ref()
-                .and_then(atpkg::devtools::row)
-                .map_or_else(|| "permission status not measured".into(), |row| row.text),
-        ),
-        readiness_row("Accessibility & UI Automation", ax.0, ax.1),
-    ])
-}
-
-impl<R> LiveInitial<R> {
-    pub(super) fn read_permissions(&self, apply: bool) -> Result<Vec<Row>, String> {
-        read_permissions_live(apply)
-    }
-}
-
 impl<R: secrets_retry::Reads> InitialHost for LiveInitial<R> {
+    fn legacy(&mut self, root: &Path) -> Result<Option<Report>, String> {
+        apply_on_first_run_at(root)
+    }
+
     fn workstation(&mut self, root: &Path) -> Result<Option<Report>, String> {
-        let (sp_due, perm_due) = match (saved_plan(root), progress(root)) {
-            (Ok(Some(plan)), Ok(Some(prog))) => (
-                Stage::Spotlight.selected(&plan) && prog.done & Stage::Spotlight.bit() == 0,
-                Stage::Permissions.selected(&plan) && prog.done & Stage::Permissions.bit() == 0,
-            ),
-            _ => (false, false),
-        };
-        if !sp_due && !perm_due {
-            return apply_on_first_run_at(root);
-        }
-        let (ws, sp, perm) = std::thread::scope(|s| {
-            let ws = s.spawn(|| apply_on_first_run_at(root));
-            let sp = sp_due.then(|| {
-                s.spawn(|| {
-                    let sys = aterm_machines::port::Live::new();
-                    let ctx = aterm_machines::init::initial_setup_context(&sys)?;
-                    aterm_machines::init::run_initial_spotlight(
-                        &sys,
-                        &ctx,
-                        aterm_machines::model::Mode::Apply,
-                    )
-                    .map(item_rows)
-                })
-            });
-            let perm = perm_due.then(|| s.spawn(|| read_permissions_live(true)));
-            (
-                ws.join().expect("workstation apply thread"),
-                sp.map(|h| h.join().expect("spotlight apply thread")),
-                perm.map(|h| h.join().expect("permissions apply thread")),
-            )
-        });
-        self.spotlight_result = sp;
-        self.permissions_result = perm;
-        ws
+        apply_preferences_at(root)
+    }
+
+    fn accounts(&mut self, root: &Path, on_screen: bool) -> Result<Option<Report>, String> {
+        apply_accounts_at(root, on_screen)
     }
 
     fn spotlight(&mut self) -> Result<Vec<Row>, String> {
-        if let Some(res) = self.spotlight_result.take() {
-            return res;
-        }
         let sys = aterm_machines::port::Live::new();
         aterm_machines::init::run_initial_spotlight(
             &sys,
@@ -1351,11 +2154,8 @@ impl<R: secrets_retry::Reads> InitialHost for LiveInitial<R> {
         .map(item_rows)
     }
 
-    fn permissions(&mut self) -> Result<Vec<Row>, String> {
-        if let Some(res) = self.permissions_result.take() {
-            return res;
-        }
-        self.read_permissions(true)
+    fn permissions(&mut self, _plan: &Plan, revision: u64) -> Result<Vec<Row>, String> {
+        Ok(access::stage(revision))
     }
 
     fn secrets(
@@ -1366,6 +2166,30 @@ impl<R: secrets_retry::Reads> InitialHost for LiveInitial<R> {
     ) -> Result<Vec<Row>, String> {
         let sys = aterm_machines::port::Live::new();
         let ctx = self.context()?;
+        // A join's first request to the LAN can raise macOS's Local Network alert: only one
+        // macOS dialog this process started is up at a time (System State design §6).
+        let Some(_dialog) = aterm_types::macos_setup::MacosDialog::when_none_up(
+            aterm_types::macos_setup::DIALOG_WAIT,
+        ) else {
+            return Ok(vec![readiness_row(
+                Stage::Secrets.name(),
+                false,
+                "another macOS dialog is still up; the join waits for it".into(),
+            )]);
+        };
+        // The ALab vault's own address, not joined yet: when the probe hears no ALab vault
+        // on this network, the row waits with what it heard (design §3.3) until the next
+        // launch, a new plan or Check again, rather than asking each pass.
+        if plan.vault_url == aterm_types::macos_setup::DEFAULT_VAULT_URL
+            && !in_plan_vault(plan, live_configured_vault())
+            && let Some(note) = scope::probe_vault().note()
+        {
+            return Ok(vec![Row {
+                name: Stage::Secrets.name().into(),
+                status: WAITING.into(),
+                detail: note.into(),
+            }]);
+        }
         let ops = aterm_machines::init_secrets::unattended(&ctx)?;
         aterm_machines::init::run_initial_secrets(
             &sys,
@@ -1445,11 +2269,28 @@ fn secrets_try(
     })
 }
 
+#[cfg(test)]
 fn execute_initial(
     host: &mut dyn InitialHost,
     root: &Path,
     password: &mut Option<SecretBytes>,
 ) -> Result<Option<Report>, String> {
+    Ok(execute_pass(host, root, password, SetupHooks::NONE)?.map(|(report, _)| report))
+}
+
+/// One pass over the selected stages that are not done, in order, asking `hooks`
+/// and the durable stop request before each, and at the end, whether a person
+/// stopped this revision. A stop is folded into the progress record here, under
+/// the profile lock the pass already holds, and ends the revision without
+/// cancelling its plan; one that comes during the last stage of a run that
+/// finishes is spent, and the run is completed ([`stop_at_boundary`]).
+fn execute_pass(
+    host: &mut dyn InitialHost,
+    root: &Path,
+    password: &mut Option<SecretBytes>,
+    hooks: SetupHooks,
+) -> Result<Option<(Report, SetupNext)>, String> {
+    fold_stop_request(root)?;
     if finished_at(root)? {
         return Ok(None);
     }
@@ -1457,7 +2298,14 @@ fn execute_initial(
         return Ok(None);
     };
     let Some(mut progress) = progress(root)? else {
-        return host.workstation(root);
+        return Ok(host.legacy(root)?.map(|report| {
+            let next = if report.needs_attention() {
+                SetupNext::of(&report.rows)
+            } else {
+                SetupNext::Done
+            };
+            (report, next)
+        }));
     };
     if !progress.belongs_to(&plan) || !progress.admitted {
         return Ok(None);
@@ -1468,9 +2316,20 @@ fn execute_initial(
         manual_steps: Vec::new(),
         backup: root.join("original-preferences.json"),
     };
+    let mut next = SetupNext::Done;
+    // What the vault stage left in this pass, for the repositories waiting on it.
+    let mut vault = SetupNext::Retry;
     for stage in Stage::ALL {
         if !stage.selected(&plan) || progress.done & stage.bit() != 0 {
             continue;
+        }
+        if stop_at_boundary(root, &mut progress, hooks)? {
+            report.rows.push(Row {
+                name: "System State".into(),
+                status: "stopped".into(),
+                detail: "stopped before this step; nothing more runs until the plan changes".into(),
+            });
+            return Ok(Some((report, SetupNext::Done)));
         }
         if stage == Stage::Repositories && Stage::Secrets.selected(&plan) {
             if progress.done & Stage::Secrets.bit() != 0 {
@@ -1495,11 +2354,19 @@ fn execute_initial(
                 }
             }
             if progress.done & Stage::Secrets.bit() == 0 {
-                report.rows.push(readiness_row(
-                    stage.name(),
-                    false,
-                    "waiting for the selected secrets vault to synchronize credentials".into(),
-                ));
+                let rows = vec![Row {
+                    name: stage.name().into(),
+                    status: if vault == SetupNext::Park {
+                        WAITING
+                    } else {
+                        "blocked"
+                    }
+                    .into(),
+                    detail: "waiting for the selected secrets vault to synchronize credentials"
+                        .into(),
+                }];
+                next = next.and(SetupNext::of(&rows));
+                report.rows.extend(rows);
                 continue;
             }
         }
@@ -1512,11 +2379,18 @@ fn execute_initial(
             .as_ref()
             .and_then(|pace| secrets_retry::paused(root, progress.revision, pace))
         {
+            vault = SetupNext::of(&rows);
+            next = next.and(vault);
             report.rows.extend(rows);
             continue;
         }
         progress.running = Some(stage);
         save_progress(root, progress)?;
+        (hooks.stage)(StageEvent {
+            settings: stage.settings(),
+            subjects: stage.subjects(),
+            running: true,
+        });
         let result = match stage {
             Stage::Workstation => match host.workstation(root) {
                 Ok(Some(result)) => Ok(result.rows),
@@ -1533,7 +2407,7 @@ fn execute_initial(
                 Err(error) => Err(error),
             },
             Stage::Spotlight => host.spotlight(),
-            Stage::Permissions => host.permissions(),
+            Stage::Permissions => host.permissions(&plan, progress.access_revision()),
             Stage::Secrets => match secrets_try(host, &plan, progress.admitted_vault) {
                 Ok(SecretsTry::LeaveInPlace(vault)) => {
                     let mut rows = vec![readiness_row(
@@ -1559,6 +2433,15 @@ fn execute_initial(
                 }]),
             },
             Stage::Repositories => host.repositories(),
+            Stage::Accounts => match host.accounts(root, (hooks.on_screen)()) {
+                Ok(Some(result)) => Ok(result.rows),
+                Ok(None) => Ok(vec![readiness_row(
+                    stage.name(),
+                    false,
+                    "waiting for the next automatic sign-out retry".into(),
+                )]),
+                Err(error) => Err(error),
+            },
         };
         let (ready, mut rows) = match result {
             Ok(rows) => (rows_ready(&rows), rows),
@@ -1571,9 +2454,14 @@ fn execute_initial(
                 }],
             ),
         };
+        let left = SetupNext::of(&rows);
         if ready {
             progress.done |= stage.bit();
         }
+        if stage == Stage::Secrets {
+            vault = left;
+        }
+        next = next.and(left);
         progress.running = None;
         save_progress(root, progress)?;
         if paced.is_some()
@@ -1582,6 +2470,26 @@ fn execute_initial(
             secrets_retry::record(root, progress.revision, &after, ready, &mut rows)?;
         }
         report.rows.extend(rows);
+        (hooks.stage)(StageEvent {
+            settings: stage.settings(),
+            subjects: stage.subjects(),
+            running: false,
+        });
+    }
+    let stages_finished = Stage::ALL
+        .iter()
+        .all(|stage| !stage.selected(&plan) || progress.done & stage.bit() != 0);
+    // Follow-up can change preferences too. An in-process Stop holds before
+    // that work even while its separate durable save has not run. Preserve
+    // the last-stage rule: a run whose selected stages finished is completed.
+    if !stages_finished && stop_at_boundary(root, &mut progress, hooks)? {
+        report.rows.push(Row {
+            name: "System State".into(),
+            status: "stopped".into(),
+            detail: "stopped before deferred settings; nothing more runs until the plan changes"
+                .into(),
+        });
+        return Ok(Some((report, SetupNext::Done)));
     }
     match host.withheld(root) {
         Ok(Some(follow_up)) => report.rows.extend(follow_up.rows),
@@ -1592,14 +2500,49 @@ fn execute_initial(
             detail,
         }),
     }
-    if Stage::ALL
-        .iter()
-        .all(|stage| !stage.selected(&plan) || progress.done & stage.bit() != 0)
-    {
+    if stages_finished {
         progress.completed = true;
         save_progress(root, progress)?;
+        next = SetupNext::Done;
     }
-    Ok(Some(report))
+    // The pass's end is a boundary too. A Stop asked for during the last stage
+    // of a run that then finished came too late: the run is completed, and the
+    // request is spent. One asked for while work is left stops the run here,
+    // so no later pass of it runs.
+    if stop_at_boundary(root, &mut progress, hooks)? {
+        report.rows.push(Row {
+            name: "System State".into(),
+            status: "stopped".into(),
+            detail: "stopped after this pass; nothing more runs until the plan changes".into(),
+        });
+        next = SetupNext::Done;
+    }
+    Ok(Some((report, next)))
+}
+
+/// At a stage boundary of a pass holding profile.lock: whether a person stopped
+/// the run (`hooks`, or the durable request), saving it in the run's record if
+/// so. The request is spent once read here, folded into a stopped run or too
+/// late for a completed one; it is left only for a run it does not name.
+fn stop_at_boundary(
+    root: &Path,
+    progress: &mut Progress,
+    hooks: SetupHooks,
+) -> Result<bool, String> {
+    let request = stop_request_at(root);
+    let stopped =
+        !progress.completed && ((hooks.stop)(progress.revision) || progress.stopped_by(request));
+    if stopped {
+        progress.stopped = true;
+        progress.running = None;
+        save_progress(root, *progress)?;
+    }
+    if let Some(request) = request
+        && (stopped || progress.completed)
+    {
+        settle_stop_request(root, request)?;
+    }
+    Ok(stopped)
 }
 
 pub fn apply_initial_setup(
@@ -1613,11 +2556,31 @@ pub fn apply_initial_setup_observed(
     expected_revision: u64,
     password: &mut Option<SecretBytes>,
 ) -> InitialSetupObserved<Option<Report>> {
+    let pass = run_initial_setup_pass(expected_revision, password, SetupHooks::NONE);
+    InitialSetupObserved::new(
+        pass.result.map(|pass| pass.map(|(report, _)| report)),
+        pass.observation,
+    )
+}
+
+/// One pass of the admitted run `expected_revision`, asking `hooks` between its
+/// stages, and what it left for the next pass.
+pub fn run_initial_setup_pass(
+    expected_revision: u64,
+    password: &mut Option<SecretBytes>,
+    hooks: SetupHooks,
+) -> InitialSetupObserved<Option<(Report, SetupNext)>> {
     if aterm_types::dirs::runs_under_private_state_root() {
         return InitialSetupObserved::new(Ok(None), None);
     }
     observe_person_mutation(Ok(None), |root| {
-        execute_initial_for_revision(&mut LiveInitial::live(), root, expected_revision, password)
+        execute_initial_for_revision(
+            &mut LiveInitial::live(),
+            root,
+            expected_revision,
+            password,
+            hooks,
+        )
     })
 }
 
@@ -1626,11 +2589,12 @@ fn execute_initial_for_revision(
     root: &Path,
     expected_revision: u64,
     password: &mut Option<SecretBytes>,
-) -> Result<Option<Report>, String> {
+    hooks: SetupHooks,
+) -> Result<Option<(Report, SetupNext)>, String> {
     if revision_at(root)? != expected_revision {
         return Ok(None);
     }
-    execute_initial(host, root, password)
+    execute_pass(host, root, password, hooks)
 }
 
 #[cfg(test)]
@@ -1641,12 +2605,22 @@ mod tests {
     struct Fake {
         calls: Vec<Stage>,
         pending: Option<Stage>,
+        /// A stage whose row waits on a person ([`WAITING`]).
+        waiting: Option<Stage>,
         failure: Option<Stage>,
         password_seen: bool,
         observe: Option<PathBuf>,
         vault_checks: usize,
         vault_blocked: bool,
         vault_error: bool,
+        /// A sign-out still has work, so the Accounts stage needs System State on screen.
+        accounts_pending: bool,
+        /// The access revision the last Permissions stage read.
+        access_read: Option<u64>,
+        /// While this stage runs, a person stops the run (System State's Stop)
+        /// and the process ends: [`Self::relaunch`] is what the next launch reads.
+        stop_during: Option<(Stage, PathBuf)>,
+        relaunch: Option<Relaunch>,
         vault_url: Option<String>,
         pace: Option<Pace>,
         configured: Option<ConfiguredVault>,
@@ -1654,9 +2628,28 @@ mod tests {
         checked_url: Option<String>,
     }
 
+    /// What a launch reads of a run whose process ended mid-stage.
+    #[derive(Debug)]
+    struct Relaunch {
+        finished: bool,
+        admission: Option<InitialSetupAdmission>,
+        snapshot_finished: bool,
+    }
+
     impl Fake {
         fn stage(&mut self, stage: Stage) -> Result<Vec<Row>, String> {
             self.calls.push(stage);
+            if let Some((during, root)) = &self.stop_during
+                && *during == stage
+            {
+                let revision = progress(root).unwrap().unwrap().revision;
+                request_stop_at(root, revision).unwrap();
+                self.relaunch = Some(Relaunch {
+                    finished: finished_at(root).unwrap(),
+                    admission: admission_at(root).unwrap(),
+                    snapshot_finished: status_at(root, Plan::default()).unwrap().1,
+                });
+            }
             if let Some(root) = &self.observe {
                 let (_, finished, rows) = status_at(root, Plan::default()).unwrap();
                 assert!(!finished);
@@ -1668,6 +2661,13 @@ mod tests {
             if self.failure == Some(stage) {
                 return Err("offline; retry later".into());
             }
+            if self.waiting == Some(stage) {
+                return Ok(vec![Row {
+                    name: stage.name().into(),
+                    status: WAITING.into(),
+                    detail: "injected wait for a person".into(),
+                }]);
+            }
             Ok(vec![readiness_row(
                 stage.name(),
                 self.pending != Some(stage),
@@ -1677,6 +2677,30 @@ mod tests {
     }
 
     impl InitialHost for Fake {
+        fn legacy(&mut self, root: &Path) -> Result<Option<Report>, String> {
+            self.workstation(root)
+        }
+        fn accounts(&mut self, root: &Path, on_screen: bool) -> Result<Option<Report>, String> {
+            if !on_screen && self.accounts_pending {
+                return Ok(Some(Report {
+                    action: Action::Apply,
+                    rows: vec![Row {
+                        name: Stage::Accounts.name().into(),
+                        status: WAITING.into(),
+                        detail: "injected: waits for System State on screen".into(),
+                    }],
+                    manual_steps: Vec::new(),
+                    backup: root.join("original-preferences.json"),
+                }));
+            }
+            let rows = self.stage(Stage::Accounts)?;
+            Ok(Some(Report {
+                action: Action::Apply,
+                rows,
+                manual_steps: Vec::new(),
+                backup: root.join("original-preferences.json"),
+            }))
+        }
         fn workstation(&mut self, root: &Path) -> Result<Option<Report>, String> {
             if first_run_complete(root)? {
                 return Ok(None);
@@ -1698,7 +2722,8 @@ mod tests {
         fn spotlight(&mut self) -> Result<Vec<Row>, String> {
             self.stage(Stage::Spotlight)
         }
-        fn permissions(&mut self) -> Result<Vec<Row>, String> {
+        fn permissions(&mut self, _: &Plan, access: u64) -> Result<Vec<Row>, String> {
+            self.access_read = Some(access);
             self.stage(Stage::Permissions)
         }
         fn secrets(
@@ -1780,8 +2805,14 @@ mod tests {
             ..Fake::default()
         };
         if let Some(revision) = accepted {
-            execute_initial_for_revision(&mut old_worker, root.path(), revision, &mut None)
-                .unwrap();
+            execute_initial_for_revision(
+                &mut old_worker,
+                root.path(),
+                revision,
+                &mut None,
+                SetupHooks::NONE,
+            )
+            .unwrap();
         }
         assert!(
             old_worker.calls.is_empty(),
@@ -1827,6 +2858,42 @@ mod tests {
                 plan,
                 vault_typed,
                 read,
+                save_progress,
+                observe_restart,
+            )
+        })
+        .result
+        .unwrap()
+        .expect("admitted")
+    }
+
+    /// System State's group choice of `plan`, which sends the vault the worker holds, in a
+    /// scratch home that is in no vault: the admitted run's revision.
+    fn system_state_choice(root: &Path, plan: &Plan) -> u64 {
+        observe_mutation_at(root, None, Err("busy".into()), |root| {
+            InitialSetupRestart::chosen().persist_with(
+                root,
+                plan,
+                false,
+                || Ok(None),
+                save_progress,
+                observe_restart,
+            )
+        })
+        .result
+        .unwrap()
+        .expect("admitted")
+    }
+
+    /// System State's Join of `plan`, its vault typed, in a scratch home that is in no
+    /// vault: the admitted run's revision.
+    fn system_state_join(root: &Path, plan: &Plan) -> u64 {
+        observe_mutation_at(root, None, Err("busy".into()), |root| {
+            InitialSetupRestart::chosen().persist_with(
+                root,
+                plan,
+                true,
+                || Ok(None),
                 save_progress,
                 observe_restart,
             )
@@ -1888,6 +2955,7 @@ mod tests {
                     root.path(),
                     staged.revision,
                     &mut Some(password.clone()),
+                    SetupHooks::NONE,
                 )
                 .unwrap();
                 assert_eq!(
@@ -2399,11 +3467,11 @@ mod tests {
         let root = aterm_tempfile::tempdir().unwrap();
         let plan = selected(&[Setting::Widgets, Setting::Secrets]);
         let revision = authorize_at(root.path(), &plan).unwrap().unwrap();
+        // A run an older aterm cancelled.
         let before = observation_at(root.path()).unwrap();
-        let cancelled =
-            InitialSetupCancellation::default().persist_observed_at(root.path(), Some(before));
-        assert!(cancelled.result.unwrap());
-        let cancelled = cancelled.observation.unwrap();
+        write_legacy_cancel_at(root.path());
+        let cancelled = observation_at(root.path()).unwrap();
+        assert_ne!(cancelled, before);
         assert_eq!(revision_at(root.path()).unwrap(), revision);
         std::fs::write(
             root.path().join("original-preferences.json"),
@@ -2540,26 +3608,6 @@ mod tests {
     }
 
     #[test]
-    fn stale_cancel_retry_cannot_stop_a_newer_pending_run() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let plan = selected(&[Setting::Secrets]);
-        authorize_at(root.path(), &plan).unwrap();
-        let original = revision_at(root.path()).unwrap();
-        let mut cancel = InitialSetupCancellation::default();
-        let active = HeldLock::take(root.path()).unwrap();
-        assert!(cancel.persist_at(root.path()).is_err());
-        drop(active);
-
-        restart_at(root.path(), &plan).unwrap();
-        assert!(revision_at(root.path()).unwrap() > original);
-        assert!(!cancel.persist_at(root.path()).unwrap());
-        assert!(
-            !finished_at(root.path()).unwrap(),
-            "the old retry stopped the new run"
-        );
-    }
-
-    #[test]
     fn explicit_mac_apply_retires_workers_when_it_revives_a_stopped_modern_run() {
         for stop in ["cancelled", "restored"] {
             let root = aterm_tempfile::tempdir().unwrap();
@@ -2585,15 +3633,26 @@ mod tests {
                     &mut host,
                     root.path(),
                     original,
-                    &mut Some(password.clone())
+                    &mut Some(password.clone()),
+                    SetupHooks::NONE
                 )
                 .unwrap()
                 .is_none()
             );
             assert!(host.calls.is_empty());
             assert!(!host.password_seen);
-            execute_initial_for_revision(&mut host, root.path(), current, &mut None).unwrap();
-            assert_eq!(host.calls, [Stage::Workstation, Stage::Secrets]);
+            execute_initial_for_revision(
+                &mut host,
+                root.path(),
+                current,
+                &mut None,
+                SetupHooks::NONE,
+            )
+            .unwrap();
+            assert_eq!(
+                host.calls,
+                [Stage::Workstation, Stage::Secrets, Stage::Accounts]
+            );
         }
     }
 
@@ -2617,19 +3676,6 @@ mod tests {
     }
 
     #[test]
-    fn retained_cancel_retries_the_same_run_and_accepts_its_already_finished_decision() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        authorize_at(root.path(), &selected(&[Setting::Secrets])).unwrap();
-        let mut cancel = InitialSetupCancellation::default();
-        let active = HeldLock::take(root.path()).unwrap();
-        assert!(cancel.persist_at(root.path()).is_err());
-        drop(active);
-        assert!(cancel.persist_at(root.path()).unwrap());
-        assert!(finished_at(root.path()).unwrap());
-        assert!(cancel.persist_at(root.path()).unwrap());
-    }
-
-    #[test]
     fn explicit_workstation_completion_does_not_complete_independent_stages() {
         let root = aterm_tempfile::tempdir().unwrap();
         let plan = selected(&[Setting::Permissions, Setting::Secrets]);
@@ -2638,7 +3684,11 @@ mod tests {
         complete_explicit_workstation_plan(root.path()).unwrap();
         let current = progress(root.path()).unwrap().unwrap();
         assert_eq!(current.revision, revision);
-        assert_eq!(current.done, Stage::Workstation.bit());
+        // The explicit pass signs out with its preferences: both stages finish.
+        assert_eq!(
+            current.done,
+            Stage::Workstation.bit() | Stage::Accounts.bit()
+        );
         assert!(!current.completed);
         assert!(!finished_at(root.path()).unwrap());
     }
@@ -2921,7 +3971,7 @@ mod tests {
                 .unwrap()
                 .needs_attention()
         );
-        assert_eq!(host.calls, Stage::ALL[..4]);
+        assert_eq!(host.calls, [&Stage::ALL[..4], &[Stage::Accounts]].concat());
         assert!(first_run_complete(root.path()).unwrap());
         assert!(!finished_at(root.path()).unwrap());
         assert!(claim_automatic_setup_at(root.path()).unwrap().is_some());
@@ -3018,17 +4068,23 @@ mod tests {
     }
 
     impl InitialHost for WithholdingStages {
+        fn legacy(&mut self, root: &Path) -> Result<Option<Report>, String> {
+            self.doctor.pass(root)
+        }
         fn workstation(&mut self, root: &Path) -> Result<Option<Report>, String> {
             self.doctor.pass(root)
+        }
+        fn accounts(&mut self, root: &Path, on_screen: bool) -> Result<Option<Report>, String> {
+            self.rest.accounts(root, on_screen)
         }
         fn spotlight(&mut self) -> Result<Vec<Row>, String> {
             self.rest.spotlight()
         }
-        fn permissions(&mut self) -> Result<Vec<Row>, String> {
+        fn permissions(&mut self, plan: &Plan, access: u64) -> Result<Vec<Row>, String> {
             if self.grant_in_permissions {
                 self.doctor.grant();
             }
-            self.rest.permissions()
+            self.rest.permissions(plan, access)
         }
         fn secrets(
             &mut self,
@@ -3065,9 +4121,15 @@ mod tests {
                 super::super::tests::Withholding::widgets_and_a_dock_that_never_verifies(),
             );
             let retry = |stages: &mut WithholdingStages| {
-                execute_initial_for_revision(stages, root.path(), revision, &mut None)
-                    .unwrap()
-                    .expect("setup still runs");
+                execute_initial_for_revision(
+                    stages,
+                    root.path(),
+                    revision,
+                    &mut None,
+                    SetupHooks::NONE,
+                )
+                .unwrap()
+                .expect("setup still runs");
             };
             retry(&mut stages);
             assert_eq!(stages.doctor.window_manager_writes(), 1);
@@ -3128,9 +4190,16 @@ mod tests {
                 stages.doctor.notification_center_never_keeps();
             }
             let retry = |stages: &mut WithholdingStages| {
-                execute_initial_for_revision(stages, root.path(), revision, &mut None)
-                    .unwrap()
-                    .expect("setup still runs")
+                execute_initial_for_revision(
+                    stages,
+                    root.path(),
+                    revision,
+                    &mut None,
+                    SetupHooks::NONE,
+                )
+                .unwrap()
+                .expect("setup still runs")
+                .0
             };
             retry(&mut stages);
             stages.doctor.grant();
@@ -3180,16 +4249,28 @@ mod tests {
                 ..WithholdingStages::over(super::super::tests::Withholding::widgets())
             };
             for _ in 0..3 {
-                execute_initial_for_revision(&mut stages, root.path(), revision, &mut None)
-                    .unwrap();
+                execute_initial_for_revision(
+                    &mut stages,
+                    root.path(),
+                    revision,
+                    &mut None,
+                    SetupHooks::NONE,
+                )
+                .unwrap();
             }
             assert_eq!(stages.doctor.notification_center_writes(), 0);
             assert!(!finished_at(root.path()).unwrap());
             stages.grant_in_permissions = granted;
             stages.rest.pending = None;
-            execute_initial_for_revision(&mut stages, root.path(), revision, &mut None)
-                .unwrap()
-                .expect("the retry runs");
+            execute_initial_for_revision(
+                &mut stages,
+                root.path(),
+                revision,
+                &mut None,
+                SetupHooks::NONE,
+            )
+            .unwrap()
+            .expect("the retry runs");
             assert!(finished_at(root.path()).unwrap());
             assert_eq!(stages.doctor.notification_center_cleared(), granted);
             assert_eq!(
@@ -3202,9 +4283,15 @@ mod tests {
             );
             for _ in 0..2 {
                 assert!(
-                    execute_initial_for_revision(&mut stages, root.path(), revision, &mut None)
-                        .unwrap()
-                        .is_none()
+                    execute_initial_for_revision(
+                        &mut stages,
+                        root.path(),
+                        revision,
+                        &mut None,
+                        SetupHooks::NONE
+                    )
+                    .unwrap()
+                    .is_none()
                 );
             }
             assert_eq!(
@@ -3215,25 +4302,137 @@ mod tests {
     }
 
     #[test]
-    fn the_vault_remedy_withdraws_no_clear_setup_owes() {
+    fn a_stop_before_pending_follow_up_leaves_withheld_preferences_untouched() {
+        use super::super::tests::Withholding;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        static STOP: AtomicBool = AtomicBool::new(false);
+        fn after_permissions(event: StageEvent) {
+            if !event.running && event.settings == Stage::Permissions.settings() {
+                STOP.store(true, Ordering::SeqCst);
+            }
+        }
+
+        for (pending, request) in [(true, false), (true, true), (false, true)] {
+            STOP.store(false, Ordering::SeqCst);
+            let root = aterm_tempfile::tempdir().unwrap();
+            let plan = selected(&[Setting::Widgets, Setting::Permissions]);
+            let revision = authorize_at(root.path(), &plan).unwrap().unwrap();
+            let mut stages = WithholdingStages {
+                rest: Fake {
+                    pending: pending.then_some(Stage::Permissions),
+                    ..Fake::default()
+                },
+                grant_in_permissions: true,
+                ..WithholdingStages::over(Withholding::widgets())
+            };
+            let hooks = SetupHooks {
+                stop: |_| STOP.load(Ordering::SeqCst),
+                stage: if request { after_permissions } else { |_| {} },
+                ..SetupHooks::NONE
+            };
+            let (_, next) =
+                execute_initial_for_revision(&mut stages, root.path(), revision, &mut None, hooks)
+                    .unwrap()
+                    .expect("the admitted run makes a pass");
+
+            assert_eq!(STOP.load(Ordering::SeqCst), request);
+            assert!(
+                !root.path().join(STOP_REQUEST).exists(),
+                "the save has not run"
+            );
+            let stopped = pending && request;
+            assert_eq!(
+                stages.doctor.notification_center_writes(),
+                usize::from(!stopped),
+                "a Stop holds before follow-up while work is pending; a finished last stage keeps its completion"
+            );
+            assert_eq!(progress(root.path()).unwrap().unwrap().stopped, stopped);
+            assert_eq!(finished_at(root.path()).unwrap(), !pending || request);
+            assert_eq!(
+                Withholding::withheld(root.path()).is_empty(),
+                !stopped,
+                "a stopped clear remains withheld"
+            );
+            assert_eq!(
+                next,
+                if pending && !request {
+                    SetupNext::Retry
+                } else {
+                    SetupNext::Done
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn a_stopped_run_follows_nothing_up() {
         use super::super::tests::{WIDGETS, Withholding};
-        for (what, remedy, cleared) in [
-            ("the vault alone", selected(&[Setting::Secrets]), true),
+        for stop in [true, false] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let plan = selected(&[Setting::Widgets, Setting::Secrets]);
+            let revision = authorize_at(root.path(), &plan).unwrap().unwrap();
+            let mut stages = WithholdingStages::over(Withholding::widgets());
+            // The vault is not joined yet: the run is still going.
+            stages.rest.pending = Some(Stage::Secrets);
+            execute_initial_for_revision(
+                &mut stages,
+                root.path(),
+                revision,
+                &mut None,
+                SetupHooks::NONE,
+            )
+            .unwrap();
+            assert_eq!(Withholding::withheld(root.path()), [WIDGETS]);
+            assert!(!finished_at(root.path()).unwrap());
+            if stop {
+                request_stop_at(root.path(), revision).unwrap();
+            }
+            assert_eq!(stopped(root.path()).unwrap(), stop);
+        }
+    }
+
+    /// A later choice that leaves the widgets row as is withdraws the clear setup still owes,
+    /// one that leaves every Mac settings group as is (the vault alone) too; a restart that
+    /// keeps the row (a Join leaves the groups as they were) withdraws nothing, and once the
+    /// grant arrives that run's follow-up clears Notification Center's widgets. Negative
+    /// control: reading a choice without Mac settings as no answer clears them after the
+    /// vault-alone plan.
+    #[test]
+    fn a_choice_that_leaves_the_widgets_as_is_withdraws_the_clear_setup_owes() {
+        use super::super::tests::{WIDGETS, Withholding};
+        let plan = selected(&[Setting::Widgets, Setting::Secrets]);
+        for (what, next, cleared) in [
+            ("the vault alone", selected(&[Setting::Secrets]), false),
             (
                 "the Dock and the vault",
                 selected(&[Setting::Dock, Setting::Secrets]),
                 false,
             ),
+            ("the same groups", plan.clone(), true),
         ] {
             let root = aterm_tempfile::tempdir().unwrap();
-            let plan = selected(&[Setting::Widgets, Setting::Secrets]);
             let revision = authorize_at(root.path(), &plan).unwrap().unwrap();
             let mut stages = WithholdingStages::over(Withholding::widgets());
-            execute_initial_for_revision(&mut stages, root.path(), revision, &mut None).unwrap();
+            execute_initial_for_revision(
+                &mut stages,
+                root.path(),
+                revision,
+                &mut None,
+                SetupHooks::NONE,
+            )
+            .unwrap();
             assert_eq!(Withholding::withheld(root.path()), [WIDGETS], "{what}");
-            let revision = restart_at(root.path(), &remedy).unwrap();
+            let revision = restart_at(root.path(), &next).unwrap();
             stages.doctor.grant();
-            execute_initial_for_revision(&mut stages, root.path(), revision, &mut None).unwrap();
+            execute_initial_for_revision(
+                &mut stages,
+                root.path(),
+                revision,
+                &mut None,
+                SetupHooks::NONE,
+            )
+            .unwrap();
             assert_eq!(
                 stages.doctor.notification_center_cleared(),
                 cleared,
@@ -3279,9 +4478,15 @@ mod tests {
         let mut stages =
             WithholdingStages::over(Withholding::widgets_whose_first_try_does_not_verify());
         let retry = |stages: &mut WithholdingStages| {
-            execute_initial_for_revision(stages, root.path(), revision, &mut None)
-                .unwrap()
-                .expect("setup still runs");
+            execute_initial_for_revision(
+                stages,
+                root.path(),
+                revision,
+                &mut None,
+                SetupHooks::NONE,
+            )
+            .unwrap()
+            .expect("setup still runs");
         };
         retry(&mut stages);
         assert_eq!(stages.doctor.notification_center_writes(), 0);
@@ -3317,9 +4522,15 @@ mod tests {
             WithholdingStages::over(Withholding::widgets_whose_first_try_does_not_verify());
         let retry = |stages: &mut WithholdingStages, revision: u64| {
             let writes = stages.doctor.notification_center_writes();
-            execute_initial_for_revision(stages, root.path(), revision, &mut None)
-                .unwrap()
-                .expect("setup still runs");
+            execute_initial_for_revision(
+                stages,
+                root.path(),
+                revision,
+                &mut None,
+                SetupHooks::NONE,
+            )
+            .unwrap()
+            .expect("setup still runs");
             stages.doctor.notification_center_writes() - writes
         };
         retry(&mut stages, revision);
@@ -3343,47 +4554,58 @@ mod tests {
     }
 
     #[test]
-    fn the_vault_lines_apply_leaves_the_mac_settings_and_the_permission_asks_alone() {
+    fn a_choice_runs_only_the_steps_it_changed() {
         let root = aterm_tempfile::tempdir().unwrap();
         let allowed = || {
             snapshot_at(root.path(), Plan::default())
                 .unwrap()
                 .permissions_allowed
         };
+        let run = |revision: u64| {
+            let mut host = Fake::default();
+            execute_initial_for_revision(
+                &mut host,
+                root.path(),
+                revision,
+                &mut None,
+                SetupHooks::NONE,
+            )
+            .unwrap();
+            assert!(finished_at(root.path()).unwrap());
+            assert!(first_run_complete(root.path()).unwrap());
+            host.calls
+        };
         authorize_at(root.path(), &Plan::default()).unwrap();
         execute_initial(&mut Fake::default(), root.path(), &mut None).unwrap();
         assert!(finished_at(root.path()).unwrap());
         assert!(allowed());
 
-        let mut remedy = Plan::default();
-        for setting in Setting::ALL {
-            if setting.is_workstation() {
-                remedy.selection.set(setting, false);
-            }
-        }
-        remedy.selection.set(Setting::Secrets, true);
-        let revision = restart_at(root.path(), &remedy).unwrap();
+        let mut joined = Plan {
+            vault_url: "http://team.local:7484/v1/team".into(),
+            ..Plan::default()
+        };
+        let revision = system_state_join(root.path(), &joined);
+        assert!(!finished_at(root.path()).unwrap(), "the vault's steps run");
         assert!(first_run_complete(root.path()).unwrap());
         assert!(allowed());
-        let mut host = Fake::default();
-        execute_initial_for_revision(&mut host, root.path(), revision, &mut None).unwrap();
-        assert!(host.calls.contains(&Stage::Secrets), "{:?}", host.calls);
-        assert!(
-            !host.calls.contains(&Stage::Workstation),
-            "{:?}",
-            host.calls
-        );
-        assert!(finished_at(root.path()).unwrap());
-        assert!(first_run_complete(root.path()).unwrap());
-        assert!(allowed(), "the permission asks stay allowed");
+        assert_eq!(run(revision), [Stage::Secrets, Stage::Repositories]);
+        assert!(allowed(), "the permission steps stay allowed");
 
-        restart_at(root.path(), &selected(&[Setting::Secrets])).unwrap();
-        assert!(!allowed(), "the Secrets row alone ends them");
-        let revision = restart_at(root.path(), &Plan::default()).unwrap();
-        assert!(!first_run_complete(root.path()).unwrap());
-        let mut host = Fake::default();
-        execute_initial_for_revision(&mut host, root.path(), revision, &mut None).unwrap();
-        assert!(host.calls.contains(&Stage::Workstation), "{:?}", host.calls);
+        joined.selection.set(Setting::Spotlight, false);
+        assert!(run(system_state_choice(root.path(), &joined)).is_empty());
+        joined.selection.set(Setting::Spotlight, true);
+        let revision = system_state_choice(root.path(), &joined);
+        assert_eq!(run(revision), [Stage::Spotlight]);
+        joined.selection.set(Setting::Secrets, false);
+        assert!(run(system_state_choice(root.path(), &joined)).is_empty());
+        joined.selection.set(Setting::Secrets, true);
+        let revision = system_state_join(root.path(), &joined);
+        assert_eq!(run(revision), [Stage::Secrets, Stage::Repositories]);
+
+        let revision = system_state_apply(root.path(), &joined, false, || Ok(None));
+        let calls = run(revision);
+        assert!(calls.contains(&Stage::Workstation), "{calls:?}");
+        assert!(calls.contains(&Stage::Accounts), "{calls:?}");
     }
 
     #[test]
@@ -3393,14 +4615,20 @@ mod tests {
             rest: Fake,
         }
         impl InitialHost for Stages {
+            fn legacy(&mut self, root: &Path) -> Result<Option<Report>, String> {
+                self.doctor.pass(root)
+            }
             fn workstation(&mut self, root: &Path) -> Result<Option<Report>, String> {
                 self.doctor.pass(root)
+            }
+            fn accounts(&mut self, root: &Path, on_screen: bool) -> Result<Option<Report>, String> {
+                self.rest.accounts(root, on_screen)
             }
             fn spotlight(&mut self) -> Result<Vec<Row>, String> {
                 self.rest.spotlight()
             }
-            fn permissions(&mut self) -> Result<Vec<Row>, String> {
-                self.rest.permissions()
+            fn permissions(&mut self, plan: &Plan, access: u64) -> Result<Vec<Row>, String> {
+                self.rest.permissions(plan, access)
             }
             fn secrets(
                 &mut self,
@@ -3438,9 +4666,16 @@ mod tests {
         };
         let retries = |stages: &mut Stages, count: usize, why: &str| {
             for retry in 0..count {
-                let report = execute_initial_for_revision(stages, root.path(), revision, &mut None)
-                    .unwrap()
-                    .unwrap();
+                let report = execute_initial_for_revision(
+                    stages,
+                    root.path(),
+                    revision,
+                    &mut None,
+                    SetupHooks::NONE,
+                )
+                .unwrap()
+                .unwrap()
+                .0;
                 assert!(report.needs_attention(), "retry {retry}");
                 assert!(
                     report
@@ -3452,19 +4687,34 @@ mod tests {
                 );
             }
         };
-        let first = execute_initial_for_revision(&mut stages, root.path(), revision, &mut None)
-            .unwrap()
-            .unwrap();
+        let first = execute_initial_for_revision(
+            &mut stages,
+            root.path(),
+            revision,
+            &mut None,
+            SetupHooks::NONE,
+        )
+        .unwrap()
+        .unwrap()
+        .0;
         assert!(first.needs_attention());
         let once = (stages.doctor.changes(), stages.doctor.relaunches());
         assert_eq!(once.1, 1);
-        retries(&mut stages, 9, WAITING);
+        // macos_doctor's held-row text, not this module's `waiting` row status.
+        retries(&mut stages, 9, super::super::WAITING);
         assert_eq!(
             (stages.doctor.changes(), stages.doctor.relaunches()),
             once,
             "nothing between the tries"
         );
-        execute_initial_for_revision(&mut stages, root.path(), revision, &mut None).unwrap();
+        execute_initial_for_revision(
+            &mut stages,
+            root.path(),
+            revision,
+            &mut None,
+            SetupHooks::NONE,
+        )
+        .unwrap();
         let twice = (stages.doctor.changes(), stages.doctor.relaunches());
         assert_eq!(twice.1, 2);
         assert!(twice.0 > once.0);
@@ -3530,7 +4780,7 @@ mod tests {
         assert_eq!(host.calls, [Stage::Permissions, Stage::Secrets]);
         assert!(!finished_at(root.path()).unwrap());
         assert!(first_run_complete(root.path()).unwrap());
-        cancel_automatic_setup_at(root.path()).unwrap();
+        write_legacy_cancel_at(root.path());
         assert!(finished_at(root.path()).unwrap());
         let before = std::fs::read(root.path().join("initial-setup.json")).unwrap();
         authorize_at(root.path(), &Plan::default()).unwrap();
@@ -3552,6 +4802,37 @@ mod tests {
     }
 
     #[test]
+    fn an_explicit_profile_sets_up_permissions_unless_setup_was_cancelled_or_restored() {
+        // No setup record yet: the explicit plan is the profile and the permissions.
+        let fresh = aterm_tempfile::tempdir().unwrap();
+        save_explicit_workstation_plan(fresh.path()).unwrap();
+        let plan = saved_plan(fresh.path()).unwrap().unwrap();
+        assert!(plan.selection.contains(Setting::Permissions));
+        for state in ["cancelled", "restored"] {
+            // A legacy Cancel or Restore: the explicit pass does not re-open them.
+            let legacy = aterm_tempfile::tempdir().unwrap();
+            write_json(
+                &legacy.path().join("first-run.json"),
+                &json!({"profile":PROFILE,"state":state}),
+            )
+            .unwrap();
+            save_explicit_workstation_plan(legacy.path()).unwrap();
+            let plan = saved_plan(legacy.path()).unwrap().unwrap();
+            assert!(!plan.selection.contains(Setting::Permissions), "{state}");
+            assert_eq!(plan.selection.workstation(), Selection::all().workstation());
+        }
+        // A modern run an older aterm cancelled: Permissions comes off, even
+        // where it was set up.
+        let root = aterm_tempfile::tempdir().unwrap();
+        authorize_at(root.path(), &Plan::default()).unwrap();
+        write_legacy_cancel_at(root.path());
+        save_explicit_workstation_plan(root.path()).unwrap();
+        let plan = saved_plan(root.path()).unwrap().unwrap();
+        assert!(!plan.selection.contains(Setting::Permissions));
+        assert_eq!(plan.selection.workstation(), Selection::all().workstation());
+    }
+
+    #[test]
     fn explicit_mac_apply_retains_modern_stages_and_legacy_completion_stays_honored() {
         let root = aterm_tempfile::tempdir().unwrap();
         let mut plan = selected(&[Setting::Widgets, Setting::Secrets, Setting::Repositories]);
@@ -3565,7 +4846,8 @@ mod tests {
         );
         assert!(revised.selection.contains(Setting::Secrets));
         assert!(revised.selection.contains(Setting::Repositories));
-        assert!(!revised.selection.contains(Setting::Permissions));
+        // aterm's own permissions join an explicit profile by default.
+        assert!(revised.selection.contains(Setting::Permissions));
         assert_eq!(revised.vault_url, plan.vault_url);
 
         let legacy = aterm_tempfile::tempdir().unwrap();
@@ -3694,7 +4976,7 @@ mod tests {
     }
 
     #[test]
-    fn cancel_keeps_applied_preferences_and_stops_only_unfinished_stages() {
+    fn an_older_cancel_keeps_applied_preferences_and_stops_only_unfinished_stages() {
         let root = aterm_tempfile::tempdir().unwrap();
         let plan = selected(&[Setting::Widgets, Setting::Secrets]);
         authorize_at(root.path(), &plan).unwrap();
@@ -3703,7 +4985,7 @@ mod tests {
             ..Fake::default()
         };
         execute_initial(&mut host, root.path(), &mut None).unwrap();
-        cancel_automatic_setup_at(root.path()).unwrap();
+        write_legacy_cancel_at(root.path());
         let (_, finished, rows) = status_at(root.path(), Plan::default()).unwrap();
         assert!(finished);
         assert_eq!(rows.len(), 2);
@@ -3731,7 +5013,16 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(report.needs_attention());
-        assert_eq!(host.calls, [Stage::Workstation, Stage::Secrets]);
+        // The explicit profile carries aterm's permissions (a new stage here).
+        assert_eq!(
+            host.calls,
+            [
+                Stage::Workstation,
+                Stage::Permissions,
+                Stage::Secrets,
+                Stage::Accounts
+            ]
+        );
         assert!(!first_run_complete(root.path()).unwrap());
         assert_eq!(
             progress(root.path()).unwrap().unwrap().done & Stage::Workstation.bit(),
@@ -3849,7 +5140,14 @@ mod tests {
 
         let revision = restart_at(root.path(), &snapshot.plan).unwrap();
         let mut host = Fake::default();
-        execute_initial_for_revision(&mut host, root.path(), revision, &mut None).unwrap();
+        execute_initial_for_revision(
+            &mut host,
+            root.path(),
+            revision,
+            &mut None,
+            SetupHooks::NONE,
+        )
+        .unwrap();
         let ran = host.vault_url.expect("the Secrets stage ran");
         assert_eq!(ran, team);
         let status = Status {
@@ -3921,7 +5219,14 @@ mod tests {
         assert_eq!(shown().plan, typed);
         for pass in 0..2 {
             let mut host = failing();
-            execute_initial_for_revision(&mut host, root.path(), revision, &mut None).unwrap();
+            execute_initial_for_revision(
+                &mut host,
+                root.path(),
+                revision,
+                &mut None,
+                SetupHooks::NONE,
+            )
+            .unwrap();
             assert_eq!(host.vault_url.as_deref(), Some(other), "pass {pass}");
             let snapshot = shown();
             assert!(!snapshot.finished);
@@ -3937,7 +5242,14 @@ mod tests {
         }
         let revision = apply(&shown().plan);
         let mut host = failing();
-        execute_initial_for_revision(&mut host, root.path(), revision, &mut None).unwrap();
+        execute_initial_for_revision(
+            &mut host,
+            root.path(),
+            revision,
+            &mut None,
+            SetupHooks::NONE,
+        )
+        .unwrap();
         assert_eq!(host.vault_url.as_deref(), Some(other));
         assert_eq!(shown().plan, typed);
 
@@ -4070,6 +5382,630 @@ mod tests {
         assert_eq!(revision_at(root.path()).unwrap(), u64::MAX);
     }
 
+    #[test]
+    fn a_stop_between_stages_ends_the_revision_and_a_new_plan_runs_normally() {
+        use std::sync::Mutex;
+        static ENDED: Mutex<Vec<&'static [Setting]>> = Mutex::new(Vec::new());
+        fn stage(event: StageEvent) {
+            if !event.running {
+                ENDED.lock().unwrap().push(event.settings);
+            }
+        }
+        // Stop once the first stage has ended.
+        fn stop(_: u64) -> bool {
+            !ENDED.lock().unwrap().is_empty()
+        }
+        let hooks = SetupHooks {
+            stop,
+            stage,
+            on_screen: || true,
+        };
+        let root = aterm_tempfile::tempdir().unwrap();
+        let plan = selected(&[Setting::Widgets, Setting::Secrets]);
+        let revision = authorize_at(root.path(), &plan).unwrap().unwrap();
+        let mut host = Fake::default();
+        let (report, next) =
+            execute_initial_for_revision(&mut host, root.path(), revision, &mut None, hooks)
+                .unwrap()
+                .unwrap();
+        assert_eq!(host.calls, [Stage::Workstation]);
+        assert_eq!(next, SetupNext::Done);
+        assert!(report.rows.iter().any(|row| row.status == "stopped"));
+        let stopped = progress(root.path()).unwrap().unwrap();
+        assert!(stopped.stopped && stopped.admitted && !stopped.completed);
+        assert_eq!(stopped.done, Stage::Workstation.bit());
+        // The revision ended without cancelling the plan: nothing more runs for it.
+        assert!(finished_at(root.path()).unwrap());
+        assert!(admission_at(root.path()).unwrap().unwrap().completed);
+        assert_eq!(saved_plan(root.path()).unwrap(), Some(plan.clone()));
+        assert!(
+            execute_initial_for_revision(&mut host, root.path(), revision, &mut None, hooks)
+                .unwrap()
+                .is_none()
+        );
+
+        // A later admission is a new revision, and it runs normally.
+        let next_revision = restart_at(root.path(), &plan).unwrap();
+        assert_eq!(next_revision, revision + 1);
+        assert!(!finished_at(root.path()).unwrap());
+        host.calls.clear();
+        execute_initial_for_revision(
+            &mut host,
+            root.path(),
+            next_revision,
+            &mut None,
+            SetupHooks::NONE,
+        )
+        .unwrap();
+        assert_eq!(host.calls, [Stage::Workstation, Stage::Secrets]);
+        assert!(finished_at(root.path()).unwrap());
+        assert!(!progress(root.path()).unwrap().unwrap().stopped);
+    }
+
+    #[test]
+    fn a_row_waiting_on_a_person_parks_the_run_instead_of_retrying_it() {
+        let row = |status: &str| Row {
+            name: "row".into(),
+            status: status.into(),
+            detail: String::new(),
+        };
+        assert_eq!(SetupNext::of(&[row("ok"), row("applied")]), SetupNext::Done);
+        assert_eq!(SetupNext::of(&[row("ok"), row(WAITING)]), SetupNext::Park);
+        assert_eq!(
+            SetupNext::of(&[row(WAITING), row("blocked")]),
+            SetupNext::Retry
+        );
+        assert_eq!(SetupNext::of(&[]), SetupNext::Retry);
+        assert_eq!(SetupNext::Done.and(SetupNext::Park), SetupNext::Park);
+        assert_eq!(SetupNext::Park.and(SetupNext::Retry), SetupNext::Retry);
+
+        let root = aterm_tempfile::tempdir().unwrap();
+        let plan = selected(&[Setting::Permissions, Setting::Widgets]);
+        let revision = authorize_at(root.path(), &plan).unwrap().unwrap();
+        let mut host = Fake {
+            waiting: Some(Stage::Permissions),
+            ..Fake::default()
+        };
+        let (_, next) = execute_initial_for_revision(
+            &mut host,
+            root.path(),
+            revision,
+            &mut None,
+            SetupHooks::NONE,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(next, SetupNext::Park);
+        let left = progress(root.path()).unwrap().unwrap();
+        assert_eq!(left.done, Stage::Workstation.bit());
+        assert!(!left.completed);
+        // Once the person acts, the next pass finishes only the parked stage.
+        host.calls.clear();
+        host.waiting = None;
+        let (_, next) = execute_initial_for_revision(
+            &mut host,
+            root.path(),
+            revision,
+            &mut None,
+            SetupHooks::NONE,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(next, SetupNext::Done);
+        assert_eq!(host.calls, [Stage::Permissions]);
+        assert!(finished_at(root.path()).unwrap());
+    }
+
+    #[test]
+    fn a_record_from_before_the_sign_out_stage_counts_its_finished_workstation_as_signed_out() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let plan = Plan::default();
+        authorize_at(root.path(), &plan).unwrap();
+        let mut done = progress(root.path()).unwrap().unwrap();
+        done.done = Stage::Workstation.bit();
+        save_progress(root.path(), done).unwrap();
+        let path = root.path().join("initial-setup.json");
+        let mut record: Value = aterm_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(record["stages"].as_u64(), Some(6));
+        assert_eq!(
+            progress(root.path()).unwrap().unwrap().done,
+            Stage::Workstation.bit()
+        );
+        record.as_object_mut().unwrap().remove("stages");
+        write_json(&path, &record).unwrap();
+        assert_eq!(
+            progress(root.path()).unwrap().unwrap().done,
+            Stage::Workstation.bit() | Stage::Accounts.bit()
+        );
+    }
+
+    #[test]
+    fn a_change_to_another_group_keeps_this_approvals_access_steps() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let record = || -> Value {
+            aterm_json::from_slice(&std::fs::read(root.path().join("initial-setup.json")).unwrap())
+                .unwrap()
+        };
+        let first = selected(&[Setting::Permissions, Setting::Widgets]);
+        let approved = authorize_at(root.path(), &first).unwrap().unwrap();
+        assert_eq!(access_revision_at(root.path()).unwrap(), approved);
+        assert!(record().get("access_revision").is_none());
+
+        // Another group changes at once: a new revision, the same approval of the
+        // grants, so nothing is handed to macOS again (§3.3, §6).
+        let wider = selected(&[Setting::Permissions, Setting::Widgets, Setting::Dock]);
+        let revision = restart_at(root.path(), &wider).unwrap();
+        assert!(revision > approved);
+        assert_eq!(access_revision_at(root.path()).unwrap(), approved);
+        assert_eq!(record()["access_revision"].as_u64(), Some(approved));
+        let mut host = Fake::default();
+        execute_initial(&mut host, root.path(), &mut None).unwrap();
+        assert_eq!(host.access_read, Some(approved));
+        assert_eq!(
+            admission_at(root.path()).unwrap().unwrap().revision,
+            revision
+        );
+
+        // Permissions off and on again is a new approval: this revision's own.
+        restart_at(root.path(), &selected(&[Setting::Widgets])).unwrap();
+        let again = restart_at(root.path(), &first).unwrap();
+        assert_eq!(access_revision_at(root.path()).unwrap(), again);
+        assert!(record().get("access_revision").is_none());
+
+        // A record never names an access revision after its own.
+        let mut bad = record();
+        bad.as_object_mut()
+            .unwrap()
+            .insert("access_revision".into(), Value::from(again + 1));
+        write_json(&root.path().join("initial-setup.json"), &bad).unwrap();
+        assert!(progress(root.path()).is_err());
+    }
+
+    #[test]
+    fn the_sign_outs_wait_for_system_state_on_screen_and_park_without_it() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let plan = selected(&[Setting::Widgets, Setting::Messages]);
+        let revision = authorize_at(root.path(), &plan).unwrap().unwrap();
+        let mut host = Fake {
+            accounts_pending: true,
+            ..Fake::default()
+        };
+        let hidden = SetupHooks {
+            on_screen: || false,
+            ..SetupHooks::NONE
+        };
+        let (report, next) =
+            execute_initial_for_revision(&mut host, root.path(), revision, &mut None, hidden)
+                .unwrap()
+                .unwrap();
+        // The sign-outs did not run: they wait, and the run parks rather than retries.
+        assert_eq!(host.calls, [Stage::Workstation]);
+        assert_eq!(next, SetupNext::Park);
+        assert!(report.rows.iter().any(|row| row.status == WAITING));
+        assert_eq!(
+            progress(root.path()).unwrap().unwrap().done & Stage::Accounts.bit(),
+            0
+        );
+        // With System State on screen they run.
+        let shown = SetupHooks {
+            on_screen: || true,
+            ..SetupHooks::NONE
+        };
+        host.calls.clear();
+        let (_, next) =
+            execute_initial_for_revision(&mut host, root.path(), revision, &mut None, shown)
+                .unwrap()
+                .unwrap();
+        assert_eq!(host.calls, [Stage::Accounts]);
+        assert_eq!(next, SetupNext::Done);
+        assert!(finished_at(root.path()).unwrap());
+    }
+
+    #[test]
+    fn a_legacy_run_that_waits_on_a_person_parks_like_a_modern_one() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        save_plan(root.path(), &Plan::default()).unwrap();
+        write_json(
+            &root.path().join("first-run.json"),
+            &json!({"profile":PROFILE,"state":"pending"}),
+        )
+        .unwrap();
+        assert!(progress(root.path()).unwrap().is_none());
+        let mut host = Fake {
+            waiting: Some(Stage::Workstation),
+            ..Fake::default()
+        };
+        let (report, next) = execute_pass(&mut host, root.path(), &mut None, SetupHooks::NONE)
+            .unwrap()
+            .unwrap();
+        assert!(report.needs_attention());
+        assert_eq!(next, SetupNext::Park);
+        let mut host = Fake {
+            failure: Some(Stage::Workstation),
+            ..Fake::default()
+        };
+        assert!(execute_pass(&mut host, root.path(), &mut None, SetupHooks::NONE).is_err());
+    }
+
+    #[test]
+    fn the_same_plan_again_stays_provisional_and_a_new_one_is_the_persons() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let automatic = selected(&[Setting::Permissions]);
+        save_plan_as(root.path(), &automatic, true).unwrap();
+        restart_at(root.path(), &automatic).unwrap();
+        assert!(saved_plan_provisional(root.path()).unwrap());
+        let shaped = selected(&[Setting::Permissions, Setting::Widgets]);
+        restart_at(root.path(), &shaped).unwrap();
+        assert!(!saved_plan_provisional(root.path()).unwrap());
+        // Shaping it back to what aterm chose is still the person's plan.
+        restart_at(root.path(), &automatic).unwrap();
+        assert!(!saved_plan_provisional(root.path()).unwrap());
+    }
+
+    #[test]
+    fn a_group_choice_back_to_the_provisional_plan_is_the_persons_and_set_up_now_is_not() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let automatic = selected(&[Setting::Permissions]);
+        save_plan_as(root.path(), &automatic, true).unwrap();
+        // Keyboard & Trackpad to Set up and back, while busy: the first choice
+        // was overtaken unsaved, and the second admits aterm's own plan again.
+        let mut choice = InitialSetupRestart::chosen();
+        let admitted = restart_attempt(
+            &mut choice,
+            root.path(),
+            &automatic,
+            save_progress,
+            observe_restart,
+        );
+        assert!(admitted.result.unwrap().is_some());
+        let records = Records::read(root.path()).unwrap();
+        assert_eq!(records.plan, Some((automatic.clone(), true)));
+        assert!(
+            !records.provisional,
+            "a later ALab signal must not widen groups the person left as is"
+        );
+
+        // Set up now runs the plan as it stands: a provisional one stays so.
+        save_plan_as(root.path(), &automatic, true).unwrap();
+        let mut again = InitialSetupRestart::default();
+        let admitted = restart_attempt(
+            &mut again,
+            root.path(),
+            &automatic,
+            save_progress,
+            observe_restart,
+        );
+        assert!(admitted.result.unwrap().is_some());
+        assert!(saved_plan_provisional(root.path()).unwrap());
+    }
+
+    #[test]
+    fn a_stop_asked_for_while_a_stage_runs_is_never_resumed_after_a_quit() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let plan = selected(&[Setting::Widgets, Setting::Repositories, Setting::Messages]);
+        let revision = authorize_at(root.path(), &plan).unwrap().unwrap();
+        let mut host = Fake {
+            stop_during: Some((Stage::Repositories, root.path().to_owned())),
+            ..Fake::default()
+        };
+        let (report, next) = execute_initial_for_revision(
+            &mut host,
+            root.path(),
+            revision,
+            &mut None,
+            SetupHooks::NONE,
+        )
+        .unwrap()
+        .unwrap();
+        // Had the process ended inside Repositories, the next launch would
+        // read the run as over: the window's startup finishes instead of
+        // resuming it, and the sign-outs never run.
+        let relaunch = host.relaunch.take().expect("the Stop came mid-stage");
+        assert!(relaunch.finished, "{relaunch:?}");
+        assert!(relaunch.snapshot_finished, "{relaunch:?}");
+        let admission = relaunch.admission.expect("the run stays admitted");
+        assert_eq!(admission.revision, revision);
+        assert!(admission.completed, "a stopped run has nothing to resume");
+        // This process lived on: the pass stopped at the next boundary and
+        // folded the request into the run's own record.
+        assert_eq!(host.calls, [Stage::Workstation, Stage::Repositories]);
+        assert_eq!(next, SetupNext::Done);
+        assert!(report.rows.iter().any(|row| row.status == "stopped"));
+        let stopped = progress(root.path()).unwrap().unwrap();
+        assert!(stopped.stopped && !stopped.completed);
+        assert_eq!(stop_request_at(root.path()), None);
+        assert!(finished_at(root.path()).unwrap());
+        assert!(admission_at(root.path()).unwrap().unwrap().completed);
+    }
+
+    #[test]
+    fn a_stop_request_is_folded_by_the_next_lock_holder_and_an_older_ones_is_spent() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let plan = selected(&[Setting::Widgets, Setting::Secrets]);
+        let first = authorize_at(root.path(), &plan).unwrap().unwrap();
+        // The Stop of a run whose process ended before any boundary: the next
+        // pass folds it before it runs anything.
+        request_stop_at(root.path(), first).unwrap();
+        let mut host = Fake::default();
+        assert!(
+            execute_initial_for_revision(
+                &mut host,
+                root.path(),
+                first,
+                &mut None,
+                SetupHooks::NONE
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(host.calls.is_empty());
+        assert!(progress(root.path()).unwrap().unwrap().stopped);
+        assert_eq!(stop_request_at(root.path()), None);
+
+        // A request for a revision a person's later choice replaced is ignored
+        // by every reader, and the next pass removes it and runs normally.
+        let second = restart_at(root.path(), &plan).unwrap();
+        request_stop_at(root.path(), first).unwrap();
+        assert!(!finished_at(root.path()).unwrap());
+        assert!(!admission_at(root.path()).unwrap().unwrap().completed);
+        assert!(!status_at(root.path(), Plan::default()).unwrap().1);
+        execute_initial_for_revision(&mut host, root.path(), second, &mut None, SetupHooks::NONE)
+            .unwrap();
+        assert_eq!(host.calls, [Stage::Workstation, Stage::Secrets]);
+        assert_eq!(stop_request_at(root.path()), None);
+        assert!(!progress(root.path()).unwrap().unwrap().stopped);
+
+        // A restart folds a Stop of the run it replaces, then runs its own.
+        let third = restart_at(root.path(), &plan).unwrap();
+        request_stop_at(root.path(), third).unwrap();
+        let fourth = restart_at(root.path(), &plan).unwrap();
+        assert_eq!(fourth, third + 1);
+        assert_eq!(stop_request_at(root.path()), None);
+        assert!(!finished_at(root.path()).unwrap());
+    }
+
+    #[test]
+    fn a_late_old_stop_never_replaces_the_current_runs_stop() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let plan = selected(&[Setting::Secrets]);
+        let first = authorize_at(root.path(), &plan).unwrap().unwrap();
+        let second = restart_at(root.path(), &plan).unwrap();
+        request_stop_at(root.path(), first).unwrap();
+        assert!(
+            !finished_at(root.path()).unwrap(),
+            "an old Stop alone cannot stop a newer run"
+        );
+        request_stop_at(root.path(), second).unwrap();
+        assert!(finished_at(root.path()).unwrap());
+        request_stop_at(root.path(), first).unwrap();
+        assert!(
+            finished_at(root.path()).unwrap(),
+            "a delayed old process must not erase the current Stop"
+        );
+        assert_eq!(
+            stop_request_at(root.path()),
+            Some(StopRequest::Revision(second))
+        );
+        let mut host = Fake::default();
+        assert!(
+            execute_initial_for_revision(
+                &mut host,
+                root.path(),
+                second,
+                &mut None,
+                SetupHooks::NONE
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(host.calls.is_empty());
+        assert!(progress(root.path()).unwrap().unwrap().stopped);
+    }
+
+    #[test]
+    fn settling_an_old_stop_never_unlinks_a_new_request_published_meanwhile() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let root = aterm_tempfile::tempdir().unwrap();
+        request_stop_at(root.path(), 1).unwrap();
+        let path = root.path().to_owned();
+        let (go, begin) = mpsc::sync_channel(0);
+        let (entered, entering) = mpsc::sync_channel(1);
+        let publisher = std::thread::spawn(move || {
+            begin
+                .recv_timeout(Duration::from_secs(60))
+                .expect("settler reached its removal boundary");
+            let lock = HeldLock::try_take_named(&path, STOP_REQUEST_LOCK).unwrap();
+            if lock.is_some() {
+                // No settler excludes this writer: publish in the open gap.
+                drop(lock);
+                request_stop_at(&path, 2).unwrap();
+                entered.send(()).unwrap();
+            } else {
+                // The settler excludes publication until its compare/unlink
+                // finishes. The actual writer then waits for that short lock.
+                entered.send(()).unwrap();
+                request_stop_at(&path, 2).unwrap();
+            }
+        });
+        settle_stop_request_with(root.path(), StopRequest::Revision(1), || {
+            go.send(()).unwrap();
+            entering
+                .recv_timeout(Duration::from_secs(60))
+                .expect("publisher reached the Stop protocol");
+            Ok(())
+        })
+        .unwrap();
+        publisher.join().expect("new Stop published");
+        assert_eq!(
+            stop_request_at(root.path()),
+            Some(StopRequest::Revision(2)),
+            "settling the old request must leave the newer publication intact"
+        );
+    }
+
+    #[test]
+    fn a_retained_stop_is_confirmed_durable_under_the_short_lock() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        request_stop_at(root.path(), 9).unwrap();
+        let original = std::fs::read(root.path().join(STOP_REQUEST)).unwrap();
+        for revision in [8, 9] {
+            let mut flushed = false;
+            let result = request_stop_with_flush(root.path(), revision, |_, _| {
+                assert!(
+                    HeldLock::try_take_named(root.path(), STOP_REQUEST_LOCK)
+                        .unwrap()
+                        .is_none(),
+                    "retained publication stays locked through durability confirmation"
+                );
+                flushed = true;
+                Err(std::io::Error::other(
+                    "injected Stop directory flush failure",
+                ))
+            });
+            assert!(
+                result.is_err(),
+                "a visible request alone is not a saved Stop"
+            );
+            assert!(flushed);
+            assert_eq!(
+                std::fs::read(root.path().join(STOP_REQUEST)).unwrap(),
+                original
+            );
+        }
+        request_stop_at(root.path(), 8).unwrap();
+        assert_eq!(
+            std::fs::read(root.path().join(STOP_REQUEST)).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn an_unreadable_stop_is_never_replaced_or_reported_saved() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let plan = selected(&[Setting::Secrets]);
+        let revision = authorize_at(root.path(), &plan).unwrap().unwrap();
+        let invalid = b"unreadable Stop request";
+        aterm_machines::port::write_atomic(&root.path().join(STOP_REQUEST), invalid, 0o600)
+            .unwrap();
+        assert!(request_stop_at(root.path(), revision).is_err());
+        assert_eq!(
+            std::fs::read(root.path().join(STOP_REQUEST)).unwrap(),
+            invalid
+        );
+        assert!(
+            finished_at(root.path()).unwrap(),
+            "an unreadable Stop never releases setup"
+        );
+        let mut host = Fake::default();
+        assert!(
+            execute_initial_for_revision(
+                &mut host,
+                root.path(),
+                revision,
+                &mut None,
+                SetupHooks::NONE
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(host.calls.is_empty());
+        assert!(progress(root.path()).unwrap().unwrap().stopped);
+    }
+
+    #[test]
+    fn saving_a_stop_never_waits_for_the_running_profile_pass() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let root = aterm_tempfile::tempdir().unwrap();
+        let profile = HeldLock::take(root.path()).unwrap();
+        let path = root.path().to_owned();
+        let (saved, saving) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            saved.send(request_stop_at(&path, 7)).unwrap();
+        });
+        saving
+            .recv_timeout(Duration::from_secs(60))
+            .expect("Stop is saved while the profile lock remains held")
+            .unwrap();
+        assert!(HeldLock::try_take(root.path()).unwrap().is_none());
+        assert_eq!(stop_request_at(root.path()), Some(StopRequest::Revision(7)));
+        drop(profile);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn a_stop_during_the_last_stage_of_a_run_that_finishes_comes_too_late() {
+        // Permissions is in the plan, so the snapshot's permission policy says
+        // whether the run reads as stopped (a stopped run allows no access step).
+        let plan = selected(&[Setting::Widgets, Setting::Permissions, Setting::Messages]);
+        let root = aterm_tempfile::tempdir().unwrap();
+        let revision = authorize_at(root.path(), &plan).unwrap().unwrap();
+        let mut host = Fake {
+            stop_during: Some((Stage::Accounts, root.path().to_owned())),
+            ..Fake::default()
+        };
+        let (report, next) = execute_initial_for_revision(
+            &mut host,
+            root.path(),
+            revision,
+            &mut None,
+            SetupHooks::NONE,
+        )
+        .unwrap()
+        .unwrap();
+        // The sign-outs were already running when Stop was pressed, and they
+        // finished: the run is completed, not stopped, and the request is spent.
+        assert_eq!(
+            host.calls,
+            [Stage::Workstation, Stage::Permissions, Stage::Accounts]
+        );
+        assert_eq!(next, SetupNext::Done);
+        assert!(report.rows.iter().all(|row| row.status != "stopped"));
+        let done = progress(root.path()).unwrap().unwrap();
+        assert!(done.completed && !done.stopped);
+        assert_eq!(stop_request_at(root.path()), None);
+        let snapshot = snapshot_at(root.path(), Plan::default()).unwrap();
+        assert!(snapshot.finished);
+        assert!(
+            snapshot.permissions_allowed,
+            "a completed run is not stopped"
+        );
+        // A Stop that lands after the last stage, before the worker lets the
+        // run go, is as late: every reader still reads the run as completed.
+        request_stop_at(root.path(), revision).unwrap();
+        let snapshot = snapshot_at(root.path(), Plan::default()).unwrap();
+        assert!(snapshot.finished && snapshot.permissions_allowed);
+        assert!(admission_at(root.path()).unwrap().unwrap().completed);
+
+        // A Stop during the last stage of a pass that leaves work (the stage
+        // waits on a person) stops the run at the pass's end: no later pass of
+        // it runs, and the request is folded in.
+        let root = aterm_tempfile::tempdir().unwrap();
+        let revision = authorize_at(root.path(), &plan).unwrap().unwrap();
+        let mut host = Fake {
+            stop_during: Some((Stage::Accounts, root.path().to_owned())),
+            waiting: Some(Stage::Accounts),
+            ..Fake::default()
+        };
+        let (report, next) = execute_initial_for_revision(
+            &mut host,
+            root.path(),
+            revision,
+            &mut None,
+            SetupHooks::NONE,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(next, SetupNext::Done);
+        assert!(report.rows.iter().any(|row| row.status == "stopped"));
+        let stopped = progress(root.path()).unwrap().unwrap();
+        assert!(stopped.stopped && !stopped.completed);
+        assert_eq!(stop_request_at(root.path()), None);
+        let snapshot = snapshot_at(root.path(), Plan::default()).unwrap();
+        assert!(snapshot.finished && !snapshot.permissions_allowed);
+    }
+
     mod vault {
         use super::*;
         use aterm_machines::init_secrets::SecretsOps;
@@ -4140,12 +6076,13 @@ mod tests {
         fn member(source: &str, membership: Membership) -> Status {
             let recipient = aterm_secrets::age::Identity::from_secret_bytes([31; 32]).recipient();
             let code = aterm_secrets::client::join_code(&recipient);
-            let source = Source::Url(source.into());
+            let (source, pin) =
+                aterm_secrets::transport::parse_source(source, Path::new("/test-home")).unwrap();
             Status {
                 config: Some(Config {
                     name: aterm_secrets::transport::vault_name(&source).unwrap(),
                     source,
-                    signer: Some([3; 32]),
+                    signer: Some(pin.unwrap_or([3; 32])),
                     followed: Vec::new(),
                     host: "m22".into(),
                 }),
@@ -4262,6 +6199,12 @@ mod tests {
                 *self.subscribed.lock().unwrap() = true;
                 Ok("installed the subscriber".into())
             }
+            fn turned_off(&self) -> bool {
+                false
+            }
+            fn started(&self) -> Result<(), String> {
+                Ok(())
+            }
             fn fleeting(&self) -> Option<PathBuf> {
                 self.fleeting.lock().unwrap().clone()
             }
@@ -4288,7 +6231,15 @@ mod tests {
                 if self.1 {
                     return Err("No space left on device (os error 28)".into());
                 }
-                assert!(revert.is_some_and(|revert| revert.contains("aterm secrets agent off")));
+                assert!(
+                    revert.is_some(),
+                    "every injected vault change is reversible"
+                );
+                if !*self.0.subscribed.lock().unwrap() {
+                    assert!(
+                        revert.is_some_and(|revert| revert.contains("aterm secrets agent off"))
+                    );
+                }
                 self.0.log.lock().unwrap().push(format!("line {id}"));
                 Ok(())
             }
@@ -4357,14 +6308,20 @@ mod tests {
         }
 
         impl InitialHost for Vaulted {
+            fn legacy(&mut self, root: &Path) -> Result<Option<Report>, String> {
+                self.rest.legacy(root)
+            }
             fn workstation(&mut self, root: &Path) -> Result<Option<Report>, String> {
                 self.rest.workstation(root)
             }
             fn spotlight(&mut self) -> Result<Vec<Row>, String> {
                 self.rest.spotlight()
             }
-            fn permissions(&mut self) -> Result<Vec<Row>, String> {
-                self.rest.permissions()
+            fn permissions(&mut self, plan: &Plan, revision: u64) -> Result<Vec<Row>, String> {
+                self.rest.permissions(plan, revision)
+            }
+            fn accounts(&mut self, root: &Path, on_screen: bool) -> Result<Option<Report>, String> {
+                self.rest.accounts(root, on_screen)
             }
             fn secrets(
                 &mut self,
@@ -4401,7 +6358,11 @@ mod tests {
                 Ok(read)
             }
             fn current_vault(&mut self, plan: &Plan) -> Result<Vec<Row>, String> {
-                let subscribed = *self.lan.subscribed.lock().unwrap();
+                let subscribed = if *self.lan.subscribed.lock().unwrap() {
+                    check::Subscribed::Running
+                } else {
+                    check::Subscribed::Down
+                };
                 check::vault_rows(
                     plan,
                     Path::new("/test-home"),
@@ -4416,6 +6377,182 @@ mod tests {
             fn withheld(&mut self, root: &Path) -> Result<Option<Report>, String> {
                 self.rest.withheld(root)
             }
+        }
+
+        #[test]
+        fn a_same_source_vault_joined_under_another_signer_allows_repositories() {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let source = "https://team.example/v1/team";
+            let plan = Plan {
+                vault_url: format!("{source}#{}", aterm_secrets::b64::encode_padded(&[9; 32])),
+                ..selected(&[Setting::Secrets, Setting::Repositories])
+            };
+            let revision = authorize_at(root.path(), &plan).unwrap().unwrap();
+            let lan = Lan::new(true, "office");
+            lan.in_vault(source, START);
+            let joined = lan.status_now();
+            lan.set(joined.clone(), true);
+            let mut host = Vaulted::new(&lan);
+            host.paced = false;
+            let (report, next) = execute_initial_for_revision(
+                &mut host,
+                root.path(),
+                revision,
+                &mut None,
+                SetupHooks::NONE,
+            )
+            .unwrap()
+            .expect("the admitted run executes");
+
+            assert!(rows_ready(&report.rows), "{:?}", report.rows);
+            assert_eq!(next, SetupNext::Done);
+            assert_eq!(host.rest.calls, [Stage::Repositories]);
+            assert!(host.minutes().is_empty(), "no replacement join");
+            assert!(lan.log().is_empty(), "{:?}", lan.log());
+            assert_eq!(lan.status_now(), joined);
+            assert!(finished_at(root.path()).unwrap());
+        }
+
+        #[test]
+        fn a_same_source_authority_joined_after_admission_is_preserved() {
+            for legacy in [false, true] {
+                let root = aterm_tempfile::tempdir().unwrap();
+                let source = "https://team.example/v1/team";
+                let plan = Plan {
+                    vault_url: format!("{source}#{}", aterm_secrets::b64::encode_padded(&[9; 32])),
+                    ..selected(&[Setting::Secrets, Setting::Repositories])
+                };
+                let lan = Lan::new(true, "office");
+                lan.in_vault(&plan.vault_url, START);
+                let admitted = ConfiguredVault {
+                    config: lan.status_now().config.unwrap(),
+                    home: PathBuf::from("/test-home"),
+                };
+                let revision = authorize_reading(root.path(), &plan, || Ok(Some(admitted)))
+                    .unwrap()
+                    .unwrap();
+                if legacy {
+                    let mut saved = progress(root.path()).unwrap().unwrap();
+                    // The source/name-only stamp written before authority was included.
+                    saved.admitted_vault = AdmittedVault::Configured(aterm_digest::Sha256::digest(
+                        format!("url\0{source}\0team").as_bytes(),
+                    ));
+                    save_progress(root.path(), saved).unwrap();
+                }
+                lan.in_vault(source, START);
+                let joined = lan.status_now();
+                lan.set(joined.clone(), true);
+                let mut host = Vaulted::new(&lan);
+                host.paced = false;
+                let (report, next) = execute_initial_for_revision(
+                    &mut host,
+                    root.path(),
+                    revision,
+                    &mut None,
+                    SetupHooks::NONE,
+                )
+                .unwrap()
+                .expect("the admitted run executes");
+
+                assert!(
+                    host.minutes().is_empty(),
+                    "legacy={legacy}: {:?}",
+                    lan.log()
+                );
+                assert!(lan.log().is_empty(), "legacy={legacy}: {:?}", lan.log());
+                assert_eq!(lan.status_now(), joined);
+                assert!(
+                    rows_ready(&report.rows),
+                    "legacy={legacy}: {:?}",
+                    report.rows
+                );
+                assert_eq!(host.rest.calls, [Stage::Repositories]);
+                assert_eq!(next, SetupNext::Done);
+                assert!(finished_at(root.path()).unwrap());
+            }
+        }
+
+        #[test]
+        fn a_verified_rotation_continues_the_admitted_vault_authority() {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let source = "https://team.example/v1/team";
+            let plan = Plan {
+                vault_url: format!("{source}#{}", aterm_secrets::b64::encode_padded(&[9; 32])),
+                ..selected(&[Setting::Secrets, Setting::Repositories])
+            };
+            let lan = Lan::new(true, "office");
+            lan.in_vault(&plan.vault_url, START);
+            let admitted = ConfiguredVault {
+                config: lan.status_now().config.unwrap(),
+                home: PathBuf::from("/test-home"),
+            };
+            let identity = admitted.identity();
+            let revision = authorize_reading(root.path(), &plan, || Ok(Some(admitted)))
+                .unwrap()
+                .unwrap();
+            lan.in_vault(source, START);
+            let mut rotated = lan.status_now();
+            rotated.config.as_mut().unwrap().followed.push([9; 32]);
+            lan.set(rotated.clone(), true);
+            let mut host = Vaulted::new(&lan);
+            host.paced = false;
+            assert!(!AdmittedVault::Configured(identity).stands_in(
+                &Plan {
+                    vault_url: format!("{source}#{}", aterm_secrets::b64::encode_padded(&[11; 32])),
+                    ..plan.clone()
+                },
+                &host.configured_vault().unwrap().unwrap(),
+            ));
+            let (report, _) = execute_initial_for_revision(
+                &mut host,
+                root.path(),
+                revision,
+                &mut None,
+                SetupHooks::NONE,
+            )
+            .unwrap()
+            .expect("the admitted run executes");
+
+            assert!(rows_ready(&report.rows), "{:?}", report.rows);
+            assert_eq!(host.minutes(), [0], "normal member read, not left in place");
+            assert_eq!(host.rest.calls, [Stage::Repositories]);
+            assert!(lan.log().is_empty(), "no join or sync: {:?}", lan.log());
+            assert_eq!(lan.status_now(), rotated);
+            assert!(finished_at(root.path()).unwrap());
+        }
+
+        #[test]
+        fn a_fresh_explicit_join_can_replace_a_same_source_authority() {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let source = "https://team.example/v1/team";
+            let plan = Plan {
+                vault_url: format!("{source}#{}", aterm_secrets::b64::encode_padded(&[9; 32])),
+                ..selected(&[Setting::Secrets, Setting::Repositories])
+            };
+            let lan = Lan::new(true, "office");
+            lan.in_vault(source, START);
+            let mut host = Vaulted::new(&lan);
+            host.paced = false;
+            let revision = system_state_apply(root.path(), &plan, true, || host.configured_vault());
+            let (_, next) = execute_initial_for_revision(
+                &mut host,
+                root.path(),
+                revision,
+                &mut None,
+                SetupHooks::NONE,
+            )
+            .unwrap()
+            .expect("the explicit join executes");
+
+            assert_eq!(host.minutes(), [0]);
+            assert!(lan.log().contains(&format!("join {}", plan.vault_url)));
+            assert_eq!(lan.status_now().config.unwrap().signer, Some([9; 32]));
+            assert!(
+                host.rest.calls.is_empty(),
+                "approval still holds repositories"
+            );
+            assert_ne!(next, SetupNext::Done);
+            assert!(!finished_at(root.path()).unwrap());
         }
 
         pub(super) fn authorized() -> (aterm_tempfile::TempDir, u64) {
@@ -4438,8 +6575,9 @@ mod tests {
             for minute in minutes {
                 host.now = START + minute * 60;
                 before(minute, host);
-                let Some(report) =
-                    execute_initial_for_revision(host, root, revision, password).unwrap()
+                let Some((report, _)) =
+                    execute_initial_for_revision(host, root, revision, password, SetupHooks::NONE)
+                        .unwrap()
                 else {
                     break;
                 };
@@ -4493,7 +6631,7 @@ mod tests {
             "{rows:?}"
         );
         assert!(rows[0].detail.ends_with(
-            "aterm tries again by itself a minute after this try, and at once when this Mac's network or vault changes or on Apply in System State"
+            "aterm tries again by itself a minute after this try, and at once when this Mac's network or vault changes or on Set up now or Join in System State"
         ));
         assert_eq!(
             rows[2].detail, rows[1].detail,
@@ -4547,8 +6685,9 @@ mod tests {
         assert!(!root.path().join(secrets_retry::RECORD).exists());
         let mut host = Vaulted::new(&lan);
         host.now = vault::START + 14 * 60;
-        execute_initial_for_revision(&mut host, root.path(), rerun, &mut None).unwrap();
-        assert_eq!(host.minutes(), [14], "the person's Apply tries at once");
+        execute_initial_for_revision(&mut host, root.path(), rerun, &mut None, SetupHooks::NONE)
+            .unwrap();
+        assert_eq!(host.minutes(), [14], "the person's choice tries at once");
     }
 
     #[test]
@@ -4590,7 +6729,7 @@ mod tests {
             assert!(finished_at(root.path()).unwrap());
             assert!(!root.path().join(secrets_retry::RECORD).exists());
             assert!(
-                rows[1].status == "blocked" && rows[1].detail.contains("aterm secrets approve"),
+                rows[1].status == WAITING && rows[1].detail.contains("aterm secrets approve"),
                 "{rows:?}"
             );
             assert_eq!(
@@ -4618,11 +6757,7 @@ mod tests {
             build: "1.0.0+gtest".into(),
             now: vault::START,
         };
-        let mut host = LiveInitial {
-            reads: reads(true),
-            spotlight_result: None,
-            permissions_result: None,
-        };
+        let mut host = LiveInitial { reads: reads(true) };
         let first = host.secrets_pace().expect("the live host paces every try");
         assert_eq!(first, secrets_retry::pace(&reads(true)));
         assert_eq!(first.build, "1.0.0+gtest");
@@ -4723,7 +6858,7 @@ mod tests {
         assert_eq!(last.status, "error", "{rows:?}");
         assert!(
             last.detail.ends_with(
-                "aterm tried this twice by itself and it did not take, so it tries again only when this Mac's network or vault changes, after an update of aterm, or on Apply in System State"
+                "aterm tried this twice by itself and it did not take, so it tries again only when this Mac's network or vault changes, after an update of aterm, or on Set up now or Join in System State"
             ),
             "{last:?}"
         );
@@ -4782,7 +6917,7 @@ mod tests {
             );
             let waits = &rows[..opened.map_or(rows.len(), |at| at as usize)];
             assert!(
-                waits.iter().all(|row| row.status == "blocked"
+                waits.iter().all(|row| row.status == WAITING
                     && row
                         .detail
                         .starts_with(&format!("this aterm runs from {}", image.display()))
@@ -4873,9 +7008,16 @@ mod tests {
 
         *lan.answers.lock().unwrap() = true;
         host.now = START + 60;
-        let report = execute_initial_for_revision(&mut host, root.path(), revision, &mut None)
-            .unwrap()
-            .unwrap();
+        let report = execute_initial_for_revision(
+            &mut host,
+            root.path(),
+            revision,
+            &mut None,
+            SetupHooks::NONE,
+        )
+        .unwrap()
+        .unwrap()
+        .0;
         assert_eq!(host.minutes(), [0], "the vault item ran again");
         assert!(lan.log().is_empty(), "{:?}", lan.log());
         assert_eq!(lan.status_now(), joined);
@@ -4886,10 +7028,6 @@ mod tests {
             (left.name.as_str(), left.status.as_str()),
             ("Secrets vault", "ok")
         );
-        assert_eq!(
-            left.detail,
-            "this Mac joined vault team (http://vault.example:7484/v1/team) after setup began, so setup leaves it there; to move it to vault alab (http://alab-secrets.local:7484/v1/alab), type that vault in System State and press Apply"
-        );
         assert_eq!(vault.status, "ok", "{vault:?}");
         assert_eq!(
             (subscriber.name.as_str(), subscriber.status.as_str()),
@@ -4899,9 +7037,16 @@ mod tests {
 
         lan.set(joined.clone(), true);
         host.now = START + 120;
-        let report = execute_initial_for_revision(&mut host, root.path(), revision, &mut None)
-            .unwrap()
-            .unwrap();
+        let report = execute_initial_for_revision(
+            &mut host,
+            root.path(),
+            revision,
+            &mut None,
+            SetupHooks::NONE,
+        )
+        .unwrap()
+        .unwrap()
+        .0;
         assert!(rows_ready(&report.rows), "{:?}", report.rows);
         assert_eq!(host.minutes(), [0]);
         assert!(lan.log().is_empty(), "{:?}", lan.log());
@@ -4920,9 +7065,16 @@ mod tests {
         waiting.membership = Membership::Pending;
         lan.set(waiting, true);
         let mut host = Vaulted::new(&lan);
-        let report = execute_initial_for_revision(&mut host, root.path(), revision, &mut None)
-            .unwrap()
-            .unwrap();
+        let report = execute_initial_for_revision(
+            &mut host,
+            root.path(),
+            revision,
+            &mut None,
+            SetupHooks::NONE,
+        )
+        .unwrap()
+        .unwrap()
+        .0;
         assert!(host.minutes().is_empty(), "the vault item ran");
         assert!(lan.log().is_empty(), "{:?}", lan.log());
         let vault = report
@@ -4939,28 +7091,54 @@ mod tests {
 
         lan.approve(START);
         host.now = START + 60;
-        let report = execute_initial_for_revision(&mut host, root.path(), revision, &mut None)
-            .unwrap()
-            .unwrap();
+        let report = execute_initial_for_revision(
+            &mut host,
+            root.path(),
+            revision,
+            &mut None,
+            SetupHooks::NONE,
+        )
+        .unwrap()
+        .unwrap()
+        .0;
         assert!(rows_ready(&report.rows), "{:?}", report.rows);
         assert!(finished_at(root.path()).unwrap());
         assert!(lan.log().is_empty(), "{:?}", lan.log());
     }
 
     #[test]
-    fn the_same_vault_under_another_signer_is_said_so() {
+    fn presenting_the_configured_vault_preserves_only_admitted_signer_pins() {
         let home = aterm_tempfile::tempdir().unwrap();
         let paths = aterm_secrets::client::Paths::for_home(home.path());
-        let team = "https://team.example/v1/team";
-        let vault = configure_vault(&paths, team);
-        let pinned = Plan {
-            vault_url: format!("{team}#{}", aterm_secrets::b64::encode_padded(&[9; 32])),
-            ..selected(&[Setting::Secrets])
+        let source = "https://team.example/v1/team";
+        let mut vault = configure_vault(&paths, source);
+        vault.config.followed.push([9; 32]);
+        for pin in [None, Some([7; 32]), Some([9; 32])] {
+            let plan = Plan {
+                vault_url: pin.map_or_else(
+                    || source.to_owned(),
+                    |pin| format!("{source}#{}", aterm_secrets::b64::encode_padded(&pin)),
+                ),
+                ..selected(&[Setting::Secrets, Setting::Repositories])
+            };
+            assert_eq!(vault.present(plan.clone()), plan);
+        }
+
+        let unrelated = Plan {
+            vault_url: format!("{source}#{}", aterm_secrets::b64::encode_padded(&[11; 32])),
+            ..selected(&[Setting::Secrets, Setting::Repositories])
         };
-        assert!(AdmittedVault::None.stands_in(&pinned, &vault));
-        assert_eq!(
-            vault.left_in_place(&pinned),
-            "this Mac joined vault team (https://team.example/v1/team) after setup began, under another signer than the one setup names, so setup leaves it there; to join it under that signer, type the vault with its #<signer> in System State and press Apply"
+        let presented = vault.present(unrelated.clone());
+        assert_eq!(presented.selection, unrelated.selection);
+        assert!(
+            aterm_machines::init_secrets::selected_vault(
+                &presented.vault_url,
+                &vault.home,
+                Some(&vault.config),
+            )
+            .unwrap()
+            .is_some(),
+            "the presented source must admit the configured signer"
         );
     }
 
@@ -4990,7 +7168,14 @@ mod tests {
             configured: read().unwrap(),
             ..Fake::default()
         };
-        execute_initial_for_revision(&mut host, root.path(), revision, &mut None).unwrap();
+        execute_initial_for_revision(
+            &mut host,
+            root.path(),
+            revision,
+            &mut None,
+            SetupHooks::NONE,
+        )
+        .unwrap();
         assert_eq!(host.vault_url.as_deref(), Some(team));
 
         let other = "https://other.example/v1/other";
@@ -5003,7 +7188,14 @@ mod tests {
             configured: read().unwrap(),
             ..Fake::default()
         };
-        execute_initial_for_revision(&mut host, root.path(), revision, &mut None).unwrap();
+        execute_initial_for_revision(
+            &mut host,
+            root.path(),
+            revision,
+            &mut None,
+            SetupHooks::NONE,
+        )
+        .unwrap();
         assert_eq!(host.vault_url.as_deref(), Some(other));
     }
 
@@ -5042,10 +7234,7 @@ mod tests {
             1..=1,
             |_, _| {},
         );
-        assert!(
-            rows[0].detail.starts_with("this Mac joined vault team"),
-            "{rows:?}"
-        );
+        assert_eq!(rows[0].status, "ok", "{rows:?}");
         assert!(lan.log().is_empty(), "{:?}", lan.log());
     }
 
@@ -5245,7 +7434,14 @@ mod tests {
                 pending: Some(Stage::Secrets),
                 ..Fake::default()
             };
-            execute_initial_for_revision(&mut host, root.path(), revision, &mut None).unwrap();
+            execute_initial_for_revision(
+                &mut host,
+                root.path(),
+                revision,
+                &mut None,
+                SetupHooks::NONE,
+            )
+            .unwrap();
             assert_eq!(host.calls, [Stage::Spotlight, Stage::Secrets]);
             assert_eq!(
                 kept(root.path()),
@@ -5284,7 +7480,14 @@ mod tests {
             configured: read().unwrap(),
             ..Fake::default()
         };
-        execute_initial_for_revision(&mut host, root.path(), revision, &mut None).unwrap();
+        execute_initial_for_revision(
+            &mut host,
+            root.path(),
+            revision,
+            &mut None,
+            SetupHooks::NONE,
+        )
+        .unwrap();
         assert!(host.calls.contains(&Stage::Secrets), "{:?}", host.calls);
         assert_eq!(host.vault_url.as_deref(), Some(other));
 
@@ -5300,7 +7503,14 @@ mod tests {
             configured: read().unwrap(),
             ..Fake::default()
         };
-        execute_initial_for_revision(&mut host, root.path(), revision, &mut None).unwrap();
+        execute_initial_for_revision(
+            &mut host,
+            root.path(),
+            revision,
+            &mut None,
+            SetupHooks::NONE,
+        )
+        .unwrap();
         assert!(!host.calls.contains(&Stage::Secrets), "{:?}", host.calls);
         assert!(finished_at(root.path()).unwrap());
     }

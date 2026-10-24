@@ -97,6 +97,8 @@ struct DoorWatch {
     /// The hold closed with [`Self::task_word`] standing: its clear, owed at the next step under
     /// a grant ([`Session::door_task_owed`]).
     task_clear: Option<FactWord>,
+    /// Persisted task-note custody, kept apart from typed-line books and fact deduplication.
+    task_custody: door::TaskCustody,
 }
 
 /// A line the managed guard alone holds at a break: the episode the task door notes
@@ -240,6 +242,8 @@ impl<C: Ctl> Session<'_, C> {
         // `occupancy`, and a successor must not tell them twice.
         let facts = door::seed_rows_in(body, self.setup.sid.as_deref());
         self.facts.state.seed(&facts, now_ms);
+        self.hold.door.task_custody =
+            door::TaskCustody::from_ledger(body, self.setup.sid.as_deref());
         // And the stuck lines' place in the session's pace, under any key: a line typed before
         // a restart still spaces the next one, the stuck fact's or the door's.
         let start_ms = self.hold_ms(start);
@@ -1166,7 +1170,8 @@ impl<C: Ctl> Session<'_, C> {
     /// to note the episode's fact word on the session's task record, and the outcome row
     /// (`fact-hold@v1`, `waiting … door=task noted`, or `skipped … door=task why=<word>`). The
     /// episode is booked once, but a `fenced` answer is tried again at the next break. Nothing is
-    /// typed: the line stays held by the manager.
+    /// typed: the line stays held by the manager. An older hold's clear must be acknowledged
+    /// first, so it cannot erase this note and a reused word still gets a fresh fact edge.
     fn door_task(
         &mut self,
         _grant: &super::super::config::PromptGrant,
@@ -1176,6 +1181,9 @@ impl<C: Ctl> Session<'_, C> {
         now_ms: i64,
         review: &mut dyn Review,
     ) {
+        if self.hold.door.task_clear.is_some() {
+            return;
+        }
         let (Some(host), Some(word)) = (
             self.stall_host.clone(),
             FactWord::new(task.rule, task.ordinal.saturating_add(1)),
@@ -1256,10 +1264,9 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// The clear the hold's close left owed ([`DoorWatch::task_clear`]), made under a grant
-    /// ([`Self::door_task_clear`]); with none (the owner's mode left `prompt`) it is dropped,
-    /// since nothing is written to a task record under `observe` or `off`: the word stands until
-    /// a later note replaces it or a later loop's seed under a grant clears it
-    /// ([`Self::door_task_seed`]).
+    /// ([`Self::door_task_clear`]); with none (the owner's mode left `prompt`) it stays owed
+    /// without writing under `observe` or `off`. A later grant clears it before another note;
+    /// a successor loop can also take up the standing word ([`Self::door_task_seed`]).
     fn door_task_owed(&mut self, seq: u64, cfg: Option<&SupervisorConfig>) {
         let Some(word) = self.hold.door.task_clear else {
             return;
@@ -1267,9 +1274,8 @@ impl<C: Ctl> Session<'_, C> {
         let grant = cfg
             .and_then(|cfg| cfg.occupancy.grant())
             .filter(|_| !self.fx.replay_lacks_host_door("host.occupancy_pace"));
-        match grant {
-            Some(grant) => self.door_task_clear(&grant, seq, word),
-            None => self.hold.door.task_clear = None,
+        if let Some(grant) = grant {
+            self.door_task_clear(&grant, seq, word);
         }
     }
 
@@ -1309,8 +1315,9 @@ impl<C: Ctl> Session<'_, C> {
     /// The fact word the session's task record carries at the loop's first read of it
     /// (`Session::task_seed`, `fact` as `task` gave it), in a loop that measures the hold (its
     /// start placed the wall, [`Self::hold_seed_from`]) and under a grant: with no hold open it
-    /// stands for no episode and is cleared now; with one open, this loop clears it at that hold's
-    /// close (a predecessor's word, which this loop's own note of the episode replaces).
+    /// stands for no episode and is cleared now. A word the ledger assigns to a closed hold
+    /// is also cleared before a replacement; an open or still-unconsumed carried hold keeps
+    /// its own word, including when an older ledger has no task-note provenance.
     pub(super) fn door_task_seed(&mut self, fact: Option<FactWord>, cfg: &SupervisorConfig) {
         let Some(word) = fact else {
             return;
@@ -1319,7 +1326,9 @@ impl<C: Ctl> Session<'_, C> {
         if !measures || !self.fx.slice2_recorded() || self.stall_host.is_none() {
             return;
         }
-        if self.hold.clock.since_ms().is_some() {
+        let open = self.hold.clock.since_ms().is_some()
+            || matches!(self.hold.seed, Some(Seed::Carry { .. }));
+        if open && !self.hold.door.task_custody.closed(word) {
             self.hold.door.task_word.get_or_insert(word);
             return;
         }
@@ -1464,6 +1473,7 @@ impl<C: Ctl> Session<'_, C> {
             }
         };
         if let HoldChange::Closed { .. } = change {
+            self.hold.door.task_custody.close();
             self.facts.state.observe_closed(FactKind::Hold, &[]);
             self.hold.door.ready_idle = None;
             if let Some(word) = self.hold.door.task_word.take() {

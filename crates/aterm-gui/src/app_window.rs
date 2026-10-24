@@ -1561,8 +1561,6 @@ impl App {
         }
         #[cfg(target_os = "macos")]
         self.withdraw_askpass_window(wid);
-        #[cfg(target_os = "macos")]
-        self.withdraw_secrets_sheet_window(wid);
         let deferred_attribution = self
             .windows
             .get_mut(&wid)

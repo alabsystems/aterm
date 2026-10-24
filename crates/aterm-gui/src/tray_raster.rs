@@ -3801,6 +3801,26 @@ impl Canvas {
         }
     }
 
+    /// A [`DrawPrim::Image`] in the `w`×`h` device rect at `(x, y)`: `art`
+    /// baked at exactly that many device pixels ([`baked_image`]) and
+    /// composited pixel by pixel at its own alpha, through the clip stack.
+    fn image(&mut self, x: f32, y: f32, w: f32, h: f32, art: crate::widget::ImageArt) {
+        let (width, height) = (w.round().max(0.0) as u32, h.round().max(0.0) as u32);
+        if width == 0 || height == 0 {
+            return;
+        }
+        let pixels = baked_image(art, width, height);
+        let (x0, y0) = (x.round() as i32, y.round() as i32);
+        for (row, line) in pixels.chunks_exact(width as usize * 4).enumerate() {
+            for (col, pixel) in line.as_chunks::<4>().0.iter().enumerate() {
+                if pixel[3] == 0 {
+                    continue;
+                }
+                self.blend(x0 + col as i32, y0 + row as i32, *pixel, 1.0);
+            }
+        }
+    }
+
     fn disc(&mut self, cx: f32, cy: f32, r: f32, c: [u8; 4]) {
         let (x0, y0, x1, y1) = self.clipped_bounds(
             (cx - r - 1.0) as i32,
@@ -4475,6 +4495,39 @@ fn tile_around(tile: DeviceRect, covered: DeviceRect) -> impl Iterator<Item = De
     .filter(|rect| rect.0 < rect.2 && rect.1 < rect.3)
 }
 
+/// How many baked [`DrawPrim::Image`] bitmaps a raster thread keeps: a page
+/// shows one or two, at one size per display scale and theme.
+const BAKED_IMAGES_KEPT: usize = 4;
+
+/// A baked bitmap's key: the art and its device width and height.
+type BakedImageKey = (crate::widget::ImageArt, u32, u32);
+
+thread_local! {
+    static BAKED_IMAGES: std::cell::RefCell<Vec<(BakedImageKey, Rc<[u8]>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `art` baked at `width`×`height` device pixels: baked once per size and
+/// kept, so a page that repaints draws the same pixels without a re-bake.
+fn baked_image(art: crate::widget::ImageArt, width: u32, height: u32) -> Rc<[u8]> {
+    BAKED_IMAGES.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let key = (art, width, height);
+        if let Some(at) = cache.iter().position(|(baked, _)| *baked == key) {
+            let entry = cache.remove(at);
+            let pixels = Rc::clone(&entry.1);
+            cache.push(entry);
+            return pixels;
+        }
+        let pixels: Rc<[u8]> = art.bake(width, height).into();
+        if cache.len() >= BAKED_IMAGES_KEPT {
+            cache.remove(0);
+        }
+        cache.push((key, Rc::clone(&pixels)));
+        pixels
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn replay_tray(
     cv: &mut Canvas,
@@ -4626,6 +4679,7 @@ fn replay_tray(
                 icon,
                 color,
             } => cv.band_icon(x * s, y * s, size * s, *icon, *color),
+            DrawPrim::Image { x, y, w, h, art } => cv.image(x * s, y * s, w * s, h * s, *art),
             DrawPrim::ClipPush { .. }
             | DrawPrim::ClipPop
             | DrawPrim::FadePush { .. }

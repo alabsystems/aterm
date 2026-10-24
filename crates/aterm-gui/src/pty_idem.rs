@@ -296,9 +296,20 @@ impl Drop for Claim<'_> {
     }
 }
 
-/// Whether `reply` is a refusal that cannot have followed a write.
+/// Whether `reply` is a refusal that cannot have followed a write: `ERR busy…` and `ERR denied`. Every producer answers these heads only while nothing of the attempt has reached the PTY; one that has written answers some other `ERR`, which leaves the sequence in doubt.
 fn refused_before_any_write(reply: &str) -> bool {
     reply.starts_with("ERR busy") || reply.starts_with("ERR denied")
+}
+
+/// An attempt's own word that none of its bytes reached the PTY, for a verb that keeps an account of its writes (`turn`, through [`crate::control_session::TurnIo::witness`]); the reply alone cannot say it, since `ERR exited` or a skip answers both before and after a write.
+#[derive(Default)]
+pub(crate) struct Witness(std::cell::Cell<bool>);
+
+impl Witness {
+    /// The attempt answers having written nothing: its sequence goes back, whatever the reply.
+    pub(crate) fn nothing_written(&self) {
+        self.0.set(true);
+    }
 }
 
 /// Whether `reply` is `OK skipped` from a non-matching guard.
@@ -333,10 +344,10 @@ pub(crate) fn guarded<F>(
 where
     F: FnOnce() -> String,
 {
-    guarded_waking(ctx, scope, verb, key, &|| {}, attempt)
+    guarded_waking(ctx, scope, verb, key, &|| {}, |_| attempt())
 }
 
-/// `guarded`, calling `wake` (the control worker's, for this session's watchers) once the session log's readers are owed one: an `in-doubt` mark was written, after its timeline hold was released.
+/// `guarded`, calling `wake` (the control worker's, for this session's watchers) once the session log's readers are owed one: an `in-doubt` mark was written, after its timeline hold was released. `attempt` is handed the [`Witness`] it may tell that it wrote nothing.
 pub(crate) fn guarded_waking<F>(
     ctx: &SessionCtx,
     scope: crate::control::Scope,
@@ -346,10 +357,11 @@ pub(crate) fn guarded_waking<F>(
     attempt: F,
 ) -> String
 where
-    F: FnOnce() -> String,
+    F: FnOnce(&Witness) -> String,
 {
+    let witness = Witness::default();
     let Some(raw) = key else {
-        return attempt();
+        return attempt(&witness);
     };
     let key = match parse_key(raw, ctx.nonce) {
         Ok(key) => key,
@@ -360,8 +372,8 @@ where
         Claimed::Fresh(claim) => claim,
         Claimed::Answer(reply) => return reply,
     };
-    let reply = attempt();
-    if skipped_by_guard(&reply) {
+    let reply = attempt(&witness);
+    if witness.0.get() || skipped_by_guard(&reply) {
         claim.released();
     } else if reply.starts_with("OK") {
         claim.applied();

@@ -1,0 +1,2874 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! System State's access steps: the Local Network trigger's target, the menu
+//! line, the step gating and a Needs-you row's press. Nothing reaches a LAN, a
+//! state directory, System Settings or the process-wide dialog count.
+
+use std::cell::RefCell;
+use std::net::Ipv4Addr;
+use std::time::{Duration, Instant};
+
+use aterm_types::macos_setup::{
+    Access, AccessOutcome, Observation, Plan, Selection, Setting, Standing, Subject,
+};
+
+use super::{
+    JOIN_PENDING_KEY, LOCAL_NETWORK_ALERT_HOLD, LanInterface, RETIRED_KEYS, StepsReach, lan_target,
+    menu_line,
+};
+use crate::status_item::SystemStateLine;
+use crate::{App, InitialSetupPermissionPolicy, SetupStatus};
+
+fn ip(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {
+    Ipv4Addr::new(a, b, c, d)
+}
+
+/// A broadcast-capable interface (a LAN segment).
+fn lan(address: Ipv4Addr, mask: Ipv4Addr) -> LanInterface {
+    LanInterface {
+        address,
+        mask,
+        broadcast: true,
+    }
+}
+
+/// THE LOCAL NETWORK TARGET: a private subnet's first host (its second when the
+/// first is this Mac), a link-local one only when no private subnet is up, and
+/// nothing on a subnet with no room for another host, a mask outside /8–/30, a
+/// tunnel (no broadcast: a VPN's `utun`) or a public address.
+#[test]
+fn the_lan_target_is_a_private_subnets_other_host() {
+    let slash24 = ip(255, 255, 255, 0);
+    assert_eq!(
+        lan_target(&[lan(ip(192, 168, 1, 23), slash24)]),
+        Some(ip(192, 168, 1, 1))
+    );
+    assert_eq!(
+        lan_target(&[lan(ip(192, 168, 1, 1), slash24)]),
+        Some(ip(192, 168, 1, 2)),
+        "the first host is this Mac"
+    );
+    assert_eq!(
+        lan_target(&[
+            lan(ip(17, 5, 7, 8), slash24),
+            lan(ip(10, 0, 0, 9), ip(255, 0, 0, 0))
+        ]),
+        Some(ip(10, 0, 0, 1)),
+        "a public address is no LAN"
+    );
+    assert_eq!(
+        lan_target(&[
+            lan(ip(169, 254, 3, 4), ip(255, 255, 0, 0)),
+            lan(ip(172, 16, 5, 5), ip(255, 240, 0, 0))
+        ]),
+        Some(ip(172, 16, 0, 1)),
+        "private before link-local"
+    );
+    assert_eq!(
+        lan_target(&[lan(ip(169, 254, 3, 4), ip(255, 255, 0, 0))]),
+        Some(ip(169, 254, 0, 1))
+    );
+    assert_eq!(
+        lan_target(&[lan(ip(10, 0, 0, 5), ip(255, 255, 255, 252))]),
+        Some(ip(10, 0, 0, 6)),
+        "a /30 has room for one other host"
+    );
+    let tunnel = LanInterface {
+        broadcast: false,
+        ..lan(ip(10, 8, 0, 2), slash24)
+    };
+    assert_eq!(
+        lan_target(&[tunnel, lan(ip(192, 168, 1, 23), slash24)]),
+        Some(ip(192, 168, 1, 1)),
+        "a VPN's tunnel is passed over"
+    );
+    for (interface, why) in [
+        (lan(ip(10, 0, 0, 4), ip(255, 255, 255, 254)), "/31"),
+        (lan(ip(10, 0, 0, 4), ip(255, 255, 255, 255)), "/32"),
+        (lan(ip(10, 0, 0, 4), ip(0, 0, 0, 0)), "an empty mask (/0)"),
+        (lan(ip(10, 0, 0, 4), ip(254, 0, 0, 0)), "/7"),
+        (
+            lan(ip(10, 0, 0, 4), ip(255, 0, 255, 0)),
+            "a mask with holes",
+        ),
+        (lan(ip(17, 5, 7, 8), slash24), "public only"),
+        (tunnel, "a tunnel only"),
+    ] {
+        assert_eq!(lan_target(&[interface]), None, "{why}");
+    }
+    assert_eq!(lan_target(&[]), None);
+}
+
+fn observed(subject: Subject, standing: Standing, note: Option<&str>) -> Observation {
+    Observation {
+        subject,
+        standing,
+        now: None,
+        wanted: subject.wanted().to_string(),
+        note: note.map(str::to_string),
+        detail: None,
+    }
+}
+
+fn status(selection: Selection, observed: Vec<Observation>) -> SetupStatus {
+    SetupStatus {
+        plan: Some(Plan::from(selection)),
+        observed,
+        ..SetupStatus::default()
+    }
+}
+
+fn line(label: &str, note: Option<&str>) -> Option<SystemStateLine> {
+    Some(SystemStateLine {
+        label: label.to_string(),
+        note: note.map(str::to_string),
+    })
+}
+
+/// THE ONE QUIET SIGNAL (§3.6): only rows the approved plan manages that need a
+/// person or failed, each said as it is; one is named, several are counted; a
+/// regressed Full Disk Access grant counts once, as needing a person; the
+/// Secrets row's approval code rides along.
+#[test]
+fn the_menu_line_names_what_needs_a_person() {
+    let dock = Subject::Setting(Setting::Dock);
+    let fda = Subject::Access(Access::FullDiskAccess);
+    let accessibility = Subject::Access(Access::Accessibility);
+    let secrets = Subject::Setting(Setting::Secrets);
+    let all = Selection::all();
+
+    assert_eq!(menu_line(&SetupStatus::default(), false), None);
+    let settled = status(
+        all,
+        vec![
+            observed(dock, Standing::InPlace, None),
+            observed(fda, Standing::Differs, None),
+            observed(secrets, Standing::Waiting, None),
+        ],
+    );
+    assert_eq!(menu_line(&settled, false), None, "nothing needs a person");
+
+    let one = status(all, vec![observed(dock, Standing::NeedsYou, None)]);
+    assert_eq!(
+        menu_line(&one, false),
+        line("System State: Dock needs you", None)
+    );
+    let two = status(
+        all,
+        vec![
+            observed(dock, Standing::NeedsYou, None),
+            observed(fda, Standing::NeedsYou, None),
+        ],
+    );
+    assert_eq!(
+        menu_line(&two, false),
+        line("System State: 2 need you", None)
+    );
+    // A failure is said as one: it may retry by itself and need no one.
+    let failed = status(all, vec![observed(dock, Standing::Failed, None)]);
+    assert_eq!(
+        menu_line(&failed, false),
+        line("System State: Dock failed", None)
+    );
+    let mixed = status(
+        all,
+        vec![
+            observed(dock, Standing::Failed, None),
+            observed(fda, Standing::NeedsYou, None),
+        ],
+    );
+    assert_eq!(
+        menu_line(&mixed, false),
+        line("System State: 1 needs you, 1 failed", None)
+    );
+    let both_failed = status(
+        all,
+        vec![
+            observed(dock, Standing::Failed, None),
+            observed(fda, Standing::Failed, None),
+        ],
+    );
+    assert_eq!(
+        menu_line(&both_failed, false),
+        line("System State: 2 failed", None)
+    );
+    assert_eq!(
+        menu_line(&both_failed, true),
+        line("System State: 1 needs you, 1 failed", None),
+        "a regressed grant needs a person, failed or not"
+    );
+
+    let mut unmanaged = Selection::all();
+    unmanaged.set(Setting::Dock, false);
+    assert_eq!(
+        menu_line(
+            &status(unmanaged, vec![observed(dock, Standing::Failed, None)]),
+            false
+        ),
+        None,
+        "a row the plan does not manage"
+    );
+    let mut no_signouts = Selection::all();
+    no_signouts.set(Setting::Messages, false);
+    no_signouts.set(Setting::FaceTime, false);
+    assert_eq!(
+        menu_line(
+            &status(
+                no_signouts,
+                vec![observed(accessibility, Standing::NeedsYou, None)]
+            ),
+            false
+        ),
+        None,
+        "Accessibility is needed only for a sign-out"
+    );
+    assert_eq!(
+        menu_line(
+            &status(all, vec![observed(accessibility, Standing::NeedsYou, None)]),
+            false
+        ),
+        line("System State: Accessibility needs you", None)
+    );
+
+    assert_eq!(
+        menu_line(&SetupStatus::default(), true),
+        line("System State: Full Disk Access needs you", None),
+        "a regressed grant shows with no plan"
+    );
+    assert_eq!(
+        menu_line(
+            &status(all, vec![observed(fda, Standing::NeedsYou, None)]),
+            true
+        ),
+        line("System State: Full Disk Access needs you", None),
+        "counted once"
+    );
+
+    let code = "Approve 4F7-2KQ on an admin Mac";
+    assert_eq!(
+        menu_line(
+            &status(all, vec![observed(secrets, Standing::NeedsYou, Some(code))]),
+            false
+        ),
+        line("System State: Secrets vault needs you", Some(code))
+    );
+    assert_eq!(
+        menu_line(
+            &status(all, vec![observed(secrets, Standing::Failed, Some(code))]),
+            false
+        )
+        .and_then(|line| line.note),
+        None,
+        "only a join that waits on a person carries its code"
+    );
+}
+
+/// A STEP THE LAST RUN COULD NOT FINISH IS A FAILURE ON THE MENU LINE (§3.6),
+/// as a failed row is, though no reading says so: a join the vault refused
+/// reads Not joined, and its stage's error is the vault failing. A step that
+/// names a row is that row, counted once with it; any other is a step of its
+/// own, counted and never named in the run's long words; one for a group
+/// left as is, or one that only waits or was blocked, is none.
+#[test]
+fn a_step_the_run_could_not_finish_is_on_the_menu_line() {
+    let secrets = Subject::Setting(Setting::Secrets);
+    let dock = Subject::Setting(Setting::Dock);
+    let fda = Subject::Access(Access::FullDiskAccess);
+    let all = Selection::all();
+    let step = |name: &str, status: &str| crate::SetupStatusRow {
+        name: name.into(),
+        status: status.into(),
+        detail: "DETAIL".into(),
+    };
+    let ran = |selection: Selection, observed: Vec<Observation>, rows| SetupStatus {
+        rows,
+        ..status(selection, observed)
+    };
+    let not_joined = || vec![observed(secrets, Standing::Differs, None)];
+    assert_eq!(
+        menu_line(
+            &ran(all, not_joined(), vec![step("Secrets vault", "error")]),
+            false
+        ),
+        line("System State: Secrets vault failed", None)
+    );
+    assert_eq!(
+        menu_line(
+            &ran(
+                all,
+                vec![observed(secrets, Standing::Failed, None)],
+                vec![step("Secrets vault", "failed")]
+            ),
+            false
+        ),
+        line("System State: Secrets vault failed", None),
+        "counted once with its row"
+    );
+    assert_eq!(
+        menu_line(
+            &ran(
+                all,
+                vec![observed(dock, Standing::Failed, None)],
+                vec![step("Secrets vault", "error")]
+            ),
+            false
+        ),
+        line("System State: 2 failed", None)
+    );
+    assert_eq!(
+        menu_line(
+            &ran(
+                all,
+                vec![observed(fda, Standing::NeedsYou, None)],
+                vec![step("Selected Mac settings", "error")]
+            ),
+            false
+        ),
+        line("System State: 1 needs you, 1 failed", None)
+    );
+    assert_eq!(
+        menu_line(
+            &ran(
+                all,
+                Vec::new(),
+                vec![step(
+                    "Caps Lock acts as Control now on keyboard 05ac-0342",
+                    "error"
+                )]
+            ),
+            false
+        ),
+        line("System State: 1 step failed", None),
+        "a step no row names is counted, not named"
+    );
+    assert_eq!(
+        menu_line(
+            &ran(
+                all,
+                Vec::new(),
+                vec![
+                    step("Selected Mac settings", "error"),
+                    step("aterm permissions", "error")
+                ]
+            ),
+            false
+        ),
+        line("System State: 2 failed", None)
+    );
+    let mut left = all;
+    left.set(Setting::Secrets, false);
+    assert_eq!(
+        menu_line(
+            &ran(left, not_joined(), vec![step("Secrets vault", "error")]),
+            false
+        ),
+        None,
+        "the vault is left as is"
+    );
+    for quiet in [
+        "blocked",
+        "waiting",
+        "not started",
+        "unverified",
+        "restored",
+        "ok",
+    ] {
+        assert_eq!(
+            menu_line(
+                &ran(all, not_joined(), vec![step("Secrets vault", quiet)]),
+                false
+            ),
+            None,
+            "{quiet}"
+        );
+    }
+}
+
+/// A FAILURE THE RUN STILL RETRIES BY ITSELF IS THE PAGE'S ALONE (§3.5, §3.6):
+/// a stage's error, a pass that failed and a row that failed stay off the menu
+/// line while the worker retries them, and are said once it stops retrying. A
+/// row that needs a person, or a verified grant that reads off, is said at once,
+/// since no pass retries it.
+#[test]
+fn a_failure_the_run_still_retries_stays_off_the_menu_line() {
+    let secrets = Subject::Setting(Setting::Secrets);
+    let dock = Subject::Setting(Setting::Dock);
+    let fda = Subject::Access(Access::FullDiskAccess);
+    let step = |name: &str, status: &str| crate::SetupStatusRow {
+        name: name.into(),
+        status: status.into(),
+        detail: "DETAIL".into(),
+    };
+    let ran =
+        |observed: Vec<Observation>, rows: Vec<crate::SetupStatusRow>, retrying| SetupStatus {
+            rows,
+            retrying,
+            ..status(Selection::all(), observed)
+        };
+    for (observed, rows, said) in [
+        (
+            vec![observed(secrets, Standing::Differs, None)],
+            vec![step("Secrets vault", "error")],
+            "System State: Secrets vault failed",
+        ),
+        (
+            Vec::new(),
+            vec![step("Setup", "failed")],
+            "System State: 1 step failed",
+        ),
+        (
+            vec![observed(dock, Standing::Failed, None)],
+            Vec::new(),
+            "System State: Dock failed",
+        ),
+    ] {
+        assert_eq!(
+            menu_line(&ran(observed.clone(), rows.clone(), true), false),
+            None,
+            "{said}: retried"
+        );
+        assert_eq!(
+            menu_line(&ran(observed, rows, false), false),
+            line(said, None),
+            "no longer retried"
+        );
+    }
+    let person = vec![
+        observed(fda, Standing::NeedsYou, None),
+        observed(dock, Standing::Failed, None),
+    ];
+    let failed = vec![step("Secrets vault", "error")];
+    assert_eq!(
+        menu_line(&ran(person.clone(), failed.clone(), true), false),
+        line("System State: Full Disk Access needs you", None)
+    );
+    assert_eq!(
+        menu_line(&ran(person, failed.clone(), false), false),
+        line("System State: 1 needs you, 2 failed", None)
+    );
+    assert_eq!(
+        menu_line(&ran(Vec::new(), failed, true), true),
+        line("System State: Full Disk Access needs you", None),
+        "a grant that reads off"
+    );
+}
+
+thread_local! {
+    static TRIGGERS: RefCell<u32> = const { RefCell::new(0) };
+    static RECORDS: RefCell<Vec<(u64, Access, AccessOutcome)>> = const { RefCell::new(Vec::new()) };
+}
+
+fn triggers() -> u32 {
+    TRIGGERS.with(|t| *t.borrow())
+}
+
+fn records() -> Vec<(u64, Access, AccessOutcome)> {
+    RECORDS.with(|r| r.borrow().clone())
+}
+
+/// Steps whose trigger and record are counted on this thread, with System State
+/// frontmost and a quiet moment.
+fn stepping() -> StepsReach {
+    StepsReach {
+        trigger_local_network: || {
+            TRIGGERS.with(|t| *t.borrow_mut() += 1);
+            true
+        },
+        record: |revision, access, outcome| {
+            RECORDS.with(|r| r.borrow_mut().push((revision, access, outcome)));
+        },
+        recorded: |_, _| None,
+        frontmost: |_| true,
+        quiet: |_, _| true,
+        ..StepsReach::INERT
+    }
+}
+
+fn approve(app: &mut App, revision: u64) {
+    app.observe_initial_setup_permissions(Some(InitialSetupPermissionPolicy {
+        revision,
+        allowed: true,
+    }));
+}
+
+/// Give every window of `app` a stand-in OS surface with keyboard focus, or take
+/// it away (`App::any_os_window_focused`).
+fn focus(app: &mut App, focused: bool) {
+    for window in app.windows.values_mut() {
+        window.os_window_for_test = focused;
+        window.focused = focused;
+    }
+}
+
+/// THE LOCAL NETWORK STEP: nothing before an approved revision; then once per
+/// revision, first, recorded `triggered`, its alert counted as up for its hold
+/// (no later step meanwhile); a new revision asks again.
+#[test]
+fn the_local_network_step_runs_first_and_once_per_approved_revision() {
+    let mut app = App::headless_for_test();
+    app.access_steps.set_reach(stepping());
+    let now = Instant::now();
+    let (fired, recorded) = (triggers(), records().len());
+
+    app.tick_local_network_step(now);
+    assert_eq!(triggers(), fired, "no approved revision");
+    assert!(!app.access_step_moment(now));
+    assert_eq!(app.system_state_access_step(), None);
+
+    approve(&mut app, 3);
+    assert_eq!(app.access_revision(), Some(3));
+    assert_eq!(
+        app.system_state_access_step(),
+        Some(Access::LocalNetwork),
+        "about to start"
+    );
+    assert!(!app.access_step_moment(now), "Local Network goes first");
+    app.tick_local_network_step(now);
+    assert_eq!(triggers(), fired + 1);
+    assert_eq!(
+        records()[recorded..],
+        [(3, Access::LocalNetwork, AccessOutcome::Triggered)]
+    );
+    assert_eq!(app.system_state_access_step(), Some(Access::LocalNetwork));
+    // The host fills the step into each publication (the worker's status
+    // arrives about once a second), so the page's headline names it.
+    app.publish_system_state(crate::system_state::SetupStatus::default());
+    assert_eq!(
+        app.published_system_state_access_step(),
+        Some(Access::LocalNetwork),
+        "the page is told which step is up"
+    );
+    assert!(!app.access_step_moment(now), "its alert is up");
+    assert_eq!(
+        app.next_access_step_deadline(now),
+        Some(now + LOCAL_NETWORK_ALERT_HOLD)
+    );
+
+    let later = now + LOCAL_NETWORK_ALERT_HOLD + Duration::from_secs(1);
+    app.tick_local_network_step(later);
+    assert_eq!(triggers(), fired + 1, "once per revision");
+    assert!(app.access_step_moment(later), "the next step's moment");
+    assert_eq!(app.next_access_step_deadline(later), None);
+
+    approve(&mut app, 4);
+    app.tick_local_network_step(later);
+    assert_eq!(triggers(), fired + 2, "a new revision asks again");
+}
+
+/// Recorded already (an earlier process of this revision): not asked again. Not
+/// frontmost, or a `[privacy]` switch off: not asked at all.
+#[test]
+fn the_local_network_step_waits_for_its_moment_and_honours_the_opt_outs() {
+    let now = Instant::now();
+    let fired = triggers();
+
+    let mut app = App::headless_for_test();
+    app.access_steps.set_reach(StepsReach {
+        recorded: |_, _| Some(AccessOutcome::Triggered),
+        ..stepping()
+    });
+    approve(&mut app, 5);
+    app.tick_local_network_step(now);
+    assert_eq!(triggers(), fired, "on record for this revision");
+    assert!(app.access_step_moment(now));
+
+    let mut app = App::headless_for_test();
+    app.access_steps.set_reach(StepsReach {
+        frontmost: |_| false,
+        ..stepping()
+    });
+    approve(&mut app, 5);
+    app.tick_local_network_step(now);
+    assert_eq!(triggers(), fired, "System State is not frontmost");
+    assert_eq!(app.system_state_access_step(), None);
+
+    for privacy in [
+        crate::app_config::PrivacyConfig {
+            enabled: Some(false),
+            ..Default::default()
+        },
+        crate::app_config::PrivacyConfig {
+            check: Some(false),
+            ..Default::default()
+        },
+        crate::app_config::PrivacyConfig {
+            notice: Some(false),
+            ..Default::default()
+        },
+    ] {
+        let mut app = App::headless_for_test();
+        app.access_steps.set_reach(stepping());
+        app.config.privacy = Some(privacy);
+        approve(&mut app, 5);
+        app.tick_local_network_step(now);
+        assert_eq!(triggers(), fired, "a switch is off");
+        assert!(!app.access_step_moment(now));
+    }
+
+    let mut app = App::headless_for_test();
+    app.access_steps.set_reach(StepsReach {
+        dialog_up: || true,
+        ..stepping()
+    });
+    approve(&mut app, 5);
+    app.tick_local_network_step(now);
+    assert_eq!(triggers(), fired, "another macOS dialog is up");
+}
+
+/// Outcomes are recorded under the approved revision only, one line each per
+/// process.
+#[test]
+fn an_outcome_is_recorded_once_under_the_approved_revision() {
+    let mut app = App::headless_for_test();
+    app.access_steps.set_reach(stepping());
+    let before = records().len();
+    app.record_access_step(Access::FullDiskAccess, AccessOutcome::Granted);
+    assert_eq!(records().len(), before, "no approved revision");
+    approve(&mut app, 9);
+    app.record_access_step(Access::FullDiskAccess, AccessOutcome::Granted);
+    app.record_access_step(Access::FullDiskAccess, AccessOutcome::Granted);
+    app.record_access_step(Access::DeveloperTools, AccessOutcome::Handed);
+    assert_eq!(
+        records()[before..],
+        [
+            (9, Access::FullDiskAccess, AccessOutcome::Granted),
+            (9, Access::DeveloperTools, AccessOutcome::Handed),
+        ]
+    );
+}
+
+/// The marker words bind to the approved revision; with none they keep the
+/// running version, so `aterm doctor`'s own reads still match.
+#[test]
+fn the_markers_are_bound_to_the_approved_revision() {
+    let mut app = App::headless_for_test();
+    let marks = app.access_marks();
+    assert_eq!(marks.revision, None);
+    assert_eq!(marks.devtools, aterm_types::version::app_version());
+    approve(&mut app, 12);
+    let marks = app.access_marks();
+    assert_eq!(marks.revision, Some(12));
+    assert_eq!(marks.devtools, "r12");
+    assert!(marks.fda.starts_with("r12"), "{}", marks.fda);
+}
+
+/// A regressed grant lights the menu line (and ends it when it is settled); the
+/// retired digest keys end once.
+#[test]
+fn a_regressed_grant_lights_the_menu_line() {
+    use aterm_messages::exceptions::{Entry, Family};
+    use aterm_messages::need::{Reason, Then, Why};
+    let mut app = App::headless_for_test();
+    let now = Instant::now();
+    // What an older aterm left in the digest.
+    app.except(&Entry::new(
+        Family::Privacy,
+        "fda",
+        "needed",
+        "aterm cannot read your files",
+        Why::OnlyYou(Reason::new("only you can turn on Full Disk Access")),
+        Then::step("Turn on Full Disk Access"),
+    ));
+    assert!(
+        app.messages
+            .digest()
+            .entries
+            .iter()
+            .any(|e| e.key == "privacy.fda.needed"),
+        "the stand-in entry is raised"
+    );
+    app.settle_access_steps(now);
+    assert_eq!(app.system_state_menu_line(), None);
+    app.note_fda_regression(true);
+    assert!(app.access_steps.fda_regressed());
+    app.settle_access_steps(now);
+    assert_eq!(
+        app.system_state_menu_line(),
+        line("System State: Full Disk Access needs you", None)
+    );
+    app.note_fda_regression(false);
+    app.settle_access_steps(now);
+    assert_eq!(app.system_state_menu_line(), None);
+    for key in RETIRED_KEYS {
+        assert!(
+            !app.messages.digest().entries.iter().any(|e| e.key == key),
+            "{key}"
+        );
+    }
+}
+
+/// The Accessibility pane's System Settings address.
+#[cfg(target_os = "macos")]
+const ACCESSIBILITY_PANE: &str =
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
+
+/// A Needs-you row's press: a person's opens the Local Network and
+/// Accessibility panes at once; a client's act opens nothing at once (it is
+/// queued for the step moment), and with no approved revision it is not even
+/// queued (it never mints the yes); the debugger's is the consent track's and
+/// opens nothing here.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_persons_press_opens_its_pane_at_once() {
+    let mut app = App::headless_for_test();
+    app.headless = false;
+    let _ = crate::platform::take_opened_urls();
+    assert!(!app.open_access_from_system_state(Access::Accessibility, false));
+    assert!(
+        crate::platform::take_opened_urls().is_empty(),
+        "no approved revision: a client's act opens nothing"
+    );
+    assert_eq!(app.access_steps.pane_act, None, "and waits for nothing");
+    approve(&mut app, 1);
+    assert!(app.open_access_from_system_state(Access::LocalNetwork, true));
+    assert!(app.open_access_from_system_state(Access::Accessibility, true));
+    assert_eq!(
+        crate::platform::take_opened_urls(),
+        [crate::fleet_glance::LOCAL_NETWORK_PANE, ACCESSIBILITY_PANE]
+    );
+    assert!(!app.open_access_from_system_state(Access::Accessibility, false));
+    assert!(
+        crate::platform::take_opened_urls().is_empty(),
+        "a client's act waits for the step moment"
+    );
+    assert!(!app.open_access_from_system_state(Access::Debugger, true));
+    let mut headless = App::headless_for_test();
+    assert!(!headless.open_access_from_system_state(Access::LocalNetwork, true));
+}
+
+/// Full Disk Access from its row: a person's press opens the page with the
+/// panel past a standing Not now; a client's act does not pass it.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_persons_press_passes_not_now_and_a_clients_act_does_not() {
+    use crate::devtools_helper::{Lane, test_arms};
+    let mut app = App::headless_for_test();
+    app.headless = false;
+    approve(&mut app, 1);
+    app.devtools_helper = Lane::windowed_with_fda_for_test(
+        test_arms::opening(),
+        test_arms::fda_declined(),
+        test_arms::showing(),
+    );
+    let opens = test_arms::fda_counts().0;
+    assert!(!app.open_access_from_system_state(Access::FullDiskAccess, false));
+    assert_eq!(
+        test_arms::fda_counts().0,
+        opens,
+        "Not now holds for a client"
+    );
+    assert!(app.open_access_from_system_state(Access::FullDiskAccess, true));
+    assert_eq!(test_arms::fda_counts().0, opens + 1);
+    assert!(app.fda_panel_up());
+    assert_eq!(
+        app.system_state_access_step(),
+        Some(Access::FullDiskAccess),
+        "the panel is the step that is up"
+    );
+}
+
+/// A Local Network trigger that attempted nothing (no LAN to name, no socket)
+/// records nothing and takes no hold: the steps after it go on.
+#[test]
+fn a_trigger_that_asked_nothing_records_nothing_and_looks_again() {
+    let mut app = App::headless_for_test();
+    app.access_steps.set_reach(StepsReach {
+        trigger_local_network: || false,
+        ..stepping()
+    });
+    let before = records().len();
+    approve(&mut app, 6);
+    let now = Instant::now();
+    app.tick_local_network_step(now);
+    assert_eq!(records().len(), before, "nothing recorded");
+    assert!(
+        app.access_step_moment(now),
+        "no hold: the next step may run"
+    );
+    let retry = now + super::LOCAL_NETWORK_RETRY;
+    focus(&mut app, true);
+    assert_eq!(
+        app.next_access_step_deadline(now),
+        Some(retry),
+        "it looks again for a LAN, so the run's Permissions stage is not left waiting"
+    );
+    // Not before the retry is due.
+    app.access_steps.set_reach(stepping());
+    let fired = triggers();
+    app.tick_local_network_step(now);
+    assert_eq!(triggers(), fired);
+    // The network came up: the retry asks, and records it.
+    app.tick_local_network_step(retry);
+    assert_eq!(triggers(), fired + 1);
+    assert!(records().contains(&(6, Access::LocalNetwork, AccessOutcome::Triggered)));
+    app.tick_local_network_step(retry + super::LOCAL_NETWORK_RETRY);
+    assert_eq!(
+        triggers(),
+        fired + 1,
+        "once recorded, never again this revision"
+    );
+}
+
+/// The menu line is composed where what it reads changes — a status
+/// publication, a regression — and never on a park.
+#[test]
+fn the_menu_line_follows_publications_not_parks() {
+    let mut app = App::headless_for_test();
+    let now = Instant::now();
+    let dock = Subject::Setting(Setting::Dock);
+    // What the line reads changes behind the park's back: the park leaves it be.
+    app.access_steps.fda_regressed = true;
+    app.settle_access_steps(now);
+    assert_eq!(
+        app.system_state_menu_line(),
+        None,
+        "a park composes nothing"
+    );
+    app.access_steps.fda_regressed = false;
+    app.publish_system_state(status(
+        Selection::all(),
+        vec![observed(dock, Standing::NeedsYou, None)],
+    ));
+    assert_eq!(
+        app.system_state_menu_line(),
+        line("System State: Dock needs you", None)
+    );
+    app.publish_system_state(status(Selection::all(), Vec::new()));
+    assert_eq!(app.system_state_menu_line(), None);
+}
+
+/// An older aterm's vault-join entry carries the approval code: it stays until a
+/// status has read the Secrets row (whose note carries a waiting code), then ends.
+#[test]
+fn the_join_entry_ends_only_once_the_secrets_row_is_read() {
+    use aterm_messages::exceptions::{Entry, Family};
+    use aterm_messages::need::{Reason, Then, Why};
+    let mut app = App::headless_for_test();
+    let now = Instant::now();
+    app.except(&Entry::new(
+        Family::Privacy,
+        "secrets",
+        "join-pending",
+        "This Mac needs vault approval",
+        Why::OnlyYou(Reason::new("an admin Mac approves this Mac")),
+        Then::step("On an admin Mac run aterm secrets approve ABCD-EFGH"),
+    ));
+    let pending = |app: &App| {
+        app.messages
+            .digest()
+            .entries
+            .iter()
+            .any(|e| e.key == JOIN_PENDING_KEY)
+    };
+    assert!(pending(&app), "the stand-in entry is raised");
+    app.settle_access_steps(now);
+    app.publish_system_state(status(
+        Selection::all(),
+        vec![observed(
+            Subject::Setting(Setting::Dock),
+            Standing::InPlace,
+            None,
+        )],
+    ));
+    assert!(pending(&app), "no reading of the Secrets row yet");
+    let code = "Approve on an admin Mac: ABCD-EFGH";
+    app.publish_system_state(status(
+        Selection::all(),
+        vec![observed(
+            Subject::Setting(Setting::Secrets),
+            Standing::NeedsYou,
+            Some(code),
+        )],
+    ));
+    assert!(!pending(&app), "the row carries the code now");
+    assert_eq!(
+        app.system_state_menu_line(),
+        line("System State: Secrets vault needs you", Some(code))
+    );
+}
+
+#[cfg(target_os = "macos")]
+thread_local! {
+    static FRONT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// System State is frontmost while [`FRONT`] says so.
+#[cfg(target_os = "macos")]
+fn front(_app: &App) -> bool {
+    FRONT.with(std::cell::Cell::get)
+}
+
+#[cfg(target_os = "macos")]
+fn set_front(front: bool) {
+    FRONT.with(|cell| cell.set(front));
+}
+
+#[cfg(target_os = "macos")]
+fn probe(state: aterm_containment::consent::FdaState) -> aterm_containment::consent::FdaProbe {
+    use aterm_containment::consent::{FdaProbe, FdaState, ProbeLabel};
+    FdaProbe {
+        state,
+        label: if state == FdaState::Granted {
+            ProbeLabel::OpenOk
+        } else {
+            ProbeLabel::OpenEperm
+        },
+    }
+}
+
+/// A new Mac at revision 1: the probe reads Full Disk Access off, the pages and
+/// panels are counted stand-ins (`reach`, `fda`), Local Network is on record,
+/// and System State is frontmost while [`FRONT`] says so, at a quiet moment.
+/// Nothing reaches the OS.
+#[cfg(target_os = "macos")]
+fn new_mac(reach: crate::devtools_helper::Reach, fda: crate::devtools_helper::FdaReach) -> App {
+    use crate::consent_launch::{LaunchConsent, LaunchReach};
+    use crate::devtools_helper::{Lane, test_arms};
+    let mut app = App::headless_for_test();
+    app.headless = false;
+    app.consent = crate::consent_state::ConsentState::with_cached_probe_for_test(probe(
+        aterm_containment::consent::FdaState::Denied,
+    ));
+    app.config.privacy = Some(crate::app_config::PrivacyConfig {
+        probe_interval_ms: Some(3_600_000),
+        ..Default::default()
+    });
+    app.devtools_helper = Lane::windowed_with_fda_for_test(reach, fda, test_arms::showing());
+    app.consent_launch = LaunchConsent::with_reach(LaunchReach {
+        bundle_id: || Some(test_arms::SUBJECT),
+        live: true,
+        ..LaunchReach::inert()
+    });
+    app.access_steps.set_reach(StepsReach {
+        recorded: |_, _| Some(AccessOutcome::Triggered),
+        frontmost: front,
+        ..stepping()
+    });
+    approve(&mut app, 1);
+    app
+}
+
+/// THE STEP MOMENT THROUGH THE REAL TICK (§6): the window's own Full Disk Access
+/// page waits, queued, while System State is not the visible view, however many
+/// parks pass, and comes up at the first park it is; the folder warm-up after a
+/// Not now waits the same way.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_windows_own_steps_wait_for_system_state_through_the_tick() {
+    use crate::consent_launch::FdaLaunch;
+    use crate::devtools_helper::{Origin, PanelEvent, RECHECK_EVERY, test_arms};
+    set_front(false);
+    let t0 = Instant::now();
+    let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
+    assert!(app.consent_card.begin_deciding(t0));
+    app.decide_macos_access_card(crate::consent_card::PendingDecision::launch(None));
+    assert_eq!(app.devtools_helper.fda_queued(), Some(Origin::Automatic));
+    let opens = test_arms::fda_counts().0;
+    let t1 = Instant::now();
+    for park in 0..3 {
+        app.tick_consent_lanes(t1 + RECHECK_EVERY * park);
+    }
+    assert_eq!(
+        test_arms::fda_counts().0,
+        opens,
+        "System State is not in front"
+    );
+    assert_eq!(app.devtools_helper.fda_queued(), Some(Origin::Automatic));
+    assert_eq!(app.system_state_access_step(), None);
+
+    set_front(true);
+    let t2 = t1 + RECHECK_EVERY * 3;
+    app.tick_consent_lanes(t2);
+    assert_eq!(test_arms::fda_counts().0, opens + 1, "the page comes up");
+    assert!(app.fda_panel_up());
+    assert_eq!(app.system_state_access_step(), Some(Access::FullDiskAccess));
+
+    // The Not now ends the panel; the folders are next, and they wait for System
+    // State too.
+    set_front(false);
+    app.devtools_helper.press_for_test(PanelEvent::NotNow);
+    app.tick_consent_lanes(t2);
+    assert!(!app.fda_panel_up());
+    assert_eq!(
+        app.consent_launch.fda(),
+        FdaLaunch::Ended { owner_acted: false }
+    );
+    app.consent = crate::consent_state::ConsentState::with_cached_probe_for_test(probe(
+        aterm_containment::consent::FdaState::Denied,
+    ));
+    let t3 = t2 + Duration::from_secs(5);
+    app.tick_consent_lanes(t3);
+    app.tick_consent_lanes(t3 + RECHECK_EVERY);
+    assert!(
+        !app.consent_launch.walking(),
+        "not while System State is away"
+    );
+    set_front(true);
+    app.tick_consent_lanes(t3 + RECHECK_EVERY * 2);
+    assert!(app.consent_launch.walking(), "the folders are asked for");
+    // Walking, it parks between folders while the person is away from System State.
+    let gate = app
+        .access_steps
+        .warmup_gate
+        .clone()
+        .expect("the launch pass is gated");
+    assert!(gate.is_open());
+    set_front(false);
+    app.settle_access_steps(t3 + RECHECK_EVERY * 3);
+    assert!(!gate.is_open(), "parked while System State is away");
+    set_front(true);
+    app.settle_access_steps(t3 + RECHECK_EVERY * 4);
+    assert!(gate.is_open(), "back at System State, it walks on");
+}
+
+/// A CONTROL CLIENT'S ACT ON THE FULL DISK ACCESS ROW never mints the yes and
+/// passes nothing the window's own hand-over obeys: with no approved revision
+/// or a `[privacy]` switch off it does nothing; otherwise it is queued for the
+/// step moment as a System State act (never opened at once), held by the
+/// panel's Not now of this revision, the access
+/// card's Not now, an unstable build, the page within ten minutes and a grant;
+/// and once the page is up it writes the revision's marker but not the card's
+/// owner-acted record, so a regressed grant's menu line is never held dark.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_clients_act_on_full_disk_access_is_held_as_the_windows_own() {
+    use crate::consent_card::Marker;
+    use crate::devtools_helper::{Origin, test_arms};
+    set_front(true);
+    let opens = || test_arms::fda_counts().0;
+
+    let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
+    app.hold_initial_setup_permissions();
+    let before = opens();
+    assert!(!app.open_access_from_system_state(Access::FullDiskAccess, false));
+    app.tick_consent_lanes(Instant::now());
+    assert_eq!(opens(), before, "no approved revision");
+    for privacy in ["enabled", "check", "notice"] {
+        let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
+        app.config =
+            aterm_toml::from_str(&format!("[privacy]\n{privacy} = false\n")).expect("config");
+        assert!(!app.open_access_from_system_state(Access::FullDiskAccess, false));
+        assert_eq!(app.devtools_helper.fda_queued(), None, "{privacy} off");
+    }
+
+    let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
+    let before = opens();
+    assert!(
+        !app.open_access_from_system_state(Access::FullDiskAccess, false),
+        "queued, not opened"
+    );
+    assert_eq!(
+        app.devtools_helper.fda_queued(),
+        Some(Origin::SystemStateAct)
+    );
+    assert_eq!(opens(), before);
+    set_front(false);
+    app.tick_consent_lanes(Instant::now());
+    assert_eq!(opens(), before, "it waits for the step moment");
+    set_front(true);
+    app.tick_consent_lanes(Instant::now() + crate::devtools_helper::RECHECK_EVERY);
+    assert_eq!(opens(), before + 1);
+    assert!(app.fda_panel_up());
+    assert_eq!(
+        app.consent_card_host.marker, None,
+        "a client's act is no one's act"
+    );
+
+    /// A refusal case: its name, the build's reach, the page's markers, and
+    /// what else it sets on the window.
+    type Case = (
+        &'static str,
+        fn() -> crate::devtools_helper::Reach,
+        fn() -> crate::devtools_helper::FdaReach,
+        fn(&mut App),
+    );
+    let cases: [Case; 5] = [
+        (
+            "the panel's Not now",
+            test_arms::opening,
+            test_arms::fda_declined,
+            |_| {},
+        ),
+        (
+            "the card's Not now",
+            test_arms::opening,
+            test_arms::fda_opening,
+            |app| {
+                app.consent_card_host.marker = Some(Marker::NotNow);
+            },
+        ),
+        (
+            "an unstable build",
+            test_arms::unstable,
+            test_arms::fda_opening,
+            |_| {},
+        ),
+        (
+            "the page within ten minutes",
+            test_arms::opening,
+            test_arms::fda_opened_just_now,
+            |_| {},
+        ),
+        (
+            "a grant",
+            test_arms::opening,
+            test_arms::fda_opening,
+            |app| {
+                app.consent = crate::consent_state::ConsentState::with_cached_probe_for_test(
+                    probe(aterm_containment::consent::FdaState::Granted),
+                );
+            },
+        ),
+    ];
+    for (why, reach, fda, setup) in cases {
+        let mut app = new_mac(reach(), fda());
+        setup(&mut app);
+        let before = opens();
+        assert!(
+            !app.open_access_from_system_state(Access::FullDiskAccess, false),
+            "{why}"
+        );
+        assert_eq!(app.devtools_helper.fda_queued(), None, "{why}: refused");
+        app.tick_consent_lanes(Instant::now());
+        assert_eq!(opens(), before, "{why}: nothing opens");
+        // A person's press passes it.
+        assert!(
+            app.open_access_from_system_state(Access::FullDiskAccess, true),
+            "{why}"
+        );
+        assert_eq!(opens(), before + 1, "{why}: a person's press");
+    }
+}
+
+/// A client's act on Developer Tools that is only queued answers `false`: no page
+/// came up (it may lapse without one).
+#[cfg(target_os = "macos")]
+#[test]
+fn a_queued_developer_tools_act_is_not_reported_opened() {
+    use crate::devtools_helper::{Origin, test_arms};
+    let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
+    test_arms::stand_in(&mut app, test_arms::opening());
+    let before = test_arms::opens();
+    assert!(!app.open_access_from_system_state(Access::DeveloperTools, false));
+    assert_eq!(app.devtools_helper.queued(), Some(Origin::SystemStateAct));
+    assert_eq!(test_arms::opens(), before);
+}
+
+/// THE DEBUGGER'S OPT-OUT IS READ FROM THE RECORD AT EVERY LAUNCH (design §4):
+/// debugger access off by the person's choice — the observed record says it was
+/// allowed, or that aterm or something else turned it off — is the Debugger row's
+/// opt-out on a launch with no admission of the window's own and before any probe
+/// or step has run, so a row that reads off says the person turned it off, never
+/// Needs you or Not now. It is published as a while-off opt-out: the record says
+/// what an off reading means, not that the rule reads off now, so the worker
+/// says it of no other reading (`initial::access`'s
+/// `a_turned_off_debugger_is_said_only_of_an_off_reading`). CONTROLS: no record,
+/// or one that saw it off by nobody's hand (a new Mac's first reading), is no
+/// opt-out, and the other rows are untouched; a `[privacy]` switch off names that
+/// instead, on every row and whatever it reads.
+#[test]
+fn a_debugger_turned_off_on_record_is_the_rows_opt_out_at_launch() {
+    use super::{DEBUGGER_OFF, PRIVACY_OFF};
+    use crate::debugger_access::{DebuggerChangeLane, ObservedMarker, Origin, RecordsRead};
+    use aterm_containment::consent::DebuggerMode;
+    use aterm_types::macos_setup::opt_out::OptOut;
+    /// A launch whose shared records were read with `observed` on file.
+    fn launched(observed: Option<ObservedMarker>) -> App {
+        let mut app = App::headless_for_test();
+        app.debugger_change = DebuggerChangeLane::with_liveness(|_| false);
+        app.debugger_change.settle_records(RecordsRead {
+            observed,
+            ..RecordsRead::default()
+        });
+        app.debugger_change.poll(1);
+        app
+    }
+    let marker = |mode, origin| {
+        Some(ObservedMarker {
+            mode,
+            since: 1_790_000_000,
+            origin,
+        })
+    };
+    let chosen = Some(OptOut::WhileOff(DEBUGGER_OFF));
+    let cases: [(&str, Option<ObservedMarker>, Option<OptOut>); 6] = [
+        (
+            "was allowed",
+            marker(DebuggerMode::Enabled, Origin::Outside),
+            chosen,
+        ),
+        (
+            "turned on by aterm",
+            marker(DebuggerMode::Enabled, Origin::Aterm),
+            chosen,
+        ),
+        (
+            "turned off by aterm",
+            marker(DebuggerMode::Disabled, Origin::Aterm),
+            chosen,
+        ),
+        (
+            "turned off by something else",
+            marker(DebuggerMode::Disabled, Origin::Outside),
+            chosen,
+        ),
+        (
+            "a new Mac's first reading",
+            marker(DebuggerMode::Disabled, Origin::Unknown),
+            None,
+        ),
+        ("no record", None, None),
+    ];
+    for (name, observed, want) in cases {
+        let app = launched(observed);
+        assert!(app.admitted_access().is_none(), "{name}: no admission");
+        assert_eq!(
+            app.access_opt_outs(),
+            [None, None, want, None],
+            "{name}: the Debugger row alone"
+        );
+    }
+    let mut app = launched(marker(DebuggerMode::Enabled, Origin::Outside));
+    app.config.privacy = Some(crate::app_config::PrivacyConfig {
+        notice: Some(false),
+        ..Default::default()
+    });
+    assert_eq!(
+        app.access_opt_outs(),
+        [Some(OptOut::Always(PRIVACY_OFF)); 4],
+        "privacy off"
+    );
+}
+
+thread_local! {
+    static FAILED_TRIGGERS: RefCell<u32> = const { RefCell::new(0) };
+}
+
+/// A trigger that finds no LAN to name, counted on this thread.
+fn no_lan() -> bool {
+    FAILED_TRIGGERS.with(|t| *t.borrow_mut() += 1);
+    false
+}
+
+fn failed_triggers() -> u32 {
+    FAILED_TRIGGERS.with(|t| *t.borrow())
+}
+
+/// THE LOCAL NETWORK RETRY NEVER SPINS THE LOOP: a trigger that found no LAN
+/// looks again a minute later, at the step's moment only. A retry that falls
+/// due while System State is away is moved on a minute — never left due, which
+/// would wake the event loop at once on every park — an unfocused window arms
+/// none, one of an earlier revision is dropped when another is approved, and
+/// while none is approved it is kept but arms nothing.
+#[test]
+fn a_failed_trigger_away_from_system_state_never_arms_a_deadline_due_now() {
+    let retry = super::LOCAL_NETWORK_RETRY;
+    let mut app = App::headless_for_test();
+    app.access_steps.set_reach(StepsReach {
+        trigger_local_network: no_lan,
+        ..stepping()
+    });
+    approve(&mut app, 7);
+    let t0 = Instant::now();
+    let tried = failed_triggers();
+    app.tick_local_network_step(t0);
+    assert_eq!(failed_triggers(), tried + 1, "System State in front: tried");
+
+    // The person goes to a terminal tab, then to another app.
+    app.access_steps.set_reach(StepsReach {
+        trigger_local_network: no_lan,
+        frontmost: |_| false,
+        ..stepping()
+    });
+    focus(&mut app, false);
+    let due = t0 + retry + Duration::from_secs(1);
+    for park in 0..3 {
+        let now = due + Duration::from_millis(park);
+        app.tick_local_network_step(now);
+        assert!(
+            app.next_access_step_deadline(now)
+                .is_none_or(|at| at >= due + retry),
+            "park {park}: an unfocused window's retry is a minute out or none, never now"
+        );
+    }
+    focus(&mut app, true);
+    let now = due + Duration::from_millis(10);
+    app.tick_local_network_step(now);
+    assert_eq!(
+        app.next_access_step_deadline(now),
+        Some(due + retry),
+        "focused on a terminal tab: the retry was moved on a minute"
+    );
+    assert_eq!(failed_triggers(), tried + 1, "never away from its moment");
+
+    // Back at System State when it falls due again: it tries, and fails again.
+    app.access_steps.set_reach(StepsReach {
+        trigger_local_network: no_lan,
+        ..stepping()
+    });
+    let back = due + retry;
+    app.tick_local_network_step(back);
+    assert_eq!(failed_triggers(), tried + 2);
+    assert_eq!(app.next_access_step_deadline(back), Some(back + retry));
+
+    // A new approval drops the old revision's retry.
+    app.access_steps.set_reach(StepsReach {
+        trigger_local_network: no_lan,
+        frontmost: |_| false,
+        ..stepping()
+    });
+    approve(&mut app, 8);
+    let later = back + retry * 2;
+    app.tick_local_network_step(later);
+    assert_eq!(app.access_steps.local_network_retry, None);
+    assert!(
+        app.next_access_step_deadline(later)
+            .is_none_or(|at| at > later),
+        "nothing due at once for a revision no longer approved"
+    );
+    // The approval going away (an Apply holds the gate) keeps revision 8's
+    // retry, which arms nothing meanwhile.
+    app.access_steps.set_reach(StepsReach {
+        trigger_local_network: no_lan,
+        ..stepping()
+    });
+    app.tick_local_network_step(later);
+    assert_eq!(failed_triggers(), tried + 3, "revision 8 tried");
+    assert!(app.access_steps.local_network_retry.is_some());
+    app.hold_initial_setup_permissions();
+    app.tick_local_network_step(later + retry * 2);
+    assert_eq!(
+        app.access_steps
+            .local_network_retry
+            .map(|(failed, _)| failed),
+        Some(8),
+        "kept while no revision is approved"
+    );
+    assert_eq!(
+        app.next_access_step_deadline(later + retry * 2),
+        None,
+        "nothing armed while no revision is approved"
+    );
+}
+
+/// A RETRY OUTLIVES A GAP IN THE APPROVAL (design §3.3: a change to another
+/// group keeps the access revision). The Local Network trigger finds no LAN
+/// under revision 7; the person then applies a change to another group, whose
+/// Apply holds the Permissions gate (no approved revision) until its fresh
+/// status names revision 7 again. The retry is kept through the gap and arms
+/// nothing during it; then it is armed again and looks for a LAN when due, so
+/// the run's Permissions stage is not left waiting on Local Network until a
+/// relaunch.
+#[test]
+fn a_retry_outlives_an_apply_that_keeps_the_access_revision() {
+    let retry = super::LOCAL_NETWORK_RETRY;
+    let mut app = App::headless_for_test();
+    app.access_steps.set_reach(StepsReach {
+        trigger_local_network: no_lan,
+        ..stepping()
+    });
+    focus(&mut app, true);
+    approve(&mut app, 7);
+    let t0 = Instant::now();
+    let tried = failed_triggers();
+    app.tick_local_network_step(t0);
+    assert_eq!(failed_triggers(), tried + 1, "no LAN yet");
+
+    // Keyboard & Trackpad → Set up: the Apply holds the gate.
+    app.hold_initial_setup_permissions();
+    assert_eq!(app.access_revision(), None);
+    let gap = t0 + Duration::from_secs(1);
+    app.tick_local_network_step(gap);
+    assert_eq!(
+        app.next_access_step_deadline(gap),
+        None,
+        "nothing armed while no revision is approved"
+    );
+
+    // The fresh status names the same access revision.
+    app.accepted_initial_setup_apply();
+    approve(&mut app, 7);
+    assert_eq!(app.access_revision(), Some(7));
+    app.tick_local_network_step(gap);
+    let due = t0 + retry;
+    assert_eq!(
+        app.next_access_step_deadline(gap),
+        Some(due),
+        "the retry is armed again for revision 7"
+    );
+    app.tick_local_network_step(due);
+    assert_eq!(failed_triggers(), tried + 2, "it looks for a LAN again");
+    assert_eq!(app.next_access_step_deadline(due), Some(due + retry));
+}
+
+/// A CONTROL CLIENT'S ACT ON A SYSTEM STATE ROW is a step of the approved
+/// revision (§6): it is queued, never opened at once, and comes up only at the
+/// step moment — System State the visible view of the focused window and no
+/// other macOS dialog up — not at a control verb's quiet moment with a
+/// terminal tab in front. Developer Tools goes through the hand-over lane
+/// (`Origin::SystemStateAct`); Local Network and Accessibility wait for the
+/// same moment, their pane then counts as up for its hold, and an act still
+/// waiting after the lapse is dropped.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_clients_act_on_a_row_waits_for_the_step_moment() {
+    use crate::devtools_helper::{ASKED_LAPSE, Origin, RECHECK_EVERY, test_arms};
+    let with_dialog_up = StepsReach {
+        recorded: |_, _| Some(AccessOutcome::Triggered),
+        frontmost: front,
+        dialog_up: || true,
+        ..stepping()
+    };
+    let at_rest = StepsReach {
+        dialog_up: || false,
+        ..with_dialog_up
+    };
+
+    // Developer Tools.
+    set_front(false);
+    let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
+    test_arms::stand_in(&mut app, test_arms::opening());
+    focus(&mut app, true);
+    app.user_input_recent = |within| within == crate::devtools_helper::PRESENT_WITHIN;
+    let t0 = Instant::now() + crate::consent_card::LAUNCH_SETTLE;
+    assert!(
+        app.devtools_moment_is_quiet(t0),
+        "precondition: a control verb's quiet moment, a terminal tab in front"
+    );
+    let opens = test_arms::opens();
+    assert!(!app.open_access_from_system_state(Access::DeveloperTools, false));
+    assert_eq!(app.devtools_helper.queued(), Some(Origin::SystemStateAct));
+    for park in 0..3 {
+        app.tick_consent_lanes(t0 + RECHECK_EVERY * park);
+    }
+    assert_eq!(test_arms::opens(), opens, "System State is not in front");
+    set_front(true);
+    app.access_steps.set_reach(with_dialog_up);
+    let t1 = t0 + RECHECK_EVERY * 3;
+    app.tick_consent_lanes(t1);
+    assert_eq!(test_arms::opens(), opens, "another macOS dialog is up");
+    app.access_steps.set_reach(at_rest);
+    app.tick_consent_lanes(t1 + RECHECK_EVERY);
+    assert_eq!(test_arms::opens(), opens + 1, "the page at the step moment");
+
+    // Local Network and Accessibility.
+    set_front(false);
+    let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
+    let _ = crate::platform::take_opened_urls();
+    let t0 = Instant::now();
+    assert!(!app.open_access_from_system_state(Access::Accessibility, false));
+    assert!(
+        crate::platform::take_opened_urls().is_empty(),
+        "queued, never opened at once"
+    );
+    for park in 0..3 {
+        app.tick_consent_lanes(t0 + RECHECK_EVERY * park);
+    }
+    assert!(
+        crate::platform::take_opened_urls().is_empty(),
+        "System State is not in front"
+    );
+    set_front(true);
+    app.access_steps.set_reach(with_dialog_up);
+    let t1 = t0 + RECHECK_EVERY * 3;
+    app.tick_consent_lanes(t1);
+    assert!(
+        crate::platform::take_opened_urls().is_empty(),
+        "another macOS dialog is up"
+    );
+    app.access_steps.set_reach(at_rest);
+    let t2 = t1 + RECHECK_EVERY;
+    app.tick_consent_lanes(t2);
+    assert_eq!(
+        crate::platform::take_opened_urls(),
+        [ACCESSIBILITY_PANE],
+        "the pane at the step moment"
+    );
+    assert!(
+        !app.access_step_moment(t2),
+        "one gesture at a time: the pane counts as up"
+    );
+    assert!(app.access_step_moment(t2 + super::PANE_HOLD));
+    app.tick_consent_lanes(t2 + RECHECK_EVERY);
+    assert!(
+        crate::platform::take_opened_urls().is_empty(),
+        "opened once"
+    );
+
+    // An act System State never comes to the front for lapses.
+    set_front(false);
+    assert!(!app.open_access_from_system_state(Access::LocalNetwork, false));
+    let asked = t2 + super::PANE_HOLD;
+    app.tick_consent_lanes(asked + ASKED_LAPSE);
+    set_front(true);
+    app.tick_consent_lanes(asked + ASKED_LAPSE + RECHECK_EVERY);
+    assert!(
+        crate::platform::take_opened_urls().is_empty(),
+        "lapsed after {ASKED_LAPSE:?}"
+    );
+}
+
+/// A NEW APPROVAL ASKS AGAIN (§6: turning Permissions off and on again is a new
+/// approval; the row's Not now says so): the Full Disk Access panel's Not now,
+/// said under revision 1 and still inside its span, answers revision 1's step,
+/// which is recorded declined; under revision 2 the window's own page comes up
+/// at the step moment, and nothing records revision 2's step declined.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_not_now_of_an_earlier_revision_does_not_answer_a_new_approval() {
+    use crate::consent_card::PendingDecision;
+    use crate::devtools_helper::{Origin, test_arms};
+    set_front(true);
+    let t0 = Instant::now();
+    let fda = Access::FullDiskAccess;
+
+    let mut app = new_mac(test_arms::opening(), test_arms::fda_declined());
+    let before = records().len();
+    assert!(app.consent_card.begin_deciding(t0));
+    app.decide_macos_access_card(PendingDecision::launch(None));
+    assert_eq!(app.devtools_helper.fda_queued(), None, "its Not now holds");
+    assert_eq!(
+        records()[before..],
+        [(1, fda, AccessOutcome::Declined)],
+        "the step is answered"
+    );
+
+    let mut app = new_mac(test_arms::opening(), test_arms::fda_declined());
+    approve(&mut app, 2);
+    let before = records().len();
+    let opens = test_arms::fda_counts().0;
+    assert!(app.consent_card.begin_deciding(t0));
+    app.decide_macos_access_card(PendingDecision::launch(None));
+    assert_eq!(app.devtools_helper.fda_queued(), Some(Origin::Automatic));
+    app.tick_consent_lanes(Instant::now());
+    assert_eq!(
+        test_arms::fda_counts().0,
+        opens + 1,
+        "the new approval asks again"
+    );
+    assert!(app.fda_panel_up());
+    assert!(!records()[before..].contains(&(2, fda, AccessOutcome::Declined)));
+}
+
+/// THE ACCESS CARD'S NOT NOW (an older aterm's file-access question) IS SPENT ON
+/// THE FIRST APPROVED REVISION IT MEETS: recorded once as that revision's
+/// `declined` — the row reads as the person's choice, not as waiting on them —
+/// unless something is on record for the row in it already, and retired either
+/// way, so a later revision records nothing for it and asks again, as the row's
+/// Not now says. Without an approved revision, or with a `[privacy]` switch off,
+/// it is neither recorded nor spent.
+#[test]
+fn the_access_cards_not_now_is_spent_on_the_first_revision_it_meets() {
+    use crate::consent_card::Marker;
+    let fda = Access::FullDiskAccess;
+    let now = Instant::now();
+    let unrecorded = StepsReach {
+        recorded: |_, access| (access == Access::LocalNetwork).then_some(AccessOutcome::Triggered),
+        ..stepping()
+    };
+
+    let mut app = App::headless_for_test();
+    app.access_steps.set_reach(unrecorded);
+    let before = records().len();
+    app.consent_card_host.marker = Some(Marker::NotNow);
+    app.settle_access_steps(now);
+    assert_eq!(records().len(), before, "no approved revision");
+    assert_eq!(
+        app.consent_card_host.marker,
+        Some(Marker::NotNow),
+        "kept for the first revision"
+    );
+    app.consent_card_host.marker = None;
+    approve(&mut app, 3);
+    app.settle_access_steps(now);
+    assert_eq!(records().len(), before, "no Not now on record");
+    app.consent_card_host.marker = Some(Marker::NotNow);
+    for _ in 0..3 {
+        app.settle_access_steps(now);
+    }
+    assert_eq!(
+        records()[before..],
+        [(3, fda, AccessOutcome::Declined)],
+        "once"
+    );
+    assert_eq!(app.consent_card_host.marker, None, "spent, and retired");
+    approve(&mut app, 4);
+    app.settle_access_steps(now);
+    assert_eq!(
+        records()[before..],
+        [(3, fda, AccessOutcome::Declined)],
+        "a new approval is not answered by it"
+    );
+
+    let mut app = App::headless_for_test();
+    app.access_steps.set_reach(StepsReach {
+        recorded: |_, _| Some(AccessOutcome::Handed),
+        ..stepping()
+    });
+    app.consent_card_host.marker = Some(Marker::NotNow);
+    let before = records().len();
+    approve(&mut app, 5);
+    app.settle_access_steps(now);
+    assert_eq!(
+        records().len(),
+        before,
+        "the row's step is on record already"
+    );
+    assert_eq!(app.consent_card_host.marker, None, "spent all the same");
+
+    let mut app = App::headless_for_test();
+    app.access_steps.set_reach(unrecorded);
+    app.config.privacy = Some(crate::app_config::PrivacyConfig {
+        notice: Some(false),
+        ..Default::default()
+    });
+    app.consent_card_host.marker = Some(Marker::NotNow);
+    let before = records().len();
+    approve(&mut app, 6);
+    app.settle_access_steps(now);
+    assert_eq!(records().len(), before, "a [privacy] switch is off");
+    assert_eq!(app.consent_card_host.marker, Some(Marker::NotNow));
+}
+
+/// THE ROW AND THE WINDOW AGREE ON THE ACCESS CARD'S NOT NOW (design §6): the
+/// row says "Setting Permissions up again asks again", and it does. Met under
+/// revision 1, the card's Not now is noted as revision 1's panel Not now and
+/// recorded as its `declined`, and the marker beside `aterm.toml` is removed. A
+/// later launch under revision 1 still brings nothing up; under revision 2
+/// (Permissions turned off and on again) nothing records the row declined and
+/// the window's own Full Disk Access page comes up at the step moment.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_access_cards_not_now_holds_its_revision_and_a_new_one_asks_again() {
+    use crate::consent_card::{self, Marker, PendingDecision};
+    use crate::devtools_helper::test_arms;
+    let fda = Access::FullDiskAccess;
+    let on_record_but_lan = StepsReach {
+        recorded: |_, access| (access == Access::LocalNetwork).then_some(AccessOutcome::Triggered),
+        frontmost: front,
+        ..stepping()
+    };
+    let dir = aterm_tempfile::tempdir().expect("a scratch config folder");
+    let config = dir.path().join("aterm.toml");
+    consent_card::record_marker(Some(&config), Marker::NotNow).expect("an older aterm's answer");
+    let on_disk = || consent_card::read_marker(Some(&config));
+    let launch = |revision: u64| {
+        let mut app = new_mac(test_arms::opening(), test_arms::fda_keeping_declines());
+        app.access_steps.set_reach(on_record_but_lan);
+        app.consent_card_config = Some(config.clone());
+        approve(&mut app, revision);
+        assert!(app.consent_card.begin_deciding(Instant::now()));
+        app.decide_macos_access_card(PendingDecision::launch(on_disk()));
+        app
+    };
+    set_front(true);
+    test_arms::forget_fda_declines();
+    let opens = test_arms::fda_counts().0;
+
+    // Revision 1 meets the card's Not now: answered, and spent.
+    let before = records().len();
+    let mut app = launch(1);
+    assert_eq!(app.devtools_helper.fda_queued(), None, "its Not now holds");
+    app.settle_access_steps(Instant::now());
+    assert_eq!(records()[before..], [(1, fda, AccessOutcome::Declined)]);
+    assert_eq!(app.consent_card_host.marker, None, "spent");
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the spent not-now is removed beside aterm.toml",
+        || on_disk().is_none().then_some(()),
+    );
+
+    // A later launch under revision 1: its Not now still holds.
+    let mut app = launch(1);
+    assert_eq!(
+        app.devtools_helper.fda_queued(),
+        None,
+        "revision 1 is answered"
+    );
+    app.tick_consent_lanes(Instant::now());
+    assert_eq!(test_arms::fda_counts().0, opens, "nothing comes up");
+
+    // Permissions turned off and on again: revision 2 asks again.
+    let before = records().len();
+    let mut app = launch(2);
+    // The page's own `opened` marker, written off the UI thread, goes nowhere:
+    // the scratch folder goes with the test.
+    app.consent_card_config = None;
+    app.settle_access_steps(Instant::now());
+    app.tick_consent_lanes(Instant::now());
+    assert!(
+        !records()[before..].contains(&(2, fda, AccessOutcome::Declined)),
+        "nothing answers revision 2"
+    );
+    assert_eq!(
+        test_arms::fda_counts().0,
+        opens + 1,
+        "the new approval asks again"
+    );
+    assert!(app.fda_panel_up());
+}
+
+/// A NEW APPROVAL IN THIS PROCESS ASKS AGAIN (§6), with no relaunch: the
+/// window's own Full Disk Access page, held for the rest of revision 1 by its
+/// panel's Not now, comes back at the next step moment once Permissions is
+/// turned off and on again (revision 2); the same revision coming back after a
+/// gap with none approved brings nothing; a page brought up within ten minutes
+/// holds the next revision's until they are up, never refusing it; and a grant
+/// that reads on brings nothing.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_new_access_revision_in_this_process_brings_the_full_disk_access_page_back() {
+    use crate::consent_launch::FdaLaunch;
+    use crate::devtools_helper::{Origin, PanelEvent, RECHECK_EVERY, test_arms};
+    let fda = Access::FullDiskAccess;
+    let opens = || test_arms::fda_counts().0;
+    set_front(true);
+    test_arms::forget_fda_declines();
+    let mut app = new_mac(test_arms::opening(), test_arms::fda_keeping_declines());
+    // No folder pass after a Not now: its dialogs would hold the step moment.
+    app.config.privacy = Some(crate::app_config::PrivacyConfig {
+        probe_interval_ms: Some(3_600_000),
+        warmup: Some("never".to_owned()),
+        ..Default::default()
+    });
+    let mut t = Instant::now();
+    let mut park = |app: &mut App, by: Duration| {
+        t += by;
+        app.tick_consent_lanes(t);
+        t
+    };
+    // A page brought up retires the cached probe; here nothing reads it again.
+    let reads_off = |app: &mut App| {
+        app.consent = crate::consent_state::ConsentState::with_cached_probe_for_test(probe(
+            aterm_containment::consent::FdaState::Denied,
+        ));
+    };
+    assert!(app.consent_card.begin_deciding(Instant::now()));
+    app.decide_macos_access_card(crate::consent_card::PendingDecision::launch(None));
+    let first = opens();
+    park(&mut app, RECHECK_EVERY);
+    assert_eq!(opens(), first + 1, "revision 1's page");
+    app.devtools_helper.press_for_test(PanelEvent::NotNow);
+    park(&mut app, RECHECK_EVERY);
+    reads_off(&mut app);
+    assert!(!app.fda_panel_up());
+    assert!(records().contains(&(1, fda, AccessOutcome::Declined)));
+    for _ in 0..3 {
+        park(&mut app, RECHECK_EVERY);
+    }
+    assert_eq!(opens(), first + 1, "its Not now holds revision 1");
+
+    // Permissions turned off and on again on the page: revision 2.
+    approve(&mut app, 2);
+    park(&mut app, RECHECK_EVERY);
+    park(&mut app, RECHECK_EVERY);
+    assert_eq!(opens(), first + 2, "the new approval asks again");
+    assert!(app.fda_panel_up());
+    assert_eq!(
+        app.consent_launch.fda(),
+        FdaLaunch::Waiting,
+        "the folders wait"
+    );
+    app.devtools_helper.press_for_test(PanelEvent::NotNow);
+    park(&mut app, RECHECK_EVERY);
+    reads_off(&mut app);
+    assert!(records().contains(&(2, fda, AccessOutcome::Declined)));
+
+    // A gap with none approved, then the same revision: nothing comes back.
+    app.observe_initial_setup_permissions(None);
+    park(&mut app, RECHECK_EVERY);
+    approve(&mut app, 2);
+    for _ in 0..3 {
+        park(&mut app, RECHECK_EVERY);
+    }
+    assert_eq!(app.devtools_helper.fda_queued(), None);
+    assert_eq!(opens(), first + 2, "revision 2 is answered");
+
+    // Revision 3 within ten minutes of the last page: it waits them out.
+    test_arms::set_fda_opened_ago(Some(30));
+    approve(&mut app, 3);
+    park(&mut app, RECHECK_EVERY);
+    park(&mut app, RECHECK_EVERY);
+    assert_eq!(opens(), first + 2, "never two pages within ten minutes");
+    assert_eq!(
+        app.devtools_helper.fda_queued(),
+        Some(Origin::Automatic),
+        "a wait, not a refusal"
+    );
+    test_arms::set_fda_opened_ago(None);
+    park(
+        &mut app,
+        Duration::from_secs(atpkg::devtools::REOPEN_AFTER_S),
+    );
+    assert_eq!(opens(), first + 3, "then it comes up");
+    app.devtools_helper.press_for_test(PanelEvent::NotNow);
+    park(&mut app, RECHECK_EVERY);
+
+    // A grant that reads on: revision 4 brings nothing.
+    app.consent = crate::consent_state::ConsentState::with_cached_probe_for_test(probe(
+        aterm_containment::consent::FdaState::Granted,
+    ));
+    approve(&mut app, 4);
+    park(&mut app, RECHECK_EVERY);
+    park(&mut app, RECHECK_EVERY);
+    assert_eq!(app.devtools_helper.fda_queued(), None);
+    assert_eq!(opens(), first + 3, "nothing to ask for");
+    test_arms::forget_fda_declines();
+}
+
+/// A NEW APPROVAL IN THIS PROCESS ASKS AGAIN for Developer Tools too (§6): the
+/// watch asks once per process, so after revision 1's page and its Not now a
+/// `not_granted` reading asks nothing more; revision 2, approved with no
+/// relaunch, lets that latch go and brings the page back at the next step
+/// moment from the reading in hand.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_new_access_revision_in_this_process_brings_the_developer_tools_page_back() {
+    use crate::devtools_helper::{HandOver, Origin, PanelEvent, RECHECK_EVERY, test_arms};
+    use crate::devtools_watch::Step;
+    use aterm_containment::DevToolGrant;
+    set_front(true);
+    let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
+    app.consent = crate::consent_state::ConsentState::with_cached_probe_for_test(probe(
+        aterm_containment::consent::FdaState::Granted,
+    ));
+    let mut t = Instant::now();
+    let mut park = |app: &mut App| {
+        t += RECHECK_EVERY;
+        app.tick_consent_lanes(t);
+    };
+    app.devtools_helper.note_reading(
+        test_arms::reading(DevToolGrant::NotGranted, test_arms::absent(2)),
+        Instant::now(),
+    );
+    let first = test_arms::opens();
+    assert_eq!(
+        app.devtools_watch.observe(DevToolGrant::NotGranted, false),
+        Step::NotOn { hand_over: true }
+    );
+    assert_eq!(
+        app.hand_devtools_to_owner(Origin::Automatic),
+        HandOver::Queued
+    );
+    park(&mut app);
+    assert_eq!(test_arms::opens(), first + 1, "revision 1's page");
+    app.devtools_helper.press_for_test(PanelEvent::NotNow);
+    park(&mut app);
+    assert!(app.devtools_helper.panel().is_none());
+    assert_eq!(
+        app.devtools_watch.observe(DevToolGrant::NotGranted, false),
+        Step::NotOn { hand_over: false },
+        "once per process"
+    );
+    park(&mut app);
+    assert_eq!(test_arms::opens(), first + 1);
+
+    approve(&mut app, 2);
+    park(&mut app);
+    park(&mut app);
+    assert_eq!(test_arms::opens(), first + 2, "the new approval asks again");
+}
+
+/// The `[privacy]` switches each test below turns off, one at a time.
+const SWITCHES: [&str; 3] = ["enabled", "check", "notice"];
+
+/// `[privacy]` with the switch `off` turned off (none: every switch on), a probe
+/// planted for an hour, and no folder pass (its dialogs would hold the step
+/// moment).
+fn switches(off: Option<&str>) -> crate::app_config::PrivacyConfig {
+    let mut privacy = crate::app_config::PrivacyConfig {
+        probe_interval_ms: Some(3_600_000),
+        warmup: Some("never".to_owned()),
+        ..Default::default()
+    };
+    match off {
+        Some("enabled") => privacy.enabled = Some(false),
+        Some("check") => privacy.check = Some(false),
+        Some("notice") => privacy.notice = Some(false),
+        _ => {}
+    }
+    privacy
+}
+
+/// A `[privacy]` SWITCH OFF IS A PAUSE, NEVER AN ANSWER, FOR LOCAL NETWORK: with
+/// one off when the revision's trigger would run, nothing is asked and nothing
+/// recorded, and on again the trigger runs for the same revision; with one off
+/// when a retry falls due, the retry is moved on (never left due) and, on again,
+/// looks for a LAN when it next falls due.
+#[test]
+fn a_privacy_switch_off_pauses_the_local_network_step() {
+    let retry = super::LOCAL_NETWORK_RETRY;
+    for off in SWITCHES {
+        let t0 = Instant::now();
+        let mut app = App::headless_for_test();
+        app.access_steps.set_reach(stepping());
+        app.config.privacy = Some(switches(Some(off)));
+        approve(&mut app, 5);
+        let (fired, recorded) = (triggers(), records().len());
+        app.tick_local_network_step(t0);
+        assert_eq!(triggers(), fired, "{off} off: nothing asked");
+        assert_eq!(records().len(), recorded, "{off} off: nothing recorded");
+        app.config.privacy = Some(switches(None));
+        app.tick_local_network_step(t0);
+        assert_eq!(triggers(), fired + 1, "{off} on again: asked");
+        assert_eq!(
+            records()[recorded..],
+            [(5, Access::LocalNetwork, AccessOutcome::Triggered)]
+        );
+
+        let mut app = App::headless_for_test();
+        app.access_steps.set_reach(StepsReach {
+            trigger_local_network: no_lan,
+            ..stepping()
+        });
+        focus(&mut app, true);
+        approve(&mut app, 7);
+        let tried = failed_triggers();
+        app.tick_local_network_step(t0);
+        assert_eq!(failed_triggers(), tried + 1, "PRECONDITION: no LAN yet");
+        app.config.privacy = Some(switches(Some(off)));
+        let due = t0 + retry;
+        app.tick_local_network_step(due);
+        assert_eq!(failed_triggers(), tried + 1, "{off} off: not looked for");
+        assert_eq!(
+            app.next_access_step_deadline(due),
+            None,
+            "{off} off: nothing armed"
+        );
+        app.config.privacy = Some(switches(None));
+        assert_eq!(
+            app.next_access_step_deadline(due),
+            Some(due + retry),
+            "{off} on again: the retry was moved on, never left due"
+        );
+        app.tick_local_network_step(due + retry);
+        assert_eq!(failed_triggers(), tried + 2, "{off} on again: looked for");
+    }
+}
+
+/// `n` parks of the consent lanes, each [`crate::devtools_helper::RECHECK_EVERY`]
+/// after the last.
+#[cfg(target_os = "macos")]
+fn parks(app: &mut App, t: &mut Instant, n: u32) {
+    for _ in 0..n {
+        *t += crate::devtools_helper::RECHECK_EVERY;
+        app.tick_consent_lanes(*t);
+    }
+}
+
+/// A `[privacy]` SWITCH OFF IS A PAUSE, NEVER AN ANSWER, FOR THE WINDOW'S OWN FULL
+/// DISK ACCESS PAGE (design §4): queued by the launch check, it waits while a
+/// switch is off, still queued and with the folders waiting behind it, and comes
+/// up at the first step moment once every switch is on again.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_privacy_switch_off_pauses_the_full_disk_access_page() {
+    use crate::consent_launch::FdaLaunch;
+    use crate::devtools_helper::{Origin, test_arms};
+    set_front(true);
+    for off in SWITCHES {
+        let mut t = Instant::now();
+        let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
+        app.config.privacy = Some(switches(None));
+        assert!(app.consent_card.begin_deciding(t));
+        app.decide_macos_access_card(crate::consent_card::PendingDecision::launch(None));
+        assert_eq!(
+            app.devtools_helper.fda_queued(),
+            Some(Origin::Automatic),
+            "PRECONDITION: the launch check queued the page"
+        );
+        app.config.privacy = Some(switches(Some(off)));
+        let opens = test_arms::fda_counts().0;
+        parks(&mut app, &mut t, 3);
+        assert_eq!(test_arms::fda_counts().0, opens, "{off} off: nothing opens");
+        assert_eq!(
+            app.devtools_helper.fda_queued(),
+            Some(Origin::Automatic),
+            "{off} off: still waiting"
+        );
+        assert_eq!(app.consent_launch.fda(), FdaLaunch::Waiting, "{off} off");
+        app.config.privacy = Some(switches(None));
+        parks(&mut app, &mut t, 1);
+        assert_eq!(
+            test_arms::fda_counts().0,
+            opens + 1,
+            "{off} on again: the page comes up"
+        );
+        assert!(app.fda_panel_up());
+    }
+}
+
+/// The same for the window's own DEVELOPER TOOLS PAGE: queued, it waits while a
+/// switch is off and comes up once every switch is on again.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_privacy_switch_off_pauses_the_developer_tools_page() {
+    use crate::devtools_helper::{HandOver, Origin, test_arms};
+    use aterm_containment::DevToolGrant;
+    set_front(true);
+    for off in SWITCHES {
+        let mut t = Instant::now();
+        let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
+        app.config.privacy = Some(switches(None));
+        app.consent = crate::consent_state::ConsentState::with_cached_probe_for_test(probe(
+            aterm_containment::consent::FdaState::Granted,
+        ));
+        app.devtools_helper.note_reading(
+            test_arms::reading(DevToolGrant::NotGranted, test_arms::absent(2)),
+            Instant::now(),
+        );
+        assert_eq!(
+            app.hand_devtools_to_owner(Origin::Automatic),
+            HandOver::Queued
+        );
+        app.config.privacy = Some(switches(Some(off)));
+        let opens = test_arms::opens();
+        parks(&mut app, &mut t, 3);
+        assert_eq!(test_arms::opens(), opens, "{off} off: nothing opens");
+        assert_eq!(
+            app.devtools_helper.queued(),
+            Some(Origin::Automatic),
+            "{off} off: still waiting"
+        );
+        app.config.privacy = Some(switches(None));
+        parks(&mut app, &mut t, 1);
+        assert_eq!(
+            test_arms::opens(),
+            opens + 1,
+            "{off} on again: the page comes up"
+        );
+    }
+}
+
+/// The same for A CONTROL CLIENT'S ACT ON THE ACCESSIBILITY ROW, queued for the
+/// step moment before the switch went off: no pane while it is off, and the pane
+/// once every switch is on again.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_privacy_switch_off_pauses_a_clients_queued_act() {
+    use crate::devtools_helper::test_arms;
+    set_front(true);
+    for off in SWITCHES {
+        let mut t = Instant::now();
+        let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
+        app.config.privacy = Some(switches(None));
+        let _ = crate::platform::take_opened_urls();
+        assert!(!app.open_access_from_system_state(Access::Accessibility, false));
+        app.config.privacy = Some(switches(Some(off)));
+        parks(&mut app, &mut t, 3);
+        assert!(
+            crate::platform::take_opened_urls().is_empty(),
+            "{off} off: nothing opens"
+        );
+        app.config.privacy = Some(switches(None));
+        parks(&mut app, &mut t, 1);
+        assert_eq!(
+            crate::platform::take_opened_urls(),
+            [ACCESSIBILITY_PANE],
+            "{off} on again: the pane opens"
+        );
+    }
+}
+
+/// A REVISION APPROVED WHILE A SWITCH IS OFF ASKS AGAIN ONCE IT IS ON (§6: a new
+/// approval asks again; a switch off is a pause, never an answer): revision 1's
+/// Full Disk Access page and its Not now; the person turns a `[privacy]` switch
+/// off and approves revision 2, which brings nothing up while the switch is off;
+/// with every switch on again revision 2's page comes up at the step moment.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_revision_approved_while_a_switch_is_off_asks_again_once_it_is_on() {
+    use crate::devtools_helper::{PanelEvent, RECHECK_EVERY, test_arms};
+    let opens = || test_arms::fda_counts().0;
+    set_front(true);
+    for off in SWITCHES {
+        test_arms::forget_fda_declines();
+        let mut app = new_mac(test_arms::opening(), test_arms::fda_keeping_declines());
+        app.config.privacy = Some(switches(None));
+        let mut t = Instant::now();
+        let mut park = |app: &mut App| {
+            t += RECHECK_EVERY;
+            app.tick_consent_lanes(t);
+        };
+        assert!(app.consent_card.begin_deciding(Instant::now()));
+        app.decide_macos_access_card(crate::consent_card::PendingDecision::launch(None));
+        let first = opens();
+        park(&mut app);
+        assert_eq!(opens(), first + 1, "PRECONDITION: revision 1's page");
+        app.devtools_helper.press_for_test(PanelEvent::NotNow);
+        park(&mut app);
+        app.consent = crate::consent_state::ConsentState::with_cached_probe_for_test(probe(
+            aterm_containment::consent::FdaState::Denied,
+        ));
+
+        app.config.privacy = Some(switches(Some(off)));
+        approve(&mut app, 2);
+        for _ in 0..3 {
+            park(&mut app);
+        }
+        assert_eq!(opens(), first + 1, "{off} off: nothing comes up");
+        app.config.privacy = Some(switches(None));
+        park(&mut app);
+        park(&mut app);
+        assert_eq!(opens(), first + 2, "{off} on again: revision 2 asks again");
+        assert!(app.fda_panel_up());
+    }
+    test_arms::forget_fda_declines();
+}
+
+/// THE FOLDER PASS PARKS WHILE A SWITCH IS OFF: walking after a Full Disk Access
+/// Not now, it parks at the next folder once `enabled`, `check` or `notice` is
+/// turned off, or `warmup = "never"` is set, and walks on once they are back.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_privacy_switch_turned_off_mid_walk_parks_the_folders() {
+    use crate::devtools_helper::{PanelEvent, RECHECK_EVERY, test_arms};
+    let walking = || crate::app_config::PrivacyConfig {
+        probe_interval_ms: Some(3_600_000),
+        ..Default::default()
+    };
+    let never = || crate::app_config::PrivacyConfig {
+        warmup: Some("never".to_owned()),
+        ..walking()
+    };
+    let mut offs: Vec<(&str, crate::app_config::PrivacyConfig)> = SWITCHES
+        .iter()
+        .map(|off| {
+            (
+                *off,
+                crate::app_config::PrivacyConfig {
+                    warmup: None,
+                    ..switches(Some(off))
+                },
+            )
+        })
+        .collect();
+    offs.push(("warmup", never()));
+    set_front(true);
+    for (off, privacy) in offs {
+        let mut t = Instant::now();
+        let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
+        assert!(app.consent_card.begin_deciding(t));
+        app.decide_macos_access_card(crate::consent_card::PendingDecision::launch(None));
+        t += RECHECK_EVERY;
+        app.tick_consent_lanes(t);
+        assert!(app.fda_panel_up(), "PRECONDITION: the page");
+        app.devtools_helper.press_for_test(PanelEvent::NotNow);
+        app.tick_consent_lanes(t);
+        app.consent = crate::consent_state::ConsentState::with_cached_probe_for_test(probe(
+            aterm_containment::consent::FdaState::Denied,
+        ));
+        for _ in 0..3 {
+            t += RECHECK_EVERY;
+            app.tick_consent_lanes(t);
+        }
+        assert!(
+            app.consent_launch.walking(),
+            "PRECONDITION: the folders are asked for"
+        );
+        let gate = app
+            .access_steps
+            .warmup_gate
+            .clone()
+            .expect("the launch pass is gated");
+        assert!(gate.is_open());
+        app.config.privacy = Some(privacy);
+        app.settle_access_steps(t);
+        assert!(!gate.is_open(), "{off}: parked at the next folder");
+        app.config.privacy = Some(walking());
+        app.settle_access_steps(t);
+        assert!(gate.is_open(), "{off} back: it walks on");
+    }
+}
+
+/// THE MENU LINE STAYS DARK FOR A SPENT CARD'S NOT NOW THROUGH ITS REVISION (the
+/// checker's case): an older aterm asked again after a verified grant read off
+/// (`asked_at` after `verified_at`) and the person answered Not now. Revision 1
+/// spends that Not now and retires the marker; the next launch under the same
+/// revision 1, whose row still says "You chose Not now", finds the grant
+/// regressed but leaves the menu line dark. Revision 2 (Permissions turned off
+/// and on again) asks again, and the line names Full Disk Access.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_spent_card_not_now_keeps_the_menu_line_dark_in_its_own_revision() {
+    use crate::consent_card::{self, AccessRecord, DecideWhy, Marker, PendingDecision};
+    use crate::devtools_helper::test_arms;
+    let on_record_but_lan = StepsReach {
+        recorded: |_, access| (access == Access::LocalNetwork).then_some(AccessOutcome::Triggered),
+        frontmost: front,
+        ..stepping()
+    };
+    let dir = aterm_tempfile::tempdir().expect("a scratch config folder");
+    let config = dir.path().join("aterm.toml");
+    consent_card::record_marker(Some(&config), Marker::NotNow).expect("an older aterm's answer");
+    let on_disk = || consent_card::read_marker(Some(&config));
+    let record = AccessRecord {
+        asked_at: Some(200),
+        verified_at: Some(100),
+        ..AccessRecord::default()
+    };
+    let launch = |revision: u64| {
+        let mut app = new_mac(test_arms::opening(), test_arms::fda_keeping_declines());
+        app.access_steps.set_reach(on_record_but_lan);
+        app.consent_card_config = Some(config.clone());
+        approve(&mut app, revision);
+        assert!(app.consent_card.begin_deciding(Instant::now()));
+        app.decide_macos_access_card(PendingDecision {
+            marker: on_disk(),
+            record,
+            why: DecideWhy::Launch,
+            verified_here: Some(true),
+        });
+        app
+    };
+    let names_fda = line("System State: Full Disk Access needs you", None);
+    set_front(true);
+    test_arms::forget_fda_declines();
+    let mut app = launch(1);
+    assert_ne!(
+        app.system_state_menu_line(),
+        names_fda,
+        "the card's Not now"
+    );
+    app.settle_access_steps(Instant::now());
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the spent not-now is removed beside aterm.toml",
+        || on_disk().is_none().then_some(()),
+    );
+    assert_ne!(
+        app.system_state_menu_line(),
+        names_fda,
+        "spent in revision 1"
+    );
+
+    let app = launch(1);
+    assert!(
+        app.access_steps.fda_regressed(),
+        "PRECONDITION: the grant reads regressed"
+    );
+    assert_ne!(
+        app.system_state_menu_line(),
+        names_fda,
+        "revision 1's Not now still holds: the line does not name Full Disk Access"
+    );
+
+    let mut app = launch(2);
+    app.consent_card_config = None;
+    assert_eq!(
+        app.system_state_menu_line(),
+        names_fda,
+        "a new approval asks again, and the line follows it"
+    );
+    test_arms::forget_fda_declines();
+}
+
+/// THE STATUS ITEM'S PRESS WITH NO WINDOW takes the new-window path, as Cmd-N
+/// does: with every window closed it asks for one (here, with no event loop, the
+/// ask is refused in its own message row, which is how a test sees the path),
+/// and answers `false` since nothing is up yet. A headless instance asks for
+/// none. CONTROL: with a window it shows System State in it at once, raised.
+#[test]
+fn the_status_item_with_no_window_asks_for_a_new_one() {
+    let said_no_window = |app: &App| {
+        app.messages
+            .live_rows()
+            .any(|row| row.msg.title == "Couldn't open a new window")
+    };
+    let mut app = App::headless_for_test();
+    let wid = *app.windows.keys().next().expect("a window");
+    let _ = crate::app_tabs::take_raised_windows();
+    assert!(app.open_system_state_from_status_item());
+    assert_eq!(crate::app_tabs::take_raised_windows(), vec![wid]);
+
+    let mut app = App::headless_for_test();
+    app.windows.clear();
+    app.frontmost_window = None;
+    assert!(!app.open_system_state_from_status_item());
+    assert!(!said_no_window(&app), "headless: no window asked for");
+
+    app.headless = false;
+    let next = app.next_window_id;
+    assert!(!app.open_system_state_from_status_item());
+    assert_eq!(app.next_window_id, next + 1, "a new window was asked for");
+    assert!(said_no_window(&app), "the ask's own refusal row");
+}
+
+/// THE NEW WINDOW THE STATUS ITEM ASKED FOR shows System State once its first
+/// shell lands, in that window, raised; a window that never came shows nothing.
+/// Unix only: the session it lands writes into `tab_spawn::tests`' libc pipe.
+#[cfg(unix)]
+#[test]
+fn the_status_items_new_window_shows_system_state_once_it_lands() {
+    use crate::tab_spawn::{SpawnAdmission, TabSpawned};
+    let mut app = App::headless_for_test();
+    let _ = crate::app_tabs::take_raised_windows();
+    let (id, wid) = crate::tab_spawn::test_support::book_window(
+        &mut app,
+        None,
+        SpawnAdmission::Plain,
+        App::system_state_once_landed(),
+    );
+    assert!(
+        !app.windows.contains_key(&wid),
+        "no window before its shell"
+    );
+    let (session, _pty) = crate::tab_spawn::tests::registered_piped_session(id);
+    assert!(app.install_spawned_tab(TabSpawned {
+        id,
+        window: wid,
+        session: Ok(session),
+        reader_gate: None,
+    }));
+    let (instance, _) = app
+        .active_native_view(wid)
+        .expect("System State is the new window's view");
+    assert_eq!(
+        app.native_runtime.app(instance).map(|a| a.kind()),
+        Some(crate::native_app::AppKind::SystemState)
+    );
+    assert!(crate::app_tabs::take_raised_windows().contains(&wid));
+
+    let windows = app.windows.len();
+    let (id, wid) = crate::tab_spawn::test_support::book_window(
+        &mut app,
+        None,
+        SpawnAdmission::Plain,
+        App::system_state_once_landed(),
+    );
+    assert!(!app.install_spawned_tab(TabSpawned {
+        id,
+        window: wid,
+        session: Err(std::io::Error::other("exec refused")),
+        reader_gate: None,
+    }));
+    assert_eq!(app.windows.len(), windows, "no window, so nothing shown");
+    assert!(!crate::app_tabs::take_raised_windows().contains(&wid));
+}
+
+/// The window's probe once a switch is on again: `enabled` or `check` off
+/// retires the cached Full Disk Access answer (a closed gate reads nothing),
+/// and the probe the next read dispatches answers `fda`, as its completion
+/// (`Wake::ConsentProbeReady`) would publish it.
+#[cfg(target_os = "macos")]
+fn reread(fda: aterm_containment::consent::FdaState) -> crate::consent_state::ConsentState {
+    crate::consent_state::ConsentState::with_cached_probe_for_test(probe(fda))
+}
+
+/// A `[privacy]` SWITCH OFF AT LAUNCH HOLDS THE ACCESS CHECK, NEVER ANSWERS IT
+/// (design §4): with one off when aterm starts, the access card's launch check
+/// gives no verdict and nothing is queued, however many parks pass. Once every
+/// switch is on, the check runs again with the Full Disk Access hand-over
+/// undecided (the folders and the debugger step wait on it), and its verdict
+/// queues the window's own page for the step moment, as at launch; the
+/// access card's Not now still answers it. A check that gave its verdict is
+/// not run again for a switch turned off and on later.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_switch_off_at_launch_holds_the_access_check_until_it_is_on() {
+    use crate::consent_card::{CardPhase, Marker, PendingDecision};
+    use crate::consent_launch::FdaLaunch;
+    use crate::devtools_helper::{Origin, test_arms};
+    use aterm_containment::consent::FdaState;
+    for off in SWITCHES {
+        set_front(true);
+        let mut t = Instant::now();
+        let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
+        app.set_privacy_for_test(switches(Some(off)));
+        let opens = test_arms::fda_counts().0;
+        parks(&mut app, &mut t, 3);
+        assert_eq!(
+            app.consent_card.phase(),
+            CardPhase::Settled,
+            "{off} off at launch: the check is held"
+        );
+        assert_eq!(app.devtools_helper.fda_queued(), None, "{off} off");
+        assert_eq!(app.consent_launch.fda(), FdaLaunch::NotAsked, "{off} off");
+        assert_eq!(test_arms::fda_counts().0, opens, "{off} off: nothing opens");
+
+        // On again; the probe a switch off retired reads again
+        // (`Wake::ConsentProbeReady`).
+        app.consent = reread(FdaState::Denied);
+        app.set_privacy_for_test(switches(None));
+        app.resume_held_launch_steps(t);
+        assert_eq!(
+            app.consent_card.phase(),
+            CardPhase::Idle,
+            "{off} on again: the check runs again"
+        );
+        assert_eq!(
+            app.consent_launch.fda(),
+            FdaLaunch::Undecided,
+            "{off} on again: what waits on it waits again"
+        );
+        // Its worker's verdict, as `Wake::MacosAccessCardDecided` brings it.
+        assert!(app.consent_card.begin_deciding(t));
+        app.decide_macos_access_card(PendingDecision::launch(None));
+        assert_eq!(
+            app.devtools_helper.fda_queued(),
+            Some(Origin::Automatic),
+            "{off} on again: the page is queued"
+        );
+        assert_eq!(app.consent_launch.fda(), FdaLaunch::Waiting, "{off}");
+        set_front(false);
+        parks(&mut app, &mut t, 2);
+        assert_eq!(
+            test_arms::fda_counts().0,
+            opens,
+            "{off}: not before the step moment"
+        );
+        set_front(true);
+        parks(&mut app, &mut t, 1);
+        assert_eq!(
+            test_arms::fda_counts().0,
+            opens + 1,
+            "{off}: the page comes up"
+        );
+        assert!(app.fda_panel_up());
+
+        // Decided: a switch off and on later does not run it twice.
+        app.set_privacy_for_test(switches(Some(off)));
+        parks(&mut app, &mut t, 1);
+        app.set_privacy_for_test(switches(None));
+        app.resume_held_launch_steps(t);
+        assert_eq!(
+            app.consent_card.phase(),
+            CardPhase::Settled,
+            "{off}: decided once"
+        );
+
+        // The access card's Not now answers the check run again, as at launch.
+        let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
+        app.set_privacy_for_test(switches(Some(off)));
+        parks(&mut app, &mut t, 1);
+        app.consent = reread(FdaState::Denied);
+        app.set_privacy_for_test(switches(None));
+        app.resume_held_launch_steps(t);
+        assert!(app.consent_card.begin_deciding(t));
+        app.decide_macos_access_card(PendingDecision::launch(Some(Marker::NotNow)));
+        assert_eq!(app.devtools_helper.fda_queued(), None, "{off}: Not now");
+        let opens = test_arms::fda_counts().0;
+        parks(&mut app, &mut t, 2);
+        assert_eq!(test_arms::fda_counts().0, opens, "{off}: Not now holds");
+    }
+}
+
+/// A CHECK RUN AGAIN THAT GIVES NO VERDICT HOLDS NOTHING BACK: once every
+/// switch is on, the first park runs the access check again with the Full Disk
+/// Access hand-over undecided; when no verdict can come (here no worker can be
+/// started; a worker that never answers runs out of attempts the same way), the
+/// hand-over is not asked this process, so the debugger step and the folders
+/// that wait on it go on, even with the folder warm-up over already (with
+/// `warmup = "never"` and `notice` off it is settled before the switch comes
+/// on; with `enabled` or `check` off it waits).
+#[cfg(target_os = "macos")]
+#[test]
+fn a_check_run_again_that_gives_no_verdict_holds_nothing_back() {
+    use crate::consent_card::CardPhase;
+    use crate::consent_launch::FdaLaunch;
+    use crate::devtools_helper::test_arms;
+    for off in SWITCHES {
+        set_front(true);
+        let mut t = Instant::now();
+        let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
+        app.set_privacy_for_test(switches(Some(off)));
+        parks(&mut app, &mut t, 2);
+        assert!(app.consent_card_host.launch_held, "PRECONDITION: {off} off");
+        app.consent = reread(aterm_containment::consent::FdaState::Denied);
+        app.set_privacy_for_test(switches(None));
+        parks(&mut app, &mut t, 1);
+        assert_eq!(
+            app.consent_card.phase(),
+            CardPhase::Settled,
+            "PRECONDITION: {off} on again: no worker, no verdict"
+        );
+        assert_eq!(
+            app.consent_launch.fda(),
+            FdaLaunch::NotAsked,
+            "{off} on again: nothing waits on a verdict that cannot come"
+        );
+    }
+}
+
+/// `[privacy]` with the switch `off` turned off and the folder pass on
+/// (`warmup` automatic).
+#[cfg(target_os = "macos")]
+fn walking(off: Option<&str>) -> crate::app_config::PrivacyConfig {
+    crate::app_config::PrivacyConfig {
+        warmup: None,
+        ..switches(off)
+    }
+}
+
+/// The same for THE FOLDER WARM-UP: with `enabled` or `check` off at launch it
+/// does not walk, and that is a pause, never an answer: it waits, never
+/// settled for the process, and walks at the first step moment once every
+/// switch is on again.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_switch_off_at_launch_holds_the_folder_warm_up_until_it_is_on() {
+    use crate::devtools_helper::test_arms;
+    for off in ["enabled", "check"] {
+        set_front(true);
+        let mut t = Instant::now();
+        let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
+        app.set_privacy_for_test(walking(Some(off)));
+        parks(&mut app, &mut t, 3);
+        assert!(
+            !app.consent_launch.walking(),
+            "{off} off at launch: no walk"
+        );
+        assert!(!app.consent_launch.settled(), "{off} off: it waits");
+
+        app.consent = reread(aterm_containment::consent::FdaState::Denied);
+        app.set_privacy_for_test(walking(None));
+        parks(&mut app, &mut t, 1);
+        assert!(
+            app.consent_launch.walking(),
+            "{off} on again: the folders are asked for"
+        );
+    }
+}
+
+/// A FOLDER PASS WAITING FOR ITS MOMENT WAITS THROUGH A SWITCH (design §4; the
+/// round-3 checker's S1): after the Full Disk Access page's Not now the folders
+/// are next; a `[privacy]` switch turned off then asks for nothing, however
+/// many parks pass, and once every switch is on again the pass walks. `notice`
+/// off holds it at the step moment; `enabled` and `check` off hold it before.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_waiting_folder_pass_goes_on_after_a_switch() {
+    use crate::devtools_helper::{PanelEvent, RECHECK_EVERY, test_arms};
+    set_front(true);
+    for off in SWITCHES {
+        let mut t = Instant::now();
+        let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
+        app.set_privacy_for_test(walking(None));
+        assert!(app.consent_card.begin_deciding(t));
+        app.decide_macos_access_card(crate::consent_card::PendingDecision::launch(None));
+        t += RECHECK_EVERY;
+        app.tick_consent_lanes(t);
+        assert!(app.fda_panel_up(), "PRECONDITION: the page");
+        app.devtools_helper.press_for_test(PanelEvent::NotNow);
+        app.set_privacy_for_test(walking(Some(off)));
+        parks(&mut app, &mut t, 3);
+        assert!(!app.consent_launch.walking(), "{off} off: nothing asked");
+        assert!(!app.consent_launch.settled(), "{off} off: it waits");
+        app.consent = reread(aterm_containment::consent::FdaState::Denied);
+        app.set_privacy_for_test(walking(None));
+        parks(&mut app, &mut t, 3);
+        assert!(app.consent_launch.walking(), "{off} on again: it walks");
+    }
+}
+
+/// A SWITCH OFF WHILE THE ACCESS CHECK'S WORKER READS (the round-3 checker's
+/// S2): the card settles for the switch, and the worker's verdict that lands
+/// once the switch is on again finds it settled; the check runs again at the
+/// first park, so the window's own Full Disk Access page comes once, and a new
+/// approval in this process brings it back. With every switch on throughout
+/// (`None`, the control) the worker's own verdict brings the page.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_switch_off_during_the_access_check_keeps_the_page() {
+    use crate::consent_card::PendingDecision;
+    use crate::devtools_helper::{PanelEvent, test_arms};
+    use aterm_containment::consent::FdaState;
+    set_front(true);
+    for off in [None, Some("enabled"), Some("check"), Some("notice")] {
+        let mut t = Instant::now();
+        let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
+        app.set_privacy_for_test(switches(None));
+        assert!(app.consent_card.begin_deciding(t));
+        app.set_privacy_for_test(switches(off));
+        parks(&mut app, &mut t, 1);
+        app.consent = reread(FdaState::Denied);
+        app.set_privacy_for_test(switches(None));
+        app.decide_macos_access_card(PendingDecision::launch(None));
+        if off.is_some() {
+            assert_eq!(
+                app.devtools_helper.fda_queued(),
+                None,
+                "{off:?}: the verdict finds the card settled"
+            );
+            // The first park runs the check again; its worker's verdict, as
+            // `Wake::MacosAccessCardDecided` brings it.
+            app.resume_held_launch_steps(t);
+            assert!(app.consent_card.begin_deciding(t), "{off:?}: it runs again");
+            app.decide_macos_access_card(PendingDecision::launch(None));
+        }
+        let opens = test_arms::fda_counts().0;
+        parks(&mut app, &mut t, 3);
+        assert_eq!(
+            test_arms::fda_counts().0 - opens,
+            1,
+            "{off:?}: the page for revision 1"
+        );
+        app.devtools_helper.press_for_test(PanelEvent::NotNow);
+        parks(&mut app, &mut t, 1);
+        app.consent = reread(FdaState::Denied);
+        approve(&mut app, 2);
+        parks(&mut app, &mut t, 3);
+        assert_eq!(
+            test_arms::fda_counts().0 - opens,
+            2,
+            "{off:?}: a new approval asks again"
+        );
+    }
+}
+
+/// The same with THE FOLDER PASS ON (the round-3 checker's S2b): once the
+/// switch is on again the folders wait behind the check run again, and the
+/// Full Disk Access page comes first, never the folder dialogs instead.
+#[cfg(target_os = "macos")]
+#[test]
+fn after_a_switch_during_the_access_check_the_page_comes_before_the_folders() {
+    use crate::consent_card::PendingDecision;
+    use crate::devtools_helper::test_arms;
+    use aterm_containment::consent::FdaState;
+    set_front(true);
+    for off in [None, Some("enabled"), Some("check"), Some("notice")] {
+        let mut t = Instant::now();
+        let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
+        app.set_privacy_for_test(walking(None));
+        assert!(app.consent_card.begin_deciding(t));
+        app.set_privacy_for_test(walking(off));
+        parks(&mut app, &mut t, 1);
+        app.consent = reread(FdaState::Denied);
+        app.set_privacy_for_test(walking(None));
+        if off.is_some() {
+            app.resume_held_launch_steps(t);
+            assert!(
+                !app.consent_launch.walking(),
+                "{off:?}: not before the check"
+            );
+            assert!(app.consent_card.begin_deciding(t));
+        }
+        app.decide_macos_access_card(PendingDecision::launch(None));
+        let opens = test_arms::fda_counts().0;
+        parks(&mut app, &mut t, 4);
+        assert_eq!(test_arms::fda_counts().0 - opens, 1, "{off:?}: the page");
+        assert!(app.fda_panel_up(), "{off:?}");
+        assert!(
+            !app.consent_launch.walking(),
+            "{off:?}: no folder dialog over the page"
+        );
+    }
+}
+
+/// The same for THE DEVELOPER TOOLS LAUNCH READ: with `enabled` or `check` off
+/// at the first focus gain, nothing is read (a reading taken meanwhile only
+/// says the probe is off), and the read stays owed; the first park after every
+/// switch is on again forgets that reading, makes the launch read, and its
+/// `not_granted` brings the window's own page up at the step moment.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_switch_off_at_launch_holds_the_developer_tools_read_until_it_is_on() {
+    use crate::consent_state::SlotKind;
+    use crate::devtools_helper::{Origin, test_arms};
+    use aterm_containment::consent::FdaState;
+    use aterm_containment::{DevToolProbe, DevToolProbeLabel, DevToolState, ProbeGate};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static READS: AtomicUsize = AtomicUsize::new(0);
+    fn not_on(_gate: ProbeGate, _subject: &str) -> DevToolProbe {
+        READS.fetch_add(1, Ordering::AcqRel);
+        DevToolProbe {
+            state: DevToolState::Unlisted,
+            label: DevToolProbeLabel::Observed,
+            requests: Some(1),
+            not_allowed: Some(1),
+            answered_at_ms: Some(1),
+        }
+    }
+    fn subject() -> Option<&'static str> {
+        Some(test_arms::SUBJECT)
+    }
+    for off in ["enabled", "check"] {
+        set_front(true);
+        let mut t = Instant::now();
+        let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
+        // Full Disk Access reads on: the Developer Tools page is the next step.
+        // A switch off retires that answer, and the probe reads it again once
+        // every switch is on.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let consent = || {
+            let mut consent = reread(FdaState::Granted);
+            consent.set_devtools_arms_for_test(not_on, subject);
+            let tx = tx.clone();
+            consent.set_slot_wake(std::sync::Arc::new(move |kind: SlotKind| {
+                if kind == SlotKind::Devtools {
+                    let _ = tx.send(());
+                }
+            }));
+            consent
+        };
+        app.consent = consent();
+        focus(&mut app, true);
+        assert!(
+            app.any_os_window_focused(),
+            "PRECONDITION: a focused window"
+        );
+        app.set_privacy_for_test(switches(Some(off)));
+        let reads = READS.load(Ordering::Acquire);
+        // The launch's first focus gain, and a reading taken while it is off.
+        app.read_devtools_list(t);
+        let _ = app.devtools_reading();
+        assert_eq!(
+            app.devtools_helper
+                .reading()
+                .map(|reading| reading.log.label),
+            Some(DevToolProbeLabel::RefusedDisabled),
+            "PRECONDITION: {off} off reads that it is off"
+        );
+        parks(&mut app, &mut t, 3);
+        assert_eq!(READS.load(Ordering::Acquire), reads, "{off} off: no read");
+        assert_eq!(app.devtools_helper.queued(), None, "{off} off");
+
+        app.consent = consent();
+        app.set_privacy_for_test(switches(None));
+        parks(&mut app, &mut t, 1);
+        assert_ne!(
+            app.devtools_helper
+                .reading()
+                .map(|reading| reading.log.label),
+            Some(DevToolProbeLabel::RefusedDisabled),
+            "{off} on again: the off reading decides nothing"
+        );
+        rx.recv_timeout(Duration::from_secs(60))
+            .unwrap_or_else(|_| panic!("{off} on again: the launch read runs"));
+        assert_eq!(READS.load(Ordering::Acquire), reads + 1, "{off}: one read");
+        // Its completion, as `Wake::DevToolsProbeReady` brings it.
+        app.on_devtools_probe_ready();
+        assert_eq!(
+            app.devtools_helper.queued(),
+            Some(Origin::Automatic),
+            "{off}: not_granted asks for the page"
+        );
+        let opens = test_arms::opens();
+        parks(&mut app, &mut t, 1);
+        assert_eq!(test_arms::opens(), opens + 1, "{off}: the page comes up");
+    }
+}
+
+/// A LAUNCH READ THAT LANDS WHILE A SWITCH IS OFF IS MADE AGAIN: the Developer
+/// Tools launch read goes out with every switch on, and `enabled` or `check`
+/// is turned off before its completion is handled, so the completion only says
+/// the probe is off. On again, that reading is forgotten and its read, spent on
+/// nothing, is owed again: the first park with a window focused reads once
+/// more, and `not_granted` asks for the page. Negative control: the
+/// `hold_read` in `App::resume_held_launch_steps` removed, nothing reads again
+/// in this process (the launch read is spent and nothing was held).
+#[cfg(target_os = "macos")]
+#[test]
+fn a_launch_read_that_lands_while_a_switch_is_off_is_made_again() {
+    use crate::consent_state::SlotKind;
+    use crate::devtools_helper::{Origin, test_arms};
+    use aterm_containment::consent::FdaState;
+    use aterm_containment::{DevToolProbe, DevToolProbeLabel, DevToolState, ProbeGate};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static READS: AtomicUsize = AtomicUsize::new(0);
+    fn not_on(_gate: ProbeGate, _subject: &str) -> DevToolProbe {
+        READS.fetch_add(1, Ordering::AcqRel);
+        DevToolProbe {
+            state: DevToolState::Unlisted,
+            label: DevToolProbeLabel::Observed,
+            requests: Some(1),
+            not_allowed: Some(1),
+            answered_at_ms: Some(1),
+        }
+    }
+    fn subject() -> Option<&'static str> {
+        Some(test_arms::SUBJECT)
+    }
+    for off in ["enabled", "check"] {
+        set_front(true);
+        let mut t = Instant::now();
+        let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let consent = || {
+            let mut consent = reread(FdaState::Granted);
+            consent.set_devtools_arms_for_test(not_on, subject);
+            let tx = tx.clone();
+            consent.set_slot_wake(std::sync::Arc::new(move |kind: SlotKind| {
+                if kind == SlotKind::Devtools {
+                    let _ = tx.send(());
+                }
+            }));
+            consent
+        };
+        app.consent = consent();
+        focus(&mut app, true);
+        app.set_privacy_for_test(switches(None));
+        let reads = READS.load(Ordering::Acquire);
+        // The launch's first focus gain, every switch on: the read goes out.
+        app.read_devtools_list(t);
+        rx.recv_timeout(Duration::from_secs(60))
+            .unwrap_or_else(|_| panic!("{off}: PRECONDITION the launch read runs"));
+        assert_eq!(READS.load(Ordering::Acquire), reads + 1, "PRECONDITION");
+        // The switch goes off before `Wake::DevToolsProbeReady` is handled.
+        app.set_privacy_for_test(switches(Some(off)));
+        app.on_devtools_probe_ready();
+        assert_eq!(
+            app.devtools_helper
+                .reading()
+                .map(|reading| reading.log.label),
+            Some(DevToolProbeLabel::RefusedDisabled),
+            "PRECONDITION: {off} off: the completion reads that it is off"
+        );
+        // On again: the first park makes the read again.
+        app.consent = consent();
+        app.set_privacy_for_test(switches(None));
+        parks(&mut app, &mut t, 1);
+        rx.recv_timeout(Duration::from_secs(60))
+            .unwrap_or_else(|_| panic!("{off} on again: the spent read is made again"));
+        assert_eq!(READS.load(Ordering::Acquire), reads + 2, "{off}: once more");
+        app.on_devtools_probe_ready();
+        assert_eq!(
+            app.devtools_helper.queued(),
+            Some(Origin::Automatic),
+            "{off}: not_granted asks for the page"
+        );
+        // Once: later parks and a focus gain read no more.
+        parks(&mut app, &mut t, 3);
+        app.read_devtools_list(t);
+        assert_eq!(READS.load(Ordering::Acquire), reads + 2, "{off}: once");
+    }
+}
+
+/// A SWITCH TOGGLED TWICE WHILE THE RE-RUN ACCESS CHECK IS OUT BRINGS THE PAGE
+/// ONCE: the check a switch held runs again, the switch goes off and on again
+/// with the first worker still out, a second worker starts, and both verdicts
+/// land: one Full Disk Access page, and nothing is left held.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_switch_toggled_twice_brings_the_page_once() {
+    use crate::consent_card::{CardPhase, PendingDecision};
+    use crate::devtools_helper::test_arms;
+    use aterm_containment::consent::FdaState;
+    set_front(true);
+    for off in SWITCHES {
+        let mut t = Instant::now();
+        let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
+        app.set_privacy_for_test(switches(Some(off)));
+        parks(&mut app, &mut t, 2);
+        assert!(app.consent_card_host.launch_held, "PRECONDITION: {off}");
+        app.consent = reread(FdaState::Denied);
+        app.set_privacy_for_test(switches(None));
+        app.resume_held_launch_steps(t);
+        assert!(app.consent_card.begin_deciding(t), "{off}: worker A");
+        app.set_privacy_for_test(switches(Some(off)));
+        parks(&mut app, &mut t, 1);
+        assert!(app.consent_card_host.launch_held, "{off}: held again");
+        app.consent = reread(FdaState::Denied);
+        app.set_privacy_for_test(switches(None));
+        app.resume_held_launch_steps(t);
+        assert_eq!(app.consent_card.phase(), CardPhase::Idle, "{off}");
+        assert!(app.consent_card.begin_deciding(t), "{off}: worker B");
+        let opens = test_arms::fda_counts().0;
+        app.decide_macos_access_card(PendingDecision::launch(None));
+        app.decide_macos_access_card(PendingDecision::launch(None));
+        parks(&mut app, &mut t, 4);
+        assert_eq!(test_arms::fda_counts().0 - opens, 1, "{off}: one page");
+        assert!(!app.consent_card_host.launch_held, "{off}: nothing held");
+    }
+}

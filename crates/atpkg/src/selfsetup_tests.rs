@@ -37,6 +37,24 @@ impl Account {
         )
     }
 
+    fn sweep_within(&self, hang: Duration) -> (bool, String, String) {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let ok = self_uninstall_with_caffeine(
+            &self.places,
+            None,
+            false,
+            &mut out,
+            &mut err,
+            sweep_caffeine,
+            hang,
+        );
+        (
+            ok,
+            String::from_utf8(out).expect("utf-8"),
+            String::from_utf8(err).expect("utf-8"),
+        )
+    }
+
     fn setup(&self, env: &ShellEnv, exe: &Path, setup: &Setup) -> (bool, String, String) {
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let ok = shell_setup(&self.places, env, exe, setup, &mut out, &mut err);
@@ -71,8 +89,8 @@ fn bundle(app: &Path, atpkg: Option<&str>) {
 
 fn sweeping_atpkg(support: &Path, log: &Path) -> String {
     format!(
-        "#!/bin/sh\necho swept >>'{}'\np='{}/pkg'\nmkdir -p \"$p\" && {{ [ -f \"$p/declined\" ] || \
-         echo declined >\"$p/declined\"; }}\n",
+        "#!/bin/sh\n[ \"$1\" = --version ] && {{ echo atpkg 0; exit 0; }}\necho swept >>'{}'\np='{}/pkg'\n\
+         mkdir -p \"$p\" && {{ [ -f \"$p/declined\" ] || echo declined >\"$p/declined\"; }}\n",
         log.display(),
         support.display()
     )
@@ -182,6 +200,8 @@ fn a_scoped_uninstall_leaves_what_another_aterm_uses() {
         .expect("link");
     }
     bundle(&home.join("aterm.app"), Some(&atpkg));
+    // The sweep asks this atpkg `--version` (no sweep of it runs), under a minute's wait.
+    aterm_spec::wait::first_exec(&home.join("aterm.app/Contents/MacOS/atpkg"), &["--version"]);
     a.places.install_dir = Some(home.clone());
     let (ok, out, err) = a.sweep(None, false);
     assert!(ok, "{out}{err}");
@@ -939,12 +959,16 @@ fn an_uninstall_quits_the_caffeine_mug_and_removes_its_files() {
         &aterm,
         &format!("#!/bin/sh\necho \"$*\" >>'{}'\n", log.display()),
     );
+    aterm_spec::wait::first_exec(&aterm, &["warm"]);
+    std::fs::remove_file(&log).expect("the warm-up's line");
     let (ok, out, err) = a.sweep(None, false);
     assert!(ok, "{out}{err}");
-    assert!(
-        !log.exists(),
-        "no mug ran here, so no aterm was asked: {out}"
+    assert_eq!(
+        std::fs::read_to_string(&log).expect("asked"),
+        "--version\n",
+        "no mug ran here, so its aterm was asked only before its bundle went: {out}"
     );
+    std::fs::remove_file(&log).expect("the ask's line");
 
     let a = Account::new("caffeine-left");
     let home = a.home().to_path_buf();
@@ -982,7 +1006,7 @@ fn an_uninstall_quits_the_caffeine_mug_and_removes_its_files() {
     assert!(ok, "{out}{err}");
     assert_eq!(
         std::fs::read_to_string(&log).expect("asked"),
-        "help caffeine\ncaffeine startup off\ncaffeine quit\n"
+        "help caffeine\ncaffeine startup off\ncaffeine quit\n--version\n"
     );
     for name in [
         "caffeine-code.noindex",
@@ -1107,8 +1131,13 @@ fn an_uninstall_quits_the_caffeine_mug_and_removes_its_files() {
     let mut calls = Vec::new();
     let mut failed = Vec::new();
     let (mut out, mut err) = (Vec::new(), Vec::new());
-    let ok =
-        self_uninstall_with_caffeine(&a.places, None, false, &mut out, &mut err, |s, p, dirs| {
+    let ok = self_uninstall_with_caffeine(
+        &a.places,
+        None,
+        false,
+        &mut out,
+        &mut err,
+        |s, p, dirs| {
             failed = sweep_caffeine_with(
                 s,
                 p,
@@ -1127,7 +1156,9 @@ fn an_uninstall_quits_the_caffeine_mug_and_removes_its_files() {
                 },
             );
             failed.clone()
-        });
+        },
+        CHILD_HANG,
+    );
     assert_eq!(calls, [preflight, help]);
     assert_eq!(
         failed.as_slice(),
@@ -1298,8 +1329,13 @@ fn a_root_sweep_runs_nothing_an_account_could_replace() {
     );
     let mut failed = Vec::new();
     let (mut out, mut err) = (Vec::new(), Vec::new());
-    let ok =
-        self_uninstall_with_caffeine(&a.places, None, false, &mut out, &mut err, |s, p, dirs| {
+    let ok = self_uninstall_with_caffeine(
+        &a.places,
+        None,
+        false,
+        &mut out,
+        &mut err,
+        |s, p, dirs| {
             failed = sweep_caffeine_with(
                 s,
                 p,
@@ -1309,7 +1345,9 @@ fn a_root_sweep_runs_nothing_an_account_could_replace() {
                 |program, args| panic!("root ran {} {args:?}", program.display()),
             );
             failed.clone()
-        });
+        },
+        CHILD_HANG,
+    );
     let err = String::from_utf8(err).expect("utf-8");
     assert!(!ok, "{err}");
     assert!(err.contains(NOT_AS_ROOT), "{err}");
@@ -1744,7 +1782,7 @@ fn a_scoped_uninstall_quits_only_its_own_mug() {
         assert!(ok, "{out}{err}");
         assert_eq!(
             std::fs::read_to_string(&log).expect("asked"),
-            "help caffeine\ncaffeine startup off\ncaffeine quit own\n"
+            "help caffeine\ncaffeine startup off\ncaffeine quit own\n--version\n"
         );
         assert!(!scoped.exists(), "{out}");
         assert!(
@@ -1788,4 +1826,331 @@ fn a_decline_left_for_a_kept_bundle_goes_with_it() {
         !decline.exists(),
         "the tagged decline went with the last aterm: {out}"
     );
+}
+
+#[test]
+fn an_uninstall_keeps_a_bundle_whose_program_has_not_answered() {
+    let hang = Duration::from_millis(100);
+    // `aterm-ctl` stands for any sibling an older toolset's `aterm-cli` may have started.
+    for program in ["aterm", "aterm-cli", "aterm-ctl"] {
+        let a = Account::new(&format!("unanswered-{program}"));
+        let app = a.home().join("Applications/aterm.app");
+        bundle(&app, None);
+        let stand_in = app.join("Contents/MacOS").join(program);
+        exe(
+            &stand_in,
+            &format!(
+                "#!/bin/sh\n[ \"$1\" = --version ] && exec sleep {}\nexit 0\n",
+                aterm_spec::wait::PARKED_SECS
+            ),
+        );
+        aterm_spec::wait::first_exec(&stand_in, &[]);
+        let (ok, out, err) = a.sweep_within(hang);
+        assert!(!ok, "a kept bundle is a partial uninstall: {out}{err}");
+        assert!(app.is_dir(), "{program}: {out}{err}");
+        assert!(
+            err.contains(&format!(
+                "SKIPPED {} — kept: `{} --version` did not answer within {hang:?}, so macOS may \
+                 still be checking its first start, and removing the bundle now can stall every \
+                 program start until a restart — uninstall again in 10 minutes, or after a restart",
+                app.display(),
+                stand_in.display()
+            )),
+            "{err}"
+        );
+    }
+}
+
+#[test]
+fn an_uninstall_removes_a_bundle_whose_programs_ended_however_they_ended() {
+    let a = Account::new("answered");
+    let log = a.dir.join("asked.log");
+    let app = a.home().join("Applications/aterm.app");
+    bundle(&app, None);
+    let macos = app.join("Contents/MacOS");
+    for (program, end) in [("aterm", "exit 3"), ("aterm-cli", "kill -KILL $$")] {
+        exe(
+            &macos.join(program),
+            &format!(
+                "#!/bin/sh\necho \"{program} $*\" >>'{}'\n{end}\n",
+                log.display()
+            ),
+        );
+        aterm_spec::wait::first_exec(&macos.join(program), &["warm"]);
+    }
+    std::fs::remove_file(&log).expect("the warm-ups' lines");
+    let (ok, out, err) = a.sweep(None, true);
+    assert!(ok && app.is_dir(), "{out}{err}");
+    assert!(!log.exists(), "a dry run asks nothing: {out}");
+    for program in ["aterm", "aterm-cli"] {
+        assert!(
+            out.contains(&format!(
+                "would ask {} --version, then if it answers:",
+                macos.join(program).display()
+            )),
+            "{out}"
+        );
+    }
+    assert!(
+        out.contains(&format!("would remove app bundle: {}", app.display())),
+        "{out}"
+    );
+    let (ok, out, err) = a.sweep(None, false);
+    assert!(ok, "{out}{err}");
+    assert_eq!(
+        std::fs::read_to_string(&log).expect("asked"),
+        "aterm --version\naterm-cli --version\n"
+    );
+    assert!(!app.exists(), "{out}");
+}
+
+/// Through sudo a shell asks the program ([`ENDED`]): the run shows the program ran once it
+/// printed, or the shell wrote that its run ended, but for an `ended 126` or `ended 127` that is
+/// the shell's own failure to exec it, which shows only a kernel refusal. No such line at all is
+/// sudo's end or the shell's.
+#[test]
+fn a_run_through_sudo_shows_the_program_ran_by_its_end_or_a_kernel_refusal() {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let hang = Duration::from_millis(100);
+    let program = Path::new("/Applications/aterm.app/Contents/MacOS/aterm");
+    let p = program.display();
+    let account = RunAs::Account(501);
+    let ended = |code: i32, stdout: &str, stderr: &str| {
+        Ok(std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        })
+    };
+    // sudo's refusal, or a shell that could not fork (bash exits 128): no `ended` line.
+    for code in [1, 2, 126, 127, 128] {
+        assert!(
+            ran_unproven(
+                program,
+                account,
+                ended(code, "", "sudo: a password is required\n"),
+                hang
+            )
+            .is_some_and(|why| why.starts_with("may not have started: sudo ended")
+                && why.contains("saying `sudo: a password is required`")),
+            "{code}"
+        );
+        assert!(ran_unproven(program, RunAs::Me, ended(code, "", ""), hang).is_none());
+    }
+    // A run the shell started and saw end, whatever its status, or one that printed.
+    for status in [0, 1, 2, 75, 125, 128, 137] {
+        let out = format!("ended {status}\n");
+        assert!(
+            ran_unproven(program, account, ended(0, &out, ""), hang).is_none(),
+            "{status}"
+        );
+    }
+    for out in ["aterm 1\nended 0\n", "aterm 1\n", "partialended 126\n"] {
+        assert!(
+            ran_unproven(program, account, ended(0, out, ""), hang).is_none(),
+            "{out}"
+        );
+    }
+    // The shell could not exec it (denied, gone, a folder): no run, so nothing shown.
+    for (status, said) in [
+        (126, strerror(libc::EACCES)),
+        (126, strerror(libc::EPERM)),
+        (127, strerror(libc::ENOENT)),
+        (126, "is a directory".to_owned()),
+    ] {
+        let line = format!("{p}: {p}: {said}");
+        let out = format!("ended {status}\n");
+        assert!(
+            ran_unproven(program, account, ended(0, &out, &format!("{line}\n")), hang)
+                .is_some_and(|why| why.contains(&format!("saying `{line}`"))),
+            "{line}"
+        );
+    }
+    // A refusal of the kernel's the shell names for this program comes before macOS's check.
+    let refusals = EXEC_REFUSALS
+        .iter()
+        .map(|&code| strerror(code))
+        .chain(["cannot execute binary file".to_owned()]);
+    for why in refusals {
+        let line = format!("{p}: {p}: {why}\n");
+        assert!(
+            ran_unproven(program, account, ended(0, "ended 126\n", &line), hang).is_none(),
+            "{line}"
+        );
+        let other = line.replace("MacOS/aterm", "MacOS/atpkg");
+        assert!(
+            ran_unproven(program, account, ended(0, "ended 126\n", &other), hang).is_some(),
+            "{other}"
+        );
+    }
+}
+
+/// The atpkg an uninstall runs through sudo is sudo's own child: an exec of it the kernel
+/// refused shows in sudo's words, or its `/bin/sh`'s for ENOEXEC, and a denial does not count.
+#[test]
+fn sudo_names_a_kernel_refusal_of_the_atpkg_it_runs() {
+    let program = Path::new("/Applications/aterm.app/Contents/MacOS/atpkg");
+    let p = program.display();
+    let account = RunAs::Account(501);
+    for code in [1, 126, 127] {
+        assert!(sudo_may_not_have_run(account, Some(code)));
+        assert!(!sudo_may_not_have_run(RunAs::Me, Some(code)));
+    }
+    for code in [0, 2, 75, 125, 128] {
+        assert!(!sudo_may_not_have_run(account, Some(code)), "{code}");
+    }
+    assert!(!sudo_may_not_have_run(account, None));
+    for code in EXEC_REFUSALS {
+        let line = format!("sudo: unable to execute {p}: {}\n", strerror(code));
+        assert!(
+            sudo_refused_exec(account, Some(1), line.as_bytes(), program),
+            "{line}"
+        );
+        let other = line.replace("MacOS/atpkg", "MacOS/aterm");
+        assert!(
+            !sudo_refused_exec(account, Some(1), other.as_bytes(), program),
+            "{other}"
+        );
+    }
+    for code in [libc::EACCES, libc::EPERM] {
+        let line = format!("sudo: unable to execute {p}: {}\n", strerror(code));
+        assert!(
+            !sudo_refused_exec(account, Some(1), line.as_bytes(), program),
+            "{line}"
+        );
+    }
+    let sh = format!("/bin/sh: {p}: cannot execute binary file\n");
+    assert!(sudo_refused_exec(
+        account,
+        Some(126),
+        sh.as_bytes(),
+        program
+    ));
+    assert!(!sudo_refused_exec(
+        RunAs::Me,
+        Some(126),
+        sh.as_bytes(),
+        program
+    ));
+    assert!(!sudo_refused_exec(account, Some(0), sh.as_bytes(), program));
+}
+
+/// Through sudo the program is asked by a shell that writes once its run ends: a program that
+/// ends with nothing on standard output, or that the kernel will not start, shows it ran, and
+/// one the shell could not exec (denied, gone) does not. No startup file of the account's, as
+/// sshd's `SSH_CLIENT` has bash read, or the environment's (`BASH_ENV`) writes to it.
+#[test]
+fn the_shell_a_run_through_sudo_asks_by_writes_once_the_run_ends() {
+    let a = Account::new("ended");
+    let quiet = a.dir.join("quiet");
+    exe(&quiet, "#!/bin/sh\necho 'unknown command' >&2\nexit 1\n");
+    aterm_spec::wait::first_exec(&quiet, &[]);
+    // A Mach-O header for a CPU no Mac runs now (32-bit PowerPC): the kernel refuses its exec.
+    let refused = a.dir.join("refused");
+    let header: Vec<u8> = [0xfeed_face_u32, 18, 0, 2, 0, 0, 0]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect();
+    std::fs::write(&refused, header).expect("the file");
+    std::fs::set_permissions(&refused, std::fs::Permissions::from_mode(0o755)).expect("mode");
+    // A file it may not run, and none at all: the shell's own failure, no run.
+    let denied = a.dir.join("denied");
+    std::fs::write(&denied, "#!/bin/sh\nexit 0\n").expect("the file");
+    let gone = a.dir.join("gone");
+    let home = a.dir.join("home");
+    std::fs::create_dir_all(&home).expect("the home");
+    std::fs::write(home.join(".bashrc"), "echo bashrc\n").expect("the file");
+    let env = a.dir.join("env");
+    std::fs::write(&env, "echo env\n").expect("the file");
+    for (program, ended, ran) in [
+        (&quiet, "ended 1", true),
+        (&refused, "ended 126", true),
+        (&denied, "ended 126", false),
+        (&gone, "ended 127", false),
+    ] {
+        let out = aterm_uds::deadline::output_until(
+            aterm_uds::spawnfd::command(Path::new(SH[0]))
+                .args(&SH[1..])
+                .args(["-c", ENDED])
+                .arg(program)
+                .arg("--version")
+                .env("HOME", &home)
+                .env("SSH_CLIENT", "10.0.0.2 50000 22")
+                .env("BASH_ENV", &env)
+                .env_remove("SHLVL"),
+            std::time::Instant::now() + aterm_spec::wait::FIRST_EXEC,
+        );
+        let text = out
+            .as_ref()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned());
+        assert_eq!(text.as_deref().ok(), Some(ended), "{}", program.display());
+        assert_eq!(
+            ran_unproven(program, RunAs::Account(501), out, Duration::from_secs(1)).is_none(),
+            ran,
+            "{}",
+            program.display()
+        );
+    }
+}
+
+#[test]
+fn an_uninstall_removes_a_bundle_whose_program_the_kernel_will_not_start() {
+    let a = Account::new("unstartable");
+    let app = a.home().join("Applications/aterm.app");
+    bundle(&app, None);
+    let aterm = app.join("Contents/MacOS/aterm");
+    std::fs::create_dir_all(app.join("Contents/MacOS")).expect("the folder");
+    // A Mach-O header for a CPU no Mac runs now (32-bit PowerPC): the kernel refuses its exec.
+    let header: Vec<u8> = [0xfeed_face_u32, 18, 0, 2, 0, 0, 0]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect();
+    std::fs::write(&aterm, header).expect("the file");
+    std::fs::set_permissions(&aterm, std::fs::Permissions::from_mode(0o755)).expect("mode");
+    let (ok, out, err) = a.sweep(None, false);
+    assert!(ok, "{out}{err}");
+    assert!(!app.exists(), "a file no exec starts is in no check: {out}");
+}
+
+#[test]
+fn an_uninstall_asks_an_atpkg_whose_run_a_signal_ended() {
+    let hang = Duration::from_millis(100);
+    let hangs = format!("exec sleep {}", aterm_spec::wait::PARKED_SECS);
+    for (run, rc, answer, removed) in [
+        ("kill -KILL $$", 137, hangs.as_str(), false),
+        ("kill -KILL $$", 137, "exit 0", true),
+        ("exit 126", 126, hangs.as_str(), true),
+    ] {
+        let a = Account::new("atpkg-run");
+        let app = a.home().join("Applications/aterm.app");
+        bundle(
+            &app,
+            Some(&format!(
+                "#!/bin/sh\n[ \"$1\" = --version ] && {answer}\n[ \"$1\" = uninstall ] && {run}\n\
+                 exit 0\n"
+            )),
+        );
+        let atpkg = app.join("Contents/MacOS/atpkg");
+        aterm_spec::wait::first_exec(&atpkg, &[]);
+        let (ok, out, err) = a.sweep_within(hang);
+        assert!(!ok, "the store's removal did not finish: {out}{err}");
+        assert!(
+            err.contains(&format!(
+                "`{} uninstall --all` could not run (exit {rc})",
+                atpkg.display()
+            )),
+            "{err}"
+        );
+        assert_eq!(app.is_dir(), !removed, "{run}, then {answer}: {out}{err}");
+        assert_eq!(
+            err.contains(&format!(
+                "SKIPPED {} — kept: `{} --version` did not answer within {hang:?}",
+                app.display(),
+                atpkg.display()
+            )),
+            !removed,
+            "{err}"
+        );
+    }
 }

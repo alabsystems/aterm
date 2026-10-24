@@ -575,3 +575,59 @@ pub(crate) fn take_cell_geometry_derivations() -> usize {
     let taken = 0;
     taken
 }
+
+thread_local! {
+    static SETTINGS_PAGES_BUILT: Cell<usize> = const { Cell::new(0) };
+    static SETTINGS_LISTS_MEASURED: Cell<usize> = const { Cell::new(0) };
+    static DOCK_LAYOUTS: Cell<usize> = const { Cell::new(0) };
+    static BAR_LAYOUTS: Cell<usize> = const { Cell::new(0) };
+    static PAGE_WORK_UNCOUNTED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The settings page's work since the last [`take_settings_page_work`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SettingsPageWork {
+    /// Pages built.
+    pub(crate) pages: usize,
+    /// Lists measured with no page built.
+    pub(crate) measures: usize,
+    /// A compact window's status docks laid out.
+    pub(crate) docks: usize,
+    /// Status bars laid out.
+    pub(crate) bars: usize,
+}
+
+fn bump_page_work(counter: &'static std::thread::LocalKey<Cell<usize>>) {
+    if !PAGE_WORK_UNCOUNTED.with(Cell::get) {
+        bump(counter);
+    }
+}
+
+/// Run `f`, a check only test builds make, with the settings page's work in it uncounted.
+pub(crate) fn page_work_uncounted<R>(f: impl FnOnce() -> R) -> R {
+    let was = PAGE_WORK_UNCOUNTED.with(|off| off.replace(true));
+    let out = f();
+    PAGE_WORK_UNCOUNTED.with(|off| off.set(was));
+    out
+}
+
+pub(crate) fn settings_page_built() {
+    bump_page_work(&SETTINGS_PAGES_BUILT);
+}
+pub(crate) fn settings_list_measured() {
+    bump_page_work(&SETTINGS_LISTS_MEASURED);
+}
+pub(crate) fn dock_laid_out() {
+    bump_page_work(&DOCK_LAYOUTS);
+}
+pub(crate) fn bar_laid_out() {
+    bump_page_work(&BAR_LAYOUTS);
+}
+pub(crate) fn take_settings_page_work() -> SettingsPageWork {
+    SettingsPageWork {
+        pages: take(&SETTINGS_PAGES_BUILT),
+        measures: take(&SETTINGS_LISTS_MEASURED),
+        docks: take(&DOCK_LAYOUTS),
+        bars: take(&BAR_LAYOUTS),
+    }
+}

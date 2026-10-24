@@ -3092,11 +3092,12 @@ impl crate::App {
             .by_local(session)
             .map(|h| h.sid.as_str().to_string());
         let input = format!(
-            "{input} {} {} {} {}",
+            "{input} {} {} {} {} {}",
             crate::disk_board::status_fields(session, reported_cwd.as_deref()),
             self.status_job_fields(session),
             crate::program_check_watch::status_fields(),
-            crate::occupancy_host::status_fields(occupancy_sid.as_deref())
+            crate::occupancy_host::status_fields(occupancy_sid.as_deref()),
+            crate::occupancy_wakes::status_fields(occupancy_sid.as_deref())
         );
         let (
             agent,

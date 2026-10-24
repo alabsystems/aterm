@@ -462,4 +462,20 @@ fn reads_agy_subagent_panel_rows_with_unwrapped_name_and_activity_clock() {
     assert_eq!(bare.name_hash, text_hash("Probe"));
     assert_eq!(bare.activity_hash, text_hash("Working"));
     assert_eq!(bare.elapsed, None);
+
+    let idle = parse("  ● Agent(self: Probe)  Idle");
+    assert_eq!(idle.elapsed.map(|e| e.1), Some(Elapsed::Idle));
+
+    let approval = parse("  ● Agent(self: Verifier)  Waiting for approval · 14s");
+    assert_eq!(
+        approval.elapsed.map(|e| e.1),
+        Some(Elapsed::AwaitingApproval)
+    );
+
+    let working_5s = parse("  ● Agent(self: Probe)  Working · 5s");
+    let working_25s = parse("  ● Agent(self: Probe)  Working · 25s");
+    assert_ne!(
+        working_5s.activity_hash, working_25s.activity_hash,
+        "ticking model clock refreshes activity_hash across 10s buckets"
+    );
 }

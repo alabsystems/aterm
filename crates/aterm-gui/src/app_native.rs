@@ -2888,6 +2888,9 @@ impl App {
         for effect in outcome.effects {
             self.execute_native_effect(wid, instance, view, effect)?;
         }
+        if kind == crate::native_app::AppKind::SystemState {
+            self.drain_system_state_actions();
+        }
         self.refresh_native_presentation(wid, instance, view);
         if outcome.result == EventResult::Handled {
             self.note_native_handled_dispatch(wid);
@@ -3603,7 +3606,7 @@ impl App {
             .native_runtime
             .view_state(view)
             .and_then(|state| state.common().last_focus.clone());
-        let (focus_order, next, passes_list) = {
+        let key = {
             let compiled = self.current_native_ui(wid)?;
             let focus_order = &compiled.focus_order;
             if focus_order.is_empty() {
@@ -3666,30 +3669,38 @@ impl App {
                         }
                     })
                 });
-            (focus_order.clone(), next, passes_list)
+            // Settings keeps a plan of its list; any other page's list that
+            // holds every row says its stops in the compiled tree
+            // ([`crate::native_ui::CompiledUi::list_stops`]).
+            let settings = match self.native_runtime.view_state(view) {
+                Some(crate::native_app::AppViewState::Settings(state)) => Some(&**state),
+                _ => None,
+            };
+            let mut key = focus_order[next].clone();
+            if passes_list
+                && let Some(target) = match settings {
+                    Some(state) => state.tab_into_unshown_list(!backwards, focus_order),
+                    None => compiled.tab_into_unshown_list(!backwards),
+                }
+            {
+                key = target;
+            }
+            if let Some(current) = current.as_ref()
+                && let Some(beyond) = match settings {
+                    Some(state) => state.tab_past_screen(current, &key, !backwards, focus_order),
+                    None => compiled.tab_past_screen(current, &key, !backwards),
+                }
+            {
+                key = beyond;
+            }
+            if let Some(state) = settings
+                && let Some(target) =
+                    state.tab_past_options(current.as_ref(), &key, !backwards, focus_order)
+            {
+                key = target;
+            }
+            key
         };
-        let mut key = focus_order[next].clone();
-        if passes_list
-            && let Some(crate::native_app::AppViewState::Settings(state)) =
-                self.native_runtime.view_state(view)
-            && let Some(target) = state.tab_into_unshown_list(!backwards, &focus_order)
-        {
-            key = target;
-        }
-        if let Some(current) = current.as_ref()
-            && let Some(crate::native_app::AppViewState::Settings(state)) =
-                self.native_runtime.view_state(view)
-            && let Some(beyond) = state.tab_past_screen(current, &key, !backwards, &focus_order)
-        {
-            key = beyond;
-        }
-        if let Some(crate::native_app::AppViewState::Settings(state)) =
-            self.native_runtime.view_state(view)
-            && let Some(target) =
-                state.tab_past_options(current.as_ref(), &key, !backwards, &focus_order)
-        {
-            key = target;
-        }
         self.invalidate_native_view_cache(wid, view, DamageRegion::All);
         let outcome = self
             .native_runtime
@@ -9642,12 +9653,6 @@ impl App {
         )
     )]
     fn native_update_close_preflight(&self) -> (ClosePreflight, Option<NativeUpdateSafetyToken>) {
-        if self.system_state_cancel_pending() {
-            return (
-                ClosePreflight::Blocked(vec!["Cancel has not been saved".into()]),
-                None,
-            );
-        }
         let documents = self
             .view_store
             .iter()

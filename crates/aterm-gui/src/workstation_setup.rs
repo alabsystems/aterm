@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Cancellable foreground-only countdown for first-launch macOS setup.
+//! The first-launch Mac setup's offer, which System State answers once it is on screen.
 
 use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::time::{Duration, Instant};
@@ -11,25 +11,25 @@ use aterm_window::event_loop::EventLoopProxy;
 
 use crate::{App, Wake};
 
-/// The result of the visible first-launch countdown.
+/// System State's answer to the first-launch offer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkstationSetupDecision {
-    /// Apply was selected, or thirty foreground seconds elapsed, with these boxes checked.
+    /// Begin with this plan: the page applied the offer once it was presented
+    /// in an active window, or a person changed a group first.
     Begin(Plan),
-    /// The person cancelled setup before it began.
-    Cancel,
     /// This process has no live window, or its window closed before a decision.
     Unavailable,
 }
 
-/// The review's decision and the optional, ephemeral vault password.
+/// The page's decision and the optional, ephemeral vault password.
 #[derive(Debug)]
 pub struct SetupAnswer {
     pub decision: WorkstationSetupDecision,
     pub password: Option<aterm_secrets::SecretBytes>,
     pub receipt: Option<crate::InitialSetupApplyReceipt>,
-    pub cancel_receipt: Option<crate::InitialSetupCancelReceipt>,
-    /// The vault field no longer reads as System State showed it.
+    /// The plan is a group choice (or a Join) made on the page, not the plan as it stood (the first-run offer applied, or Set up now): it is the chooser's, never the provisional plan aterm chose by itself (§3.5).
+    pub chosen: bool,
+    /// A Join: the plan names the vault the person typed, which moves the Mac.
     pub vault_typed: bool,
 }
 
@@ -39,7 +39,7 @@ impl From<WorkstationSetupDecision> for SetupAnswer {
             decision,
             password: None,
             receipt: None,
-            cancel_receipt: None,
+            chosen: false,
             vault_typed: false,
         }
     }
@@ -55,28 +55,8 @@ pub(crate) fn send_setup_wake(wake: Wake) -> bool {
         .is_some_and(|proxy| proxy.send_event(wake).is_ok())
 }
 
-/// Wait on a worker thread for the Mac setup countdown ([`await_initial_setup_countdown_while`]).
-pub fn await_workstation_setup_countdown(initial: Selection) -> WorkstationSetupDecision {
-    await_workstation_setup_countdown_while(initial, || false)
-}
-
-/// Withdraw the offer if another process finishes setup while it is displayed.
-pub fn await_workstation_setup_countdown_while(
-    initial: Selection,
-    finished: impl FnMut() -> bool,
-) -> WorkstationSetupDecision {
-    await_initial_setup_countdown_while(
-        Plan {
-            selection: initial,
-            ..Plan::default()
-        },
-        finished,
-    )
-    .decision
-}
-
-/// Wait for the unified setup review.
-pub fn await_initial_setup_countdown_while(
+/// Wait on a worker thread for System State's answer to the offer of `initial`.
+pub fn await_initial_setup_answer_while(
     initial: Plan,
     finished: impl FnMut() -> bool,
 ) -> SetupAnswer {
@@ -141,7 +121,7 @@ impl Request {
             reply: Arc::new(Mutex::new(Some(reply))),
         }
     }
-    /// The native callback and expiry compete for this single decision.
+    /// The page's answer, a closing window and a withdrawn offer compete for this single decision.
     pub(crate) fn finish(&self, decision: WorkstationSetupDecision) {
         self.finish_answer(decision.into());
     }
@@ -157,134 +137,64 @@ impl Request {
     pub(crate) fn pending(&self) -> bool {
         self.reply.lock().is_ok_and(|reply| reply.is_some())
     }
-
-    pub(crate) fn same_offer(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.reply, &other.reply)
-    }
 }
 
-const COUNTDOWN: Duration = Duration::from_secs(30);
-
-/// Only intervals during which the sheet is visible in the active application count.
-#[derive(Debug)]
-pub(crate) struct Clock {
-    remaining: Duration,
-    active_since: Option<Instant>,
-    modal_epoch: u64,
-    interacted: bool,
+/// Who the window's own admission of a setup plan came from
+/// (`docs/DESIGN-system-state-2026-10-21.md` §6, "The standing yes").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AdmittedBy {
+    /// The page's own automatic answer to the startup offer: the first
+    /// launch's admission, with nobody's gesture in it.
+    Window,
+    /// A person's press on the page: a person touched it and no control
+    /// client's gesture came since the page's previous action.
+    Person,
 }
 
-impl Default for Clock {
-    fn default() -> Self {
-        Self {
-            remaining: COUNTDOWN,
-            active_since: None,
-            modal_epoch: modal_epoch(),
-            interacted: false,
-        }
-    }
+/// THE WINDOW'S OWN ADMISSION: the gate that reads who touched System State
+/// and which revision the window's own Apply admitted ([`PermissionGate`]), and
+/// the token it alone mints ([`AdmittedAccess`]), live in a leaf module of
+/// their own, whose private fields nothing else in the crate can reach: not
+/// this module, nor its tests (the aterm-census guard `devtools-door` holds the
+/// leaf to that shape).
+#[path = "workstation_setup_gate.rs"]
+mod permission_gate;
+pub(crate) use permission_gate::AdmittedAccess;
+use permission_gate::PermissionGate;
+
+/// Whose gestures reached System State since its previous action was taken
+/// ([`PermissionGate::take_press`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PagePress {
+    /// A control client's gesture came (anywhere): never a person's press.
+    Controller,
+    /// A person touched the page, and no control client's gesture came.
+    Person,
+    /// Nobody touched it: the page acted by itself.
+    Nobody,
 }
 
-impl Clock {
-    pub(crate) fn tick(&mut self, now: Instant, active: bool) -> Duration {
-        self.tick_at_epoch(now, active, modal_epoch())
-    }
-
-    fn tick_at_epoch(&mut self, now: Instant, active: bool, modal_epoch: u64) -> Duration {
-        if self.interacted {
-            return self.remaining;
-        }
-        if self.modal_epoch != modal_epoch {
-            self.active_since = None;
-            self.modal_epoch = modal_epoch;
-        }
-        if let Some(since) = self.active_since.take() {
-            self.remaining = self
-                .remaining
-                .saturating_sub(now.saturating_duration_since(since));
-        }
-        if active {
-            self.active_since = Some(now);
-        }
-        self.remaining
-    }
-
-    pub(crate) fn seconds(&self) -> u64 {
-        self.remaining.as_secs() + u64::from(self.remaining.subsec_nanos() != 0)
-    }
-
-    pub(crate) const fn interact(&mut self) {
-        self.interacted = true;
-        self.active_since = None;
-    }
-
-    pub(crate) const fn expired(&self) -> bool {
-        !self.interacted && self.remaining.is_zero()
-    }
-
-    pub(crate) const fn interacted(&self) -> bool {
-        self.interacted
-    }
-}
-
-fn modal_epoch() -> u64 {
-    #[cfg(any(target_os = "macos", test))]
-    {
-        crate::watchdog::modal_epoch()
-    }
-    #[cfg(not(any(target_os = "macos", test)))]
-    {
-        0
-    }
-}
-
-#[derive(Default)]
-enum PermissionHold {
-    #[default]
-    None,
-    Decision,
-    FreshStatus,
-}
-
-#[derive(Default)]
-struct PermissionGate {
-    policy: Option<crate::InitialSetupPermissionPolicy>,
-    latest_revision: u64,
-    hold: PermissionHold,
-}
-
-impl PermissionGate {
-    fn allowed(&self) -> bool {
-        matches!(self.hold, PermissionHold::None)
-            && self.policy.is_some_and(|policy| policy.allowed)
-    }
-
-    const fn hold(&mut self) {
-        self.hold = PermissionHold::Decision;
-    }
-
-    fn accepted(&mut self) {
-        self.await_fresh_status();
-    }
-
-    const fn await_fresh_status(&mut self) {
-        self.hold = PermissionHold::FreshStatus;
-    }
-
-    fn observe(&mut self, policy: Option<crate::InitialSetupPermissionPolicy>) {
-        let Some(policy) = policy else {
-            self.policy = None;
-            return;
-        };
-        if policy.allowed && policy.revision < self.latest_revision {
-            return;
-        }
-        self.latest_revision = self.latest_revision.max(policy.revision);
-        self.policy = Some(policy);
-        if matches!(self.hold, PermissionHold::FreshStatus) {
-            self.hold = PermissionHold::None;
-        }
-    }
+/// What a real gate gives the debugger step's Tier-1 rig
+/// (`debugger_access::conformance`, the model's `Admitted`): the gate takes an
+/// Apply — the page's own answer to the startup offer (`window`), or a control
+/// client's — and the fresh status naming revision 1 with its Permissions group
+/// admitted, and answers the standing yes it then holds.
+#[cfg(test)]
+pub(crate) fn gate_admission_for_test(window: bool) -> Option<AdmittedAccess> {
+    let mut gate = PermissionGate::default();
+    gate.hold();
+    let press = if window {
+        PagePress::Nobody
+    } else {
+        PagePress::Controller
+    };
+    gate.apply_started(true, press);
+    gate.accepted();
+    gate.observe(Some(crate::InitialSetupPermissionPolicy {
+        revision: 1,
+        allowed: true,
+    }));
+    gate.admitted(false)
 }
 
 #[derive(Default)]
@@ -349,11 +259,15 @@ impl Host {
     pub(crate) fn pending(&self) -> bool {
         self.request.as_ref().is_some_and(Request::pending)
     }
-    pub(crate) const fn unified(&self) -> bool {
-        self.unified
-    }
     pub(crate) fn suppresses_permissions(&self) -> bool {
         self.unified && !self.permissions.allowed()
+    }
+
+    /// The approved setup revision whose access steps may run
+    /// (`system_state_access`): the admitted plan's revision while the gate
+    /// allows Permissions, else none.
+    pub(crate) fn access_revision(&self) -> Option<u64> {
+        self.permissions.access_revision()
     }
 
     fn start(&mut self, now: Instant) {
@@ -388,7 +302,7 @@ const fn preview_mode(requested: bool, headless: bool, private: bool) -> Preview
     }
 }
 
-/// Exercise the real countdown with an inert worker.
+/// Exercise the real offer with an inert worker.
 fn preview_subset() -> Selection {
     use aterm_types::macos_setup::Setting;
     let mut selected = Selection::all();
@@ -411,34 +325,25 @@ fn start_preview() -> bool {
             } else {
                 Selection::all()
             };
-            let mut answer = await_initial_setup_countdown_while(initial.into(), || false);
+            let mut answer = await_initial_setup_answer_while(initial.into(), || false);
             if matches!(answer.decision, WorkstationSetupDecision::Begin(_))
                 && let Some(receipt) = answer.receipt.take()
             {
                 receipt.accept();
             }
-            let cancel_receipt = answer.cancel_receipt.take();
-            let saved = if let Some(root) = aterm_types::dirs::state_dir() {
+            if let Some(root) = aterm_types::dirs::state_dir() {
                 let word = match answer.decision {
                     WorkstationSetupDecision::Begin(plan) => {
                         format!("begin\nselection_bits={}\n", plan.selection.bits())
                     }
-                    WorkstationSetupDecision::Cancel => "cancel\n".to_owned(),
                     WorkstationSetupDecision::Unavailable => "unavailable\n".to_owned(),
                 };
                 let result = format!("{word}elapsed_ms={}\n", started.elapsed().as_millis());
-                match std::fs::write(root.join("workstation-setup-preview-result"), result) {
-                    Ok(()) => true,
-                    Err(error) => {
-                        aterm_log::warn!("Mac setup preview could not write its result: {error}");
-                        false
-                    }
+                if let Err(error) =
+                    std::fs::write(root.join("workstation-setup-preview-result"), result)
+                {
+                    aterm_log::warn!("Mac setup preview could not write its result: {error}");
                 }
-            } else {
-                false
-            };
-            if saved && let Some(receipt) = cancel_receipt {
-                receipt.complete();
             }
         },
     )
@@ -502,7 +407,91 @@ impl App {
         &mut self,
         policy: Option<crate::InitialSetupPermissionPolicy>,
     ) {
-        self.workstation_setup.permissions.observe(policy);
+        if self.workstation_setup.permissions.observe(policy)
+            && let Some(policy) = policy
+        {
+            // The window's own admission: the debugger's step, parked for want
+            // of one, or over for an earlier revision, looks again (design §6:
+            // a new approval asks again; once per Mac, so a Mac that answered
+            // has the new revision's row settled with no second dialog). While
+            // a change System State started is under way, macOS's dialog
+            // perhaps unanswered, the new revision joins that change instead:
+            // handed now, its outcome when it ends.
+            if self.debugger_launch.started().is_some() && self.debugger_change.under_way() {
+                self.debugger_launch.join_started(policy.revision);
+            } else {
+                self.debugger_launch.unpark(policy.revision);
+            }
+        }
+    }
+
+    /// A gesture reached the System State page (before its reducer runs). A
+    /// control client's is never a person's press; the App's count of those
+    /// ([`crate::app_take_over::AgentsState::controller_gestures`]) is read
+    /// when the page's action is taken, so a path into the page that skips
+    /// this call still cannot pass for a person.
+    pub(crate) fn note_system_state_touch(&mut self) {
+        let controller = self.person_gesture_refused();
+        self.workstation_setup.permissions.note_touch(controller);
+    }
+
+    /// Whose gestures led to the page's action being handled now (design §6):
+    /// a person's press only when a person touched the page and no control
+    /// client's gesture came since the page's previous action. Call it once
+    /// per action the page queued, as that action is taken: a row's
+    /// `Turn On…` passes `== PagePress::Person` as its `by_person`. A key an
+    /// `hwkey` burst posted counts as a control client's gesture too
+    /// (`hwkey::posted_keys`): its real `NSEvent` carries no gesture mark, and
+    /// one already queued as the page came to the front reaches it before the
+    /// burst stops.
+    pub(crate) fn take_system_state_press(&mut self) -> PagePress {
+        let controller_gestures = self
+            .agents
+            .controller_gestures
+            .wrapping_add(crate::hwkey::posted_keys());
+        self.workstation_setup
+            .permissions
+            .take_press(controller_gestures)
+    }
+
+    /// The page's Apply is being handled, with the page's own word on whose
+    /// it is (`admission`). Its acceptance becomes the window's own admission
+    /// only for a person's press that the gate's evidence agrees with (no
+    /// control client's gesture since the page's previous action), or the
+    /// page's own answer to the startup offer, which no gesture makes.
+    pub(crate) fn note_system_state_apply(&mut self, admission: crate::system_state::Admission) {
+        use crate::system_state::Admission;
+        let page_touched_by_controller = self.workstation_setup.permissions.controller_touched();
+        let press = self.take_system_state_press();
+        let (answers_offer, press) = match admission {
+            // The page answers the offer by itself on its first presented
+            // tick, so a control client's gesture elsewhere in the app does not
+            // taint it; one that reached the page itself does.
+            Admission::Automatic if page_touched_by_controller => (true, PagePress::Controller),
+            Admission::Automatic => (true, PagePress::Nobody),
+            Admission::Person if press == PagePress::Person => (false, PagePress::Person),
+            Admission::Person | Admission::Client => (false, PagePress::Controller),
+        };
+        self.workstation_setup
+            .permissions
+            .apply_started(answers_offer, press);
+    }
+
+    /// THE STANDING YES for an access step the window starts by itself: the
+    /// plan with its Permissions group admitted, while that plan is the
+    /// window's own admission (design §6). `None` otherwise.
+    pub(crate) fn admitted_access(&self) -> Option<AdmittedAccess> {
+        self.workstation_setup.permissions.admitted(false)
+    }
+
+    /// The yes for a person's press on a Permissions row's own button
+    /// (`Turn On…`), while a plan with its Permissions group is admitted.
+    /// `by_person` false — a control client's `act` or `key` — is never one.
+    pub(crate) fn admitted_by_press(&self, by_person: bool) -> Option<AdmittedAccess> {
+        if !by_person {
+            return None;
+        }
+        self.workstation_setup.permissions.admitted(true)
     }
 
     pub(crate) fn tick_workstation_setup(&mut self, now: Instant) {
@@ -521,6 +510,8 @@ impl App {
             self.first_present_done,
             self.incoming_handoff_pending,
         ) {
+            // No setup here; a dev scenario's page still runs (lab captures).
+            self.tick_system_state_fixture(now);
             return;
         }
         if !self.workstation_setup.proxy_registered {
@@ -563,7 +554,7 @@ mod tests {
         gate.observe(allowed);
         assert!(
             !gate.allowed(),
-            "an old durable plan cannot undo a local Cancel or pending Apply"
+            "an old durable plan cannot undo a pending Apply"
         );
         gate.accepted();
         assert!(
@@ -580,6 +571,179 @@ mod tests {
         }));
         gate.observe(allowed);
         assert!(!gate.allowed(), "an older run cannot re-enable guidance");
+    }
+
+    fn policy(revision: u64, allowed: bool) -> Option<crate::InitialSetupPermissionPolicy> {
+        Some(crate::InitialSetupPermissionPolicy { revision, allowed })
+    }
+
+    /// One Apply through the gate as the host runs it: the hold, who it came
+    /// from, the receipt, and the fresh status naming `revision`. Returns
+    /// whether that status established the window's own admission.
+    fn apply(gate: &mut PermissionGate, offer: bool, press: PagePress, revision: u64) -> bool {
+        gate.hold();
+        gate.apply_started(offer, press);
+        gate.accepted();
+        gate.observe(policy(revision, true))
+    }
+
+    /// THE STANDING YES (design §6) is the window's own admission only: the
+    /// page's automatic answer to the startup offer, with nobody's gesture in
+    /// it, or a person's press on the page — and only for the revision that
+    /// admission named, while that plan stands.
+    #[test]
+    fn the_standing_yes_is_the_windows_own_admission_of_the_plan_in_force() {
+        let mut gate = PermissionGate::default();
+        assert!(apply(&mut gate, true, PagePress::Nobody, 3));
+        let yes = gate
+            .admitted(false)
+            .expect("the window's first automatic one");
+        assert_eq!((yes.revision(), yes.by()), (3, AdmittedBy::Window));
+
+        let mut gate = PermissionGate::default();
+        assert!(apply(&mut gate, false, PagePress::Person, 4));
+        let yes = gate.admitted(false).expect("a person's press on the page");
+        assert_eq!((yes.revision(), yes.by()), (4, AdmittedBy::Person));
+
+        // A newer status naming another plan, a held intent, a plan withdrawn
+        // or an unreadable status each end it.
+        gate.observe(policy(5, true));
+        assert!(
+            gate.allowed() && gate.admitted(false).is_none(),
+            "another plan"
+        );
+        assert!(apply(&mut gate, true, PagePress::Nobody, 6));
+        gate.hold();
+        assert!(gate.admitted(false).is_none(), "a newer intent held");
+        gate.accepted();
+        gate.observe(policy(6, true));
+        assert!(gate.admitted(false).is_none(), "an Apply of nobody's own");
+        assert!(apply(&mut gate, true, PagePress::Nobody, 7));
+        gate.observe(policy(7, false));
+        assert!(gate.admitted(false).is_none(), "Permissions not admitted");
+        assert!(apply(&mut gate, true, PagePress::Nobody, 8));
+        gate.observe(None);
+        assert!(gate.admitted(false).is_none(), "an unreadable status");
+    }
+
+    /// NEVER FROM A CONTROL CLIENT, A STATUS POLL OR A HAND-EDITED RECORD: a
+    /// plan admitted by a control client's Apply, or one a status names that no
+    /// Apply of this window admitted (a poll, a record edited by hand), allows
+    /// the page's guidance but is no standing yes. A person's press on a row's
+    /// own button is one while the plan stands; a control client's is never one
+    /// (`App::admitted_by_press`).
+    #[test]
+    fn no_control_client_status_poll_or_record_mints_the_standing_yes() {
+        let mut gate = PermissionGate::default();
+        assert!(!apply(&mut gate, true, PagePress::Controller, 2));
+        assert!(gate.allowed(), "the plan is admitted");
+        assert!(gate.admitted(false).is_none(), "a control client's Apply");
+
+        let mut gate = PermissionGate::default();
+        assert!(!gate.observe(policy(2, true)), "a status poll");
+        assert!(gate.allowed() && gate.admitted(false).is_none());
+        let pressed = gate
+            .admitted(true)
+            .expect("a person's press while it stands");
+        assert_eq!((pressed.revision(), pressed.by()), (2, AdmittedBy::Person));
+        gate.observe(policy(3, false));
+        assert!(
+            gate.admitted(true).is_none(),
+            "not while Permissions is out"
+        );
+
+        let mut gate = PermissionGate::default();
+        assert!(!apply(&mut gate, false, PagePress::Nobody, 2));
+        assert!(
+            gate.admitted(false).is_none(),
+            "an Apply that answers no offer"
+        );
+    }
+
+    /// Whose gesture an action came from: a control client's gesture anywhere
+    /// since the page's previous action, or one on the page itself, taints it,
+    /// whatever else touched the page; a person's touch alone is a person's
+    /// press; nothing is nobody's. Each take starts the evidence again.
+    #[test]
+    fn a_control_clients_gesture_is_never_a_persons_press() {
+        let mut gate = PermissionGate::default();
+        assert_eq!(gate.take_press(0), PagePress::Nobody);
+        gate.note_touch(false);
+        assert_eq!(gate.take_press(0), PagePress::Person);
+        assert_eq!(gate.take_press(0), PagePress::Nobody, "taken once");
+        gate.note_touch(false);
+        assert_eq!(gate.take_press(1), PagePress::Controller, "the count moved");
+        gate.note_touch(true);
+        assert_eq!(
+            gate.take_press(1),
+            PagePress::Controller,
+            "a controller's touch on the page"
+        );
+        assert_eq!(gate.take_press(1), PagePress::Nobody, "taken once");
+        assert_eq!(gate.take_press(u64::MAX), PagePress::Controller);
+        assert_eq!(gate.take_press(u64::MAX), PagePress::Nobody);
+    }
+
+    /// THE PAGE'S OWN AUTOMATIC ANSWER, END TO END THROUGH THE HOST: the startup
+    /// offer on System State, its first frame presented, its first tick in an
+    /// active window with nobody touching it — the page queues its Apply, the
+    /// host answers the offer (`App::run_system_state_action` →
+    /// `App::note_system_state_apply` with the offer pending and no gesture),
+    /// the worker accepts it, and the fresh status naming the plan with its
+    /// Permissions group makes the window's own admission (`AdmittedBy::Window`),
+    /// the standing yes the debugger step spends. It holds when a control
+    /// client drove another tab meanwhile: agents at work elsewhere never cost a
+    /// new Mac its yes. CONTROL: a control client's gesture on the page itself
+    /// before that answer leaves the same plan admitted and no standing yes.
+    /// Any rework of the automatic run must keep this path.
+    #[test]
+    fn the_pages_automatic_answer_is_the_windows_own_admission() {
+        for (elsewhere, on_page) in [(false, false), (true, false), (false, true)] {
+            let mut app = App::headless_for_test();
+            app.headless = false;
+            let wid = crate::WindowId(0);
+            app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
+            let (send, receive) = std::sync::mpsc::channel();
+            app.offer_system_state(Request::new(Plan::default(), send));
+            assert!(app.prepare_native_input_scratch(wid));
+            assert!(app.commit_glassless_native_frame(wid), "the offer on glass");
+            if elsewhere {
+                app.with_gesture_source(true, |_| ());
+            }
+            if on_page {
+                app.with_gesture_source(true, App::note_system_state_touch);
+            }
+            let start = Instant::now();
+            app.tick_system_state(start);
+            let mut answer = receive
+                .try_recv()
+                .expect("the page answered the offer by itself");
+            assert!(matches!(
+                answer.decision,
+                WorkstationSetupDecision::Begin(_)
+            ));
+            answer.receipt.take().expect("an Apply's receipt").accept();
+            app.tick_system_state(start + Duration::from_secs(1));
+            app.observe_initial_setup_permissions(policy(3, true));
+            let admitted = app.admitted_access().map(|yes| (yes.revision(), yes.by()));
+            if on_page {
+                assert_eq!(admitted, None, "a control client touched the page first");
+                assert!(
+                    app.workstation_setup.permissions.allowed(),
+                    "the plan stands"
+                );
+            } else {
+                assert_eq!(admitted, Some((3, AdmittedBy::Window)));
+            }
+        }
+    }
+
+    /// The rig's admission comes from a real gate: the window's own answer
+    /// holds one, a control client's holds none.
+    #[test]
+    fn the_rigs_admission_is_the_gates() {
+        assert!(gate_admission_for_test(true).is_some());
+        assert!(gate_admission_for_test(false).is_none());
     }
 
     #[test]
@@ -605,69 +769,6 @@ mod tests {
         assert_eq!(preview_mode(true, true, true), PreviewMode::Refused);
         assert_eq!(preview_mode(true, false, false), PreviewMode::Refused);
         assert_eq!(preview_mode(false, false, false), PreviewMode::Ordinary);
-    }
-
-    #[test]
-    fn countdown_needs_thirty_visible_seconds_and_pauses_in_background() {
-        let start = Instant::now();
-        let mut clock = Clock::default();
-        clock.tick(start, true);
-        assert_eq!(
-            clock.tick(start + Duration::from_secs(12), false),
-            Duration::from_secs(18)
-        );
-        assert_eq!(
-            clock.tick(start + Duration::from_secs(100), true),
-            Duration::from_secs(18)
-        );
-        assert_eq!(
-            clock.tick(start + Duration::from_millis(117_999), true),
-            Duration::from_millis(1)
-        );
-        assert_eq!(clock.seconds(), 1);
-        assert_eq!(
-            clock.tick(start + Duration::from_secs(118), true),
-            Duration::ZERO
-        );
-    }
-
-    #[test]
-    fn fresh_interaction_permanently_stops_the_offer_even_after_long_waits() {
-        let start = Instant::now();
-        let mut clock = Clock::default();
-        clock.tick(start, true);
-        clock.tick(start + Duration::from_secs(4), true);
-        clock.interact();
-        assert_eq!(
-            clock.tick(start + Duration::from_secs(90), true),
-            Duration::from_secs(26)
-        );
-        clock.tick(start + Duration::from_secs(100), false);
-        clock.tick(start + Duration::from_secs(200), true);
-        assert!(!clock.expired());
-    }
-
-    #[test]
-    fn a_blocking_native_modal_cannot_consume_the_cancellation_interval() {
-        let start = Instant::now();
-        let mut clock = Clock::default();
-        clock.tick_at_epoch(start, true, 10);
-        assert_eq!(
-            clock.tick_at_epoch(start + Duration::from_secs(2), true, 10),
-            Duration::from_secs(28)
-        );
-        assert_eq!(
-            clock.tick_at_epoch(start + Duration::from_secs(42), true, 12),
-            Duration::from_secs(28)
-        );
-        assert_eq!(
-            clock.tick_at_epoch(start + Duration::from_secs(69), true, 12),
-            Duration::from_secs(1)
-        );
-        assert_eq!(
-            clock.tick_at_epoch(start + Duration::from_secs(70), true, 12),
-            Duration::ZERO
-        );
     }
 
     #[test]
@@ -725,28 +826,28 @@ mod tests {
     }
 
     #[test]
-    fn cancel_delivered_at_expiry_cannot_be_replaced_by_begin() {
+    fn a_closed_window_cannot_be_overtaken_by_a_late_choice() {
         let (send, receive) = mpsc::channel();
         let request = Request::new(Selection::all(), send);
-        request.finish(WorkstationSetupDecision::Cancel);
+        request.finish(WorkstationSetupDecision::Unavailable);
         request.finish(WorkstationSetupDecision::Begin(Selection::all().into()));
         assert_eq!(
             receive
                 .recv_timeout(Duration::from_secs(60))
                 .unwrap()
                 .decision,
-            WorkstationSetupDecision::Cancel
+            WorkstationSetupDecision::Unavailable
         );
         assert!(!request.pending());
     }
 
     #[test]
-    fn apply_now_cannot_be_replaced_by_later_cancel_or_expiry() {
+    fn the_first_choice_cannot_be_replaced_by_a_closing_window_or_another_choice() {
         let (send, receive) = mpsc::channel();
         let request = Request::new(Selection::all(), send);
         let chosen = preview_subset();
         assert!(request.finish_answer(WorkstationSetupDecision::Begin(chosen.into()).into()));
-        assert!(!request.finish_answer(WorkstationSetupDecision::Cancel.into()));
+        assert!(!request.finish_answer(WorkstationSetupDecision::Unavailable.into()));
         assert!(
             !request
                 .finish_answer(WorkstationSetupDecision::Begin(Selection::none().into()).into())

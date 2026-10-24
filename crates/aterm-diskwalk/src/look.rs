@@ -179,7 +179,7 @@ pub fn build_dir_above(start: &Path, policy: &Policy) -> Option<PathBuf> {
 }
 
 fn tested(dir: &Path, policy: &Policy) -> Result<PathBuf, Refusal> {
-    let canon = canonical(dir).ok_or(Refusal::Relative)?;
+    let canon = crate::walk::walk_path(dir)?;
     match refuse_look(Some(dir), &canon, &policy.mounts, &policy.deny) {
         Some(why) => Err(why),
         None => Ok(canon),

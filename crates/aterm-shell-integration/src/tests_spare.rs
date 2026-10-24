@@ -255,12 +255,6 @@ fn spare_zsh() -> &'static str {
     live_pty_zsh()
 }
 
-/// A bash and a pty: COULD NOT RUN where the host cannot allocate a pty.
-#[cfg(unix)]
-fn spare_bash() -> &'static str {
-    bash_shell()
-}
-
 /// `${BASH_VERSINFO[0]}` of `bash`: the spare hold's SIGWINCH negative control holds only where a signal fails the hold's FIFO open (bash 3.2).
 #[cfg(unix)]
 fn bash_major_version(bash: &str) -> u32 {
@@ -274,20 +268,25 @@ fn bash_major_version(bash: &str) -> u32 {
         .unwrap_or_else(|_| panic!("{bash}: BASH_VERSINFO[0] read {text:?}"))
 }
 
-/// The shells under test with the startup file whose run each reports.
+/// The shells under test with the startup file whose run each reports: zsh, then every bash ([`ShellLanes::bashes`]).
 #[cfg(unix)]
-fn spare_shells() -> Vec<(ShellType, &'static str, &'static str)> {
-    vec![
-        (ShellType::Zsh, spare_zsh(), ".zshenv"),
-        (ShellType::Bash, spare_bash(), ".bashrc"),
-    ]
+fn spare_shells(shells: &mut ShellLanes) -> Vec<(ShellType, &'static str, &'static str)> {
+    let mut lanes = vec![(ShellType::Zsh, spare_zsh(), ".zshenv")];
+    lanes.extend(
+        shells
+            .bashes()
+            .into_iter()
+            .map(|bash| (ShellType::Bash, bash, ".bashrc")),
+    );
+    lanes
 }
 
 /// S1, the PARKED hold. With the FIFO present no startup file runs until a line arrives: `go` runs them in view, then the shell signs `cold` and its first prompt; `run` runs them unseen, then it signs `spare` and draws no prompt until `go`. What was typed meanwhile waits in the tty and runs after the release (S7). Negative control: with no FIFO the same shell runs its startup files at once and signs `cold`, never `parked`.
 #[cfg(unix)]
 #[test]
 fn a_spare_runs_no_startup_file_until_asked_and_signs_one_start_record() {
-    for (shell, program, rc) in spare_shells() {
+    let mut shells = ShellLanes::default();
+    for (shell, program, rc) in spare_shells(&mut shells) {
         let rc_body = ": > \"$HOME/rc.ran\"\nPS1='P> '\n".to_owned();
         let rig = SpareRig::new();
         rig.rc(rc, &rc_body);
@@ -354,7 +353,8 @@ fn a_parked_shell_told_a_folder_reads_as_a_cold_shell_started_there() {
     const PROBE: &str = "printf 'RD=%s|%s|%s|%s|' \"$PWD\" \"$(pwd -P)\" \"${OLDPWD-unset}\" \
          \"$(env | grep -c '^OLDPWD=')\"; cd /; printf '%s|%s|E%s\\n' \"${OLDPWD-unset}\" \
          \"$(env | grep -c '^OLDPWD=')\" \"$((40+2))\"";
-    for (shell, program, rc) in spare_shells() {
+    let mut shells = ShellLanes::default();
+    for (shell, program, rc) in spare_shells(&mut shells) {
         let scratch = aterm_tempfile::tempdir().expect("tempdir");
         let root = std::fs::canonicalize(scratch.path()).expect("canonical scratch");
         let (there, elsewhere) = (root.join("there"), root.join("elsewhere"));
@@ -697,8 +697,12 @@ fn a_warm_zsh_reads_its_history_again_only_when_the_file_moved() {
 
 /// The bash twin of [`zsh_history_reading`].
 #[cfg(unix)]
-fn bash_history_reading(rig: &SpareRig, warm: bool, append_during_hold: &str) -> String {
-    let bash = spare_bash();
+fn bash_history_reading(
+    bash: &str,
+    rig: &SpareRig,
+    warm: bool,
+    append_during_hold: &str,
+) -> String {
     let mut host = warm.then(|| rig.fifo());
     let mut sh = rig.spawn(ShellType::Bash, bash);
     if let Some(host) = host.as_mut() {
@@ -747,7 +751,6 @@ fn bash_history_reading(rig: &SpareRig, warm: bool, append_during_hold: &str) ->
 #[cfg(unix)]
 #[test]
 fn a_warm_bash_holds_and_leaves_the_history_a_cold_one_does() {
-    spare_bash();
     const KNOBS: [&str; 4] = [
         "shopt -s histappend\n",
         "HISTCONTROL=ignoreboth\n",
@@ -776,50 +779,54 @@ fn a_warm_bash_holds_and_leaves_the_history_a_cold_one_does() {
         ]
         .map(|rc| format!("{rc}PS1='P> '\n")),
     );
-    let failures = std::sync::Mutex::new(Vec::new());
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    std::thread::scope(|scope| {
-        for _ in 0..2 {
-            scope.spawn(|| {
-                loop {
-                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let Some(rc) = cases.get(i) else { break };
-                    for append in [appended, ""] {
-                        let warm_rig = SpareRig::new();
-                        warm_rig.rc(".bashrc", rc);
-                        std::fs::write(warm_rig.home.join("hist"), seed).unwrap();
-                        let warm = bash_history_reading(&warm_rig, true, append);
-                        let cold_rig = SpareRig::new();
-                        cold_rig.rc(".bashrc", rc);
-                        std::fs::write(cold_rig.home.join("hist"), format!("{seed}{append}"))
-                            .unwrap();
-                        let cold = bash_history_reading(&cold_rig, false, "");
-                        if warm != cold {
-                            failures.lock().unwrap().push(format!(
-                                "{rc:?} appended={}:\n--- warm ---\n{warm}\n--- cold ---\n{cold}",
-                                !append.is_empty()
-                            ));
+    let mut shells = ShellLanes::default();
+    for bash in shells.bashes() {
+        let failures = std::sync::Mutex::new(Vec::new());
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(rc) = cases.get(i) else { break };
+                        for append in [appended, ""] {
+                            let warm_rig = SpareRig::new();
+                            warm_rig.rc(".bashrc", rc);
+                            std::fs::write(warm_rig.home.join("hist"), seed).unwrap();
+                            let warm = bash_history_reading(bash, &warm_rig, true, append);
+                            let cold_rig = SpareRig::new();
+                            cold_rig.rc(".bashrc", rc);
+                            std::fs::write(cold_rig.home.join("hist"), format!("{seed}{append}"))
+                                .unwrap();
+                            let cold = bash_history_reading(bash, &cold_rig, false, "");
+                            if warm != cold {
+                                failures.lock().unwrap().push(format!(
+                                    "{rc:?} appended={}:\n--- warm ---\n{warm}\n--- cold ---\n{cold}",
+                                    !append.is_empty()
+                                ));
+                            }
                         }
                     }
-                }
-            });
-        }
-    });
-    let failures = failures.into_inner().unwrap();
-    assert!(
-        failures.is_empty(),
-        "{} of {} differ:\n{}",
-        failures.len(),
-        2 * cases.len(),
-        failures.join("\n\n")
-    );
+                });
+            }
+        });
+        let failures = failures.into_inner().unwrap();
+        assert!(
+            failures.is_empty(),
+            "{bash}: {} of {} differ:\n{}",
+            failures.len(),
+            2 * cases.len(),
+            failures.join("\n\n")
+        );
+    }
 }
 
 /// S5: both holds ride out a resize. Ten SIGWINCHes (what each TIOCSWINSZ on the master sends the foreground group) at the parked hold and at the warm hold release neither; `go` releases each. Negative control: bash's warm hold with its loop cut and no writer held is released by the signals, as the design's probe found (bash 3.2's `read < fifo` fails when a signal interrupts the open, and the shell runs on; bash 5 restarts the open).
 #[cfg(unix)]
 #[test]
 fn a_spare_hold_survives_sigwinch_and_only_go_releases_it() {
-    for (shell, program, _) in spare_shells() {
+    let mut shells = ShellLanes::default();
+    for (shell, program, _) in spare_shells(&mut shells) {
         let rig = SpareRig::new();
         rig.rc(
             if shell == ShellType::Zsh {
@@ -913,7 +920,8 @@ fn a_spare_hold_survives_sigwinch_and_only_go_releases_it() {
 #[cfg(unix)]
 #[test]
 fn a_discarded_spare_writes_no_history_and_ends_without_its_fifo() {
-    for (shell, program, _) in spare_shells() {
+    let mut shells = ShellLanes::default();
+    for (shell, program, _) in spare_shells(&mut shells) {
         let (rc_name, rc) = match shell {
             ShellType::Zsh => (
                 ".zshrc",
@@ -975,7 +983,8 @@ fn a_warm_spare_carries_seconds_on_from_its_rc_run() {
             .expect("after the epoch")
             .as_secs_f64()
     };
-    for (shell, program, _) in spare_shells() {
+    let mut shells = ShellLanes::default();
+    for (shell, program, _) in spare_shells(&mut shells) {
         let (rc_name, rc) = match shell {
             ShellType::Zsh => (
                 ".zshrc",

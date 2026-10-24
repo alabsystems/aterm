@@ -359,7 +359,7 @@ pub fn read(text: &str) -> (Local, Vec<String>) {
                 Some(k) => local.fleet_key = Some(k.trim().to_string()),
                 None => notes.push(
                     "[ai] `fleet_key` takes an Ed25519 public key in base64 \
-                     (`aterm ai fleet keygen` prints one); ignored"
+                     (`aterm ai fleet keygen <secret-key-file>` prints one); ignored"
                         .to_string(),
                 ),
             },

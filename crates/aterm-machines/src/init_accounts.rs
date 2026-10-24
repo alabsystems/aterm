@@ -57,7 +57,10 @@ impl Service {
 struct SignOut {
     service: Service,
     user: User,
-    blocked: Mutex<Option<String>>,
+    /// Why the last apply stood aside before signing out, if it did.
+    blocked: Mutex<Option<aterm_converge::StoodAside>>,
+    /// Whether the last probe found the account signed in, for System State.
+    reading: crate::init_observe::LastReading,
 }
 
 /// The two account items for each selected local user.
@@ -89,6 +92,7 @@ pub fn selected_items(ctx: &Ctx, selected: Selection) -> Result<Vec<Box<dyn Item
                 service,
                 user: user.clone(),
                 blocked: Mutex::new(None),
+                reading: crate::init_observe::LastReading::default(),
             }));
         }
     }
@@ -109,7 +113,11 @@ impl Item for SignOut {
     }
 
     fn probe(&self, sys: &dyn System, ctx: &Ctx) -> Probe {
-        match registered(sys, &self.user, self.service) {
+        let registered = registered(sys, &self.user, self.service);
+        // Signed in, whether or not this run may sign it out now.
+        self.reading
+            .set(matches!(registered, Ok(true)).then_some(crate::init_observe::Reading::SignedIn));
+        match registered {
             Err(why) => Probe::Unusable { why },
             Ok(false) => Probe::Ok {
                 now: "signed out (no persisted, active, or online account)".into(),
@@ -133,9 +141,21 @@ impl Item for SignOut {
         *self.blocked.lock().unwrap_or_else(PoisonError::into_inner) = None;
         let deadline = Instant::now() + Duration::from_secs(60);
         if !accessibility_ready_for(sys, Some(&self.user), Some(deadline))? {
-            *self.blocked.lock().unwrap_or_else(PoisonError::into_inner) = Some("macOS Accessibility permission for aterm is unavailable; account setup will retry automatically".into());
+            *self.blocked.lock().unwrap_or_else(PoisonError::into_inner) = Some(aterm_converge::StoodAside::Permission("macOS Accessibility permission for aterm is off; the sign-out runs once it is on".into()));
             return Ok(());
         }
+        // Driving System Events can raise macOS's Automation dialog: only one macOS
+        // dialog this process started is up at a time (System State design §6).
+        let Some(_dialog) = aterm_types::macos_setup::MacosDialog::when_none_up(
+            aterm_types::macos_setup::DIALOG_WAIT,
+        ) else {
+            *self.blocked.lock().unwrap_or_else(PoisonError::into_inner) =
+                Some(aterm_converge::StoodAside::Waiting(
+                    "another macOS dialog is still up; account setup will retry automatically"
+                        .into(),
+                ));
+            return Ok(());
+        };
         let labels = localized_labels(sys, &self.user, self.service, Some(deadline))?;
         let command = limited(
             signout_cmd(&self.user, self.service, &labels),
@@ -145,7 +165,7 @@ impl Item for SignOut {
             .run_complete_stdout(&command)
             .map_err(|_| format!("{} sign-out could not run", self.service.name()))?;
         if ran.success() && ran.out().trim() == "permission-blocked" {
-            *self.blocked.lock().unwrap_or_else(PoisonError::into_inner) = Some("macOS Automation permission to control System Events is unavailable; account setup will retry automatically".into());
+            *self.blocked.lock().unwrap_or_else(PoisonError::into_inner) = Some(aterm_converge::StoodAside::Permission("macOS Automation permission to control System Events is off; the sign-out runs once it is on".into()));
             return Ok(());
         }
         if !ran.success() || ran.out().trim() != "sign-out-requested" {
@@ -179,7 +199,10 @@ impl Item for SignOut {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
-            .map(aterm_converge::StoodAside::Permission)
+    }
+
+    fn detail(&self, _sys: &dyn System, _ctx: &Ctx) -> Option<String> {
+        self.reading.detail()
     }
 }
 
@@ -701,6 +724,7 @@ mod tests {
             service: Service::Messages,
             user,
             blocked: Mutex::new(None),
+            reading: crate::init_observe::LastReading::default(),
         };
         (Fake::root(), ctx, item)
     }
@@ -739,6 +763,11 @@ mod tests {
         let printed = format!("{:?}", item.probe(&sys, &ctx));
         assert!(!printed.contains("private-account-id"));
         assert!(!printed.contains("private-token"));
+        // System State reads it as signed in, from the probe, not the printed line.
+        assert_eq!(
+            item.detail(&sys, &ctx),
+            Some(crate::init_observe::Reading::SignedIn.token())
+        );
     }
 
     #[test]
@@ -748,6 +777,7 @@ mod tests {
         prefs(&sys, &item, EMPTY_PREFS);
         assert!(matches!(item.probe(&sys, &ctx), Probe::Ok { .. }));
         assert!(sys.calls().iter().all(|c| !c.contains("osascript")));
+        assert_eq!(item.detail(&sys, &ctx), None);
     }
 
     #[test]

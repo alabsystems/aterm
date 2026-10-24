@@ -123,6 +123,8 @@ struct Knobs {
     /// The command line the shell's integration recorded for the command the
     /// tab runs (default `sh agy.sh`, a launcher naming no agy).
     cmdline: Option<&'static str>,
+    /// agy's quota rotates the launch onto this model (default: it keeps its own).
+    quota_to: Option<&'static str>,
 }
 
 struct LiveKernel {
@@ -301,6 +303,29 @@ impl AgyKernel for LiveKernel {
 
     fn started_ms(&self, pid: u32) -> Option<u64> {
         (pid == TUI).then_some(START_MS)
+    }
+
+    fn quota_pick(
+        &self,
+        model: Option<&str>,
+        _exe: &Path,
+        _env: &[(String, String)],
+        _flags: &[String],
+    ) -> Option<crate::harness::agy_quota::Pick> {
+        use crate::harness::agy_quota::{Pick, Standing};
+        let from = model.unwrap_or("gemini-4-argon-high").to_owned();
+        Some(match self.knobs.quota_to {
+            Some(to) if to != from => Pick::Rotate {
+                from,
+                from_standing: Standing::Spent,
+                to: to.to_owned(),
+                to_standing: Standing::Open,
+            },
+            _ => Pick::Keep {
+                model: from,
+                standing: Standing::Open,
+            },
+        })
     }
 
     fn summaries(&self, _: &Path, _: &str) -> Result<String, ()> {
@@ -1766,4 +1791,63 @@ fn tier1_the_real_agy_quiet_upgrade_conforms_to_the_model() {
         "{restarts} {waits} {exits} {lasts}"
     );
     assert_eq!(caught, BTreeSet::from(MUTANTS), "every mutant caught alone");
+}
+
+#[test]
+fn an_idle_agy_on_a_spent_pool_is_relaunched_on_the_quota_pick() {
+    let knobs = Knobs {
+        twin: Some(Twin::Same),
+        quota_to: Some("claude-opus-5-5-medium"),
+        ..Knobs::default()
+    };
+    let rig = LiveRig::new("quota", knobs.clone());
+    let tabs = LiveRig::tabs();
+    assert_eq!(
+        live::upgrade_due_with(&rig.opts, &tabs, Some(rig.twin.clone()), &rig.kernel),
+        Some(Due::Yes),
+        "a rotation owed is due though the build is current"
+    );
+    let r = rig.visit();
+    assert_eq!(r.step, "done:resumed", "{r:?}");
+    assert_eq!(
+        (r.from.as_str(), r.to.as_str()),
+        ("gemini-4-argon-high", "claude-opus-5-5-medium(quota)")
+    );
+    let typed = rig.asked("turn");
+    assert_eq!(typed.len(), 1, "the relaunch line alone: {typed:#?}");
+    assert!(
+        typed[0].contains(&format!(
+            "'--model=claude-opus-5-5-medium' '--effort' 'high' '--conversation={C1}'"
+        )),
+        "{}",
+        typed[0]
+    );
+    let st = rig.record().expect("the record");
+    assert_eq!(st.cause, "model:claude-opus-5-5-medium");
+    assert_eq!(
+        ag::argv_model(&st.argv).as_deref(),
+        Some("claude-opus-5-5-medium")
+    );
+    assert!(
+        st.outcome
+            .starts_with("agy moved onto claude-opus-5-5-medium by its quota"),
+        "{}",
+        st.outcome
+    );
+    let kept = LiveRig::new(
+        "quota-kept",
+        Knobs {
+            twin: Some(Twin::Same),
+            ..Knobs::default()
+        },
+    );
+    assert_eq!(
+        kept.visit().step,
+        "current",
+        "a pool that keeps its model moves nothing"
+    );
+    assert_eq!(
+        live::upgrade_due_with(&kept.opts, &tabs, Some(kept.twin.clone()), &kept.kernel),
+        Some(Due::No)
+    );
 }

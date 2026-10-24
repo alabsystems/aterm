@@ -25,7 +25,6 @@ pub(crate) struct InboxMessage {
 }
 
 static INBOX_PENDING: AtomicBool = AtomicBool::new(false);
-static WORKSTATION_SETUP_FINISHED: AtomicBool = AtomicBool::new(false);
 
 /// THE EXCEPTIONS LANE: a fact for the owner's later look
 /// ([`aterm_messages::exceptions::Entry`], an event family's) raised, or
@@ -115,20 +114,6 @@ pub(crate) fn take_queued_exceptions() -> Vec<ExceptionWord> {
         EXCEPTIONS_PENDING.store(false, Ordering::Relaxed);
     }
     mine.into_iter().map(|(_, word)| word).collect()
-}
-
-/// Flag that workstation setup finished so its failure digests clear after draining.
-pub(crate) fn note_workstation_setup_finished() {
-    WORKSTATION_SETUP_FINISHED.store(true, Ordering::Release);
-}
-
-/// Take and clear the workstation-setup completion flag for lane `0`.
-pub(crate) fn take_workstation_setup_finished() -> bool {
-    // An unrelated test's private inbox must not consume their completion.
-    if current_lane() != 0 {
-        return false;
-    }
-    WORKSTATION_SETUP_FINISHED.swap(false, Ordering::AcqRel)
 }
 
 /// Each message with its LANE: always `0` in a build that is not a unit test
@@ -293,7 +278,6 @@ pub(crate) fn whole_inbox_for_test() -> std::sync::RwLockWriteGuard<'static, ()>
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     q.clear();
     INBOX_PENDING.store(false, Ordering::Relaxed);
-    WORKSTATION_SETUP_FINISHED.store(false, Ordering::Relaxed);
     drop(q);
     EXCEPTIONS
         .lock()

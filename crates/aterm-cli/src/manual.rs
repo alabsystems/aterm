@@ -93,12 +93,16 @@ too (a clean checkout of aterm's origin with HEAD on a branch, any branch), its
 tools' `verify provision --check` (cargo --offline, stopped after two minutes). It
 reaches no network for them and changes none of them: `aterm init --develop` does.
 
-The first Mac window opens System State with every setup choice checked.
-Apply runs them now; otherwise the checked items apply after 30 active seconds
-(paused while unfocused or behind a dialog, stopped by a click, key or scroll).
-Cancel closes the offer; System State reruns setup or restores preferences later.
-Nested sessions, -e commands, headless runs, private lab homes and utilities do
-not set up the Mac.
+The first Mac window opens System State. aterm's own permissions are set up on every
+Mac; the rest of the profile is set up by itself only on an ALab Mac (a vault member, a
+fleet member, or one where the ALab vault answers). Elsewhere those groups start at
+Leave as is, and their rows still show the value now and the value setup wants. A later
+launch that finds the ALab signal widens the plan aterm chose by itself; a plan you
+shaped is never changed. Setup starts as soon as the tab is shown, with no countdown. A
+group's Set up / Leave as is takes effect at once, and Stop, beside the headline while a
+run is going, ends that run between steps. Closing the tab never cancels. System State
+remains available to rerun setup or restore preferences. Terminal and ssh sessions, -e
+commands, headless runs, private lab homes and utilities never start setup.
 
 Setup choices:
   Caps Lock as Control; natural scrolling off; trackpad momentum scrolling on
@@ -107,18 +111,27 @@ Setup choices:
     aterm has Full Disk Access
   Dock: only aterm, System Settings and Safari (Finder, Trash and running apps remain)
   Sign out of Messages and FaceTime
-  Keep Rust offline documentation out of Spotlight
+  Keep Rust offline documentation and build folders out of Spotlight
   Set up aterm's macOS permissions (switches still need your clicks)
   Sync the secrets vault (default http://alab-secrets.local:7484/v1/alab, or the vault
     this Mac is in; editable)
   Authenticate GitHub via synced credentials and clone accessible repositories
 
+Approved setup resumes unfinished steps on later launches, silently. A row that waits
+for you is not retried until you act, press Check again, or launch aterm again; a vault
+approval waits the same way, and the run goes on once an admin Mac approves. Rows are
+read without changing anything when the tab is shown, after each step and on Check
+again; GitHub repositories is read only while it is set up, or on Check again.
+Completed setup preserves later local changes.
+
 Only changed preference keys are backed up (no credentials). Restore preferences puts
 them back and stops automatic setup, leaving cloned repos, credentials and sign-outs
 in place; without Full Disk Access it leaves Notification Center's widget list alone
 and keeps its original in the backup (run Restore again from an app with the grant).
-`doctor --apply` applies the preference and account profile; System State also
-does permissions, Spotlight, the vault and repositories.
+`doctor --apply` applies the preference and account profile and adds aterm's
+permissions to the plan, unless setup was cancelled or restored; System State also
+does Spotlight, the vault and repositories. The Messages and FaceTime sign-outs run
+last, only while System State is on screen, where Stop can end them.
 
 Settings modes exit 0 when verified, 1 for drift or unfinished work, 2 for bad
 usage. A health run exits 0 only when every selected check is satisfied or not
@@ -185,7 +198,8 @@ GOTCHAS
   * Rust here is the Trust toolchain (`targo`, `trustc`, `tippy`, `trustfmt`,
     `trustdoc`). Inside a session the upstream names (`cargo`, `rustc`, `clippy`,
     `rustfmt`, `rustdoc`, `lean`, `tlc`, `z3`) are rerouted (`aterm help reroute`).
-  * `aterm --help` prints the terse CLI usage; `aterm help` prints this manual."#
+  * `aterm --help` prints the terse CLI usage; `aterm help` prints the agent brief in a
+    tab and the topic index (`aterm help topics`) outside one."#
         )),
     },
     Topic {
@@ -531,7 +545,9 @@ VERBS
                   admins, rotate-key
   a server        serve, server on|off|status
   `watch` is the subscriber `agent on` installs; on an admin it also lets in machines
-  that type the join password. A path vault has no join queue: approve each key.
+  that type the join password. `agent off` records that choice, which setup keeps,
+  and every install of the subscriber removes it. A path vault has no join queue:
+  approve each key.
 
 FILES
   `~/.config/aterm/secrets/{source.toml,identity,state.toml,vault}` and `~/.secrets/<name>`."#,
@@ -1662,18 +1678,19 @@ WHAT THIS OS MEASURES (macOS)
   CPU per core and per cluster (host_processor_info, clusters from hw.perflevelN
   and the device tree); memory by page class, the compressor, swap, the kernel's
   pressure level and its paging counters; the GPU's device-wide busy percent and
-  memory in use (IORegistry); the thermal state and Low Power Mode; every process
-  you own: CPU time, time waiting to run, footprint and its peak, bytes written
-  (libproc); each volume's free space (statfs); your tabs' folders' sizes (`sys
-  disk`, from a background walk); each job in your tabs (`sys jobs`): its class,
-  the wait it is in, how long it has been quiet and whether it still makes
-  progress, from its file descriptors, sockets and kqueue.
+  memory in use (IORegistry), and each process's GPU time, every user's, from the
+  GPU's user clients (`sys gpu`, `gpu_ppm=`); the thermal state and Low Power
+  Mode; every process you own: CPU time, time waiting to run, footprint and its
+  peak, bytes written (libproc); each volume's free space (statfs); your tabs'
+  folders' sizes (`sys disk`, from a background walk); each job in your tabs
+  (`sys jobs`): its class, the wait it is in, how long it has been quiet and
+  whether it still makes progress, from its file descriptors, sockets and kqueue.
 
 WHAT IT CANNOT MEASURE HERE
   - which core a process runs on: macOS does not say. `sys cores` shows each
     scope's SHARE of each cluster, never placement.
   - CPU frequency (delivered or requested): read as unavailable.
-  - GPU use per process or per core: one device-wide figure.
+  - GPU use per core: one device-wide figure.
   - other users' processes one by one: "services" is the machine's CPU minus
     what aterm reads (by subtraction), and a negative residual is printed signed;
     `sys why` reads them per coalition.
@@ -2142,10 +2159,10 @@ KEY USAGE (`aterm ctl help <verb>` has every flag)
 AGENTS
   Each agent starts interactive with the task as its first prompt, and trusts the
   spawned `cwd=` for that worker alone: `agent=claude` (Claude Code; `result` reads its
-  transcript), `agent=gemini` (Gemini CLI), `agent=agy` (Antigravity CLI), `agent=muse`
-  (Muse Code). `agent=codex` is codex-alab, which carries itself: it trusts its folder by
-  its own rule (`harness policy`'s approve level and trust roots), and `result` reads its
-  rollout.
+  transcript), `agent=gemini` (Gemini CLI), `agent=agy` (Antigravity CLI, on the model its
+  quota rotation picks: `aterm harness agy pick`), `agent=muse` (Muse Code). `agent=codex`
+  is codex-alab, which carries itself: it trusts its folder by its own rule (`harness
+  policy`'s approve level and trust roots), and `result` reads its rollout.
 
 ON ANOTHER MAC (`aterm fleet allow drive --from <this Mac>` on `<h>`)
   aterm ctl --host <h> spawn agent=<word> [model=<m>] [cwd=<abs-path>] - < task
@@ -2310,8 +2327,9 @@ DEBUGGER ACCESS (a password dialog, not privacy)
   1. `aterm ctl privacy`: the `debugger` row (`mode=disabled` means macOS prompts).
   2. Tell your operator before attaching, or wait with
      `aterm ctl @<sid> await consent kind=debugger timeout=<ms>`.
-  3. The owner can allow debugger access Mac-wide in aterm's Settings ▸ Security (or the
-     first-launch alert). To turn developer mode off again in a terminal:
+  3. The owner can allow debugger access Mac-wide in aterm's Settings ▸ Security, and
+     System State turns it on once per Mac behind macOS's own password dialog. To turn
+     developer mode off again in a terminal:
     {revert}
   4. A binary you built yourself, signed ad hoc with `com.apple.security.get-task-allow`,
      lets `lldb` attach without a prompt.

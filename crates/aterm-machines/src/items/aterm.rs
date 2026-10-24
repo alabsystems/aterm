@@ -30,8 +30,11 @@ pub const APP: &str = "/Applications/aterm.app";
 pub const EXE: &str = "/Applications/aterm.app/Contents/MacOS/aterm";
 
 /// Where [`App`] records whether the aterm.app it installed showed it ran
-/// ([`crate::first_exec`]): nothing replaces that bundle while its hold lasts.
-pub const FIRST_RUN: &str = "/Library/Management/aterm/state/aterm.app-first-run";
+/// ([`crate::agent::Layout::app_first_run`]): nothing replaces that bundle while its hold
+/// lasts.
+fn first_run_record() -> PathBuf {
+    crate::agent::Layout::installed().app_first_run()
+}
 
 /// `staff`, the group install.sh's own installs leave aterm.app in.
 pub const STAFF_GID: u32 = 20;
@@ -263,10 +266,10 @@ impl App {
     }
 
     /// Run the aterm just installed once, as its owner: its first exec, which
-    /// [`FIRST_RUN`] holds the bundle in place for until it showed it ran. The record is
+    /// [`first_run_record`] holds the bundle in place for until it showed it ran. The record is
     /// readable by all, so a plan run without root reads the hold too.
     fn first_run(&self, sys: &dyn System) -> Result<(), String> {
-        let record = Path::new(FIRST_RUN);
+        let record = &first_run_record();
         sys.create_dir_all(record, 0o755)
             .and_then(|()| crate::first_exec::stamp(sys, record))
             .map_err(|e| format!("{APP} is in place, but {}: {e}", record.display()))?;
@@ -347,7 +350,7 @@ impl Item for App {
             };
         }
         if from != "absent"
-            && let Some(left) = crate::first_exec::hold_left(sys, Path::new(FIRST_RUN))
+            && let Some(left) = crate::first_exec::hold_left(sys, &first_run_record())
         {
             return Probe::Deferred {
                 why: format!(
@@ -581,7 +584,7 @@ impl Item for Toolset {
                 };
             }
         }
-        // It may be the first exec of an aterm.app no [`FIRST_RUN`] record covers, so it is
+        // It may be the first exec of an aterm.app no [`first_run_record`] covers, so it is
         // killed no sooner than macOS's check of that exec can last.
         let ran = match sys.run(
             &self
@@ -762,6 +765,9 @@ mod tests {
     };
     use crate::model::{Mode, Outcome};
     use crate::port::{Fake, Ran, Stat};
+
+    /// [`first_run_record`] on this Mac.
+    const FIRST_RUN: &str = "/Library/Management/aterm/state/aterm.app-first-run";
 
     const ZIP_SHA: &str = "457cee7e20d0d406fb6ce43275593d0f553eb0fccd46fcc812dfb8d02c0b427f";
     const INSTALL_SH_SHA: &str = "dd92e2224c1c5a8e2c69992c4bafdf79142cf27f36a5bacfbfaa8efe12949b98";

@@ -1284,6 +1284,150 @@ fn a_first_sweeps_procs_are_warming_never_zero() {
     );
 }
 
+/// [`snapshot`] with two GPU client reads 1 s apart: aterm's own client ran 15 ms, the tab's
+/// cargo 5 ms, Safari (another of the user's) 2 ms, WindowServer (another user's) 8 ms, against
+/// the device's 4 %.
+fn gpu_snapshot() -> Snapshot {
+    use crate::gpu_clients::{GpuClientRow, GpuClientsSample};
+    let read = |s: &mut Sample, k: u64| {
+        let row = |entry: u64, pid: u32, name: &str, ms: u64| GpuClientRow {
+            entry,
+            pid,
+            name: name.into(),
+            gpu_ns: ms * k * 1_000_000,
+        };
+        s.gpu_clients = Some(GpuClientsSample {
+            at_ns: s.at_ns,
+            complete: true,
+            entries: vec![1, 2, 3, 4],
+            rows: vec![
+                row(1, 100, "aterm", 15),
+                row(2, 201, "cargo", 5),
+                row(3, 900, "Safari", 2),
+                row(4, 88, "WindowServer", 8),
+            ],
+        });
+    };
+    let mut v = Vitals::new();
+    let mut first = sample(10, &[0, 0, 0, 0], 0);
+    read(&mut first, 0);
+    let _ = v.absorb(&first);
+    let mut second = sample(11, &[20, 30, 100, 90], 1);
+    read(&mut second, 1);
+    v.absorb(&second)
+}
+
+#[test]
+fn gpu_client_time_fills_the_lanes_slots_in_text_and_json() {
+    let w = world();
+    let off = snapshot();
+    let c = ctx(&w, Some(&off), true, true);
+    let gpu = all_text(&render_text(&query(View::Gpu, false), &c));
+    assert!(
+        gpu.contains("per-scope GPU time unavailable(lane_off:gpu_clients)")
+            && !gpu.contains("client pid="),
+        "{gpu}"
+    );
+    let tab = all_text(&render_text(&query(View::Tab, false), &c));
+    assert!(
+        tab.contains("per-tab GPU time unavailable(lane_off:gpu_clients)"),
+        "{tab}"
+    );
+    let j = render_json(&query(View::Gpu, true), &c);
+    let g = j.get("gpu").expect("gpu");
+    assert_eq!(g.get("split_pm"), Some(&Jv::why("lane_off:gpu_clients")));
+    assert_eq!(g.get("clients"), Some(&Jv::why("lane_off:gpu_clients")));
+    let procs = all_text(&render_text(&query(View::Procs, false), &c));
+    assert!(
+        procs.contains("gpu_ppm=unavailable(lane_off:gpu_clients)"),
+        "{procs}"
+    );
+
+    let on = gpu_snapshot();
+    let c = ctx(&w, Some(&on), true, true);
+    for view in View::ALL {
+        let j = render_json(&query(view, true), &c);
+        let v = contract_violations(&j);
+        assert!(v.is_empty(), "{view:?}: {v:?}\n{}", j.to_text());
+    }
+    let gpu = all_text(&render_text(&query(View::Gpu, false), &c));
+    assert!(
+        gpu.contains(
+            "split   tab 0.5% · rest of aterm 1.5% · others 0.2% · macOS services 0.8% · client \
+             time 3.0%, within 2% of the device's whole percent, so no residual"
+        ),
+        "{gpu}"
+    );
+    let rows: Vec<&str> = gpu.lines().filter(|l| l.starts_with("client ")).collect();
+    assert_eq!(
+        rows,
+        [
+            "client pid=100 exe=aterm scope=self share_ppm=15000",
+            "client pid=88 exe=WindowServer scope=services share_ppm=8000",
+            "client pid=201 exe=cargo scope=tab tab=1 share_ppm=5000",
+            "client pid=900 exe=Safari scope=others share_ppm=2000",
+        ],
+        "{gpu}"
+    );
+    let tab = all_text(&render_text(&query(View::Tab, false), &c));
+    assert!(
+        tab.contains("per-tab GPU time 0.5% · the device is 4% busy"),
+        "{tab}"
+    );
+    let aterm = all_text(&render_text(&query(View::Aterm, false), &c));
+    assert!(
+        aterm.contains("aterm's GPU time 2.0% of the GPU"),
+        "{aterm}"
+    );
+    let procs = all_text(&render_text(&query(View::Procs, false), &c));
+    assert!(
+        procs.contains("exe=cargo") && procs.contains("gpu_ppm=5000 "),
+        "{procs}"
+    );
+
+    let j = render_json(&query(View::Gpu, true), &c);
+    let g = j.get("gpu").expect("gpu");
+    let split = g.get("split_pm").expect("split_pm");
+    let part = |k: &str| split.get(k).and_then(part_value);
+    assert_eq!(
+        SPLIT_PARTS.map(part),
+        [Some(5), Some(15), Some(2), Some(8), Some(10)],
+        "{}",
+        j.to_text()
+    );
+    match g.get("clients") {
+        Some(Jv::Arr(rows)) => {
+            assert_eq!(rows.len(), 4);
+            assert_eq!(rows[0].get("share_ppm"), Some(&Jv::u(15_000)));
+            assert_eq!(rows[2].get("tab"), Some(&Jv::u(1)));
+        }
+        other => panic!("{other:?}"),
+    }
+    let j = render_json(&query(View::Tab, true), &c);
+    assert_eq!(j.get("tab").and_then(|t| t.get("gpu_pm")), Some(&Jv::u(5)));
+    let j = render_json(&query(View::Aterm, true), &c);
+    assert_eq!(
+        j.get("aterm").and_then(|a| a.get("gpu_pm")),
+        Some(&Jv::u(20))
+    );
+
+    let scoped = ctx(&w, Some(&on), false, true);
+    let gpu = all_text(&render_text(&query(View::Gpu, false), &scoped));
+    let rows: Vec<&str> = gpu.lines().filter(|l| l.starts_with("client ")).collect();
+    assert_eq!(
+        rows,
+        ["client pid=201 exe=cargo scope=tab tab=1 share_ppm=5000"]
+    );
+    assert!(
+        gpu.contains("withheld=3") && !gpu.contains("Safari") && !gpu.contains("WindowServer"),
+        "{gpu}"
+    );
+    let j = render_json(&query(View::Gpu, true), &scoped);
+    let g = j.get("gpu").expect("gpu");
+    assert_eq!(g.get("withheld"), Some(&Jv::u(3)));
+    assert!(matches!(g.get("clients"), Some(Jv::Arr(rows)) if rows.len() == 1));
+}
+
 #[test]
 fn sys_net_reports_links_rates_and_tcp_connections_in_both_shapes() {
     let s = snapshot();

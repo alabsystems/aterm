@@ -20,6 +20,69 @@ fn row(sid: &str, ts: i64, rule_id: &str, outcome: Outcome, reason: &str) -> Str
 }
 
 #[test]
+fn task_custody_follows_acknowledged_notes_and_hold_closes_only() {
+    let word = super::super::FactWord::new(RuleId::WaitNudge, 1).expect("word");
+    let note = |sid, outcome, reason: &str| {
+        Row {
+            rule_id: FactKind::Hold.rule(),
+            outcome,
+            command: &word.word(),
+            reason,
+            box_seq: 1,
+        }
+        .to_json(1, Some(sid))
+    };
+    let accepted = note(
+        SID,
+        Outcome::Waiting,
+        "rule=wait-nudge@v1 episode=1 held_ms=1 door=task noted",
+    );
+    let closed = row(
+        SID,
+        2,
+        FactKind::Hold.rule(),
+        Outcome::Waiting,
+        "hold=closed why=foreign held_ms=1",
+    );
+    let clear = note(
+        SID,
+        Outcome::Waiting,
+        &task_clear_reason(word, super::super::NoteOutcome::Cleared),
+    );
+    let intent = row(
+        SID,
+        3,
+        INTENT_RULE,
+        Outcome::Waiting,
+        "rule=wait-nudge@v1 episode=2 held_ms=1 door=task",
+    );
+    let refused = note(
+        SID,
+        Outcome::Skipped,
+        "rule=wait-nudge@v1 episode=2 held_ms=1 door=task why=fenced",
+    );
+    let other = note(
+        "@s-2",
+        Outcome::Waiting,
+        "rule=wait-nudge@v1 episode=2 held_ms=1 door=task noted",
+    );
+    for (suffix, old) in [
+        (String::new(), true),
+        (intent.clone(), true),
+        (format!("{intent}\n{refused}"), true),
+        (other, true),
+        (clear.clone(), false),
+        (format!("{clear}\n{intent}"), false),
+        (accepted.clone(), false),
+    ] {
+        let body = format!("{accepted}\n{closed}\n{suffix}");
+        assert_eq!(TaskCustody::from_ledger(&body, Some(SID)).closed(word), old);
+    }
+    assert!(!TaskCustody::from_ledger(&closed, Some(SID)).closed(word));
+    assert!(!TaskCustody::from_ledger(&format!("{accepted}\n{intent}"), Some(SID)).closed(word));
+}
+
+#[test]
 fn the_status_read_judges_hands_hold_and_unread_input() {
     let quiet = StatusSeen::of("OK seq=4 hold=0 input=- human_ms=600000\n").expect("an OK");
     assert_eq!(

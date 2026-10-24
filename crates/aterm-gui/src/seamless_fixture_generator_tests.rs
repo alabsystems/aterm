@@ -297,6 +297,7 @@ fn fx_record(local_id: u64, title: &str) -> SessionRecord {
         task: None,
         status_seen: None,
         autopilot_end: None,
+        wakes: None,
     }
 }
 
@@ -3550,9 +3551,11 @@ fn fx_carried_state_desk() -> FxDesk {
     ));
     record.autopilot_end = crate::harness_end_carry::EndCarry {
         end: None,
+        face: None,
         worked_ms: 25_000,
     }
     .row();
+    record.wakes = Some(crate::occupancy_wakes::fixture_row(release_ms + 3_300_000));
     {
         let mut timeline = sessions[0].timeline.lock().unwrap();
         timeline
@@ -3603,6 +3606,10 @@ fn fx_carried_state_desk() -> FxDesk {
     assert!(
         crate::harness_end_carry::EndCarry::parse(record.autopilot_end.as_deref().unwrap())
             .is_some()
+    );
+    assert_eq!(
+        crate::occupancy_wakes::carried_wakes(record.wakes.as_deref().unwrap()),
+        Some(2)
     );
     assert!(
         crate::task_record::TaskRecord::from_carry_row(

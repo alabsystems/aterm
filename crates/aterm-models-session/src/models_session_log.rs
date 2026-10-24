@@ -1922,12 +1922,14 @@ pub fn transcript_join_model() -> Model {
             var wd = 0;
             var rf = 0;
             var ts = 0;
+            var vc = 0;
             var g = 0;
 
             action ScreenBusy {
                 lt = if lt == 0 { if vm == 3 && ve == 0 && vo == 0 { 2 } else { 1 } } else { lt };
                 old = if lt == 0 { 0 } else { old };
                 vm = if lt == 0 && ve == 0 && (vm == 2 || (vm == 3 && vo == 0)) { 1 } else { vm };
+                vc = if lt == 0 { if ve == 0 && vm == 2 { 1 } else { 0 } } else { vc };
                 ss = 0;
                 wr = 0;
                 pend = 0;
@@ -1953,6 +1955,7 @@ pub fn transcript_join_model() -> Model {
                 old = 0;
                 ts = 0;
                 vm = if vm == 1 { 2 } else { vm };
+                vc = 0;
                 wr = 0;
                 wd = 1;
                 rf = 0;
@@ -1964,6 +1967,7 @@ pub fn transcript_join_model() -> Model {
                 old = 0;
                 ts = 0;
                 vm = if vm == 1 { 2 } else { vm };
+                vc = 0;
                 ss = 0;
                 wr = 1;
                 pend = 0;
@@ -1977,6 +1981,7 @@ pub fn transcript_join_model() -> Model {
             action Bind {
                 wm = 1;
                 vm = 0;
+                vc = 0;
                 ve = 0;
                 vo = 0;
             }
@@ -1986,6 +1991,7 @@ pub fn transcript_join_model() -> Model {
             action AdoptWithoutWatermark {
                 wm = 0;
                 vm = 0;
+                vc = 0;
                 ve = 0;
                 vo = 0;
                 rf = 0;
@@ -2003,11 +2009,13 @@ pub fn transcript_join_model() -> Model {
             action PromptAttach when (wm == 1 && lt == 1 && old == 0) {
                 lt = 2;
                 vm = 1;
+                vc = 0;
                 ve = 0;
                 vo = 0;
             }
             action PromptShare when (wm == 1 && (lt == 2 || (lt == 1 && old == 1)) && (ss > 0 || pt == 1)) {
                 vm = 1;
+                vc = 0;
                 ve = 0;
                 vo = 0;
             }
@@ -2018,6 +2026,7 @@ pub fn transcript_join_model() -> Model {
                 lv = if lt == 1 { 1 } else { 0 };
                 ts = 0;
                 vm = 1;
+                vc = 0;
                 ve = 0;
                 vo = 0;
             }
@@ -2025,11 +2034,13 @@ pub fn transcript_join_model() -> Model {
                 lc = 0;
                 lv = 0;
                 vm = 2;
+                vc = 0;
                 ve = 0;
                 vo = 0;
             }
             action PromptOld when (wm == 1 && lt > 0) {
                 vm = 3;
+                vc = 0;
                 ve = 0;
                 vo = 1;
             }
@@ -2037,11 +2048,13 @@ pub fn transcript_join_model() -> Model {
                 lc = 0;
                 lv = 0;
                 vm = 2;
+                vc = 0;
                 ve = 0;
                 vo = 0;
             }
             action PromptUnmapped when (wm == 1 && lt == 0 && lc == 0 && pt == 1) {
                 vm = 3;
+                vc = 0;
                 ve = 0;
                 vo = 0;
             }
@@ -2049,6 +2062,7 @@ pub fn transcript_join_model() -> Model {
                 lt = 2;
                 old = 0;
                 vm = 1;
+                vc = 0;
                 ve = 0;
                 vo = 0;
             }
@@ -2065,8 +2079,14 @@ pub fn transcript_join_model() -> Model {
                 old = 0;
                 ts = 0;
                 vm = 2;
+                vc = 0;
                 ve = 1;
                 vo = 0;
+            }
+            action TxEndBeforeCont when (wm == 1 && vm == 1 && vc == 1 && ve == 0) {
+                vm = 2;
+                ve = 1;
+                vc = 0;
             }
             action TxEndHeld when (wm == 1 && vm > 0 && ve == 0 && (vm > 1 || ss > 0 || pt == 1)) {
                 ve = 1;
@@ -2188,6 +2208,18 @@ pub fn transcript_join_model() -> Model {
                 vo = 0;
                 g = 8;
             }
+            action EarlyEndClosesCont when (Buggy == 1 && g == 0 && wm == 1 && vm == 1 && vc == 1 && ve == 0 && ss == 0 && pt == 0) {
+                lt = 0;
+                lc = if lt == 1 && old == 0 { 1 } else { 0 };
+                lv = if lt == 1 { 1 } else { 0 };
+                old = 0;
+                ts = 0;
+                vm = 2;
+                vc = 0;
+                ve = 1;
+                vo = 0;
+                g = 10;
+            }
 
             invariant AtMostOneOpenTurn: 1 > g || g > 1;
             invariant StepsUnderOpenTurn: ts == 0 || lt > 0;
@@ -2200,7 +2232,8 @@ pub fn transcript_join_model() -> Model {
             invariant RefutedWallStaysShut: rf == 0 || (ss <= 1 && pend == 0 && wr == 0);
             invariant PartialNeverOverrules: 8 > g || g > 8;
             invariant PromptNamesNearestTurn: 9 > g || g > 9;
-            bound StateBounded: lt <= 2 && lv <= 1 && vm <= 3 && vo <= 1 && ss <= 2 && ts <= 2 && g <= 9;
+            invariant EndClosesOnlyItsOwnTurn: 10 > g || g > 10;
+            bound StateBounded: lt <= 2 && lv <= 1 && vm <= 3 && vc <= 1 && vo <= 1 && ss <= 2 && ts <= 2 && g <= 10;
         }
     }
 }

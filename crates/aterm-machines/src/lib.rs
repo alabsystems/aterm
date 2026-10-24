@@ -29,6 +29,7 @@ pub mod init_activation;
 pub mod init_clt;
 pub mod init_develop;
 pub mod init_github;
+pub mod init_observe;
 pub mod init_preferences;
 pub mod init_secrets;
 pub mod init_spotlight;

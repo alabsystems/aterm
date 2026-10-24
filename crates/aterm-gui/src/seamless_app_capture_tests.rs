@@ -2291,6 +2291,7 @@ fn the_autopilot_end_rides_the_park_and_the_intake_to_the_successor() {
             at_ms,
             seen: false,
         }),
+        face: None,
         worked_ms: 0,
     };
     let end_carry = std::mem::take(&mut incoming.end_carry);

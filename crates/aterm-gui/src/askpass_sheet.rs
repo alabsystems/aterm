@@ -104,7 +104,6 @@ impl App {
             ));
             return;
         }
-        self.withdraw_secrets_sheet_window(wid);
         self.build_askpass_sheet(wid, session, &command, &invoker, ticket, reply);
     }
 

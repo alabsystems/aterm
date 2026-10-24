@@ -1299,7 +1299,8 @@ fn under_root_the_proof_runs_no_toolchain_file_another_account_can_change() {
     // group-writable, below folders that show as plain root ones whatever ACL
     // the host gives them (a macOS home's `everyone deny delete`, which root
     // refuses). The lab's uname says Darwin, so on a host whose ls takes no -e
-    // (GNU's) the ACL listings drop it.
+    // (GNU's) the ACL listings drop it, and the mount table is a Mac's with one
+    // local volume at /.
     let top = scratch.join("lab");
     let top = q(s(top.parent().expect("the scratch")));
     let mut lib = lab.lib();
@@ -1310,6 +1311,7 @@ fn under_root_the_proof_runs_no_toolchain_file_another_account_can_change() {
          case \"$a\" in -?*) [ -n \"$HOST_LS_E\" ] || [ \"$a\" = -- ] || a=\"${{a//e/}}\" ;; *) break ;; esac; \
          [ \"$a\" = -- ] && break; [ \"$a\" = - ] || v+=(\"$a\"); \
          shift; done; command ls ${{v[@]+\"${{v[@]}}\"}} \"$@\"; }}\n\
+         macos_mounts() {{ echo '/dev/disk1s1 on / (apfs, local, journaled)'; }}\n\
          id() {{ if [ \"$1\" = -u ]; then echo 0; else command id \"$@\"; fi; }}; \
          ls_entry() {{ local last t=-; for last; do :; done; case \"$last\" in */theirs/*) host_ls \"$@\" ;; \
          {top} | {top}/*) host_ls \"$@\" | \

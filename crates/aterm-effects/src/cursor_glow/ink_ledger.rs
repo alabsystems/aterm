@@ -970,6 +970,10 @@ impl CursorGlow {
         }
         let ledger = &mut self.ink_ledger;
         ledger.lines = lines;
+        if lines.iter().all(Option::is_none) {
+            ledger.on = false;
+            return;
+        }
         ledger.grid = (
             f32::from(geom.origin_x),
             f32::from(geom.origin_y),

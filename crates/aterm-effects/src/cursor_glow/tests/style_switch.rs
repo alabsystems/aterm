@@ -196,7 +196,7 @@ fn a_pooled_bolt_jag_is_deterministic_across_strikes() {
             .last()
             .expect("a strike longer than one pixel pushes a bolt")
             .pts
-            .clone()
+            .to_vec()
     };
     for big in [false, true] {
         let first = strike(&mut g, 0x1234_5678, big);

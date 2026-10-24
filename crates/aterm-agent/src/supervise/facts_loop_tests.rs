@@ -644,8 +644,14 @@ fn a_prompt_left_in_the_composer_says_its_fact_not_submitted() {
         "facts-left-halted",
         ok("OK 0 turn skipped reason=halted submitted=0 seq=102 id=1\n"),
     );
-    let busy = guarded("facts-left-busy", err("busy sink"));
-    for left in [fenced, missed, halted, busy] {
+    let busy = guarded(
+        "facts-left-busy",
+        err(aterm_types::control_verbs::TURN_SUBMIT_BUSY_REPLY
+            .strip_prefix("ERR ")
+            .expect("an ERR reply")),
+    );
+    let busy_before = guarded("facts-left-busy-older", err("busy sink"));
+    for left in [fenced, missed, halted, busy, busy_before] {
         let rows = left.rows();
         assert_eq!(
             rows.last()

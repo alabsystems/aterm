@@ -767,6 +767,7 @@ fn real_renewal_is_clean() -> bool {
         claude_session: None,
         claude_pid: None,
         codex_thread: None,
+        agy_conversation: None,
         codex_home: None,
         now: 1_790_600_000,
         sid: String::new(),

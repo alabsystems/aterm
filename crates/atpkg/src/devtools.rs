@@ -653,7 +653,9 @@ pub fn handled_words(handled: &Handled) -> String {
     }
 }
 
-/// The two markers that hold back one System Settings page aterm brings up for the owner, both in `<state>`: when aterm last opened it ([`Self::last_opened`]) and the owner's Not now ([`Self::declined_until`]).
+/// The two markers that hold back one System Settings page aterm brings up for the owner, both in `<state>`: when aterm last opened it ([`Self::last_opened`]) and the owner's Not now ([`Self::declined_until`], [`Self::last_declined`]).
+///
+/// Each line's first word is a key ([`same_step`] compares two): the window writes the approved System State setup revision's ([`revision_key`]), so its own hand-over opens a page once per approved revision; `aterm doctor` writes the running version, which a revision's key never equals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PageMarkers {
     opened: &'static str,
@@ -673,13 +675,13 @@ pub const FULL_DISK_ACCESS: PageMarkers = PageMarkers {
 };
 
 impl PageMarkers {
-    /// Where aterm notes that it opened the page for the owner: one line, `<aterm version> <unix seconds>`.
+    /// Where aterm notes that it opened the page for the owner: one line, `<key> <unix seconds>`.
     #[must_use]
     pub fn opened_marker(self) -> Option<std::path::PathBuf> {
         aterm_types::dirs::state_dir().map(|dir| dir.join(self.opened))
     }
 
-    /// The last time aterm opened the page: `(version, unix seconds)`, or `None`.
+    /// The last time aterm opened the page: `(key, unix seconds)`, or `None`.
     #[must_use]
     pub fn last_opened(self) -> Option<(String, u64)> {
         self.last_opened_in(&aterm_types::dirs::state_dir()?)
@@ -709,7 +711,7 @@ impl PageMarkers {
         opened_ago(at, now, window_s)
     }
 
-    /// Note that aterm opened the page now, for `version`.
+    /// Note that aterm opened the page now, under `version` (a [`revision_key`], or the running version).
     pub fn note_opened(self, version: &str) {
         let Some(path) = self.opened_marker() else {
             return;
@@ -723,7 +725,7 @@ impl PageMarkers {
         let _ = std::fs::write(&path, format!("{version} {now}\n"));
     }
 
-    /// Where aterm notes that the owner said Not now to the page's helper panel, or closed it with aterm not switched on: one `<aterm version> <unix seconds>` line per decline, newest last.
+    /// Where aterm notes that the owner said Not now to the page's helper panel, or closed it with aterm not switched on: one `<key> <unix seconds>` line per decline, newest last.
     #[must_use]
     pub fn declined_marker(self) -> Option<std::path::PathBuf> {
         aterm_types::dirs::state_dir().map(|dir| dir.join(self.declined))
@@ -742,7 +744,20 @@ impl PageMarkers {
         decline_holding(&text, now)
     }
 
-    /// Note that the owner declined the page now, under `version`.
+    /// The owner's newest decline whatever its age: `(key, unix seconds)`.
+    #[must_use]
+    pub fn last_declined(self) -> Option<(String, u64)> {
+        self.last_declined_in(&aterm_types::dirs::state_dir()?)
+    }
+
+    /// [`Self::last_declined`] with `<state>` given.
+    #[must_use]
+    pub fn last_declined_in(self, state: &std::path::Path) -> Option<(String, u64)> {
+        let text = std::fs::read_to_string(state.join(self.declined)).ok()?;
+        text.lines().filter_map(parse_opened).next_back()
+    }
+
+    /// Note that the owner declined the page now, under `version` (a [`revision_key`], or the running version).
     pub fn note_declined(self, version: &str) {
         let Some(path) = self.declined_marker() else {
             return;
@@ -756,6 +771,28 @@ impl PageMarkers {
         let text = std::fs::read_to_string(&path).unwrap_or_default();
         let _ = std::fs::write(&path, with_decline(&text, version, now));
     }
+}
+
+/// The markers' key for an approved System State setup revision: `r<revision>`. The window
+/// writes it when it opens a page or the owner declines its panel, so its own hand-over is
+/// once per approved revision; a key that does not start with `r` and a digit was written
+/// by an older aterm, or by `aterm doctor`, under a version.
+#[must_use]
+pub fn revision_key(revision: u64) -> String {
+    format!("r{revision}")
+}
+
+/// Whether two marker keys name the same step: one's `@`-separated words begin the other's.
+/// The window writes `r<revision>@<bundle id>@<this Mac>` once it has read the bundle id
+/// and this Mac's UUID, and fewer words before that; a key written cold (`r4`) and one
+/// written warm (`r4@com.aterm.aterm@UUID`) are one revision's, so neither a Not now nor an
+/// opening is lost to the warm-up. Keys that differ in a word both carry (another revision,
+/// a dev bundle, another Mac) are not. Pure.
+#[must_use]
+pub fn same_step(a: &str, b: &str) -> bool {
+    a.split('@')
+        .zip(b.split('@'))
+        .all(|(left, right)| left == right)
 }
 
 /// Where aterm notes that it opened the Developer Tools pane for the owner ([`PageMarkers::opened_marker`] of [`DEVELOPER_TOOLS`]).
@@ -1443,6 +1480,40 @@ mod tests {
 
         assert_eq!(decline_holding(&once, at - 2 * 3_600), None);
         assert!(decline_holding(&once, at - 600).is_some());
+    }
+
+    /// A key written cold and one written warm for the same revision are one step; another
+    /// revision, bundle or Mac, or a version, is not. The newest decline is read whatever its
+    /// age, so a Not now holds for the rest of its revision.
+    #[test]
+    fn a_key_matches_its_own_step_warm_or_cold_and_the_newest_decline_is_read() {
+        assert_eq!(revision_key(7), "r7");
+        let warm = "r4@com.aterm.aterm@UUID";
+        for (a, b, want) in [
+            ("r4", "r4", true),
+            ("r4", warm, true),
+            (warm, "r4", true),
+            ("r4@com.aterm.aterm", warm, true),
+            (warm, warm, true),
+            ("r40", "r4", false),
+            ("r3", warm, false),
+            ("r4@com.aterm.aterm.dev@UUID", warm, false),
+            ("r4@com.aterm.aterm@OTHER", warm, false),
+            ("0.110.0", "r4", false),
+            ("", "r4", false),
+        ] {
+            assert_eq!(same_step(a, b), want, "{a} vs {b}");
+        }
+        let state = aterm_tempfile::tempdir().expect("tempdir");
+        assert_eq!(FULL_DISK_ACCESS.last_declined_in(state.path()), None);
+        let once = with_decline("", "0.110.0", 1_000);
+        let twice = with_decline(&once, &revision_key(4), 5_000_000_000);
+        std::fs::write(state.path().join(FULL_DISK_ACCESS.declined), twice).expect("write");
+        assert_eq!(
+            FULL_DISK_ACCESS.last_declined_in(state.path()),
+            Some(("r4".to_string(), 5_000_000_000))
+        );
+        assert_eq!(DEVELOPER_TOOLS.last_declined_in(state.path()), None);
     }
 
     /// The words every surface shares: the drag is never offered without the + route;

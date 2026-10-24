@@ -534,7 +534,7 @@ fn a_crackle_keeps_the_letter_it_crosses_readable() {
         let glow = CursorGlow {
             streak_unbudgeted: unbudgeted,
             bolts: vec![Bolt {
-                pts: vec![(4.0, 40.0), (80.0, 40.0), (156.0, 40.0)],
+                pts: BoltPts::from_3((4.0, 40.0), (80.0, 40.0), (156.0, 40.0)),
                 born,
                 life: 0.2,
                 branch: true,

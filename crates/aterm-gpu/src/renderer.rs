@@ -13909,8 +13909,7 @@ impl GpuRenderer {
         let slack = i64::from(input.scroll_frac_px).abs();
         let c0 = (x0.saturating_sub(pad) / cw) as usize;
         let c1 = (x1.saturating_sub(pad)).div_ceil(cw) as usize;
-        let mut foot = 0u32;
-        for (r, line) in input.cells.iter().enumerate().take(input.rows) {
+        for (r, line) in input.cells.iter().enumerate().take(input.rows).rev() {
             let r_top = top + r as i64 * i64::from(ch) - slack;
             let r_foot = r_top + i64::from(ch) + 2 * slack;
             if r_foot <= i64::from(y0) || r_top >= i64::from(y1) {
@@ -13920,10 +13919,10 @@ impl GpuRenderer {
                 .get(c0.min(line.len())..c1.min(line.len()))
                 .is_some_and(|cells| cells.iter().any(|c| c.ch != ' ' && c.ch != '\0'));
             if lettered {
-                foot = foot.max(u32::try_from(r_foot.max(0)).unwrap_or(u32::MAX));
+                return u32::try_from(r_foot.max(0)).unwrap_or(u32::MAX);
             }
         }
-        foot
+        0
     }
 
     fn shimmer_region(&self, input: &RenderInput, w: u32, h: u32) -> Option<ShimmerRegion> {
@@ -15755,6 +15754,9 @@ impl GpuRenderer {
                 cw,
             );
             let row_uniform = aterm_render::row_is_uniform(input, r);
+            let row_has_images = input.images.get(r).is_some_and(|v| !v.is_empty());
+            let row_has_clusters = input.clusters.get(r).is_some_and(|v| !v.is_empty());
+            let row_has_combining = input.combining.get(r).is_some_and(|v| !v.is_empty());
             for (c, cell) in cells.iter().take(cols).enumerate() {
                 let (cell_x, ccw, _) = place(r, c, row_uniform, rcw);
                 if off_right(cell_x, ccw) {
@@ -15766,10 +15768,15 @@ impl GpuRenderer {
                     continue; // a mixed row's runs are not monotone in x — see the glyph loop
                 }
                 let slot = &mut key_scratch[r * cols + c];
-                if !Self::drawable(cell) || input.image_hides_glyph_at(r, c) {
+                if !Self::drawable(cell) || (row_has_images && input.image_hides_glyph_at(r, c)) {
                     *slot = None;
                     continue;
                 }
+                let cluster = if row_has_clusters {
+                    input.cluster_at(r, c)
+                } else {
+                    None
+                };
                 let key = match plan
                     .get(c)
                     .copied()
@@ -15782,7 +15789,7 @@ impl GpuRenderer {
                         .cpu
                         .ligature_slice_key(gid, k, aterm_render::cell_style(cell)),
                     aterm_render::ColumnGlyph::PerCell => self.cell_key(
-                        input.cluster_at(r, c),
+                        cluster,
                         cell,
                         aterm_render::materialized_cell_span(cells, c),
                     ),
@@ -15796,7 +15803,8 @@ impl GpuRenderer {
                 if keys.insert(key) {
                     key_order.push(key);
                 }
-                if input.cluster_at(r, c).is_none()
+                if row_has_combining
+                    && cluster.is_none()
                     && let Some(marks) = input.combining_at(r, c)
                 {
                     for &m in marks {
@@ -15916,13 +15924,17 @@ impl GpuRenderer {
         };
         let selection_palette = self.cpu.selection_palette(input);
         let min_contrast = self.cpu.effective_minimum_contrast();
+        let may_have_sel = input.any_selection();
         let cell_selection =
             |r: usize,
              c: usize,
              cells: &[aterm_core::terminal::RenderCell],
              cell: &aterm_core::terminal::RenderCell| {
-                let hit =
-                    input.selection_hit(r, c, cells.get(c + 1).is_some_and(|n| n.wide), cell.wide);
+                let hit = if may_have_sel {
+                    input.selection_hit(r, c, cells.get(c + 1).is_some_and(|n| n.wide), cell.wide)
+                } else {
+                    None
+                };
                 let colors = selection_palette.at_hit(hit);
                 let bg_under = if hit.is_some() {
                     rgb4_u32(colors.bg)
@@ -16000,7 +16012,6 @@ impl GpuRenderer {
                 });
             }
         }
-        let may_have_sel = input.any_selection();
         for (r, cells) in rendered.iter().enumerate().take(vis_rows) {
             if !row_active(r) {
                 continue;
@@ -16284,6 +16295,16 @@ impl GpuRenderer {
             let raster_split = input.chrome_raster(r).and_then(|m| m.split);
             let windowed = win != (i32::MIN, i32::MAX);
             let mut ink_top = i32::MAX;
+            let (knock_y0, knock_y1) = (
+                (grid_top + r * ch) as i32 - 1,
+                (grid_top + (r + 1) * ch) as i32 + 1,
+            );
+            let row_has_knocks =
+                !knocks.is_empty() && knocks.iter().any(|k| k[1] < knock_y1 && k[3] > knock_y0);
+            let has_pane_defaults = input
+                .default_bg_spans
+                .get(r)
+                .is_some_and(|spans| !spans.is_empty());
             type FgMemo = ((u32, [u8; 3], Option<usize>), ([u8; 4], [u8; 4]));
             let mut fg_memo: Option<FgMemo> = None;
             for (c, cell) in cells.iter().take(cols).enumerate() {
@@ -16380,25 +16401,17 @@ impl GpuRenderer {
                     }
                 };
                 let quad = slot.quad((pad + cx) as f32, anchor_y, baseline, scale, (aw, ah));
-                if !knocks.is_empty() {
+                if row_has_knocks {
                     let (x0, x1) = ((pad + cx) as i32 - 1, (pad + cx + ccw) as i32 + 1);
-                    let (y0, y1) = (
-                        (grid_top + r * ch) as i32 - 1,
-                        (grid_top + (r + 1) * ch) as i32 + 1,
-                    );
                     let on_body = knocks
                         .iter()
-                        .any(|k| k[0] < x1 && k[2] > x0 && k[1] < y1 && k[3] > y0);
+                        .any(|k| k[0] < x1 && k[2] > x0 && k[1] < knock_y1 && k[3] > knock_y0);
                     let page = || {
                         if cell_selected {
                             return Some(bg_under);
                         }
                         let cell_bg = aterm_render::rgb_to_u32(cell.bg);
-                        let default_bg = if input
-                            .default_bg_spans
-                            .get(r)
-                            .is_some_and(|spans| !spans.is_empty())
-                        {
+                        let default_bg = if has_pane_defaults {
                             aterm_render::resolved_default_bg_at(input, r, c, self.theme.bg)
                         } else {
                             frame_bg
@@ -16775,7 +16788,11 @@ impl GpuRenderer {
                 let is_wide_lead = cells.get(c + 1).is_some_and(|n| n.wide);
                 let dw = if is_wide_lead { 2 * ccw } else { ccw };
                 let base_fg = cell_base_fg(&mut ink_walk, &mut char_fg_walk, c, cell);
-                let hit = input.selection_hit(r, c, is_wide_lead, cell.wide);
+                let hit = if may_have_sel {
+                    input.selection_hit(r, c, is_wide_lead, cell.wide)
+                } else {
+                    None
+                };
                 let cell_selected = hit.is_some();
                 let aterm_render::SelectionColors {
                     bg: theme_selection,

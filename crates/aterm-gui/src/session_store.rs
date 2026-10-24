@@ -177,6 +177,14 @@ pub(crate) struct SessionRecord {
         deserialize_with = "lenient_count"
     )]
     pub log_seq: u64,
+    /// The session's book of declared wakes (`crate::occupancy_wakes::Carry`, one JSON row),
+    /// read back leniently: a row this build cannot read restores nothing.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_row"
+    )]
+    pub wakes: Option<String>,
 }
 
 /// Formats a `(pid, local_id)` crash-journal key as `<pid>:<id>`.
@@ -731,17 +739,20 @@ impl Drawn {
                 live.handoff_attention_owners(),
             )
         };
+        let (task, reexec) = {
+            let timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+            (timeline.task_carry_row(), timeline.in_self_reexec(now_us))
+        };
         Self {
             meta,
+            // In the gap of a proven self-claim's own re-exec the claim is given back and
+            // owed again: this process cannot vouch for what holds the session next, so the
+            // successor holds its loop off as for a proven claim (`SessionRecord::claim_grace`).
+            claim_known: claim_known && !(supervisor.is_none() && reexec),
             supervisor,
-            claim_known,
             attention_owners,
             topics: crate::fabric::render_topics(&ctx.fabric.topics()),
-            task: ctx
-                .timeline
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .task_carry_row(),
+            task,
         }
     }
 }
@@ -756,10 +767,22 @@ pub(crate) struct CarriedClaims {
     supervisor: Option<String>,
     claim_known: bool,
     task: Option<String>,
+    /// A proven self-claim's task face, which no loop restates at the successor (`App::self_claim_face`): set beside the record's claims at the park, and beside the live ones at the Commit ([`Self::with_self_face`]).
+    self_face: Option<(aterm_agent::harness::acts::TaskFace, i64)>,
 }
 
 #[cfg(unix)]
 impl CarriedClaims {
+    /// These claims with session's self-claim face `face` beside them.
+    #[must_use]
+    pub(crate) const fn with_self_face(
+        mut self,
+        face: Option<(aterm_agent::harness::acts::TaskFace, i64)>,
+    ) -> Self {
+        self.self_face = face;
+        self
+    }
+
     /// Extracts [`CarriedClaims`] from a parked [`SessionRecord`].
     #[must_use]
     pub(crate) fn of_record(record: &SessionRecord) -> Self {
@@ -770,6 +793,7 @@ impl CarriedClaims {
             supervisor: record.supervisor.as_deref().map(lease_holder),
             claim_known: record.claim_known,
             task: record.task.clone(),
+            self_face: None,
         }
     }
 
@@ -789,6 +813,7 @@ impl CarriedClaims {
             supervisor: drawn.supervisor.as_deref().map(lease_holder),
             claim_known: drawn.claim_known,
             task: drawn.task,
+            self_face: None,
         }
     }
 }
@@ -900,6 +925,7 @@ impl SessionHandoff {
                         status_seen: None,
                         autopilot_end: None,
                         log_seq,
+                        wakes: crate::occupancy_wakes::carry_row(h.sid.as_str()),
                     }
                 })
                 .collect(),

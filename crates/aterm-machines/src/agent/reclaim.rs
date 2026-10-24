@@ -21,7 +21,8 @@ const DAEMONS: &str = "/Library/LaunchDaemons";
 
 /// The file uninstall writes in each folder it keeps, holding its run id. The job takes only
 /// a folder that holds it, so a folder made again at that path since (a later enrollment's
-/// stage) stays.
+/// stage), or one a program is started from again ([`crate::first_exec::stamp`]) before the
+/// job reads its mark, stays.
 pub const KEPT: &str = "kept";
 
 /// The commands the job reads the clocks, waits and takes itself out with.
@@ -50,7 +51,8 @@ const MAC: Commands<'static> = Commands {
 /// counts time asleep. Then it empties each folder that still holds [`KEPT`] with `<run>`
 /// from inside it, so a folder made again at that path since is never entered, [`KEPT`] last
 /// so a run cut short by a shutdown is taken up at the next boot. It removes each folder,
-/// `stage/` and the agent root that is empty then. Last it removes its plist and itself.
+/// `stage/`, `state/` and the agent root that is empty then. Last it removes its plist and
+/// itself.
 fn script(layout: &Layout, plist: &Path, label: &str, c: &Commands<'_>) -> String {
     let Commands {
         session,
@@ -59,7 +61,12 @@ fn script(layout: &Layout, plist: &Path, label: &str, c: &Commands<'_>) -> Strin
         launchctl,
     } = c;
     let q = |p: &Path| shell_word(&p.to_string_lossy());
-    let (root, stage, plist) = (q(&layout.root), q(&layout.stage()), q(plist));
+    let (root, stage, state, plist) = (
+        q(&layout.root),
+        q(&layout.stage()),
+        q(&layout.state()),
+        q(plist),
+    );
     format!(
         "run=$1 was=$2 secs=$3\n\
          shift 3\n\
@@ -77,7 +84,7 @@ fn script(layout: &Layout, plist: &Path, label: &str, c: &Commands<'_>) -> Strin
          && /usr/bin/find . -mindepth 1 ! -path ./{KEPT} -delete && /bin/rm {KEPT})\n\
          /bin/rmdir \"$dir\" 2>/dev/null\n\
          done\n\
-         /bin/rmdir {stage} {root} 2>/dev/null\n\
+         /bin/rmdir {stage} {state} {root} 2>/dev/null\n\
          /bin/rm -f {plist}\n\
          {launchctl} bootout system/{label}\n",
         boot_id_check("$was"),
@@ -295,6 +302,7 @@ mod tests {
         std::fs::write(cut.join(KEPT), "1-9").unwrap();
         let ours = [
             kept(&root, ".staging", Some("1-9")),
+            kept(&root, "state/aterm.app-first-run", Some("1-9")),
             kept(&root, "stage/upgrade-1-5", Some("1-9")),
             cut,
             emptied,

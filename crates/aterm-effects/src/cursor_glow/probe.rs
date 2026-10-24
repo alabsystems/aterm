@@ -177,13 +177,17 @@ impl CursorGlow {
         for row in lo..=hi {
             let line = line(row);
             let glyph = |c: &aterm_core::terminal::RenderCell| c.ch != ' ' || c.wide;
-            let mut span: Option<(i32, i32)> = None;
+            let mut first_glyph: Option<i32> = None;
+            let mut last_glyph = 0i32;
             let n_cols = line.len().min(ft.cols);
             for (c, cell) in line[..n_cols].iter().enumerate() {
                 let is_glyph = glyph(cell);
                 if is_glyph {
                     let ci = c0 + c as i32;
-                    span = Some(span.map_or((ci, ci + 1), |(f, _)| (f, ci + 1)));
+                    if first_glyph.is_none() {
+                        first_glyph = Some(ci);
+                    }
+                    last_glyph = ci + 1;
                 }
                 ft.pairs
                     .push(Some((is_glyph.then(|| rgb(cell.fg)), rgb(cell.bg))));
@@ -191,7 +195,7 @@ impl CursorGlow {
             if n_cols < ft.cols {
                 ft.pairs.resize(ft.pairs.len() + (ft.cols - n_cols), None);
             }
-            ft.rows.push(span);
+            ft.rows.push(first_glyph.map(|f| (f, last_glyph)));
         }
     }
 
@@ -254,11 +258,10 @@ impl CursorGlow {
             .filter(|p| p.cross_row)
             .map(|p| p.row)
             .or_else(|| {
-                (self.type_hint.slots.iter().any(Option::is_some)
-                    || !self.type_press_ring.is_empty())
-                .then_some(self.last)
-                .flatten()
-                .map(|(row, _)| row)
+                (self.type_hint.armed() || !self.type_press_ring.is_empty())
+                    .then_some(self.last)
+                    .flatten()
+                    .map(|(row, _)| row)
             })
             .or_else(|| self.insert.armed.and_then(|licence| licence.row));
         let caret_move = self

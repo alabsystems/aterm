@@ -309,11 +309,15 @@ impl App {
     pub(crate) fn note_occupancy_mode(&mut self, mode: aterm_agent::supervise::Occupancy) {
         use crate::message_reporters::{occupancy_prompt_entry, occupancy_prompt_key};
         crate::occupancy_host::set_mode(mode);
+        let wake_idles = crate::occupancy_wakes::note_mode(mode);
         if crate::occupancy_host::prompt_now() {
             self.except(&occupancy_prompt_entry());
         } else {
             self.except_clear(&occupancy_prompt_key());
-            for sid in crate::occupancy_host::told_sids() {
+            for sid in crate::occupancy_host::told_sids()
+                .into_iter()
+                .chain(wake_idles)
+            {
                 self.end_occupancy_lines_of(&sid);
             }
         }
@@ -327,7 +331,6 @@ impl App {
     ) {
         use crate::message_reporters::{
             occupancy_hold_entry, occupancy_hold_key, occupancy_ready_idle_entry,
-            occupancy_ready_idle_key,
         };
         let registered = self
             .store
@@ -357,6 +360,24 @@ impl App {
         }
         match ready_idle {
             Some(idle) => self.except(&occupancy_ready_idle_entry(sid, &idle, at_ms)),
+            None => self.note_wake_idle(sid),
+        }
+    }
+
+    /// Raise or clear tab `sid`'s `ready-idle` entry for its book's wake K
+    /// ([`HostNote::WakeIdle`]), under the owner's `prompt` alone: a hold rule's line its loop
+    /// says stood K looks keeps the key first, and the wake's stands once it ends.
+    pub(crate) fn note_wake_idle(&mut self, sid: &str) {
+        use crate::message_reporters::{occupancy_ready_idle_key, occupancy_wake_idle_entry};
+        let prompt = crate::occupancy_host::prompt_now();
+        let rule_idle = crate::occupancy_host::said_of(sid)
+            .and_then(|said| said.ready_idle_under_prompt())
+            .filter(|_| prompt);
+        if rule_idle.is_some() {
+            return;
+        }
+        match crate::occupancy_wakes::idle_of(sid).filter(|_| prompt) {
+            Some(idle) => self.except(&occupancy_wake_idle_entry(sid, &idle)),
             None => self.except_clear(&occupancy_ready_idle_key(sid)),
         }
     }
@@ -740,6 +761,7 @@ impl App {
                 self.record_message(message_reporters::supervisor_note(&sid, &place, &text));
             }
             HostNote::OccupancySaid { sid, said } => self.note_occupancy_said(&sid, said),
+            HostNote::WakeIdle { sid } => self.note_wake_idle(&sid),
             HostNote::UsageTap { sid, silent } => {
                 let tab = format!("{USAGE_TAP_NOTED}{sid}");
                 if silent {
@@ -1472,8 +1494,18 @@ mod tests {
         )
     }
 
+    /// A second family's entry for the digest fixtures, keyed `privacy.fda.needed`.
     fn full_disk_access() -> Entry {
-        crate::message_reporters::file_access_entry(&crate::consent_card::NeedWords::sample())
+        Entry::new(
+            Family::Privacy,
+            "fda",
+            "needed",
+            "aterm cannot read your files",
+            Why::OnlyYou(Reason::new(
+                "only you can turn on Full Disk Access in System Settings",
+            )),
+            Then::step("Turn on Full Disk Access"),
+        )
     }
 
     /// `HostNote::AgentPublished` schedules an immediate crash-journal capture without posting a digest entry.

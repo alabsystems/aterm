@@ -3436,6 +3436,7 @@ mod tests {
             crate::verify::VerifyOutcome::VendorRoot {
                 build: v("0.157.0").build_id(),
                 vendor: "OpenAI".into(),
+                measured: false,
                 drift: None,
             }
         );
@@ -3526,6 +3527,7 @@ mod tests {
             crate::verify::VerifyOutcome::VendorRoot {
                 build: v("0.163.0").build_id(),
                 vendor: "OpenAI".into(),
+                measured: false,
                 drift: None,
             }
         );

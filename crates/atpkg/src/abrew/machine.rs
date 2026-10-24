@@ -4,40 +4,44 @@
 
 use std::sync::OnceLock;
 
-const RELEASES: [(u64, &str, u64); 8] = [
-    (27, "golden_gate", 27),
-    (26, "tahoe", 26),
-    (15, "sequoia", 16),
-    (14, "sonoma", 15),
-    (13, "ventura", 14),
-    (12, "monterey", 13),
-    (11, "big_sur", 12),
-    (10, "catalina", 11),
+/// Each macOS release abrew names, newest first: its major version (`10` is
+/// 10.15 alone), Homebrew's name for it, and the first Xcode released for it,
+/// which is Homebrew's `MacOS::Xcode.minimum_version` (`os/mac/xcode.rb`).
+const RELEASES: [(u64, &str, &str); 8] = [
+    (27, "golden_gate", "27.0"),
+    (26, "tahoe", "26.0"),
+    (15, "sequoia", "16.0"),
+    (14, "sonoma", "15.0"),
+    (13, "ventura", "14.1"),
+    (12, "monterey", "13.1"),
+    (11, "big_sur", "12.2"),
+    (10, "catalina", "11.0"),
 ];
 
 const OLDEST_BOTTLE_MAJOR: u64 = 11;
 
 const ARCHES: [&str; 2] = ["arm64", "x86_64"];
 
-/// Homebrew's name for a macOS major version.
-#[must_use]
-pub fn release_name(major: u64) -> Option<&'static str> {
-    RELEASES
-        .iter()
-        .find(|(known, ..)| *known == major)
-        .map(|(_, name, _)| *name)
+/// The release macOS `version` is: by its major from 11 on, and of the 10.x
+/// line, whose releases are its minors, only 10.15.
+fn release(version: &str) -> Option<&'static (u64, &'static str, &'static str)> {
+    let mut parts = version.split('.');
+    let major: u64 = parts.next()?.parse().ok()?;
+    if major == 10 && parts.next() != Some("15") {
+        return None;
+    }
+    RELEASES.iter().find(|(known, ..)| *known == major)
 }
 
-/// The Xcode version released with macOS `macos`.
+/// The first Xcode released for macOS `macos`; past the table, the yearly
+/// Xcode that shares its number.
 #[must_use]
 pub fn release_xcode(macos: &str) -> Option<String> {
+    if let Some((.., xcode)) = release(macos) {
+        return Some((*xcode).to_string());
+    }
     let major: u64 = macos.split('.').next()?.parse().ok()?;
-    let xcode = match RELEASES.iter().find(|(known, ..)| *known == major) {
-        Some((.., xcode)) => *xcode,
-        None if major > RELEASES[0].0 => major,
-        None => return None,
-    };
-    Some(format!("{xcode}.0"))
+    (major > RELEASES[0].0).then(|| format!("{major}.0"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,11 +206,11 @@ impl Machine {
         match self.os {
             Os::Linux => Some(vec![format!("{}_linux", self.arch)]),
             Os::Macos => {
-                let release = release_name(self.macos_major()?)?;
+                let (_, name, _) = release(self.macos_version()?)?;
                 Some(if self.arch == "arm64" {
-                    vec![format!("arm64_{release}")]
+                    vec![format!("arm64_{name}")]
                 } else {
-                    vec![format!("{}_{release}", self.arch), release.to_string()]
+                    vec![format!("{}_{name}", self.arch), (*name).to_string()]
                 })
             }
             Os::Other => None,
@@ -360,6 +364,15 @@ mod tests {
         assert_eq!(
             Machine::mac("arm64", "40.0", None, true).variation_keys(),
             None
+        );
+        assert_eq!(
+            Machine::mac("x86_64", "10.15.7", None, true).variation_keys(),
+            Some(vec!["x86_64_catalina".to_string(), "catalina".to_string()])
+        );
+        assert_eq!(
+            Machine::mac("x86_64", "10.14", None, true).variation_keys(),
+            None,
+            "Mojave is not Catalina"
         );
     }
 
@@ -605,9 +618,13 @@ mod tests {
             ("27.0", Some("27.0")),
             ("26.1", Some("26.0")),
             ("15.5", Some("16.0")),
-            ("13.5", Some("14.0")),
-            ("11.7", Some("12.0")),
-            ("10.15", Some("11.0")),
+            ("14.6", Some("15.0")),
+            ("13.5", Some("14.1")),
+            ("12.7", Some("13.1")),
+            ("11.7", Some("12.2")),
+            ("10.15.7", Some("11.0")),
+            ("10.14", None),
+            ("10", None),
             ("30.0", Some("30.0")),
             ("20.0", None),
             ("9.3", None),

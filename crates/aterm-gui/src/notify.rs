@@ -523,7 +523,7 @@ fn post(
     }
 }
 
-/// Deliver one notification on the calling thread, at once (blocking up to twice [`freedesktop::CALL_TIMEOUT`]: the bus's handshake, then the call, each bounded by it): the Linux arm of `menu::notify`, whose callers (a launch that cannot start, a file that cannot open) may end the process right after it, before the delivery thread would run.
+/// Deliver one notification on the calling thread, at once (blocking up to twice [`freedesktop::CALL_TIMEOUT`]: joining the bus, its connect and handshake, then the call, each bounded by it): the Linux arm of `menu::notify`, whose callers (a launch that cannot start, a file that cannot open) may end the process right after it, before the delivery thread would run.
 #[cfg(target_os = "linux")]
 pub(crate) fn deliver_now(title: &str, body: &str) {
     if cfg!(test) || crate::menu::process_is_headless() {

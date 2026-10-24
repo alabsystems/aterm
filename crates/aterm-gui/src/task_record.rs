@@ -131,7 +131,7 @@ pub(crate) struct TaskRecord {
     /// Canonical `cwd` trusted by the starter when spawning the worker.
     pub(crate) trusted_cwd: Option<String>,
     /// THE FACT WORD the harness loop noted for a managed worker under the owner's `prompt`
-    /// ([`mark_session_task_fact`], `fact=`): the line it would have typed but for the manager.
+    /// ([`mark_session_task_fact_if`], `fact=`): the line it would have typed but for the manager.
     /// Only the closed [`FactWord`] stands here; a mark never touches it.
     pub(crate) fact: Option<FactWord>,
     /// The fact word's own revision (`fact_rev=`): moved by every edit of [`Self::fact`], never by
@@ -692,6 +692,17 @@ fn mark_on_timeline(
     Ok(outcome)
 }
 
+/// Unconditional fact edit for the task-record tests.
+#[cfg(test)]
+pub(crate) fn mark_session_task_fact(
+    ctx: &SessionCtx,
+    local_id: u64,
+    word: Option<FactWord>,
+    fence_wait: std::time::Duration,
+) -> NoteOutcome {
+    mark_session_task_fact_if(ctx, local_id, word, fence_wait, || true)
+}
+
 /// THE FACT WORD'S EDIT (`fact=`, the occupancy design's manager door): `word` set on
 /// `ctx`'s task record, or cleared with `None`, under the lock a mark takes
 /// ([`mark_session_task_with`]) and the fence a committing update holds (waiting at most
@@ -702,15 +713,21 @@ fn mark_on_timeline(
 ///
 /// [`NoteOutcome::NoTask`] with no record, [`NoteOutcome::Closed`] for a word on an `exited`
 /// record (a clear is always taken), [`NoteOutcome::Fenced`] when the fence held past
-/// `fence_wait`. The caller gates on the owner's mode ([`crate::occupancy_host::prompt_now`]).
-pub(crate) fn mark_session_task_fact(
+/// `fence_wait` or the caller's live write authority (`when`) was withdrawn. Read that authority
+/// after both the fence and timeline waits, beside the edit: a mode change during either wait
+/// must retain the loop's pending note or clear without moving the record or posting a wake.
+pub(crate) fn mark_session_task_fact_if(
     ctx: &SessionCtx,
     local_id: u64,
     word: Option<FactWord>,
     fence_wait: std::time::Duration,
+    when: impl FnOnce() -> bool,
 ) -> NoteOutcome {
     let edited = ctx.fabric.run_unfenced(fence_wait, || {
         let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        if !when() {
+            return (NoteOutcome::Fenced, false);
+        }
         let edited = timeline.note_task_fact(word);
         timeline.slog_take_wake();
         edited
@@ -725,7 +742,7 @@ pub(crate) fn mark_session_task_fact(
 }
 
 /// What [`TaskRecord`] the fact edit `word` makes of `current`, and the outcome: `None` for no
-/// move ([`mark_session_task_fact`]'s rules).
+/// move ([`mark_session_task_fact_if`]'s rules).
 pub(crate) fn fact_edit(
     current: &TaskRecord,
     word: Option<FactWord>,

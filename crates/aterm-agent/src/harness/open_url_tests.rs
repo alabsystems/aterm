@@ -1088,6 +1088,52 @@ fn maildir_threads_keep_consumed_links_across_authorizations() {
 }
 
 #[test]
+fn a_plaintext_mailbox_with_credentials_is_refused_off_loopback() {
+    use super::super::headless_oauth::{
+        MailboxConfig, plaintext_credential_refusal, poll_mailbox_config_for_credential,
+    };
+    let imap = |url: &str| MailboxConfig {
+        imap_url: Some(url.to_owned()),
+        password: Some("pw".to_owned()),
+        ..MailboxConfig::default()
+    };
+    let http = |url: &str, token: Option<&str>| MailboxConfig {
+        http_url: Some(url.to_owned()),
+        bearer_token: token.map(str::to_owned),
+        ..MailboxConfig::default()
+    };
+    for spoken in [
+        imap("imap://127.0.0.1:1143/INBOX"),
+        imap("imap://localhost:1143/INBOX"),
+        imap("imap://[::1]:1143/INBOX"),
+        imap("imaps://mail.example.test/INBOX"),
+        http("http://127.0.0.1:9/m", Some("t")),
+        http("http://[::1]:9/m", Some("t")),
+        http("http://mail.example.test/m", None),
+        http("https://mail.example.test/m", Some("t")),
+    ] {
+        assert_eq!(
+            plaintext_credential_refusal(&spoken, None),
+            None,
+            "{spoken:?}"
+        );
+    }
+    for remote in [
+        imap("imap://mail.example.test/INBOX"),
+        imap("imap://127.0.0.1.example.test:143/INBOX"),
+        http("http://mail.example.test/m", Some("t")),
+        http("http://u:p@mail.example.test/m", None),
+    ] {
+        let why = plaintext_credential_refusal(&remote, None).expect("refused");
+        assert_eq!(
+            poll_mailbox_config_for_credential(&remote, None, Duration::ZERO),
+            Err(why),
+            "{remote:?}"
+        );
+    }
+}
+
+#[test]
 fn imap_bridge_and_http_json_mailbox_fetch_credentials_and_track_seen_digests() {
     use super::super::headless_oauth::{
         MailboxConfig, MailboxCredential, poll_mailbox_config_for_credential,
@@ -3811,4 +3857,236 @@ fn webmail_user_for_and_all_webmail_ui_urls_route_cleanly() {
     let step_js = oauth_step_js(Some("sol_m27_2+claude@proton.me"), None, false, false);
     assert!(step_js.contains("const canonEmail ="));
     assert!(step_js.contains("canonEmail(e) === targetCanon"));
+}
+
+#[test]
+fn hex_3d_tokens_multipart_qp_dot_segments_and_subaddressed_profiles_work() {
+    use super::super::headless_oauth::{
+        browser_profile_dir, extract_otp_from_email, has_browser_profile,
+        resolve_browser_profile_dir,
+    };
+
+    // Non-QP email whose hex query token starts with `3d` / `3D` must not be corrupted by
+    // false-positive Quoted-Printable decoding.
+    let raw_hex_token_eml = concat!(
+        "From: Claude <no-reply@claude.ai>\r\n",
+        "To: <sol-m27@proton.me>\r\n",
+        "Subject: Sign in to Claude\r\n\r\n",
+        "https://claude.ai/magic-link?token=3d8f9a1b2c&state=41bc99\r\n"
+    );
+    assert_eq!(
+        extract_magic_link_from_email(raw_hex_token_eml, Some("sol-m27@proton.me")).as_deref(),
+        Some("https://claude.ai/magic-link?token=3d8f9a1b2c&state=41bc99"),
+        "hex query token starting with 3d must not trigger QP decoding of =3d and =41"
+    );
+
+    // Multipart email mixing folded Quoted-Printable and 8bit MIME parts decodes QP per-part
+    // without corrupting the 8bit part.
+    let multipart_mixed_eml = concat!(
+        "From: Claude <no-reply@claude.ai>\r\n",
+        "To: <sol-m27@proton.me>\r\n",
+        "Content-Type: multipart/alternative; boundary=\"b_qp\"\r\n\r\n",
+        "--b_qp\r\n",
+        "Content-Type: text/plain; charset=utf-8\r\n",
+        "Content-Transfer-Encoding:\r\n",
+        " quoted-printable\r\n\r\n",
+        "Sign in: https://claude.ai/magic-link?token=3Dqp_folded_ok&state=3Ds1\r\n",
+        "--b_qp\r\n",
+        "Content-Type: text/html; charset=utf-8\r\n",
+        "Content-Transfer-Encoding: 8bit\r\n\r\n",
+        "<a href=\"https://claude.ai/magic-link?token=3d8f9a1b2c&amp;state=41bc99\">Sign in</a>\r\n",
+        "--b_qp--\r\n"
+    );
+    let links = extract_magic_links_from_email(multipart_mixed_eml, Some("sol-m27@proton.me"));
+    assert_eq!(
+        links,
+        vec![
+            "https://claude.ai/magic-link?token=qp_folded_ok&state=s1".to_owned(),
+            "https://claude.ai/magic-link?token=3d8f9a1b2c&state=41bc99".to_owned(),
+        ]
+    );
+
+    // Child spans with `>` in quoted attributes inside `<button>` must not hide negative text,
+    // and relative `../` form actions normalize dot segments per RFC 3986.
+    let consent_html = r#"
+      <form method="POST" action="../approve">
+        <input type="hidden" name="csrf" value="c1">
+        <button type="submit" name="decision" value="0"><span data-icon="1 > 0">Deny</span></button>
+        <button type="submit" name="decision" value="1"><span data-icon="1 > 0">Allow</span></button>
+      </form>
+    "#;
+    assert_eq!(
+        parse_html_approval_action(
+            consent_html,
+            "https://claude.ai/oauth/v2/authorize?state=s1"
+        ),
+        Some((
+            "POST".to_owned(),
+            "https://claude.ai/oauth/approve".to_owned(),
+            Some("csrf=c1&decision=1".to_owned()),
+        ))
+    );
+
+    // `<meta http-equiv="refresh">` handles `>` inside quoted attributes, spaces around `=`,
+    // and skips negative refresh URLs.
+    let meta_html = r#"
+      <html><head>
+        <meta data-rule="1 > 0" http-equiv="refresh" content="0; url = '/oauth/logout'">
+        <meta data-rule="2 > 1" http-equiv="refresh" content="0; URL = '../consent?step=2'">
+      </head></html>
+    "#;
+    assert_eq!(
+        parse_html_approval_action(meta_html, "https://claude.ai/oauth/v2/landing"),
+        Some((
+            "GET".to_owned(),
+            "https://claude.ai/oauth/consent?step=2".to_owned(),
+            None,
+        ))
+    );
+
+    // JSON OTP fields accept hyphenated `"482-910"` and 6-digit integer `654321`.
+    assert_eq!(
+        extract_otp_from_email(
+            r#"{"to":"sol-m27@proton.me","otp":"482-910"}"#,
+            Some("sol-m27@proton.me")
+        )
+        .as_deref(),
+        Some("482910")
+    );
+    assert_eq!(
+        extract_otp_from_email(
+            r#"{"to":"sol-m27@proton.me","code":200,"verification_code":654321}"#,
+            Some("sol-m27@proton.me")
+        )
+        .as_deref(),
+        Some("654321")
+    );
+
+    // Subaddressed emails reuse existing base-email or derived-label browser profile directories.
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let store = tmp.path().join("accounts");
+    let base_dir = browser_profile_dir(&store, Some("sol_m27_2@proton.me"));
+    assert_eq!(
+        resolve_browser_profile_dir(&store, None, Some("sol_m27_2+claude@proton.me")),
+        base_dir,
+        "fresh subaddressed email defaults to base email profile directory"
+    );
+    let label_dir = browser_profile_dir(&store, Some("m27-2"));
+    std::fs::create_dir_all(&label_dir).unwrap();
+    assert!(has_browser_profile(
+        &store,
+        "m27_2",
+        Some("sol_m27_2+claude@proton.me")
+    ));
+    assert_eq!(
+        resolve_browser_profile_dir(&store, Some("m27_2"), Some("sol_m27_2+claude@proton.me")),
+        label_dir
+    );
+    std::fs::create_dir_all(&base_dir).unwrap();
+    assert_eq!(
+        resolve_browser_profile_dir(&store, Some("m27_2"), Some("sol_m27_2+claude@proton.me")),
+        base_dir
+    );
+}
+
+#[test]
+fn multipart_mime_boundary_and_consent_negation_hardening() {
+    use crate::harness::headless_oauth::extract_otp_from_email;
+
+    // 1. Multipart email with LF top-level headers (`\n\n`), CRLF MIME part headers (`\r\n\r\n`),
+    // an 8bit part containing hex `=3d` query values (`?token=3d8f9a1b2c`), and a quoted-printable
+    // part containing `-->` at line start and `---` dividers before the magic link and OTP.
+    let mixed_multipart = concat!(
+        "From: Anthropic <no-reply@anthropic.com>\n",
+        "To: sol-m27@proton.me\n",
+        "Subject: Sign in to Claude\n",
+        "Content-Type: multipart/alternative; boundary=\"part-bound\"\n",
+        "\n",
+        "--part-bound\r\n",
+        "Content-Type: text/plain; charset=utf-8\r\n",
+        "Content-Transfer-Encoding: 8bit\r\n",
+        "\r\n",
+        "----------------\r\n",
+        "Use https://claude.ai/magic-link?token=3d8f9a1b2c&state=41bc99\r\n",
+        "-- \r\n",
+        "Anthropic Team\r\n",
+        "--part-bound\r\n",
+        "Content-Type: text/html; charset=utf-8\r\n",
+        "Content-Transfer-Encoding: quoted-printable\r\n",
+        "\r\n",
+        "<!-- header comment\r\n",
+        "-->\r\n",
+        "<p>Or click <a href=3D\"https://claude.ai/magic-link?token=3Dsecond-qp&=\r\n",
+        "state=3D99\">Sign in</a></p>\r\n",
+        "<p>Your verification code is: 739=3204</p>\r\n",
+        "--part-bound--\r\n"
+    );
+    let links = extract_magic_links_from_email(mixed_multipart, Some("sol-m27@proton.me"));
+    assert_eq!(
+        links,
+        vec![
+            "https://claude.ai/magic-link?token=3d8f9a1b2c&state=41bc99".to_owned(),
+            "https://claude.ai/magic-link?token=second-qp&state=99".to_owned(),
+        ],
+        "8bit hex `=3d` is preserved intact while quoted-printable part after `-->` is decoded"
+    );
+    assert_eq!(
+        extract_otp_from_email(mixed_multipart, Some("sol-m27@proton.me")).as_deref(),
+        Some("739204"),
+        "OTP after `-->` in quoted-printable part with LF top-level header is decoded"
+    );
+
+    // 2. JSON-wrapped raw MIME with per-part quoted-printable and `-->` / `---` lines.
+    let json_multipart = r#"{"to":"sol-m27@proton.me","body":"--b1\r\nContent-Type: text/html\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n<!--\r\n-->\r\n<a href=3D\"https://claude.ai/magic-link?token=3Djson-qp-tok&state=3D77\">Log in</a>\r\n--b1--"}"#;
+    assert_eq!(
+        extract_magic_link_from_email(json_multipart, Some("sol-m27@proton.me")).as_deref(),
+        Some("https://claude.ai/magic-link?token=json-qp-tok&state=77")
+    );
+
+    // 3. Multi-word negative consent buttons (`"Do not allow"`, `"Don't allow"`) are rejected,
+    // and forms with an explicit positive submit button beat earlier forms whose surrounding HTML
+    // merely mentions `"allow"` or `"continue"`.
+    let html_multi_form = r#"
+        <html><body>
+          <form method="POST" action="/account/switch">
+            <p>Allow switching accounts to continue with another user</p>
+            <input type="hidden" name="switch" value="1">
+            <button type="submit">Switch account</button>
+          </form>
+          <form method="POST" action="/oauth/decision">
+            <input type="hidden" name="req" value="req-99">
+            <button type="submit" name="decision" value="do_not_allow">Do not allow</button>
+            <button type="submit" name="decision" value="dont_allow">Don't allow</button>
+            <button type="submit" name="decision" value="allow_access">Allow access</button>
+          </form>
+        </body></html>
+    "#;
+    assert_eq!(
+        parse_html_approval_action(html_multi_form, "https://claude.ai/oauth/authorize"),
+        Some((
+            "POST".to_owned(),
+            "https://claude.ai/oauth/decision".to_owned(),
+            Some("req=req-99&decision=allow_access".to_owned()),
+        ))
+    );
+
+    // 4. Form with only `"Do not allow"` / `"Don't allow"` buttons is rejected completely.
+    let html_only_neg = r#"
+        <form method="POST" action="/oauth/consent">
+          <button type="submit" name="act" value="no">Do not allow</button>
+          <button type="submit" name="act" value="no2">Don't authorize</button>
+        </form>
+    "#;
+    assert_eq!(
+        parse_html_approval_action(html_only_neg, "https://claude.ai/oauth/authorize"),
+        None
+    );
+
+    // 5. `parse_raw_http_response` splits LF headers (`\n\n`) before CRLF body (`\r\n\r\n`).
+    let mut cookies = BTreeMap::new();
+    let raw_http = "HTTP/1.1 200 OK\nSet-Cookie: sid=abc; Path=/\n\nline1\r\n\r\nline2";
+    let resp = super::parse_raw_http_response(raw_http, &mut cookies).expect("http response");
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, "line1\r\n\r\nline2");
+    assert_eq!(cookies.get("sid").map(String::as_str), Some("abc"));
 }

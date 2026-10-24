@@ -355,6 +355,69 @@ pub fn is_task_row(reason: &str) -> bool {
     reason.split(' ').any(|w| w == TASK_DOOR)
 }
 
+/// The last acknowledged task note, and whether its hold subsequently closed.
+/// This is custody only: it gives no typed-line credit, pace or rule-cap booking.
+#[derive(Debug, Default)]
+pub(crate) struct TaskCustody {
+    word: Option<super::FactWord>,
+    closed: bool,
+}
+
+impl TaskCustody {
+    /// Read this session's acknowledged notes and clears beside actual hold boundaries.
+    /// An intent, would-be note or refusal cannot replace an acknowledged predecessor.
+    pub(crate) fn from_ledger(body: &str, sid: Option<&str>) -> Self {
+        let want = sid.map(|sid| sid.trim_start_matches('@'));
+        let hold = FactKind::Hold.rule();
+        let mut custody = Self::default();
+        for line in body.lines().filter(|line| line.contains(hold)) {
+            let Ok(row) = aterm_json::from_str::<aterm_json::Value>(line) else {
+                continue;
+            };
+            let text = |key: &str| row.get(key).and_then(aterm_json::Value::as_str);
+            if text("sid") != want
+                || text("rule_id") != Some(hold)
+                || text("decision") != Some("waiting")
+            {
+                continue;
+            }
+            let Some(reason) = text("reason") else {
+                continue;
+            };
+            if matches!(
+                super::hold::row_said(reason),
+                Some(super::hold::RowSaid::Closed { .. })
+            ) {
+                custody.close();
+            } else if is_task_row(reason)
+                && let Some(word) = text("command").and_then(super::FactWord::parse)
+            {
+                if reason == task_clear_reason(word, super::NoteOutcome::Cleared) {
+                    custody = Self::default();
+                } else if reason.split(' ').next_back() == Some("noted")
+                    && reason
+                        .split(' ')
+                        .any(|part| part.strip_prefix("rule=") == Some(word.rule.name()))
+                {
+                    custody.word = Some(word);
+                    custody.closed = false;
+                }
+            }
+        }
+        custody
+    }
+
+    /// A stale/relaunch close can be observed after the ledger was read but before task seeding.
+    pub(crate) fn close(&mut self) {
+        self.closed = true;
+    }
+
+    /// Whether this exact standing word is known to belong to a hold that ended.
+    pub(crate) fn closed(&self, word: super::FactWord) -> bool {
+        self.closed && self.word == Some(word)
+    }
+}
+
 /// The task door's intent row's reason (`fact-intent@v1`, `waiting`), and under `observe` its
 /// would-be note's (`fact-would@v1`): the episode's words and [`TASK_DOOR`].
 #[must_use]

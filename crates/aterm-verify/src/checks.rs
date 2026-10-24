@@ -93,6 +93,7 @@ pub const CHECKS: [Spec; 19] = [
             "targo",
             "cc",
             "bash",
+            "bash-5.3",
             "zsh",
             "fish",
             "pwsh",
@@ -525,6 +526,7 @@ mod tests {
         let test = needs_of(Check::Test);
         for want in [
             "fish (verify provision)",
+            "bash-5.3 (verify provision)",
             "pwsh (verify provision)",
             "cc (CLT)",
             "zstd (unprovided)",

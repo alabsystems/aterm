@@ -117,16 +117,18 @@ impl Companions {
             self.kitty_sing.note_keyed_enter(now, session);
         }
         let mut fired = TypedHit::default();
-        press.feed(
-            &mut self.kitty_summon,
-            |kitty| kitty.note_break(),
-            |kitty| kitty.note_backspace(session),
-            |kitty, c| {
-                if let Some((lexicon, opts)) = words {
-                    fired = fired.merge(kitty.note_char(now, session, c, lexicon, opts));
-                }
-            },
-        );
+        if words.is_some() || press.brk || press.backspace {
+            press.feed(
+                &mut self.kitty_summon,
+                |kitty| kitty.note_break(),
+                |kitty| kitty.note_backspace(session),
+                |kitty, c| {
+                    if let Some((lexicon, opts)) = words {
+                        fired = fired.merge(kitty.note_char(now, session, c, lexicon, opts));
+                    }
+                },
+            );
+        }
         fired
     }
 

@@ -1406,7 +1406,7 @@ fn every_producer_runs_under_the_timeline_lock_alone() {
             "send",
             Some(&key),
             &|| {},
-            || "ERR write failed\n".to_string(),
+            |_| "ERR write failed\n".to_string(),
         );
         let _ = super::validate_cause(&ctx, super::CauseRef::Rec(1));
         let _ = super::validate_cause(&ctx, super::CauseRef::Mail(7));

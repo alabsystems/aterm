@@ -133,6 +133,14 @@ pub trait SecretsOps: Send + Sync {
     /// The job could not be installed or started.
     fn install_subscriber(&self) -> aterm_secrets::Result<String>;
 
+    /// Whether the person turned the subscriber off (`aterm_secrets::service::subscriber_turned_off`): their recorded choice, which System State's setup installs nothing over.
+    fn turned_off(&self) -> bool;
+
+    /// Wait for a subscriber System State's setup just installed to keep running, read again through launchd's restart window (`aterm_secrets::service::back_within_restart_window`).
+    /// # Errors
+    /// It does not keep running (the error names its log), or cannot be read.
+    fn started(&self) -> Result<(), String>;
+
     /// The running aterm when it is a copy that goes away when it quits.
     fn fleeting(&self) -> Option<PathBuf>;
 
@@ -341,6 +349,35 @@ impl SecretsOps for LiveSecrets {
             &program,
             &["secrets".to_owned(), "watch".to_owned()],
         )
+    }
+
+    fn turned_off(&self) -> bool {
+        aterm_secrets::service::subscriber_turned_off(&self.home)
+    }
+
+    fn started(&self) -> Result<(), String> {
+        let unread =
+            |why: aterm_secrets::Error| format!("cannot read whether the subscriber runs: {why}");
+        let mut running = || self.subscriber().map(|state| idle(&state).is_none());
+        let up = match running() {
+            Ok(true) => true,
+            Ok(false) => aterm_secrets::service::back_within_restart_window(
+                &mut None,
+                &mut Instant::now,
+                &mut running,
+                &mut std::thread::sleep,
+            )
+            .map_err(unread)?,
+            Err(why) => return Err(unread(why)),
+        };
+        if up {
+            return Ok(());
+        }
+        Err(format!(
+            "the secrets subscriber was installed but does not keep running; its log is {}",
+            aterm_secrets::service::log_path(&self.home, aterm_secrets::service::Job::Subscriber)
+                .display()
+        ))
     }
 
     fn fleeting(&self) -> Option<PathBuf> {
@@ -827,6 +864,7 @@ impl Vault {
                 }
                 None => Err(why),
             },
+            Ok(()) if self.origin == Origin::Selected => self.ops.started().map(|()| true),
             installed => installed.map(|()| true),
         }
     }
@@ -998,7 +1036,7 @@ const fn idle(state: &State) -> Option<&'static str> {
     }
 }
 
-fn judge(status: &Status, source: &str, unsynced: Option<&str>, synced: bool) -> Probe {
+fn judge(status: &Status, source: &str, unsynced: Option<&str>, synced: bool, off: bool) -> Probe {
     let name = status
         .config
         .as_ref()
@@ -1019,6 +1057,11 @@ fn judge(status: &Status, source: &str, unsynced: Option<&str>, synced: bool) ->
         to: SUBSCRIBED.into(),
     };
     let watched = unsynced.is_none();
+    let kept = if off {
+        "sync turned off on this Mac by choice"
+    } else {
+        "kept in sync by the subscriber"
+    };
     let unwritten = |now: String| Probe::Change {
         from: format!("{now}, but a file it wrote failed, is missing or was changed"),
         to: WRITTEN.into(),
@@ -1031,12 +1074,12 @@ fn judge(status: &Status, source: &str, unsynced: Option<&str>, synced: bool) ->
             unwritten(format!("reading the plain text file {}", shown(source)))
         }
         Membership::In { seq, .. } if watched => Probe::Ok {
-            now: format!("in vault {name} (seq {seq}): {held}, kept in sync by the subscriber"),
+            now: format!("in vault {name} (seq {seq}): {held}, {kept}"),
         },
         Membership::In { seq, .. } => unwatched(format!("in vault {name} (seq {seq})")),
         Membership::Plain if watched => Probe::Ok {
             now: format!(
-                "reading the plain text file {}: {held}, kept in sync by the subscriber",
+                "reading the plain text file {}: {held}, {kept}",
                 shown(source)
             ),
         },
@@ -1106,7 +1149,8 @@ impl Item for Vault {
                     let subscribe = self
                         .ops
                         .subscriber()
-                        .map_or(true, |state| idle(&state).is_some());
+                        .map_or(true, |state| idle(&state).is_some())
+                        && !self.ops.turned_off();
                     self.plan(Planned {
                         join: true,
                         over: status.config.clone(),
@@ -1147,7 +1191,11 @@ impl Item for Vault {
             },
             _ => true,
         };
-        let probe = judge(&status, &self.source, unsynced, synced);
+        // A subscriber the person turned off is their choice, which System State's setup
+        // keeps: no change to make, the files as last synced.
+        let off = self.origin == Origin::Selected && unsynced.is_some() && self.ops.turned_off();
+        let unsynced = unsynced.filter(|_| !off);
+        let probe = judge(&status, &self.source, unsynced, synced, off);
         if matches!(probe, Probe::Change { .. }) {
             self.plan(match self.origin {
                 Origin::Chosen => Planned {
@@ -1366,6 +1414,10 @@ mod tests {
         log: Mutex<Vec<String>>,
         /// What `say` was given.
         said: Mutex<Vec<String>>,
+        /// The person turned the subscriber off.
+        turned_off: Mutex<bool>,
+        /// Why a subscriber just installed does not keep running (`None`: it does).
+        dies: Mutex<Option<String>>,
     }
 
     impl Scripted {
@@ -1556,6 +1608,14 @@ mod tests {
                 *self.subscriber.lock().unwrap() = None;
             }
             installed
+        }
+
+        fn turned_off(&self) -> bool {
+            *self.turned_off.lock().unwrap()
+        }
+
+        fn started(&self) -> Result<(), String> {
+            self.dies.lock().unwrap().clone().map_or(Ok(()), Err)
         }
 
         fn fleeting(&self) -> Option<PathBuf> {
@@ -2845,6 +2905,68 @@ mod tests {
         assert_eq!(row.outcome, Outcome::Changed, "{row:?}");
         assert_eq!(ops.changes(), ["sync"]);
         journaled_first(&ops.log());
+    }
+
+    /// SYNC OFF IS THE PERSON'S RECORDED CHOICE, WHICH SETUP KEEPS: a member whose
+    /// subscriber they turned off (`aterm secrets agent off`) is no change to make, and
+    /// a join over that record installs no subscriber. NEGATIVE CONTROL: with no record,
+    /// the same Mac is a change that installs it.
+    #[test]
+    fn a_subscriber_turned_off_is_left_off_by_setup() {
+        let source = aterm_secrets::ALAB_DEFAULT_URL;
+        for off in [true, false] {
+            let ops = Scripted::new(vec![Ok(configured(Membership::In { seq: 7, heard: 0 }))]);
+            *ops.turned_off.lock().unwrap() = off;
+            let row = setup_pass(&ops, source, &mut None, false);
+            if off {
+                assert_eq!(row.outcome, Outcome::Ok, "{row:?}");
+                assert!(
+                    row.to
+                        .as_deref()
+                        .is_some_and(|to| to.ends_with("sync turned off on this Mac by choice")),
+                    "{row:?}"
+                );
+                assert!(ops.changes().is_empty(), "{:?}", ops.changes());
+            } else {
+                assert_eq!(row.outcome, Outcome::Changed, "{row:?}");
+                assert_eq!(ops.changes(), ["install"]);
+            }
+        }
+
+        let ops = Scripted::new(vec![Ok(unconfigured())]);
+        *ops.turned_off.lock().unwrap() = true;
+        let _ = setup_pass(&ops, source, &mut None, false);
+        assert_eq!(ops.joins().len(), 1, "the join is made");
+        assert_eq!(ops.installs(), 0, "no subscriber over the person's record");
+    }
+
+    /// AN INSTALL THAT LEAVES NO PROCESS IS A FAILED STEP NAMING ITS LOG: setup waits
+    /// through launchd's restart window for a subscriber it installed, and one that
+    /// never keeps running fails the step (retried, then said on the menu line), never
+    /// a wait Set up now repeats. NEGATIVE CONTROL: one that keeps running is changed.
+    #[test]
+    fn an_install_that_leaves_no_subscriber_running_is_a_failed_step_naming_its_log() {
+        let source = aterm_secrets::ALAB_DEFAULT_URL;
+        let log = "/Users//alice/.config/aterm/secrets/systems.alab.aterm-secrets.log";
+        for dies in [true, false] {
+            let ops = Scripted::new(vec![Ok(configured(Membership::In { seq: 7, heard: 0 }))]);
+            *ops.dies.lock().unwrap() = dies.then(|| {
+                format!(
+                    "the secrets subscriber was installed but does not keep running; its log is {log}"
+                )
+            });
+            let row = setup_pass(&ops, source, &mut None, false);
+            assert_eq!(ops.changes(), ["install"]);
+            if dies {
+                assert_eq!(row.outcome, Outcome::Failed, "{row:?}");
+                assert!(
+                    row.why.as_deref().is_some_and(|why| why.contains(log)),
+                    "{row:?}"
+                );
+            } else {
+                assert_eq!(row.outcome, Outcome::Changed, "{row:?}");
+            }
+        }
     }
 
     #[test]

@@ -46,6 +46,22 @@ pub(crate) const fn landing_turns(counted: u64, typed_at: Option<u64>) -> u64 {
     }
 }
 
+/// THE LANDING'S OWN TURN ON BOTH COUNTS a reopen reads ([`App::reopen_self_claim_landing`]): [`landing_turns`] for the program's turns and for the screen reader's busy entries, each against the count the holder's last turn-starting act stood at. The reader's first `busy` read of a land turn answered in moments can come after its `landed@v1`, as the program's own reports can (the codex-alab lab's reland leg, 2026-10-23).
+#[must_use]
+pub(crate) const fn landing_mark(
+    counted: crate::session_timeline::LandingMark,
+    typed_at: Option<crate::session_timeline::LandingMark>,
+) -> crate::session_timeline::LandingMark {
+    let (turns, busy) = match typed_at {
+        Some(at) => (Some(at.program_turns), Some(at.busy_entries)),
+        None => (None, None),
+    };
+    crate::session_timeline::LandingMark {
+        program_turns: landing_turns(counted.program_turns, turns),
+        busy_entries: landing_turns(counted.busy_entries, busy),
+    }
+}
+
 /// THE WORK FLOOR OF AN END (§11.2.3, items 1 and 3): a landing marks the tab only after this much of the agent's busy time since its task opened — the kitty's own line between a quick success and a build (`kitty_pet::CHEER_BIG_MS`), kept apart and named for what it guards: a cold restore's first point, a move from open over whatever busy time this process saw of the session, arms nothing for a reply under it.
 pub(crate) const END_WORK_MS: u64 = 30_000;
 
@@ -137,7 +153,7 @@ impl App {
         }
     }
 
-    /// A PROVEN SELF-CLAIM'S FACE ON ITS WORKER'S TASK RECORD (codex-alab under Autopilot Land), read as a level, not an edge, so a mark an update's fence refused is made at a later pass while the face still shows it (a landing a seamless update carried, at the new build's; one whose glass end the update did not carry is not): a landed face beside a record open to it since before the landing ([`open_before`]) marks it `done why=landed` with the report the claim's rollout holds ([`land_self_claim_task`], one thread per session at a time), and an open face beside a record a landing marked done before that turn ([`landed_before`]) reopens it `working why=turn` ([`reopen_self_claim_task`]). Called at each move of the face and at each status sweep's visit.
+    /// A PROVEN SELF-CLAIM'S FACE ON ITS WORKER'S TASK RECORD (codex-alab under Autopilot Land), read as a level, not an edge, so a mark an update's fence refused is made at a later pass while the timeline holds the face (at the new build's, the face a seamless update carried, from the glass's end or the claim's own: `App::end_carry_rows`, `SessionTimeline::carried_task_face`): a landed face beside a record open to it since before the landing ([`open_before`]) marks it `done why=landed` with the report the claim's rollout holds ([`land_self_claim_task`], one thread per session at a time), and an open face beside a record a landing marked done before that turn ([`landed_before`]) reopens it `working why=turn` ([`reopen_self_claim_task`]). Called at each move of the face and at each status sweep's visit.
     pub(crate) fn reconcile_self_claim_task(&self, session: u64) {
         if !self.beside_proven_self_claim(session) {
             return;
@@ -148,7 +164,7 @@ impl App {
         let (face, landed_at, record) = {
             let timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             (
-                timeline.task_face(),
+                told_or_carried(&timeline),
                 timeline.task_face_at(TaskFace::Landed),
                 timeline.task().cloned(),
             )
@@ -407,10 +423,15 @@ fn settled_rollout(path: &std::path::Path) -> Option<String> {
     }
 }
 
-/// A TURN BEGUN AFTER A PROVEN SELF-CLAIM'S LANDING, ON THE TASK RECORD of session `local`: a record a landing marked done is `working why=turn` again, as aterm's own loop reopens one, if, under the mark's lock, the face still shows the turn. On the window's thread, so it never waits on an update's fence: a refused reopen is made at a later pass.
+/// The face a turn begun after a landing is read from: the one shown, or the one a seamless update carried while none is ([`crate::session_timeline::SessionTimeline::carried_task_face`]); never a face held only because the shown one went unknown, which may be aterm's own watch-only loop's start face, not the self-claim's.
+fn told_or_carried(timeline: &crate::session_timeline::SessionTimeline) -> Option<(TaskFace, i64)> {
+    timeline.task_face().or(timeline.carried_task_face())
+}
+
+/// A TURN BEGUN AFTER A PROVEN SELF-CLAIM'S LANDING, ON THE TASK RECORD of session `local`: a record a landing marked done is `working why=turn` again, as aterm's own loop reopens one, if, under the mark's lock, the face still shows the turn ([`told_or_carried`]). On the window's thread, so it never waits on an update's fence: a refused reopen is made at a later pass.
 fn reopen_self_claim_task(ctx: &crate::SessionCtx, local: u64) {
     let turn_begun =
-        |timeline: &crate::session_timeline::SessionTimeline| match timeline.task_face() {
+        |timeline: &crate::session_timeline::SessionTimeline| match told_or_carried(timeline) {
             Some((TaskFace::Open, at_ms)) => landed_before(timeline.task(), at_ms),
             _ => false,
         };

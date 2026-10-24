@@ -276,9 +276,10 @@ impl Failure {
                                      Mac; if it was erased or reinstalled, `aterm machines \
                                      unenroll <host> --unreachable`, then enroll it again"
                 .into(),
-            Self::HostKeyUnknown => {
-                "no host key is pinned for it: `aterm machines enroll` it first".into()
-            }
+            Self::HostKeyUnknown => "no host key is pinned for it: `aterm machines unenroll \
+                                     <host> --unreachable`, remove at the Mac what that \
+                                     lists as left on it, then enroll it again"
+                .into(),
             Self::Denied => "it refused the fleet key (its authorized_keys line is gone): if \
                              it was erased or reinstalled, `aterm machines unenroll <host> \
                              --unreachable`, then enroll it again"

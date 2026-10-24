@@ -1330,6 +1330,22 @@ mod unix {
         Ok(ExitCode::SUCCESS)
     }
 
+    /// `--no-agent` where no subscriber runs: the person's choice that this Mac keeps none,
+    /// recorded ([`service::subscriber_off_path`]) so aterm's setup leaves it so and System
+    /// State reads its sync as off by choice. A subscriber that runs is left be, and so is
+    /// the record; one that cannot be written is a warning.
+    pub(super) fn record_no_agent(
+        paths: &Paths,
+        state: &dyn Fn() -> crate::Result<service::State>,
+    ) {
+        if matches!(state(), Ok(service::State::Installed { pid: Some(_), .. })) {
+            return;
+        }
+        if let Err(error) = service::record_subscriber_off(&paths.home) {
+            eprintln!("warning: the choice to run no subscriber was not recorded ({error})");
+        }
+    }
+
     fn install_subscriber(paths: &Paths, program: Option<String>) -> crate::Result<String> {
         let program = match program {
             Some(program) => PathBuf::from(program),
@@ -1423,6 +1439,9 @@ mod unix {
                 install();
             }
         })?;
+        if !agent {
+            record_no_agent(paths, &|| service::state(&paths.home, Job::Subscriber));
+        }
         match &outcome {
             JoinOutcome::Joined { seq, names } => {
                 println!("joined: seq {seq}, {} secrets in ~/.secrets", names.len());
@@ -1527,6 +1546,9 @@ mod unix {
     ) -> crate::Result<ExitCode> {
         let import = import.map(|dir| expand(paths, &dir));
         let created = client::create(paths, source, import.as_deref(), name.as_deref())?;
+        if !agent {
+            record_no_agent(paths, subscriber.state);
+        }
         println!("created vault {} (seq 1)", created.name);
         println!(
             "signer: {} (fingerprint {})",
@@ -2300,6 +2322,11 @@ mod unix {
                 println!("{}", service::install(&paths.home, job, &program, &args)?);
             }
             Action::Off => {
+                // The person's choice, recorded before the job goes, so nothing reads a
+                // subscriber gone without it: setup leaves it off until `agent on`.
+                if job == Job::Subscriber {
+                    service::record_subscriber_off(&paths.home)?;
+                }
                 if service::uninstall(&paths.home, job)? {
                     println!("{} stopped and removed", job.label());
                 } else {
@@ -3465,13 +3492,25 @@ mod tests {
             assert_eq!(code, ExitCode::SUCCESS);
             crate::client::admin_open(&admin).expect("an admin of it");
         };
+        let off =
+            |dir: &str| crate::service::subscriber_turned_off(&root.path().join(dir).join("ma"));
         create("a", true, &played(&absent, &install));
         assert_eq!(installs.get(), 1, "create installs the subscriber");
+        assert!(!off("a"), "no choice to record");
         create("b", false, &played(&absent, &install));
         assert_eq!(installs.get(), 1, "--no-agent installs nothing");
+        assert!(off("b"), "--no-agent is the person's choice, recorded");
         create("d", false, &played(&running, &install));
-        assert_eq!(reads.get(), 1, "--no-agent reads whether the approver runs");
+        assert_eq!(
+            reads.get(),
+            2,
+            "--no-agent reads whether the approver runs, for the record and for the approver"
+        );
         assert_eq!(installs.get(), 1, "a running subscriber is left be");
+        assert!(
+            !off("d"),
+            "a subscriber that runs is left be, its choice not recorded"
+        );
         create("c", true, &played(&absent, &refused));
         assert_eq!(installs.get(), 2, "a failed install still makes the vault");
         create("path", true, &played(&unread, &install));

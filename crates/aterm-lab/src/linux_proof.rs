@@ -424,9 +424,6 @@ pub fn test_verdict(name: &str, out: &Out) -> Row {
 /// How the x86_64 cell's uds, pty and libc tests run: one at a time.
 pub const ROSETTA_ONE_AT_A_TIME: &str = "--test-threads=1";
 
-/// A test row's hang detector; it times the tests alone ([`test_run`] builds them first).
-pub const TEST_ROW_HANG_SECS: u32 = 1800;
-
 /// `timeout` for a guest command: TERM at `secs`, KILL ten seconds later.
 #[must_use]
 pub fn hang_detector(secs: u32) -> Vec<String> {
@@ -443,10 +440,12 @@ pub fn no_run<'a>(args: &[&'a str]) -> Vec<&'a str> {
 }
 
 /// A test row's run, `cargo(args)` being its cargo argv: built first ([`no_run`]) with no hang
-/// detector, since a cold build on a loaded host is slow, not hung, then run under
-/// [`TEST_ROW_HANG_SECS`]. A failed build is the row's output; the seconds are both steps'.
+/// detector, since a cold build on a loaded host is slow, not hung, then run under the row's
+/// 30-minute one, which only this names. A failed build is the row's output; the seconds are both
+/// steps'.
 #[must_use]
 pub fn test_run(up: &Up, cargo: impl Fn(&[&str]) -> Vec<String>, args: &[&str]) -> Out {
+    const TEST_ROW_HANG_SECS: u32 = 1800;
     let built = up
         .lima
         .shell_streamed(&up.home, &cargo(&no_run(args)), "  | ");
@@ -511,11 +510,11 @@ fn verifier_rows(up: &Up, arch: Arch, tag: &str, repo: &str, lane: &str) -> Vec<
     let mut built = Vec::new();
     for (shape, dir, assertions) in VERIFIER_SHAPES {
         let target_dir = format!("{lane}/{dir}");
-        let mut argv = hang_detector(TEST_ROW_HANG_SECS);
-        argv.extend(guest::with_env(
+        // A build has no hang detector: on a loaded host it is slow, not hung (as in test_run).
+        let argv = guest::with_env(
             &guest::cargo_env(arch, &target_dir, false),
             &verifier_build_args(&manifest, arch.triple(), assertions),
-        ));
+        );
         let out = up.lima.shell_streamed(&up.home, &argv, "  | ");
         let exe = format!("{target_dir}/{}/release/{VERIFIER}", arch.triple());
         let name = format!("{tag} bootstrap verifier: static {shape} build");
@@ -559,7 +558,7 @@ fn verifier_rows(up: &Up, arch: Arch, tag: &str, repo: &str, lane: &str) -> Vec<
             ],
         ),
     ];
-    for (what, selection) in suites {
+    let cargo = |args: &[&str]| {
         let mut cargo = vec![
             "cargo".to_string(),
             "test".into(),
@@ -569,10 +568,11 @@ fn verifier_rows(up: &Up, arch: Arch, tag: &str, repo: &str, lane: &str) -> Vec<
             manifest.clone(),
         ];
         cargo.extend(arch.target_args());
-        cargo.extend(selection.iter().map(|s| (*s).to_string()));
-        let mut argv = hang_detector(TEST_ROW_HANG_SECS);
-        argv.extend(guest::with_env(&env, &cargo));
-        let out = up.lima.shell_streamed(&up.home, &argv, "  | ");
+        cargo.extend(args.iter().map(|s| (*s).to_string()));
+        guest::with_env(&env, &cargo)
+    };
+    for (what, selection) in suites {
+        let out = test_run(up, cargo, selection);
         rows.push(translator_not_runs(
             test_verdict(&format!("{tag} tests: {what}"), &out),
             &out.text,

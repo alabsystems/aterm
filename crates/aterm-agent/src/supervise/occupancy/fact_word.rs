@@ -57,10 +57,10 @@ pub enum NoteOutcome {
     Cleared,
     /// The session has no task record: the default host's answer.
     NoTask,
-    /// The record is closed, or the host refuses the write (its own copy of the owner's mode is
-    /// not `prompt`).
+    /// The record is closed.
     Closed,
-    /// Another write held the record: tried again at the next break.
+    /// Another write or the host's current mode withholds the record: tried again at the next
+    /// break with a grant.
     Fenced,
 }
 

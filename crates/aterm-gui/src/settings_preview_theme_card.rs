@@ -345,6 +345,7 @@ impl ShowcaseCard {
 
     /// The paint-only slab's value.
     pub(crate) fn slab_value(&self, narrow: bool) -> String {
+        use std::fmt::Write as _;
         let mut value = String::with_capacity(48);
         for color in [
             self.bg,
@@ -354,7 +355,7 @@ impl ShowcaseCard {
             self.ansi[4],
             self.ansi[5],
         ] {
-            value.push_str(&format!("{color:06x} "));
+            let _ = write!(value, "{color:06x} ");
         }
         value.push_str(if narrow { "narrow" } else { "wide" });
         value

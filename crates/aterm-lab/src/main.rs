@@ -14,6 +14,10 @@ mod aos_repair;
 #[cfg(target_os = "macos")]
 mod aos_search;
 #[cfg(target_os = "macos")]
+mod aos_workers;
+#[cfg(target_os = "macos")]
+mod aos_workers_bench;
+#[cfg(target_os = "macos")]
 mod band;
 #[cfg(target_os = "macos")]
 mod bus;
@@ -401,6 +405,8 @@ Outside any lab (no jail, no stub):
                                  OPENS A WINDOW: verify Aos M2 live repair of a stranded momentum glow, or publish an Aos M4 plan against a control (~25 s; `--help` for details)
   aos-search [--grid] [--plans FILE] --out DIR [--toolchain LINE] | aos-search --verify FILE
                                  run Aos M4's candidate search under the pinned policy, or verify a bundle FILE offline (`--help` for details)
+  aos-workers-bench --plans FILE --out DIR [--lab PATH] [--faults] [--rounds N]
+                                 design §11.8's pre-registered M5b measurement: six aos-search arms in a Williams order, gates and criteria in DIR/record.txt (~60 min, ~70 with --faults; `--help` for details)
   aos-phase TRACE --build BUILD [--plan PLAN_HEX]
                                  re-derive a windowed aos-repair run's measured phase from its kept trace (`--help` for details)
   resource-attribution [--aterm PATH]
@@ -593,6 +599,7 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "trail-contrast" => trail_contrast::cmd_trail_contrast(args),
         "aos-repair" => aos_repair::cmd_aos_repair(args),
         "aos-search" => aos_search::cmd_aos_search(args),
+        "aos-workers-bench" => aos_workers_bench::cmd_aos_workers_bench(args),
         "aos-phase" => aos_phase::cmd_aos_phase(args),
         "presence-flap" => presence::cmd_presence_flap(args),
         "meta-keys" => meta_keys::cmd_meta_keys(args),
@@ -677,6 +684,7 @@ fn main() -> std::process::ExitCode {
                 "band-standin" => band::standin_main(rest),
                 "presence-standin" => presence::standin_main(rest),
                 slot_lane::HOLD_VERB => slot_lane::hold_main(rest),
+                aos_workers::WORKER_VERB => aos_workers::worker_main(rest),
                 "key-dump" => meta_keys::keydump_main(rest),
                 "mcp-standin" => codex_rig::mcp_main(rest),
                 _ => {

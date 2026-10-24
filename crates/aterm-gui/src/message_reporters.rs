@@ -2315,39 +2315,7 @@ pub(crate) fn log_did_not_open(path: &str) -> Message {
     .no_excerpt()
 }
 
-/// Builds the exceptions digest entry when Full Disk Access is needed.
-pub(crate) fn file_access_entry(words: &crate::consent_card::NeedWords) -> Entry {
-    use crate::consent_card::{
-        FDA_AFTER, FDA_DETAIL, FDA_GRANTS, FDA_THEN, FDA_WHAT, FDA_WHAT_DENIED, FDA_WHAT_REGRESSED,
-        FDA_WHY, NeedCause,
-    };
-    let cause = if words.regressed {
-        "regressed"
-    } else {
-        "needed"
-    };
-    let what = match (words.regressed, words.cause) {
-        (true, _) => FDA_WHAT_REGRESSED,
-        (false, NeedCause::ProtectedRead { .. }) => FDA_WHAT_DENIED,
-        (false, NeedCause::PromptObserved { .. }) => FDA_WHAT,
-    };
-    Entry::new(
-        Family::Privacy,
-        "fda",
-        cause,
-        what,
-        Why::OnlyYou(Reason::new(FDA_WHY)),
-        Then::press(Mover::open_system_pane(PANE_FULL_DISK_ACCESS), FDA_THEN),
-    )
-    .resurface(Resurface::CHOICE)
-    .more(FDA_GRANTS)
-    .more(FDA_AFTER)
-    .more(FDA_DETAIL)
-}
-
-pub(crate) const FDA_ENTRY_KEYS: [&str; 2] = ["privacy.fda.needed", "privacy.fda.regressed"];
-
-/// Builds the interactive decision row prompting for Full Disk Access.
+/// Builds the interactive decision row prompting for Full Disk Access. Nothing posts it (System State's Full Disk Access row carries the need): it is a test fixture of a decision row with two capsules.
 #[cfg(test)]
 pub(crate) fn file_access_question(words: &crate::consent_card::NeedWords) -> Message {
     use crate::consent_card::{FDA_AFTER, FDA_DETAIL, FDA_GRANTS, FDA_THEN, FDA_TITLE, FDA_WHY};
@@ -3527,6 +3495,50 @@ pub(crate) fn occupancy_ready_idle_entry(
     ))
 }
 
+/// A TAB'S DECLARED WAKE STOOD K LOOKS READY AND UNTOLD, under `prompt` (the slice-2 plan's
+/// 2.5, the wake K): on the same key as a hold rule's ([`occupancy_ready_idle_key`]), which the
+/// exceptions host gives the rule's first. Every word it fills in is the tab's sid, the wake's
+/// ordinal, the closed guard list's (or `no-loop`, where no loop told the window a word) or a span
+/// the window's clock measured; no word of the agent's declaration.
+pub(crate) fn occupancy_wake_idle_entry(
+    sid: &str,
+    idle: &crate::occupancy_wakes::WakeIdle,
+) -> Entry {
+    use aterm_agent::supervise::occupancy::said::span_words;
+    let ord = idle.ord;
+    let span = span_words(idle.at_ms.saturating_sub(idle.since_ms));
+    let guard = match (idle.looped, idle.guard) {
+        (false, _) => "no-loop",
+        (true, Some(guard)) => guard.word(),
+        (true, None) => "none",
+    };
+    let held = match (idle.looped, idle.guard) {
+        (false, _) => String::from("no loop reads this tab's wakes"),
+        (true, Some(guard)) => format!("{} held its line at the last look", guard.word()),
+        (true, None) => String::from("no guard held it, and nothing told it"),
+    };
+    Entry::new(
+        Family::Occupancy,
+        sid,
+        "ready-idle",
+        "A tab's declared wake stands untold",
+        Why::Spent {
+            tried: Reason::new(format!("kept wake #{ord} ready for {span}")),
+            reason: Reason::new(&held),
+        },
+        Then::step(format!("Look at the tab's wakes with aterm ctl @{sid} waits why")),
+    )
+    .severity(Severity::Info)
+    .resurface(Resurface::WAIT)
+    .more(format!(
+        "The tab's agent declared wake #{ord}; its condition held {span} ago and nothing told it: {held}."
+    ))
+    .log_line(format!(
+        "occupancy ready-idle sid={sid} wake=#{ord} guard={guard} due_ms={}",
+        idle.at_ms.saturating_sub(idle.since_ms).max(0)
+    ))
+}
+
 /// Retired `aterm.toml` feature table and its replacement guidance.
 pub(crate) struct RemovedFeature {
     pub(crate) table: &'static str,
@@ -4129,113 +4141,6 @@ pub(crate) fn disk_settings_entry(notes: &[String]) -> Entry {
     entry.log_line(format!("disk-settings-off notes={}", notes.len()))
 }
 
-pub(crate) const DEVTOOLS_KEY: &str = "privacy.devtools.not-granted";
-
-/// Builds the exceptions digest entry when macOS blocks workstation account automation.
-pub(crate) fn workstation_accounts_entry() -> Entry {
-    Entry::new(
-        Family::Privacy,
-        "workstation",
-        "account-signout",
-        "macOS blocked account automation",
-        Why::OnlyYou(Reason::new("macOS requires your permission to automate account settings")),
-        Then::step("Allow account automation in System Settings"),
-    )
-    .resurface(Resurface::CHOICE)
-    .more("System Settings > Privacy & Security > Accessibility: allow aterm")
-    .more("System Settings > Privacy & Security > Automation: allow aterm to control Messages and FaceTime")
-    .more("Account automation retries after permission is granted; aterm signs out the accounts")
-}
-
-pub(crate) const SYSTEM_STATE_MENU: &str = "aterm \u{25B8} System State\u{2026}";
-
-/// Builds the exceptions digest entry when first-run workstation setup has failing steps.
-pub(crate) fn workstation_setup_failure_entry() -> Entry {
-    Entry::new(
-        Family::Privacy,
-        "workstation",
-        "settings-incomplete",
-        "Mac setup needs attention",
-        Why::OnlyYou(Reason::new("background setup has not finished every step")),
-        Then::step(format!("Open {SYSTEM_STATE_MENU}")),
-    )
-    .resurface(Resurface::CHOICE)
-    .more("Automatic setup retries while aterm remains open")
-    .more("System State shows what each step waits for; its Apply runs the checked steps again now")
-}
-
-/// The devtools Entry's live line ([`crate::App::held_line`]): how many programs aterm started macOS's program check holds while a backed-up episode stands, and the longest held, ms.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct HeldLine {
-    /// The held programs aterm started.
-    pub(crate) count: u32,
-    /// The longest any of them has been held, ms.
-    pub(crate) oldest_ms: u64,
-}
-
-impl HeldLine {
-    /// "now: 2 programs aterm started wait for macOS's program check, the oldest 9 h 59 m".
-    pub(crate) fn words(self) -> String {
-        let age = aterm_uds::process::held_age(self.oldest_ms);
-        if self.count == 1 {
-            format!("now: 1 program aterm started waits for macOS's program check, for {age}")
-        } else {
-            format!(
-                "now: {} programs aterm started wait for macOS's program check, the oldest {age}",
-                self.count
-            )
-        }
-    }
-}
-
-/// Builds the exceptions digest entry when aterm lacks macOS Developer Tools permission. Its first detail line, the one every step keeps within `MORE_LINES`, is `live`'s words while macOS's program check holds programs aterm started (leftover §5.1), else why the list matters.
-pub(crate) fn devtools_entry(step: atpkg::devtools::Step, live: Option<HeldLine>) -> Entry {
-    use atpkg::devtools::Step;
-    let skips = aterm_containment::SpikeEvidence::MEASURED.devtool_skips_first_run_check;
-    let (title, why) = match step {
-        Step::Add => (
-            "aterm is not in Developer Tools",
-            "only you can add aterm to the Developer Tools list in System Settings",
-        ),
-        Step::SwitchOn => (
-            "aterm is off in Developer Tools",
-            "only you can switch on aterm's row in Developer Tools in System Settings",
-        ),
-        Step::ListedOn => (
-            "macOS still checks programs aterm starts",
-            "only you can change aterm's row in the Developer Tools list in System Settings",
-        ),
-    };
-    let path = crate::menu::privacy_settings_path_words(crate::menu::PrivacyPane::DeveloperTools);
-    let entry = Entry::new(
-        Family::Privacy,
-        "devtools",
-        "not-granted",
-        title,
-        Why::OnlyYou(Reason::new(why)),
-        Then::press(Mover::open_system_pane(PANE_DEVELOPER_TOOLS), step.action()),
-    )
-    .show(Intent::OpenSettings {
-        route: SettingsRoute::Security.path().to_string(),
-    })
-    .severity(Severity::Warn)
-    .resurface(Resurface::CHOICE)
-    .more(live.map_or_else(|| atpkg::devtools::why(skips).to_owned(), HeldLine::words));
-    let entry = match step {
-        Step::Add => entry
-            .more(format!("{path} ({})", atpkg::devtools::PLUS_ROUTE))
-            .more(DEVTOOLS_ONCE_ON),
-        Step::SwitchOn => entry.more(path).more(DEVTOOLS_ONCE_ON),
-        Step::ListedOn => entry.more(atpkg::devtools::HELPER_LISTED_ON).more(path),
-    };
-    entry.log_line("devtools not-granted")
-}
-
-/// What switching aterm on does, for a step that switches it on (a row already on has nothing to switch).
-const DEVTOOLS_ONCE_ON: &str = "Once it is on, aterm has macOS check it again: when aterm reads \
-                                the switch on, or when you come back to aterm from the page. \
-                                Programs started before that may still wait.";
-
 /// The key every record of macOS's program check's backed-up episodes takes (leftover §6.5's `program-check.` stem).
 pub(crate) const PROGRAM_CHECK_EPISODE_KEY: &str = "program-check.episode";
 
@@ -4291,6 +4196,42 @@ pub(crate) fn program_check_episode(edge: HeldEdge, aterm: u32) -> Message {
     }
     .record()
     .key(PROGRAM_CHECK_EPISODE_KEY)
+}
+
+/// The key of the record naming this user's programs that have not started for a reason other than macOS's program check (leftover §5.1: Rosetta's translation, or a volume not proven local).
+pub(crate) const NOT_STARTED_KEY: &str = "program-check.not-started";
+
+/// Builds the record of the programs `rows` names that have not started, each with what keeps it (leftover §5.1, §6.5): "translating (Rosetta)", which aterm's Developer Tools grant does not reach, or "has not started" with nothing read to say why. It is posted when a view first names a row, so it gives no age: a row's age counts from that first sighting (`sys jobs` shows it growing). A fact for later, never an Entry or a Now: no step of aterm's moves either.
+pub(crate) fn not_started_record(
+    rows: &[(aterm_vitals::jobs::StartWait, &aterm_vitals::jobs::Named)],
+) -> Message {
+    use aterm_vitals::jobs::StartWait;
+    let n = rows.len();
+    let title = if n == 1 {
+        "1 program has not started".to_owned()
+    } else {
+        format!("{n} programs have not started")
+    };
+    let line = |(wait, named): &(StartWait, &aterm_vitals::jobs::Named)| {
+        let who = format!(
+            "pid {} {}",
+            named.pid,
+            aterm_vitals::jobs::wire::exe_word(&named.name)
+        );
+        match wait {
+            StartWait::Translating => format!(
+                "{who}: translating (Rosetta), which aterm's Developer Tools grant does not reach"
+            ),
+            StartWait::NotStarted | StartWait::ProgramCheck => format!(
+                "{who}: it has not started, and its program is on a volume aterm cannot prove \
+                 local, so nothing read says why"
+            ),
+        }
+    };
+    Message::new(tags::SYSTEM, Severity::Info, title)
+        .lines(rows.iter().map(line))
+        .record()
+        .key(NOT_STARTED_KEY)
 }
 
 /// Builds the exceptions digest entry when the live upgrade host cannot lock its state directory.

@@ -358,6 +358,9 @@ pub const fn has_rekey_hook(shell: ShellType) -> bool {
 /// Subdirectory under the host's control dir holding warm-spare hold FIFOs (`<control dir>/spare/<sid>`, derived by the shell from [`REKEY_PATH_VAR`]).
 pub const SPARE_DIR: &str = "spare";
 
+#[cfg(unix)]
+pub mod spare_fifo;
+
 /// OSC 633 `P` key emitted when a spare shell parks before startup files (`633;P;AtermSpare=parked;id=<nonce>`).
 pub const SPARE_KEY: &str = "AtermSpare";
 

@@ -56,7 +56,9 @@ fn ended_with_the_session(lines: &[String], code: u8) {
 #[test]
 fn a_frozen_worker_is_held_and_its_badge_withdrawn() {
     let mut m = box_that_sits();
-    m.input_after = vec![(2, INPUT_STALLED)];
+    // The first `status` is the busy wait's (the session log's head, 6H-5); the freeze comes
+    // after the box's own reads, as it did before that read was added.
+    m.input_after = vec![(3, INPUT_STALLED)];
     let (lines, code, journal) = watch_journaled(&mut m, "stall-held");
     assert!(writes(&m).is_empty(), "{:?}", m.requests);
     let acts = badge_acts(&m);
@@ -87,7 +89,8 @@ fn a_frozen_worker_is_held_and_its_badge_withdrawn() {
 #[test]
 fn a_thawed_worker_has_its_point_decided_again() {
     let mut m = box_that_sits();
-    m.input_after = vec![(2, INPUT_STALLED), (4, INPUT_CLEAR)];
+    // One `status` later for the busy wait's own read of the session log's head (6H-5).
+    m.input_after = vec![(3, INPUT_STALLED), (5, INPUT_CLEAR)];
     let (lines, code, journal) = watch_journaled(&mut m, "stall-thawed");
     assert!(writes(&m).is_empty(), "{:?}", m.requests);
     let acts = badge_acts(&m);
@@ -166,7 +169,8 @@ fn a_press_refused_or_warned_input_unread_reads_status_before_it_presses_again()
         let mut m = fenced(vec![busy_screen(), bash_one_row()]);
         m.vanish_after = Some(4);
         m.key_replies.push_back(reply);
-        m.input_after = vec![(1, INPUT_STALLED)];
+        // One `status` later for the busy wait's own read of the session log's head (6H-5).
+        m.input_after = vec![(2, INPUT_STALLED)];
         let (lines, code, journal) = watch_journaled(&mut m, tag);
         assert_eq!(writes(&m).len(), 1, "{tag}: {:?}", m.requests);
         assert_eq!(
@@ -257,7 +261,8 @@ fn a_continuation_warned_input_unread_reads_status_at_the_next_look() {
         };
         m.verb_replies
             .insert("turn", VecDeque::from([rendered("turn", header, "row\n")]));
-        m.input_after = vec![(1, INPUT_STALLED)];
+        // One `status` later for the busy wait's own read of the session log's head (6H-5).
+        m.input_after = vec![(2, INPUT_STALLED)];
         let (dir, path) = journal_file(if warned {
             "stall-turn-warned"
         } else {
@@ -315,7 +320,12 @@ fn a_host_that_does_not_measure_input_is_probed_on_no_step() {
         let mut m = box_that_sits();
         m.input = input;
         let (lines, code, journal) = watch_journaled(&mut m, "stall-none");
-        assert_eq!(count(&m, "status"), 1, "input={input:?}: {:#?}", m.requests);
+        assert_eq!(
+            count(&m, "status"),
+            2,
+            "the busy wait's read of the session log's head, and the box's: {input:?}: {:#?}",
+            m.requests
+        );
         let first_step = m
             .requests
             .iter()
@@ -464,7 +474,10 @@ fn the_windows_host_raises_no_badge_over_a_worker_frozen_under_its_point() {
     ] {
         let mut m = Mock::new(vec![busy_screen(), screen]);
         m.vanish_after = Some(4);
-        m.input = INPUT_STALLED;
+        // Frozen under its point: after the busy wait's own `status` (the session log's head,
+        // 6H-5), which a worker frozen from the start would show (the already-stalled case,
+        // `a_worker_already_stalled_when_the_loop_looks_is_neither_pressed_nor_badged`).
+        m.input_after = vec![(1, INPUT_STALLED)];
         let (lines, end, journal) = hosted_journaled(&mut m, tag);
         assert!(writes(&m).is_empty(), "{tag}: {:?}", m.requests);
         assert!(
@@ -518,7 +531,8 @@ fn the_windows_host_raises_no_badge_over_a_worker_frozen_under_its_point() {
 fn the_windows_host_withdraws_the_badge_of_a_worker_that_freezes_under_it() {
     let mut m = Mock::new(vec![busy_screen(), question_screen()]);
     m.vanish_after = Some(4);
-    m.input_after = vec![(1, INPUT_STALLED)];
+    // One `status` later for the busy wait's own read of the session log's head (6H-5).
+    m.input_after = vec![(2, INPUT_STALLED)];
     let (lines, end, journal) = hosted_journaled(&mut m, "hosted-freezes");
     assert!(writes(&m).is_empty(), "{:?}", m.requests);
     assert!(
@@ -547,7 +561,9 @@ fn the_windows_host_withdraws_the_badge_of_a_worker_that_freezes_under_it() {
 
 #[test]
 fn a_wait_that_never_read_status_probes_and_holds() {
-    let mut m = Mock::new(vec![busy_screen(), idle_screen()]);
+    // At rest from the first look: no busy wait reads the session log's head (6H-5), so the
+    // first step's wait is the first to read `status`.
+    let mut m = Mock::new(vec![idle_screen(), idle_screen()]);
     m.vanish_after = Some(3);
     m.input = INPUT_STALLED;
     let (lines, code, journal) = watch_journaled(&mut m, "stall-unread-idle");
@@ -578,9 +594,11 @@ fn the_windows_host_asks_a_host_that_does_not_measure_input_once() {
         m.vanish_after = Some(4);
         m.input = input;
         let (lines, end, journal) = hosted_journaled(&mut m, "hosted-none");
+        // The one ask is the busy wait's read of the session log's head (6H-5): it learns
+        // the host measures no input, so the question's badge reads no `status` of its own.
         assert_eq!(count(&m, "status"), 1, "input={input:?}: {:#?}", m.requests);
         assert!(
-            before_the_badge(&m).ends_with(&["status".to_string(), "meta".to_string()]),
+            before_the_badge(&m).contains(&"status".to_string()),
             "input={input:?}: {:#?}",
             m.requests
         );

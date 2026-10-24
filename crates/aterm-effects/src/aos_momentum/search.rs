@@ -61,7 +61,7 @@ pub trait Proposer {
     /// Its identity, as the bundle records it.
     fn id(&self) -> ProposerId;
 
-    /// Candidates for `round` (from 0), given feedback from earlier rounds in judging order.
+    /// Candidates for `round` (from 0), given feedback from earlier rounds in proposal order.
     fn propose(&mut self, round: u8, feedback: &[TrainFeedback]) -> Vec<Vec<u8>>;
 }
 
@@ -135,6 +135,10 @@ pub enum Mode {
     Search,
     /// On-demand re-evaluation of one candidate (`m4::Evaluator::admit_one`).
     OnDemand,
+    /// A search whose training judgments ran in workers and were checked here only as far as
+    /// the winner needs, so its admitted count rests on their claims (`m4::Distributed`, design
+    /// §11.3).
+    Distributed,
 }
 
 impl Mode {
@@ -145,6 +149,7 @@ impl Mode {
         match self {
             Mode::Search => 0,
             Mode::OnDemand => 1,
+            Mode::Distributed => 2,
         }
     }
 
@@ -155,6 +160,7 @@ impl Mode {
         match tag {
             0 => Some(Mode::Search),
             1 => Some(Mode::OnDemand),
+            2 => Some(Mode::Distributed),
             _ => None,
         }
     }

@@ -709,9 +709,9 @@ fn unarmed(root: &Path, live: &Live, update: bool) -> Outcome {
     }
     let _ = writeln!(
         log,
-        "    The live surface measures:\n\n{}\n    Arm it with `targo --unverified forge budget --update`, \
-         which writes exactly those rows. Until then this verb ratchets nothing, so it \
-         reports RED rather than a pass.",
+        "    The live surface measures:\n\n{}\n    Arm it with `targo --unverified forge budget --update` \
+         once every cell measures; it writes the rows that run measures. Until then this \
+         verb ratchets nothing, so it reports RED rather than a pass.",
         indent(&body)
     );
     Outcome { ok: false, log }

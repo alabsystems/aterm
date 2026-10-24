@@ -179,6 +179,24 @@ pub fn findings_in(f: &Findings, keys: &[u64], all: bool) -> Findings {
         program_check_aterm: f.program_check_aterm,
         program_check_episode: f.program_check_episode,
         program_check_drained: f.program_check_drained,
+        translating: f
+            .translating
+            .iter()
+            .filter(|n| mine(n.tab))
+            .cloned()
+            .collect(),
+        not_started: f
+            .not_started
+            .iter()
+            .filter(|n| mine(n.tab))
+            .cloned()
+            .collect(),
+        probably_program_check: f
+            .probably_program_check
+            .iter()
+            .filter(|n| mine(n.tab))
+            .cloned()
+            .collect(),
         own_procs: f.own_procs,
         process_limit: f.process_limit,
     }
@@ -390,6 +408,16 @@ pub fn findings_json(f: &Findings) -> Jv {
     items.extend(f.d_state.iter().map(|n| named("d_state", n)));
     items.extend(f.busy_orphans.iter().map(|n| named("busy_orphan", n)));
     items.extend(f.program_check.iter().map(|n| named("program_check", n)));
+    items.extend(f.translating.iter().map(|n| named("translating", n)));
+    items.extend(f.not_started.iter().map(|n| named("not_started", n)));
+    items.extend(f.probably_program_check.iter().map(|n| {
+        Jv::obj([
+            ("kind", Jv::s("probably_program_check")),
+            ("pid", Jv::u(u64::from(n.pid))),
+            ("exe", Jv::s(exe_word(&n.name))),
+            ("heuristic", Jv::s("fresh-dylib")),
+        ])
+    }));
     Jv::obj([
         ("items", Jv::Arr(items)),
         ("own_procs", Jv::u(f.own_procs)),
@@ -566,6 +594,22 @@ mod tests {
 
     #[test]
     fn a_finding_prints_only_where_the_scope_reaches_unless_global() {
+        let two = |pid: u32, name: &str| {
+            vec![
+                Named {
+                    pid,
+                    name: name.into(),
+                    tab: Some(7),
+                    for_ms: 4_000,
+                },
+                Named {
+                    pid: pid + 1,
+                    name: name.into(),
+                    tab: None,
+                    for_ms: 4_000,
+                },
+            ]
+        };
         let f = Findings {
             stopped: vec![
                 Named {
@@ -595,29 +639,52 @@ mod tests {
                     for_ms: 35_940_000,
                 },
             ],
+            translating: two(7010, "x86tool"),
+            not_started: two(7020, "nfsprog"),
+            probably_program_check: two(7030, "trustc"),
             own_procs: 300,
             process_limit: Some(5_000),
             ..Findings::default()
         };
+        let pids = |list: &[Named]| list.iter().map(|n| n.pid).collect::<Vec<_>>();
         let mine = findings_in(&f, &[7], false);
         assert_eq!(mine.stopped.len(), 1);
         assert_eq!(mine.stopped[0].pid, 10);
         assert_eq!(
-            mine.program_check.iter().map(|n| n.pid).collect::<Vec<_>>(),
+            pids(&mine.program_check),
             [63454],
             "a held program no tab holds prints only at scope=global"
         );
-        assert_eq!(findings_in(&f, &[7], true).stopped.len(), 2);
-        assert_eq!(findings_in(&f, &[7], true).program_check.len(), 2);
+        assert_eq!(
+            [
+                pids(&mine.translating),
+                pids(&mine.not_started),
+                pids(&mine.probably_program_check)
+            ],
+            [[7010], [7020], [7030]],
+            "nor does a program that has not started, or one that probably waits"
+        );
+        let global = findings_in(&f, &[7], true);
+        assert_eq!(global.stopped.len(), 2);
+        assert_eq!(global.program_check.len(), 2);
+        assert_eq!(
+            [
+                global.translating.len(),
+                global.not_started.len(),
+                global.probably_program_check.len()
+            ],
+            [2, 2, 2]
+        );
         let j = findings_json(&mine);
         assert!(contract_violations(&j).is_empty(), "{}", j.to_text());
-        assert!(
-            j.to_text().contains(
-                r#"{"kind":"program_check","pid":63454,"exe":"git-remote-https","for_ms":1139000}"#
-            ),
-            "{}",
-            j.to_text()
-        );
+        for item in [
+            r#"{"kind":"program_check","pid":63454,"exe":"git-remote-https","for_ms":1139000}"#,
+            r#"{"kind":"translating","pid":7010,"exe":"x86tool","for_ms":4000}"#,
+            r#"{"kind":"not_started","pid":7020,"exe":"nfsprog","for_ms":4000}"#,
+            r#"{"kind":"probably_program_check","pid":7030,"exe":"trustc","heuristic":"fresh-dylib"}"#,
+        ] {
+            assert!(j.to_text().contains(item), "{item}: {}", j.to_text());
+        }
         let odd = Findings {
             stopped: vec![Named {
                 pid: 12,

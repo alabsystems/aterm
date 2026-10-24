@@ -703,7 +703,7 @@ fn a_topic_escalation_or_claim_moved_after_the_draw_stands_the_commit_down() {
             &app.store.read().expect("the registry"),
         );
         pending.carried_claims =
-            super::carried_claims_of(&super::handed_sessions_only(manifest, &pending.live));
+            app.carried_claims_of(&super::handed_sessions_only(manifest, &pending.live));
         assert_eq!(pending.carried_claims.len(), 1, "the boot session is drawn");
         app.pending_update_handoff = Some(pending);
     };

@@ -267,8 +267,8 @@ fn a_dev_linked_codex_names_the_build_unlink_returns_to() {
     assert!(unlink_returns_to_alab(&alab, "codex"));
     assert_eq!(
         dev_linked_line("codex", true),
-        "atpkg: codex is dev-linked; run `aterm pkg unlink codex` to return to the codex-alab \
-         build"
+        "atpkg: codex is dev-linked; run `aterm pkg unlink codex`, then `aterm pkg install \
+         codex`, to return to the codex-alab build"
     );
     assert!(
         !unlink_returns_to_alab(&alab, "claude"),
@@ -285,7 +285,8 @@ fn a_dev_linked_codex_names_the_build_unlink_returns_to() {
     assert!(!unlink_returns_to_alab(&vendor, "codex"));
     assert_eq!(
         dev_linked_line("codex", false),
-        "atpkg: codex is dev-linked; run `aterm pkg unlink codex` to install OpenAI's latest"
+        "atpkg: codex is dev-linked; run `aterm pkg unlink codex`, then `aterm pkg install \
+         codex`, to install OpenAI's latest"
     );
 }
 

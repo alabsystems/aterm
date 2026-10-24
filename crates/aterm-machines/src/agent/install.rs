@@ -272,25 +272,42 @@ pub fn main(
 
 fn refuse_enrolled(sys: &dyn System, layout: &Layout, admin: &User) -> Result<(), String> {
     let signers = layout.allowed_signers();
-    let how = format!(
-        "to enroll it again, run `aterm machines unenroll <host>` from its controller, or at \
-         this Mac `sudo rm -rf {} {}` and remove the fleet key's line (its comment starts \
-         `aterm-machines:`) from {}/.ssh/authorized_keys, then enroll again",
-        layout.root.display(),
-        crate::SUDOERS_FILE,
-        admin.home
-    );
+    let how = || {
+        // An inventory that cannot be read holds as long as a stamp that cannot be.
+        let wait = unproven(sys, layout)
+            .map_or(Some(aterm_uds::deadline::FIRST_EXEC_HANG), |held| {
+                held.iter().map(|(_, left)| *left).max()
+            })
+            .map(|left| {
+                format!(
+                    " once {} more minute(s) of awake time have passed, or after a restart (a \
+                     program it holds has not shown it ran)",
+                    crate::first_exec::minutes(left)
+                )
+            })
+            .unwrap_or_default();
+        format!(
+            "to enroll it again, run `aterm machines unenroll <host>` from its controller, or at \
+             this Mac `sudo rm -rf {} {}`{wait} and remove the fleet key's line (its comment \
+             starts `aterm-machines:`) from {}/.ssh/authorized_keys, then enroll again",
+            layout.root.display(),
+            crate::SUDOERS_FILE,
+            admin.home
+        )
+    };
     match sys.stat(&signers) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Ok(_) => Err(format!(
             "this Mac is already enrolled ({} exists) and only a signed rekey changes who it \
-             trusts; {how}",
-            signers.display()
+             trusts; {}",
+            signers.display(),
+            how()
         )),
         Err(e) => Err(format!(
             "{}: {e}; whether this Mac is already enrolled cannot be told, so nothing was \
-             changed; {how}",
-            signers.display()
+             changed; {}",
+            signers.display(),
+            how()
         )),
     }
 }
@@ -489,8 +506,10 @@ fn signed_by(principals: &[String]) -> String {
     }
 }
 
-/// The folders under the agent root a program was started from that has not shown it ran
-/// ([`crate::first_exec::hold_left`]): enrollment's stage and each upgrade's work folder. A
+/// The folders under the agent root that hold a program that has not shown it ran
+/// ([`crate::first_exec::hold_left`]): enrollment's stage and each upgrade's work folder, which
+/// a program was started from, and the record that holds `/Applications/aterm.app` in place
+/// ([`Layout::app_first_run`]), so an enrollment after this uninstall still waits it out. A
 /// file in `stage/` (an envelope's or a sudoers check's scratch) is no such folder.
 fn unproven(
     sys: &dyn System,
@@ -505,7 +524,10 @@ fn unproven(
         Err(e) => return Err(io(&stage, e)),
     };
     let mut held = Vec::new();
-    for dir in std::iter::once(layout.staging()).chain(names.iter().map(|name| stage.join(name))) {
+    for dir in [layout.staging(), layout.app_first_run()]
+        .into_iter()
+        .chain(names.iter().map(|name| stage.join(name)))
+    {
         let st = match sys.stat(&dir) {
             Ok(st) => st,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -673,7 +695,7 @@ pub fn uninstall(
             "folders of programs that have not shown they ran",
             outcome,
             Some(format!(
-                "{list} stay: a program started from there has not shown it ran, and macOS may \
+                "{list} stay: a program they hold has not shown it ran, and macOS may \
                  still be checking it; {then}"
             )),
         );
@@ -1106,8 +1128,10 @@ mod tests {
     /// The agent root of [`seed_held_folders`].
     const HELD_ROOT: &str = "/Library/Management/aterm";
 
-    /// An agent root holding enrollment's stage and three upgrade folders, of which
-    /// `.staging` and `stage/upgrade-1-5` have not shown they ran; its uninstall request.
+    /// An agent root holding enrollment's stage, three upgrade folders and the aterm.app's
+    /// first-run record, of which `.staging` (a stamp with no reading), the record (an
+    /// aterm.app started 50 seconds ago) and `stage/upgrade-1-5` (a program started 100
+    /// seconds ago) have not shown they ran; its uninstall request.
     fn seed_held_folders(fake: &Fake) -> Opened {
         let root = HELD_ROOT;
         fake.file(&format!("{root}/managed.toml"), b"schema = 1\nadmin = \"admin\"\npayload_sha256 = \"\"\nagent_version = \"\"\nexecutable = \"agent/x\"\ninstalled = 0\n");
@@ -1124,6 +1148,15 @@ mod tests {
             fake.file(&dir, b"").stat_of(&dir, root_dir());
             fake.file(&format!("{dir}/aterm"), b"agent");
         }
+        for dir in ["state", "state/aterm.app-first-run"] {
+            let dir = format!("{root}/{dir}");
+            fake.file(&dir, b"").stat_of(&dir, root_dir());
+        }
+        fake.file(&format!("{root}/state/journal.ndjson"), b"{}\n");
+        fake.file(
+            &format!("{root}/state/aterm.app-first-run/exec"),
+            b"9950000",
+        );
         fake.awake_at(10_000_000);
         fake.file(&format!("{root}/stage/upgrade-1-3/exec"), b"1000000");
         fake.file(&format!("{root}/stage/upgrade-1-4/exec"), b"9900000");
@@ -1163,6 +1196,12 @@ mod tests {
                 fake.calls()
             );
         }
+        assert!(
+            fake.written(&format!("{root}/state/aterm.app-first-run/exec"))
+                .is_some(),
+            "the record that holds /Applications/aterm.app: {:#?}",
+            fake.calls()
+        );
         for gone in ["agent", "stage/upgrade-1-3", "stage/upgrade-1-4"] {
             assert!(
                 fake.written(&format!("{root}/{gone}/aterm")).is_none(),
@@ -1170,13 +1209,21 @@ mod tests {
             );
         }
         assert!(
+            fake.written(&format!("{root}/state/journal.ndjson"))
+                .is_none()
+        );
+        assert!(
             fake.written(&format!("{root}/stage/aterm-open-1.sig"))
                 .is_none(),
             "a file is no folder a program was started from"
         );
         assert!(fake.written(&format!("{root}/managed.toml")).is_none());
         let calls = fake.calls();
-        for holder in [root.to_owned(), format!("{root}/stage")] {
+        for holder in [
+            root.to_owned(),
+            format!("{root}/stage"),
+            format!("{root}/state"),
+        ] {
             assert!(!calls.contains(&format!("remove {holder}")), "{calls:#?}");
         }
         let text = String::from_utf8(out).unwrap();
@@ -1191,8 +1238,9 @@ mod tests {
             .unwrap_or_else(|| panic!("{:#?}", report.items));
         let why = row.why.as_deref().unwrap();
         assert!(
-            why.contains(&format!("{root}/.staging {root}/stage/upgrade-1-5 stay"))
-                && why.contains("10 more minute(s)")
+            why.contains(&format!(
+                "{root}/.staging {root}/state/aterm.app-first-run {root}/stage/upgrade-1-5 stay"
+            )) && why.contains("10 more minute(s)")
                 && !why.contains("aterm-open-1.sig"),
             "{why}"
         );
@@ -1321,6 +1369,7 @@ mod tests {
             .into_iter()
             .chain([
                 format!("{root}/.staging"),
+                format!("{root}/state/aterm.app-first-run"),
                 format!("{root}/stage/upgrade-1-5"),
             ])
             .collect();
@@ -1329,7 +1378,7 @@ mod tests {
             expected,
             "the longest hold left, and the boot it is held in"
         );
-        for kept in [".staging", "stage/upgrade-1-5"] {
+        for kept in [".staging", "state/aterm.app-first-run", "stage/upgrade-1-5"] {
             assert_eq!(
                 fake.written(&format!("{root}/{kept}/{}", super::super::reclaim::KEPT)),
                 Some(b"1-9".to_vec()),
@@ -1521,12 +1570,43 @@ mod tests {
         );
         assert!(err.contains("/Users//admin/.ssh/authorized_keys"), "{err}");
         assert!(!err.contains('\n'), "one line: {err}");
+        assert!(
+            !err.contains("more minute(s)"),
+            "nothing held, no wait: {err}"
+        );
         assert_eq!(fake.calls(), Vec::<String>::new(), "nothing ran or changed");
         assert!(out.is_empty());
         assert_eq!(
             fake.written("/Library/Management/aterm/allowed_signers")
                 .unwrap(),
             format!("old@ctl namespaces=\"aterm-machines\" ssh-ed25519 {BLOB}\n").as_bytes()
+        );
+        let record = "/Library/Management/aterm/state/aterm.app-first-run";
+        fake.file(record, b"").stat_of(record, root_dir());
+        // Five minutes into the record's hold: its own wait, not the whole one.
+        fake.file(&format!("{record}/exec"), b"9700000");
+        fake.awake_at(10_000_000);
+        let err = refuse_enrolled(&fake, &layout, &admin()).unwrap_err();
+        assert!(
+            err.contains(
+                "`sudo rm -rf /Library/Management/aterm /etc/sudoers.d/aterm-machines` once 5 \
+                 more minute(s) of awake time have passed, or after a restart"
+            ),
+            "a held folder's wait: {err}"
+        );
+        let (fake, layout, _) = staged();
+        fake.file(
+            "/Library/Management/aterm/allowed_signers",
+            format!("old@ctl namespaces=\"aterm-machines\" ssh-ed25519 {BLOB}\n").as_bytes(),
+        );
+        fake.stat_fails(
+            "/Library/Management/aterm/stage",
+            std::io::ErrorKind::PermissionDenied,
+        );
+        let err = refuse_enrolled(&fake, &layout, &admin()).unwrap_err();
+        assert!(
+            err.contains("once 10 more minute(s) of awake time have passed"),
+            "an inventory that cannot be read holds the whole wait: {err}"
         );
         let (fake, layout, args) = staged();
         script_install(&fake);

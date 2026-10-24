@@ -734,7 +734,7 @@ pub struct Cost {
 const COSTS_HEADER: &str = "# trust lane cost history: <name> <CPU s> <wall s> <largest process's peak RSS bytes> <when>; the slots take the longest first, a library with no row first of all";
 
 /// The committed seed's first line ([`trust_facts::COSTS`]), above [`COSTS_HEADER`].
-const SEED_HEADER: &str = "# The trust lane's cost-history SEED: the fallback a clone with no history of its own reads (a library its git directory's aterm-release/trust-costs.tsv has no row for takes its row here). `targo --unverified ship trust run --update-ratchet` rewrites it with floors.tsv and memory.tsv. A library in neither file runs first, as heavy.";
+const SEED_HEADER: &str = "# The trust lane's cost-history SEED: the fallback a clone with no history of its own reads (a library its git directory's aterm-release/trust-costs.tsv has no row for takes its row here). `targo --unverified ship trust run -p <crate>… --update-ratchet` rewrites it with floors.tsv and memory.tsv. A library in neither file runs first, as heavy.";
 
 /// Loads cost history, overlaying local `history` onto the committed `seed`.
 #[must_use]
@@ -1531,6 +1531,7 @@ fn check_and_conclude(
         })
         .collect();
     let mut new_costs: BTreeMap<String, Cost> = BTreeMap::new();
+    let mut credit = crate::trust_credit::Credit::default();
     if !jobs.is_empty() {
         let slots = prep.jobs.min(jobs.len());
         let _ = writeln!(
@@ -1546,6 +1547,11 @@ fn check_and_conclude(
         let mut done = |f: Finished, checks: &mut dyn Checks| {
             let mut probe = || checks.probe_trustd();
             let _ = record(&f, budget, &mut probe);
+            // Read before the slot runs another check: the package's graded record.
+            credit.add(
+                &f.job.name,
+                crate::trust_credit::read_record(&f.job.target, package_identity(&f.job.name)),
+            );
             if let Some(r) = &reducer {
                 r.send(&f.job);
             }
@@ -1637,7 +1643,49 @@ fn check_and_conclude(
     if !done.verdict.tail.is_empty() {
         let _ = writeln!(out, "{}", done.verdict.tail);
     }
-    Ok(Outcome::of(&done.verdict))
+    Ok(with_credit(
+        Outcome::of(&done.verdict),
+        &cfg.repo,
+        &credit,
+        out,
+    ))
+}
+
+/// The D27 gate's "proved (calculus)" counter over this run's records, judged against the
+/// current credit epoch ([`crate::trust_credit`]): a regression or an unreadable record or
+/// ledger fails a run that would pass, and joins a failing run's list.
+fn with_credit(
+    outcome: Outcome,
+    repo: &Path,
+    credit: &crate::trust_credit::Credit,
+    out: &mut dyn Write,
+) -> Outcome {
+    let (line, failed) = match crate::trust_credit::current_epoch(repo) {
+        Ok(Some(e)) => (
+            credit.line(Some(&e)),
+            crate::trust_credit::judge(&e, credit),
+        ),
+        Ok(None) => (credit.line(None), Vec::new()),
+        Err(why) => (
+            credit.line(None),
+            vec![format!("credit epoch CREDIT-UNREADABLE {why}")],
+        ),
+    };
+    let _ = writeln!(out, "trust: {line}");
+    for f in &failed {
+        let _ = writeln!(out, "trust: {f}");
+    }
+    if failed.is_empty() {
+        return outcome;
+    }
+    match outcome {
+        Outcome::Pass => Outcome::Fail(failed),
+        Outcome::Fail(mut v) => {
+            v.extend(failed);
+            Outcome::Fail(v)
+        }
+        other => other,
+    }
 }
 
 /// Background worker that reduces `--obligations` proof reports off the slot-polling thread.
@@ -3480,6 +3528,9 @@ pub mod proc_tree {
         /// `posix_spawn` child does until its new image is in ([`Proc::spawning`]). Never set
         /// elsewhere.
         pub(super) forked: bool,
+        /// Linux: a zombie thread-group leader whose other threads still run, which reads as
+        /// a zombie (no image, no environment) while the process runs. Never set elsewhere.
+        pub(super) leader_only: bool,
     }
 
     /// `pid`'s [`Kin`], or `None` when unread: gone, another user's, or no reader here.
@@ -3513,6 +3564,7 @@ pub mod proc_tree {
             ctty: info.pbsd.pbi_flags & PROC_FLAG_CONTROLT != 0 || info.pbsd.e_tdev != NODEV,
             trustd: comm == b"trustd",
             forked: info.pbsd.pbi_flags & PROC_FLAG_EXEC == 0,
+            leader_only: false,
         })
     }
 
@@ -3533,6 +3585,8 @@ pub mod proc_tree {
 
     /// [`Kin`] from `pid`'s `/proc/<pid>/stat` line, `pid (comm) state ppid pgrp session
     /// tty_nr …`, its serial the start in clock ticks ([`aterm_uds::process::process_serial`]).
+    /// A zombie counts itself among its threads until it is reaped, so one that counts more
+    /// is a leader whose other threads run (as `aterm_uds`' procfs reader tells them apart).
     #[cfg(any(target_os = "linux", test))]
     fn stat_kin(stat: &str, pid: i32) -> Option<Kin> {
         let open = stat.find(" (")?;
@@ -3546,20 +3600,29 @@ pub mod proc_tree {
         let ppid = fields.next()?.parse().ok()?;
         let sid = fields.nth(1)?.parse().ok().filter(|s| *s > 0);
         let tty: i64 = fields.next()?.parse().ok()?;
-        let serial = fields.nth(14)?.parse().ok()?;
+        let threads: u64 = fields.nth(12)?.parse().ok()?;
+        let serial = fields.nth(1)?.parse().ok()?;
+        let exited = matches!(state, "Z" | "X" | "x");
         Some(Kin {
             ppid,
             serial,
             sid,
-            zombie: matches!(state, "Z" | "X" | "x"),
+            zombie: exited && threads <= 1,
             ctty: tty != 0,
             trustd: comm == "trustd",
             forked: false,
+            leader_only: exited && threads > 1,
         })
     }
 
-    /// Lists a listing takes before it is not whole ([`table`]).
-    const LISTS: usize = 16;
+    /// Lists a listing takes before it is not whole ([`table`]). They come back to back, so a
+    /// busy account, whose builds start processes all the time, needs many for two in a row
+    /// to name nothing new; a list reads a serial per pid, and a row only for a new one.
+    const LISTS: usize = 64;
+
+    /// Rounds of `SIGKILL` a sweep sends, each settling up to a second, before it says one of
+    /// the check's processes lives ([`end_marked_with`]).
+    const KILLS: usize = 16;
 
     /// This user's processes but this one and its zombies, each judged against `mark`: the
     /// root and those it keeps by their pid and serial, any other by the environment it was
@@ -3578,7 +3641,19 @@ pub mod proc_tree {
     /// is read as [`EXITED`]. After [`LISTS`] lists it is not whole.
     #[must_use]
     pub fn table(mark: &Mark, held: Option<i32>, slot: &Path) -> Option<Listing> {
+        #[cfg(test)]
+        if let Some(pids) = LISTED.with(|l| l.borrow().clone()) {
+            return table_from(mark, held, slot, &mut || Ok(pids.clone()));
+        }
         table_from(mark, held, slot, &mut aterm_uds::holders::uid_pids)
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        /// The pids [`table`] lists on this thread in place of all of this user's, so a test
+        /// can judge a sweep by a listing whose wholeness no other process's churn decides.
+        pub(super) static LISTED: std::cell::RefCell<Option<Vec<u32>>> =
+            const { std::cell::RefCell::new(None) };
     }
 
     /// The serial [`table_from`] reads for a process that exited and is not yet reaped, whose
@@ -3686,12 +3761,17 @@ pub mod proc_tree {
         if kin.as_ref().is_some_and(|k| k.zombie) {
             return None;
         }
+        // A leader whose other threads still run has no image of its own to read: it is the
+        // check's by its pid and serial, its session or its parent ([`marked`]), and a stranger's
+        // tied to none of those counts for nothing ([`unread`]).
+        let leader_only = kin.as_ref().is_some_and(|k| k.leader_only);
         let ran = aterm_uds::process::thread_ran(p);
         // An environment the kernel withheld (a platform binary's on macOS) reads as unread.
         let marked = match &kin {
             Some(k) if mark.root == Some((p, k.serial)) || mark.kept.contains(&(p, k.serial)) => {
                 Some(true)
             }
+            Some(_) if leader_only => None,
             Some(_) if ran == Some(true) => aterm_uds::process::read_process_markers(p)
                 .filter(|m| !m.withheld)
                 .map(|m| m.trust_check.is_some() && m.trust_check == mark.nonce),
@@ -3699,6 +3779,7 @@ pub mod proc_tree {
         };
         let exe = match marked {
             Some(_) => None,
+            None if leader_only => None,
             None => match exe_of(pid) {
                 Exe::Exited => return None,
                 Exe::At(path) => Some(path),
@@ -3851,7 +3932,7 @@ pub mod proc_tree {
     /// [`end_marked`] over `procs`. No process is ever stopped, so a sweep cut short (its
     /// lane killed) leaves each running or ended. The check's processes are sent `SIGTERM`;
     /// after up to a second, those each fresh listing names are sent `SIGKILL`, until one
-    /// names none or [`LISTS`] listings have, and only a whole one that names none, with
+    /// names none or [`KILLS`] listings have, and only a whole one that names none, with
     /// nothing tied to the check left ([`unread`]), says it ended. A signal ends what tied a
     /// survivor to the check (its parent, the carriers that proved its session), so each
     /// listing counts what a signal already reached as the check's ([`marked`]), and the
@@ -3878,7 +3959,7 @@ pub mod proc_tree {
         let sig = if procs.keep(&term) { SIGTERM } else { SIGKILL };
         reached.extend(procs.send(&term, sig));
         settle(procs, &term);
-        for _ in 0..LISTS {
+        for _ in 0..KILLS {
             let Some((listed, mine)) = list(procs, &reached) else {
                 return Left::Lives;
             };
@@ -3948,8 +4029,15 @@ pub mod proc_tree {
                 ),
                 (4200, Some(4100), 987_654, false, false, false, false)
             );
+            assert!(!k.leader_only);
             let k = stat_kin(&line.replace("(trust d) x) S", "(trustd) Z"), 4242).unwrap();
-            assert!(k.zombie && k.trustd);
+            assert!(k.zombie && k.trustd && !k.leader_only);
+            let leader = line
+                .replace(") S", ") Z")
+                .replace(" 20 0 1 0 ", " 20 0 3 0 ");
+            let k = stat_kin(&leader, 4242).unwrap();
+            assert!(k.leader_only && !k.zombie, "two threads still run");
+            assert_eq!(k.serial, 987_654);
             let k = stat_kin(&line.replace(" 4100 0 ", " 4100 34816 "), 4242).unwrap();
             assert!(k.ctty && !k.zombie, "on /dev/pts/0");
             assert_eq!(k.serial, 987_654);
@@ -3984,6 +4072,7 @@ pub mod proc_tree {
                 ctty: false,
                 trustd,
                 forked: false,
+                leader_only: false,
             };
             // The kin `table` holds, by pid.
             let read = |table: &[(i32, Kin)]| {
@@ -5763,6 +5852,14 @@ mod tests {
             std::thread::yield_now();
         };
         assert!(ended.is_some(), "the stale check outlived its reap");
+        for n in 1..=3 {
+            reap_until_gone(
+                &root,
+                &root.join(format!(".check.{n}")),
+                "the record of a check ended, or of one nothing is left of, goes",
+                || {},
+            );
+        }
         let slots = ["j1", "j2", "j3"].map(|slot| root.join(slot));
         let mut held = held_slots(&root);
         held.sort();
@@ -5771,10 +5868,6 @@ mod tests {
         kept.sort();
         assert_eq!(kept, slots);
         assert!(slots.iter().all(|slot| slot.is_dir()));
-        assert!(
-            (1..=3).all(|n| !root.join(format!(".check.{n}")).exists()),
-            "the record of a check ended, or of one nothing is left of, goes"
-        );
     }
 
     #[test]
@@ -6890,6 +6983,20 @@ mod tests {
         true
     }
 
+    /// Reaps `root` until `record` is gone, as the runs after this one would: a sweep or a
+    /// reap whose listing is not whole keeps the record it watched, and a loaded machine's
+    /// listing (every pid of this user's, read again until a list names none it did not read)
+    /// seldom is. `between` checks, after each reap, what no reap may do. A one-minute hang
+    /// detector.
+    fn reap_until_gone(root: &Path, record: &Path, what: &str, mut between: impl FnMut()) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while record.exists() {
+            assert!(Instant::now() < deadline, "{what}");
+            reap_stale_checks(root);
+            between();
+        }
+    }
+
     /// Kills a process a test left running when dropped, if its pid still holds it.
     struct Leftover {
         pid: u32,
@@ -7134,6 +7241,7 @@ mod tests {
                 ctty: false,
                 trustd: q.trustd,
                 forked: q.spawning,
+                leader_only: false,
             })
         }
 
@@ -8268,13 +8376,18 @@ mod tests {
             std::thread::yield_now();
         };
         assert_eq!(ended.code, 128 + proc_tree::SIGKILL);
-        assert!(!record.exists());
         let held = held_slots(d.path());
         assert!(
             ends(left.pid, left.serial),
             "what the killed root started outlived it"
         );
         assert_eq!(held, [target]);
+        reap_until_gone(
+            d.path(),
+            &record,
+            "the record of what was ended stayed",
+            || {},
+        );
     }
 
     /// A check record whose root is gone, someone else having ended it: what the root left
@@ -8296,7 +8409,7 @@ mod tests {
             ends(g.left.pid, g.left.serial),
             "what the gone root left outlived the reap"
         );
-        assert!(!record.exists());
+        reap_until_gone(&root, &record, "the record of what was ended stayed", || {});
         assert_eq!(held_slots(&root), [slot]);
     }
 
@@ -8354,9 +8467,11 @@ mod tests {
             "what outlived the SIGTERM outlived the reap"
         );
         let _ = check.wait();
-        assert!(
-            !record.exists(),
-            "the reap kept the record of a check it ended"
+        reap_until_gone(
+            &root,
+            &record,
+            "the reap kept the record of a check it ended",
+            || {},
         );
         drop(quiet);
     }
@@ -8402,12 +8517,23 @@ mod tests {
                     record_at(&nonce(), named, &root)
                 };
                 fs::write(&record, text).unwrap();
+                let unsignalled = || {
+                    assert!(
+                        g.beats_on() && g.left.running(),
+                        "a member {how} was signalled (earlier build's record: {earlier})"
+                    );
+                };
                 reap_stale_checks(&root);
-                assert!(
-                    g.beats_on() && g.left.running(),
-                    "a member {how} was signalled (earlier build's record: {earlier})"
-                );
+                unsignalled();
                 let held = at_slot || earlier;
+                if !held {
+                    reap_until_gone(
+                        &root,
+                        &record,
+                        &format!("{how}: a stranger's member held the record"),
+                        unsignalled,
+                    );
+                }
                 assert_eq!(
                     record.exists(),
                     held,
@@ -8422,11 +8548,14 @@ mod tests {
                 assert!(g.end(), "the group outlived its kill");
                 let stamp = slot.join(aterm_uds::deadline::EXEC_STAMP);
                 fs::write(&stamp, u64::MAX.to_string()).unwrap();
-                reap_stale_checks(&root);
-                assert!(
-                    !record.exists(),
-                    "{how}: once the session is empty the record goes (earlier build's \
-                     record: {earlier})"
+                reap_until_gone(
+                    &root,
+                    &record,
+                    &format!(
+                        "{how}: once the session is empty the record goes (earlier build's \
+                         record: {earlier})"
+                    ),
+                    || {},
                 );
                 let kept: &[PathBuf] = if held {
                     std::slice::from_ref(&slot)
@@ -8449,7 +8578,10 @@ mod tests {
     /// session at a dead root's reused pid has, and macOS keeps that mark on what the shell
     /// left there when it exited. Such a member holds no record, though its environment cannot
     /// be read and the record (an earlier build's) names no nonce; the reap signals it no more
-    /// than any member.
+    /// than any member. The shell exits only once the member has exec'd, as a tab's shell's
+    /// children have long before it ends: macOS drops the mark from a process that execs after
+    /// its session's leader is gone, which a loaded machine's late exec did here. The record goes
+    /// at a reap whose listing is whole; a loaded machine's may not be, and that reap keeps it.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn a_member_that_had_a_terminal_holds_no_record() {
@@ -8465,7 +8597,11 @@ mod tests {
         let (left, leader) = (d.path().join("left.pid"), d.path().join("leader.pid"));
         let mut tab = command("/usr/bin/script")
             .args(["-q", "/dev/null", "/bin/sh", "-c"])
-            .arg("trap '' HUP; (cd /; exec /bin/sleep 600) & echo $! > \"$1\"; echo $$ > \"$2\"")
+            .arg(
+                "trap '' HUP; (cd /; exec /bin/sleep 600) & p=$!; n=0; \
+                 until [ \"$(ps -o comm= -p $p)\" = /bin/sleep ] || [ $n -ge 6000 ]; do \
+                 n=$((n + 1)); sleep 0.01; done; echo $p > \"$1\"; echo $$ > \"$2\"",
+            )
             .arg("sh")
             .arg(&left)
             .arg(&leader)
@@ -8510,12 +8646,15 @@ mod tests {
         assert!(!row.in_session, "{row:?}");
         let record = root.join(".check.0");
         fs::write(&record, format!("{leader} whenever\n")).unwrap();
-        reap_stale_checks(&root);
-        assert!(member.running(), "the reap signalled a member");
-        assert!(
-            !record.exists(),
-            "a member that had a terminal holds no record"
-        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while record.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "a member that had a terminal holds no record"
+            );
+            reap_stale_checks(&root);
+            assert!(member.running(), "the reap signalled a member");
+        }
     }
 
     /// A LIVE CHECK IS ENDED BY ITS MARK, never by a start's text (`ps` prints one in the
@@ -8578,7 +8717,7 @@ mod tests {
             ends(withheld.pid, withheld.serial),
             "what it left in its session, its environment withheld, outlived the reap"
         );
-        assert!(!record.exists());
+        reap_until_gone(&root, &record, "the record of what was ended stayed", || {});
         assert_eq!(held_slots(&root), [slot]);
     }
 
@@ -8640,7 +8779,12 @@ mod tests {
             ends(orphan.pid, orphan.serial),
             "what the root left in its session outlived it"
         );
-        assert!(!record.exists(), "the record goes once its sweep ended all");
+        reap_until_gone(
+            d.path(),
+            &record,
+            "the record stayed once a sweep ended all",
+            || {},
+        );
         assert_eq!(held_slots(d.path()), [target]);
     }
 
@@ -8698,8 +8842,7 @@ mod tests {
             .args(["-KILL", &orphan.pid.to_string()])
             .status();
         assert!(ends(orphan.pid, orphan.serial));
-        reap_stale_checks(&root);
-        assert!(!record.exists(), "once it is gone the record goes");
+        reap_until_gone(&root, &record, "once it is gone the record goes", || {});
         assert_ne!(fs::read_to_string(&stamp).unwrap(), u64::MAX.to_string());
         assert_eq!(held_slots(&root), [slot]);
     }
@@ -8731,14 +8874,16 @@ mod tests {
         let orphan = orphan_named(&pidfile, live.id());
         let record = root.join(".check.0");
         fs::write(&record, format!("{} {}\n", live.id(), lstart(live.id()))).unwrap();
-        reap_stale_checks(&root);
-        assert!(
-            leader.running() && orphan.running(),
-            "the reap signalled what an earlier build's record names"
-        );
-        assert!(
-            !record.exists(),
-            "a session another process leads at its pid holds nothing"
+        reap_until_gone(
+            &root,
+            &record,
+            "a session another process leads at its pid holds nothing",
+            || {
+                assert!(
+                    leader.running() && orphan.running(),
+                    "the reap signalled what an earlier build's record names"
+                );
+            },
         );
         assert_eq!(held_slots(&root), std::slice::from_ref(&slot));
         let _ = live.kill();
@@ -8746,7 +8891,9 @@ mod tests {
     }
 
     /// A reap that could not read keeps the record, so the slot stays held whatever its
-    /// stamp says, and the check runs on; one that reads ends it and takes the record.
+    /// stamp says, and the check runs on; one that reads ends it, and once nothing of the check
+    /// is left a reap takes the record (the ending reap keeps it while a listing still names
+    /// the dying process, as a loaded machine's can).
     #[test]
     fn a_reap_that_could_not_read_keeps_the_record_past_a_spent_stamp() {
         let d = tmp("trust-lane-unread");
@@ -8788,7 +8935,11 @@ mod tests {
             std::thread::yield_now();
         };
         assert!(ended, "a reap that reads ends the check");
-        assert!(!record.exists());
+        reap_stale_checks(&root);
+        assert!(
+            !record.exists(),
+            "a reap that finds nothing of the check takes its record"
+        );
         assert_ne!(fs::read_to_string(&stamp).unwrap(), u64::MAX.to_string());
         assert_eq!(held_slots(&root), [slot]);
     }
@@ -8826,10 +8977,11 @@ mod tests {
         );
         assert!(g.end(), "the group outlived its kill");
         fs::write(&stamp, &spent).unwrap();
-        reap_stale_checks(&root);
-        assert!(
-            !record.exists(),
-            "the record goes once the session is empty"
+        reap_until_gone(
+            &root,
+            &record,
+            "the record goes once the session is empty",
+            || {},
         );
         assert_eq!(
             clear_slots(&root).unwrap(),
@@ -8941,13 +9093,15 @@ mod tests {
         assert!(said.contains(&format!("run {}", lane.pid)), "{said}");
 
         fs::write(stamp("j0"), u64::MAX.to_string()).unwrap();
-        reap_stale_checks(&root);
-        assert!(check.running(), "a reap signalled a check it does not own");
-        assert!(
-            !root.join(".check.0").exists(),
-            "a copy's record goes once its first stamp is spent"
+        reap_until_gone(
+            &root,
+            &root.join(".check.0"),
+            "a copy's record goes once its first stamp is spent",
+            || {
+                assert!(check.running(), "a reap signalled a check it does not own");
+                assert!(root.join(".check.1").exists() && !stamp("j1").exists());
+            },
         );
-        assert!(root.join(".check.1").exists() && !stamp("j1").exists());
 
         let _ = command("/bin/kill")
             .args(["-KILL", &lane.pid.to_string()])
@@ -8967,7 +9121,12 @@ mod tests {
             std::thread::yield_now();
         };
         assert!(ended, "once its run is gone, the reap ends the check");
-        assert!(!root.join(".check.1").exists());
+        reap_until_gone(
+            &root,
+            &root.join(".check.1"),
+            "the record of the check its run's reap ended stayed",
+            || {},
+        );
         assert_eq!(held_slots(&root), [root.join("j1")]);
     }
 
@@ -9097,7 +9256,8 @@ mod tests {
             root: None,
             kept: BTreeSet::new(),
         };
-        let listing = proc_tree::table(&mark, None, d.path()).unwrap();
+        let listing =
+            proc_tree::table_from(&mark, None, d.path(), &mut || Ok(vec![child.id()])).unwrap();
         assert!(
             listing.whole,
             "a listing that names an unreaped child is whole"
@@ -9196,11 +9356,7 @@ mod tests {
         let mut lists = 0;
         let listing = proc_tree::table_from(&mark, None, &slot, &mut || {
             lists += 1;
-            let all = aterm_uds::holders::uid_pids()?;
-            Ok(all
-                .into_iter()
-                .filter(|p| lists > 1 || *p != missed)
-                .collect())
+            Ok(if lists > 1 { vec![missed] } else { Vec::new() })
         })
         .unwrap();
         assert!(listing.whole);
@@ -9310,7 +9466,12 @@ mod tests {
             std::thread::yield_now();
         };
         assert_eq!(ended.code, 0);
-        assert!(!root.join(".check.0").exists() && !stamp.exists());
+        reap_until_gone(
+            &root,
+            &root.join(".check.0"),
+            "the record of a check that ended stayed",
+            || {},
+        );
         assert!(rec.root.is_some() && rec.boot == aterm_uds::process::boot_id());
         assert_eq!(
             (rec.lane, rec.dir),
@@ -9345,7 +9506,6 @@ mod tests {
             panic!("a check whose root was not identified started");
         };
         assert!(e.to_string().contains("could not be identified"), "{e}");
-        assert!(!root.join(".check.0").exists());
         let pid = ASKED.load(Ordering::SeqCst);
         assert!(pid > 1, "the root's serial was never asked for");
         let state = state(pid.unsigned_abs());
@@ -9357,6 +9517,12 @@ mod tests {
         assert!(
             state.is_empty_or_zombie(),
             "the root is left running or stopped: {state}"
+        );
+        reap_until_gone(
+            &root,
+            &root.join(".check.0"),
+            "the record of a check that never started stayed",
+            || {},
         );
     }
 
@@ -9440,8 +9606,12 @@ mod tests {
         );
         let record = d.path().join("root").join(".check.0");
         assert!(record.exists(), "the record was written before the root");
-        reap_stale_checks(&d.path().join("root"));
-        assert!(!record.exists(), "the next run's reap kept the record");
+        reap_until_gone(
+            &d.path().join("root"),
+            &record,
+            "the next runs' reaps kept the record",
+            || {},
+        );
     }
 
     const DIES_SWEEPING_ENV: &str = "ATERM_RELEASE_TRUST_LANE_DIES_SWEEPING";
@@ -9593,9 +9763,11 @@ mod tests {
             ends(member.pid, member.serial),
             "what the dead lane's SIGTERM reached outlived the next reap"
         );
-        assert!(
-            !record.exists(),
-            "the reap kept the record of a check it ended"
+        reap_until_gone(
+            &root,
+            &record,
+            "the reap kept the record of a check it ended",
+            || {},
         );
     }
 
@@ -9791,7 +9963,7 @@ mod tests {
         let gone = ends(gen_pid, gen_serial);
         drop(input);
         assert!(gone, "what ran from the slot outlived the reap");
-        assert!(!record.exists());
+        reap_until_gone(&root, &record, "the record of what was ended stayed", || {});
         assert_eq!(held_slots(&root), [slot]);
     }
 
@@ -9841,10 +10013,16 @@ mod tests {
 
         assert!(g.end(), "the group outlived its kill");
         fs::write(&stamp, &spent).unwrap();
+        reap_until_gone(
+            &root,
+            &record,
+            "the record goes once the session is empty",
+            || {},
+        );
         let (outcome, said, filed) = run_site(&mut s);
         assert!(
             matches!(&outcome, Outcome::CouldNotRun(why) if why.contains("may have left a program")),
-            "the stamp the run that took the record wrote holds the slot: {outcome:?}: {said}"
+            "the stamp the reap that took the record wrote holds the slot: {outcome:?}: {said}"
         );
         assert!(filed.is_empty() && !record.exists(), "{said}");
 
@@ -9949,9 +10127,11 @@ mod tests {
         assert_eq!(check.poll().unwrap(), Some(ended));
         assert_eq!(check.end(), ended);
         assert_eq!(held_slots(d.path()), [target]);
-        assert!(
-            !d.path().join(".check.0").exists(),
-            "the record goes once the lane saw the end it made, the slot stamped"
+        reap_until_gone(
+            d.path(),
+            &d.path().join(".check.0"),
+            "the record stayed once the lane saw the end it made, the slot stamped",
+            || {},
         );
         assert!(
             ends(grandchild.pid, grandchild.serial),
@@ -9969,6 +10149,10 @@ mod tests {
             .stdin(Stdio::null())
             .spawn()
             .unwrap();
+        // Its sweep lists the root alone: whether a clean exit stamps the slot is judged on a
+        // whole listing, which a loaded machine's churn may not give.
+        let only_root = child.id();
+        proc_tree::LISTED.with(|l| *l.borrow_mut() = Some(vec![only_root]));
         fs::write(d.path().join(".check.1"), "the lane's own\n").unwrap();
         let mut exited = RealCheck {
             mark: proc_tree::Mark {
@@ -9989,6 +10173,7 @@ mod tests {
             assert!(Instant::now() < deadline, "true never exited");
             std::thread::yield_now();
         };
+        proc_tree::LISTED.with(|l| *l.borrow_mut() = None);
         assert_eq!((ended.code, exited.end()), (0, ended));
         assert!(!target.join(aterm_uds::deadline::EXEC_STAMP).exists());
         assert!(
@@ -10041,9 +10226,11 @@ mod tests {
             target.join(aterm_uds::deadline::EXEC_STAMP).is_file(),
             "a failed check's slot is stamped"
         );
-        assert!(
-            !record.exists(),
-            "the record goes once the stamp holds the slot"
+        reap_until_gone(
+            d.path(),
+            &record,
+            "the record goes once the stamp holds the slot",
+            || {},
         );
         assert_eq!(
             clear_slots(d.path()).unwrap(),

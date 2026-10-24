@@ -14,8 +14,19 @@ use super::{SettingsRoute, SettingsViewState};
 /// The least of a card a list's edge leaves in view that reads as the card going on.
 pub(super) const PEEK_MIN: f32 = crate::native_ui::LIST_PEEK_MIN;
 
-/// The keyboard's control, and for each height a stop lays it out, the band its words paint in.
-type WatchedWords = (UiKey, Vec<(f32, Option<(f32, f32)>)>);
+/// The keyboard's control, and for each height a stop lays it out, the words that name it.
+type WatchedWords = (UiKey, Vec<(f32, Words)>);
+
+/// The words whose cut makes a list draw a control as a picture, as bands from its top.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Words {
+    /// Its own, which an edge crossing them cuts.
+    Own(f32, f32),
+    /// Its named row's, which a cut of the control leaves out of view.
+    Row(f32, f32),
+    /// None: a cut paints what is in view.
+    Nothing,
+}
 
 thread_local! {
     /// The keyboard's control while a page is built ([`KeyboardWords`]).
@@ -33,24 +44,33 @@ impl KeyboardWords {
         Self
     }
 
-    fn note(node: &UiNode, height: f32) {
+    /// Note control `node` laid out `height` tall at `top`, under `rows` (each with its top and height).
+    fn note(node: &UiNode, top: f32, height: f32, rows: &[(&UiNode, f32, f32)]) {
         KEYBOARD_WORDS.with(|words| {
             if let Some((key, bands)) = words.borrow_mut().as_mut()
                 && node.key == *key
                 && !bands.iter().any(|(tall, _)| (tall - height).abs() < 0.01)
             {
-                bands.push((
-                    height,
-                    crate::native_ui::words_band(key, &node.content, height),
-                ));
+                let own = crate::native_ui::words_band(key, &node.content, height);
+                let row = || {
+                    rows.iter().rev().find_map(|(row, at, tall)| {
+                        crate::native_ui::named_row_words(row, *tall)
+                            .map(|(from, to)| Words::Row(at + from - top, at + to - top))
+                    })
+                };
+                let words = own.map_or_else(
+                    || row().unwrap_or(Words::Nothing),
+                    |(from, to)| Words::Own(from, to),
+                );
+                bands.push((height, words));
             }
         });
     }
 
-    /// The band `key`'s words paint in laid out `height` tall: a control's words sit by its
-    /// height (a row whose name wraps at 2× text is taller), so one band read for another height
-    /// counted Catppuccin Latte's row 56pt shown where the list drew it as a picture.
-    fn of(key: &UiKey, height: f32) -> Option<(f32, f32)> {
+    /// The words naming `key` laid out `height` tall: they sit by its height (a row whose name
+    /// wraps at 2× text is taller), so one band read for another height counted Catppuccin
+    /// Latte's row 56pt shown where the list drew it as a picture.
+    fn of(key: &UiKey, height: f32) -> Option<Words> {
         KEYBOARD_WORDS.with(|words| {
             words
                 .borrow()
@@ -60,7 +80,7 @@ impl KeyboardWords {
                     bands
                         .iter()
                         .find(|(tall, _)| (tall - height).abs() < 0.01)
-                        .and_then(|(_, band)| *band)
+                        .map(|(_, words)| *words)
                 })
         })
     }
@@ -881,9 +901,13 @@ impl ScrollPlan {
             return index.min(limit);
         }
         let mut first = top + 1;
-        while first < index
-            && self.stop_top(first, index) - self.seat_drop(first) + to > self.room + 0.01
-        {
+        let shows = |first: usize| match self.foot {
+            ListFoot::Peek => {
+                self.stop_top(first, index) - self.seat_drop(first) + to <= self.room + 0.01
+            }
+            ListFoot::Whole => self.shows_span(index, first, (from, to)),
+        };
+        while first < index && !shows(first) {
             first += 1;
         }
         first.min(limit)
@@ -903,7 +927,7 @@ impl ScrollPlan {
     }
 
     /// How much of control `key`'s `span` in stop `index` the screen whose first stop is `top`
-    /// paints: none where that is a sliver, or where an edge of the list crosses its words
+    /// paints: none where that is a sliver, or where a cut leaves out the words naming it
     /// ([`KeyboardWords`]; all of it where they are not known), which the list draws as a picture.
     fn painted_of_span(
         &self,
@@ -926,17 +950,25 @@ impl ScrollPlan {
         if shown + 0.01 < PEEK_MIN.min(to - from) {
             return 0.0;
         }
-        let (words, ink) = KeyboardWords::of(key, to - from)
-            .map_or((start, end), |(top, bottom)| (start + top, start + bottom));
         let fades = screen.fades && screen.height > screen.live + 0.01;
-        let crosses = |edge: f32| {
-            start < edge - 0.01 && end > edge + 0.01 && words < edge - 0.01 && ink > edge + 0.01
+        let edges = [Some(floor), (!fades).then_some(bottom)];
+        let across = |(top, end): (f32, f32), edge: f32| top < edge - 0.01 && end > edge + 0.01;
+        let cut = |words: (f32, f32)| {
+            edges
+                .into_iter()
+                .flatten()
+                .any(|edge| across((start, end), edge) && across(words, edge))
         };
-        if crosses(floor) || (!fades && crosses(bottom)) {
-            0.0
-        } else {
-            shown
-        }
+        let picture = match KeyboardWords::of(key, to - from) {
+            None => cut((start, end)),
+            Some(Words::Own(top, under)) => cut((start + top, start + under)),
+            Some(Words::Row(top, under)) => {
+                cut((start, end))
+                    && (start + top < floor - 0.01 || (!fades && start + under > bottom + 0.01))
+            }
+            Some(Words::Nothing) => false,
+        };
+        if picture { 0.0 } else { shown }
     }
 
     fn live_band(&self, screen: &Screen, index: usize) -> Option<(f32, f32, f32)> {
@@ -1077,8 +1109,41 @@ impl ScrollPlan {
             {
                 self.nudged(screen, seat.nudge, seat.bare)
             }
+            Some(seat) if seat.top == screen.view.start && self.seats_partway(seat) => Screen {
+                offset: seat.nudge,
+                ..screen
+            },
             _ => screen,
         }
+    }
+
+    /// Whether `seat` starts a whole-stop list's screen partway into a stop taller than its room.
+    fn seats_partway(&self, seat: Seat) -> bool {
+        self.foot == ListFoot::Whole
+            && !seat.bare
+            && seat.top < self.len()
+            && self.heights[seat.top] > self.room + 0.01
+            && seat.nudge > 0.01
+            && seat.nudge <= self.lead_of(seat.top) + self.heights[seat.top] - self.room + 0.01
+    }
+
+    /// The seat partway into `key`'s stop, taller than the room, that shows most of the control.
+    pub(super) fn tall_stop_seat(&self, key: &UiKey) -> Option<Seat> {
+        let index = self.stop_of(key)?;
+        if self.foot != ListFoot::Whole
+            || index > self.limit()
+            || self.heights[index] <= self.room + 0.01
+        {
+            return None;
+        }
+        let (from, to) = self.control_span(index, key)?;
+        let at = self.lead_of(index);
+        let seat = if to - from > self.room + 0.01 {
+            Seat::nudged(index, at + from)
+        } else {
+            Seat::nudged(index, at + to - self.room)
+        };
+        (self.seats_partway(seat) && at + from - seat.nudge >= -0.01).then_some(seat)
     }
 
     fn bare_at(&self, top: usize) -> bool {
@@ -1533,7 +1598,7 @@ impl ScrollPlan {
 
     fn seat_fits(&self, seat: Seat) -> bool {
         if self.foot == ListFoot::Whole {
-            return false;
+            return self.seats_partway(seat);
         }
         if !seat.bare {
             return self.nudge_fits(seat.top, seat.nudge);
@@ -1814,6 +1879,11 @@ impl ScrollRecord {
     /// The stop the list's screen started at.
     pub(super) const fn top(&self) -> usize {
         self.top
+    }
+
+    /// The keyboard's control as this screen found it.
+    pub(super) const fn keyboard(&self) -> Option<&UiKey> {
+        self.keyboard.as_ref()
     }
 
     /// Whether `state` shows the list this record was drawn for.
@@ -2240,6 +2310,32 @@ impl SettingsViewState {
         if opening && land {
             self.land_beside_keyboard(plan, &mut top, owed);
         }
+        // A CONTROL IN A STOP TALLER THAN THE ROOM IS SHOWN WHOLE WHERE IT
+        // FITS (R2, R5), else from its top where the last screen showed it cut
+        // and R2 owes more of it: a whole-stop list seats partway into the
+        // stop. Seated at the stop, the Customize sheet's colour well at
+        // 444x420 at 2× text under a status went out of view, 22pt in the
+        // room's 32pt, and the chooser's pack row, 56pt, made 1240x151 at 2×
+        // text under a status, showed 47pt of the 48pt the screen before did.
+        if let Some(key) = focus
+            && let Some(index) = plan.stop_of(key)
+            && let Some(span) = plan.control_span(index, key)
+            && !plan.shows_span(index, top, span)
+        {
+            let before = Left::on(plan, key, top);
+            let owing = owed(key).filter(|want| !want.kept_by(&before));
+            if (first_screen || revealing == Some(key) || owing.is_some())
+                && let Some(seat) = plan.tall_stop_seat(key)
+            {
+                let (was, seated) = (top, plan.seated.replace(seat));
+                top = seat.top;
+                let more = owing.is_some_and(|want| !want.whole)
+                    && Left::on(plan, key, top).part > before.part + 0.5;
+                if !plan.shows_span(index, top, span) && !more {
+                    (top, plan.seated) = (was, seated);
+                }
+            }
+        }
         let left = focus.map(|key| {
             let now = Left::on(plan, key, top);
             let record = self.scroll_record.borrow();
@@ -2539,6 +2635,164 @@ impl SettingsViewState {
         let left = record.left_of(&key);
         (record.plan.stop_of(&key).is_some() && if whole { left.whole } else { left.shows() })
             .then_some(key)
+    }
+
+    /// Whether the list last seated lists the keyboard's control and no screen shows it whole, by
+    /// its stop or its paint, a whole-stop list's seat partway into a stop taller than the room too
+    /// ([`ScrollPlan::tall_stop_seat`]).
+    pub(super) fn keyboard_cut(&self) -> bool {
+        let Some(key) = self.common.last_focus.as_ref() else {
+            return false;
+        };
+        let context = self.scroll_context();
+        let record = self.scroll_record.borrow();
+        record
+            .as_ref()
+            .filter(|record| record.context == context)
+            .is_some_and(|record| {
+                let plan = &record.plan;
+                let Some(index) = plan.stop_of(key) else {
+                    return false;
+                };
+                let (from, to) = plan
+                    .control_span(index, key)
+                    .unwrap_or_else(|| plan.controls_of(index));
+                let whole = |plan: &ScrollPlan, top: usize| {
+                    let left = Left::on(plan, key, top);
+                    left.whole || left.part + 0.5 >= to - from
+                };
+                let partway = || {
+                    let seat = plan.tall_stop_seat(key)?;
+                    let mut seated = plan.clone();
+                    seated.seated = Some(seat);
+                    Some(whole(&seated, seat.top))
+                };
+                !whole(plan, record.top)
+                    && !(0..=plan.limit()).any(|top| whole(plan, top))
+                    && partway() != Some(true)
+            })
+    }
+
+    /// Whether the screen last seated before the person's first event cuts the theme in use.
+    pub(super) fn landing_cut(&self) -> bool {
+        let Some(landing) = self
+            .page_reveal
+            .as_ref()
+            .filter(|_| matches!(self.reveal_as, Reveal::Land | Reveal::LandWhole))
+        else {
+            return false;
+        };
+        let context = self.scroll_context();
+        let record = self.scroll_record.borrow();
+        record
+            .as_ref()
+            .filter(|record| record.opening && record.context == context)
+            .is_some_and(|record| {
+                record
+                    .plan
+                    .stop_holding(landing)
+                    .is_some_and(|index| !record.plan.shows_landing(index, record.top))
+            })
+    }
+
+    /// Whether the theme in use, as [`Self::landing_cut`] reads it, fits a room `more` taller than
+    /// the list last seated has; with `keyboard`, a list whose stops stay as they are, on one screen
+    /// with the keyboard's listed control where the screen showed that whole (R2 and R3 of
+    /// [`Self::seat_scroll`]).
+    pub(super) fn landing_fits(&self, more: f32, keyboard: bool) -> bool {
+        let Some(landing) = self.page_reveal.as_ref() else {
+            return false;
+        };
+        let context = self.scroll_context();
+        let record = self.scroll_record.borrow();
+        record
+            .as_ref()
+            .filter(|record| record.context == context)
+            .and_then(|record| {
+                let plan = &record.plan;
+                let index = plan.stop_holding(landing)?;
+                let at = plan.stop_top(0, index);
+                let (from, to) = plan.revealed_span(index, Reveal::Keep);
+                let (from, to) = keyboard
+                    .then_some(self.common.last_focus.as_ref())
+                    .flatten()
+                    .and_then(|key| {
+                        let stop = plan.stop_of(key)?;
+                        Left::on(plan, key, record.top).whole.then(|| {
+                            let at = plan.stop_top(0, stop);
+                            let (top, bottom) = plan
+                                .control_span(stop, key)
+                                .unwrap_or_else(|| plan.controls_of(stop));
+                            (at + top, at + bottom)
+                        })
+                    })
+                    .map_or((at + from, at + to), |(top, bottom)| {
+                        ((at + from).min(top), (at + to).max(bottom))
+                    });
+                Some(to - from <= plan.room + more + 0.01)
+            })
+            .unwrap_or_default()
+    }
+
+    /// What the screen last seated shows of the keyboard's listed control.
+    pub(super) fn keyboard_left(&self) -> Option<Left> {
+        let key = self.common.last_focus.as_ref()?;
+        let context = self.scroll_context();
+        let record = self.scroll_record.borrow();
+        let record = record.as_ref().filter(|record| record.context == context)?;
+        record
+            .plan
+            .stop_of(key)
+            .map(|_| Left::on(&record.plan, key, record.top))
+    }
+
+    /// Whether the screen last seated shows the keyboard's listed control less than `record`, the
+    /// screen before it, left the person; whole where the keyboard moved since (R2 of
+    /// [`Self::seat_scroll`]).
+    pub(super) fn keyboard_short_of(&self, record: Option<&ScrollRecord>) -> bool {
+        self.common.last_focus.is_some() && !self.keyboard_kept(self.keyboard_was(record).as_ref())
+    }
+
+    /// How much of the keyboard's listed control the list owes the person: what `record`, the
+    /// screen before, showed of it where that was cut, else all of it (R2 of [`Self::seat_scroll`]).
+    pub(super) fn keyboard_owed(&self, record: Option<&ScrollRecord>) -> Option<f32> {
+        match self.keyboard_was(record) {
+            Some(left) if !left.whole => Some(left.part),
+            _ => self.keyboard_height(),
+        }
+    }
+
+    /// What `record` left the person of the keyboard's control, where it was drawn for it.
+    fn keyboard_was(&self, record: Option<&ScrollRecord>) -> Option<Left> {
+        let key = self.common.last_focus.as_ref()?;
+        record
+            .filter(|record| record.same_context(self) && record.keyboard.as_ref() == Some(key))
+            .map(|record| record.left_of(key))
+    }
+
+    /// How tall the list last seated lays the keyboard's listed control out.
+    fn keyboard_height(&self) -> Option<f32> {
+        let key = self.common.last_focus.as_ref()?;
+        let context = self.scroll_context();
+        let record = self.scroll_record.borrow();
+        let plan = &record
+            .as_ref()
+            .filter(|record| record.context == context)?
+            .plan;
+        let index = plan.stop_of(key)?;
+        let (from, to) = plan
+            .control_span(index, key)
+            .unwrap_or_else(|| plan.controls_of(index));
+        Some(to - from)
+    }
+
+    /// Whether the screen last seated shows the keyboard's control no less than `was` did.
+    pub(super) fn keyboard_kept(&self, was: Option<&Left>) -> bool {
+        match (was, self.keyboard_left()) {
+            (Some(was), Some(now)) => was.kept_by(&now),
+            (None, Some(now)) => now.whole,
+            (_, None) => true,
+        }
     }
 
     /// Keep `key` in view at the next render, its whole stop.
@@ -2842,21 +3096,14 @@ impl SettingsViewState {
         (order.contains(&selected) && selected != *next).then_some(selected)
     }
 
-    /// TAB ENTERS A LIST WHOSE SCREEN SHOWS NONE OF ITS CONTROLS.
+    /// TAB ENTERS A LIST WHOSE SCREEN SHOWS NONE OF ITS CONTROLS ([`crate::native_ui::tab_into_unshown_list`] over this page's list).
     pub(crate) fn tab_into_unshown_list(&self, forward: bool, order: &[UiKey]) -> Option<UiKey> {
         let plan = self.scroll_plan()?;
-        if plan.controls().any(|(_, key)| order.contains(key)) {
-            return None;
-        }
-        let mut controls = plan.controls().map(|(_, key)| key.clone());
-        if forward {
-            controls.next()
-        } else {
-            controls.last()
-        }
+        let controls: Vec<&UiKey> = plan.controls().map(|(_, key)| key).collect();
+        crate::native_ui::tab_into_unshown_list(&controls, forward, order).cloned()
     }
 
-    /// TAB WALKS THE WHOLE LIST, not just its screen.
+    /// TAB WALKS THE WHOLE LIST, not just its screen ([`crate::native_ui::tab_past_screen`] over this page's list).
     pub(crate) fn tab_past_screen(
         &self,
         current: &UiKey,
@@ -2866,22 +3113,14 @@ impl SettingsViewState {
     ) -> Option<UiKey> {
         let plan = self.scroll_plan()?;
         let controls: Vec<&UiKey> = plan.controls().map(|(_, key)| key).collect();
-        let target = match (plan.control_index(current), plan.control_index(next)) {
-            (Some(index), Some(after)) if index == after => {
-                if forward {
-                    controls.get(index + 1)
-                } else {
-                    controls.get(index.checked_sub(1)?)
-                }
-            }
-            (Some(index), None) if forward => controls.get(index + 1),
-            (Some(index), None) => controls.get(index.checked_sub(1)?),
-            (None, Some(_)) if !order.contains(current) => None,
-            (None, Some(_)) if forward => controls.first(),
-            (None, Some(_)) => controls.last(),
-            (Some(_), Some(_)) | (None, None) => None,
-        }?;
-        (*target != next).then(|| (*target).clone())
+        crate::native_ui::tab_past_screen(
+            &controls,
+            |key| plan.control_index(key),
+            current,
+            next,
+            forward,
+            order,
+        )
     }
 }
 
@@ -3011,14 +3250,21 @@ fn keys_within(node: &UiNode, out: &mut Vec<UiKey>) {
 
 /// Each control under `node`, with `node` laid out `height` tall: its key, top and height.
 pub(super) fn control_spans_in(node: &UiNode, height: f32) -> Vec<(UiKey, f32, f32)> {
-    fn walk(node: &UiNode, top: f32, height: f32, out: &mut Vec<(UiKey, f32, f32)>) {
+    fn walk<'a>(
+        node: &'a UiNode,
+        top: f32,
+        height: f32,
+        out: &mut Vec<(UiKey, f32, f32)>,
+        rows: &mut Vec<(&'a UiNode, f32, f32)>,
+    ) {
         if node.paint_only {
             return;
         }
         if is_control(node) {
             out.push((node.key.clone(), top, height));
-            KeyboardWords::note(node, height);
+            KeyboardWords::note(node, top, height, rows);
         }
+        rows.push((node, top, height));
         let layout = &node.layout;
         let inner = (height - layout.padding.top - layout.padding.bottom).max(0.0);
         let length = |length: Length, available: f32| match length {
@@ -3049,7 +3295,7 @@ pub(super) fn control_spans_in(node: &UiNode, height: f32) -> Vec<(UiKey, f32, f
                 let tall = length(child.layout.height, available)
                     .unwrap_or(fill)
                     .max(0.0);
-                walk(child, y, tall, out);
+                walk(child, y, tall, out, rows);
                 y += tall + layout.gap;
             }
         } else {
@@ -3057,12 +3303,13 @@ pub(super) fn control_spans_in(node: &UiNode, height: f32) -> Vec<(UiKey, f32, f
                 let tall = length(child.layout.height, inner)
                     .map_or(inner, |value| value.min(inner))
                     .max(0.0);
-                walk(child, top + layout.padding.top, tall, out);
+                walk(child, top + layout.padding.top, tall, out, rows);
             }
         }
+        rows.pop();
     }
     let mut out = Vec::new();
-    walk(node, 0.0, height, &mut out);
+    walk(node, 0.0, height, &mut out, &mut Vec::new());
     out
 }
 
@@ -3288,14 +3535,7 @@ pub(super) fn seat_room(plan: &mut ScrollPlan, room: f32, overhang: Overhang) {
     }
 }
 
-/// [`seat_room`] for a list a plain status's bar may stand under.
-/// The room a list `room` tall fits and groups its stops for: a list whose
-/// screens end on whole stops ([`ListFoot::Whole`]) the room a status leaves
-/// it, so no stop is grouped taller than every screen under the bar (the
-/// built-in section's caption over its first theme, 64pt in 48pt at 300x160
-/// under a status); a list that peeks its whole room, so a status that comes
-/// or goes regroups nothing and moves nothing pressed (it starts a screen
-/// bare instead, [`ScrollPlan::starts_bare`]).
+/// The room a list `room` tall that ends as `foot` fits and groups its stops for: under a status, a whole-stop list's room the bar leaves.
 fn stops_room(state: &SettingsViewState, room: f32, foot: ListFoot) -> f32 {
     match foot {
         ListFoot::Whole => (room - state.status_extra.get()).max(0.0),
@@ -3303,6 +3543,7 @@ fn stops_room(state: &SettingsViewState, room: f32, foot: ListFoot) -> f32 {
     }
 }
 
+/// [`seat_room`] for a list a plain status's bar may stand under.
 pub(super) fn seat_room_under_status(
     state: &SettingsViewState,
     plan: &mut ScrollPlan,

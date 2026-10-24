@@ -1744,6 +1744,24 @@ impl TurnTracker {
         }
     }
 
+    /// The turn the open turn `node` continues (`cont=`, §2.3) on behalf of vendor turn `v`, and
+    /// `node`'s open time: `node` holds no vendor turn of its own and `v`'s prompt is dated no
+    /// later than `node` opened, so `v` is the vendor turn the screen carried into `node` from the
+    /// turn it names. `None` for any other turn.
+    fn continued_from(log: &Log, node: Node, v: VTurn) -> Option<(Node, u64)> {
+        let opened = log.open_entry(node)?.t;
+        let open = log
+            .state()
+            .turn()
+            .filter(|o| o.node == node && o.f.get(Key::Vref).is_none())?;
+        let Some(Val::Id(cont)) = open.f.get(Key::Cont) else {
+            return None;
+        };
+        Node::parse(cont.as_str())
+            .filter(|p| p.lvl == Lvl::Turn && *p != node && v.at_ms <= opened)
+            .map(|p| (p, opened))
+    }
+
     fn amend_vref(log: &mut Log, node: Node, vref: ShortId, conf: Conf, at: Stamp) {
         let mut f = Fields::new();
         let _ = f.set(Key::Vref, Val::Id(vref));
@@ -1927,6 +1945,21 @@ impl TurnTracker {
         });
         let Some(node) = v.node else {
             return;
+        };
+        // AN END DATED BEFORE THE TURN ITS VENDOR TURN WAS CONTINUED INTO OPENED is that
+        // vendor turn's own (§2.3): the screen closed its turn at the rest and opened the next
+        // before the tap read the end row, so the next carries `cont=`. The end amends the
+        // turn it continues and never closes the one the screen opened after it.
+        let node = match Self::continued_from(log, node, v) {
+            Some((prev, opened)) if row.wall_ms < opened => {
+                self.tx.cur = Some(VTurn {
+                    node: Some(prev),
+                    end_ms: Some(row.wall_ms),
+                    ..v
+                });
+                prev
+            }
+            _ => node,
         };
         let mut at = row;
         let open = Some(node) == self.turn && log.is_open(node);

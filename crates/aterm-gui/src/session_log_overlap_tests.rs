@@ -2242,10 +2242,10 @@ fn every_row_only_kind_is_a_row_mark_the_view_prints_whole() {
         );
         let mut frames = String::new();
         let _ = crate::subscribe::drain_timeline_events(&g, "7", before, &mut frames);
-        let want = if kind == crate::sys_host::JOB_CHANGE {
-            format!("EVENT 7 job {payload}\n")
-        } else {
-            String::new()
+        let want = match kind {
+            crate::sys_host::JOB_CHANGE => format!("EVENT 7 job {payload}\n"),
+            crate::occupancy_wakes::WAKE_READY => format!("EVENT 7 wake {payload}\n"),
+            _ => String::new(),
         };
         assert_eq!(frames, want, "{kind}");
     }

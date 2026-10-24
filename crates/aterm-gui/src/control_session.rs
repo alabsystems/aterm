@@ -680,9 +680,11 @@ pub(crate) fn cmd_ready(
     );
     let look = |now: Instant, parked: bool, closing: bool| {
         let mut t = term_lock(term);
+        // The shipped integrations mark `133;B` once their prompt is drawn, so a resting prompt
+        // is `EnteringCommand`, with or without a line typed at it.
         let prompt = matches!(
             t.all_blocks().last().map(|b| b.state),
-            Some(BlockState::PromptOnly | BlockState::Complete)
+            Some(BlockState::PromptOnly | BlockState::EnteringCommand | BlockState::Complete)
         );
         fire_idle_unless_parked(&mut t, now, parked);
         let settled = idle_id.and_then(|id| t.watch_poll(id)).is_some();
@@ -857,7 +859,10 @@ pub(crate) fn cmd_await(
                 }
                 t.watch(WatcherSpec::SeqAdvanced { after }, now0)
             }
-            "block" => t.watch(WatcherSpec::BlockComplete, now0),
+            "block" => {
+                let after = t.completed_command_seq();
+                t.watch(WatcherSpec::BlockComplete { after }, now0)
+            }
             "frame" => t.watch(WatcherSpec::FrameWhole, now0),
             _ => return USAGE.to_string(),
         }
@@ -1027,7 +1032,12 @@ pub(crate) fn await_task(
     let mut out = format!("OK {}{tail}\n", targets.len());
     for ((target, exited), latch) in targets.iter().zip(&exits).zip(latched) {
         let row = latch.unwrap_or_else(|| {
-            task_wait_row(target, task_record_of(target.ctx).as_ref(), exited(store))
+            task_wait_row(
+                target,
+                task_record_of(target.ctx).as_ref(),
+                exited(store),
+                false,
+            )
         });
         out.push_str(&row);
         out.push('\n');
@@ -1043,19 +1053,25 @@ fn task_record_of(ctx: &SessionCtx) -> Option<crate::task_record::TaskRecord> {
         .cloned()
 }
 
+/// `task_news` belongs to this request's qualifying latch, not its latest record
+/// level. It preserves partial all-wait news across client legs, including the
+/// initial leg whose armed rev/fact edges the client has not read yet.
 fn task_wait_row(
     target: &TaskTarget<'_>,
     record: Option<&crate::task_record::TaskRecord>,
     closed: bool,
+    news: bool,
 ) -> String {
     let (agent, attention) = crate::task_record::agent_and_attention(target.ctx);
-    crate::task_record::await_row(
+    let mut row = crate::task_record::await_row(
         target.ctx.self_id.as_str(),
         record,
         agent,
         &attention,
         closed,
-    )
+    );
+    row.push_str(&format!(" task_news={}", u8::from(news)));
+    row
 }
 
 fn latch_task_news<F: Fn(&Store) -> bool>(
@@ -1087,7 +1103,7 @@ fn latch_task_news<F: Fn(&Store) -> bool>(
         };
         if closed || news.is_some() {
             let record = news.or_else(|| task_record_of(target.ctx));
-            *latch = Some(task_wait_row(target, record.as_ref(), closed));
+            *latch = Some(task_wait_row(target, record.as_ref(), closed, true));
         }
     }
 }
@@ -1279,6 +1295,10 @@ pub(crate) struct TurnIo<'a> {
     pub cause: Option<aterm_slog::ShortId>,
     /// Shared receipt observer for the actual production routes; bool alone is not byte evidence.
     pub mark: Option<&'a crate::control_input_ack::InputMark>,
+    /// The `id=` claim's witness, told when the turn answers having written nothing (no paste, typed key or submit press reached for the PTY, or its first was refused whole by the input queue or the fence ([`TurnIo::refused`])), so its sequence goes back whatever it answered.
+    pub witness: Option<&'a crate::pty_idem::Witness>,
+    /// Asked once a write route (`paste`, `press`, `key`) answered `false`: the `ERR busy …` line `send` answers when that write was refused whole, nothing of it written (the session's input queue full, the `if-supervisor=` fence), else `None`.
+    pub refused: &'a dyn Fn() -> Option<String>,
 }
 
 /// The end of turn `id`'s INPUT: its lease stops saying the driver may type ([`crate::Lease::driver_may_type`]) — only while the slot still holds this turn, never a turn that preempted it — and the presence is woken, so the session's slot reads the lease's end now.
@@ -1317,6 +1337,9 @@ impl TurnIo<'static> {
         fn no_momentum() -> Result<(f32, std::time::Instant), String> {
             Err("no momentum source on this route".to_string())
         }
+        fn not_refused() -> Option<String> {
+            None
+        }
         TurnIo {
             paste: &no_paste,
             press: &no_paste,
@@ -1327,6 +1350,8 @@ impl TurnIo<'static> {
             actor: aterm_slog::Actor::Ctl,
             cause: None,
             mark: None,
+            witness: None,
+            refused: &not_refused,
         }
     }
 }
@@ -1900,6 +1925,8 @@ pub(crate) fn cmd_await_momentum(
 enum GuardedSubmit {
     Pressed,
     Missed,
+    /// The sink took none of the Enter until the submit window ended: nothing of this press was written.
+    Busy,
     Failed(String),
 }
 
@@ -1939,6 +1966,7 @@ fn guarded_submit(
             GuardedInput::Pressed(Delivery::BusyZero) if std::time::Instant::now() < window => {
                 std::thread::sleep(BUSY_RETRY);
             }
+            GuardedInput::Pressed(Delivery::BusyZero) => return GuardedSubmit::Busy,
             decision @ GuardedInput::Pressed(_) => {
                 return GuardedSubmit::Failed(super::control_input::guarded_input_reply(decision));
             }
@@ -1948,6 +1976,12 @@ fn guarded_submit(
 
 /// `turn`'s usage line.
 pub(crate) const TURN_USAGE: &str = "ERR usage: turn [id=<epoch>:<producer>:<seq>] [if-supervisor=<holder>] [idle=<ms>] [timeout=<ms>] [submit=<key|none|guarded:<re>>] [settle=match:<re>|gone:<re>|submitted] [submit_window=<ms>] [presses=<n>] [submit_verify=<auto|seq|block>] [trim=<0|1>] [typed=<0|1>] [cadence=<ms>] [cap=<n>] [yield=<floor>] [if-gen=<epoch>.<seq>] [if-rows=<first>-<last>:<hex16>] [cause=@<off>|<seq>] <text>\n";
+
+/// `turn`'s answer when a key it pressed (a typed grapheme, the submit key) did not deliver.
+const KEY_DELIVERY_FAILED: &str = "ERR key delivery failed\n";
+
+/// `turn`'s answer when a paste of its text did not deliver.
+const PASTE_DELIVERY_FAILED: &str = "ERR paste delivery failed\n";
 
 /// `turn`'s options as parsed ([`turn_options`]): every leading `k=v`, and the message after them, verbatim.
 pub(crate) struct TurnOptions<'a> {
@@ -1971,7 +2005,7 @@ pub(crate) struct TurnOptions<'a> {
     text: &'a str,
 }
 
-/// PARSE `turn`'s options (pure: no lock, no session): the leading `k=v` options, the message after them verbatim, and every refusal of their shape — a bad value, a repeated `cause=`, a turn with no text that still submits.
+/// PARSE `turn`'s options (pure: no lock, no session): the leading `k=v` options, the message after them verbatim, and every refusal of their shape — a bad value, a `submit=` that names no key, a repeated `cause=`, a turn with no text that still submits.
 pub(crate) fn turn_options(rest: &str) -> Result<TurnOptions<'_>, String> {
     const USAGE: &str = TURN_USAGE;
     let mut idle_ms = 1_500u64;
@@ -2098,6 +2132,9 @@ pub(crate) fn turn_options(rest: &str) -> Result<TurnOptions<'_>, String> {
     if settle_submitted && submit == "none" {
         return Err(USAGE.to_string());
     }
+    if submit != "none" && crate::control::parse_key(&submit).is_none() {
+        return Err(USAGE.to_string());
+    }
     Ok(TurnOptions {
         idle_ms,
         timeout_ms,
@@ -2153,11 +2190,30 @@ pub(crate) fn cmd_turn(
     ctx: &SessionCtx,
     io: &TurnIo<'_>,
 ) -> String {
+    let wrote = std::cell::Cell::new(false);
+    let reply = turn_attempt(term, store, session, rest, ctx, io, &wrote);
+    if !wrote.get()
+        && let Some(witness) = io.witness
+    {
+        witness.nothing_written();
+    }
+    reply
+}
+
+/// The body of [`cmd_turn`]: `wrote` is set before each write it makes, delivered or not, and cleared again when its first write was refused whole by the input queue or the fence ([`TurnIo::refused`]).
+fn turn_attempt(
+    term: &Arc<Mutex<Terminal>>,
+    store: &Store,
+    session: u64,
+    rest: &str,
+    ctx: &SessionCtx,
+    io: &TurnIo<'_>,
+    wrote: &std::cell::Cell<bool>,
+) -> String {
     use std::time::{Duration, Instant};
 
     use aterm_core::terminal::{BlockState, WatcherSpec};
 
-    const USAGE: &str = TURN_USAGE;
     const ECHO_SETTLE: Duration = Duration::from_millis(150);
     const ECHO_CAP: Duration = Duration::from_secs(5);
 
@@ -2355,6 +2411,16 @@ pub(crate) fn cmd_turn(
             }
         })
     };
+    // The answer for a write a route did not deliver. The turn's first write, refused whole,
+    // wrote nothing at all: it answers the `ERR busy …` line `send` does and clears `wrote`, so
+    // the `id=` goes back. Any later one follows bytes already written: `failed`, in doubt.
+    let undelivered = |first: bool, failed: &str| match (io.refused)().filter(|_| first) {
+        Some(refusal) => {
+            wrote.set(false);
+            refusal
+        }
+        None => failed.to_string(),
+    };
 
     let mut typed_keys = 0usize;
     let mut pasted_graphemes = 0usize;
@@ -2405,13 +2471,19 @@ pub(crate) fn cmd_turn(
                     note_ctl_input();
                 }
                 due = Instant::now() + cadence;
+                let first = !wrote.replace(true);
                 if !(io.key)(ev) {
-                    return "ERR key delivery failed\n".to_string();
+                    return undelivered(first, KEY_DELIVERY_FAILED);
                 }
                 committed.get_or_insert_with(crate::control::CommittedInput::enter);
                 typed_keys += 1;
             }
             if !remainder.is_empty() {
+                // The loop checks before each key only: a head of control characters, which
+                // `typed_key_events` drops, presses none and leaves this paste the first write.
+                if exited(store) {
+                    return "ERR exited\n".to_string();
+                }
                 if let Some(Err(why)) = hold
                     .as_mut()
                     .map(|h| h.held(term, ctx, &sub, None, cadence, deadline))
@@ -2425,18 +2497,23 @@ pub(crate) fn cmd_turn(
                 if typed_keys == 0 {
                     note_ctl_input();
                 }
+                let first = !wrote.replace(true);
                 if !(io.paste)(remainder) {
-                    return "ERR paste delivery failed\n".to_string();
+                    return undelivered(first, PASTE_DELIVERY_FAILED);
                 }
                 committed.get_or_insert_with(crate::control::CommittedInput::enter);
             }
         } else {
+            if exited(store) {
+                return "ERR exited\n".to_string();
+            }
             if let Some(refusal) = halted(None) {
                 return refusal;
             }
             note_ctl_input();
+            let first = !wrote.replace(true);
             if !(io.paste)(text) {
-                return "ERR paste delivery failed\n".to_string();
+                return undelivered(first, PASTE_DELIVERY_FAILED);
             }
             committed = Some(crate::control::CommittedInput::enter());
         }
@@ -2528,6 +2605,7 @@ pub(crate) fn cmd_turn(
                 }
             };
             note_ctl_input();
+            let first = !wrote.replace(true);
             if let Some(guard) = submit_matcher.as_deref() {
                 match guarded_submit(term, ctx, guard, window, io.mark) {
                     GuardedSubmit::Pressed => guarded_presses += 1,
@@ -2542,14 +2620,26 @@ pub(crate) fn cmd_turn(
                         }
                         break;
                     }
+                    GuardedSubmit::Busy => {
+                        term_lock(term).watch_disarm(id);
+                        // A re-press the sink took none of wrote nothing, as a missed one: an
+                        // earlier Enter went, so the verdict says `pressed=<n>`. A first one is
+                        // its own reply, never `ERR busy`: the text is typed, and that head
+                        // would give an `id=` back for a retry that types it again.
+                        if press_no > 0 {
+                            break;
+                        }
+                        return aterm_types::control_verbs::TURN_SUBMIT_BUSY_LINE.to_string();
+                    }
                     GuardedSubmit::Failed(reply) => {
                         term_lock(term).watch_disarm(id);
                         return reply;
                     }
                 }
             } else if !(io.press)(&submit) {
+                // `turn_options` refused a name that is no key, so this press failed to deliver.
                 term_lock(term).watch_disarm(id);
-                return USAGE.to_string();
+                return undelivered(first, KEY_DELIVERY_FAILED);
             }
             let mut advanced = false;
             let mut composer_gone = false;
@@ -3428,8 +3518,7 @@ pub(super) fn cmd_meta_harness_act_with_clock(
             if let Some(point) = snapshot {
                 let mut mark = point.mark;
                 if face == Some(aterm_agent::harness::acts::TaskFace::Landed) {
-                    mark.program_turns =
-                        crate::harness_task::landing_turns(mark.program_turns, typed_at);
+                    mark = crate::harness_task::landing_mark(mark, typed_at);
                 }
                 timeline.mark_landing(mark);
             }
@@ -3439,7 +3528,7 @@ pub(super) fn cmd_meta_harness_act_with_clock(
             timeline.note_typed_act(
                 snapshot
                     .filter(|point| point.left_at_rest)
-                    .map(|point| point.mark.program_turns),
+                    .map(|point| point.mark),
             );
         }
         if let Some(face) = face {
@@ -5118,6 +5207,111 @@ mod tests {
         (header, states)
     }
 
+    /// A row names qualifying request news, independently of the current display
+    /// string. Already-terminal/noted baselines stay quiet; captured edges hold.
+    #[test]
+    fn await_task_rows_name_recorded_news_without_guessing_display_attention() {
+        use crate::session_timeline::{MetaEdit, write_attention_owned};
+        use crate::task_record::{
+            Combine, TaskMark, TaskState, mark_session_task, mark_session_task_fact,
+        };
+        use aterm_agent::supervise::occupancy::{FactWord, NoteOutcome, RuleId};
+        let store = crate::session_store::new_store();
+        let workers = three_workers(&store);
+        let bit = |line: &str| {
+            line.split_whitespace()
+                .find_map(|word| word.strip_prefix("task_news="))
+                .map(str::to_string)
+        };
+        let w = &workers[0];
+        write_attention_owned(
+            &w.ctx,
+            "unrelated-owner",
+            MetaEdit::Set("an unrelated display message"),
+            aterm_slog::Actor::Harness,
+        )
+        .expect("the display entry");
+        mark_session_task(
+            &workers[2].ctx,
+            workers[2].local_id,
+            &TaskMark::new(TaskState::Done),
+        )
+        .expect("terminal baseline");
+        let f = &workers[1];
+        let note =
+            |word| mark_session_task_fact(&f.ctx, f.local_id, word, std::time::Duration::ZERO);
+        assert_eq!(note(FactWord::new(RuleId::HoldRoom, 1)), NoteOutcome::Noted);
+        let targets: Vec<_> = workers
+            .iter()
+            .map(|w| TaskTarget {
+                local_id: w.local_id,
+                ctx: &w.ctx,
+                since: None,
+                facts: true,
+                fact_since: None,
+            })
+            .collect();
+        let quiet = await_task(&store, &targets, Combine::All, 0);
+        assert!(quiet.contains("attention=an%20unrelated"));
+        assert!(
+            quiet
+                .lines()
+                .skip(1)
+                .all(|row| bit(row).as_deref() == Some("0")),
+            "{quiet}"
+        );
+        let edges: Vec<_> = targets
+            .iter()
+            .map(|t| {
+                let record = task_record_of(t.ctx).expect("a task");
+                (record.rev, Some(record.fact_rev))
+            })
+            .collect();
+        let exits: Vec<_> = targets
+            .iter()
+            .map(|t| exit_probe(&store, t.local_id))
+            .collect();
+        let mut latched = vec![None; targets.len()];
+        write_attention_owned(
+            &w.ctx,
+            crate::harness_host::ATTENTION_OWNER,
+            MetaEdit::Set("a login"),
+            aterm_slog::Actor::Harness,
+        )
+        .expect("the task entry");
+        assert_eq!(
+            note(FactWord::new(RuleId::WaitNudge, 1)),
+            NoteOutcome::Noted
+        );
+        latch_task_news(&store, &targets, &edges, &exits, &mut latched);
+        assert!(latched[..2].iter().all(|row| {
+            row.as_deref()
+                .is_some_and(|row| bit(row).as_deref() == Some("1"))
+        }));
+        assert!(latched[2].is_none(), "the terminal baseline is no new edge");
+        write_attention_owned(
+            &w.ctx,
+            crate::harness_host::ATTENTION_OWNER,
+            MetaEdit::Clear,
+            aterm_slog::Actor::Harness,
+        )
+        .expect("the task entry clears");
+        assert_eq!(note(None), NoteOutcome::Cleared);
+        latch_task_news(&store, &targets, &edges, &exits, &mut latched);
+        assert!(latched[..2].iter().all(|row| {
+            row.as_deref()
+                .is_some_and(|row| bit(row).as_deref() == Some("1"))
+        }));
+        let quiet = await_task(&store, &targets, Combine::All, 0);
+        assert!(
+            quiet
+                .lines()
+                .skip(1)
+                .all(|row| bit(row).as_deref() == Some("0")),
+            "{quiet}"
+        );
+    }
+
     #[test]
     fn await_task_answers_news_past_each_targets_rev_once() {
         use crate::task_record::{Combine, TaskMark, TaskState, mark_session_task};
@@ -5145,7 +5339,7 @@ mod tests {
         );
         assert!(
             quiet.contains(&format!(
-                "@{} rev=1 state=working agent=- attention=- result_bytes=0\n",
+                "@{} rev=1 state=working agent=- attention=- result_bytes=0 task_news=0\n",
                 workers[0].sid.as_str()
             )),
             "{quiet}"
@@ -5160,7 +5354,7 @@ mod tests {
             ("OK 3", vec!["working", "done", "working"])
         );
         assert!(
-            any.contains(" rev=2 state=done agent=- attention=- result_bytes=64\n"),
+            any.contains(" rev=2 state=done agent=- attention=- result_bytes=64 task_news=1\n"),
             "{any}"
         );
         for (since, combine) in [
@@ -5238,7 +5432,9 @@ mod tests {
         .unwrap();
         let reply = one(&workers[1], 1);
         assert!(
-            reply.ends_with(" rev=2 state=working agent=- attention=a%20login result_bytes=0\n"),
+            reply.ends_with(
+                " rev=2 state=working agent=- attention=a%20login result_bytes=0 task_news=1\n"
+            ),
             "{reply}"
         );
         store
@@ -5293,7 +5489,7 @@ mod tests {
         let quiet = wait(20);
         assert_eq!(task_reply(&quiet).0, "OK 1 status=timeout", "{quiet}");
         assert!(
-            quiet.contains(" fact=hold-room@v1#1 fact_rev=1\n"),
+            quiet.contains(" fact=hold-room@v1#1 fact_rev=1 task_news=0\n"),
             "the row shows the word: {quiet}"
         );
         assert_eq!(task_record_of(&w.ctx).map(|t| t.rev), Some(rev));
@@ -5353,7 +5549,7 @@ mod tests {
             assert!(
                 reply.ends_with(
                     " rev=1 state=working agent=- attention=- result_bytes=0 \
-                     fact=hold-room@v1#1 fact_rev=1\n"
+                     fact=hold-room@v1#1 fact_rev=1 task_news=1\n"
                 ),
                 "{reply}"
             );
@@ -5377,7 +5573,10 @@ mod tests {
         assert_eq!(note(None), NoteOutcome::Cleared);
         let cleared = wait(Some(1), 20);
         assert_eq!(task_reply(&cleared).0, "OK 1 status=timeout", "{cleared}");
-        assert!(cleared.ends_with(" fact=- fact_rev=2\n"), "{cleared}");
+        assert!(
+            cleared.ends_with(" fact=- fact_rev=2 task_news=0\n"),
+            "{cleared}"
+        );
         assert_eq!(
             task_reply(&wait(Some(0), 20)).0,
             "OK 1 status=timeout",
@@ -5395,7 +5594,7 @@ mod tests {
         let verb = |rest: &str| cmd_await(&w.term, &store, w.local_id, &w.ctx, rest);
         assert!(
             verb("task facts=1 fact_since=2 timeout=60000")
-                .ends_with(" fact=wait-nudge@v1#1 fact_rev=3\n"),
+                .ends_with(" fact=wait-nudge@v1#1 fact_rev=3 task_news=1\n"),
             "the single form reads facts=1"
         );
         assert_eq!(

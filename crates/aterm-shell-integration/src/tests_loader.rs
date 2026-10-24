@@ -65,11 +65,14 @@ fn canonical_text(shell: &str, script: &str) -> String {
 #[cfg(unix)]
 #[test]
 fn installed_scripts_run_the_code_of_their_source() {
-    let shells = [
-        ("bash", bash_shell(), scripts::BASH, installed_bash()),
-        ("zsh", need_zsh(), scripts::ZSH, installed_zsh()),
-    ];
-    for (label, shell, source, installed) in shells {
+    let mut lanes = ShellLanes::default();
+    let mut shells: Vec<_> = lanes
+        .bashes()
+        .into_iter()
+        .map(|bash| (bash, scripts::BASH, installed_bash()))
+        .collect();
+    shells.push((need_zsh(), scripts::ZSH, installed_zsh()));
+    for (shell, source, installed) in shells {
         let comment = |line: &&str| line.trim_start().starts_with('#');
         assert!(
             installed
@@ -78,23 +81,23 @@ fn installed_scripts_run_the_code_of_their_source() {
                 .filter(comment)
                 .all(|line| line.starts_with(scripts::BODY_BEGIN)
                     || line.starts_with(scripts::BODY_END)),
-            "{label}: the folder's loader keeps only its BODY markers of its comment lines"
+            "{shell}: the folder's loader keeps only its BODY markers of its comment lines"
         );
         assert_eq!(
             canonical_text(shell, installed),
             canonical_text(shell, source),
-            "{label}: the folder's loader runs the source's code"
+            "{shell}: the folder's loader runs the source's code"
         );
         assert_eq!(
             scripts::body(installed).map(|body| canonical_text(shell, body)),
             scripts::body(source).map(|body| canonical_text(shell, body)),
-            "{label}: the folder's body runs the source's body's code"
+            "{shell}: the folder's body runs the source's body's code"
         );
         let control = "x='first\n# a line of the string\nlast'\n";
         assert_ne!(
             canonical_text(shell, &strip_comment_lines(control)),
             canonical_text(shell, control),
-            "{label}: a `#` line inside a string is text, and the reading sees it go"
+            "{shell}: a `#` line inside a string is text, and the reading sees it go"
         );
     }
 }
@@ -193,29 +196,22 @@ fn a_real_zsh_sources_the_body_alone_cleanly() {
 fn live_body_exports_agy_fast_prompt_editor_default_without_clobbering_override() {
     let dir = aterm_tempfile::tempdir().unwrap();
     ensure_scripts(dir.path()).unwrap();
-    let mut cases = vec![
-        (
-            "zsh",
-            need_zsh(),
-            "-f",
-            ". \"$1\" && /usr/bin/printenv AGY_CLI_FAST_PROMPT_EDITOR",
-        ),
-        (
-            "bash",
-            bash_shell(),
-            "--norc",
-            ". \"$1\" && /usr/bin/printenv AGY_CLI_FAST_PROMPT_EDITOR",
-        ),
-    ];
-    if let Some(fish) = fish_shell() {
-        cases.push((
-            "fish",
-            fish,
-            "--no-config",
-            "source \"$argv[2]\"; and /usr/bin/printenv AGY_CLI_FAST_PROMPT_EDITOR",
-        ));
-    }
-    for (ext, shell, flag, snippet) in cases {
+    let mut shells = ShellLanes::default();
+    for (ext, shell) in shells.lanes(&["zsh", "bash", "fish"]) {
+        let (flag, snippet) = match ext {
+            "fish" => (
+                "--no-config",
+                "source \"$argv[2]\"; and /usr/bin/printenv AGY_CLI_FAST_PROMPT_EDITOR",
+            ),
+            "zsh" => (
+                "-f",
+                ". \"$1\" && /usr/bin/printenv AGY_CLI_FAST_PROMPT_EDITOR",
+            ),
+            _ => (
+                "--norc",
+                ". \"$1\" && /usr/bin/printenv AGY_CLI_FAST_PROMPT_EDITOR",
+            ),
+        };
         let body = dir.path().join(format!("{BODY_FILE_STEM}.{ext}"));
         let default_out = shell_command(shell)
             .args([flag, "-c", snippet, ext])
@@ -225,13 +221,13 @@ fn live_body_exports_agy_fast_prompt_editor_default_without_clobbering_override(
             .unwrap();
         assert!(
             default_out.status.success(),
-            "{ext} default failed: {}",
+            "{shell}: default failed: {}",
             String::from_utf8_lossy(&default_out.stderr)
         );
         assert_eq!(
             String::from_utf8_lossy(&default_out.stdout).trim(),
             "true",
-            "{ext} body must export AGY_CLI_FAST_PROMPT_EDITOR=true when unset"
+            "{shell}: body must export AGY_CLI_FAST_PROMPT_EDITOR=true when unset"
         );
 
         let override_out = shell_command(shell)
@@ -243,13 +239,13 @@ fn live_body_exports_agy_fast_prompt_editor_default_without_clobbering_override(
             .unwrap();
         assert!(
             override_out.status.success(),
-            "{ext} override failed: {}",
+            "{shell}: override failed: {}",
             String::from_utf8_lossy(&override_out.stderr)
         );
         assert_eq!(
             String::from_utf8_lossy(&override_out.stdout).trim(),
             "false",
-            "{ext} body must preserve explicit AGY_CLI_FAST_PROMPT_EDITOR=false"
+            "{shell}: body must preserve explicit AGY_CLI_FAST_PROMPT_EDITOR=false"
         );
     }
 }
@@ -322,14 +318,20 @@ fn spawn_live_zsh_from(
     LiveShell::spawn("zsh", &mut cmd).holding(cmd.into_home())
 }
 
+/// An interactive `bash` started on the loader set in `dir`.
 #[cfg(unix)]
-fn spawn_live_bash_from(fx: &LiveFixture, dir: &Path, extra: &[(&str, &str)]) -> LiveShell {
+fn spawn_live_bash_from(
+    bash: &str,
+    fx: &LiveFixture,
+    dir: &Path,
+    extra: &[(&str, &str)],
+) -> LiveShell {
     let InjectionEnv {
         env_add,
         argv_override,
     } = injection_for(ShellType::Bash, dir).expect("bash");
     let argv = argv_override.expect("bash uses --rcfile");
-    let mut cmd = shell_command(bash_shell());
+    let mut cmd = shell_command(bash);
     cmd.args(&argv[1..])
         .arg("-i")
         .env("HOME", &fx.home)
@@ -342,7 +344,7 @@ fn spawn_live_bash_from(fx: &LiveFixture, dir: &Path, extra: &[(&str, &str)]) ->
     for (key, value) in extra {
         cmd.env(key, value);
     }
-    LiveShell::spawn("bash", &mut cmd).holding(cmd.into_home())
+    LiveShell::spawn(bash, &mut cmd).holding(cmd.into_home())
 }
 
 #[cfg(unix)]
@@ -542,16 +544,19 @@ fn a_live_zsh_takes_a_newer_body_at_its_next_prompt() {
 #[cfg(unix)]
 #[test]
 fn a_live_bash_takes_a_newer_body_at_its_next_prompt() {
-    for hooked in [true, false] {
-        let bf = BodyFixture::new();
-        let pointer = bf.pointer.to_str().unwrap().to_string();
-        let mut extra = vec![("ATERM_SHELL_NONCE", REKEY_OLD)];
-        if hooked {
-            extra.push((BODY_POINTER_VAR, pointer.as_str()));
+    let mut shells = ShellLanes::default();
+    for bash in shells.bashes() {
+        for hooked in [true, false] {
+            let bf = BodyFixture::new();
+            let pointer = bf.pointer.to_str().unwrap().to_string();
+            let mut extra = vec![("ATERM_SHELL_NONCE", REKEY_OLD)];
+            if hooked {
+                extra.push((BODY_POINTER_VAR, pointer.as_str()));
+            }
+            let mut sh = spawn_live_bash_from(bash, &bf.fx, &bf.ours, &extra);
+            live_body_pickup("bash", &mut sh, &bf, hooked);
+            sh.finish();
         }
-        let mut sh = spawn_live_bash_from(&bf.fx, &bf.ours, &extra);
-        live_body_pickup("bash", &mut sh, &bf, hooked);
-        sh.finish();
     }
 }
 
@@ -568,57 +573,61 @@ fn a_running_bash_takes_the_fileless_ps0_hook_from_a_newer_body_and_in_place() {
             format!("PZ{}", 400 + n),
         )
     };
-    for in_place in [false, true] {
-        let how = if in_place { "in place" } else { "pointer" };
-        let bf = BodyFixture::new();
-        let pointer = bf.pointer.to_str().unwrap().to_string();
-        let mut sh = spawn_live_bash_from(
-            &bf.fx,
-            &bf.ours,
-            &[
-                ("ATERM_SHELL_NONCE", REKEY_OLD),
-                (BODY_POINTER_VAR, pointer.as_str()),
-            ],
-        );
-        sh.send(&format!("PS0='{OLD_HOOK}'"));
-        let (line, marker) = probe(1);
-        sh.send(&line);
-        let at = sh.wait_for_after(&marker, 0);
-        assert_eq!(
-            sh.value_before("PS0=", at),
-            OLD_HOOK,
-            "{how}: the running shell holds the older loaders' hook\n{}",
-            sh.transcript()
-        );
-        if in_place {
-            let loader = bf.ours.join("aterm_shell_integration.bash");
-            sh.send(&format!(". {}", posix_quoted(&loader)));
-        } else {
-            sh.wait_for_after(&format!("133;A;id={REKEY_OLD}"), at);
-            deliver(&bf.pointer, NEWER_REV);
-            sh.send("true");
+    let mut shells = ShellLanes::default();
+    for bash in shells.bashes() {
+        for in_place in [false, true] {
+            let how = if in_place { "in place" } else { "pointer" };
+            let bf = BodyFixture::new();
+            let pointer = bf.pointer.to_str().unwrap().to_string();
+            let mut sh = spawn_live_bash_from(
+                bash,
+                &bf.fx,
+                &bf.ours,
+                &[
+                    ("ATERM_SHELL_NONCE", REKEY_OLD),
+                    (BODY_POINTER_VAR, pointer.as_str()),
+                ],
+            );
+            sh.send(&format!("PS0='{OLD_HOOK}'"));
+            let (line, marker) = probe(1);
+            sh.send(&line);
+            let at = sh.wait_for_after(&marker, 0);
+            assert_eq!(
+                sh.value_before("PS0=", at),
+                OLD_HOOK,
+                "{bash} ({how}): the running shell holds the older loaders' hook\n{}",
+                sh.transcript()
+            );
+            if in_place {
+                let loader = bf.ours.join("aterm_shell_integration.bash");
+                sh.send(&format!(". {}", posix_quoted(&loader)));
+            } else {
+                sh.wait_for_after(&format!("133;A;id={REKEY_OLD}"), at);
+                deliver(&bf.pointer, NEWER_REV);
+                sh.send("true");
+            }
+            let (line, marker) = probe(2);
+            sh.send(&line);
+            let end = sh.wait_for_after(&marker, at);
+            let (fresh, rev) = if in_place {
+                ("0", bf.ours_rev())
+            } else {
+                ("1", NEWER_REV.to_owned())
+            };
+            assert_eq!(
+                (sh.value_before("FRESH=", end), sh.value_before("REV=", end)),
+                (fresh.to_owned(), rev),
+                "{bash} ({how}): the load it is (`__aterm_fresh_load`, the body's revision)\n{}",
+                sh.transcript()
+            );
+            assert_eq!(
+                sh.value_before("PS0=", end),
+                "${| __aterm_ps0; }",
+                "{bash} ({how}): PS0's hook after the newer build came\n{}",
+                sh.transcript()
+            );
+            sh.finish();
         }
-        let (line, marker) = probe(2);
-        sh.send(&line);
-        let end = sh.wait_for_after(&marker, at);
-        let (fresh, rev) = if in_place {
-            ("0", bf.ours_rev())
-        } else {
-            ("1", NEWER_REV.to_owned())
-        };
-        assert_eq!(
-            (sh.value_before("FRESH=", end), sh.value_before("REV=", end)),
-            (fresh.to_owned(), rev),
-            "{how}: the load it is (`__aterm_fresh_load`, the body's revision)\n{}",
-            sh.transcript()
-        );
-        assert_eq!(
-            sh.value_before("PS0=", end),
-            "${| __aterm_ps0; }",
-            "{how}: PS0's hook after the newer build came\n{}",
-            sh.transcript()
-        );
-        sh.finish();
     }
 }
 
@@ -928,39 +937,46 @@ fn a_live_zsh_from_before_loaders_is_upgraded_by_the_typed_line() {
 #[cfg(unix)]
 #[test]
 fn a_live_bash_from_before_loaders_is_upgraded_by_the_typed_line() {
-    let bf = BodyFixture::new();
-    let old = preloader_folder(&bf.fx);
-    lay_aterm_bin(&bf.fx);
-    std::fs::write(bf.fx.home.join(".bashrc"), "set -u\n").unwrap();
-    let mut sh = spawn_live_bash_from(&bf.fx, &old, &[("ATERM_SHELL_NONCE", REKEY_OLD)]);
-    live_typed_upgrade("bash", ShellType::Bash, &mut sh, &bf);
-    sh.finish();
+    let mut shells = ShellLanes::default();
+    for bash in shells.bashes() {
+        let bf = BodyFixture::new();
+        let old = preloader_folder(&bf.fx);
+        lay_aterm_bin(&bf.fx);
+        std::fs::write(bf.fx.home.join(".bashrc"), "set -u\n").unwrap();
+        let mut sh = spawn_live_bash_from(bash, &bf.fx, &old, &[("ATERM_SHELL_NONCE", REKEY_OLD)]);
+        live_typed_upgrade("bash", ShellType::Bash, &mut sh, &bf);
+        sh.finish();
+    }
 }
 
 #[cfg(unix)]
 #[test]
 fn the_key_only_line_takes_the_first_line_of_a_three_line_file() {
-    let bf = BodyFixture::new();
-    let mut sh = spawn_live_bash_from(&bf.fx, &bf.ours, &[("ATERM_SHELL_NONCE", REKEY_OLD)]);
-    let file = bf.fx.home.join("three");
-    std::fs::write(
-        &file,
-        format!(
-            "{REKEY_NEW}\n{}\n{}\n",
-            bf.ours.display(),
-            bf.pointer.display()
-        ),
-    )
-    .unwrap();
-    let typed = typed_rekey(ShellType::Bash, &posix_quoted(&file)).expect("scripted");
-    sh.send(&format!("{typed} echo RAN$((200 + 1))"));
-    let at = sh.wait_for_after("RAN201", 0);
-    let (line, marker) = rekey_probe("bash", 1);
-    sh.send(&line);
-    let at = sh.wait_for_after(&marker, at);
-    assert_eq!(sh.value_before("NONCE=", at), REKEY_NEW);
-    assert!(!file.exists());
-    sh.finish();
+    let mut shells = ShellLanes::default();
+    for bash in shells.bashes() {
+        let bf = BodyFixture::new();
+        let mut sh =
+            spawn_live_bash_from(bash, &bf.fx, &bf.ours, &[("ATERM_SHELL_NONCE", REKEY_OLD)]);
+        let file = bf.fx.home.join("three");
+        std::fs::write(
+            &file,
+            format!(
+                "{REKEY_NEW}\n{}\n{}\n",
+                bf.ours.display(),
+                bf.pointer.display()
+            ),
+        )
+        .unwrap();
+        let typed = typed_rekey(ShellType::Bash, &posix_quoted(&file)).expect("scripted");
+        sh.send(&format!("{typed} echo RAN$((200 + 1))"));
+        let at = sh.wait_for_after("RAN201", 0);
+        let (line, marker) = rekey_probe("bash", 1);
+        sh.send(&line);
+        let at = sh.wait_for_after(&marker, at);
+        assert_eq!(sh.value_before("NONCE=", at), REKEY_NEW, "{bash}");
+        assert!(!file.exists(), "{bash}");
+        sh.finish();
+    }
 }
 
 #[cfg(unix)]
@@ -1039,20 +1055,23 @@ fn a_nested_zsh_is_not_integrated_by_the_typed_line() {
 #[cfg(unix)]
 #[test]
 fn a_nested_bash_is_not_integrated_by_the_typed_line() {
-    let bf = BodyFixture::new();
-    bf.fx.lay_dirs();
-    let path = format!("/usr/bin:/bin:{}", bf.fx.reroute.display());
-    let mut cmd = shell_command(bash_shell());
-    cmd.args(["--norc", "--noprofile", "-i"])
-        .env("HOME", &bf.fx.home)
-        .env("PATH", &path)
-        .env("TERM", "dumb")
-        .env("ATERM_CHILD", "1")
-        .env("ATERM_REROUTE_DIR", &bf.fx.reroute)
-        .env("ATERM_SHELL_INTEGRATION_INSTALLED", "1");
-    let mut sh = LiveShell::spawn("bash", &mut cmd);
-    nested_shell_is_left_alone("bash", ShellType::Bash, &mut sh, &bf);
-    sh.finish();
+    let mut shells = ShellLanes::default();
+    for bash in shells.bashes() {
+        let bf = BodyFixture::new();
+        bf.fx.lay_dirs();
+        let path = format!("/usr/bin:/bin:{}", bf.fx.reroute.display());
+        let mut cmd = shell_command(bash);
+        cmd.args(["--norc", "--noprofile", "-i"])
+            .env("HOME", &bf.fx.home)
+            .env("PATH", &path)
+            .env("TERM", "dumb")
+            .env("ATERM_CHILD", "1")
+            .env("ATERM_REROUTE_DIR", &bf.fx.reroute)
+            .env("ATERM_SHELL_INTEGRATION_INSTALLED", "1");
+        let mut sh = LiveShell::spawn(bash, &mut cmd);
+        nested_shell_is_left_alone("bash", ShellType::Bash, &mut sh, &bf);
+        sh.finish();
+    }
 }
 
 #[cfg(any(unix, windows))]
@@ -1561,15 +1580,18 @@ fn a_live_zsh_takes_an_older_loaders_aterm_bin_off_and_only_that() {
 #[cfg(unix)]
 #[test]
 fn a_live_bash_takes_an_older_loaders_aterm_bin_off_and_only_that() {
-    live_older_loaders_aterm_bin("bash", |bf, dir, spawned_by| {
-        let pointer = bf.pointer.to_str().unwrap().to_string();
-        let mut env = vec![
-            ("ATERM_SHELL_NONCE", REKEY_OLD),
-            (BODY_POINTER_VAR, pointer.as_str()),
-        ];
-        env.extend_from_slice(spawned_by);
-        spawn_live_bash_from(&bf.fx, dir, &env)
-    });
+    let mut shells = ShellLanes::default();
+    for bash in shells.bashes() {
+        live_older_loaders_aterm_bin("bash", |bf, dir, spawned_by| {
+            let pointer = bf.pointer.to_str().unwrap().to_string();
+            let mut env = vec![
+                ("ATERM_SHELL_NONCE", REKEY_OLD),
+                (BODY_POINTER_VAR, pointer.as_str()),
+            ];
+            env.extend_from_slice(spawned_by);
+            spawn_live_bash_from(bash, &bf.fx, dir, &env)
+        });
+    }
 }
 
 #[cfg(unix)]

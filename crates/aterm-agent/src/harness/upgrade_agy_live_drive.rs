@@ -75,6 +75,54 @@ pub(super) fn behind(exe: &Path, twin: Option<PathBuf>) -> Result<Option<Move>, 
     }))
 }
 
+/// A model move agy's quota owes the agy a tab runs: its model's pool is low or spent and
+/// [`crate::harness::agy_quota::pick`] puts it on a model in another pool. The relaunch is the
+/// live upgrade's, onto the build it runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Rotation {
+    /// The build move, here onto the build that runs.
+    pub(super) mv: Move,
+    /// The model it runs (its `--model`, else agy's default).
+    pub(super) from: String,
+    /// The model it is relaunched on.
+    pub(super) to: String,
+    /// The pick's own words ([`crate::harness::agy_quota::Pick::describe`]).
+    pub(super) why: String,
+}
+
+/// The [`Rotation`] the agy `args` runs as `exe` owes, `None` when its pool keeps it.
+pub(super) fn rotation_due(
+    exe: &Path,
+    args: &atpkg::caller_shell::ProcArgs,
+    twin: Option<PathBuf>,
+    user_home: &Path,
+    k: &dyn AgyKernel,
+) -> Option<Rotation> {
+    let model = ag::argv_model(&args.argv);
+    let env = ag::relaunch_env(|n| args.env_var(n), user_home);
+    let flags = ag::config_flags(&args.argv);
+    let pick = k.quota_pick(model.as_deref(), exe, &env, &flags)?;
+    let crate::harness::agy_quota::Pick::Rotate { from, to, .. } = &pick else {
+        return None;
+    };
+    let program = if ag::store_build(exe) {
+        twin?
+    } else {
+        exe.to_path_buf()
+    };
+    let running = build_record(exe).unwrap_or_else(|| "-".to_string());
+    Some(Rotation {
+        mv: Move {
+            running: running.clone(),
+            target: running,
+            twin: program,
+        },
+        from: from.clone(),
+        to: to.clone(),
+        why: pick.describe(),
+    })
+}
+
 /// Answers [`super::super::due`] for a tab led by `agy`.
 pub(in super::super) fn upgrade_due(opts: &Opts, tabs: &[LiveTab]) -> Option<Due> {
     upgrade_due_with(
@@ -103,8 +151,9 @@ pub(super) fn upgrade_due_with(
     let Some(exe) = k.exe(pid) else {
         return Some(Due::Unread(super::super::UNREAD_PROCESS));
     };
-    Some(match behind(&exe, twin) {
+    Some(match behind(&exe, twin.clone()) {
         Ok(Some(_)) => Due::Yes,
+        Ok(None) if rotation_due(&exe, &args, twin, &opts.home, k).is_some() => Due::Yes,
         Ok(None) => Due::No,
         Err(word) => Due::Unread(word),
     })
@@ -458,15 +507,25 @@ pub(super) fn upgrade_visit(
     let Some(exe) = k.exe(pid) else {
         return Some(said(r, format!("wait:{}", super::super::UNREAD_PROCESS)));
     };
-    let mv = match behind(&exe, twin) {
-        Ok(Some(mv)) => mv,
-        Ok(None) => return Some(said(r, "current")),
+    let (mv, rotation) = match behind(&exe, twin.clone()) {
+        Ok(Some(mv)) => (mv, None),
+        Ok(None) => match rotation_due(&exe, &args, twin, &opts.home, k) {
+            Some(rot) => (rot.mv.clone(), Some(rot)),
+            None => return Some(said(r, "current")),
+        },
         Err(word) => return Some(said(r, format!("wait:{word}"))),
     };
-    let r = Report {
-        from: mv.running.clone(),
-        to: format!("{}(managed)", mv.target),
-        ..r
+    let r = match &rotation {
+        Some(rot) => Report {
+            from: rot.from.clone(),
+            to: format!("{}(quota)", rot.to),
+            ..r
+        },
+        None => Report {
+            from: mv.running.clone(),
+            to: format!("{}(managed)", mv.target),
+            ..r
+        },
     };
     if opts.background {
         return Some(said(r, AT_BREAK));
@@ -501,6 +560,10 @@ pub(super) fn upgrade_visit(
     let Some(mut st) = claim_record(&snap, &mv, now) else {
         return Some(said(r, "wait:no-session"));
     };
+    if let Some(rot) = &rotation {
+        st.argv = ag::with_model(&st.argv, &rot.to);
+        st.cause = format!("{}{}", super::super::super::relaunch::CAUSE_MODEL, rot.to);
+    }
     match plan(opts, &st, k) {
         Ok(_) => {}
         Err(super::NoPlan::Wait(why)) => return Some(said(r, format!("wait:{why}"))),
@@ -513,7 +576,9 @@ pub(super) fn upgrade_visit(
     {
         return Some(said(r, "skip:env-not-carried"));
     }
-    if let Err(why) = build_start::proved_named(opts, &r, &mv.twin, &mv.target, SOURCE, now) {
+    if rotation.is_none()
+        && let Err(why) = build_start::proved_named(opts, &r, &mv.twin, &mv.target, SOURCE, now)
+    {
         return Some(said(r, format!("wait:{why}")));
     }
     if opts.dry_run {
@@ -566,14 +631,17 @@ pub(super) fn upgrade_visit(
             return Some(r);
         }
     }
-    ledger(
-        opts,
-        &said(r.clone(), "terminated"),
-        &format!(
+    let note = match &rotation {
+        Some(rot) => format!(
+            "SIGTERM (idle: nothing asked or typed; its conversation {} resumed on --model {}: {})",
+            st.thread, rot.to, rot.why
+        ),
+        None => format!(
             "SIGTERM (idle: nothing asked or typed; its conversation {} resumed on {} as it was)",
             st.thread, mv.target
         ),
-    );
+    };
+    ledger(opts, &said(r.clone(), "terminated"), &note);
     let r = relaunch_held(opts, r, &mut st, &mut c, &mut hand, k);
     if !matches!(st.phase, Phase::Exiting { .. }) {
         hand.give_back(&mut c);

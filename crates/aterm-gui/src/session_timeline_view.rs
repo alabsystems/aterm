@@ -18,8 +18,9 @@ pub(crate) fn row_span(r: &Rec) -> u8 {
 pub(crate) const SPARE_ADOPTED: &str = "spare adopted";
 
 /// THE ROWS THE LOG HOLDS AS THEIR ROW ALONE: the timeline kinds whose fact no other mark names, each a `row` mark.
-pub(crate) const ROW_ONLY: [&str; 13] = [
+pub(crate) const ROW_ONLY: [&str; 14] = [
     crate::sys_host::JOB_CHANGE,
+    crate::occupancy_wakes::WAKE_READY,
     SPARE_ADOPTED,
     crate::claude_footer::REGISTRY_READ,
     "holder-edge",

@@ -15,8 +15,7 @@ use aterm_net::fleet::{
 };
 use aterm_net::fleet_member::{
     self as member, BookRead, BookUnread, CODE_FILE, ISSUER_BOOK_FILE, JoinCode, Keyring,
-    NODE_KEY_FILE, PEERS_FILE, PEERS_LEFT_FILE, Peer, Recorded, Registration, Unreached, Via,
-    target_of,
+    NODE_KEY_FILE, PEERS_FILE, Peer, Recorded, Registration, Unreached, Via, target_of,
 };
 use aterm_uds::atomic_file::ConfigFile;
 
@@ -403,12 +402,16 @@ fn listen_on(issuer_host: &str, port: u16) -> String {
 
 fn private_state(places: &Places, out: &mut String) -> Result<(), Failure> {
     if let Some(was) = member::ensure_private_dir(&places.state).map_err(failed)? {
-        out.push_str(&format!(
-            "  state      {} was open to other users ({was:o}); it is 0700 now\n",
-            places.state.display()
-        ));
+        out.push_str(&narrowed(places, was));
     }
     Ok(())
+}
+
+fn narrowed(places: &Places, was: u32) -> String {
+    format!(
+        "  state      {} was open to other users ({was:o}); it is 0700 now\n",
+        places.state.display()
+    )
 }
 
 fn init(places: &Places, args: &[String]) -> Result<String, Failure> {
@@ -484,11 +487,29 @@ fn init(places: &Places, args: &[String]) -> Result<String, Failure> {
         .or_else(|| issued.as_ref().map(|issued| issued.port))
         .or_else(|| table.listen_port())
         .unwrap_or(member::DEFAULT_PORT);
-    let allow = opts
+    // A new fleet keeps no drive grants: they named nodes of the fleet a leave stopped short of aterm.toml left.
+    let allow = match opts
         .allow
         .map(FleetScope::word)
         .or_else(|| table.level())
-        .unwrap_or(FleetScope::Facts.word());
+        .unwrap_or(FleetScope::Facts.word())
+    {
+        aterm_net::fleet::DRIVE_LEVEL if !opts.rotate => FleetScope::Content.word(),
+        allow => allow,
+    };
+    let listen = listen_on(&host, port);
+    let grants_gone = !opts.rotate && !table.drive_from.is_empty();
+    // Before the new key: an init stopped here has written nothing of the fleet, and the init again takes them out.
+    let ungranted = if grants_gone {
+        Some(write_fleet(
+            &config,
+            &places.config,
+            (&listen, allow),
+            true,
+        )?)
+    } else {
+        None
+    };
     let secret = member::mint_secret().map_err(failed)?;
     let code = JoinCode { secret, host, port };
     member::write_private(
@@ -512,8 +533,10 @@ fn init(places: &Places, args: &[String]) -> Result<String, Failure> {
     } else {
         Vec::new()
     };
-    let listen = listen_on(&code.host, port);
-    let config_line = write_fleet(&config, &places.config, (&listen, allow), false)?;
+    let config_line = match ungranted {
+        Some(line) => line,
+        None => write_fleet(&config, &places.config, (&listen, allow), !opts.rotate)?,
+    };
     out.insert_str(
         0,
         &format!(
@@ -535,6 +558,9 @@ fn init(places: &Places, args: &[String]) -> Result<String, Failure> {
         code_path.display(),
         places.state.join(NODE_KEY_FILE).display(),
     ));
+    if grants_gone {
+        out.push_str(GRANTS_GONE);
+    }
     if !old_secret.is_empty() {
         out.push_str(&format!(
             "  members    {} in the book hold the old secret until each joins again with the \
@@ -564,7 +590,7 @@ fn init(places: &Places, args: &[String]) -> Result<String, Failure> {
     Ok(out)
 }
 
-/// A test's hook at each step a kill could stop [`join`] before (`key`, `config`, `book`): a panic stops the join there as a kill would.
+/// A test's hook at each step a kill could stop [`join`] before (`key`, `drop`, `config`, `book`): a panic stops the join there as a kill would.
 #[cfg(test)]
 type StepHook = Box<dyn FnMut(&str)>;
 
@@ -585,6 +611,10 @@ fn at_step(step: &str) {
     let _ = step;
 }
 
+const GRANTS_GONE: &str = "  drive      no Mac drives this one: its drive grants named the nodes of \
+                           the fleet it held before, so none is kept (`aterm fleet allow drive \
+                           --from <host|node>` grants again)\n";
+
 const FOLLOWS: &str = "An aterm running here follows [fleet] without a relaunch (`aterm ctl \
                        status` reads fleet=listening); one started later reads it at launch.";
 
@@ -601,7 +631,6 @@ fn issued_code(places: &Places, path: &Path) -> Result<JoinCode, Failure> {
 fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure> {
     let code = JoinCode::parse(code_text).map_err(failed)?;
     let secret = FleetSecret::new(&code.secret).map_err(failed)?;
-    not_an_issuer(places, &code)?;
     let host = match opts.host.clone() {
         Some(host) => host,
         None => aterm_uds::process::lan_host_name()
@@ -613,39 +642,43 @@ fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure
                 )
             })?,
     };
+    let config = ConfigFile::open(&places.config).map_err(failed)?;
+    let table = fleet_table(text_of(&config)?).map_err(failed)?;
+    let mut out = String::new();
+    // Before any read of the state, so no read a loose directory refuses decides this join.
+    private_state(places, &mut out)?;
+    let bound = not_an_issuer(places, &code, &secret)
+        .and_then(|()| bound_issuer(places, &secret).map_err(failed))
+        .inspect_err(|_| aterm_uds::stdout::print(format_args!("{out}")))?;
     // A join of another fleet, of one a join left unfinished, or held to no issuer keeps no drive grants.
     let named = member::read_peers(&places.state)
         .is_ok_and(|book| book.iter().any(|peer| peer.via == Via::Issuer));
-    let regrant = aterm_net::fleet::read_key_file(&places.state).ok().as_ref() != Some(&secret)
-        || !named
-        || member::holds_another_fleet(&places.state);
-    let (port, allow, grants_gone, listened) = {
-        let config = ConfigFile::open(&places.config).map_err(failed)?;
-        let text = text_of(&config)?;
-        let table = fleet_table(text).map_err(failed)?;
-        let port = opts
-            .port
-            .or_else(|| table.listen_port())
-            .unwrap_or(code.port);
-        let allow = match opts
-            .allow
-            .map(FleetScope::word)
-            .or_else(|| table.level())
-            .unwrap_or(FleetScope::Facts.word())
-        {
-            aterm_net::fleet::DRIVE_LEVEL if regrant => FleetScope::Content.word(),
-            allow => allow,
-        };
-        with_fleet(text, &listen_on(&code.host, port), allow, regrant).map_err(failed)?;
-        (
-            port,
-            allow,
-            regrant && !table.drive_from.is_empty(),
-            table.listen_port().is_some(),
-        )
+    let regrant =
+        aterm_net::fleet::read_key_file(&places.state).ok().as_ref() != Some(&secret) || !named;
+    let port = opts
+        .port
+        .or_else(|| table.listen_port())
+        .unwrap_or(code.port);
+    let allow = match opts
+        .allow
+        .map(FleetScope::word)
+        .or_else(|| table.level())
+        .unwrap_or(FleetScope::Facts.word())
+    {
+        aterm_net::fleet::DRIVE_LEVEL if regrant => FleetScope::Content.word(),
+        allow => allow,
     };
-    let mut out = String::new();
-    private_state(places, &mut out)?;
+    if let Err(why) = with_fleet(
+        text_of(&config)?,
+        &listen_on(&code.host, port),
+        allow,
+        regrant,
+    ) {
+        aterm_uds::stdout::print(format_args!("{out}"));
+        return Err(failed(why));
+    }
+    let grants_gone = regrant && !table.drive_from.is_empty();
+    let listened = table.listen_port().is_some();
     let me = member::node_identity(&places.state).map_err(failed)?;
     let issuer_at = member::host_port(&code.host, code.port);
     let registration = Registration {
@@ -656,7 +689,6 @@ fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure
         key: Some(me.key()),
     };
     let keys = Keyring::read(&places.state);
-    let bound = (!regrant).then(|| bound_issuer(places)).flatten();
     let (joined, at, issuer_key) = match register_with(
         &code,
         (&secret, &me),
@@ -669,32 +701,42 @@ fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure
             return Err(failed(not_recorded(&issuer_at, &why)));
         }
     };
+    // The marking, the key's write and the drop are one take of the book's lock, so no other edit comes between them (an older aterm's writes every mark away).
+    let locked = member::hold_book(&places.state).map_err(|why| {
+        unfinished(
+            &out,
+            &issuer_at,
+            why,
+            "the fleet's key was not written, and the book is as it was",
+        )
+    })?;
     let held = aterm_net::fleet::read_key_file(&places.state).ok();
     let same_fleet = held.as_ref() == Some(&secret);
     let replaced = std::fs::symlink_metadata(places.state.join(KEY_FILE)).is_ok() && !same_fleet;
     // The key's one write moves this machine to another fleet: the old fleet's entries are marked as its own first, which no read under the key held sees.
     if !same_fleet {
-        member::update_peers(&places.state, |book| {
-            match held.as_ref().map(FleetSecret::mark) {
-                Some(mark) => {
-                    for peer in book.iter_mut() {
-                        if peer.via != Via::Manual && peer.fleet.is_none() {
-                            peer.fleet = Some(mark);
+        locked
+            .update(|book| {
+                match held.as_ref().map(FleetSecret::mark) {
+                    Some(mark) => {
+                        for peer in book.iter_mut() {
+                            if peer.via != Via::Manual && peer.fleet.is_none() {
+                                peer.fleet = Some(mark);
+                            }
                         }
                     }
+                    None => book.retain(|peer| peer.via == Via::Manual),
                 }
-                None => book.retain(|peer| peer.via == Via::Manual),
-            }
-            Ok(())
-        })
-        .map_err(|why| {
-            unfinished(
-                &out,
-                &issuer_at,
-                why,
-                "the fleet's key was not written, and the book is as it was",
-            )
-        })?;
+                Ok(())
+            })
+            .map_err(|why| {
+                unfinished(
+                    &out,
+                    &issuer_at,
+                    why,
+                    "the fleet's key was not written, and the book is as it was",
+                )
+            })?;
     }
     at_step("key");
     member::write_key_file(&places.state, &code.secret).map_err(|e| {
@@ -730,9 +772,12 @@ fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure
         (false, false) => "the book does not name the issuer",
     };
     let holds = format!("the fleet's key is held here, but {config}, and {book}");
-    // The old fleet's entries out of the book an older aterm reads, which takes no mark.
-    member::set_aside_peers(&places.state)
+    at_step("drop");
+    // The key is written, so this edit of nothing writes the book without the old issuer, which an older aterm (it takes no mark) would read as the new key's.
+    locked
+        .update(|_| Ok(()))
         .map_err(|why| unfinished(&out, &issuer_at, why, &holds))?;
+    drop(locked);
     // aterm.toml before the book: until the old grants are out, the book names no issuer to back them.
     at_step("config");
     let config_line = ConfigFile::open(&places.config)
@@ -762,22 +807,28 @@ fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure
         fleet: Some(secret.mark()),
     };
     at_step("book");
-    member::settle_peers(&places.state, |book| {
+    member::update_peers(&places.state, |book| {
         book.retain(|peer| peer.via != Via::Issuer);
         member::record(book, issuer)
     })
     .map_err(|why| {
         unfinished(
-            &out,
+            &format!("{out}{config_line}"),
             &issuer_at,
             why,
-            if named {
-                "the fleet's key is held here and aterm.toml listens for the fleet, but the \
-                 book's entry of the issuer is as it was"
-            } else {
-                "the fleet's key is held here and aterm.toml listens for the fleet, but the book \
-                 does not name the issuer"
-            },
+            &format!(
+                "the fleet's key is held here and aterm.toml listens for the fleet{}, but {}",
+                if grants_gone {
+                    " with its drive grants taken out (no Mac drives this one)"
+                } else {
+                    ""
+                },
+                if named {
+                    "the book's entry of the issuer is as it was"
+                } else {
+                    "the book does not name the issuer"
+                }
+            ),
         )
     })?;
     out.insert_str(
@@ -804,11 +855,7 @@ fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure
         );
     }
     if grants_gone {
-        out.push_str(
-            "  drive      no Mac drives this one: its drive grants named the nodes of the fleet \
-             it held before, so none is kept (`aterm fleet allow drive --from <host|node>` \
-             grants again)\n",
-        );
+        out.push_str(GRANTS_GONE);
     }
     out.push_str(&format!(
         "  issuer     {} at {issuer_at} recorded this machine ({} peers in its book){}\n\
@@ -1011,33 +1058,70 @@ fn unfinished(out: &str, issuer_at: &str, why: impl std::fmt::Display, holds: &s
 
 const NO_ISSUER: &str = "is no fleet's issuer";
 
-fn not_an_issuer(places: &Places, code: &JoinCode) -> Result<(), Failure> {
+fn not_an_issuer(places: &Places, code: &JoinCode, secret: &FleetSecret) -> Result<(), Failure> {
     let path = places.state.join(CODE_FILE);
     match std::fs::symlink_metadata(&path) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         _ => {}
     }
-    let own = member::read_join_code(&places.state).ok();
+    let own = member::read_join_code(&places.state);
+    // init and `--rotate` write the key with the code's secret, so either names the fleet this machine issues.
+    let same = own.as_ref().is_ok_and(|own| own.secret == code.secret)
+        || aterm_net::fleet::read_key_file(&places.state).ok().as_ref() == Some(secret);
     Err(failed(match own {
-        Some(own) if own.secret == code.secret => {
+        _ if same => {
             "this machine is the issuer of the fleet that code is for: it does not join its \
              own fleet (`aterm fleet peers` lists its members)"
                 .to_owned()
         }
-        _ => format!(
+        Ok(_) => format!(
             "this machine is the issuer of a fleet (its join code is {}): `aterm fleet leave` \
              first — that fleet's members then hold a secret no issuer keeps — and join again",
+            path.display()
+        ),
+        Err(why) => format!(
+            "this machine is the issuer of a fleet, and its join code {} cannot be read ({why}), \
+             so this join cannot tell whether that code is its own fleet's: it dialled nothing; \
+             once that file reads (0600, one link), join again",
             path.display()
         ),
     }))
 }
 
-fn bound_issuer(places: &Places) -> Option<(String, NodeKey)> {
-    member::read_peers(&places.state)
-        .ok()?
-        .into_iter()
-        .find(|peer| peer.via == Via::Issuer)
-        .and_then(|issuer| issuer.node.zip(issuer.key))
+/// The issuer a join of `secret`'s fleet must reach: the one the book read as that fleet's binds ([`member::read_peers_as`]) while that fleet's key is held, or marks as that fleet's (`fleet=`) while the key cannot be read; none with no key or another fleet's.
+/// # Errors
+/// The book cannot be read, or the key cannot be read beside an issuer's entry that names no fleet (an older aterm's), so the join cannot tell whether it holds the code's fleet.
+fn bound_issuer(
+    places: &Places,
+    secret: &FleetSecret,
+) -> Result<Option<(String, NodeKey)>, String> {
+    let book = member::read_peers_as(&places.state, secret.mark()).map_err(|e| {
+        format!(
+            "{e}: a join reads the book before it dials the issuer, so it dialled nothing and \
+             nothing of the fleet was written here; once {} reads (0600, one link, a peer on \
+             each line), or after `aterm fleet leave`, join again",
+            places.state.join(PEERS_FILE).display()
+        )
+    })?;
+    let Some(issuer) = book.into_iter().find(|peer| peer.via == Via::Issuer) else {
+        return Ok(None);
+    };
+    let Some(bound) = issuer.node.zip(issuer.key) else {
+        return Ok(None);
+    };
+    match aterm_net::fleet::read_key_file(&places.state) {
+        Ok(held) if held == *secret => Ok(Some(bound)),
+        Ok(_) | Err(aterm_net::fleet::KeyFileError::Missing) => Ok(None),
+        Err(_) if issuer.fleet.is_some() => Ok(Some(bound)),
+        Err(e) => Err(format!(
+            "{e}, and the book's issuer (node {}) names no fleet, so this join cannot tell \
+             whether the code is the fleet this machine holds, whose issuer a join again must \
+             reach: it dialled nothing, and nothing of the fleet was written here; once {} \
+             reads (0600, one link), or after `aterm fleet leave`, join again",
+            short(&bound.0),
+            places.state.join(KEY_FILE).display()
+        )),
+    }
 }
 
 fn register_with(
@@ -1323,7 +1407,7 @@ fn check_peers(places: &Places, within: Duration) -> Result<Listing, Failure> {
                 within,
                 "survey facts",
             );
-            let dropped = keep_book(places, &book, own.as_deref());
+            let dropped = keep_book(places, &secret, &book, own.as_deref());
             let rows = reads
                 .into_iter()
                 .map(|read| {
@@ -1358,22 +1442,30 @@ fn own_identity(places: &Places) -> Option<NodeIdentity> {
     member::read_node_identity(&places.state).ok().flatten()
 }
 
-fn keep_book(places: &Places, read: &BookRead, own: Option<&str>) -> Option<String> {
-    let _ = match read {
-        BookRead::Fetched(book) => {
-            let kept =
-                member::write_issuer_book(&places.state, &book.node, &member::copies_of(book, own));
-            if kept.is_ok() && book.proven {
-                return drop_unbacked_grants(places);
-            }
-            kept
-        }
+/// What `read`, a read under `secret`, leaves as the copy of the issuer's book, while that fleet is held still ([`member::keep_issuer_book`]), and the grants a proven book backs no more taken out.
+fn keep_book(
+    places: &Places,
+    secret: &FleetSecret,
+    read: &BookRead,
+    own: Option<&str>,
+) -> Option<String> {
+    let kept = match read {
+        BookRead::Fetched(book) => member::keep_issuer_book(
+            &places.state,
+            secret,
+            Some((&book.node, &member::copies_of(book, own))),
+        ),
         BookRead::Refused(_) | BookRead::NoIssuer => {
-            member::remove_private(&places.state, ISSUER_BOOK_FILE).map(|_| ())
+            member::keep_issuer_book(&places.state, secret, None)
         }
-        BookRead::Unshared(_) | BookRead::Unread(_) => Ok(()),
+        BookRead::Unshared(_) | BookRead::Unread(_) => return None,
     };
-    None
+    match read {
+        BookRead::Fetched(book) if book.proven && matches!(kept, Ok(true)) => {
+            drop_unbacked_grants(places)
+        }
+        _ => None,
+    }
 }
 
 fn drop_unbacked_grants(places: &Places) -> Option<String> {
@@ -1812,26 +1904,38 @@ fn leave(places: &Places, args: &[String]) -> Result<String, Failure> {
     if !args.is_empty() {
         return Err(Failure::Usage("leave takes nothing".to_owned()));
     }
-    let mut out = String::from("aterm fleet leave:\n");
+    let mut out = String::new();
+    let mut left = false;
     let mut issued = false;
-    for (name, what) in [
-        (KEY_FILE, "the fleet's secret"),
-        (CODE_FILE, "the join code"),
-        (PEERS_FILE, "the book of peers"),
-        (
-            PEERS_LEFT_FILE,
-            "what a join set aside of the fleet held before",
-        ),
-        (ISSUER_BOOK_FILE, "the copy of the issuer's book"),
-    ] {
-        let path = places.state.join(name);
-        let had = member::remove_private(&places.state, name)
-            .map_err(|e| failed(format!("{}: {e}", path.display())))?;
-        if had {
-            out.push_str(&format!("  removed    {} ({what})\n", path.display()));
-            issued |= name == CODE_FILE;
+    // Under the book's lock, so an edit of the book in progress (a member's registration, `peers add`) writes nothing after.
+    member::with_book_held(&places.state, |was| -> Result<(), Failure> {
+        if let Some(was) = was {
+            out.push_str(&narrowed(places, was));
         }
-    }
+        for (name, what) in [
+            (KEY_FILE, "the fleet's secret"),
+            (CODE_FILE, "the join code"),
+            (PEERS_FILE, "the book of peers"),
+            // Written by dev builds since 1b60ca3c4b; nothing reads it.
+            (
+                "fleet-peers-left",
+                "what a join set aside of the fleet held before",
+            ),
+            (ISSUER_BOOK_FILE, "the copy of the issuer's book"),
+        ] {
+            let path = places.state.join(name);
+            let had = member::remove_private(&places.state, name)
+                .map_err(|e| failed(format!("{}: {e}", path.display())))?;
+            if had {
+                out.push_str(&format!("  removed    {} ({what})\n", path.display()));
+                left = true;
+                issued |= name == CODE_FILE;
+            }
+        }
+        Ok(())
+    })
+    .map_err(failed)?
+    .inspect_err(|_| aterm_uds::stdout::print(format_args!("{out}")))?;
     let config = ConfigFile::open(&places.config).map_err(failed)?;
     match without_fleet(text_of(&config)?).map_err(failed)? {
         None => {}
@@ -1848,11 +1952,15 @@ fn leave(places: &Places, args: &[String]) -> Result<String, Failure> {
                     b.display()
                 ))
             ));
+            left = true;
         }
     }
-    if out.lines().count() == 1 {
-        return Ok("aterm fleet leave: this machine is in no fleet\n".to_owned());
+    if !left {
+        return Ok(format!(
+            "aterm fleet leave: this machine is in no fleet\n{out}"
+        ));
     }
+    let mut out = format!("aterm fleet leave:\n{out}");
     out.push_str("The running aterm stops listening within 2 s (it watches the key). ");
     out.push_str(if issued {
         "This machine issued the fleet, and its fleet went with it: no machine can join it \
@@ -1892,7 +2000,7 @@ fn drive_fleet_in(
     let secret = aterm_net::fleet::read_key_file(&places.state).map_err(|e| no_key(&e))?;
     let me = own_identity(places).ok_or(
         "this machine holds no node key it can read, so it proves no node and drives none: \
-         `aterm fleet join` again mints it",
+         `aterm fleet join` again mints it (on the fleet's issuer, `aterm fleet init`)",
     )?;
     let known = known_peers(places).map_err(failure_words)?;
     let keys = known.keys;
@@ -1997,7 +2105,7 @@ fn survey_fleet_in(
         ask.within,
         "survey",
     );
-    let dropped = keep_book(places, &book_read, own.as_deref());
+    let dropped = keep_book(places, &secret, &book_read, own.as_deref());
     let (entries, answers): (Vec<Peer>, Vec<_>) =
         reads.into_iter().map(|read| (read.peer, read.read)).unzip();
     let mut peers: Vec<aterm_ctl::PeerSurvey> = entries

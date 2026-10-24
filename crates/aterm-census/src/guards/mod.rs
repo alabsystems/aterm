@@ -351,26 +351,75 @@ impl Corpus {
     /// The files under `prefix` that compile only under `test`: each file a test-gated `mod` declaration names (`#[cfg(all(test, unix))] #[path = "x.rs"] mod x;`), and every module such a file declares.
     pub(crate) fn test_only(&self, prefix: &str) -> BTreeSet<String> {
         let prefixes = [prefix];
-        let declared: Vec<(&str, Vec<(String, bool)>)> = self
+        let loads: Vec<(&str, Vec<Load>)> = self
             .under(&prefixes)
-            .map(|f| (f.rel.as_str(), f.mod_decls()))
+            .map(|f| (f.rel.as_str(), f.loads()))
             .collect();
         let mut out = BTreeSet::new();
         loop {
             let before = out.len();
-            for (rel, decls) in &declared {
+            for (rel, loads) in &loads {
                 let whole = out.contains(*rel);
-                for (child, gated) in decls {
-                    if (whole || *gated) && self.get(child).is_some() {
+                for load in loads.iter().filter(|l| whole || l.gated) {
+                    for child in load.files.iter().filter(|c| self.get(c).is_some()) {
                         out.insert(child.clone());
                     }
                 }
             }
             if out.len() == before {
-                return out;
+                break;
+            }
+        }
+        let shipped = self.shipped_loads(&prefixes, &|rel| out.contains(rel));
+        out.retain(|file| !shipped.contains(file));
+        out
+    }
+
+    /// The files a shipped line of a shipped file under `prefixes` loads
+    /// ([`SourceFile::loads`]), where `test` says which files are test code
+    /// by their parents' say: a file it names ships too once a shipped file
+    /// loads it, and so does what that one loads.
+    pub(crate) fn shipped_loads(
+        &self,
+        prefixes: &[&str],
+        test: &dyn Fn(&str) -> bool,
+    ) -> BTreeSet<String> {
+        let loads: Vec<(&str, Vec<Load>)> = self
+            .under(prefixes)
+            .map(|f| (f.rel.as_str(), f.loads()))
+            .collect();
+        let mut shipped = BTreeSet::new();
+        loop {
+            let before = shipped.len();
+            for (rel, loads) in &loads {
+                if test(rel) && !shipped.contains(*rel) {
+                    continue;
+                }
+                for load in loads.iter().filter(|l| !l.gated) {
+                    for file in load.files.iter().filter(|f| self.get(f).is_some()) {
+                        shipped.insert(file.clone());
+                    }
+                }
+            }
+            if shipped.len() == before {
+                return shipped;
             }
         }
     }
+}
+
+/// A file one source file brings into its crate ([`SourceFile::loads`]): an
+/// out-of-line `mod`, or an `include!` of a literal path.
+pub(crate) struct Load {
+    /// The files it can name: `x.rs` and `x/mod.rs` for a `mod x;` without a
+    /// `path`, else the one file its `path` or literal names.
+    pub(crate) files: Vec<String>,
+    /// Outside the shipped lines: inside an item whose `cfg` proves it
+    /// test-only.
+    pub(crate) gated: bool,
+    /// A `mod` at the file's top level: not one in an inline module or a
+    /// block, and not an `include!`.
+    pub(crate) top: bool,
 }
 
 /// A directory no walk enters: `.git`, build output (`target`, `target-*`,
@@ -610,36 +659,102 @@ impl SourceFile {
         code
     }
 
-    /// Each out-of-line `mod` this file declares, as the files it can name
-    /// (`x.rs` and `x/mod.rs` beside the file's own module directory, or its
-    /// `#[path]`), each with whether the declaration is test-gated: outside
-    /// the shipped lines.
-    fn mod_decls(&self) -> Vec<(String, bool)> {
-        let shipped: BTreeSet<usize> = self.shipped_lines().map(|l| l.no).collect();
-        let lines: Vec<Line<'_>> = self.lines().collect();
+    /// Every file this one loads ([`Load`]), each with whether the load is
+    /// test-gated: each out-of-line `mod`, at any depth and whatever its
+    /// layout (`#[path = "x.rs"] mod y;` on one line), resolved as rustc
+    /// resolves it — a `path` (`#[path]`, or `cfg_attr`'s) against the file's
+    /// directory, or inside an inline module against that module's directory;
+    /// else `name.rs` or `name/mod.rs` in the module's own directory — and each
+    /// `include!` of a literal, against the file's directory.
+    pub(crate) fn loads(&self) -> Vec<Load> {
+        let Lexed { code, text } = self.lexed();
+        let shipped = self
+            .shipped
+            .get_or_init(|| crate::shipped_lines(&self.lexed().code));
+        let starts: Vec<usize> = std::iter::once(0)
+            .chain(code.match_indices('\n').map(|(at, _)| at + 1))
+            .collect();
+        let gated = |at: usize| {
+            let line = starts.partition_point(|&start| start <= at) - 1;
+            !shipped.get(line).copied().unwrap_or(true)
+        };
         let dir = self.rel.rsplit_once('/').map_or("", |(dir, _)| dir);
-        let base = match self.name() {
+        let own = match self.name() {
             "lib.rs" | "main.rs" | "mod.rs" => dir.to_string(),
             name => format!("{dir}/{}", name.trim_end_matches(".rs")),
         };
-        let mut out = Vec::new();
-        for (i, line) in lines.iter().enumerate() {
-            let Some(name) = mod_decl(line.code) else {
+        // Every `mod <name>`: a declaration, or an inline module's body (its
+        // braces, and the directory its children resolve in).
+        let mut decls: Vec<(usize, &str, Option<&str>)> = Vec::new();
+        let mut inline: Vec<(usize, usize, &str)> = Vec::new();
+        for at in hits(code, "mod", Bound::Word) {
+            let rest = &code[at + 3..];
+            let name_at = at + 3 + (rest.len() - rest.trim_start().len());
+            let len = code[name_at..].bytes().take_while(|&b| is_word(b)).count();
+            if name_at == at + 3 || len == 0 {
                 continue;
-            };
-            let gated = !shipped.contains(&line.no);
-            let path = lines[..i]
-                .iter()
-                .rev()
-                .take_while(|l| l.code.trim_start().starts_with("#["))
-                .find_map(|l| path_attr(l.text));
-            match path {
-                Some(path) => out.push((joined(dir, path), gated)),
-                None => {
-                    out.push((format!("{base}/{name}.rs"), gated));
-                    out.push((format!("{base}/{name}/mod.rs"), gated));
+            }
+            let name = &code[name_at..name_at + len];
+            let after = code[name_at + len..].trim_start();
+            let path = attr_path(code, text, at);
+            if after.starts_with(';') {
+                decls.push((at, name, path));
+            } else if after.starts_with('{') {
+                let open = code.len() - after.len();
+                if let Some(close) = brace_close(code, open) {
+                    inline.push((open, close, path.unwrap_or(name)));
                 }
             }
+        }
+        let depth = depths_at(code, decls.iter().map(|d| d.0));
+        let mut out = Vec::new();
+        for (&(at, name, path), depth) in decls.iter().zip(depth) {
+            let chain: Vec<&str> = inline
+                .iter()
+                .filter(|&&(open, close, _)| open < at && at < close)
+                .map(|&(_, _, dir)| dir)
+                .collect();
+            let base = if chain.is_empty() {
+                own.clone()
+            } else {
+                format!("{own}/{}", chain.join("/"))
+            };
+            let files = match path {
+                Some(path) if chain.is_empty() => vec![joined(dir, path)],
+                Some(path) => vec![joined(&base, path)],
+                None => vec![format!("{base}/{name}.rs"), format!("{base}/{name}/mod.rs")],
+            };
+            out.push(Load {
+                files,
+                gated: gated(at),
+                top: depth == 0,
+            });
+        }
+        for at in hits(code, "include", Bound::Word) {
+            let Some(args) = code[at + 7..].trim_start().strip_prefix('!') else {
+                continue;
+            };
+            let args = args.trim_start();
+            if !args.starts_with(['(', '[', '{']) {
+                continue;
+            }
+            // A literal first: `"…"`, or a raw `r"…"`, `r#"…"#`.
+            let lit = args[1..].trim_start();
+            let raw = lit
+                .strip_prefix('r')
+                .map_or(lit, |r| r.trim_start_matches('#'));
+            if !raw.starts_with('"') {
+                continue;
+            }
+            let open = code.len() - raw.len() + 1;
+            let Some(path) = text[open..].split_once('"').map(|(p, _)| p) else {
+                continue;
+            };
+            out.push(Load {
+                files: vec![joined(dir, path)],
+                gated: gated(at),
+                top: false,
+            });
         }
         out
     }
@@ -673,11 +788,60 @@ fn mod_decl(code: &str) -> Option<&str> {
     (end > 0 && rest[end..].trim() == ";").then(|| &rest[..end])
 }
 
-/// The path of a `#[path = "…"]` attribute line (TEXT view).
-fn path_attr(text: &str) -> Option<&str> {
-    let rest = after_ws(text, "#[path")?.trim_start().strip_prefix('=')?;
-    let rest = rest.trim_start().strip_prefix('"')?;
-    rest.split_once('"').map(|(path, _)| path)
+/// The path the attributes of the item whose keyword is at `at` name, if
+/// any: `path = "…"` in any of them (`#[path = "x.rs"]`,
+/// `#[cfg_attr(unix, path = "x.rs")]`), found in the CODE view and read from
+/// the TEXT view. The attributes are what lies between the item before (its
+/// `;`, `}` or a block's `{`) and the keyword.
+fn attr_path<'a>(code: &str, text: &'a str, at: usize) -> Option<&'a str> {
+    let start = code[..at].rfind([';', '}', '{']).map_or(0, |b| b + 1);
+    hits(&code[..at], "path", Bound::Word)
+        .filter(|&p| p >= start)
+        .find_map(|p| {
+            let value = code[p + 4..at].trim_start().strip_prefix('=')?.trim_start();
+            // `value` runs to `at`: its `"` sits `value.len()` bytes before it.
+            value.starts_with('"').then_some(())?;
+            let open = at - value.len() + 1;
+            text[open..at].split_once('"').map(|(path, _)| path)
+        })
+}
+
+/// The `}` that closes the `{` at `open` in a CODE view (whose literals and
+/// comments hold no brace), if it closes.
+fn brace_close(code: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, b) in code.bytes().enumerate().skip(open) {
+        match b {
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The brace depth at each of `positions` (ascending) in a CODE view.
+fn depths_at(code: &str, positions: impl Iterator<Item = usize>) -> Vec<i64> {
+    let b = code.as_bytes();
+    let (mut depth, mut from) = (0i64, 0usize);
+    positions
+        .map(|at| {
+            for &c in &b[from..at] {
+                match c {
+                    b'{' => depth += 1,
+                    b'}' => depth -= 1,
+                    _ => {}
+                }
+            }
+            from = at;
+            depth
+        })
+        .collect()
 }
 
 /// `path` under the directory `dir`, `..` and `.` resolved.
@@ -852,6 +1016,75 @@ pub(crate) mod tests {
                 "crates/x/src/a/b/mod.rs",
                 "crates/x/src/plain/tests.rs",
                 "crates/x/src/rig_conformance.rs",
+            ]
+        );
+    }
+
+    /// A file a shipped line also loads ships, whatever gates it elsewhere,
+    /// and so does what it declares; a file only a test-only file loads stays
+    /// test-only. And each load resolves as rustc does: an attribute on the
+    /// `mod`'s own line, a `cfg_attr` path, an inline module's directory, an
+    /// `include!` literal.
+    #[test]
+    fn a_test_module_a_shipped_line_also_loads_ships() {
+        let corpus = Corpus::of(&[
+            (
+                "crates/x/src/lib.rs",
+                "#[cfg(test)]\nmod a;\n#[cfg(test)]\nmod b;\n#[path = \"b.rs\"] mod b_again;\n\
+                 mod outer {\n    #[cfg_attr(unix, path = \"o.rs\")]\n    mod inner;\n    \
+                 mod plain;\n}\ninclude!(\"inc.rs\");\n#[cfg(test)]\nmod c {\n    \
+                 include!(\"c_inc.rs\");\n}\n",
+            ),
+            ("crates/x/src/a.rs", "mod a_child;\n"),
+            ("crates/x/src/a/a_child.rs", ""),
+            ("crates/x/src/b.rs", "mod b_child;\n"),
+            ("crates/x/src/b/b_child.rs", ""),
+            ("crates/x/src/outer/o.rs", ""),
+            ("crates/x/src/outer/plain.rs", ""),
+            ("crates/x/src/inc.rs", ""),
+            ("crates/x/src/c_inc.rs", ""),
+        ]);
+        let found: Vec<String> = corpus.test_only("crates/x/").into_iter().collect();
+        assert_eq!(
+            found,
+            [
+                "crates/x/src/a.rs",
+                "crates/x/src/a/a_child.rs",
+                "crates/x/src/c_inc.rs",
+            ]
+        );
+        let lib = corpus.get("crates/x/src/lib.rs").map(SourceFile::loads);
+        let loads: Vec<(Vec<String>, bool, bool)> = lib
+            .unwrap_or_default()
+            .into_iter()
+            .map(|l| (l.files, l.gated, l.top))
+            .collect();
+        let s = |p: &str| p.to_string();
+        assert_eq!(
+            loads,
+            [
+                (
+                    vec![s("crates/x/src/a.rs"), s("crates/x/src/a/mod.rs")],
+                    true,
+                    true
+                ),
+                (
+                    vec![s("crates/x/src/b.rs"), s("crates/x/src/b/mod.rs")],
+                    true,
+                    true
+                ),
+                (vec![s("crates/x/src/b.rs")], false, true),
+                (vec![s("crates/x/src/outer/o.rs")], false, false),
+                (
+                    vec![
+                        s("crates/x/src/outer/plain.rs"),
+                        s("crates/x/src/outer/plain/mod.rs")
+                    ],
+                    false,
+                    false
+                ),
+                (vec![s("crates/x/src/inc.rs")], false, false),
+                (vec![s("crates/x/src/c_inc.rs")], true, false),
             ]
         );
     }

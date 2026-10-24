@@ -1785,10 +1785,12 @@ pub(crate) struct SessionTimeline {
     upgrade_recorded: bool,
     self_reexec_since_us: Option<u64>,
     landing_mark: Option<LandingMark>,
-    typed_turn: Option<u64>,
+    typed_turn: Option<LandingMark>,
     task_face: Option<(aterm_agent::harness::acts::TaskFace, i64)>,
     watchers: Arc<crate::session_watch::Watchers>,
     task_face_held: Option<(aterm_agent::harness::acts::TaskFace, i64)>,
+    /// The held face is a seamless update's carry ([`Self::seed_task_face_held`]), not yet told here.
+    task_face_seeded: bool,
     pause: Option<crate::PausePlan>,
     harness_needs: crate::needs::ToldNeeds,
     land_held: Option<aterm_agent::harness::acts::LandHeld>,
@@ -2096,13 +2098,13 @@ impl SessionTimeline {
         self.landing_mark
     }
 
-    /// Record a turn-starting act typed by a proven self-claim holder.
-    pub(crate) const fn note_typed_act(&mut self, at_rest_turns: Option<u64>) {
-        self.typed_turn = at_rest_turns;
+    /// Record a turn-starting act typed by a proven self-claim holder: the program's turns and the screen's busy entries it stood at, where it came with the program at rest.
+    pub(crate) const fn note_typed_act(&mut self, at_rest: Option<LandingMark>) {
+        self.typed_turn = at_rest;
     }
 
-    /// The count [`Self::note_typed_act`] kept, taken by the landing or the point left to a person that follows it.
-    pub(crate) const fn take_typed_turn(&mut self) -> Option<u64> {
+    /// The counts [`Self::note_typed_act`] kept, taken by the landing or the point left to a person that follows it.
+    pub(crate) const fn take_typed_turn(&mut self) -> Option<LandingMark> {
         self.typed_turn.take()
     }
 
@@ -3149,24 +3151,23 @@ impl SessionTimeline {
             return false;
         }
         let mut next = facts.map(|facts| (pgid, started, facts));
-        let is_muse = match self
+        let is_muse_or_agy = match self
             .agent
             .program
             .as_deref()
             .and_then(aterm_phase::program_of)
         {
-            Some(aterm_phase::Program::Muse) => true,
+            Some(aterm_phase::Program::Muse | aterm_phase::Program::Agy) => true,
             Some(
                 aterm_phase::Program::Claude
                 | aterm_phase::Program::Codex
-                | aterm_phase::Program::Agy
                 | aterm_phase::Program::Gemini
                 | aterm_phase::Program::Generic,
             )
             | None => false,
         };
         let mut switched = false;
-        if is_muse
+        if is_muse_or_agy
             && let Some(email) = next
                 .as_ref()
                 .and_then(|(_, _, facts)| facts.subscription.as_ref()?.email.as_deref())
@@ -3176,14 +3177,16 @@ impl SessionTimeline {
             self.muse_cards_need_account |= switched;
             self.muse_card_account = Some(email.to_owned());
         }
-        if is_muse
+        if is_muse_or_agy
             && self.muse_cards_need_account
             && let Some(sub) = next
                 .as_mut()
                 .and_then(|(_, _, facts)| facts.subscription.as_mut())
         {
-            sub.weekly = None;
-            sub.weekly_reset = None;
+            if sub.weekly_figure.is_none() {
+                sub.weekly = None;
+                sub.weekly_reset = None;
+            }
             if switched {
                 sub.plan = None;
             }
@@ -3501,6 +3504,7 @@ impl SessionTimeline {
         if self.task_face.map(|(f, _)| f) == face {
             return false;
         }
+        self.task_face_seeded = false;
         let held = self.task_face_held.take();
         self.task_face = match face {
             None => {
@@ -3517,7 +3521,7 @@ impl SessionTimeline {
         self.task_face
     }
 
-    /// A SEAMLESS UPDATE'S CARRIED END.
+    /// A SEAMLESS UPDATE'S CARRIED END, or a proven self-claim's carried face.
     pub(crate) const fn seed_task_face_held(
         &mut self,
         face: aterm_agent::harness::acts::TaskFace,
@@ -3527,7 +3531,18 @@ impl SessionTimeline {
             return false;
         }
         self.task_face_held = Some((face, at_ms));
+        self.task_face_seeded = true;
         true
+    }
+
+    /// The face a seamless update carried ([`Self::seed_task_face_held`]), and its wall time (unix ms), while nothing has been told here since: a face held only because the shown one went unknown is no carry.
+    pub(crate) const fn carried_task_face(
+        &self,
+    ) -> Option<(aterm_agent::harness::acts::TaskFace, i64)> {
+        match (self.task_face, self.task_face_seeded) {
+            (None, true) => self.task_face_held,
+            _ => None,
+        }
     }
 
     /// The wall time (unix ms) the task's face moved to `face`, where that is the face this timeline holds.

@@ -175,6 +175,7 @@ impl<C: Ctl> Session<'_, C> {
     pub(super) fn note_status(&mut self, args: &[&str], r: &CtlReply) {
         if args.first() == Some(&"status") && r.ok() {
             self.caps.input = Some(publishes_input(&r.stdout));
+            self.caps.log = Some(super::log_wake::LogHead::of_status(&r.stdout).is_some());
             if self.stalled.is_none() && worker_stall(&r.stdout).is_some() {
                 self.stall_suspect = true;
             }

@@ -150,25 +150,6 @@ fn roster() -> Vec<Entry> {
     all.push(mr::upgrade_records_unreadable_entry(&[
         std::path::PathBuf::from("/Users//someone/.local/state/aterm/harness/upgrade/0badf00d.json"),
     ]));
-    for step in [
-        atpkg::devtools::Step::Add,
-        atpkg::devtools::Step::SwitchOn,
-        atpkg::devtools::Step::ListedOn,
-    ] {
-        for live in [
-            None,
-            Some(mr::HeldLine {
-                count: 1,
-                oldest_ms: 20_000,
-            }),
-            Some(mr::HeldLine {
-                count: 9,
-                oldest_ms: 35_940_000,
-            }),
-        ] {
-            all.push(mr::devtools_entry(step, live));
-        }
-    }
     all.push(mr::palette_refused_entry());
     for labels in [
         vec!["work-2".to_string()],
@@ -969,117 +950,17 @@ fn a_full_disk_is_one_standing_alert_and_what_was_freed_is_a_fact() {
     );
 }
 
-/// THE DEVELOPER TOOLS LIST is one line however often a reading says `not_granted`, whose one
-/// press opens the Developer Tools pane and whose second capsule opens aterm's own Settings ▸
-/// Security, in `atpkg::devtools`' words (one spelling on every surface); a reading that finds
-/// aterm on the list ends it; `unknown` leaves it as it was.
+/// THE DEVELOPER TOOLS LIST is never a line of its own: a reading that says `not_granted` posts nothing and only asks for the hand-over.
 #[test]
-fn the_developer_tools_list_is_one_line_and_a_reading_decides_it() {
+fn a_developer_tools_reading_posts_nothing() {
     use crate::devtools_watch::Step;
     let mut app = App::headless_for_test();
     let regrids = message_regrids();
-    let keys = |app: &App| -> Vec<String> {
-        app.messages
-            .digest()
-            .entries
-            .iter()
-            .map(|e| e.key.clone())
-            .collect()
-    };
-    assert!(app.apply_devtools_step(Step::Raise { hand_over: true }));
-    assert!(!app.apply_devtools_step(Step::Raise { hand_over: false }));
-    assert_eq!(
-        keys(&app),
-        [mr::DEVTOOLS_KEY],
-        "one line, however often it is told"
-    );
-    let line = app.messages.digest().entries[0].clone();
-    assert_eq!(
-        line.actions,
-        [
-            aterm_messages::Intent::OpenSystemPane {
-                pane: mr::PANE_DEVELOPER_TOOLS.to_string()
-            },
-            aterm_messages::Intent::OpenSettings {
-                route: crate::native_settings::SettingsRoute::Security
-                    .path()
-                    .to_string()
-            },
-        ],
-        "the one press opens Developer Tools; beside it, aterm's Security page"
-    );
-    assert_eq!(
-        line.actions
-            .iter()
-            .map(aterm_messages::Intent::label)
-            .collect::<Vec<_>>(),
-        ["Open Settings", "Security"],
-        "two capsules that never read alike"
-    );
-    assert_eq!(line.then, atpkg::devtools::HELPER_STEP, "the one action");
-    let skips = aterm_containment::SpikeEvidence::MEASURED.devtool_skips_first_run_check;
-    assert!(
-        line.detail.iter().any(|l| l == atpkg::devtools::why(skips)),
-        "why, in atpkg's words: {:?}",
-        line.detail
-    );
-    assert!(
-        line.detail.iter().any(|l| l
-            .starts_with(aterm_containment::consent::DEVTOOLS_SETTINGS_WORDS)
-            && l.ends_with(&format!("({})", atpkg::devtools::PLUS_ROUTE))),
-        "the path, and the + route beside the drag: {:?}",
-        line.detail
-    );
-    for (list, title, then, causes) in [
-        (
-            crate::devtools_helper::test_arms::list(
-                aterm_containment::consent::DevToolListing::Off,
-                aterm_containment::consent::DevToolListLabel::Read,
-                Some(2),
-            ),
-            "aterm is off in Developer Tools",
-            atpkg::devtools::STEP_SWITCH_ON,
-            false,
-        ),
-        (
-            crate::devtools_helper::test_arms::on(),
-            "macOS still checks programs aterm starts",
-            atpkg::devtools::STEP_LISTED_ON,
-            true,
-        ),
-    ] {
-        let mut app = App::headless_for_test();
-        app.devtools_helper.note_reading(
-            crate::devtools_helper::test_arms::reading(
-                aterm_containment::DevToolGrant::NotGranted,
-                list,
-            ),
-            std::time::Instant::now(),
-        );
-        let _ = app.apply_devtools_step(Step::Raise { hand_over: false });
-        assert_eq!(keys(&app), [mr::DEVTOOLS_KEY], "one line");
-        let line = app.messages.digest().entries[0].clone();
-        assert_eq!((line.title.as_str(), line.then.as_str()), (title, then));
-        assert_eq!(
-            line.detail
-                .iter()
-                .any(|l| l == atpkg::devtools::HELPER_LISTED_ON),
-            causes,
-            "{:?}",
-            line.detail
-        );
-        assert!(
-            line.detail
-                .iter()
-                .all(|l| !l.contains(atpkg::devtools::PLUS_ROUTE)),
-            "no + route for a listed aterm: {:?}",
-            line.detail
-        );
-    }
+    assert!(app.apply_devtools_step(Step::NotOn { hand_over: true }));
+    assert!(!app.apply_devtools_step(Step::NotOn { hand_over: false }));
     assert!(!app.apply_devtools_step(Step::Nothing));
-    assert_eq!(keys(&app), [mr::DEVTOOLS_KEY], "unknown leaves it");
     assert!(!app.apply_devtools_step(Step::Clear));
-    assert!(app.messages.digest().is_empty(), "on the list: it ends");
+    assert!(app.messages.digest().is_empty(), "no line, ever");
     assert_eq!(app.message_band_rows, 0, "never a band row");
     assert_eq!(message_regrids(), regrids, "no re-grid");
     app.on_devtools_probe_ready();
@@ -3509,41 +3390,6 @@ fn the_adoption_sweep_ends_supervisor_lines_nothing_has_told_of() {
     }
 }
 
-/// The Full Disk Access card, in the order it is used: the owner presses the button
-/// (`Answered`), the probe then reads the grant, and the regression after the next update is
-/// news again.
-#[test]
-fn a_verified_grant_after_the_owners_answer_makes_the_next_regression_news() {
-    use aterm_messages::ActionIndex;
-    let mut app = App::headless_for_test();
-    let words = crate::consent_card::NeedWords {
-        cause: crate::consent_card::NeedCause::PromptObserved {
-            service: None,
-            session: None,
-        },
-        tab_number: None,
-        regressed: true,
-    };
-    let regressed = mr::file_access_entry(&words);
-    assert_eq!(regressed.key(), mr::FDA_ENTRY_KEYS[1]);
-    app.except(&regressed);
-    let id = app.messages.digest().entries[0].id;
-    let _ = app.messages.act_digest(
-        id,
-        ActionIndex(0),
-        crate::messages_host::wall_stamp_now(),
-        Instant::now(),
-    );
-    assert!(app.messages.digest().is_empty(), "answered: closed");
-    app.clear_fda_entries();
-    app.except(&regressed);
-    assert_eq!(
-        app.messages.digest().len(),
-        1,
-        "the second regression is news after a verified grant"
-    );
-}
-
 /// atpkg's `foreign:` lines (a foreign rustup `trust` link, a managed tool shadowed on PATH) are
 /// one entry per look carrying atpkg's fix, re-said as the same entry and ended by that look's
 /// first report that sees nothing.
@@ -4142,6 +3988,159 @@ fn a_due_line_held_k_looks_under_prompt_is_the_tabs_ready_idle_entry() {
     crate::occupancy_host::told(sid, None);
     crate::occupancy_host::told(&observe_sid, None);
     crate::occupancy_host::told(&forged_sid, None);
+}
+
+/// THE WAKE K ENTRY (the slice-2 plan's 2.5): a ready wake of the tab's book K looks untold,
+/// told through the host's note, raises the tab's `ready-idle` entry under the owner's `prompt`;
+/// a hold rule's line its loop says stood K looks keeps the key first, and once the loop's line
+/// ends, the wake's stands until it too ends. NEGATIVE CONTROL: under `observe` the same note
+/// raises nothing.
+#[test]
+fn a_ready_wake_k_looks_untold_under_prompt_is_the_tabs_ready_idle_entry() {
+    use crate::occupancy_wakes::{WakeIdle, set_idle_for_test};
+    use aterm_agent::supervise::Occupancy;
+    use aterm_agent::supervise::occupancy::SaidVerdict::Quiet;
+    let idle = WakeIdle {
+        ord: 1,
+        guard: None,
+        looped: false,
+        since_ms: 1_792_600_000_000,
+        at_ms: 1_792_600_600_000,
+    };
+    for shown in [
+        idle,
+        WakeIdle {
+            looped: true,
+            ..idle
+        },
+        WakeIdle {
+            looped: true,
+            guard: Some(aterm_agent::supervise::Guard::Draft),
+            ..idle
+        },
+    ] {
+        mr::occupancy_wake_idle_entry("s-0123", &shown)
+            .message()
+            .expect("the words pass the rule");
+    }
+    let mut app = App::headless_for_test();
+    let stable = occupancy_sid(&app);
+    let sid = stable.as_str();
+    let keys = |app: &App| -> Vec<String> {
+        app.messages
+            .digest()
+            .entries
+            .iter()
+            .map(|e| e.key.clone())
+            .collect()
+    };
+    crate::occupancy_host::set_mode(Occupancy::Prompt);
+    set_idle_for_test(sid, Some(idle));
+    app.note_harness_host(HostNote::WakeIdle {
+        sid: sid.to_string(),
+    });
+    let title = |app: &App| app.messages.digest().entries[0].title.clone();
+    let wake_title = mr::occupancy_wake_idle_entry(sid, &idle)
+        .message()
+        .expect("the words pass the rule")
+        .title;
+    assert_eq!(keys(&app), [mr::occupancy_ready_idle_key(sid)]);
+    assert_eq!(title(&app), wake_title, "the wake's Entry");
+    app.note_occupancy_said(
+        sid,
+        occupancy_word(Occupancy::Prompt, [Quiet; 2], Some(held_nudge())),
+    );
+    assert_eq!(keys(&app), [mr::occupancy_ready_idle_key(sid)]);
+    assert_ne!(title(&app), wake_title, "the rule's line holds the key");
+    set_idle_for_test(sid, None);
+    app.note_harness_host(HostNote::WakeIdle {
+        sid: sid.to_string(),
+    });
+    assert_eq!(
+        keys(&app),
+        [mr::occupancy_ready_idle_key(sid)],
+        "the wake's end leaves the rule's line"
+    );
+    set_idle_for_test(sid, Some(idle));
+    app.note_occupancy_said(sid, occupancy_word(Occupancy::Prompt, [Quiet; 2], None));
+    assert_eq!(
+        keys(&app),
+        [mr::occupancy_ready_idle_key(sid)],
+        "the rule's line told, the wake's stands"
+    );
+    assert_eq!(title(&app), wake_title);
+    set_idle_for_test(sid, None);
+    app.note_harness_host(HostNote::WakeIdle {
+        sid: sid.to_string(),
+    });
+    assert!(keys(&app).is_empty(), "both told: it ends");
+
+    let mut observe = App::headless_for_test();
+    let observe_sid = occupancy_sid(&observe);
+    crate::occupancy_host::set_mode(Occupancy::Observe);
+    set_idle_for_test(&observe_sid, Some(idle));
+    observe.note_harness_host(HostNote::WakeIdle {
+        sid: observe_sid.clone(),
+    });
+    assert!(keys(&observe).is_empty(), "observe raises nothing");
+    set_idle_for_test(&observe_sid, None);
+    crate::occupancy_host::told(sid, None);
+}
+
+const WAKE_AGENT: aterm_agent::supervise::occupancy::declarer::AgentId =
+    aterm_agent::supervise::occupancy::declarer::AgentId {
+        pid: 300,
+        birth_us: 30_000_000,
+    };
+
+/// THE OWNER'S SWITCH TO `off` ENDS EVERY TAB'S BOOK (the slice-2 plan's 2.5): through
+/// `note_occupancy_mode`, a tab's declared wake ends `Expired why=off`. NEGATIVE CONTROL: a
+/// switch to `observe` leaves it pending.
+#[test]
+fn the_owners_switch_to_off_ends_every_tabs_book() {
+    use crate::occupancy_wakes::{book_for_test, states_for_test};
+    use aterm_agent::supervise::Occupancy;
+    use aterm_agent::supervise::occupancy::wakes_seen::{ExpireWhy, WakeState};
+    let mut app = App::headless_for_test();
+    let sid = occupancy_sid(&app);
+    book_for_test(&sid, 0, WAKE_AGENT, "label=t when=in:1h", 1_792_600_000_000);
+    app.note_occupancy_mode(Occupancy::Observe);
+    assert_eq!(
+        states_for_test(&sid),
+        [WakeState::Pending],
+        "NEGATIVE CONTROL: observe keeps it"
+    );
+    app.note_occupancy_mode(Occupancy::Off);
+    assert_eq!(
+        states_for_test(&sid),
+        [WakeState::Expired {
+            why: ExpireWhy::Off
+        }]
+    );
+    app.note_occupancy_mode(Occupancy::Observe);
+    crate::occupancy_wakes::forget(&sid);
+}
+
+/// A TAB'S CLOSE FORGETS ITS BOOK (the slice-2 plan's 2.5): retiring the session's registration
+/// drops its declared wakes, so `status` counts none and no tick reads them. NEGATIVE CONTROL:
+/// the book stands while its tab is open.
+#[test]
+fn a_tabs_close_forgets_its_book() {
+    use crate::occupancy_wakes::{book_for_test, states_for_test, status_fields};
+    let mut app = App::headless_for_test();
+    let sid = occupancy_sid(&app);
+    book_for_test(&sid, 0, WAKE_AGENT, "label=t when=in:1h", 1_792_600_000_000);
+    assert_eq!(
+        status_fields(Some(&sid)),
+        "waits=1 waits_ready=0",
+        "NEGATIVE CONTROL: the book stands while its tab is open"
+    );
+    app.retire_session_registration(0);
+    assert_eq!(status_fields(Some(&sid)), "waits=0 waits_ready=0");
+    assert!(
+        states_for_test(&sid).is_empty(),
+        "the book went with its tab"
+    );
 }
 
 /// A tab's close ends its occupancy entries even when a queued word arrives afterward. The

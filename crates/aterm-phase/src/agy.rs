@@ -285,13 +285,71 @@ const SUBAGENT_WORKING_STATES: &[&str] = &[
     "Thinking",
 ];
 
-fn is_subagent_working_state(state: &str) -> bool {
+fn subagent_state_head(state: &str) -> &str {
     let head = state
         .split_once(" · ")
         .map_or(state, |(activity, _)| crate::text::trim_end(activity));
+    let head = crate::text::trim(head);
+    head.strip_suffix("...").unwrap_or(head)
+}
+
+fn is_subagent_working_state(state: &str) -> bool {
+    let head = subagent_state_head(state);
     SUBAGENT_WORKING_STATES
         .iter()
-        .any(|&known| head == known || state.starts_with(known))
+        .any(|&known| head == known || head.starts_with(known) || state.starts_with(known))
+}
+
+/// Whether an `agy` subagent panel activity string denotes an idle subagent (`"Idle"`).
+#[must_use]
+pub fn is_subagent_idle_state(state: &str) -> bool {
+    subagent_state_head(state).eq_ignore_ascii_case("Idle")
+}
+
+/// Whether an `agy` subagent panel activity string denotes a subagent waiting on user approval or input.
+#[must_use]
+pub fn is_subagent_approval_state(state: &str) -> bool {
+    let head = subagent_state_head(state);
+    [
+        "Waiting for approval",
+        "Needs approval",
+        "Awaiting approval",
+        "Has a question",
+    ]
+    .iter()
+    .any(|&p| {
+        head.eq_ignore_ascii_case(p)
+            || head
+                .get(..p.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(p))
+    })
+}
+
+/// Whether an `agy` subagent panel activity string denotes a model/thinking step rather than a tool call.
+#[must_use]
+pub fn is_subagent_model_state(state: &str) -> bool {
+    let head = subagent_state_head(state);
+    [
+        anchor_text("agy.panel.working"),
+        "Thinking",
+        "Processing",
+        "Spawning",
+    ]
+    .iter()
+    .any(|&p| head == p || head.starts_with(p))
+}
+
+/// Canonical tool activity name when an `agy` subagent panel activity string names an in-flight tool call.
+#[must_use]
+pub fn subagent_tool_activity(state: &str) -> Option<&'static str> {
+    if is_subagent_model_state(state) {
+        return None;
+    }
+    let head = subagent_state_head(state);
+    SUBAGENT_WORKING_STATES
+        .iter()
+        .copied()
+        .find(|&known| head == known || head.starts_with(known))
 }
 
 fn footer_work(row: &str) -> Option<&'static str> {
@@ -1672,9 +1730,23 @@ fn parse_agy_usage_row(row: &str) -> Option<(&str, u32, Option<String>)> {
 /// Extracts the [`crate::muse::UsageCardWeekly`] quota summary from an `agy` `/usage` or `/quota` table on `rows`.
 #[must_use]
 pub fn usage_card_weekly(rows: &[String]) -> Option<crate::muse::UsageCardWeekly> {
+    usage_card_weekly_for_model(rows, None)
+}
+
+/// Extracts the [`crate::muse::UsageCardWeekly`] quota summary from an `agy` `/usage` or `/quota`
+/// table on `rows`, using `model` (if known by the footer) before falling back to the on-screen
+/// launch card.
+#[must_use]
+pub fn usage_card_weekly_for_model(
+    rows: &[String],
+    model: Option<&str>,
+) -> Option<crate::muse::UsageCardWeekly> {
     let f = frame(rows)?;
-    let third_party = launch_card(rows).is_some_and(|c| {
-        let lower = c.model.to_ascii_lowercase();
+    let active_model = model
+        .map(str::to_owned)
+        .or_else(|| launch_card(rows).map(|c| c.model));
+    let third_party = active_model.as_deref().is_some_and(|m| {
+        let lower = m.to_ascii_lowercase();
         lower.contains("claude") || lower.contains("gpt")
     });
     let matches_group = |group: &str| {

@@ -394,6 +394,27 @@ fn row_closed(row: &str) -> bool {
     row_field(row, "state") == Some("closed")
 }
 
+/// News already observed by an all-wait survives subsequent legs. The server owns
+/// `task_news` from its qualifying request latch, including the initial baseline
+/// leg's edges the client has not read yet. Only absent bits use legacy edges.
+fn row_news(row: &str, target: &Target, facts: bool) -> bool {
+    match row_field(row, "task_news") {
+        Some("1") => return true,
+        Some(_) => return false,
+        None => {}
+    }
+    let terminal = matches!(row_field(row, "state"), Some("done" | "exited" | "stalled"))
+        && row_rev(row)
+            .zip(target.since)
+            .is_some_and(|(rev, edge)| rev > edge);
+    let fact = facts
+        && target
+            .fact_since
+            .is_some_and(|edge| row_fact_rev(row) > edge)
+        && row_field(row, "fact").is_some_and(|word| !word.is_empty() && word != "-");
+    terminal || fact
+}
+
 fn closed_row(last: Option<&str>, target: &Target) -> String {
     match last {
         Some(row) => row
@@ -488,15 +509,15 @@ fn run_group(
 ) -> End {
     let n = group.targets.len();
     let mut rows: Vec<Option<String>> = vec![None; n];
-    let mut gone = vec![false; n];
+    let mut ready = vec![false; n];
     let mut baseline_read = false;
     let mut unserved_since: Option<Instant> = None;
     loop {
-        let live: Vec<usize> = (0..n).filter(|&i| !gone[i]).collect();
+        let live: Vec<usize> = (0..n).filter(|&i| !ready[i]).collect();
         if live.is_empty() {
             return End::Answered(rows.into_iter().flatten().collect());
         }
-        let wait = if !baseline_read || (combine == Combine::Any && gone.contains(&true)) {
+        let wait = if !baseline_read || (combine == Combine::Any && ready.contains(&true)) {
             Duration::ZERO
         } else {
             until.map_or(legs.max, |until| {
@@ -521,7 +542,7 @@ fn run_group(
                 else {
                     return End::Failed(e);
                 };
-                gone[i] = true;
+                ready[i] = true;
                 rows[i] = Some(closed_row(rows[i].as_deref(), &group.targets[i]));
                 continue;
             }
@@ -603,12 +624,13 @@ fn run_group(
                     target.fact_since = target.fact_since.or(Some(row_fact_rev(&row)));
                 }
             }
-            gone[i] = row_closed(&row);
+            ready[i] = row_closed(&row) || row_news(&row, &group.targets[i], facts);
             rows[i] = Some(row);
         }
         baseline_read = true;
         let latest: Vec<String> = rows.iter().flatten().cloned().collect();
-        if answered || (combine == Combine::Any && gone.contains(&true)) || !gone.contains(&false) {
+        if answered || (combine == Combine::Any && ready.contains(&true)) || !ready.contains(&false)
+        {
             return End::Answered(latest);
         }
         if until.is_some_and(|until| Instant::now() >= until) {
@@ -1174,6 +1196,13 @@ mod tests {
             (
                 x,
                 "await task @s-b:1 any timeout=600\n",
+                timed_out(&[
+                    "@s-b rev=1 state=working agent=- attention=- result_bytes=0 fact=hold-room@v1#1 fact_rev=5",
+                ]),
+            ),
+            (
+                x,
+                "await task @s-b:1 any timeout=600\n",
                 answered(&[
                     "@s-b rev=2 state=done agent=- attention=- result_bytes=3 fact=- fact_rev=4",
                 ]),
@@ -1182,6 +1211,151 @@ mod tests {
         let (rows, woke) = waited(one_group(x, &["s-b"]), Combine::Any, None, &legs);
         assert!(woke);
         assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn all_waits_do_not_latch_baseline_or_cleared_facts_or_display_attention() {
+        let x = "/x.sock";
+        let a = "@s-a rev=1 state=working agent=- attention=- result_bytes=0 fact=hold-room@v1#1 fact_rev=3";
+        let b = "@s-b rev=1 state=working agent=- attention=- result_bytes=0";
+        let final_a = "@s-a rev=3 state=done agent=- attention=- result_bytes=9";
+        let final_b = "@s-b rev=2 state=done agent=- attention=- result_bytes=3";
+        let legs = scripted(vec![
+            (
+                x,
+                "await task @s-a,@s-b all facts=1 timeout=0\n",
+                timed_out(&[a, b]),
+            ),
+            (
+                x,
+                "await task @s-a:1:3,@s-b:1:0 all facts=1 timeout=600\n",
+                timed_out(&[
+                    "@s-a rev=2 state=working agent=- attention=an%20unrelated%20owner result_bytes=0 fact=hold-room@v1#2 fact_rev=4 task_news=0",
+                    b,
+                ]),
+            ),
+            (
+                x,
+                "await task @s-a:1:3,@s-b:1:0 all facts=1 timeout=600\n",
+                timed_out(&[
+                    "@s-a rev=2 state=done agent=- attention=- result_bytes=0 fact=- fact_rev=4 task_news=unknown",
+                    b,
+                ]),
+            ),
+            (
+                x,
+                "await task @s-a:1:3,@s-b:1:0 all facts=1 timeout=600\n",
+                answered(&[final_a, final_b]),
+            ),
+        ]);
+        let result = wait_task_groups(
+            one_group(x, &["s-a", "s-b"]),
+            Combine::All,
+            true,
+            None,
+            &redial::Redial::none(),
+            &legs,
+        );
+        assert!(
+            matches!(result, Ok(Waited::Rows { rows, answered: true }) if rows == [final_a, final_b])
+        );
+    }
+
+    /// An all-wait owns news once it saw it, even when a fact clears or a terminal task
+    /// reopens while another target is still quiet. Server legs latch those rows too.
+    #[test]
+    fn all_waits_keep_terminal_news_that_came_and_went_between_legs() {
+        all_waits_keep_news_between_legs(false, false);
+    }
+
+    #[test]
+    fn all_waits_keep_fact_news_that_came_and_went_between_legs() {
+        all_waits_keep_news_between_legs(true, false);
+    }
+
+    #[test]
+    fn all_waits_keep_authoritative_attention_news_between_legs() {
+        all_waits_keep_news_between_legs(false, true);
+    }
+
+    #[test]
+    fn all_waits_keep_news_the_initial_baseline_leg_already_latched() {
+        let x = "/x.sock";
+        let first_news = "@s-a rev=2 state=working agent=- attention=- result_bytes=0 task_news=1";
+        let final_news = "@s-b rev=2 state=done agent=- attention=- result_bytes=3 task_news=1";
+        let legs = scripted(vec![
+            (
+                x,
+                "await task @s-a,@s-b all timeout=0\n",
+                timed_out(&[
+                    first_news,
+                    "@s-b rev=1 state=working agent=- attention=- result_bytes=0 task_news=0",
+                ]),
+            ),
+            (
+                x,
+                "await task @s-b:1 all timeout=600\n",
+                answered(&[final_news]),
+            ),
+        ]);
+        let result = wait_task_groups(
+            one_group(x, &["s-a", "s-b"]),
+            Combine::All,
+            false,
+            None,
+            &redial::Redial::none(),
+            &legs,
+        );
+        assert!(
+            matches!(result, Ok(Waited::Rows { rows, answered: true }) if rows == [first_news, final_news])
+        );
+    }
+
+    fn all_waits_keep_news_between_legs(facts: bool, attention: bool) {
+        let x = "/x.sock";
+        let baseline = "@s-a rev=1 state=working agent=- attention=- result_bytes=0";
+        let other = "@s-b rev=1 state=working agent=- attention=- result_bytes=0";
+        let news = if attention {
+            "@s-a rev=2 state=working agent=- attention=- result_bytes=0 task_news=1"
+        } else if facts {
+            "@s-a rev=1 state=working agent=- attention=- result_bytes=0 fact=hold-room@v1#1 fact_rev=1"
+        } else {
+            "@s-a rev=2 state=done agent=- attention=- result_bytes=9"
+        };
+        let first = if facts {
+            "await task @s-a,@s-b all facts=1 timeout=0\n"
+        } else {
+            "await task @s-a,@s-b all timeout=0\n"
+        };
+        let second = if facts {
+            "await task @s-a:1:0,@s-b:1:0 all facts=1 timeout=600\n"
+        } else {
+            "await task @s-a:1,@s-b:1 all timeout=600\n"
+        };
+        let third = if facts {
+            "await task @s-b:1:0 all facts=1 timeout=600\n"
+        } else {
+            "await task @s-b:1 all timeout=600\n"
+        };
+        let final_news = "@s-b rev=2 state=done agent=- attention=- result_bytes=3";
+        let legs = scripted(vec![
+            (x, first, timed_out(&[baseline, other])),
+            (x, second, timed_out(&[news, other])),
+            // A has cleared/reopened before this leg. It must not be asked again.
+            (x, third, answered(&[final_news])),
+        ]);
+        let result = wait_task_groups(
+            one_group(x, &["s-a", "s-b"]),
+            Combine::All,
+            facts,
+            None,
+            &redial::Redial::none(),
+            &legs,
+        );
+        assert!(
+            matches!(result, Ok(Waited::Rows { rows, answered: true }) if rows == [news, final_news]),
+            "the all-wait must retain each observed row (facts={facts}, attention={attention})"
+        );
     }
 
     #[test]
@@ -1208,16 +1382,13 @@ mod tests {
             ),
             (
                 x,
-                "await task @s-a:1,@s-b:1,@s-c:1 all timeout=600\n",
+                "await task @s-b:1,@s-c:1 all timeout=600\n",
                 refused("ERR no such session @s-b"),
             ),
             (
                 x,
-                "await task @s-a:1,@s-c:1 all timeout=600\n",
-                answered(&[
-                    "@s-a rev=2 state=done agent=- attention=- result_bytes=9",
-                    "@s-c rev=3 state=exited agent=- attention=- result_bytes=0",
-                ]),
+                "await task @s-c:1 all timeout=600\n",
+                answered(&["@s-c rev=3 state=exited agent=- attention=- result_bytes=0"]),
             ),
         ]);
         let (rows, answered) = waited(one_group(x, &["1", "s-b", "."]), Combine::All, None, &legs);

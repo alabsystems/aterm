@@ -436,13 +436,19 @@ fn peaks_round_trip_through_the_json_file() {
     }
     peaks.net_tx.note_bucket(20_381, 412_345.75);
     peaks.tokens.note_bucket(20_381, 9_012.5);
+    let (a, b) = (account("aaaaaaaa-0000"), account("bbbbbbbb-0000"));
+    peaks.note_plan(&a, plan_day(20_381, 10, 412));
+    peaks.note_plan(&b, plan_day(20_380, 22, 87));
+    peaks.note_plan(&b, plan_day(20_381, 9, 95));
     file.keep(&peaks, t0 + PEAKS_EVERY / 2, false);
     assert!(!path.exists(), "within ten minutes of the start: not yet");
     file.keep(&peaks, t0 + PEAKS_EVERY, false);
     assert_eq!(reopen(), peaks, "the file gives the peaks back");
+    assert_eq!(reopen().plan.len(), 2, "and both accounts' weeks");
 
     let mut more = peaks.clone();
     more.tokens.note_bucket(20_382, 12_000.0);
+    more.note_plan(&a, plan_day(20_382, 8, 450));
     file.keep(&more, t0 + PEAKS_EVERY + PEAKS_EVERY / 2, false);
     assert_eq!(reopen(), peaks, "within ten minutes of the last write");
     file.keep(&more, t0 + PEAKS_EVERY + PEAKS_EVERY / 2, true);
@@ -469,6 +475,488 @@ fn peaks_round_trip_through_the_json_file() {
     std::fs::write(&path, &text).expect("small");
     assert_eq!(reopen(), more, "control: the same peaks within the bound");
     assert_eq!(PeakFile::open(None, t0).1, Peaks::default());
+}
+
+fn account(id: &str) -> String {
+    AccountKey::claude(id).expect("a key").to_string()
+}
+
+/// A reading of the weekly figure at `hour` UTC on `day`, in a window that resets 3 days on.
+fn plan_day(day: u32, hour: i64, used_x10: u16) -> PlanDay {
+    let at = i64::from(day) * 86_400 + hour * 3_600;
+    PlanDay {
+        day,
+        used_x10,
+        resets_at: (i64::from(day) + 3) * 86_400,
+        at,
+    }
+}
+
+/// The text the peaks file held before it kept the plan (schema 1).
+const PEAKS_BEFORE_PLAN: &str = r#"{"schema":1,"peaks":[{"name":"net_rx","read_s":86400,"days":[[20380,2500000.0],[20381,11000000.0]]},{"name":"net_tx","read_s":86400,"days":[[20381,412345.75]]},{"name":"tokens","read_s":3000,"days":[[20381,9012.5]]}]}"#;
+
+#[test]
+fn a_peaks_file_from_before_the_plan_still_reads() {
+    let peaks = peaks_of(PEAKS_BEFORE_PLAN).expect("a schema-1 file");
+    assert_eq!(peaks.net_rx.peak(20_381), Some(11_000_000.0));
+    assert_eq!(peaks.net_tx.peak(20_381), Some(412_345.75));
+    assert_eq!(
+        (peaks.tokens.peak(20_381), peaks.tokens.read_s),
+        (Some(9_012.5), 3000)
+    );
+    assert!(peaks.plan.is_empty());
+
+    let a = account("aaaaaaaa-0000");
+    let with = |plan: &str| {
+        let text = PEAKS_BEFORE_PLAN
+            .strip_suffix('}')
+            .map(|head| format!("{head},\"plan\":{plan}}}"))
+            .expect("an object");
+        peaks_of(&text).expect("the peaks")
+    };
+    let kept = with(&format!(
+        r#"[{{"account":"{a}","days":[[20381,412,1761177600,1760954400]]}}]"#
+    ));
+    assert_eq!(
+        (kept.net_rx.clone(), kept.plan.len()),
+        (peaks.net_rx.clone(), 1),
+        "control: a plan row reads"
+    );
+    for plan in [
+        r#"{"weeks":[]}"#.to_owned(),
+        r#"[{"account":"c-0","days":[[20381,412,1761177600,1760954400]]}]"#.to_owned(),
+        format!(r#"[{{"account":"{a}","days":[[20381,412,1761177600]]}}]"#),
+        format!(r#"[{{"account":"{a}","days":[[20381,70000,1761177600,1760954400]]}}]"#),
+        format!(r#"[{{"account":"{a}","days":[[20381,1001,1761177600,1760954400]]}}]"#),
+    ] {
+        let read = with(&plan);
+        assert_eq!(
+            (read.plan.len(), &read.tokens),
+            (0, &peaks.tokens),
+            "{plan}: no week, the peaks kept"
+        );
+    }
+}
+
+#[test]
+fn the_plan_rows_leave_an_older_reader_its_peaks() {
+    #[derive(serde::Deserialize)]
+    struct OlderDoc {
+        schema: u32,
+        peaks: Vec<PeakDoc>,
+    }
+    let mut peaks = peaks_of(PEAKS_BEFORE_PLAN).expect("a schema-1 file");
+    peaks.note_plan(&account("aaaaaaaa-0000"), plan_day(20_381, 10, 412));
+    let text = peaks_json(&peaks).expect("text");
+    assert!(text.contains("\"plan\""), "{text}");
+    let older: OlderDoc = aterm_json::from_str(&text).expect("an older build reads the file");
+    assert_eq!(older.schema, PEAKS_SCHEMA);
+    let back = Peaks::from_pairs(
+        older
+            .peaks
+            .iter()
+            .map(|p| (p.name.as_str(), p.read_s, p.days.as_slice())),
+    );
+    assert_eq!(
+        back,
+        Peaks {
+            plan: Vec::new(),
+            ..peaks
+        },
+        "with every peak"
+    );
+}
+
+#[test]
+fn the_fullest_peaks_file_fits_its_bound() {
+    use aterm_vitals::peaks::{PEAK_DAYS, PLAN_ACCOUNTS, PLAN_ROWS};
+    let widest = || aterm_vitals::DailyMax {
+        days: (0..PEAK_DAYS)
+            .rev()
+            .map(|age| (u32::MAX - age, f64::MIN_POSITIVE))
+            .collect(),
+        read_s: u32::MAX,
+    };
+    let mut fullest = Peaks {
+        net_rx: widest(),
+        net_tx: widest(),
+        tokens: widest(),
+        plan: Vec::new(),
+    };
+    for n in 0..PLAN_ACCOUNTS {
+        let key = account(&format!("{n:08}-0000-0000-0000-000000000000"));
+        for age in 0..PEAK_DAYS {
+            for window in [0, 7_200] {
+                let read = PlanDay {
+                    day: u32::MAX - age,
+                    used_x10: 1000,
+                    resets_at: i64::MAX - window,
+                    at: i64::MIN + i64::from(age),
+                };
+                fullest.note_plan(&key, read);
+            }
+        }
+    }
+    assert_eq!(fullest.plan.len(), PLAN_ACCOUNTS);
+    assert!(fullest.plan.iter().all(|week| week.days.len() == PLAN_ROWS));
+    let text = peaks_json(&fullest).expect("text");
+    assert!(
+        text.len() as u64 <= PEAKS_MAX_BYTES,
+        "{} bytes over the {PEAKS_MAX_BYTES}-byte bound reads as no peaks at all",
+        text.len()
+    );
+    let dir = aterm_tempfile::tempdir().expect("scratch state");
+    let path = dir.path().join(PEAKS_FILE);
+    std::fs::write(&path, &text).expect("the file");
+    assert_eq!(PeakFile::open(Some(path), Instant::now()).1, fullest);
+}
+
+#[test]
+fn week_facts_place_a_reading_on_its_local_day() {
+    const DAY: u32 = 20_381;
+    let midnight = i64::from(DAY) * 86_400;
+    let row = |hour: i64| WeekRow {
+        account: AccountKey::claude("aaaaaaaa-0000").expect("a key"),
+        front: true,
+        figure: Some(WeeklyFigure {
+            used_x10: 412,
+            resets_at: midnight + 3 * 86_400,
+            at: midnight + hour * 3_600,
+        }),
+    };
+    let day = |hour: i64, offset_at: OffsetProbe| {
+        week_facts(&[row(hour)], offset_at)[0]
+            .reading
+            .map(|r| r.day)
+    };
+    assert_eq!(
+        day(3, |_| Some(-7 * 3_600)),
+        Some(DAY - 1),
+        "03:00 UTC is the evening before at UTC-7"
+    );
+    assert_eq!(
+        day(20, |_| Some(9 * 3_600)),
+        Some(DAY + 1),
+        "20:00 UTC is the next morning at UTC+9"
+    );
+    assert_eq!(day(20, |_| None), Some(DAY), "an unread zone counts in UTC");
+    assert_eq!(local_day(midnight - 1, |_| Some(0)), DAY - 1);
+
+    let facts = week_facts(&[row(10)], |_| Some(0));
+    assert_eq!(
+        facts,
+        [WeekFact {
+            account: account("aaaaaaaa-0000"),
+            front: true,
+            reading: Some(PlanDay {
+                day: DAY,
+                used_x10: 412,
+                resets_at: midnight + 3 * 86_400,
+                at: midnight + 10 * 3_600,
+            }),
+        }]
+    );
+    let unread = WeekRow {
+        figure: None,
+        ..row(10)
+    };
+    let wide = WeekRow {
+        figure: row(10).figure.map(|f| WeeklyFigure {
+            used_x10: 70_000,
+            ..f
+        }),
+        ..row(10)
+    };
+    assert!(
+        week_facts(&[unread, wide], |_| Some(0))
+            .iter()
+            .all(|f| f.reading.is_none()),
+        "an account with no figure, a figure no reading holds"
+    );
+}
+
+#[test]
+fn each_account_once_keeps_the_newest_and_the_front() {
+    let (a, b) = (
+        AccountKey::claude("aaaaaaaa-0000").expect("a key"),
+        AccountKey::claude("bbbbbbbb-0000").expect("a key"),
+    );
+    let fig = |used_x10: u32, at: i64| {
+        Some(WeeklyFigure {
+            used_x10,
+            resets_at: 1_761_177_600,
+            at,
+        })
+    };
+    let row = |account, front, figure| WeekRow {
+        account,
+        front,
+        figure,
+    };
+    let rows = each_account_once(vec![
+        row(b, false, fig(95, 1_760_950_000)),
+        row(a, false, fig(410, 1_760_954_000)),
+        row(b, true, None),
+        row(a, false, fig(412, 1_760_954_400)),
+        row(b, false, fig(90, 1_760_940_000)),
+    ]);
+    assert_eq!(
+        rows,
+        [
+            row(b, true, fig(95, 1_760_950_000)),
+            row(a, false, fig(412, 1_760_954_400)),
+        ]
+    );
+}
+
+/// THE PROBE THREAD CARRIES THE FOOTERS' WEEKS INTO THE MODEL ([`Reader::read`],
+/// [`Reader::read_machine`]): a request's week rows reach it on the day the reader's zone probe
+/// gives, each figure's and the reading's own, full or hidden, and the reading's facts carry the
+/// front account's run.
+#[test]
+fn a_reading_carries_the_front_accounts_plan_week() {
+    const AHEAD: i64 = 3 * 86_400;
+    let now = aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX));
+    let resets_at = now + 3 * 86_400;
+    let day_of = |unix: i64| u32::try_from((unix + AHEAD).div_euclid(86_400)).expect("a day");
+    let row = |id: &str, front, used_x10, at| WeekRow {
+        account: AccountKey::claude(id).expect("a key"),
+        front,
+        figure: Some(WeeklyFigure {
+            used_x10,
+            resets_at,
+            at,
+        }),
+    };
+    let mut reader = Reader::new(Arc::default());
+    reader.offset_at = |_| Some(AHEAD);
+    let req = Request {
+        self_pid: std::process::id(),
+        cadence_ms: 1_000,
+        weeks: vec![
+            row("bbbbbbbb-0000", false, 610, now - 120),
+            row("aaaaaaaa-0000", true, 340, now - 60),
+        ],
+        ..Request::default()
+    };
+    let snap = reader.read(&req);
+    let run = snap.facts.plan_week.expect("the front account's run");
+    assert_eq!(
+        (run.week.account, run.front, run.today),
+        (
+            account("aaaaaaaa-0000"),
+            true,
+            day_of(snap.at_unix_ms.div_euclid(1000))
+        ),
+        "the front account's, its right end the reading's day in the probe's zone"
+    );
+    assert_eq!(
+        run.week.days,
+        [PlanDay {
+            day: day_of(now - 60),
+            used_x10: 340,
+            resets_at,
+            at: now - 60,
+        }]
+    );
+    assert_eq!(
+        reader.vitals.peaks().plan.len(),
+        2,
+        "both accounts' weeks are kept"
+    );
+
+    let hidden = Request {
+        cadence_ms: 10_000,
+        machine_only: true,
+        weeks: vec![row("aaaaaaaa-0000", true, 345, now - 30)],
+        ..req
+    };
+    let snap = reader.read_machine(&hidden);
+    let run = snap.facts.plan_week.expect("a hidden reading's run");
+    assert_eq!(
+        run.week.days.last().map(|d| (d.used_x10, d.at)),
+        Some((345, now - 30)),
+        "a hidden reading notes the newer figure"
+    );
+}
+
+const FREE_MOUNT: &str = "/System/Volumes/Data";
+const FREE_SIZE: u64 = 994_662_584_320;
+
+#[test]
+fn the_free_history_round_trips_through_the_json_file() {
+    let dir = aterm_tempfile::tempdir().expect("scratch state");
+    let path = dir.path().join(FREE_FILE);
+    let at0: i64 = 1_791_936_000_000;
+    let hour = 3_600_000;
+    let now = at0 + 3 * hour;
+    let reopen = |now_ms| FreeFile::open(Some(path.clone()), Instant::now(), now_ms).1;
+    let t0 = Instant::now();
+    let (mut file, restored) = FreeFile::open(Some(path.clone()), t0, now);
+    assert_eq!(restored, FreeHistory::default(), "no file, no history");
+
+    let mut day = FreeHistory::new();
+    for m in 0..3 * 60 {
+        day.note_on(
+            FREE_MOUNT,
+            FREE_SIZE,
+            at0 + m * 60_000,
+            412_345_678_901 - m as u64 * 1_000_000,
+        );
+    }
+    file.keep(&day, t0 + PEAKS_EVERY / 2, false);
+    assert!(!path.exists(), "within ten minutes of the start: not yet");
+    file.keep(&day, t0 + PEAKS_EVERY, false);
+    let back = reopen(now);
+    assert_eq!(
+        back.window(now),
+        day.window(now),
+        "the file gives the hours back"
+    );
+    assert_eq!(back.saved(), day.saved());
+    assert_eq!(
+        back.volume(),
+        Some(&VolumeId {
+            mount: FREE_MOUNT.into(),
+            total: FREE_SIZE
+        })
+    );
+
+    let mut more = day.clone();
+    more.note_on(FREE_MOUNT, FREE_SIZE, now, 1);
+    file.keep(&more, t0 + PEAKS_EVERY + PEAKS_EVERY / 2, false);
+    assert_eq!(
+        reopen(now).saved(),
+        day.saved(),
+        "within ten minutes of the last write"
+    );
+    file.keep(&more, t0 + PEAKS_EVERY + PEAKS_EVERY / 2, true);
+    assert_eq!(
+        reopen(now).saved(),
+        more.saved(),
+        "the thread's stop writes at once"
+    );
+    std::fs::write(&path, "kept").expect("a stand-in");
+    file.keep(&more, t0 + 10 * PEAKS_EVERY, true);
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("readable"),
+        "kept",
+        "an unchanged history is not written"
+    );
+
+    let text = free_json(&more).expect("text");
+    std::fs::write(&path, &text).expect("the history");
+    let later = at0 + 160 * 600_000;
+    assert_eq!(
+        read_of(&reopen(later), later),
+        [412_345_678_901 - 179_000_000, 1],
+        "only the last 24 hours are kept"
+    );
+    assert_eq!(
+        reopen(now + 25 * hour),
+        FreeHistory::default(),
+        "a day and more after the last write"
+    );
+    let peaks = peaks_json(&Peaks::default()).expect("peaks");
+    for damaged in [
+        "kept",
+        "{",
+        "",
+        r#"{"schema":2,"mount":"/","total":1,"buckets":[[1791936000000,5,1]]}"#,
+        r#"{"schema":1,"mount":"/","total":1,"buckets":[[1791936000000,"5",1]]}"#,
+        r#"{"schema":1,"mount":"/","total":-1,"buckets":[[1791936000000,5,1]]}"#,
+        r#"{"schema":1,"mount":"/","buckets":[[1791936000000,5,1]]}"#,
+        &peaks,
+    ] {
+        std::fs::write(&path, damaged).expect("a damaged file");
+        assert_eq!(reopen(now), FreeHistory::default(), "{damaged}");
+    }
+    std::fs::write(
+        &path,
+        format!("{text}{}", " ".repeat(PEAKS_MAX_BYTES as usize)),
+    )
+    .expect("big");
+    assert_eq!(reopen(now), FreeHistory::default(), "a file over the bound");
+    std::fs::write(&path, &text).expect("small");
+    assert_eq!(
+        reopen(now).saved(),
+        more.saved(),
+        "control: within the bound"
+    );
+    assert_eq!(FreeFile::open(None, t0, now).1, FreeHistory::default());
+
+    let ten = aterm_vitals::history::FREE_BUCKET_S * 1000;
+    let first = i64::MIN / ten * ten;
+    let widest = SavedFree {
+        volume: VolumeId {
+            mount: "\u{1}".repeat(1024),
+            total: u64::MAX,
+        },
+        rows: (0..aterm_vitals::history::FREE_BUCKETS as i64)
+            .map(|k| (first + k * ten, u64::MAX, u32::MAX))
+            .collect(),
+    };
+    let full = FreeHistory::restored(&widest, first + 143 * ten);
+    assert_eq!(full.saved(), Some(widest), "a full day");
+    let wide = free_json(&full).expect("text");
+    assert!(
+        wide.len() as u64 <= PEAKS_MAX_BYTES,
+        "a full day of the widest rows fits the read bound: {}",
+        wide.len()
+    );
+}
+
+fn read_of(h: &FreeHistory, now_ms: i64) -> Vec<u64> {
+    h.window(now_ms).into_iter().flatten().collect()
+}
+
+struct Fills {
+    vitals: aterm_vitals::Vitals,
+}
+
+impl Source for Fills {
+    fn reading(&mut self, _req: &Request) -> Snapshot {
+        self.vitals.absorb(&Sample {
+            at_unix_ms: unix_ms_now(),
+            volume: Some(VolumeSample {
+                total: FREE_SIZE,
+                free: 7_000,
+                available: 7_000,
+                mount: FREE_MOUNT.into(),
+            }),
+            ..Sample::default()
+        })
+    }
+
+    fn model(&mut self) -> &mut aterm_vitals::Vitals {
+        &mut self.vitals
+    }
+}
+
+#[test]
+fn the_probe_thread_reads_on_from_the_kept_history_and_writes_it_at_quit() {
+    let dir = aterm_tempfile::tempdir().expect("scratch state");
+    let path = dir.path().join(FREE_FILE);
+    let mut earlier = FreeHistory::new();
+    earlier.note_on(FREE_MOUNT, FREE_SIZE, unix_ms_now() - 3_600_000, 9_000);
+    std::fs::write(&path, free_json(&earlier).expect("text")).expect("an earlier run's file");
+    let mut host = VitalsHost::default();
+    host.start(
+        || Fills {
+            vitals: aterm_vitals::Vitals::new(),
+        },
+        || true,
+        Some(dir.path().join(PEAKS_FILE)),
+        None,
+    );
+    assert!(host.offer(Msg::Read(Box::default())));
+    assert!(
+        host.stop_at_exit(Duration::from_secs(60)),
+        "the thread ended"
+    );
+    let now = unix_ms_now();
+    let kept = FreeFile::open(Some(path), Instant::now(), now).1;
+    assert_eq!(read_of(&kept, now), [9_000, 7_000], "an hour ago, then now");
 }
 
 struct Moves {
@@ -502,6 +990,7 @@ fn the_quit_writes_the_peaks_that_moved() {
     let path = dir.path().join(PEAKS_FILE);
     let mut peaks = Peaks::default();
     peaks.tokens.note_bucket(20_381, 9_012.5);
+    peaks.note_plan(&account("aaaaaaaa-0000"), plan_day(20_381, 10, 412));
     let mut host = VitalsHost::default();
     let moved = peaks.clone();
     host.start(
@@ -669,6 +1158,15 @@ fn publish(app: &crate::App, session: u64, id: &str, plan: Option<PlanUsage>, re
     tl.note_foreground_group(4242);
     let facts = FooterFacts {
         plan,
+        subscription: plan.map(|p| aterm_agent::harness::profile::SubscriptionDisplay {
+            account: Some(p.account),
+            weekly_figure: Some(WeeklyFigure {
+                used_x10: u32::from(p.used_x10),
+                resets_at: p.resets_at,
+                at: p.read_at,
+            }),
+            ..Default::default()
+        }),
         ..footer(Some(id), Some(usage(7_000, true)))
     };
     assert!(tl.set_claude_footer(4242, None, Some(facts)));
@@ -722,15 +1220,26 @@ fn every_pane_counts_and_the_plan_is_the_frontmost_windows() {
         [(0, "s-split", Some(read)), (s1, "s-other", Some(read))],
         "the split pane's agent is its tab's"
     );
-    let front = req.plan.expect("the first window's plan");
+    let front = req.plan.as_ref().expect("the first window's plan");
     assert_eq!((front.used_x10, front.account), (340, AccountIx(0)));
+    let weeks = |req: &Request| -> Vec<(String, bool, Option<u32>)> {
+        req.weeks
+            .iter()
+            .map(|w| (w.account.to_string(), w.front, w.figure.map(|f| f.used_x10)))
+            .collect()
+    };
+    let (a, b) = (account("aaaaaaaa-0000"), account("bbbbbbbb-0000"));
+    assert_eq!(
+        weeks(&req),
+        [(a.clone(), true, Some(340)), (b.clone(), false, Some(610))],
+        "every pane's account, the front tab's marked"
+    );
 
     app.frontmost_window = Some(w1);
-    let front = app
-        .vitals_request(FOCUSED_PERIOD, false)
-        .plan
-        .expect("the frontmost window's plan");
+    let req = app.vitals_request(FOCUSED_PERIOD, false);
+    let front = req.plan.as_ref().expect("the frontmost window's plan");
     assert_eq!((front.used_x10, front.account), (610, AccountIx(1)));
+    assert_eq!(weeks(&req), [(a, false, Some(340)), (b, true, Some(610))]);
 }
 
 #[test]
@@ -3196,16 +3705,91 @@ fn an_episode_edge_is_read_against_the_view_before() {
     }
 }
 
-/// A HELD EPISODE REWRITES THE DEVTOOLS ENTRY'S FIRST LINE AND RECORDS ITS EDGES (leftover §5.1,
-/// §6.5): while the last reading says aterm is not granted, an adopted view tells the standing
-/// Entry again at once when the count of programs aterm started that macOS's program check holds
-/// in a backed-up episode moves (from none, between counts, back to none, inside one episode as
-/// at its edges), and when only the oldest moved, at most once a `RESTATE_QUIET`; an episode in
-/// which aterm started nothing tells it nothing, so it counts no repeat. One `program-check.`
-/// record marks each edge, the opening saying when aterm started none of them. With no Entry
-/// standing nothing is raised; under a granted reading the records are posted and no Entry.
+/// A PROGRAM FIRST NAMED AS NOT STARTED FOR ANOTHER REASON IS RECORDED ONCE (leftover §5.1,
+/// §6.5): over the engine's own views, its first reading of a translating row is one
+/// `program-check.not-started` record saying "translating (Rosetta)", the same row in the next
+/// view none, and a row on a volume not proven local, new in a later view, one more saying it
+/// has not started; each record gives no age (the view that first names a row has just first
+/// seen it), no Entry and no Now.
 #[test]
-fn a_held_episode_rewrites_the_entrys_first_line_and_records_its_end() {
+fn a_program_first_named_as_not_started_is_recorded_once() {
+    use crate::message_reporters as mr;
+    use aterm_vitals::jobs::{HeldProc, JobTick, Jobs, StartWait};
+    static BOARD: JobsBoard = JobsBoard::new();
+    let row = |pid, name: &str, wait| HeldProc {
+        pid,
+        exec: u64::from(pid),
+        name: name.into(),
+        aterm: true,
+        wait,
+    };
+    let x86 = row(7010, "x86tool", StartWait::Translating);
+    let nfs = row(7011, "nfsprog", StartWait::NotStarted);
+    let mut engine = Jobs::new();
+    let mut adopt = |app: &mut crate::App, seq, held: &[HeldProc]| {
+        let at_ms = seq * 2_000;
+        let view = engine.absorb(&JobTick {
+            at_ms,
+            read_ms: at_ms,
+            self_uid: Some(501),
+            held: held.to_vec(),
+            ..JobTick::default()
+        });
+        app.vitals.latest.lock().unwrap().snap = Some(Arc::new(Snapshot {
+            seq,
+            jobs: Some(Arc::new(view)),
+            ..Snapshot::default()
+        }));
+        app.on_vitals_wake();
+    };
+    let mut app = crate::App::headless_for_test();
+    app.vitals.board = &BOARD;
+    adopt(&mut app, 1, std::slice::from_ref(&x86));
+    adopt(&mut app, 2, std::slice::from_ref(&x86));
+    adopt(&mut app, 3, &[x86.clone(), nfs]);
+    let records: Vec<(String, Vec<String>)> = app
+        .messages
+        .log()
+        .records()
+        .filter(|r| r.key.as_deref() == Some(mr::NOT_STARTED_KEY))
+        .map(|r| (r.title.clone(), r.detail.clone()))
+        .collect();
+    let one = |line: &str| {
+        (
+            "1 program has not started".to_owned(),
+            vec![line.to_owned()],
+        )
+    };
+    assert_eq!(
+        records,
+        [
+            one(
+                "pid 7010 x86tool: translating (Rosetta), which aterm's Developer Tools grant \
+                 does not reach"
+            ),
+            one(
+                "pid 7011 nfsprog: it has not started, and its program is on a volume aterm \
+                 cannot prove local, so nothing read says why"
+            ),
+        ],
+        "each program once, when a view first names it"
+    );
+    assert!(
+        app.messages
+            .digest()
+            .entries
+            .iter()
+            .all(|e| !e.key.starts_with("program-check")),
+        "a record only"
+    );
+}
+
+/// A HELD EPISODE IS A RECORD AT EACH EDGE AND RAISES NOTHING (leftover §5.1, §6.5): one
+/// `program-check.` record marks each edge, the opening saying when aterm started none of the
+/// held programs; nothing is filed in the digest, whatever the Developer Tools reading says (the
+/// list is System State's access step, never a digest line).
+#[test]
+fn a_held_episode_is_recorded_at_its_edges_and_raises_nothing() {
     use crate::devtools_helper::test_arms;
     use crate::message_reporters as mr;
     use aterm_containment::DevToolGrant;
@@ -3251,22 +3835,6 @@ fn a_held_episode_rewrites_the_entrys_first_line_and_records_its_end() {
             .map(|r| (r.title.clone(), r.detail.clone()))
             .collect()
     };
-    let entry = |app: &crate::App| {
-        app.messages
-            .digest()
-            .entries
-            .iter()
-            .find(|e| e.key == mr::DEVTOOLS_KEY)
-            .map(|e| (e.detail[2].clone(), e.repeats))
-    };
-    let first = |app: &crate::App| entry(app).map(|(line, _)| line);
-    let skips = aterm_containment::SpikeEvidence::MEASURED.devtool_skips_first_run_check;
-    let why = Some(atpkg::devtools::why(skips).to_owned());
-    let live = |n: u32, age: &str| {
-        Some(format!(
-            "now: {n} programs aterm started wait for macOS's program check, the oldest {age}"
-        ))
-    };
     let opened = |outside: bool| {
         let mut detail =
             vec!["the oldest for 9 h 59 m; only this user's programs are counted".to_owned()];
@@ -3282,90 +3850,35 @@ fn a_held_episode_rewrites_the_entrys_first_line_and_records_its_end() {
         "macOS's program check caught up".to_owned(),
         vec!["drained after 10 h 05 m, at most 3 programs held at once".to_owned()],
     );
-    let not_granted = |app: &mut crate::App| {
+    let reading = |app: &mut crate::App, grant| {
         app.vitals.board = &BOARD;
-        app.devtools_helper.note_reading(
-            test_arms::reading(DevToolGrant::NotGranted, test_arms::absent(1)),
-            Instant::now(),
-        );
+        let list = if grant == DevToolGrant::Granted {
+            test_arms::on()
+        } else {
+            test_arms::absent(1)
+        };
+        app.devtools_helper
+            .note_reading(test_arms::reading(grant, list), Instant::now());
     };
 
     let mut app = crate::App::headless_for_test();
-    not_granted(&mut app);
-    let _ = app.apply_devtools_step(crate::devtools_watch::Step::Raise { hand_over: false });
-    assert_eq!(first(&app), why, "the standing Entry, before any wait");
+    reading(&mut app, DevToolGrant::NotGranted);
     adopt(&mut app, 1, &held((0, 0)));
-    assert_eq!(
-        entry(&app),
-        why.clone().map(|why| (why, 1)),
-        "aterm started none of them: the Entry is not told again, so no repeat"
-    );
     assert_eq!(records(&app), [opened(true)]);
     adopt(&mut app, 2, &held((2, 35_940_000)));
-    assert_eq!(
-        first(&app),
-        live(2, "9 h 59 m"),
-        "inside the episode aterm's programs are held: the live line first"
-    );
-    adopt(&mut app, 3, &held((2, 35_970_000)));
-    assert_eq!(
-        first(&app),
-        live(2, "9 h 59 m"),
-        "only the oldest moved: it waits out RESTATE_QUIET"
-    );
-    app.vitals.live_told = app.vitals.live_told.and_then(|(n, at)| {
-        at.checked_sub(aterm_messages::need::RESTATE_QUIET)
-            .map(|at| (n, at))
-    });
-    assert!(app.vitals.live_told.is_some(), "the live line was told");
-    adopt(&mut app, 4, &held((2, 36_000_000)));
-    assert_eq!(
-        first(&app),
-        live(2, "10 h 00 m"),
-        "RESTATE_QUIET after the last telling: the oldest moves too"
-    );
-    adopt(&mut app, 5, &held((4, 36_000_000)));
-    assert_eq!(first(&app), live(4, "10 h 00 m"), "the count moved");
-    adopt(&mut app, 6, &held((0, 0)));
-    assert_eq!(
-        first(&app),
-        why,
-        "aterm's programs started while others' keep the episode open"
-    );
-    adopt(&mut app, 7, &drained);
-    assert_eq!(first(&app), why, "drained: why the list matters");
+    assert_eq!(records(&app), [opened(true)], "one episode, one opening");
+    adopt(&mut app, 3, &drained);
     assert_eq!(records(&app), [opened(true), ended.clone()]);
-    assert_eq!(
-        app.messages.digest().entries.len(),
-        1,
-        "the one Entry, no second ask"
-    );
-    assert_eq!(entry(&app).map(|(_, n)| n), Some(1), "told, never repeated");
+    assert!(app.messages.digest().is_empty(), "not granted: no line");
 
-    let mut app = crate::App::headless_for_test();
-    not_granted(&mut app);
-    adopt(&mut app, 1, &held((2, 35_940_000)));
-    adopt(&mut app, 2, &drained);
-    assert_eq!(records(&app), [opened(false), ended.clone()]);
-    assert!(
-        app.messages.digest().is_empty(),
-        "no Entry standing: none is raised"
-    );
-
-    let mut app = crate::App::headless_for_test();
-    app.vitals.board = &BOARD;
-    app.devtools_helper.note_reading(
-        test_arms::reading(DevToolGrant::Granted, test_arms::on()),
-        Instant::now(),
-    );
-    adopt(&mut app, 1, &held((2, 35_940_000)));
-    adopt(&mut app, 2, &drained);
-    assert_eq!(
-        records(&app),
-        [opened(false), ended],
-        "granted: the records"
-    );
-    assert!(app.messages.digest().is_empty(), "granted: no Entry");
+    for grant in [DevToolGrant::NotGranted, DevToolGrant::Granted] {
+        let mut app = crate::App::headless_for_test();
+        reading(&mut app, grant);
+        adopt(&mut app, 1, &held((2, 35_940_000)));
+        adopt(&mut app, 2, &drained);
+        assert_eq!(records(&app), [opened(false), ended.clone()], "{grant:?}");
+        assert!(app.messages.digest().is_empty(), "{grant:?}: no line");
+    }
 }
 
 /// THE VERDICT REFRESH WAITS OUT A BACKED-UP EPISODE (leftover §5.1, §13): its prime is a new

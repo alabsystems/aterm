@@ -18,7 +18,10 @@ pub fn items(ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
     let [user] = ctx.users.as_slice() else {
         return Err("aterm init trackpad settings require exactly one local user".into());
     };
-    Ok(vec![Box::new(ScrollDirection { user: user.clone() })])
+    Ok(vec![Box::new(ScrollDirection {
+        user: user.clone(),
+        reading: crate::init_observe::LastReading::default(),
+    })])
 }
 
 /// Returns trackpad scrolling behavior preference items for the resolved local user.
@@ -67,6 +70,8 @@ pub fn behavior_items(ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
 #[derive(Debug)]
 struct ScrollDirection {
     user: User,
+    /// Whether the last probe found natural scrolling on, for System State.
+    reading: crate::init_observe::LastReading,
 }
 
 impl ScrollDirection {
@@ -114,6 +119,7 @@ impl Item for ScrollDirection {
     }
 
     fn probe(&self, sys: &dyn System, _ctx: &Ctx) -> Probe {
+        self.reading.set(None);
         let stored = match self.persisted(sys) {
             Ok(stored) => stored,
             Err(why) => return Probe::Unusable { why },
@@ -123,15 +129,23 @@ impl Item for ScrollDirection {
             Ok(false) if stored => Probe::Ok {
                 now: "Natural scrolling is saved as off in macOS and System Settings".into(),
             },
-            Ok(natural) => Probe::Change {
-                from: format!(
-                    "Natural scrolling: {} in System Settings; preferred value {}persisted",
-                    if natural { "on" } else { "off" },
-                    if stored { "" } else { "not " },
-                ),
-                to: self.title(),
-            },
+            Ok(natural) => {
+                self.reading
+                    .set(natural.then_some(crate::init_observe::Reading::NaturalOn));
+                Probe::Change {
+                    from: format!(
+                        "Natural scrolling: {} in System Settings; preferred value {}persisted",
+                        if natural { "on" } else { "off" },
+                        if stored { "" } else { "not " },
+                    ),
+                    to: self.title(),
+                }
+            }
         }
+    }
+
+    fn detail(&self, _sys: &dyn System, _ctx: &Ctx) -> Option<String> {
+        self.reading.detail()
     }
 
     fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
@@ -286,6 +300,11 @@ mod tests {
         );
         assert_eq!(rows[0].outcome, Outcome::Planned);
         assert_eq!(sys.calls(), [READ, "scroll-direction get"]);
+        // System State reads natural scrolling as on from the probe itself.
+        assert_eq!(
+            crate::init_observe::Reading::of(&rows[0]),
+            Some(crate::init_observe::Reading::NaturalOn)
+        );
     }
 
     #[test]

@@ -182,13 +182,13 @@ impl App {
         }
     }
 
-    /// `theme session set`: refused, changing nothing, as a preview is when the selector has grammar issues or a side would draw Default for want of a theme; else the session's own theme, installed.
+    /// `theme session set`: refused, changing nothing, when the selector has grammar issues or a side would draw Default for want of a theme as the session resolves it ([`Self::session_theme_unavailable`]: a community pack theme the themes folder lacks is refused, though a preview draws it); else the session's own theme, installed.
     pub(crate) fn set_session_theme_checked(
         &mut self,
         sid: u64,
         selector: &str,
     ) -> Result<String, String> {
-        if let Some(why) = self.theme_preview_unavailable(selector) {
+        if let Some(why) = self.session_theme_unavailable(selector) {
             return Err(format!("theme session {selector:?}: {why}"));
         }
         self.set_session_theme(
@@ -379,6 +379,17 @@ impl App {
                     ThemeSource::Builtin | ThemeSource::File(_) | ThemeSource::Pack(_) => None,
                 }
             })
+    }
+
+    /// Why selector `id` cannot be a session's own theme under the config and catalog now held: its grammar issues, else a side, dark or light, that [`Self::resolve_session_selector_on`] (what the session draws with) does not draw, so a community pack theme the themes folder lacks is refused though a preview draws it.
+    pub(crate) fn session_theme_unavailable(&self, id: &str) -> Option<String> {
+        if let Some(notice) = crate::app_config::theme_selector_notice(Some(id)) {
+            return Some(notice);
+        }
+        [Appearance::Dark, Appearance::Light]
+            .into_iter()
+            .find_map(|side| self.resolve_session_selector_on(side, id).err())
+            .map(|reason| format!("unavailable ({reason}); nothing changed"))
     }
 
     /// End the preview if `held` says it is the one standing, and install what the config draws.

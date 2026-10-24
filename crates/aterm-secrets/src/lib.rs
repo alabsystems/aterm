@@ -26,6 +26,8 @@ pub mod fsx;
 #[cfg(unix)]
 pub mod materialize;
 #[cfg(unix)]
+pub mod network;
+#[cfg(unix)]
 pub mod server;
 #[cfg(unix)]
 pub mod service;

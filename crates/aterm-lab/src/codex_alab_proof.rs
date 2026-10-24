@@ -900,6 +900,121 @@ impl Proof {
         })
     }
 
+    /// A worker `spawn agent=codex` starts from the lab's own client, in a
+    /// folder of its own: it runs the codex-alab the instance's `codex` link
+    /// names, under `$HOME/.codex` (no codex started it, so no `CODEX_HOME`
+    /// rides along), or `None` when the spawn was refused.
+    fn spawn_worker(&mut self) -> Result<Option<Leg>, Fail> {
+        let name = "worker";
+        let dir = self.s.join("legs").join(name);
+        let home = self.h.join(".codex");
+        let made = (|| -> Result<PathBuf, String> {
+            let io = |e: std::io::Error| e.to_string();
+            let proj = dir.join("proj");
+            std::fs::create_dir_all(&home).map_err(io)?;
+            std::fs::create_dir_all(&proj).map_err(io)?;
+            let proj = std::fs::canonicalize(&proj).map_err(io)?;
+            self.lay_folder(&dir, &proj, Folder::Plain)?;
+            std::fs::write(
+                home.join("config.toml"),
+                codex_config(self.port, &proj, &home, ""),
+            )
+            .map_err(io)?;
+            Ok(proj)
+        })();
+        let proj = made.map_err(|e| format!("cannot lay out leg {name}: {e}"))?;
+        let task = format!("LEG-{name} {}", model::WORKER_TASK);
+        let spawned = self.inst.ctl_stdin(
+            &[
+                "spawn",
+                "agent=codex",
+                &format!("cwd={}", proj.display()),
+                "-",
+            ],
+            task.as_bytes(),
+        );
+        let sid = spawned
+            .first()
+            .strip_prefix("OK ")
+            .and_then(|r| r.split_whitespace().next())
+            .map(str::to_string);
+        self.check(
+            &format!(
+                "worker: `spawn agent=codex` starts a worker on its task ({})",
+                spawned.first()
+            ),
+            sid.is_some(),
+        );
+        Ok(sid.map(|sid| {
+            println!("  leg {name}: tab {sid}");
+            Leg {
+                name,
+                sid,
+                home,
+                proj,
+            }
+        }))
+    }
+
+    /// The worker [`Self::spawn_worker`] started lands under Autopilot Land:
+    /// `await task` wakes on its task `done why=landed`, and `result` reads
+    /// its report out of codex's own rollout.
+    fn worker_leg(&mut self, leg: &Leg) -> Result<(), Stopped> {
+        let word = field(&self.status(&leg.sid), "autopilot").unwrap_or_default();
+        self.check(
+            &format!("worker: its tab runs under Autopilot Land (status autopilot={word})"),
+            word == "land",
+        );
+        let at = format!("@{}", leg.sid);
+        let (mut since, mut row) = (0_u64, String::new());
+        let end = Instant::now() + Duration::from_secs(240);
+        while Instant::now() < end {
+            let woke = self.on(
+                &leg.sid,
+                &["await", "task", &format!("since={since}"), "timeout=60000"],
+            );
+            row = woke
+                .stdout
+                .lines()
+                .find(|l| l.starts_with(&format!("{at} ")))
+                .unwrap_or_default()
+                .to_string();
+            if field(&row, "state").as_deref() == Some("done") || !matches!(woke.code, 0 | 124) {
+                break;
+            }
+            since = field(&row, "rev")
+                .and_then(|r| r.parse().ok())
+                .unwrap_or(since);
+            sleep(Duration::from_millis(250))?;
+        }
+        let task = self.on(&leg.sid, &["task"]).first();
+        self.check(
+            &format!(
+                "worker: `await task` wakes on its landing and the task reads done why=landed ({row}; {task})"
+            ),
+            field(&row, "state").as_deref() == Some("done")
+                && field(&task, "state").as_deref() == Some("done")
+                && field(&task, "why").as_deref() == Some("landed"),
+        );
+        let result = self.on(&leg.sid, &["result"]);
+        // `aterm ctl` prints a counted reply's `OK` line on stderr and its lines on stdout.
+        let head = result.header();
+        let body = result.stdout.trim_end();
+        self.check(
+            &format!(
+                "worker: `result` reads its report from codex's rollout: the worker's words, then its `Nothing left:` defense ({head}; {})",
+                tail(body, 160)
+            ),
+            head.starts_with("OK ")
+                && field(&head, "source").as_deref() == Some("rollout")
+                && field(&head, "thread").is_some_and(|t| !t.is_empty())
+                && field(&head, "turn").is_some_and(|t| !t.is_empty())
+                && body.contains(model::WORKER_REPORT)
+                && body.contains("Nothing left:"),
+        );
+        Ok(())
+    }
+
     fn link(&self, pkg: &Path) -> Result<(), String> {
         let out = aterm_uds::spawnfd::command(&self.inst.aterm)
             .env_clear()
@@ -2894,6 +3009,7 @@ fn legs(proof: &mut Proof, pkg: &Path, pkg_b: &Path) -> Result<(), Fail> {
     let carry = proof.spawn_leg("carry", "Do the long task.", "", Folder::Scratch, None)?;
     let exchange = proof.start_leg("exchange", None, "", Folder::Scratch, None)?;
     let control = proof.start_leg("control", None, "", Folder::Scratch, None)?;
+    let worker = proof.spawn_worker()?;
     let all = [
         &first, &land, &reland, &repo, &hold, &off, &needs, &cont, &approval, &question, &usage,
         &carry, &exchange, &control,
@@ -2905,6 +3021,9 @@ fn legs(proof: &mut Proof, pkg: &Path, pkg_b: &Path) -> Result<(), Fail> {
         } else {
             proof.claim(leg)?
         };
+    }
+    if let Some(worker) = &worker {
+        proof.claim(worker)?;
     }
     let pid_of = |name: &str| {
         all.iter()
@@ -2938,6 +3057,11 @@ fn legs(proof: &mut Proof, pkg: &Path, pkg_b: &Path) -> Result<(), Fail> {
     let t = Instant::now();
     proof.first_leg(&first)?;
     timed(proof, "first", t);
+    if let Some(worker) = &worker {
+        let t = Instant::now();
+        proof.worker_leg(worker)?;
+        timed(proof, "worker", t);
+    }
     let t = Instant::now();
     proof.crash_leg(&first, pid_of("first"))?;
     timed(proof, "crash", t);

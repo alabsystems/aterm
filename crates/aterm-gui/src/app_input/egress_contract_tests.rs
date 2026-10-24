@@ -320,7 +320,9 @@ fn replies_stay_outside_the_paste_envelope_before_and_during_it() {
 
     let mut rest = Vec::new();
     let mut chunk = [0u8; 65536];
-    while !(rest.ends_with(b"K") && rest.windows(8).any(|w| w == b"\x1b[12;40R")) {
+    // The reply writer and the key's queue are unordered with each other (both tails are
+    // accepted below): wait for both, in either order.
+    while !(rest.contains(&b'K') && rest.windows(8).any(|w| w == b"\x1b[12;40R")) {
         let n = reader.read(&mut chunk).expect("the rest");
         assert!(n > 0, "peer open");
         rest.extend_from_slice(&chunk[..n]);

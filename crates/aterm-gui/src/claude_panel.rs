@@ -36,6 +36,11 @@ pub(crate) struct RowInk {
 pub(crate) struct PanelRead {
     pub(crate) panel: AgentsPanel,
     pub(crate) ink: [RowInk; PANEL_ROWS_MAX],
+    /// Whether each row is an `agy` subagent row whose unwrapped name cells
+    /// are already rainbow-tinted in `scratch.cells` by `claude_footer`.
+    pub(crate) agy_agent: [bool; PANEL_ROWS_MAX],
+    /// In-flight activity derived directly from `agy` subagent panel rows.
+    pub(crate) agy_flights: [aterm_agent::harness::flight::Flight; PANEL_ROWS_MAX],
     /// What the fold is told of each row's bullet colour.
     tints: [Tint; PANEL_ROWS_MAX],
     /// What each task row is matched to its agent's file by
@@ -62,6 +67,8 @@ pub(crate) fn read_panel(
     let mut read = PanelRead {
         panel,
         ink: [RowInk::default(); PANEL_ROWS_MAX],
+        agy_agent: [false; PANEL_ROWS_MAX],
+        agy_flights: [aterm_agent::harness::flight::Flight::Unknown; PANEL_ROWS_MAX],
         tints: [Tint::Plain; PANEL_ROWS_MAX],
         keys: [None; PANEL_ROWS_MAX],
     };
@@ -71,7 +78,34 @@ pub(crate) fn read_panel(
         let agy_agent = row.kind == RowKind::Agent
             && row
                 .bullet
-                .is_some_and(|(_, b)| b == aterm_phase::agents_panel::Bullet::Filled);
+                .is_some_and(|(_, b)| b == aterm_phase::agents_panel::Bullet::Filled)
+            && rows
+                .get(usize::from(row.row))
+                .and_then(|text| text.strip_prefix("  ● "))
+                .and_then(|body| body.split("  ").next())
+                .and_then(aterm_phase::agy::unwrap_agent_token)
+                .is_some();
+        read.agy_agent[i] = agy_agent;
+        if agy_agent
+            && let Some(text) = rows.get(usize::from(row.row))
+            && let Some((_, after_close)) = text.split_once(')')
+        {
+            let state = after_close.trim_start();
+            if let Some(tool) = aterm_phase::agy::subagent_tool_activity(state) {
+                let age_ms = row
+                    .elapsed
+                    .and_then(|(_, e)| e.clock())
+                    .map_or(0, |(ms, _)| ms);
+                read.agy_flights[i] = aterm_agent::harness::flight::Flight::Tool {
+                    call: row.activity_hash,
+                    tool: aterm_agent::harness::flight::ToolName::of(tool),
+                    age_ms,
+                    left_ms: aterm_agent::harness::flight::DEFAULT_BUDGET_MS,
+                };
+            } else if aterm_phase::agy::is_subagent_model_state(state) {
+                read.agy_flights[i] = aterm_agent::harness::flight::Flight::Model;
+            }
+        }
         let part = |span: Span| part_ink(scratch, cells, frame_row, pane, span, blank);
         let part_or_agy = |span: Span| {
             part(span).or_else(|| {
@@ -636,7 +670,9 @@ fn make_look(look: &LookIn<'_>, ink: &mut Vec<InkCell>, halo: &mut Vec<RainHalo>
                     put(col, text(PanelMark::Pointer, row_t, fg));
                 }
             }
-            if let Some(fg) = cells.name {
+            if !look.read.agy_agent[k]
+                && let Some(fg) = cells.name
+            {
                 let len = row.name.range().len();
                 for (j, col) in row.name.range().enumerate() {
                     put(col, text(PanelMark::Name, glass::name_x(row_t, j, len), fg));
@@ -701,6 +737,42 @@ fn make_look(look: &LookIn<'_>, ink: &mut Vec<InkCell>, halo: &mut Vec<RainHalo>
     }
     ink.sort_unstable_by_key(|c| (c.row, c.col));
     ink.dedup_by_key(|c| (c.row, c.col));
+}
+
+#[cfg(test)]
+pub(crate) fn look_for_test(
+    read: &PanelRead,
+    track: &PanelTrack,
+    palette: CardPalette,
+    pane: PaneGeom,
+    blank: RenderCell,
+) -> (Vec<InkCell>, Vec<RainHalo>) {
+    let mut ink = Vec::new();
+    let mut halo = Vec::new();
+    let dark = crate::claude_card::dark_ground(blank);
+    make_look(
+        &LookIn {
+            read,
+            track,
+            palette,
+            dark,
+            ground: pack(blank.bg),
+            serious: false,
+            crest_ms: None,
+            breath: glass::BREATH_REST,
+            pane,
+            px: Px {
+                cw: 8,
+                ch: 16,
+                pad: 0,
+                grid_top: 0,
+            },
+            skip: 0,
+        },
+        &mut ink,
+        &mut halo,
+    );
+    (ink, halo)
 }
 
 /// What window `wid` draws its panels with this frame.
@@ -804,7 +876,13 @@ impl App {
                 let placed = leaf.flights.as_deref().map(|table| {
                     aterm_agent::harness::flight::place(&leaf.read.keys, table, wall_ms())
                 });
-                let flights = placed.as_ref().map_or(&[][..], |f| &f[..]);
+                let flights = if let Some(f) = placed.as_ref() {
+                    &f[..]
+                } else if leaf.read.agy_agent.iter().any(|&b| b) {
+                    &leaf.read.agy_flights[..]
+                } else {
+                    &[][..]
+                };
                 if read_moved {
                     entry
                         .track

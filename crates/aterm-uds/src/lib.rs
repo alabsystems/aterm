@@ -56,6 +56,9 @@ pub mod latest;
 pub mod lifeline;
 /// Which listening socket a path names, so a hang-up is judged by the listener that accepted the stream and never by the pid alone.
 pub mod listener;
+/// Local interface addresses for retry decisions, read without connecting a socket.
+#[cfg(unix)]
+pub mod network;
 /// Captured subprocess output, optionally delegated to a caller-owned executor.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod output;

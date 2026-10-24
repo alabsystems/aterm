@@ -35,8 +35,9 @@ enum State {
     Blocks(FrameHeader),
     /// The input ended cleanly after a frame.
     Done,
-    /// An error was returned; the stream is not trusted past it.
-    Failed,
+    /// An error was returned; the stream is not trusted past it. It came at a
+    /// frame's magic number or header when `between_frames` holds.
+    Failed { between_frames: bool },
 }
 
 /// Decodes a stream of Zstandard frames read from `R`: the shape of `zstd::Decoder` (a [`Read`] adapter), for what atpkg's installer reads.
@@ -117,7 +118,22 @@ impl<R: BufRead> Decoder<R> {
                 Ok(true)
             }
             State::Done => Ok(false),
-            State::Failed => Err(io::Error::other("zstd: an earlier error ended this stream")),
+            State::Failed { .. } => {
+                Err(io::Error::other("zstd: an earlier error ended this stream"))
+            }
+        }
+    }
+
+    /// Whether all this decoder has decoded belongs to whole frames: before
+    /// the first frame, between frames, at the end, and after an error at a
+    /// frame's magic number or header, before any of that frame's content.
+    /// `false` inside a frame's blocks and after an error there.
+    #[must_use]
+    pub const fn between_frames(&self) -> bool {
+        match self.state {
+            State::FrameStart | State::Done => true,
+            State::Blocks(_) => false,
+            State::Failed { between_frames } => between_frames,
         }
     }
 
@@ -240,7 +256,9 @@ impl<R: BufRead> Read for Decoder<R> {
                 Ok(true) => {}
                 Ok(false) => return Ok(0),
                 Err(e) => {
-                    self.state = State::Failed;
+                    self.state = State::Failed {
+                        between_frames: self.between_frames(),
+                    };
                     self.out.start(0);
                     self.pos = 0;
                     return Err(e);
@@ -314,5 +332,43 @@ mod tests {
             Some(&DecodeError::NoChecksum)
         );
         assert!(decoder.read(&mut buf).is_err(), "the stream stays failed");
+    }
+
+    #[test]
+    fn an_error_at_a_frames_magic_or_header_leaves_the_decoder_between_frames() {
+        let mut whole = Vec::new();
+        frame::write_raw(&mut whole, b"kept", Checksum::Xxh64).unwrap();
+        let after = |tail: &[u8]| {
+            let mut zst = whole.clone();
+            zst.extend(tail);
+            zst
+        };
+        let mut bad_sum = after(&whole);
+        let at = bad_sum.len() - 1;
+        bad_sum[at] ^= 1;
+        for (zst, between, why) in [
+            (after(b"junk"), true, "not a frame"),
+            (after(b"ju"), true, "ends inside a frame"),
+            (
+                after(&[0x28, 0xb5, 0x2f, 0xfd, 0x01, 0x00, 7]),
+                true,
+                "dictionary",
+            ),
+            (
+                after(&whole[..whole.len() - 3]),
+                false,
+                "ends inside a frame",
+            ),
+            (bad_sum, false, "checksum"),
+        ] {
+            let mut decoder = Decoder::new(&zst[..]);
+            let mut out = Vec::new();
+            let e = decoder.read_to_end(&mut out).unwrap_err();
+            assert!(e.to_string().contains(why), "{e} names {why}");
+            assert_eq!(decoder.between_frames(), between, "{why}");
+            assert_eq!(out, b"kept", "{why}: the whole frame before it");
+            assert!(decoder.read(&mut [0; 1]).is_err());
+            assert_eq!(decoder.between_frames(), between, "a later read keeps it");
+        }
     }
 }

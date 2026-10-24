@@ -307,3 +307,24 @@ fn open_within_gives_up_on_a_bus_that_never_answers() {
     assert!(conn.unique_name().starts_with(':'));
     drop(answered.join().unwrap());
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn open_within_gives_up_on_a_bus_whose_backlog_is_full() {
+    use std::os::fd::AsRawFd as _;
+
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let (full, addresses) = listening(scratch.path(), "full");
+    // SAFETY: listen(2) on the listener's own open descriptor; a second call resizes its backlog.
+    assert_eq!(unsafe { libc::listen(full.as_raw_fd(), 0) }, 0);
+    let _queued = CtlStream::connect(scratch.path().join("full")).unwrap();
+    let (said, heard) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let joined = Connection::open_within(&addresses, Duration::from_millis(100));
+        let _ = said.send(joined.err());
+    });
+    let joined = heard
+        .recv_timeout(HANG)
+        .expect("the connect to a full backlog outlived the join's bound");
+    assert!(matches!(joined, Some(Error::Timeout)), "{joined:?}");
+}

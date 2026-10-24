@@ -2722,7 +2722,9 @@ pub fn on(opts: &OnOpts) -> ExitCode {
     if let Some(fleet) = role.fleet() {
         if opts.fleet.as_deref().is_some_and(|asked| asked != fleet) {
             eprintln!(
-                "aterm fabric on: this root belongs to fleet {fleet}; `aterm fabric off` first before choosing another fleet"
+                "aterm fabric on: this root belongs to fleet {fleet}; `aterm fabric off` and move \
+                 {} aside before choosing another fleet",
+                p.cap().display()
             );
             return ExitCode::from(2);
         }
@@ -3513,8 +3515,9 @@ pub fn fix_for(warning: &str, role: &Role) -> String {
         format!("{cause}; the bridge then reconnects on its own")
     } else if s("bus could not be read") || s("could not be read:") {
         format!(
-            "the cap file's grants do not cover this fleet, or the broker died mid-read: {again} \
-             re-mints the cap for the node id in the state dir and probes again; check `--fleet`"
+            "the cap file's grants do not cover this fleet, or the broker died mid-read: move \
+             <root>/node.cap aside and run {again}, which mints the cap for the node id in the \
+             state dir and probes again; check `--fleet`"
         )
     } else if s("no [fabric] command") {
         format!(
@@ -3522,7 +3525,10 @@ pub fn fix_for(warning: &str, role: &Role) -> String {
              a bridge on its own"
         )
     } else if s("no node id") {
-        format!("{again} provisions one and mints the cap for it")
+        format!(
+            "{again} provisions one and mints the cap for it (first move aside a node file \
+             that holds something else)"
+        )
     } else if s("cap file") {
         format!("{again} re-mints the cap file for the node id in the state dir")
     } else if s("has no bridge") {
@@ -3590,8 +3596,8 @@ pub fn fix_for(warning: &str, role: &Role) -> String {
             )
         }
     } else if s("lost") && s("evicted") {
-        "read mail sooner (`aterm ctl @<sid> await inbox`) and `inbox seen` what is handled; the \
-         evicted records are still on the bus"
+        "read mail sooner (`aterm ctl @<sid> await inbox since=<id>`) and `inbox seen` what is \
+         handled; the evicted records are still on the bus"
             .to_string()
     } else if s("passed its deadline") && s("@p passed") {
         "a person was asked: `aterm fabric inbox --cap-file <their cap>` shows it, and `aterm \

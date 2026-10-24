@@ -188,15 +188,23 @@ impl TypedStamps {
 
     /// Keep only the stamps `keep` admits, packed oldest-first in their banked order.
     pub(super) fn retain(&mut self, keep: impl Fn(Instant) -> bool) {
-        let mut kept = [None; TYPED_STAMP_DEPTH];
-        let mut n = 0;
-        for t in self.slots.into_iter().map_while(|s| s) {
+        let mut write = 0;
+        let mut read = 0;
+        while read < TYPED_STAMP_DEPTH {
+            let Some(t) = self.slots[read] else {
+                break;
+            };
             if keep(t) {
-                kept[n] = Some(t);
-                n += 1;
+                if write != read {
+                    self.slots[write] = Some(t);
+                }
+                write += 1;
             }
+            read += 1;
         }
-        self.slots = kept;
+        if write < read {
+            self.slots[write..read].fill(None);
+        }
     }
 
     /// Remove only the stamp(s) written at `at`.
@@ -205,7 +213,6 @@ impl TypedStamps {
     }
 
     /// Whether any stamp is banked, fresh or stale.
-    #[cfg(test)]
     #[inline]
     pub(crate) const fn armed(&self) -> bool {
         self.slots[0].is_some()

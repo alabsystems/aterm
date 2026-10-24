@@ -790,12 +790,10 @@ impl App {
 
     /// Drains messages queued in the pre-`App` inbox and reconciles the exceptions digest row.
     pub(crate) fn drain_message_inbox(&mut self) {
-        let workstation_finished = crate::message_inbox::take_workstation_setup_finished();
         let queued = crate::message_inbox::take_queued();
         let exceptions = crate::message_inbox::take_queued_exceptions();
         let folders = crate::spawn_folder::take_noted();
-        if queued.is_empty() && exceptions.is_empty() && folders.is_empty() && !workstation_finished
-        {
+        if queued.is_empty() && exceptions.is_empty() && folders.is_empty() {
             return;
         }
         for word in &exceptions {
@@ -811,10 +809,6 @@ impl App {
                     self.post_unsynced(m.message, m.stamp);
                 }
             }
-        }
-        if workstation_finished {
-            self.except_clear(&crate::message_reporters::workstation_accounts_entry().key());
-            self.except_clear(&crate::message_reporters::workstation_setup_failure_entry().key());
         }
         let _ = self.keep_config_rows_settings_shows_as_records();
         if !folders.is_empty() {
@@ -1091,10 +1085,6 @@ impl App {
             _ => false,
         };
         let performed = self.perform_intent(wid, id, intent.clone());
-        let applies = applies
-            || (performed
-                && intent == Intent::ReviewVaultSync
-                && self.native_runtime.system_state_shows_vault_sync());
         let feedback = act_feedback(&intent, performed, applies);
         if performed {
             MessageActOutcome::Performed { feedback }

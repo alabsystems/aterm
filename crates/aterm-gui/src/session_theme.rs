@@ -133,14 +133,21 @@ impl App {
         &self,
         selector: &str,
     ) -> Result<ResolvedColors, String> {
+        self.resolve_session_selector_on(self.os_appearance, selector)
+    }
+
+    /// Resolve `selector` as a session theme on `side`, through the catalog alone (never the community pack): the colours, or why it does not draw.
+    pub(crate) fn resolve_session_selector_on(
+        &self,
+        side: aterm_types::Appearance,
+        selector: &str,
+    ) -> Result<ResolvedColors, String> {
         if let Some(notice) = crate::app_config::theme_selector_notice(Some(selector)) {
             return Err(notice);
         }
-        let colors = self.config.resolved_colors(
-            self.os_appearance,
-            &self.config_assets.themes,
-            Some(selector),
-        );
+        let colors = self
+            .config
+            .resolved_colors(side, &self.config_assets.themes, Some(selector));
         match &colors.source {
             ThemeSource::DefaultFallback { reason } => Err(reason.clone()),
             ThemeSource::Builtin | ThemeSource::File(_) | ThemeSource::Pack(_) => Ok(colors),

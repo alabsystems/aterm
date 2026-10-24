@@ -369,10 +369,16 @@ impl FxAtlasSide {
     fn admit(&mut self, draw: &[Arc<FxArt>], hint: &[Arc<FxArt>], cap: u32) {
         self.clock += 1;
         let clock = self.clock;
+        let mut all_resident = true;
         for art in draw.iter().chain(hint) {
             if let Some(r) = self.resident.get_mut(&art.id()) {
                 r.used = clock;
+            } else {
+                all_resident = false;
             }
+        }
+        if all_resident {
+            return;
         }
         let mut overflow = false;
         for art in draw {
@@ -819,10 +825,10 @@ struct FxCur {
     /// The item's `ink`: its offset into its content's palette.
     ink: u32,
     flags: u32,
-    /// Whether the fragment reads the palette (every kind but Premul).
-    reads_palette: bool,
     /// The content's key in `bases`.
     content: usize,
+    /// Resolved frame-palette offset (`Some(0)` when the fragment reads no palette).
+    pal: Option<u32>,
     /// A Ramps item's last drawable row bound (exclusive, window px): rows
     /// past the palette write nothing, so slices are cut there.
     y_limit: i64,
@@ -914,8 +920,8 @@ impl<'a> FxSliceSink<'a> for FxBuild<'_, 'a> {
                 src,
                 ink,
                 flags,
-                reads_palette,
                 content: Arc::as_ptr(&layer.content) as usize,
+                pal: (!reads_palette).then_some(0),
                 y_limit,
             },
             &layer.content,
@@ -924,27 +930,30 @@ impl<'a> FxSliceSink<'a> for FxBuild<'_, 'a> {
     }
 
     fn slice(&mut self, s: FxSlice, _band: usize) {
-        let Some((cur, content)) = self.cur else {
+        let Some((cur, content)) = &mut self.cur else {
             return;
         };
         let y1 = (s.y1 as i64).min(cur.y_limit);
         if (s.y0 as i64) >= y1 {
             return;
         }
-        let pal = if cur.reads_palette {
-            let base = match self.bases.iter().find(|(k, _)| *k == cur.content) {
-                Some(&(_, base)) => base,
-                None => {
-                    let base = self.palette.len() as u32;
-                    self.palette
-                        .extend(content.palette().iter().map(|&ink| palette_word(ink)));
-                    self.bases.push((cur.content, base));
-                    base
-                }
-            };
-            base + cur.ink
-        } else {
-            0
+        let pal = match cur.pal {
+            Some(pal) => pal,
+            None => {
+                let base = match self.bases.iter().rev().find(|(k, _)| *k == cur.content) {
+                    Some(&(_, base)) => base,
+                    None => {
+                        let base = self.palette.len() as u32;
+                        self.palette
+                            .extend(content.palette().iter().map(|&ink| palette_word(ink)));
+                        self.bases.push((cur.content, base));
+                        base
+                    }
+                };
+                let pal = base + cur.ink;
+                cur.pal = Some(pal);
+                pal
+            }
         };
         self.out[cur.stream as usize].push(FxInstance {
             rect: [

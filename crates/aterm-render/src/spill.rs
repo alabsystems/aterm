@@ -589,8 +589,21 @@ impl FxCanvas for StripCanvas<'_> {
     }
 
     fn ramp(&mut self, y: usize, x0: usize, x1: usize, i0: u32, qw: u32, c0: FxInk, c1: FxInk) {
+        if c0 == c1 {
+            self.flat(y, x0, x1, c0.color, c0.alpha);
+            return;
+        }
         let k = self.span(y, x0, x1);
         fx_raster::fill_glow_span(&mut self.color[k.clone()], i0, qw, c0, c1);
+        if c0.alpha == c1.alpha {
+            let a = c0.alpha;
+            for (j, v) in self.cover[k].iter_mut().enumerate() {
+                let i = i0 + j as u32;
+                let c = crate::glow_lerp_rgb(c0.color, c1.color, i, qw);
+                *v = cover_union(*v, a.max(max_channel(c)));
+            }
+            return;
+        }
         let (a0, a1) = (u32::from(c0.alpha), u32::from(c1.alpha));
         for (j, v) in self.cover[k].iter_mut().enumerate() {
             let i = i0 + j as u32;
@@ -624,11 +637,29 @@ fn replay_flat_add(color: &mut [u32], cover: &mut [u8], s: StripRect, quads: &[G
         let Some((x0, y0, xe, ye)) = clip_to_strip(s, q.rect()) else {
             continue;
         };
+        if q.is_flat() {
+            let a = q.alpha;
+            let c = q.color;
+            let ap = a.max(max_channel(c));
+            for y in y0..ye {
+                let row = (y - s.y) * s.w;
+                let span = row + (x0 - s.x)..row + (xe - s.x);
+                fx_raster::fill_flat(&mut color[span.clone()], c, a);
+                for v in &mut cover[span] {
+                    *v = cover_union(*v, ap);
+                }
+            }
+            continue;
+        }
         let (a0, a1) = (u32::from(q.alpha), u32::from(q.alpha2));
         let qw = u32::from(q.w);
         for x in x0..xe {
             let i = (x - q.x as usize) as u32;
-            let a = crate::glow_lerp(a0, a1, i, qw) as u8;
+            let a = if a0 == a1 {
+                q.alpha
+            } else {
+                crate::glow_lerp(a0, a1, i, qw) as u8
+            };
             let c = crate::glow_lerp_rgb(q.color, q.color2, i, qw);
             let ap = a.max(max_channel(c));
             for y in y0..ye {

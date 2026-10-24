@@ -187,7 +187,7 @@ impl App {
             return;
         }
         match change {
-            Some(Some(id)) if self.theme_preview_unavailable(&id).is_none() => {
+            Some(Some(id)) if self.session_theme_unavailable(&id).is_none() => {
                 self.set_session_theme(
                     trial.session,
                     Some(crate::session_theme::SessionTheme {
@@ -267,7 +267,7 @@ impl App {
             if self.pool.get(trial.session).is_none() {
                 return;
             }
-            let theme = match self.theme_preview_unavailable(id) {
+            let theme = match self.session_theme_unavailable(id) {
                 None => Some(crate::session_theme::SessionTheme {
                     selector: id.to_string(),
                     origin: crate::session_theme::SessionThemeOrigin::Ctl,

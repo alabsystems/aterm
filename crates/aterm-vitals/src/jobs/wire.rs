@@ -5,7 +5,7 @@
 
 use std::fmt::Write as _;
 
-use super::{Class, Findings, JobKind, JobRow, Verdict, Wait, WaitName};
+use super::{Class, Findings, JobKind, JobRow, StartWait, Verdict, Wait, WaitName};
 
 /// φ × 1000 as the row prints it.
 #[must_use]
@@ -340,12 +340,26 @@ impl Findings {
                 n.for_ms
             ));
         }
-        for n in &self.program_check {
+        for (wait, list) in [
+            (StartWait::ProgramCheck, &self.program_check),
+            (StartWait::Translating, &self.translating),
+            (StartWait::NotStarted, &self.not_started),
+        ] {
+            for n in list {
+                out.push(format!(
+                    "finding kind={} pid={} exe={} for_ms={}",
+                    wait.word(),
+                    n.pid,
+                    exe_word(&n.name),
+                    n.for_ms
+                ));
+            }
+        }
+        for n in &self.probably_program_check {
             out.push(format!(
-                "finding kind=program-check pid={} exe={} for_ms={}",
+                "finding kind=probably-program-check pid={} exe={} heuristic=fresh-dylib",
                 n.pid,
-                exe_word(&n.name),
-                n.for_ms
+                exe_word(&n.name)
             ));
         }
         let mut t = format!("finding kind=process-table own={}", self.own_procs);

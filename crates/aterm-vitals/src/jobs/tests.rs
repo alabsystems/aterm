@@ -171,6 +171,7 @@ fn file(fd: i32) -> Fd {
             dev: 1,
             ino: 2,
             lf_tail: None,
+            fresh_dylib: false,
         },
     }
 }

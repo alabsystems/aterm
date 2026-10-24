@@ -85,6 +85,7 @@ fn record() -> SessionRecord {
         task: None,
         status_seen: None,
         autopilot_end: None,
+        wakes: None,
     }
 }
 

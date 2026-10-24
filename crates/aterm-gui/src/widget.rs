@@ -369,6 +369,54 @@ pub(crate) enum DrawPrim {
         icon: aterm_render::BandIcon,
         color: Rgba,
     },
+    /// A bitmap in the `w`×`h` rect at `(x, y)`, baked at device scale: the
+    /// raster bakes `art` at exactly the rect's device size, once per size
+    /// (cached), so it is sharp at every display scale and never resampled.
+    Image {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        art: ImageArt,
+    },
+}
+
+/// What a [`DrawPrim::Image`] shows. Each is baked from vector art at the
+/// device size it is drawn at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum ImageArt {
+    /// The aterm · ALab rainbow kitty: the pet roster's tabby mid-stretch
+    /// (`PetStretchHind`: long body, tail up, content closed eyes, the pose of
+    /// `assets/aterm-rainbow-kitty.png`) in the brand coat, its keyline pale
+    /// on a dark ground.
+    BrandKitty { dark: bool },
+}
+
+impl ImageArt {
+    const BRAND_POSE: aterm_effects::pet_glyphs_gen::PetGlyphId =
+        aterm_effects::pet_glyphs_gen::PetGlyphId::PetStretchHind;
+
+    /// The art's authored width ÷ height: a caller sizes its rect from it, so
+    /// the bake is never stretched.
+    pub(crate) fn aspect(self) -> f32 {
+        match self {
+            Self::BrandKitty { .. } => aterm_effects::pet_baker::PetBaker::aspect(Self::BRAND_POSE),
+        }
+    }
+
+    /// Straight-alpha RGBA8 rows of the art at exactly `w`×`h` device pixels.
+    pub(crate) fn bake(self, w: u32, h: u32) -> Vec<u8> {
+        match self {
+            Self::BrandKitty { dark } => aterm_effects::pet_baker::bake_pose(
+                Self::BRAND_POSE,
+                &aterm_effects::cat_baker::ResolvedFills::from_indices(13, 4, dark),
+                w,
+                h,
+            )
+            .pixels()
+            .to_vec(),
+        }
+    }
 }
 
 /// Translate every prim by `(dx, dy)` frame px, e.g. to rasterize a floating card into a
@@ -380,7 +428,8 @@ pub(crate) fn translate_prims(prims: &mut [DrawPrim], dx: f32, dy: f32) {
             | DrawPrim::Capsule { x, y, .. }
             | DrawPrim::Stroke { x, y, .. }
             | DrawPrim::ClipPush { x, y, .. }
-            | DrawPrim::BandIcon { x, y, .. } => {
+            | DrawPrim::BandIcon { x, y, .. }
+            | DrawPrim::Image { x, y, .. } => {
                 *x += dx;
                 *y += dy;
             }

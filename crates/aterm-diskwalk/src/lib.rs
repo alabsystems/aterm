@@ -29,11 +29,14 @@ pub use walk::{
     Walker, diskwalk_size_full, entry_count_of, list_one_level,
 };
 
-// Both read Unix spellings (`/Users//a`, which Windows reads as relative); off Unix every
-// walk is `Refusal::Unsupported`.
+// Both read Unix spellings (`/Users//a`, which Windows reads as relative).
 #[cfg(all(test, unix))]
 #[path = "lib_tests.rs"]
 mod tests;
 #[cfg(all(test, unix))]
 #[path = "walk_tests.rs"]
 mod walk_tests;
+// Off Unix every walk and look is `Refusal::Unsupported`.
+#[cfg(all(test, not(unix)))]
+#[path = "off_unix_tests.rs"]
+mod off_unix_tests;

@@ -243,25 +243,31 @@ pub fn apply(
     let sy0 = (y0 as usize).saturating_sub(d);
     let sx1 = (x1 as usize).saturating_add(d).min(w);
     let sy1 = (y1 as usize).saturating_add(d).min(h);
+    let mut taps = [(0.0f32, 0.0f32, 0.0f32); 25];
+    let mut wsum = 0.0f32;
+    let mut tap_idx = 0usize;
+    for j in -2i32..=2 {
+        for i in -2i32..=2 {
+            let (oi, oj) = (i as f32 * tu, j as f32 * tv);
+            let weight = (-((i * i + j * j) as f32) / 4.0).exp();
+            taps[tap_idx] = (oi, oj, weight);
+            wsum += weight;
+            tap_idx += 1;
+        }
+    }
     for py in sy0..sy1 {
         let v = (py as f32 + 0.5) / h as f32;
         for px in sx0..sx1 {
             let u = (px as f32 + 0.5) / w as f32;
             let mut white = 0.0f32;
             let mut chroma = [0.0f32; 3];
-            let mut wsum = 0.0f32;
-            for j in -2i32..=2 {
-                for i in -2i32..=2 {
-                    let (oi, oj) = (i as f32 * tu, j as f32 * tv);
-                    let weight = (-((i * i + j * j) as f32) / 4.0).exp();
-                    let sw = sample(u + oi * rw, v + oj * rw);
-                    white += white_part(sw) * weight;
-                    let sc = sample(u + oi * rc, v + oj * rc);
-                    let wc = white_part(sc);
-                    for k in 0..3 {
-                        chroma[k] += (sc[k] - wc) * weight;
-                    }
-                    wsum += weight;
+            for &(oi, oj, weight) in &taps {
+                let sw = sample(u + oi * rw, v + oj * rw);
+                white += white_part(sw) * weight;
+                let sc = sample(u + oi * rc, v + oj * rc);
+                let wc = white_part(sc);
+                for k in 0..3 {
+                    chroma[k] += (sc[k] - wc) * weight;
                 }
             }
             let src = [
@@ -310,6 +316,16 @@ pub fn sdr_crown(
             (qx + usize::from(q.w)).min(w),
             (qy + usize::from(q.h)).min(h),
         );
+        if q.color == q.color2 {
+            let src = channels(q.color).map(|v| v * budget);
+            for py in qy..ye {
+                for px in qx..xe {
+                    let idx = py * w + px;
+                    frame.pixels[idx] = screen(frame.pixels[idx], src);
+                }
+            }
+            continue;
+        }
         let wq = u32::from(q.w);
         for py in qy..ye {
             for px in qx..xe {

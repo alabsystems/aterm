@@ -26,6 +26,9 @@ mod seed_matrix;
 #[path = "tap_clock_loop_tests.rs"]
 mod tap_clock_loop;
 
+#[path = "log_wake_loop_tests.rs"]
+mod log_wake_loop;
+
 fn hosted(max_s: u64) -> SuperviseOpts {
     SuperviseOpts {
         policy: SupervisorConfig {

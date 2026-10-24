@@ -12,74 +12,6 @@ fn a_volume_short_while_cleanup_is_off_is_not_the_passes_line() {
     assert_eq!(off.mover(), settings.mover());
 }
 
-#[test]
-fn blocked_account_automation_permission_remains_an_owner_step_in_the_digest() {
-    let entry = super::workstation_accounts_entry();
-    let message = entry
-        .message()
-        .expect("the account step passes the digest rule");
-    assert_eq!(
-        entry.family().mode(),
-        aterm_messages::exceptions::Mode::Event
-    );
-    assert!(
-        message.actions.is_empty(),
-        "the permission is controlled by macOS"
-    );
-    let aterm_messages::need::Need::Later(ask) = message.need() else {
-        panic!("an account automation permission block belongs in the digest");
-    };
-    assert_eq!(ask.resurface(), aterm_messages::need::Resurface::CHOICE);
-    assert!(entry.mover().is_none());
-}
-
-#[test]
-fn incomplete_workstation_setup_is_a_separate_manual_digest_step() {
-    let entry = super::workstation_setup_failure_entry();
-    let message = entry
-        .message()
-        .expect("the setup failure passes the digest rule");
-    assert_ne!(entry.key(), super::workstation_accounts_entry().key());
-    assert_eq!(
-        entry.family().mode(),
-        aterm_messages::exceptions::Mode::Event
-    );
-    assert!(message.actions.is_empty());
-    let aterm_messages::need::Need::Later(ask) = message.need() else {
-        panic!("incomplete workstation setup belongs in the digest");
-    };
-    assert_eq!(ask.resurface(), aterm_messages::need::Resurface::CHOICE);
-    assert!(entry.mover().is_none());
-}
-
-#[test]
-fn incomplete_workstation_setup_points_at_system_state() {
-    let (title, why, then, more) = entry_words(&super::workstation_setup_failure_entry());
-    assert_eq!(title, "Mac setup needs attention");
-    assert_eq!(why, "background setup has not finished every step");
-    assert_eq!(then, "Open aterm \u{25B8} System State\u{2026}");
-    for line in std::iter::once(&then).chain(&more) {
-        assert!(!line.contains("doctor"), "{line}");
-    }
-    assert!(
-        more.iter().any(|line| line.contains("System State")),
-        "{more:?}"
-    );
-}
-
-#[test]
-fn the_system_state_words_name_the_real_menu_row() {
-    let named = crate::menu::MENU_MODEL.iter().find_map(|section| {
-        section
-            .entries
-            .iter()
-            .flat_map(crate::menu::MenuEntry::items)
-            .find(|(_, action, _, _)| *action == crate::menu::MenuAction::SystemState)
-            .map(|(label, ..)| format!("{} \u{25B8} {label}", section.title))
-    });
-    assert_eq!(named.as_deref(), Some(super::SYSTEM_STATE_MENU));
-}
-
 fn entry_words(entry: &Entry) -> (String, String, String, Vec<String>) {
     let msg = entry
         .message()
@@ -1637,37 +1569,6 @@ fn gesture_failures() -> Vec<Message> {
 }
 
 #[test]
-fn the_file_access_entry_is_honest_and_fence_clean() {
-    use crate::consent_card::{NeedCause, NeedWords};
-    let words = NeedWords::sample();
-    let entry = file_access_entry(&words);
-    let msg = entry.message().expect("the words pass the rule");
-    assert_eq!(
-        msg.actions,
-        [Intent::OpenSystemPane {
-            pane: PANE_FULL_DISK_ACCESS.to_string()
-        }]
-    );
-    let regressed = file_access_entry(&NeedWords {
-        regressed: true,
-        ..words
-    });
-    regressed.message().expect("the words pass the rule");
-    let denied = file_access_entry(&NeedWords {
-        cause: NeedCause::ProtectedRead { session: None },
-        ..words
-    });
-    denied.message().expect("the words pass the rule");
-    assert_eq!(denied.key(), entry.key(), "a refused read is the same need");
-    assert_eq!(
-        FDA_ENTRY_KEYS,
-        [entry.key().as_str(), regressed.key().as_str()],
-        "what a grant clears is exactly what the builder can raise"
-    );
-    assert_ne!(entry.key(), KEY_FILE_ACCESS);
-}
-
-#[test]
 fn a_failed_gesture_is_a_short_row_with_the_whole_error_behind_details() {
     let long = "x".repeat(200);
     assert_eq!(
@@ -3030,62 +2931,6 @@ fn the_disk_full_alert_says_what_ends_it() {
         );
         assert!(!moved.detail[2].contains(&figure), "{cause:?}");
     }
-}
-
-/// THE DEVTOOLS ENTRY LEADS WITH THE LIVE WAIT WHILE ONE STANDS: for each step the live line
-/// takes the first line behind Details, the one every step keeps, in place of why the list
-/// matters, and the step's own lines follow it whole within `MORE_LINES`; a row already on has no
-/// switch-on line.
-#[test]
-fn the_devtools_entry_leads_with_the_live_wait_while_one_stands() {
-    use aterm_messages::exceptions::MORE_LINES;
-    use atpkg::devtools::Step;
-    let skips = aterm_containment::SpikeEvidence::MEASURED.devtool_skips_first_run_check;
-    let more = |step, live| {
-        let msg = super::devtools_entry(step, live)
-            .message()
-            .expect("the entry passes the digest rule");
-        msg.detail[2..].to_vec()
-    };
-    let nine = super::HeldLine {
-        count: 9,
-        oldest_ms: 35_940_000,
-    };
-    let words = "now: 9 programs aterm started wait for macOS's program check, the oldest 9 h 59 m";
-    assert_eq!(nine.words(), words);
-    assert_eq!(
-        super::HeldLine {
-            count: 1,
-            oldest_ms: 20_000
-        }
-        .words(),
-        "now: 1 program aterm started waits for macOS's program check, for 20 s"
-    );
-    for step in [Step::Add, Step::SwitchOn, Step::ListedOn] {
-        let plain = more(step, None);
-        let held = more(step, Some(nine));
-        assert_eq!(plain[0], atpkg::devtools::why(skips), "{step:?}");
-        assert_eq!(held[0], words, "{step:?}: the live line leads");
-        assert_eq!(
-            held[1..],
-            plain[1..],
-            "{step:?}: the step's own lines follow"
-        );
-        assert_eq!(
-            held.len(),
-            MORE_LINES,
-            "{step:?}: every line kept: {held:?}"
-        );
-        assert_eq!(
-            held.iter().any(|l| l.starts_with("Once it is on")),
-            step != Step::ListedOn,
-            "{step:?}: {held:?}"
-        );
-    }
-    assert_eq!(
-        more(Step::ListedOn, Some(nine))[1],
-        atpkg::devtools::HELPER_LISTED_ON
-    );
 }
 
 /// A BACKED-UP EPISODE OF MACOS'S PROGRAM CHECK IS A RECORD AT EACH EDGE: the opening says how

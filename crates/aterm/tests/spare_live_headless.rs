@@ -1039,6 +1039,20 @@ impl Leftover {
     fn alive(&self) -> bool {
         aterm_pty::process_birth(self.pid) == Some(self.birth)
     }
+
+    /// Whether the shell runs and waits in the kernel: once nothing writes its FIFO, the only wait
+    /// its hold has left is the open of that FIFO.
+    fn waits(&self) -> bool {
+        let req = aterm_sysprobe::jobs::ReadReq {
+            pid: self.pid.unsigned_abs(),
+            fds: false,
+        };
+        aterm_sysprobe::jobs::JobsReader::new()
+            .read(req)
+            .is_some_and(|f| {
+                f.start == Some(self.birth) && f.state == aterm_sysprobe::jobs::RunState::Sleeping
+            })
+    }
 }
 
 impl Drop for Leftover {
@@ -1050,19 +1064,23 @@ impl Drop for Leftover {
     }
 }
 
-#[test]
-fn a_crashed_instances_spare_is_released_by_the_next_launch() {
-    let mut crashed = boot_spare(
-        "aterm-spare-l12",
-        "if [[ ${__aterm_spare_mode-} == warm ]]; then\n  trap '' HUP\n  echo $$ > \"$HOME/spare-pid\"\nfi\nPS1='SPARE%# '\n",
+/// An rc whose warm spare ignores the hangup and writes its pid to `~/spare-pid`, so only a
+/// retire or a release of its FIFO ends it.
+const HUP_DEAF_RC: &str = "if [[ ${__aterm_spare_mode-} == warm ]]; then\n  trap '' HUP\n  echo $$ > \"$HOME/spare-pid\"\nfi\nPS1='SPARE%# '\n";
+
+/// [`boot_spare`] with [`HUP_DEAF_RC`], once its spare is ready: the instance and that spare.
+fn boot_hup_deaf_spare(prefix: &str) -> (Instance, Leftover) {
+    let inst = boot_spare(
+        prefix,
+        HUP_DEAF_RC,
         "spare_shell_needs_person = false",
         &[
             ("ATERM_DEBUG_SPARE_ELIGIBLE", "1"),
             ("ATERM_DEBUG_SPARE_IDLE_MS", "100"),
         ],
     );
-    await_spare(&crashed, "ready");
-    let pid: i32 = std::fs::read_to_string(crashed.tmp.join("home/spare-pid"))
+    await_spare(&inst, "ready");
+    let pid: i32 = std::fs::read_to_string(inst.tmp.join("home/spare-pid"))
         .expect("the warm rc wrote its pid")
         .trim()
         .parse()
@@ -1071,6 +1089,12 @@ fn a_crashed_instances_spare_is_released_by_the_next_launch() {
         pid,
         birth: aterm_pty::process_birth(pid).expect("the ready spare runs"),
     };
+    (inst, spare)
+}
+
+#[test]
+fn a_crashed_instances_spare_is_released_by_the_next_launch() {
+    let (mut crashed, spare) = boot_hup_deaf_spare("aterm-spare-l12");
     let spare_dir = crashed.tmp.join("run/aterm/spare");
     crashed.child.kill().expect("SIGKILL the instance");
     crashed.child.wait().expect("reap the instance");
@@ -1098,6 +1122,30 @@ fn a_crashed_instances_spare_is_released_by_the_next_launch() {
             "the next launch never released the crashed instance's spare (alive: {}; left: {:?})",
             spare.alive(),
             spare_entries(&spare_dir)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_test_worlds_teardown_releases_its_killed_instances_spare() {
+    let (mut inst, spare) = boot_hup_deaf_spare("aterm-spare-l15");
+    inst.child.kill().expect("SIGKILL the instance");
+    inst.child.wait().expect("reap the instance");
+    // The teardown starts once the shell waits opening its FIFO again: earlier, the world's removal
+    // could unlink the link before the shell looks for it, and the shell would end with no release.
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the spare's shell waits opening its FIFO",
+        || spare.waits().then_some(()),
+    );
+    drop(inst);
+    let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    while spare.alive() {
+        assert!(
+            Instant::now() < give_up,
+            "the spare's shell (pid {}) outlived its instance's teardown",
+            spare.pid
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
@@ -1142,25 +1190,7 @@ PS1='SPARE%# '
 
 #[test]
 fn quitting_with_a_spare_retires_it_before_the_exit() {
-    let mut inst = boot_spare(
-        "aterm-spare-l9",
-        "if [[ ${__aterm_spare_mode-} == warm ]]; then\n  trap '' HUP\n  echo $$ > \"$HOME/spare-pid\"\nfi\nPS1='SPARE%# '\n",
-        "spare_shell_needs_person = false",
-        &[
-            ("ATERM_DEBUG_SPARE_ELIGIBLE", "1"),
-            ("ATERM_DEBUG_SPARE_IDLE_MS", "100"),
-        ],
-    );
-    await_spare(&inst, "ready");
-    let pid: i32 = std::fs::read_to_string(inst.tmp.join("home/spare-pid"))
-        .expect("the warm rc wrote its pid")
-        .trim()
-        .parse()
-        .expect("a pid");
-    let spare = Leftover {
-        pid,
-        birth: aterm_pty::process_birth(pid).expect("the ready spare runs"),
-    };
+    let (mut inst, spare) = boot_hup_deaf_spare("aterm-spare-l9");
     let spare_dir = inst.tmp.join("run/aterm/spare");
     assert!(
         !spare_entries(&spare_dir).is_empty(),

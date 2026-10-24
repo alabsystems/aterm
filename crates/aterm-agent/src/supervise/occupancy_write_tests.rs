@@ -43,6 +43,10 @@ struct DoorHost {
     /// The task record's answer to the task door ([`IdleHost::task_fact`]); `None`, a record's:
     /// `noted` for a word, `cleared` for none.
     note: Mutex<Option<NoteOutcome>>,
+    /// A clear can remain fenced while a replacement note is accepted.
+    clear_note: Mutex<Option<NoteOutcome>>,
+    /// The host's persistent task slot across loop instances: edits alone move its revision.
+    record: Mutex<(Option<FactWord>, u64)>,
 }
 
 impl DoorHost {
@@ -118,12 +122,23 @@ impl IdleHost for DoorHost {
             "task_fact {}",
             word.map_or_else(|| "-".to_string(), FactWord::word)
         ));
-        let answer = *self.note.lock().expect("note");
-        answer.unwrap_or(if word.is_some() {
+        let answer = word
+            .is_none()
+            .then(|| *self.clear_note.lock().expect("clear_note"))
+            .flatten()
+            .or(*self.note.lock().expect("note"));
+        let answer = answer.unwrap_or(if word.is_some() {
             NoteOutcome::Noted
         } else {
             NoteOutcome::Cleared
-        })
+        });
+        if matches!(answer, NoteOutcome::Noted | NoteOutcome::Cleared) {
+            let mut record = self.record.lock().expect("record");
+            if record.0 != word {
+                *record = (word, record.1 + 1);
+            }
+        }
+        answer
     }
 }
 
@@ -308,6 +323,8 @@ struct Script<'a> {
     set: &'a dyn Fn(&mut Mock),
     host: Arc<DoorHost>,
     seed: Option<(String, i64)>,
+    /// Cross-loop fixtures need ledger stamps and hold arithmetic on the same clock.
+    virtual_time: bool,
 }
 
 fn policy(occupancy: Occupancy) -> SupervisorConfig {
@@ -327,7 +344,13 @@ impl<'a> Script<'a> {
             set: &|_| {},
             host: Arc::new(DoorHost::default()),
             seed: None,
+            virtual_time: false,
         }
+    }
+
+    fn virtualized(mut self) -> Self {
+        self.virtual_time = true;
+        self
     }
 
     fn run(self, before: Before<'_>) -> Ran {
@@ -356,8 +379,17 @@ impl<'a> Script<'a> {
             let clock = Arc::new(crate::supervise::fx::ScriptedClock::default());
             clock.stand_mono();
             clock.set_at_ms(start_ms);
+            let virtual_clock = self.virtual_time.then(|| {
+                Arc::new(crate::supervise::fx::VirtualClock::new(
+                    Instant::now(),
+                    start_ms,
+                ))
+            });
             let mut s = session(&mut logged, Some("@s-1".to_string()));
-            s.set_fx(Fx::over(ClockSource::Scripted(Arc::clone(&clock))));
+            s.set_fx(Fx::over(virtual_clock.as_ref().map_or_else(
+                || ClockSource::Scripted(Arc::clone(&clock)),
+                |clock| ClockSource::Virtual(Arc::clone(clock)),
+            )));
             s.ledger = approvals::Ledger::open(Some(&path), Some("@s-1"), &mut Vec::new());
             s.stall_host = Some(Arc::clone(&self.host) as Arc<dyn IdleHost>);
             s.setup.background_settle = Duration::ZERO;
@@ -370,7 +402,14 @@ impl<'a> Script<'a> {
             for (i, s_at) in self.at_s.iter().enumerate() {
                 let ahead = start_ms + s_at * 1000 - at_ms;
                 if ahead > 0 {
-                    skip(&clock, &mut at_ms, ahead);
+                    if virtual_clock.is_some() {
+                        s.fx.sleep(Duration::from_millis(
+                            u64::try_from(ahead).expect("forward"),
+                        ));
+                        at_ms += ahead;
+                    } else {
+                        skip(&clock, &mut at_ms, ahead);
+                    }
                 }
                 let looked_at = start_ms + (at_ms - start_ms).div_euclid(60_000) * 60_000;
                 let board = self.host.board.lock().expect("board").taken_ms > 0;
@@ -2561,6 +2600,313 @@ fn a_standing_word_with_no_hold_open_is_cleared_at_the_seed_under_prompt_alone()
         Vec::<String>::new(),
         "the open hold's close clears it"
     );
+}
+
+#[test]
+fn an_accepted_replacement_fact_retires_an_older_fenced_clear() {
+    let host = Arc::new(DoorHost::default());
+    *host.clear_note.lock().expect("clear_note") = Some(NoteOutcome::Fenced);
+    let seen = Arc::clone(&host);
+    let cfg = policy(Occupancy::Prompt);
+    let ran = Script {
+        host,
+        ..Script::new(
+            "write-task-replacement-clear",
+            Occupancy::Prompt,
+            &[0, 31 * 60, 32 * 60, 33 * 60],
+        )
+    }
+    .run(&mut |s, i| {
+        s.turn_end.set_managed(true);
+        if i == 0 {
+            s.door_task_seed(FactWord::new(RuleId::HoldRoom, 1), &cfg);
+        }
+        if i == 2 {
+            *seen.clear_note.lock().expect("clear_note") = Some(NoteOutcome::Cleared);
+        }
+        if i == 3 {
+            let calls = seen.calls();
+            let replacement = calls
+                .iter()
+                .rposition(|call| call == &format!("task_fact {NUDGE}#1"))
+                .expect("the new hold's fact was noted");
+            assert!(
+                calls[replacement + 1..]
+                    .iter()
+                    .all(|call| call != "task_fact -"),
+                "a delayed old clear must not erase the new hold's fact: {calls:?}"
+            );
+        }
+    });
+    assert!(ran.writes().is_empty());
+    assert_eq!(
+        task_rows(&ran.ledger)
+            .iter()
+            .filter(|row| row.3.ends_with(" door=task noted"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn a_fenced_clear_without_a_replacement_retries_until_acknowledged() {
+    let host = Arc::new(DoorHost::default());
+    *host.clear_note.lock().expect("clear_note") = Some(NoteOutcome::Fenced);
+    let seen = Arc::clone(&host);
+    let cfg = policy(Occupancy::Prompt);
+    let ran = Script {
+        host,
+        ..Script::new("write-task-retry-clear", Occupancy::Prompt, &[0, 60, 120])
+    }
+    .run(&mut |s, i| {
+        if i == 0 {
+            s.door_task_seed(FactWord::new(RuleId::HoldRoom, 1), &cfg);
+        }
+        if i == 1 {
+            *seen.clear_note.lock().expect("clear_note") = Some(NoteOutcome::Cleared);
+        }
+    });
+    assert_eq!(
+        task_facts(&ran),
+        ["task_fact -", "task_fact -", "task_fact -"]
+    );
+    assert_eq!(task_rows(&ran.ledger).len(), 1);
+    assert!(task_rows(&ran.ledger)[0].3.ends_with(" door=task cleared"));
+    assert!(ran.writes().is_empty());
+}
+
+#[test]
+fn a_reused_fact_word_waits_for_the_older_fenced_clear() {
+    let host = Arc::new(DoorHost::default());
+    *host.clear_note.lock().expect("clear_note") = Some(NoteOutcome::Fenced);
+    let seen = Arc::clone(&host);
+    let cfg = policy(Occupancy::Prompt);
+    let ran = Script {
+        host,
+        ..Script::new(
+            "write-task-reused-word",
+            Occupancy::Prompt,
+            &[0, 31 * 60, 32 * 60],
+        )
+    }
+    .run(&mut |s, i| {
+        s.turn_end.set_managed(true);
+        if i == 0 {
+            s.door_task_seed(FactWord::new(RuleId::WaitNudge, 1), &cfg);
+        }
+        if i == 2 {
+            assert!(
+                !seen.calls().contains(&format!("task_fact {NUDGE}#1")),
+                "noting the same word before its old clear would lose its new fact edge"
+            );
+            *seen.clear_note.lock().expect("clear_note") = Some(NoteOutcome::Cleared);
+        }
+    });
+    assert_eq!(
+        task_facts(&ran),
+        [
+            "task_fact -".to_string(),
+            "task_fact -".to_string(),
+            "task_fact -".to_string(),
+            "task_fact -".to_string(),
+            format!("task_fact {NUDGE}#1"),
+        ]
+    );
+    assert!(ran.writes().is_empty());
+}
+
+#[test]
+fn a_clear_deferred_in_observe_is_completed_when_prompt_returns() {
+    let prompt = policy(Occupancy::Prompt);
+    let observe = policy(Occupancy::Observe);
+    let host = Arc::new(DoorHost::default());
+    let seen = Arc::clone(&host);
+    let ran = Script {
+        host,
+        ..Script::new("write-task-clear-observe", Occupancy::Prompt, &[0, 60])
+    }
+    .run(&mut |s, i| {
+        if i == 1 {
+            s.door_task_seed(FactWord::new(RuleId::HoldRoom, 1), &prompt);
+            s.hold_live(90, Some(&observe), &mut Heard::default());
+            assert!(
+                seen.calls().is_empty(),
+                "Observe must not write a task record"
+            );
+        }
+    });
+    assert_eq!(task_facts(&ran), ["task_fact -"]);
+    assert!(ran.writes().is_empty());
+}
+
+fn managed_hold(host: Arc<DoorHost>) -> Ran {
+    Script {
+        host,
+        ..Script::new("write-task-custody-first", Occupancy::Prompt, &[0, 31 * 60]).virtualized()
+    }
+    .run(&mut |s, _| s.turn_end.set_managed(true))
+}
+
+#[test]
+fn a_reconnected_replacement_hold_clears_the_predecessors_fact_before_reusing_its_word() {
+    let host = Arc::new(DoorHost::default());
+    let first = managed_hold(Arc::clone(&host));
+    let word = FactWord::new(RuleId::WaitNudge, 1);
+    assert_eq!(*host.record.lock().expect("record"), (word, 1));
+    let observed = Script {
+        host: Arc::clone(&host),
+        seed: Some((first.ledger, T0 + 32 * MIN)),
+        drawn: &|i| if i == 1 { live_turn() } else { break_screen() },
+        ..Script::new(
+            "write-task-custody-observe",
+            Occupancy::Observe,
+            &[0, 60, 2 * 60, 12 * 60],
+        )
+        .virtualized()
+    }
+    .run(&mut |s, i| {
+        s.turn_end.set_managed(true);
+        if i == 1 {
+            s.door_task_seed(word, &policy(Occupancy::Observe));
+            s.hold_live(90, Some(&policy(Occupancy::Observe)), &mut Heard::default());
+        }
+    });
+    assert_eq!(*host.record.lock().expect("record"), (word, 1));
+    assert!(observed.ledger.contains("hold=closed"));
+    assert!(
+        crate::supervise::occupancy::hold::hold_rows_in(&observed.ledger, Some("@s-1"))
+            .iter()
+            .any(|(_, row)| matches!(
+                row,
+                crate::supervise::occupancy::hold::RowSaid::Closed { .. }
+            )),
+        "the predecessor must leave a valid close: {}",
+        observed.ledger
+    );
+    let carried = Script {
+        host: Arc::clone(&host),
+        seed: Some((observed.ledger, T0 + 45 * MIN)),
+        ..Script::new(
+            "write-task-custody-replacement",
+            Occupancy::Prompt,
+            &[0, 60, 20 * 60],
+        )
+        .virtualized()
+    }
+    .run(&mut |s, i| {
+        s.turn_end.set_managed(true);
+        if i == 1 {
+            let standing = host.record.lock().expect("record").0;
+            s.door_task_seed(standing, &policy(Occupancy::Prompt));
+        }
+    });
+    assert_eq!(
+        *host.record.lock().expect("record"),
+        (word, 3),
+        "a manager past the first fact edge must see this different hold: {:?}",
+        carried.calls
+    );
+    assert!(carried.writes().is_empty());
+}
+
+#[test]
+fn reconnecting_the_same_open_hold_keeps_its_fact_revision() {
+    let host = Arc::new(DoorHost::default());
+    let first = managed_hold(Arc::clone(&host));
+    let before = *host.record.lock().expect("record");
+    let carried = Script {
+        host: Arc::clone(&host),
+        seed: Some((first.ledger, T0 + 32 * MIN)),
+        ..Script::new("write-task-custody-same", Occupancy::Prompt, &[0, 60]).virtualized()
+    }
+    .run(&mut |s, i| {
+        s.turn_end.set_managed(true);
+        if i == 1 {
+            s.door_task_seed(before.0, &policy(Occupancy::Prompt));
+        }
+    });
+    assert_eq!(*host.record.lock().expect("record"), before);
+    assert!(!carried.calls.iter().any(|call| call == "task_fact -"));
+    assert!(carried.writes().is_empty());
+}
+
+#[test]
+fn the_first_fold_keeps_a_carried_holds_fact_before_its_clock_opens() {
+    let host = Arc::new(DoorHost::default());
+    let first = managed_hold(Arc::clone(&host));
+    let before = *host.record.lock().expect("record");
+    let carried = Script {
+        host: Arc::clone(&host),
+        seed: Some((first.ledger, T0 + 32 * MIN)),
+        ..Script::new("write-task-custody-first-fold", Occupancy::Prompt, &[0, 60]).virtualized()
+    }
+    .run(&mut |s, i| {
+        s.turn_end.set_managed(true);
+        if i == 0 {
+            s.door_task_seed(before.0, &policy(Occupancy::Prompt));
+        }
+    });
+    assert_eq!(
+        *host.record.lock().expect("record"),
+        before,
+        "the first task read precedes the first hold step: {:?}",
+        carried.calls
+    );
+    assert!(!carried.calls.iter().any(|call| call == "task_fact -"));
+}
+
+#[test]
+fn a_carried_task_fact_survives_drift_between_the_last_read_and_end_stamp() {
+    let host = Arc::new(DoorHost::default());
+    let first = managed_hold(Arc::clone(&host));
+    let before = *host.record.lock().expect("record");
+    let end = approvals::Row {
+        rule_id: HOLD,
+        outcome: approvals::Outcome::Waiting,
+        command: "",
+        reason: "hold=open held_ms=1860000",
+        box_seq: 0,
+    }
+    .to_json(T0 + 31 * MIN + 1_000, Some("@s-1"));
+    let carried = Script {
+        host: Arc::clone(&host),
+        seed: Some((format!("{}\n{end}\n", first.ledger), T0 + 32 * MIN)),
+        ..Script::new("write-task-custody-drift", Occupancy::Prompt, &[0, 60]).virtualized()
+    }
+    .run(&mut |s, i| {
+        s.turn_end.set_managed(true);
+        if i == 0 {
+            s.door_task_seed(before.0, &policy(Occupancy::Prompt));
+        }
+    });
+    assert_eq!(*host.record.lock().expect("record"), before);
+    assert!(!carried.calls.iter().any(|call| call == "task_fact -"));
+}
+
+#[test]
+fn a_runtime_close_retires_seeded_task_custody_before_a_new_hold_opens() {
+    let host = Arc::new(DoorHost::default());
+    let first = managed_hold(Arc::clone(&host));
+    let before = *host.record.lock().expect("record");
+    Script {
+        host: Arc::clone(&host),
+        seed: Some((first.ledger, T0 + 32 * MIN)),
+        ..Script::new(
+            "write-task-custody-runtime-close",
+            Occupancy::Prompt,
+            &[0, 60],
+        )
+        .virtualized()
+    }
+    .run(&mut |s, i| {
+        s.turn_end.set_managed(true);
+        if i == 0 {
+            s.hold_live(90, Some(&policy(Occupancy::Prompt)), &mut Heard::default());
+        } else {
+            s.door_task_seed(before.0, &policy(Occupancy::Prompt));
+        }
+    });
+    assert_eq!(*host.record.lock().expect("record"), (None, before.1 + 1));
 }
 
 /// A standing word seeded with a hold open is taken up as the hold's (`DoorWatch::task_word`):

@@ -49,7 +49,7 @@ impl ReadLimit {
     }
 }
 
-fn time_left(deadline: Option<Instant>) -> Result<Option<Duration>> {
+pub(crate) fn time_left(deadline: Option<Instant>) -> Result<Option<Duration>> {
     deadline
         .map(|deadline| {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -84,10 +84,7 @@ pub struct Connection {
 #[must_use]
 // Skip: bottoms out at the `geteuid(2)` FFI call.
 #[cfg_attr(trust_verify, trust::skip)]
-#[expect(
-    unsafe_code,
-    reason = "the crate's one FFI call: geteuid(2), which has no preconditions"
-)]
+#[expect(unsafe_code, reason = "geteuid(2), which has no preconditions")]
 pub fn effective_uid() -> u32 {
     // SAFETY: geteuid(2) takes nothing, cannot fail and touches no memory.
     unsafe { libc::geteuid() }
@@ -110,16 +107,16 @@ impl Connection {
         Self::open_within(addresses, HANDSHAKE_TIMEOUT)
     }
 
-    /// [`Connection::open`] with each handshake bounded by `timeout`.
+    /// [`Connection::open`] with its connects and handshake bounded by `timeout` together.
     ///
     /// # Errors
-    /// As [`Connection::open`], or [`Error::Timeout`] if the handshake exceeds `timeout`.
+    /// As [`Connection::open`], or [`Error::Timeout`] if they exceed `timeout`.
     pub fn open_within(addresses: &[Address], timeout: Duration) -> Result<Self> {
+        let deadline = Instant::now().checked_add(timeout);
         let mut last = Error::Invalid("empty address");
         for address in addresses {
-            match address::connect(address) {
+            match address::connect(address, deadline) {
                 Ok(stream) => {
-                    let deadline = Instant::now().checked_add(timeout);
                     return Self::handshake_until(
                         stream,
                         effective_uid(),
@@ -204,7 +201,7 @@ impl Connection {
         self.max_incoming = bytes.min(message::MAX_MESSAGE);
     }
 
-    /// Whether [`Connection::recv`] has a queued message or terminal state without reading the socket.
+    /// Whether [`Connection::recv`] would return a message or an error (a fault in the next frame, or the connection's end) without reading the socket.
     #[must_use]
     pub fn has_buffered(&self) -> bool {
         self.broken

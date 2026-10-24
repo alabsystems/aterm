@@ -1267,7 +1267,12 @@ impl Engine {
         }
         self.note_rewrap_starts(rows, park);
         let caret = self.caret_known.then_some(self.caret);
-        if self.witness.scroll_carry() == 0 && self.witness.caret_carry() == 0 {
+        let same_caret_row = self.caret_seen.is_none_or(|(r, _)| r == self.caret.0);
+        if self.witness.scroll_carry() == 0
+            && self.witness.caret_carry() == 0
+            && lifted.is_none()
+            && same_caret_row
+        {
             self.witness.shift_runs(
                 self.ribbon.cells(),
                 rows,
@@ -1302,7 +1307,7 @@ impl Engine {
         }
         let hand = self
             .hand_rides(rows, hand_withheld, lifted)
-            .or_else(|| self.hand_returns());
+            .or_else(|| self.hand_returns(rows));
         self.witness.end_scroll_carry();
         if let Some(h) = hand
             && !self
@@ -1381,9 +1386,9 @@ impl Engine {
         }
         let Some(run) = self.hand_line_follow(rows, None) else {
             let row = self.caret.0;
-            let waits = [row.checked_sub(1), row.checked_add(1)]
+            let waits = [-2i16, -1, 1, 2]
                 .into_iter()
-                .flatten()
+                .filter_map(|dr| row.checked_add_signed(dr))
                 .find_map(|to| self.hand_line_follow(rows, Some(to)));
             self.witness
                 .await_caret(waits.map(|run| (run.row, run.cohort)));
@@ -1395,14 +1400,25 @@ impl Engine {
         Some(run)
     }
 
-    fn hand_returns(&mut self) -> Option<witness::FollowRun> {
+    fn hand_returns(&mut self, rows: &[RowSample<'_>]) -> Option<witness::FollowRun> {
         if !self.caret_known {
             return None;
         }
-        let run = *self
+        let seen_row = self.caret_seen.map(|(r, _)| r);
+        let run = self
             .follow_scratch
             .iter()
-            .find(|r| r.dr.unsigned_abs() > 2 && r.row == self.caret.0)?;
+            .copied()
+            .find(|r| {
+                r.row == self.caret.0
+                    && (r.dr.unsigned_abs() > 2
+                        || (seen_row.is_some() && r.row.checked_add_signed(r.dr) == seen_row))
+            })
+            .or_else(|| {
+                let sr = seen_row.filter(|&sr| sr != self.caret.0)?;
+                self.hand_line_follow(rows, Some(sr))
+                    .filter(|r| r.row == self.caret.0 && r.row.checked_add_signed(r.dr) == Some(sr))
+            })?;
         let to = run.row.checked_add_signed(run.dr)?;
         self.lift_hand_anchors(run.row, to);
         self.hand_lift = Some((run.row, to));
@@ -4090,6 +4106,50 @@ mod tests {
             eng.ribbon().cells().iter().all(|c| c.row == 10),
             "control: the run stays on row 10"
         );
+    }
+
+    #[test]
+    fn a_box_shifted_within_the_follow_offsets_keeps_the_hand_on_its_line() {
+        fn sample<'a>(lines: &[(u16, &'a [char])]) -> Vec<RowSample<'a>> {
+            const BLANK: [char; 4] = [' '; 4];
+            (8..=12u16)
+                .map(|row| RowSample {
+                    row,
+                    cols: lines
+                        .iter()
+                        .find(|(r, _)| *r == row)
+                        .map_or(&BLANK[..], |(_, l)| l),
+                })
+                .collect()
+        }
+        let ms = Duration::from_millis;
+        let text: Vec<char> = "  ab".chars().collect();
+        let other: Vec<char> = "  xy".chars().collect();
+        let asked: Vec<u16> = (8..=12).collect();
+        for target in [8u16, 9, 11, 12] {
+            let (mut eng, t) = typed_runs(&[10]);
+            assert_eq!(eng.witness_rows(&sample(&[(10, &text)]), t), 0);
+            let now = t + ms(600);
+            tick_at(&mut eng, now);
+            eng.observe_caret((target, 4));
+            let shifted = sample(&[(10, &other), (target, &text)]);
+            let followed = eng.follow_rows(&shifted, &asked, now);
+            assert_eq!(followed, 2, "target {target}: the run followed the caret");
+            assert_eq!(
+                eng.caret.0, target,
+                "target {target}: the hand rode with its line"
+            );
+            assert_eq!(
+                eng.take_hand_lift(),
+                Some((10, target)),
+                "target {target}: the host is notified of the hand lift"
+            );
+            tick_at(&mut eng, now + ms(350));
+            assert!(
+                eng.field_at(target, 2).is_some() && eng.field_at(target, 3).is_some(),
+                "target {target}: the run was not flowed away as an abandoned line"
+            );
+        }
     }
 
     #[test]

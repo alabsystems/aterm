@@ -45,6 +45,9 @@ pub enum VerifyOutcome {
         build: u64,
         /// Who published it.
         vendor: String,
+        /// Whether the lane measured the payload's digest from bytes the vendor's Developer ID
+        /// signature vouched for, no vendor document naming it ([`crate::vendor_direct::Anchor`]).
+        measured: bool,
         /// `None` when the tree matches; the recomputed root when it drifted.
         drift: Option<String>,
     },
@@ -150,6 +153,7 @@ fn verify_vendor_build(layout: &Layout, program: &str, build: u64) -> VerifyOutc
         Ok(got) => VerifyOutcome::VendorRoot {
             build,
             vendor: record.vendor,
+            measured: !record.anchor.publishes_digest(),
             drift: (!got.eq_ignore_ascii_case(&record.tree_root)).then_some(got),
         },
         Err(e) => VerifyOutcome::Unreadable {
@@ -352,8 +356,44 @@ mod tests {
             VerifyOutcome::VendorRoot {
                 build,
                 vendor: "Anthropic".into(),
+                measured: false,
                 drift: None
             }
+        );
+        let grok_version = crate::vendor_direct::Version::parse("1.0.70").unwrap();
+        let grok_build = grok_version.build_id();
+        let grok = install(&l, "grok", grok_build);
+        let measured = crate::vendor_direct::VendorRecord {
+            program: "grok".into(),
+            version: grok_version,
+            vendor: "xAI".into(),
+            source_url: "https://storage.googleapis.com/grok-build-public-artifacts/cli/\
+                         grok-1.0.70-macos-aarch64"
+                .into(),
+            tree_root: signed_root(&grok, "grok"),
+            apple_team: cfg!(target_os = "macos").then(|| {
+                crate::vendor_direct::spec("grok")
+                    .unwrap()
+                    .apple_team
+                    .to_string()
+            }),
+            anchor: crate::vendor_direct::Anchor::XaiDeveloperId,
+            ..rec.clone()
+        };
+        crate::vendor_direct::durable::write_durable(
+            &crate::vendor_direct::record_path(&grok).unwrap(),
+            &measured.record_bytes().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            verify_program(&l, "grok"),
+            VerifyOutcome::VendorRoot {
+                build: grok_build,
+                vendor: "xAI".into(),
+                measured: true,
+                drift: None
+            },
+            "grok's digest is the lane's measure, no xAI document's"
         );
         std::fs::write(dir.join("bin").join(exe_name("claude")), b"tampered").unwrap();
         assert!(
@@ -439,6 +479,7 @@ mod tests {
         let vendor = |drift| V::VendorRoot {
             build: 1,
             vendor: "Anthropic".into(),
+            measured: false,
             drift,
         };
         for (o, pass) in [

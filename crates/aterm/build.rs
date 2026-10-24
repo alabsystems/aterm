@@ -26,7 +26,8 @@ fn main() {
         return;
     }
 
-    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+    let msvc = std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
+    if msvc {
         println!("cargo:rustc-link-arg-bins=/STACK:{}", 8 * 1024 * 1024);
     }
 
@@ -45,8 +46,18 @@ fn main() {
     println!("cargo:rerun-if-changed={}", app_manifest.display());
     println!("cargo:rerun-if-env-changed=ATERM_REQUIRE_WIN_RESOURCES");
 
+    // MSVC's linker writes the one manifest, the `asInvoker` one every executable gets
+    // (.cargo/config.toml) merged with this file: a second `RT_MANIFEST` 1 from rc.exe would
+    // collide with it. Another linker takes the file as a resource.
+    if msvc {
+        println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");
+        println!(
+            "cargo:rustc-link-arg-bins=/MANIFESTINPUT:{}",
+            app_manifest.display()
+        );
+    }
     let rc_path = out_dir.join("aterm.rc");
-    let rc_text = resource_script(&icon, &app_manifest);
+    let rc_text = resource_script(&icon, (!msvc).then_some(app_manifest.as_path()));
     if let Err(e) = std::fs::write(&rc_path, rc_text) {
         report(&format!("could not write {}: {e}", rc_path.display()));
         return;
@@ -75,8 +86,8 @@ fn report(why: &str) {
         format!("  cause: {why}"),
         "  visible result: the generic Windows exe icon in the title bar, in".to_string(),
         "    Alt-Tab and in Task View; a bare filename (no description, no".to_string(),
-        "    version) in Task Manager, Explorer and Apps & Features; classic".to_string(),
-        "    grey 3D dialog buttons instead of Common-Controls v6.".to_string(),
+        "    version) in Task Manager, Explorer and Apps & Features; and off".to_string(),
+        "    MSVC, classic grey 3D dialog buttons instead of Common-Controls v6.".to_string(),
         "  fix: install a resource compiler — the Windows SDK's rc.exe (it is".to_string(),
         "    on PATH inside a VS Developer prompt / vcvars64) or LLVM's".to_string(),
         "    llvm-rc — or point ATERM_RC at one — then rebuild.".to_string(),
@@ -96,7 +107,7 @@ fn report(why: &str) {
 }
 
 /// Build the `.rc` script text from `CARGO_PKG_VERSION_*`.
-fn resource_script(icon: &std::path::Path, app_manifest: &std::path::Path) -> String {
+fn resource_script(icon: &std::path::Path, app_manifest: Option<&std::path::Path>) -> String {
     let major = env_num("CARGO_PKG_VERSION_MAJOR");
     let minor = env_num("CARGO_PKG_VERSION_MINOR");
     let patch = env_num("CARGO_PKG_VERSION_PATCH");
@@ -125,7 +136,7 @@ fn resource_script(icon: &std::path::Path, app_manifest: &std::path::Path) -> St
 // decodes differently on a machine with a different locale.
 
 {RESOURCE_ID} ICON "{icon}"
-{RESOURCE_ID} {RT_MANIFEST} "{app_manifest}"
+{manifest}
 
 // The id is the literal 1, NOT the VS_VERSION_INFO macro -- see the const's doc
 // comment in build.rs. Without <winver.h> the macro becomes a resource NAME and
@@ -168,7 +179,10 @@ BEGIN
 END
 "#,
         icon = rc_path_literal(icon),
-        app_manifest = rc_path_literal(app_manifest),
+        manifest = app_manifest.map_or_else(String::new, |m| format!(
+            "{RESOURCE_ID} {RT_MANIFEST} \"{}\"",
+            rc_path_literal(m)
+        )),
     )
 }
 

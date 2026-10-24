@@ -3,12 +3,13 @@
 
 //! Native GitHub transport using `agh` and [`crate::git_credential`].
 
-use super::{Github, INPUT_MAX, decode, get, identity, read_token, repos};
+use super::{Github, INPUT_MAX, TokenUnread, decode, get, identity, read_token, repos};
 use crate::engine::Place;
 use crate::git_credential::{GITHUB, Git, Lookups};
+use crate::init_observe::{LastReading, Reading, Wait};
 use crate::items::{Ctx, Item};
 use crate::model::{ItemReport, Mode, Probe, User};
-use crate::port::{Secret, System};
+use crate::port::{GithubError, GithubFailure, Secret, System};
 use aterm_converge::{Class, Layer, Remedy, Requires};
 use std::io;
 use std::path::Path;
@@ -19,7 +20,10 @@ pub(super) fn run(sys: &dyn System, ctx: &Ctx, mode: Mode) -> Result<Vec<ItemRep
     let [user] = ctx.users.as_slice() else {
         return Err("initial repository setup requires exactly one local user".into());
     };
-    let item = NativeRepositories { user: user.clone() };
+    let item = NativeRepositories {
+        user: user.clone(),
+        reading: LastReading::default(),
+    };
     let bound = crate::engine::bind(
         [(
             &item as &dyn Item,
@@ -44,6 +48,9 @@ pub(super) fn run(sys: &dyn System, ctx: &Ctx, mode: Mode) -> Result<Vec<ItemRep
 
 struct NativeRepositories {
     user: User,
+    /// How many repositories the last probe found and whether it signed in, for
+    /// System State.
+    reading: LastReading,
 }
 
 impl Item for NativeRepositories {
@@ -58,16 +65,27 @@ impl Item for NativeRepositories {
     }
 
     fn probe(&self, sys: &dyn System, _ctx: &Ctx) -> Probe {
+        self.reading.set(None);
         let check = (|| {
             let plan = self.plan(sys)?;
-            let missing = repos::missing(sys, &self.user, &plan.repositories)?;
+            let missing = repos::missing(sys, &self.user, &plan.repositories)
+                .map_err(Block::of(Wait::InTheWay))?;
             let ready = lookups_answer(sys, &self.user, &plan.token)
                 || (Git::keychain()
                     .configured(sys, &self.user, &plan.account)?
                     .ready()
                     && credential_ready(sys, &self.user, &plan.account, &plan.token)?);
-            Ok::<_, String>((plan.repositories.len(), missing.len(), ready))
+            Ok::<_, Block>((plan.repositories.len(), missing.len(), ready))
         })();
+        self.reading.set(match &check {
+            Ok((count, missing, signed_in)) => Some(Reading::Repositories {
+                present: count.saturating_sub(*missing),
+                count: *count,
+                signed_in: *signed_in,
+            }),
+            // Why it cannot go on, where this probe decided it: System State's note.
+            Err(block) => block.wait.map(Reading::Waits),
+        });
         match check {
             Ok((count, 0, true)) => Probe::Ok {
                 now: format!("{count} matching worktrees present; native GitHub credentials verified"),
@@ -76,18 +94,22 @@ impl Item for NativeRepositories {
                 from: format!("{missing} of {count} repositories missing, or native GitHub credentials need setup"),
                 to: "configure native GitHub credentials and clone missing repositories; preserve existing worktrees".into(),
             },
-            Err(why) => Probe::Blocked { why },
+            Err(block) => Probe::Blocked { why: block.why },
         }
     }
 
     fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
-        let plan = self.plan(sys)?;
+        let plan = self.plan(sys).map_err(|block| block.why)?;
         let missing = repos::missing(sys, &self.user, &plan.repositories)?;
         install_credentials(sys, &self.user, &plan.account, &plan.token)?;
         for repo in missing {
             repos::clone_one(sys, &self.user, &repo.owner, &repo)?;
         }
         Ok(())
+    }
+
+    fn detail(&self, _sys: &dyn System, _ctx: &Ctx) -> Option<String> {
+        self.reading.detail()
     }
 }
 
@@ -97,42 +119,93 @@ struct Plan {
     repositories: Vec<repos::Repo>,
 }
 
+/// Why [`NativeRepositories::plan`] cannot go on: the engine's line, and the reason System
+/// State words for a person where the step that stopped decided one. A step that decided
+/// none leaves the page its own words for a waiting row.
+#[derive(Debug)]
+struct Block {
+    why: String,
+    wait: Option<Wait>,
+}
+
+impl Block {
+    /// A step that stopped for `wait`, with its line.
+    fn of(wait: Wait) -> impl FnOnce(String) -> Self {
+        move |why| Self {
+            why,
+            wait: Some(wait),
+        }
+    }
+
+    /// A GitHub read that failed, by its kind: no answer, a token GitHub does not take, or
+    /// anything else.
+    fn github(error: GithubError) -> Self {
+        Self::of(match error.failure {
+            GithubFailure::Unreached => Wait::Unreached,
+            GithubFailure::Unauthenticated => Wait::TokenRefused,
+            GithubFailure::Other => Wait::GitHub,
+        })(error.why)
+    }
+
+    /// The token source that could not be read: not there yet, or there and unusable.
+    fn token(unread: TokenUnread) -> Self {
+        Self::of(if unread.absent {
+            Wait::Token
+        } else {
+            Wait::TokenUnusable
+        })(unread.why)
+    }
+}
+
+impl From<String> for Block {
+    /// A step that decided no reason.
+    fn from(why: String) -> Self {
+        Self { why, wait: None }
+    }
+}
+
 impl NativeRepositories {
-    fn plan(&self, sys: &dyn System) -> Result<Plan, String> {
+    fn plan(&self, sys: &dyn System) -> Result<Plan, Block> {
         if sys.euid() != self.user.uid {
-            return Err("repository setup must run as its local user".into());
+            return Err(String::from("repository setup must run as its local user").into());
+        }
+        if !repos::git_installed(sys) {
+            return Err(Block::of(Wait::CommandLineTools)(repos::NO_GIT.into()));
         }
         repos::admit_home(sys, &self.user)?;
         crate::port::no_core_dumps();
-        let configured = configuration(sys, &self.user)?;
+        let configured = configuration(sys, &self.user).map_err(Block::of(Wait::Settings))?;
         let source = configured.clone().unwrap_or_else(|| Github {
             account: String::new(),
             owner: String::new(),
             token_file: Path::new(&self.user.home).join(".secrets/gh_access_token"),
             token_key: None,
         });
-        let token = read_token(sys, &self.user, &source)?;
-        let account = identity(sys, &self.user, &token)?;
+        let token = read_token(sys, &self.user, &source).map_err(Block::token)?;
+        let account = identity(sys, &self.user, &token).map_err(Block::github)?;
         if configured
             .as_ref()
             .is_some_and(|config| !account.eq_ignore_ascii_case(&config.account))
         {
-            return Err("the synced token belongs to a different configured GitHub account; nothing changed".into());
+            return Err(Block::of(Wait::OtherAccount)(
+                "the synced token belongs to a different configured GitHub account; nothing changed".into(),
+            ));
         }
         let (base, owner) = if let Some(config) = &configured {
             if config.owner.eq_ignore_ascii_case(&account) {
                 ("/user/repos?affiliation=owner&visibility=all&per_page=30&sort=full_name&direction=asc".to_owned(), Some(config.owner.as_str()))
             } else {
-                let (owner, _) = get(sys, &self.user, &token, &format!("/users/{}", config.owner))?;
+                let (owner, _) = get(sys, &self.user, &token, &format!("/users/{}", config.owner))
+                    .map_err(Block::github)?;
                 if owner["login"]
                     .as_str()
                     .is_none_or(|owner| !owner.eq_ignore_ascii_case(&config.owner))
                     || owner["type"].as_str() != Some("Organization")
                 {
-                    return Err(
+                    return Err(Block::of(Wait::Settings)(
                         "a different configured repository owner must be a GitHub organization"
                             .into(),
-                    );
+                    ));
                 }
                 (
                     format!(
@@ -145,8 +218,20 @@ impl NativeRepositories {
         } else {
             (ACCESSIBLE.into(), None)
         };
+        // A page that failed keeps its kind; one read whole but not usable as an
+        // inventory is GitHub's answer that could not be used.
+        let failed = std::cell::Cell::new(GithubFailure::Other);
         let repositories = repos::enumerate_pages(&base, owner, |endpoint| {
-            get(sys, &self.user, &token, endpoint)
+            get(sys, &self.user, &token, endpoint).map_err(|error| {
+                failed.set(error.failure);
+                error.why
+            })
+        })
+        .map_err(|why| {
+            Block::github(GithubError {
+                failure: failed.get(),
+                why,
+            })
         })?;
         Ok(Plan {
             account,
@@ -251,12 +336,7 @@ mod tests {
     }
 
     fn fixture() -> (Fake, NativeRepositories) {
-        let mut sys = Fake::root();
-        sys.euid = 501;
-        let item = NativeRepositories {
-            user: user("alice", 501),
-        };
-        sys.stat_of(&item.user.home, stat(true, 0o700));
+        let (sys, item) = bare();
         sys.file(crate::items::github::CLT_GIT, b"synthetic git");
         source(&sys, "/Users//alice/.secrets/gh_access_token");
         answer(
@@ -265,6 +345,18 @@ mod tests {
             "/user",
             aterm_json::json!({"login":"alice"}),
         );
+        (sys, item)
+    }
+
+    /// Alice's own home and nothing else: no git, no token, no GitHub answer.
+    fn bare() -> (Fake, NativeRepositories) {
+        let mut sys = Fake::root();
+        sys.euid = 501;
+        let item = NativeRepositories {
+            user: user("alice", 501),
+            reading: LastReading::default(),
+        };
+        sys.stat_of(&item.user.home, stat(true, 0o700));
         (sys, item)
     }
 
@@ -436,14 +528,169 @@ mod tests {
                 ..stat(false, 0o600)
             },
         );
-        let why = item.plan(&sys).err().unwrap();
-        assert!(why.contains("different configured"));
-        assert!(!why.contains(TOKEN));
+        let block = item.plan(&sys).err().unwrap();
+        assert!(block.why.contains("different configured"));
+        assert!(!block.why.contains(TOKEN));
+        assert_eq!(block.wait, Some(Wait::OtherAccount));
         assert!(
             !sys.calls()
                 .iter()
                 .any(|call| call.contains("/repos?") || call.contains("credential approve"))
         );
+    }
+
+    /// EVERY BLOCKED STEP SAYS WHY IN SYSTEM STATE'S WORDS (design §3.3): the probe
+    /// decides the reason at the step that stopped, from what that step knows (no git, the
+    /// token file absent or unusable, GitHub's kind of failure, another account, the
+    /// settings, a folder in the way), never from the engine's line; the row the plan pass
+    /// reads carries it, and the Repositories row's note is its words. A step that decides
+    /// none gives no note here, and the page words that row itself.
+    #[test]
+    fn every_blocked_step_says_why_in_system_states_words() {
+        use crate::init_observe::observation;
+        use aterm_types::macos_setup::{Setting, Standing};
+        let profile = "/Users//alice/.config/aterm/init.toml";
+        let with_profile = |sys: &Fake, bytes: &[u8]| {
+            sys.file(profile, bytes).stat_of(
+                profile,
+                Stat {
+                    len: bytes.len() as u64,
+                    ..stat(false, 0o600)
+                },
+            );
+        };
+        // Git and the token, without GitHub's answer to `/user`.
+        let signed_out = || {
+            let (sys, item) = bare();
+            sys.file(crate::items::github::CLT_GIT, b"synthetic git");
+            source(&sys, "/Users//alice/.secrets/gh_access_token");
+            (sys, item)
+        };
+        let cases: Vec<(&str, (Fake, NativeRepositories), Option<Wait>)> = vec![
+            ("no git", bare(), Some(Wait::CommandLineTools)),
+            (
+                "no token yet",
+                {
+                    let (sys, item) = bare();
+                    sys.file(crate::items::github::CLT_GIT, b"synthetic git");
+                    (sys, item)
+                },
+                Some(Wait::Token),
+            ),
+            (
+                "a token others can read",
+                {
+                    let (sys, item) = signed_out();
+                    sys.stat_of("/Users//alice/.secrets/gh_access_token", stat(false, 0o644));
+                    (sys, item)
+                },
+                Some(Wait::TokenUnusable),
+            ),
+            (
+                "GitHub unreached",
+                {
+                    let (sys, item) = signed_out();
+                    sys.fail_github_api(&item.user, "/user", GithubFailure::Unreached);
+                    (sys, item)
+                },
+                Some(Wait::Unreached),
+            ),
+            (
+                "a token GitHub refuses",
+                {
+                    let (sys, item) = signed_out();
+                    sys.fail_github_api(&item.user, "/user", GithubFailure::Unauthenticated);
+                    (sys, item)
+                },
+                Some(Wait::TokenRefused),
+            ),
+            (
+                "GitHub's other failure",
+                {
+                    let (sys, item) = signed_out();
+                    sys.fail_github_api(&item.user, "/user", GithubFailure::Other);
+                    (sys, item)
+                },
+                Some(Wait::GitHub),
+            ),
+            (
+                "another account",
+                {
+                    let (sys, item) = fixture();
+                    with_profile(
+                        &sys,
+                        b"[github]\naccount='someone-else'\nowner='someone-else'\ntoken_file='~/.secrets/gh_access_token'\n",
+                    );
+                    (sys, item)
+                },
+                Some(Wait::OtherAccount),
+            ),
+            (
+                "settings it cannot read",
+                {
+                    let (sys, item) = fixture();
+                    with_profile(&sys, b"[github]\naccount='alice'\n");
+                    (sys, item)
+                },
+                Some(Wait::Settings),
+            ),
+            (
+                "the inventory unreached",
+                {
+                    let (sys, item) = fixture();
+                    sys.fail_github_api(
+                        &item.user,
+                        &format!("{ACCESSIBLE}&page=1"),
+                        GithubFailure::Unreached,
+                    );
+                    (sys, item)
+                },
+                Some(Wait::Unreached),
+            ),
+            (
+                "a file where a repository goes",
+                {
+                    let (sys, item) = fixture();
+                    answer(
+                        &sys,
+                        &item.user,
+                        &format!("{ACCESSIBLE}&page=1"),
+                        aterm_json::json!([repository("alice", "work", 1)]),
+                    );
+                    sys.file("/Users//alice/work", b"not a worktree");
+                    (sys, item)
+                },
+                Some(Wait::InTheWay),
+            ),
+            (
+                "another login",
+                {
+                    let (mut sys, item) = fixture();
+                    sys.euid = 502;
+                    (sys, item)
+                },
+                None,
+            ),
+        ];
+        for (case, (sys, item), wait) in cases {
+            // The pass System State's reading runs: a plan.
+            let context = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
+            let rows = run(&sys, &context, Mode::Plan).unwrap();
+            assert_eq!(rows[0].outcome, crate::model::Outcome::Blocked, "{case}");
+            assert_eq!(
+                Reading::of(&rows[0]),
+                wait.map(Reading::Waits),
+                "{case}: {rows:?}"
+            );
+            let seen = observation(Setting::Repositories, &[&rows[0]]);
+            assert_eq!(seen.standing, Standing::Waiting, "{case}");
+            assert_eq!(seen.note.as_deref(), wait.map(Wait::note), "{case}");
+            let line = rows[0].why.as_deref().unwrap();
+            assert!(
+                seen.note.as_deref().is_none_or(|note| !note.contains(line)),
+                "{case}"
+            );
+        }
     }
 
     /// git's github.com settings unset, then as `configure` leaves them.

@@ -1511,7 +1511,7 @@ impl MatrixRain {
         if !cycle_active(cv.hk, density) {
             return true;
         }
-        let material_start = (!self.material.is_empty()).then(|| self.material_start(col));
+        let mut material_start: Option<Option<usize>> = None;
         let r_hi = cv.head_row.min(rows.saturating_sub(1));
         let r_lo = cv.head_row.saturating_sub(cp.l);
         if r_lo <= r_hi && r_lo < rows {
@@ -1534,7 +1534,10 @@ impl MatrixRain {
                     return false;
                 }
                 let head_flash = is_head && lvl == 15;
-                quads.push(self.cell_quad(ctx, col, r, lvl, head_flash, material_start));
+                let ms = *material_start.get_or_insert_with(|| {
+                    (!self.material.is_empty()).then(|| self.material_start(col))
+                });
+                quads.push(self.cell_quad(ctx, col, r, lvl, head_flash, ms));
                 if head_flash && cv.bright {
                     self.halo_cands.push((r as u16, col));
                 }
@@ -1549,7 +1552,10 @@ impl MatrixRain {
             if quads.len() >= ctx.cap {
                 return false;
             }
-            quads.push(self.cell_quad(ctx, col, wr, lvl, true, material_start));
+            let ms = *material_start.get_or_insert_with(|| {
+                (!self.material.is_empty()).then(|| self.material_start(col))
+            });
+            quads.push(self.cell_quad(ctx, col, wr, lvl, true, ms));
         }
         true
     }

@@ -122,6 +122,7 @@ struct Fig {
     write_bps: Option<f64>,
     refused: u32,
     program: String,
+    gpu: Option<f32>,
 }
 
 impl Fig {
@@ -135,6 +136,7 @@ impl Fig {
             write_bps: sv.write_bps,
             refused: sv.refused,
             program: String::new(),
+            gpu: sv.gpu,
         }
     }
 
@@ -157,6 +159,10 @@ impl Fig {
             (a, b) => a.or(b),
         };
         self.write_bps = match (self.write_bps, o.write_bps) {
+            (Some(a), Some(b)) => Some(a + b),
+            (a, b) => a.or(b),
+        };
+        self.gpu = match (self.gpu, o.gpu) {
             (Some(a), Some(b)) => Some(a + b),
             (a, b) => a.or(b),
         };
@@ -228,6 +234,24 @@ fn mc(x: f32) -> u64 {
 
 fn mc_opt(x: Option<f32>) -> Option<u64> {
     x.map(mc)
+}
+
+/// The GPU lane's word while it holds no figure ([`crate::gpu_clients`]).
+const GPU_LANE_OFF: &str = "lane_off:gpu_clients";
+
+/// A share of the device (`1.0` the whole GPU) in per-mille.
+fn gpu_pm(share: f32) -> u64 {
+    (share.max(0.0) * 1000.0).round() as u64
+}
+
+/// A share of the device in parts per million.
+fn gpu_ppm(share: f32) -> u64 {
+    (share.max(0.0) * 1e6).round() as u64
+}
+
+/// A share of the device as a sentence says it: `1.5%`.
+fn gpu_share(share: f32) -> String {
+    format!("{:.1}%", share.max(0.0) * 100.0)
 }
 
 fn bps_word(b: f64) -> String {
@@ -710,7 +734,7 @@ pub fn render_text(q: &SysQuery, ctx: &Ctx<'_>) -> Reply {
             View::Global => global_text(q, ctx, s, &mut lines),
             View::Jobs => jobs_text(q, ctx, s, &mut lines),
             View::Cores => cores_text(ctx, s, &mut lines),
-            View::Gpu => gpu_text(ctx, s, &mut lines),
+            View::Gpu => gpu_text(q, ctx, s, &mut lines),
             View::Mem => mem_text(q, ctx, s, &mut lines),
             View::Disk => disk_text(q, ctx, s, &mut lines),
             View::Net => net_text(q, s, &mut lines),
@@ -803,7 +827,9 @@ fn tab_text(ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
         "gpu",
         format!(
             "gpu    per-tab GPU time {} · the device is {}",
-            unavailable("lane_off:gpu_clients"),
+            f.gpu
+                .filter(|_| f.present)
+                .map_or_else(|| unavailable(GPU_LANE_OFF), gpu_share),
             s.gpu.as_ref().map_or_else(
                 || unavailable("unsupported"),
                 |g| format!("{:.0}% busy", (g.load.raw * 100.0).round())
@@ -976,7 +1002,10 @@ fn aterm_text(ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
         "gpu",
         format!(
             "gpu     aterm's GPU time {}",
-            unavailable("lane_off:gpu_clients")
+            a.gpu.map_or_else(
+                || unavailable(GPU_LANE_OFF),
+                |g| format!("{} of the GPU", gpu_share(g))
+            )
         ),
     ));
     lines.push(line(
@@ -1478,7 +1507,7 @@ fn cores_text(ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
     lines.push(line("throttle", format!("throttle {}", throttle_words(s))));
 }
 
-fn gpu_text(ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
+fn gpu_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
     let name = s
         .gpu
         .as_ref()
@@ -1499,18 +1528,101 @@ fn gpu_text(ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
             gpu_words(s)
         ),
     ));
-    lines.push(line(
-        "split",
-        format!(
-            "split   per-scope GPU time {} · clients {}",
-            unavailable("lane_off:gpu_clients"),
-            unavailable("lane_off:gpu_clients")
-        ),
-    ));
+    lines.push(line("split", gpu_split_words(ctx, s)));
+    let (clients, withheld) = gpu_clients(ctx, s);
+    for r in clients.iter().take(q.top) {
+        lines.push(line(
+            format!("client {}", r.pid),
+            format!(
+                "client pid={} exe={} {} share_ppm={}",
+                r.pid,
+                exe_word(&r.name),
+                row_scope_words(ctx, r),
+                gpu_ppm(r.gpu.unwrap_or(0.0))
+            ),
+        ));
+    }
+    if withheld > 0 {
+        lines.push(note(
+            "withheld",
+            format!("withheld={withheld} (client rows outside this tab are the owner's)"),
+        ));
+    }
     lines.push(note(
         "note",
         "note    the device reports one whole-percent figure; there is no per-core GPU use",
     ));
+}
+
+/// The `sys gpu` split line: client time by owner against the device's whole percent, the
+/// residual printed only from 2 quanta (2 %).
+fn gpu_split_words(ctx: &Ctx<'_>, s: &Snapshot) -> String {
+    let Some((g, sp)) = s.gpu.as_ref().and_then(|g| Some((g, g.split?))) else {
+        return format!(
+            "split   per-scope GPU time {} · clients {}",
+            unavailable(GPU_LANE_OFF),
+            unavailable(GPU_LANE_OFF)
+        );
+    };
+    let tab = tabs_fig(s, &scope_keys(ctx, ScopeArg::Tab), ctx.target.key)
+        .gpu
+        .unwrap_or(0.0);
+    let residual = g.load.raw - sp.clients;
+    let mut t = format!(
+        "split   tab {} · rest of aterm {} · others {} · {} {} · client time {}",
+        gpu_share(tab),
+        gpu_share((sp.aterm - tab).max(0.0)),
+        gpu_share(sp.others),
+        ctx.machine.services_word(),
+        gpu_share(sp.services),
+        gpu_share(sp.clients)
+    );
+    if residual.abs() < 0.02 {
+        t.push_str(", within 2% of the device's whole percent, so no residual");
+    } else {
+        t.push_str(&format!(" · residual {:+.1}%", residual * 100.0));
+    }
+    t.push_str(" · live processes");
+    t
+}
+
+/// Processes holding GPU time, most first, with how many outside the target tab a non-owner
+/// may not see.
+fn gpu_clients<'a>(ctx: &Ctx<'_>, s: &'a Snapshot) -> (Vec<&'a ProcView>, usize) {
+    let keys = scope_keys(ctx, ScopeArg::Tab);
+    let mut withheld = 0usize;
+    let mut rows: Vec<&ProcView> = s
+        .procs
+        .iter()
+        .filter(|r| r.gpu.is_some_and(|g| g > 0.0))
+        .filter(|r| {
+            let own = matches!(r.scope, RowScope::Tab(k) if keys.contains(&k));
+            if own || ctx.owner_class {
+                true
+            } else {
+                withheld += 1;
+                false
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.gpu
+            .unwrap_or(0.0)
+            .total_cmp(&a.gpu.unwrap_or(0.0))
+            .then(a.pid.cmp(&b.pid))
+    });
+    (rows, withheld)
+}
+
+/// A row's `scope=` words, with its tab's number where it has one.
+fn row_scope_words(ctx: &Ctx<'_>, r: &ProcView) -> String {
+    match r.scope {
+        RowScope::Tab(k) => ctx.tab_number(k).map_or_else(
+            || format!("scope=tab local={k}"),
+            |n| format!("scope=tab tab={n}"),
+        ),
+        other => format!("scope={}", other.word()),
+    }
 }
 
 fn device_word(name: &str) -> String {
@@ -2043,7 +2155,7 @@ fn procs_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) 
     ));
     for r in rows.iter().take(q.top) {
         let mut t = format!(
-            "proc pid={} exe={} label={} pgid={} cpu_mc={} wait_mc={} fp_bytes={} peak_bytes={} write_bps={} stat={}",
+            "proc pid={} exe={} label={} pgid={} cpu_mc={} wait_mc={} fp_bytes={} peak_bytes={} write_bps={} gpu_ppm={} stat={}",
             r.pid,
             exe_word(&r.name),
             proc_label(ctx, s, r),
@@ -2059,6 +2171,7 @@ fn procs_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) 
                 r.write_bps.map(|b| b.round() as u64),
                 if r.refused { "refused" } else { "warming" }
             ),
+            rec(r.gpu.map(gpu_ppm), GPU_LANE_OFF),
             r.state.word()
         );
         if let RowScope::Tab(k) = r.scope
@@ -2383,7 +2496,7 @@ pub fn render_json(q: &SysQuery, ctx: &Ctx<'_>) -> Jv {
             let tab = tabs_fig(s, &keys, ctx.target.key);
             let mut t = tab_obj(ctx, s, &keys, &tab);
             t.set("panes", Jv::u(keys.len() as u64));
-            t.set("gpu_pm", Jv::why("lane_off:gpu_clients"));
+            t.set("gpu_pm", Jv::known_or(tab.gpu.map(gpu_pm), GPU_LANE_OFF));
             t.set("roots", Jv::u(ctx.roots.len() as u64));
             t.set(
                 "root_bytes",
@@ -2411,7 +2524,7 @@ pub fn render_json(q: &SysQuery, ctx: &Ctx<'_>) -> Jv {
             o.set("global", global_json(s));
             o.set("cores", cores_json(s));
             o.set("mem", mem_json(q, ctx, s));
-            o.set("gpu", gpu_json(s));
+            o.set("gpu", gpu_json(q, ctx, s));
             o.set("net", net_json(q, s));
             let tab = tabs_fig(s, &scope_keys(ctx, ScopeArg::Tab), ctx.target.key);
             o.set("split_mc", split_json(s, &tab));
@@ -2533,7 +2646,7 @@ pub fn render_json(q: &SysQuery, ctx: &Ctx<'_>) -> Jv {
                     .map_or_else(|| Jv::why("unsupported"), |t| Jv::s(t.level.word())),
             );
         }
-        View::Gpu => o.set("gpu", gpu_json(s)),
+        View::Gpu => o.set("gpu", gpu_json(q, ctx, s)),
         View::Mem => {
             if let Jv::Obj(pairs) = mem_json(q, ctx, s) {
                 for (k, v) in pairs {
@@ -2574,6 +2687,7 @@ fn aterm_json(s: &Snapshot) -> Jv {
                     Jv::u(((a.cores.raw / b) * 1000.0).round().clamp(0.0, 1000.0) as u64),
                 );
             }
+            o.set("gpu_pm", Jv::known_or(a.gpu.map(gpu_pm), GPU_LANE_OFF));
             o.set("instance", Jv::u(u64::from(s.self_pid)));
             o.set("coalitions", Jv::why("lane_off:coalitions"));
             o.set("via", Jv::s("parent_chains"));
@@ -2704,7 +2818,7 @@ fn cores_json(s: &Snapshot) -> Jv {
     ])
 }
 
-fn gpu_json(s: &Snapshot) -> Jv {
+fn gpu_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
     let Some(g) = s.gpu.as_ref() else {
         return Jv::why("unsupported");
     };
@@ -2721,14 +2835,62 @@ fn gpu_json(s: &Snapshot) -> Jv {
             Jv::known_or(g.sample.in_use_bytes, "unsupported"),
         ),
         ("cores", Jv::known_or(g.cores.map(u64::from), "unsupported")),
-        ("split_pm", Jv::why("lane_off:gpu_clients")),
-        ("clients", Jv::why("lane_off:gpu_clients")),
+        ("split_pm", gpu_split_json(ctx, s)),
+        ("clients", Jv::why(GPU_LANE_OFF)),
         ("exact", Jv::s("exact")),
     ]);
     if let Some(n) = g.name.as_ref() {
         o.set("name", Jv::s(n.clone()));
     }
+    if g.split.is_some() {
+        let (rows, withheld) = gpu_clients(ctx, s);
+        o.set(
+            "clients",
+            Jv::Arr(
+                rows.iter()
+                    .take(q.top)
+                    .map(|r| {
+                        let mut c = Jv::obj([
+                            ("pid", Jv::u(u64::from(r.pid))),
+                            ("exe", Jv::s(exe_word(&r.name))),
+                            ("scope", Jv::s(r.scope.word())),
+                            ("share_ppm", Jv::u(gpu_ppm(r.gpu.unwrap_or(0.0)))),
+                        ]);
+                        if let RowScope::Tab(k) = r.scope {
+                            c.set("local", Jv::u(k));
+                            if let Some(n) = ctx.tab_number(k) {
+                                c.set("tab", Jv::u(n as u64));
+                            }
+                        }
+                        c
+                    })
+                    .collect(),
+            ),
+        );
+        if withheld > 0 {
+            o.set("withheld", Jv::u(withheld as u64));
+        }
+    }
     o
+}
+
+/// The device's busy time split by owner, per-mille: client time by owner, and the device less
+/// the clients' sum as `unaccounted` (signed).
+fn gpu_split_json(ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
+    let Some((g, sp)) = s.gpu.as_ref().and_then(|g| Some((g, g.split?))) else {
+        return Jv::why(GPU_LANE_OFF);
+    };
+    let tab = tabs_fig(s, &scope_keys(ctx, ScopeArg::Tab), ctx.target.key)
+        .gpu
+        .unwrap_or(0.0);
+    let signed = |x: f32| (x * 1000.0).round() as i64;
+    Jv::obj([
+        ("tab", Jv::u(gpu_pm(tab))),
+        ("aterm_rest", Jv::u(gpu_pm(sp.aterm - tab))),
+        ("others", Jv::u(gpu_pm(sp.others))),
+        ("services", Jv::u(gpu_pm(sp.services))),
+        ("unaccounted", Jv::Int(signed(g.load.raw - sp.clients))),
+    ])
 }
 
 /// [`mem_classes`] as JSON: `[{class, bytes}]`, an unread class's bytes an
@@ -2891,6 +3053,7 @@ fn proc_json(ctx: &Ctx<'_>, s: &Snapshot, r: &ProcView) -> Jv {
         "write_bytes_per_s",
         Jv::known_or(r.write_bps.map(|b| b.round() as u64), why),
     );
+    o.set("gpu_ppm", Jv::known_or(r.gpu.map(gpu_ppm), GPU_LANE_OFF));
     o.set("stat", Jv::s(r.state.word()));
     o
 }

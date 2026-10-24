@@ -152,8 +152,91 @@ struct Vapor {
     born: Instant,
 }
 
+const BOLT_MAX_PTS: usize = 17;
+
+#[derive(Clone, Copy)]
+struct BoltPts {
+    buf: [(f32, f32); BOLT_MAX_PTS],
+    len: u8,
+}
+
+impl Default for BoltPts {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            buf: [(0.0, 0.0); BOLT_MAX_PTS],
+            len: 0,
+        }
+    }
+}
+
+impl BoltPts {
+    #[inline]
+    const fn push(&mut self, pt: (f32, f32)) {
+        let i = self.len as usize;
+        if i < BOLT_MAX_PTS {
+            self.buf[i] = pt;
+            self.len += 1;
+        }
+    }
+
+    #[inline]
+    const fn from_3(a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> Self {
+        let mut pts = Self {
+            buf: [(0.0, 0.0); BOLT_MAX_PTS],
+            len: 3,
+        };
+        pts.buf[0] = a;
+        pts.buf[1] = b;
+        pts.buf[2] = c;
+        pts
+    }
+}
+
+impl std::ops::Deref for BoltPts {
+    type Target = [(f32, f32)];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.buf[..usize::from(self.len)]
+    }
+}
+
+impl std::ops::DerefMut for BoltPts {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        let len = usize::from(self.len);
+        &mut self.buf[..len]
+    }
+}
+
+impl<'a> IntoIterator for &'a mut BoltPts {
+    type Item = &'a mut (f32, f32);
+    type IntoIter = std::slice::IterMut<'a, (f32, f32)>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        let len = usize::from(self.len);
+        self.buf[..len].iter_mut()
+    }
+}
+
+impl PartialEq for BoltPts {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl std::fmt::Debug for BoltPts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
+#[derive(Clone, Copy)]
 struct Bolt {
-    pts: Vec<(f32, f32)>,
+    pts: BoltPts,
     born: Instant,
     life: f32,
     branch: bool,
@@ -167,8 +250,6 @@ struct OutgoingFade {
     started: Instant,
     level0: f32,
 }
-
-type BoltJag = (Vec<(f32, f32)>, Vec<(f32, f32)>);
 
 /// Per-window aurora animation state.
 #[derive(Default)]
@@ -288,7 +369,6 @@ pub struct CursorGlow {
     water_run: Vec<BeamVertex>,
     bolt_verts: Vec<BeamVertex>,
     bolt_channel: Vec<(f32, f32, f32, bool)>,
-    bolt_jag: BoltJag,
     beam_scratch: BeamScratch,
     ink_ledger: InkLedger,
     /// The frame's last word on legibility ([`Self::guard_letters`]).
@@ -1041,11 +1121,6 @@ impl CursorGlow {
     /// Returns the deadline for the next visible change, or `None` when idle.
     #[must_use]
     pub fn next_change_deadline(&self, now: Instant, frame_interval: Duration) -> Option<Instant> {
-        let v2_due = if self.v2.engaged() {
-            self.v2.next_change_deadline(now)
-        } else {
-            None
-        };
         let v1_due = if self.needs_frame_cadence() {
             Some(now + frame_interval)
         } else if let Some(t) = self.poof_hint_pending() {
@@ -1061,7 +1136,11 @@ impl CursorGlow {
         } else {
             None
         };
-        let park_due = self.held_park.filter(|_| self.v2.engaged()).map(|p| {
+        if !self.v2.engaged() {
+            return v1_due;
+        }
+        let v2_due = self.v2.next_change_deadline(now);
+        let park_due = self.held_park.map(|p| {
             let park_expiry = p.at + p.patience() + rk::ARM_MIN;
             let credit_expiry = p.cross_row.then(|| {
                 self.type_press_ring
@@ -1073,7 +1152,7 @@ impl CursorGlow {
                 .min(credit_expiry.unwrap_or(park_expiry))
                 .max(now + rk::ARM_MIN)
         });
-        let torn_due = self.torn_lay.filter(|_| self.v2.engaged()).map(|l| {
+        let torn_due = self.torn_lay.map(|l| {
             (l.moved_at + Duration::from_secs_f32(Self::TORN_REST_S) + rk::ARM_MIN)
                 .max(now + rk::ARM_MIN)
         });
@@ -1488,22 +1567,22 @@ impl CursorGlow {
             }
             _ => 0,
         };
-        let carried = caret_carry.unsigned_abs() > 2
-            && (!scroll_frame || i32::from(caret_carry) != i32::from(scroll_rows));
         if witness_n > 0 {
             self.v2.carry_caret(caret_carry);
         }
+        let carried = caret_carry.unsigned_abs() > 2
+            && (!scroll_frame || i32::from(caret_carry) != i32::from(scroll_rows));
         let mut lifted = false;
         if self.v2.engaged()
             && witness_n > 0
-            && let (Some((pr, _)), Some((cr, _))) = (shown, cur)
             && (key_in_flight || scroll_frame || carried)
+            && let (Some((pr, _)), Some((cr, _))) = (shown, cur)
             && if carried {
                 true
             } else if scroll_frame {
                 cr.checked_sub(pr) == Some(scroll_rows)
             } else {
-                pr.abs_diff(cr) == 1
+                pr.abs_diff(cr) <= 2
             }
         {
             let (samples, n) = witness_samples(&self.witness_rows, witness_n);
@@ -1588,8 +1667,20 @@ impl CursorGlow {
         }
         self.particles
             .retain(|p| now.saturating_duration_since(p.born).as_secs_f32() < p.life);
-        self.fire_meteors
-            .retain(|m| now.saturating_duration_since(m.born).as_secs_f32() < m.life);
+        let mut struck: Option<Meteor> = None;
+        if !self.fire_meteors.is_empty() {
+            self.fire_meteors.retain_mut(|m| {
+                let age = now.saturating_duration_since(m.born).as_secs_f32();
+                if age >= m.life {
+                    return false;
+                }
+                if !m.arrived && age >= m.life * Self::METEOR_STRIKE_FRAC {
+                    m.arrived = true;
+                    struck = Some(*m);
+                }
+                true
+            });
+        }
         self.vapor
             .retain(|v| now.saturating_duration_since(v.born).as_secs_f32() < v.life);
         if matches!(cfg.style, GlowStyle::Fire)
@@ -1617,16 +1708,6 @@ impl CursorGlow {
                     born: now,
                 });
                 self.last_smoke = Some(now);
-            }
-        }
-        let mut struck: Option<Meteor> = None;
-        for m in &mut self.fire_meteors {
-            if !m.arrived
-                && now.saturating_duration_since(m.born).as_secs_f32()
-                    >= m.life * Self::METEOR_STRIKE_FRAC
-            {
-                m.arrived = true;
-                struck = Some(*m);
             }
         }
         if let Some(m) = struck {

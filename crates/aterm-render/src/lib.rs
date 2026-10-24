@@ -11990,12 +11990,18 @@ impl Renderer {
         let cols = input.cols;
         let pad_x = self.pad;
         let row_images = input.images.get(r).map(Vec::as_slice).unwrap_or(&[]);
+        let has_images = !row_images.is_empty();
         let row_clusters = input.clusters.get(r).map(Vec::as_slice).unwrap_or(&[]);
+        let has_clusters = !row_clusters.is_empty();
         let row_raster = input.chrome_raster(r);
         let may_have_sel = input.any_selection();
-        let mut plan: Option<Vec<ColumnGlyph>> = None;
+        let mut plan = std::mem::take(&mut self.glyph_plan_scratch);
         for (c, cell) in cells.iter().take(cols).enumerate() {
-            if image_covers(row_images, c) || cell.wide || cell.ch == ' ' || cell.ch.is_control() {
+            if (has_images && image_covers(row_images, c))
+                || cell.wide
+                || cell.ch == ' '
+                || cell.ch.is_control()
+            {
                 continue;
             }
             let (x, cell_w, scale, anchor_y) = if uniform {
@@ -12026,15 +12032,18 @@ impl Renderer {
                     cell_bg
                 }
             };
-            let plan = plan.get_or_insert_with(|| {
+            if self.glyph_plan_row != Some(r) {
                 let mut break_cols = std::mem::take(&mut self.ligature_break_scratch);
                 ligature_break_cols_into(input, r, &self.shaping, &mut break_cols);
-                let mut plan = Vec::new();
                 self.row_glyph_plan(input, r, &break_cols, &mut plan);
                 self.ligature_break_scratch = break_cols;
-                plan
-            });
-            let cluster = cluster_for(row_clusters, c);
+                self.glyph_plan_row = Some(r);
+            }
+            let cluster = if has_clusters {
+                cluster_for(row_clusters, c)
+            } else {
+                None
+            };
             let key = match plan.get(c).copied().unwrap_or(ColumnGlyph::PerCell) {
                 ColumnGlyph::Ligated(gid) => self.ligature_key(gid, cell_style(cell)),
                 ColumnGlyph::LigatedSlice { gid, k, .. } => {
@@ -12053,6 +12062,7 @@ impl Renderer {
             };
             self.blit_glyph_knock(pixels, w, x as i32, anchor_y, key, scale, under);
         }
+        self.glyph_plan_scratch = plan;
     }
 
     /// Stamp `key`'s coverage at each of [`KNOCK_DILATE_OFFSETS`] in `page`
@@ -12572,11 +12582,14 @@ impl Renderer {
             ..
         } = *ctx;
         let row_images = input.images.get(r).map(Vec::as_slice).unwrap_or(&[]);
-        let mut break_cols = std::mem::take(&mut self.ligature_break_scratch);
-        ligature_break_cols_into(input, r, &self.shaping, &mut break_cols);
+        let has_images = !row_images.is_empty();
         let mut plan = std::mem::take(&mut self.glyph_plan_scratch);
-        self.row_glyph_plan(input, r, &break_cols, &mut plan);
-        self.ligature_break_scratch = break_cols;
+        if self.glyph_plan_row != Some(r) {
+            let mut break_cols = std::mem::take(&mut self.ligature_break_scratch);
+            ligature_break_cols_into(input, r, &self.shaping, &mut break_cols);
+            self.row_glyph_plan(input, r, &break_cols, &mut plan);
+            self.ligature_break_scratch = break_cols;
+        }
         for &(c, ref image) in row_images {
             if image.image.z_index >= 0
                 || kitty_image_is_below_non_default_bg(image.image.z_index)
@@ -12594,7 +12607,9 @@ impl Renderer {
             }
         }
         let row_clusters = input.clusters.get(r).map(Vec::as_slice).unwrap_or(&[]);
+        let has_clusters = !row_clusters.is_empty();
         let row_combining = input.combining.get(r).map(Vec::as_slice).unwrap_or(&[]);
+        let has_combining = !row_combining.is_empty();
         let mut ink_walk = InkWalk::new(ink_row);
         let mut char_fg_walk = CharFgWalk::new(char_fg_row);
         let fire_present = !input.fire_patch.is_empty();
@@ -12605,7 +12620,10 @@ impl Renderer {
         type FgMemo = ((u32, [u8; 3], Option<usize>), (u32, u32));
         let mut fg_memo: Option<FgMemo> = None;
         for (c, cell) in cells.iter().take(cols).enumerate() {
-            if !image_covers(row_images, c) && !cell.wide && cell.ch != ' ' && !cell.ch.is_control()
+            if (!has_images || !image_covers(row_images, c))
+                && !cell.wide
+                && cell.ch != ' '
+                && !cell.ch.is_control()
             {
                 let (x, cw, scale, anchor_y) = if uniform {
                     (pad_x + c * cw, cw, scale, anchor_y)
@@ -12613,7 +12631,11 @@ impl Renderer {
                     let p = self.mixed_cell_place(input, r, c, y0);
                     (p.x, p.w, p.scale, p.anchor_y)
                 };
-                let cluster = cluster_for(row_clusters, c);
+                let cluster = if has_clusters {
+                    cluster_for(row_clusters, c)
+                } else {
+                    None
+                };
                 let base_fg = match ink_walk.at(c as u16) {
                     Some(ink) => rgb_to_u32(ink),
                     None => char_fg_walk
@@ -12690,7 +12712,8 @@ impl Renderer {
                     }
                     None => self.blit(pixels, w, x as i32, anchor_y, key, fg, bg_under, scale),
                 }
-                if cluster.is_none()
+                if has_combining
+                    && cluster.is_none()
                     && let Some(marks) = combining_for(row_combining, c)
                 {
                     let mut stack = MarkStack::default();
@@ -12759,7 +12782,11 @@ impl Renderer {
                     .at(c as u16)
                     .unwrap_or_else(|| rgb_to_u32(cell.fg)),
             };
-            let hit = input.selection_hit(r, c, is_wide_lead, cell.wide);
+            let hit = if may_have_sel {
+                input.selection_hit(r, c, is_wide_lead, cell.wide)
+            } else {
+                None
+            };
             let selected = hit.is_some();
             let SelectionColors {
                 bg: sel_bg,
@@ -17573,9 +17600,17 @@ pub const fn glow_lerp(c0: u32, c1: u32, i: u32, w: u32) -> u32 {
 #[must_use]
 #[inline]
 pub const fn glow_lerp_rgb(c0: u32, c1: u32, i: u32, w: u32) -> u32 {
-    let r = glow_lerp((c0 >> 16) & 0xff, (c1 >> 16) & 0xff, i, w);
-    let g = glow_lerp((c0 >> 8) & 0xff, (c1 >> 8) & 0xff, i, w);
-    let b = glow_lerp(c0 & 0xff, c1 & 0xff, i, w);
+    if c0 == c1 {
+        return c0 & 0x00FF_FFFF;
+    }
+    let w = if w < 1 { 1 } else { w };
+    let i_clamped = if i < w - 1 { i } else { w - 1 };
+    let m = 2 * i_clamped + 1;
+    let denom = 2 * w;
+    let w0 = denom - m;
+    let r = (((c0 >> 16) & 0xff) * w0 + ((c1 >> 16) & 0xff) * m + w) / denom;
+    let g = (((c0 >> 8) & 0xff) * w0 + ((c1 >> 8) & 0xff) * m + w) / denom;
+    let b = ((c0 & 0xff) * w0 + (c1 & 0xff) * m + w) / denom;
     (r << 16) | (g << 8) | b
 }
 
@@ -17596,6 +17631,9 @@ pub const fn add_sat(dst: u32, premul: u32) -> u32 {
 #[inline]
 #[must_use]
 pub const fn over_premul(dst: u32, premul: u32, a: u8) -> u32 {
+    if a == 0 {
+        return add_sat(dst, premul);
+    }
     let inv = 255 - a as u32;
     let r = ((premul >> 16) & 0xff) + (((dst >> 16) & 0xff) * inv + 127) / 255;
     let g = ((premul >> 8) & 0xff) + (((dst >> 8) & 0xff) * inv + 127) / 255;
@@ -17673,6 +17711,9 @@ pub struct BeamVertex {
 
 #[inline]
 fn lerp_rgb_f(a: u32, b: u32, t: f32) -> u32 {
+    if a == b {
+        return a;
+    }
     let t = t.clamp(0.0, 1.0);
     let m = |sh: u32| -> u32 {
         let ca = ((a >> sh) & 0xff) as f32;
@@ -18229,7 +18270,11 @@ fn ribbon_beam_ordered(
                     let c = (level * cover + BAYER4[y.rem_euclid(4) as usize][dither_x]) as u8;
                     if c > 0 {
                         let premul0 = premul_rgb(col0, c);
-                        let premul1 = premul_rgb(col1, c);
+                        let premul1 = if col0 == col1 {
+                            premul0
+                        } else {
+                            premul_rgb(col1, c)
+                        };
                         if (premul0 != 0 || premul1 != 0)
                             && rect_x1 > rect_x0
                             && y >= clip.y0
@@ -18540,8 +18585,6 @@ pub fn layered_beam_quads_with(
     if run.len() < 2 {
         return;
     }
-    scratch.styles.clear();
-    scratch.styles.extend(run.iter().map(|s| color_at(s.pos)));
     scratch.simplify(run, straighten);
     let BeamScratch {
         styles,
@@ -18549,11 +18592,12 @@ pub fn layered_beam_quads_with(
         verts,
         ..
     } = scratch;
+    styles.clear();
+    styles.extend(kept.iter().map(|&i| color_at(run[i].pos)));
     for &(tmul, cmul, target, mbase, mpos, lstep) in layers {
         verts.clear();
-        for &i in kept.iter() {
+        for (&i, &style) in kept.iter().zip(styles.iter()) {
             let s = &run[i];
-            let style = styles[i];
             let color = if mbase > 0.0 || mpos > 0.0 {
                 lerp_rgb_f(style, target, (mbase + mpos * s.pos).min(1.0))
             } else {

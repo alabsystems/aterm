@@ -12,7 +12,8 @@ use aterm_sysprobe::{ProcessReading, processes};
 use aterm_uds::spawnfd::{Child, Stdio, command};
 use aterm_vitals::jobs::{
     Fd, FdKind, HeldProc, JobCounters, JobProc, JobTab, JobTick, Jobs, JobsView, Knote,
-    KnoteFilter, LanesSeen, Machine, ProcState, SweepProc, TcpState, ThreadState, Verdict,
+    KnoteFilter, LanesSeen, Machine, ProcState, StartWait, SweepProc, TcpState, ThreadState,
+    Verdict,
 };
 
 const TICK: Duration = Duration::from_secs(2);
@@ -250,6 +251,7 @@ impl Host {
                 exec: p.start.unwrap_or(0),
                 name: p.exe.clone().unwrap_or_else(|| p.name.clone()),
                 aterm: true,
+                wait: StartWait::ProgramCheck,
             })
             .collect();
         let lanes = self.reader.lanes();
@@ -358,12 +360,14 @@ fn fd(f: &probe::FdReading) -> Fd {
             dev,
             ino,
             lf_tail,
+            fresh_dylib,
         } => FdKind::File {
             regular: *regular,
             size: *size,
             dev: *dev,
             ino: *ino,
             lf_tail: *lf_tail,
+            fresh_dylib: *fresh_dylib,
         },
         probe::FdKind::Device { tty } => FdKind::Device { tty: *tty },
         probe::FdKind::Pipe {

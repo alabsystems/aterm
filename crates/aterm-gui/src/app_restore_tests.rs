@@ -3721,6 +3721,7 @@ fn handed_off_shell(local_id: u64) -> crate::spawn::Adopted {
         journal_key: None,
         task: None,
         autopilot_end: None,
+        wakes: None,
     }
 }
 

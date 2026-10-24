@@ -2292,4 +2292,8 @@ fn agy_usage_card_weekly_parses_gemini_and_third_party_rows() {
     let gemini = usage_card_weekly(&rows).expect("gemini weekly");
     assert_eq!(gemini.text, "weekly 78% left");
     assert_eq!(gemini.reset.as_deref(), Some("2026-10-29 09:31 PDT"));
+    let claude =
+        usage_card_weekly_for_model(&rows, Some("Claude Opus 4.6")).expect("claude weekly");
+    assert_eq!(claude.text, "weekly 100% left");
+    assert_eq!(claude.reset.as_deref(), Some("2026-10-31 00:51 PDT"));
 }

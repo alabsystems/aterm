@@ -889,6 +889,15 @@ pub(crate) mod fault {
         /// The fact word's edit moves the record's `rev` too, so every `await task` past a rev
         /// with news standing wakes on it.
         NoteBumpsNews,
+        /// An `await wake` answer's slot is asked of the typed lines' pace (`pace_on`), which
+        /// under `observe` grants nothing.
+        PaceOnAwait,
+        /// An `await wake` answer whose need names slots takes no reservation.
+        AwaitSkipsReserve,
+        /// The wake K clock is fed only from a loop's break, which no loop of this build runs.
+        KFromBreakOnly,
+        /// A restored book's `pid:` atoms are not armed again: their births are not carried over.
+        NoRearm,
     }
 
     thread_local! {
@@ -923,6 +932,10 @@ pub(crate) mod fault {
         YoungestFirst,
         CountOwn,
         NoteBumpsNews,
+        PaceOnAwait,
+        AwaitSkipsReserve,
+        KFromBreakOnly,
+        NoRearm,
     }
 
     /// Never armed.
@@ -1222,6 +1235,26 @@ pub(crate) fn told(sid: &str, said: Option<OccupancySaid>) {
         .unwrap_or_else(PoisonError::into_inner)
         .get_or_insert_with(Judged::default)
         .tell(sid, said);
+}
+
+/// What session `sid`'s loop last told this window ([`told`]).
+pub(crate) fn said_of(sid: &str) -> Option<OccupancySaid> {
+    BOARD
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .and_then(|j| j.said(sid).cloned())
+}
+
+/// Reserve a free build slot for session `sid`'s `await wake` answer on the board's table
+/// ([`Pace::reserve`]): aged from `age_ms`, with `usable` slots its snapshot proves at `now_ms`.
+pub(crate) fn reserve_for_await(sid: &str, age_ms: i64, usable: u16, now_ms: i64) -> Reserve {
+    BOARD
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get_or_insert_with(Judged::default)
+        .pace
+        .reserve(sid, age_ms, usable, now_ms)
 }
 
 /// Every session whose loop told this window a word ([`Judged::told_sids`]).

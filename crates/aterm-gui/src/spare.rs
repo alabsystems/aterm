@@ -226,28 +226,6 @@ pub(crate) struct SpareFifo {
     file: std::fs::File,
 }
 
-#[cfg(unix)]
-fn fifo_owner() -> &'static str {
-    static OWNER: OnceLock<String> = OnceLock::new();
-    OWNER.get_or_init(|| {
-        let pid = std::process::id();
-        let birth = i32::try_from(pid)
-            .ok()
-            .and_then(aterm_pty::process_birth)
-            .unwrap_or(0);
-        format!("{pid}-{birth}")
-    })
-}
-
-#[cfg(unix)]
-fn fifo_name_parts(name: &str) -> Option<(u32, u64, &str)> {
-    let mut parts = name.splitn(3, '-');
-    let pid = parts.next()?.parse().ok()?;
-    let birth = parts.next()?.parse().ok()?;
-    let sid = parts.next()?;
-    crate::keeper_link::valid_sid(sid).then_some((pid, birth, sid))
-}
-
 impl SpareFifo {
     /// Create and open session `sid`'s FIFO and symlink.
     #[cfg(unix)]
@@ -256,7 +234,7 @@ impl SpareFifo {
             .ok_or_else(|| std::io::Error::other("no private control dir"))?;
         let link = crate::control_auth::sid_file_in(&dir, sid)
             .ok_or_else(|| std::io::Error::other("not a minted sid"))?;
-        let name = format!("{}-{}", fifo_owner(), sid.as_str());
+        let name = aterm_core::shell_integration::spare_fifo::name(sid.as_str());
         let mut fifo = Self::make_at(dir.join(&name))?;
         std::os::unix::fs::symlink(&name, &link)?;
         fifo.link = Some(link);
@@ -310,45 +288,6 @@ impl Drop for SpareFifo {
         }
         let _ = std::fs::remove_file(&self.path);
     }
-}
-
-/// Wake and unlink stale spare FIFOs left in `dir` by dead owner processes.
-#[cfg(unix)]
-pub(crate) fn sweep_dead_fifos(dir: &Path) {
-    use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _};
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some((pid, birth, sid)) = name.to_str().and_then(fifo_name_parts) else {
-            continue;
-        };
-        if !entry.file_type().is_ok_and(|t| t.is_fifo()) || fifo_owner_alive(pid, birth) {
-            continue;
-        }
-        let path = entry.path();
-        let writer = std::fs::OpenOptions::new()
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
-            .open(&path);
-        let link = dir.join(sid);
-        if std::fs::read_link(&link).is_ok_and(|to| to.as_os_str() == name.as_os_str()) {
-            let _ = std::fs::remove_file(&link);
-        }
-        let _ = std::fs::remove_file(&path);
-        drop(writer);
-    }
-}
-
-#[cfg(unix)]
-fn fifo_owner_alive(pid: u32, birth: u64) -> bool {
-    aterm_uds::process::pid_alive(pid)
-        && (birth == 0
-            || i32::try_from(pid)
-                .ok()
-                .and_then(aterm_pty::process_birth)
-                .is_none_or(|now| now == birth))
 }
 
 /// Bitflags recording pre-adoption host effects requested by a spare.
@@ -2404,7 +2343,9 @@ fn worker(rx: Receiver<Job>) {
             Some(Job::Sweep) => {
                 #[cfg(unix)]
                 if let Some(dir) = crate::control_auth::socket_dir() {
-                    sweep_dead_fifos(&dir.join(aterm_core::shell_integration::SPARE_DIR));
+                    aterm_core::shell_integration::spare_fifo::sweep_dead(
+                        &dir.join(aterm_core::shell_integration::SPARE_DIR),
+                    );
                 }
                 false
             }
@@ -2809,7 +2750,6 @@ impl Wake {
             | Wake::DevToolsProbeReady
             | Wake::DebuggerAccessResult
             | Wake::DevToolsHandOver
-            | Wake::SecretsVault(..)
             | Wake::GpuSurfaceReady { .. }
             | Wake::MacosAccessCardDecided { .. }
             | Wake::ReadDims { .. }

@@ -70,6 +70,8 @@ pub const VNODE_DEV_AT: usize = 24;
 pub const VNODE_MODE_AT: usize = 28;
 /// `… vst_ino`.
 pub const VNODE_INO_AT: usize = 32;
+/// `… vst_mtime` (`int64_t`, seconds since the epoch): when its data last changed.
+pub const VNODE_MTIME_AT: usize = 64;
 /// `… vst_size` (`off_t`).
 pub const VNODE_SIZE_AT: usize = 112;
 /// `… pvip.vip_path` (`MAXPATHLEN` bytes).
@@ -217,6 +219,10 @@ pub const SDK_ROWS: &[(&str, i64)] = &[
     (
         "offsetof(struct vnode_fdinfowithpath, pvip.vip_vi.vi_stat.vst_ino)",
         VNODE_INO_AT as i64,
+    ),
+    (
+        "offsetof(struct vnode_fdinfowithpath, pvip.vip_vi.vi_stat.vst_mtime)",
+        VNODE_MTIME_AT as i64,
     ),
     (
         "offsetof(struct vnode_fdinfowithpath, pvip.vip_vi.vi_stat.vst_size)",
@@ -401,6 +407,8 @@ pub struct VnodeFd {
     pub ino: u64,
     /// `vst_size`, never negative.
     pub size: u64,
+    /// `vst_mtime`: when its data last changed, seconds since the epoch.
+    pub mtime_s: i64,
     /// `vip_path`, up to its NUL.
     pub path: Vec<u8>,
 }
@@ -439,6 +447,7 @@ pub fn vnode(b: &[u8]) -> Option<VnodeFd> {
         dev: u32_at(b, VNODE_DEV_AT)?,
         ino: u64_at(b, VNODE_INO_AT)?,
         size: u64::try_from(i64_at(b, VNODE_SIZE_AT)?).unwrap_or(0),
+        mtime_s: i64_at(b, VNODE_MTIME_AT)?,
         path: raw[..end].to_vec(),
     })
 }

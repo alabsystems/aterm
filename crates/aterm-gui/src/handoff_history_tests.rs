@@ -74,6 +74,7 @@ fn record(local_id: u64) -> SessionRecord {
         task: None,
         status_seen: None,
         autopilot_end: None,
+        wakes: None,
     }
 }
 

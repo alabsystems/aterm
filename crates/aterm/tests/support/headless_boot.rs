@@ -43,8 +43,15 @@ impl Drop for Instance {
     }
 }
 
-/// Remove a scratch world whose instances (and keeper) are dead.
+/// Remove a scratch world whose instances (and keeper) are dead, first releasing the warm spares
+/// they left waiting on their FIFOs as the next launch in the world would: no launch comes to a
+/// removed world, and a spare its hangup did not end waits in its FIFO's open for ever.
 pub fn remove_world(root: &Path) {
+    aterm_shell_integration::spare_fifo::sweep_dead(
+        &root
+            .join("run/aterm")
+            .join(aterm_shell_integration::SPARE_DIR),
+    );
     for _ in 0..40 {
         if std::fs::remove_dir_all(root).is_ok() || !root.exists() {
             return;

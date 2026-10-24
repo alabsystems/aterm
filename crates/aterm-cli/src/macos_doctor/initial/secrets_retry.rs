@@ -39,7 +39,7 @@ pub(super) trait Reads {
     fn build(&self) -> String;
     /// Now, in seconds since the epoch.
     fn now(&self) -> u64;
-    /// Outbound route source addresses as text.
+    /// Stable local interface facts as text.
     fn routes(&self) -> String;
     /// Vault handle for the single console account, if any.
     fn vault(&self) -> Option<Arc<dyn SecretsOps>>;
@@ -96,7 +96,7 @@ impl Reads for Live {
     }
 
     fn routes(&self) -> String {
-        format!("{:?}", aterm_secrets::server::route_sources())
+        format!("{:?}", aterm_secrets::network::interfaces().ok())
     }
 
     fn vault(&self) -> Option<Arc<dyn SecretsOps>> {
@@ -209,6 +209,24 @@ pub(super) fn paused(root: &Path, revision: u64, pace: &Pace) -> Option<Vec<Row>
     )
 }
 
+/// The deadline of a retryable try now due, for a parked worker. Waiting on a
+/// person has no timer, and two failed changes stay held until a fact changes.
+/// The worker consumes a deadline once; only a later actual try advances it.
+pub(super) fn retry_due(root: &Path, revision: u64, now: u64) -> Option<u64> {
+    let last = Attempt::load(root)?;
+    if last.revision != revision
+        || last.held()
+        || !last
+            .rows
+            .iter()
+            .any(|(_, status, _)| !matches!(status.as_str(), "ok" | "applied" | super::WAITING))
+    {
+        return None;
+    }
+    let due = last.at.saturating_add(pause(last.tries).as_secs());
+    (!(last.at..due).contains(&now)).then_some(due)
+}
+
 /// Records the outcome of a Secrets attempt for `revision` at `pace`.
 /// # Errors
 /// The record cannot be written or removed.
@@ -271,7 +289,7 @@ pub(super) fn record(
     .save(root)
 }
 
-const HELD: &str = "aterm tried this twice by itself and it did not take, so it tries again only when this Mac's network or vault changes, after an update of aterm, or on Apply in System State";
+const HELD: &str = "aterm tried this twice by itself and it did not take, so it tries again only when this Mac's network or vault changes, after an update of aterm, or on Set up now or Join in System State";
 
 fn note(pause: Duration) -> String {
     let minutes = pause.as_secs() / 60;
@@ -281,7 +299,7 @@ fn note(pause: Duration) -> String {
         format!("{minutes} minutes")
     };
     format!(
-        "aterm tries again by itself {after} after this try, and at once when this Mac's network or vault changes or on Apply in System State"
+        "aterm tries again by itself {after} after this try, and at once when this Mac's network or vault changes or on Set up now or Join in System State"
     )
 }
 
@@ -321,7 +339,7 @@ mod tests {
         record(root, 3, &pace("m", 1_000), false, &mut rows).unwrap();
         assert_eq!(
             rows[0].detail,
-            "the vault does not answer; aterm tries again by itself a minute after this try, and at once when this Mac's network or vault changes or on Apply in System State"
+            "the vault does not answer; aterm tries again by itself a minute after this try, and at once when this Mac's network or vault changes or on Set up now or Join in System State"
         );
         let shown = paused(root, 3, &pace("m", 1_059)).expect("paused");
         assert_eq!(shown[0].detail, rows[0].detail);
@@ -357,6 +375,44 @@ mod tests {
         assert_eq!(done[0].detail, "in vault alab (seq 7)");
         assert!(!root.join(RECORD).exists());
         assert!(paused(root, 3, &pace("n", 1_303)).is_none());
+    }
+
+    #[test]
+    fn parked_retry_deadlines_belong_to_the_unfinished_attempt_and_hold_failed_changes() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let root = root.path();
+        assert_eq!(retry_due(root, 3, 2_000), None);
+        record(root, 3, &pace("m", 1_000), false, &mut blocked("offline")).unwrap();
+        assert_eq!(retry_due(root, 3, 1_059), None);
+        assert_eq!(retry_due(root, 3, 1_060), Some(1_060));
+        assert_eq!(retry_due(root, 3, 1_300), Some(1_060));
+        assert_eq!(retry_due(root, 4, 1_300), None, "another run's deadline");
+        record(root, 3, &pace("m", 1_300), false, &mut blocked("offline")).unwrap();
+        assert_eq!(retry_due(root, 3, 1_419), None);
+        assert_eq!(
+            retry_due(root, 3, 1_420),
+            Some(1_420),
+            "a new try advances it"
+        );
+        let mut waiting = blocked("an administrator must approve");
+        waiting[0].status = super::super::WAITING.into();
+        record(root, 3, &pace("m", 1_500), false, &mut waiting).unwrap();
+        assert_eq!(retry_due(root, 3, 9_000), None);
+        let failed = || {
+            let mut rows = blocked("the change failed");
+            rows[0].status = "error".into();
+            rows
+        };
+        record(root, 3, &pace("m", 2_000), false, &mut failed()).unwrap();
+        record(root, 3, &pace("m", 3_000), false, &mut failed()).unwrap();
+        assert_eq!(retry_due(root, 3, 9_000), None, "failed changes are held");
+        let mut rows = blocked("offline on another network");
+        record(root, 3, &pace("n", 4_000), false, &mut rows).unwrap();
+        assert_eq!(
+            retry_due(root, 3, 4_060),
+            Some(4_060),
+            "external change re-arms it"
+        );
     }
 
     #[test]

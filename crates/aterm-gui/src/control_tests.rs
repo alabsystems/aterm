@@ -1086,6 +1086,60 @@ fn a_reply_wire_releases_when_its_reply_is_written() {
     assert!(!wire.wait_released(std::time::Instant::now() + std::time::Duration::from_millis(20)));
 }
 
+/// A reply's release hook ([`ReplyWire::on_release`]) is told whether the reply reached its
+/// peer whole: delivered once written and flushed, not delivered on a failed write or an outbox
+/// dropped unwritten, and told at once when hung on a latch released already.
+#[test]
+fn a_replys_release_hook_hears_whether_it_was_delivered() {
+    let hung = |reply: &str| {
+        let (wire, written) = ReplyWire::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        wire.on_release(move |delivered| {
+            let _ = tx.send(delivered);
+        });
+        (
+            ControlReply::from(reply).releasing_on_write(written),
+            wire,
+            rx,
+        )
+    };
+    let (reply, wire, heard) = hung("OK wake #1 ready since=1\n");
+    let mut bytes = Vec::new();
+    assert!(deliver_waiting(&mut outbox_of(reply), &mut bytes).unwrap());
+    assert_eq!(bytes, b"OK wake #1 ready since=1\n");
+    assert!(wire.is_released());
+    assert_eq!(heard.try_recv(), Ok(true), "written and flushed: delivered");
+
+    let (reply, _wire, heard) = hung("OK wake #2 ready since=1\n");
+    let mut failing = FailPast {
+        limit: 0,
+        bytes: Vec::new(),
+    };
+    assert!(deliver_waiting(&mut outbox_of(reply), &mut failing).is_err());
+    assert_eq!(heard.try_recv(), Ok(false), "a failed write is no delivery");
+
+    let (reply, _wire, heard) = hung("OK wake #3 ready since=1\n");
+    drop(outbox_of(reply));
+    assert_eq!(
+        heard.try_recv(),
+        Ok(false),
+        "dropped unwritten: no delivery"
+    );
+
+    let (reply, wire, heard) = hung("OK wake #4 ready since=1\n");
+    drop(reply);
+    assert_eq!(heard.try_recv(), Ok(false));
+    let (tx, late) = std::sync::mpsc::channel();
+    wire.on_release(move |delivered| {
+        let _ = tx.send(delivered);
+    });
+    assert_eq!(
+        late.try_recv(),
+        Ok(false),
+        "a late hook hears the released latch at once"
+    );
+}
+
 fn capture_reply_target(
     label: &str,
 ) -> (
@@ -2409,6 +2463,8 @@ fn wait_requests_are_the_ones_that_park_or_relay() {
         "askpass",
         &format!("@{local_sid} edit file:///tmp/x.txt"),
         "await edit ticket=1",
+        "await wake",
+        &format!("@{local_sid} await wake timeout=1000"),
     ] {
         assert!(
             request_waits(line, Scope::Owner, &store),
@@ -10360,6 +10416,44 @@ fn ready_verb_reports_prompt_executing_and_exit() {
     );
 }
 
+/// Every shipped integration script sends `133;B` right after drawing its prompt, so a resting
+/// prompt is `EnteringCommand`; `ready` calls it a prompt, a typed line included.
+#[test]
+fn ready_verb_reports_prompt_at_an_integrated_prompt() {
+    let store = session_store::new_store();
+    let h = registered_session(0, -1, b"");
+    store.write().unwrap().register(h.clone());
+    let term = &h.term;
+
+    term.lock()
+        .unwrap()
+        .process(b"\x1b]133;A\x07user@host:~$ \x1b]133;B\x07");
+    assert_eq!(
+        cmd_ready(term, &store, 0, &h.ctx, "2000"),
+        "OK ready prompt\n",
+        "a resting prompt the shell marked with 133;B"
+    );
+
+    term.lock().unwrap().process(b"ls -l");
+    assert_eq!(
+        cmd_ready(term, &store, 0, &h.ctx, "2000"),
+        "OK ready prompt\n",
+        "a line typed at the prompt leaves the shell at its prompt"
+    );
+
+    term.lock()
+        .unwrap()
+        .process(b"\r\n\x1b]133;C\x07total 0\r\n\x1b]133;D;0\x07");
+    term.lock()
+        .unwrap()
+        .process(b"\x1b]133;A\x07user@host:~$ \x1b]133;B\x07");
+    assert_eq!(
+        cmd_ready(term, &store, 0, &h.ctx, "2000"),
+        "OK ready prompt\n",
+        "the next prompt after a command"
+    );
+}
+
 #[test]
 fn the_wait_family_refuses_an_ms_that_is_not_one() {
     use std::time::Instant;
@@ -10690,6 +10784,8 @@ fn an_agent_s_typed_turn_lays_ribbon_and_a_pasted_turn_does_not() {
                 actor: aterm_slog::Actor::Ctl,
                 cause: None,
                 mark: None,
+                witness: None,
+                refused: &|| None,
             },
         );
         let laid = app.borrow().windows[&wid]
@@ -10763,6 +10859,8 @@ fn the_typed_turn_s_only_signature_is_its_even_cadence() {
             actor: aterm_slog::Actor::Ctl,
             cause: None,
             mark: None,
+            witness: None,
+            refused: &|| None,
         },
     );
     assert!(out.starts_with("OK "), "{out}");
@@ -10851,6 +10949,8 @@ fn cap_gives_a_typed_turn_room_to_press_a_long_text() {
                 actor: aterm_slog::Actor::Ctl,
                 cause: None,
                 mark: None,
+                witness: None,
+                refused: &|| None,
             },
         );
         let verdict = out.lines().next().unwrap_or("").to_string();
@@ -10947,6 +11047,8 @@ fn typed_turn_with(
             actor: aterm_slog::Actor::Ctl,
             cause: None,
             mark: None,
+            witness: None,
+            refused: &|| None,
         },
     );
     let verdict = out.lines().next().unwrap_or("").to_string();
@@ -11195,6 +11297,8 @@ fn composer_turn_on(
                 actor: aterm_slog::Actor::Ctl,
                 cause: None,
                 mark: None,
+                witness: None,
+                refused: &|| None,
             },
         );
         drop(tx);
@@ -11673,6 +11777,8 @@ fn a_yielding_turn_types_only_after_the_ribbon_exhales() {
             actor: aterm_slog::Actor::Ctl,
             cause: None,
             mark: None,
+            witness: None,
+            refused: &|| None,
         },
     );
     let verdict = out.lines().next().unwrap_or("");
@@ -11702,6 +11808,8 @@ fn a_yielding_turn_types_only_after_the_ribbon_exhales() {
             actor: aterm_slog::Actor::Ctl,
             cause: None,
             mark: None,
+            witness: None,
+            refused: &|| None,
         },
     );
     assert_eq!(out, "ERR yield timeout momentum=0.90\n");
@@ -11751,6 +11859,37 @@ fn await_gone_verb_latches_at_arm_when_clear_and_when_the_row_leaves() {
         t0.elapsed() < std::time::Duration::from_secs(60),
         "woken by the clearing frame, not by the timeout"
     );
+}
+
+/// PowerShell's prompt function sends `D`, `A`, its prompt and `B` in one write: `await block`
+/// armed while the command runs answers at that batch, with the seq it latched at.
+#[test]
+fn await_block_answers_a_completion_whose_next_prompt_lands_in_the_same_batch() {
+    let store = session_store::new_store();
+    let h = registered_session(
+        0,
+        -1,
+        b"\x1b]133;A\x07PS> \x1b]133;B\x07make\r\n\x1b]133;C\x07",
+    );
+    store.write().unwrap().register(h.clone());
+
+    let (term_t, watchers) = (h.term.clone(), h.ctx.watchers.clone());
+    let shell = std::thread::spawn(move || {
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the `block` await parks on the session",
+            || (watchers.count() == 1).then_some(()),
+        );
+        let mut t = crate::term_lock(&term_t);
+        t.process(b"built\r\n\x1b]133;D;0\x07\x1b]133;A\x07PS> \x1b]133;B\x07");
+        let seq = t.content_seq();
+        drop(t);
+        watchers.ring_watchers();
+        seq
+    });
+    let out = cmd_await(&h.term, &store, 0, &h.ctx, "block timeout=60000");
+    let seq = shell.join().unwrap();
+    assert_eq!(out, format!("OK block {seq}\n"));
 }
 
 #[test]
@@ -13160,8 +13299,6 @@ fn turn_fails_closed_on_exit_and_bad_submit_key() {
     store.write().unwrap().register(h.clone());
     let term = &h.term;
 
-    let paste = |_: &str| true;
-    let bad_press = |_: &str| false; // parse_key rejected the name
     let out = cmd_turn(
         term,
         &store,
@@ -13169,8 +13306,7 @@ fn turn_fails_closed_on_exit_and_bad_submit_key() {
         "submit=bogus-key timeout=3000 hi",
         &h.ctx,
         &TurnIo {
-            paste: &paste,
-            press: &bad_press,
+            paste: &|_: &str| panic!("a submit= that names no key is refused before typing"),
             ..TurnIo::paste_only()
         },
     );
@@ -13191,7 +13327,7 @@ fn turn_fails_closed_on_exit_and_bad_submit_key() {
         "timeout=3000 hi",
         &h.ctx,
         &TurnIo {
-            paste: &paste,
+            paste: &|_: &str| panic!("a turn into an exited session is refused before pasting"),
             press: &press,
             ..TurnIo::paste_only()
         },
@@ -14968,6 +15104,59 @@ fn feed_idempotent_the_mark_is_per_producer_and_covers_everything_under_it() {
     assert_eq!(go(format!("{hex}:1:6")), "OK\n", "above the mark");
     assert_eq!(go(format!("{hex}:2:5")), "OK\n");
     assert_eq!(runs.get(), 3);
+}
+
+/// A `key` whose name parses to no key is refused with the request's own words, before
+/// the claim: the retry with the same `id=` and a good name is a first attempt, not
+/// `ERR in-doubt`.
+#[test]
+#[cfg(unix)]
+fn a_key_that_names_no_key_leaves_its_id_for_the_retry() {
+    let (h, rx) = guarded_pipe_session(1);
+    let key = format!("{}:4:1", h.ctx.nonce.to_hex());
+    let dispatch = |rest: &str| -> String {
+        if let Err(refusal) = admit_with(
+            InputAdmission {
+                class: input_of("key"),
+                verb: "key",
+                ctx: &h.ctx,
+                session: 1,
+                is_cross: true,
+                args: rest.as_bytes(),
+                unread_ok: false,
+                usage: None,
+            },
+            || input_words(Scope::Owner, "key", rest, None, &h.ctx),
+        ) {
+            return refusal;
+        }
+        crate::pty_idem::guarded(&h.ctx, Scope::Owner, "key", Some(key.as_str()), || {
+            parse_key(rest).map_or_else(
+                || control_input::KEY_USAGE.to_string(),
+                |ev| control_input::input_reply_to_str(background("key", &h.term, &h.ctx, ev)),
+            )
+        })
+    };
+
+    assert_eq!(dispatch("no-such-key"), control_input::KEY_USAGE);
+    assert!(drain_pipe(&rx).is_empty());
+    assert_eq!(
+        dispatch("down"),
+        "OK\n",
+        "the refused name gave its sequence back"
+    );
+    assert_eq!(drain_pipe(&rx), b"\x1b[B");
+    assert_eq!(dispatch("down"), "OK dup=1\n");
+    assert!(drain_pipe(&rx).is_empty());
+    assert!(
+        h.ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .since(None)
+            .all(|e| e.kind != "in-doubt"),
+        "a refusal of the request's own words is not in doubt"
+    );
 }
 
 #[test]
@@ -17202,6 +17391,589 @@ fn a_refused_turn_option_leaves_its_id_for_the_retry() {
     });
     assert_eq!(retry, "ERR in-doubt seq=2\n");
     assert_eq!(typed.borrow().as_str(), "", "nothing typed");
+}
+
+/// A `submit=` that names no key is one of the turn's own words: refused before the
+/// claim and before the text is typed, so the corrected retry is a first attempt.
+#[test]
+fn a_turn_whose_submit_names_no_key_types_nothing_and_leaves_its_id() {
+    let store = session_store::new_store();
+    let h = registered_session(0, -1, b"");
+    store.write().unwrap().register(h.clone());
+    let typed = std::cell::RefCell::new(String::new());
+    let paste = |text: &str| {
+        typed.borrow_mut().push_str(text);
+        true
+    };
+    let press = |name: &str| parse_key(name).is_some();
+    let key = format!("{}:4:1", h.ctx.nonce.to_hex());
+    let dispatch = |line: &str| -> String {
+        if let Err(refusal) = control_session::turn_preflight(line) {
+            return refusal;
+        }
+        crate::pty_idem::guarded(&h.ctx, Scope::Owner, "turn", Some(key.as_str()), || {
+            cmd_turn(
+                &h.term,
+                &store,
+                0,
+                line,
+                &h.ctx,
+                &TurnIo {
+                    paste: &paste,
+                    press: &press,
+                    ..TurnIo::paste_only()
+                },
+            )
+        })
+    };
+
+    assert_eq!(
+        dispatch("submit=no-such-key idle=5 timeout=60000 hi"),
+        control_session::TURN_USAGE
+    );
+    assert_eq!(typed.borrow().as_str(), "", "nothing typed");
+    let reply = dispatch("submit=none idle=5 timeout=60000 hi");
+    assert!(
+        reply.starts_with("OK "),
+        "the corrected retry is a first attempt: {reply}"
+    );
+    assert_eq!(typed.borrow().as_str(), "hi");
+}
+
+/// A turn refused after its claim but before it typed anything (a hold that landed
+/// after admission, a `yield=` that could not read the momentum) gives its `id=` back,
+/// as the same refusal at admission would.
+#[test]
+fn a_turn_refused_before_it_types_leaves_its_id_for_the_retry() {
+    let store = session_store::new_store();
+    let h = registered_session(0, -1, b"");
+    store.write().unwrap().register(h.clone());
+    let typed = std::cell::RefCell::new(String::new());
+    let paste = |text: &str| {
+        typed.borrow_mut().push_str(text);
+        true
+    };
+    let key = format!("{}:4:1", h.ctx.nonce.to_hex());
+    let turn = |line: &str| {
+        crate::pty_idem::guarded_waking(
+            &h.ctx,
+            Scope::Owner,
+            "turn",
+            Some(key.as_str()),
+            &|| {},
+            |witness| {
+                cmd_turn(
+                    &h.term,
+                    &store,
+                    0,
+                    line,
+                    &h.ctx,
+                    &TurnIo {
+                        paste: &paste,
+                        witness: Some(witness),
+                        ..TurnIo::paste_only()
+                    },
+                )
+            },
+        )
+    };
+
+    assert!(crate::fabric::apply_hold_for_test(
+        &h.ctx,
+        Some(crate::fabric::Hold {
+            reason: "demo".to_string(),
+            origin: "local".to_string(),
+        })
+    ));
+    assert_eq!(
+        turn("submit=none idle=5 timeout=60000 hi"),
+        "ERR halted reason=demo origin=local\n"
+    );
+    assert!(crate::fabric::apply_hold_for_test(&h.ctx, None));
+    let unreadable = turn("submit=none yield=0.5 idle=5 timeout=60000 hi");
+    assert!(unreadable.starts_with("ERR yield: "), "{unreadable}");
+    assert_eq!(typed.borrow().as_str(), "", "nothing typed");
+
+    let reply = turn("submit=none idle=5 timeout=60000 hi");
+    assert!(
+        reply.starts_with("OK "),
+        "both refusals gave the sequence back: {reply}"
+    );
+    assert_eq!(typed.borrow().as_str(), "hi");
+    assert!(
+        h.ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .since(None)
+            .all(|e| e.kind != "in-doubt"),
+        "a refusal before any write is not in doubt"
+    );
+}
+
+/// A guarded submit whose Enter finds the sink busy until its window ends comes after
+/// the text was typed: the reply must not read as a refusal before any write (`ERR
+/// busy`), which would give the `id=` back and let the retry type the text again.
+#[test]
+#[cfg(unix)]
+fn a_guarded_submit_into_a_busy_sink_after_typing_keeps_its_id_in_doubt() {
+    let store = session_store::new_store();
+    // No nonblocking master: every immediate write of the Enter is `BusyZero`.
+    let h = registered_session(0, -1, b"> ");
+    store.write().unwrap().register(h.clone());
+    let pastes = std::cell::Cell::new(0u32);
+    let paste = |_: &str| {
+        pastes.set(pastes.get() + 1);
+        true
+    };
+    let key = format!("{}:4:1", h.ctx.nonce.to_hex());
+    let turn = || {
+        crate::pty_idem::guarded_waking(
+            &h.ctx,
+            Scope::Owner,
+            "turn",
+            Some(key.as_str()),
+            &|| {},
+            |witness| {
+                cmd_turn(
+                    &h.term,
+                    &store,
+                    0,
+                    "submit=guarded:^> submit_window=20 idle=5 timeout=60000 hi",
+                    &h.ctx,
+                    &TurnIo {
+                        paste: &paste,
+                        witness: Some(witness),
+                        ..TurnIo::paste_only()
+                    },
+                )
+            },
+        )
+    };
+
+    assert_eq!(
+        turn(),
+        aterm_types::control_verbs::TURN_SUBMIT_BUSY_LINE,
+        "the text is typed, so this is its own reply, no refusal before any write"
+    );
+    assert_eq!(turn(), "ERR in-doubt seq=1\n");
+    assert_eq!(pastes.get(), 1, "typed exactly once");
+}
+
+/// A guarded re-press the sink takes none of until its window ends, after an earlier Enter
+/// went, wrote nothing of its own: it stops the re-presses as a missed one does, so the verdict
+/// says `submitted=0 pressed=<n>` (an Enter written and not seen, as the harness reads it:
+/// `an_enter_written_and_not_seen_is_a_continuation_typed`), never the first Enter's "typed,
+/// not submitted" reply. That verdict is `OK`, so the `id=` is spent.
+#[test]
+#[cfg(unix)]
+fn a_guarded_re_press_into_a_busy_sink_says_the_enter_that_went() {
+    let store = session_store::new_store();
+    let (h, rx) = guarded_pipe_session(0);
+    // SAFETY: guarded_pipe_session returned this new write descriptor; the
+    // session/sink borrow it and no other owner closes it. No writer is pending.
+    let _write_end = unsafe { std::os::fd::OwnedFd::from_raw_fd(h.master) };
+    store.write().unwrap().register(h.clone());
+    crate::term_lock(&h.term).process(b"> ");
+    // The first Enter the sink takes leaves it refusing every later immediate write whole.
+    let sink = Arc::downgrade(&h.ctx.sink);
+    h.ctx.sink.install_input_hook(move || {
+        if let Some(sink) = sink.upgrade() {
+            sink.note_master_nonblocking(false);
+        }
+    });
+    let pastes = std::cell::Cell::new(0u32);
+    let paste = |_: &str| {
+        pastes.set(pastes.get() + 1);
+        true
+    };
+    let key = format!("{}:4:1", h.ctx.nonce.to_hex());
+    let turn = || {
+        crate::pty_idem::guarded_waking(
+            &h.ctx,
+            Scope::Owner,
+            "turn",
+            Some(key.as_str()),
+            &|| {},
+            |witness| {
+                cmd_turn(
+                    &h.term,
+                    &store,
+                    0,
+                    "submit=guarded:^> presses=2 submit_window=20 idle=5 timeout=60000 hi",
+                    &h.ctx,
+                    &TurnIo {
+                        paste: &paste,
+                        witness: Some(witness),
+                        ..TurnIo::paste_only()
+                    },
+                )
+            },
+        )
+    };
+
+    let reply = turn();
+    let verdict = reply.lines().next().unwrap_or_default();
+    assert!(
+        verdict.starts_with("OK 24 turn submitted=0 status=timeout "),
+        "{reply}"
+    );
+    assert!(verdict.ends_with(" pressed=1"), "{verdict}");
+    assert_eq!(drain_pipe(&rx), b"\r", "exactly the one Enter went");
+    assert_eq!(turn(), "OK 0 dup=1\n", "the answer was OK");
+    assert_eq!(pastes.get(), 1, "typed exactly once");
+}
+
+/// A `turn` that stops before it writes anything (its `if-gen=` fence moved, a `typed=1`
+/// turn whose keys cannot all go out before its deadline, a session that exited before the
+/// paste) tells the claim so, whatever it answered: the retry with the same `id=` types. One
+/// that stops after its paste (a hold before the submit press) keeps its sequence, and so do a
+/// `typed=1` turn's keys: one that typed is a duplicate on the retry, and one the session's
+/// exit cut after its first key stays in doubt.
+#[test]
+fn a_turn_that_wrote_nothing_leaves_its_id_for_the_retry() {
+    let store = session_store::new_store();
+    let h = registered_session(0, -1, b"");
+    store.write().unwrap().register(h.clone());
+    let typed = std::cell::RefCell::new(String::new());
+    let hold_on_paste = std::cell::Cell::new(false);
+    let paste = |text: &str| {
+        typed.borrow_mut().push_str(text);
+        if hold_on_paste.get() {
+            assert!(crate::fabric::apply_hold_for_test(
+                &h.ctx,
+                Some(crate::fabric::Hold {
+                    reason: "demo".to_string(),
+                    origin: "local".to_string(),
+                })
+            ));
+        }
+        true
+    };
+    let keys = std::cell::Cell::new(0u32);
+    let exit_on_key = std::cell::Cell::new(false);
+    let key_press = |_: InputEvent| {
+        keys.set(keys.get() + 1);
+        if exit_on_key.get() {
+            store
+                .write()
+                .unwrap()
+                .set_state(0, session_store::SessionState::Exited);
+        }
+        true
+    };
+    let press = |_: &str| panic!("no turn here reaches its submit press");
+    let turn = |seq: u32, line: &str| {
+        let key = format!("{}:4:{seq}", h.ctx.nonce.to_hex());
+        crate::pty_idem::guarded_waking(
+            &h.ctx,
+            Scope::Owner,
+            "turn",
+            Some(key.as_str()),
+            &|| {},
+            |witness| {
+                cmd_turn(
+                    &h.term,
+                    &store,
+                    0,
+                    line,
+                    &h.ctx,
+                    &TurnIo {
+                        paste: &paste,
+                        press: &press,
+                        key: &key_press,
+                        witness: Some(witness),
+                        ..TurnIo::paste_only()
+                    },
+                )
+            },
+        )
+    };
+
+    let judged = crate::control::screen_gen(&h.term.lock().unwrap());
+    h.term.lock().unwrap().process(b"moved");
+    let fenced = turn(
+        1,
+        &format!("submit=none if-gen={judged} idle=5 timeout=60000 hi"),
+    );
+    assert!(
+        fenced.starts_with("OK 0 turn skipped reason=changed submitted=0 "),
+        "{fenced}"
+    );
+    let cut = turn(1, "submit=none typed=1 cadence=2000 timeout=1 hi");
+    assert!(
+        cut.starts_with("OK 0 turn skipped reason=deadline typed=0 pasted=0 submitted=0 "),
+        "the fence's skip gave the sequence back: {cut}"
+    );
+    store
+        .write()
+        .unwrap()
+        .set_state(0, session_store::SessionState::Exited);
+    assert_eq!(
+        turn(1, "submit=none idle=5 timeout=60000 hi"),
+        "ERR exited\n",
+        "the deadline's cut gave the sequence back"
+    );
+    store
+        .write()
+        .unwrap()
+        .set_state(0, session_store::SessionState::Alive);
+    assert_eq!(
+        (typed.borrow().as_str(), keys.get()),
+        ("", 0),
+        "nothing typed"
+    );
+    let reply = turn(1, "submit=none idle=5 timeout=60000 hi");
+    assert!(
+        reply.starts_with("OK 24 turn submitted=0 "),
+        "the exit gave the sequence back: {reply}"
+    );
+    assert_eq!(typed.borrow().as_str(), "hi");
+    assert_eq!(
+        turn(1, "submit=none idle=5 timeout=60000 hi"),
+        "OK 0 dup=1\n"
+    );
+
+    hold_on_paste.set(true);
+    let held = turn(2, "idle=5 timeout=60000 hi");
+    assert!(
+        held.starts_with("OK 0 turn skipped reason=halted submitted=0 "),
+        "{held}"
+    );
+    assert!(crate::fabric::apply_hold_for_test(&h.ctx, None));
+    hold_on_paste.set(false);
+    assert_eq!(
+        turn(2, "idle=5 timeout=60000 hi"),
+        "OK 0 dup=1\n",
+        "a skip after the paste keeps its sequence"
+    );
+    assert_eq!(typed.borrow().as_str(), "hihi");
+    assert!(
+        h.ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .since(None)
+            .all(|e| e.kind != "in-doubt"),
+        "a turn that wrote nothing is not in doubt"
+    );
+
+    let keyed = "submit=none typed=1 cadence=2 idle=5 timeout=60000 hi";
+    let reply = turn(3, keyed);
+    assert!(reply.starts_with("OK 24 turn submitted=0 "), "{reply}");
+    assert_eq!(keys.get(), 2, "both graphemes went as keys");
+    assert_eq!(
+        turn(3, keyed),
+        "OK 0 dup=1\n",
+        "a turn that typed keeps its sequence"
+    );
+    exit_on_key.set(true);
+    assert_eq!(turn(4, keyed), "ERR exited\n");
+    assert_eq!(keys.get(), 3, "one key went before the exit");
+    assert_eq!(
+        turn(4, keyed),
+        "ERR in-doubt seq=4\n",
+        "an exit after a key is no turn that wrote nothing"
+    );
+    assert_eq!(keys.get(), 3, "typed nothing twice");
+
+    // A head of control characters presses no key, so the remainder's paste is the first write.
+    exit_on_key.set(false);
+    let control_head = "submit=none typed=1 cap=1 idle=5 timeout=60000 \u{1}hi";
+    assert_eq!(turn(5, control_head), "ERR exited\n");
+    assert_eq!(
+        typed.borrow().as_str(),
+        "hihi",
+        "nothing pasted into the exited session"
+    );
+    store
+        .write()
+        .unwrap()
+        .set_state(0, session_store::SessionState::Alive);
+    let reply = turn(5, control_head);
+    assert!(
+        reply.starts_with("OK 24 turn submitted=0 ") && reply.contains(" typed=0 pasted=2"),
+        "the exit gave the sequence back: {reply}"
+    );
+    assert_eq!(
+        turn(5, control_head),
+        "OK 0 dup=1\n",
+        "the remainder's paste spent the sequence"
+    );
+    assert_eq!(typed.borrow().as_str(), "hihihi", "pasted once");
+    assert_eq!(keys.get(), 3, "and no key pressed");
+}
+
+/// A turn's write that the `if-supervisor=` fence or the session's full input queue refuses
+/// whole wrote nothing, and carries the `ERR busy …` line `send` answers there; any other
+/// failure may have written part of it, and carries none.
+#[test]
+fn a_turn_write_refused_whole_carries_the_line_send_answers() {
+    let h = crate::session_store::test_handle(0);
+    assert_eq!(
+        turn_write(&h.ctx, Some("sup-a"), || panic!("the fence refuses first")),
+        Err(Some("ERR busy supervisor=-\n".to_string()))
+    );
+    assert_eq!(
+        turn_write(&h.ctx, None, || Ok(InputOutcome::QueueFull)),
+        Err(Some(INPUT_QUEUE_FULL.to_string()))
+    );
+    assert_eq!(turn_write(&h.ctx, None, || Ok(InputOutcome::Ok)), Ok(()));
+    assert_eq!(
+        turn_write(&h.ctx, None, || Ok(InputOutcome::WriteFailed)),
+        Err(None)
+    );
+    assert_eq!(
+        turn_write(&h.ctx, None, || Err("ERR no window\n".to_string())),
+        Err(None)
+    );
+}
+
+/// A turn whose first write (its paste, its first typed key, a submit press with nothing
+/// before it) is refused whole wrote nothing: it answers the `ERR busy …` line `send` answers
+/// there, and the retry with the same `id=` types. A write refused whole after one went
+/// follows typed bytes: it answers its failure and leaves the sequence in doubt.
+#[test]
+fn a_turn_whose_first_write_is_refused_whole_gives_its_id_to_the_retry() {
+    let store = session_store::new_store();
+    let h = registered_session(0, -1, b"");
+    store.write().unwrap().register(h.clone());
+    // How many more writes the route takes; one past them is refused whole with `busy`.
+    let room = std::cell::Cell::new(0u32);
+    let busy = std::cell::Cell::new(INPUT_QUEUE_FULL);
+    let refusal = std::cell::RefCell::new(None);
+    let take = || {
+        let taken = room.get() > 0;
+        room.set(room.get().saturating_sub(1));
+        *refusal.borrow_mut() = (!taken).then(|| busy.get().to_string());
+        taken
+    };
+    let typed = std::cell::RefCell::new(String::new());
+    let paste = |text: &str| {
+        let taken = take();
+        if taken {
+            typed.borrow_mut().push_str(text);
+        }
+        taken
+    };
+    let keys = std::cell::Cell::new(0u32);
+    let key_press = |_: InputEvent| {
+        let taken = take();
+        if taken {
+            keys.set(keys.get() + 1);
+        }
+        taken
+    };
+    let presses = std::cell::Cell::new(0u32);
+    let press = |_: &str| {
+        let taken = take();
+        if taken {
+            presses.set(presses.get() + 1);
+        }
+        taken
+    };
+    let refused = || refusal.take();
+    let turn = |seq: u32, line: &str| {
+        let key = format!("{}:4:{seq}", h.ctx.nonce.to_hex());
+        crate::pty_idem::guarded_waking(
+            &h.ctx,
+            Scope::Owner,
+            "turn",
+            Some(key.as_str()),
+            &|| {},
+            |witness| {
+                cmd_turn(
+                    &h.term,
+                    &store,
+                    0,
+                    line,
+                    &h.ctx,
+                    &TurnIo {
+                        paste: &paste,
+                        press: &press,
+                        key: &key_press,
+                        witness: Some(witness),
+                        refused: &refused,
+                        ..TurnIo::paste_only()
+                    },
+                )
+            },
+        )
+    };
+
+    let pasted = "submit=none idle=5 timeout=60000 hi";
+    assert_eq!(turn(1, pasted), INPUT_QUEUE_FULL);
+    assert_eq!(typed.borrow().as_str(), "", "nothing pasted");
+    room.set(u32::MAX);
+    let reply = turn(1, pasted);
+    assert!(
+        reply.starts_with("OK 24 turn submitted=0 "),
+        "the refused paste gave the sequence back: {reply}"
+    );
+    assert_eq!(turn(1, pasted), "OK 0 dup=1\n");
+    assert_eq!(typed.borrow().as_str(), "hi", "pasted once");
+
+    let keyed = "submit=none typed=1 cadence=2 idle=5 timeout=60000 hi";
+    room.set(0);
+    busy.set("ERR busy supervisor=-\n");
+    assert_eq!(turn(2, keyed), "ERR busy supervisor=-\n");
+    assert_eq!(keys.get(), 0, "no key pressed");
+    room.set(u32::MAX);
+    let reply = turn(2, keyed);
+    assert!(
+        reply.starts_with("OK 24 turn submitted=0 ") && reply.contains(" typed=2 pasted=0"),
+        "the refused first key gave the sequence back: {reply}"
+    );
+    assert_eq!(turn(2, keyed), "OK 0 dup=1\n");
+    assert_eq!(keys.get(), 2, "typed once");
+
+    let pressed = "submit=enter presses=1 submit_window=20 typed=1 idle=5 timeout=60000 \u{1}";
+    room.set(0);
+    busy.set(INPUT_QUEUE_FULL);
+    assert_eq!(turn(3, pressed), INPUT_QUEUE_FULL);
+    room.set(u32::MAX);
+    let reply = turn(3, pressed);
+    assert!(
+        reply.starts_with("OK 24 turn "),
+        "the refused press gave the sequence back: {reply}"
+    );
+    assert_eq!(turn(3, pressed), "OK 0 dup=1\n");
+    assert_eq!(presses.get(), 1, "pressed once");
+
+    room.set(1);
+    assert_eq!(
+        turn(4, keyed),
+        "ERR key delivery failed\n",
+        "the second key refused whole follows the first"
+    );
+    assert_eq!(keys.get(), 3, "the first key went");
+    room.set(u32::MAX);
+    assert_eq!(turn(4, keyed), "ERR in-doubt seq=4\n");
+    assert_eq!(keys.get(), 3, "typed nothing twice");
+
+    let pressed_after = "presses=1 submit_window=20 idle=5 timeout=60000 hi";
+    room.set(1);
+    assert_eq!(
+        turn(5, pressed_after),
+        "ERR key delivery failed\n",
+        "the press refused whole follows the paste"
+    );
+    room.set(u32::MAX);
+    assert_eq!(turn(5, pressed_after), "ERR in-doubt seq=5\n");
+    let rest_after = "submit=none typed=1 cap=1 cadence=2 idle=5 timeout=60000 hi";
+    room.set(1);
+    assert_eq!(
+        turn(6, rest_after),
+        "ERR paste delivery failed\n",
+        "the remainder refused whole follows a key"
+    );
+    room.set(u32::MAX);
+    assert_eq!(turn(6, rest_after), "ERR in-doubt seq=6\n");
+    assert_eq!(
+        (typed.borrow().as_str(), keys.get(), presses.get()),
+        ("hihi", 4, 1),
+        "typed nothing twice"
+    );
 }
 
 #[test]

@@ -1789,6 +1789,8 @@ impl PrivacyWarmup {
 }
 
 /// The `[privacy]` table (macOS consent / tcc, `docs/DESIGN-macos-tcc-prompts-2026-08-30.md` §4).
+/// It gates System State's access steps (`docs/DESIGN-system-state-2026-10-21.md` §6): a switch
+/// turned off pauses a step and records no answer; no key raises one.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
 #[cfg_attr(test, derive(Debug))]
 #[serde(default)]

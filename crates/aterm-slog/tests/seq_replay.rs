@@ -1818,6 +1818,29 @@ pub const JOIN_MUTANTS: &[Mutant] = &[
             )
         },
     },
+    Mutant {
+        join: true,
+        dial: 1,
+        name: "EarlyEndClosesCont",
+        law: "EndClosesOnlyItsOwnTurn",
+        hand: |s| {
+            set(
+                s,
+                &[
+                    ("lt", 0),
+                    ("lc", i64::from(s["lt"] == 1 && s["old"] == 0)),
+                    ("lv", lv(s)),
+                    ("old", 0),
+                    ("ts", 0),
+                    ("vm", 2),
+                    ("vc", 0),
+                    ("ve", 1),
+                    ("vo", 0),
+                    ("g", 10),
+                ],
+            )
+        },
+    },
 ];
 
 fn catches(m: &Model, buggy: &Model, mu: &Mutant, s: &State) -> bool {

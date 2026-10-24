@@ -3,4 +3,5 @@
 
 //! Combined Tier-0 model test binary for `aterm-models-aos`.
 
+mod derived_lease;
 mod derived_publication;

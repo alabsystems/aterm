@@ -298,8 +298,8 @@ pub fn lock_entries(root: &Path) -> Result<Vec<LockEntry>, String> {
     let path = root.join("Cargo.lock");
     let text = std::fs::read_to_string(&path).map_err(|e| {
         format!(
-            "cannot read {} ({e}) — run `targo --unverified metadata --locked --offline` from the \
-             workspace root to regenerate it",
+            "cannot read {} ({e}) — run `targo metadata --offline` from the workspace root to \
+             regenerate it",
             path.display()
         )
     })?;

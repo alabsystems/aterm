@@ -1072,60 +1072,48 @@ fn fda_entries(app: &App) -> Vec<aterm_messages::DigestEntry> {
 }
 
 #[test]
-fn the_launch_reassert_keeps_an_open_entrys_words() {
-    use super::consent_card::{FDA_WHAT_DENIED, NeedCause, NeedWords};
+fn the_launch_reassert_posts_nothing_and_lights_the_menu_line_for_a_regression() {
+    use super::consent_card::{NeedCause, NeedWords};
     let mut app = App::headless_for_test();
-    app.except(&super::message_reporters::file_access_entry(&NeedWords {
-        cause: NeedCause::ProtectedRead { session: None },
-        tab_number: None,
-        regressed: false,
-    }));
-    app.reassert_fda_need(&NeedWords {
+    let words = NeedWords {
         cause: NeedCause::PromptObserved {
             service: None,
             session: None,
         },
         tab_number: None,
         regressed: false,
+    };
+    app.reassert_fda_need(&words);
+    assert!(fda_entries(&app).is_empty());
+    assert!(!app.access_steps.fda_regressed());
+    app.reassert_fda_need(&NeedWords {
+        regressed: true,
+        ..words
     });
-    let entries = fda_entries(&app);
-    assert_eq!(entries.len(), 1, "{entries:?}");
-    assert_eq!(entries[0].title, FDA_WHAT_DENIED);
+    assert!(fda_entries(&app).is_empty(), "never an entry");
+    assert!(app.access_steps.fda_regressed(), "the menu line names it");
 }
 
-fn access_card_posted(app: &mut App, now: std::time::Instant) -> aterm_messages::MessageId {
-    use super::consent_card::{CardPhase, FDA_WHAT_DENIED, Verdict};
+/// Drive a due card through the park's tick at `now`: the question posts nothing and the card watches the probe for the grant.
+fn access_card_due(app: &mut App, now: std::time::Instant) {
+    use super::consent_card::{CardPhase, Verdict};
     assert!(app.consent_card.begin_deciding(now));
     assert!(app.consent_card.on_decided(&Verdict::Offer, now));
     app.tick_macos_access_card(now);
-    let entries = fda_entries(app);
-    assert_eq!(
-        entries.len(),
-        1,
-        "the question is in the digest: {entries:?}"
-    );
-    let entry = &entries[0];
-    assert_eq!(entry.key, "privacy.fda.needed");
-    assert_eq!(
-        entry.title, FDA_WHAT_DENIED,
-        "no words kept: a refused read"
-    );
+    assert!(fda_entries(app).is_empty(), "the question posts nothing");
     assert!(
         app.messages
             .live_by_key(super::message_reporters::KEY_FILE_ACCESS)
             .is_none(),
         "and never a band row"
     );
-    assert_eq!(
-        app.consent_card_message, None,
-        "an entry has no id to watch"
-    );
+    assert_eq!(app.consent_card_message, None);
     assert_eq!(app.consent_card.phase(), CardPhase::Watching { since: now });
-    entry.id
 }
 
+/// platform gate) hold on every host. On macOS the park asks once, posts nothing and watches the probe; a regressed grant lights the menu line.
 #[test]
-fn the_access_entry_is_raised_once_watches_the_probe_and_is_dismissed_once() {
+fn the_access_question_posts_nothing_and_watches_the_probe() {
     use super::consent_card::{CardPhase, NeedCause, NeedWords};
     use super::message_reporters::KEY_FILE_ACCESS;
     use aterm_messages::{Message, Severity, tags};
@@ -1153,73 +1141,41 @@ fn the_access_entry_is_raised_once_watches_the_probe_and_is_dismissed_once() {
 
     let mut app = access_card_windowed();
     let other = app.post_message(Message::new(tags::SYSTEM, Severity::Warn, "already here"));
-    let id = access_card_posted(&mut app, t0);
+    access_card_due(&mut app, t0);
     assert_eq!(
         app.messages.on_glass().next().map(|l| l.id),
         Some(other),
         "the question is no row: the row that was there is still the top one"
     );
     assert_eq!(app.messages.wanted_rows(), 1, "only the row that was there");
-    let entry = app.messages.digest_entry(id).expect("open");
-    assert_eq!(entry.severity, Severity::Info, "a look, never an alarm");
-    assert_eq!(
-        entry.actions,
-        [aterm_messages::Intent::OpenSystemPane {
-            pane: super::message_reporters::PANE_FULL_DISK_ACCESS.to_string()
-        }],
-        "one button, and no `Not now`: the dismissal is the decline"
+    assert!(
+        app.consent_card_host.record.asked_at.is_some(),
+        "asking recorded that it was asked"
     );
+    assert!(!app.access_steps.fda_regressed(), "a need is no regression");
     app.tick_macos_access_card(t0 + Duration::from_secs(1));
-    assert_eq!(fda_entries(&app).len(), 1, "raised once");
-
-    let hour = Instant::now() + Duration::from_secs(3_600);
-    app.settle_messages(hour);
-    assert_eq!(fda_entries(&app).len(), 1, "no patience to run out");
+    assert!(fda_entries(&app).is_empty());
     assert!(matches!(
         app.consent_card.phase(),
         CardPhase::Watching { .. }
     ));
-    assert!(
-        app.consent_card_host.record.asked_at.is_some(),
-        "raising the question recorded that it was asked"
-    );
 
-    assert_eq!(app.dismiss_exceptions(), 1);
-    assert!(fda_entries(&app).is_empty());
-    assert!(matches!(
-        app.messages
-            .log()
-            .get(id)
-            .and_then(aterm_messages::LogRecord::retired),
-        Some(aterm_messages::Retired::Dismissed)
-    ));
-    let words = NeedWords {
-        cause: NeedCause::ProtectedRead { session: None },
-        tab_number: None,
-        regressed: false,
-    };
-    app.raise_fda_need(&words, t0);
-    app.reassert_fda_need(&words);
-    assert!(
-        fda_entries(&app).is_empty(),
-        "a fact the owner filed stays filed"
-    );
-
-    app.raise_fda_need(
+    // A regression (a verified grant later reads off) lights the menu line.
+    app.hold_fda_need(
         &NeedWords {
+            cause: NeedCause::ProtectedRead { session: None },
+            tab_number: None,
             regressed: true,
-            ..words
         },
         t0,
     );
-    let regressed = fda_entries(&app);
-    assert_eq!(regressed.len(), 1);
-    assert_eq!(regressed[0].key, "privacy.fda.regressed");
+    assert!(fda_entries(&app).is_empty(), "never an entry");
+    assert!(app.access_steps.fda_regressed());
 
     let mut app = access_card_windowed();
     let record = crate::test_scratch::outlived_dir("aterm-access-");
     app.consent_card_config = Some(record.path().join("aterm.toml"));
-    access_card_posted(&mut app, t0);
+    access_card_due(&mut app, t0);
     let asked = app.consent_card_host.record.asked_at;
     assert!(asked.is_some());
     aterm_spec::wait::until_within(
@@ -1234,32 +1190,14 @@ fn the_access_entry_is_raised_once_watches_the_probe_and_is_dismissed_once() {
 
 #[test]
 #[cfg(target_os = "macos")]
-fn open_settings_answers_the_entry_and_only_a_verified_grant_ends_it() {
-    use super::consent_card::{CardPhase, GRANTED_CAPTION, Marker, NeedCause, NeedWords};
-    use aterm_messages::{LogRecord, Retired};
+fn open_settings_is_recorded_and_only_a_verified_grant_ends_the_question() {
+    use super::consent_card::{CardPhase, GRANTED_CAPTION, Marker};
     use std::time::{Duration, Instant};
 
     let t0 = Instant::now();
-    let wid = WindowId(0);
     let mut app = access_card_windowed();
-    let id = access_card_posted(&mut app, t0);
-    let outcome = app.perform_message_act(wid, id.raw(), 0);
-    assert!(
-        matches!(
-            outcome,
-            crate::native_app::MessageActOutcome::Refused { .. }
-        ),
-        "the arm refuses off the main thread"
-    );
-    assert!(fda_entries(&app).is_empty(), "the answer files the entry");
-    assert!(
-        matches!(
-            app.messages.log().get(id).and_then(LogRecord::retired),
-            Some(Retired::Answered { label }) if label == "Open Settings"
-        ),
-        "{:?}",
-        app.messages.log().get(id).and_then(LogRecord::retired)
-    );
+    access_card_due(&mut app, t0);
+    app.note_macos_access_settings_opened(t0);
     assert!(!crate::macos_access_refresh_tests::grant_recorded(&app));
     assert!(app.consent_card_host.record.opened_at.is_some());
     assert_eq!(app.consent_card_host.marker, Some(Marker::Opened));
@@ -1267,13 +1205,6 @@ fn open_settings_answers_the_entry_and_only_a_verified_grant_ends_it() {
         app.consent_card.phase(),
         CardPhase::Watching { .. }
     ));
-    let words = NeedWords {
-        cause: NeedCause::ProtectedRead { session: None },
-        tab_number: None,
-        regressed: false,
-    };
-    app.raise_fda_need(&words, t0);
-    assert!(fda_entries(&app).is_empty(), "answered: no second entry");
     app.consent = crate::consent_state::ConsentState::with_cached_probe_for_test(
         aterm_containment::consent::FdaProbe {
             state: aterm_containment::consent::FdaState::Granted,
@@ -1295,15 +1226,14 @@ fn open_settings_answers_the_entry_and_only_a_verified_grant_ends_it() {
 
 #[test]
 #[cfg(target_os = "macos")]
-fn a_grant_ends_the_entry_and_is_a_record() {
+fn a_grant_settles_the_card_and_is_a_record() {
     use super::consent_card::{CardPhase, GRANTED_CAPTION};
     use super::message_reporters::KEY_FILE_ACCESS;
-    use aterm_messages::{LogRecord, Outcome, Retired};
     use std::time::{Duration, Instant};
 
     let t0 = Instant::now();
     let mut app = access_card_windowed();
-    let id = access_card_posted(&mut app, t0);
+    access_card_due(&mut app, t0);
     app.consent = crate::consent_state::ConsentState::with_cached_probe_for_test(
         aterm_containment::consent::FdaProbe {
             state: aterm_containment::consent::FdaState::Granted,
@@ -1318,10 +1248,6 @@ fn a_grant_ends_the_entry_and_is_a_record() {
         0,
         "nothing wants the glass, before or after"
     );
-    assert!(matches!(
-        app.messages.log().get(id).and_then(LogRecord::retired),
-        Some(Retired::Resolved(Outcome::Ok))
-    ));
     let granted = app
         .messages
         .log()
@@ -1332,7 +1258,8 @@ fn a_grant_ends_the_entry_and_is_a_record() {
     assert_eq!(granted.key.as_deref(), Some(KEY_FILE_ACCESS));
     assert_eq!(app.next_macos_access_card_deadline(t0), None);
 
-    app.raise_fda_need(
+    // A regression lights the menu line, and a grant ends it.
+    app.hold_fda_need(
         &super::consent_card::NeedWords {
             cause: super::consent_card::NeedCause::ProtectedRead { session: None },
             tab_number: None,
@@ -1340,8 +1267,9 @@ fn a_grant_ends_the_entry_and_is_a_record() {
         },
         t0,
     );
-    assert_eq!(fda_entries(&app)[0].key, "privacy.fda.regressed");
+    assert!(app.access_steps.fda_regressed());
     app.resolve_fda_need(true, t0);
+    assert!(!app.access_steps.fda_regressed());
     assert!(fda_entries(&app).is_empty());
 }
 
@@ -1362,7 +1290,7 @@ fn macos_access_card_honors_live_policy_without_dismissing_other_messages() {
                 assert!(app.consent_card.on_decided(&Verdict::Offer, now));
                 if raised {
                     app.tick_macos_access_card(now);
-                    assert_eq!(fda_entries(&app).len(), 1);
+                    assert!(fda_entries(&app).is_empty(), "the question posts nothing");
                 }
                 let other_id = other.then(|| {
                     app.post_message(

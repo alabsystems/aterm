@@ -234,12 +234,95 @@ pub fn decode_quoted_printable(input: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+pub(super) fn split_header_body(s: &str) -> Option<(&str, &str)> {
+    match (s.find("\r\n\r\n"), s.find("\n\n")) {
+        (Some(crlf), Some(lf)) if crlf <= lf => Some((&s[..crlf], &s[crlf + 4..])),
+        (Some(_), Some(lf)) => Some((&s[..lf], &s[lf + 2..])),
+        (Some(crlf), None) => Some((&s[..crlf], &s[crlf + 4..])),
+        (None, Some(lf)) => Some((&s[..lf], &s[lf + 2..])),
+        (None, None) => None,
+    }
+}
+
+fn is_mime_boundary_line(line: &str) -> bool {
+    let trimmed = line.trim_end_matches(['\r', '\n']);
+    let Some(after_dashes) = trimmed.strip_prefix("--") else {
+        return false;
+    };
+    if after_dashes.is_empty()
+        || after_dashes == " "
+        || after_dashes.starts_with('>')
+        || after_dashes.bytes().all(|b| b == b'-')
+    {
+        return false;
+    }
+    after_dashes
+        .bytes()
+        .all(|b| b.is_ascii_graphic() || b == b' ')
+}
+
 pub(super) fn is_quoted_printable_email(raw_email: &str) -> bool {
-    let lower = raw_email.to_ascii_lowercase();
-    lower.contains("quoted-printable")
-        || raw_email.contains("=3D")
-        || raw_email.contains("=3d")
-        || raw_email.contains("=\r\n")
+    let (head, body) = split_header_body(raw_email).unwrap_or(("", raw_email));
+    for line in unfold_rfc5322_headers(head) {
+        if let Some((k, v)) = line.split_once(':')
+            && k.trim().eq_ignore_ascii_case("content-transfer-encoding")
+        {
+            return v
+                .trim()
+                .trim_matches('"')
+                .to_ascii_lowercase()
+                .starts_with("quoted-printable");
+        }
+    }
+    if find_ascii_ci(body, "content-transfer-encoding").is_some() {
+        return false;
+    }
+    if body.contains("=\r\n")
+        || find_ascii_ci(body, "=3d\"").is_some()
+        || find_ascii_ci(body, "=3d'").is_some()
+    {
+        return true;
+    }
+    if !head.is_empty() || find_ascii_ci(body, "=3d").is_none() {
+        return false;
+    }
+    let bytes = body.as_bytes();
+    let mut i = 0usize;
+    let mut saw_qp_eq = false;
+    while i < bytes.len() {
+        if bytes[i] != b'=' {
+            i += 1;
+            continue;
+        }
+        if bytes.get(i + 1..i + 3) == Some(b"\r\n") {
+            i += 3;
+            continue;
+        }
+        if bytes.get(i + 1) == Some(&b'\n') {
+            i += 2;
+            continue;
+        }
+        let Some(&[hi, lo]) = bytes.get(i + 1..i + 3) else {
+            return false;
+        };
+        if !hi.is_ascii_hexdigit() || !lo.is_ascii_hexdigit() {
+            return false;
+        }
+        if hi == b'3' && matches!(lo, b'D' | b'd') {
+            let hex_run = bytes[i + 1..]
+                .iter()
+                .take_while(|b| b.is_ascii_hexdigit())
+                .count();
+            let double_qp = bytes
+                .get(i + 3..i + 5)
+                .is_some_and(|pair| pair.eq_ignore_ascii_case(b"3d"));
+            if double_qp || hex_run < 6 {
+                saw_qp_eq = true;
+            }
+        }
+        i += 3;
+    }
+    saw_qp_eq
 }
 
 pub(super) fn decode_html_amp(input: &str) -> String {
@@ -524,9 +607,7 @@ pub(super) fn decode_rfc2047_words(input: &str) -> String {
 }
 
 pub(super) fn extract_rfc5322_subject(raw_email: &str) -> Option<String> {
-    let (head, _) = raw_email
-        .split_once("\r\n\r\n")
-        .or_else(|| raw_email.split_once("\n\n"))?;
+    let (head, _) = split_header_body(raw_email)?;
     for line in unfold_rfc5322_headers(head) {
         if let Some((k, v)) = line.split_once(':')
             && k.trim().eq_ignore_ascii_case("subject")
@@ -542,27 +623,46 @@ pub(super) fn extract_rfc5322_subject(raw_email: &str) -> Option<String> {
 
 pub(super) fn decode_mime_base64_parts(raw_email: &str) -> String {
     let mut decoded_parts = String::new();
-    let mut search = raw_email;
-    while let Some(pos) = search
-        .to_ascii_lowercase()
-        .find("content-transfer-encoding")
-    {
-        let from_hdr = &search[pos..];
+    let mut search_from = 0usize;
+    while let Some(rel) = find_ascii_ci(&raw_email[search_from..], "content-transfer-encoding") {
+        let pos = search_from + rel;
+        let from_hdr = &raw_email[pos..];
         let line_end = from_hdr.find('\n').unwrap_or(from_hdr.len());
         let hdr_line = &from_hdr[..line_end];
-        let is_b64 = hdr_line
-            .split_once(':')
-            .is_some_and(|(_, v)| v.trim().to_ascii_lowercase().starts_with("base64"));
         let after_line = &from_hdr[line_end..];
+        let valid_line_start = pos == 0 || matches!(raw_email.as_bytes()[pos - 1], b'\n' | b'\r');
+        let (hdr_name, first_val) = hdr_line.split_once(':').unwrap_or(("", ""));
+        if !valid_line_start
+            || !hdr_name
+                .trim()
+                .eq_ignore_ascii_case("content-transfer-encoding")
+        {
+            if after_line.is_empty() {
+                break;
+            }
+            search_from = pos + line_end + 1;
+            continue;
+        }
+        let mut encoding_val = first_val.trim();
+        if encoding_val.is_empty()
+            && let Some(cont) = after_line.strip_prefix('\n')
+            && cont.starts_with([' ', '\t'])
+        {
+            let cont_end = cont.find('\n').unwrap_or(cont.len());
+            encoding_val = cont[..cont_end].trim();
+        }
+        let is_b64 = encoding_val
+            .trim_matches('"')
+            .to_ascii_lowercase()
+            .starts_with("base64");
         if is_b64
-            && let Some((_, body_start)) = from_hdr
-                .split_once("\r\n\r\n")
-                .or_else(|| from_hdr.split_once("\n\n"))
+            && let Some((hdr_rest, body_start)) = split_header_body(from_hdr)
+            && !hdr_rest.lines().any(is_mime_boundary_line)
         {
             let mut body_end = body_start.len();
             let mut offset = 0usize;
             for line in body_start.split_inclusive('\n') {
-                if line.starts_with("--") {
+                if is_mime_boundary_line(line) {
                     body_end = offset;
                     break;
                 }
@@ -576,9 +676,76 @@ pub(super) fn decode_mime_base64_parts(raw_email: &str) -> String {
         if after_line.is_empty() {
             break;
         }
-        search = &after_line[1..];
+        search_from = pos + line_end + 1;
     }
     decoded_parts
+}
+
+pub(super) fn decode_qp_mime_parts(input: &str) -> String {
+    if find_ascii_ci(input, "quoted-printable").is_none() {
+        return input.to_owned();
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut cursor = 0usize;
+    let mut search_from = 0usize;
+    while let Some(rel) = find_ascii_ci(&input[search_from..], "content-transfer-encoding") {
+        let pos = search_from + rel;
+        let from_hdr = &input[pos..];
+        let line_end = from_hdr.find('\n').unwrap_or(from_hdr.len());
+        let hdr_line = &from_hdr[..line_end];
+        let after_line = &from_hdr[line_end..];
+        let valid_line_start = pos == 0 || matches!(input.as_bytes()[pos - 1], b'\n' | b'\r');
+        let (hdr_name, first_val) = hdr_line.split_once(':').unwrap_or(("", ""));
+        if !valid_line_start
+            || !hdr_name
+                .trim()
+                .eq_ignore_ascii_case("content-transfer-encoding")
+        {
+            if after_line.is_empty() {
+                break;
+            }
+            search_from = pos + line_end + 1;
+            continue;
+        }
+        let mut encoding_val = first_val.trim();
+        if encoding_val.is_empty()
+            && let Some(cont) = after_line.strip_prefix('\n')
+            && cont.starts_with([' ', '\t'])
+        {
+            let cont_end = cont.find('\n').unwrap_or(cont.len());
+            encoding_val = cont[..cont_end].trim();
+        }
+        let is_qp = encoding_val
+            .trim_matches('"')
+            .to_ascii_lowercase()
+            .starts_with("quoted-printable");
+        if is_qp
+            && let Some((hdr_rest, body_start)) = split_header_body(from_hdr)
+            && !hdr_rest.lines().any(is_mime_boundary_line)
+        {
+            let body_offset = pos + (from_hdr.len() - body_start.len());
+            let mut body_end = body_start.len();
+            let mut offset = 0usize;
+            for line in body_start.split_inclusive('\n') {
+                if is_mime_boundary_line(line) {
+                    body_end = offset;
+                    break;
+                }
+                offset += line.len();
+            }
+            out.push_str(&input[cursor..body_offset]);
+            out.push_str(&decode_quoted_printable(&body_start[..body_end]));
+            cursor = body_offset + body_end;
+            search_from = cursor;
+            continue;
+        }
+        if after_line.is_empty() {
+            break;
+        }
+        search_from = pos + line_end + 1;
+    }
+    out.push_str(&input[cursor..]);
+    out
 }
 
 fn is_supported_auth_url(url: &str) -> bool {
@@ -820,10 +987,7 @@ pub(super) fn email_matches_target(raw_email: &str, target: &str) -> bool {
             return false;
         }
     }
-    let head = raw_email
-        .split_once("\r\n\r\n")
-        .or_else(|| raw_email.split_once("\n\n"))
-        .map_or(raw_email, |(h, _)| h);
+    let head = split_header_body(raw_email).map_or(raw_email, |(h, _)| h);
     let mut saw_recipient_header = false;
     for line in unfold_rfc5322_headers(head) {
         if let Some((k, v)) = line.split_once(':') {
@@ -996,7 +1160,7 @@ fn append_decoded_json_body_str(s: &str, is_b64: bool, is_qp: bool, extra_text: 
         if is_quoted_printable_email(&decoded) {
             extra_text.push_str(&decode_quoted_printable(&decoded));
         } else {
-            extra_text.push_str(&decoded);
+            extra_text.push_str(&decode_qp_mime_parts(&decoded));
         }
         return;
     }
@@ -1006,8 +1170,9 @@ fn append_decoded_json_body_str(s: &str, is_b64: bool, is_qp: bool, extra_text: 
         extra_text.push_str(&decoded);
         extra_text.push_str(&decode_mime_base64_parts(&decoded));
     } else {
-        extra_text.push_str(s);
-        extra_text.push_str(&decode_mime_base64_parts(s));
+        let decoded = decode_qp_mime_parts(s);
+        extra_text.push_str(&decoded);
+        extra_text.push_str(&decode_mime_base64_parts(&decoded));
     }
 }
 
@@ -1065,14 +1230,33 @@ fn extract_json_email_fields_inner(
                 if matches!(
                     key.as_str(),
                     "otp" | "code" | "verification_code" | "login_code"
-                ) && let Some(c) = v.as_str()
-                {
-                    let trimmed = c.trim();
-                    if trimmed.len() == 6
-                        && trimmed.bytes().all(|b| b.is_ascii_digit())
-                        && !explicit_otps.iter().any(|existing| existing == trimmed)
+                ) {
+                    let parsed_otp = if let Some(c) = v.as_str() {
+                        let trimmed = c.trim();
+                        if trimmed.len() == 6 && trimmed.bytes().all(|b| b.is_ascii_digit()) {
+                            Some(trimmed.to_owned())
+                        } else if let Some((a, b)) = trimmed.split_once('-')
+                            && a.len() == 3
+                            && b.len() == 3
+                            && a.bytes().all(|c| c.is_ascii_digit())
+                            && b.bytes().all(|c| c.is_ascii_digit())
+                        {
+                            Some(format!("{a}{b}"))
+                        } else {
+                            None
+                        }
+                    } else if key != "code"
+                        && let Some(n) = v.as_u64()
+                        && (100_000..=999_999).contains(&n)
                     {
-                        explicit_otps.push(trimmed.to_owned());
+                        Some(n.to_string())
+                    } else {
+                        None
+                    };
+                    if let Some(code_str) = parsed_otp
+                        && !explicit_otps.iter().any(|existing| existing == &code_str)
+                    {
+                        explicit_otps.push(code_str);
                     }
                 }
                 if matches!(
@@ -1257,7 +1441,7 @@ pub fn extract_magic_links_from_email(raw_email: &str, target_email: Option<&str
     } else if is_quoted_printable_email(raw_email) {
         decode_quoted_printable(raw_email)
     } else {
-        raw_email.to_owned()
+        decode_qp_mime_parts(raw_email)
     };
     if let Some(subj) = extract_rfc5322_subject(raw_email) {
         extra_text.push('\n');
@@ -1348,6 +1532,38 @@ pub fn extract_magic_link_from_email(
         .next()
 }
 
+fn normalize_dot_segments(path_and_query: &str) -> String {
+    let (raw_path, query) = path_and_query
+        .split_once('?')
+        .map_or((path_and_query, None), |(p, q)| (p, Some(q)));
+    if !raw_path.contains("/.") {
+        return path_and_query.to_owned();
+    }
+    let trailing_slash = raw_path.len() > 1
+        && (raw_path.ends_with('/') || raw_path.ends_with("/.") || raw_path.ends_with("/.."));
+    let mut stack: Vec<&str> = Vec::new();
+    for seg in raw_path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                stack.pop();
+            }
+            s => stack.push(s),
+        }
+    }
+    let normalized_path = if stack.is_empty() {
+        "/".to_owned()
+    } else if trailing_slash {
+        format!("/{}/", stack.join("/"))
+    } else {
+        format!("/{}", stack.join("/"))
+    };
+    match query {
+        Some(q) => format!("{normalized_path}?{q}"),
+        None => normalized_path,
+    }
+}
+
 fn resolve_relative_url(base_url: &str, target: &str) -> String {
     let target = decode_html_amp(target.trim());
     if target.starts_with("https://") || target.starts_with("http://") {
@@ -1367,18 +1583,19 @@ fn resolve_relative_url(base_url: &str, target: &str) -> String {
     if target.is_empty() {
         return base_url.split('#').next().unwrap_or(base_url).to_owned();
     }
+    let target = target.split('#').next().unwrap_or(&target);
     if target.starts_with('?') {
         return format!("{scheme}://{authority}{effective_path}{target}");
     }
-    if target.starts_with('/') {
-        format!("{scheme}://{authority}{target}")
+    let combined = if target.starts_with('/') {
+        normalize_dot_segments(target)
     } else {
-        let rel = target.strip_prefix("./").unwrap_or(&target);
         let dir = effective_path
             .rfind('/')
             .map_or("/", |idx| &effective_path[..=idx]);
-        format!("{scheme}://{authority}{dir}{rel}")
-    }
+        normalize_dot_segments(&format!("{dir}{target}"))
+    };
+    format!("{scheme}://{authority}{combined}")
 }
 
 /// Find a real attribute; `Some(None)` is a bare boolean attribute.
@@ -1463,7 +1680,36 @@ fn is_negative_form_token(s: &str) -> bool {
             | "sign out"
             | "log out"
             | "abort"
-    )
+            | "back"
+            | "dismiss"
+            | "close"
+            | "never"
+            | "disagree"
+            | "refuse"
+            | "revoke"
+    ) || [
+        "do not ",
+        "don't ",
+        "dont ",
+        "not allow",
+        "not authorize",
+        "not approve",
+        "not accept",
+        "not you",
+        "deny ",
+        "cancel ",
+        "reject ",
+        "decline ",
+        "abort ",
+        "revoke ",
+        "refuse ",
+        "disagree",
+        "switch account",
+        "another account",
+        "different account",
+    ]
+    .iter()
+    .any(|bad| lower.contains(bad))
 }
 
 fn has_negative_url_keyword(s: &str) -> bool {
@@ -1484,6 +1730,9 @@ fn has_negative_url_keyword(s: &str) -> bool {
 }
 
 fn has_positive_approval_keyword(s: &str) -> bool {
+    if is_negative_form_token(s) {
+        return false;
+    }
     let lower = s.to_ascii_lowercase();
     [
         "approve",
@@ -1502,16 +1751,17 @@ fn has_positive_approval_keyword(s: &str) -> bool {
 
 fn strip_inline_html(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut in_tag = false;
-    for ch in s.chars() {
-        if ch == '<' {
-            in_tag = true;
-        } else if ch == '>' {
-            in_tag = false;
-        } else if !in_tag {
-            out.push(ch);
+    let mut rest = s;
+    while let Some(lt) = rest.find('<') {
+        out.push_str(&rest[..lt]);
+        let from_lt = &rest[lt..];
+        if let Some(gt) = find_tag_close(from_lt) {
+            rest = &from_lt[gt + 1..];
+        } else {
+            break;
         }
     }
+    out.push_str(rest);
     decode_html_amp(out.trim())
 }
 
@@ -1566,7 +1816,7 @@ fn parse_json_approval_action(
 
 fn extract_meta_refresh_url(html: &str, base_url: &str) -> Option<String> {
     let mut scan = html;
-    while let Some(meta_pos) = scan.to_ascii_lowercase().find("<meta") {
+    while let Some(meta_pos) = find_ascii_ci(scan, "<meta") {
         let after_meta = &scan[meta_pos..];
         if after_meta.len() > 5
             && !after_meta.as_bytes()[5].is_ascii_whitespace()
@@ -1575,7 +1825,7 @@ fn extract_meta_refresh_url(html: &str, base_url: &str) -> Option<String> {
             scan = &after_meta[5..];
             continue;
         }
-        let Some(end_meta) = after_meta.find('>') else {
+        let Some(end_meta) = find_tag_close(after_meta) else {
             break;
         };
         let meta_tag = &after_meta[..=end_meta];
@@ -1583,14 +1833,31 @@ fn extract_meta_refresh_url(html: &str, base_url: &str) -> Option<String> {
             .is_some_and(|v| v.trim().eq_ignore_ascii_case("refresh"))
             && let Some(content) = extract_attr(meta_tag, "content")
         {
-            let content_low = content.to_ascii_lowercase();
-            if let Some(url_idx) = content_low.find("url=") {
-                let raw_target = content[url_idx + 4..]
-                    .trim()
-                    .trim_matches(['"', '\''])
-                    .trim();
-                if !raw_target.is_empty() {
-                    return Some(resolve_relative_url(base_url, raw_target));
+            let after_semi = content
+                .split_once(';')
+                .map_or(content.as_str(), |(_, tail)| tail)
+                .trim();
+            let raw_target = if after_semi
+                .get(..3)
+                .is_some_and(|p| p.eq_ignore_ascii_case("url"))
+            {
+                after_semi[3..]
+                    .trim_start()
+                    .strip_prefix('=')
+                    .map(|v| v.trim().trim_matches(['"', '\'']).trim())
+            } else {
+                None
+            };
+            if let Some(raw_target) = raw_target.filter(|s| !s.is_empty()) {
+                let low = raw_target.to_ascii_lowercase();
+                if !low.starts_with("javascript:")
+                    && !low.starts_with("mailto:")
+                    && !raw_target.starts_with('#')
+                {
+                    let resolved = resolve_relative_url(base_url, raw_target);
+                    if !has_negative_url_keyword(&resolved) {
+                        return Some(resolved);
+                    }
                 }
             }
         }
@@ -1679,10 +1946,7 @@ pub fn parse_html_approval_action(
             let ctrl_tag = &after_ctrl[..=end_ctrl];
             let after_open = &after_ctrl[end_ctrl + 1..];
             let button_text = if is_button {
-                let end_btn = after_open
-                    .to_ascii_lowercase()
-                    .find("</button>")
-                    .unwrap_or(0);
+                let end_btn = find_ascii_ci(after_open, "</button>").unwrap_or(0);
                 strip_inline_html(&after_open[..end_btn])
             } else {
                 String::new()
@@ -1787,18 +2051,18 @@ pub fn parse_html_approval_action(
             };
             ("GET".to_owned(), full_url, None)
         };
-        let score = if submit_score == 2
-            || has_positive_approval_keyword(&action)
-            || has_positive_approval_keyword(form_html)
+        let score = if submit_score == 2 {
+            3
+        } else if has_positive_approval_keyword(&action) || has_positive_approval_keyword(form_html)
         {
             2
         } else {
             1
         };
-        if score == 2 {
-            return Some(candidate);
-        }
-        if best_form.is_none() {
+        if best_form
+            .as_ref()
+            .is_none_or(|(prev_score, ..)| score > *prev_score)
+        {
             best_form = Some((score, candidate.0, candidate.1, candidate.2));
         }
     }
@@ -1820,7 +2084,7 @@ pub fn parse_html_approval_action(
         };
         let a_tag = &after_a[..=end_a];
         let after_open = &after_a[end_a + 1..];
-        let end_anchor = after_open.to_ascii_lowercase().find("</a>").unwrap_or(0);
+        let end_anchor = find_ascii_ci(after_open, "</a>").unwrap_or(0);
         let anchor_text = strip_inline_html(&after_open[..end_anchor]);
         if let Some(href) = extract_attr(a_tag, "href") {
             let href_trimmed = href.trim();
@@ -1867,10 +2131,7 @@ pub(super) fn parse_raw_http_response(
     cookies: &mut BTreeMap<String, String>,
 ) -> Option<HttpResponse> {
     let mut current = raw;
-    while let Some((head, rest)) = current
-        .split_once("\r\n\r\n")
-        .or_else(|| current.split_once("\n\n"))
-    {
+    while let Some((head, rest)) = split_header_body(current) {
         let first_line = head.lines().next()?;
         let mut parts = first_line.split_ascii_whitespace();
         let proto = parts.next()?;

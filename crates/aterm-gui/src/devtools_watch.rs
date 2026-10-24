@@ -15,12 +15,12 @@ pub(crate) const REREAD_EVERY: Duration = Duration::from_secs(60);
 pub(crate) enum Step {
     /// Nothing changes.
     Nothing,
-    /// Raises the digest line and optionally requests bringing up the Settings pane.
-    Raise {
-        /// Ask for the pane brought up (once per aterm version).
+    /// aterm is not on the list: when `hand_over`, ask for the pane brought up for the owner.
+    NotOn {
+        /// Ask for the pane brought up (once per approved revision).
         hand_over: bool,
     },
-    /// aterm is on the list: end the line.
+    /// aterm is on the list.
     Clear,
 }
 
@@ -29,6 +29,12 @@ pub(crate) enum Step {
 pub(crate) struct DevToolsWatch {
     /// The launch read was asked for.
     read_once: bool,
+    /// A read is owed once the probe is on again ([`Self::hold_read`]): a focus
+    /// gain's read held back by a `[privacy]` switch that was off, or a read made
+    /// whose completion only said a switch went off before it landed. The window
+    /// makes it then (`App::resume_held_launch_steps`), whatever else the gate
+    /// says.
+    read_held: bool,
     /// Whether the last reading was `NotGranted`.
     awaiting_owner: bool,
     /// When a focus gain last asked for a read.
@@ -50,12 +56,8 @@ pub(crate) struct DevToolsWatch {
 impl DevToolsWatch {
     /// Returns whether a focus gain at `now` should read the Developer Tools list.
     pub(crate) fn wants_read(&mut self, now: Instant) -> bool {
-        let want = !self.read_once
-            || self.read_on_return
-            || (self.awaiting_owner
-                && self
-                    .last_read
-                    .is_none_or(|at| now.saturating_duration_since(at) >= REREAD_EVERY));
+        let want = self.due(now);
+        self.read_held = false;
         self.read_once = true;
         if want {
             self.last_read = Some(now);
@@ -65,18 +67,45 @@ impl DevToolsWatch {
         want
     }
 
+    /// Whether a focus gain at `now` reads ([`Self::wants_read`]), spending nothing.
+    pub(crate) fn due(&self, now: Instant) -> bool {
+        self.read_held
+            || !self.read_once
+            || self.read_on_return
+            || (self.awaiting_owner
+                && self
+                    .last_read
+                    .is_none_or(|at| now.saturating_duration_since(at) >= REREAD_EVERY))
+    }
+
+    /// The probe could read nothing for a read that was due: a focus gain came
+    /// while `[privacy] enabled` or `check` was off (no read is spent; the launch
+    /// read stays owed), or a read went out and a switch went off before its
+    /// completion was handled, so the completion only said the probe was off (the
+    /// read was spent on nothing). Either way the first park with every switch on
+    /// while a window is focused, or the next focus gain, reads
+    /// ([`Self::read_held`]). A switch off is a pause, never an answer.
+    pub(crate) fn hold_read(&mut self) {
+        self.read_held = true;
+    }
+
+    /// Whether a focus gain's read waits for the probe to be on again.
+    pub(crate) const fn read_held(&self) -> bool {
+        self.read_held
+    }
+
     /// Records that aterm opened the Developer Tools pane so the next focus gain re-reads.
     pub(crate) const fn note_handed_over(&mut self) {
         self.read_on_return = true;
     }
 
-    /// Resets the hand-over latch after an inconclusive helper attempt.
+    /// Resets the hand-over latch after an inconclusive helper attempt or a newly approved access revision.
     pub(crate) const fn forget_hand_over(&mut self) {
         self.handed_over = false;
     }
 
-    /// Folds a completed `grant` reading into the watcher and returns the window [`Step`].
-    pub(crate) fn observe(&mut self, grant: DevToolGrant, opened_this_version: bool) -> Step {
+    /// What a completed reading asks for.
+    pub(crate) fn observe(&mut self, grant: DevToolGrant, opened_this_revision: bool) -> Step {
         match grant {
             DevToolGrant::Granted => {
                 if self.awaiting_owner {
@@ -88,9 +117,9 @@ impl DevToolsWatch {
             DevToolGrant::NotGranted => {
                 self.awaiting_owner = true;
                 self.refreshed = false;
-                let hand_over = !opened_this_version && !self.handed_over;
+                let hand_over = !opened_this_revision && !self.handed_over;
                 self.handed_over |= hand_over;
-                Step::Raise { hand_over }
+                Step::NotOn { hand_over }
             }
             DevToolGrant::Unknown => Step::Nothing,
         }
@@ -141,7 +170,7 @@ impl DevToolsWatch {
 mod tests {
     use super::*;
 
-    /// Reads once at launch, re-reads only while `NotGranted`, and hands over once per version.
+    /// Reads once at launch, re-reads only while `NotGranted`, and hands over once per approved revision.
     #[test]
     fn the_watch_reads_at_launch_and_while_the_owner_is_wanted() {
         let t0 = Instant::now();
@@ -152,7 +181,7 @@ mod tests {
         assert!(!watch.wants_read(t0 + REREAD_EVERY * 9));
         assert_eq!(
             watch.observe(DevToolGrant::NotGranted, false),
-            Step::Raise { hand_over: true }
+            Step::NotOn { hand_over: true }
         );
         let t1 = t0 + REREAD_EVERY;
         assert!(watch.wants_read(t1), "the owner coming back reads again");
@@ -163,13 +192,13 @@ mod tests {
         assert!(watch.wants_read(t1 + REREAD_EVERY));
         assert_eq!(
             watch.observe(DevToolGrant::NotGranted, false),
-            Step::Raise { hand_over: false },
+            Step::NotOn { hand_over: false },
             "a second reading before the marker is written opens nothing"
         );
         assert_eq!(
             watch.observe(DevToolGrant::NotGranted, true),
-            Step::Raise { hand_over: false },
-            "opened once for this version"
+            Step::NotOn { hand_over: false },
+            "opened once for this revision"
         );
         assert_eq!(watch.observe(DevToolGrant::Granted, true), Step::Clear);
         assert!(
@@ -179,12 +208,28 @@ mod tests {
         watch.forget_hand_over();
         assert_eq!(
             watch.observe(DevToolGrant::NotGranted, false),
-            Step::Raise { hand_over: true }
+            Step::NotOn { hand_over: true }
         );
         assert_eq!(
             watch.observe(DevToolGrant::NotGranted, false),
-            Step::Raise { hand_over: false }
+            Step::NotOn { hand_over: false }
         );
+    }
+
+    /// A HELD READ IS MADE though the launch read was spent: a read that went out
+    /// and only learned a switch was off is owed again, once. `due` spends
+    /// nothing. NEGATIVE CONTROL: the same focus gain, nothing held, reads nothing.
+    #[test]
+    fn a_held_read_is_made_once_though_the_launch_read_was_spent() {
+        let t0 = Instant::now();
+        let mut watch = DevToolsWatch::default();
+        assert!(watch.wants_read(t0), "the launch read");
+        assert!(!watch.due(t0) && !watch.wants_read(t0), "the control");
+        watch.hold_read();
+        assert!(watch.read_held() && watch.due(t0) && watch.due(t0));
+        assert!(watch.wants_read(t0), "the held read");
+        assert!(!watch.read_held());
+        assert!(!watch.wants_read(t0), "once");
     }
 
     /// Returning from a Settings hand-over bypasses the cooldown for a single read.
@@ -197,14 +242,14 @@ mod tests {
         assert!(watch.wants_read(t0));
         assert_eq!(
             watch.observe(DevToolGrant::NotGranted, false),
-            Step::Raise { hand_over: true }
+            Step::NotOn { hand_over: true }
         );
         assert!(!watch.wants_read(t0 + soon), "no hand-over: the gate holds");
         let mut watch = DevToolsWatch::default();
         assert!(watch.wants_read(t0));
         assert_eq!(
             watch.observe(DevToolGrant::NotGranted, false),
-            Step::Raise { hand_over: true }
+            Step::NotOn { hand_over: true }
         );
         watch.note_handed_over();
         assert!(watch.wants_read(t0 + soon), "back from System Settings");

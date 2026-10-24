@@ -17,7 +17,8 @@ mod view;
 #[cfg(test)]
 pub(super) use view::SHEET_TITLE;
 pub(super) use view::{
-    BlocksShared, SharedBlocks, SharedSheet, demo_font_candidate, demo_spec, themes_page,
+    BlocksShared, ListRoom, SharedBlocks, SharedSheet, demo_font_candidate, demo_spec, list_room,
+    themes_page,
 };
 #[cfg(test)]
 pub(super) use view::{list_blocks, section_items};
@@ -601,6 +602,7 @@ impl SettingsViewState {
         let stop = self.scroll_plan().and_then(|plan| plan.stop_of(&filter));
         self.drop_list_nudge();
         self.page_chrome_at.set(None);
+        self.page_chromes.borrow_mut().clear();
         if !shown || stop.is_none() {
             let at = stop.unwrap_or(0);
             self.reduce_page_scroll(at, SettingsPageScrollCommand::Absolute(at));

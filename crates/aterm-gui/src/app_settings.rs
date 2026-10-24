@@ -2966,13 +2966,8 @@ mod tests {
         assert_eq!(fold(&app, now).0, None, "ended: nothing left to arm");
     }
 
-    /// THE DEVELOPER TOOLS HAND-OVER at the park, the debugger change's
-    /// sibling: the window's own hand-over waits for a quiet
-    /// moment and arms nothing while no aterm window is focused; the owner's
-    /// press opens the page and shows the helper panel through the one lane;
-    /// while the panel is up the App folds its turn into the park as
-    /// `DeadlineOwner::DevToolsHandOver`, and the park's own consent-lane tick
-    /// reads the list on a worker and takes the result whatever its wake did.
+    /// The Developer Tools hand-over at the park: one under way is folded into the park and
+    /// read by the consent lane's tick.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_devtools_hand_over_under_way_is_folded_into_the_park_and_read_by_its_tick() {
@@ -2995,10 +2990,6 @@ mod tests {
         let _ = app
             .devtools_watch
             .observe(aterm_containment::DevToolGrant::NotGranted, true);
-        app.except(&crate::message_reporters::devtools_entry(
-            atpkg::devtools::Step::Add,
-            None,
-        ));
         assert_eq!(fold(&app, now).0, None, "nothing waits");
         assert_eq!(
             app.hand_devtools_to_owner(Origin::Automatic),
@@ -3039,7 +3030,7 @@ mod tests {
         );
         let t1 = std::time::Instant::now() + PANEL_TICK;
         let start = std::time::Instant::now();
-        while !app.messages.digest().is_empty() {
+        while app.devtools_helper.panel().map(|p| p.phase()) != Some(Phase::Done) {
             assert!(start.elapsed() < Duration::from_secs(60), "hang");
             app.tick_consent_lanes(t1);
             std::thread::sleep(Duration::from_millis(1));
@@ -3062,7 +3053,7 @@ mod tests {
             "ended: nothing left to arm"
         );
         assert_eq!(
-            app.hand_devtools_to_owner(Origin::Automatic),
+            app.hand_devtools_to_owner(Origin::Ctl { now: false }),
             HandOver::Refused(crate::devtools_helper::Refusal::Granted),
             "the panel's read is the lane's reading now"
         );
@@ -3261,6 +3252,17 @@ mod tests {
         let empty = || test_arms::reading(DevToolGrant::NotGranted, test_arms::absent(0));
         let mut app = App::headless_for_test();
         test_arms::stand_in(&mut app, test_arms::opening());
+        // A step of an approved setup revision, with Full Disk Access on.
+        app.observe_initial_setup_permissions(Some(crate::InitialSetupPermissionPolicy {
+            revision: 1,
+            allowed: true,
+        }));
+        app.consent = crate::consent_state::ConsentState::with_cached_probe_for_test(
+            aterm_containment::consent::FdaProbe {
+                state: aterm_containment::consent::FdaState::Granted,
+                label: aterm_containment::consent::ProbeLabel::OpenOk,
+            },
+        );
         app.devtools_helper
             .note_reading(empty(), std::time::Instant::now());
         let opens = test_arms::opens();
@@ -3359,9 +3361,20 @@ mod tests {
         ] {
             let mut app = App::headless_for_test();
             test_arms::stand_in(&mut app, reach);
+            // A step of an approved setup revision, with Full Disk Access on.
+            app.observe_initial_setup_permissions(Some(crate::InitialSetupPermissionPolicy {
+                revision: 1,
+                allowed: true,
+            }));
+            app.consent = crate::consent_state::ConsentState::with_cached_probe_for_test(
+                aterm_containment::consent::FdaProbe {
+                    state: aterm_containment::consent::FdaState::Granted,
+                    label: aterm_containment::consent::ProbeLabel::OpenOk,
+                },
+            );
             assert_eq!(
                 app.devtools_watch.observe(DevToolGrant::NotGranted, false),
-                Step::Raise { hand_over: true },
+                Step::NotOn { hand_over: true },
                 "the first reading asks"
             );
             app.devtools_helper
@@ -3374,7 +3387,7 @@ mod tests {
             assert_eq!(test_arms::opens(), opens, "nothing opens");
             assert_eq!(
                 app.devtools_watch.observe(DevToolGrant::NotGranted, false),
-                Step::Raise {
+                Step::NotOn {
                     hand_over: asks_again
                 },
                 "{why:?}"

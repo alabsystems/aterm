@@ -171,8 +171,13 @@ pub enum WatcherSpec {
         /// Latch after this much wall-time with no content mutation.
         dur: Duration,
     },
-    /// Latch when the visible surface shows a completed/prompt-ready shell block.
-    BlockComplete,
+    /// Latch once `completed_command_seq()` exceeds `after`: a command finished (an OSC 133/633
+    /// `D` the A→B→C→D gate accepted) since the count was read, whatever marks follow it in the
+    /// same batch.
+    BlockComplete {
+        /// Latch once the completed-command count exceeds this value.
+        after: u64,
+    },
     /// Latch when any visible row in `rows` satisfies `matcher`.
     RowMatches {
         /// The opaque pre-compiled matcher.
@@ -224,6 +229,7 @@ impl WatcherSpec {
             WatcherSpec::RowMatches { .. }
                 | WatcherSpec::RowsClear { .. }
                 | WatcherSpec::SeqAdvanced { .. }
+                | WatcherSpec::BlockComplete { .. }
                 | WatcherSpec::FrameWhole
         )
     }
@@ -248,8 +254,8 @@ pub struct Satisfaction {
 pub trait SurfaceSource {
     /// The monotonic content clock (`content_seq`).
     fn content_seq(&self) -> u64;
-    /// Whether the newest shell-integration block is complete/prompt-ready.
-    fn newest_block_complete(&self) -> bool;
+    /// The monotonic count of completed shell commands (`completed_command_seq`).
+    fn completed_command_seq(&self) -> u64;
     /// The number of visible rows.
     fn rows(&self) -> usize;
     /// The live screen's text of visible row `idx`, or `None`.
@@ -502,15 +508,6 @@ impl WatcherSet {
         self.seed_seq(seq);
     }
 
-    /// Whether an un-latched `BlockComplete` watcher is armed.
-    #[inline]
-    #[must_use]
-    pub fn has_block_complete(&self) -> bool {
-        self.watchers
-            .iter()
-            .any(|w| w.latched.is_none() && matches!(w.spec, WatcherSpec::BlockComplete))
-    }
-
     /// Soonest pending watcher deadline, settling `RowsClear` deadline, or unparked frame hang
     /// detector.
     #[inline]
@@ -548,7 +545,7 @@ impl WatcherSet {
     pub fn observe(
         &mut self,
         content_seq: u64,
-        newest_block_complete: bool,
+        completed_commands: u64,
         now: Instant,
         rows: &[Option<String>],
     ) -> bool {
@@ -557,7 +554,7 @@ impl WatcherSet {
             content_seq,
             false,
             epoch,
-            newest_block_complete,
+            completed_commands,
             now,
             rows,
             Frame::CLOSED,
@@ -575,7 +572,7 @@ impl WatcherSet {
         content_seq: u64,
         alt: bool,
         epoch: u64,
-        newest_block_complete: bool,
+        completed_commands: u64,
         now: Instant,
         rows: &[Option<String>],
         frame: Frame,
@@ -615,8 +612,8 @@ impl WatcherSet {
                         new_deadline = Some(now + *dur);
                     }
                 }
-                WatcherSpec::BlockComplete => {
-                    if newest_block_complete {
+                WatcherSpec::BlockComplete { after } => {
+                    if completed_commands > *after {
                         new_latch = Some(here);
                     }
                 }
@@ -748,13 +745,7 @@ impl super::Terminal {
         let alt = self.is_alternate_screen();
         let epoch = self.content_scroll_state.invalidation_epoch;
         let advanced = self.watchers.is_advance(seq, alt, epoch);
-        let newest_complete = self.watchers.has_block_complete()
-            && self.all_blocks().last().is_some_and(|b| {
-                matches!(
-                    b.state,
-                    super::BlockState::PromptOnly | super::BlockState::Complete
-                )
-            });
+        let completed = self.completed_command_seq();
         let rows = self.rows() as usize;
         let hull = if frame.whole {
             self.watchers.row_scan_hull(advanced, rows)
@@ -772,20 +763,14 @@ impl super::Terminal {
                 let mut s = slot.take().unwrap_or_default();
                 *slot = self.live_row_text_into(i, &mut s).then_some(s);
             }
-            let latched = self.watchers.observe_screen(
-                seq,
-                alt,
-                epoch,
-                newest_complete,
-                now,
-                &scratch,
-                frame,
-            );
+            let latched = self
+                .watchers
+                .observe_screen(seq, alt, epoch, completed, now, &scratch, frame);
             self.row_text_scratch = scratch;
             latched
         } else {
             self.watchers
-                .observe_screen(seq, alt, epoch, newest_complete, now, &[], frame)
+                .observe_screen(seq, alt, epoch, completed, now, &[], frame)
         }
     }
 
@@ -880,13 +865,8 @@ impl SurfaceSource for super::Terminal {
         self.content_seq()
     }
     #[inline]
-    fn newest_block_complete(&self) -> bool {
-        self.all_blocks().last().is_some_and(|b| {
-            matches!(
-                b.state,
-                super::BlockState::PromptOnly | super::BlockState::Complete
-            )
-        })
+    fn completed_command_seq(&self) -> u64 {
+        self.completed_command_seq()
     }
     #[inline]
     fn rows(&self) -> usize {
@@ -972,7 +952,10 @@ mod tests {
             }
             .needs_arm_eval()
         );
-        assert!(!WatcherSpec::BlockComplete.needs_arm_eval());
+        assert!(
+            WatcherSpec::BlockComplete { after: 0 }.needs_arm_eval(),
+            "BlockComplete is level-triggered: a count already past `after` latches at arm"
+        );
     }
 
     /// `MomentumBelow` latches at its armed crossing whenever the host wakes, and content
@@ -1002,7 +985,7 @@ mod tests {
         assert_eq!(set.next_deadline(), Some(crossing));
 
         let typed = base + Duration::from_millis(300);
-        assert!(!set.observe(7, false, typed, NO_ROWS));
+        assert!(!set.observe(7, 0, typed, NO_ROWS));
         assert_eq!(
             set.next_deadline(),
             Some(crossing),
@@ -1052,10 +1035,10 @@ mod tests {
         let mut w = WatcherSet::default();
         let id = w.arm(WatcherSpec::SeqAdvanced { after: 5 }, base).unwrap();
         assert!(w.poll(id).is_none(), "pending before any advance");
-        w.observe(5, false, base + Duration::from_millis(1), NO_ROWS);
+        w.observe(5, 0, base + Duration::from_millis(1), NO_ROWS);
         assert!(w.poll(id).is_none());
         let at = base + Duration::from_millis(2);
-        w.observe(7, false, at, NO_ROWS);
+        w.observe(7, 0, at, NO_ROWS);
         assert_eq!(w.poll(id), Some(Satisfaction { seq: 7, at }));
     }
 
@@ -1096,7 +1079,7 @@ mod tests {
             let mut w = WatcherSet::default();
             let id = w.arm(WatcherSpec::IdleFor { dur: d }, base).unwrap();
             for (seq, off) in schedule {
-                w.observe(seq, false, base + off, NO_ROWS);
+                w.observe(seq, 0, base + off, NO_ROWS);
             }
             w.expire(base + expire_at);
             w.poll(id)
@@ -1115,7 +1098,7 @@ mod tests {
         let base = t0();
         let d = Duration::from_millis(500);
         let mut w = WatcherSet::default();
-        w.observe(1, false, base, NO_ROWS);
+        w.observe(1, 0, base, NO_ROWS);
         let arm_at = base + Duration::from_millis(5000);
         let id = w.arm(WatcherSpec::IdleFor { dur: d }, arm_at).unwrap();
         assert!(!w.expire(arm_at), "must not latch at arm on stale idleness");
@@ -1151,14 +1134,65 @@ mod tests {
     }
 
     #[test]
-    fn block_complete_latches_on_first_complete() {
+    fn block_complete_latches_once_the_completed_count_passes_after() {
         let base = t0();
         let mut w = WatcherSet::default();
-        let id = w.arm(WatcherSpec::BlockComplete, base).unwrap();
-        w.observe(1, false, base + Duration::from_millis(1), NO_ROWS);
-        assert!(w.poll(id).is_none());
-        w.observe(2, true, base + Duration::from_millis(2), NO_ROWS);
+        let id = w
+            .arm(WatcherSpec::BlockComplete { after: 3 }, base)
+            .unwrap();
+        w.observe(1, 3, base + Duration::from_millis(1), NO_ROWS);
+        assert!(
+            w.poll(id).is_none(),
+            "no command finished since the count was read"
+        );
+        w.observe(2, 4, base + Duration::from_millis(2), NO_ROWS);
         assert_eq!(w.poll(id).unwrap().seq, 2);
+    }
+
+    /// PowerShell's prompt function sends `D`, `A`, its prompt and `B` as one string, so the
+    /// batch that finishes a command ends on the next prompt's input; a count already past
+    /// `after` latches at arm, and a keystroke echoed at a prompt, with or without its `B`,
+    /// finishes nothing.
+    #[test]
+    fn block_complete_latches_on_a_completion_the_next_prompt_follows_in_the_same_batch() {
+        let mut term = crate::terminal::Terminal::new(6, 40);
+        term.process(b"\x1b]133;A\x07PS> \x1b]133;B\x07make\r\n\x1b]133;C\x07");
+        let block = |term: &mut crate::terminal::Terminal| {
+            let after = term.completed_command_seq();
+            term.watch(WatcherSpec::BlockComplete { after }, t0())
+                .expect("watcher budget")
+        };
+        let id = block(&mut term);
+        assert!(
+            term.watch_poll(id).is_none(),
+            "armed at the count, nothing latches at arm"
+        );
+        term.process(b"built\r\n");
+        assert!(term.watch_poll(id).is_none(), "the command still runs");
+        term.process(b"\x1b]133;D;0\x07\x1b]133;A\x07PS> \x1b]133;B\x07");
+        let latched = term
+            .watch_poll(id)
+            .expect("the D latches although the batch ends on the next prompt's B");
+        assert_eq!(latched.seq, term.content_seq());
+        let after = term.completed_command_seq() - 1;
+        let behind = term
+            .watch(WatcherSpec::BlockComplete { after }, t0())
+            .expect("watcher budget");
+        assert!(
+            term.watch_poll(behind).is_some(),
+            "a count already past `after` latches before `watch` returns"
+        );
+
+        let typed = block(&mut term);
+        term.process(b"l");
+        assert!(term.watch_poll(typed).is_none(), "an echo after B");
+        term.process(b"\x1b]133;A\x07$ ");
+        let bare = block(&mut term);
+        term.process(b"l");
+        assert!(
+            term.watch_poll(bare).is_none(),
+            "an echo at a prompt with no B"
+        );
     }
 
     /// Equal-seq re-entry: watchers armed at `(seq 15, alt, epoch 1)` see
@@ -1184,14 +1218,14 @@ mod tests {
                 15,
                 true,
                 1,
-                false,
+                0,
                 base,
                 &[Some("ls".to_string())],
                 Frame::CLOSED,
             );
             assert!(w.poll(rows).is_none() && w.poll(seq).is_none());
             assert_eq!(w.is_advance(15, true, epoch), moves, "epoch {epoch}");
-            w.observe_screen(15, true, epoch, false, base, &box_b, Frame::CLOSED);
+            w.observe_screen(15, true, epoch, 0, base, &box_b, Frame::CLOSED);
             assert_eq!(w.poll(rows).is_some(), moves, "row watcher, epoch {epoch}");
             assert_eq!(w.poll(seq).is_some(), moves, "seq watcher, epoch {epoch}");
             assert_eq!(w.seen_epoch(), epoch);
@@ -1221,7 +1255,7 @@ mod tests {
         w.seed_seq(7);
         let id = w.arm(rows_clear(RowRange::All), base).unwrap();
         let rows = [Some("done".to_string()), Some("❯ ".to_string())];
-        w.observe(7, false, base, &rows);
+        w.observe(7, 0, base, &rows);
         assert_eq!(
             w.poll(id).unwrap().seq,
             7,
@@ -1239,21 +1273,21 @@ mod tests {
             Some("thinking…".to_string()),
             Some("esc to interrupt".to_string()),
         ];
-        w.observe(1, false, base, &busy);
+        w.observe(1, 0, base, &busy);
         assert!(w.poll(id).is_none(), "a matching row keeps `gone` pending");
         let still_busy = [
             Some("still thinking…".to_string()),
             Some("(3s · esc to interrupt)".to_string()),
         ];
-        w.observe(2, false, base, &still_busy);
+        w.observe(2, 0, base, &still_busy);
         assert!(w.poll(id).is_none(), "still matching => still pending");
-        w.observe(2, false, base, NO_ROWS);
+        w.observe(2, 0, base, NO_ROWS);
         assert!(
             w.poll(id).is_none(),
             "an un-scanned frame is not a clear surface"
         );
         let clear = [Some("Done.".to_string()), Some("❯ ".to_string())];
-        w.observe(3, false, base, &clear);
+        w.observe(3, 0, base, &clear);
         assert_eq!(w.poll(id).unwrap().seq, 3);
     }
 
@@ -1272,7 +1306,7 @@ mod tests {
         let covering = w
             .arm(rows_clear(RowRange::Span { start: 0, end: 1 }), base)
             .unwrap();
-        w.observe(1, false, base, &rows);
+        w.observe(1, 0, base, &rows);
         assert_eq!(
             w.poll(outside).unwrap().seq,
             1,
@@ -1294,16 +1328,16 @@ mod tests {
         let unb = |n| Frame::unbracketed(Some(ms(n)));
         let mut w = WatcherSet::default();
         let id = w.arm(rows_clear(RowRange::All), base).unwrap();
-        w.observe_screen(1, false, 0, false, ms(0), &busy, unb(0));
-        w.observe_screen(2, false, 0, false, ms(10), &clear, unb(10));
+        w.observe_screen(1, false, 0, 0, ms(0), &busy, unb(0));
+        w.observe_screen(2, false, 0, 0, ms(10), &clear, unb(10));
         assert!(w.poll(id).is_none());
         assert_eq!(w.next_deadline(), Some(ms(10) + GONE_SETTLE));
-        w.observe_screen(3, false, 0, false, ms(50), &clear, unb(50));
+        w.observe_screen(3, false, 0, 0, ms(50), &clear, unb(50));
         assert_eq!(w.next_deadline(), Some(ms(10) + GONE_SETTLE));
-        w.observe_screen(4, false, 0, false, ms(60), &busy, unb(60));
+        w.observe_screen(4, false, 0, 0, ms(60), &busy, unb(60));
         assert_eq!(w.next_deadline(), None);
         assert!(!w.expire(ms(10) + GONE_SETTLE));
-        w.observe_screen(5, false, 0, false, ms(200), &clear, unb(200));
+        w.observe_screen(5, false, 0, 0, ms(200), &clear, unb(200));
         w.restart_idle(ms(250));
         assert_eq!(w.next_deadline(), Some(ms(250) + GONE_SETTLE));
         assert!(!w.expire(ms(200) + GONE_SETTLE));
@@ -1316,7 +1350,7 @@ mod tests {
             })
         );
         let closed = w.arm(rows_clear(RowRange::All), ms(300)).unwrap();
-        w.observe_screen(6, false, 0, false, ms(300), &clear, Frame::CLOSED);
+        w.observe_screen(6, false, 0, 0, ms(300), &clear, Frame::CLOSED);
         assert_eq!(
             w.poll(closed),
             Some(Satisfaction {
@@ -1342,8 +1376,8 @@ mod tests {
             Some("❯ ".to_string()),
             Some(String::new()),
         ];
-        w.observe(1, false, base, &clear);
-        w.observe(2, false, base, &clear);
+        w.observe(1, 0, base, &clear);
+        w.observe(2, 0, base, &clear);
         assert!(
             w.poll(past_the_grid).is_none(),
             "rows 40..=50 on a 3-row grid meets no row: no vacuous latch"
@@ -1355,7 +1389,7 @@ mod tests {
         let covering = w
             .arm(rows_clear(RowRange::Span { start: 2, end: 50 }), base)
             .unwrap();
-        w.observe(2, false, base, &clear);
+        w.observe(2, 0, base, &clear);
         assert_eq!(
             w.poll(covering).unwrap().seq,
             2,
@@ -1406,15 +1440,15 @@ mod tests {
             )
             .unwrap();
         let heavy = [Some("done".to_string()), Some(format!("{:>40}", "busy"))];
-        w.observe(1, false, base, &heavy);
+        w.observe(1, 0, base, &heavy);
         assert!(w.poll(shown).is_none(), "undecided is not a match");
         assert!(w.poll(gone).is_none(), "undecided is not clear");
         let light = [Some("done".to_string()), Some("busy".to_string())];
-        w.observe(2, false, base, &light);
+        w.observe(2, 0, base, &light);
         assert_eq!(w.poll(shown).unwrap().seq, 2);
         assert!(w.poll(gone).is_none(), "a decided match holds `gone`");
         let clear = [Some("done".to_string()), Some("❯ ".to_string())];
-        w.observe(3, false, base, &clear);
+        w.observe(3, 0, base, &clear);
         assert_eq!(w.poll(gone).unwrap().seq, 3);
     }
 
@@ -1503,14 +1537,14 @@ mod tests {
             "a grid with no rows has none to read"
         );
         let busy = vec![Some("esc to interrupt".to_string()); 24];
-        w.observe(0, false, base, &busy);
+        w.observe(0, 0, base, &busy);
         assert_eq!(w.row_scan_hull(false, 24), None);
         assert_eq!(w.row_scan_hull(true, 24), Some((0, 23)));
         w.arm(rows_clear(RowRange::All), base).unwrap();
         assert_eq!(w.row_scan_hull(false, 3), Some((0, 2)));
         let mut once = WatcherSet::default();
         let id = once.arm(shown(RowRange::All), base).unwrap();
-        once.observe(1, false, base, &[Some("never shown".to_string())]);
+        once.observe(1, 0, base, &[Some("never shown".to_string())]);
         assert!(once.poll(id).is_some());
         assert_eq!(once.row_scan_hull(true, 24), None);
     }

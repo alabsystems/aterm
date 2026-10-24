@@ -3397,10 +3397,14 @@ fn text_well(c: Ctx<'_>, focus: Instrument) -> LensDoc<'_> {
                     |count| format!("GPU recovery counter observed: {count}"),
                 )),
             }
-            lines.push(format!(
-                "no per-app GPU figure on {}",
-                c.loc.platform.name()
-            ));
+            if snap.resources[Resource::Gpu.index()].aterm.missing
+                == Some(aterm_vitals::NoFigure::NotPerApp)
+            {
+                lines.push(format!(
+                    "no per-app GPU figure on {}",
+                    c.loc.platform.name()
+                ));
+            }
         }
     }
     let mut seen = std::collections::HashSet::new();

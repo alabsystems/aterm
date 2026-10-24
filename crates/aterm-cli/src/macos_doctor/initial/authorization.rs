@@ -26,8 +26,22 @@ struct AuthorizationCommit {
     publications: observation::Publications,
 }
 
+/// Who admits a plan through a ticket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Admission {
+    /// A person's reviewed choice: the plan is theirs and is never widened.
+    Person,
+    /// aterm's own first-launch plan (System State design §3.5): provisional.
+    Automatic,
+    /// A provisional plan widened on a later launch that found the ALab signal.
+    /// It may follow a finished provisional run; the stages both plans select
+    /// keep their completion.
+    Upgrade,
+}
+
 enum AuthorizationWrite {
-    Plan(Plan),
+    /// The plan, and whether aterm chose it by itself.
+    Plan(Plan, bool),
     Progress(Progress),
     Workstation(Plan),
 }
@@ -35,7 +49,7 @@ enum AuthorizationWrite {
 impl AuthorizationWrite {
     fn persist(&self, root: &Path) -> Result<(), String> {
         match self {
-            Self::Plan(plan) => save_plan(root, plan),
+            Self::Plan(plan, provisional) => save_plan_as(root, plan, *provisional),
             Self::Progress(progress) => save_progress(root, *progress),
             Self::Workstation(plan) => save_workstation_authorization(root, plan),
         }
@@ -43,7 +57,10 @@ impl AuthorizationWrite {
 
     fn update(&self, records: &mut Records) {
         match self {
-            Self::Plan(plan) => records.plan = Some((plan.clone(), true)),
+            Self::Plan(plan, provisional) => {
+                records.plan = Some((plan.clone(), true));
+                records.provisional = *provisional;
+            }
             Self::Progress(progress) => records.progress = Some(*progress),
             Self::Workstation(plan) => {
                 records.decision = if plan.selection.workstation().is_empty() {
@@ -60,6 +77,7 @@ impl AuthorizationCommit {
     fn new(
         baseline: InitialSetupObservation,
         plan: &Plan,
+        admission: Admission,
         vault: AdmittedVault,
     ) -> Result<Self, String> {
         validate_plan(plan)?;
@@ -71,13 +89,25 @@ impl AuthorizationCommit {
             } else {
                 Progress::for_plan(plan)
             };
+        if admission == Admission::Upgrade
+            && let (Some(previous), Some(prior)) = (previous, prior)
+            && prior.belongs_to(previous)
+        {
+            // Widening keeps what the provisional run finished: the Permissions
+            // steps of a finished revision are not handed to macOS again.
+            next.done = Stage::ALL
+                .into_iter()
+                .filter(|stage| stage.selected(previous) && stage.selected(plan))
+                .fold(0, |done, stage| done | (prior.done & stage.bit()));
+        }
+        next.access = carried_access(previous, prior, plan);
         next.revision = next_revision(prior.unwrap_or_default().revision)?;
         next.completed = plan.selection.is_empty();
         next.admitted = false;
         next.running = None;
         next.admitted_vault = vault;
         let mut writes = vec![
-            AuthorizationWrite::Plan(plan.clone()),
+            AuthorizationWrite::Plan(plan.clone(), admission != Admission::Person),
             AuthorizationWrite::Progress(next),
         ];
         if next.done & Stage::Workstation.bit() == 0 {
@@ -147,10 +177,39 @@ impl InitialSetupAuthorization {
 
     /// Some confirms this ticket's exact admitted revision, including an empty plan.
     pub fn persist_observed(&mut self, plan: &Plan) -> InitialSetupObserved<Option<u64>> {
+        self.persist_as(plan, Admission::Person)
+    }
+
+    /// [`Self::persist_observed`] for the plan aterm chose by itself at first
+    /// launch ([`Self::offer_scoped`]): saved as provisional, so a later
+    /// launch that finds the ALab signal may widen it.
+    pub fn persist_automatic_observed(&mut self, plan: &Plan) -> InitialSetupObserved<Option<u64>> {
+        self.persist_as(plan, Admission::Automatic)
+    }
+
+    /// Widen the provisional plan this ticket observed to `plan`, even after its
+    /// run finished. The caller checked the observed records allow it.
+    pub(super) fn upgrade_observed(&mut self, plan: &Plan) -> InitialSetupObserved<Option<u64>> {
+        self.persist_as(plan, Admission::Upgrade)
+    }
+
+    /// The records this ticket observed when it was captured.
+    pub(super) fn baseline_records(&self) -> Result<Records, String> {
+        match &self.state {
+            AuthorizationState::Bound(baseline) => Ok(baseline.records.clone()),
+            _ => Err("the setup review was already used".into()),
+        }
+    }
+
+    fn persist_as(
+        &mut self,
+        plan: &Plan,
+        admission: Admission,
+    ) -> InitialSetupObserved<Option<u64>> {
         observe_person_mutation(
             Err("another doctor profile pass is running".into()),
             |root| {
-                self.persist_with(root, plan, AuthorizationWrite::persist, |root| {
+                self.persist_with(root, plan, admission, AuthorizationWrite::persist, |root| {
                     observation_at(root).map_err(|error| error.to_string())
                 })
             },
@@ -163,13 +222,32 @@ impl InitialSetupAuthorization {
         root: &Path,
         plan: &Plan,
     ) -> InitialSetupObserved<Option<u64>> {
+        self.persist_at_as(root, plan, Admission::Person)
+    }
+
+    #[cfg(test)]
+    pub(super) fn upgrade_at(
+        &mut self,
+        root: &Path,
+        plan: &Plan,
+    ) -> InitialSetupObserved<Option<u64>> {
+        self.persist_at_as(root, plan, Admission::Upgrade)
+    }
+
+    #[cfg(test)]
+    fn persist_at_as(
+        &mut self,
+        root: &Path,
+        plan: &Plan,
+        admission: Admission,
+    ) -> InitialSetupObserved<Option<u64>> {
         observe_mutation_at(
             root,
             observation_at(root).ok(),
             Err("busy".into()),
             |root| {
                 assert!(HeldLock::try_take(root)?.is_none());
-                self.persist_with(root, plan, AuthorizationWrite::persist, |root| {
+                self.persist_with(root, plan, admission, AuthorizationWrite::persist, |root| {
                     observation_at(root).map_err(|error| error.to_string())
                 })
             },
@@ -180,6 +258,7 @@ impl InitialSetupAuthorization {
         &mut self,
         root: &Path,
         plan: &Plan,
+        admission: Admission,
         mut write: impl FnMut(&AuthorizationWrite, &Path) -> Result<(), String>,
         observe: impl FnOnce(&Path) -> Result<InitialSetupObservation, String>,
     ) -> Result<Option<u64>, String> {
@@ -195,14 +274,19 @@ impl InitialSetupAuthorization {
         let current = observe(root)?;
         match &self.state {
             AuthorizationState::Bound(baseline) => {
-                if current != *baseline || records_finished(&current.records) {
+                let finished = records_finished(&current.records);
+                if current != *baseline
+                    || (finished && admission != Admission::Upgrade)
+                    || (admission == Admission::Upgrade && !current.records.provisional)
+                {
                     self.state = AuthorizationState::Ended;
                     return Ok(None);
                 }
                 let owned = baseline.clone();
                 self.state = AuthorizationState::Ended;
-                self.state =
-                    AuthorizationState::Writing(AuthorizationCommit::new(owned, plan, self.vault)?);
+                self.state = AuthorizationState::Writing(AuthorizationCommit::new(
+                    owned, plan, admission, self.vault,
+                )?);
             }
             AuthorizationState::Writing(commit) => {
                 if current.publications() != commit.publications
@@ -247,7 +331,7 @@ fn records_finished(records: &Records) -> bool {
         None => records.decision == Decision::Applied(true),
         Some(progress) => {
             progress.admitted
-                && progress.completed
+                && (progress.completed || progress.stopped_by(records.stop_request))
                 && records
                     .plan
                     .as_ref()
@@ -285,7 +369,7 @@ mod tests {
             Err("busy".into()),
             |root| {
                 assert!(HeldLock::try_take(root)?.is_none());
-                ticket.persist_with(root, plan, write, read)
+                ticket.persist_with(root, plan, Admission::Person, write, read)
             },
         )
     }
@@ -573,5 +657,47 @@ mod tests {
         assert!(InitialSetupAuthorization::capture_at(root.path()).is_err());
         std::fs::remove_file(root.path().join("automatic-plan.json")).unwrap();
         assert!(InitialSetupAuthorization::capture_at(root.path()).is_err());
+    }
+
+    fn admit(root: &Path, plan: &Plan, admission: Admission) -> Option<u64> {
+        let mut ticket = InitialSetupAuthorization::capture_at(root).unwrap();
+        observe_mutation_at(
+            root,
+            observation_at(root).ok(),
+            Err("busy".into()),
+            |root| ticket.persist_with(root, plan, admission, AuthorizationWrite::persist, observe),
+        )
+        .result
+        .unwrap()
+    }
+
+    #[test]
+    fn a_finished_provisional_plan_widens_keeping_its_stages_and_a_persons_plan_never_does() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let narrow = selected(&[Setting::Permissions]);
+        let first = admit(root.path(), &narrow, Admission::Automatic).unwrap();
+        assert!(saved_plan_provisional(root.path()).unwrap());
+        let mut finished = progress(root.path()).unwrap().unwrap();
+        finished.done |= Stage::Permissions.bit();
+        finished.completed = true;
+        save_progress(root.path(), finished).unwrap();
+        assert!(records_finished(&Records::read(root.path()).unwrap()));
+
+        let full = Plan::from(Selection::all());
+        assert_eq!(admit(root.path(), &full, Admission::Automatic), None);
+        let widened = admit(root.path(), &full, Admission::Upgrade).unwrap();
+        assert_eq!(widened, first + 1);
+        let after = progress(root.path()).unwrap().unwrap();
+        assert!(after.admitted && !after.completed);
+        assert_eq!(after.done, Stage::Permissions.bit());
+        assert_eq!(saved_plan(root.path()).unwrap(), Some(full.clone()));
+        assert!(saved_plan_provisional(root.path()).unwrap());
+
+        // A person's plan is theirs: no upgrade replaces it.
+        let other = aterm_tempfile::tempdir().unwrap();
+        admit(other.path(), &narrow, Admission::Person).unwrap();
+        assert!(!saved_plan_provisional(other.path()).unwrap());
+        assert_eq!(admit(other.path(), &full, Admission::Upgrade), None);
+        assert_eq!(saved_plan(other.path()).unwrap(), Some(narrow));
     }
 }

@@ -8,8 +8,8 @@ use std::path::Path;
 #[cfg(target_os = "macos")]
 use crate::support::Home;
 use crate::support::{
-    Run, Scratch, bash, hermetic, install_sh, installer, q, read, run, s, symlink, system_path,
-    tree, write,
+    Lib, Run, Scratch, bash, hermetic, install_sh, installer, q, read, run, s, symlink,
+    system_path, tree, write,
 };
 
 const LOGGER: &str = "#!/bin/sh\necho \"$(basename \"$0\") $*\" >>\"${SHIM_LOG:?}\"\nexit 1\n";
@@ -253,6 +253,81 @@ fn a_dry_run_s_toolset_line_follows_the_console_owner() {
         assert_eq!(dry.run.code(), 0, "{plan}");
         assert!(plan.contains(want), "console {console}: {plan}");
         assert!(!plan.contains(not), "console {console}: {plan}");
+    }
+}
+
+/// A dry run makes no folder, so `ensure_dirs_writable` answers for one still to be made
+/// as `mkdir -p` then does: by the nearest part of the way that is there. A folder this
+/// account can write takes it, through a link or not; a file, a folder it cannot write,
+/// or a link that leads nowhere, standing where the folder would or above it, does not.
+#[test]
+fn a_dry_run_answers_for_a_folder_still_to_be_made_as_mkdir_does() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    lib.step(
+        "answers() {\n\
+         \tlocal dry=made real=made before\n\
+         \tbefore=\"$(ls -lAR \"$p\")\"\n\
+         \tDRY_RUN=1; ensure_dirs_writable \"$1\" || dry=refused; DRY_RUN=0\n\
+         \t[[ \"$(ls -lAR \"$p\")\" == \"$before\" ]] || dry=\"$dry, changing $p\"\n\
+         \tensure_dirs_writable \"$1\" || real=refused\n\
+         \techo \"$dry $real\"\n\
+         }",
+    );
+    let rows = [
+        (
+            "a folder below one it can write",
+            "true",
+            "new/deep",
+            "made",
+        ),
+        (
+            "through a link to one it can write",
+            "mkdir real && ln -s real l",
+            "l/new",
+            "made",
+        ),
+        (
+            "below a link that leads nowhere",
+            "ln -s gone dl",
+            "dl/new",
+            "refused",
+        ),
+        (
+            "at a link that leads nowhere",
+            "ln -s gone dl",
+            "dl",
+            "refused",
+        ),
+        ("below a file", ": >f", "f/new", "refused"),
+        (
+            "below a folder it cannot write",
+            "mkdir ro && chmod 555 ro",
+            "ro/new",
+            "refused",
+        ),
+    ];
+    let calls: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .map(|(n, (_, setup, path, _))| {
+            lib.call(
+                format!(
+                    "( p=\"$TMPDIR/p{n}\"; mkdir \"$p\" && cd \"$p\" && {setup} && \
+                     answers \"$p/{path}\"; s=$?; chmod -R u+w \"$p\"; exit $s )"
+                ),
+                &[],
+            )
+        })
+        .collect();
+    let recs = lib.run(&scratch);
+    for ((label, _, _, want), i) in rows.iter().zip(calls) {
+        assert_eq!(recs[i].rc, 0, "{label}: {}", recs[i].err);
+        assert_eq!(
+            recs[i].out.trim(),
+            format!("{want} {want}"),
+            "{label}: the dry run's answer, then mkdir -p's"
+        );
     }
 }
 

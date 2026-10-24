@@ -74,6 +74,9 @@ pub(crate) enum StatusAction {
     MacScreen(Pick),
     /// A Fleet submenu Mac's Copy "`ssh <it>`".
     MacSsh(Pick),
+    /// The System State line's press ([`Glance::system_state`]): the System
+    /// State tab in the frontmost window.
+    OpenSystemState,
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -98,6 +101,7 @@ impl StatusAction {
             Self::ReadFleet => 10,
             Self::ReadFleetNow => 11,
             Self::OpenLocalNetwork => 12,
+            Self::OpenSystemState => 13,
             Self::ShowException(id) => packed(4, id),
             Self::Go(pick) => packed(5, pick.packed()),
             Self::ReadResult(pick) => packed(6, pick.packed()),
@@ -124,6 +128,7 @@ impl StatusAction {
             10 => Some(Self::ReadFleet),
             11 => Some(Self::ReadFleetNow),
             12 => Some(Self::OpenLocalNetwork),
+            13 => Some(Self::OpenSystemState),
             t if t >= TAG_BAND => {
                 let payload = u64::try_from(t % TAG_BAND).ok()?;
                 let pick = || Pick::unpacked(payload);
@@ -1308,6 +1313,20 @@ pub(crate) struct Glance {
     pub peers: Vec<PeerRef>,
     /// The Fleet row.
     pub fleet: FleetLine,
+    /// System State's one quiet signal (`docs/DESIGN-system-state-2026-10-21.md`
+    /// §3.6): a row it manages needs a person or failed.
+    pub system_state: Option<SystemStateLine>,
+}
+
+/// The status menu's System State line: `System State: <row> needs you` (or
+/// `<row> failed`, `N need you`, `N failed`), which opens the tab, and a waiting
+/// vault approval code under it (`system_state_access::menu_line`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SystemStateLine {
+    /// The line's words.
+    pub label: String,
+    /// A note under it: the vault approval code a join waits on.
+    pub note: Option<String>,
 }
 
 /// Whose banner aterm's own notices arrive as on this Mac (`notify::own_voice`, macOS): what the Notify Me row's hover says.
@@ -2394,6 +2413,14 @@ pub(crate) fn compose_status_menu(g: &Glance, now_unix: i64) -> Vec<StatusRow> {
                 ),
                 StatusAction::Overview,
             ));
+        }
+        rows.push(StatusRow::Separator);
+    }
+    // System State's one quiet signal: a pull surface, so it interrupts nothing.
+    if let Some(line) = &g.system_state {
+        rows.push(act(line.label.clone(), StatusAction::OpenSystemState));
+        if let Some(note) = &line.note {
+            rows.push(StatusRow::Info(fold_clip(note, LINE_MAX)));
         }
         rows.push(StatusRow::Separator);
     }
@@ -5573,6 +5600,7 @@ mod tests {
             StatusAction::MacRead(p),
             StatusAction::MacScreen(p),
             StatusAction::MacSsh(p),
+            StatusAction::OpenSystemState,
         ];
         for a in every {
             assert_ne!(a.tag(), 0, "{a:?}");
@@ -6829,5 +6857,42 @@ mod tests {
         assert!(own.len() <= LINE_MAX, "{own}");
         assert!(own.ends_with("\u{2026} \u{b7} 3m"), "{own}");
         assert!(own.contains("\u{2014} grant Screen Recording"), "{own}");
+    }
+
+    /// System State's one quiet signal (§3.6): one action row that opens the
+    /// tab, with the vault approval code under it, before This Mac; no row when
+    /// nothing needs a person.
+    #[test]
+    fn the_system_state_line_opens_the_tab_and_carries_the_code() {
+        let mut g = Glance::default();
+        let plain = compose_status_menu(&g, 0);
+        assert!(
+            !plain.iter().any(|row| matches!(
+                row,
+                StatusRow::Action {
+                    action: StatusAction::OpenSystemState,
+                    ..
+                }
+            )),
+            "nothing needs a person: no line"
+        );
+        g.system_state = Some(SystemStateLine {
+            label: "System State: Secrets vault needs you".to_string(),
+            note: Some("Approval code 4F7-2KQ".to_string()),
+        });
+        let menu = compose_status_menu(&g, 0);
+        assert_eq!(
+            menu.first(),
+            Some(&act(
+                "System State: Secrets vault needs you",
+                StatusAction::OpenSystemState
+            ))
+        );
+        assert_eq!(
+            menu.get(1),
+            Some(&StatusRow::Info("Approval code 4F7-2KQ".to_string()))
+        );
+        assert_eq!(menu.get(2), Some(&StatusRow::Separator));
+        assert_eq!(menu.get(3), Some(&StatusRow::Info(here_line(&g.here))));
     }
 }

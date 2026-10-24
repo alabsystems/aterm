@@ -635,6 +635,40 @@ fn an_account_rows_store_figure_carries_its_age() {
         "main \u{b7} dedicated \u{b7} 61% left \u{b7} 2d ago",
         "the control: another account's session figure never reaches this row"
     );
+    {
+        let mut state = accounts::State::default();
+        let acct = accounts::Account {
+            warned_week: Some(accounts::WindowSaid {
+                pct: Some(20),
+                reset: Some(NOW + 86_400),
+                at: NOW - 2 * 86_400,
+            }),
+            ..accounts::Account::default()
+        };
+        state.accounts.insert("main".into(), acct);
+        let figure = aterm_agent::harness::profile::WeeklyFigure {
+            used_x10: 600,
+            resets_at: NOW + 86_400,
+            at: NOW - 25 * 60,
+        };
+        let (rows, _) = account_menu_rows_from(
+            &roster,
+            &state,
+            &enrolled,
+            Some("main"),
+            None,
+            SessionWeek {
+                label: None,
+                figure: Some(figure),
+                left: None,
+            },
+            NOW,
+        );
+        assert_eq!(
+            rows[0].label, "main \u{b7} dedicated \u{b7} 40% left \u{b7} 25m ago",
+            "the session's own figure wins over a warned_week when no store window figure exists"
+        );
+    }
 
     let roster = accounts::Roster {
         rows: vec![

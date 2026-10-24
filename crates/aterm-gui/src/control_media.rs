@@ -3193,7 +3193,7 @@ impl crate::App {
         let Some(selector) = theme else {
             return Ok(None);
         };
-        if let Some(why) = self.theme_preview_unavailable(&selector) {
+        if let Some(why) = self.session_theme_unavailable(&selector) {
             return Err(format!("theme {selector:?}: {why}"));
         }
         Ok(Some(crate::session_theme::SessionTheme {

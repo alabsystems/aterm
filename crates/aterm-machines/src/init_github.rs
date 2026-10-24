@@ -6,7 +6,7 @@
 use crate::git_credential::{GITHUB, Git, Lookups};
 use crate::items::{Ctx, Item};
 use crate::model::{Probe, User};
-use crate::port::{Secret, System};
+use crate::port::{GithubError, Secret, System};
 use serde::Deserialize;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -170,13 +170,23 @@ pub(super) fn get(
     user: &User,
     token: &Secret,
     endpoint: &str,
-) -> Result<crate::github_pages::Page, String> {
+) -> Result<crate::github_pages::Page, GithubError> {
     let reply = sys.github_api(user, token, endpoint)?;
-    crate::github_pages::page(reply.status, reply.headers, &reply.body)
+    if reply.status == 401 {
+        return Err(GithubError {
+            failure: crate::port::GithubFailure::Unauthenticated,
+            why: "GitHub rejected the credential or repository request (output withheld)".into(),
+        });
+    }
+    crate::github_pages::page(reply.status, reply.headers, &reply.body).map_err(GithubError::other)
 }
 
 /// The account `token` signs in as (`GET /user`).
-pub(super) fn identity(sys: &dyn System, user: &User, token: &Secret) -> Result<String, String> {
+pub(super) fn identity(
+    sys: &dyn System,
+    user: &User,
+    token: &Secret,
+) -> Result<String, GithubError> {
     signed_in(get(sys, user, token, "/user")?)
 }
 
@@ -193,15 +203,16 @@ fn signs_in_as(sys: &dyn System, user: &User, token: &Secret) -> Result<Option<S
         &reply.body,
     )?)
     .map(Some)
+    .map_err(String::from)
 }
 
 /// The login a `GET /user` page names.
-fn signed_in((value, _): crate::github_pages::Page) -> Result<String, String> {
+fn signed_in((value, _): crate::github_pages::Page) -> Result<String, GithubError> {
     value["login"]
         .as_str()
         .filter(|account| login(account))
         .map(str::to_owned)
-        .ok_or_else(|| "GitHub returned an invalid authenticated account".into())
+        .ok_or_else(|| GithubError::other("GitHub returned an invalid authenticated account"))
 }
 
 fn stored(sys: &dyn System, user: &User, account: &str) -> Result<Option<Secret>, String> {
@@ -315,7 +326,7 @@ impl Item for Auth {
                         from: "GitHub credential or HTTPS helper needs setup".into(),
                         to: self.title(),
                     },
-                    Err(why) => Probe::Blocked { why },
+                    Err(unread) => Probe::Blocked { why: unread.why },
                 },
                 (Lookups::Ready, Some(_)) => Probe::Ok { now: self.title() },
             },
@@ -363,13 +374,34 @@ impl Item for Auth {
     }
 }
 
-fn read_token(sys: &dyn System, user: &User, config: &Github) -> Result<Secret, String> {
+/// Why [`read_token`] has no token: the engine's line, and whether the source is not there
+/// at all (the vault has not written it yet) rather than there and unusable.
+pub(super) struct TokenUnread {
+    /// Nothing is at the source's path.
+    pub(super) absent: bool,
+    /// The engine's line; it never quotes the file.
+    pub(super) why: String,
+}
+
+impl From<TokenUnread> for String {
+    fn from(unread: TokenUnread) -> Self {
+        unread.why
+    }
+}
+
+fn read_token(sys: &dyn System, user: &User, config: &Github) -> Result<Secret, TokenUnread> {
     crate::port::no_core_dumps();
-    let mut bytes = sys.read_owned_file(&config.token_file, user.uid, INPUT_MAX, true)
-        .map_err(|_| "GitHub token source must be an owned private regular file (0600), without links, at most 64 KiB")?;
+    let mut bytes = sys
+        .read_owned_file(&config.token_file, user.uid, INPUT_MAX, true)
+        .map_err(|error| TokenUnread {
+            absent: error.kind() == io::ErrorKind::NotFound,
+            why: "GitHub token source must be an owned private regular file (0600), without \
+                  links, at most 64 KiB"
+                .into(),
+        })?;
     let result = token(&bytes, config.token_key.as_deref());
     scrub(&mut bytes);
-    result
+    result.map_err(|why| TokenUnread { absent: false, why })
 }
 
 fn token(bytes: &[u8], key: Option<&str>) -> Result<Secret, String> {

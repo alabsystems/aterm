@@ -1225,7 +1225,9 @@ impl CursorFx {
             && matches!(glow_cfg.style, GlowStyle::Laser);
         let bolt_fill = bolt_cursor.then(|| bolt_body(glow_cfg.color, self.glow.blaze(), dark));
         let glow_fp = glow_fp ^ u64::from(bolt_fill.unwrap_or(0)).rotate_left(59);
-        crate::cursor_trail::ignite(&mut trail_cfg, energy, warmth);
+        if trail_cfg.enabled {
+            crate::cursor_trail::ignite(&mut trail_cfg, energy, warmth);
+        }
         let _ = self
             .trail
             .tick(cur, now, &trail_cfg, &mut self.trail_scratch);

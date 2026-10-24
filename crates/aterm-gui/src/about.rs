@@ -6,8 +6,9 @@
 
 /// The build-provenance rows for the native Settings `/about` route.
 pub(crate) struct AboutState {
-    /// `(key, value)` provenance rows from `build_info::about_fields()`.
-    rows: Vec<(&'static str, String)>,
+    /// `(key, value)` provenance rows from `build_info::about_fields()`, read when first asked for:
+    /// which copy is running is probed on disk, which a view that never shows About does not need.
+    rows: std::cell::OnceCell<Vec<(&'static str, String)>>,
 }
 
 /// The provenance block as clipboard-ready `key: value` lines.
@@ -22,7 +23,7 @@ pub(crate) fn provenance_text() -> String {
 
 /// The `site` provenance row as an absolute URL (`https://` when it names no scheme), if present.
 pub(crate) fn site_url(state: &AboutState) -> Option<String> {
-    let (_, v) = state.rows.iter().find(|(k, _)| *k == "site")?;
+    let (_, v) = state.semantic_rows().iter().find(|(k, _)| *k == "site")?;
     Some(if v.contains("://") {
         v.clone()
     } else {
@@ -33,21 +34,23 @@ pub(crate) fn site_url(state: &AboutState) -> Option<String> {
 impl AboutState {
     pub(crate) fn new() -> Self {
         Self {
-            rows: crate::build_info::about_fields(),
+            rows: std::cell::OnceCell::new(),
         }
     }
 
     /// The provenance rows the route paints, its semantics and the copy action read.
     pub(crate) fn semantic_rows(&self) -> &[(&'static str, String)] {
-        &self.rows
+        self.rows.get_or_init(crate::build_info::about_fields)
     }
 
     /// Test seam: replace the shipping `site` row (`alab.systems`) with a
     /// caller-chosen one, so link tests pin behaviour rather than the address.
     #[cfg(test)]
     pub(crate) fn add_test_site(&mut self, site: &str) {
-        self.rows.retain(|(key, _)| *key != "site");
-        self.rows.push(("site", site.to_string()));
+        self.semantic_rows();
+        let rows = self.rows.get_mut().expect("read just now");
+        rows.retain(|(key, _)| *key != "site");
+        rows.push(("site", site.to_string()));
     }
 }
 
@@ -58,7 +61,7 @@ mod tests {
     #[test]
     fn site_url_is_absolute_or_absent() {
         let mut state = AboutState {
-            rows: vec![("version", "0.0.0".to_string())],
+            rows: std::cell::OnceCell::from(vec![("version", "0.0.0".to_string())]),
         };
         state.add_test_site("example.test");
         assert_eq!(site_url(&state).as_deref(), Some("https://example.test"));
@@ -67,7 +70,11 @@ mod tests {
             site_url(&state).as_deref(),
             Some("https://example.test/path")
         );
-        state.rows.retain(|(key, _)| *key != "site");
+        state
+            .rows
+            .get_mut()
+            .expect("set")
+            .retain(|(key, _)| *key != "site");
         assert_eq!(site_url(&state), None);
     }
 }

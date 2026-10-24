@@ -2066,6 +2066,8 @@ fn records_that_cannot_be_read_whole_hand_the_window_nothing() {
     );
     std::fs::remove_file(state_dir(&o)).expect("unblock");
     std::fs::create_dir_all(state_dir(&o)).expect("state dir");
+    crate::harness::upgrade_drive::set_models(&o, "claude-opus-5-5")
+        .expect("a model priority cache beside the records");
     save(
         &o,
         "aaa",
@@ -2122,6 +2124,56 @@ fn records_that_cannot_be_read_whole_hand_the_window_nothing() {
     assert_eq!(sent[1][0].stalled.as_deref(), Some("overdue"));
     assert!(kept[1].is_empty(), "read whole: no tab left as it stands");
     assert!(view.unreadable().is_empty(), "read whole: none named");
+
+    let record = state_dir(&o).join("aaa.json");
+    let saved = std::fs::read_to_string(&record).expect("the live upgrade record");
+    for malformed in [
+        "{",
+        "null",
+        "[]",
+        r#"{"phase":"future"}"#,
+        r#"{"phase":"future","priority":["claude-opus-5-5"]}"#,
+    ] {
+        std::fs::write(&record, malformed).expect("a readable malformed record");
+        let mut frames = Vec::new();
+        view.refresh_with_keeping(&o, &tabs, NOW, &held, &mut |rows, tabs| {
+            frames.push((rows.to_vec(), tabs.to_vec()));
+        });
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].0.is_empty());
+        assert_eq!(frames[0].1, [TAB.to_string()]);
+        assert_eq!(view.unreadable(), std::slice::from_ref(&record));
+        let (status, whole) = status_rows_with(&o, NOW, &held, &Aside::default);
+        assert!(status.is_empty());
+        assert!(!whole, "malformed bytes cannot report no upgrade");
+
+        std::fs::write(&record, &saved).expect("restore the live upgrade");
+        let mut restored = Vec::new();
+        view.refresh_with_keeping(&o, &tabs, NOW, &held, &mut |rows, tabs| {
+            restored.push((rows.to_vec(), tabs.to_vec()));
+        });
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].0.len(), 1);
+        assert_eq!(restored[0].0[0].session, "aaa");
+        assert!(restored[0].1.is_empty());
+        assert!(view.unreadable().is_empty());
+    }
+
+    let mut other = St::from_json(&saved).expect("the saved record");
+    other.cause = crate::harness::relaunch::CAUSE_EXIT.to_string();
+    std::fs::write(&record, other.to_json()).expect("a valid non-upgrade record");
+    let (status, whole) = status_rows_with(&o, NOW, &held, &Aside::default);
+    assert!(status.is_empty());
+    assert!(whole, "a valid non-upgrade is intentionally omitted");
+
+    std::fs::write(&record, &saved).expect("restore the live upgrade");
+    let filtered = Opts {
+        only_sid: Some("s-other".to_string()),
+        ..o.clone()
+    };
+    let (status, whole) = read_rows(&filtered, NOW);
+    assert!(status.is_empty());
+    assert!(whole, "a valid record for another tab is omitted");
     std::fs::remove_dir_all(state_dir(&o)).expect("no records");
     view.refresh_with(&o, &tabs, NOW, &held, &mut |rows| sent.push(rows.to_vec()));
     assert_eq!(sent.len(), 3);

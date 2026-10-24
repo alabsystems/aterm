@@ -3960,6 +3960,27 @@ fn a_launch_card_fills_only_open_facts() {
         away,
         "the card's xhigh was Opus 5.5's, not Sonnet 5's"
     );
+    let open_fallback = FooterFacts {
+        model: Some("Gemini 4 Argon".into()),
+        effort: Some("high".into()),
+        model_open: true,
+        effort_open: true,
+        ..open
+    };
+    assert_eq!(
+        open_fallback.filled_from(None),
+        open_fallback,
+        "fallback model/effort stands when no screen card is admitted"
+    );
+    let card_override = open_fallback.filled_from(Some(&card));
+    assert_eq!(
+        (
+            card_override.model.as_deref(),
+            card_override.effort.as_deref()
+        ),
+        (Some("Opus 5.5"), Some("xhigh")),
+        "an admitted screen card overrides an open fallback model/effort"
+    );
 }
 
 #[test]

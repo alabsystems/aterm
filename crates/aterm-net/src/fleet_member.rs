@@ -34,9 +34,6 @@ pub const PEERS_FILE: &str = "fleet-peers";
 /// A member's copy of its issuer's book, in the state directory: a file of its own, so an older aterm reading [`PEERS_FILE`] never meets a copy, and no edit of the book (`peers add`, `rm`, a join) ever writes one.
 pub const ISSUER_BOOK_FILE: &str = "fleet-issuer-book";
 
-/// The old fleet's entries a join of another fleet set aside once it wrote the new key ([`set_aside_peers`]), kept until the join finishes ([`settle_peers`]): a file of their own, so an older aterm, which reads no [`Peer::fleet`], never reads them as the new fleet's or drops them.
-pub const PEERS_LEFT_FILE: &str = "fleet-peers-left";
-
 const PEERS_LOCK: &str = ".fleet-peers.lock";
 
 /// The most peers one book holds: a fleet is one LAN's machines, and a secret holder cannot grow an issuer's book past this with made-up node ids.
@@ -58,7 +55,7 @@ const PEERS_FILE_MAX: usize = 256 * 1024;
 
 const LOCK_WAIT: Duration = Duration::from_secs(2);
 
-use aterm_uds::private_file::check_private_dir;
+use aterm_uds::private_file::{PrivateDir, check_private_dir, judge_private_dir};
 pub use aterm_uds::private_file::{
     PrivateFileError, ensure_private_dir, read_private, remove_private, write_private,
 };
@@ -814,33 +811,12 @@ impl std::error::Error for PeersError {}
 
 /// The book of peers in the state directory `dir` as the fleet whose key `dir` holds reads it: empty when there is none, and an entry marked with another fleet ([`Peer::fleet`]), or any marked one when no key is held, left out.
 pub fn read_peers(dir: &Path) -> Result<Vec<Peer>, PeersError> {
-    Ok(read_book(dir)?.0)
+    Ok(read_book(dir, held_mark(dir))?.0)
 }
 
-/// Whether the book in `dir` holds entries of another fleet than the key held ([`Peer::fleet`]) or set aside ([`PEERS_LEFT_FILE`]): a join of that key's fleet unfinished, which a join again finishes.
-#[must_use]
-pub fn holds_another_fleet(dir: &Path) -> bool {
-    std::fs::symlink_metadata(dir.join(PEERS_LEFT_FILE)).is_ok()
-        || read_book(dir).is_ok_and(|(_, others)| !others.is_empty())
-}
-
-fn read_left(dir: &Path) -> Vec<Peer> {
-    read_private(dir, PEERS_LEFT_FILE, PEERS_FILE_MAX).map_or_else(
-        |_| Vec::new(),
-        |bytes| {
-            String::from_utf8_lossy(&bytes)
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty() && !line.starts_with('#'))
-                .filter_map(Peer::parse)
-                .collect()
-        },
-    )
-}
-
-/// The book in `dir`: its entries of the fleet whose key `dir` holds ([`read_peers`]), then those of another fleet.
-fn read_book(dir: &Path) -> Result<(Vec<Peer>, Vec<Peer>), PeersError> {
-    read_book_as(dir, held_mark(dir))
+/// The book in `dir` as the fleet `fleet` marks reads it, whatever key `dir` holds: its entries of that fleet, and those marked with none.
+pub fn read_peers_as(dir: &Path, fleet: FleetMark) -> Result<Vec<Peer>, PeersError> {
+    Ok(read_book(dir, Some(fleet))?.0)
 }
 
 /// The mark of the fleet whose key `dir` holds, when it holds one it can read.
@@ -850,8 +826,8 @@ fn held_mark(dir: &Path) -> Option<FleetMark> {
         .map(|secret| secret.mark())
 }
 
-/// [`read_book`], as the fleet `held` marks.
-fn read_book_as(dir: &Path, held: Option<FleetMark>) -> Result<(Vec<Peer>, Vec<Peer>), PeersError> {
+/// The book in `dir` as the fleet `held` marks: its entries of that fleet ([`read_peers`]), then those of another fleet.
+fn read_book(dir: &Path, held: Option<FleetMark>) -> Result<(Vec<Peer>, Vec<Peer>), PeersError> {
     let bytes = match read_private(dir, PEERS_FILE, PEERS_FILE_MAX) {
         Ok(bytes) => bytes,
         Err(PrivateFileError::Missing) => return Ok((Vec::new(), Vec::new())),
@@ -930,6 +906,27 @@ pub fn write_issuer_book(dir: &Path, issuer: &str, copies: &[Peer]) -> io::Resul
     write_private(dir, ISSUER_BOOK_FILE, text.as_bytes())
 }
 
+/// Keep what a read of the issuer's book under `secret` made of it as the copy in `dir` — `copies` of the book of `issuer` ([`write_issuer_book`]), or no copy for `None` — under the book's lock and only while `dir` holds `secret`'s key still, so a read that ends after `aterm fleet leave`, or after a join moved this machine to another fleet, keeps nothing of the fleet it read: whether it kept it.
+/// # Errors
+/// The lock cannot be taken, or the copy cannot be written or removed.
+pub fn keep_issuer_book(
+    dir: &Path,
+    secret: &FleetSecret,
+    copy: Option<(&str, &[Peer])>,
+) -> io::Result<bool> {
+    let _lock = BookLock::take(dir, LOCK_WAIT)?;
+    if crate::fleet::read_key_file(dir).ok().as_ref() != Some(secret) {
+        return Ok(false);
+    }
+    match copy {
+        Some((issuer, copies)) => write_issuer_book(dir, issuer, copies)?,
+        None => {
+            remove_private(dir, ISSUER_BOOK_FILE)?;
+        }
+    }
+    Ok(true)
+}
+
 fn book_text(book: &[Peer]) -> String {
     let mut text = String::from(
         "# The fleet's peers, one per line: written by aterm (`aterm fleet peers`).\n",
@@ -941,70 +938,85 @@ fn book_text(book: &[Peer]) -> String {
     text
 }
 
-/// Edit the book in `dir` under its lock: read it ([`read_peers`]), run `edit`, and write it back whole when `edit` changed it, its entries of another fleet kept (set aside while a key is held: [`set_aside_peers`]).
+/// Edit the book in `dir` under its lock: read it ([`read_peers`]), run `edit`, and write it back whole when `edit` changed it or a key is held beside entries of another fleet, those entries kept while no key is held and dropped while one is (by an `edit` that changes nothing too), so an older aterm, which reads no [`Peer::fleet`], never reads the old issuer as the new key's.
 pub fn update_peers<R>(
     dir: &Path,
     edit: impl FnOnce(&mut Vec<Peer>) -> Result<R, String>,
 ) -> Result<R, String> {
-    edit_book(dir, true, edit)
+    hold_book(dir)?.update(edit)
 }
 
-/// [`update_peers`], every entry of another fleet dropped and those set aside removed: how a join that holds its fleet's key finishes the book.
-pub fn settle_peers<R>(
-    dir: &Path,
-    edit: impl FnOnce(&mut Vec<Peer>) -> Result<R, String>,
-) -> Result<R, String> {
-    edit_book(dir, false, edit)
+/// The book's lock in a state directory, held while this lives ([`hold_book`]): no other edit of the book, an older aterm's included, comes between the edits made under it.
+pub struct HeldBook<'a> {
+    dir: &'a Path,
+    _lock: BookLock,
 }
 
-/// Move the book's entries of another fleet out of [`PEERS_FILE`] into [`PEERS_LEFT_FILE`] once a join wrote its new key, so an older aterm reads the book of no fleet until the join finishes.
-pub fn set_aside_peers(dir: &Path) -> Result<(), String> {
-    edit_book(dir, true, |_| Ok(()))
+/// Take the book's lock in `dir`, as [`update_peers`] does.
+/// # Errors
+/// Another edit holds it past the lock's wait, or it cannot be taken.
+pub fn hold_book(dir: &Path) -> Result<HeldBook<'_>, String> {
+    let lock = BookLock::take(dir, LOCK_WAIT).map_err(|e| format!("{PEERS_FILE}'s lock: {e}"))?;
+    Ok(HeldBook { dir, _lock: lock })
 }
 
-/// [`update_peers`] (`keep_others`) or [`settle_peers`].
-fn edit_book<R>(
-    dir: &Path,
-    keep_others: bool,
-    edit: impl FnOnce(&mut Vec<Peer>) -> Result<R, String>,
-) -> Result<R, String> {
-    let _lock = BookLock::take(dir, LOCK_WAIT).map_err(|e| format!("{PEERS_FILE}'s lock: {e}"))?;
-    let held = held_mark(dir);
-    let (mut book, mut others) = read_book_as(dir, held).map_err(|e| e.to_string())?;
-    let before = book.clone();
-    let out = edit(&mut book)?;
-    // Removed before the book is written, so a failure leaves the book as it was.
-    if !keep_others {
-        remove_private(dir, PEERS_LEFT_FILE).map_err(|e| format!("{PEERS_LEFT_FILE}: {e}"))?;
-    }
-    // Set aside only while a key is held, and before they leave the book: a kill between leaves them in both, each read as no fleet's.
-    let aside = keep_others && held.is_some() && !others.is_empty();
-    if aside {
-        let mut left = read_left(dir);
-        for peer in &others {
-            if !left.contains(peer) {
-                left.push(peer.clone());
+impl HeldBook<'_> {
+    /// [`update_peers`]'s edit, under this lock.
+    /// # Errors
+    /// The book cannot be read or written, or `edit` refuses.
+    pub fn update<R>(
+        &self,
+        edit: impl FnOnce(&mut Vec<Peer>) -> Result<R, String>,
+    ) -> Result<R, String> {
+        let held = held_mark(self.dir);
+        let (mut book, mut others) = read_book(self.dir, held).map_err(|e| e.to_string())?;
+        let before = book.clone();
+        let out = edit(&mut book)?;
+        let drops = held.is_some() && !others.is_empty();
+        if book != before || drops {
+            if held.is_none() {
+                book.append(&mut others);
             }
+            write_private(self.dir, PEERS_FILE, book_text(&book).as_bytes())
+                .map_err(|e| format!("{PEERS_FILE}: {e}"))?;
         }
-        let mut text = String::from(
-            "# What a join of another fleet set aside of the fleet this machine held, until it \
-             finishes: written by aterm, never read as the book.\n",
-        );
-        for peer in &left {
-            text.push_str(&peer.line());
-            text.push('\n');
-        }
-        write_private(dir, PEERS_LEFT_FILE, text.as_bytes())
-            .map_err(|e| format!("{PEERS_LEFT_FILE}: {e}"))?;
+        Ok(out)
     }
-    if book != before || aside || (!keep_others && !others.is_empty()) {
-        if keep_others && !aside {
-            book.append(&mut others);
+}
+
+/// `act` under the book's lock in `dir`, so no edit of the book in progress writes it after `act` removed it (`aterm fleet leave`): `dir` narrowed first where it is open to others, as `join` and `peers add` narrow it before their edits (`act` is given the mode it had, and a refusal names it), and without the lock only where no edit could take it either ([`stops_every_edit`]).
+pub fn with_book_held<R>(dir: &Path, act: impl FnOnce(Option<u32>) -> R) -> Result<R, String> {
+    let narrowed = match judge_private_dir(dir) {
+        Ok(PrivateDir::Open(_)) => {
+            ensure_private_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?
         }
-        write_private(dir, PEERS_FILE, book_text(&book).as_bytes())
-            .map_err(|e| format!("{PEERS_FILE}: {e}"))?;
-    }
-    Ok(out)
+        _ => None,
+    };
+    let _lock = match BookLock::take(dir, LOCK_WAIT) {
+        Ok(lock) => Some(lock),
+        Err(e) if stops_every_edit(&e) => None,
+        Err(e) => {
+            return Err(match narrowed {
+                Some(was) => format!(
+                    "{PEERS_FILE}'s lock: {e}; {} was open to other users ({was:o}), and is 0700 now",
+                    dir.display()
+                ),
+                None => format!("{PEERS_FILE}'s lock: {e}"),
+            });
+        }
+    };
+    Ok(act(narrowed))
+}
+
+/// Whether `e`, why the book's lock was not taken, stops every edit of the book too: the directory is one no edit narrows (a symlink, another user's, one an access list opens) or none, which holds no book, or the lock is no file this user can lock — never another edit holding it, nor a failure of the moment (no descriptor free, an interrupted call).
+fn stops_every_edit(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::PermissionDenied
+            | io::ErrorKind::NotFound
+            | io::ErrorKind::InvalidData
+            | io::ErrorKind::Unsupported
+    ) || matches!(e.raw_os_error(), Some(libc::ELOOP | libc::EISDIR))
 }
 
 /// What [`record`] did.
@@ -1360,7 +1372,7 @@ pub fn proven_driver(
 ) -> Result<String, Undriven> {
     driver_as_of(
         served.peer_node(),
-        (state_dir, grants),
+        (state_dir, grants, secret),
         std::time::SystemTime::now(),
         |issuer| {
             fetch_book(
@@ -1383,7 +1395,7 @@ pub fn listed_driver(
 
 fn driver_as_of(
     proof: Option<&NodeProof>,
-    (state_dir, grants): (&Path, &[DriveGrant]),
+    (state_dir, grants, secret): (&Path, &[DriveGrant], &FleetSecret),
     now: std::time::SystemTime,
     fetch: impl FnOnce(&Target) -> Result<Book, BookUnread>,
 ) -> Result<String, Undriven> {
@@ -1409,7 +1421,11 @@ fn driver_as_of(
         ));
     }
     let own = read_node_id(state_dir).ok().flatten();
-    let _ = write_issuer_book(state_dir, &book.node, &copies_of(&book, own.as_deref()));
+    let _ = keep_issuer_book(
+        state_dir,
+        secret,
+        Some((&book.node, &copies_of(&book, own.as_deref()))),
+    );
     keys.with_book(&book, own.as_deref()).driver(proof, grants)
 }
 
@@ -1664,13 +1680,15 @@ pub fn serve_join<S: Read + Write>(
     now_ms: u64,
 ) -> io::Result<Result<(Recorded, Peer), String>> {
     let line = read_record(stream)?;
-    let issues = !matches!(
-        std::fs::symlink_metadata(state_dir.join(CODE_FILE)),
-        Err(e) if e.kind() == io::ErrorKind::NotFound
-    );
+    let issues = || {
+        !matches!(
+            std::fs::symlink_metadata(state_dir.join(CODE_FILE)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound
+        )
+    };
     let outcome = match Registration::parse(&line) {
         Err(why) => Err(why.to_owned()),
-        Ok(_) if !issues => Err(NOT_THE_ISSUER.to_owned()),
+        Ok(_) if !issues() => Err(NOT_THE_ISSUER.to_owned()),
         Ok(reg)
             if reg.key.is_some_and(|key| {
                 proof.is_none_or(|proof| proof.node != reg.node || proof.key != key)
@@ -1712,6 +1730,10 @@ pub fn serve_join<S: Read + Write>(
                 };
                 let recorded_as = peer.clone();
                 update_peers(state_dir, |book| {
+                    // Under the book's lock: a `leave` that took the code meanwhile left no fleet to record in.
+                    if !issues() {
+                        return Err(NOT_THE_ISSUER.to_owned());
+                    }
                     record(book, peer).map(|recorded| (recorded, book.len()))
                 })
                 .map(|(recorded, peers)| (recorded, peers, issuer, recorded_as))
@@ -1931,7 +1953,7 @@ pub fn fetch_book(
     fetch_book_in(issuer, (secret, me), deadline, (None, None))
 }
 
-/// [`fetch_book`] as a read's dial ([`HeldAddrs`]): it opens the exchange at an address where none is open (`first`, the one its read opened at the issuer's recorded address) and waits on none.
+/// [`fetch_book`] as a read's dial ([`HeldAddrs`]): it reads no other dial's exchange, and makes its own at the issuer's recorded address in the one its read opened there first (`first`), at any other once no other dial of the read has one open there.
 fn fetch_book_in<'a>(
     issuer: &Target,
     (secret, me): (&FleetSecret, Option<&NodeIdentity>),
@@ -1947,7 +1969,7 @@ fn fetch_book_in<'a>(
         |to| {
             let mine = match first.take() {
                 Some((at, opened)) if at == to => Some(opened),
-                _ => held.and_then(|held| held.enter(to).ok()),
+                _ => held.and_then(|held| held.enter_after(to, deadline)),
             };
             let reached = reach(to, (secret, me), FleetOp::Book, (deadline, within));
             if let Some(mut mine) = mine {
@@ -2204,6 +2226,19 @@ impl HeldAddrs {
             exchange: mine,
             closed: false,
         })
+    }
+
+    /// This dial's own exchange at `to` once no other dial of the read has one open there, or `None` when `by` comes first.
+    fn enter_after(&self, to: SocketAddr, by: Instant) -> Option<Opened<'_>> {
+        loop {
+            match self.enter(to) {
+                Ok(opened) => return Some(opened),
+                Err(theirs) => theirs.read(by, |now| match now {
+                    Exchanged::Dialing | Exchanged::Proved(..) => None,
+                    _ => Some(()),
+                })?,
+            }
+        }
     }
 
     /// `to`'s answer for one dial of the read by `deadline`: this dial's own exchange there (`dial`, `judge`, then `ask`) when none is open, else the open one read as its own, its node judged by this dial's `judge`.
@@ -2775,7 +2810,7 @@ enum AtAddr<R> {
     Ended(Unreached),
 }
 
-/// The addresses of a dial to `host` (at `addr` first) on `port` by `deadline`, never one in `avoid`: `attempt` of each in turn until one is reached or ends the dial, the first failure the reason when none answers.
+/// The addresses of a dial to `host` (at `addr` first) on `port` by `deadline`, never one in `avoid`: `attempt` of each in turn until one is reached or ends the dial, the first failure the reason when none answers — or the first past the peer's proof (a busy address), which says where it answers.
 fn walk<R>(
     (host, addr, port): (&str, Option<IpAddr>, u16),
     (deadline, within): (Instant, Duration),
@@ -2792,7 +2827,12 @@ fn walk<R>(
         match attempt(to) {
             AtAddr::Reached(reached) => Some(Ok(reached)),
             AtAddr::Passed(why) => {
-                first.get_or_insert(why);
+                if first
+                    .as_ref()
+                    .is_none_or(|had| had.before_proof() && !why.before_proof())
+                {
+                    *first = Some(why);
+                }
                 None
             }
             AtAddr::Ended(why) => Some(Err(why)),

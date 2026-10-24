@@ -3548,9 +3548,9 @@ fn read_records(opts: &Opts, now: u64) -> (Vec<Row>, bool, Vec<Unread>) {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             record_row(opts, &session, &text, now)
         })) {
-            Ok(Some(row)) => out.push(row),
-            Ok(None) => {}
-            Err(_) => {
+            Ok(Ok(Some(row))) => out.push(row),
+            Ok(Ok(None)) => {}
+            Ok(Err(())) | Err(_) => {
                 let tab = std::panic::catch_unwind(|| St::from_json(&text).map(|st| st.tab))
                     .ok()
                     .flatten()
@@ -3564,16 +3564,25 @@ fn read_records(opts: &Opts, now: u64) -> (Vec<Row>, bool, Vec<Unread>) {
     (out, whole, unread)
 }
 
-fn record_row(opts: &Opts, session: &str, text: &str, now: u64) -> Option<Row> {
+fn record_row(opts: &Opts, session: &str, text: &str, now: u64) -> Result<Option<Row>, ()> {
     #[cfg(test)]
     if session == RECORD_PANICS {
         panic!("a record whose read panics (a test's)");
     }
-    let st = St::from_json(text).filter(St::is_upgrade)?;
-    if !opts.only_sid.as_ref().is_none_or(|s| *s == st.tab) {
-        return None;
+    let st = match St::from_json(text) {
+        Some(st) => st,
+        None => {
+            let value: Value = aterm_json::from_str(text).map_err(|_| ())?;
+            if value.get("phase").is_none() && super::models::Priority::parse(text).is_some() {
+                return Ok(None);
+            }
+            return Err(());
+        }
+    };
+    if !st.is_upgrade() || !opts.only_sid.as_ref().is_none_or(|s| *s == st.tab) {
+        return Ok(None);
     }
-    Some(Row::of(session, &st, now).in_flow(opts, now))
+    Ok(Some(Row::of(session, &st, now).in_flow(opts, now)))
 }
 
 /// The session whose record's read panics ([`record_row`], tests only).

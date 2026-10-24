@@ -323,6 +323,17 @@ macro_rules! hold_cost {
 /// What a hold costs the whole instance, in the one sentence every surface that states it uses.
 pub const HOLD_COST: &str = hold_cost!();
 
+/// [`TURN_SUBMIT_BUSY_REPLY`] as a literal, so the `turn` entry quotes it through `concat!`.
+macro_rules! turn_submit_busy_reply {
+    () => {
+        "ERR key delivery failed sink=busy"
+    };
+}
+/// A guarded `turn`'s answer when its text is typed and the sink took none of its first Enter before the submit window ended: the text stands in the composer unsent. Never an `ERR busy…` head, which says nothing was written and gives an `id=` back. A re-press the sink takes none of answers no such thing: it stops the re-presses, and the verdict's `pressed=<n>` counts the Enters that went.
+pub const TURN_SUBMIT_BUSY_REPLY: &str = turn_submit_busy_reply!();
+/// [`TURN_SUBMIT_BUSY_REPLY`] framed as the wire carries it.
+pub const TURN_SUBMIT_BUSY_LINE: &str = concat!(turn_submit_busy_reply!(), "\n");
+
 /// The cap on a [`VerbSpec::summary`] as a literal.
 macro_rules! summary_max_chars {
     () => {
@@ -582,7 +593,7 @@ const fn bytes_eq(a: &[u8], b: &[u8], len: usize) -> bool {
 }
 
 /// The budget for the short catalog's rows put together (every [`catalog_lines`] row, `\n`-terminated).
-pub const SHORT_CATALOG_MAX_BYTES: usize = 13927;
+pub const SHORT_CATALOG_MAX_BYTES: usize = 14134;
 
 /// The `subscribe` stream vocabulary: frame sources, then the two modifiers.
 pub const SUBSCRIBE_STREAMS: &[&str] = &[
@@ -895,7 +906,7 @@ pub const VERBS: &[VerbSpec] = &[
         Meta,
         AnyScopeMeta,
         "privacy [--json]: the macOS consent posture behind EPERM",
-        "— instance-wide (a selector other than `@self` is refused; `--headless` answers it); \
+        "— instance-wide (every selector but `@.` is refused; `--headless` answers it); \
          reading raises no dialog. `OK <n>` then rows: `schema=1`; `platform= os=`; `bundle_id= \
          display_name= signing= team= dr= grant_stable=<yes|no> dev_build=<true|false>`; \
          `install= running= anchor=`; `full_disk_access= probe= probe_age_ms= fda_scope=`; \
@@ -937,7 +948,9 @@ pub const VERBS: &[VerbSpec] = &[
          no reading). Only a person changes these, at the places `remediate` names: \
          `settings:<pane>` is a System Settings pane, `aterm-settings:<page>` a page of aterm's \
          Settings (the debugger's is Settings ▸ Security); `devtools hand-over` opens the \
-         Developer Tools pane and `await consent [kind=debugger]` waits for a change.",
+         Developer Tools pane and `await consent [kind=debugger]` waits for a change. System \
+         State turns debugger access on once per Mac behind macOS's own password dialog; nothing \
+         a session sends starts or answers it, and `[privacy] notice = false` pauses it.",
     )
     .json(Json::Emits),
     v(
@@ -1044,10 +1057,10 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Session,
         "cell <r> <c>|abs=<n> <c>: OK <grapheme%enc> <fg> <bg> <attrs>[ link=][ frame=open]",
-        "— `abs=<n>` reads absolute row `n` (`line`/`search` coordinates, history or screen, no \
-         `link=`); `ERR evicted` older than retained history, `ERR out of range` past the screen. \
-         A screen row is read on a whole frame as `text` is (` frame=open` last when one is still \
-         unfinished); a history row at once.",
+        "— `abs=<n>` reads absolute row `n` (`line`/`search` coordinates, history or screen; a \
+         history row has no `link=`); `ERR evicted` older than retained history, `ERR out of \
+         range` past the screen. A screen row is read on a whole frame as `text` is \
+         (` frame=open` last when one is still unfinished); a history row at once.",
     )
     .json(Json::Refused),
     v(
@@ -1068,7 +1081,7 @@ pub const VERBS: &[VerbSpec] = &[
         "OK <rows> <cols> <px_w> <px_h>",
         "then `session= cell_w= cell_h= font_px= scale= window=<id|none> window_rows= \
          window_cols=`, the grid, frame and surface sizes, offsets, bands, crops, padding, \
-         `geometry=`, `present_retry_*` and `layer_*` (`--json` carries the same).",
+         `geometry=`, `present_retry_*` and `layer_*` (`--json` lacks `layer_*`).",
     )
     .json(Json::Emits),
     v(
@@ -1117,7 +1130,7 @@ pub const VERBS: &[VerbSpec] = &[
         App,
         "theme [status] | theme list | theme palette [session]: active theme and palette",
         "— `OK id=\"<id>\" label=\"<label>\" configured=\"<raw>\"|- side=dark|light \
-         source=builtin|file|default [path=\"<file>\"] reported=dark|light miss=\"<why>\"|- \
+         source=builtin|file|pack|default [path=\"<file>\"] reported=dark|light miss=\"<why>\"|- \
          os_appearance=dark|light preview=\"<id>\"|- [restore=\"<id>\" ttl_ms=<n>|-] fg=#rrggbb \
          bg= cursor=|- selection=|- selection_fg=|- … generate=on|off \
          generate_from=theme|config|default pinned=<n> palette=<16 #rrggbb, comma separated>`. \
@@ -1144,9 +1157,10 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         App,
         "theme preview <name> [ttl=<secs>] | theme revert: preview a theme transiently",
-        "— applies `<name>` (built-in, themes-folder id or `dark:…,light:…`) across windows and \
-         sessions without writing config; explicit colour keys still apply. Ends after `ttl=` \
-         seconds (default 120, max 3600), on `theme revert`, or on config/themes reload. Unknown \
+        "— applies `<name>` (built-in, themes-folder id, community pack id (`source=pack`) or \
+         `dark:…,light:…`) across windows and sessions without writing config; explicit colour \
+         keys still apply. Ends after `ttl=` seconds (default 120, max 3600), on `theme revert`, \
+         on a config change, or on a themes reload that leaves `<name>` unavailable. Unknown \
          names are refused. Answers the `theme` status line.",
     )
     .input(Input::NONE),
@@ -1156,14 +1170,16 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         App,
         "theme session [status] | set <name> | clear: this session's own theme",
-        "— `OK session=<sid> theme=\"<selector>\"|- origin=ctl|spawn|split|restored|instance \
-         asked=<origin>|- id=\"<drawn id>\" source=builtin|file|default side=dark|light \
+        "— `OK session=<local> theme=\"<selector>\"|- origin=ctl|spawn|split|restored|instance \
+         asked=<origin>|- id=\"<drawn id>\" source=builtin|file|pack|default side=dark|light \
          reported=dark|light miss=\"<why>\"|- generate=on|off fg=#rrggbb bg=#rrggbb`. Recolours \
          this session's cells, cursor, selection, palette and DSR 996 / mode 2031 reports; window \
          chrome follows the instance theme. Inherited by splits, carried across seamless updates \
-         and restores, and unaffected by instance previews. `set` refuses an undrawable name \
-         (`ERR theme session \"<name>\": <why>`); if it stops drawing later, `miss=` is set and \
-         the instance theme is drawn. `spawn theme=<name>` sets it at creation.",
+         and restores, and unaffected by instance previews. `set` refuses a name the session \
+         cannot draw (`ERR theme session \"<name>\": <why>`), including a community pack theme \
+         not yet in the themes folder: `aterm theme install <id>` adds one (`theme preview` \
+         draws it without installing); if it stops drawing later, `miss=` is set and the \
+         instance theme is drawn. `spawn theme=<name>` sets it at creation.",
     )
     .forms(&[
         form(Word("status")),
@@ -1191,11 +1207,11 @@ pub const VERBS: &[VerbSpec] = &[
          `screen_first=<row>`, the screen's top row. `incomplete` names its causes: `capped` \
          (100000 matches), `rewrapping` (a resize holds history; screen only), `long-line` (the \
          regex budget, or a row over 1 MiB), `moving` (the screen switched, resized or renumbered \
-         mid-scan), `older` (older history not searched). Rows are absolute (`line` \
-         coordinates); a soft-wrapped hit can run past `col+len > cols` into the next row, and \
-         regex `^` and `$` bind to the logical line. The search starts on a whole frame as \
-         `text` reads; ` frame=open` before `screen_first=` says the frame was unfinished, which \
-         is no `incomplete` cause.",
+         mid-scan), `older` (older history not searched; alone it is a bare `incomplete`). Rows \
+         are absolute (`line` coordinates); a soft-wrapped hit can run past `col+len > cols` into \
+         the next row, and regex `^` and `$` bind to the logical line. The search starts on a \
+         whole frame as `text` reads; ` frame=open` before `screen_first=` says the frame was \
+         unfinished, which is no `incomplete` cause.",
     ),
     v(
         "find",
@@ -1272,8 +1288,9 @@ pub const VERBS: &[VerbSpec] = &[
          --bytes` returns the PNG inline (`OK 1` then `<w> <h> <nbytes> <base64>`). `image \
          --meta` adds the frame's pixel fingerprint, phase, theme and per-leaf identity: `OK <w> \
          <h> image-meta image-meta-version=3 <key=value…> path=\"<path>\"` (with `--bytes`: `OK \
-         2`, the `image-meta` row, then the PNG row; `frame-phase=destination|presented|staged`; \
-         `identity=unavailable` when provenance was not kept). `image plain` leaves out the \
+         2`, the `image-meta` row, then the PNG row; \
+         `frame-phase=destination|presented|staged|unknown`; `identity=unavailable` when \
+         provenance was not kept). `image plain` leaves out the \
          visual effects; `image read` returns the session's inline OSC 1337 images as base64.",
     )
     .ack()
@@ -1389,8 +1406,9 @@ pub const VERBS: &[VerbSpec] = &[
          after 120 s unrefreshed); `notice done <key> [ok|warn|withdraw] [<words>]` ends it (`OK \
          done=<id|-> how=<resolved-ok|resolved-warn|withdrawn|gone>`). `notice ask <key> \
          [tag=<tag>] <title> -- <reason> -- <step>` raises a standing owner ask (reason and step \
-         <= 90 chars; quiet for 24 h after `done <key> ok` or a dismissal; `OK message=<id>`). \
-         `notice later <key> [tag=<tag>] [url=<https-url>] <title> -- <reason> -- <step>[ -- \
+         <= 90 chars; quiet for 24 h after a dismissal, a Details read or an answer; \
+         `OK message=<id>`). `notice later <key> [tag=<tag>] [url=<https-url>] <title> -- \
+         <reason> -- <step>[ -- \
          <detail>]` files a non-urgent exception in the menu-bar item and Settings ▸ Messages \
          (`OK later=<id> how=<new|restated|duplicate|quiet>`; up to 4 wire entries, filed after \
          14 d; `url=` adds an Open in browser button). `notice settle <key> <id> <revision>` \
@@ -1402,10 +1420,11 @@ pub const VERBS: &[VerbSpec] = &[
          exhausted `rev` disables settlement (`how=gone`); `rev` is independent of UI revisions. \
          Settling never forgets a dismissal. `notice dismiss <id|review>` dismisses a row or \
          files the open exceptions; `notice act <id> <label|index|details>` presses a button (`OK \
-         acted=<label> performed=<1|0>`). Titles <= 6 words / 48 chars; keys `1..=40` of \
-         `[a-z0-9._-]` (stored as `wire.<key>`); built-in tags are reserved (use `script` or \
-         your own). Limits: 3 live wire rows, 60 messages or 16 KiB a minute, 10 acts a minute \
-         (`ERR busy notice: … retry_ms=<ms>`; `retry_ms=1000` during a version handoff).",
+         acted=<label> performed=<1|0>`). Titles <= 6 words / 48 chars (`sev=success|info` posts \
+         are clipped at 120 chars); keys `1..=40` of `[a-z0-9._-]` (stored as `wire.<key>`); \
+         built-in tags are reserved (use `script` or your own). Limits: 3 live wire rows, 60 \
+         messages or 16 KiB a minute, 10 acts a minute (`ERR busy notice: … retry_ms=<ms>`; \
+         `retry_ms=1000` during a version handoff).",
     )
     .input(Input::NONE),
     va(
@@ -1415,7 +1434,7 @@ pub const VERBS: &[VerbSpec] = &[
         Session,
         OwnerOnly,
         "story chose [<text>]: record what the harness chose",
-        "— Owner-only; takes `@<sid>` (bare: own session). `<text>` is optional (<= 96 bytes, no \
+        "— Owner-only; takes `@<sid>` (bare: active tab). `<text>` is optional (<= 96 bytes, no \
          control bytes). Records a harness question-dialog policy choice (`[harness] \
          answer_questions` or `meta set questions`) as a story point (`status story=` and `status \
          level=story` until a human key clears it; nothing is drawn or played). Replies `OK \
@@ -1449,8 +1468,9 @@ pub const VERBS: &[VerbSpec] = &[
         "appearance [dark|light]: the OS appearance the theme follows",
         "— answers `os_appearance=<dark|light> source=<nsapp|desktop|window|inert|injected> \
          theme_side=<dark|light|-> reported_scheme=<dark|light> bg_dark=<0|1> theme=<id> \
-         installs=<n> session_installs=<n>` (a session's `status` carries these plus \
-         `scheme_from=`). `appearance dark|light` injects an OS flip (`dev-seams` builds).",
+         installs=<n> session_installs=<n>` (a session's `status` carries `os_appearance= \
+         theme_side= reported_scheme= bg_dark=` plus `scheme_from=`). `appearance dark|light` \
+         injects an OS flip (`dev-seams` builds).",
     )
     .input(Input::NONE),
     v(
@@ -1494,10 +1514,10 @@ pub const VERBS: &[VerbSpec] = &[
          need `dev-seams`: `program-check full` stages `syspolicyd` at the kernel thread limit \
          (after 5 min it reads `stuck`, raising the restart alert and pausing harness \
          continuations); `program-check live` restores live sampling; `program-check held <pid>` \
-         has the jobs engine read `<pid>` as held at macOS's program check wherever it reads a \
-         start (a tab's job member, or another process of this user with at most 20 ms of CPU), \
-         so `sys jobs` shows `wait=program-check` and a `finding kind=program-check` row; \
-         `program-check held -` ends it.",
+         has the jobs engine read `<pid>`, a live process of this user (any other is refused), \
+         as held at macOS's program check whatever its CPU (a tab's job member where its reading \
+         judged a start), so `sys jobs` shows `wait=program-check` and a `finding \
+         kind=program-check` row and `privacy` counts it; `program-check held -` ends it.",
     )
     .input(Input::NONE),
     v(
@@ -1640,8 +1660,8 @@ pub const VERBS: &[VerbSpec] = &[
         App,
         "the front window's active-tab panes: `layout tab=<i> panes=<n> zoomed= terminal=`",
         "header (`terminal=false` with `panes=0` when the active tab is a native view), then \
-         one `pane session=<sid> rect=<row_off>,<col_off>,<rows>x<cols> focused=<bool>` row per \
-         visible pane (cell coordinates; dividers are 1-cell gaps). `@<sid>` describes the \
+         one `pane session=<local> rect=<row_off>,<col_off>,<rows>x<cols> focused=<bool>` row \
+         per visible pane (cell coordinates; dividers are 1-cell gaps). `@<sid>` describes the \
          window showing that session (`OK 0` when none does).",
     ),
     v(
@@ -1727,8 +1747,9 @@ pub const VERBS: &[VerbSpec] = &[
         "meta -> OK title= user_title= description= icon= role= attention= cwd= state=",
         "— `attention_owner= attention_owners= attention_kinds= supervisor= supervisor_proven= \
          questions= agent_cwd= trusted_cwd= worker= autopilot= land_at= autopilot_by= \
-         autopilot_since=` (pct-encoded; `-` is unset; `trusted_cwd=` and `worker=` come from \
-         `spawn agent=<word>`; the window is in `sessions` and `dims`). `meta set \
+         autopilot_since=` (pct-encoded; `-` is unset, an unset `title=` is empty; \
+         `trusted_cwd=` and `worker=` come from `spawn agent=<word>`; the window is in \
+         `sessions` and `dims`). `meta set \
          <title|description|icon|role|attention|questions|autopilot> <text...>` / `meta unset \
          <field>` set or clear user metadata (title 120 B, description 1024 B, icon 64 B, role 64 \
          B, attention 256 B; `user_title=` overrides the OSC `title=`). KEYED ATTENTION: `meta set \
@@ -1750,9 +1771,9 @@ pub const VERBS: &[VerbSpec] = &[
          questions` (Owner-only) override `[harness] answer_questions` and `question_priority`. \
          AUTOPILOT: `meta set autopilot cruise [until=HH:MM|+DURATION]|land|off` / `meta unset \
          autopilot` (Owner-only; aliases `forever`/`infinity` and `wrap-up`/`wrapup`/`wrap`; \
-         `until=` goes with `cruise` only) sets the session's Autopilot (`OK land_at=<unix s> \
-         local=<date>T<HH:MM><offset>`, plus `journaled=0` when the disk sync took over 5 s); a \
-         finished Land sets `task=landed`.",
+         `until=` goes with `cruise` only) sets the session's Autopilot (`OK`, plus \
+         `land_at=<unix s> local=<date>T<HH:MM><offset>` for `until=`, plus `journaled=0` when \
+         the disk sync took over 5 s); a finished Land sets `task=landed`.",
     )
     .forms(&[form(AnyOf(&["set", "unset"])).op(Write)]),
     v(
@@ -1819,8 +1840,10 @@ pub const VERBS: &[VerbSpec] = &[
          fg_rss_mb= disk=<ok|low|short|emergency|-> disk_free_mb= disk_room_mb= disk_age_ms= \
          job=<verdict|none> job_quiet_ms= syspolicyd=<-|ok|full|stuck> syspolicyd_workers= \
          syspolicyd_full_ms= occupancy=<off|observe|prompt> \
-         occupancy_hold=<declared|undeclared|none> ready= slots= idle_ready_min=` (`occupancy \
-         why` explains the last four). Harness and records: `supervisor= supervisor_proven= \
+         occupancy_hold=<declared|undeclared|none> ready= slots= idle_ready_min= waits= \
+         waits_ready=` (`occupancy why` explains `occupancy_hold=` to `idle_ready_min=`; `waits=` \
+         counts the session's declared wakes still to be told and `waits_ready=` those whose \
+         condition held, which `waits` lists). Harness and records: `supervisor= supervisor_proven= \
          autopilot=<off|cruise|land|-> human_ms= human_seq= \
          launch=<person|since|typed|boxed|other|pending|none> launch_seq= path_evidence= \
          copy=<managed|foreign|-> upgrade= history_lost= journal=<live|off> (then its \
@@ -2000,6 +2023,46 @@ pub const VERBS: &[VerbSpec] = &[
          <HH:MM|never>` per rule.",
     ),
     v(
+        "wake",
+        Write,
+        Status,
+        Session,
+        "wake label=<token> when=<term> …: declare a wake for this session's agent",
+        "— the occupancy door's declared wakes (`[harness] occupancy`): the agent's own book, \
+         judged by aterm and told back to it. `wake label=<1-64 of A-Z a-z 0-9 . _ -> \
+         when=<term>[ and <term>…] [for=<dur>] [need=<sys>[ and <sys>…] [for=<dur>]] \
+         [unless=<source>]… [prio=critical] [by=+<dur>]`, `<term>` a `pid:<n> exited` of the \
+         session's own tree, an `at:<HH>:<MM>` or `in:<dur>`, or a machine term of `await sys` \
+         (`need=` takes machine terms alone; `free`, `disk=` and `vol=` arrive in a later slice; \
+         `file:` and `gone:` are not served yet), `<dur>` `<n>s|m|h` and `by=` at most +48h \
+         (default +24h): `OK wake #<n>` (` await_only=1` for a time alone, which only `await \
+         wake` answers), `ERR usage wake: <why>`, or `ERR denied wake: <why>`. `wake rm #<n>` \
+         and `wake taken #<n>` remove it or mark it taken (`OK wake #<n> rm|taken`, `ERR no such \
+         wake #<n>`). At most 16 a session. Only a process descended from the session's own PTY \
+         child (and from its hosted agent, where aterm hosts one), proved by the kernel's peer \
+         pid and each process's birth, may declare, remove, take or await: `ERR denied wake: no \
+         kernel peer` (a relay or the bridge), `another session's`, `not in this session's tree`, \
+         or `occupancy=off` (under `off` every book ends). No word of a declaration is ever typed \
+         into a session. `waits` and `await wake` read and wait on the book; `status` carries \
+         `waits= waits_ready=`.",
+    )
+    .input(Input::NONE),
+    v(
+        "waits",
+        Read,
+        Lines,
+        Session,
+        "waits [why [#<n>]]: this session's declared wakes",
+        "— `OK <n>` then one line a wake, lowest ordinal first: `#<n> <pending|ready|answering|\
+         answered|claimed|told|taken|expired> prio=<normal|critical> kinds=<kind>[,…] \
+         declared=<ms> by=<ms> since=<ms|-> label=<token>` (`<kind>` `pid|at|in|sys`, times unix \
+         ms). `waits why` says why each is not told yet: `#<n> <state>[ why=<due|unless|agent|\
+         path|off|admit>] atoms=<kind>:<0|1>[,…][ need=<sys …>] [await_only=1]`, and `waits why \
+         #<n>` that wake alone. A peer outside the session's tree (see `wake`) is shown ordinals, \
+         states, priorities, atom kinds and times alone: no label and no need. `ERR denied wake: \
+         occupancy=off` under `off`.",
+    ),
+    v(
         "sys",
         Read,
         Lines,
@@ -2032,49 +2095,65 @@ pub const VERBS: &[VerbSpec] = &[
         Lines,
         Session,
         "turn [option=value ...] <text>: ONE HUMAN TURN",
-        "— types `<text>`, verifies the submit (`submit=` names any `key`, default `enter`; \
-         `none` skips it), waits for the screen to settle (`idle=<ms>`, default 1500, within \
-         `timeout=<ms>`, default 240000), and returns the settled screen. Options, after a \
-         leading `id=` and `if-supervisor=`: `[idle=<ms>] [timeout=<ms>] \
-         [submit=<key|none|guarded:<re>>] [settle=match:<re>|gone:<re>|submitted] \
-         [submit_window=<ms>] [presses=<n>] [submit_verify=<auto|seq|block>] [trim=<0|1>] \
-         [typed=<0|1>] [cadence=<ms>] [cap=<n>] [yield=<floor>] [if-gen=<epoch>.<seq>] \
-         [if-rows=<first>-<last>:<hex16>] [cause=@<off>|<seq>]`; they end at `--` or the first \
-         word that is not one of them (text that starts `<option>=` needs the `--`). \
-         `presses=<n>` (default 3, max \
-         10) retries the submit within `submit_window=<ms>` (default 2000). `settle=match:<re>` \
-         settles when a visible row matches; `settle=gone:<re>` waits for `<re>` to appear \
-         within `submit_window` and then leave (an idle settle when it never shows); \
-         `settle=submitted` returns once the submit is verified (`status=submitted`). \
-         `submit_verify=auto` (the default) verifies a Claude Code submit by the typed text \
-         leaving the composer, another TUI's by `seq`, and a shell's by its command block. \
-         `submit=guarded:<re>` presses Enter only while the cursor row matches `<re>`, under the \
-         same terminal lock (as `key if=`; a first-press miss is `OK 0 turn skipped reason=guard \
-         submitted=0 seq=<n> id=<n>`, plus `pressed=<n>` when re-presses stop). `typed=1` \
-         presses key by key at `cadence=<ms>` (default 70) up to `cap=<n>` graphemes (default \
-         240, max 4096) and pastes the rest (`typed=<keys> pasted=<graphemes>`), stopping with \
-         `OK 0 turn skipped reason=<deadline|person|changed> typed=<k> pasted=<p> submitted=0 \
-         seq=<n> id=<n>` when the timeout, a person's key, or a screen or input-frame change \
-         overtakes it. `yield=<floor 0..=1>` waits for `trail status` `momentum=` to fall to \
-         `<floor>` before typing (`yielded_ms=<n>`, or `ERR yield timeout momentum=<v>`). \
-         `if-gen=<epoch>.<seq>` (`status gen=`) and `if-rows=<first>-<last>:<hex16>` (FNV-1a-64 \
-         of those rows) fence on the screen before typing (`reason=changed` on a mismatch). \
-         `if-rows=` never vouches for half a frame: a `typed=1` turn whose first look finds an \
-         unfinished DEC 2026 frame waits within `timeout=` for it to close and judges the fence \
-         on it; any other turn waits as `text` does, and a frame still open has moved. The \
-         settled screen is read on a whole frame too (` frame=open` when not). \
-         `if-supervisor=<holder>` fences on the live supervisor claim; `cause=` links the turn \
-         in `log` to held mail (`@<off>`) or a log record (`<seq>`; `ERR cause` when it names \
-         neither). A leading `id=<epoch>:<producer>:<seq>` makes it exactly-once (`OK 0 dup=1` \
-         on a repeat; see `send`). A `hold` before the bytes land is `ERR halted …`; one \
-         mid-turn stops it (`OK 0 turn skipped reason=halted submitted=0 seq=<n> id=<n>`). Into \
-         a `stalled` or stopped program it is `ERR busy input-unread …` (`turn` takes no \
-         `unread=ok`); input over 1 s old appends `warn=input-unread input_bytes=<n> \
-         input_wait_ms=<ms>`. Reply: a verdict line (`id= submitted=<0|1> \
-         status=settled|timeout|submitted seq= dur_ms= hash=<FNV16>[ task_rev=<n>][ \
-         agent_rev=<n>][ frame=open][ trimmed=<k>]`; `agent_rev=` feeds `await agent <words> \
-         since=<n>`), then the rows (`trim=1` drops trailing blank rows; `hash=` covers the \
-         untrimmed screen).",
+        concat!(
+            "— types `<text>`, verifies the submit (`submit=` names any `key`, default \
+             `enter`; `none` skips it), waits for the screen to settle (`idle=<ms>`, default \
+             1500, within `timeout=<ms>`, default 240000), and returns the settled screen. \
+             Options, after a leading `id=` and `if-supervisor=`: `[idle=<ms>] [timeout=<ms>] \
+             [submit=<key|none|guarded:<re>>] [settle=match:<re>|gone:<re>|submitted] \
+             [submit_window=<ms>] [presses=<n>] [submit_verify=<auto|seq|block>] [trim=<0|1>] \
+             [typed=<0|1>] [cadence=<ms>] [cap=<n>] [yield=<floor>] [if-gen=<epoch>.<seq>] \
+             [if-rows=<first>-<last>:<hex16>] [cause=@<off>|<seq>]`; they end at `--` or the \
+             first word that is not one of them (text that starts `<option>=` needs `--`, or \
+             `-- --` when no option but a leading `id=`, `if-supervisor=` or `cause=` comes \
+             before it). `presses=<n>` (default 3, max 10) retries the submit within \
+             `submit_window=<ms>` (default 2000). `settle=match:<re>` settles when a visible row \
+             matches; `settle=gone:<re>` waits for `<re>` to appear within `submit_window` and \
+             then leave (an idle settle when it never shows); `settle=submitted` returns once the \
+             submit is verified (`status=submitted`). `submit_verify=auto` (the default) \
+             verifies a Claude Code submit by the typed text leaving the composer, another TUI's \
+             by `seq`, and a shell's by its command block. `submit=guarded:<re>` presses Enter \
+             only while the cursor row matches `<re>`, under the same terminal lock (as `key \
+             if=`; a first-press miss is `OK 0 turn skipped reason=guard submitted=0 seq=<n> \
+             id=<n>`, plus `pressed=<n>` when re-presses stop; a first Enter the sink takes none \
+             of before `submit_window=` (or `timeout=`, if sooner) ends is `",
+            turn_submit_busy_reply!(),
+            "`, the text typed and not submitted, and a re-press it takes none of stops the \
+             re-presses as a miss does). `typed=1` presses key by key at \
+             `cadence=<ms>` (default 70) up to `cap=<n>` graphemes (default 240, max 4096) and \
+             pastes the rest (`typed=<keys> pasted=<graphemes>`), stopping with `OK 0 turn \
+             skipped reason=<deadline|person|changed> typed=<k> pasted=<p> submitted=0 seq=<n> \
+             id=<n>` when the timeout, a person's key, or a screen or input-frame change \
+             overtakes it. `yield=<floor 0..=1>` waits for `trail status` `momentum=` to fall to \
+             `<floor>` before typing (`yielded_ms=<n>`, or `ERR yield timeout momentum=<v>`). \
+             `if-gen=<epoch>.<seq>` (`status gen=`) and `if-rows=<first>-<last>:<hex16>` \
+             (FNV-1a-64 of those rows) fence on the screen before typing (`reason=changed` on a \
+             mismatch). `if-rows=` never vouches for half a frame: a `typed=1` turn whose first \
+             look finds the fence spanning a composer box (rules at `<first>` and `<last>`) in an \
+             unfinished DEC 2026 frame waits within `timeout=` for it to close and judges the \
+             fence on it; any other turn waits as `text` does, and a frame still open has moved. \
+             The settled screen is read on a whole frame too (` frame=open` when not). \
+             `if-supervisor=<holder>` fences on the live supervisor claim; `cause=` links the \
+             turn in `log` to held mail (`@<off>`) or a log record (`<seq>`; `ERR cause` when it \
+             names neither). A leading `id=<epoch>:<producer>:<seq>` makes it exactly-once (`OK \
+             0 dup=1` on a repeat; a turn that reached for the PTY with nothing, or whose first \
+             write a full input queue or the `if-supervisor=` fence refused, gives the id back, \
+             whatever it answered, and any other refused write leaves it in doubt; see `send`). \
+             A `hold` before the bytes land is `ERR halted …`; one after \
+             but before the first submit press stops it (`OK 0 turn skipped reason=halted[ \
+             typed=<k> pasted=<p>] submitted=0 seq=<n> id=<n>`, `typed=` on a `typed=1` turn); a \
+             later one only ends re-presses. Into a `stalled` or stopped program it is `ERR busy \
+             input-unread …` (`turn` takes no `unread=ok`); input over 1 s old appends \
+             `warn=input-unread input_bytes=<n> input_wait_ms=<ms>`. Its first write refused \
+             whole, by a full input queue or the `if-supervisor=` fence, is `ERR busy \
+             input-queue-full …` or `ERR busy supervisor=<holder|->` as for `send`, nothing \
+             typed; a later one is `ERR paste delivery failed` or `ERR key delivery failed`. \
+             Reply: a verdict line (`id= \
+             submitted=<0|1> status=settled|timeout|submitted seq= dur_ms= hash=<FNV16>[ \
+             task_rev=<n>][ agent_rev=<n>][ frame=open][ trimmed=<k>]`; `agent_rev=` feeds \
+             `await agent <words> since=<n>`), then the rows (`trim=1` drops trailing blank rows; \
+             `hash=` covers the untrimmed screen)."
+        ),
     )
     .lane(Wait)
     .input(
@@ -2114,8 +2193,15 @@ pub const VERBS: &[VerbSpec] = &[
          [if-gen=<epoch>.<seq>] [if-fp=<hex16>] [if-human=<n>] [if-supervisor=<holder>] \
          [unread=ok] [cause=@<off>|<seq>] [act=approve|deny|answer] [as=person]`. `id=` (shared \
          by `send`, `key`, `feed-bin`, `turn`) makes the write idempotent against the session's \
-         `nonce=` (a repeat is `OK dup=1`, or `OK 0 dup=1` for `turn`; `ERR in-doubt seq=<n>` \
-         when the first attempt did not finish `OK`; `ERR epoch` across a relaunch). \
+         `nonce=` (a repeat is `OK dup=1`, or `OK 0 dup=1` for `turn`; `ERR epoch` across a \
+         relaunch). A refusal at admission or of the request's own words (`ERR halted`, `ERR \
+         rate`, `ERR usage`, `ERR badregex`, `ERR cause`) takes no sequence. Once claimed, the \
+         id goes back only on `ERR busy…`, `ERR denied`, a fence's `OK skipped…`, or a `turn` \
+         that reached for the PTY with nothing, or whose first write the input queue or the \
+         `if-supervisor=` fence refused, whatever it answered (`ERR halted`, `ERR yield`, `ERR exited`, an \
+         `OK 0 turn skipped` before its first paste or key: the `if-gen=`/`if-rows=` fence's \
+         `reason=changed` with no `typed=`, or `typed=0 pasted=0`); any other attempt that did \
+         not finish `OK` leaves it `ERR in-doubt seq=<n>`. \
          `if=<re>`, `if-gen=`, `if-fp=`, `if-human=` and `if-supervisor=` fence under the \
          terminal/meta lock (see `key`). `unread=ok` bypasses the `input=stalled|stopped` refusal \
          (`ERR busy input-unread …`); slow unread queues (>= 1 s) append `warn=input-unread \
@@ -2172,9 +2258,10 @@ pub const VERBS: &[VerbSpec] = &[
          replies `OK skipped reason=person seq=<n>` if a person gave input since `<n>`. \
          `if-supervisor=<holder>` requires `<holder>` to hold `meta set supervisor` (`ERR busy \
          supervisor=<holder|->` otherwise). Refusal order: `ERR halted`, `ERR rate`, `ERR busy \
-         turn=`, `ERR usage`, `ERR busy input-unread bytes=<n> wait_ms=<ms> \
-         input=<stalled|stopped>`, `ERR badregex`, guards/fences, then `id=`. On macOS, raw input \
-         unread >= 1 s appends `warn=input-unread input_bytes=<n> input_wait_ms=<ms>`; stalled or \
+         turn=`, `ERR usage` (the options, then the key name), `ERR busy input-unread bytes=<n> \
+         wait_ms=<ms> input=<stalled|stopped>`, `ERR badregex`, `ERR busy supervisor=`, `id=`, \
+         then the `if=`/`if-gen=`/`if-fp=`/`if-human=` guards. On macOS, raw input unread >= 1 s \
+         appends `warn=input-unread input_bytes=<n> input_wait_ms=<ms>`; stalled or \
          stopped programs refuse unless `unread=ok` or an ISIG signal char (`ctrl+c`) can be taken \
          immediately. Trailing tokens: `mods=<ctrl+shift+...>` (on `type=release`, `mods=` names \
          the modifiers remaining held), `type=press|repeat|release` (`down`/`up`), and \
@@ -2208,7 +2295,8 @@ pub const VERBS: &[VerbSpec] = &[
          elsewhere). Posts a real `NSEvent` (`shape=press` builds it from a CoreGraphics key \
          event, so layout and Option dead keys compose), to measure hardware-path typing latency \
          in `metrics percentiles` (`n_key_write`). Replies `OK posted=<n> key=<0|1>`. Takes a \
-         leading `unread=ok`; `ERR hwkey` while a palette, Overview or tab menu is open.",
+         leading `unread=ok`; `ERR hwkey` while a palette, Overview or tab menu is open, or \
+         System State is the front window's active view.",
     )
     .input(Input::PTY.with(Input::WRITES).with(Input::APP_UNREAD)),
     v(
@@ -2274,10 +2362,10 @@ pub const VERBS: &[VerbSpec] = &[
          position, reply `OK at=-`. \
          `click` (Owner-only; 10 a minute on band capsules, else `ERR busy notice: 10 presses a \
          minute retry_ms=<ms>`) left-clicks where the pointer is. `wheel dy=<n> [dx=<n>] \
-         [unit=lines|pt] [key=<ui-key>|xy=<x>,<y>]` scrolls (`1..=10000`). `mods <list>` \
-         (Owner-only) holds modifiers (`cmd`/`super`, `ctrl`, `alt`/`option`, `shift`, `link`, \
-         or `none`) until the next physical event (`cell <r> <c>` `link=` reads a hovered link). \
-         Takes a leading `unread=ok`.",
+         [unit=lines|pt] [key=<ui-key>|xy=<x>,<y>]` scrolls (each `|n|<=10000`, not both 0). \
+         `mods <list>` (Owner-only) holds modifiers (`cmd`/`super`, `ctrl`, `alt`/`option`, \
+         `shift`, `link`, or `none`) until the next physical event (`cell <r> <c>` `link=` reads a \
+         hovered link). Takes a leading `unread=ok`.",
     )
     .forms(&[form(AnyOf(&["click", "mods"])).owner_only()])
     .input(Input::PTY.with(Input::WRITES).with(Input::APP_UNREAD)),
@@ -2364,7 +2452,8 @@ pub const VERBS: &[VerbSpec] = &[
          (OSC 104/110–119, `colors`) without clearing screen or scrollback. Records \
          `modes-restored reason=manual source=ctl reverted=<csv|-> bytes=<n>` on `timeline` and \
          replies `OK reset reverted=<csv|-> bytes=<n>` (`flush` drops unread macOS tty input and \
-         appends `discarded=<n|->`). Equivalent to `invoke ResetTerminal`.",
+         appends `discarded=<n|->`). `invoke ResetTerminal` resets the front window's focused \
+         pane (`source=menu`).",
     )
     .input(Input::PTY),
     v(
@@ -2520,7 +2609,7 @@ pub const VERBS: &[VerbSpec] = &[
         "rain [status|on|off|toggle]: matrix rain for the focused window's front session",
         "(status prints `config_enabled= session_override= effective= engine= active= \
          scope=window|focused-pane focused= animating=`, plus a live engine's `weather= density= \
-         tick= scanned= material= emitting= vis= drain= seq= streak= diag`)",
+         tick= scanned= material= emitting= vis= drain= seq= streak=`)",
     )
     .input(Input::NONE),
     v(
@@ -2731,13 +2820,18 @@ pub const VERBS: &[VerbSpec] = &[
         "— blocks on a condition (`timeout=` default 30000 ms, 300000 for `await consent`, max \
          600000; `OK timeout` exits 124 in `aterm ctl`; `ERR exited` when the session ends; 64 \
          waits at once across tabs, then `ERR control server busy`). `await idle <ms>`: no \
-         output for `<ms>`. `await seq [<n>]`: content `seq` >= `<n>`, else the next change (`OK \
-         seq <current>`). `await match <re> [rows <a> <b>]` / `await gone <re> [rows <a> <b>]`: \
-         a visible row matches, or every row in range is clear of `<re>` on a closed DEC 2026 \
-         frame or for 1 s (`ERR bad rows` on an empty span). `await frame`: an open DEC 2026 \
-         frame closes (60 s hang cap; `text --json` `\"frame\":\"open\"`). `await block`: the \
-         running command completes. `await sys <condition> [for=<dur>] [scope=tab|aterm]`: the \
-         terms `aterm help sys` lists, joined by `and`; a bare `quiet` is `cpu<25% wait<0.25 \
+         output for `<ms>`. `await seq [<n>]`: content `seq` > `<n>`, by default the current \
+         one, and an `<n>` past it answers at once (`OK seq <current>`). `await match <re> [rows \
+         <a> <b>]` / `await gone <re> [rows <a> <b>]`: a visible row matches, or every row in \
+         range is clear of `<re>` on a closed DEC 2026 frame or for 1 s (`ERR bad rows` on an \
+         empty span). `await frame`: an open DEC 2026 \
+         frame closes (60 s hang cap; `text --json` `\"frame\":\"open\"`). `await block`: a \
+         command finishes after the wait is armed, by an OSC 133/633 `D` that follows its `C`, \
+         which follows its prompt's `A` and `B`, with no other `A` and no reset (RIS) between \
+         them (a `D` out of that order answers nothing; `wait` also answers a command that \
+         already finished). `await sys <condition> \
+         [for=<dur>] [scope=tab|aterm]`: the terms `aterm help sys` lists, joined by `and`; a \
+         bare `quiet` is `cpu<25% wait<0.25 \
          gpu<10% throttle=none swap<1MB/s`, a term it cannot measure dropped as \
          `skipped=<metric>:<why>` (`OK sys <metric>=<value> … held_ms= as_of= next=`, a `job=` \
          term's reading `job=<id> verdict= class= [wait=] [quiet_ms=] [phi=] [exit=]`; `ERR \
@@ -2757,21 +2851,28 @@ pub const VERBS: &[VerbSpec] = &[
          `busy|prompt|question|idle|survey|unknown|-|wall|wall:<kind>` at a `rev` past \
          `since=`, such as a `settle=submitted` turn's `agent_rev=` (`OK agent <word> \
          rev=<n>`). `await task [@<sel>[:<rev>[:<fact_rev>]][,...]] [any|all] [since=<rev>] [facts=1 \
-         [fact_since=<fact_rev>]]`: a `task` `rev` past `since=`, and with `facts=1` a fact word \
-         noted past `fact_since=` (by default the `fact_rev` at the wait; a clear wakes nothing) \
-         (`OK <n>`, or `OK <n> status=timeout`, then `@<sid> rev=<n> \
+         [fact_since=<fact_rev>]]`: a `task` `rev` past `since=` whose state is not `working` or \
+         whose attention stands, with `facts=1` a fact word noted past `fact_since=` (by default \
+         the `fact_rev` at the wait; a clear wakes nothing), or the session closing (`OK <n>`, or \
+         `OK <n> status=timeout`, then `@<sid> rev=<n> \
          state=<working|done|exited|stalled|-|closed> agent=<word> attention=<pct|-> \
-         result_bytes=<n> [fact=<word|-> fact_rev=<n>]` rows). `await consent [kind=debugger] [timeout=<ms>]`: this session's \
+         result_bytes=<n> [fact=<word|-> fact_rev=<n>]` rows). `await wake [timeout=<ms>]`: \
+         the session's next ready wake (`wake`), its `need=` holding, a build slot reserved where \
+         that names `slots` (`OK wake #<n> ready since=<ms>[ slots=<usable>/<n>]`), or its last \
+         open wake's end (`EXPIRED wake #<n> why=<due|unless|agent|path|off|admit|rm|taken|told>`); \
+         one parked at a time a session (`ERR busy await wake parked`), `ERR usage await wake: no \
+         wake pending`, and `ERR denied wake: <why>` from outside the session's tree as `wake` \
+         says. A reply that cannot be written leaves the wake ready. `await consent [kind=debugger] [timeout=<ms>]`: this session's \
          consent (`privacy`'s `full_disk_access=` and its `session` row's `fs_consent=` and \
          `attribution=`; with `kind=debugger`, `debugger mode=`) differs from the first completed \
          reading (`OK consent fs_consent= fda= attribution= elapsed_ms=`, or `OK consent \
          debugger_mode= elapsed_ms=`). `await log need|open=<lvl>|close=<lvl>|kind=<k> \
-         [since=<seq> ep=<e>]` (`<lvl>` in `session|run|turn|step`, also `out=fail` and \
-         `conf=claim`; `status log_seq= log_ep=`): `OK seq=<n> ep=<e> [as_of=<head> latched=1] \
-         [gap=<why>:<lost>] <record>` or `OK gap why=<w> lost=<k> resync_to=<seq> ep=<e>`. \
-         `await edit ticket=<t>|uri=<file-uri> [timeout=<ms>]` (Owner-only): `OK edit done \
-         result=<finished|closed|aborted> saved=<0|1> seq=<n>`, `ERR unknown ticket` or `ERR \
-         hangup`.",
+         [since=<seq> ep=<e>]` (`<lvl>` in `session|run|turn|step`; `need` also answers a run's \
+         `out=fail` close, the session's close and a `mark` need (`conf=claim`); `status log_seq= \
+         log_ep=`): `OK seq=<n> ep=<e> [as_of=<head> latched=1] [gap=<why>:<lost>] <record>` or \
+         `OK gap why=<w> lost=<k> resync_to=<seq> ep=<e>`. `await edit ticket=<t>|uri=<file-uri> \
+         [timeout=<ms>]` (Owner-only): `OK edit done result=<finished|closed|aborted> saved=<0|1> \
+         seq=<n>`, `ERR unknown ticket` or `ERR hangup`.",
     )
     .lane(Wait)
     .forms(&[form(Word("task")).framing(Lines)]),
@@ -2796,7 +2897,7 @@ pub const VERBS: &[VerbSpec] = &[
         Session,
         "subscribe [@<sel>[,...]|@*] <streams> [since=][every-frame]: push \
          DELTA/EVENT/GAP/BYTES/MAIL.",
-        "`streams=screen,cursor,cells,bytes,events,mail,log,sessions` (plus inline modifiers \
+        "streams: `screen,cursor,cells,bytes,events,mail,log,sessions` (plus inline modifiers \
          `timestamps`/`ts` for `T <local|*> <t_us>` prefixes and `trim` for `screen,trim`; no \
          target means `@.`; resumed via `since=<seq>` for content, `since-turn=<id>` and \
          `since-block=<id>` for `events`' turns and blocks, or `since-log=<seq> log-ep=<e>` for \
@@ -2811,14 +2912,16 @@ pub const VERBS: &[VerbSpec] = &[
          gen=<e.s> fp=<hex16>` from `status agent=`, `task rev=<n> state=<s> attention=<0|1> \
          [why=<w>] [exit=<n>]`, `status phase=<p> outcome=<o> exit_code=<n|-> signal=<n|-> \
          confidence=<c>`, `human` (`status human_ms=`), `harness-policy gen=<n>`, `job <verdict> \
-         job=<id> class=<class> rev=<n> [task=<id>] [code=<n>]` (`status job=`), `resize n=<k> \
+         job=<id> class=<class> rev=<n> [task=<id>] [code=<n>]` (`status job=`), `wake #<n> \
+         ready` (a declared wake's condition held, under the owner's `[harness] occupancy = \
+         \"prompt\"` alone; `waits`), `resize n=<k> \
          id=<last> to=<CxR> run=<r>[ dropped=<n>]`, `render desync-risk run=<r> displaced=<+-k> \
          net=zero at=<ms>` / `render healed run=<r> after_ms=<ms>` (`status render=`), `closing \
          reason= by=`, `exited`, and `GAP <local> events-dropped=<n>`: the timeline's rows are a \
          view of the session `log`, and a GAP counts the rows past the watermark it no longer \
          holds). `sessions` (Owner-only) \
          pushes `EVENT * session-created <sid>[ watch=deferred]`, `EVENT * session-exited <sid> \
-         reason=<shell-exit|ctl-close|ui-close|window-close|app-quit|unknown>`, `EVENT * \
+         reason=<shell-exit|ctl-close|ui-close|window-close|unknown>`, `EVENT * \
          fabric-retire <sid>`, and `EVENT * bye <quit|handoff>`. `mail` pushes live `MAIL <local> \
          id=<n> off=<n> from=<p> kind=<k>[ re=<n>][ topic=<t>]` (filtered by `mail:kinds=<k,..>`, \
          `mail:from=<class|principal>`, `mail:topic=<t>`) and `GAP <local> mail-dropped=<n>`. \
@@ -2865,15 +2968,16 @@ pub const VERBS: &[VerbSpec] = &[
         Lines,
         Session,
         "inbox [<n>] [since=<id>] [--peek] [--meta]: this session's message rows",
-        "— header: `OK <n> hold=<0|1> holder=<p|-> seen=<id> bus_head=<off> oldest_on_bus=<@off|-> \
-         dropped=<n> pending=<n>`, then `msg <id> off=<n> t=<ms> from=<p> kind=<k> \
-         trust=<human|agent|relayed|screen> [re=<n> [re-id=<id>]] \
+        "— header: `OK <n> hold=<0|1> holder=<turn-id|lease:<holder>|-> seen=<id> \
+         bus_head=<off> oldest_on_bus=<@off|-> dropped=<n> pending=<n>`, then `msg <id> \
+         off=<n> t=<ms> from=<p> kind=<k> trust=<human|agent|relayed|screen> [re=<n> [re-id=<id>]] \
          [verdict=<handled|refused|deferred>] [dl=<ms>] [late=1] [demoted=<k>] [via=<p,...>] \
          [topic=<t>] len=<n> [more=1] [truncated=1] text=<pct>` (text preview capped at 512 B; \
          use `inbox get <id>` or `inbox get @<off>` for full bodies; lost bus records below \
          retention return `ERR retained-from=<floor>` or `ERR no such record`) and queued \
-         outbound `post <id> to=<> kind=<> off=- len=<n> [key=<token>]` rows. `<n>` selects the newest `n` rows above \
-         `since=`; `--peek` leaves rows unlisted and `--meta` omits `text=`.",
+         outbound `post <id> to=<> kind=<> off=- len=<n> [key=<token>]` rows. `<n>` selects the \
+         newest `n` `msg` rows above `since=`; `--peek` leaves rows unlisted and `--meta` omits \
+         `text=`.",
     ),
     v(
         "inbox get",
@@ -2898,7 +3002,7 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Session,
         "inbox seen <id> [handled|refused|deferred]: advance the HANDLED watermark (and ack)",
-        "— lists all rows `<= <id>`, advances `seen=`, and replies `OK seen=<id>` (emitting `EVENT \
+        "— lists all rows `<= <id>`, advances `seen=`, and replies `OK seen=<w>` (emitting `EVENT \
          <local> inbox-seen <id> off=<n> floor=<f|-> seen=<w>`). Adding \
          `handled|refused|deferred` attaches `verdict=<v> kind=<k> from=<p>` for row `<id>` and \
          queues a receipt (`kind=ack re=<off> verdict=<v>`) on `outbox` for an `ask` or `task` \
@@ -3089,7 +3193,7 @@ pub const VERBS: &[VerbSpec] = &[
         OwnerOnly,
         "OK <n> local sid parent state title meta= nonce= window= active= wfocus= detail= path=",
         "— Owner-only roster (relayed by `ls` and folded by `windows`). Columns per session: \
-         `nonce=<hex32>` (fabric `epoch=`), `window=<id|none|->` (`window=0 geometry=headless` on \
+         `nonce=<hex32>` (fabric `epoch=`), `window=<id|none|->` (`window=0` on \
          `--headless`), `active=<1|0|->`, `wfocus=<1|0|->` (most recently focused window), \
          `detail=<pct|->`, `path=<frozen|live>`, `program=<name|-> agent=<word|-> \
          agent_detail=<pct|-> agent_rev=<n> agent_since_ms=<ms> agent_gen=<e.s|-> \
@@ -3128,16 +3232,17 @@ pub const VERBS: &[VerbSpec] = &[
          program=<pct|-> program_kind=<agent|shell|program|-> agent=<word|-> agent_detail=<pct|-> \
          agent_ms=<ms> human_ms=<ms|-> bg=<n|-> task=<state|-> task_rev=<n> task_from=<pct|-> \
          task_ms=<ms|-> model=<pct|-> effort=<pct|-> ctx_left_pct=<n|-> detail=<pct|-> \
-         doing=<pct|-> role=<pct|-> supervisor=<pct|-> attention=<1|-> needs=<word|-> \
+         doing=<pct|-> role=<pct|-> supervisor=<pct|-> attention=<1|pct|-> needs=<word|-> \
          hold_by=<word|-> held_from=<32 hex|-> typed_by=<pct|-> typed_ms=<ms|-> bells=<n> \
          bells_sounded=<n> last_bell=<ms>/<sound>/<program|->[,…]|->`, plus under `content` (the \
-         local default; `needs=ask` selects the ask excerpt and `by=harness` turns are skipped in \
-         `prompt=`): `user_title= title= cwd= branch= prompt= said= cmd= rows=` (<= 400 B per \
-         excerpt, credentials/fleet codes redacted, fleet replies capped at 256 KiB; `rows=-` on \
-         an unfinished DEC 2026 frame, never waited for). `aterm ctl survey [--fleet] [--budget \
-         <chars>]`, `survey [--json] [--sid <s>] [--fleet | --host <h>]` (`--timeout <s>` with \
-         `--fleet` or `--host`) and `survey --brief [--budget <chars>]` (`log n` + `brief all`) \
-         format multi-instance and fleet digests.",
+         local default; `attention=` is the excerpt, `needs=ask` selects the ask excerpt and \
+         `by=harness` turns are skipped in `prompt=`): `user_title= title= cwd= branch= prompt= \
+         said= cmd= rows=` (<= 400 B per excerpt, credentials/fleet codes redacted, fleet \
+         replies capped at 256 KiB; `rows=-` on an unfinished DEC 2026 frame, never waited for). \
+         `aterm ctl survey [--fleet] [--budget <chars>]`, `survey [--json] [--sid <s>] [--fleet \
+         | --host <h>]` (`--timeout <s>` with `--fleet` or `--host`) and `survey --brief \
+         [--budget <chars>]` (`log n` + `brief all`) format multi-instance and fleet digests and \
+         take no `facts`/`content` word.",
     )
     .for_fleet(),
     va(
@@ -3148,7 +3253,7 @@ pub const VERBS: &[VerbSpec] = &[
         OwnerOnly,
         "exits [<n>] [since=<id>]: the instance EXIT LEDGER (Owner-only)",
         "— one `exit <id> t=<ms> sid=<sid> local=<n> \
-         reason=<shell-exit|ctl-close|ui-close|window-close|app-quit|unknown> exit_code=<n|-> \
+         reason=<shell-exit|ctl-close|ui-close|window-close|unknown> exit_code=<n|-> \
          by=<sid|human|ctl|bridge|->` line per exited session, read from the closed-session \
          index (its last 512 closes, in the order they left the registry; also pushed live via \
          `subscribe @<sid> events` `closing reason= by=` and `subscribe … sessions` \
@@ -3200,7 +3305,7 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Meta,
         OwnerOnly,
-        "grant <src-sid> <op>: mint a cross-session edge onto this session",
+        "grant <src-sid> <op>: mint a cross-session edge onto `whoami`'s session",
         "— Owner-only; replies `OK <token-hex>`. `<op>` is \
          `read-screen|write-input|signal|config-write|clipboard-write|derive-loop`; a \
          `<src-sid>` that is a session-log actor word is `ERR reserved`.",
@@ -3212,7 +3317,8 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Meta,
         OwnerOnly,
-        "revoke <edge-hex> | revoke src=<sid>: remove one edge, or every edge from <sid>",
+        "revoke <edge-hex> | revoke src=<sid>: remove one edge, or all from <sid> onto `whoami`'s \
+         session",
         "— Owner-only. A token answers `OK`, `src=` answers `OK <removed>` (`ERR no such edge` \
          when none matched); a token also finds a grant a closed session held.",
     )
@@ -3224,10 +3330,10 @@ pub const VERBS: &[VerbSpec] = &[
         Meta,
         OwnerOnly,
         "connect dst=<sid> src=<sid> [kind=pull|push|both]: set the src->dst session connection",
-        "— Owner-only and declarative: mints the missing ops and revokes the rest so the edges \
-         are exactly `kind=` (default `both`), then replies `OK read-screen=<hex> \
-         write-input=<hex> signal=<hex>`, naming each op the connection holds; a `src=` that is \
-         a session-log actor word is `ERR reserved`.",
+        "— Owner-only and declarative: a new kind revokes the connection's tokens and mints each \
+         op afresh, so the connection's edges are exactly `kind=` (default `both`), then replies \
+         `OK read-screen=<hex> write-input=<hex> signal=<hex>`, naming each op the connection \
+         holds; a `src=` that is a session-log actor word is `ERR reserved`.",
     )
     .input(Input::NONE),
     va(
@@ -3748,6 +3854,21 @@ mod tests {
         assert_eq!(framing_of("trail", "@s-a trail 5"), Lines);
         assert_eq!(framing_of("status", "status"), Status);
         assert_eq!(framing_of("status", "@s-a status"), Status);
+        assert_eq!(framing_of("wake", "wake label=built when=in:5m"), Status);
+        assert_eq!(
+            framing_of(
+                "wake",
+                "@self wake label=b when=pid:42 exited need=slots>=1"
+            ),
+            Status
+        );
+        assert_eq!(framing_of("wake", "@s-a wake rm #1"), Status);
+        assert_eq!(framing_of("wake", "wake taken #2"), Status);
+        assert_eq!(framing_of("waits", "waits"), Lines);
+        assert_eq!(framing_of("waits", "waits why"), Lines);
+        assert_eq!(framing_of("waits", "@s-a waits why #2"), Lines);
+        assert_eq!(framing_of("await", "await wake"), Status);
+        assert_eq!(framing_of("await", "@self await wake timeout=5000"), Status);
     }
 
     #[test]
@@ -4000,6 +4121,16 @@ mod tests {
         assert!(r("controls", "overview").owner_only && !r("controls", "").owner_only);
         assert!(r("controls", "connections").owner_only);
         assert!(r("task", "mark done").owner_only && !r("task", "").owner_only);
+        let wake = r("wake", "label=b when=in:5m");
+        assert_eq!((wake.op, wake.lane, wake.owner_only), (Write, Rpc, false));
+        assert_eq!(
+            wake.row.input_class(),
+            Input::NONE,
+            "a wake writes no session input"
+        );
+        assert_eq!(r("wake", "rm #1").op, Write);
+        assert_eq!((r("waits", "why").op, r("waits", "").lane), (Read, Rpc));
+        assert_eq!(r("await", "wake").lane, Wait);
         assert_eq!(r("meta", "unset icon").op, Write);
         assert_eq!(r("meta", "").op, Read);
         assert_eq!(r("log", "take").row.name, "log");

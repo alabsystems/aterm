@@ -850,14 +850,18 @@ fn a_band_rides_a_box_the_growing_transcript_pushes_down() {
     assert_eq!(retired, 0, "nothing melts ({note})");
 }
 
-fn rest_after_a_push(push: bool) -> Vec<RestSample> {
+fn rest_after_a_push_by(step_rows: usize, pre_idle_ms: u64) -> Vec<RestSample> {
     let mut c = Claude::with_transcript(FRESH_LINES, COLS);
     c.type_str("check ");
     c.paste(URL);
-    c.idle(120);
-    if push {
-        c.tool_rows(STEP_ROWS);
-        assert_eq!(c.row, 11, "fixture: the step pushed the box down");
+    c.idle(pre_idle_ms);
+    if step_rows > 0 {
+        c.tool_rows(step_rows);
+        assert_eq!(
+            usize::from(c.row),
+            7 + step_rows,
+            "fixture: the step pushed the box down"
+        );
     } else {
         c.frame();
     }
@@ -873,19 +877,28 @@ fn rest_after_a_push(push: bool) -> Vec<RestSample> {
 
 #[test]
 fn a_band_pushed_down_with_its_box_lives_the_same_life_at_rest() {
-    let calm = rest_after_a_push(false);
-    let pushed = rest_after_a_push(true);
-    assert!(
-        !calm[0].0.is_empty(),
-        "the paste is lit after it: {:?}",
-        calm[0]
-    );
-    for (i, (want, got)) in calm.iter().zip(&pushed).enumerate() {
-        assert_eq!(got, want, "{} ms into the rest", (i + 1) * 100);
+    for pre_idle_ms in [120u64, 600] {
+        let calm = rest_after_a_push_by(0, pre_idle_ms);
+        assert!(
+            !calm[0].0.is_empty(),
+            "the paste is lit after {pre_idle_ms} ms idle: {:?}",
+            calm[0]
+        );
+        for step_rows in [1usize, 2, STEP_ROWS] {
+            let pushed = rest_after_a_push_by(step_rows, pre_idle_ms);
+            for (i, (want, got)) in calm.iter().zip(&pushed).enumerate() {
+                assert_eq!(
+                    got,
+                    want,
+                    "step_rows={step_rows}, pre_idle={pre_idle_ms} ms, {} ms into the rest",
+                    (i + 1) * 100
+                );
+            }
+        }
     }
 }
 
-fn pushed_wrapped_take(steps: bool) -> WrappedTake {
+fn pushed_wrapped_take(step_rows: usize) -> WrappedTake {
     let mut c = Claude::with_transcript(FRESH_LINES, LAB_COLS);
     c.wrap = Some(140);
     c.space_wrap = true;
@@ -902,8 +915,8 @@ fn pushed_wrapped_take(steps: bool) -> WrappedTake {
     );
     let lit = |c: &Claude| (c.h.live(c.row - 1), c.h.live(c.row));
     let step = |c: &mut Claude| {
-        if steps {
-            c.tool_rows(STEP_ROWS);
+        if step_rows > 0 {
+            c.tool_rows(step_rows);
         } else {
             c.frame();
         }
@@ -922,7 +935,7 @@ fn pushed_wrapped_take(steps: bool) -> WrappedTake {
         step(&mut c);
         lives.push(lit(&c));
     }
-    if steps {
+    if step_rows == STEP_ROWS {
         assert_eq!(
             c.row, TEXT_ROW,
             "fixture: the steps pushed the box to the bottom"
@@ -935,8 +948,7 @@ fn pushed_wrapped_take(steps: bool) -> WrappedTake {
 
 #[test]
 fn a_wrapped_box_pushed_down_lives_the_same_life() {
-    let (calm, calm_stray, calm_retired) = pushed_wrapped_take(false);
-    let (pushed, stray, retired) = pushed_wrapped_take(true);
+    let (calm, calm_stray, calm_retired) = pushed_wrapped_take(0);
     assert!(
         calm_stray.is_empty() && calm_retired == 0,
         "fixture: the calm take is clean"
@@ -945,22 +957,32 @@ fn a_wrapped_box_pushed_down_lives_the_same_life() {
         calm.iter().any(|(first, _)| !first.is_empty()),
         "fixture: the first line is lit"
     );
-    for (i, (want, got)) in calm.iter().zip(&pushed).enumerate() {
-        assert_eq!(
-            got, want,
-            "sample {i}: (first line, second line) live columns"
+    for step_rows in [1usize, 2, STEP_ROWS] {
+        let (pushed, stray, retired) = pushed_wrapped_take(step_rows);
+        for (i, (want, got)) in calm.iter().zip(&pushed).enumerate() {
+            assert_eq!(
+                got, want,
+                "step_rows={step_rows}, sample {i}: (first line, second line) live columns"
+            );
+        }
+        assert!(
+            stray.is_empty(),
+            "step_rows={step_rows}: band cells off the composer {stray:?}"
         );
+        assert_eq!(retired, 0, "step_rows={step_rows}: nothing melts");
     }
-    assert!(stray.is_empty(), "band cells off the composer {stray:?}");
-    assert_eq!(retired, 0, "nothing melts");
 }
 
-fn one_glyph_under_a_push() -> (Vec<u16>, Vec<(u16, u16)>, u64) {
+fn one_glyph_under_a_push(step_rows: usize, pre_idle_ms: u64) -> (Vec<u16>, Vec<(u16, u16)>, u64) {
     let mut c = Claude::with_transcript(FRESH_LINES, COLS);
     c.type_str("t");
-    c.idle(300);
-    c.tool_rows(STEP_ROWS);
-    assert_eq!(c.row, 11, "fixture: the step pushed the box down");
+    c.idle(pre_idle_ms);
+    c.tool_rows(step_rows);
+    assert_eq!(
+        usize::from(c.row),
+        7 + step_rows,
+        "fixture: the step pushed the box down"
+    );
     c.idle(200);
     let mut stray = c.stray();
     stray.extend(c.on_scroll_frames.iter().copied());
@@ -969,13 +991,26 @@ fn one_glyph_under_a_push() -> (Vec<u16>, Vec<(u16, u16)>, u64) {
 
 #[test]
 fn a_one_glyph_line_rides_a_box_pushed_down() {
-    let (dark, stray, retired) = one_glyph_under_a_push();
-    assert!(dark.is_empty(), "dark composer columns {dark:?}");
-    assert!(stray.is_empty(), "band cells off the composer {stray:?}");
-    assert_eq!(retired, 0, "nothing melts");
+    for pre_idle_ms in [300u64, 600] {
+        for step_rows in [1usize, 2, STEP_ROWS] {
+            let (dark, stray, retired) = one_glyph_under_a_push(step_rows, pre_idle_ms);
+            assert!(
+                dark.is_empty(),
+                "step_rows={step_rows}, pre_idle={pre_idle_ms}: dark composer columns {dark:?}"
+            );
+            assert!(
+                stray.is_empty(),
+                "step_rows={step_rows}, pre_idle={pre_idle_ms}: band cells off the composer {stray:?}"
+            );
+            assert_eq!(
+                retired, 0,
+                "step_rows={step_rows}, pre_idle={pre_idle_ms}: nothing melts"
+            );
+        }
+    }
 }
 
-fn push_under_a_key() -> (Vec<u16>, Vec<(u16, u16)>, u64, String) {
+fn push_under_a_key(step_rows: usize) -> (Vec<u16>, Vec<(u16, u16)>, u64, String) {
     let mut c = Claude::with_transcript(FRESH_LINES, COLS);
     c.type_str("check ");
     c.paste(URL);
@@ -984,8 +1019,12 @@ fn push_under_a_key() -> (Vec<u16>, Vec<(u16, u16)>, u64, String) {
     let judged = c.h.glow.admission_tally();
     c.press('e');
     c.h.now += Duration::from_millis(11);
-    c.tool_rows(STEP_ROWS);
-    assert_eq!(c.row, 11, "fixture: the step pushed the box down");
+    c.tool_rows(step_rows);
+    assert_eq!(
+        usize::from(c.row),
+        7 + step_rows,
+        "fixture: the step pushed the box down"
+    );
     c.h.now += Duration::from_millis(10);
     c.echo("e");
     c.frame();
@@ -1000,19 +1039,25 @@ fn push_under_a_key() -> (Vec<u16>, Vec<(u16, u16)>, u64, String) {
 
 #[test]
 fn a_key_pressed_as_a_tool_step_pushes_the_box_keeps_its_press() {
-    let (dark, stray, retired, verdicts) = push_under_a_key();
-    assert!(
-        dark.is_empty(),
-        "dark composer columns {dark:?} (verdicts: {verdicts})"
-    );
-    assert!(
-        stray.is_empty(),
-        "band cells off the composer {stray:?} (verdicts: {verdicts})"
-    );
-    assert_eq!(retired, 0, "nothing melts (verdicts: {verdicts})");
-    assert_eq!(
-        verdicts,
-        format!("licensed {:?}->{:?} key", (11, 60), (11, 61)),
-        "the echo is the one move judged from the press on, licensed by its key"
-    );
+    for step_rows in [1usize, 2, STEP_ROWS] {
+        let (dark, stray, retired, verdicts) = push_under_a_key(step_rows);
+        let row = u16::try_from(7 + step_rows).unwrap();
+        assert!(
+            dark.is_empty(),
+            "step_rows={step_rows}: dark composer columns {dark:?} (verdicts: {verdicts})"
+        );
+        assert!(
+            stray.is_empty(),
+            "step_rows={step_rows}: band cells off the composer {stray:?} (verdicts: {verdicts})"
+        );
+        assert_eq!(
+            retired, 0,
+            "step_rows={step_rows}: nothing melts (verdicts: {verdicts})"
+        );
+        assert_eq!(
+            verdicts,
+            format!("licensed {:?}->{:?} key", (row, 60), (row, 61)),
+            "step_rows={step_rows}: the echo is the one move judged from the press on, licensed by its key"
+        );
+    }
 }

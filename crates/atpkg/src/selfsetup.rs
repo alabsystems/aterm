@@ -286,6 +286,211 @@ fn is_executable_file(path: &Path) -> bool {
         .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
+/// Why `program` may still be in macOS's check of its first exec, which crashes when the file
+/// goes mid-check: `None` once a `--version` run of it ended without our kill (at `hang`, or on
+/// a failed wait), or once the kernel refused to exec it ([`never_execs`]), which it does
+/// before that check. An exec waits on that check, so its exit, or a signal of its own or
+/// macOS's, comes after it. Through sudo, a shell asks it and says when the run ends
+/// ([`ENDED`], [`shell_end_unproven`]).
+fn first_exec_unproven(program: &Path, run_as: RunAs, hang: Duration) -> Option<String> {
+    const UNASKED: &str = "was not asked, and only its answer shows macOS is done checking its \
+                           first start";
+    let mut cmd = match run_as {
+        RunAs::Me => aterm_uds::spawnfd::command(program),
+        RunAs::Account(uid) => {
+            if let Some(rc) = sudo_refuses(uid) {
+                return Some(format!(
+                    "{UNASKED}: sudo could not run it as uid {uid} (exit {rc})"
+                ));
+            }
+            let mut cmd = aterm_uds::spawnfd::command(Path::new(SUDO));
+            // sudo's and the shell's lines in the words [`says_never_execs`] reads.
+            cmd.env("LC_ALL", "C")
+                .args(as_account_argv(
+                    uid,
+                    Path::new(SH[0]),
+                    &[&SH[1..], &["-c", ENDED]].concat(),
+                ))
+                .arg(program);
+            cmd
+        }
+        RunAs::Nobody => return Some(format!("{UNASKED}: {NOT_AS_ROOT}")),
+    };
+    cmd.arg("--version");
+    ran_unproven(
+        program,
+        run_as,
+        aterm_uds::deadline::output_until(&mut cmd, Instant::now() + hang),
+        hang,
+    )
+}
+
+/// What [`first_exec_unproven`]'s `--version` run of `program` as `run_as` came to.
+fn ran_unproven(
+    program: &Path,
+    run_as: RunAs,
+    ran: Result<std::process::Output, aterm_uds::deadline::RunError>,
+    hang: Duration,
+) -> Option<String> {
+    let why = match ran {
+        Ok(out) if matches!(run_as, RunAs::Account(_)) => shell_end_unproven(&out, program)?,
+        Ok(_) => return None,
+        Err(aterm_uds::deadline::RunError::Spawn(e)) if never_execs(&e) => return None,
+        Err(aterm_uds::deadline::RunError::TimedOut) => format!("did not answer within {hang:?}"),
+        Err(e) => e.to_string(),
+    };
+    Some(format!(
+        "{why}, so macOS may still be checking its first start, and removing the bundle now can \
+         stall every program start until a restart — uninstall again in {} minutes, or after a \
+         restart",
+        aterm_uds::deadline::FIRST_EXEC_HANG.as_secs() / 60
+    ))
+}
+
+/// Whether a run as `run_as` that ended with `code` may have run nothing: through sudo, which
+/// exits 1 on its own refusal and when it cannot exec the program, and hands a file the kernel
+/// refuses as no program (ENOEXEC) to `/bin/sh`, which exits 126 or 127.
+fn sudo_may_not_have_run(run_as: RunAs, code: Option<i32>) -> bool {
+    matches!(run_as, RunAs::Account(_)) && matches!(code, Some(1 | 126 | 127))
+}
+
+/// Why `out`, sudo's run of [`ENDED`] asking `program`, does not show the program ran: `None`
+/// once the program printed anything, or the shell wrote `ended <status>` for a run it started.
+/// No such line is sudo's end (its refusal, or one it cannot exec the shell for) or the
+/// shell's (a fork that failed). An `ended 126` or `ended 127` with nothing printed may be the
+/// shell's own failure to exec the program (denied, gone, a folder), which proves nothing but
+/// a kernel refusal it names ([`says_never_execs`]).
+fn shell_end_unproven(out: &std::process::Output, program: &Path) -> Option<String> {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let (printed, ended) = match stdout
+        .strip_suffix('\n')
+        .and_then(|s| s.rsplit_once("ended "))
+        .and_then(|(printed, code)| Some((printed, code.parse::<i32>().ok()?)))
+    {
+        Some((printed, code)) => (printed, Some(code)),
+        None => (&*stdout, None),
+    };
+    if !printed.is_empty() {
+        return None;
+    }
+    let said = String::from_utf8_lossy(&out.stderr);
+    let saying = match said.lines().map(str::trim).rfind(|line| !line.is_empty()) {
+        Some(line) => format!("saying `{line}`"),
+        None => "with nothing printed".to_owned(),
+    };
+    match ended {
+        None => Some(format!(
+            "may not have started: sudo ended {} with nothing on standard output, {saying}",
+            out.status
+        )),
+        Some(code @ (126 | 127)) if !says_never_execs(&out.stderr, program) => Some(format!(
+            "may not have started: the shell sudo ran to ask it could not run it (exit {code}), \
+             {saying}"
+        )),
+        Some(_) => None,
+    }
+}
+
+/// Whether a run of `program` as `run_as` that ended with `code`, `stderr` its words, is the
+/// kernel's refusal to exec it that sudo names ([`says_never_execs`]): it never ran, and no
+/// check of macOS's holds it.
+fn sudo_refused_exec(run_as: RunAs, code: Option<i32>, stderr: &[u8], program: &Path) -> bool {
+    sudo_may_not_have_run(run_as, code) && says_never_execs(stderr, program)
+}
+
+/// Whether `stderr` says the kernel refused to exec `program` ([`never_execs`]), in sudo's words
+/// (`unable to execute <program>: <why>`) or a shell's (`<name>: <program>: <why>`, or `cannot
+/// execute binary file` for ENOEXEC). A program that printed such a line itself ran.
+fn says_never_execs(stderr: &[u8], program: &Path) -> bool {
+    let text = String::from_utf8_lossy(stderr);
+    let program = program.display();
+    let mut whys: Vec<String> = EXEC_REFUSALS.iter().map(|&code| strerror(code)).collect();
+    let binary = "cannot execute binary file";
+    whys.extend([
+        binary.to_owned(),
+        format!("{binary}: {}", strerror(libc::ENOEXEC)),
+    ]);
+    let by = [
+        format!("unable to execute {program}: "),
+        format!(": {program}: "),
+    ];
+    text.lines().map(str::trim_end).any(|line| {
+        by.iter()
+            .any(|by| whys.iter().any(|why| line.ends_with(&format!("{by}{why}"))))
+    })
+}
+
+/// `code`'s words as the C library says them, which sudo and the shell print.
+fn strerror(code: i32) -> String {
+    let why = std::io::Error::from_raw_os_error(code).to_string();
+    why.split(" (os error").next().unwrap_or(&why).to_owned()
+}
+
+/// The programs in `app` aterm's tools may have started: each file in `Contents/MacOS` but a
+/// link, since an older toolset's `aterm-cli` starts its siblings (`atpkg` for `pkg`).
+fn bundle_programs(app: &Path) -> Vec<PathBuf> {
+    let mut programs: Vec<PathBuf> = std::fs::read_dir(app.join("Contents/MacOS"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| is_executable_file(path))
+        .collect();
+    programs.sort();
+    programs
+}
+
+/// The errors of an exec the kernel refuses as no program it can run here (its format or CPU
+/// type), which it does before macOS's check, so no exec of it waits on one.
+#[cfg(target_vendor = "apple")]
+const EXEC_REFUSALS: [i32; 4] = [
+    libc::ENOEXEC,
+    libc::EBADARCH,
+    libc::EBADEXEC,
+    libc::EBADMACHO,
+];
+/// See the Apple twin.
+#[cfg(not(target_vendor = "apple"))]
+const EXEC_REFUSALS: [i32; 1] = [libc::ENOEXEC];
+
+/// Whether `e`, a spawn's error, is one of [`EXEC_REFUSALS`].
+fn never_execs(e: &std::io::Error) -> bool {
+    e.raw_os_error()
+        .is_some_and(|code| EXEC_REFUSALS.contains(&code))
+}
+
+/// Why `app` stays: the first of its programs ([`bundle_programs`]) but `proven`, one this sweep
+/// already saw exit, whose answer does not show macOS is done checking it
+/// ([`first_exec_unproven`]). A dry run asks nothing and says what it would ask.
+fn bundle_unproven(
+    s: &mut Sweep<'_>,
+    p: &Places,
+    app: &Path,
+    proven: Option<&Path>,
+    hang: Duration,
+) -> Option<String> {
+    for program in bundle_programs(app) {
+        if proven == Some(program.as_path()) {
+            continue;
+        }
+        let run_as = runs_as(aterm_uds::peer::our_uid(), &p.home, &program);
+        let ask = match run_as {
+            RunAs::Account(uid) => format!(
+                "{SUDO} -n -H -u #{uid} -- {} -c '{ENDED}' {} --version",
+                SH.join(" "),
+                program.display()
+            ),
+            RunAs::Me | RunAs::Nobody => format!("{} --version", program.display()),
+        };
+        if s.dry && run_as != RunAs::Nobody {
+            s.say(&format!("would ask {ask}, then if it answers:"));
+        } else if let Some(why) = first_exec_unproven(&program, run_as, hang) {
+            return Some(format!("`{ask}` {why}"));
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunAs {
     Me,
@@ -1031,6 +1236,19 @@ fn home_is_the_accounts(our_uid: u32, home: &Path) -> bool {
 
 const SUDO: &str = "/usr/bin/sudo";
 const TRUE: &str = "/usr/bin/true";
+/// The shell a run through sudo asks a program by ([`ENDED`]), with its flags: bash, whose words
+/// for an exec it could not make [`says_never_execs`] reads (macOS's `/bin/sh` may be zsh, which
+/// says a kernel refusal otherwise), reading no startup file (`--norc`: the account's `.bashrc`,
+/// which sshd's `SSH_CLIENT` has it read) and none the environment names (`-p`: `BASH_ENV`), so
+/// nothing but the program and the script writes what is read as the run.
+#[cfg(target_vendor = "apple")]
+const SH: [&str; 3] = ["/bin/bash", "--norc", "-p"];
+/// See the Apple twin.
+#[cfg(not(target_vendor = "apple"))]
+const SH: [&str; 1] = ["/bin/sh"];
+/// The script a run through sudo asks a program by: `ended <status>` once the shell's run of
+/// it ends, which sudo's own refusal never writes ([`shell_end_unproven`]).
+const ENDED: &str = "\"$0\" \"$@\"; echo \"ended $?\"";
 const TOUCH: &str = "/usr/bin/touch";
 const RM: &str = "/bin/rm";
 const RMDIR: &str = "/bin/rmdir";
@@ -1088,9 +1306,11 @@ pub fn self_uninstall(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> bool {
-    self_uninstall_with_caffeine(p, man_src, dry, out, err, sweep_caffeine)
+    self_uninstall_with_caffeine(p, man_src, dry, out, err, sweep_caffeine, CHILD_HANG)
 }
 
+/// [`self_uninstall`] with its Caffeine sweep, and `hang`, how long a bundle's program is given
+/// to answer before its bundle is kept.
 fn self_uninstall_with_caffeine(
     p: &Places,
     man_src: Option<&Path>,
@@ -1098,6 +1318,7 @@ fn self_uninstall_with_caffeine(
     out: &mut dyn Write,
     err: &mut dyn Write,
     mut caffeine: impl FnMut(&mut Sweep<'_>, &Places, &[PathBuf]) -> Vec<PathBuf>,
+    hang: Duration,
 ) -> bool {
     let outsider = p.install_dir.as_ref().and_then(|_| scope_outsider(p));
     let mut s = Sweep {
@@ -1126,6 +1347,8 @@ fn self_uninstall_with_caffeine(
     let atpkg_app = uninstall_bundle(p);
     let mut swept = false;
     let mut atpkg_kept: Option<PathBuf> = None;
+    // The atpkg whose run this sweep saw exit: past macOS's check of it.
+    let mut atpkg_proven: Option<PathBuf> = None;
     match (&atpkg_app, s.outsider.is_some()) {
         (Some(_), true) => {
             s.say("left in place: the ALab toolchain store");
@@ -1153,7 +1376,11 @@ fn self_uninstall_with_caffeine(
                 let mut cmd = match run_as {
                     RunAs::Account(uid) => {
                         let mut cmd = aterm_uds::spawnfd::command(Path::new(SUDO));
-                        cmd.args(as_account_argv(uid, &atpkg, &["uninstall", "--all"]));
+                        cmd.env("LC_ALL", "C").args(as_account_argv(
+                            uid,
+                            &atpkg,
+                            &["uninstall", "--all"],
+                        ));
                         cmd
                     }
                     RunAs::Me | RunAs::Nobody => {
@@ -1162,20 +1389,56 @@ fn self_uninstall_with_caffeine(
                         cmd
                     }
                 };
-                let ran = match refused {
+                // Through sudo, its words say whether the kernel refused atpkg: kept in a file,
+                // which nothing atpkg starts can hold open as it could a pipe.
+                let said = matches!(run_as, RunAs::Account(_))
+                    .then(aterm_tempfile::tempdir)
+                    .and_then(Result::ok)
+                    .map(|dir| {
+                        let file = dir.path().join("stderr");
+                        (dir, file)
+                    });
+                let stderr = said
+                    .as_ref()
+                    .and_then(|(_, file)| std::fs::File::create(file).ok())
+                    .map_or_else(
+                        aterm_uds::spawnfd::Stdio::null,
+                        aterm_uds::spawnfd::Stdio::from,
+                    );
+                let status = match refused {
                     Some(why) => Err(why),
                     None => Ok(cmd
                         .stdin(aterm_uds::spawnfd::Stdio::null())
                         .stdout(aterm_uds::spawnfd::Stdio::null())
-                        .stderr(aterm_uds::spawnfd::Stdio::null())
+                        .stderr(stderr)
                         .status()
-                        .map_or(127, |st| {
-                            st.code().unwrap_or_else(|| {
-                                128 + std::os::unix::process::ExitStatusExt::signal(&st)
-                                    .unwrap_or(0)
-                            })
-                        })),
+                        .ok()),
                 };
+                // Only an exit shows the run got past macOS's check of atpkg: it shares this
+                // process group and has no deadline, so a signal that ended it may be anyone's.
+                let exited = matches!(status, Ok(Some(st)) if st.code().is_some());
+                let code = match &status {
+                    Ok(Some(st)) => st.code(),
+                    _ => None,
+                };
+                let exec_refused = said
+                    .as_ref()
+                    .and_then(|(_, file)| std::fs::read(file).ok())
+                    .is_some_and(|err| sudo_refused_exec(run_as, code, &err, &atpkg));
+                if exec_refused || (exited && !sudo_may_not_have_run(run_as, code)) {
+                    atpkg_proven = Some(atpkg.clone());
+                }
+                // A refusal sudo names is no failure of atpkg's: it could not run.
+                let ran = status.map(|st| {
+                    st.map_or(127, |st| {
+                        if exec_refused {
+                            return 127;
+                        }
+                        st.code().unwrap_or_else(|| {
+                            128 + std::os::unix::process::ExitStatusExt::signal(&st).unwrap_or(0)
+                        })
+                    })
+                });
                 if ran == Ok(0) {
                     s.say("removed the ALab toolchain store");
                     swept = true;
@@ -1236,7 +1499,13 @@ fn self_uninstall_with_caffeine(
                      not finish (above)",
                 );
             } else if bundle_is_ours(&app) {
-                s.rm(&app, "app bundle");
+                let proven = atpkg_proven
+                    .as_deref()
+                    .filter(|atpkg| atpkg.starts_with(&app));
+                match bundle_unproven(&mut s, p, &app, proven, hang) {
+                    Some(why) => s.skip(&app.display().to_string(), &format!("kept: {why}")),
+                    None => s.rm(&app, "app bundle"),
+                }
             } else {
                 let id = bundle_identifier(&app).unwrap_or_else(|| "unreadable".to_string());
                 s.skip(

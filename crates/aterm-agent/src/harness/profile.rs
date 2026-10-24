@@ -782,6 +782,10 @@ pub struct SubscriptionDisplay {
     pub label: Option<String>,
     /// The screen reading's placed reset, retained after expiry so an unchanged card cannot revive the same window.
     pub weekly_reset: Option<WeeklyReset>,
+    /// The account the selected profile names ([`Profile::key`]): the one whose week
+    /// [`Self::weekly_figure`] is. `None` where the profile names none, and for Muse Code and
+    /// `agy` ([`agy_subscription_for`]), whose weeks are not a Claude plan's.
+    pub account: Option<AccountKey>,
 }
 
 /// ONE WEEKLY FIGURE, whichever source read it (Claude Code's `/usage` cache, this
@@ -1160,7 +1164,10 @@ pub fn parse_agy_usage_json(bytes: &[u8], third_party: bool, now: i64) -> Option
     })
 }
 
-fn agy_log_email(argv: &[String], config: &Path) -> Option<String> {
+fn agy_log_scan<T, F>(argv: &[String], config: &Path, parse: F) -> Option<T>
+where
+    F: Fn(&[u8]) -> Option<T>,
+{
     let mut log_arg = None;
     let mut i = 0;
     while let Some(arg) = argv.get(i) {
@@ -1177,7 +1184,7 @@ fn agy_log_email(argv: &[String], config: &Path) -> Option<String> {
         }
         i += 1;
     }
-    let read_log = |path: &Path| -> Option<String> {
+    let read_log = |path: &Path| -> Option<T> {
         const WINDOW: u64 = 128 * 1024;
         let mut f = std::fs::File::open(path).ok()?;
         let len = f.metadata().ok().map_or(0, |m| m.len());
@@ -1187,23 +1194,23 @@ fn agy_log_email(argv: &[String], config: &Path) -> Option<String> {
             let offset = i64::try_from(WINDOW).unwrap_or(131_072);
             if f.seek(SeekFrom::End(-offset)).is_ok()
                 && (&mut f).take(WINDOW).read_to_end(&mut tail).is_ok()
-                && let Some(email) = parse_agy_auth_log(&tail)
+                && let Some(found) = parse(&tail)
             {
-                return Some(email);
+                return Some(found);
             }
             let _ = f.seek(SeekFrom::Start(0));
         }
         let mut head = Vec::new();
         f.take(WINDOW).read_to_end(&mut head).ok()?;
-        parse_agy_auth_log(&head)
+        parse(&head)
     };
     if let Some(path) = log_arg.as_deref().map(Path::new)
-        && let Some(email) = read_log(path)
+        && let Some(found) = read_log(path)
     {
-        return Some(email);
+        return Some(found);
     }
-    if let Some(email) = read_log(&config.join("cli.log")) {
-        return Some(email);
+    if let Some(found) = read_log(&config.join("cli.log")) {
+        return Some(found);
     }
     let mut logs: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(config.join("log"))
         .ok()?
@@ -1223,6 +1230,514 @@ fn agy_log_email(argv: &[String], config: &Path) -> Option<String> {
         .collect();
     logs.sort_by_key(|a| std::cmp::Reverse(a.0));
     logs.into_iter().take(3).find_map(|(_, p)| read_log(&p))
+}
+
+fn agy_log_email(argv: &[String], config: &Path) -> Option<String> {
+    agy_log_scan(argv, config, parse_agy_auth_log)
+}
+
+/// Parses an `agy` or `muse` model label such as `"Gemini 4 Argon (High)"` into
+/// `(model, effort)` normalized with [`super::footer::footer_model_name`] and
+/// [`super::footer::effort_level`].
+#[must_use]
+pub fn parse_agy_model_label(label: &str) -> Option<(String, Option<String>)> {
+    let t = label.trim();
+    if t.is_empty() || t.contains('\u{2026}') {
+        return None;
+    }
+    if let Some((model, effort)) = t.strip_suffix(')').and_then(|s| s.rsplit_once(" (")) {
+        let lower = effort.trim().to_ascii_lowercase();
+        if let Some(level) = super::footer::effort_level(&lower)
+            && let Some(named) = super::footer::footer_model_name(model)
+        {
+            return Some((named, Some(level.to_owned())));
+        }
+    }
+    super::footer::footer_model_name(t).map(|named| (named, None))
+}
+
+/// Extracts the latest propagated model override from `agy`'s CLI log
+/// (`Propagating selected model override to backend: label="..."`).
+#[must_use]
+pub fn parse_agy_model_log(bytes: &[u8]) -> Option<(String, Option<String>)> {
+    let text = String::from_utf8_lossy(bytes);
+    for line in text.lines().rev() {
+        let Some((_, rest)) =
+            line.split_once("Propagating selected model override to backend: label=\"")
+        else {
+            continue;
+        };
+        let Some(label) = rest.strip_suffix('"').or_else(|| rest.split('"').next()) else {
+            continue;
+        };
+        if let Some(parsed) = parse_agy_model_label(label) {
+            return Some(parsed);
+        }
+    }
+    None
+}
+
+fn non_claude_argv_model_effort(argv: &[String]) -> (Option<String>, Option<String>, bool, bool) {
+    let mut raw_model = None;
+    let mut raw_effort = None;
+    let mut i = 1;
+    while let Some(arg) = argv.get(i) {
+        if arg == "--" {
+            break;
+        }
+        if matches!(arg.as_str(), "--model" | "-m") {
+            raw_model = argv.get(i + 1).cloned();
+            i += 2;
+            continue;
+        }
+        if let Some(v) = arg.strip_prefix("--model=") {
+            raw_model = Some(v.to_owned());
+        } else if matches!(arg.as_str(), "--effort" | "--reasoning-effort") {
+            raw_effort = argv.get(i + 1).cloned();
+            i += 2;
+            continue;
+        } else if let Some(v) = arg
+            .strip_prefix("--effort=")
+            .or_else(|| arg.strip_prefix("--reasoning-effort="))
+        {
+            raw_effort = Some(v.to_owned());
+        }
+        i += 1;
+    }
+    let parsed_model = raw_model.as_deref().and_then(parse_agy_model_label);
+    let model = parsed_model.as_ref().map(|(m, _)| m.clone());
+    let model_effort = parsed_model.and_then(|(_, e)| e);
+    let explicit_effort = raw_effort
+        .as_deref()
+        .and_then(|e| super::footer::effort_level(&e.trim().to_ascii_lowercase()))
+        .map(str::to_owned);
+    let effort = explicit_effort.clone().or(model_effort);
+    let model_open = model.is_none();
+    let effort_open = explicit_effort.is_none() && (model_open || effort.is_none());
+    (model, effort, model_open, effort_open)
+}
+
+/// The active `(model, effort, model_open, effort_open)` for an `agy` process:
+/// pinned when passed on `argv`, else read from `<config>/settings.json` or
+/// `<config>/cli.log` while remaining open to a live admitted screen card.
+#[must_use]
+pub fn agy_model_effort_for(
+    argv: &[String],
+    env: &[String],
+    user_home: &Path,
+) -> (Option<String>, Option<String>, bool, bool) {
+    let (argv_model, argv_effort, model_open, effort_open) = non_claude_argv_model_effort(argv);
+    if argv_model.is_some() {
+        return (argv_model, argv_effort, model_open, effort_open);
+    }
+    let var = |key: &str| {
+        env.iter()
+            .find_map(|entry| entry.strip_prefix(key)?.strip_prefix('='))
+            .filter(|value| !value.is_empty())
+    };
+    let Some(config) = (match var("AGY_CLI_CONFIG_DIR").map(PathBuf::from) {
+        Some(dir) if dir.is_absolute() => Some(dir),
+        _ => super::upgrade_agy::config_dir(argv, var("HOME"), user_home),
+    }) else {
+        return (None, argv_effort, true, effort_open);
+    };
+    let from_settings = std::fs::read(config.join("settings.json"))
+        .ok()
+        .and_then(|b| aterm_json::from_slice::<aterm_json::Value>(&b).ok())
+        .and_then(|s| {
+            s.get("model")
+                .and_then(aterm_json::Value::as_str)
+                .and_then(parse_agy_model_label)
+        });
+    let (model, cfg_effort) = from_settings
+        .or_else(|| agy_log_scan(argv, &config, parse_agy_model_log))
+        .map_or((None, None), |(m, e)| (Some(m), e));
+    (model, argv_effort.or(cfg_effort), true, effort_open)
+}
+
+/// The active `(model, effort, model_open, effort_open)` for a `muse` process:
+/// pinned when passed on `argv`, else read from `<config>/settings.json` while
+/// remaining open to a live admitted screen card.
+#[must_use]
+pub fn muse_model_effort_for(
+    argv: &[String],
+    env: &[String],
+    user_home: &Path,
+) -> (Option<String>, Option<String>, bool, bool) {
+    let (argv_model, argv_effort, model_open, effort_open) = non_claude_argv_model_effort(argv);
+    if argv_model.is_some() {
+        return (argv_model, argv_effort, model_open, effort_open);
+    }
+    let var = |key: &str| {
+        env.iter()
+            .find_map(|entry| entry.strip_prefix(key)?.strip_prefix('='))
+            .filter(|value| !value.is_empty())
+    };
+    let config = match var("XDG_CONFIG_HOME").map(PathBuf::from) {
+        Some(xdg) if xdg.is_absolute() => xdg,
+        _ => var("HOME")
+            .map_or_else(|| user_home.to_path_buf(), PathBuf::from)
+            .join(".config"),
+    }
+    .join("muse");
+    let from_settings = std::fs::read(config.join("settings.json"))
+        .ok()
+        .and_then(|b| aterm_json::from_slice::<aterm_json::Value>(&b).ok())
+        .and_then(|s| {
+            s.get("model")
+                .and_then(aterm_json::Value::as_str)
+                .and_then(parse_agy_model_label)
+        });
+    let (model, cfg_effort) = from_settings.map_or((None, None), |(m, e)| (Some(m), e));
+    (model, argv_effort.or(cfg_effort), true, effort_open)
+}
+
+fn read_jsonl_tail(path: &Path, window: u64) -> Option<(Vec<u8>, u64)> {
+    use std::io::{Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let mut buf = Vec::new();
+    if len > window {
+        let offset = i64::try_from(window).unwrap_or(65_536);
+        f.seek(SeekFrom::End(-offset)).ok()?;
+        f.take(window).read_to_end(&mut buf).ok()?;
+        if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            buf.drain(..=pos);
+        }
+    } else {
+        f.take(window).read_to_end(&mut buf).ok()?;
+    }
+    Some((buf, len))
+}
+
+fn agy_db_conversation(config: &Path, file: &Path) -> Option<String> {
+    let rest = file.strip_prefix(config).ok()?;
+    let parts: Vec<&str> = rest
+        .components()
+        .map(|c| c.as_os_str().to_str())
+        .collect::<Option<_>>()?;
+    let [dir, name] = parts.as_slice() else {
+        return None;
+    };
+    let conversation = name.strip_suffix(".db")?;
+    (*dir == super::upgrade_agy::CONVERSATIONS
+        && super::upgrade_agy::is_conversation_uuid(conversation))
+    .then(|| conversation.to_owned())
+}
+
+fn agy_held_conversation(
+    config: &Path,
+    files: &[PathBuf],
+    has_conversation: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let canon = std::fs::canonicalize(config).unwrap_or_else(|_| config.to_path_buf());
+    let mut locks: Vec<String> = files
+        .iter()
+        .filter_map(|f| {
+            super::upgrade_agy::lock_conversation(&canon, f)
+                .or_else(|| super::upgrade_agy::lock_conversation(config, f))
+        })
+        .filter(|cid| has_conversation(cid))
+        .collect();
+    locks.sort();
+    locks.dedup();
+    if let [cid] = locks.as_slice() {
+        return Some(cid.clone());
+    }
+    let mut dbs: Vec<String> = files
+        .iter()
+        .filter_map(|f| agy_db_conversation(&canon, f).or_else(|| agy_db_conversation(config, f)))
+        .filter(|cid| has_conversation(cid))
+        .collect();
+    dbs.sort();
+    dbs.dedup();
+    match dbs.as_slice() {
+        [cid] => Some(cid.clone()),
+        _ => None,
+    }
+}
+
+fn agy_active_conversation(
+    pid: u32,
+    argv: &[String],
+    config: &Path,
+    cwd: Option<&Path>,
+    history_tail: Option<&[u8]>,
+    require_transcript: bool,
+) -> Option<String> {
+    let has_conversation = |cid: &str| {
+        if !super::upgrade_agy::is_conversation_uuid(cid) {
+            return false;
+        }
+        let transcript = config
+            .join("brain")
+            .join(cid)
+            .join(".system_generated/logs/transcript.jsonl")
+            .is_file();
+        if require_transcript {
+            transcript
+        } else {
+            transcript
+                || super::upgrade_agy::conversation_db(config, cid).is_file()
+                || super::upgrade_agy::presence_lock(config, cid).is_file()
+        }
+    };
+    if let Some(cid) = super::upgrade_agy::resumed_conversation(argv)
+        && ((!require_transcript && super::upgrade_agy::is_conversation_uuid(&cid))
+            || has_conversation(&cid))
+    {
+        return Some(cid);
+    }
+    if pid > 0
+        && let Ok(files) = aterm_uds::holders::open_files(pid)
+        && let Some(cid) = agy_held_conversation(config, &files, has_conversation)
+    {
+        return Some(cid);
+    }
+    if let Some(history_bytes) = history_tail {
+        let text = String::from_utf8_lossy(history_bytes);
+        let mut fallback_locked = None;
+        let mut fallback_any = None;
+        let mut cwd_unlocked = None;
+        for line in text.lines().rev() {
+            let Ok(row) = aterm_json::from_str::<aterm_json::Value>(line) else {
+                continue;
+            };
+            let Some(cid) = row
+                .get("conversationId")
+                .and_then(aterm_json::Value::as_str)
+            else {
+                continue;
+            };
+            if !has_conversation(cid) {
+                continue;
+            }
+            let locked = super::upgrade_agy::presence_lock(config, cid).is_file();
+            if let Some(dir) = cwd
+                && row
+                    .get("workspace")
+                    .and_then(aterm_json::Value::as_str)
+                    .is_some_and(|w| Path::new(w) == dir)
+            {
+                if locked {
+                    return Some(cid.to_owned());
+                }
+                if cwd_unlocked.is_none() {
+                    cwd_unlocked = Some(cid.to_owned());
+                }
+            }
+            if locked && fallback_locked.is_none() {
+                fallback_locked = Some(cid.to_owned());
+            }
+            if fallback_any.is_none() {
+                fallback_any = Some(cid.to_owned());
+            }
+        }
+        if let Some(cid) = cwd_unlocked.or(fallback_locked).or(fallback_any) {
+            return Some(cid);
+        }
+    }
+    let mut locks: Vec<(std::time::SystemTime, String)> =
+        std::fs::read_dir(config.join(super::upgrade_agy::PRESENCE))
+            .ok()?
+            .flatten()
+            .filter_map(|e| {
+                let p = e.path();
+                let cid = super::upgrade_agy::lock_conversation(config, &p)?;
+                has_conversation(&cid).then_some((e.metadata().ok()?.modified().ok()?, cid))
+            })
+            .collect();
+    locks.sort_by_key(|a| std::cmp::Reverse(a.0));
+    locks.into_iter().next().map(|(_, cid)| cid)
+}
+
+/// Formats the manual `agy --conversation=<uuid>` resume line for an active `agy` session.
+#[must_use]
+pub fn agy_resume_for(
+    pid: u32,
+    argv: &[String],
+    env: &[String],
+    user_home: &Path,
+    cwd: Option<&Path>,
+) -> Option<String> {
+    const WINDOW: u64 = 64 * 1024;
+    let var = |key: &str| {
+        env.iter()
+            .find_map(|entry| entry.strip_prefix(key)?.strip_prefix('='))
+            .filter(|value| !value.is_empty())
+    };
+    let default_config = super::upgrade_agy::config_dir(argv, var("HOME"), user_home);
+    let config = match var("AGY_CLI_CONFIG_DIR").map(PathBuf::from) {
+        Some(dir) if dir.is_absolute() => dir,
+        _ => default_config.clone()?,
+    };
+    let history = read_jsonl_tail(&config.join("history.jsonl"), WINDOW);
+    let conversation = agy_active_conversation(
+        pid,
+        argv,
+        &config,
+        cwd,
+        history.as_ref().map(|(b, _)| b.as_slice()),
+        false,
+    )?;
+    let mut relaunch_env = Vec::new();
+    if let Some(cfg) = var("AGY_CLI_CONFIG_DIR")
+        && Path::new(cfg).is_absolute()
+        && default_config.as_deref() != Some(Path::new(cfg))
+    {
+        relaunch_env.push(("AGY_CLI_CONFIG_DIR".to_owned(), cfg.to_owned()));
+    }
+    relaunch_env.extend(super::upgrade_agy::relaunch_env(var, user_home));
+    super::upgrade_agy::told_line(&conversation, &relaunch_env, argv)
+}
+
+/// Reads the survey [`super::excerpt::Excerpts`] (`prompts`, `said`, `said_end`,
+/// `doing`) and `transcript_len` for an active `agy` session from
+/// `<config>/brain/<cid>/.system_generated/logs/transcript.jsonl` and
+/// `<config>/history.jsonl`.
+#[must_use]
+pub fn agy_excerpts_for(
+    pid: u32,
+    argv: &[String],
+    env: &[String],
+    user_home: &Path,
+    cwd: Option<&Path>,
+) -> Option<(super::excerpt::Excerpts, u64)> {
+    const WINDOW: u64 = 64 * 1024;
+    let var = |key: &str| {
+        env.iter()
+            .find_map(|entry| entry.strip_prefix(key)?.strip_prefix('='))
+            .filter(|value| !value.is_empty())
+    };
+    let config = match var("AGY_CLI_CONFIG_DIR").map(PathBuf::from) {
+        Some(dir) if dir.is_absolute() => dir,
+        _ => super::upgrade_agy::config_dir(argv, var("HOME"), user_home)?,
+    };
+    let history = read_jsonl_tail(&config.join("history.jsonl"), WINDOW);
+    let conversation = agy_active_conversation(
+        pid,
+        argv,
+        &config,
+        cwd,
+        history.as_ref().map(|(b, _)| b.as_slice()),
+        true,
+    )?;
+    let transcript_path = config
+        .join("brain")
+        .join(&conversation)
+        .join(".system_generated/logs/transcript.jsonl");
+    let (transcript_tail, transcript_len) = read_jsonl_tail(&transcript_path, WINDOW)?;
+    let excerpts = super::excerpt::agy_excerpts_from(
+        &transcript_tail,
+        history.as_ref().map(|(b, _)| b.as_slice()),
+        &conversation,
+    );
+    Some((excerpts, transcript_len))
+}
+
+fn muse_active_session_lock(
+    pid: u32,
+    argv: &[String],
+    env: &[String],
+    user_home: &Path,
+) -> Option<(String, Option<PathBuf>)> {
+    let var = |key: &str| {
+        env.iter()
+            .find_map(|entry| entry.strip_prefix(key)?.strip_prefix('='))
+            .filter(|value| !value.is_empty())
+    };
+    let data = super::upgrade_muse::data_home(
+        var(super::upgrade_muse::DATA_ENV),
+        var(super::upgrade_muse::HOME_ENV),
+        user_home,
+    )?;
+    let root = super::upgrade_muse::sessions_root(&data);
+    let dirs = |p: &Path| -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = std::fs::read_dir(p)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        out.sort();
+        out.reverse();
+        out
+    };
+    if let Some(session) =
+        super::upgrade_muse::resumed_ref(argv).filter(|s| super::upgrade_muse::is_session_uuid(s))
+    {
+        let found = dirs(&root)
+            .into_iter()
+            .flat_map(|y| dirs(&y))
+            .flat_map(|m| dirs(&m))
+            .map(|d| d.join(&session).join(super::upgrade_muse::LOCK))
+            .find(|lock| {
+                super::upgrade_muse::session_of_lock(&root, lock).is_some()
+                    && (lock.is_file() || lock.with_file_name(super::upgrade_muse::LOG).is_file())
+            });
+        return Some((session, found));
+    }
+    if pid == 0 {
+        return None;
+    }
+    let mut matches: Vec<(Option<std::time::SystemTime>, String, PathBuf)> = dirs(&root)
+        .into_iter()
+        .flat_map(|y| dirs(&y))
+        .flat_map(|m| dirs(&m))
+        .flat_map(|d| dirs(&d))
+        .map(|s| s.join(super::upgrade_muse::LOCK))
+        .filter_map(|lock| {
+            let session = super::upgrade_muse::session_of_lock(&root, &lock)?;
+            let body = std::fs::read_to_string(&lock).ok()?;
+            (super::upgrade_muse::lock_pid(&body) == Some(pid)).then(|| {
+                let mtime = std::fs::metadata(&lock)
+                    .ok()
+                    .and_then(|m| m.modified().ok());
+                (mtime, session, lock)
+            })
+        })
+        .collect();
+    matches.sort_by_key(|a| std::cmp::Reverse(a.0));
+    matches
+        .into_iter()
+        .next()
+        .map(|(_, session, lock)| (session, Some(lock)))
+}
+
+/// Formats the manual `muse resume <uuid>` command line for an active `muse` session.
+#[must_use]
+pub fn muse_resume_for(
+    pid: u32,
+    argv: &[String],
+    env: &[String],
+    user_home: &Path,
+) -> Option<String> {
+    let var = |key: &str| {
+        env.iter()
+            .find_map(|entry| entry.strip_prefix(key)?.strip_prefix('='))
+            .filter(|value| !value.is_empty())
+    };
+    let (session, _) = muse_active_session_lock(pid, argv, env, user_home)?;
+    let relaunch_env = super::upgrade_muse::relaunch_env(var, user_home);
+    super::upgrade_muse::told_line(&session, &relaunch_env)
+}
+
+/// Reads the survey [`super::excerpt::Excerpts`] (`prompts`, `said`, `said_end`,
+/// `doing`) and `transcript_len` for an active `muse` session from
+/// `<data>/muse/sessions/YYYY/MM/DD/<uuid>/session.jsonl`.
+#[must_use]
+pub fn muse_excerpts_for(
+    pid: u32,
+    argv: &[String],
+    env: &[String],
+    user_home: &Path,
+) -> Option<(super::excerpt::Excerpts, u64)> {
+    const WINDOW: u64 = 64 * 1024;
+    let (_, lock) = muse_active_session_lock(pid, argv, env, user_home)?;
+    let log_path = lock?.with_file_name(super::upgrade_muse::LOG);
+    let (tail, len) = read_jsonl_tail(&log_path, WINDOW)?;
+    Some((super::excerpt::muse_excerpts_from(&tail), len))
 }
 
 fn agy_exe_for(argv: &[String], user_home: &Path) -> Option<PathBuf> {
@@ -1334,15 +1849,28 @@ pub fn agy_subscription_for(
         let lower = m.to_ascii_lowercase();
         lower.contains("claude") || lower.contains("gpt")
     });
+    let same_email = prev.email.as_deref() == Some(email.as_str());
     let key = (config.clone(), email.clone(), third_party);
-    let cached = AGY_USAGE_CACHE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_ref()
-        .and_then(|map| map.get(&key).copied());
+    let other_key = (config.clone(), email.clone(), !third_party);
+    let (cached, other_cached) = {
+        let guard = AGY_USAGE_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let map = guard.as_ref();
+        (
+            map.and_then(|m| m.get(&key).copied()),
+            map.and_then(|m| m.get(&other_key).copied()),
+        )
+    };
+    let from_other_bucket = prev.weekly_figure.is_some_and(|fig| {
+        cached.and_then(|(_, f)| f) != Some(fig) && other_cached.and_then(|(_, f)| f) == Some(fig)
+    });
+    let prev_figure = (same_email && !from_other_bucket)
+        .then_some(prev.weekly_figure)
+        .flatten();
     let figure = match cached {
         Some((_, Some(fig))) if fig.current(now) => Some(fig),
-        Some((at, None)) if now.saturating_sub(at) < AGY_USAGE_RETRY_S => prev.weekly_figure,
+        Some((at, None)) if now.saturating_sub(at) < AGY_USAGE_RETRY_S => prev_figure,
         _ => {
             if let Some(exe) = agy_exe_for(argv, user_home) {
                 let fetched = fetch_agy_usage(&exe, &config, &home_dir, third_party, now);
@@ -1352,13 +1880,12 @@ pub fn agy_subscription_for(
                 guard
                     .get_or_insert_with(std::collections::HashMap::new)
                     .insert(key, (now, fetched));
-                fetched.or(prev.weekly_figure)
+                fetched.or(prev_figure)
             } else {
-                prev.weekly_figure
+                prev_figure
             }
         }
     };
-    let same_email = prev.email.as_deref() == Some(email.as_str());
     let figure = figure.filter(|f| f.words(now).is_some());
     let weekly = figure.and_then(|f| f.words(now)).or_else(|| {
         (same_email && prev.weekly_figure.is_none())
@@ -1477,6 +2004,7 @@ impl Selected {
             weekly_gap: None,
             label: None,
             weekly_reset: None,
+            account: self.profile.key,
         }
     }
 

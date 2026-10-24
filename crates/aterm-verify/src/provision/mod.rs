@@ -4,6 +4,7 @@
 //! Workspace tool provisioning (`targo --unverified verify provision`,
 //! [`aterm_uds::host::Provider::Workspace`], [`ROWS`], [`place`]).
 
+mod bash;
 mod fish;
 mod place;
 mod rows;
@@ -330,7 +331,11 @@ pub(crate) fn placed_browser(engine: Engine, machine: &Machine) -> Option<PathBu
 fn target(row: &Row, machine: &Machine) -> Option<Target> {
     let (os, arch) = machine.os_arch();
     match row.install {
-        Install::Unpack { .. } | Install::Build { .. } | Install::Cargo | Install::Files { .. } => {
+        Install::Unpack { .. }
+        | Install::Build { .. }
+        | Install::Configure { .. }
+        | Install::Cargo
+        | Install::Files { .. } => {
             let tool = row.tool_row()?;
             let pin = tool.pin?;
             if !pin.pinned_for(&machine.platform) {
@@ -541,6 +546,9 @@ pub fn provide_for(
                 .archive_for(&machine.platform)
                 .expect("target() found it");
             fish::build(&archive, &t, machine, host, say).map_err(Refused::from)
+        }
+        Install::Configure { source, patches } => {
+            bash::build(&source, patches, &t, machine, host, say).map_err(Refused::from)
         }
         Install::Cargo => return cargo_row(row, &t, machine, host, say),
         Install::Browser(engine) => return browser_row(engine, &t, machine, host, say),

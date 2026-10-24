@@ -1496,7 +1496,7 @@ mod tests {
                 Artifact::Font("fonts/F.ttf".to_string(), Some("Renamed.ttf".to_string())),
                 Artifact::Wrapper(
                     "demo".to_string(),
-                    "Demo.app/Contents/MacOS/demo".to_string(),
+                    "/Applications/Demo.app/Contents/MacOS/demo".to_string(),
                     vec!["--fixed".to_string()],
                     None,
                 ),
@@ -1930,15 +1930,21 @@ mod tests {
         }
     }
 
-    /// wezterm's shape: brew's `$APPDIR/WezTerm.app/...` binaries name
-    /// the app the cask installs, which its zip keeps in a folder; and
-    /// isabelle's: the app is a generic artifact installed into `$APPDIR/`.
+    /// wezterm's shape: brew's `$APPDIR/WezTerm.app/...` binaries and
+    /// command wrappers (blender's, firefox's) name the app the cask
+    /// installs, which its zip keeps in a folder; and isabelle's: the app is
+    /// a generic artifact installed into `$APPDIR/`.
     #[test]
     #[cfg(unix)]
     fn appdir_sources_resolve_to_the_app_the_cask_installs() {
         let tmp = aterm_tempfile::tempdir().unwrap();
         let machine = Machine::mac("arm64", "27.0", Some("27.0"), true);
         let binary = aterm_json::json!({"binary": ["$APPDIR/Demo.app/Contents/MacOS/demo"]});
+        let wrapper = |executable: &str| {
+            aterm_json::json!({"command_wrapper": [
+                "wrapdemo", {"executable": executable, "args": ["--fixed"]}
+            ]})
+        };
         let installs = |shape: &str, root: &str, installer: aterm_json::Value| {
             let plist = format!("{root}Demo.app/Contents/Info.plist");
             let script = format!("{root}Demo.app/Contents/MacOS/demo");
@@ -1952,7 +1958,7 @@ mod tests {
                 ZipMember {
                     name: &script,
                     mode: 0o100755,
-                    data: b"#!/bin/sh\nprintf 'demo ready\\n'\n",
+                    data: b"#!/bin/sh\nprintf 'demo ready [%s]\\n' \"$*\"\n",
                     deflate: false,
                 },
             ];
@@ -1962,7 +1968,7 @@ mod tests {
             let cask = Cask::from_api(&aterm_json::json!({
                 "token": "demo", "version": "1", "sha256": "no_check",
                 "url": format!("file://{}", archive.display()),
-                "artifacts": [installer, binary],
+                "artifacts": [installer, binary, wrapper("$APPDIR/Demo.app/Contents/MacOS/demo")],
             }))
             .unwrap();
             preflight(&prefix, &cask, &machine).unwrap();
@@ -1970,10 +1976,19 @@ mod tests {
                 install(&prefix, &cask, false, false, false, false).unwrap(),
                 "1"
             );
-            let output = aterm_uds::spawnfd::command(prefix.bin().join("demo"))
-                .output()
-                .unwrap();
-            assert_eq!(output.stdout, b"demo ready\n", "{shape}");
+            for (command, said) in [
+                ("demo", "demo ready []\n"),
+                ("wrapdemo", "demo ready [--fixed]\n"),
+            ] {
+                let output = aterm_uds::spawnfd::command(prefix.bin().join(command))
+                    .output()
+                    .unwrap();
+                assert_eq!(
+                    String::from_utf8_lossy(&output.stdout),
+                    said,
+                    "{shape} {command}"
+                );
+            }
         };
         installs(
             "wezterm",
@@ -2018,18 +2033,20 @@ mod tests {
                 "$APPDIR/Demo.app/Contents/MacOS/demo",
             ),
         ] {
-            let elsewhere = Cask::from_api(&aterm_json::json!({
-                "token": "demo", "version": "1", "sha256": "no_check", "url": "unused.zip",
-                "artifacts": [installer, {"binary": [source]}],
-            }))
-            .unwrap();
-            assert!(
-                matches!(
-                    preflight(&prefix, &elsewhere, &machine),
-                    Err(InstallError::PassThrough(why)) if why.contains("outside its payload")
-                ),
-                "{installer} {source}"
-            );
+            for artifact in [aterm_json::json!({"binary": [source]}), wrapper(source)] {
+                let elsewhere = Cask::from_api(&aterm_json::json!({
+                    "token": "demo", "version": "1", "sha256": "no_check", "url": "unused.zip",
+                    "artifacts": [installer.clone(), artifact.clone()],
+                }))
+                .unwrap();
+                assert!(
+                    matches!(
+                        preflight(&prefix, &elsewhere, &machine),
+                        Err(InstallError::PassThrough(why)) if why.contains("outside its payload")
+                    ),
+                    "{installer} {artifact}"
+                );
+            }
         }
     }
 

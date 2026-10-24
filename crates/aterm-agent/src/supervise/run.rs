@@ -292,6 +292,13 @@ pub struct Caps {
     pub await_agent: Option<bool>,
     /// Whether `status` reports a measured `input=` age.
     pub input: Option<bool>,
+    /// Whether the last `status` printed the session log's head (`log_seq= log_ep= … turn=`).
+    /// `None` until a `status` is read this session (or since a reconnect): the first busy
+    /// wait then reads one itself (6H-5, `log_wake`).
+    pub log: Option<bool>,
+    /// `Some(false)` once the host refused the loop's `await log` (an older build answers the
+    /// comma list `ERR usage`): the loop waits on the screen from then on.
+    pub await_log: Option<bool>,
 }
 
 /// Observed turn-end state comprising the classified [`Phase`] and [`Screen`].
@@ -3528,6 +3535,8 @@ impl<'a, C: Ctl> Session<'a, C> {
         // The last read held as still starting (its seq), and since when ([`FIRST_FRAME_HANG`]).
         let mut first_frame_still: Option<(u64, Instant)> = None;
         let mut settle_cap = SETTLE_CAP;
+        // The session log's cursor a timed-out log wait left standing ([`Self::log_wake`]).
+        let mut log_at: Option<log_wake::LogHead> = None;
         loop {
             // The hosted loop's stop ends a turn that may run for hours:
             // the look it returns to says so ([`Self::look`]). Checked here
@@ -3543,9 +3552,23 @@ impl<'a, C: Ctl> Session<'a, C> {
                 .min(self.setup.wait_step);
             let mut unsettled = false;
             let mut settled = false;
+            // A READ SHOWED THE TURN RUNNING (`footer_seen`, the busy row up): the log may
+            // wake the wait for its end, and the read after it still decides (6H-5,
+            // [`log_wake`]). A cursor stands only from one such wait to the next.
+            let on_the_log = footer_seen && matches!(next, Next::Gone(_));
+            if !on_the_log {
+                log_at = None;
+            }
             match &next {
                 Next::Gone(busy) => {
-                    self.wait_gone(busy, busy.step(step))?;
+                    let woke = if on_the_log {
+                        self.log_wake(&mut log_at, busy.step(step))?
+                    } else {
+                        log_wake::LogWoke::Screen
+                    };
+                    if woke == log_wake::LogWoke::Screen {
+                        self.wait_gone(busy, busy.step(step))?;
+                    }
                     unsettled = true;
                 }
                 Next::Settle => {
@@ -6929,6 +6952,8 @@ pub use host_door::IdleHost;
 mod facts_loop;
 #[path = "lifecycle.rs"]
 mod lifecycle;
+#[path = "log_wake.rs"]
+mod log_wake;
 #[path = "occupancy_loop.rs"]
 mod occupancy_loop;
 #[path = "press.rs"]

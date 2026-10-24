@@ -54,6 +54,12 @@ pub const RESETS_IN_S: i64 = 5;
 /// Number of Land nudges issued before the model returns a clean defense.
 pub const NUDGES_BEFORE_DEFENSE: usize = 4;
 
+/// The task `spawn agent=codex` hands the worker leg.
+pub const WORKER_TASK: &str = "Write the worker's report.";
+
+/// The worker leg's report, the words its `result` carries.
+pub const WORKER_REPORT: &str = "Wrote the worker's report: the lab's task is done.";
+
 /// First-leg reply claiming completion with the retired done token.
 pub const FIRST_DONE: &str = "Hello from the lab model. Nothing else to do.\n\nATERM-TASK-DONE";
 
@@ -332,6 +338,7 @@ pub fn answer(body: &J) -> Answered {
     }
     let mut a = match (leg.as_str(), step) {
         ("first", Step::Person) => say(FIRST_DONE),
+        ("worker", Step::Person) => say(WORKER_REPORT),
         ("needs", Step::Person) => say(NEEDS_REPORT),
         ("needs", Step::Continue | Step::Other) if texts_after_prompt(body) == 1 => {
             slow(NEEDS_PLAIN, NEEDS_HOLD)

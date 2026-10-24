@@ -671,6 +671,24 @@ pub(crate) const DISPLAY_FACE_NAME_AUDIT: &str = "settings.text.display-face-nam
 /// About's WORDMARK, its label "aterm", in the hero's type.
 pub(crate) const WORDMARK_AUDIT: &str = "settings.about.wordmark";
 
+/// System State's BRAND LOCKUP (`docs/DESIGN-system-state-2026-10-21.md`
+/// §3.1, [`crate::system_state::paint_brand`]): `❯ aterm · ALab▌` in the
+/// terminal's mono face over a dim six-stripe ribbon, and the rainbow kitty
+/// after the caret. Paint only; its value is the lockup's
+/// [`crate::system_state::BrandSpec`], and its accessible parent names it.
+pub(crate) const SYSTEM_STATE_BRAND_AUDIT: &str = "system-state.brand";
+
+/// A System State row's CHIP (§3.3, [`crate::system_state::paint_chip`]):
+/// ✓, `Will change`, `Needs you`, `Failed` or the quiet `Left as is`,
+/// right-aligned in its rect. Paint only; its value is the chip's word, and
+/// the row's accessible label says it.
+pub(crate) const SYSTEM_STATE_CHIP_AUDIT: &str = "system-state.chip";
+
+/// System State's run METER (§3.2, [`crate::system_state::paint_meter`]): a
+/// thin capsule while a run is going. Paint only; its value is `done,total`,
+/// and the headline says the same in words.
+pub(crate) const SYSTEM_STATE_METER_AUDIT: &str = "system-state.meter";
+
 /// The size and face a [`WORDMARK_AUDIT`] node paints `label` in, in a node `width` wide.
 pub(crate) fn wordmark_typography(
     label: &str,
@@ -2434,6 +2452,7 @@ fn ink_marks(
                 }
             }
             DrawPrim::BandIcon { x, y, size, .. } => (None, LogicalRect::new(*x, *y, *size, *size)),
+            DrawPrim::Image { x, y, w, h, .. } => (None, LogicalRect::new(*x, *y, *w, *h)),
             _ => continue,
         };
         if let Some(rect) = rect.intersect(current).filter(|rect| !rect.is_empty()) {
@@ -2660,6 +2679,22 @@ fn is_named_row(node: &UiNode) -> bool {
 }
 
 fn row_words_whole(row: &UiNode, rect: LogicalRect, list: ListContext) -> bool {
+    row_words_band(row, rect).is_none_or(|(top, bottom)| {
+        top >= list.top_edge - CLIP_EDGE_EPSILON
+            && list
+                .bottom_edge
+                .is_none_or(|edge| bottom <= edge + CLIP_EDGE_EPSILON)
+    })
+}
+
+/// The band, from the top of named row `row` laid out `height` tall, its words paint in ([`row_words_whole`]).
+pub(crate) fn named_row_words(row: &UiNode, height: f32) -> Option<(f32, f32)> {
+    is_named_row(row)
+        .then(|| row_words_band(row, LogicalRect::new(0.0, 0.0, 4096.0, height)))
+        .flatten()
+}
+
+fn row_words_band(row: &UiNode, rect: LogicalRect) -> Option<(f32, f32)> {
     fn walk(node: &UiNode, rect: LogicalRect, each: &mut dyn FnMut(&UiNode, LogicalRect)) {
         each(node, rect);
         if is_list_control(node) {
@@ -2677,9 +2712,9 @@ fn row_words_whole(row: &UiNode, rect: LogicalRect, list: ListContext) -> bool {
     }
     let theme = aterm_render::Theme::default();
     let roles = crate::settings::Roles::from_theme(theme);
-    let mut whole = true;
+    let mut band: Option<(f32, f32)> = None;
     walk(row, rect, &mut |node, rect| {
-        if !whole || !matches!(node.content, UiContent::Text(_)) {
+        if !matches!(node.content, UiContent::Text(_)) {
             return;
         }
         let words = PaintNode {
@@ -2694,18 +2729,15 @@ fn row_words_whole(row: &UiNode, rect: LogicalRect, list: ListContext) -> bool {
         };
         let mut prims = Vec::new();
         paint_compiled_node(&mut prims, &words, roles, theme, 14.0);
-        whole = prims.iter().all(|prim| match prim {
-            crate::widget::DrawPrim::Text { baseline, px, .. } => {
+        for prim in &prims {
+            if let crate::widget::DrawPrim::Text { baseline, px, .. } = prim {
                 let (top, bottom) = word_line_band(*baseline, *px);
-                top >= list.top_edge - CLIP_EDGE_EPSILON
-                    && list
-                        .bottom_edge
-                        .is_none_or(|edge| bottom <= edge + CLIP_EDGE_EPSILON)
+                band =
+                    Some(band.map_or((top, bottom), |(from, to)| (from.min(top), to.max(bottom))));
             }
-            _ => true,
-        });
+        }
     });
-    whole
+    band
 }
 
 fn cuts_own_words(key: &UiKey, content: &UiContent, rect: LogicalRect, edges: CutEdges) -> bool {
@@ -2797,6 +2829,11 @@ pub(crate) struct CompiledUi {
     pub(crate) default_action: Option<(UiKey, ActionId)>,
     pub(crate) segment_groups: Vec<SegmentGroup>,
     pub(crate) list_pictures: Vec<ListPicture>,
+    /// THE TAB STOPS OF A LIST THAT HOLDS EVERY ROW ([`ListRoom::lists_all`]),
+    /// in reading order, on its screen or off it: what Tab walks through
+    /// that list ([`Self::tab_past_screen`]), where [`Self::focus_order`]
+    /// holds only the stops its screen shows.
+    pub(crate) list_stops: Vec<UiKey>,
 }
 
 /// The picture of a control a list draws in the strip under its room ([`CompiledUi::list_pictures`]).
@@ -2813,7 +2850,110 @@ pub(crate) struct SegmentGroup {
     pub(crate) segments: Vec<UiKey>,
 }
 
+/// TAB ENTERS A LIST WHOSE SCREEN SHOWS NONE OF ITS CONTROLS: where a Tab
+/// (`forward`) or Shift-Tab passes over a scrolling list in reading order and
+/// Tab `order` holds none of its `controls` (its screen shows words only — a
+/// hero, a status card, a row's note), the list's first control (Shift-Tab:
+/// its last). `None` where the screen shows one of its controls (Tab walks
+/// into it, [`tab_past_screen`]) or the list holds none.
+pub(crate) fn tab_into_unshown_list<'a>(
+    controls: &[&'a UiKey],
+    forward: bool,
+    order: &[UiKey],
+) -> Option<&'a UiKey> {
+    if controls.iter().any(|key| order.contains(key)) {
+        return None;
+    }
+    if forward {
+        controls.first().copied()
+    } else {
+        controls.last().copied()
+    }
+}
+
+/// TAB WALKS THE WHOLE LIST, not just its screen: Tab (`forward`) or
+/// Shift-Tab from `current` to the window's next control in Tab `order`
+/// (`next`) is kept within the list's screen, but where it would leave the
+/// list from one of its `controls` (top to bottom; `index_of` says where a
+/// key stands among them, a segment where its control does) it moves to the
+/// list's next or previous control instead, and where it enters the list
+/// from a control outside it starts at the list's first control (Shift-Tab:
+/// its last); the list scrolls to it. A focus that is no stop of `order` and
+/// no control of the list (it left the order, s-25) is not entering: `next`
+/// is already where it stood. `None` keeps `next`.
+pub(crate) fn tab_past_screen(
+    controls: &[&UiKey],
+    index_of: impl Fn(&UiKey) -> Option<usize>,
+    current: &UiKey,
+    next: &UiKey,
+    forward: bool,
+    order: &[UiKey],
+) -> Option<UiKey> {
+    // A segment is its control here: Tab from one leaves the control, and
+    // never lands on another segment of it.
+    let target = match (index_of(current), index_of(next)) {
+        (Some(index), Some(after)) if index == after => {
+            if forward {
+                controls.get(index + 1)
+            } else {
+                controls.get(index.checked_sub(1)?)
+            }
+        }
+        (Some(index), None) if forward => controls.get(index + 1),
+        (Some(index), None) => controls.get(index.checked_sub(1)?),
+        (None, Some(_)) if !order.contains(current) => None,
+        (None, Some(_)) if forward => controls.first(),
+        (None, Some(_)) => controls.last(),
+        (Some(_), Some(_)) | (None, None) => None,
+    }?;
+    (*target != next).then(|| (*target).clone())
+}
+
 impl CompiledUi {
+    /// Where `key` stands among [`Self::list_stops`]: a segment where its
+    /// control's stop does.
+    fn list_stop_index(&self, key: &UiKey) -> Option<usize> {
+        self.list_stops
+            .iter()
+            .position(|stop| stop == key)
+            .or_else(|| {
+                let group = self
+                    .segment_groups
+                    .iter()
+                    .find(|group| group.segments.contains(key))?;
+                self.list_stops
+                    .iter()
+                    .position(|stop| group.segments.contains(stop))
+            })
+    }
+
+    /// [`tab_into_unshown_list`] over the list that holds every row
+    /// ([`Self::list_stops`]), in this page's Tab order.
+    pub(crate) fn tab_into_unshown_list(&self, forward: bool) -> Option<UiKey> {
+        let controls: Vec<&UiKey> = self.list_stops.iter().collect();
+        tab_into_unshown_list(&controls, forward, &self.focus_order).cloned()
+    }
+
+    /// [`tab_past_screen`] over the list that holds every row
+    /// ([`Self::list_stops`]), in this page's Tab order: Tab from the last
+    /// control its screen shows goes on to its next one, off the screen.
+    pub(crate) fn tab_past_screen(
+        &self,
+        current: &UiKey,
+        next: &UiKey,
+        forward: bool,
+    ) -> Option<UiKey> {
+        let controls: Vec<&UiKey> = self.list_stops.iter().collect();
+        tab_past_screen(
+            &controls,
+            |key| self.list_stop_index(key),
+            current,
+            next,
+            forward,
+            &self.focus_order,
+        )
+    }
+
     /// THE STRIP UNDER A LIST'S ROOM TAKES A PRESS AS A SCROLL.
     pub(crate) fn list_picture_at(&self, x: f32, y: f32) -> Option<&UiKey> {
         self.list_pictures
@@ -4119,6 +4259,13 @@ fn text_fit_audit(node: &PaintNode) -> Option<TextFitAudit> {
             } else if spec.audit_id == WORDMARK_AUDIT {
                 let (size, face) = wordmark_typography(&spec.label, node.rect.width);
                 crate::tray_raster::ui_text_width_for(face, &spec.label, size.get())
+            } else if spec.audit_id == SYSTEM_STATE_BRAND_AUDIT {
+                crate::system_state::BrandSpec::parse(spec.value.as_deref()).width()
+            } else if spec.audit_id == SYSTEM_STATE_CHIP_AUDIT {
+                crate::system_state::Chip::parse(spec.value.as_deref())
+                    .map_or(0.0, crate::system_state::Chip::width)
+            } else if spec.audit_id == SYSTEM_STATE_METER_AUDIT {
+                0.0
             } else {
                 crate::tray_raster::ui_text_width(&spec.label, native_type_px(TypeStep::Body).get())
             };
@@ -5496,6 +5643,18 @@ fn paint_compiled_node(
                         rim,
                     );
                 }
+                return;
+            }
+            if spec.audit_id == SYSTEM_STATE_BRAND_AUDIT {
+                crate::system_state::paint_brand(prims, rect, spec.value.as_deref(), &roles);
+                return;
+            }
+            if spec.audit_id == SYSTEM_STATE_CHIP_AUDIT {
+                crate::system_state::paint_chip(prims, rect, spec.value.as_deref(), &roles);
+                return;
+            }
+            if spec.audit_id == SYSTEM_STATE_METER_AUDIT {
+                crate::system_state::paint_meter(prims, rect, spec.value.as_deref(), &roles);
                 return;
             }
             if spec.audit_id == WORDMARK_AUDIT {
@@ -7916,7 +8075,7 @@ impl Compiler {
                 &layout,
                 children,
                 rect,
-                parent,
+                (parent, list.filter(|list| list.lists_all)),
                 (projection, description, value_text, paint_only),
             );
         }
@@ -7931,7 +8090,7 @@ impl Compiler {
                     &layout,
                     children,
                     rect,
-                    parent,
+                    (parent, list),
                     (projection, description, value_text, paint_only),
                 );
             }
@@ -7974,6 +8133,11 @@ impl Compiler {
                     });
                 }
                 if list.lists_all {
+                    // Still one of the list's stops: Tab reaches it, and the
+                    // list scrolls it whole into view, as an offscreen one.
+                    if projection.focusable && !self.not_tab_stops.contains(&key) {
+                        self.output.list_stops.push(key.clone());
+                    }
                     self.output.semantics.push(SemanticNode {
                         key,
                         parent: parent.cloned(),
@@ -8006,6 +8170,13 @@ impl Compiler {
             Some(shown) if !paint_only => Some(shown),
             _ => None,
         };
+        if list.is_some_and(|list| list.lists_all)
+            && !paint_only
+            && projection.focusable
+            && !self.not_tab_stops.contains(&key)
+        {
+            self.output.list_stops.push(key.clone());
+        }
         if let Some(list) = list
             && !paint_only
             && projection.action.is_some()
@@ -8119,13 +8290,14 @@ impl Compiler {
         Ok(())
     }
 
+    /// A node off its screen, under `parent`: one of [`CompiledUi::list_stops`] only in `list`, a list that holds every row.
     fn offscreen_node(
         &mut self,
         key: UiKey,
         layout: &Layout,
         children: Vec<UiNode>,
         rect: LogicalRect,
-        parent: Option<&UiKey>,
+        (parent, list): (Option<&UiKey>, Option<ListContext>),
         (projection, description, value_text, paint_only): (
             SemanticProjection,
             Option<String>,
@@ -8134,6 +8306,9 @@ impl Compiler {
         ),
     ) -> Result<(), CompileError> {
         if !paint_only {
+            if list.is_some() && projection.focusable && !self.not_tab_stops.contains(&key) {
+                self.output.list_stops.push(key.clone());
+            }
             self.output.semantics.push(SemanticNode {
                 key: key.clone(),
                 parent: parent.cloned(),
@@ -8153,7 +8328,7 @@ impl Compiler {
         let child_rects = layout_children(layout, &children, rect.inset(layout.padding))?;
         for (mut child, child_rect) in children.into_iter().zip(child_rects) {
             child.offscreen = true;
-            self.node(child, child_rect, child_rect, parent, None)?;
+            self.node(child, child_rect, child_rect, parent, list)?;
         }
         Ok(())
     }

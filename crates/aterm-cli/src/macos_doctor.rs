@@ -12,12 +12,15 @@ use aterm_types::macos_setup::{Selection, Setting};
 mod initial;
 pub use initial::{
     InitialSetupAdmission, InitialSetupAuthorization, InitialSetupObservation,
-    InitialSetupObserved, InitialSetupRestart, InitialSetupSnapshot, InitialSetupSnapshotError,
-    apply_initial_setup, apply_initial_setup_observed, authorize_initial_setup,
-    authorize_initial_setup_observed, check_initial_setup, check_initial_setup_observed,
-    initial_setup_admission, initial_setup_finished, initial_setup_observation,
-    initial_setup_revision, initial_setup_snapshot, initial_setup_status, restart_initial_setup,
-    restart_initial_setup_observed, validate_initial_setup_plan,
+    InitialSetupObserved, InitialSetupParkMark, InitialSetupRestart, InitialSetupSnapshot,
+    InitialSetupSnapshotError, SetupHooks, SetupNext, StageEvent, alab_mac, apply_initial_setup,
+    apply_initial_setup_observed, authorize_initial_setup, authorize_initial_setup_observed,
+    automatic_plan, check_initial_setup, check_initial_setup_observed,
+    initial_setup_access_revision, initial_setup_admission, initial_setup_finished,
+    initial_setup_observation, initial_setup_park_mark, initial_setup_revision,
+    initial_setup_snapshot, initial_setup_status, observe_initial_setup,
+    request_initial_setup_stop, restart_initial_setup, restart_initial_setup_observed,
+    run_initial_setup_pass, upgrade_provisional_setup, validate_initial_setup_plan,
 };
 #[cfg(any(test, debug_assertions))]
 pub use initial::{initial_setup_observation_at, initial_setup_snapshot_at};
@@ -52,8 +55,8 @@ impl Action {
 pub struct Row {
     /// Human-readable setting name.
     pub name: String,
-    /// `ok`, `drift`, `applied`, `restored`, `blocked`, `unverified` or `error`; a setup
-    /// snapshot's rows also `pending`, `running` or `stopped`.
+    /// `ok`, `drift`, `applied`, `restored`, `blocked`, `waiting`, `unverified` or `error`; a
+    /// setup snapshot's rows also `pending`, `running` or `stopped`.
     pub status: String,
     /// Action or failure detail, without account identifiers.
     pub detail: String,
@@ -80,7 +83,7 @@ impl Report {
         self.rows.iter().any(|r| {
             matches!(
                 r.status.as_str(),
-                "drift" | "error" | "blocked" | "unverified"
+                "drift" | "error" | "blocked" | "waiting" | "unverified"
             )
         })
     }
@@ -152,6 +155,10 @@ pub fn run_observed(action: Action) -> InitialSetupObserved<Report> {
         |root| {
             if action == Action::Apply {
                 initial::save_explicit_workstation_plan(root)?;
+            }
+            if action == Action::Restore {
+                // Restore puts the earlier values back: nothing is "at login" now.
+                initial::forget_at_login(root);
             }
             let report = execute(&mut NativeHost::new(), root, action)?;
             if action == Action::Apply && !report.needs_attention() {
@@ -225,13 +232,13 @@ fn authorized_selection_with_flush(
     Ok(Some(selected))
 }
 
-/// Exclusive ownership of the automatic countdown and its subsequent retry worker.
+/// Exclusive ownership of the automatic offer and its subsequent retry worker.
 #[must_use = "keep the claim alive until the automatic setup worker ends"]
 pub struct AutomaticSetupClaim {
     _lock: HeldLock,
 }
 
-/// Claim the automatic countdown without inspecting preferences or accounts.
+/// Claim the automatic offer without inspecting preferences or accounts.
 pub fn claim_automatic_setup() -> Result<Option<AutomaticSetupClaim>, String> {
     ensure_person_scope()?;
     claim_automatic_setup_at(&state_root()?)
@@ -241,6 +248,14 @@ pub fn claim_automatic_setup() -> Result<Option<AutomaticSetupClaim>, String> {
 pub fn claim_initial_setup_rerun() -> Result<Option<AutomaticSetupClaim>, String> {
     ensure_person_scope()?;
     Ok(HeldLock::try_take_named(&state_root()?, "automatic.lock")?
+        .map(|lock| AutomaticSetupClaim { _lock: lock }))
+}
+
+/// [`claim_initial_setup_rerun`] in `root`, a test's scratch folder: the same
+/// lock, never the person's state root.
+#[cfg(any(test, debug_assertions))]
+pub fn claim_initial_setup_rerun_at(root: &Path) -> Result<Option<AutomaticSetupClaim>, String> {
+    Ok(HeldLock::try_take_named(root, "automatic.lock")?
         .map(|lock| AutomaticSetupClaim { _lock: lock }))
 }
 
@@ -268,16 +283,48 @@ pub fn apply_on_first_run() -> Result<Option<Report>, String> {
 }
 
 fn apply_on_first_run_at(root: &Path) -> Result<Option<Report>, String> {
+    apply_part_at(root, Part::All)
+}
+
+/// The Workstation stage of a setup run: the selected preferences, without the
+/// sign-outs, which are the Accounts stage's and run last.
+fn apply_preferences_at(root: &Path) -> Result<Option<Report>, String> {
+    apply_part_at(root, Part::Preferences)
+}
+
+/// The Accounts stage of a setup run: the selected Messages and FaceTime
+/// sign-outs, with the one Accessibility request they need. A sign-out opens
+/// Messages or FaceTime, presses its controls, and may raise macOS's
+/// Accessibility and Automation prompts, so it runs only while System State is
+/// on screen (`on_screen`, System State design §6); until then the stage waits
+/// for the page. Accounts signed out already need neither, and finish here.
+fn apply_accounts_at(root: &Path, on_screen: bool) -> Result<Option<Report>, String> {
+    apply_part_at(root, Part::Accounts { on_screen })
+}
+
+/// Which part of the authorized selection one unattended pass applies: all of it
+/// (the first-run entry), or one stage of a System State setup run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Part {
+    All,
+    Preferences,
+    Accounts { on_screen: bool },
+}
+
+fn apply_part_at(root: &Path, part: Part) -> Result<Option<Report>, String> {
     let sys = aterm_machines::port::Live::new();
-    apply_on_first_run_with(
+    apply_part_with(
         root,
         &sys,
         &mut NativeHost::new(),
         &aterm_types::version::build_id(),
         std::time::SystemTime::now(),
+        part,
     )
 }
 
+/// [`apply_on_first_run_at`] on `sys` and `host`, as `build` at `now`.
+#[cfg(test)]
 fn apply_on_first_run_with(
     root: &Path,
     sys: &dyn System,
@@ -285,15 +332,62 @@ fn apply_on_first_run_with(
     build: &str,
     now: std::time::SystemTime,
 ) -> Result<Option<Report>, String> {
-    if first_run_complete(root)? {
-        return Ok(None);
-    }
-    let Some(selected) = authorized_selection(root)? else {
-        return Ok(None);
+    apply_part_with(root, sys, host, build, now, Part::All)
+}
+
+/// One unattended pass over `part` of the authorized selection, on `sys` and `host`, as `build` at `now`: what each stage of the System State worker runs.
+fn apply_part_with(
+    root: &Path,
+    sys: &dyn System,
+    host: &mut dyn Host,
+    build: &str,
+    now: std::time::SystemTime,
+    part: Part,
+) -> Result<Option<Report>, String> {
+    let selected = match part {
+        Part::All => {
+            if first_run_complete(root)? {
+                return Ok(None);
+            }
+            let Some(selected) = authorized_selection(root)? else {
+                return Ok(None);
+            };
+            if selected.is_empty() {
+                authorize_automatic_setup_at(root, selected)?;
+                return Ok(None);
+            }
+            selected
+        }
+        Part::Preferences | Part::Accounts { .. } => {
+            let Some(selected) = authorized_selection(root)? else {
+                return Ok(None);
+            };
+            let selected = if part == Part::Preferences {
+                initial::preferences(selected)
+            } else {
+                initial::accounts(selected)
+            };
+            if selected.is_empty() {
+                return Ok(None);
+            }
+            selected
+        }
     };
-    if selected.is_empty() {
-        authorize_automatic_setup_at(root, selected)?;
-        return Ok(None);
+    if part == (Part::Accounts { on_screen: false })
+        && aterm_machines::init_accounts::accessibility_needed_selected(sys, selected) != Ok(false)
+    {
+        return Ok(Some(Report {
+            action: Action::Apply,
+            rows: vec![Row {
+                name: "Messages and FaceTime sign-out".into(),
+                status: initial::WAITING.into(),
+                detail: "runs while System State is on screen: it opens Messages and FaceTime, \
+                         and macOS may ask for Accessibility"
+                    .into(),
+            }],
+            manual_steps: Vec::new(),
+            backup: root.join("original-preferences.json"),
+        }));
     }
     let accounts_selected =
         selected.contains(Setting::Messages) || selected.contains(Setting::FaceTime);
@@ -318,13 +412,25 @@ fn apply_on_first_run_with(
             .map_err(|e| format!("{}: {e}", consent.display()))?
         && aterm_machines::init_accounts::accessibility_needed_selected(sys, selected)
             .unwrap_or(false)
+        && let Some(_dialog) = aterm_types::macos_setup::MacosDialog::when_none_up(
+            aterm_types::macos_setup::DIALOG_WAIT,
+        )
     {
         write_json(
             &consent,
             &json!({ "profile": PROFILE, "state": "requested" }),
         )?;
-        if let Err(detail) = aterm_machines::init_accounts::request_accessibility(sys) {
-            request_failure = Some(detail);
+        match aterm_machines::init_accounts::request_accessibility(sys) {
+            Err(detail) => request_failure = Some(detail),
+            Ok(true) => {}
+            Ok(false) => {
+                let deadline = std::time::Instant::now() + aterm_types::macos_setup::DIALOG_WAIT;
+                while std::time::Instant::now() < deadline
+                    && aterm_machines::init_accounts::accessibility_ready(sys) != Ok(true)
+                {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+            }
         }
     }
     host.select(selected);
@@ -341,91 +447,14 @@ fn apply_on_first_run_with(
     Ok(Some(report))
 }
 
-/// Cancel automatic setup until `aterm doctor --apply` or a System State rerun starts it again.
-pub fn cancel_automatic_setup() -> Result<(), String> {
-    InitialSetupCancellation::default().persist().map(|_| ())
-}
-
+/// The record an older aterm's Cancel left in `root`.
 #[cfg(test)]
-fn cancel_automatic_setup_at(root: &Path) -> Result<(), String> {
-    InitialSetupCancellation::default()
-        .persist_at(root)
-        .map(|_| ())
-}
-
-/// A retained Cancel choice, bound to the first readable setup run.
-#[derive(Default)]
-pub struct InitialSetupCancellation {
-    revision: Option<u64>,
-}
-
-impl InitialSetupCancellation {
-    /// Persist this choice through transient errors.
-    pub fn persist(&mut self) -> Result<bool, String> {
-        self.persist_observed().result
-    }
-
-    /// Keep this choice's result bound to its observed setup state.
-    pub fn persist_observed(&mut self) -> InitialSetupObserved<bool> {
-        let root = state_root();
-        let before = root
-            .as_ref()
-            .ok()
-            .and_then(|root| initial::observation_at(root).ok());
-        if let Err(why) = ensure_person_scope() {
-            return InitialSetupObserved::new(Err(why), before);
-        }
-        match root {
-            Ok(root) => self.persist_observed_at(&root, before),
-            Err(why) => InitialSetupObserved::new(Err(why), before),
-        }
-    }
-
-    #[cfg(test)]
-    fn persist_at(&mut self, root: &Path) -> Result<bool, String> {
-        self.persist_observed_at(root, initial::observation_at(root).ok())
-            .result
-    }
-
-    fn persist_observed_at(
-        &mut self,
-        root: &Path,
-        before: Option<InitialSetupObservation>,
-    ) -> InitialSetupObserved<bool> {
-        let revision = match self.revision {
-            Some(revision) => revision,
-            None => {
-                let revision = match initial::revision_at(root) {
-                    Ok(revision) => revision,
-                    Err(why) => return InitialSetupObserved::new(Err(why), before),
-                };
-                self.revision = Some(revision);
-                revision
-            }
-        };
-        initial::observe_mutation_at(
-            root,
-            before,
-            Err("another doctor profile pass is running".into()),
-            |root| {
-                if initial::revision_at(root)? != revision {
-                    return Ok(false);
-                }
-                cancel_automatic_setup_locked_at(root)?;
-                Ok(true)
-            },
-        )
-    }
-}
-
-fn cancel_automatic_setup_locked_at(root: &Path) -> Result<(), String> {
-    if initial::finished_at(root)? {
-        return Ok(());
-    }
+fn write_legacy_cancel_at(root: &Path) {
     write_json(
         &root.join("first-run.json"),
         &json!({ "profile": PROFILE, "state": "cancelled" }),
     )
+    .expect("an older aterm's Cancel record");
 }
 
 /// Whether automatic setup was fully verified, explicitly restored, or cancelled.
@@ -488,13 +517,13 @@ fn automatic_retry_due(
     Ok(age.map_or(true, |age| age >= std::time::Duration::from_secs(60)))
 }
 
-const HELD: &str = "aterm tried this by itself and it did not take, so this build does not try it again on its own; Apply in System State, or run aterm doctor --apply, to try again";
+const HELD: &str = "aterm tried this by itself and it did not take, so this build does not try it again on its own; Set up now in System State, or run aterm doctor --apply, to try again";
 
-const WAITING: &str = "aterm tried this by itself and it did not take; it tries once more on its own at setup's next try or aterm's next launch once ten minutes have passed; Apply in System State, or run aterm doctor --apply, to try now";
+const WAITING: &str = "aterm tried this by itself and it did not take; it tries once more on its own at setup's next try or aterm's next launch once ten minutes have passed; Set up now in System State, or run aterm doctor --apply, to try now";
 
-const SETTLED: &str = "this setup had it as wanted once and it has changed since; Apply in System State, or run aterm doctor --apply, to set it again";
+const SETTLED: &str = "this setup had it as wanted once and it has changed since; Set up now in System State, or run aterm doctor --apply, to set it again";
 
-const SETTLED_OWED: &str = "Notification Center's widget list is left to the Full Disk Access follow-up, whose row says how that went; Apply in System State, or run aterm doctor --apply, to clear it now";
+const SETTLED_OWED: &str = "Notification Center's widget list is left to setup's own step for it, whose row says how that went; aterm set the rest once in this setup and leaves it as it is now; Set up now in System State, or run aterm doctor --apply, to set it all now";
 
 const TRIES: u32 = 2;
 
@@ -898,17 +927,7 @@ impl HeldLock {
     }
 
     fn try_take_named(root: &Path, name: &str) -> Result<Option<Self>, String> {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        std::fs::create_dir_all(root).map_err(|e| format!("{}: {e}", root.display()))?;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
-            .open(root.join(name))
-            .map_err(|e| format!("doctor lock: {e}"))?;
+        let file = Self::open_named(root, name)?;
         #[expect(
             clippy::disallowed_methods,
             reason = "HeldLock::drop releases by LOCK_UN before closing, including child-spawn paths"
@@ -918,6 +937,32 @@ impl HeldLock {
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
             Err(std::fs::TryLockError::Error(e)) => Err(format!("doctor profile lock: {e}")),
         }
+    }
+
+    /// Wait only for a short record protocol, never for the profile's OS work.
+    fn take_named(root: &Path, name: &str) -> Result<Self, String> {
+        let file = Self::open_named(root, name)?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "HeldLock::drop releases by LOCK_UN before closing, including child-spawn paths"
+        )]
+        file.lock()
+            .map_err(|error| format!("doctor lock: {error}"))?;
+        Ok(Self(file))
+    }
+
+    fn open_named(root: &Path, name: &str) -> Result<std::fs::File, String> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::create_dir_all(root).map_err(|e| format!("{}: {e}", root.display()))?;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
+            .open(root.join(name))
+            .map_err(|e| format!("doctor lock: {e}"))
     }
 }
 
@@ -1213,6 +1258,9 @@ impl Host for NativeHost {
             use aterm_machines::items::defaults::Scope;
             use aterm_machines::model::Read;
             let result = prepared.run_recording(self.sys.as_ref(), mode)?;
+            if let Ok(root) = state_root() {
+                initial::note_at_login(&root, initial::changed_at_login(result.tagged()));
+            }
             let attempts = result
                 .attempts
                 .into_iter()
@@ -1267,14 +1315,7 @@ impl Host for NativeHost {
         Ok({
             rows.into_iter()
                 .map(|row| {
-                    let status = match row.outcome {
-                        Outcome::Ok | Outcome::NotApplicable => "ok",
-                        Outcome::Changed => "applied",
-                        Outcome::Planned => "drift",
-                        Outcome::Person | Outcome::Blocked | Outcome::Deferred => "blocked",
-                        Outcome::Unknown => "unverified",
-                        Outcome::Failed => "error",
-                    };
+                    let status = initial::row_status(&row);
                     Row {
                         name: row.title,
                         status: status.into(),
@@ -1602,7 +1643,10 @@ fn execute_pass(
         });
         return Ok(report.into());
     }
-    let full_profile = host.selection().workstation() == Selection::all().workstation();
+    // The sign-outs are their own stage now: a pass of every preference is the
+    // full profile's, with or without them.
+    let full_profile =
+        initial::preferences(host.selection()) == initial::preferences(Selection::all());
     let previous_activation = if full_profile {
         pending_refresh(root)?
     } else {
@@ -1941,8 +1985,7 @@ fn follow_up_at(
     let mut selected = Selection::none();
     for item in &record.items {
         if let Some(setting) = aterm_machines::init_preferences::setting_of(item)
-            && chosen
-                .is_none_or(|chosen| chosen.workstation().is_empty() || chosen.contains(setting))
+            && chosen.is_none_or(|chosen| chosen.contains(setting))
         {
             selected.set(setting, true);
         }
@@ -3519,7 +3562,7 @@ mod tests {
             "the slot, after the follow-up and its lock"
         );
         record_withheld(root.path(), &[WIDGETS.to_owned()], &[], &[], (BUILD, 0)).unwrap();
-        cancel_automatic_setup_at(root.path()).unwrap();
+        write_legacy_cancel_at(root.path());
         let unbuilt = || -> Result<Fake, String> { panic!("a stopped setup measures nothing") };
         assert!(
             follow_up_finished_at(root.path(), reserve, unbuilt, BUILD, now)
@@ -3569,7 +3612,7 @@ mod tests {
                     execute(&mut doctor.host, root.path(), Action::Restore).unwrap();
                     assert!(Withholding::withheld(root.path()).is_empty());
                 }
-                "cancel" => cancel_automatic_setup_at(root.path()).unwrap(),
+                "cancel" => write_legacy_cancel_at(root.path()),
                 "unchecked" => save_automatic_plan(root.path(), dock).unwrap(),
                 _ => {}
             }
@@ -4891,10 +4934,10 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_is_durable_until_explicit_apply_and_check_leaves_it_alone() {
+    fn an_older_cancel_is_durable_until_explicit_apply_and_check_leaves_it_alone() {
         let root = aterm_tempfile::tempdir().expect("scratch");
         assert!(!first_run_complete(root.path()).expect("new profile"));
-        cancel_automatic_setup_at(root.path()).expect("cancel");
+        write_legacy_cancel_at(root.path());
         assert!(first_run_complete(root.path()).expect("cancelled profile"));
         let marker_path = root.path().join("first-run.json");
         let cancelled = std::fs::read(&marker_path).expect("durable cancellation");
@@ -4923,33 +4966,6 @@ mod tests {
                 .as_str(),
             Some("pending")
         );
-    }
-
-    #[test]
-    fn cancellation_preserves_completed_decisions_and_cannot_race_an_apply() {
-        let root = aterm_tempfile::tempdir().expect("scratch");
-        let marker_path = root.path().join("first-run.json");
-        for marker in [
-            json!({ "profile": PROFILE, "state": "restored" }),
-            json!({ "profile": PROFILE, "state": "applied", "accounts_verified": true }),
-        ] {
-            write_json(&marker_path, &marker).expect("completed state");
-            let before = std::fs::read(&marker_path).unwrap();
-            cancel_automatic_setup_at(root.path()).expect("already finished");
-            assert_eq!(std::fs::read(&marker_path).unwrap(), before);
-        }
-
-        write_json(
-            &marker_path,
-            &json!({ "profile": PROFILE, "state": "pending" }),
-        )
-        .expect("pending state");
-        let held = HeldLock::take(root.path()).expect("active apply");
-        assert!(cancel_automatic_setup_at(root.path()).is_err());
-        assert!(!first_run_complete(root.path()).expect("cancellation refused"));
-        drop(held);
-        cancel_automatic_setup_at(root.path()).expect("cancel after apply");
-        assert!(first_run_complete(root.path()).expect("cancelled after release"));
     }
 
     #[test]
@@ -4994,11 +5010,12 @@ mod tests {
         assert!(claim_automatic_setup_at(root.path()).unwrap().is_none());
         let profile = HeldLock::take(root.path()).expect("explicit apply remains available");
         drop(profile);
-        cancel_automatic_setup_at(root.path()).expect("cancel during countdown");
+        // An older aterm's Cancel, saved while this worker held its claim.
+        write_legacy_cancel_at(root.path());
         drop(claim);
         assert!(
             claim_automatic_setup_at(root.path()).unwrap().is_none(),
-            "a cancelled setup never starts another countdown"
+            "a cancelled setup is never offered again"
         );
 
         write_json(
@@ -5014,7 +5031,7 @@ mod tests {
             .unwrap()
             .expect("released claim can be acquired again");
         let mut host = Fake::default();
-        execute(&mut host, root.path(), Action::Apply).expect("explicit apply during countdown");
+        execute(&mut host, root.path(), Action::Apply).expect("explicit apply during an offer");
         drop(replacement);
         assert!(
             claim_automatic_setup_at(root.path()).unwrap().is_none(),

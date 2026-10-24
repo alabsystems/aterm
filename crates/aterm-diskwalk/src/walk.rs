@@ -152,10 +152,10 @@ impl std::fmt::Debug for Walk {
     }
 }
 
-/// `path` as a walk names it ([`crate::refuse::canonical`]). Off Unix nothing is walked, so
-/// every path is [`Refusal::Unsupported`] before its spelling is read: a drive-letter path is
-/// absolute, never [`Refusal::Relative`].
-fn walk_path(path: &Path) -> Result<PathBuf, Refusal> {
+/// `path` as a walk or a look names it ([`crate::refuse::canonical`]). Off Unix nothing is
+/// walked or looked at, so every path is [`Refusal::Unsupported`] before its spelling is read: a
+/// drive-letter path is absolute, never [`Refusal::Relative`].
+pub(crate) fn walk_path(path: &Path) -> Result<PathBuf, Refusal> {
     if cfg!(unix) {
         crate::refuse::canonical(path).ok_or(Refusal::Relative)
     } else {
@@ -575,7 +575,7 @@ pub fn diskwalk_size_full(
 }
 
 fn file_root(root: &RootSpec, policy: &Policy) -> Result<SizeFull, Refusal> {
-    let canon = crate::refuse::canonical(&root.path).ok_or(Refusal::Relative)?;
+    let canon = walk_path(&root.path)?;
     let parent = canon.parent().ok_or(Refusal::TooBroad)?;
     let name = canon.file_name().ok_or(Refusal::Relative)?;
     #[cfg(unix)]

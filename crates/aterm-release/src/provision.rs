@@ -1622,7 +1622,7 @@ pub fn ask_words(label: &str, what: &str) -> AskWords {
             "key",
             "Release key blocks the release".to_string(),
             "this Mac's release key is not authorized to sign a release".to_string(),
-            "Run targo --unverified ship provision on this Mac".to_string(),
+            "Run targo --unverified ship provision --id <machine-id> on this Mac".to_string(),
         ),
     };
     AskWords {

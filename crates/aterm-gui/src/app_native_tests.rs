@@ -1968,9 +1968,10 @@ fn plain_terminal_theme_os_flip_invalidates_auto_window_preview() {
 fn shared_native_model_edits_invalidate_sibling_presentations() {
     use crate::native_app::{ActionInvocation, AppEvent, DamageRegion, SemanticInput};
     use crate::native_ui::{ActionId, UiKey};
-    use crate::system_state::SystemStateAction;
-    use crate::workstation_setup::WorkstationSetupDecision;
-    use aterm_types::macos_setup::{Plan, Setting};
+    use aterm_types::macos_setup::Plan;
+    thread_local! {
+        static APPLIED: std::cell::RefCell<Vec<Plan>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
 
     let mut app = App::headless_for_test();
     let first = WindowId(0);
@@ -1980,6 +1981,12 @@ fn shared_native_model_edits_invalidate_sibling_presentations() {
         window.cols = 160;
     }
     assert!(app.open_system_state_tab_in_window(first));
+    // The worker's read names the plan in force; a page opened by hand
+    // submits nothing before it.
+    app.publish_system_state(crate::system_state::SetupStatus {
+        plan: Some(Plan::default()),
+        ..crate::system_state::SetupStatus::default()
+    });
     let (instance, first_view) = app.active_native_view(first).unwrap();
     let next_session = app.next_session_id;
     let second = app.insert_logical_window(crate::stub_session(next_session), 90, 160);
@@ -2012,16 +2019,18 @@ fn shared_native_model_edits_invalidate_sibling_presentations() {
         .or_default()
         .native_damage = None;
 
-    let mut selected = Plan {
+    let selected = Plan {
         vault_url: "http://selected.invalid:7484/v1/team".into(),
         ..Plan::default()
     };
-    selected.selection.set(Setting::ALL[0], false);
     for (key, value) in [
-        ("system-state/setting/0", SemanticInput::Bool(false)),
         (
             "system-state/url",
             SemanticInput::Text(selected.vault_url.clone()),
+        ),
+        (
+            "system-state/password",
+            SemanticInput::Text("inert-password".into()),
         ),
     ] {
         let before = app.native_ui_compile_stamp(second).unwrap();
@@ -2046,20 +2055,29 @@ fn shared_native_model_edits_invalidate_sibling_presentations() {
             Some(DamageRegion::All)
         );
     }
+    app.set_system_state_handlers_for_test(crate::system_state_host::InitialSetupHandlers {
+        apply: |plan, _, password, receipt| {
+            assert_eq!(password.unwrap().as_str(), Some("inert-password"));
+            APPLIED.with(|applied| applied.borrow_mut().push(plan));
+            receipt.accept();
+            true
+        },
+        ..crate::system_state_host::InitialSetupHandlers::inert_for_test()
+    });
     app.dispatch_native_view_event(
         second,
         second_view,
         AppEvent::Action(ActionInvocation {
-            id: ActionId::new("system-state/apply"),
+            id: ActionId::new("system-state/vault/join"),
             value: None,
         }),
     )
     .unwrap();
-    let Some(SystemStateAction::Apply(answer)) = app.native_runtime.take_system_state_action()
-    else {
-        panic!("the sibling Apply must use the newly presented shared choices");
-    };
-    assert!(matches!(answer.decision, WorkstationSetupDecision::Begin(plan) if plan == selected));
+    assert_eq!(
+        APPLIED.with(|applied| std::mem::take(&mut *applied.borrow_mut())),
+        [selected],
+        "the sibling's Join must deliver the shared plan once"
+    );
 }
 
 #[test]
@@ -7352,6 +7370,103 @@ fn tab_walks_the_whole_settings_list() {
             .semantic(&first)
             .is_some()
     );
+}
+
+/// TAB WALKS SYSTEM STATE'S WHOLE LIST, as it walks a Settings list: from
+/// the last control the list's screen shows, Tab goes on to the groups under
+/// it and the vault's fields, each scrolled into view, then out of the list
+/// and round to its first control again.
+#[test]
+fn tab_walks_the_whole_system_state_list() {
+    use crate::native_ui::UiKey;
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let window = app.windows.get_mut(&wid).unwrap();
+    window.rows = 30;
+    window.cols = 100;
+    assert!(app.open_system_state_tab());
+    app.native_runtime
+        .publish_system_state(crate::system_state::fixture_status("vault").expect("a scenario"));
+    let (_, view) = app
+        .active_native_view(wid)
+        .expect("active System State view");
+    let compiled = app.compiled_native_ui(wid).unwrap();
+    // Every group's choice, then the vault's disclosure, fields and Join.
+    let stops: Vec<&str> = compiled.list_stops.iter().map(UiKey::as_str).collect();
+    assert_eq!(
+        stops,
+        [
+            "system-state/group/0/set-up",
+            "system-state/group/1/set-up",
+            "system-state/group/2/set-up",
+            "system-state/group/3/set-up",
+            "system-state/group/4/set-up",
+            "system-state/row/secrets/disclose",
+            "system-state/url",
+            "system-state/password",
+            "system-state/vault/join",
+        ]
+    );
+    let stops = compiled.list_stops.clone();
+    let shown = stops
+        .iter()
+        .rposition(|key| compiled.focus_order.contains(key))
+        .expect("the list's screen shows a control");
+    assert!(
+        shown + 1 < stops.len(),
+        "the list's screen leaves controls under it"
+    );
+    let focus = |app: &App| {
+        app.native_runtime
+            .view_state(view)
+            .and_then(|state| state.common().last_focus.clone())
+            .expect("a focused control")
+    };
+    let on_screen = |app: &App, key: &UiKey| {
+        app.compiled_native_ui(wid)
+            .unwrap()
+            .semantic(key)
+            .is_some_and(|node| !node.offscreen)
+    };
+    app.native_runtime
+        .view_state_mut(view)
+        .expect("the view")
+        .common_mut()
+        .last_focus = Some(stops[shown].clone());
+    for want in &stops[shown + 1..] {
+        app.move_native_focus(wid, false).unwrap();
+        assert_eq!(&focus(&app), want, "Tab goes on down the list");
+        assert!(on_screen(&app, want), "{want:?} scrolled into view");
+    }
+    // Out of the list after Join, round the window, and in at its top.
+    app.move_native_focus(wid, false).unwrap();
+    assert!(!stops.contains(&focus(&app)), "Tab leaves the list");
+    let mut wrapped = false;
+    for _ in 0..8 {
+        app.move_native_focus(wid, false).unwrap();
+        if focus(&app) == stops[0] {
+            wrapped = true;
+            break;
+        }
+    }
+    assert!(wrapped, "Tab comes round to the list's first control");
+    assert!(on_screen(&app, &stops[0]));
+    // Shift-Tab from there leaves the list upward, and comes back in at its
+    // last control.
+    app.move_native_focus(wid, true).unwrap();
+    assert!(!stops.contains(&focus(&app)));
+    let mut back = false;
+    for _ in 0..8 {
+        app.move_native_focus(wid, true).unwrap();
+        if stops.contains(&focus(&app)) {
+            back = true;
+            break;
+        }
+    }
+    assert!(back);
+    let last = stops.last().unwrap();
+    assert_eq!(&focus(&app), last, "Shift-Tab enters the list at its end");
+    assert!(on_screen(&app, last));
 }
 
 #[test]

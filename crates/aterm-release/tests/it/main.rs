@@ -107,6 +107,9 @@ mod tap;
 #[path = "../../src/transforms.rs"]
 #[allow(dead_code)]
 mod transforms;
+#[path = "../../src/trust_credit.rs"]
+#[allow(dead_code)]
+mod trust_credit;
 #[path = "../../src/trust_facts.rs"]
 #[allow(dead_code)]
 mod trust_facts;

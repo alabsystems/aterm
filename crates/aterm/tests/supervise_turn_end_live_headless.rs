@@ -692,7 +692,9 @@ impl Ctl for Tap {
     fn call(&mut self, args: &[&str]) -> Result<CtlReply, String> {
         let mut words = args.iter().filter(|a| !a.starts_with('@')).copied();
         let verb = words.next();
-        if verb == Some("await") && words.next() == Some("gone") && self.read_busy {
+        // The loop's wait for a running turn: `await log` where the host keeps the session
+        // log, `await gone` on the screen where it keeps none (6H-5).
+        if verb == Some("await") && matches!(words.next(), Some("log" | "gone")) && self.read_busy {
             self.saw_busy();
         }
         let reply = self.ctl.call(args);
@@ -1181,21 +1183,21 @@ fn a_weekly_wall_behind_a_shell_is_published_waited_out_and_continued_once() {
     );
     submit(&inst, &sid, "go");
     drawn(&inst, "wall");
-    let deadline = Instant::now() + HANG;
     let mut status = String::new();
-    while Instant::now() < deadline {
+    let published = moving(&inst, || {
         status = ctl_ok(&inst, &[&format!("@{sid}"), "status"]);
-        if status.contains("agent=wall:") {
-            break;
+        let wall = status.contains("agent=wall:");
+        if !wall {
+            std::thread::sleep(Duration::from_millis(80));
         }
-        std::thread::sleep(Duration::from_millis(100));
-    }
+        wall.then_some(())
+    });
     let submitted = submits_when(&inst, &subs, 2);
     let out = sup.stop();
     let ev = evidence(&inst, &out);
     assert!(
-        status.contains("agent=wall:usage-weekly"),
-        "published as the wall: {status}\n{ev}"
+        published.is_ok() && status.contains("agent=wall:usage-weekly"),
+        "published as the wall: {published:?} {status}\n{ev}"
     );
     assert_eq!(
         submitted,

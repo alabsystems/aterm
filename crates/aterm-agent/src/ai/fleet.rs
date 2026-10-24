@@ -269,7 +269,8 @@ pub fn fetch(
     }
     if key_bytes(key).is_none() {
         return Fetched::Refused(
-            "no [ai] fleet_key pins the document's signer (aterm ai fleet keygen makes one)"
+            "no [ai] fleet_key pins the document's signer (the public key `aterm ai fleet \
+             keygen <secret-key-file>` printed for the key that signs it)"
                 .to_string(),
         );
     }

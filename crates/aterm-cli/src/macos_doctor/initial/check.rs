@@ -4,17 +4,18 @@
 //! Read-only observations of the displayed setup checklist.
 
 use super::{
-    Action, InitialSetupObserved, LiveInitial, NativeHost, Path, Plan, Report, Row, Selection,
-    Stage, ensure_person_scope, execute, item_rows, observe_read_only, readiness_row, rows_ready,
-    state_root,
+    Action, InitialHost, InitialSetupObserved, LiveInitial, NativeHost, Path, Plan, Report, Row,
+    Selection, Stage, access_revision_at, accounts, ensure_person_scope, execute, item_rows,
+    observe_read_only, preferences, readiness_row, rows_ready, state_root,
 };
 use aterm_secrets::client::{self, Membership, Paths, Status};
 use aterm_secrets::service::{self, Job, State};
 
 trait InitialCheckHost {
     fn workstation(&mut self, root: &Path, selected: Selection) -> Result<Vec<Row>, String>;
+    fn accounts(&mut self, root: &Path, selected: Selection) -> Result<Vec<Row>, String>;
     fn spotlight(&mut self) -> Result<Vec<Row>, String>;
-    fn permissions(&mut self) -> Result<Vec<Row>, String>;
+    fn permissions(&mut self, plan: &Plan, revision: u64) -> Result<Vec<Row>, String>;
     fn vault(&mut self, plan: &Plan) -> Result<Vec<Row>, String>;
     fn repositories(&mut self) -> Result<Vec<Row>, String>;
 }
@@ -22,26 +23,33 @@ trait InitialCheckHost {
 #[derive(Default)]
 struct LiveCheck {
     workstation: Option<Result<Vec<Row>, String>>,
+    accounts: Option<Result<Vec<Row>, String>>,
     spotlight: Option<Result<Vec<Row>, String>>,
-    permissions: Option<Result<Vec<Row>, String>>,
     vault: Option<Result<Vec<Row>, String>>,
 }
 
 impl LiveCheck {
+    /// Read the plan's slow stages at once, each on its own thread: the Mac settings (then the
+    /// sign-ins, one pass after the other), Spotlight and the vault. Aterm's permissions are
+    /// read from the access record when the check reaches them.
     fn prefetch(root: &Path, plan: &Plan) -> Self {
+        let check = |selected: Selection| {
+            execute(&mut NativeHost::selected(selected), root, Action::Check)
+                .map(|report| report.rows)
+        };
+        let (prefs, signins) = (preferences(plan.selection), accounts(plan.selection));
         let ws_selected = Stage::Workstation.selected(plan);
-        let sp_selected = Stage::Spotlight.selected(plan);
-        let perm_selected = Stage::Permissions.selected(plan);
-        let vault_selected = Stage::Secrets.selected(plan);
-        let ws_sel = plan.selection.workstation();
+        let accounts_selected = Stage::Accounts.selected(plan);
         std::thread::scope(|s| {
-            let ws = ws_selected.then(|| {
+            let ws = (ws_selected || accounts_selected).then(|| {
                 s.spawn(move || {
-                    execute(&mut NativeHost::selected(ws_sel), root, Action::Check)
-                        .map(|report| report.rows)
+                    (
+                        ws_selected.then(|| check(prefs)),
+                        accounts_selected.then(|| check(signins)),
+                    )
                 })
             });
-            let sp = sp_selected.then(|| {
+            let sp = Stage::Spotlight.selected(plan).then(|| {
                 s.spawn(|| {
                     aterm_machines::init::run_initial_spotlight(
                         &aterm_machines::port::Live::new(),
@@ -51,13 +59,16 @@ impl LiveCheck {
                     .map(item_rows)
                 })
             });
-            let perm =
-                perm_selected.then(|| s.spawn(|| LiveInitial::live().read_permissions(false)));
-            let vault = vault_selected.then(|| s.spawn(|| current_vault_rows(plan)));
+            let vault = Stage::Secrets
+                .selected(plan)
+                .then(|| s.spawn(|| current_vault_rows(plan)));
+            let (workstation, accounts) = ws
+                .map(|h| h.join().expect("workstation check thread"))
+                .unwrap_or_default();
             Self {
-                workstation: ws.map(|h| h.join().expect("workstation check thread")),
+                workstation,
+                accounts,
                 spotlight: sp.map(|h| h.join().expect("spotlight check thread")),
-                permissions: perm.map(|h| h.join().expect("permissions check thread")),
                 vault: vault.map(|h| h.join().expect("vault check thread")),
             }
         })
@@ -67,6 +78,13 @@ impl LiveCheck {
 impl InitialCheckHost for LiveCheck {
     fn workstation(&mut self, root: &Path, selected: Selection) -> Result<Vec<Row>, String> {
         self.workstation.take().unwrap_or_else(|| {
+            execute(&mut NativeHost::selected(selected), root, Action::Check)
+                .map(|report| report.rows)
+        })
+    }
+
+    fn accounts(&mut self, root: &Path, selected: Selection) -> Result<Vec<Row>, String> {
+        self.accounts.take().unwrap_or_else(|| {
             execute(&mut NativeHost::selected(selected), root, Action::Check)
                 .map(|report| report.rows)
         })
@@ -83,10 +101,8 @@ impl InitialCheckHost for LiveCheck {
         })
     }
 
-    fn permissions(&mut self) -> Result<Vec<Row>, String> {
-        self.permissions
-            .take()
-            .unwrap_or_else(|| LiveInitial::live().read_permissions(false))
+    fn permissions(&mut self, plan: &Plan, revision: u64) -> Result<Vec<Row>, String> {
+        LiveInitial::live().permissions(plan, revision)
     }
 
     fn vault(&mut self, plan: &Plan) -> Result<Vec<Row>, String> {
@@ -121,14 +137,34 @@ pub(super) fn current_vault_rows(plan: &Plan) -> Result<Vec<Row>, String> {
             client::materialization_ready_for(&paths, expected).map_err(|error| error.to_string())
         },
         || {
-            service::state(&paths.home, Job::Subscriber)
+            let running = service::state(&paths.home, Job::Subscriber)
                 .map(|state| matches!(state, State::Installed { pid: Some(_), .. }))
-                .map_err(|error| error.to_string())
+                .map_err(|error| error.to_string())?;
+            Ok(if running {
+                Subscribed::Running
+            } else if service::subscriber_turned_off(&paths.home) {
+                Subscribed::TurnedOff
+            } else {
+                Subscribed::Down
+            })
         },
     )
 }
 
-fn selected_vault<'a>(
+/// This login's subscriber, as the vault's readiness reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Subscribed {
+    /// It runs.
+    Running,
+    /// It does not run, and the person turned it off
+    /// (`aterm_secrets::service::subscriber_off_path`): their choice, which the
+    /// vault's readiness honors with the files as last synced.
+    TurnedOff,
+    /// It does not run.
+    Down,
+}
+
+pub(super) fn selected_vault<'a>(
     plan: &Plan,
     home: &Path,
     status: &'a Status,
@@ -142,13 +178,13 @@ pub(super) fn vault_rows(
     home: &Path,
     status: &Status,
     materialized: impl FnOnce(&client::Config) -> Result<bool, String>,
-    subscriber_running: impl FnOnce() -> Result<bool, String>,
+    subscriber: impl FnOnce() -> Result<Subscribed, String>,
 ) -> Result<Vec<Row>, String> {
     let Some(config) = selected_vault(plan, home, status)? else {
         return Ok(vec![Row {
             name: Stage::Secrets.name().into(),
             status: "drift".into(),
-            detail: "vault source or signer differs; Apply to enroll".into(),
+            detail: "vault source or signer differs; Set up now to enroll".into(),
         }]);
     };
     let membership_ready = matches!(status.membership, Membership::In { .. } | Membership::Plain);
@@ -159,25 +195,27 @@ pub(super) fn vault_rows(
         }
         Membership::Plain if ready => "synced files verified".into(),
         Membership::In { .. } | Membership::Plain => {
-            "vault files are incomplete; Apply to retry".into()
+            "vault files are incomplete; Set up now to retry".into()
         }
         Membership::Pending => match &status.machine {
             Some((_, code)) => format!("waiting for vault approval, code {code}"),
-            None => "no machine identity is available; Apply to enroll".into(),
+            None => "no machine identity is available; Set up now to enroll".into(),
         },
         Membership::Revoked { .. } => "this machine no longer has vault membership".into(),
         Membership::Unconfigured => "no vault membership is configured".into(),
     };
-    let subscriber = subscriber_running()?;
+    let subscriber = subscriber()?;
     Ok(vec![
         readiness_row(Stage::Secrets.name(), ready, detail),
         readiness_row(
             aterm_types::macos_setup::SECRETS_SUBSCRIBER_ROW,
-            subscriber,
-            if subscriber {
-                String::new()
-            } else {
-                "subscriber is not running; Apply to install or restart it".into()
+            subscriber != Subscribed::Down,
+            match subscriber {
+                Subscribed::Running => String::new(),
+                Subscribed::TurnedOff => "turned off on this Mac by choice".into(),
+                Subscribed::Down => {
+                    "subscriber is not running; Set up now to install or restart it".into()
+                }
             },
         ),
     ])
@@ -204,11 +242,12 @@ fn check_with(host: &mut dyn InitialCheckHost, root: &Path, plan: &Plan) -> Repo
             continue;
         }
         let result = match stage {
-            Stage::Workstation => host.workstation(root, plan.selection.workstation()),
+            Stage::Workstation => host.workstation(root, preferences(plan.selection)),
             Stage::Spotlight => host.spotlight(),
-            Stage::Permissions => host.permissions(),
+            Stage::Permissions => host.permissions(plan, access_revision_at(root).unwrap_or(0)),
             Stage::Secrets => host.vault(plan),
             Stage::Repositories => host.repositories(),
+            Stage::Accounts => host.accounts(root, accounts(plan.selection)),
         };
         match result {
             Ok(rows) if !rows.is_empty() => {
@@ -281,10 +320,14 @@ mod tests {
             self.workstation = Some(selected);
             self.observe(Stage::Workstation)
         }
+        fn accounts(&mut self, _root: &Path, selected: Selection) -> Result<Vec<Row>, String> {
+            self.workstation = Some(selected);
+            self.observe(Stage::Accounts)
+        }
         fn spotlight(&mut self) -> Result<Vec<Row>, String> {
             self.observe(Stage::Spotlight)
         }
-        fn permissions(&mut self) -> Result<Vec<Row>, String> {
+        fn permissions(&mut self, _: &Plan, _: u64) -> Result<Vec<Row>, String> {
             self.observe(Stage::Permissions)
         }
         fn vault(&mut self, _plan: &Plan) -> Result<Vec<Row>, String> {
@@ -344,7 +387,8 @@ mod tests {
             ..Fake::default()
         };
         let report = check_with(&mut host, root.path(), &Plan::default());
-        assert_eq!(host.calls, Stage::ALL[..4]);
+        // The sign-outs need no vault: they run last either way.
+        assert_eq!(host.calls, [&Stage::ALL[..4], &[Stage::Accounts]].concat());
         assert!(report.needs_attention());
         assert!(
             report
@@ -399,7 +443,7 @@ mod tests {
             home,
             &pending,
             |_| panic!("pending membership cannot verify files"),
-            || Ok(true),
+            || Ok(Subscribed::Running),
         )
         .unwrap();
         assert_eq!(rows[0].status, "blocked");
@@ -416,7 +460,7 @@ mod tests {
             Path::new("/fixture"),
             &status,
             |_| panic!("pending membership cannot verify files"),
-            || Ok(true),
+            || Ok(Subscribed::Running),
         )
         .unwrap();
         assert_eq!(rows[0].status, "blocked");
@@ -457,7 +501,7 @@ mod tests {
             Path::new("/fixture"),
             &status,
             |_| panic!("pending membership cannot verify files"),
-            || Ok(true),
+            || Ok(Subscribed::Running),
         )
         .unwrap();
         assert_eq!(rows[0].status, "blocked");
@@ -485,7 +529,7 @@ mod tests {
             Path::new("/fixture"),
             &status,
             |_| Ok(true),
-            || Ok(true),
+            || Ok(Subscribed::Running),
         )
         .unwrap();
         assert!(rows_ready(&rows));
@@ -500,10 +544,20 @@ mod tests {
         assert_eq!(rows[0].status, "drift");
     }
 
+    /// The vault is ready with its files written and a subscriber that runs, or
+    /// one the person turned off: their choice, with the files as last synced,
+    /// which the check names. NEGATIVE CONTROL: a subscriber that is down for no
+    /// choice of theirs is not ready.
     #[test]
     fn vault_check_requires_materialized_files_and_a_running_subscriber() {
         let status = vault_status(Membership::In { seq: 3, heard: 1 });
-        for (materialized, subscriber) in [(false, true), (true, false), (true, true)] {
+        for (materialized, subscriber, ready) in [
+            (false, Subscribed::Running, false),
+            (true, Subscribed::Down, false),
+            (true, Subscribed::Running, true),
+            (true, Subscribed::TurnedOff, true),
+            (false, Subscribed::TurnedOff, false),
+        ] {
             let rows = vault_rows(
                 &Plan::default(),
                 Path::new("/fixture"),
@@ -515,7 +569,11 @@ mod tests {
                 || Ok(subscriber),
             )
             .unwrap();
-            assert_eq!(rows_ready(&rows), materialized && subscriber);
+            assert_eq!(rows_ready(&rows), ready, "{materialized} {subscriber:?}");
+            assert_eq!(
+                rows[1].detail.contains("by choice"),
+                subscriber == Subscribed::TurnedOff
+            );
         }
     }
 }

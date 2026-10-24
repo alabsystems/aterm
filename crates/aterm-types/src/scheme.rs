@@ -996,8 +996,8 @@ impl ForeignFormat {
         match self {
             ForeignFormat::Kitty => "kitty",
             ForeignFormat::Ghostty => "Ghostty",
-            ForeignFormat::Plist => "property-list (iTerm2 / Terminal.app)",
-            ForeignFormat::Toml => "TOML (Alacritty / WezTerm)",
+            ForeignFormat::Plist => "property-list (iTerm2 .itermcolors)",
+            ForeignFormat::Toml => "TOML (Alacritty)",
             ForeignFormat::Json => "JSON (Windows Terminal)",
         }
     }

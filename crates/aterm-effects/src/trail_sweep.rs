@@ -65,17 +65,28 @@ pub fn line_cells_tail(
         -1i128
     };
     let bias = i128::from(major.saturating_sub(1)) / 2;
+    let origin_r = i128::from(origin.0);
+    let origin_c = i128::from(origin.1);
+    let major128 = i128::from(major);
 
-    for k in start..available {
-        let k = i128::from(k);
-        let (r_steps, c_steps) = if dc >= dr {
-            ((k * i128::from(dr) + bias) / i128::from(major), k)
-        } else {
-            (k, (k * i128::from(dc) + bias) / i128::from(major))
-        };
-        let r = i128::from(origin.0) + sr * r_steps;
-        let c = i128::from(origin.1) + sc * c_steps;
-        out.push((r as i32, c as i32));
+    if dc >= dr {
+        let dr128 = i128::from(dr);
+        for k in start..available {
+            let k = i128::from(k);
+            let r_steps = (k * dr128 + bias) / major128;
+            let r = origin_r + sr * r_steps;
+            let c = origin_c + sc * k;
+            out.push((r as i32, c as i32));
+        }
+    } else {
+        let dc128 = i128::from(dc);
+        for k in start..available {
+            let k = i128::from(k);
+            let c_steps = (k * dc128 + bias) / major128;
+            let r = origin_r + sr * k;
+            let c = origin_c + sc * c_steps;
+            out.push((r as i32, c as i32));
+        }
     }
 }
 

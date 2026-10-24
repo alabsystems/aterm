@@ -307,8 +307,8 @@ pub fn default_secrets(home: Option<&Path>) -> Vec<SecretRule> {
         .map(|g| SecretRule::Basename(g.to_string())),
     );
     if let Some(h) = home {
-        // Joined with `/`, as [`secret_hit`] reads a rule: `Path::join` puts
-        // Windows' `\` between the home and the rest, and no rule matched.
+        // Joined with `/`, which [`path_readings`] reads in a Unix home and a
+        // Windows one (`C:\Users\name/.secrets`) alike.
         let h = h.to_string_lossy();
         let h = h.trim_end_matches('/');
         for sub in [
@@ -2257,9 +2257,61 @@ fn read_comps_allowed(comps: &[String], shown: &str, ctx: &ApprovalCtx) -> Resul
     Ok(())
 }
 
+/// Every component list a path's text may name, for the secrets check, which takes a hit on
+/// any of them, so each reading past the plain `/` split only adds refusals: split at `/` alone
+/// (a Unix name may hold a `\`) and at `\` too (Windows' separator, which Git Bash's MSYS layer
+/// also takes); a drive path (`C:\a`, `C:/a`) read as Git Bash spells it (`c`, `a`), so one
+/// Windows path's spellings, and a rule under a Windows home (`C:\Users\name/.secrets`),
+/// share their components; and a rooted path's `..` kept as a component (a symlink before it
+/// leads elsewhere, as `cat` resolves `..` on disk) and also taken lexically (where none does).
+fn path_readings(path: &str) -> Vec<Vec<String>> {
+    let (drive, rest) = match path.split_at_checked(2) {
+        Some((d, rest))
+            if d.ends_with(':')
+                && d.as_bytes()[0].is_ascii_alphabetic()
+                && rest.starts_with(['/', '\\']) =>
+        {
+            (Some(d[..1].to_ascii_lowercase()), rest)
+        }
+        _ => (None, path),
+    };
+    let floor = usize::from(drive.is_some());
+    let mut out = Vec::new();
+    for seps in [&['/'][..], &['/', '\\']] {
+        if seps.len() == 2 && !rest.contains('\\') {
+            break;
+        }
+        let literal: Vec<String> = drive
+            .iter()
+            .cloned()
+            .chain(
+                rest.split(seps)
+                    .filter(|c| !c.is_empty() && *c != ".")
+                    .map(str::to_string),
+            )
+            .collect();
+        let lexical = ((drive.is_some() || rest.starts_with(seps))
+            && literal.iter().any(|c| c == ".."))
+        .then(|| {
+            let mut comps: Vec<String> = Vec::new();
+            for c in &literal {
+                if c != ".." {
+                    comps.push(c.clone());
+                } else if comps.len() > floor {
+                    comps.pop();
+                }
+            }
+            comps
+        });
+        out.push(literal);
+        out.extend(lexical);
+    }
+    out
+}
+
 fn secret_hit<'a>(comps: &[String], secrets: &'a [SecretRule]) -> Option<&'a SecretRule> {
     secrets.iter().find(|rule| match rule {
-        SecretRule::Under(dir) => abs_components(&dir.to_string_lossy()).is_some_and(|d| {
+        SecretRule::Under(dir) => path_readings(&dir.to_string_lossy()).iter().any(|d| {
             comps.len() >= d.len() && d.iter().zip(comps).all(|(a, b)| a.eq_ignore_ascii_case(b))
         }),
         SecretRule::Component(name) => comps.iter().any(|c| c.eq_ignore_ascii_case(name)),
@@ -2269,33 +2321,36 @@ fn secret_hit<'a>(comps: &[String], secrets: &'a [SecretRule]) -> Option<&'a Sec
     })
 }
 
+/// The texts an operand may name, each read by [`path_readings`]: the word itself, a `~` lead
+/// resolved to the home, a word led by an expansion (`$HOME/…`, `$USERPROFILE\…`) also read as
+/// under the home at either separator, and a root-relative `\…` also read on a drive home's
+/// drive, as Windows resolves it on the current one.
 fn operand_comps(op: &str, home: Option<&Path>) -> Vec<Vec<String>> {
-    let split = |s: &str| -> Vec<String> {
-        s.split('/')
-            .filter(|c| !c.is_empty() && *c != ".")
-            .map(str::to_string)
-            .collect()
-    };
     let home_text = home.map(|h| h.to_string_lossy().trim_end_matches('/').to_string());
-    let resolve = |full: &str| {
-        if full.starts_with('/') {
-            abs_components(full).unwrap_or_else(|| split(full))
-        } else {
-            split(full)
-        }
-    };
-    let mut out = Vec::new();
+    let mut texts = Vec::new();
     match (op.strip_prefix('~'), &home_text) {
-        (Some(""), Some(h)) => out.push(resolve(h)),
-        (Some(rest), Some(h)) if rest.starts_with('/') => out.push(resolve(&format!("{h}{rest}"))),
-        _ => out.push(resolve(op)),
+        (Some(""), Some(h)) => texts.push(h.clone()),
+        (Some(rest), Some(h)) if rest.starts_with('/') => texts.push(format!("{h}{rest}")),
+        _ => texts.push(op.to_string()),
     }
-    if let (Some((lead, rest)), Some(h)) = (op.split_once('/'), &home_text)
-        && lead.starts_with('$')
-    {
-        out.push(resolve(&format!("{h}/{rest}")));
+    if let Some(h) = &home_text {
+        for sep in ['/', '\\'] {
+            if let Some((lead, rest)) = op.split_once(sep)
+                && lead.starts_with('$')
+            {
+                texts.push(format!("{h}/{rest}"));
+            }
+        }
+        if op.starts_with('\\')
+            && !op.starts_with(r"\\")
+            && let Some(drive) = h
+                .get(..2)
+                .filter(|d| d.ends_with(':') && d.as_bytes()[0].is_ascii_alphabetic())
+        {
+            texts.push(format!("{drive}{op}"));
+        }
     }
-    out
+    texts.iter().flat_map(|t| path_readings(t)).collect()
 }
 
 fn secrets_free(

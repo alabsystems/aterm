@@ -209,6 +209,11 @@ fn the_refusal_names_its_provider() {
         "no fish here: `targo --unverified verify provision` builds the pinned 4.9.3 into this \
          user's cache (or ATERM_TEST_FISH=<path> names one)"
     );
+    assert_eq!(
+        tool("bash-5.3").refusal_on(mac),
+        "no bash-5.3 here: `targo --unverified verify provision` builds the pinned 5.3.20 into \
+         this user's cache (or ATERM_TEST_BASH_5_3=<path> names one)"
+    );
     let pwsh = tool("pwsh").refusal_on(mac);
     assert_eq!(
         pwsh,
@@ -292,7 +297,7 @@ fn every_workspace_row_names_the_run_that_provides_it() {
 
 #[test]
 fn a_host_the_tree_pins_nothing_for_is_told_so() {
-    for name in ["fish", "pwsh", "wasm-opt", "limactl"] {
+    for name in ["fish", "bash-5.3", "pwsh", "wasm-opt", "limactl"] {
         let row = tool(name);
         let linux = row.refusal_on("linux-x86_64");
         assert!(

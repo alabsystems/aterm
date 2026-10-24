@@ -7,6 +7,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::exec::{self, Cmd, Run};
 use crate::ladder::Report;
@@ -16,6 +17,9 @@ pub const RECORD_FLAG: &str = "--record-test-binary";
 
 /// How many test binaries run at once unless `--test-jobs` says otherwise.
 pub const DEFAULT_JOBS: u32 = 8;
+
+/// How many of the run's slowest binaries [`poles`] names.
+const POLES_SHOWN: usize = 8;
 
 const RECORD_MAGIC: &[u8] = b"aterm-verify test record 1\0";
 
@@ -381,23 +385,56 @@ pub fn plan(records: Vec<Record>, log: &str, exes: &[TestExe]) -> Result<Vec<Bin
         .collect()
 }
 
-/// Run every binary through [`pool`], `jobs` at a time.
-pub fn run_all<F>(bins: &[Binary], jobs: usize, threads: u32, run_one: F) -> Vec<Run>
+/// Run every binary through [`pool`], `jobs` at a time: each one's run and
+/// its own wall time.
+pub fn run_all<F>(bins: &[Binary], jobs: usize, threads: u32, run_one: F) -> Vec<(Run, Duration)>
 where
     F: Fn(&Binary, u32) -> Run + Sync,
 {
     let all: Vec<usize> = (0..bins.len()).collect();
-    pool(bins.len(), &all, jobs, |i| run_one(&bins[i], threads))
-        .into_iter()
-        .map(|pooled| {
-            pooled.unwrap_or_else(|| Run {
+    pool(bins.len(), &all, jobs, |i| {
+        let started = Instant::now();
+        let run = run_one(&bins[i], threads);
+        (run, started.elapsed())
+    })
+    .into_iter()
+    .map(|pooled| {
+        pooled.unwrap_or_else(|| {
+            let run = Run {
                 ok: false,
                 output: "aterm-verify: this test binary was never run (a gate defect)\n".into(),
                 code: None,
                 spawn_error: None,
-            })
+            };
+            (run, Duration::ZERO)
         })
-        .collect()
+    })
+    .collect()
+}
+
+/// The run's long poles: its own wall, then its slowest binaries by their own
+/// wall, longest first. The run cannot end before its longest binary, so a
+/// binary near the run's wall is where a faster suite starts.
+#[must_use]
+pub fn poles(bins: &[Binary], walls: &[Duration], total: Duration) -> String {
+    let mut order: Vec<usize> = (0..bins.len().min(walls.len())).collect();
+    order.sort_by(|&a, &b| walls[b].cmp(&walls[a]));
+    let named: Vec<String> = order
+        .iter()
+        .take(POLES_SHOWN)
+        .map(|&i| {
+            format!(
+                "{} {}",
+                bins[i].spec,
+                crate::report::duration(walls[i].as_secs_f64())
+            )
+        })
+        .collect();
+    format!(
+        "  test binaries' long poles: the run took {}; {}",
+        crate::report::duration(total.as_secs_f64()),
+        named.join(", ")
+    )
 }
 
 /// Run `run(i)` for each distinct index below `n` in `order`, `jobs` at a time (at least one).
@@ -503,7 +540,7 @@ pub fn summary(bins: &[Binary], jobs: usize, threads: u32) -> String {
 
 /// A binary the test run's ceiling left no time to start.
 #[must_use]
-pub fn not_started(b: &Binary, limit: std::time::Duration) -> Run {
+pub fn not_started(b: &Binary, limit: Duration) -> Run {
     Run {
         ok: false,
         output: format!(
@@ -641,8 +678,8 @@ pub fn run_tests(
     let jobs = ctx.test_jobs();
     let threads = ctx.test_threads();
     let ceiling = ctx.exec_env().child_ceiling;
-    let started = std::time::Instant::now();
-    let runs = run_all(&bins, jobs, threads, |b, t| {
+    let started = Instant::now();
+    let timed = run_all(&bins, jobs, threads, |b, t| {
         let mut env = ctx.exec_env();
         if let Some(limit) = ceiling {
             let left = limit.saturating_sub(started.elapsed());
@@ -653,6 +690,8 @@ pub fn run_tests(
         }
         exec::run(&binary_cmd(b, t), env)
     });
+    let total = started.elapsed();
+    let (runs, walls): (Vec<Run>, Vec<Duration>) = timed.into_iter().unzip();
     let preface: String = pass
         .output
         .lines()
@@ -663,6 +702,7 @@ pub fn run_tests(
     r.raw(summary(&bins, jobs, threads));
     let all = combined(&bins, &runs);
     r.raw(all.output.as_str());
+    r.raw(poles(&bins, &walls, total));
     decide(r, &all, label, &env);
 }
 
@@ -938,7 +978,7 @@ mod tests {
         assert!(peak.load(Ordering::SeqCst) <= 3, "never past the jobs");
         let said: Vec<String> = runs
             .iter()
-            .map(|r| r.output.lines().nth(1).unwrap().to_string())
+            .map(|(r, _)| r.output.lines().nth(1).unwrap().to_string())
             .collect();
         assert_eq!(
             said,
@@ -947,6 +987,30 @@ mod tests {
                 .collect::<Vec<_>>(),
             "declared order"
         );
+    }
+
+    /// THE LONG POLES: the run's own wall, then its slowest binaries longest
+    /// first, at most [`POLES_SHOWN`] of them, each by cargo's re-run spec.
+    #[test]
+    fn the_long_poles_name_the_slowest_binaries_longest_first() {
+        let secs = [3, 41, 0, 7, 12, 1, 2, 5, 9, 4];
+        let bins: Vec<Binary> = (0..secs.len())
+            .map(|i| Binary {
+                header: format!("     Running tests/t{i}.rs (target/debug/deps/t{i}-1)"),
+                spec: format!("-p x --test t{i}"),
+                record: rec(&format!("/r/t{i}"), "x"),
+            })
+            .collect();
+        let walls: Vec<Duration> = secs.iter().map(|&s| Duration::from_secs(s)).collect();
+        let line = poles(&bins, &walls, Duration::from_secs(44));
+        assert!(line.contains("the run took 44s"), "{line}");
+        let at = |i: usize| line.find(&format!("--test t{i} ")).map(|p| (p, i));
+        let named: Vec<usize> = {
+            let mut found: Vec<(usize, usize)> = (0..secs.len()).filter_map(at).collect();
+            found.sort_unstable();
+            found.into_iter().map(|(_, i)| i).collect()
+        };
+        assert_eq!(named, [1, 4, 8, 3, 7, 9, 0, 6], "{line}");
     }
 
     /// A BINARY THE RUN'S CEILING LEFT NO TIME TO START is a FAIL in cargo's
@@ -959,7 +1023,7 @@ mod tests {
             spec: "-p x --test late".into(),
             record: rec("/r/late", "x"),
         };
-        let run = not_started(&b, std::time::Duration::from_secs(10_800));
+        let run = not_started(&b, Duration::from_secs(10_800));
         assert!(!run.ok);
         assert!(run.output.starts_with(&b.header), "{}", run.output);
         assert!(

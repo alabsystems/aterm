@@ -113,6 +113,7 @@ pub(super) fn pre_carry_parse(toml: &str) -> Option<SessionHandoff> {
                 task: None,
                 status_seen: None,
                 autopilot_end: None,
+                wakes: None,
             })
             .collect(),
         roster_seq: None,
@@ -931,6 +932,7 @@ fn manifests_cross_between_the_two_shapes_both_ways() {
             task: None,
             status_seen: None,
             autopilot_end: None,
+            wakes: None,
         }],
         roster_seq: None,
         fabric_attached: Vec::new(),

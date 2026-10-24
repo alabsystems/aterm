@@ -97,8 +97,8 @@ fn window_rows(layer: &FxLayer, bands: RowBands) -> Option<(i128, i128)> {
 
 /// Mark the bands `layer` may write: each item's rows (its bounds moved and
 /// clipped as the layer draws it), not their hull, so a layer whose items
-/// stand apart down the frame (the cursor's stars) marks the rows they stand
-/// on, as their quads did, and none between.
+/// stand apart down the frame marks the rows they stand on, as quads of the
+/// same pixels would, and none between.
 ///
 /// Every item's rows lie inside the hull's bands, so the walk stops once each
 /// of those is dirty: a changed layer whose old self already marked its bands
@@ -300,40 +300,37 @@ pub(crate) fn mark_fx_scroll(
     if rows == 0 {
         return;
     }
-    let rides = |i: usize| {
-        prev_layers
+    let top = bands.grid_top as i128;
+    let bottom = top.saturating_add((rows as i128).saturating_mul(bands.cell_h as i128));
+    for i in 0..prev_layers.len().max(cur_layers.len()) {
+        if prev_layers
             .get(i)
             .zip(cur_layers.get(i))
             .is_some_and(|(p, c)| rides_the_blit(p, c, bands, rows, da, [prev_occ, cur_occ]))
-    };
-    let top = bands.grid_top as i128;
-    let bottom = top.saturating_add((rows as i128).saturating_mul(bands.cell_h as i128));
-    for (i, layer) in prev_layers.iter().enumerate() {
-        let Some((y0, y1)) = window_rows(layer, bands) else {
-            continue;
-        };
-        if rides(i) {
+        {
             continue;
         }
-        if y0 < top {
-            dirty[0] = true;
-        }
-        if y1 > bottom {
-            dirty[rows - 1] = true;
-        }
-        let (g0, g1) = (y0.max(top), y1.min(bottom));
-        if g0 < g1 {
-            let (lo, hi) = (bands.band_of(g0, rows), bands.band_of(g1 - 1, rows));
-            for b in lo..=hi {
-                let r = b as i128 - i128::from(da);
-                if (0..rows as i128).contains(&r) {
-                    dirty[r as usize] = true;
+        if let Some(layer) = prev_layers.get(i)
+            && let Some((y0, y1)) = window_rows(layer, bands)
+        {
+            if y0 < top {
+                dirty[0] = true;
+            }
+            if y1 > bottom {
+                dirty[rows - 1] = true;
+            }
+            let (g0, g1) = (y0.max(top), y1.min(bottom));
+            if g0 < g1 {
+                let (lo, hi) = (bands.band_of(g0, rows), bands.band_of(g1 - 1, rows));
+                for b in lo..=hi {
+                    let r = b as i128 - i128::from(da);
+                    if (0..rows as i128).contains(&r) {
+                        dirty[r as usize] = true;
+                    }
                 }
             }
         }
-    }
-    for (i, layer) in cur_layers.iter().enumerate() {
-        if !rides(i) {
+        if let Some(layer) = cur_layers.get(i) {
             mark_layer(dirty, bands, layer);
         }
     }

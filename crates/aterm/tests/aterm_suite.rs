@@ -67,6 +67,8 @@ mod lifeline_live_headless;
 #[cfg(unix)]
 mod messages_live_headless;
 #[cfg(unix)]
+mod occupancy_wakes_live_headless;
+#[cfg(unix)]
 mod person_seam_live_headless;
 mod protected_spawn;
 #[cfg(unix)]

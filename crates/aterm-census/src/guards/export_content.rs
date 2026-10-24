@@ -11,6 +11,7 @@ use aterm_regex::{Regex, RegexBuilder};
 
 use super::captures::{self, EXTRA, Row, file_rows};
 use super::{Finding, Rule, Tree};
+use crate::export::plaintext::{self, Plaintext};
 use crate::export::{MANIFEST, Selection, rewrite};
 
 pub(super) const EXPORT_CONTENT: Rule = Rule {
@@ -423,10 +424,19 @@ fn held_to(tree: &Tree<'_>, baseline: Result<(String, String), String>, out: &mu
     out.extend(found.into_iter().flatten());
 }
 
-/// One exported file: its path, then each line of its rewritten text, held to
-/// the rows. A file holding a NUL the transforms leave as it is, and the
-/// engine's grep reads its bytes (`-a`): a match there is a binary hit, at no
-/// line and cleared by no tag, so it is one finding per row at line 0.
+/// How much of a file the engine's grep reads for a NUL before it calls the
+/// file binary: macOS's grep (BSD grep 2.6.0) looks only in its first 32 KiB
+/// read, so a file whose first NUL comes later is text to it (measured: a
+/// first NUL at byte 32767 is binary to `grep -IlE`, at 32768 text).
+const GREP_HEAD: usize = 32 << 10;
+
+/// One exported file as the engine reads it: its path, its content as the
+/// engine's grep reads it, and what it decodes to ([`Plaintext`]). The
+/// transforms leave a file holding a NUL as it is. A file with a NUL where the
+/// engine's grep looks ([`GREP_HEAD`]) is binary to it: a match in its bytes,
+/// as in what it decodes to, is a binary hit, at no line and cleared by no
+/// tag, so it is one finding per row at line 0. Otherwise its lines are held
+/// as [`by_line`] says.
 fn judge(tree: &Tree<'_>, rel: &str, held: &Held<'_>, out: &mut Vec<Finding>) {
     for (k, _) in held.candidates(rel.as_bytes()) {
         if held.rows[k].line.is_match(rel) {
@@ -444,42 +454,250 @@ fn judge(tree: &Tree<'_>, rel: &str, held: &Held<'_>, out: &mut Vec<Finding>) {
             return;
         }
     };
-    let binary = bytes.contains(&0);
-    let text = if binary { bytes } else { rewrite(&bytes) };
-    let lossy = String::from_utf8_lossy(&text);
-    let lines: Vec<&str> = lossy.split('\n').collect();
+    let exported = if bytes.contains(&0) {
+        bytes
+    } else {
+        rewrite(&bytes)
+    };
+    let plain = plaintext::read(&exported);
+    let binary = exported[..exported.len().min(GREP_HEAD)].contains(&0);
+    // A binary stream that decodes whole is judged by its plaintext alone: the
+    // engine sets its bytes' verdict aside (a zstd copy holds them again).
+    if !binary || !matches!(plain, Plaintext::Stream { stopped: None, .. }) {
+        let how = if binary { Lines::Bytes } else { Lines::Text };
+        by_line(rel, &exported, how, held, out);
+    }
+    match plain {
+        Plaintext::None => {}
+        Plaintext::Bom { encoding, text } => whole(rel, encoding, &text, held, out),
+        Plaintext::Stream {
+            kind,
+            copy,
+            stopped,
+        } => {
+            let stopped = stopped.as_deref();
+            by_line(rel, &copy, Lines::Copy { kind, stopped }, held, out);
+        }
+        Plaintext::Unjudged { kind, why } => out.push(finding(
+            rel,
+            0,
+            format!(
+                "its {kind} stream {why}, so it is not judged here (`verify export` runs the \
+                 engine itself on a pushed HEAD)"
+            ),
+        )),
+    }
+}
+
+/// What [`by_line`] holds.
+#[derive(Clone, Copy)]
+enum Lines<'a> {
+    /// A text file's lines, as exported: each at its number, a tag honoured.
+    Text,
+    /// A binary file's bytes.
+    Bytes,
+    /// The copy the engine greps of a compressed file, and why it stopped
+    /// early, if it did.
+    Copy {
+        kind: &'static str,
+        stopped: Option<&'a str>,
+    },
+}
+
+/// Each line of `text`, as `grep` reads it, held to the rows. The engine reads
+/// the lines its text grep prints as UTF-8 and aborts its whole scan on one
+/// that is not (its BUG-3), so such a line that matches is a finding no tag
+/// clears.
+fn by_line(rel: &str, text: &[u8], how: Lines<'_>, held: &Held<'_>, out: &mut Vec<Finding>) {
+    let binary = !matches!(how, Lines::Text);
+    let lines: Vec<(&[u8], std::borrow::Cow<'_, str>)> = text
+        .split(|&b| b == b'\n')
+        .map(|raw| (raw, String::from_utf8_lossy(raw)))
+        .collect();
     let mut reported = BTreeSet::new();
-    for (k, i) in held.candidates(&text) {
+    for (k, i) in held.candidates(text) {
         if binary && reported.contains(&k) {
             continue;
         }
-        let line = lines[i];
+        let (raw, line) = &lines[i];
         let row = held.rows[k];
-        let detail = match row.line.try_is_match(line) {
-            Ok(false) => continue,
-            Ok(true) if !binary && held.credential[k] && line.contains(ALLOW_TAG) => continue,
-            Ok(true) if binary => format!(
-                "its bytes match {} (a binary file, which the transforms leave as it is and no \
-                 tag clears); make it without that text",
-                row.source
+        let source = &row.source;
+        let detail = match (row.line.try_is_match(line), how) {
+            (Ok(false), _) => continue,
+            (Ok(true), Lines::Text) if std::str::from_utf8(raw).is_err() => format!(
+                "as exported, this line matches {source} and its bytes are not UTF-8: the \
+                 engine's grep prints it and the engine aborts its scan on output that is not \
+                 UTF-8 (its BUG-3), whatever tag the line carries; write the line as UTF-8"
             ),
-            Ok(true) => format!(
-                "as exported, this line matches {}; replace the text, or spell what a test \
-                 needs in halves",
-                row.source
+            (Ok(true), Lines::Text) if held.credential[k] && line.contains(ALLOW_TAG) => continue,
+            (Ok(true), Lines::Text) => format!(
+                "as exported, this line matches {source}; replace the text, or spell what a \
+                 test needs in halves"
             ),
-            Err(_) => format!(
-                "{} exhausted the search for {}, so it is not judged",
-                if binary {
-                    "a line of its bytes"
-                } else {
-                    "this line"
-                },
-                row.source
+            (Ok(true), Lines::Bytes) => format!(
+                "its bytes match {source} (a binary file, which the transforms leave as it is \
+                 and no tag clears); make it without that text"
+            ),
+            (Ok(true), Lines::Copy { kind, stopped }) => format!(
+                "what it decodes to{} matches {source} (the engine greps a {kind} file's \
+                 decoded stream, where no tag clears a match); make it without that text",
+                stopped.map_or_else(String::new, |why| format!(
+                    " before its stream stops where the engine's does ({why})"
+                ))
+            ),
+            (Err(_), _) => format!(
+                "{} exhausted the search for {source}, so it is not judged",
+                match how {
+                    Lines::Text => "this line",
+                    Lines::Bytes => "a line of its bytes",
+                    Lines::Copy { .. } => "a line of what it decodes to",
+                }
             ),
         };
         reported.insert(k);
         out.push(finding(rel, if binary { 0 } else { i + 1 }, detail));
+    }
+}
+
+/// A BOM'd file's decoded `text`, searched whole as the engine searches it
+/// with Python's `re`: a row both read alike ([`python`]) matches when it
+/// matches the text or the text less a final newline, where Python's `$` also
+/// matches. A row read apart is unjudged, unless it reads apart only past
+/// ASCII and the text holds none of its anchors, which every match in either
+/// reading holds.
+fn whole(rel: &str, encoding: &str, text: &str, held: &Held<'_>, out: &mut Vec<Finding>) {
+    let ascii = text
+        .bytes()
+        .all(|b| b.is_ascii() && !(0x1c..=0x1f).contains(&b));
+    let anchored: BTreeSet<usize> = held
+        .anchors
+        .lines(text.as_bytes())
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    let less = text.strip_suffix('\n');
+    for (k, row) in held.rows.iter().enumerate() {
+        let source = &row.source;
+        let reading = python(row.line.as_str());
+        if reading == Python::Apart || (reading == Python::AsciiAlike && !ascii) {
+            if reading == Python::AsciiAlike && !held.whole.contains(&k) && !anchored.contains(&k) {
+                continue;
+            }
+            out.push(finding(
+                rel,
+                0,
+                format!(
+                    "the engine searches its {encoding} text whole with Python's re, which may \
+                     read {source} apart from this guard's regex there, so it is not judged"
+                ),
+            ));
+            continue;
+        }
+        let found = row.line.try_is_match(text).and_then(|hit| match less {
+            Some(less) if !hit => row.line.try_is_match(less),
+            _ => Ok(hit),
+        });
+        let detail = match found {
+            Ok(false) => continue,
+            Ok(true) => format!(
+                "decoded as the engine reads it ({encoding}), its text matches {source} (no tag \
+                 clears it); make it without that text"
+            ),
+            Err(_) => format!(
+                "its {encoding} text exhausted the search for {source}, so it is not judged"
+            ),
+        };
+        out.push(finding(rel, 0, detail));
+    }
+}
+
+/// How Python's `re`, the engine's reader of a BOM'd file's text, reads a row
+/// beside this crate's regex, both searching one whole text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Python {
+    /// Alike over any text, once the text less a final newline is searched
+    /// too: every `$` ends its branch.
+    Alike,
+    /// Alike over ASCII text without U+001C..U+001F; past it, its `\w`, `\d`,
+    /// `\s`, `\b` or `(?i)` may read a character apart.
+    AsciiAlike,
+    /// Apart: a character past ASCII, a POSIX class, a flag or extension but
+    /// `(?:` and `(?i)`, `{,n}`, an escape the two read apart (`\<` and `\>` are
+    /// literal in Python), or a `$` something may follow.
+    Apart,
+}
+
+fn python(pattern: &str) -> Python {
+    /// An escape's reading: `None` apart, `Some(true)` alike over ASCII only.
+    fn escape(e: Option<&char>) -> Option<bool> {
+        match *e? {
+            'w' | 'W' | 'd' | 'D' | 's' | 'S' | 'b' | 'B' => Some(true),
+            'n' | 't' | 'r' | 'f' | 'v' | 'a' | 'x' | 'u' | 'U' | 'A' => Some(false),
+            e => (e.is_ascii_punctuation() && !matches!(e, '<' | '>')).then_some(false),
+        }
+    }
+    let chars: Vec<char> = pattern.chars().collect();
+    let (mut ascii_only, mut depth, mut i) = (false, 0usize, 0);
+    while let Some(&c) = chars.get(i) {
+        match c {
+            _ if !c.is_ascii() => return Python::Apart,
+            '\\' => {
+                let Some(only) = escape(chars.get(i + 1)) else {
+                    return Python::Apart;
+                };
+                ascii_only |= only;
+                i += 1;
+            }
+            '[' => {
+                let Some(end) = class_end(&chars, i) else {
+                    return Python::Apart;
+                };
+                let mut j = i + 1;
+                while j < end {
+                    match chars[j] {
+                        '\\' => {
+                            j += 1;
+                            let Some(only) = escape(chars.get(j)) else {
+                                return Python::Apart;
+                            };
+                            ascii_only |= only;
+                        }
+                        '[' => return Python::Apart,
+                        c if !c.is_ascii() => return Python::Apart,
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                i = end;
+            }
+            '(' => {
+                depth += 1;
+                match chars.get(i + 1..i + 4) {
+                    Some(['?', ':', ..]) => {}
+                    Some(['?', 'i', ')' | ':']) => ascii_only = true,
+                    _ if chars.get(i + 1) == Some(&'?') => return Python::Apart,
+                    _ => {}
+                }
+            }
+            ')' => depth = depth.saturating_sub(1),
+            '{' if chars.get(i + 1) == Some(&',') => return Python::Apart,
+            '$' => {
+                let (mut j, mut d) = (i + 1, depth);
+                while chars.get(j) == Some(&')') {
+                    (j, d) = (j + 1, d.saturating_sub(1));
+                }
+                if !(j == chars.len() || (chars[j] == '|' && d == 0)) {
+                    return Python::Apart;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if ascii_only {
+        Python::AsciiAlike
+    } else {
+        Python::Alike
     }
 }
 

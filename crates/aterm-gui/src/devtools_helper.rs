@@ -12,6 +12,7 @@ use aterm_containment::consent::{
     DevToolList, DevToolListLabel, DevToolListing, DevToolProbe, FdaState, ProbeGate, devtool_grant,
 };
 use aterm_types::MutexExt as _;
+use aterm_types::macos_setup::Access;
 
 /// How long the owner's hands must have been off the keyboard and mouse before aterm puts System Settings in front of them: a pause, not a word being typed (the automatic update's 2.5 s gap is tuned for an apply landing mid-word, not for taking focus away).
 pub(crate) const QUIET_FOR: Duration = Duration::from_secs(10);
@@ -43,8 +44,17 @@ pub(crate) const fn quiet(
 /// Where a hand-over came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Origin {
-    /// The window's own, once per aterm version (`devtools_watch` for Developer Tools, the launch check, `App::note_launch_fda`, for Full Disk Access): at a quiet moment.
+    /// The window's own, once per approved setup revision (`devtools_watch` for Developer Tools, the launch check, `App::note_launch_fda`, for Full Disk Access): a step of System State's run.
     Automatic,
+    /// A control client's act on System State's Full Disk Access or Developer Tools row
+    /// (`aterm ctl app act`, a key a client sends: `App::open_access_from_system_state`).
+    /// It never mints the yes, so it is a step of the approved revision as the window's
+    /// own is: judged at the step moment (`App::access_step_moment`: System State
+    /// frontmost, no macOS dialog up), never opened at once, and held by every refusal
+    /// the window's own obeys — a Not now only for its own revision — but once per
+    /// revision: it asks, and the ten-minute gap bounds how often. It lapses after
+    /// [`ASKED_LAPSE`] as a control verb's does.
+    SystemStateAct,
     /// The Settings ▸ Security card's button: the owner's press.
     Settings,
     /// The digest line's mover: the owner's press.
@@ -67,13 +77,15 @@ impl Origin {
         match self {
             Self::Settings | Self::Digest => None,
             Self::Ctl { now: true } => Some(atpkg::devtools::REOPEN_NOW_AFTER_S),
-            Self::Automatic | Self::Ctl { now: false } => Some(atpkg::devtools::REOPEN_AFTER_S),
+            Self::Automatic | Self::SystemStateAct | Self::Ctl { now: false } => {
+                Some(atpkg::devtools::REOPEN_AFTER_S)
+            }
         }
     }
 
     const fn lapses_after(self) -> Option<Duration> {
         match self {
-            Self::Ctl { now: false } => Some(ASKED_LAPSE),
+            Self::Ctl { now: false } | Self::SystemStateAct => Some(ASKED_LAPSE),
             _ => None,
         }
     }
@@ -82,11 +94,19 @@ impl Origin {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Automatic => "automatic",
+            Self::SystemStateAct => "system state act",
             Self::Settings => "settings",
             Self::Digest => "digest",
             Self::Ctl { now: false } => "ctl",
             Self::Ctl { now: true } => "ctl now",
         }
+    }
+
+    /// A step of System State's run, judged at its step moment
+    /// (`App::access_step_moment`): the window's own and a control client's act on a
+    /// System State row. A control verb's keeps the quiet moment alone.
+    pub(crate) const fn system_state_step(self) -> bool {
+        matches!(self, Self::Automatic | Self::SystemStateAct)
     }
 }
 
@@ -116,6 +136,43 @@ impl Page {
             Self::FullDiskAccess => "full disk access",
         }
     }
+
+    /// The System State row the page grants.
+    pub(crate) const fn access(self) -> Access {
+        match self {
+            Self::DeveloperTools => Access::DeveloperTools,
+            Self::FullDiskAccess => Access::FullDiskAccess,
+        }
+    }
+}
+
+/// WHETHER THE OWNER'S NOT NOW HOLDS a hand-over from `origin` back, for the page whose
+/// current key is `key` (`atpkg::devtools::revision_key`, or the running version with no
+/// approved revision): `last` is the newest decline whatever its age
+/// (`PageMarkers::last_declined`) and `held` whether one is inside its span
+/// (`PageMarkers::declined_until`). A step of System State's run — the window's own
+/// hand-over and a control client's act on its row ([`Origin::system_state_step`]) — is
+/// held back by a Not now under the approved revision for the rest of that revision
+/// (`atpkg::devtools::same_step`: a key written before the bundle id or this Mac was read
+/// is that revision's too) and by nothing else: a new access revision is a new
+/// Permissions approval (`docs/DESIGN-system-state-2026-10-21.md` §6: turning Permissions
+/// off and on again), which asks again, as the row's Not now says. The control verb
+/// (`aterm ctl devtools hand-over`), which no approval stands behind, is also held by any
+/// Not now for its span (30 days, 90 after a second), whatever revision or version it
+/// was said under. An owner's press is never asked. Pure.
+#[must_use]
+pub(crate) fn declined_for(
+    origin: Origin,
+    key: &str,
+    last: Option<&(String, u64)>,
+    held: bool,
+) -> bool {
+    let this_revision = last.is_some_and(|(word, _)| atpkg::devtools::same_step(word, key));
+    match origin {
+        Origin::Settings | Origin::Digest => false,
+        Origin::Automatic | Origin::SystemStateAct => this_revision,
+        Origin::Ctl { .. } => this_revision || held,
+    }
 }
 
 /// When [`admit`] is asked: as the request arrives, or at the quiet moment a waiting one was held for.
@@ -132,9 +189,13 @@ pub(crate) enum Moment {
 pub(crate) struct Facts {
     pub(crate) grant: DevToolGrant,
     pub(crate) list: DevToolList,
+    /// The owner's Not now still holds ([`declined_for`]).
     pub(crate) declined: bool,
     pub(crate) grant_stable: bool,
     pub(crate) recent: bool,
+    /// The window's own Full Disk Access probe reads the grant on: the window's own
+    /// hand-over waits for it, since without it the list cannot be read back.
+    pub(crate) fda_on: bool,
 }
 
 /// Why a hand-over did nothing.
@@ -152,8 +213,12 @@ pub(crate) enum Refusal {
     Recent,
     /// aterm's row reads on while macOS still checks its new programs: the page holds nothing to add or switch on (`atpkg::devtools::Step::ListedOn`).
     Listed,
-    /// aterm already brought the page up for this version, unasked ([`FdaFacts::shown_this_version`]).
+    /// aterm already brought the page up for this approved revision, unasked ([`FdaFacts::shown_this_revision`]).
     Shown,
+    /// The window's own Developer Tools hand-over waits for Full Disk Access to read on:
+    /// without it the list cannot be read back, so a switch flipped there could not be
+    /// confirmed.
+    NoFullDiskAccess,
     /// Another app is responsible for this window ([`FdaFacts::own`]): the probe read that app's grant, which aterm's page cannot change.
     NotOwn,
 }
@@ -169,6 +234,7 @@ impl Refusal {
             Self::Recent => "recent",
             Self::Listed => "listed",
             Self::Shown => "shown",
+            Self::NoFullDiskAccess => "waits on full disk access",
             Self::NotOwn => "not own",
         }
     }
@@ -192,7 +258,7 @@ pub(crate) enum Admit {
     },
 }
 
-/// WHO MAY BRING THE PAGE UP, AND WHEN.
+/// WHO MAY BRING THE PAGE UP, AND WHEN. The window's own hand-over waits for Full Disk Access to read on.
 #[must_use]
 pub(crate) fn admit(origin: Origin, moment: Moment, facts: &Facts) -> Admit {
     let empty = facts.list.label == DevToolListLabel::Read && facts.list.rows == Some(0);
@@ -211,6 +277,9 @@ pub(crate) fn admit(origin: Origin, moment: Moment, facts: &Facts) -> Admit {
         DevToolGrant::Granted => return Admit::Refuse(Refusal::Granted),
         DevToolGrant::Unknown => return Admit::Refuse(Refusal::Unknown),
         DevToolGrant::NotGranted => {}
+    }
+    if origin == Origin::Automatic && !facts.fda_on {
+        return Admit::Refuse(Refusal::NoFullDiskAccess);
     }
     let now = origin == Origin::Ctl { now: true };
     if !now && atpkg::devtools::Step::of(&facts.list) == atpkg::devtools::Step::ListedOn {
@@ -242,11 +311,12 @@ pub(crate) struct FdaFacts {
     pub(crate) grant_stable: bool,
     pub(crate) recent: bool,
     pub(crate) devtools_recent: bool,
-    pub(crate) shown_this_version: bool,
+    /// aterm already brought this page up under the approved setup revision (`fda-pane-opened`'s key, `atpkg::devtools::same_step`).
+    pub(crate) shown_this_revision: bool,
     pub(crate) own: bool,
 }
 
-/// WHO MAY BRING THE FULL DISK ACCESS PAGE UP, AND WHEN.
+/// WHO MAY BRING THE FULL DISK ACCESS PAGE UP, AND WHEN. A control client's act on System State's row ([`Origin::SystemStateAct`]) is held as the window's own hand-over, but for once per revision, and is only ever queued.
 #[must_use]
 pub(crate) fn admit_fda(origin: Origin, moment: Moment, facts: &FdaFacts) -> Admit {
     if origin.owner_press() {
@@ -269,7 +339,7 @@ pub(crate) fn admit_fda(origin: Origin, moment: Moment, facts: &FdaFacts) -> Adm
     if !facts.grant_stable {
         return Admit::Refuse(Refusal::Unstable);
     }
-    if facts.shown_this_version {
+    if origin == Origin::Automatic && facts.shown_this_revision {
         return Admit::Refuse(Refusal::Shown);
     }
     if facts.recent {
@@ -1661,6 +1731,7 @@ pub(crate) struct Reach {
     pub(crate) opened_within: fn(u64) -> Option<u64>,
     pub(crate) note_opened: fn(&str),
     pub(crate) declined: fn() -> Option<(u64, u64)>,
+    pub(crate) last_declined: fn() -> Option<(String, u64)>,
     pub(crate) note_declined: fn(&str),
     pub(crate) grant_stable: fn() -> bool,
     pub(crate) drag_bundle: fn(Option<&str>) -> Option<PathBuf>,
@@ -1679,6 +1750,7 @@ impl Reach {
             opened_within: atpkg::devtools::opened_within,
             note_opened: atpkg::devtools::note_opened,
             declined: live_declined,
+            last_declined: live_last_declined,
             note_declined: atpkg::devtools::note_declined,
             grant_stable: live_grant_stable,
             drag_bundle,
@@ -1697,6 +1769,7 @@ impl Reach {
             opened_within: inert_opened_within,
             note_opened: inert_note,
             declined: inert_not_declined,
+            last_declined: inert_last_opened,
             note_declined: inert_note,
             grant_stable: inert_no,
             drag_bundle: inert_drag_bundle,
@@ -1718,6 +1791,10 @@ fn live_open_pane() -> bool {
 
 fn live_declined() -> Option<(u64, u64)> {
     atpkg::devtools::declined_until().map(|declined| (declined.at, declined.until))
+}
+
+fn live_last_declined() -> Option<(String, u64)> {
+    atpkg::devtools::DEVELOPER_TOOLS.last_declined()
 }
 
 fn live_grant_stable() -> bool {
@@ -1762,6 +1839,7 @@ pub(crate) struct FdaReach {
     pub(crate) opened_within: fn(u64) -> Option<u64>,
     pub(crate) note_opened: fn(&str),
     pub(crate) declined: fn() -> Option<(u64, u64)>,
+    pub(crate) last_declined: fn() -> Option<(String, u64)>,
     pub(crate) note_declined: fn(&str),
     live: bool,
 }
@@ -1775,6 +1853,7 @@ impl FdaReach {
             opened_within: live_fda_opened_within,
             note_opened: live_fda_note_opened,
             declined: live_fda_declined,
+            last_declined: live_fda_last_declined,
             note_declined: live_fda_note_declined,
             live: true,
         }
@@ -1788,6 +1867,7 @@ impl FdaReach {
             opened_within: inert_opened_within,
             note_opened: inert_note,
             declined: inert_not_declined,
+            last_declined: inert_last_opened,
             note_declined: inert_note,
             live: false,
         }
@@ -1822,6 +1902,10 @@ fn live_fda_declined() -> Option<(u64, u64)> {
     atpkg::devtools::FULL_DISK_ACCESS
         .declined_until()
         .map(|declined| (declined.at, declined.until))
+}
+
+fn live_fda_last_declined() -> Option<(String, u64)> {
+    atpkg::devtools::FULL_DISK_ACCESS.last_declined()
 }
 
 fn live_fda_note_declined(version: &str) {
@@ -2014,6 +2098,31 @@ pub(crate) struct Asks {
     pub(crate) open_status: bool,
 }
 
+/// The keys a panel's Not now is noted under, and the approved revision it is recorded
+/// for: the window sets them before it shows a panel ([`Lane::set_marks`]). With no
+/// approved revision the keys are the running version and nothing is recorded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Marks {
+    /// `devtools-declined`'s key (`atpkg::devtools::revision_key`).
+    pub(crate) devtools: String,
+    /// `fda-declined`'s key: the revision's, with the bundle id and this Mac after it.
+    pub(crate) fda: String,
+    /// The approved setup revision a decline is recorded for in
+    /// `<state>/system-state-access`.
+    pub(crate) revision: Option<u64>,
+}
+
+impl Default for Marks {
+    fn default() -> Self {
+        let version = aterm_types::version::app_version().to_owned();
+        Self {
+            devtools: version.clone(),
+            fda: version,
+            revision: None,
+        }
+    }
+}
+
 /// THE `App`-OWNED HAND-OVER LANE: the hand-over waiting for its quiet moment, the `spctl` worker, the panel and its reads, and the latest reading.
 #[derive(Debug)]
 pub(crate) struct Lane {
@@ -2038,6 +2147,11 @@ pub(crate) struct Lane {
     now_answered: Option<Instant>,
     refreshing: Arc<std::sync::atomic::AtomicBool>,
     refreshes: u32,
+    /// The keys and revision a panel's Not now is noted under ([`Self::set_marks`]).
+    marks: Marks,
+    /// Not nows said under an approved revision, until the window records them
+    /// ([`Self::take_declines`]).
+    declines: Vec<(u64, Access)>,
 }
 
 impl Lane {
@@ -2084,6 +2198,8 @@ impl Lane {
             now_answered: None,
             refreshing: Arc::default(),
             refreshes: 0,
+            marks: Marks::default(),
+            declines: Vec::new(),
         }
     }
 
@@ -2139,7 +2255,6 @@ impl Lane {
     }
 
     /// The origin of the hand-over waiting for its quiet moment.
-    #[cfg(test)]
     pub(crate) fn queued(&self) -> Option<Origin> {
         self.queued.as_ref().map(|q| q.origin)
     }
@@ -2147,6 +2262,20 @@ impl Lane {
     /// The latest reading.
     pub(crate) const fn reading(&self) -> Option<Reading> {
         self.reading
+    }
+
+    /// Forget a reading that only said the probe was switched off (`[privacy]
+    /// enabled` or `check`): it read nothing, so once every switch is on again
+    /// it decides nothing either, and the next completed reading takes its
+    /// place (`App::resume_held_launch_steps`). `true` when one was forgotten.
+    pub(crate) fn forget_switched_off_reading(&mut self) -> bool {
+        let switched_off = self.reading.is_some_and(|reading| {
+            reading.log.label == aterm_containment::consent::DevToolProbeLabel::RefusedDisabled
+        });
+        if switched_off {
+            self.reading = None;
+        }
+        switched_off
     }
 
     /// When aterm last opened the page for the owner (unix seconds, the shared marker any aterm writes, `aterm doctor` included), read at most once between focus gains: the Settings card's "last opened" line.
@@ -2280,7 +2409,11 @@ impl Lane {
 
     /// Hold the Full Disk Access hand-over for its quiet moment.
     pub(crate) fn queue_fda(&mut self, origin: Origin, now: Instant) {
-        if self.fda_queued.is_some() {
+        if self
+            .fda_queued
+            .as_ref()
+            .is_some_and(|q| q.origin == Origin::Automatic || origin != Origin::Automatic)
+        {
             return;
         }
         self.fda_queued = Some(Queued {
@@ -2330,15 +2463,37 @@ impl Lane {
         }
     }
 
+    /// The waiting Developer Tools hand-over looks at `at`, not before: aterm brought the
+    /// page up within [`atpkg::devtools::REOPEN_AFTER_S`], and a new access revision's
+    /// page waits until those ten minutes are up (`App::rearm_devtools_step`).
+    pub(crate) fn defer(&mut self, at: Instant) {
+        if let Some(queued) = self.queued.as_mut() {
+            queued.next_check = at;
+        }
+    }
+
     /// Whether a Developer Tools hand-over waits for its quiet moment, or its `spctl` run is out.
     pub(crate) const fn devtools_waiting(&self) -> bool {
         self.queued.is_some() || self.listing.is_some()
     }
 
-    /// The waiting Full Disk Access hand-over, when `quiet` and no panel is up (an owner's Developer Tools panel is not taken away from them); otherwise it looks again [`RECHECK_EVERY`] later.
+    /// The waiting Full Disk Access hand-over, when `quiet` and no panel is up (an owner's Developer Tools panel is not taken away from them); otherwise it looks again [`RECHECK_EVERY`] later, or (a control client's act, after [`ASKED_LAPSE`]) lapses.
     pub(crate) fn take_queued_fda(&mut self, now: Instant, quiet: bool) -> Option<Origin> {
         let panel_up = self.panel.is_some();
         let queued = self.fda_queued.as_mut()?;
+        if queued
+            .origin
+            .lapses_after()
+            .is_some_and(|after| now.saturating_duration_since(queued.at) >= after)
+        {
+            aterm_log::info!(
+                "full disk access hand-over ({}): no step moment came in {} minutes; it lapsed",
+                queued.origin.as_str(),
+                ASKED_LAPSE.as_secs() / 60
+            );
+            self.fda_queued = None;
+            return None;
+        }
         if quiet && !panel_up {
             return self.fda_queued.take().map(|q| q.origin);
         }
@@ -2543,22 +2698,39 @@ impl Lane {
         true
     }
 
+    /// The keys a panel's Not now is noted under from now on, and the approved revision
+    /// it is recorded for ([`Marks`]).
+    pub(crate) fn set_marks(&mut self, marks: Marks) {
+        self.marks = marks;
+    }
+
+    /// The Not nows said under an approved revision since the last take, for the window to
+    /// record as each row's `declined` (`<state>/system-state-access`).
+    pub(crate) fn take_declines(&mut self) -> Vec<(u64, Access)> {
+        std::mem::take(&mut self.declines)
+    }
+
     fn close(&mut self, why: Closed) {
         let Some(panel) = self.panel.take() else {
             return;
         };
         (self.arm.close)();
         self.next_tick = None;
+        if why.declines()
+            && let Some(revision) = self.marks.revision
+        {
+            self.declines.push((revision, panel.page.access()));
+        }
         match panel.page {
             Page::DeveloperTools => {
                 if why.declines() {
-                    (self.reach.note_declined)(aterm_types::version::app_version());
+                    (self.reach.note_declined)(&self.marks.devtools);
                     self.declined = None;
                 }
             }
             Page::FullDiskAccess => {
                 if why.declines() {
-                    (self.fda.note_declined)(aterm_types::version::app_version());
+                    (self.fda.note_declined)(&self.marks.fda);
                 }
                 self.fda_ended = Some(FdaEnded {
                     why,
@@ -4389,6 +4561,9 @@ pub(crate) mod test_arms {
         static FDA_OPENS: Cell<u32> = const { Cell::new(0) };
         static FDA_OPENED_NOTES: Cell<u32> = const { Cell::new(0) };
         static FDA_DECLINE_NOTES: Cell<u32> = const { Cell::new(0) };
+        static FDA_DECLINED_KEY: std::cell::RefCell<Option<String>> =
+            const { std::cell::RefCell::new(None) };
+        static FDA_OPENED_AGO: Cell<Option<u64>> = const { Cell::new(None) };
     }
 
     pub(crate) fn fda_counts() -> (u32, u32, u32) {
@@ -4417,6 +4592,54 @@ pub(crate) mod test_arms {
             note_declined: |_| bump(&FDA_DECLINE_NOTES),
             ..FdaReach::inert()
         }
+    }
+
+    /// [`fda_opening`], with the owner's Not now on the panel holding, said under
+    /// approved setup revision 1.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn fda_declined() -> FdaReach {
+        FdaReach {
+            declined: || Some((1, u64::MAX)),
+            last_declined: || Some((atpkg::devtools::revision_key(1), 1)),
+            ..fda_opening()
+        }
+    }
+
+    /// [`fda_opening`], whose panel Not now is kept on this thread as
+    /// `fda-declined` keeps it: noted under its key, read back as the newest, and
+    /// held for its span; and whose page was opened as long ago as
+    /// [`set_fda_opened_ago`] says. [`forget_fda_declines`] starts both empty.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn fda_keeping_declines() -> FdaReach {
+        FdaReach {
+            opened_within: |window| FDA_OPENED_AGO.with(Cell::get).filter(|ago| *ago < window),
+            declined: || {
+                FDA_DECLINED_KEY
+                    .with(|key| key.borrow().is_some())
+                    .then_some((1, u64::MAX))
+            },
+            last_declined: || FDA_DECLINED_KEY.with(|key| key.borrow().clone().map(|key| (key, 1))),
+            note_declined: |noted| {
+                bump(&FDA_DECLINE_NOTES);
+                FDA_DECLINED_KEY.with(|key| *key.borrow_mut() = Some(noted.to_owned()));
+            },
+            ..fda_opening()
+        }
+    }
+
+    /// No Not now kept for [`fda_keeping_declines`] on this thread, and no page
+    /// opened.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn forget_fda_declines() {
+        FDA_DECLINED_KEY.with(|key| *key.borrow_mut() = None);
+        set_fda_opened_ago(None);
+    }
+
+    /// [`fda_keeping_declines`]'s page was opened `ago` seconds ago (`None`: not
+    /// within any window).
+    #[cfg(target_os = "macos")]
+    pub(crate) fn set_fda_opened_ago(ago: Option<u64>) {
+        FDA_OPENED_AGO.with(|cell| cell.set(ago));
     }
 
     fn bump(counter: &'static std::thread::LocalKey<Cell<u32>>) {
@@ -4501,6 +4724,7 @@ pub(crate) mod test_arms {
     pub(crate) fn declining() -> Reach {
         Reach {
             declined: || Some(DECLINED),
+            last_declined: || Some((atpkg::devtools::revision_key(1), DECLINED.0)),
             ..opening()
         }
     }
@@ -4604,7 +4828,7 @@ mod tests {
             grant_stable: true,
             recent: false,
             devtools_recent: false,
-            shown_this_version: false,
+            shown_this_revision: false,
             own: true,
         }
     }
@@ -4622,7 +4846,7 @@ mod tests {
                 grant_stable: false,
                 recent: true,
                 devtools_recent: true,
-                shown_this_version: true,
+                shown_this_revision: true,
                 own: false,
             };
             assert_eq!(admit_fda(origin, Moment::Asked, &refused_everything), hand);
@@ -4666,7 +4890,7 @@ mod tests {
             ),
             (
                 FdaFacts {
-                    shown_this_version: true,
+                    shown_this_revision: true,
                     ..fda_facts()
                 },
                 Refusal::Shown,
@@ -4679,6 +4903,7 @@ mod tests {
                 Refusal::Recent,
             ),
         ];
+        let act = Origin::Ctl { now: false };
         for (facts, why) in cases {
             for moment in [Moment::Asked, Moment::Quiet] {
                 assert_eq!(
@@ -4686,8 +4911,24 @@ mod tests {
                     Admit::Refuse(why),
                     "{facts:?} {moment:?}"
                 );
+                let for_act = if why == Refusal::Shown {
+                    // An act asks: the page shown this revision does not hold it.
+                    if moment == Moment::Quiet {
+                        hand
+                    } else {
+                        Admit::Queue
+                    }
+                } else {
+                    Admit::Refuse(why)
+                };
+                assert_eq!(
+                    admit_fda(act, moment, &facts),
+                    for_act,
+                    "a client's act: {facts:?} {moment:?}"
+                );
             }
         }
+        assert_eq!(admit_fda(act, Moment::Asked, &fda_facts()), Admit::Queue);
         let devtools_recent = FdaFacts {
             devtools_recent: true,
             ..fda_facts()
@@ -4824,6 +5065,77 @@ mod tests {
         );
     }
 
+    /// A Not now under the approved revision holds a step of System State's run (the
+    /// window's own hand-over, a control client's act on its row) back for the rest of that
+    /// revision, said before or after the bundle id and this Mac were read, and nothing
+    /// else holds it: a Not now of an earlier revision, or an older aterm's under a version,
+    /// is answered by the new approval, inside its span or not. The control verb is also
+    /// held by any Not now for its span; an owner's press by neither.
+    #[test]
+    fn a_not_now_holds_a_system_state_step_for_its_own_revision_only() {
+        let key = "r4@com.aterm.aterm@UUID";
+        let this = (key.to_owned(), 10);
+        let cold = (atpkg::devtools::revision_key(4), 10);
+        let earlier = (atpkg::devtools::revision_key(3), 10);
+        let version = ("0.105.0".to_owned(), 10);
+        for (origin, last, held, want) in [
+            (Origin::Automatic, None, false, false),
+            (Origin::Automatic, Some(&this), false, true),
+            (Origin::Automatic, Some(&this), true, true),
+            (Origin::Automatic, Some(&cold), false, true),
+            (Origin::Automatic, Some(&earlier), true, false),
+            (Origin::Automatic, Some(&earlier), false, false),
+            (Origin::Automatic, Some(&version), true, false),
+            (Origin::Automatic, Some(&version), false, false),
+            (Origin::SystemStateAct, Some(&this), false, true),
+            (Origin::SystemStateAct, Some(&cold), true, true),
+            (Origin::SystemStateAct, Some(&earlier), true, false),
+            (Origin::SystemStateAct, Some(&version), true, false),
+            (Origin::Ctl { now: false }, Some(&earlier), true, true),
+            (Origin::Ctl { now: false }, Some(&earlier), false, false),
+            (Origin::Ctl { now: false }, Some(&this), false, true),
+            (Origin::Ctl { now: true }, Some(&version), true, true),
+            (Origin::Settings, Some(&this), true, false),
+            (Origin::Digest, Some(&this), true, false),
+        ] {
+            assert_eq!(
+                declined_for(origin, key, last, held),
+                want,
+                "{origin:?} after {last:?} (held {held})"
+            );
+        }
+    }
+
+    /// A panel's Not now is noted under the keys the window set and handed back once as
+    /// that revision's decline; with no approved revision nothing is handed back.
+    #[test]
+    fn a_not_now_is_handed_back_once_as_the_revisions_decline() {
+        let now = Instant::now();
+        let wake: Wake = Arc::new(|| {});
+        for (revision, want) in [
+            (Some(4), vec![(4, Access::FullDiskAccess)]),
+            (None, Vec::new()),
+        ] {
+            let mut lane = Lane::windowed_with_fda_for_test(
+                test_arms::opening(),
+                test_arms::fda_opening(),
+                test_arms::showing(),
+            );
+            lane.set_marks(Marks {
+                devtools: "r4".to_owned(),
+                fda: "r4@com.aterm.test@HERE".to_owned(),
+                revision,
+            });
+            assert!(lane.show(fda_show(None), now, Arc::clone(&wake)));
+            assert!(lane.take_declines().is_empty(), "nothing said yet");
+            lane.press_for_test(PanelEvent::NotNow);
+            let _ = lane.tick_panel(now, None, &wake);
+            assert!(lane.panel().is_none());
+            assert_eq!(lane.take_declines(), want, "revision {revision:?}");
+            assert!(lane.take_declines().is_empty(), "handed back once");
+        }
+    }
+
     #[test]
     fn a_grant_ends_the_full_disk_access_wait_and_panel() {
         let now = Instant::now();
@@ -4871,6 +5183,7 @@ mod tests {
             declined,
             grant_stable,
             recent,
+            fda_on: true,
         };
         let presses = [Origin::Settings, Origin::Digest];
         let asked = [
@@ -4985,6 +5298,28 @@ mod tests {
             ),
             Admit::Hand {
                 list_terminal: true
+            }
+        );
+        // Without Full Disk Access the window's own waits (the list could not be read
+        // back); a control verb's and an owner's press do not.
+        let no_fda = Facts {
+            fda_on: false,
+            ..facts(DevToolGrant::NotGranted, absent(2), false, true, false)
+        };
+        for moment in [Moment::Asked, Moment::Quiet] {
+            assert_eq!(
+                admit(Origin::Automatic, moment, &no_fda),
+                Admit::Refuse(Refusal::NoFullDiskAccess)
+            );
+        }
+        assert_eq!(
+            admit(Origin::Ctl { now: false }, Moment::Asked, &no_fda),
+            Admit::Queue
+        );
+        assert_eq!(
+            admit(Origin::Settings, Moment::Asked, &no_fda),
+            Admit::Hand {
+                list_terminal: false
             }
         );
         assert_eq!(Origin::Digest.reopen_after_s(), None);
@@ -6033,6 +6368,30 @@ mod tests {
         lane.queue(Origin::Ctl { now: false }, t0);
         assert_eq!(lane.take_queued(t0 + ASKED_LAPSE, true), None);
         assert_eq!(lane.queued(), None, "lapsed");
+        // The Full Disk Access queue keeps the same order: the window's own outranks a
+        // client's act, which lapses while the window's own waits on.
+        let queue_fda = |lane: &mut Lane, origin: Origin, at: Instant| {
+            #[expect(clippy::disallowed_methods, reason = "the lane's own test")]
+            lane.queue_fda(origin, at);
+        };
+        queue_fda(&mut lane, Origin::Ctl { now: false }, t0);
+        queue_fda(&mut lane, Origin::Ctl { now: false }, t0 + RECHECK_EVERY);
+        assert_eq!(lane.fda_queued(), Some(Origin::Ctl { now: false }));
+        assert_eq!(lane.take_queued_fda(t0 + ASKED_LAPSE, false), None);
+        assert_eq!(lane.fda_queued(), None, "a client's act lapsed");
+        queue_fda(&mut lane, Origin::Ctl { now: false }, t0);
+        queue_fda(&mut lane, Origin::Automatic, t0);
+        queue_fda(&mut lane, Origin::Ctl { now: false }, t0);
+        assert_eq!(
+            lane.fda_queued(),
+            Some(Origin::Automatic),
+            "the window's own wins"
+        );
+        assert_eq!(
+            lane.take_queued_fda(late, true),
+            Some(Origin::Automatic),
+            "and never lapses"
+        );
         lane.queue(Origin::Automatic, t0);
         lane.note_reading(
             Reading {

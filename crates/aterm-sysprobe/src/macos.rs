@@ -12,8 +12,8 @@ use crate::iokit::{
 };
 use crate::machine::{DtCpu, Level, VmPages};
 use crate::{
-    CoreTicks, CpuLayout, GpuReading, LinkReading, MemoryDetail, PATH_CAP, ProcessLimits,
-    TcpCounts, VolumeReading, pressure_of,
+    CoreTicks, CpuLayout, GpuClients, GpuReading, LinkReading, MAX_GPU_CLIENTS, MemoryDetail,
+    PATH_CAP, ProcessLimits, TcpCounts, VolumeReading, pressure_of,
 };
 
 /// `PROC_PIDT_SHORTBSDINFO` (`sys/proc_info.h`, 64-byte `proc_bsdshortinfo`).
@@ -803,7 +803,7 @@ pub(crate) fn memory_detail() -> Option<MemoryDetail> {
     Some(detail)
 }
 
-/// The keys of `PerformanceStatistics`, made once.
+/// The keys of `PerformanceStatistics` and of the user clients' properties, made once.
 struct GpuKeys {
     stats: CFTypeRef,
     device: CFTypeRef,
@@ -812,6 +812,9 @@ struct GpuKeys {
     in_use: CFTypeRef,
     alloc: CFTypeRef,
     recoveries: CFTypeRef,
+    app_usage: CFTypeRef,
+    creator: CFTypeRef,
+    gpu_time: CFTypeRef,
 }
 
 /// The first `IOAccelerator`, matched once per process, with what never changes about it.
@@ -863,6 +866,9 @@ fn accel() -> Option<&'static Accel> {
                 in_use: kept_string(c"In use system memory")?,
                 alloc: kept_string(c"Alloc system memory")?,
                 recoveries: kept_string(c"recoveryCount")?,
+                app_usage: kept_string(c"AppUsage")?,
+                creator: kept_string(c"IOUserClientCreator")?,
+                gpu_time: kept_string(c"accumulatedGPUTime")?,
             };
             let name = Cf::string(c"model")
                 .and_then(|k| Cf::property(service, k.0))
@@ -919,6 +925,92 @@ pub(crate) fn gpu() -> Option<GpuReading> {
         reading.unread = Some(crate::Why::Unsupported);
     }
     Some(reading)
+}
+
+/// The most queues one client's `AppUsage` gives.
+const MAX_QUEUES: iokit::CFIndex = 1024;
+
+/// [`crate::gpu_clients`] on macOS: the cached accelerator's children in the `IOService` plane
+/// (its user clients, never registered, so matching cannot find them), each one's entry id,
+/// `IOUserClientCreator` and `AppUsage`, and whether the walk saw them all (a client that comes
+/// or goes mid-walk invalidates the iterator, which then ends early). It only reads registry
+/// properties: no client is opened, no Metal device made, nothing reaches WindowServer. Measured
+/// on an M5 Max with 43 clients (2026-10-23, release build, `examples/live.rs`'s `gpu_clients`
+/// row): 0.30 ms a read at the median, 0.37 ms at p90.
+pub(crate) fn gpu_clients() -> Option<GpuClients> {
+    let a = accel()?;
+    let mut iter: io_object_t = 0;
+    // SAFETY: `a.service` is a live entry kept for the process, the plane
+    // name NUL-terminated, `iter` writable; on success the iterator is +1.
+    let kr = unsafe {
+        iokit::IORegistryEntryGetChildIterator(a.service, c"IOService".as_ptr(), &raw mut iter)
+    };
+    if kr != 0 || iter == 0 {
+        return None;
+    }
+    let iter = Io(iter);
+    let mut out = GpuClients::default();
+    let mut identified = true;
+    let mut times = Vec::new();
+    loop {
+        // SAFETY: `iter` is a live iterator; the child is +1 or 0 at the end.
+        let child = unsafe { iokit::IOIteratorNext(iter.0) };
+        if child == 0 {
+            break;
+        }
+        let child = Io(child);
+        if out.children as usize >= MAX_GPU_CLIENTS {
+            out.truncated = true;
+            break;
+        }
+        out.children += 1;
+        let mut entry = 0u64;
+        // SAFETY: `child` is a live entry and `entry` writable.
+        if unsafe { iokit::IORegistryEntryGetRegistryEntryID(child.0, &raw mut entry) } != 0 {
+            identified = false;
+            continue;
+        }
+        let creator = Cf::property(child.0, a.keys.creator).and_then(|v| cf_text(v.0));
+        let usage = Cf::property(child.0, a.keys.app_usage);
+        let usage = usage
+            .as_ref()
+            .and_then(|u| app_usage(u.0, a.keys.gpu_time, &mut times));
+        out.record(entry, creator.as_deref(), usage);
+    }
+    // SAFETY: `iter` is a live iterator.
+    let valid = unsafe { iokit::IOIteratorIsValid(iter.0) } != 0;
+    out.complete = valid && !out.truncated && identified;
+    Some(out)
+}
+
+/// A borrowed `AppUsage` value's `accumulatedGPUTime` per queue into `times`; `None` where it is
+/// no array. A queue that is no dictionary, or has no such number, reads `None`.
+fn app_usage(
+    value: CFTypeRef,
+    key: CFTypeRef,
+    times: &mut Vec<Option<u64>>,
+) -> Option<&[Option<u64>]> {
+    times.clear();
+    // SAFETY: `value` is a live CF object (borrowed for this call); its type
+    // is checked before it is read as an array, and each element is
+    // borrowed (the Get rule) while the array lives, its type checked
+    // before it is read as a dictionary.
+    unsafe {
+        if iokit::CFGetTypeID(value) != iokit::CFArrayGetTypeID() {
+            return None;
+        }
+        let n = iokit::CFArrayGetCount(value.cast()).clamp(0, MAX_QUEUES);
+        for i in 0..n {
+            let queue = iokit::CFArrayGetValueAtIndex(value.cast(), i);
+            let dict =
+                !queue.is_null() && iokit::CFGetTypeID(queue) == iokit::CFDictionaryGetTypeID();
+            times.push(
+                dict.then(|| cf_u64(iokit::CFDictionaryGetValue(queue.cast(), key)))
+                    .flatten(),
+            );
+        }
+    }
+    Some(times)
 }
 
 /// A NUL-terminated `c_char` array as text.
@@ -1167,7 +1259,11 @@ pub(crate) fn caps() -> crate::Caps {
         compressor: Cap::Yes,
         swap: Cap::Yes,
         gpu_device: crate::caps::gpu_cap(gpu().as_ref()),
-        gpu_per_proc: Cap::No(Why::NotRead),
+        gpu_per_proc: if gpu_clients().is_some_and(|c| !c.rows.is_empty()) {
+            Cap::Yes
+        } else {
+            Cap::No(Why::NotRead)
+        },
         proc_cpu_others: Cap::No(Why::NeedsPrivilege("root")),
         proc_memory_others: Cap::No(Why::NeedsPrivilege("root")),
         throttle: Cap::No(Why::NotRead),
@@ -1201,5 +1297,36 @@ mod tests {
         assert!(model.is_some(), "a key the entry has reads back");
         let absent = Cf::string(c"aterm-no-such-key").expect("a CFString");
         assert!(Cf::property(device.0, absent.0).is_none());
+    }
+
+    /// A walk over children that never change (the device tree's CPUs) ends
+    /// with its iterator valid: `IOIteratorIsValid` reads true for a walk that
+    /// reached its end, so [`gpu_clients`]'s `complete` is not always false.
+    #[test]
+    fn a_walk_over_unchanging_children_ends_valid() {
+        // SAFETY: A NUL-terminated registry path; the entry is +1 or 0.
+        let cpus = unsafe {
+            iokit::IORegistryEntryFromPath(MAIN_PORT_DEFAULT, c"IODeviceTree:/cpus".as_ptr())
+        };
+        assert_ne!(cpus, 0, "the device tree's cpus node");
+        let cpus = Io(cpus);
+        let mut iter: io_object_t = 0;
+        // SAFETY: `cpus` is a live entry, the plane name NUL-terminated,
+        // `iter` writable; on success the iterator is +1.
+        let kr = unsafe {
+            iokit::IORegistryEntryGetChildIterator(cpus.0, c"IODeviceTree".as_ptr(), &raw mut iter)
+        };
+        assert!(kr == 0 && iter != 0, "{kr}");
+        let iter = Io(iter);
+        let mut walked = 0;
+        // SAFETY: `iter` is a live iterator; each child is +1, released by
+        // its `Io`, or 0 at the end.
+        while let child @ 1.. = unsafe { iokit::IOIteratorNext(iter.0) } {
+            drop(Io(child));
+            walked += 1;
+        }
+        assert!(walked > 0, "a CPU node");
+        // SAFETY: `iter` is a live iterator.
+        assert_ne!(unsafe { iokit::IOIteratorIsValid(iter.0) }, 0);
     }
 }

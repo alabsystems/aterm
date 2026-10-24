@@ -5,7 +5,10 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
+
+use aterm_types::MutexExt as _;
 
 #[cfg(any(target_os = "macos", test))]
 use aterm_containment::consent;
@@ -15,6 +18,52 @@ use aterm_containment::consent::Folder;
 /// de-duplicated folders (`n <= Folder::ALL.len()`), so the bound is never reached; it exists
 /// because the worker must not block on its output.
 const RESULT_QUEUE_CAP: usize = 16;
+
+/// Whether a gated pass may ask its next folder (`docs/DESIGN-system-state-2026-10-21.md` §6:
+/// steps park when the person leaves the tab). The window holds it open while System State
+/// is the visible view and shuts it when the person leaves; the worker waits at it before
+/// each folder. A folder already asked stays asked — macOS's dialog cannot be taken back —
+/// but the next waits. Only the launch pass is gated; the owner's own pass from the
+/// Security page never is.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct WarmupGate(Arc<(Mutex<bool>, Condvar)>);
+
+impl WarmupGate {
+    /// A gate that starts open: a pass starts only at its step moment.
+    pub(crate) fn open() -> Self {
+        let gate = Self::default();
+        gate.set(true);
+        gate
+    }
+
+    /// Open or shut the gate; a worker waiting at it goes on once it opens.
+    pub(crate) fn set(&self, open: bool) {
+        let (state, changed) = &*self.0;
+        let mut state = state.lock_or_recover();
+        if *state != open {
+            *state = open;
+            changed.notify_all();
+        }
+    }
+
+    /// Whether the gate is open.
+    #[cfg(test)]
+    pub(crate) fn is_open(&self) -> bool {
+        *self.0.0.lock_or_recover()
+    }
+
+    /// Wait until the gate is open (the worker; it may wait for the life of the process,
+    /// as a listing parked in `tccd` may).
+    fn wait_open(&self) {
+        let (state, changed) = &*self.0;
+        let mut open = state.lock_or_recover();
+        while !*open {
+            open = changed
+                .wait(open)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
 
 /// What one folder's listing attempt returned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -267,10 +316,26 @@ impl WarmupState {
     }
 
     /// Start one pass over `folders`, already-resolved paths.
+    #[cfg(test)]
     pub(crate) fn start<P>(
         &mut self,
         folders: &[(Folder, PathBuf)],
         hold_cap: Duration,
+        poke: P,
+    ) -> StartOutcome
+    where
+        P: Fn() + Send + 'static,
+    {
+        self.start_gated(folders, hold_cap, None, poke)
+    }
+
+    /// [`Self::start`], the worker waiting at `gate` (when one is given) before each folder:
+    /// the launch pass parks while the person is away from System State.
+    pub(crate) fn start_gated<P>(
+        &mut self,
+        folders: &[(Folder, PathBuf)],
+        hold_cap: Duration,
+        gate: Option<WarmupGate>,
         poke: P,
     ) -> StartOutcome
     where
@@ -289,7 +354,7 @@ impl WarmupState {
         let probe = self.probe;
         let spawned = std::thread::Builder::new()
             .name("consent-warmup".into())
-            .spawn(move || run_pass(generation, &walk, probe, &tx, &poke));
+            .spawn(move || run_pass(generation, &walk, probe, gate.as_ref(), &tx, &poke));
         match spawned {
             Ok(_handle) => {}
             Err(err) => {
@@ -484,12 +549,17 @@ fn run_pass(
     generation: u64,
     walk: &[(Folder, PathBuf)],
     probe: WarmupProbe,
+    gate: Option<&WarmupGate>,
     tx: &SyncSender<WarmupProgress>,
     poke: &(impl Fn() + ?Sized),
 ) {
     let started = Instant::now();
     let mut answers: Vec<(Folder, ReadDirOutcome)> = Vec::with_capacity(walk.len());
     for (folder, path) in walk {
+        // The launch pass asks nothing while the person is away from System State.
+        if let Some(gate) = gate {
+            gate.wait_open();
+        }
         post(
             tx,
             poke,
@@ -850,5 +920,38 @@ mod tests {
             state.start(&folders, Duration::from_millis(120_000), || {}),
             StartOutcome::Started
         );
+    }
+
+    /// A GATED PASS PARKS: shut, its worker asks no folder (a shut gate is never
+    /// passed, so no message can arrive); opened, it walks to its end.
+    #[test]
+    fn a_gated_pass_asks_nothing_until_its_gate_opens() {
+        let mut state = WarmupState::inert();
+        let gate = WarmupGate::default();
+        assert!(!gate.is_open());
+        let folders = vec![
+            (Folder::Documents, PathBuf::from("/nonexistent-warm-up-a")),
+            (Folder::Desktop, PathBuf::from("/nonexistent-warm-up-b")),
+        ];
+        assert_eq!(
+            state.start_gated(
+                &folders,
+                Duration::from_millis(120_000),
+                Some(gate.clone()),
+                || {}
+            ),
+            StartOutcome::Started
+        );
+        assert_eq!(state.drain(), 0, "nothing asked behind a shut gate");
+        assert!(state.is_live(), "parked, not ended");
+        gate.set(true);
+        assert!(gate.is_open());
+        let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        while state.is_live() && Instant::now() < deadline {
+            state.drain();
+            std::thread::yield_now();
+        }
+        assert!(!state.is_live(), "the pass ended once the gate opened");
+        assert!(state.last_pass_ms().is_some());
     }
 }

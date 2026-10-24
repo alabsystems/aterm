@@ -133,54 +133,16 @@ pub(super) fn build(
     let scratch = scratch
         .run_build(host, &spawn)
         .map_err(|e| format!("the fish {version} build failed: {e}"))?;
-    let built = target.join("release/fish");
-    if !built.is_file() {
-        return Err(format!("the build left no {}", built.display()));
-    }
-    let tree = scratch.fresh("tree")?;
-    let fish = tree.join("bin/fish");
-    std::fs::create_dir(tree.join("bin")).map_err(|e| format!("mkdir bin: {e}"))?;
-    std::fs::copy(&built, &fish).map_err(|e| format!("could not copy the build: {e}"))?;
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&fish, std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| format!("chmod {}: {e}", fish.display()))?;
-    }
-    if src.join("COPYING").is_file() {
-        std::fs::copy(src.join("COPYING"), tree.join("COPYING"))
-            .map_err(|e| format!("could not keep COPYING: {e}"))?;
-    }
-    let foreign = atpkg::macho::foreign_dylibs(&fish)
-        .map_err(|e| format!("the built fish cannot be read: {e}"))?;
-    if !foreign.is_empty() {
-        return Err(format!(
-            "the built fish loads {} from outside /usr/lib and /System: refused (the pin is a \
-             fish that runs on any Mac; a dynamic PCRE2 from Homebrew is what PCRE2_SYS_STATIC=1 \
-             keeps out)",
-            foreign.join(", ")
-        ));
-    }
-    let home = scratch.fresh("home")?;
-    let probe = Spawn {
-        program: fish.clone(),
-        args: vec!["--version".into()],
-        cwd: scratch.path().to_path_buf(),
-        set: ["HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"]
-            .iter()
-            .map(|k| ((*k).to_string(), home.clone().into_os_string()))
-            .collect(),
-        remove: Vec::new(),
-    };
-    let (scratch, reports) = scratch
-        .run_copied(host, &probe)
-        .map_err(|e| format!("the built fish did not answer --version: {e}"))?;
-    let reports = reports.trim().to_string();
-    if !reports.ends_with(&format!(" {version}")) {
-        return Err(format!(
-            "the built fish answers `{reports}`, not version {version}"
-        ));
-    }
-    place::write_stamp(&tree, &t.stamp("fish", Some(url), "sha256", Some(reports)))?;
-    place::place(&scratch, &tree, &t.dir, &|| super::complete(t))?;
-    Ok(t.dir.join(&t.exe))
+    place::lay_built(
+        scratch,
+        host,
+        t,
+        place::Built {
+            row: "fish",
+            url,
+            program: &target.join("release/fish"),
+            licence: &src.join("COPYING"),
+            answers: &|first| first.ends_with(&format!(" {version}")),
+        },
+    )
 }

@@ -825,16 +825,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    fn publish_apply(app: &mut App, wid: WindowId, view: ViewId) -> ActionRequest {
+    /// The published accessibility press on the Keyboard & Trackpad group's
+    /// `Leave as is` segment.
+    fn publish_leave(app: &mut App, wid: WindowId, view: ViewId) -> ActionRequest {
         set_a11y_active(app, wid, true);
         assert!(app.prepare_native_input_scratch(wid));
         let (update, published) = app.take_native_accessibility_update(wid).unwrap().unwrap();
-        let node = stable_node_id_for_view(view, &UiKey::new("system-state/apply"));
+        let node = stable_node_id_for_view(view, &UiKey::new("system-state/group/1/leave"));
         let context = update
             .nodes
             .iter()
             .find(|(id, _)| *id == node)
-            .expect("published Apply control")
+            .expect("published Leave as is segment")
             .1
             .action_context();
         assert!(context.is_some());
@@ -849,10 +851,12 @@ mod tests {
     }
 
     #[test]
-    fn queued_accessibility_apply_cannot_accept_a_replacement_setup_offer() {
-        use crate::system_state::SystemStateAction;
-        use crate::workstation_setup::{Request, WorkstationSetupDecision};
-        use aterm_types::macos_setup::{Plan, Setting};
+    fn queued_accessibility_choice_cannot_answer_a_replacement_setup_offer() {
+        use crate::workstation_setup::Request;
+        use aterm_types::macos_setup::{Group, Plan, Setting};
+        thread_local! {
+            static APPLIED: std::cell::RefCell<Vec<Plan>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
 
         for (by_offer, republish) in [(true, false), (true, true), (false, false), (false, true)] {
             let mut app = App::headless_for_test();
@@ -861,15 +865,25 @@ mod tests {
             window.rows = 90;
             window.cols = 160;
             assert!(app.open_system_state_tab());
+            app.set_system_state_handlers_for_test(
+                crate::system_state_host::InitialSetupHandlers {
+                    apply: |plan, _, _, receipt| {
+                        APPLIED.with(|applied| applied.borrow_mut().push(plan));
+                        receipt.accept();
+                        true
+                    },
+                    ..crate::system_state_host::InitialSetupHandlers::inert_for_test()
+                },
+            );
             let (_, view) = app.active_native_view(wid).unwrap();
             let generation = app.native_runtime.view_generation(view).unwrap();
-            let old_apply = publish_apply(&mut app, wid, view);
+            let old_press = publish_leave(&mut app, wid, view);
 
             let mut replacement = Plan {
                 vault_url: "http://new-review.invalid:7484/v1/team".into(),
                 ..Plan::default()
             };
-            replacement.selection.set(Setting::ALL[0], false);
+            replacement.selection.set(Setting::Dock, false);
             let (send, _receive) = std::sync::mpsc::channel();
             if by_offer {
                 assert!(
@@ -884,80 +898,90 @@ mod tests {
             }
             assert_eq!(app.native_runtime.view_generation(view), Some(generation));
             if republish {
-                let _fresh_apply = publish_apply(&mut app, wid, view);
+                let _fresh = publish_leave(&mut app, wid, view);
             }
-            app.on_native_accessibility_action(wid, old_apply);
+            app.on_native_accessibility_action(wid, old_press);
             assert!(
-                app.native_runtime.take_system_state_action().is_none(),
-                "an old Apply cannot authorize a different offer, before or after its new frame publishes"
+                APPLIED.with(|applied| applied.borrow().is_empty()),
+                "an old press cannot answer a different offer, before or after its new frame publishes"
             );
 
-            let fresh_apply = publish_apply(&mut app, wid, view);
-            let start = std::time::Instant::now();
-            app.native_runtime.tick_system_state(start, true);
-            app.native_runtime
-                .tick_system_state(start + std::time::Duration::from_secs(2), true);
+            let fresh = publish_leave(&mut app, wid, view);
+            app.native_runtime.tick_system_state(false);
+            app.native_runtime.tick_system_state(false);
             app.native_runtime.publish_system_state(crate::SetupStatus {
                 plan: Some(replacement.clone()),
                 ..crate::SetupStatus::default()
             });
             app.dispatch_native_view_event(wid, view, AppEvent::FocusChanged(None))
                 .unwrap();
-            let after_repaint = publish_apply(&mut app, wid, view);
+            let after_repaint = publish_leave(&mut app, wid, view);
             assert_eq!(
-                fresh_apply.context, after_repaint.context,
-                "countdown, status, and focus do not retire the current review"
+                fresh.context, after_repaint.context,
+                "ticks, status and focus do not retire the current page"
             );
-            app.on_native_accessibility_action(wid, fresh_apply.clone());
-            let Some(SystemStateAction::Apply(answer)) =
-                app.native_runtime.take_system_state_action()
-            else {
-                panic!("the current review must remain actionable");
-            };
-            assert!(
-                matches!(answer.decision, WorkstationSetupDecision::Begin(plan) if plan == replacement)
+            app.on_native_accessibility_action(wid, fresh.clone());
+            let mut expected = replacement.clone();
+            for setting in Group::Input.settings() {
+                expected.selection.set(*setting, false);
+            }
+            assert_eq!(
+                APPLIED.with(|applied| std::mem::take(&mut *applied.borrow_mut())),
+                [expected.clone()],
+                "the current page must remain actionable"
             );
             app.native_runtime
-                .accept_system_state_apply(replacement.clone());
+                .accept_system_state_apply(expected.clone());
             app.native_runtime.publish_system_state(crate::SetupStatus {
-                plan: Some(replacement),
+                plan: Some(expected),
                 ..crate::SetupStatus::default()
             });
-            app.on_native_accessibility_action(wid, fresh_apply);
+            app.on_native_accessibility_action(wid, fresh);
             assert!(
-                app.native_runtime.take_system_state_action().is_none(),
-                "a consumed review cannot trigger a second Apply after its receipt clears busy"
+                APPLIED.with(|applied| applied.borrow().is_empty()),
+                "a press already taken cannot submit a second time"
             );
         }
     }
 
     #[test]
-    fn a_cancel_intent_retires_queued_accessibility_apply_before_the_host_drains_it() {
+    fn a_check_intent_retires_a_queued_accessibility_choice_before_it_can_run() {
+        thread_local! {
+            static CHECKS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         let window = app.windows.get_mut(&wid).unwrap();
         window.rows = 90;
         window.cols = 160;
         assert!(app.open_system_state_tab());
+        app.set_system_state_handlers_for_test(crate::system_state_host::InitialSetupHandlers {
+            apply: |_, _, _, _| panic!("an old accessibility choice cannot follow Check"),
+            check: |_| {
+                CHECKS.with(|checks| checks.set(checks.get() + 1));
+                crate::system_state_host::CheckStarted {
+                    reading: true,
+                    check: true,
+                }
+            },
+            ..crate::system_state_host::InitialSetupHandlers::inert_for_test()
+        });
         let (_, view) = app.active_native_view(wid).unwrap();
-        let old_apply = publish_apply(&mut app, wid, view);
+        let old_press = publish_leave(&mut app, wid, view);
         app.dispatch_native_view_event(
             wid,
             view,
             AppEvent::Action(ActionInvocation {
-                id: crate::native_ui::ActionId::new("system-state/cancel"),
+                id: crate::native_ui::ActionId::new("system-state/check"),
                 value: None,
             }),
         )
         .unwrap();
-        app.on_native_accessibility_action(wid, old_apply);
-        assert!(matches!(
-            app.native_runtime.take_system_state_action(),
-            Some(crate::system_state::SystemStateAction::Cancel)
-        ));
+        app.on_native_accessibility_action(wid, old_press);
+        assert_eq!(CHECKS.with(std::cell::Cell::get), 1);
         assert!(
             app.native_runtime.take_system_state_action().is_none(),
-            "the queued old Apply cannot follow a Cancel before its worker starts"
+            "the old press cannot follow a Check"
         );
     }
 

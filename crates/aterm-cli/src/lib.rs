@@ -722,24 +722,26 @@ const PRIVACY_CONFIG_PARAGRAPH: &str = "\n\
      \x20                         Developer Tools list (tccd's log, and its switch in the system\n\
      \x20                         TCC.db, read-only). They raise NO dialog. Off, every field\n\
      \x20                         reads `unknown`, which is not `denied`; the report says which.\n\
-     \x20 notice                  the Full Disk Access ask, in two places. At launch, while the\n\
-     \x20                         grant reads off on a Mac where aterm has never seen it on,\n\
-     \x20                         System Settings opens at Privacy & Security \u{25b8} Full Disk\n\
-     \x20                         Access at the first quiet moment (a focused aterm window, your\n\
-     \x20                         hands off for 10 seconds), with aterm's panel beside it: its\n\
-     \x20                         icon to drag into the list, I've switched it on, and Not now.\n\
-     \x20                         Once per version, never on a build whose grant would not last\n\
-     \x20                         (ad hoc or unsigned), never within 10 minutes of another\n\
-     \x20                         Settings page; Not now holds 30 days, then 90. aterm presses\n\
-     \x20                         nothing there: switching it on is yours. Later, after macOS\n\
-     \x20                         shows the \"access data from other apps\" dialog for a program\n\
-     \x20                         of yours (or refuses aterm a read), it files one entry in\n\
-     \x20                         aterm's Messages with an Open Settings button: at most once a\n\
-     \x20                         week; a window started before you pressed Open Settings waits\n\
-     \x20                         14 days; Dismiss all files it for 30 days, then 90. Off, it\n\
-     \x20                         also keeps aterm from asking (once per Mac and account, after\n\
-     \x20                         those pages) whether to allow debugger access (macOS's\n\
-     \x20                         developer mode) in its own alert; no key makes aterm ask it.\n\
+     \x20 notice                  System State's access steps for an approved setup plan, only\n\
+     \x20                         while System State is the visible view, one macOS gesture at a\n\
+     \x20                         time: the Local Network question; while Full Disk Access reads\n\
+     \x20                         off, System Settings at Privacy & Security \u{25b8} Full Disk Access\n\
+     \x20                         with aterm's panel beside it (its icon to drag into the list,\n\
+     \x20                         I've switched it on, and Not now); the Developer Tools page;\n\
+     \x20                         and once per Mac and account debugger access (macOS's developer\n\
+     \x20                         mode), behind macOS's own password dialog. Each page comes once\n\
+     \x20                         per approval, never on a build whose grant would not last (ad\n\
+     \x20                         hoc or unsigned); Not now holds until Permissions is set up\n\
+     \x20                         again. aterm presses nothing there: switching it on is yours.\n\
+     \x20                         Later, a grant aterm verified that reads off again (found at\n\
+     \x20                         launch, or when macOS shows its \"access data from other apps\"\n\
+     \x20                         dialog for a program of yours) puts one line on aterm's\n\
+     \x20                         menu-bar menu, \"System State: Full Disk Access needs you\",\n\
+     \x20                         which opens System State; nothing is filed in Messages, and\n\
+     \x20                         Not now on that step keeps the line dark until Permissions is\n\
+     \x20                         set up again. Off pauses the steps with no answer\n\
+     \x20                         recorded, and they go on once it is on again; no key makes\n\
+     \x20                         aterm start one.\n\
      \x20 report_attribution      per-session corroboration of the app macOS holds responsible\n\
      \x20                         for each session; aterm's own adoption record decides whether\n\
      \x20                         a session reads `live` or `adopted`.\n\
@@ -754,14 +756,15 @@ const PRIVACY_CONFIG_PARAGRAPH: &str = "\n\
      \x20 warmup                  \"automatic\" (default) | \"on-request\" | \"never\". The warm-up\n\
      \x20                         asks macOS for the folders up front, which RAISES the dialogs\n\
      \x20                         on purpose, while you are at the screen rather than inside an\n\
-     \x20                         agent's blocked read. automatic: the button in Settings, and,\n\
-     \x20                         while Full Disk Access reads off, a pass at a launch's first\n\
-     \x20                         quiet moment once the Full Disk Access page was left without\n\
-     \x20                         you acting on it (Not now, or its panel lapsed) or was not\n\
-     \x20                         offered. Acting on that page (switching it on, dropping the\n\
-     \x20                         icon) asks for no folder that launch; once every folder has an\n\
-     \x20                         answer, no launch asks again. on-request: only the button.\n\
-     \x20                         never: neither. No program inside a session can start it.\n\
+     \x20                         agent's blocked read. automatic: the button in Settings, and\n\
+     \x20                         at launch while Full Disk Access reads off, once the Full Disk\n\
+     \x20                         Access page was left without you acting on it (Not now, or its\n\
+     \x20                         panel lapsed) or was not offered, as System State's last access\n\
+     \x20                         step, parked whenever System State is not the visible view.\n\
+     \x20                         Acting on that page (switching it on, dropping the icon) asks\n\
+     \x20                         for no folder that launch; once every folder has an answer, no\n\
+     \x20                         launch asks again. on-request: only the button. never: neither.\n\
+     \x20                         No program inside a session can start it.\n\
      \x20 warmup_folders          what the warm-up asks for. Default: Documents, Desktop and\n\
      \x20                         Downloads. `app-data` (every other app's own data) is a valid\n\
      \x20                         name, not in the default and never asked at launch: macOS\n\

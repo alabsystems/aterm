@@ -932,7 +932,10 @@ fn dispatch(prefix: &Prefix, args_in: &[String], via_reroute: bool) -> ExitCode 
                     }
                 }
                 bundle::BrewfileEntry::Cask(n) => {
-                    if prefix.installed_one(prefix::Kind::Cask, n).is_some() {
+                    if prefix
+                        .installed_one(prefix::Kind::Cask, api::canonical_cask_token(n))
+                        .is_some()
+                    {
                         Ok(())
                     } else {
                         match api0.cask(n) {

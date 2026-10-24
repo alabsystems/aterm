@@ -700,6 +700,254 @@ fn a_join_again_of_the_same_fleet_reaches_only_the_issuer_it_binds() {
 }
 
 #[test]
+fn a_join_again_reaches_only_the_issuer_it_binds_while_its_state_reads_as_open() {
+    let (issuer, code, _serving) = issuing("open-issuer");
+    let member = World::new("open-member");
+    let opts = Opts {
+        port: Some(closed_port()),
+        host: Some("127.0.0.1".to_owned()),
+        ..Opts::default()
+    };
+    ok(join(&member.places, &opts, &code));
+    let issuer_node = member::node_id(&issuer.places.state).unwrap();
+    ok(allow(
+        &member.places,
+        &args(&["drive", "--from", &issuer_node]),
+    ));
+    let (book, key, config) = (
+        read_peers(&member.places.state).unwrap(),
+        read_key_file(&member.places.state).unwrap(),
+        member.config(),
+    );
+
+    let other = World::new("open-other");
+    ok(init(
+        &other.places,
+        &args(&["--host", "127.0.0.1", "--port", &closed_port().to_string()]),
+    ));
+    let secret = JoinCode::parse(&code).unwrap().secret;
+    member::write_key_file(&other.places.state, &secret).unwrap();
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let there = JoinCode {
+        secret,
+        host: "127.0.0.1".to_owned(),
+        port: listener.local_addr().unwrap().port(),
+    }
+    .text();
+    let _serving_other = Listener::serve(listener, &other.places.state);
+
+    let state = member.places.state.clone();
+    let key_file = state.join(KEY_FILE);
+    let book_file = state.join(PEERS_FILE);
+    let second = member.places.config.with_file_name("second-link");
+    let set_mode = |path: &Path, bits| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(bits)).unwrap();
+    };
+    let open = |how: &str, open: bool| match (how, open) {
+        ("directory", _) => set_mode(&state, if open { 0o755 } else { 0o700 }),
+        ("key", _) => set_mode(&key_file, if open { 0o644 } else { 0o600 }),
+        ("book", _) => set_mode(&book_file, if open { 0o644 } else { 0o600 }),
+        (_, true) => std::fs::hard_link(&key_file, &second).unwrap(),
+        (_, false) => std::fs::remove_file(&second).unwrap(),
+    };
+    let binds = format!(
+        "for the issuer this Mac binds (node {})",
+        short(&issuer_node)
+    );
+    for (how, says) in [
+        ("directory", binds.as_str()),
+        ("key", &binds),
+        ("second link", &binds),
+        ("book", "a join reads the book before it dials the issuer"),
+    ] {
+        open(how, true);
+        let refused = match join(&member.places, &opts, &there) {
+            Err(Failure::Failed(why)) => why,
+            result => panic!("{how}: {result:?} should be refused"),
+        };
+        assert!(refused.contains(says), "{how}: {refused}");
+        open(how, false);
+        assert_eq!(read_peers(&member.places.state).unwrap(), book, "{how}");
+        assert_eq!(read_key_file(&member.places.state).unwrap(), key, "{how}");
+        assert_eq!(member.config(), config, "{how}");
+        assert_eq!(
+            read_peers(&other.places.state).unwrap(),
+            Vec::new(),
+            "{how}: nothing was sent it"
+        );
+    }
+
+    open("directory", true);
+    ok(join(&member.places, &opts, &code));
+    assert_eq!(
+        (issuer_bound(&member.places), member.config()),
+        (Some(issuer_node), config),
+        "the issuer it binds, reached again, and its grant kept"
+    );
+
+    let (third, third_code, _third_serving) = issuing("open-third");
+    open("key", true);
+    ok(join(&member.places, &opts, &third_code));
+    assert_eq!(
+        issuer_bound(&member.places),
+        Some(member::node_id(&third.places.state).unwrap()),
+        "the book binds no issuer of another fleet"
+    );
+}
+
+#[test]
+fn an_issuer_whose_state_reads_as_open_is_told_it_does_not_join_its_own_fleet() {
+    let issuer = World::new("open-own");
+    ok(init(
+        &issuer.places,
+        &args(&["--host", "127.0.0.1", "--port", &closed_port().to_string()]),
+    ));
+    let state = &issuer.places.state;
+    let code = std::fs::read_to_string(state.join(CODE_FILE)).unwrap();
+    std::fs::set_permissions(state, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let opts = Opts {
+        host: Some("127.0.0.1".to_owned()),
+        ..Opts::default()
+    };
+    let refused = match join(&issuer.places, &opts, &code) {
+        Err(Failure::Failed(why)) => why,
+        result => panic!("{result:?} should be refused"),
+    };
+    assert!(
+        refused.contains("it does not join its own fleet") && !refused.contains("leave"),
+        "{refused}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(state.join(CODE_FILE)).unwrap(),
+        code,
+        "its fleet kept"
+    );
+}
+
+#[test]
+fn an_issuer_whose_code_cannot_be_read_is_never_told_to_leave() {
+    let issuer = World::new("unread-own");
+    ok(init(
+        &issuer.places,
+        &args(&["--host", "127.0.0.1", "--port", &closed_port().to_string()]),
+    ));
+    let path = issuer.places.state.join(CODE_FILE);
+    let code = std::fs::read_to_string(&path).unwrap();
+    let opts = Opts {
+        host: Some("127.0.0.1".to_owned()),
+        ..Opts::default()
+    };
+    let refused = |text: &str| match join(&issuer.places, &opts, text) {
+        Err(Failure::Failed(why)) => why,
+        result => panic!("{result:?} should be refused"),
+    };
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let own = refused(&code);
+    assert!(
+        own.contains("it does not join its own fleet") && !own.contains("leave"),
+        "{own}"
+    );
+    let other = JoinCode {
+        secret: [7; member::SECRET_LEN],
+        host: "127.0.0.1".to_owned(),
+        port: closed_port(),
+    };
+    let other = refused(&other.text());
+    assert!(
+        other.contains("cannot be read") && !other.contains("leave"),
+        "{other}"
+    );
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::hard_link(&path, issuer.places.state.join("handed-out")).unwrap();
+    let linked = refused(&code);
+    assert!(
+        linked.contains("it does not join its own fleet") && !linked.contains("leave"),
+        "{linked}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        code,
+        "its fleet kept"
+    );
+}
+
+#[test]
+fn a_leave_says_it_narrowed_an_open_state() {
+    let world = World::new("leave-open");
+    let state = &world.places.state;
+    let open = || {
+        std::fs::create_dir_all(state).unwrap();
+        std::fs::set_permissions(state, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    let narrowed = format!(
+        "{} was open to other users (755); it is 0700 now",
+        state.display()
+    );
+    open();
+    let none = ok(leave(&world.places, &[]));
+    assert!(
+        none.starts_with("aterm fleet leave: this machine is in no fleet\n")
+            && none.contains(&narrowed),
+        "{none}"
+    );
+    ok(init(
+        &world.places,
+        &args(&["--host", "127.0.0.1", "--port", &closed_port().to_string()]),
+    ));
+    open();
+    let left = ok(leave(&world.places, &[]));
+    assert!(
+        left.contains(&narrowed) && left.contains("This machine issued the fleet"),
+        "{left}"
+    );
+}
+
+#[test]
+fn an_issuer_entry_an_older_aterm_wrote_binds_a_join_only_beside_a_key_held() {
+    let (_first, first_code, _first_serving) = issuing("unmarked-first");
+    let (other, other_code, _other_serving) = issuing("unmarked-other");
+    let member = World::new("unmarked-member");
+    let opts = Opts {
+        port: Some(closed_port()),
+        host: Some("127.0.0.1".to_owned()),
+        ..Opts::default()
+    };
+    ok(join(&member.places, &opts, &first_code));
+    let mut text = String::from("# The fleet's peers, one per line.\n");
+    for peer in read_as_older(&member.places.state) {
+        text.push_str(&peer.line());
+        text.push('\n');
+    }
+    member::write_private(&member.places.state, PEERS_FILE, text.as_bytes()).unwrap();
+    let key_file = member.places.state.join(KEY_FILE);
+    std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let refused = match join(&member.places, &opts, &other_code) {
+        Err(Failure::Failed(why)) => why,
+        result => panic!("{result:?} should be refused"),
+    };
+    assert!(
+        refused.contains("is not private")
+            && refused.contains("cannot tell whether the code is the fleet")
+            && !refused.contains("joined this fleet before"),
+        "{refused}"
+    );
+    assert_eq!(
+        read_peers(&other.places.state).unwrap(),
+        Vec::new(),
+        "nothing was sent it"
+    );
+
+    std::fs::remove_file(&key_file).unwrap();
+    ok(join(&member.places, &opts, &other_code));
+    assert_eq!(
+        issuer_bound(&member.places),
+        Some(member::node_id(&other.places.state).unwrap()),
+        "no key held, so the old issuer binds nothing"
+    );
+}
+
+#[test]
 fn an_issuer_that_lost_its_node_key_is_bound_again_as_its_refusal_says() {
     let issuer = World::new("keyless-issuer");
     ok(init(
@@ -2086,14 +2334,28 @@ fn a_join_of_another_fleet_that_fails_after_its_issuer_recorded_it_finishes_on_a
     let held = std::fs::read(&book).unwrap();
     std::fs::remove_file(&book).unwrap();
     std::fs::create_dir(&book).unwrap();
-    let failed = match join(&member.places, &opts, &other_code) {
+    let refused = match join(&member.places, &opts, &other_code) {
         Err(Failure::Failed(why)) => why,
         other => panic!("{other:?}: its book cannot be read"),
     };
-    assert!(failed.contains("has recorded this machine"), "{failed}");
-    assert_eq!(read_peers(&other.places.state).unwrap().len(), 1);
+    assert!(refused.contains("before it dials the issuer"), "{refused}");
+    assert_eq!(read_peers(&other.places.state).unwrap(), Vec::new());
     std::fs::remove_dir(&book).unwrap();
     member::write_private(&member.places.state, PEERS_FILE, &held).unwrap();
+
+    let set_mode = |bits| {
+        std::fs::set_permissions(&member.places.state, std::fs::Permissions::from_mode(bits))
+            .unwrap();
+    };
+    set_mode(0o500);
+    let failed = join(&member.places, &opts, &other_code);
+    set_mode(0o700);
+    let failed = match failed {
+        Err(Failure::Failed(why)) => why,
+        other => panic!("{other:?}: its book cannot be written"),
+    };
+    assert!(failed.contains("has recorded this machine"), "{failed}");
+    assert_eq!(read_peers(&other.places.state).unwrap().len(), 1);
     assert_eq!(
         (read_key_file(&member.places.state).unwrap(), issuer_here()),
         (
@@ -2192,6 +2454,11 @@ fn issuing(tag: &str) -> (World, String, Listener) {
     (world, code, serving)
 }
 
+fn issuer_bound(places: &Places) -> Option<String> {
+    let held = read_key_file(&places.state).ok()?;
+    bound_issuer(places, &held).unwrap().map(|(node, _)| node)
+}
+
 fn with_step_hook<R>(hook: impl FnMut(&str) + 'static, act: impl FnOnce() -> R) -> R {
     AT_STEP.with(|at| *at.borrow_mut() = Some(Box::new(hook)));
     let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(act));
@@ -2226,7 +2493,7 @@ fn a_join_of_another_fleet_killed_before_its_key_leaves_the_old_fleet_whole() {
     assert_eq!(
         (
             read_key_file(&member.places.state).unwrap(),
-            bound_issuer(&member.places).map(|(node, _)| node)
+            issuer_bound(&member.places)
         ),
         (
             read_key_file(&first.places.state).unwrap(),
@@ -2244,7 +2511,7 @@ fn a_join_of_another_fleet_killed_before_its_key_leaves_the_old_fleet_whole() {
     assert_eq!(
         (
             read_key_file(&member.places.state).unwrap(),
-            bound_issuer(&member.places).map(|(node, _)| node)
+            issuer_bound(&member.places)
         ),
         (
             read_key_file(&other.places.state).unwrap(),
@@ -2308,10 +2575,7 @@ fn a_read_while_a_join_of_another_fleet_writes_its_key_finds_the_old_fleet_whole
         member::holds_issuer_book(&member.places.state, &first_node),
         "the copy stands"
     );
-    assert_eq!(
-        bound_issuer(&member.places).map(|(node, _)| node),
-        Some(first_node)
-    );
+    assert_eq!(issuer_bound(&member.places), Some(first_node));
 }
 
 #[test]
@@ -2409,6 +2673,58 @@ fn a_join_unfinished_on_its_config_after_a_leave_takes_the_grants_out_on_a_join_
     );
 }
 
+#[test]
+fn an_init_after_a_leave_stopped_on_its_config_takes_the_grants_out() {
+    let (issuer, code, _serving) = issuing("init-left-issuer");
+    let member = World::new("init-left-member");
+    let opts = Opts {
+        port: Some(closed_port()),
+        host: Some("127.0.0.1".to_owned()),
+        ..Opts::default()
+    };
+    ok(join(&member.places, &opts, &code));
+    let issuer_node = member::node_id(&issuer.places.state).unwrap();
+    ok(allow(
+        &member.places,
+        &args(&["drive", "--from", &issuer_node]),
+    ));
+    let granted = member.config();
+    let lock = member.lock_config();
+    assert!(
+        leave(&member.places, &[]).is_err(),
+        "aterm.toml cannot be written"
+    );
+    assert_eq!(fleet_table(&member.config()).unwrap().drive_from.len(), 1);
+
+    let port = closed_port().to_string();
+    let new_fleet = args(&["--host", "127.0.0.1", "--port", &port]);
+    assert!(matches!(
+        init(&member.places, &new_fleet),
+        Err(Failure::Failed(_))
+    ));
+    assert!(
+        read_key_file(&member.places.state).is_err(),
+        "nothing of the new fleet is written"
+    );
+
+    std::fs::remove_dir(&lock).unwrap();
+    let report = ok(init(&member.places, &new_fleet));
+    assert!(report.contains("no Mac drives this one"), "{report}");
+    let table = fleet_table(&member.config()).unwrap();
+    assert_eq!(
+        (table.level(), table.drive_from),
+        (Some("content"), Vec::new())
+    );
+
+    member.write_config(&granted);
+    ok(init(&member.places, &args(&["--rotate"])));
+    assert_eq!(
+        fleet_table(&member.config()).unwrap().drive_from,
+        fleet_table(&granted).unwrap().drive_from,
+        "a new secret of the same fleet keeps them"
+    );
+}
+
 fn read_as_older(state: &std::path::Path) -> Vec<Peer> {
     std::fs::read_to_string(state.join(PEERS_FILE))
         .unwrap_or_default()
@@ -2463,7 +2779,7 @@ fn a_join_of_another_fleet_unfinished_leaves_an_older_aterm_the_issuer_of_neithe
     assert_eq!(
         (
             read_key_file(&member.places.state).unwrap(),
-            bound_issuer(&member.places).map(|(node, _)| node)
+            issuer_bound(&member.places)
         ),
         (
             read_key_file(&other.places.state).unwrap(),
@@ -2471,7 +2787,108 @@ fn a_join_of_another_fleet_unfinished_leaves_an_older_aterm_the_issuer_of_neithe
         ),
         "the join again finishes it"
     );
-    assert!(!member::holds_another_fleet(&member.places.state));
+    assert_eq!(
+        read_as_older(&member.places.state).len(),
+        read_peers(&member.places.state).unwrap().len(),
+        "the book holds no other fleet's entries"
+    );
+}
+
+#[test]
+fn an_older_aterms_edit_never_comes_between_a_joins_marks_and_its_key() {
+    let (first, first_code, _first_serving) = issuing("between-first");
+    let (other, other_code, _other_serving) = issuing("between-other");
+    let member = World::new("between-member");
+    let opts = Opts {
+        port: Some(closed_port()),
+        host: Some("127.0.0.1".to_owned()),
+        ..Opts::default()
+    };
+    ok(join(&member.places, &opts, &first_code));
+    let first_node = member::node_id(&first.places.state).unwrap();
+    // A grant the join takes out: an edit of aterm.toml it cannot write.
+    ok(allow(
+        &member.places,
+        &args(&["drive", "--from", &first_node]),
+    ));
+    let lock = member.lock_config();
+    let state = member.places.state.clone();
+    let failed = with_step_hook(
+        move |at| {
+            // An older aterm's edit of the book, where it can take the lock: every line written back unmarked.
+            if at == "key"
+                && let Ok(_book) = member::hold_book(&state)
+            {
+                let mut text = String::from("# The fleet's peers, one per line.\n");
+                for peer in read_as_older(&state) {
+                    text.push_str(&peer.line());
+                    text.push('\n');
+                }
+                member::write_private(&state, PEERS_FILE, text.as_bytes()).unwrap();
+            }
+        },
+        || join(&member.places, &opts, &other_code),
+    );
+    assert!(
+        matches!(failed, Err(Failure::Failed(_))),
+        "{failed:?}: aterm.toml cannot be written"
+    );
+    assert_eq!(
+        (
+            issuer_bound(&member.places),
+            Keyring::read(&member.places.state).bound(&first_node)
+        ),
+        (None, None),
+        "the old issuer binds nothing under the new key"
+    );
+
+    std::fs::remove_dir(&lock).unwrap();
+    ok(join(&member.places, &opts, &other_code));
+    assert_eq!(
+        issuer_bound(&member.places),
+        Some(member::node_id(&other.places.state).unwrap())
+    );
+}
+
+#[test]
+fn a_join_of_another_fleet_killed_after_its_key_is_finished_by_a_join_again() {
+    let (first, first_code, _first_serving) = issuing("after-key-first");
+    let (other, other_code, _other_serving) = issuing("after-key-other");
+    let member = World::new("after-key-member");
+    let opts = Opts {
+        port: Some(closed_port()),
+        host: Some("127.0.0.1".to_owned()),
+        ..Opts::default()
+    };
+    ok(join(&member.places, &opts, &first_code));
+    let first_node = member::node_id(&first.places.state).unwrap();
+
+    assert!(killed_at("drop", || join(
+        &member.places,
+        &opts,
+        &other_code
+    )));
+    assert_eq!(
+        (
+            read_key_file(&member.places.state).unwrap(),
+            issuer_bound(&member.places),
+            Keyring::read(&member.places.state).bound(&first_node)
+        ),
+        (read_key_file(&other.places.state).unwrap(), None, None),
+        "the new fleet's key, beside no issuer"
+    );
+
+    ok(join(&member.places, &opts, &other_code));
+    assert_eq!(
+        issuer_bound(&member.places),
+        Some(member::node_id(&other.places.state).unwrap()),
+        "the join again finishes it"
+    );
+    assert_eq!(
+        read_as_older(&member.places.state).len(),
+        read_peers(&member.places.state).unwrap().len(),
+        "the book holds no other fleet's entries"
+    );
 }
 
 #[test]
@@ -2499,10 +2916,7 @@ fn an_unfinished_join_says_what_the_book_binds() {
             && !failed.contains("does not name the issuer"),
         "{failed}"
     );
-    assert_eq!(
-        bound_issuer(&member.places).map(|(node, _)| node),
-        Some(first_node.clone())
-    );
+    assert_eq!(issuer_bound(&member.places), Some(first_node.clone()));
 
     let member = World::new("says-back");
     ok(join(&member.places, &opts, &first_code));
@@ -2520,12 +2934,245 @@ fn an_unfinished_join_says_what_the_book_binds() {
         failed.contains("does not name the issuer") && failed.contains("for no one"),
         "{failed}"
     );
-    assert_eq!(bound_issuer(&member.places), None, "{failed}");
+    assert_eq!(issuer_bound(&member.places), None, "{failed}");
     assert_eq!(
         Keyring::read(&member.places.state).bound(&first_node),
         None,
         "the grant is backed by no book"
     );
+}
+
+#[test]
+fn a_join_an_older_aterm_finished_still_reaches_only_the_issuer_it_binds() {
+    let (first, first_code, _first_serving) = issuing("left-first");
+    let (other, other_code, _other_serving) = issuing("left-other");
+    let member = World::new("left-member");
+    let opts = Opts {
+        port: Some(closed_port()),
+        host: Some("127.0.0.1".to_owned()),
+        ..Opts::default()
+    };
+    ok(join(&member.places, &opts, &first_code));
+    let first_node = member::node_id(&first.places.state).unwrap();
+    // A grant the join takes out: an edit of aterm.toml it cannot write.
+    ok(allow(
+        &member.places,
+        &args(&["drive", "--from", &first_node]),
+    ));
+    let granted = member.config();
+    let lock = member.lock_config();
+    assert!(join(&member.places, &opts, &other_code).is_err());
+    std::fs::remove_dir(&lock).unwrap();
+    // An older aterm finishes the join: it keeps aterm.toml's grants and records the issuer unmarked.
+    ok(join(&member.places, &opts, &other_code));
+    member.write_config(&granted);
+    let mut text = String::from("# The fleet's peers, one per line.\n");
+    for peer in read_as_older(&member.places.state) {
+        text.push_str(&peer.line());
+        text.push('\n');
+    }
+    member::write_private(&member.places.state, PEERS_FILE, text.as_bytes()).unwrap();
+    ok(join(&member.places, &opts, &other_code));
+    assert_eq!(
+        (
+            fleet_table(&member.config()).unwrap().drive_from,
+            Keyring::read(&member.places.state).bound(&first_node)
+        ),
+        (fleet_table(&granted).unwrap().drive_from, None),
+        "a join again keeps the old fleet's grant, which no book backs"
+    );
+    ok(peers(&member.places, &[]));
+    assert!(
+        fleet_table(&member.config()).unwrap().drive_from.is_empty(),
+        "the next proven read takes it out"
+    );
+    let other_node = member::node_id(&other.places.state).unwrap();
+    ok(allow(
+        &member.places,
+        &args(&["drive", "--from", &other_node]),
+    ));
+    let config = member.config();
+
+    let stranger = World::new("left-stranger");
+    ok(init(
+        &stranger.places,
+        &args(&["--host", "127.0.0.1", "--port", &closed_port().to_string()]),
+    ));
+    let secret = JoinCode::parse(&other_code).unwrap().secret;
+    member::write_key_file(&stranger.places.state, &secret).unwrap();
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let there = JoinCode {
+        secret,
+        host: "127.0.0.1".to_owned(),
+        port: listener.local_addr().unwrap().port(),
+    }
+    .text();
+    let _stranger_serving = Listener::serve(listener, &stranger.places.state);
+    let refused = match join(&member.places, &opts, &there) {
+        Err(Failure::Failed(why)) => why,
+        result => panic!("{result:?} should be refused"),
+    };
+    assert!(
+        refused.contains(&format!(
+            "for the issuer this Mac binds (node {})",
+            short(&other_node)
+        )),
+        "{refused}"
+    );
+    assert_eq!(member.config(), config, "the grant stands");
+}
+
+#[test]
+fn a_join_stopped_on_its_book_says_it_took_the_grants_out() {
+    let (first, first_code, _first_serving) = issuing("book-step-first");
+    let (_other, other_code, _other_serving) = issuing("book-step-other");
+    let member = World::new("book-step-member");
+    let opts = Opts {
+        port: Some(closed_port()),
+        host: Some("127.0.0.1".to_owned()),
+        ..Opts::default()
+    };
+    ok(join(&member.places, &opts, &first_code));
+    ok(allow(
+        &member.places,
+        &args(&[
+            "drive",
+            "--from",
+            &member::node_id(&first.places.state).unwrap(),
+        ]),
+    ));
+    let book = member.places.state.join(PEERS_FILE);
+    let failed = with_step_hook(
+        {
+            let book = book.clone();
+            move |at| {
+                if at == "book" {
+                    // The book cannot be read now.
+                    let _ = std::fs::remove_file(&book);
+                    std::fs::create_dir(&book).unwrap();
+                }
+            }
+        },
+        || join(&member.places, &opts, &other_code),
+    );
+    let failed = match failed {
+        Err(Failure::Failed(why)) => why,
+        other => panic!("{other:?}: the book cannot be read"),
+    };
+    assert!(failed.contains("no Mac drives this one"), "{failed}");
+    assert!(fleet_table(&member.config()).unwrap().drive_from.is_empty());
+    std::fs::remove_dir(&book).unwrap();
+    ok(join(&member.places, &opts, &other_code));
+}
+
+struct Wire {
+    input: std::io::Cursor<Vec<u8>>,
+    output: Vec<u8>,
+}
+
+impl std::io::Read for Wire {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.input.read(buf)
+    }
+}
+
+impl std::io::Write for Wire {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.output.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_leave_beside_an_edit_of_the_book_leaves_no_book() {
+    let issuer = World::new("leave-edit");
+    ok(init(
+        &issuer.places,
+        &args(&["--host", "127.0.0.1", "--port", &closed_port().to_string()]),
+    ));
+    let state = issuer.places.state.clone();
+    // Inside an edit of the book: the leave waits it out, and past the lock's wait removes nothing.
+    let during = member::update_peers(&state, |book| {
+        member::record(book, manual_peer("127.0.0.1".to_owned(), 7199))?;
+        Ok(leave(&issuer.places, &[]))
+    })
+    .unwrap();
+    assert!(during.is_err(), "{during:?}");
+    assert!(read_key_file(&state).is_ok(), "nothing was removed");
+
+    let reg = Registration {
+        node: "cd".repeat(16),
+        host: "lab-mini".to_owned(),
+        port: 58054,
+        version: "0.105.0".to_owned(),
+        key: None,
+    };
+    let mut wire = Wire {
+        input: std::io::Cursor::new(reg.line().into_bytes()),
+        output: Vec::new(),
+    };
+    let node = member::node_id(&state).unwrap();
+    // The leave comes after the registration's check of the code, before its edit.
+    let recorded = serve_join(
+        &mut wire,
+        (IpAddr::from(Ipv4Addr::LOCALHOST), None),
+        &state,
+        || {
+            ok(leave(&issuer.places, &[]));
+            Ok(Issuer {
+                node,
+                host: "127.0.0.1".to_owned(),
+                port: 7100,
+                version: "0.95.0".to_owned(),
+            })
+        },
+        7,
+    )
+    .unwrap();
+    assert!(recorded.is_err(), "{recorded:?}");
+    assert!(
+        std::fs::symlink_metadata(state.join(PEERS_FILE)).is_err(),
+        "the book is gone"
+    );
+}
+
+#[test]
+fn a_read_that_ends_after_a_leave_keeps_nothing_of_the_fleet() {
+    let (issuer, code, _serving) = issuing("left-read-issuer");
+    let member = World::new("left-read-member");
+    let opts = Opts {
+        port: Some(closed_port()),
+        host: Some("127.0.0.1".to_owned()),
+        ..Opts::default()
+    };
+    ok(join(&member.places, &opts, &code));
+    let issuer_node = member::node_id(&issuer.places.state).unwrap();
+    let secret = read_key_file(&member.places.state).unwrap();
+    let read = BookRead::Fetched(member::Book {
+        node: issuer_node.clone(),
+        peers: Vec::new(),
+        at: IpAddr::from(Ipv4Addr::LOCALHOST),
+        proven: true,
+    });
+    let own = member::node_id(&member.places.state).unwrap();
+    assert_eq!(keep_book(&member.places, &secret, &read, Some(&own)), None);
+    assert!(member::holds_issuer_book(
+        &member.places.state,
+        &issuer_node
+    ));
+
+    ok(leave(&member.places, &[]));
+    for read in [read, BookRead::NoIssuer] {
+        assert_eq!(keep_book(&member.places, &secret, &read, Some(&own)), None);
+        assert!(
+            std::fs::symlink_metadata(member.places.state.join(ISSUER_BOOK_FILE)).is_err(),
+            "{read:?}: the copy the leave took out stays out"
+        );
+    }
 }
 
 #[test]

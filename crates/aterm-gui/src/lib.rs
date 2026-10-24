@@ -283,21 +283,22 @@ mod overview;
 mod overview_fabric;
 pub(crate) use amacs_files::save_words;
 mod secrets_join;
-#[cfg(target_os = "macos")]
-mod secrets_sheet;
 mod system_state;
+mod system_state_access;
 mod system_state_host;
 mod workstation_setup;
 #[cfg(target_os = "macos")]
 pub use devtools_helper_drive::run_devtools_helper_drive;
-pub use system_state::{InitialSetupPermissionPolicy, SetupCheck, SetupStatus, SetupStatusRow};
+pub use system_state::{
+    Admission as InitialSetupAdmission, InitialSetupPermissionPolicy, SetupCheck, SetupOperation,
+    SetupStatus, SetupStatusRow,
+};
 pub use system_state_host::{
-    InitialSetupApplyReceipt, InitialSetupCancelReceipt, InitialSetupHandlers,
-    publish_initial_setup_status, set_initial_setup_handlers,
+    CheckStarted, InitialSetupApplyReceipt, InitialSetupHandlers, publish_initial_setup_status,
+    set_initial_setup_handlers,
 };
 pub use workstation_setup::{
-    SetupAnswer, WorkstationSetupDecision, await_initial_setup_countdown_while,
-    await_workstation_setup_countdown, await_workstation_setup_countdown_while,
+    SetupAnswer, WorkstationSetupDecision, await_initial_setup_answer_while,
 };
 mod devtools_watch;
 mod harness_policy_cell;
@@ -434,6 +435,7 @@ mod messages_host;
 mod messages_store;
 mod occupancy_host;
 mod occupancy_ring;
+mod occupancy_wakes;
 mod owned_endpoint;
 mod palette;
 mod paste_banner;
@@ -681,6 +683,7 @@ mod update_checker_watch;
 mod update_control;
 mod update_screen;
 mod video_key_analysis;
+mod vitals_gpu;
 mod vitals_host;
 mod vitals_jobs;
 mod wallpaper_present;
@@ -3318,7 +3321,6 @@ enum Wake {
     AskpassWithdraw {
         id: u64,
     },
-    SecretsVault(secrets_join::VaultWake),
     EditRequest(Box<control_edit::EditCall>),
     EditCancel {
         ticket: app_edit::EditTicketId,
@@ -8255,9 +8257,6 @@ const fn update_handoff_wake_class(ev: &Wake) -> UpdateHandoffEventClass {
         | Wake::Askpass(_)
         | Wake::AskpassAnswered { .. }
         | Wake::AskpassWithdraw { .. } => UpdateHandoffEventClass::Revoking,
-        Wake::SecretsVault(secrets_join::VaultWake::Answered { .. }) => {
-            UpdateHandoffEventClass::Revoking
-        }
         Wake::EditRequest(_)
         | Wake::EditCancel { .. }
         | Wake::EditAwait(_)
@@ -9106,8 +9105,8 @@ struct App {
     devtools_watch: devtools_watch::DevToolsWatch,
     devtools_helper: devtools_helper::Lane,
     debugger_change: debugger_access::DebuggerChangeLane,
-    debugger_launch: debugger_access::LaunchAskQueue,
-    secrets_join: secrets_join::Lane,
+    debugger_launch: debugger_access::DebuggerStepQueue,
+    access_steps: system_state_access::AccessSteps,
     consent_gestures: native_settings::ConsentGestures,
     owner_quiet: native_settings::SharedOwnerQuiet,
     consent_observer: consent_observer::ObserverState,
@@ -9761,20 +9760,23 @@ impl App {
         }
         let folders =
             aterm_containment::consent::folder_paths(&self.config.privacy_warmup_folders());
-        self.start_consent_warmup_pass(&folders)
+        self.start_consent_warmup_pass(&folders, None)
     }
 
+    /// One warm-up pass over `folders`; its worker waits at `gate` before each folder.
     fn start_consent_warmup_pass(
         &mut self,
         folders: &[(aterm_containment::consent::Folder, std::path::PathBuf)],
+        gate: Option<consent_warmup::WarmupGate>,
     ) -> consent_warmup::StartOutcome {
         let hold_cap = Duration::from_millis(self.config.privacy_warmup_hold_ms());
         let proxy = self.proxy.clone();
-        self.consent_warmup.start(folders, hold_cap, move || {
-            if let Some(proxy) = &proxy {
-                let _ = proxy.send_event(Wake::WarmupResult);
-            }
-        })
+        self.consent_warmup
+            .start_gated(folders, hold_cap, gate, move || {
+                if let Some(proxy) = &proxy {
+                    let _ = proxy.send_event(Wake::WarmupResult);
+                }
+            })
     }
 
     /// Whether a warm-up worker is walking right now, freshly drained.
@@ -9881,7 +9883,7 @@ impl App {
             ));
         if spawn == debugger_access::DevtoolsSpawn::Started {
             aterm_log::info!(
-                "debugger access: the owner confirmed turning it {}{}{}; DevToolsSecurity runs once the fresh read allows it",
+                "debugger access: a yes to turning it {}{}{}; DevToolsSecurity runs once the fresh read allows it",
                 change.as_str(),
                 asked_by,
                 if not_hardened {
@@ -9971,17 +9973,23 @@ impl App {
 
     fn tick_consent_lanes(&mut self, now: Instant) {
         self.tick_debugger_access();
-        if self.workstation_setup.suppresses_permissions() {
-            self.tick_devtools_hand_over(now);
-            return;
-        }
+        // A `[privacy]` switch on again makes the launch's decisions it held first.
+        self.resume_held_launch_steps(now);
         self.tick_macos_access_card(now);
+        // The Local Network step goes first in an approved revision's order.
+        self.tick_local_network_step(now);
         self.tick_devtools_hand_over(now);
+        // A control client's act on the Local Network or Accessibility row, at the
+        // same step moment, after the pages.
+        self.tick_queued_pane(now);
         #[expect(
             clippy::disallowed_methods,
             reason = "the event loop's tick: the launch warm-up's one caller"
         )]
         self.tick_launch_warmup(now);
+        // One macOS gesture at a time: what this turn put up holds the worker's prompts,
+        // and the System State line follows the latest readings.
+        self.settle_access_steps(now);
     }
 
     fn fold_consent_lane_deadlines(
@@ -9998,36 +10006,13 @@ impl App {
         if let Some(wake) = self.system_state_host.deadline(now) {
             fold_owned_deadline(deadline, owner, wake, metrics::DeadlineOwner::ConsentCard);
         }
-        if self.workstation_setup.suppresses_permissions() {
-            if let Some(wake) = self.next_devtools_hand_over_deadline(now) {
-                fold_owned_deadline(
-                    deadline,
-                    owner,
-                    wake,
-                    metrics::DeadlineOwner::DevToolsHandOver,
-                );
-            }
-            if self.debugger_launch.offering()
-                && let Some(wake) = self.debugger_launch.next_deadline()
-                && self.devtools_helper.windowed()
-                && self.any_os_window_focused()
-            {
-                fold_owned_deadline(
-                    deadline,
-                    owner,
-                    wake,
-                    metrics::DeadlineOwner::DevToolsHandOver,
-                );
-            }
-            if let Some(wake) = self.next_debugger_change_deadline(now) {
-                fold_owned_deadline(
-                    deadline,
-                    owner,
-                    wake,
-                    metrics::DeadlineOwner::DebuggerChange,
-                );
-            }
-            return;
+        if let Some(wake) = self.next_access_step_deadline(now) {
+            fold_owned_deadline(
+                deadline,
+                owner,
+                wake,
+                metrics::DeadlineOwner::DevToolsHandOver,
+            );
         }
         if let Some(wake) = self.next_macos_access_card_deadline(now) {
             fold_owned_deadline(deadline, owner, wake, metrics::DeadlineOwner::ConsentCard);
@@ -10066,29 +10051,14 @@ impl App {
                 metrics::DeadlineOwner::DevToolsHandOver,
             );
         }
-        if let Some(wake) = self.debugger_launch.next_deadline()
+        // System State's debugger step's next look, while it is queued and an aterm
+        // window is focused. While setup holds the permission lanes it is folded only
+        // while a start owes this Mac its change ([`Self::look_for_debugger_moment`]).
+        if (!self.workstation_setup.suppresses_permissions() || self.debugger_launch.starting())
+            && let Some(wake) = self.debugger_launch.next_deadline()
             && self.devtools_helper.windowed()
             && self.any_os_window_focused()
         {
-            fold_owned_deadline(
-                deadline,
-                owner,
-                wake,
-                metrics::DeadlineOwner::DevToolsHandOver,
-            );
-        }
-        if let Some(wake) = self.secrets_join.next_deadline()
-            && self.devtools_helper.windowed()
-            && self.any_os_window_focused()
-        {
-            fold_owned_deadline(
-                deadline,
-                owner,
-                wake,
-                metrics::DeadlineOwner::DevToolsHandOver,
-            );
-        }
-        if let Some(wake) = self.secrets_join.sheet_deadline() {
             fold_owned_deadline(
                 deadline,
                 owner,
@@ -10106,9 +10076,6 @@ impl App {
     }
 
     fn on_devtools_probe_ready(&mut self) {
-        if self.workstation_setup.suppresses_permissions() {
-            return;
-        }
         if !cfg!(target_os = "macos") || self.headless {
             return;
         }
@@ -10120,9 +10087,8 @@ impl App {
             return;
         }
         self.note_devtools_reading(&row);
-        let version = aterm_types::version::app_version();
-        let opened =
-            (self.devtools_helper.reach().last_opened)().is_some_and(|(v, _)| v == version);
+        let key = self.access_marks().devtools;
+        let opened = (self.devtools_helper.reach().last_opened)().is_some_and(|(v, _)| v == key);
         let step = self.devtools_watch.observe(row.grant(), opened);
         let list_read = row.list().label == aterm_containment::DevToolListLabel::Read;
         if self
@@ -10140,26 +10106,17 @@ impl App {
         match step {
             devtools_watch::Step::Nothing => false,
             devtools_watch::Step::Clear => {
-                self.except_clear(crate::message_reporters::DEVTOOLS_KEY);
                 if self.devtools_watch.take_refresh() {
+                    self.record_access_step(
+                        aterm_types::macos_setup::Access::DeveloperTools,
+                        aterm_types::macos_setup::AccessOutcome::Granted,
+                    );
                     self.refresh_devtools_verdict();
                 }
                 false
             }
-            devtools_watch::Step::Raise { hand_over } => {
-                let entry = self.devtools_entry_now();
-                self.except(&entry);
-                hand_over
-            }
+            devtools_watch::Step::NotOn { hand_over } => hand_over,
         }
-    }
-
-    fn devtools_step(&self) -> atpkg::devtools::Step {
-        self.devtools_helper
-            .reading()
-            .map_or(atpkg::devtools::Step::Add, |reading| {
-                atpkg::devtools::Step::of(&reading.list)
-            })
     }
 
     /// THE ONE HAND-OVER.
@@ -10185,10 +10142,18 @@ impl App {
     ) -> (devtools_helper::Reading, devtools_helper::Facts) {
         let reading = self.devtools_reading();
         let reach = self.devtools_helper.reach();
+        let key = self.access_marks().devtools;
+        let declined = !origin.owner_press()
+            && devtools_helper::declined_for(
+                origin,
+                &key,
+                (reach.last_declined)().as_ref(),
+                (reach.declined)().is_some(),
+            );
         let facts = devtools_helper::Facts {
             grant: reading.grant,
             list: reading.list,
-            declined: !origin.owner_press() && (reach.declined)().is_some(),
+            declined,
             grant_stable: (reach.grant_stable)(),
             recent: origin
                 .reopen_after_s()
@@ -10196,6 +10161,7 @@ impl App {
                 || (origin == devtools_helper::Origin::Ctl { now: true }
                     && (self.devtools_helper.now_answered_within_its_minute(now)
                         || self.devtools_helper.fda_first())),
+            fda_on: self.consent_panel_facts().fda == aterm_containment::consent::FdaState::Granted,
         };
         (reading, facts)
     }
@@ -10224,9 +10190,8 @@ impl App {
             return HandOver::Headless;
         }
         let now = Instant::now();
-        if origin == devtools_helper::Origin::Automatic
-            && self.workstation_setup.suppresses_permissions()
-        {
+        if origin == devtools_helper::Origin::Automatic && self.access_revision().is_none() {
+            // No approved revision admits Permissions yet: the step waits for one.
             match carried {
                 Some(listed) => self
                     .devtools_helper
@@ -10292,13 +10257,25 @@ impl App {
         answer: devtools_helper::HandOver,
     ) {
         use devtools_helper::{HandOver, Refusal};
+        // A refusal that decides nothing against the page (an unknown reading, a row
+        // macOS still checks, Full Disk Access not on yet) leaves the next
+        // `not_granted` reading to ask again.
         if origin == devtools_helper::Origin::Automatic
             && matches!(
                 answer,
-                HandOver::Refused(Refusal::Unknown | Refusal::Listed)
+                HandOver::Refused(Refusal::Unknown | Refusal::Listed | Refusal::NoFullDiskAccess)
             )
         {
             self.devtools_watch.forget_hand_over();
+        }
+        // The owner's Not now holds for this revision: the step is answered.
+        if origin == devtools_helper::Origin::Automatic
+            && answer == HandOver::Refused(Refusal::Declined)
+        {
+            self.record_access_step(
+                aterm_types::macos_setup::Access::DeveloperTools,
+                aterm_types::macos_setup::AccessOutcome::Declined,
+            );
         }
     }
 
@@ -10336,7 +10313,11 @@ impl App {
         if !opened {
             return devtools_helper::HandOver::OpenFailed;
         }
-        (reach.note_opened)(aterm_types::version::app_version());
+        (reach.note_opened)(&self.access_marks().devtools);
+        self.record_access_step(
+            aterm_types::macos_setup::Access::DeveloperTools,
+            aterm_types::macos_setup::AccessOutcome::Handed,
+        );
         self.devtools_helper.noted_opened(aterm_time::unix_secs());
         self.devtools_watch.note_handed_over();
         self.devtools_helper.drop_queued();
@@ -10355,6 +10336,8 @@ impl App {
         now: Instant,
     ) -> bool {
         let reach = self.devtools_helper.reach();
+        let marks = self.access_marks();
+        self.devtools_helper.set_marks(marks);
         let show = devtools_helper::Show {
             page: devtools_helper::Page::DeveloperTools,
             origin,
@@ -10478,7 +10461,19 @@ impl App {
         }
         self.tick_fda_hand_over(now);
         if self.devtools_helper.hand_over_due(now) {
-            let quiet = self.devtools_moment_is_quiet(now);
+            // The window's own, and a control client's act on System State's row,
+            // are steps of System State's run: only while System State is frontmost
+            // with no other macOS gesture up. A control verb's keeps the quiet moment
+            // alone.
+            let quiet = if self
+                .devtools_helper
+                .queued()
+                .is_some_and(devtools_helper::Origin::system_state_step)
+            {
+                self.access_step_moment(now)
+            } else {
+                self.devtools_moment_is_quiet(now)
+            };
             if let Some((origin, listed)) = self.devtools_helper.take_queued(now, quiet) {
                 let _ = self.devtools_hand_over_carrying(
                     origin,
@@ -10487,38 +10482,73 @@ impl App {
                 );
             }
         }
-        self.look_for_debugger_moment(now, Self::devtools_moment_is_quiet);
-        if !self.workstation_setup.suppresses_permissions() {
-            self.look_for_secrets_moment(now, Self::devtools_moment_is_quiet);
-        }
+        // After both launch pages: System State's debugger step.
+        self.look_for_debugger_moment(now, Self::debugger_step_moment);
     }
 
-    fn look_for_debugger_moment(&mut self, now: Instant, quiet: fn(&Self, Instant) -> bool) {
-        use debugger_access::{AskWait, HostAsked, LaunchAsk, LaunchAskFacts, admit_launch_ask};
+    /// System State's once-per-Mac debugger step (`docs/DESIGN-system-state-2026-10-21.md`
+    /// §6): with the window's own admission of a plan with its Permissions group, at the
+    /// step moment (`moment`), once the page's headline has named macOS's password dialog,
+    /// the admission is spent as the yes and the change starts as a press's does.
+    /// [`debugger_access::admit_debugger_step`] decides; a `[privacy]` switch off pauses it.
+    fn look_for_debugger_moment(
+        &mut self,
+        now: Instant,
+        moment: fn(&Self) -> debugger_access::StepMoment,
+    ) {
+        self.debugger_step_look(now, moment);
+        self.republish_system_state_access_step();
+    }
+
+    /// One look of [`Self::look_for_debugger_moment`].
+    fn debugger_step_look(
+        &mut self,
+        now: Instant,
+        moment: fn(&Self) -> debugger_access::StepMoment,
+    ) {
+        use debugger_access::{
+            DebuggerStepFacts, HostAsked, StepVerdict, StepWait, admit_debugger_step,
+        };
+        // A step paused for a `[privacy]` switch goes on once every switch is on again.
+        if self.debugger_launch.paused() && self.access_steps_allowed() {
+            self.debugger_launch.resume();
+            aterm_log::info!("debugger step: the [privacy] switches are on again; it goes on");
+        }
+        // Setup's hold admits nothing new; a start whose disk half is out or answered
+        // owes this Mac its change.
+        if self.workstation_setup.suppresses_permissions() && !self.debugger_launch.starting() {
+            self.debugger_launch.withdraw();
+            return;
+        }
         if !self.debugger_launch.due(now) {
             return;
         }
+        // While the start's disk half is out the look only waits; once it has ended, its
+        // answer is spent before anything is judged again ([`Self::spend_debugger_step`]).
         if self.debugger_launch.preparing() {
-            let why = AskWait::Recording;
+            let why = StepWait::Recording;
             if self.debugger_launch.wait(why, now + why.look_again()) {
-                aterm_log::debug!("debugger launch ask: waiting ({})", why.as_str());
+                aterm_log::debug!("debugger step: waiting ({})", why.as_str());
             }
             return;
         }
         if let Some((prepared, read)) = self.debugger_launch.take_prepared() {
-            self.spend_debugger_offer_at_launch(now, prepared, &read);
+            self.spend_debugger_step(now, prepared, &read, moment);
             return;
         }
         if self.workstation_setup.suppresses_permissions() {
+            self.debugger_launch.withdraw();
             return;
         }
         let config = self.consent_card_config.clone();
-        let mut facts = LaunchAskFacts {
+        let admitted = self.admitted_access();
+        let mut facts = DebuggerStepFacts {
             windowed: !self.headless,
             macos: cfg!(target_os = "macos"),
             privacy: self.config.privacy_probe_gate().permits(),
             notice: self.config.privacy_notice(),
             config: config.is_some(),
+            admitted: admitted.is_some(),
             host: HostAsked::Cold,
             records_read: self.debugger_change.records_read(),
             under_way: self.debugger_change.under_way(),
@@ -10538,19 +10568,21 @@ impl App {
                 || self.devtools_helper.fda_waiting()
                 || self.devtools_helper.devtools_waiting(),
             warmup: self.consent_warmup.is_live(),
-            quiet: false,
+            frontmost: false,
+            dialog_up: false,
             owner_quiet: false,
         };
         let mut host = None;
         let mut read = None;
-        let mut verdict = admit_launch_ask(&facts);
-        if verdict == LaunchAsk::Wait(AskWait::HostCold)
+        let mut at = None;
+        let mut verdict = admit_debugger_step(&facts);
+        if verdict == StepVerdict::Wait(StepWait::HostCold)
             && let Some(config) = config.as_deref()
         {
-            (facts.host, host) = self.launch_ask_host(config);
-            verdict = admit_launch_ask(&facts);
+            (facts.host, host) = self.debugger_step_host(config);
+            verdict = admit_debugger_step(&facts);
         }
-        if verdict == LaunchAsk::Wait(AskWait::ProbePending) {
+        if verdict == StepVerdict::Wait(StepWait::ProbePending) {
             let gate = self.config.privacy_probe_gate();
             let row = match self.consent.debugger_cached(gate) {
                 Some(row) if !row.pending() => row,
@@ -10572,61 +10604,110 @@ impl App {
                     || self.devtools_helper.fda_waiting()
                     || self.devtools_helper.devtools_waiting();
             }
-            facts.quiet = quiet(self, now);
+            let now_at = moment(self);
+            facts.frontmost = now_at.page.is_some();
+            facts.dialog_up = now_at.dialog_up;
             facts.owner_quiet = self
                 .owner_quiet
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .quiet_now();
             read = Some(debugger);
-            verdict = admit_launch_ask(&facts);
+            at = now_at.page;
+            verdict = admit_debugger_step(&facts);
         }
-        if verdict == LaunchAsk::Wait(AskWait::ProbeStale) {
+        if verdict == StepVerdict::Wait(StepWait::ProbeStale) {
             self.consent.invalidate_debugger();
             let _ = self.debugger_access_facts();
         }
-        match (verdict, config.as_deref(), host) {
-            (LaunchAsk::Wait(why), _, _) => {
+        match (verdict, config.as_deref(), host, admitted, at) {
+            (StepVerdict::Wait(why), ..) => {
+                // The page names the dialog only while the change is about to
+                // start: any wait takes the words back.
+                self.debugger_launch.withdraw();
                 if self.debugger_launch.wait(why, now + why.look_again()) {
-                    aterm_log::debug!("debugger launch ask: waiting ({})", why.as_str());
+                    aterm_log::debug!("debugger step: waiting ({})", why.as_str());
                 }
             }
-            (LaunchAsk::Settle(why), config, Some(host)) => {
+            (StepVerdict::Park, ..) => {
+                self.debugger_launch.park();
+                aterm_log::info!(
+                    "debugger step: parked until this window admits a setup plan with its Permissions group"
+                );
+            }
+            (StepVerdict::Pause(why), ..) => {
+                // Nothing written or recorded: the published opt-out is the
+                // row's wanted state while the switch is off, and the step is
+                // still to do once it is on.
+                self.debugger_launch.withdraw();
+                self.debugger_launch.pause();
+                aterm_log::info!(
+                    "debugger step: paused ({}) until every [privacy] switch is on again",
+                    why.as_str()
+                );
+            }
+            (StepVerdict::Settle(why), config, Some(host), admitted, _) => {
+                // A turned-off rule is the row's wanted state whatever the step
+                // does: the window reads it off the record at every launch
+                // (`App::publish_access_opt_outs`), not off this verdict.
                 self.debugger_launch.end();
+                if let Some(admitted) = admitted {
+                    // Settled for the admission's revision, so its Permissions
+                    // stage counts the row: a change under way is handed, the
+                    // rule on is granted, and an answer on the Security page or
+                    // an explicit opt-out (turned off) is declined — the row's
+                    // wanted state, never turned back on.
+                    self.debugger_launch
+                        .record(admitted.revision(), why.outcome());
+                }
+                // The record goes down off the event loop: the config folder
+                // lives in the home folder, which can sit on a volume that
+                // stopped answering.
                 let config = config.map(std::path::Path::to_path_buf);
                 let record = move || match debugger_access::DebuggerChangeLane::forgo(
                     config.as_deref(),
                     host,
                 ) {
-                    Ok(()) => aterm_log::info!("debugger launch ask: settled {}", why.as_str()),
+                    Ok(()) => aterm_log::info!("debugger step: settled {}", why.as_str()),
                     Err(error) => aterm_log::warn!(
-                        "debugger launch ask: settled {}, but this Mac could not be recorded: {error}",
+                        "debugger step: settled {}, but this Mac could not be recorded: {error}",
                         why.as_str()
                     ),
                 };
-                if !self.launch_ask_disk("aterm-launch-settle", record) {
+                if !self.debugger_step_disk("aterm-launch-settle", record) {
                     aterm_log::warn!(
-                        "debugger launch ask: settled {}, but no thread could record this Mac",
+                        "debugger step: settled {}, but no thread could record this Mac",
                         why.as_str()
                     );
                 }
             }
-            (LaunchAsk::Ask, Some(config), Some(host)) => {
+            (StepVerdict::Start, Some(config), Some(host), Some(_), Some(page)) => {
+                // The admission is taken again where it is spent, after the disk
+                // half (`Self::spend_debugger_step`).
                 let read = read.unwrap_or_default();
-                self.offer_debugger_access_at_launch(now, config, host, &read);
+                self.start_debugger_step(now, config, host, page, &read, moment);
             }
-            (LaunchAsk::Drop(why), _, _) => {
+            (StepVerdict::Drop(why), _, _, admitted, _) => {
                 self.debugger_launch.end();
-                aterm_log::info!("debugger launch ask: dropped {}", why.as_str());
+                // With an admission in hand, a drop that settles the row says so
+                // for its revision: this Mac's once-per-Mac step is over (an
+                // earlier revision's, perhaps cancelled in macOS's dialog).
+                // Every later revision's stage then completes; without the line
+                // it would wait on the row for good.
+                if let (Some(admitted), Some(outcome)) = (admitted, why.outcome()) {
+                    self.debugger_launch.record(admitted.revision(), outcome);
+                }
+                aterm_log::info!("debugger step: dropped {}", why.as_str());
             }
-            (LaunchAsk::Settle(_) | LaunchAsk::Ask, _, _) => {
+            // A start or a settle names this Mac in a record, so both have one.
+            (StepVerdict::Settle(_) | StepVerdict::Start, ..) => {
                 self.debugger_launch.end();
-                aterm_log::warn!("debugger launch ask: dropped with no record to keep");
+                aterm_log::warn!("debugger step: dropped with no record to keep");
             }
         }
     }
 
-    fn launch_ask_host(
+    fn debugger_step_host(
         &mut self,
         config: &std::path::Path,
     ) -> (debugger_access::HostAsked, Option<&'static str>) {
@@ -10635,13 +10716,13 @@ impl App {
         if let Some(host) = self.debugger_launch.warm_host() {
             // The record beside `aterm.toml`, read once, off the event loop: it
             // lives in the home folder, which can sit on a volume that stopped
-            // answering (`debugger_access::RecordRead::Thread`).
+            // The record is read once, off the event loop (`debugger_access::RecordRead::Thread`).
             if let Some((slot, read)) = self.debugger_launch.start_record_read(host) {
                 let config = config.to_path_buf();
                 let answer = move || {
                     let _ = slot.set(debugger_access::read_asked(&config, host));
                 };
-                if !self.launch_ask_disk("aterm-launch-asked", answer) {
+                if !self.debugger_step_disk("aterm-launch-asked", answer) {
                     return (HostAsked::Asked, Some(host));
                 }
                 if read == debugger_access::RecordRead::Thread {
@@ -10677,6 +10758,30 @@ impl App {
         (HostAsked::Cold, None)
     }
 
+    /// The Developer Tools list's read at a focus gain, off this thread: the
+    /// launch read at the first, then as [`devtools_watch::DevToolsWatch::wants_read`]
+    /// says. Its completion wakes the window ([`Self::on_devtools_probe_ready`]),
+    /// which asks for the page where it is due. Not while `[privacy] enabled` or
+    /// `check` is off: the probe would only answer that it is switched off, which
+    /// reads nothing, so the launch read stays owed and the first focus gain or
+    /// park after every switch is on again makes it
+    /// ([`Self::resume_held_launch_steps`]). A switch off is a pause, never an
+    /// answer.
+    pub(crate) fn read_devtools_list(&mut self, now: Instant) {
+        let gate = self.config.privacy_probe_gate();
+        if !gate.permits() {
+            if self.devtools_watch.due(now) {
+                self.devtools_watch.hold_read();
+            }
+            return;
+        }
+        if self.devtools_watch.wants_read(now) {
+            let _ = self
+                .consent
+                .devtools(gate, self.config.privacy_observer_off());
+        }
+    }
+
     fn devtools_launch_read_done(&mut self) -> bool {
         if self.devtools_helper.reading().is_some() {
             return true;
@@ -10692,188 +10797,329 @@ impl App {
         self.devtools_helper.reading().is_some()
     }
 
-    fn offer_debugger_access_at_launch(
+    /// The debugger step's start: once the page has named macOS's password dialog for
+    /// [`debugger_access::ANNOUNCE_FOR`], the start's disk half
+    /// ([`debugger_access::StartDisk::prepare`]) runs on a thread of its own, and the next
+    /// look spends its answer ([`Self::spend_debugger_step`]).
+    fn start_debugger_step(
         &mut self,
         now: Instant,
         config: &std::path::Path,
         host: &'static str,
+        (window, presented): (WindowId, u64),
         read: &debugger_access::DebuggerFacts,
+        moment: fn(&Self) -> debugger_access::StepMoment,
     ) {
-        use debugger_access::AskWait;
-        if let Some(why) = self.debugger_change.offer_refusal() {
-            self.launch_offer_ended(now, debugger_access::OfferEnd::Refused(why), false);
+        use debugger_access::{StartEnd, StepWait};
+        if !self.debugger_step_announced(now, window, presented) {
+            return;
+        }
+        if let Some(why) = self.debugger_change.start_refusal() {
+            self.debugger_step_ended(now, StartEnd::Refused(why), None);
             return;
         }
         let Some(slot) = self.debugger_launch.start_prepare(*read) else {
             // One is out or untaken already: the look spends or waits on it first.
             return;
         };
-        let disk = self.debugger_change.offer_disk();
+        let disk = self.debugger_change.start_disk();
         let config = config.to_path_buf();
         let prepare = move || {
             let _ = slot.set(disk.prepare(&config, host, debugger_access::now_secs()));
         };
-        if !self.launch_ask_disk("aterm-launch-offer", prepare) {
+        if !self.debugger_step_disk("aterm-launch-start", prepare) {
+            // Nothing written or started: a later launch judges again.
             self.debugger_launch.end();
-            aterm_log::warn!("debugger launch ask: dropped: no thread could record this Mac");
+            aterm_log::warn!("debugger step: dropped: no thread could record this Mac");
             return;
         }
         if self.debugger_launch.record_read() == debugger_access::RecordRead::Thread {
-            let why = AskWait::Recording;
+            let why = StepWait::Recording;
             if self.debugger_launch.wait(why, now + why.look_again()) {
-                aterm_log::debug!("debugger launch ask: waiting ({})", why.as_str());
+                aterm_log::debug!("debugger step: waiting ({})", why.as_str());
             }
             return;
         }
         if let Some((prepared, read)) = self.debugger_launch.take_prepared() {
-            self.spend_debugger_offer_at_launch(now, prepared, &read);
+            self.spend_debugger_step(now, prepared, &read, moment);
         }
     }
 
-    fn spend_debugger_offer_at_launch(
-        &mut self,
-        now: Instant,
-        prepared: debugger_access::OfferPrep,
-        read: &debugger_access::DebuggerFacts,
-    ) {
-        use aterm_containment::consent::{DebuggerChange, DebuggerMode};
-        use debugger_access::AskWait;
-        let recorded = prepared == debugger_access::OfferPrep::Recorded;
-        let mut read = *read;
-        if recorded {
-            let (answered, quieted) = {
-                let quiet = self.owner_quiet.lock().unwrap_or_else(|p| p.into_inner());
-                (quiet.debugger_answered(), quiet.quiet_now())
-            };
-            if answered {
-                self.debugger_launch.end();
-                aterm_log::info!("debugger launch ask: settled answered after recording this Mac");
-                return;
-            }
-            if quieted {
-                self.debugger_launch.keep_prepared(prepared, read);
-                let why = AskWait::OwnerQuiet;
-                if self.debugger_launch.wait(why, now + why.look_again()) {
-                    aterm_log::debug!("debugger launch ask: waiting ({})", why.as_str());
-                }
-                return;
-            }
-            let gate = self.config.privacy_probe_gate();
-            let cached = self.consent.debugger_cached(gate);
-            let fresh = cached.filter(|row| {
-                !row.pending()
-                    && row
-                        .probe_age()
-                        .is_none_or(|age| age <= debugger_access::ASK_PROBE_FRESH)
-            });
-            match fresh {
-                Some(row)
-                    if row.probe().mode == DebuggerMode::Unknown && row.probe_age().is_some() =>
-                {
-                    let label = row.probe().label.as_str();
-                    if !self.debugger_launch.unread(now) {
-                        aterm_log::info!(
-                            "debugger launch ask: dropped after recording this Mac: the debugger rule could not be read ({label})"
-                        );
-                        return;
-                    }
-                    self.consent.invalidate_debugger();
-                    self.debugger_launch.keep_prepared(prepared, read);
-                    let why = AskWait::ProbeUnread;
-                    if self.debugger_launch.wait(why, now + why.look_again()) {
-                        aterm_log::debug!("debugger launch ask: waiting ({})", why.as_str());
-                    }
-                    return;
-                }
-                Some(row) => {
-                    read = self.debugger_access_facts_from(row);
-                }
-                None => {
-                    // Retiring the old answer also voids a read still out for it;
-                    // the next is dispatched once that one has ended.
-                    if cached.is_some() {
-                        self.consent.invalidate_debugger();
-                    }
-                    let _ = self.debugger_access_facts();
-                    self.debugger_launch.keep_prepared(prepared, read);
-                    let why = AskWait::ProbeStale;
-                    if self.debugger_launch.wait(why, now + why.look_again()) {
-                        aterm_log::debug!("debugger launch ask: waiting ({})", why.as_str());
-                    }
-                    return;
-                }
+    /// Whether a frame of `window` has named macOS's password dialog for [`debugger_access::ANNOUNCE_FOR`]; otherwise the step waits [`debugger_access::StepWait::Announced`].
+    fn debugger_step_announced(&mut self, now: Instant, window: WindowId, presented: u64) -> bool {
+        use debugger_access::StepWait;
+        if self.debugger_launch.announce(window, presented, now) {
+            aterm_log::info!("debugger step: the page names macOS's password dialog");
+            if let Some(os_window) = self
+                .windows
+                .get(&window)
+                .and_then(|state| state.os_window.as_ref())
+            {
+                os_window.request_redraw();
             }
         }
-        let (title, body, proceed) = native_settings::debugger_access_alert(
-            DebuggerChange::On,
-            &read,
-            aterm_containment::SpikeEvidence::MEASURED,
-            native_settings::DebuggerAlertFrom::Launch,
-        );
-        let quiet = Arc::clone(&self.owner_quiet);
-        let gestures = self.consent_gestures;
-        let offered = self
+        if self.debugger_launch.shown(window, presented, now) {
+            return true;
+        }
+        let why = StepWait::Announced;
+        let _ = self.debugger_launch.wait(why, now + why.look_again());
+        false
+    }
+
+    /// The standing yes spent, once the start's disk half has written this Mac into the
+    /// record (`prepared`). What can have changed meanwhile is read again (an answer on
+    /// the Security page, the admission, the `[privacy]` switches, the moment, a fresh
+    /// reading of the rule, a person's opt-out), and what holds the step keeps the answer
+    /// ([`debugger_access::DebuggerStepQueue::keep_prepared`]) for the next look. A read
+    /// that comes back with no reading is read again, the answer kept, until
+    /// [`debugger_access::REFUSED_FOR`] has passed and [`debugger_access::UNREAD_READS`]
+    /// such reads were made ([`debugger_access::DebuggerStepQueue::unread`]). Then the
+    /// admission is spent through [`debugger_access::DebuggerChangeLane::start_from_plan`]
+    /// and the change starts as a press's does.
+    fn spend_debugger_step(
+        &mut self,
+        now: Instant,
+        prepared: debugger_access::StartPrep,
+        read: &debugger_access::DebuggerFacts,
+        moment: fn(&Self) -> debugger_access::StepMoment,
+    ) {
+        use aterm_containment::consent::{DebuggerChange, DebuggerMode};
+        use aterm_types::macos_setup::AccessOutcome;
+        use debugger_access::{StartEnd, StartPrep, StepWait};
+        if let Err(end) = self
             .debugger_change
-            .offer(prepared, debugger_access::now_secs(), || {
-                native_settings::owner_confirms_with(&quiet, &gestures, &title, &body, proceed)
-            });
-        match offered {
+            .start_prepared(prepared, debugger_access::now_secs())
+        {
+            // Nothing was written: a change on disk (whose records read the lane
+            // now asks for), a lock that cannot be made, the record naming this
+            // Mac already, or a record that could not be written.
+            self.debugger_step_ended(now, end, None);
+            return;
+        }
+        debug_assert_eq!(prepared, StartPrep::Recorded);
+        let (answered, quieted) = {
+            let quiet = self.owner_quiet.lock().unwrap_or_else(|p| p.into_inner());
+            (quiet.debugger_answered(), quiet.quiet_now())
+        };
+        if answered {
+            self.debugger_launch.end();
+            if let Some(admitted) = self.admitted_access() {
+                self.debugger_launch
+                    .record(admitted.revision(), AccessOutcome::Declined);
+            }
+            aterm_log::info!("debugger step: settled answered after recording this Mac");
+            return;
+        }
+        let mut read = *read;
+        let Some(admitted) = self.admitted_access() else {
+            self.debugger_launch.keep_prepared(prepared, read);
+            self.debugger_launch.park();
+            aterm_log::info!(
+                "debugger step: recorded this Mac; parked until this window admits a setup plan with its Permissions group"
+            );
+            return;
+        };
+        // The `[privacy]` switches, read again where the answer is spent, as
+        // admission reads them after the standing yes: a kept answer may have
+        // waited any span (System State away, a decline's quiet, a dialog up)
+        // while the person switched `notice`, `check` or `enabled` off. The
+        // step pauses with the answer kept and nothing started or recorded,
+        // and goes on once every switch is on again ([`Self::debugger_step_look`]).
+        if !self.access_steps_allowed() {
+            self.debugger_launch.keep_prepared(prepared, read);
+            self.debugger_launch.withdraw();
+            self.debugger_launch.pause();
+            aterm_log::info!(
+                "debugger step: recorded this Mac; paused while a [privacy] switch is off"
+            );
+            return;
+        }
+        let now_at = moment(self);
+        let wait = if quieted {
+            Some(StepWait::OwnerQuiet)
+        } else if now_at.dialog_up {
+            Some(StepWait::DialogUp)
+        } else if now_at.page.is_none() {
+            Some(StepWait::NotFrontmost)
+        } else {
+            None
+        };
+        if let Some(why) = wait {
+            self.debugger_launch.keep_prepared(prepared, read);
+            self.debugger_launch.withdraw();
+            if self.debugger_launch.wait(why, now + why.look_again()) {
+                aterm_log::debug!("debugger step: recorded; waiting ({})", why.as_str());
+            }
+            return;
+        }
+        // The reading the change starts on is as fresh as admission's: an older one
+        // is retired and the rule read again first. A rule on by then is a press the
+        // lane refuses: the step ends, the record standing, as it does for a rule
+        // `-status` calls unrecognized.
+        let gate = self.config.privacy_probe_gate();
+        let cached = self.consent.debugger_cached(gate);
+        let fresh = cached.filter(|row| {
+            !row.pending()
+                && row
+                    .probe_age()
+                    .is_none_or(|age| age <= debugger_access::ASK_PROBE_FRESH)
+        });
+        match fresh {
+            Some(row) if row.probe().mode == DebuggerMode::Unknown && row.probe_age().is_some() => {
+                // A read that came back with no reading (`-status` timed out, did not
+                // start, or answered what the classifier does not claim) is no answer:
+                // this Mac is recorded already, so it is retired and the rule read
+                // again, for a bounded span. A closed gate's row, which no read made,
+                // is the lane's to refuse below.
+                let label = row.probe().label.as_str();
+                if !self.debugger_launch.unread(now) {
+                    aterm_log::info!(
+                        "debugger step: dropped after recording this Mac: the debugger rule could not be read ({label})"
+                    );
+                    return;
+                }
+                self.consent.invalidate_debugger();
+                self.debugger_launch.keep_prepared(prepared, read);
+                let why = StepWait::ProbeUnread;
+                if self.debugger_launch.wait(why, now + why.look_again()) {
+                    aterm_log::debug!("debugger step: recorded; waiting ({})", why.as_str());
+                }
+                return;
+            }
+            Some(row) => {
+                read = self.debugger_access_facts_from(row);
+            }
+            None => {
+                // Retiring the old answer also voids a read still out for it; the
+                // next is dispatched once that one has ended.
+                if cached.is_some() {
+                    self.consent.invalidate_debugger();
+                }
+                let _ = self.debugger_access_facts();
+                self.debugger_launch.keep_prepared(prepared, read);
+                let why = StepWait::ProbeStale;
+                if self.debugger_launch.wait(why, now + why.look_again()) {
+                    aterm_log::debug!("debugger step: recorded; waiting ({})", why.as_str());
+                }
+                return;
+            }
+        }
+        let revision = admitted.revision();
+        // A rule on by then, or a person's own press meanwhile, is a press the
+        // lane refuses: the step ends before the page names a dialog that would
+        // not come.
+        if let Some(why) = self.debugger_change.start_refusal() {
+            self.debugger_step_ended(now, StartEnd::Refused(why), Some(revision));
+            return;
+        }
+        // Debugger access off by the person's choice by then — this process saw
+        // it go off, or the observed record says it was allowed or that aterm
+        // or something else turned it off — is the row's wanted state, as
+        // admission's [`debugger_access::StepSettle::TurnedOff`] says: aterm
+        // never turns it back on, and the row is declined for the revision.
+        if read.probe.mode == DebuggerMode::Disabled
+            && debugger_access::off_is_chosen(read.drift_since.is_some(), read.recorded)
+        {
+            self.debugger_launch.end();
+            self.debugger_launch
+                .record(revision, AccessOutcome::Declined);
+            aterm_log::info!(
+                "debugger step: debugger access was turned off after recording this Mac; nothing started"
+            );
+            return;
+        }
+        let Some((window, presented)) = now_at.page else {
+            self.debugger_launch.keep_prepared(prepared, read);
+            return;
+        };
+        if !self.debugger_step_announced(now, window, presented) {
+            self.debugger_launch.keep_prepared(prepared, read);
+            return;
+        }
+        match self
+            .debugger_change
+            .start_from_plan(prepared, debugger_access::now_secs(), admitted)
+        {
             Ok(ticket) => {
                 self.debugger_launch.end();
-                self.owner_quiet
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .note_debugger_confirmed();
-                aterm_log::info!("debugger launch ask: asked; the owner said yes");
+                self.debugger_launch.note_started(revision);
+                aterm_log::info!(
+                    "debugger step: started on this window's admission of setup revision {revision}"
+                );
                 let refusal = self
                     .run_debugger_change(
                         DebuggerChange::On,
                         ticket,
                         read.not_hardened(),
-                        " (aterm's launch ask)",
+                        " (System State's step)",
                     )
                     .err();
                 self.debugger_change.note_refusal(refusal);
+                if refusal.is_none() {
+                    self.debugger_launch.record(revision, AccessOutcome::Handed);
+                }
             }
-            Err(end) => self.launch_offer_ended(now, end, recorded),
+            Err(end) => self.debugger_step_ended(now, end, Some(revision)),
         }
     }
 
-    fn launch_offer_ended(&mut self, now: Instant, end: debugger_access::OfferEnd, recorded: bool) {
-        use debugger_access::OfferEnd;
-        match end {
-            OfferEnd::Refused(why) if !recorded => {
-                // A peer's change, most likely: the lane reads the records at once
-                // (`DebuggerChangeLane::offer`), follows or adopts it, and the next
-                // look settles; after a peer's own offer held the lock, the next
-                // offer finds this Mac in the record. Bounded, so no disk state
-                // holds the folder warm-up (which waits while the ask is queued)
-                // for longer.
+    /// How a start that gave no ticket ends.
+    fn debugger_step_ended(
+        &mut self,
+        now: Instant,
+        end: debugger_access::StartEnd,
+        recorded: Option<u64>,
+    ) {
+        use aterm_containment::consent::{DebuggerChange, DebuggerMode};
+        use aterm_types::macos_setup::AccessOutcome;
+        use debugger_access::{Refusal, StartEnd};
+        match (end, recorded) {
+            (StartEnd::Refused(why), None) => {
+                self.debugger_launch.withdraw();
                 if self.debugger_launch.refused(now) {
-                    aterm_log::debug!("debugger launch ask: not yet: {}", why.words());
+                    aterm_log::debug!("debugger step: not yet: {}", why.words());
                 } else {
-                    aterm_log::info!("debugger launch ask: dropped refused: {}", why.words());
+                    aterm_log::info!("debugger step: dropped refused: {}", why.words());
                 }
             }
-            OfferEnd::Refused(why) => {
+            (StartEnd::Refused(why), Some(revision)) => {
                 self.debugger_launch.end();
+                let settled = if self.debugger_change.under_way() {
+                    Some(AccessOutcome::Handed)
+                } else if why == Refusal::State(DebuggerChange::On, DebuggerMode::Enabled) {
+                    Some(AccessOutcome::Granted)
+                } else {
+                    None
+                };
+                if let Some(outcome) = settled {
+                    self.debugger_launch.record(revision, outcome);
+                }
                 aterm_log::info!(
-                    "debugger launch ask: dropped refused after recording this Mac: {}",
+                    "debugger step: dropped refused after recording this Mac: {}",
                     why.words()
                 );
             }
-            OfferEnd::Declined | OfferEnd::NotAsked => {
+            (StartEnd::Asked, recorded) => {
                 self.debugger_launch.end();
-                aterm_log::info!("debugger launch ask: asked; {}", end.as_str());
+                if let Some(revision) =
+                    recorded.or_else(|| self.admitted_access().map(|admitted| admitted.revision()))
+                {
+                    self.debugger_launch
+                        .record(revision, AccessOutcome::Declined);
+                }
+                aterm_log::info!("debugger step: dropped {}", StartEnd::Asked.as_str());
             }
-            OfferEnd::NoLock | OfferEnd::Asked | OfferEnd::NotRecorded => {
+            (end @ (StartEnd::NoLock | StartEnd::NotRecorded), _) => {
                 self.debugger_launch.end();
-                aterm_log::info!("debugger launch ask: dropped {}", end.as_str());
+                aterm_log::info!("debugger step: dropped {}", end.as_str());
             }
         }
     }
 
-    fn launch_ask_disk(&self, name: &'static str, work: impl FnOnce() + Send + 'static) -> bool {
+    /// Run the debugger step's disk work on a thread of its own, which wakes the window
+    /// when it ends, or, a test's stand-in, here ([`debugger_access::RecordRead`]).
+    /// `false` when no thread could be started.
+    fn debugger_step_disk(&self, name: &'static str, work: impl FnOnce() + Send + 'static) -> bool {
         match self.debugger_launch.record_read() {
             debugger_access::RecordRead::Thread => {
                 let wake = self.devtools_hand_over_wake();
@@ -10891,6 +11137,222 @@ impl App {
         }
     }
 
+    /// Where System State stands for the debugger step now: the focused window
+    /// whose visible view it is (`Self::system_state_frontmost`), with how many
+    /// frames that window has presented, and whether a macOS dialog this
+    /// process put up is up.
+    fn debugger_step_moment(&self) -> debugger_access::StepMoment {
+        let page = if self.system_state_frontmost() {
+            self.windows
+                .iter()
+                .find(|(_, window)| os_window_focused(window))
+                .map(|(wid, window)| (*wid, window.capture_present_serial))
+        } else {
+            None
+        };
+        debugger_access::StepMoment {
+            page,
+            dialog_up: aterm_types::macos_setup::macos_dialog_up(),
+        }
+    }
+
+    /// The debugger row's step for System State's headline ("Enter your
+    /// password for Debugger access", design §3.2): while the page names macOS's
+    /// dialog ahead of the change, and while a change System State started (its
+    /// own step, or a person's `Turn On…`) is under way, macOS's dialog perhaps
+    /// up. `App::system_state_access_step` answers it.
+    pub(crate) fn system_state_debugger_step(&self) -> Option<aterm_types::macos_setup::Access> {
+        (self.debugger_launch.announced()
+            || (self.debugger_launch.started().is_some() && self.debugger_change.under_way()))
+        .then_some(aterm_types::macos_setup::Access::Debugger)
+    }
+
+    /// A press on System State's Debugger row's `Turn On…` (design §3.4, §6):
+    /// `by_person` only for a person's press on the page
+    /// (`App::take_system_state_press` is `PagePress::Person`), never a control
+    /// client's `act` or `key`. Such a press, while a setup plan with its
+    /// Permissions group stands, is the yes ([`Self::admitted_by_press`], spent
+    /// through `OwnerYes::from_admitted`): the change starts as Settings ▸
+    /// Security's press starts it, with no alert of aterm's — macOS's
+    /// administrator dialog is the gesture — and whatever an earlier step or
+    /// Cancel recorded. The press answers the once-per-Mac question, as the
+    /// step's own start does: this Mac goes into `ASKED_RECORD` ahead of the
+    /// change and the launch step ends for this process
+    /// ([`Self::answer_debugger_question_by_press`]), so a Cancel in macOS's
+    /// dialog is never followed by a second one from the step, here or at a
+    /// later launch. `true` when the change started. `false` starts nothing:
+    /// not a person's press, no plan admitted, a build that is not hardened
+    /// (debugger access is not needed there, and the row says so), another macOS
+    /// dialog of this process up, a press the lane would refuse, or a record
+    /// that could not be written.
+    pub(crate) fn turn_on_debugger_from_system_state(&mut self, by_person: bool) -> bool {
+        use aterm_containment::consent::{DebuggerChange, SelfHardening};
+        let Some(admitted) = self.admitted_by_press(by_person) else {
+            aterm_log::info!(
+                "debugger access: Turn On… is no person's press on an admitted plan; nothing started"
+            );
+            return false;
+        };
+        // The host's gates first: a headless instance reads no probe for it.
+        if let Err(refusal) = debugger_access::admit_begin(debugger_access::BeginInputs {
+            windowed: !self.headless,
+            macos: cfg!(target_os = "macos"),
+            privacy: self.config.privacy_probe_gate().permits(),
+            self_hardened: SelfHardening::Unknown,
+        }) {
+            aterm_log::info!("debugger access: Turn On… refused: {}", refusal.words());
+            return false;
+        }
+        let facts = self.debugger_access_facts();
+        if facts.self_hardened != SelfHardening::Hardened {
+            aterm_log::info!("debugger access: not needed on an aterm that is not hardened");
+            return false;
+        }
+        if aterm_types::macos_setup::macos_dialog_up() {
+            aterm_log::info!(
+                "debugger access: another macOS dialog of aterm's is up; nothing started"
+            );
+            return false;
+        }
+        if let Some(refusal) = self.debugger_change.press_refusal(DebuggerChange::On) {
+            aterm_log::info!("debugger access: Turn On… refused: {}", refusal.words());
+            return false;
+        }
+        if !self.answer_debugger_question_by_press() {
+            return false;
+        }
+        let revision = admitted.revision();
+        let yes =
+            native_settings::OwnerAnswer::Yes(native_settings::OwnerYes::from_admitted(admitted));
+        let ticket = match self.debugger_change.begin(DebuggerChange::On, yes) {
+            Ok(ticket) => ticket,
+            Err(refusal) => {
+                aterm_log::info!("debugger access: Turn On… refused: {}", refusal.words());
+                return false;
+            }
+        };
+        self.debugger_launch.note_started(revision);
+        let started = self.run_debugger_change(
+            DebuggerChange::On,
+            ticket,
+            false,
+            " (System State's Turn On…)",
+        );
+        self.debugger_change.note_refusal(started.err());
+        if started.is_ok() {
+            self.debugger_launch
+                .record(revision, aterm_types::macos_setup::AccessOutcome::Handed);
+        }
+        self.republish_system_state_access_step();
+        started.is_ok()
+    }
+
+    /// A PERSON'S `Turn On…` ANSWERS THE ONCE-PER-MAC QUESTION (design §6): the
+    /// launch step is over for this process, parked or queued
+    /// (`DebuggerStepQueue::answered_by_press`), and this Mac goes into
+    /// `ASKED_RECORD` ahead of the change (`DebuggerChangeLane::forgo`, the
+    /// model's `Forgo`), as the step's own start writes it, so neither this
+    /// process nor a later launch starts the step over a question the person
+    /// answered, Cancel included. The record goes down durably off the event
+    /// loop, as `start_debugger_step`'s does — the config folder lives in the
+    /// home folder, which can sit on a volume that stopped answering — on the
+    /// step's disk thread once the host key is read ([`Self::debugger_step_disk`];
+    /// a test's stand-in writes it here), or, the key not read yet, on a thread
+    /// that reads it too (`gethostuuid(2)` never runs on the event loop); the
+    /// press goes on, and a write that fails is logged. No config folder, or a
+    /// kernel that names no host: there is nothing to key a record to, and the
+    /// step never starts there either. `false` when no thread could take the
+    /// write, or a stand-in's write failed and the record does not already read
+    /// as naming this Mac: then nothing starts, as the step starts nothing it
+    /// could not record.
+    fn answer_debugger_question_by_press(&mut self) -> bool {
+        self.debugger_launch.answered_by_press();
+        let Some(config) = self.consent_card_config.clone() else {
+            return true;
+        };
+        let Some(host) = self.debugger_launch.warm_host() else {
+            let spawned = crate::qos::spawn_lane_thread(
+                "aterm-press-asked",
+                crate::qos::Role::Background,
+                move || {
+                    let Some(host) = aterm_containment::consent::host_uuid() else {
+                        return;
+                    };
+                    if let Err(error) =
+                        debugger_access::DebuggerChangeLane::forgo(Some(&config), &host)
+                    {
+                        aterm_log::warn!(
+                            "debugger access: Turn On… was not recorded for this Mac: {error}"
+                        );
+                    }
+                },
+            );
+            if let Err(error) = spawned {
+                aterm_log::warn!(
+                    "debugger access: Turn On… not started: this Mac could not be recorded: {error}"
+                );
+                return false;
+            }
+            return true;
+        };
+        let written = Arc::new(std::sync::OnceLock::new());
+        let answer = Arc::clone(&written);
+        let record = move || {
+            let recorded = match debugger_access::DebuggerChangeLane::forgo(Some(&config), host) {
+                Ok(()) => true,
+                // A record that cannot be read whole reads as asked already.
+                Err(_) if debugger_access::read_asked(&config, host) => true,
+                Err(error) => {
+                    aterm_log::warn!(
+                        "debugger access: Turn On… was not recorded for this Mac: {error}"
+                    );
+                    false
+                }
+            };
+            let _ = answer.set(recorded);
+        };
+        if !self.debugger_step_disk("aterm-press-asked", record) {
+            aterm_log::warn!(
+                "debugger access: Turn On… not started: no thread could record this Mac"
+            );
+            return false;
+        }
+        // On a thread the press goes on; a stand-in's write has its answer here.
+        written.get().copied().unwrap_or(true)
+    }
+
+    /// What became of a change System State started, for its revision's access
+    /// record and every revision the window admitted while it ran: on,
+    /// granted; Cancel in macOS's dialog (or a wrong password, or a write that
+    /// failed), declined — settled for those revisions and never retried.
+    /// Anything else (no answer, no child) records nothing beyond the
+    /// hand-over. A change System State did not start records nothing.
+    fn note_system_state_debugger_outcome(&mut self, outcome: debugger_access::Outcome) {
+        use aterm_containment::consent::{DebuggerChange, DebuggerMode};
+        use aterm_types::macos_setup::AccessOutcome;
+        // The revision that started it, and every one the window admitted
+        // while it ran (`DebuggerStepQueue::join_started`).
+        let revisions = self.debugger_launch.finish();
+        if revisions.is_empty() {
+            return;
+        }
+        let recorded = match outcome {
+            debugger_access::Outcome::Changed(DebuggerChange::On)
+            | debugger_access::Outcome::NotDue(DebuggerChange::On, DebuggerMode::Enabled) => {
+                Some(AccessOutcome::Granted)
+            }
+            debugger_access::Outcome::NotChanged(DebuggerChange::On) => {
+                Some(AccessOutcome::Declined)
+            }
+            _ => None,
+        };
+        if let Some(recorded) = recorded {
+            for revision in revisions {
+                self.debugger_launch.record(revision, recorded);
+            }
+        }
+    }
+
     /// THE FULL DISK ACCESS HAND-OVER.
     pub(crate) fn hand_fda_to_owner(
         &mut self,
@@ -10900,6 +11362,8 @@ impl App {
         self.fda_hand_over(origin, devtools_helper::Moment::Asked, fda)
     }
 
+    /// The one door to the Full Disk Access page: [`devtools_helper::admit_fda`] judges
+    /// every origin here before [`Self::open_fda_page`] runs.
     fn fda_hand_over(
         &mut self,
         origin: devtools_helper::Origin,
@@ -10911,18 +11375,17 @@ impl App {
             return HandOver::Headless;
         }
         let now = Instant::now();
-        if origin == devtools_helper::Origin::Automatic
-            && self.workstation_setup.suppresses_permissions()
-        {
+        if origin == devtools_helper::Origin::Automatic && self.access_revision().is_none() {
             #[expect(
                 clippy::disallowed_methods,
-                reason = "automatic Full Disk Access guidance waits for the current setup consent"
+                reason = "the window's own Full Disk Access step waits for an approved setup revision"
             )]
             self.devtools_helper.queue_fda(origin, now);
             return HandOver::Queued;
         }
         let (facts, gap_left) = self.fda_admit_facts(origin, fda);
-        let answer = match devtools_helper::admit_fda(origin, moment, &facts) {
+        let admitted = devtools_helper::admit_fda(origin, moment, &facts);
+        let answer = match admitted {
             Admit::Refuse(why) => HandOver::Refused(why),
             Admit::Queue => {
                 #[expect(
@@ -10935,9 +11398,23 @@ impl App {
                 }
                 HandOver::Queued
             }
-            Admit::PaneOnly => self.open_fda_page(origin, false, now),
-            Admit::Hand { .. } | Admit::PanelOnly => self.open_fda_page(origin, true, now),
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the one Full Disk Access door, after admit_fda"
+            )]
+            Admit::PaneOnly | Admit::Hand { .. } | Admit::PanelOnly => {
+                self.open_fda_page(origin, admitted != Admit::PaneOnly, now)
+            }
         };
+        if origin == devtools_helper::Origin::Automatic
+            && answer == HandOver::Refused(devtools_helper::Refusal::Declined)
+        {
+            // The owner's Not now holds for this revision: the step is answered.
+            self.record_access_step(
+                aterm_types::macos_setup::Access::FullDiskAccess,
+                aterm_types::macos_setup::AccessOutcome::Declined,
+            );
+        }
         aterm_log::info!(
             "full disk access hand-over ({}): {}",
             origin.as_str(),
@@ -10955,24 +11432,23 @@ impl App {
         let fda = self.devtools_helper.fda_reach();
         let press = origin.owner_press();
         let window = atpkg::devtools::REOPEN_AFTER_S;
-        let shown_key = Self::fda_opened_key();
+        let shown_key = self.access_marks().fda;
         let devtools_ago = (!press).then(|| (reach.opened_within)(window)).flatten();
         let facts = devtools_helper::FdaFacts {
             fda: fda_read,
             declined: !press
-                && ((fda.declined)().is_some()
-                    || self.consent_card_host.marker == Some(consent_card::Marker::NotNow)
-                    || crate::message_reporters::FDA_ENTRY_KEYS.iter().any(|key| {
-                        self.messages.dismissed_quiet(
-                            key,
-                            aterm_messages::need::Resurface::CHOICE,
-                            messages_host::wall_stamp_now(),
-                        )
-                    })),
+                && (devtools_helper::declined_for(
+                    origin,
+                    &shown_key,
+                    (fda.last_declined)().as_ref(),
+                    (fda.declined)().is_some(),
+                ) || self.consent_card_host.marker == Some(consent_card::Marker::NotNow)),
             grant_stable: (reach.grant_stable)(),
             recent: !press && (fda.opened_within)(window).is_some(),
             devtools_recent: devtools_ago.is_some(),
-            shown_this_version: !press && (fda.last_opened)().is_some_and(|(v, _)| v == shown_key),
+            shown_this_revision: !press
+                && (fda.last_opened)()
+                    .is_some_and(|(word, _)| atpkg::devtools::same_step(&word, &shown_key)),
             own: press || self.consent.window_reads_own_grant(),
         };
         let gap_left =
@@ -10980,18 +11456,25 @@ impl App {
         (facts, gap_left)
     }
 
-    fn fda_opened_key() -> String {
-        let version = aterm_types::version::app_version();
+    /// `fda-pane-opened`'s word: the approved setup revision (the running version while
+    /// none is approved) keyed to this bundle's TCC identity and this Mac.
+    pub(crate) fn fda_opened_key(revision: Option<u64>) -> String {
+        let step = revision.map_or_else(
+            || aterm_types::version::app_version().to_owned(),
+            atpkg::devtools::revision_key,
+        );
         match (
             signing_identity::running_bundle_id_if_warm(),
             aterm_containment::consent::host_uuid_if_warm(),
         ) {
-            (Some(id), Some(here)) => format!("{version}@{id}@{here}"),
-            (Some(id), None) => format!("{version}@{id}"),
-            (None, _) => version.to_string(),
+            (Some(id), Some(here)) => format!("{step}@{id}@{here}"),
+            (Some(id), None) => format!("{step}@{id}"),
+            (None, _) => step,
         }
     }
 
+    /// Open the Full Disk Access page; only [`Self::fda_hand_over`] calls it, after
+    /// [`devtools_helper::admit_fda`] (a `clippy.toml` fence).
     fn open_fda_page(
         &mut self,
         origin: devtools_helper::Origin,
@@ -11010,9 +11493,13 @@ impl App {
     }
 
     fn fda_page_brought_up(&mut self, origin: devtools_helper::Origin, panel: bool, now: Instant) {
-        (self.devtools_helper.fda_reach().note_opened)(&Self::fda_opened_key());
+        (self.devtools_helper.fda_reach().note_opened)(&self.access_marks().fda);
+        self.record_access_step(
+            aterm_types::macos_setup::Access::FullDiskAccess,
+            aterm_types::macos_setup::AccessOutcome::Handed,
+        );
         self.devtools_helper.drop_queued_fda();
-        if !origin.owner_press() {
+        if origin == devtools_helper::Origin::Automatic {
             self.record_macos_access_marker(consent_card::Marker::Opened);
             self.persist_macos_access_record(consent_card::AccessRecord {
                 opened_at: Some(consent_card::now_unix_secs()),
@@ -11025,13 +11512,20 @@ impl App {
         self.consent.invalidate();
     }
 
-    /// The owner's own *Open Settings* for Full Disk Access (the Security page's button, the digest entry's press) opened the page.
+    /// The owner's own *Open Settings* for Full Disk Access (the Security page's button, System State's row) opened the page.
     pub(crate) fn fda_page_opened_by_owner(&mut self, origin: devtools_helper::Origin) {
         if !cfg!(target_os = "macos") || !self.devtools_helper.windowed() {
             return;
         }
         let held = self.consent_panel_facts().fda == aterm_containment::consent::FdaState::Granted;
         self.fda_page_brought_up(origin, !held, Instant::now());
+        self.fda_page_up_for_launch();
+    }
+
+    /// The Full Disk Access page came up by another door than the window's own
+    /// hand-over (an owner's press, a control client's act): the launch warm-up
+    /// waits for the panel beside it, or — none — counts the owner at the page.
+    fn fda_page_up_for_launch(&mut self) {
         if self.fda_panel_up() {
             self.consent_launch
                 .set_fda(consent_launch::FdaLaunch::Waiting);
@@ -11043,6 +11537,8 @@ impl App {
 
     fn show_fda_helper(&mut self, origin: devtools_helper::Origin, now: Instant) -> bool {
         let reach = self.devtools_helper.reach();
+        let marks = self.access_marks();
+        self.devtools_helper.set_marks(marks);
         let show = devtools_helper::Show {
             page: devtools_helper::Page::FullDiskAccess,
             origin,
@@ -11117,14 +11613,9 @@ impl App {
             self.consent_launch
                 .set_fda(consent_launch::FdaLaunch::ended(ended));
         }
-        if self.devtools_helper.fda_waiting()
-            && !(self.config.privacy_notice() && self.config.privacy_probe_gate().permits())
-        {
-            self.devtools_helper.drop_queued_fda();
-            self.consent_launch
-                .set_fda(consent_launch::FdaLaunch::NotAsked);
-        }
-        self.look_for_fda_moment(now, Self::devtools_moment_is_quiet);
+        // A `[privacy]` switch off pauses a queued hand-over: its moment never comes
+        // while a switch is off.
+        self.look_for_fda_moment(now, Self::access_step_moment);
     }
 
     fn look_for_fda_moment(&mut self, now: Instant, quiet: fn(&Self, Instant) -> bool) {
@@ -11162,29 +11653,30 @@ impl App {
         }
         if let Some(origin) = self.devtools_helper.take_queued_fda(now, true) {
             let answer = self.fda_hand_over(origin, devtools_helper::Moment::Quiet, read.fda);
-            self.consent_launch
-                .set_fda(consent_launch::FdaLaunch::after(
-                    answer,
-                    self.fda_panel_up(),
-                ));
+            if origin == devtools_helper::Origin::Automatic {
+                self.consent_launch
+                    .set_fda(consent_launch::FdaLaunch::after(
+                        answer,
+                        self.fda_panel_up(),
+                    ));
+            } else if answer.brings_owner() {
+                // A client's act: its refusal decides nothing for the launch warm-up.
+                self.fda_page_up_for_launch();
+            }
         }
     }
 
     fn tick_launch_warmup(&mut self, now: Instant) {
-        self.launch_warmup_look(now, Self::devtools_moment_is_quiet);
+        self.launch_warmup_look(now, Self::access_step_moment);
     }
 
     fn launch_warmup_look(&mut self, now: Instant, quiet: fn(&Self, Instant) -> bool) {
         use consent_launch::{FdaLaunch, Skip, WarmupStep};
-        if self.workstation_setup.suppresses_permissions() {
+        // A step of an approved setup revision only: none admits Permissions yet.
+        if self.access_revision().is_none() {
             return;
         }
-        if !cfg!(target_os = "macos")
-            || !self.consent_launch.live()
-            || self.consent_launch.settled()
-            || self.consent_launch.walking()
-            || !self.consent_launch.look_due(now)
-        {
+        if !cfg!(target_os = "macos") || !self.consent_launch.live() {
             return;
         }
         if self.consent_launch.fda() == FdaLaunch::Undecided
@@ -11196,6 +11688,12 @@ impl App {
         {
             self.consent_launch.set_fda(FdaLaunch::NotAsked);
         }
+        if self.consent_launch.settled()
+            || self.consent_launch.walking()
+            || !self.consent_launch.look_due(now)
+        {
+            return;
+        }
         if matches!(
             self.consent_launch.fda(),
             FdaLaunch::Undecided | FdaLaunch::Waiting
@@ -11203,14 +11701,15 @@ impl App {
             self.consent_launch.wait();
             return;
         }
-        if !(self.config.privacy_enabled()
-            && self.config.privacy_warmup() == app_config::PrivacyWarmup::Automatic)
-        {
-            self.consent_launch.skip(Skip::Off);
+        // `enabled` or `check` off is a pause, never an answer: the warm-up waits,
+        // and the config change that turns the switch on again wakes the look;
+        // `warmup` set to anything but "automatic" is the answer.
+        if !self.config.privacy_probe_gate().permits() {
+            self.consent_launch.wait();
             return;
         }
-        if !self.config.privacy_probe_gate().permits() {
-            self.consent_launch.skip(Skip::NotDenied);
+        if self.config.privacy_warmup() != app_config::PrivacyWarmup::Automatic {
+            self.consent_launch.skip(Skip::Off);
             return;
         }
         if !self.consent.window_reads_own_grant() {
@@ -11280,7 +11779,6 @@ impl App {
             || self.devtools_helper.devtools_waiting()
             || self.debugger_launch.queued()
             || self.debugger_change.under_way()
-            || self.secrets_join.sheet_up()
             || !quiet(self, now)
         {
             self.consent_launch.look_later(now);
@@ -11304,8 +11802,12 @@ impl App {
                     self.consent_launch.skip(Skip::OnlyAppData);
                     return;
                 }
-                match self.start_consent_warmup_pass(&folders) {
+                // A step of System State's run: it parks between folders while the
+                // person is away from System State (`App::settle_access_steps`).
+                let gate = consent_warmup::WarmupGate::open();
+                match self.start_consent_warmup_pass(&folders, Some(gate.clone())) {
                     consent_warmup::StartOutcome::Started => {
+                        self.park_launch_warmup_with(gate);
                         let generation = self.consent_warmup.generation();
                         self.consent_launch
                             .started(bundle_id.unwrap_or_default(), generation);
@@ -11339,17 +11841,21 @@ impl App {
         now: Instant,
     ) -> devtools_helper::HandOver {
         use devtools_helper::HandOver;
-        if origin == devtools_helper::Origin::Automatic
-            && self.workstation_setup.suppresses_permissions()
-        {
+        let automatic = origin == devtools_helper::Origin::Automatic;
+        if automatic && self.access_revision().is_none() {
             self.devtools_helper
                 .queue_after_listing(origin, now, listed);
             return HandOver::Queued;
         }
         let (_, facts) = self.devtools_admit_facts(origin, now);
+        let moment = if origin.system_state_step() {
+            self.access_step_moment(now)
+        } else {
+            self.devtools_moment_is_quiet(now)
+        };
         let answer = match devtools_helper::admit(origin, devtools_helper::Moment::Quiet, &facts) {
             devtools_helper::Admit::Refuse(why) => HandOver::Refused(why),
-            _ if !self.devtools_moment_is_quiet(now) => {
+            _ if !moment => {
                 self.devtools_helper
                     .queue_after_listing(origin, now, listed);
                 HandOver::Queued
@@ -11379,18 +11885,9 @@ impl App {
             .is_some_and(|reading| reading.grant == aterm_containment::DevToolGrant::Granted);
         if waiting.digest && !opened && !granted {
             aterm_log::info!(
-                "devtools: the digest press's page did not open ({}); its line is back",
+                "devtools: a message's press did not bring the page ({})",
                 out.as_str()
             );
-            if self.messages.forget_filing(
-                message_reporters::DEVTOOLS_KEY,
-                messages_host::wall_stamp_now(),
-                Instant::now(),
-            ) {
-                self.flush_messages_log_within(messages_host::MESSAGES_FLUSH_UI_WAIT);
-            }
-            let entry = self.devtools_entry_now();
-            self.except(&entry);
         }
         self.note_devtools_outcome_on(&waiting.settings, out, unlisted);
     }
@@ -11433,6 +11930,7 @@ impl App {
                     .unwrap_or_else(|p| p.into_inner())
                     .note_decline();
             }
+            self.note_system_state_debugger_outcome(outcome);
         }
         if let Some(record) = step.drift.record {
             self.record_message(message_reporters::debugger_access_record(record));
@@ -11446,19 +11944,35 @@ impl App {
                 step.remove_change_marker,
             );
         }
+        // A change that ended (or was lost): the page stops naming macOS's
+        // dialog now.
+        self.republish_system_state_access_step();
+    }
+
+    /// The card's step admitted against the current `[privacy]` switches. A launch check
+    /// still owed then is held, not answered, and runs again once every switch is on
+    /// ([`Self::resume_held_launch_steps`]).
+    fn admit_card_policy(&mut self) -> bool {
+        let owed = self.consent_launch.launch_read().is_none()
+            && matches!(
+                self.consent_card.phase(),
+                consent_card::CardPhase::Idle | consent_card::CardPhase::Deciding { .. }
+            );
+        let admitted = self.consent_card.admit_current_policy(
+            self.config.privacy_probe_gate().permits(),
+            self.config.privacy_notice(),
+        );
+        if !admitted && owed {
+            self.consent_card_host.launch_held = true;
+        }
+        admitted
     }
 
     fn tick_macos_access_card(&mut self, now: Instant) {
-        if self.workstation_setup.suppresses_permissions() {
-            return;
-        }
         if !cfg!(target_os = "macos") || self.headless {
             return;
         }
-        if !self.consent_card.admit_current_policy(
-            self.config.privacy_probe_gate().permits(),
-            self.config.privacy_notice(),
-        ) {
+        if !self.admit_card_policy() {
             self.consent_card_host.pending = None;
             self.consent_card_host.need = None;
             self.consent_card_host.kept_need = None;
@@ -11568,7 +12082,7 @@ impl App {
                         tab_number: None,
                         regressed: false,
                     });
-                self.raise_fda_need(&words, now);
+                self.hold_fda_need(&words, now);
             }
             consent_card::CardPhase::Watching { .. } => {
                 if self.consent_card.wants_probe(now) && self.macos_access_probe_reads_granted() {
@@ -11578,28 +12092,25 @@ impl App {
         }
     }
 
-    fn raise_fda_need(&mut self, words: &consent_card::NeedWords, now: Instant) {
+    /// The card asked for `words`: nothing is posted. A verified grant that reads off
+    /// (`regressed`) lights the System State menu line; the ask is remembered in the record.
+    fn hold_fda_need(&mut self, words: &consent_card::NeedWords, now: Instant) {
         self.consent_card_message = None;
-        self.except(&crate::message_reporters::file_access_entry(words));
+        if words.regressed {
+            self.note_fda_regression(true);
+        }
         self.consent_card.on_raised(now);
         self.persist_macos_access_record(consent_card::AccessRecord {
             asked_at: Some(consent_card::now_unix_secs()),
             ..consent_card::AccessRecord::default()
         });
-        aterm_log::info!("macOS access card: asked \u{2014} {}", words.event_line());
+        aterm_log::info!("macOS access card: needed \u{2014} {}", words.event_line());
     }
 
     fn reassert_fda_need(&mut self, words: &consent_card::NeedWords) {
-        let keys = crate::message_reporters::FDA_ENTRY_KEYS;
-        if self
-            .messages
-            .digest_keys_under("privacy.fda.")
-            .iter()
-            .any(|key| keys.contains(&key.as_str()))
-        {
-            return;
+        if words.regressed {
+            self.note_fda_regression(true);
         }
-        self.except(&crate::message_reporters::file_access_entry(words));
         aterm_log::debug!(
             "macOS access card: the question stands from an earlier run ({})",
             words.event_line()
@@ -11614,7 +12125,13 @@ impl App {
         if granted {
             self.recover_consent_tab_attention();
             self.stamp_fda_verified_host();
-            self.clear_fda_entries();
+            // Verified here: a later approval in this process brings no page back.
+            self.note_fda_unverified_here(false);
+            self.note_fda_regression(false);
+            self.record_access_step(
+                aterm_types::macos_setup::Access::FullDiskAccess,
+                aterm_types::macos_setup::AccessOutcome::Granted,
+            );
             self.show_macos_access_granted(now);
             self.clear_macos_access_opened_marker();
             if (self.devtools_helper.reach().grant_stable)() {
@@ -11626,12 +12143,6 @@ impl App {
             }
         } else {
             self.retract_macos_access_rows(now);
-        }
-    }
-
-    fn clear_fda_entries(&mut self) {
-        for key in crate::message_reporters::FDA_ENTRY_KEYS {
-            self.except_clear(key);
         }
     }
 
@@ -11668,10 +12179,7 @@ impl App {
             return;
         }
         host.need_last = Some(now);
-        if !self.consent_card.admit_current_policy(
-            self.config.privacy_probe_gate().permits(),
-            self.config.privacy_notice(),
-        ) {
+        if !self.admit_card_policy() {
             return;
         }
         if self.incoming_handoff_pending {
@@ -11780,7 +12288,7 @@ impl App {
 
     fn retract_macos_access_rows(&mut self, now: Instant) {
         self.consent_card_message = None;
-        self.clear_fda_entries();
+        self.note_fda_regression(false);
         if self
             .messages
             .resolve_key_prefix("privacy.", aterm_messages::Outcome::Ok, now)
@@ -11815,14 +12323,7 @@ impl App {
     }
 
     fn decide_macos_access_card(&mut self, decision: consent_card::PendingDecision) {
-        if self.workstation_setup.suppresses_permissions() {
-            self.consent_card_host.pending = Some(decision);
-            return;
-        }
-        if !self.consent_card.admit_current_policy(
-            self.config.privacy_probe_gate().permits(),
-            self.config.privacy_notice(),
-        ) {
+        if !self.admit_card_policy() {
             self.consent_card_host.pending = None;
             return;
         }
@@ -11869,6 +12370,22 @@ impl App {
                 }
                 let hand_over =
                     consent_launch::hands_over(panel.fda, &verdict, decision.verified_here);
+                // The same check with the card's Not now aside (the first approved
+                // revision spends it): whether a new approval in this process brings
+                // the page back (`App::rearm_access_steps`).
+                let unmarked = consent_card::decide_launch(
+                    &consent_card::CardFacts {
+                        offered: true,
+                        ..facts
+                    },
+                    None,
+                    &record,
+                );
+                self.note_fda_unverified_here(consent_launch::hands_over(
+                    panel.fda,
+                    &unmarked,
+                    decision.verified_here,
+                ));
                 match verdict {
                     consent_card::LaunchVerdict::Confirm => self.resolve_fda_need(true, now),
                     consent_card::LaunchVerdict::Quiet(why) => {
@@ -12054,12 +12571,7 @@ impl App {
         });
         self.consent_card_host.pending = None;
         self.consent.invalidate();
-        if !self.headless
-            && self.consent_card.admit_current_policy(
-                self.config.privacy_probe_gate().permits(),
-                self.config.privacy_notice(),
-            )
-        {
+        if !self.headless && self.admit_card_policy() {
             self.consent_card.on_opened_settings(now);
         }
     }
@@ -13778,8 +14290,8 @@ impl App {
             devtools_watch: devtools_watch::DevToolsWatch::default(),
             devtools_helper: devtools_helper::Lane::new(true),
             debugger_change: debugger_access::DebuggerChangeLane::new(true),
-            debugger_launch: debugger_access::LaunchAskQueue::new(false),
-            secrets_join: secrets_join::Lane::new(false),
+            debugger_launch: debugger_access::DebuggerStepQueue::new(false),
+            access_steps: system_state_access::AccessSteps::inert(),
             consent_gestures: native_settings::ConsentGestures::inert(),
             owner_quiet: native_settings::SharedOwnerQuiet::default(),
             consent_observer: consent_observer::ObserverState::inert(),
@@ -14522,12 +15034,7 @@ impl App {
                 self.consent.invalidate_debugger();
                 self.consent.invalidate_devtools();
                 self.devtools_helper.forget_opened();
-                if self.devtools_watch.wants_read(Instant::now()) {
-                    let _ = self.consent.devtools(
-                        self.config.privacy_probe_gate(),
-                        self.config.privacy_observer_off(),
-                    );
-                }
+                self.read_devtools_list(Instant::now());
             }
             if let Some(ws) = self.windows.get_mut(&wid) {
                 ws.rearm_present(false);
@@ -17091,6 +17598,10 @@ impl ApplicationHandler<Wake> for App {
         }
         self.session_factory.loop_idle.went_idle(latch_now_ns);
         self.sync_option_as_alt();
+        // The turn's last word to a running `hwkey` burst: System State or a
+        // gateway card that came to the front this turn stops it before its next
+        // key (`hwkey::run_burst`). One atomic store.
+        self.publish_hwkey_front();
     }
 
     fn resumed(&mut self, el: &ActiveEventLoop) {
@@ -17606,7 +18117,6 @@ impl App {
             Wake::DevToolsProbeReady => self.on_devtools_probe_ready(),
             Wake::DebuggerAccessResult => self.tick_debugger_access(),
             Wake::DevToolsHandOver => self.tick_devtools_hand_over(Instant::now()),
-            Wake::SecretsVault(wake) => self.on_secrets_vault(wake),
             Wake::WorkstationSetup(request) => self.offer_workstation_setup(request),
             Wake::InitialSetupStatus { generation, status } => {
                 self.receive_system_state_status(generation, status)
@@ -22896,27 +23406,6 @@ pub(crate) fn say_font_family_rejected(warning: &str) {
     message_inbox::queue_message(message);
 }
 
-/// Keep a measured account-automation permission block in the window's Messages digest while automatic workstation setup continues retrying.
-pub fn report_workstation_setup() {
-    match message_reporters::workstation_accounts_entry().message() {
-        Ok(message) => message_inbox::queue_message(message),
-        Err(fault) => aterm_log::warn!("workstation account sign-out entry refused: {fault:?}"),
-    }
-}
-
-/// Keep an incomplete first-run setup visible while the background worker retries.
-pub fn report_workstation_setup_failure() {
-    match message_reporters::workstation_setup_failure_entry().message() {
-        Ok(message) => message_inbox::queue_message(message),
-        Err(fault) => aterm_log::warn!("workstation setup failure entry refused: {fault:?}"),
-    }
-}
-
-/// Withdraw first-run setup exceptions after verified completion or restore.
-pub fn report_workstation_setup_finished() {
-    message_inbox::note_workstation_setup_finished();
-}
-
 struct WarmPrologue {
     config: WarmConfig,
     env_add: Vec<(String, String)>,
@@ -24268,17 +24757,14 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
     let lane_sink = LaneSink::new();
     let package_update_loop_running =
         pkg_lane_runs(headless) && spawn_pkg_update_check(&config, lane_sink.clone());
+    // A configured Mac's vault subscriber is mended on a launch that runs no setup;
+    // joining is System State's Secrets vault row's.
     let unified_setup = (first_run.is_some() && first_run_eligible)
         || (!headless
             && aterm_types::dirs::runs_under_private_state_root()
             && aterm_types::dev_seam!("ATERM_DEBUG_WORKSTATION_SETUP").is_some());
     if !unified_setup {
-        secrets_join::spawn_probe_lane(headless, app_config::config_path(), {
-            let sink = lane_sink.clone();
-            Arc::new(move |wake| {
-                let _ = sink.send_event(Wake::SecretsVault(wake));
-            })
-        });
+        secrets_join::spawn_mend_lane(headless, app_config::config_path());
     }
     spawn::prime_agents_if_due(spawn::PrimeCue::Launch);
     let carry_frame = seamless_window.clone();
@@ -25025,6 +25511,12 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
             let _ = proxy.send_event(Wake::HostNote(note));
         })
     });
+    occupancy_wakes::install(store.clone(), {
+        let proxy = event_loop.create_proxy();
+        std::sync::Arc::new(move |note| {
+            let _ = proxy.send_event(Wake::HostNote(note));
+        })
+    });
 
     // The board's mode is the launch policy's before the host's first look (the ring is
     // written only while it observes); the policy's Entry follows once the app is built.
@@ -25556,10 +26048,15 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
             lane
         },
         debugger_change: debugger_access::DebuggerChangeLane::new(headless),
-        debugger_launch: debugger_access::LaunchAskQueue::new(
+        debugger_launch: debugger_access::DebuggerStepQueue::new(
             !headless && cfg!(target_os = "macos"),
-        ),
-        secrets_join: secrets_join::Lane::new(!headless && cfg!(target_os = "macos")),
+        )
+        .recording_in(aterm_types::dirs::state_dir()),
+        access_steps: if !headless && cfg!(target_os = "macos") {
+            system_state_access::AccessSteps::new(system_state_access::StepsReach::live())
+        } else {
+            system_state_access::AccessSteps::inert()
+        },
         consent_gestures: native_settings::ConsentGestures::for_instance(headless),
         owner_quiet: native_settings::SharedOwnerQuiet::default(),
         consent_observer: consent_observer::ObserverState::new(headless),
@@ -25888,15 +26385,12 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
         }));
     metrics::mark_gui_ready_for_winit();
     crate::qos::set_self(crate::qos::Role::Interactive);
-    let mut failed_status = event_loop
+    let failed_status = event_loop
         .run_app(&mut app)
         .err()
         .map(|error| event_loop_failed(&mut app, &error));
     crate::watchdog::beat(crate::watchdog::Breadcrumb::ShutdownWait);
-    if let Err(error) = app.finish_system_state_shutdown() {
-        aterm_log::error!("{error}");
-        failed_status.get_or_insert(1);
-    }
+    app.finish_system_state_shutdown();
     app.shutdown_tab_spawns();
     app.shutdown_spares();
     spawn_prep::release_at_exit(std::time::Duration::from_secs(1));

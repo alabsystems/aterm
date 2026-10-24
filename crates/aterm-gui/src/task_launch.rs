@@ -528,8 +528,20 @@ fn run_worker_launch(work: &Launch) {
             })
             .ok()
     });
+    let rotated = agy_rotation(work, &caller);
+    if let Some(pick) = &rotated {
+        note_launch(&work.ctx, format!("agy quota: {}", pick.describe()));
+        if pick.model().is_none() {
+            stall(work, &pick.describe());
+            return;
+        }
+    }
+    let model = match &rotated {
+        Some(aterm_agent::harness::agy_quota::Pick::Rotate { to, .. }) => Some(to.as_str()),
+        _ => work.model.as_deref(),
+    };
     let fresh = aterm_agent::harness::worker::Fresh {
-        model: work.model.as_deref(),
+        model,
         trusted_here: here,
         trust_file: work.trust_file.as_deref(),
         session: session.as_deref(),
@@ -698,6 +710,31 @@ pub(crate) fn type_launch_line(
         GuardedInput::Pressed(Delivery::BusyZero) => Err("its input sink is busy".to_string()),
         GuardedInput::Pressed(Delivery::Failed) => Err("its input write failed".to_string()),
     }
+}
+
+/// An agy worker's model after quota rotation ([`aterm_agent::harness::agy_quota_store::rotate_worker`]):
+/// `None` for another agent, with rotation off, or when agy's quota could not be read.
+fn agy_rotation(
+    work: &Launch,
+    caller: &aterm_agent::harness::worker::Starter,
+) -> Option<aterm_agent::harness::agy_quota::Pick> {
+    use aterm_phase::Program;
+    match work.agent {
+        Program::Agy => {}
+        Program::Claude | Program::Codex | Program::Gemini | Program::Muse | Program::Generic => {
+            return None;
+        }
+    }
+    let flags = caller.args.clone().unwrap_or_default();
+    let now = aterm_agent::supervise::limit::unix_now();
+    aterm_agent::harness::agy_quota_store::rotate_worker(
+        work.model.as_deref(),
+        &caller.exe,
+        &caller.env,
+        &flags,
+        now,
+    )
+    .map(|l| l.pick)
 }
 
 fn stall(work: &Launch, why: &str) {

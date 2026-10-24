@@ -205,7 +205,12 @@ USAGE
                            --try-refused verifies what this host would refuse for
                            memory; --stop-if-narrowed stops before any check when
                            memory would narrow the run; --obligations keeps each
-                           check's per-obligation record. Exit 0 pass, 1 fail,
+                           check's per-obligation record. Every run also prints
+                           the D27 gate's proved (calculus) counter from each
+                           check's trust.obligations.v1 record (0, and
+                           `ungraded`, from a prover that states no grade), held
+                           to the current epoch's floor in
+                           crates/aterm-release/trust/credit.tsv. Exit 0 pass, 1 fail,
                            2 undecided or could not run, 4 narrowed by memory
   targo --unverified ship trust judge [--commit REV] [--prover BIN-DIR] [--update-ratchet [--reason WHY]]
                            the lane's full report for the facts a whole-tree run
@@ -220,6 +225,12 @@ USAGE
                            working floor the up-only rule refuses is named
                            LOWERED, and fails. Exit 0 pass, 1 fail or no facts,
                            2 undecided or could not judge, 4 narrowed by memory
+  targo --unverified ship trust credit <record.ndjson>...
+                           the proved (calculus) counter over those  
+                           trust.obligations.v1 records (<target-dir>/trust/
+                           obligations/<package>.ndjson), against the current
+                           credit epoch. Exit 0 holds, 1 below the epoch's floor
+                           or a record refused, 2 no readable credit epoch
   targo --unverified ship recover vX.Y.Z <full-claim-sha> --old-publisher-stopped
         [--release-credentials <profile.toml>] [--no-draft-was-posted]
                            finish or withdraw the cut of a machine that died

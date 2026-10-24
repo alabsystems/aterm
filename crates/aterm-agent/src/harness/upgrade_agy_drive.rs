@@ -58,11 +58,40 @@ pub(super) trait AgyKernel: Kernel {
     fn summaries(&self, config: &Path, conversation: &str) -> Result<String, ()> {
         live::read_summaries(config, conversation)
     }
+    /// What agy's quota rotation makes of a launch on `model` (its `--model`; `None`: agy's
+    /// default) as `exe` under the relaunch's `env` and config `flags`
+    /// ([`crate::harness::agy_quota_store::rotate_worker`]); `None` in a kernel that reads no quota.
+    fn quota_pick(
+        &self,
+        _model: Option<&str>,
+        _exe: &Path,
+        _env: &[(String, String)],
+        _flags: &[String],
+    ) -> Option<crate::harness::agy_quota::Pick> {
+        None
+    }
 }
 
 impl AgyKernel for Live {
     fn alive(&self, pid: u32) -> bool {
         alive(pid)
+    }
+
+    fn quota_pick(
+        &self,
+        model: Option<&str>,
+        exe: &Path,
+        env: &[(String, String)],
+        flags: &[String],
+    ) -> Option<crate::harness::agy_quota::Pick> {
+        crate::harness::agy_quota_store::rotate_worker(
+            model,
+            exe,
+            env,
+            flags,
+            crate::supervise::limit::unix_now(),
+        )
+        .map(|l| l.pick)
     }
 
     fn args(&self, pid: u32) -> Option<atpkg::caller_shell::ProcArgs> {
@@ -1209,7 +1238,17 @@ fn carry_on(
     st.resumed_pid = new;
     st.resumed_on.clone_from(&st.to);
     st.done_at = now_s();
-    st.outcome = if st.quiet {
+    let rotated = st
+        .cause
+        .strip_prefix(super::super::relaunch::CAUSE_MODEL)
+        .filter(|m| !m.is_empty());
+    st.outcome = if let Some(model) = rotated {
+        format!(
+            "agy moved onto {model} by its quota (on {}) · the same conversation resumed, \
+             nothing typed",
+            st.to
+        )
+    } else if st.quiet {
         format!(
             "agy upgraded to {} (from {}) · the same conversation resumed, nothing typed",
             st.to, st.from

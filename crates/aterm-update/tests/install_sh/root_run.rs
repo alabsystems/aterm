@@ -790,6 +790,144 @@ fn under_root_an_install_folder_with_an_acl_is_refused() {
     );
 }
 
+/// A dry run makes nothing, so under root it judges an install folder still to
+/// be made as `mkdir -p` would make it: by the entries the folder above it
+/// passes on (acl_passed_on). Each verdict, one folder down, two down, and one
+/// down spelled with a trailing slash, is the one the real run reaches on the
+/// folder `mkdir -p` makes there; a listing that cannot be read refuses.
+#[cfg(target_os = "macos")]
+#[test]
+fn under_root_a_dry_run_judges_an_install_folder_to_be_made_as_the_run_would() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    lib.step(format!(
+        "{FOREIGN_FIND}\n{FAKE_ROOT}\nFOREIGN_LIST=\"$TMPDIR/foreign\"; : >\"$FOREIGN_LIST\"\n\
+         n=0\n\
+         verdict() {{ if root_dest_acl_open \"$1\"; then echo refused; else echo installs; fi; }}\n\
+         judged() {{\n\
+         \tlocal p=\"$TMPDIR/p$((n += 1))\" d dry\n\
+         \tmkdir \"$p\" && chmod 755 \"$p\" && {{ [ -z \"$1\" ] || chmod +a \"$1\" \"$p\"; }} || return\n\
+         \tfor d in \"$p/one\" \"$p/two/deep\" \"$p/three/\"; do\n\
+         \t\tDRY_RUN=1; dry=\"$(verdict \"$d\")\"; DRY_RUN=0\n\
+         \t\tmkdir -p \"$d\" || return\n\
+         \t\techo \"$dry $(verdict \"$d\")\"\n\
+         \tdone\n\
+         \tchmod -R -N \"$p\"\n\
+         }}"
+    ));
+    let rows = [
+        ("no ACL", "", ["installs"; 3]),
+        (
+            "an entry for the folder alone",
+            "user:nobody allow add_subdirectory",
+            ["installs"; 3],
+        ),
+        (
+            "a deny entry for the folder alone",
+            "group:everyone deny delete",
+            ["installs"; 3],
+        ),
+        (
+            "an entry folders inherit",
+            "user:nobody allow add_subdirectory,directory_inherit",
+            ["refused"; 3],
+        ),
+        (
+            "an entry only the folder's own children inherit",
+            "user:nobody allow list,directory_inherit,limit_inherit",
+            ["refused", "installs", "refused"],
+        ),
+        (
+            "an entry files inherit",
+            "user:nobody allow add_file,file_inherit",
+            ["installs"; 3],
+        ),
+        (
+            "an entry for what is made in it alone",
+            "user:nobody allow list,directory_inherit,only_inherit",
+            ["refused"; 3],
+        ),
+    ];
+    let calls: Vec<usize> = rows
+        .iter()
+        .map(|(_, ace, _)| lib.call(format!("judged '{ace}'"), &[]))
+        .collect();
+    let unread = lib.call(
+        "( mkdir \"$TMPDIR/q\" && ls_entry() { return 1; } && DRY_RUN=1 && \
+         root_dest_acl_open \"$TMPDIR/q/new\" )",
+        &[],
+    );
+    let as_account = lib.call(
+        "( unset -f id; DRY_RUN=1; mkdir \"$TMPDIR/inh\" && \
+         chmod +a 'user:nobody allow list,directory_inherit' \"$TMPDIR/inh\" && \
+         ! root_dest_acl_open \"$TMPDIR/inh/new\" )",
+        &[],
+    );
+    let recs = lib.run(&scratch);
+    for ((label, _, want), i) in rows.iter().zip(calls) {
+        assert_eq!(recs[i].rc, 0, "{label}: {}", recs[i].err);
+        let said: Vec<&str> = recs[i].out.lines().collect();
+        let want: Vec<String> = want.iter().map(|w| format!("{w} {w}")).collect();
+        assert_eq!(
+            said, want,
+            "{label}: the dry run's verdict and the real run's, one down, two down, one down/"
+        );
+    }
+    assert_eq!(
+        recs[unread].rc, 0,
+        "an unread listing refuses: {}",
+        recs[unread].err
+    );
+    assert_eq!(
+        recs[as_account].rc, 0,
+        "a run as the account is never refused: {}",
+        recs[as_account].err
+    );
+}
+
+/// `sh install.sh` starts bash in POSIX mode, where a command substitution
+/// keeps set -e, so a root walk run in one stopped at `head`'s early exit
+/// from a long `find` and answered nothing, which its caller read as "nothing
+/// another account owns". The script leaves that mode first: the walk names
+/// the tree. A walk that ends without an answer refuses all the same, naming
+/// the path it walked.
+#[test]
+fn under_sh_a_root_walk_names_what_it_finds_and_one_that_ends_early_refuses() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    lib.env("POSIXLY_CORRECT", "1");
+    let mode = lib.call(
+        "if shopt -oq posix; then echo posix; else echo bash; fi; \
+         if shopt -q inherit_errexit 2>/dev/null; then echo inherits; else echo own; fi",
+        &[],
+    );
+    let walk = lib.call(
+        "d=\"$TMPDIR/many\"; mkdir \"$d\" && \
+         for ((i = 0; i < 3000; i++)); do : >\"$d/an-entry-another-account-owns-$i\"; done && \
+         o=\"$(root_tree_offender \"$d\")\" && printf '%s\\n' \"$o\" && [ -n \"$o\" ]",
+        &[],
+    );
+    let ends_early = lib.call(
+        "( root_tree_failing() { return 1; }; ROOT=\"$TMPDIR/co\"; \
+         ! root_build_preflight && printf '%s\\n' \"$CARGO_RESOLVE_REASON\" )",
+        &[],
+    );
+    let recs = lib.run(&scratch);
+    assert_eq!(recs[mode].rc, 0, "{}", recs[mode].err);
+    assert_eq!(recs[mode].out.lines().collect::<Vec<_>>(), ["bash", "own"]);
+    let tmp = scratch.join("tmp");
+    assert_eq!(recs[walk].rc, 0, "the walk answered: {}", recs[walk].err);
+    assert_eq!(recs[walk].out.trim_end(), s(&tmp.join("many")));
+    assert_eq!(recs[ends_early].rc, 0, "{}", recs[ends_early].err);
+    assert!(
+        recs[ends_early]
+            .out
+            .contains(&format!("and {} is such", s(&tmp.join("co")))),
+        "{}",
+        recs[ends_early].out
+    );
+}
+
 #[test]
 fn a_home_still_to_be_made_is_judged_by_the_folder_it_lands_in() {
     let scratch = Scratch::new();
@@ -1123,27 +1261,31 @@ ls_entry() {
 }"#;
 
 /// What a root source build reads, all root's: a checkout with a build in
-/// target/, a `.cargo/config.toml` above it, cargo's home, and a store whose
-/// targo writes the PATH it ran on to `$TMPDIR/build-path` and the git config
-/// variables it was given to `$TMPDIR/build-git`.
+/// target/, a `.cargo/config.toml` above it, cargo's home, a developer folder
+/// with its SDK (DEVELOPER_DIR), and a store whose targo writes the PATH it ran
+/// on to `$TMPDIR/build-path`, the git config variables it was given to
+/// `$TMPDIR/build-git`, and the developer folder, SDK and toolchain xcrun would
+/// take to `$TMPDIR/build-dev`.
 const ROOT_LAYOUT: &str = r#"umask 022
 mk() {
 	W="$TMPDIR/$1"
 	FOREIGN_LIST="$TMPDIR/$1.foreign"
 	: >"$FOREIGN_LIST"
 	mkdir -p "$W/co/src" "$W/co/target/release/deps" "$W/home/.cargo/registry/src/idx" \
-		"$W/home/.cargo/bin" "$W/store/trust/1/bin" "$W/.cargo" "$W/their-bin"
+		"$W/home/.cargo/bin" "$W/store/trust/1/bin" "$W/.cargo" "$W/their-bin" \
+		"$W/dev/usr/bin" "$W/dev/SDKs/MacOSX.sdk"
 	printf 'fn main() {}\n' >"$W/co/src/main.rs"
 	: >"$W/co/target/release/deps/libx.rlib"
 	printf '[build]\n' >"$W/.cargo/config.toml"
-	printf '#!/bin/sh\necho "$PATH" >"$TMPDIR/build-path"\necho "${GIT_CONFIG_GLOBAL-unset} ${GIT_CONFIG_NOSYSTEM-unset}" >"$TMPDIR/build-git"\n' \
+	printf '#!/bin/sh\necho "$PATH" >"$TMPDIR/build-path"\necho "${GIT_CONFIG_GLOBAL-unset} ${GIT_CONFIG_NOSYSTEM-unset}" >"$TMPDIR/build-git"\necho "${DEVELOPER_DIR-unset} ${SDKROOT-unset} ${TOOLCHAINS-unset}" >"$TMPDIR/build-dev"\n' \
 		>"$W/store/trust/1/bin/targo"
 	printf '#!/bin/sh\n' >"$W/their-bin/sccache"
 	cp "$W/their-bin/sccache" "$W/their-bin/rustc"
-	chmod -R u=rwX,go=rX "$W" && chmod 755 "$W/store/trust/1/bin/targo" "$W/their-bin/"*
+	cp "$W/their-bin/sccache" "$W/dev/usr/bin/clang"
+	chmod -R u=rwX,go=rX "$W" && chmod 755 "$W/store/trust/1/bin/targo" "$W/their-bin/"* "$W/dev/usr/bin/clang"
 	theirs "$W/their-bin"
-	ROOT="$W/co" HOME="$W/home" CARGO_LANE=store CARGO_BIN="$W/store/trust/1/bin/targo"
-	unset CARGO_HOME RUSTC RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER
+	ROOT="$W/co" HOME="$W/home" CARGO_LANE=store CARGO_BIN="$W/store/trust/1/bin/targo" DEVELOPER_DIR="$W/dev"
+	unset CARGO_HOME RUSTC RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER SDKROOT TOOLCHAINS
 }"#;
 
 /// What a root build refuses: the path it names, relative to the row's folder
@@ -1157,7 +1299,7 @@ fn under_root_a_source_build_reads_and_runs_nothing_another_account_can_change()
     let mut lib = Lib::new();
     lib.step(format!("{FOREIGN_FIND}\n{FAKE_ROOT}\n{ROOT_LAYOUT}"));
     // (label, setup, None for a build)
-    let rows: [(&str, &str, Refusal); 21] = [
+    let rows: [(&str, &str, Refusal); 28] = [
         ("root's alone", "", None),
         (
             "a file of theirs in the checkout",
@@ -1211,6 +1353,47 @@ fn under_root_a_source_build_reads_and_runs_nothing_another_account_can_change()
             Some(("co/vendor", "checkout")),
         ),
         ("a link inside it", "ln -s src \"$W/co/alias\"", None),
+        (
+            "a link inside it by a path with ..",
+            "ln -s ../co/src \"$W/co/up\"",
+            None,
+        ),
+        (
+            "a link back into it through a link of theirs",
+            "mkdir -p \"$W/other\" && ln -s \"$W/co/src\" \"$W/other/hop\" && \
+             ln -s \"$W/other/hop\" \"$W/co/vendor\" && theirs \"$W/other\"",
+            Some(("co/vendor", "checkout")),
+        ),
+        (
+            "a link back into it by a path through their folder",
+            "mkdir -p \"$W/other/sub\" && ln -s \"$W/other/sub/../../co/src\" \"$W/co/vendor\" && \
+             theirs \"$W/other\"",
+            Some(("co/vendor", "checkout")),
+        ),
+        (
+            "a link back into it by a relative path through their folder",
+            "mkdir -p \"$W/other\" && ln -s \"$W/co/src\" \"$W/other/hop\" && \
+             ln -s ../other/hop \"$W/co/vendor\" && theirs \"$W/other\"",
+            Some(("co/vendor", "checkout")),
+        ),
+        (
+            "a link back into it through a link of root's",
+            "mkdir -p \"$W/sealed\" && ln -s \"$W/co/src\" \"$W/sealed/hop\" && \
+             ln -s \"$W/sealed/hop\" \"$W/co/vendor\"",
+            None,
+        ),
+        (
+            "a link back into it through a root link that leads through their folder",
+            "mkdir -p \"$W/sealed\" \"$W/other\" && ln -s \"$W/co\" \"$W/other/co\" && \
+             ln -s \"$W/other/co\" \"$W/sealed/mid\" && ln -s \"$W/sealed/mid/src\" \"$W/co/vendor\" && \
+             theirs \"$W/other\"",
+            Some(("co/vendor", "checkout")),
+        ),
+        (
+            "a link whose target ends in a newline",
+            "ln -s \"$W/co/src\"$'\\n' \"$W/co/vendor\"",
+            Some(("co/vendor", "checkout")),
+        ),
         (
             "a worktree's common git dir of theirs",
             "mkdir -p \"$W/repo/.git/worktrees/co\" \"$W/repo/.git/objects\" && \
@@ -1365,6 +1548,753 @@ fn under_root_git_over_the_checkout_is_roots_and_reads_no_config_of_homes() {
     );
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn under_root_an_install_folder_on_a_volume_that_ignores_owners_is_skipped_before_the_download() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    lib.step(
+        "installer_uid() { echo 0; }\n\
+         df() { [ -e \"${!#}\" ] || return 1; printf 'Filesystem 512-blocks Used Available Capacity Mounted on\\n%s 1 1 1 1%% /Volumes/X\\n' \"$DEV\"; }\n\
+         mount() { printf '%s\\n' \"$MOUNTS\"; }\n\
+         M=$'/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)\\n\
+         /dev/disk6s1 on /Volumes/USB (exfat, local, nodev, nosuid, noowners, noatime, nobrowse)\\n\
+         /dev/disk6s10 on /Volumes/Back on Up (apfs, local, journaled)\\n\
+         /dev/disk7s1 on /Volumes/Ext (apfs, local, nodev, nosuid, journaled, noowners)\\n\
+         /dev/disk8s1 on /Volumes/noowners (apfs, local, journaled)\\n\
+         //me@nas/share on /Volumes/share (smbfs, nodev, nosuid, mounted by me)'",
+    );
+    // (the device df names for the folder, whether the app half is skipped)
+    let rows = [
+        ("/dev/disk6s1", true),
+        ("/dev/disk7s1", true),
+        ("/dev/disk6s10", false),
+        ("/dev/disk3s1s1", false),
+        ("//me@nas/share", false),
+        ("/dev/disk9s1", false),
+        ("/dev/disk7", false),
+        ("/dev/disk8s1", false),
+        ("", false),
+    ];
+    let calls: Vec<usize> = rows
+        .iter()
+        .map(|(dev, _)| {
+            lib.call(
+                format!(
+                    "( DEV='{dev}'; MOUNTS=\"$M\"; root_dest_keeps_no_owner \"$TMPDIR/apps/new\" )"
+                ),
+                &[],
+            )
+        })
+        .collect();
+    let account = lib.call(
+        "( installer_uid() { echo 424242; }; DEV=/dev/disk6s1; MOUNTS=\"$M\"; \
+         root_dest_keeps_no_owner \"$TMPDIR/apps\" )",
+        &[],
+    );
+    let recs = lib.run(&scratch);
+    for ((dev, skips), call) in rows.iter().zip(calls) {
+        assert_eq!(
+            recs[call].rc,
+            i32::from(!skips),
+            "a folder on {dev:?}: {}",
+            recs[call].err
+        );
+    }
+    assert_eq!(recs[account].rc, 1, "the account's own run is not judged");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn under_root_no_app_in_a_folder_another_account_can_change_backs_the_cli() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    lib.step(format!(
+        "{FOREIGN_FIND}\n{FAKE_ROOT}\nFOREIGN_LIST=\"$TMPDIR/foreign\"; : >\"$FOREIGN_LIST\"\n\
+         umask 022; W=\"$TMPDIR/w\"; VERIFY_WAIT_SECS=5\n\
+         app() {{ mkdir -p \"$W/$1/aterm.app/Contents/MacOS\" && \
+         printf '#!/bin/sh\\necho aterm 9.9.9\\n' >\"$W/$1/aterm.app/Contents/MacOS/aterm\" && \
+         chmod 755 \"$W/$1/aterm.app/Contents/MacOS/aterm\"; }}\n\
+         app sealed && app admin && app theirs && theirs \"$W/theirs\" && \
+         chgrp \"$(command id -g)\" \"$W/admin\" && chmod g+w \"$W/admin\" && mkdir -p \"$W/none\" \"$W/bin\" \"$W/tbin\" && \
+         cp \"$W/sealed/aterm.app/Contents/MacOS/aterm\" \"$W/tbin/aterm\" && theirs \"$W/tbin\"\n\
+         bundle_dirs() {{ local d; for d in $DIRS; do printf '%s\\n' \"$W/$d\"; done; }}"
+    ));
+    // (where find_bundle_cli looks, the folder root_bundle_unsealed names)
+    let rows = [
+        ("DIRS=sealed; root_bundle_unsealed", ""),
+        ("DIRS=admin; root_bundle_unsealed", "/admin"),
+        ("DIRS='none admin'; root_bundle_unsealed", "/admin"),
+        ("DIRS='admin sealed'; root_bundle_unsealed", ""),
+        ("DIRS='theirs admin'; root_bundle_unsealed", "/theirs"),
+        (
+            "DIRS=admin/new; root_bundle_unsealed \"$W/admin/new\"",
+            "/admin",
+        ),
+        (
+            "DIRS=sealed/new; root_bundle_unsealed \"$W/sealed/new\"",
+            "",
+        ),
+        (
+            "DIRS=sealed/no/new; root_bundle_unsealed \"$W/sealed/no/new\"",
+            "/sealed/no/new",
+        ),
+        (
+            "installer_uid() { echo 424242; }; DIRS=admin; root_bundle_unsealed",
+            "",
+        ),
+    ];
+    let calls: Vec<usize> = rows
+        .iter()
+        .map(|(code, _)| lib.call(format!("( {code} )"), &["W"]))
+        .collect();
+    let drivers = [
+        (
+            "DIRS=admin; BIN_DIR=\"$W/bin\"",
+            "skip no installed `aterm` to drive it",
+        ),
+        (
+            "DIRS=sealed; BIN_DIR=\"$W/bin\"",
+            "run {w}/sealed/aterm.app/Contents/MacOS/aterm",
+        ),
+        (
+            "DIRS=sealed; BIN_DIR=\"$W/tbin\"",
+            "skip another account can change {w}/tbin/aterm ",
+        ),
+    ];
+    let driven: Vec<usize> = drivers
+        .iter()
+        .map(|(setup, _)| lib.call(format!("( {setup}; toolset_driver )"), &["W"]))
+        .collect();
+    let refusal = lib.call("root_bundle_refusal /x 1; root_bundle_refusal /x", &[]);
+    let recs = lib.run(&scratch);
+    for ((code, named), call) in rows.iter().zip(calls) {
+        let w = recs[call].var("W");
+        let want = if named.is_empty() {
+            String::new()
+        } else {
+            format!("{w}{named}")
+        };
+        assert_eq!(recs[call].out, want, "{code}: {}", recs[call].err);
+    }
+    for ((setup, says), call) in drivers.iter().zip(driven) {
+        let w = recs[call].var("W");
+        let want = says.replace("{w}", w);
+        assert!(
+            recs[call].out.starts_with(&want),
+            "{setup}: {:?} does not begin {want:?}: {}",
+            recs[call].out,
+            recs[call].err
+        );
+    }
+    let lines: Vec<&str> = recs[refusal].out.lines().collect();
+    assert_eq!(lines.len(), 2, "{}", recs[refusal].out);
+    assert!(
+        lines[0].starts_with("root runs no aterm another account can change, and /x, ")
+            && lines[0].contains(" — install the CLI as your account")
+            && !lines[1].contains(" — install"),
+        "the remedy only when asked: {lines:?}"
+    );
+}
+
+#[test]
+fn under_root_a_build_takes_no_name_a_link_another_account_can_redirect() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    lib.step(format!(
+        "{FOREIGN_FIND}\n{FAKE_ROOT}\nFOREIGN_LIST=\"$TMPDIR/foreign\"; : >\"$FOREIGN_LIST\"\n\
+         umask 022; W=\"$TMPDIR/w\"; mkdir -p \"$W/other/d\" \"$W/sealed/d\" && theirs \"$W/other\" && \
+         printf '#!/bin/sh\\n' >\"$W/sealed/real\" && chmod 755 \"$W/sealed/real\" && \
+         ln -s \"$W/sealed/real\" \"$W/other/hop\" && ln -s \"$W/other/x\" \"$W/sealed/dl\" && \
+         : >\"$W/sealed/theirs\" && theirs \"$W/sealed/theirs\" && \
+         ln -s \"$W/sealed\" \"$W/other/back\" && ln -s \"$W/other/back\" \"$W/sealed/mid\" && \
+         ln -s \"$W/other/evil\" \"$W/sealed/nl\"$'\\n' && mkdir \"$W/sealed/pbin\" && \
+         cp \"$W/sealed/real\" \"$W/sealed/pbin/tool\" && ln -s \"$W/sealed/loop\" \"$W/sealed/loop\" && \
+         ln -s \"$W/other/lb\" \"$W/sealed/la\" && ln -s \"$W/sealed/la\" \"$W/other/lb\" && \
+         ln -s \"$W/sealed/real\" \"$W/sealed/tl\" && theirs \"$W/sealed/tl\" && \
+         ln -s \"$W/sealed/gone\" \"$W/sealed/dg\" && mkdir -p \"$W/sealed/x/y\" \"$W/sealed/x\"$'\\n'/y && \
+         {{ [[ \"$OSTYPE\" != darwin* ]] || {{ ln -s \"$W/sealed/real\" \"$W/sealed/al\" && \
+         chmod -h +a 'everyone allow delete' \"$W/sealed/al\"; }}; }}\n\
+         bin() {{ mkdir -p \"$W/$1\" && ln -s \"$2\" \"$W/$1/cc\" && root_bin_dir \"$W/$1\"; }}"
+    ));
+    // (what the bin folder's cc leads to, whether root takes programs from it)
+    let rows = [
+        ("$W/sealed/real", true),
+        ("$W/sealed/cc", true),
+        // A folder that is not there yet can be made for another account: a
+        // disk image any account attaches gets one in /Volumes.
+        ("$W/sealed/new/cc", false),
+        ("$W/sealed/d", true),
+        ("$W/other/cc", false),
+        ("$W/other/new/cc", false),
+        ("$W/other/d", false),
+        ("$W/other/hop", false),
+        ("$W/other/d/../../sealed/real", false),
+        ("$W/sealed/dl/cc", false),
+        ("$W/sealed/theirs", false),
+        // A root link on the way, not at its end, that leads through their
+        // folder (back to root's).
+        ("$W/sealed/mid/real", false),
+        // A target the shell would read without its newline.
+        ("$W/sealed/nl\"$'\\n'\"", false),
+        // A loop of root's alone leads nowhere the kernel goes; one through
+        // their folder is theirs to break.
+        ("$W/sealed/loop", true),
+        ("$W/sealed/la", false),
+        // Their link in root's folder leads where root's folder says: no
+        // account rewrites a link in place, and on Linux none removes it but
+        // through its folder. On macOS its owner, or an ACL on it, can.
+        ("$W/sealed/tl", !cfg!(target_os = "macos")),
+        ("$W/sealed/al", !cfg!(target_os = "macos")),
+    ];
+    let calls: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .map(|(n, (to, _))| lib.call(format!("bin b{n} \"{to}\""), &[]))
+        .collect();
+    let by_mid = lib.call(
+        "root_bin_dir \"$W/sealed/pbin\" && ! root_bin_dir \"$W/sealed/mid/pbin\" && \
+         [ \"$(folder_failing sealed_entry \"$W/sealed/no/pbin\")\" = \"$W/sealed/no/pbin\" ] && \
+         may_run \"$W/sealed/real\" && ! may_run \"$W/sealed/real\"$'\\n'",
+        &[],
+    );
+    // A folder still to be made is judged by the one that would hold it, and
+    // refused below a name still to be made, or at a link that leads nowhere.
+    let to_make = lib.call(
+        "[ -z \"$(root_tree_failing \"$W/sealed/new\")\" ] && \
+         [ \"$(root_tree_failing \"$W/sealed/no/new\")\" = \"$W/sealed/no/new\" ] && \
+         [ \"$(root_tree_failing \"$W/sealed/dg\")\" = \"$W/sealed/gone\" ]",
+        &[],
+    );
+    // A relative way is taken from the working folder the kernel uses, whose
+    // name may end in a newline that a command substitution drops.
+    let nl_cwd = lib.call(
+        "( cd \"$W/sealed/x\"$'\\n' && [ -z \"$(cd \"$W/sealed/x\" && folder_failing sealed_entry y)\" ] && \
+         [ \"$(folder_failing sealed_entry y)\" = y ] )",
+        &[],
+    );
+    // A real ACL, on a program in a folder PATH names by a link to it.
+    let acl_by_link = cfg!(target_os = "macos").then(|| {
+        lib.call(
+            "mkdir \"$W/abin\" && cp \"$W/sealed/real\" \"$W/abin/tool\" && ln -s \"$W/abin\" \"$W/abinl\" && \
+             root_bin_dir \"$W/abinl\" && chmod +a 'everyone allow write' \"$W/abin/tool\" && \
+             ! root_bin_dir \"$W/abinl\"",
+            &[],
+        )
+    });
+    let recs = lib.run(&scratch);
+    for ((to, takes), call) in rows.iter().zip(calls) {
+        assert_eq!(
+            recs[call].rc,
+            i32::from(!takes),
+            "a cc that leads to {to}: {}",
+            recs[call].err
+        );
+    }
+    assert_eq!(recs[to_make].rc, 0, "{}", recs[to_make].err);
+    assert_eq!(
+        recs[nl_cwd].rc, 0,
+        "a working folder named with a newline refuses: {}",
+        recs[nl_cwd].err
+    );
+    if let Some(call) = acl_by_link {
+        assert_eq!(
+            recs[call].rc, 0,
+            "a folder named by a link has its own entries' ACLs read: {}",
+            recs[call].err
+        );
+    }
+    assert_eq!(
+        recs[by_mid].rc, 0,
+        "a folder of root's is refused by a way to it through their folder, one with no way to it \
+         is named, and a name with a newline is not taken for the one without: {}",
+        recs[by_mid].err
+    );
+}
+
+/// A walk proves nothing through a filesystem whose owners and modes do not say who may
+/// change it: one a server or another account's daemon serves (on Linux a network or FUSE
+/// one), or on macOS a volume that is not local or that an account mounted, which it can
+/// take away and attach another in place of. The way to a folder in one, a tree or a
+/// folder root takes programs from with one in it, a mount table that cannot be read, and a
+/// folder gone by the time the walk ends each refuse.
+#[test]
+fn under_root_a_walk_through_a_filesystem_whose_owners_say_nothing_refuses() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    let table = if cfg!(target_os = "macos") {
+        // `mount`'s lines, the kernel's own after them: one in the data volume,
+        // one mounted over another, one whose folder's name holds " on ".
+        "macos_mounts() { printf '%s\\n' \"/dev/disk9s1 on $W/vol (apfs, local, nodev, nosuid, journaled, mounted by someone)\" \
+         \"//u@h/s on $W/net (smbfs, nodev, nosuid)\" \"/dev/disk9s2 on $W/ok (apfs, local, journaled)\" \
+         \"/dev/disk9s3 on /System/Volumes/Data$W/fl (apfs, local, nodev, nosuid, mounted by someone)\" \
+         \"/dev/disk9s4 on $W/tree/sub (apfs, local, nodev, nosuid, mounted by someone)\" \
+         \"/dev/disk9s5 on $W/stack (apfs, local, journaled)\" \
+         \"/dev/disk9s6 on $W/stack (apfs, local, nodev, nosuid, mounted by someone)\" \
+         \"/dev/disk9s7 on $W/tree2/at on it (apfs, local, nodev, nosuid, mounted by someone)\" \
+         \"/dev/disk9s8 on /System/Volumes/Data$W/tree3/sub (apfs, local, nodev, nosuid, mounted by someone)\" \
+         \"/dev/disk9s9 on $W/pbin/cc (apfs, local, nodev, nosuid, mounted by someone)\"; \
+         /sbin/mount; }\n\
+         no_table() { macos_mounts() { return 1; }; }"
+    } else {
+        // The kernel's mount points, and the type stat reads for each.
+        "eval \"kernel_$(declare -f linux_mount_points)\"\n\
+         linux_mount_points() { printf '%s\\n' \"$W/vol\" \"$W/net\" \"$W/ok\" \"$W/fl\" \"$W/tree/sub\" \"$W/bad\" \
+         \"$W/pbin/cc\"; \
+         kernel_linux_mount_points; }\n\
+         stat() { case \"${!#}\" in \"$W/vol\" | \"$W/fl\" | \"$W/tree/sub\" | \"$W/pbin/cc\") echo 65735546 ;; \
+         \"$W/net\") echo 6969 ;; \"$W/ok\") echo ef53 ;; \"$W/bad\") return 1 ;; *) command stat \"$@\" ;; esac; }\n\
+         no_table() { linux_mount_points() { return 1; }; }"
+    };
+    lib.step(format!(
+        "{FOREIGN_FIND}\n{FAKE_ROOT}\nFOREIGN_LIST=\"$TMPDIR/foreign\"; : >\"$FOREIGN_LIST\"\n\
+         umask 022; W=\"$TMPDIR/w\"; mkdir -p \"$W/vol/d\" \"$W/net/d\" \"$W/ok/d\" \"$W/fl/d\" \
+         \"$W/tree/sub/d\" \"$W/bad/d\" \"$W/stack/d\" \"$W/tree2/at on it\" \"$W/tree3/sub\" \"$W/pbin\" \"$W/obin\" && \
+         printf '#!/bin/sh\\n' >\"$W/pbin/cc\" && chmod 755 \"$W/pbin/cc\" && cp \"$W/pbin/cc\" \"$W/obin/cc\"\n{table}"
+    ));
+    // (what is walked, what it names)
+    let mut rows = vec![
+        ("folder_failing sealed_entry \"$W/vol/d\"", "$W/vol"),
+        ("folder_failing sealed_entry \"$W/net/d\"", "$W/net"),
+        ("folder_failing sealed_entry \"$W/ok/d\"", ""),
+        ("folder_failing sealed_entry \"$W/fl/d\"", "$W/fl"),
+        ("folder_failing sealed_entry \"$W/vol\"", "$W/vol"),
+        ("root_entries_offender \"$W/tree\"", "$W/tree/sub"),
+        ("root_entries_offender \"$W/ok\"", ""),
+        ("no_table; folder_failing sealed_entry \"$W/ok/d\"", "/"),
+        ("no_table; root_entries_offender \"$W/ok\"", "$W/ok"),
+        ("foreign_mount_among \"$W/ok\" \"$W/gone\"", "$W/gone"),
+        // A folder root takes programs from by name, with one mounted on a
+        // file in it (Linux mounts on a file too).
+        ("root_bin_dir \"$W/pbin\" || echo refused", "refused"),
+        ("root_bin_dir \"$W/obin\" || echo refused", ""),
+    ];
+    if cfg!(target_os = "linux") {
+        rows.push(("folder_failing sealed_entry \"$W/bad/d\"", "$W/bad"));
+    } else {
+        rows.extend([
+            ("folder_failing sealed_entry \"$W/stack/d\"", "$W/stack"),
+            ("root_entries_offender \"$W/tree2\"", "$W/tree2/at on it"),
+            (
+                "root_entries_offender \"$W/tree3\"",
+                "/System/Volumes/Data$W/tree3/sub",
+            ),
+        ]);
+    }
+    let calls: Vec<usize> = rows
+        .iter()
+        .map(|(walk, named)| {
+            lib.call(
+                format!("( o=\"$({walk})\"; [ \"$o\" = \"{named}\" ] || {{ echo \"named [$o]\"; exit 1; }} )"),
+                &[],
+            )
+        })
+        .collect();
+    let recs = lib.run(&scratch);
+    for ((walk, named), call) in rows.iter().zip(calls) {
+        assert_eq!(
+            recs[call].rc, 0,
+            "{walk} names [{named}]: {}{}",
+            recs[call].out, recs[call].err
+        );
+    }
+}
+
+/// statfs's network and FUSE types are the ones the updater's rule names.
+#[test]
+fn a_root_walks_remote_filesystem_types_are_the_updaters() {
+    use aterm_uds::shared_write::{REMOTE_FILESYSTEMS, remote_filesystem};
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    let magics: Vec<u32> = REMOTE_FILESYSTEMS
+        .iter()
+        .copied()
+        .chain([
+            0xEF53,
+            0x0102_1994,
+            0x9123_683E,
+            0x5846_5342,
+            0x794C_7630,
+            0x9FA0,
+            0,
+        ])
+        .collect();
+    let calls: Vec<usize> = magics
+        .iter()
+        .map(|magic| lib.call(format!("remote_filesystem_type {magic:x}"), &[]))
+        .collect();
+    let unread: Vec<usize> = ["''", "0x6969", "6969x"]
+        .iter()
+        .map(|t| lib.call(format!("remote_filesystem_type {t}"), &[]))
+        .collect();
+    let recs = lib.run(&scratch);
+    for (magic, call) in magics.iter().zip(calls) {
+        assert_eq!(
+            recs[call].rc == 0,
+            remote_filesystem(*magic),
+            "{magic:#x}: {}",
+            recs[call].err
+        );
+    }
+    for call in unread {
+        assert_eq!(
+            recs[call].rc, 0,
+            "a type stat did not read counts as remote"
+        );
+    }
+}
+
+/// The developer folder and SDK a root build pins, or what its refusal names
+/// and the remedy it gives, each relative to the row's folder.
+type Pinned = Result<(&'static str, &'static str), (&'static str, &'static str)>;
+
+/// On macOS a root build pins the developer folder and SDK it judged, and
+/// refuses one another account can change, naming the remedy by where the
+/// folder came from. Linux runs no developer folder, but runs the same
+/// judgment here, under the bash it has (5.x, where an unset variable stops
+/// the run even inside a condition), with getfacl for the ACL.
+#[test]
+fn under_root_cc_runs_only_from_a_developer_folder_and_sdk_root_alone_can_change() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    // What an environment says root judged is never taken for it.
+    lib.env("ROOT_DEVELOPER_DIR", "/nonexistent");
+    lib.env("ROOT_SDKROOT", "/nonexistent");
+    // acl_on's ACL grants no write, which on Linux would show in the group bits
+    // (its mask) for the mode walk to find before the ACL walk.
+    lib.step(format!(
+        "{FOREIGN_FIND}\n{FAKE_ROOT}\n{ROOT_LAYOUT}\n\
+         picks() {{ unset DEVELOPER_DIR; \
+         xcode_dirs() {{ printf '%s\\n' \"$W/select\" \"$W/xcode\" \"$W/clt\"; }}; }}\n\
+         acl_on() {{ if [[ \"$OSTYPE\" == darwin* ]]; then chmod +a 'everyone allow add_file' \"$1\"; \
+         else setfacl -m u:nobody:r-x \"$1\"; fi; }}"
+    ));
+    let (developer, sdk_root, select) = ("unset DEVELOPER_DIR", "unset SDKROOT", "xcode-select -s");
+    // (label, setup, what the build pins or the refusal names)
+    let rows: [(&str, &str, Pinned); 16] = [
+        (
+            "root's",
+            "export TOOLCHAINS=x",
+            Ok(("dev", "dev/SDKs/MacOSX.sdk")),
+        ),
+        (
+            "a program of theirs in it",
+            "theirs \"$W/dev/usr/bin/clang\"",
+            Err(("dev/usr/bin/clang", developer)),
+        ),
+        (
+            "an ACL in it",
+            "acl_on \"$W/dev/usr/bin\"",
+            Err(("dev", developer)),
+        ),
+        (
+            "a folder above it their group can write",
+            "mkdir \"$W/g\" && mv \"$W/dev\" \"$W/g/\" && chgrp \"$(command id -g)\" \"$W/g\" && \
+             chmod g+w \"$W/g\" && DEVELOPER_DIR=\"$W/g/dev\"",
+            Err(("g", developer)),
+        ),
+        (
+            "an SDK of theirs",
+            "mkdir \"$W/sdk\" && theirs \"$W/sdk\" && export SDKROOT=\"$W/sdk\"",
+            Err(("sdk", sdk_root)),
+        ),
+        (
+            "an SDK of root's holding a file of theirs",
+            "mkdir \"$W/sdk\" && : >\"$W/sdk/lib\" && theirs \"$W/sdk/lib\" && export SDKROOT=\"$W/sdk\"",
+            Err(("sdk/lib", sdk_root)),
+        ),
+        (
+            "an SDK of root's outside it",
+            "mkdir \"$W/sdk\" && export SDKROOT=\"$W/sdk\"",
+            Ok(("dev", "sdk")),
+        ),
+        (
+            "no SDK",
+            "rm -r \"$W/dev/SDKs\"",
+            Err((
+                "dev/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk",
+                developer,
+            )),
+        ),
+        (
+            "an Xcode.app",
+            "mkdir -p \"$W/x/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk\" && \
+             DEVELOPER_DIR=\"$W/x/Xcode.app\"",
+            Ok((
+                "x/Xcode.app/Contents/Developer",
+                "x/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk",
+            )),
+        ),
+        (
+            "a library of theirs beside an Xcode.app's developer folder",
+            "mkdir -p \"$W/x/Xcode.app/Contents/Developer/SDKs/MacOSX.sdk\" \
+             \"$W/x/Xcode.app/Contents/SharedFrameworks\" && \
+             : >\"$W/x/Xcode.app/Contents/SharedFrameworks/lib\" && \
+             theirs \"$W/x/Xcode.app/Contents/SharedFrameworks/lib\" && DEVELOPER_DIR=\"$W/x/Xcode.app\"",
+            Err(("x/Xcode.app/Contents/SharedFrameworks/lib", developer)),
+        ),
+        (
+            "a library of theirs beside a developer folder in a bundle not named .app",
+            "mkdir -p \"$W/opt/xc16/Contents/Developer/SDKs/MacOSX.sdk\" \
+             \"$W/opt/xc16/Contents/SharedFrameworks\" \"$W/x\" && \
+             : >\"$W/opt/xc16/Contents/SharedFrameworks/lib\" && \
+             theirs \"$W/opt/xc16/Contents/SharedFrameworks/lib\" && \
+             ln -s \"$W/opt/xc16\" \"$W/x/Xcode16.app\" && DEVELOPER_DIR=\"$W/x/Xcode16.app\"",
+            Err(("opt/xc16/Contents/SharedFrameworks/lib", developer)),
+        ),
+        (
+            "the one xcode-select chose",
+            "picks; ln -s \"$W/dev\" \"$W/select\"",
+            Ok(("dev", "dev/SDKs/MacOSX.sdk")),
+        ),
+        (
+            "the one xcode-select chose, by a way through their folder",
+            "picks; mkdir \"$W/other\" && ln -s \"$W/dev\" \"$W/other/dev\" && theirs \"$W/other\" && \
+             ln -s \"$W/other/dev\" \"$W/select\"",
+            Err(("other", select)),
+        ),
+        (
+            "with none chosen, Xcode's",
+            "picks; mv \"$W/dev\" \"$W/xcode\"",
+            Ok(("xcode", "xcode/SDKs/MacOSX.sdk")),
+        ),
+        (
+            "with none chosen and no Xcode, the Command Line Tools'",
+            "picks; mv \"$W/dev\" \"$W/clt\"",
+            Ok(("clt", "clt/SDKs/MacOSX.sdk")),
+        ),
+        (
+            "with none at all",
+            "picks; rm -r \"$W/dev\"",
+            Err(("clt", select)),
+        ),
+    ];
+    let macos = cfg!(target_os = "macos");
+    // On macOS the pre-flight judges and the build pins; elsewhere the judgment
+    // runs alone.
+    let run = if macos {
+        "source_build_preflight || { echo \"$CARGO_RESOLVE_REASON\"; exit 1; }; \
+         cargo_build_pinned \"$ROOT\" && cat \"$TMPDIR/build-dev\""
+    } else {
+        "root_xcode_judged || { echo \"$CARGO_RESOLVE_REASON\"; exit 1; }; \
+         echo \"$ROOT_DEVELOPER_DIR $ROOT_SDKROOT\""
+    };
+    let calls: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .map(|(n, (_, setup, _))| lib.call(format!("( mk row{n}; {setup}\n {run} )"), &[]))
+        .collect();
+    let by_name = lib.call(
+        "( mk by-name; export SDKROOT=macosx; ! root_xcode_judged && \
+         [[ \"$CARGO_RESOLVE_REASON\" == *SDKROOT=macosx* ]] )",
+        &[],
+    );
+    // A build the pre-flight did not judge judges the folder itself.
+    let unjudged = macos.then(|| {
+        lib.call(
+            "( mk unjudged; theirs \"$W/dev/usr/bin/clang\"; rm -f \"$TMPDIR/build-dev\"; \
+             ! cargo_build_pinned \"$ROOT\" && [ ! -e \"$TMPDIR/build-dev\" ] )",
+            &[],
+        )
+    });
+    let git = macos.then(|| {
+        lib.call(
+            format!(
+                "( mk git; mkdir \"$W/root-bin\" && \
+                 printf '#!/bin/sh\\necho \"$DEVELOPER_DIR $SDKROOT ${{TOOLCHAINS-unset}}\"\\n' >\"$W/root-bin/git\" && \
+                 chmod 755 \"$W/root-bin/git\" && export PATH=\"$W/root-bin:{}\" TOOLCHAINS=x && checkout_git )",
+                system_path()
+            ),
+            &[],
+        )
+    });
+    let recs = lib.run(&scratch);
+    let tmp = scratch.join("tmp");
+    for (n, ((label, _, want), call)) in rows.iter().zip(calls).enumerate() {
+        let row = tmp.join(format!("row{n}"));
+        let w = s(&row);
+        match want {
+            Ok((dev, sdk)) => {
+                assert_eq!(
+                    recs[call].rc, 0,
+                    "{label}: {}{}",
+                    recs[call].out, recs[call].err
+                );
+                let toolchains = if macos { " unset" } else { "" };
+                assert_eq!(
+                    recs[call].out.trim_end(),
+                    format!("{w}/{dev} {w}/{sdk}{toolchains}"),
+                    "{label}: the build pins what root judged"
+                );
+            }
+            Err((named, remedy)) => {
+                assert_eq!(recs[call].rc, 1, "{label}: {}", recs[call].err);
+                assert!(
+                    recs[call].out.starts_with(&format!(
+                        "root runs no compiler another account can change, and {w}/{named} is such "
+                    )) && recs[call].out.contains(remedy),
+                    "{label}: {}",
+                    recs[call].out
+                );
+            }
+        }
+    }
+    assert_eq!(
+        recs[by_name].rc, 0,
+        "an SDK named, not its folder, is refused in its own words: {}",
+        recs[by_name].err
+    );
+    if let (Some(unjudged), Some(git)) = (unjudged, git) {
+        assert_eq!(recs[unjudged].rc, 0, "{}", recs[unjudged].err);
+        assert_eq!(recs[git].rc, 0, "{}", recs[git].err);
+        let git_dir = tmp.join("git");
+        let w = s(&git_dir);
+        assert_eq!(
+            recs[git].out,
+            format!("{w}/dev {w}/dev/SDKs/MacOSX.sdk unset"),
+            "root's git runs in the developer folder it judged"
+        );
+    }
+}
+
+#[test]
+fn under_root_temporary_folders_go_in_tmp_whatever_tmpdir_says() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    let root = lib.call(
+        "( T=\"$TMPDIR\"; installer_uid() { echo 0; }; root_metadata_path && \
+         [[ \"$T\" != /tmp && \"$TMPDIR\" == /tmp && \"$(env | grep '^TMPDIR=')\" == TMPDIR=/tmp ]] )",
+        &[],
+    );
+    let account = lib.call(
+        "( T=\"$TMPDIR\"; installer_uid() { echo 424242; }; root_metadata_path && [[ \"$TMPDIR\" == \"$T\" ]] )",
+        &[],
+    );
+    let recs = lib.run(&scratch);
+    assert_eq!(
+        recs[root].rc, 0,
+        "root's temporary folders go in /tmp, for root and what it runs: {}",
+        recs[root].err
+    );
+    assert_eq!(
+        recs[account].rc, 0,
+        "the account keeps its own TMPDIR: {}",
+        recs[account].err
+    );
+}
+
+/// A Linux root run without getfacl can read no ACL, so each file and folder it checks
+/// fails as one another account could change; it says so once, naming where it looked,
+/// and goes on, since the signed binary's verifier reads ACLs itself. A getfacl that runs
+/// is taken, one that does not is passed over, and a run as the account or on macOS says
+/// nothing.
+#[test]
+fn under_root_on_linux_a_missing_getfacl_is_noted_once_and_stops_nothing() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    // Root's TMPDIR becomes /tmp, so the file's name is fixed before the run.
+    lib.step("PLAIN=\"$TMPDIR/plain\"; : >\"$PLAIN\"");
+    let rows = [
+        (
+            "none that runs",
+            "0",
+            "Linux",
+            "\"$PLAIN\" /nonexistent/getfacl",
+            true,
+        ),
+        ("one that runs", "0", "Linux", "\"$PLAIN\" /bin/sh", false),
+        (
+            "the account",
+            "424242",
+            "Linux",
+            "/nonexistent/getfacl",
+            false,
+        ),
+        ("macOS", "0", "Darwin", "/nonexistent/getfacl", false),
+    ];
+    let calls: Vec<usize> = rows
+        .iter()
+        .map(|(_, uid, os, tools, _)| {
+            lib.call(
+                format!(
+                    "( installer_uid() {{ echo {uid}; }}; uname() {{ echo {os}; }}; \
+                     linux_acl_tools() {{ printf '%s\\n' {tools}; }}; root_metadata_path )"
+                ),
+                &[],
+            )
+        })
+        .collect();
+    let recs = lib.run(&scratch);
+    let plain = s(&scratch.join("tmp/plain")).to_string();
+    for ((label, _, _, _, noted), i) in rows.iter().zip(calls) {
+        assert_eq!(recs[i].rc, 0, "{label}: the run goes on: {}", recs[i].err);
+        let notes: Vec<&str> = recs[i]
+            .err
+            .lines()
+            .filter(|l| l.contains("getfacl"))
+            .collect();
+        if *noted {
+            assert_eq!(notes.len(), 1, "{label}: {}", recs[i].err);
+            assert!(
+                notes[0].starts_with("install.sh: NOTE: ")
+                    && notes[0].contains(&format!("({plain} /nonexistent/getfacl)")),
+                "{label}: a note naming where root looked: {}",
+                notes[0]
+            );
+        } else {
+            assert!(notes.is_empty(), "{label}: {}", recs[i].err);
+        }
+    }
+}
+
+#[test]
+fn under_root_a_build_keeps_the_os_folders_root_runs_its_own_tools_from() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    // The host's own folders as they are: macOS's sealed /usr/bin and /usr/sbin
+    // hold _uucp's cu and uucico, and a build without them has no cc or git.
+    let host = lib.call(
+        "( installer_uid() { echo 0; }; ROOT_LOOKUP_PATH=\"$ROOT_SYSTEM_PATH\"; root_build_path )",
+        &[],
+    );
+    lib.step(format!(
+        "{FOREIGN_FIND}\n{FAKE_ROOT}\nFOREIGN_LIST=\"$TMPDIR/foreign\"; : >\"$FOREIGN_LIST\"\n\
+         umask 022; W=\"$TMPDIR/w\"; mkdir -p \"$W/os\" \"$W/o\" && for d in os o; do \
+         printf '#!/bin/sh\\n' >\"$W/$d/cu\" && chmod 755 \"$W/$d/cu\"; theirs \"$W/$d\"; done"
+    ));
+    let unlisted = lib.call("root_bin_dir \"$W/os\"", &[]);
+    let listed = lib.call(
+        "( ROOT_SYSTEM_PATH=\"$W/os:$ROOT_SYSTEM_PATH\"; root_bin_dir \"$W/os\" && root_bin_dir \"$W/os//\" && \
+         ! root_bin_dir \"$W/o\" && ROOT_LOOKUP_PATH=\"$W/o:$W/os/:$W/os\" root_build_path )",
+        &["W"],
+    );
+    let recs = lib.run(&scratch);
+    assert_eq!(recs[host].rc, 0, "{}", recs[host].err);
+    let fixed: Vec<&str> = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+        .into_iter()
+        .filter(|d| std::path::Path::new(d).is_dir())
+        .collect();
+    let kept: Vec<&str> = recs[host].out.split(':').collect();
+    assert!(
+        fixed.iter().all(|d| kept.contains(d)),
+        "a root build keeps each OS folder this host has ({fixed:?}), whatever system account's \
+         files it holds: {}",
+        recs[host].out
+    );
+    assert_eq!(
+        recs[unlisted].rc, 1,
+        "a folder another account owns is refused"
+    );
+    assert_eq!(recs[listed].rc, 0, "{}", recs[listed].err);
+    let w = recs[listed].var("W");
+    assert_eq!(
+        recs[listed].out,
+        format!("{w}/os/:{w}/os"),
+        "the same folder is root's word once it is an OS folder, however its slashes are spelled, \
+         and a folder whose name only begins one is not"
+    );
+}
+
 #[test]
 fn root_build_authority_includes_acls_and_the_folders_program_names_pass_through() {
     let scratch = Scratch::new();
@@ -1376,6 +2306,10 @@ fn root_build_authority_includes_acls_and_the_folders_program_names_pass_through
     lib.step(
         r#"eval "$(declare -f ls_entry | sed '1s/ls_entry/base_ls_entry/')"
 uname() { if [ "$1" = -s ]; then echo "$PLATFORM"; else command uname "$@"; fi; }
+# Each platform's mount table, one local filesystem at /.
+macos_mounts() { echo '/dev/disk1s1 on / (apfs, local, journaled)'; }
+linux_mount_points() { echo /; }
+stat() { if [ "$1" = -f ]; then echo ef53; else command stat "$@"; fi; }
 ls_entry() {
 	local p="${!#}" arg flags="" within=0 listing
 	local -a args=()

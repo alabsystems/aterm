@@ -144,8 +144,33 @@ enum Ask {
     Held(Option<u32>),
 }
 
-/// Parses `program-check` arguments and validates build/platform gates.
-fn parse(rest: &str, injection: bool, watching: bool) -> Result<Ask, &'static str> {
+/// What `held <pid>` answers for a pid no live process of this user holds: a start is read only for those (another user's thread list is not read, a zombie has none), so the stand-in would count nowhere.
+const NOT_OURS: &str = "program-check held <pid>: no live process of this user has that pid, and a start is read \
+     only for those";
+
+/// Whether `pid` is a live process of this user ([`NOT_OURS`]).
+fn ours(pid: u32) -> bool {
+    #[cfg(target_vendor = "apple")]
+    {
+        i32::try_from(pid)
+            .ok()
+            .and_then(aterm_uds::process::read_short_info)
+            .is_some_and(|i| i.pbsi_uid == aterm_uds::peer::our_uid())
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// Parses `program-check` arguments and validates build/platform gates, then that a `held <pid>` names a live process of this user (`ours`).
+fn parse(
+    rest: &str,
+    injection: bool,
+    watching: bool,
+    ours: impl Fn(u32) -> bool,
+) -> Result<Ask, &'static str> {
     let ask = match rest.split_whitespace().collect::<Vec<_>>().as_slice() {
         [] => return Ok(Ask::Read),
         ["full"] => Ask::Pool(true),
@@ -163,12 +188,22 @@ fn parse(rest: &str, injection: bool, watching: bool) -> Result<Ask, &'static st
     if !watching {
         return Err("program-check full|live|held: this instance runs no stuck check (not macOS)");
     }
+    if let Ask::Held(Some(pid)) = ask
+        && !ours(pid)
+    {
+        return Err(NOT_OURS);
+    }
     Ok(ask)
 }
 
 /// Handles the `program-check [full|live|held <pid>|held -]` control verb.
 pub(crate) fn cmd(rest: &str) -> String {
-    match parse(rest, STAND_IN_ENABLED, WATCHING.load(Ordering::SeqCst)) {
+    match parse(
+        rest,
+        STAND_IN_ENABLED,
+        WATCHING.load(Ordering::SeqCst),
+        ours,
+    ) {
         Ok(Ask::Pool(full)) => FULL_STAND_IN.store(full, Ordering::SeqCst),
         Ok(Ask::Held(pid)) => HELD_STAND_IN.store(pid.unwrap_or(0), Ordering::SeqCst),
         Ok(Ask::Read) => {}
@@ -424,24 +459,53 @@ mod tests {
 
     #[test]
     fn the_verb_reads_bare_and_stands_in_only_where_a_look_reads() {
-        assert_eq!(parse("", false, false), Ok(Ask::Read));
-        assert_eq!(parse("  ", true, true), Ok(Ask::Read));
-        assert_eq!(parse("full", true, true), Ok(Ask::Pool(true)));
-        assert_eq!(parse(" live ", true, true), Ok(Ask::Pool(false)));
-        assert_eq!(parse("stuck", true, true), Err(USAGE));
-        assert_eq!(parse("full live", true, true), Err(USAGE));
-        assert!(parse("full", false, true).is_err_and(|e| e.contains("development build")));
-        assert!(parse("live", true, false).is_err_and(|e| e.contains("runs no stuck check")));
+        let any = |_| true;
+        assert_eq!(parse("", false, false, any), Ok(Ask::Read));
+        assert_eq!(parse("  ", true, true, any), Ok(Ask::Read));
+        assert_eq!(parse("full", true, true, any), Ok(Ask::Pool(true)));
+        assert_eq!(parse(" live ", true, true, any), Ok(Ask::Pool(false)));
+        assert_eq!(parse("stuck", true, true, any), Err(USAGE));
+        assert_eq!(parse("full live", true, true, any), Err(USAGE));
+        assert!(parse("full", false, true, any).is_err_and(|e| e.contains("development build")));
+        assert!(parse("live", true, false, any).is_err_and(|e| e.contains("runs no stuck check")));
     }
 
+    /// The held stand-in needs a development build and a pid of a live process of this user
+    /// (the only kind a start is read for, so any other would count nowhere); `held -` needs no
+    /// pid. This process is one of this user's; pid 1 (launchd, root's) is not.
     #[test]
     fn the_held_stand_in_needs_a_development_build_and_a_pid() {
-        assert_eq!(parse("held 25311", true, true), Ok(Ask::Held(Some(25311))));
-        assert_eq!(parse(" held  - ", true, true), Ok(Ask::Held(None)));
+        let any = |_| true;
+        let only = |mine: u32| move |pid| pid == mine;
+        assert_eq!(
+            parse("held 25311", true, true, only(25311)),
+            Ok(Ask::Held(Some(25311)))
+        );
+        assert_eq!(
+            parse(" held  - ", true, true, |_| false),
+            Ok(Ask::Held(None))
+        );
         for refused in ["held", "held gh", "held 0", "held -1", "held 7 8"] {
-            assert_eq!(parse(refused, true, true), Err(USAGE), "{refused:?}");
+            assert_eq!(parse(refused, true, true, any), Err(USAGE), "{refused:?}");
         }
-        assert!(parse("held 25311", false, true).is_err_and(|e| e.contains("development build")));
-        assert!(parse("held -", true, false).is_err_and(|e| e.contains("runs no stuck check")));
+        assert!(
+            parse("held 25311", false, true, any).is_err_and(|e| e.contains("development build"))
+        );
+        assert!(
+            parse("held -", true, false, any).is_err_and(|e| e.contains("runs no stuck check"))
+        );
+        assert_eq!(
+            parse("held 25311", true, true, only(7)),
+            Err(NOT_OURS),
+            "a pid no live process of this user holds"
+        );
+        #[cfg(target_vendor = "apple")]
+        {
+            assert!(ours(std::process::id()), "this process is this user's");
+            assert!(
+                aterm_uds::peer::our_uid() == 0 || !ours(1),
+                "launchd is root's"
+            );
+        }
     }
 }

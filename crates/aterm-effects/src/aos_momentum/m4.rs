@@ -85,7 +85,9 @@
 //! }
 //! ```
 
+use core::convert::Infallible;
 use core::fmt;
+use core::ops::ControlFlow;
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
@@ -101,14 +103,17 @@ use aterm_aos::{ArtifactId, Digest};
 use aterm_time::Instant;
 
 use super::bundle::{
-    BUNDLE_GRADE, CandidateBundle, MAX_TIMINGS, PLAN_ASSUMPTIONS, Row, RowVerdict, SelectionPart,
-    Timing, UNDECLARED, UncheckedBundle, add,
+    BUNDLE_GRADE, BundleField, CandidateBundle, MAX_TIMINGS, PLAN_ASSUMPTIONS, Row, RowVerdict,
+    SelectionPart, Timing, UNDECLARED, UncheckedBundle, add,
 };
 use super::corpus::{Corpus, CorpusSplit, ItemKind};
+use super::dist::{Claim, ClaimKind};
 use super::fidelity::{LANE_SETTLES, LaneFidelity, ORACLE};
 use super::lane::{LANE_MODEL, Scenario, encode_glass, run};
 use super::plan::{PLAN_INTERPRETER, PLAN_LEN, PlanRefusal, SchedulePlan};
-use super::policy::{AcceptancePolicy, Body, CORPUS_FOLD, ItemFacts, PolicyRefusal, Totals};
+use super::policy::{
+    AcceptancePolicy, Body, Budgets, CORPUS_FOLD, ItemFacts, PolicyRefusal, Totals,
+};
 use super::search::{
     GridProposer, Mode, Proposer, ProposerId, SearchStats, TrainFeedback, candidate_id,
 };
@@ -474,10 +479,493 @@ struct TrainAdmitted {
 }
 
 impl TrainAdmitted {
+    /// `plan` admitted with `rows`, its totals summed here.
+    fn of(plan: SchedulePlan, rows: Vec<(usize, Row)>) -> TrainAdmitted {
+        let totals = rows
+            .iter()
+            .fold(Totals::default(), |t, (_, r)| add(t, r.totals()));
+        TrainAdmitted { plan, rows, totals }
+    }
+
     /// The selection rule's key: `ΣT`, then `ΣZ`, then the plan's bytes.
     #[inline]
     fn key(&self) -> (u64, u64, [u8; PLAN_LEN]) {
         (self.totals.ticks, self.totals.wasted, self.plan.encode())
+    }
+}
+
+/// Runs a round's jobs on any threads: a job it skips is run in place by its caller, so a spread
+/// changes only how fast a search runs (design §11.4).
+pub trait Spread: Sync {
+    /// Runs any of `job(0)` .. `job(n - 1)`, each at most once and in any order, and returns
+    /// when they are done.
+    fn run(&self, n: usize, job: &(dyn Fn(usize) + Sync));
+}
+
+/// Every job in order, on the caller's thread.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Serial;
+
+impl Spread for Serial {
+    fn run(&self, n: usize, job: &(dyn Fn(usize) + Sync)) {
+        (0..n).for_each(job);
+    }
+}
+
+/// A candidate's training rows ([`Evaluator::training_rows`]).
+#[derive(Debug)]
+pub(super) struct TrainingRows<B> {
+    /// The rows judged, with their corpus indices, in corpus order.
+    pub(super) rows: Vec<(usize, Row)>,
+    /// How the run ended.
+    pub(super) end: TrainingEnd<B>,
+}
+
+/// How a training run ended.
+#[derive(Debug)]
+pub(super) enum TrainingEnd<B> {
+    /// Every training item passed.
+    Admitted,
+    /// The last row's item refused the candidate.
+    Refused(CandidateRefusal),
+    /// `keep` stopped the run after the last row.
+    Stopped(B),
+}
+
+/// What a search learned of one distinct candidate.
+enum Judged {
+    /// Judged here on every training item, each passing.
+    Admitted(TrainAdmitted),
+    /// Refused here, on the training split or by its decode.
+    Refused(CandidateRefusal),
+    /// Claimed admitted by a worker, with its claimed training `ΣT`, and shown here to have a
+    /// higher `ΣT` than the winner's (design §11.3).
+    Dominated {
+        /// The claimed `ΣT`.
+        ticks: u64,
+    },
+}
+
+/// One distinct candidate of a round.
+#[derive(Clone, Copy, Debug)]
+struct Distinct<'p> {
+    /// Its index among the round's proposals.
+    index: usize,
+    /// Its id ([`candidate_id`]).
+    cid: Digest,
+    /// Its bytes.
+    bytes: &'p [u8],
+}
+
+/// The selection every search shares: the budgets, dedupe, the counts, feedback in proposal order
+/// and the key. Only this builds a [`Selection`] from a search.
+struct Fold {
+    id: ProposerId,
+    /// Whether every round so far proposed what the grid proposes.
+    is_grid: bool,
+    stats: SearchStats,
+    seen: BTreeSet<Digest>,
+    feedback: Vec<TrainFeedback>,
+    best: Option<(TrainAdmitted, u8, u64)>,
+}
+
+impl Fold {
+    fn new(id: ProposerId) -> Fold {
+        Fold {
+            is_grid: id == GridProposer::new().id(),
+            id,
+            stats: SearchStats::default(),
+            seen: BTreeSet::new(),
+            feedback: Vec::new(),
+            best: None,
+        }
+    }
+
+    /// Round `round`'s proposals, the proposer shown the feedback so far.
+    fn propose(&mut self, proposer: &mut dyn Proposer, round: u8) -> Vec<Vec<u8>> {
+        self.stats.rounds = round + 1;
+        let proposed = proposer.propose(round, &self.feedback);
+        self.is_grid =
+            self.is_grid && proposed == GridProposer::new().propose(round, &self.feedback);
+        proposed
+    }
+
+    /// `proposed` counted against `budgets`: the distinct candidates, in proposal order.
+    fn distinct<'p>(&mut self, budgets: &Budgets, proposed: &'p [Vec<u8>]) -> Vec<Distinct<'p>> {
+        let mut out = Vec::new();
+        for (index, bytes) in proposed.iter().enumerate() {
+            self.stats.proposed += 1;
+            if bytes.len() > budgets.proposal_bytes {
+                self.stats.oversized += 1;
+                continue;
+            }
+            let cid = candidate_id(bytes);
+            if self.seen.contains(&cid) {
+                self.stats.duplicates += 1;
+                continue;
+            }
+            if self.seen.len() >= budgets.distinct {
+                self.stats.over_budget += 1;
+                continue;
+            }
+            self.seen.insert(cid);
+            self.stats.distinct += 1;
+            out.push(Distinct { index, cid, bytes });
+        }
+        out
+    }
+
+    /// One distinct candidate's judgment, taken in proposal order.
+    fn take(&mut self, round: u8, index: usize, cid: Digest, judged: Judged) {
+        match judged {
+            Judged::Admitted(t) => {
+                self.stats.admitted += 1;
+                self.feedback
+                    .push(TrainFeedback::admitted(cid, t.totals.ticks));
+                if self.best.as_ref().is_none_or(|(b, _, _)| t.key() < b.key()) {
+                    self.best = Some((t, round, wide(index)));
+                }
+            }
+            Judged::Dominated { ticks } => {
+                self.stats.admitted += 1;
+                self.feedback.push(TrainFeedback::admitted(cid, ticks));
+            }
+            Judged::Refused(r) => self.feedback.push(TrainFeedback::refused(cid, r.law())),
+        }
+    }
+
+    /// The selection recorded as `mode`, or why there is none; and whether every round proposed
+    /// what the grid proposes.
+    fn end(self, ev: &Evaluator, mode: Mode) -> (Result<Selection, NoOutcome>, bool) {
+        let Fold {
+            id,
+            is_grid,
+            stats,
+            best,
+            ..
+        } = self;
+        let Some((winner, round, index)) = best else {
+            return (Err(NoOutcome::NoneAdmitted { stats }), is_grid);
+        };
+        let train = Compared {
+            candidate: winner.totals,
+            baseline: ev.policy.totals(CorpusSplit::Train),
+        };
+        if !train.beats() {
+            let no = NoOutcome::NoGain {
+                plan: winner.plan,
+                train,
+                stats,
+            };
+            return (Err(no), is_grid);
+        }
+        let selection = Selection {
+            build: ev.build.clone(),
+            winner,
+            proposer: id,
+            round,
+            index,
+            stats,
+            mode,
+        };
+        (Ok(selection), is_grid)
+    }
+}
+
+/// `f` of each of `items` through `spread`, any it skipped run in place, in order.
+fn spread_map<I: Sync, T: Send + Sync>(
+    spread: &dyn Spread,
+    items: &[I],
+    f: &(dyn Fn(&I) -> T + Sync),
+) -> Vec<T> {
+    let slots: Vec<OnceLock<T>> = items.iter().map(|_| OnceLock::new()).collect();
+    spread.run(items.len(), &|i| {
+        if let (Some(slot), Some(item)) = (slots.get(i), items.get(i)) {
+            let _ = slot.get_or_init(|| f(item));
+        }
+    });
+    slots
+        .into_iter()
+        .zip(items)
+        .map(|(slot, item)| slot.into_inner().unwrap_or_else(|| f(item)))
+        .collect()
+}
+
+#[inline]
+fn index(slot: u32) -> usize {
+    usize::try_from(slot).unwrap_or(usize::MAX)
+}
+
+/// How far a distributed search judges the workers' claims again (design §11.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CheckLevel {
+    /// Every refused claim on its prefix, the best admitted claim in full, and every other
+    /// admitted claim until its judged rows' `ΣT` exceed the winner's: [`Mode::Distributed`].
+    Dominance,
+    /// Every claim in full: [`Mode::Search`].
+    All,
+}
+
+/// One job of a distributed search: a distinct round-0 candidate that decodes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Job {
+    /// Its ordinal among the jobs.
+    pub slot: u32,
+    /// The plan.
+    pub plan: SchedulePlan,
+}
+
+/// Why a distributed search has no result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DistNoOutcome {
+    /// The local fold's own: [`NoOutcome::NoneAdmitted`] or [`NoOutcome::NoGain`].
+    Local(NoOutcome),
+    /// A job had no claim when the search was finished.
+    Unclaimed {
+        /// The job.
+        slot: u32,
+    },
+    /// A claim for a slot that is no job, or a second one.
+    Misplaced {
+        /// The slot.
+        slot: u32,
+    },
+    /// A claimed row, or the claim's kind, is not what this evaluator judges.
+    Contradicted {
+        /// The job.
+        slot: u32,
+        /// The training item.
+        item: String,
+        /// The first part that differs.
+        field: BundleField,
+    },
+    /// The proposer proposed after round 0, having been shown feedback that rests on claims.
+    Adaptive {
+        /// The round.
+        round: u8,
+    },
+}
+
+impl fmt::Display for DistNoOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DistNoOutcome::Local(no) => no.fmt(f),
+            DistNoOutcome::Unclaimed { slot } => {
+                write!(f, "void: job {slot} has no claim")
+            }
+            DistNoOutcome::Misplaced { slot } => {
+                write!(f, "void: a claim for slot {slot}, which is no open job")
+            }
+            DistNoOutcome::Contradicted { slot, item, field } => write!(
+                f,
+                "void: job {slot}'s claim is contradicted on {item}: its {} is not what this evaluator judges",
+                field.name()
+            ),
+            DistNoOutcome::Adaptive { round } => write!(
+                f,
+                "void: the proposer proposed in round {round}; only feedback-blind proposers distribute"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DistNoOutcome {}
+
+/// Step 5's verdict per slot, or its first contradiction; and the (slot, ordinal) pairs judged.
+type Checked = (Result<Vec<Judged>, Contradiction>, Vec<(u32, usize)>);
+
+/// A contradiction step 5 found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Contradiction {
+    slot: u32,
+    ordinal: usize,
+    item: String,
+    field: BundleField,
+}
+
+impl Contradiction {
+    /// A slot whose judgments do not add up to its claim (never, for a shaped claim).
+    fn unjudged(slot: u32) -> Contradiction {
+        Contradiction {
+            slot,
+            ordinal: usize::MAX,
+            item: String::new(),
+            field: BundleField::Row,
+        }
+    }
+}
+
+/// The item of training ordinal `t`, by id.
+fn claim_item(ev: &Evaluator, train: &[usize], t: usize) -> String {
+    train
+        .get(t)
+        .and_then(|&k| ev.corpus.items().get(k))
+        .map(|i| i.id().to_owned())
+        .unwrap_or_default()
+}
+
+/// One task of step 5.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Task {
+    /// A refused claim's prefix, in order.
+    Prefix(u32),
+    /// One training item of an admitted claim judged in full.
+    Item(u32, usize),
+    /// An admitted claim judged in descending claimed `T` until dominated.
+    Dominate(u32),
+}
+
+/// What a task found.
+#[derive(Debug)]
+enum Done {
+    /// The prefix refuses where it claims to.
+    Refused(CandidateRefusal),
+    /// The item at this corpus index passes, as claimed.
+    Row(usize, Row),
+    /// Its judged rows' `ΣT` exceed the winner's.
+    Dominated,
+    /// Every row judged, each as claimed, never exceeding the winner's `ΣT`.
+    Rows(Vec<(usize, Row)>),
+}
+
+/// A task's result and the (slot, ordinal) pairs it judged.
+#[derive(Debug)]
+struct TaskOut {
+    done: Result<Done, Contradiction>,
+    judged: Vec<(u32, usize)>,
+}
+
+/// The contradiction of the lowest slot, then ordinal.
+fn first_contradiction(done: &[(Task, Result<Done, Contradiction>)]) -> Option<Contradiction> {
+    done.iter()
+        .filter_map(|(_, d)| d.as_ref().err())
+        .min_by_key(|c| (c.slot, c.ordinal))
+        .cloned()
+}
+
+/// A distributed search: its round-0 jobs and the claims workers returned for them.
+pub struct Distributed<'a> {
+    ev: &'a Evaluator,
+    proposer: &'a mut dyn Proposer,
+    check: CheckLevel,
+    fold: Fold,
+    rounds: u8,
+    /// Round 0's distinct candidates in proposal order: index, id, and the job slot or the
+    /// candidate's decode refusal.
+    distinct: Vec<(usize, Digest, Result<u32, CandidateRefusal>)>,
+    jobs: Vec<Job>,
+    claims: Vec<Option<Claim>>,
+}
+
+impl fmt::Debug for Distributed<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Distributed")
+            .field("check", &self.check)
+            .field("jobs", &self.jobs.len())
+            .field(
+                "claimed",
+                &self.claims.iter().filter(|c| c.is_some()).count(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl Distributed<'_> {
+    /// The jobs, by slot.
+    #[inline]
+    #[must_use]
+    pub fn jobs(&self) -> &[Job] {
+        &self.jobs
+    }
+
+    /// The check level.
+    #[inline]
+    #[must_use]
+    pub const fn check(&self) -> CheckLevel {
+        self.check
+    }
+
+    /// Records `claim` for job `slot`.
+    /// # Errors
+    /// [`DistNoOutcome::Misplaced`] for a slot that is no job, or one already claimed.
+    pub fn claim(&mut self, slot: u32, claim: Claim) -> Result<(), DistNoOutcome> {
+        match self.claims.get_mut(index(slot)) {
+            Some(at @ None) => {
+                *at = Some(claim);
+                Ok(())
+            }
+            _ => Err(DistNoOutcome::Misplaced { slot }),
+        }
+    }
+
+    /// The selection, every claim judged as far as design §11.3's step 5 requires before any
+    /// held-out read; then the later rounds asked for nothing.
+    /// # Errors
+    /// The first contradiction, an unclaimed job, a proposal after round 0, or the local fold's
+    /// [`NoOutcome`].
+    pub fn finish(self, spread: &dyn Spread) -> Result<Selection, DistNoOutcome> {
+        self.finish_noting(spread).0
+    }
+
+    /// [`Self::finish`], and the (slot, training ordinal) pairs it judged itself: indices, never a
+    /// claimed row, so a caller can count local judgments against claimed ones.
+    pub fn finish_noting(
+        self,
+        spread: &dyn Spread,
+    ) -> (Result<Selection, DistNoOutcome>, Vec<(u32, usize)>) {
+        let Distributed {
+            ev,
+            proposer,
+            check,
+            mut fold,
+            rounds,
+            distinct,
+            jobs,
+            claims,
+        } = self;
+        let mut taken = Vec::with_capacity(claims.len());
+        for (job, claim) in jobs.iter().zip(claims) {
+            match claim {
+                Some(c) => taken.push(c),
+                None => return (Err(DistNoOutcome::Unclaimed { slot: job.slot }), Vec::new()),
+            }
+        }
+        let (verdicts, judged) = ev.check_claims(&jobs, &taken, check, spread);
+        let mut verdicts: Vec<Option<Judged>> = match verdicts {
+            Ok(v) => v.into_iter().map(Some).collect(),
+            Err(c) => {
+                let no = DistNoOutcome::Contradicted {
+                    slot: c.slot,
+                    item: c.item,
+                    field: c.field,
+                };
+                return (Err(no), judged);
+            }
+        };
+        for (at, cid, job) in distinct {
+            let verdict = match job {
+                Ok(slot) => match verdicts.get_mut(index(slot)).and_then(Option::take) {
+                    Some(v) => v,
+                    None => return (Err(DistNoOutcome::Unclaimed { slot }), judged),
+                },
+                Err(r) => Judged::Refused(r),
+            };
+            fold.take(0, at, cid, verdict);
+        }
+        for round in 1..rounds {
+            if !fold.propose(proposer, round).is_empty() {
+                return (Err(DistNoOutcome::Adaptive { round }), judged);
+            }
+        }
+        let mode = match check {
+            CheckLevel::Dominance => Mode::Distributed,
+            CheckLevel::All => Mode::Search,
+        };
+        let (selected, is_grid) = fold.end(ev, mode);
+        if is_grid && mode == Mode::Search {
+            let _ = ev.grid.set(selected.as_ref().ok().map(GridSelection::of));
+        }
+        (selected.map_err(DistNoOutcome::Local), judged)
     }
 }
 
@@ -1034,22 +1522,47 @@ impl Evaluator {
         (row, refusal)
     }
 
-    fn train(&self, bytes: &[u8]) -> Result<TrainAdmitted, CandidateRefusal> {
-        let plan = self.decode(bytes)?;
+    /// `plan`'s training rows, in corpus order up to its first refusal, whose row is the last;
+    /// after each passing item, `keep` is given its training ordinal and may stop the run.
+    pub(super) fn training_rows<B>(
+        &self,
+        plan: SchedulePlan,
+        keep: &mut dyn FnMut(usize) -> ControlFlow<B>,
+    ) -> TrainingRows<B> {
         let mut rows = Vec::new();
-        for k in self.indices(CorpusSplit::Train) {
+        for (ordinal, k) in self.indices(CorpusSplit::Train).into_iter().enumerate() {
             let Some((row, refusal)) = self.judge(Sched::Plan(plan), k) else {
                 continue;
             };
-            if let Some(refusal) = refusal {
-                return Err(refusal);
-            }
             rows.push((k, row));
+            if let Some(refusal) = refusal {
+                return TrainingRows {
+                    rows,
+                    end: TrainingEnd::Refused(refusal),
+                };
+            }
+            if let ControlFlow::Break(why) = keep(ordinal) {
+                return TrainingRows {
+                    rows,
+                    end: TrainingEnd::Stopped(why),
+                };
+            }
         }
-        let totals = rows
-            .iter()
-            .fold(Totals::default(), |t, (_, r)| add(t, r.totals()));
-        Ok(TrainAdmitted { plan, rows, totals })
+        TrainingRows {
+            rows,
+            end: TrainingEnd::Admitted,
+        }
+    }
+
+    fn train(&self, bytes: &[u8]) -> Result<TrainAdmitted, CandidateRefusal> {
+        let plan = self.decode(bytes)?;
+        let TrainingRows { rows, end } =
+            self.training_rows::<Infallible>(plan, &mut |_| ControlFlow::Continue(()));
+        match end {
+            TrainingEnd::Admitted => Ok(TrainAdmitted::of(plan, rows)),
+            TrainingEnd::Refused(refusal) => Err(refusal),
+            TrainingEnd::Stopped(never) => match never {},
+        }
     }
 
     fn decode(&self, bytes: &[u8]) -> Result<SchedulePlan, CandidateRefusal> {
@@ -1068,7 +1581,19 @@ impl Evaluator {
     /// [`NoOutcome::NoneAdmitted`], or [`NoOutcome::NoGain`] when the winner does not beat the
     /// baseline on training.
     pub fn select(&self, proposer: &mut dyn Proposer) -> Result<Selection, NoOutcome> {
-        let (selected, grid) = self.select_noting_grid(proposer);
+        self.select_spread(proposer, &Serial)
+    }
+
+    /// [`Self::select`], each round's distinct candidates trained through `spread` and taken in
+    /// proposal order: the same selection, counts and feedback whatever the spread runs.
+    /// # Errors
+    /// [`Self::select`]'s.
+    pub fn select_spread(
+        &self,
+        proposer: &mut dyn Proposer,
+        spread: &dyn Spread,
+    ) -> Result<Selection, NoOutcome> {
+        let (selected, grid) = self.select_local(proposer, spread);
         if grid {
             let _ = self.grid.set(selected.as_ref().ok().map(GridSelection::of));
         }
@@ -1078,7 +1603,7 @@ impl Evaluator {
     /// Return the grid's selection, running the grid search once per evaluator if needed.
     pub(super) fn grid_selection(&self) -> Option<GridSelection> {
         *self.grid.get_or_init(|| {
-            self.select_noting_grid(&mut GridProposer::new())
+            self.select_local(&mut GridProposer::new(), &Serial)
                 .0
                 .as_ref()
                 .ok()
@@ -1086,76 +1611,299 @@ impl Evaluator {
         })
     }
 
-    fn select_noting_grid(
+    fn select_local(
         &self,
         proposer: &mut dyn Proposer,
+        spread: &dyn Spread,
     ) -> (Result<Selection, NoOutcome>, bool) {
         let budgets = self.policy.budgets();
-        let id = proposer.id();
-        let mut grid = GridProposer::new();
-        let mut is_grid = id == grid.id();
-        let mut stats = SearchStats::default();
-        let mut seen: BTreeSet<Digest> = BTreeSet::new();
-        let mut feedback: Vec<TrainFeedback> = Vec::new();
-        let mut best: Option<(TrainAdmitted, u8, u64)> = None;
+        let mut fold = Fold::new(proposer.id());
         for round in 0..budgets.rounds {
-            stats.rounds = round + 1;
-            let proposed = proposer.propose(round, &feedback);
-            is_grid = is_grid && proposed == grid.propose(round, &feedback);
-            for (index, bytes) in proposed.iter().enumerate() {
-                stats.proposed += 1;
-                if bytes.len() > budgets.proposal_bytes {
-                    stats.oversized += 1;
-                    continue;
+            let proposed = fold.propose(proposer, round);
+            let distinct = fold.distinct(&budgets, &proposed);
+            let trained = spread_map(spread, &distinct, &|d| self.train(d.bytes));
+            for (d, judged) in distinct.iter().zip(trained) {
+                fold.take(
+                    round,
+                    d.index,
+                    d.cid,
+                    judged.map_or_else(Judged::Refused, Judged::Admitted),
+                );
+            }
+        }
+        fold.end(self, Mode::Search)
+    }
+
+    /// A distributed search of `proposer`'s round-0 candidates: the jobs workers run, and the
+    /// claims they return, folded into a selection only by [`Distributed::finish`].
+    pub fn distributed<'a>(
+        &'a self,
+        proposer: &'a mut dyn Proposer,
+        check: CheckLevel,
+    ) -> Distributed<'a> {
+        let budgets = self.policy.budgets();
+        let mut fold = Fold::new(proposer.id());
+        let proposed = if budgets.rounds > 0 {
+            fold.propose(proposer, 0)
+        } else {
+            Vec::new()
+        };
+        let mut jobs = Vec::new();
+        let distinct = fold
+            .distinct(&budgets, &proposed)
+            .into_iter()
+            .map(|d| {
+                let at = self.decode(d.bytes).map(|plan| {
+                    let slot = u32::try_from(jobs.len()).unwrap_or(u32::MAX);
+                    jobs.push(Job { slot, plan });
+                    slot
+                });
+                (d.index, d.cid, at)
+            })
+            .collect();
+        Distributed {
+            claims: jobs.iter().map(|_| None).collect(),
+            ev: self,
+            proposer,
+            check,
+            fold,
+            rounds: budgets.rounds,
+            distinct,
+            jobs,
+        }
+    }
+
+    /// Training ordinal `t` of `plan` judged here and compared with `claim`'s row `t`.
+    fn judge_claimed(
+        &self,
+        plan: SchedulePlan,
+        claim: &Claim,
+        train: &[usize],
+        t: usize,
+    ) -> Result<(usize, Row, Option<CandidateRefusal>), BundleField> {
+        let k = *train.get(t).ok_or(BundleField::Row)?;
+        let (row, refusal) = self.judge(Sched::Plan(plan), k).ok_or(BundleField::Row)?;
+        claim.check(t, &row)?;
+        let claimed_refusal = claim.kind() == ClaimKind::Refused && t + 1 == claim.len();
+        if refusal.is_some() == claimed_refusal {
+            Ok((k, row, refusal))
+        } else {
+            Err(BundleField::Run)
+        }
+    }
+
+    /// Design §11.3's step 5 on `claims`, one per job: every refused claim judged on its
+    /// prefix, the best admitted claim in full, then each other admitted claim until its judged
+    /// rows' `ΣT` exceed the winner's, or in full under [`CheckLevel::All`]. Each slot's verdict,
+    /// or the first contradiction by slot and item; and the (slot, ordinal) pairs judged.
+    fn check_claims(
+        &self,
+        jobs: &[Job],
+        claims: &[Claim],
+        check: CheckLevel,
+        spread: &dyn Spread,
+    ) -> Checked {
+        let train = self.indices(CorpusSplit::Train);
+        let best = jobs
+            .iter()
+            .zip(claims)
+            .filter(|(_, c)| c.kind() == ClaimKind::Admitted)
+            .min_by_key(|(j, c)| {
+                let t = c.totals();
+                (t.ticks, t.wasted, j.plan.encode())
+            })
+            .map(|(j, _)| j.slot);
+        let mut tasks = Vec::new();
+        for (j, c) in jobs.iter().zip(claims) {
+            match c.kind() {
+                ClaimKind::Refused => tasks.push(Task::Prefix(j.slot)),
+                ClaimKind::Admitted if Some(j.slot) == best || check == CheckLevel::All => {
+                    tasks.extend((0..c.len()).map(|t| Task::Item(j.slot, t)));
                 }
-                let cid = candidate_id(bytes);
-                if seen.contains(&cid) {
-                    stats.duplicates += 1;
-                    continue;
+                ClaimKind::Admitted => {}
+            }
+        }
+        let first = spread_map(spread, &tasks, &|task| {
+            self.run_task(*task, jobs, claims, &train, 0)
+        });
+        let mut judged: Vec<(u32, usize)> = first.iter().flat_map(|o| o.judged.clone()).collect();
+        let mut done: Vec<(Task, Result<Done, Contradiction>)> = tasks
+            .into_iter()
+            .zip(first.into_iter().map(|o| o.done))
+            .collect();
+        if let Some(c) = first_contradiction(&done) {
+            return (Err(c), judged);
+        }
+        let mut rows: Vec<Vec<(usize, Row)>> = jobs.iter().map(|_| Vec::new()).collect();
+        let mut refused: Vec<Option<CandidateRefusal>> = jobs.iter().map(|_| None).collect();
+        for (task, out) in done.drain(..) {
+            match (task, out) {
+                (Task::Prefix(slot), Ok(Done::Refused(r))) => {
+                    if let Some(at) = refused.get_mut(index(slot)) {
+                        *at = Some(r);
+                    }
                 }
-                if seen.len() >= budgets.distinct {
-                    stats.over_budget += 1;
-                    continue;
+                (Task::Item(slot, _), Ok(Done::Row(k, row))) => {
+                    if let Some(at) = rows.get_mut(index(slot)) {
+                        at.push((k, row));
+                    }
                 }
-                seen.insert(cid);
-                stats.distinct += 1;
-                match self.train(bytes) {
-                    Ok(t) => {
-                        stats.admitted += 1;
-                        feedback.push(TrainFeedback::admitted(cid, t.totals.ticks));
-                        if best.as_ref().is_none_or(|(b, _, _)| t.key() < b.key()) {
-                            best = Some((t, round, wide(index)));
+                _ => {}
+            }
+        }
+        let winner_ticks = best.and_then(|slot| rows.get(index(slot))).map(|r| {
+            r.iter()
+                .fold(0u64, |t, (_, row)| t.saturating_add(row.ticks))
+        });
+        let mut dominated: Vec<bool> = jobs.iter().map(|_| false).collect();
+        if let (CheckLevel::Dominance, Some(winner)) = (check, winner_ticks) {
+            let rest: Vec<Task> = jobs
+                .iter()
+                .zip(claims)
+                .filter(|(j, c)| c.kind() == ClaimKind::Admitted && Some(j.slot) != best)
+                .map(|(j, _)| Task::Dominate(j.slot))
+                .collect();
+            let second = spread_map(spread, &rest, &|task| {
+                self.run_task(*task, jobs, claims, &train, winner)
+            });
+            judged.extend(second.iter().flat_map(|o| o.judged.clone()));
+            let done: Vec<(Task, Result<Done, Contradiction>)> = rest
+                .into_iter()
+                .zip(second.into_iter().map(|o| o.done))
+                .collect();
+            if let Some(c) = first_contradiction(&done) {
+                return (Err(c), judged);
+            }
+            for (task, out) in done {
+                match (task, out) {
+                    (Task::Dominate(slot), Ok(Done::Dominated)) => {
+                        if let Some(at) = dominated.get_mut(index(slot)) {
+                            *at = true;
                         }
                     }
-                    Err(r) => feedback.push(TrainFeedback::refused(cid, r.law())),
+                    (Task::Dominate(slot), Ok(Done::Rows(all))) => {
+                        if let Some(at) = rows.get_mut(index(slot)) {
+                            *at = all;
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
-        let Some((winner, round, index)) = best else {
-            return (Err(NoOutcome::NoneAdmitted { stats }), is_grid);
+        let verdicts = jobs
+            .iter()
+            .zip(claims)
+            .map(|(j, c)| {
+                let slot = index(j.slot);
+                match (c.kind(), refused.get_mut(slot).and_then(Option::take)) {
+                    (ClaimKind::Refused, Some(r)) => Ok(Judged::Refused(r)),
+                    (ClaimKind::Admitted, None) if dominated.get(slot) == Some(&true) => {
+                        Ok(Judged::Dominated {
+                            ticks: c.totals().ticks,
+                        })
+                    }
+                    (ClaimKind::Admitted, None) => {
+                        let mut r = rows.get_mut(slot).map(core::mem::take).unwrap_or_default();
+                        r.sort_by_key(|&(k, _)| k);
+                        if r.len() == c.len() {
+                            Ok(Judged::Admitted(TrainAdmitted::of(j.plan, r)))
+                        } else {
+                            Err(Contradiction::unjudged(j.slot))
+                        }
+                    }
+                    (ClaimKind::Refused, None) | (ClaimKind::Admitted, Some(_)) => {
+                        Err(Contradiction::unjudged(j.slot))
+                    }
+                }
+            })
+            .collect::<Result<Vec<Judged>, Contradiction>>();
+        (verdicts, judged)
+    }
+
+    /// One task of step 5, `winner` being the winner's local `ΣT` for [`Task::Dominate`].
+    fn run_task(
+        &self,
+        task: Task,
+        jobs: &[Job],
+        claims: &[Claim],
+        train: &[usize],
+        winner: u64,
+    ) -> TaskOut {
+        let slot = match task {
+            Task::Prefix(s) | Task::Item(s, _) | Task::Dominate(s) => s,
         };
-        let train = Compared {
-            candidate: winner.totals,
-            baseline: self.policy.totals(CorpusSplit::Train),
-        };
-        if !train.beats() {
-            let no = NoOutcome::NoGain {
-                plan: winner.plan,
-                train,
-                stats,
+        let (Some(job), Some(claim)) = (jobs.get(index(slot)), claims.get(index(slot))) else {
+            return TaskOut {
+                done: Err(Contradiction::unjudged(slot)),
+                judged: Vec::new(),
             };
-            return (Err(no), is_grid);
-        }
-        let selection = Selection {
-            build: self.build.clone(),
-            winner,
-            proposer: id,
-            round,
-            index,
-            stats,
-            mode: Mode::Search,
         };
-        (Ok(selection), is_grid)
+        let mut judged = Vec::new();
+        let contradicted = |t: usize, field: BundleField, judged: Vec<(u32, usize)>| TaskOut {
+            done: Err(Contradiction {
+                slot,
+                ordinal: t,
+                item: claim_item(self, train, t),
+                field,
+            }),
+            judged,
+        };
+        match task {
+            Task::Prefix(_) => {
+                for t in 0..claim.len() {
+                    judged.push((slot, t));
+                    match self.judge_claimed(job.plan, claim, train, t) {
+                        Err(field) => return contradicted(t, field, judged),
+                        Ok((_, _, Some(r))) => {
+                            return TaskOut {
+                                done: Ok(Done::Refused(r)),
+                                judged,
+                            };
+                        }
+                        Ok((_, _, None)) => {}
+                    }
+                }
+                contradicted(claim.len(), BundleField::Run, judged)
+            }
+            Task::Item(_, t) => {
+                judged.push((slot, t));
+                match self.judge_claimed(job.plan, claim, train, t) {
+                    Ok((k, row, None)) => TaskOut {
+                        done: Ok(Done::Row(k, row)),
+                        judged,
+                    },
+                    Ok((_, _, Some(_))) => contradicted(t, BundleField::Run, judged),
+                    Err(field) => contradicted(t, field, judged),
+                }
+            }
+            Task::Dominate(_) => {
+                let mut order: Vec<usize> = (0..claim.len()).collect();
+                order.sort_by_key(|&t| (core::cmp::Reverse(claim.ticks(t)), t));
+                let mut sum = 0u64;
+                let mut rows = Vec::new();
+                for t in order {
+                    judged.push((slot, t));
+                    match self.judge_claimed(job.plan, claim, train, t) {
+                        Ok((k, row, None)) => {
+                            sum = sum.saturating_add(row.ticks);
+                            rows.push((k, row));
+                            if sum > winner {
+                                return TaskOut {
+                                    done: Ok(Done::Dominated),
+                                    judged,
+                                };
+                            }
+                        }
+                        Ok((_, _, Some(_))) => return contradicted(t, BundleField::Run, judged),
+                        Err(field) => return contradicted(t, field, judged),
+                    }
+                }
+                TaskOut {
+                    done: Ok(Done::Rows(rows)),
+                    judged,
+                }
+            }
+        }
     }
 
     /// The held-out gate: `selection`'s winner on every held-out item, once, then the result.

@@ -311,6 +311,8 @@ pub enum FdKind {
         ino: u64,
         /// Whether the bytes appended since this reader last looked hold a line feed: `None` when nothing was appended, when this is the first look, or when the file is not one the reader may open ([`tail_allowed`]); its growth then counts unverified.
         lf_tail: Option<bool>,
+        /// A dylib a build just wrote ([`fresh_dylib`]): `false` where its change time is unread, and off macOS.
+        fresh_dylib: bool,
     },
     /// A character device; `tty` for a terminal.
     Device {
@@ -414,6 +416,22 @@ impl ProcFacts {
     }
 }
 
+/// How long before a process's start a dylib it holds open may have been written and still read as fresh ([`fresh_dylib`]): a build writes a proc macro, then starts the compiler that loads it.
+pub const FRESH_DYLIB_US: u64 = 3_600_000_000;
+
+/// Whether a descriptor's file at `path`, its data last changed at `mtime_s` (seconds since the epoch), is a dylib a build just wrote for the process that started at `start_us` (µs since the epoch): its name ends `.dylib`, and it changed at most [`FRESH_DYLIB_US`] before that start, or since. macOS checks a program's new code as it loads it, so a started program that holds one open while its CPU stays flat may wait for that check (leftover §5.1's dylib case, U4): a heuristic, never a verdict. `false` with no start read.
+#[must_use]
+pub fn fresh_dylib(path: &[u8], mtime_s: i64, start_us: Option<u64>) -> bool {
+    let (Some(start_us), Ok(mtime_s)) = (start_us, u64::try_from(mtime_s)) else {
+        return false;
+    };
+    path.ends_with(b".dylib")
+        && mtime_s
+            .saturating_mul(1_000_000)
+            .saturating_add(FRESH_DYLIB_US)
+            >= start_us
+}
+
 /// How long since its fork a process whose one thread never ran must have stood before it reads as held at macOS's program check: a normal exec reads its first thread's handle as `0` for under 0.3 ms (M2).
 pub const PROGRAM_CHECK_AGE_MS: u64 = 20_000;
 
@@ -428,19 +446,6 @@ pub enum AtStart {
     Translating,
     /// The same signature on an executable whose volume is not proven local: it has not started, and nothing read says why.
     Unstarted,
-}
-
-impl AtStart {
-    /// The word a reader prints: `started`, `program-check`, `translating` or `not-started`.
-    #[must_use]
-    pub const fn word(self) -> &'static str {
-        match self {
-            Self::Started => "started",
-            Self::Held => "program-check",
-            Self::Translating => "translating",
-            Self::Unstarted => "not-started",
-        }
-    }
 }
 
 /// What [`judge_start`] judges a process's start by, as [`read_start`] reads it.

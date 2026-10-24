@@ -147,6 +147,19 @@ fn vote_token(
 /// token votes, `None` when silent.
 #[inline]
 fn token_vote_hash(tok_chars: &[char], tok: &mut String, folded: &mut String) -> Option<u64> {
+    if tok_chars.iter().all(char::is_ascii) {
+        if tok_chars.len() < 2 {
+            return None;
+        }
+        let mut h = aterm_hash::FNV64_OFFSET;
+        for &c in tok_chars {
+            if !c.is_ascii_alphabetic() {
+                return None;
+            }
+            h = aterm_hash::fnv_mix_u64(h, u64::from(c.to_ascii_lowercase() as u8));
+        }
+        return Some(mix(h));
+    }
     tok.clear();
     tok.extend(tok_chars.iter().copied());
     fold_into(tok, folded);

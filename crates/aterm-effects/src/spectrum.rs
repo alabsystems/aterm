@@ -418,7 +418,7 @@ pub const fn spectrum(t: f32) -> u32 {
 #[must_use]
 #[inline]
 pub const fn spectrum_with_min_saturation(rgb: u32, s_min: f32) -> u32 {
-    if !s_min.is_finite() {
+    if !s_min.is_finite() || s_min <= 0.0 {
         return rgb;
     }
     let (r, g, b) = ((rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff);

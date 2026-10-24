@@ -110,6 +110,14 @@ impl Layout {
         self.state().join("run.lock.guard")
     }
 
+    /// `state/aterm.app-first-run/` (0755): whether the aterm.app the `aterm.app` item
+    /// installed showed it ran ([`crate::first_exec`]); nothing replaces that bundle while its
+    /// hold lasts, and uninstall keeps it until then.
+    #[must_use]
+    pub fn app_first_run(&self) -> PathBuf {
+        self.state().join("aterm.app-first-run")
+    }
+
     /// `state/last_run` (0644): the newest finished run's id.
     #[must_use]
     pub fn last_run(&self) -> PathBuf {
@@ -320,7 +328,8 @@ pub fn remove_tree(sys: &dyn System, path: &Path) -> std::io::Result<()> {
 
 /// [`remove_tree`] of `path`, leaving each of `keep` and the folders that still hold one; a
 /// folder that held one is removed once empty. The [`reclaim`] job may be removing the kept
-/// folders, `stage/` and the root meanwhile, so what is already gone counts as removed.
+/// folders, `stage/`, `state/` and the root meanwhile, so what is already gone counts as
+/// removed.
 /// # Errors
 /// Each path that could not be removed (not the folders left holding it), once everything else
 /// that could be was.
@@ -504,6 +513,7 @@ mod tests {
             {
                 let _ = std::fs::remove_dir_all(&self.held);
                 let _ = std::fs::remove_dir(self.root.join("stage"));
+                let _ = std::fs::remove_dir(self.root.join("state"));
                 let _ = std::fs::remove_dir(&self.root);
             }
         }
@@ -593,6 +603,7 @@ mod tests {
             ".staging/payload/aterm",
             "agent/aterm",
             "stage/upgrade-1-5/payload/aterm",
+            "state/aterm.app-first-run/exec",
             "state/journal",
         ] {
             let file = root.join(file);
@@ -611,6 +622,8 @@ mod tests {
             ("stage/upgrade-1-5", true, When::Removing, "stage"),
             ("stage/upgrade-1-5", false, When::Removed, "state"),
             (".staging", false, When::Removing, "stage"),
+            ("state/aterm.app-first-run", false, When::Listed(1), "state"),
+            ("state/aterm.app-first-run", true, When::Removing, "state"),
         ];
         for (held, gone, when, at) in cases {
             let tmp = aterm_tempfile::tempdir().unwrap();

@@ -953,6 +953,10 @@ impl PaneTextCache {
         program: Option<aterm_phase::Program>,
     ) -> Option<(&str, Option<&str>)> {
         let cached = self.panes.get(leaf_index)?.as_ref()?;
+        let model = self
+            .footers
+            .get(leaf_index)
+            .and_then(|f| f.shown().model.as_deref());
         cached
             .weekly
             .get_or_init(|| {
@@ -962,7 +966,7 @@ impl PaneTextCache {
                     &cached.rows,
                     || match program {
                         Some(aterm_phase::Program::Agy) => {
-                            aterm_phase::agy::usage_card_weekly(&cached.rows)
+                            aterm_phase::agy::usage_card_weekly_for_model(&cached.rows, model)
                         }
                         _ => aterm_phase::muse::usage_card_weekly(&cached.rows),
                     },
@@ -2919,6 +2923,7 @@ fn resolve_facts_at_with_cwd(
         .map(|dirs| (Some(dirs.cwd.clone()), dirs.repo_root.clone()));
     let mut generation = facts.as_ref().and(fold.traffic_generation());
     let mut flight_generation = facts.as_ref().and(fold.flight_generation());
+    let mut non_claude_excerpts: Option<(aterm_agent::harness::excerpt::Excerpts, u64)> = None;
     if facts.is_none() {
         let (non_registry_prog, prev_sub, prev_ctx, prev_card_model) = {
             let held = timeline.lock().unwrap_or_else(|p| p.into_inner());
@@ -2953,15 +2958,34 @@ fn resolve_facts_at_with_cwd(
             generation = None;
             flight_generation = None;
             let args = (asks.args)(identity.pid);
+            identity.login = login_of_args(args.as_ref());
+            identity.task = args
+                .as_ref()
+                .and_then(|a| crate::survey::task_prompt_of_env(&a.env));
             let launch = args
                 .as_ref()
                 .map(|a| footer::launch_facts_of(&a.argv, &a.env))
                 .unwrap_or_default();
-            let model = launch
+            let launch_model = launch
                 .model
                 .as_deref()
                 .and_then(footer::footer_model_name)
                 .or(launch.model);
+            let (model, effort, model_open, effort_open) =
+                match (prog, args.as_ref(), home.as_deref()) {
+                    (aterm_phase::Program::Agy, Some(args), Some(home)) => {
+                        aterm_agent::harness::profile::agy_model_effort_for(
+                            &args.argv, &args.env, home,
+                        )
+                    }
+                    (aterm_phase::Program::Muse, Some(args), Some(home)) => {
+                        aterm_agent::harness::profile::muse_model_effort_for(
+                            &args.argv, &args.env, home,
+                        )
+                    }
+                    _ => (launch_model.clone(), None, launch_model.is_none(), true),
+                };
+            let model = model.or(launch_model);
             let mut sub = prev_sub;
             if matches!(prog, aterm_phase::Program::Muse | aterm_phase::Program::Agy)
                 && muse_weekly_expired(
@@ -2971,35 +2995,60 @@ fn resolve_facts_at_with_cwd(
             {
                 sub.weekly = None;
             }
+            let mut resume = None;
             if prog == aterm_phase::Program::Muse
                 && let (Some(args), Some(home)) = (args.as_ref(), home.as_deref())
-                && let Some(read) = aterm_agent::harness::profile::muse_subscription_for(
-                    &args.argv, &args.env, home,
-                )
             {
-                match sub.email.as_deref() {
-                    Some(previous) if read.email.as_deref() != Some(previous) => sub = read,
-                    _ => sub.email = read.email,
+                if let Some(read) = aterm_agent::harness::profile::muse_subscription_for(
+                    &args.argv, &args.env, home,
+                ) {
+                    match sub.email.as_deref() {
+                        Some(previous) if read.email.as_deref() != Some(previous) => sub = read,
+                        _ => sub.email = read.email,
+                    }
                 }
+                let muse_pid = u32::try_from(identity.pid).unwrap_or(0);
+                resume = aterm_agent::harness::profile::muse_resume_for(
+                    muse_pid, &args.argv, &args.env, home,
+                );
+                non_claude_excerpts = aterm_agent::harness::profile::muse_excerpts_for(
+                    muse_pid, &args.argv, &args.env, home,
+                );
             }
             if prog == aterm_phase::Program::Agy
                 && let (Some(args), Some(home)) = (args.as_ref(), home.as_deref())
-                && let Some(read) = aterm_agent::harness::profile::agy_subscription_for(
+            {
+                if let Some(read) = aterm_agent::harness::profile::agy_subscription_for(
                     &args.argv,
                     &args.env,
                     home,
                     &sub,
-                    model.as_deref().or(prev_card_model.as_deref()),
+                    prev_card_model.as_deref().or(model.as_deref()),
                     clock.now,
-                )
-            {
-                sub = read;
+                ) {
+                    sub = read;
+                }
+                let agy_pid = u32::try_from(identity.pid).unwrap_or(0);
+                resume = aterm_agent::harness::profile::agy_resume_for(
+                    agy_pid,
+                    &args.argv,
+                    &args.env,
+                    home,
+                    cwd.as_deref(),
+                );
+                non_claude_excerpts = aterm_agent::harness::profile::agy_excerpts_for(
+                    agy_pid,
+                    &args.argv,
+                    &args.env,
+                    home,
+                    cwd.as_deref(),
+                );
             }
             facts = Some(FooterFacts {
-                model_open: model.is_none(),
+                model_open,
                 model,
-                effort: None,
-                effort_open: true,
+                effort,
+                effort_open,
                 effort_for: None,
                 path: cwd
                     .as_deref()
@@ -3007,7 +3056,7 @@ fn resolve_facts_at_with_cwd(
                 branch,
                 repo_read_denied,
                 version: None,
-                resume: None,
+                resume,
                 usage: None,
                 owner: Some(footer::FactsOwner {
                     floor: started,
@@ -3085,11 +3134,25 @@ fn resolve_facts_at_with_cwd(
         facts.plan = plan;
     }
     let denied = facts.as_ref().and_then(|f| f.repo_read_denied.clone());
-    let excerpts = facts.as_ref().map(|_| crate::survey::ClaudeExcerpts {
-        excerpts: tail.excerpts().cloned().unwrap_or_default(),
-        task: identity.task.clone(),
-        transcript_len: tail.transcript_len(),
-    });
+    let excerpts = facts
+        .as_ref()
+        .filter(|_| {
+            is_claude
+                || tail.excerpts().is_some()
+                || non_claude_excerpts.is_some()
+                || identity.task.is_some()
+        })
+        .map(|_| crate::survey::ClaudeExcerpts {
+            excerpts: tail
+                .excerpts()
+                .cloned()
+                .or_else(|| non_claude_excerpts.as_ref().map(|(e, _)| e.clone()))
+                .unwrap_or_default(),
+            task: identity.task.clone(),
+            transcript_len: tail
+                .transcript_len()
+                .or_else(|| non_claude_excerpts.as_ref().map(|(_, len)| *len)),
+        });
     let side = facts.as_ref().map(|_| {
         let held = timeline
             .lock()
@@ -5025,22 +5088,30 @@ impl App {
                         let screen_acct = want_acct
                             .then(|| texts.screen_account(leaf_index, agent))
                             .flatten();
-                        let stale_muse_cards = agent == Some(aterm_phase::Program::Muse)
-                            && screen_acct.is_some_and(|(email, _)| {
-                                shown
-                                    .subscription
-                                    .as_ref()
-                                    .and_then(|sub| sub.email.as_deref())
-                                    .is_some_and(|current| current != email)
-                            });
+                        let stale_muse_cards = matches!(
+                            agent,
+                            Some(aterm_phase::Program::Muse | aterm_phase::Program::Agy)
+                        ) && screen_acct.is_some_and(|(email, _)| {
+                            shown
+                                .subscription
+                                .as_ref()
+                                .and_then(|sub| sub.email.as_deref())
+                                .is_some_and(|current| current != email)
+                        });
                         let screen_acct = (!stale_muse_cards).then_some(screen_acct).flatten();
+                        let has_live_agy_figure = agent == Some(aterm_phase::Program::Agy)
+                            && shown
+                                .subscription
+                                .as_ref()
+                                .and_then(|sub| sub.weekly_figure)
+                                .is_some();
                         let screen_weekly = (matches!(
                             agent,
                             Some(aterm_phase::Program::Muse | aterm_phase::Program::Agy)
                         ) && want_acct
+                            && !has_live_agy_figure
                             && !stale_muse_cards
-                            && (agent != Some(aterm_phase::Program::Muse)
-                                || !muse_cards_need_account))
+                            && !muse_cards_need_account)
                             .then(|| texts.usage_weekly(leaf_index, agent))
                             .flatten()
                             .map(|reading| {
@@ -5274,7 +5345,8 @@ impl App {
                     if matches!(
                         prog,
                         aterm_phase::Program::Claude | aterm_phase::Program::Agy
-                    ) && !agy_switch_off
+                    ) && (prog == aterm_phase::Program::Claude || harness_on)
+                        && !agy_switch_off
                         && let Some(palette) = theme
                         && self.config.claude_footer_agents()
                         && let Some((_, bottom)) = readings.reach.and_then(|r| r.rules())
@@ -7770,6 +7842,15 @@ fn render_agy_subagent_transcript_row(
             "Messaged ",
             "Messaging ",
             "Killed ",
+            "Killing ",
+            "Defined ",
+            "Defining ",
+            "Listed ",
+            "Listing ",
+            "Invoked ",
+            "Invoking ",
+            "Sent message to ",
+            "Sending message to ",
         ]
         .iter()
         .any(|v| core.starts_with(v))
@@ -7971,8 +8052,9 @@ fn render_agy_panel_item_row(
         let agent_tok = &rest[..=close];
         let unwrapped = aterm_phase::agy::unwrap_agent_token(agent_tok).unwrap_or(agent_tok);
         // Column 4..4+unwrapped.chars().count() matches `agents_panel::agy_agent_row`'s `name`
-        // span so `claude_panel::make_look` paints its animated rainbow `InkCell`s on the exact
-        // same characters.
+        // span, and `claude_panel::make_look` leaves `agy_agent` name cells untouched so this
+        // full-spectrum bold rainbow in `scratch.cells` is preserved while `claude_panel`
+        // animates the status dot at column 2.
         push_rainbow_text(
             unwrapped,
             (panel_idx as f32) * 0.23,
@@ -7990,14 +8072,23 @@ fn render_agy_panel_item_row(
                         out.push(blank);
                     }
                 }
-                let is_passive = matches!(clean_act, "Idle" | "Processing");
-                let act_fg = if is_passive { inks.quiet } else { inks.quote };
+                let is_passive = aterm_phase::agy::is_subagent_idle_state(clean_act)
+                    || clean_act == "Processing";
+                let is_approval = aterm_phase::agy::is_subagent_approval_state(clean_act);
+                let act_fg = if is_approval {
+                    inks.h1
+                } else if is_passive {
+                    inks.quiet
+                } else {
+                    inks.quote
+                };
                 let human_act = humanize_agy_subagent_phrase(clean_act);
                 for ch in human_act.chars() {
                     if out.len() < max_cols {
                         out.push(RenderCell {
                             ch,
                             fg: act_fg,
+                            bold: is_approval,
                             ..blank
                         });
                     }
@@ -8890,7 +8981,11 @@ mod tests {
             let bare = switch_cell('\u{25d0}', SwitchInk::Turning, turning, None, blank, accent);
             let k = contrast(bare.fg, blank.bg);
             assert!(k >= 4.5, "{name}: the bare settling switch at {k:.2}:1");
-            for palette in [CardPalette::Cruise, CardPalette::Land, CardPalette::Off] {
+            for palette in [
+                aterm_effects::harness_card::CardPalette::Cruise,
+                aterm_effects::harness_card::CardPalette::Land,
+                aterm_effects::harness_card::CardPalette::Off,
+            ] {
                 for stop in 0..255u8 {
                     let t = f32::from(stop) / 255.0;
                     let settling = switch_cell(
@@ -14725,7 +14820,7 @@ mod tests {
 
         // Verify rainbow spectrum ink (bold, distinct hues, >= 4.5:1 contrast) on subagent names.
         let name_range = panel_read.panel.rows()[0].name.range();
-        let name_cells = &scratch.cells[7][name_range];
+        let name_cells = &scratch.cells[7][name_range.clone()];
         let mut distinct_fgs = std::collections::HashSet::new();
         for c in name_cells.iter().filter(|c| c.ch != ' ') {
             assert!(c.bold, "subagent name cell {:?} should be bold", c.ch);
@@ -14741,6 +14836,67 @@ mod tests {
             distinct_fgs.len() >= 4,
             "subagent name should span multiple rainbow spectrum stops, got {distinct_fgs:?}"
         );
+
+        // Verify `claude_panel` derives in-flight tool states (`DotState::Tool`) for agy subagents
+        // past `QUIET_MS` and emits dot `InkCell` + `RainHalo` without overwriting the rainbow
+        // name cells in `scratch.cells`.
+        assert!(panel_read.agy_agent[0] && panel_read.agy_agent[1]);
+        let mut track = aterm_agent::harness::agents::PanelTrack::default();
+        track.fold_flown(
+            &panel_read.panel,
+            &[aterm_agent::harness::agents::Tint::Plain; aterm_phase::agents_panel::PANEL_ROWS_MAX],
+            &panel_read.agy_flights,
+            0,
+        );
+        let mut rows_25s = rows.clone();
+        rows_25s[7] =
+            "  ● Agent(self: Codebase Researcher)  Reading file \u{00B7} 5m01s".to_owned();
+        rows_25s[8] = "  ● Agent(research: Docs Finder)  Searching web \u{00B7} 33s".to_owned();
+        let panel_read_25s =
+            crate::claude_panel::read_panel(1, &rows_25s, 6, &scratch, pane_geom, blank)
+                .expect("agy panel after 25s");
+        track.fold_flown(
+            &panel_read_25s.panel,
+            &[aterm_agent::harness::agents::Tint::Plain; aterm_phase::agents_panel::PANEL_ROWS_MAX],
+            &panel_read_25s.agy_flights,
+            25_000,
+        );
+        assert_eq!(
+            track.dots()[0].state,
+            aterm_agent::harness::agents::DotState::Tool,
+            "agy tool subagent stays in DotState::Tool (sat=1.0) past QUIET_MS instead of fading to Quiet"
+        );
+        assert_eq!(track.dots()[0].sat, 1.0);
+        assert_eq!(
+            track.dots()[0].waits.as_ref().map(|w| w.tool.as_str()),
+            Some("Reading file")
+        );
+        for palette in [
+            aterm_effects::harness_card::CardPalette::Cruise,
+            aterm_effects::harness_card::CardPalette::Land,
+            aterm_effects::harness_card::CardPalette::Off,
+        ] {
+            let (ink, halo) = crate::claude_panel::look_for_test(
+                &panel_read_25s,
+                &track,
+                palette,
+                pane_geom,
+                blank,
+            );
+            assert!(
+                ink.iter().any(|c| c.row == 7 && c.col == 2),
+                "bullet dot at col 2 is inked under {palette:?}"
+            );
+            assert!(
+                !ink.iter()
+                    .any(|c| c.row == 7 && name_range.contains(&usize::from(c.col))),
+                "make_look must not emit InkCells over agy rainbow name columns under {palette:?}: {ink:?}"
+            );
+            assert!(
+                halo.iter().any(|h| h.row == 7),
+                "subagent bullet dot emits halo light quads under {palette:?}"
+            );
+        }
 
         // Verify `undo` restores all original cells cleanly.
         assert!(undo(&mut undo_slot, &mut scratch));
@@ -14796,5 +14952,200 @@ mod tests {
             expired_reset,
             Some(("2026-10-29 09:31 PDT", Some(reset_unix)))
         );
+    }
+
+    #[test]
+    fn agy_resolver_populates_model_effort_from_settings_and_gates_excerpts_on_task() {
+        const PID: i32 = 4299;
+        thread_local! {
+            static HOME_DIR: std::cell::RefCell<PathBuf> = const { std::cell::RefCell::new(PathBuf::new()) };
+            static PROC_ENV: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        fn test_home() -> Option<PathBuf> {
+            Some(HOME_DIR.with(|h| h.borrow().clone()))
+        }
+        fn test_args(_: i32) -> Option<atpkg::caller_shell::ProcArgs> {
+            Some(atpkg::caller_shell::ProcArgs {
+                argv: vec!["agy".to_owned()],
+                env: PROC_ENV.with(|e| e.borrow().clone()),
+                ..Default::default()
+            })
+        }
+
+        let (root, _) = claude_home("agy-footer-model", PID, 1_790_607_848);
+        let home = root.join("home");
+        let cfg = home.join(".gemini/antigravity-cli");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(
+            cfg.join("settings.json"),
+            br#"{"model":"Gemini 4 Argon (High)"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cfg.join("cli.log"),
+            b"I1023 17:50:20.000000 1 server_oauth.go:224] applyAuthResult: email=dev@example.com, authMethod=consumer\n",
+        )
+        .unwrap();
+        HOME_DIR.with(|h| *h.borrow_mut() = home.clone());
+
+        let run_with_env = |extra_env: Option<&str>| {
+            let mut env = vec![
+                format!("HOME={}", home.display()),
+                format!("AGY_CLI_CONFIG_DIR={}", cfg.display()),
+            ];
+            if let Some(extra) = extra_env {
+                env.push(extra.to_owned());
+            }
+            PROC_ENV.with(|e| *e.borrow_mut() = env);
+
+            let timeline = Arc::new(Mutex::new(SessionTimeline::default()));
+            {
+                let mut held = timeline.lock().unwrap();
+                held.note_foreground_group(PID);
+                held.set_program(PID, Some("agy".to_owned()));
+            }
+            let mut identity = unread(PID, &home.join("no-claude"));
+            identity.dir = None;
+            resolve_facts_at_with_cwd(
+                &timeline,
+                &mut identity,
+                &mut footer::TailCache::default(),
+                &mut footer::FooterCache::default(),
+                &mut RosterMemo::default(),
+                (
+                    Asks {
+                        tap: NO_TAP,
+                        args: test_args,
+                        roster: || None,
+                        home: test_home,
+                        stored_login: |_, _, _| false,
+                    },
+                    |_| None,
+                ),
+                &footer::ReadClock {
+                    read_at: std::time::UNIX_EPOCH,
+                    now: 1_792_000_000,
+                    offset_at: &|_, _| Some(0),
+                },
+            );
+            let held = timeline.lock().unwrap();
+            (held.claude_footer_shown(), held.claude_excerpts().cloned())
+        };
+
+        let (shown, excerpts) = run_with_env(None);
+        let shown = shown.expect("agy footer facts");
+        assert_eq!(shown.model.as_deref(), Some("Gemini 4 Argon"));
+        assert_eq!(shown.effort.as_deref(), Some("high"));
+        assert_eq!(
+            shown.subscription.as_ref().and_then(|s| s.email.as_deref()),
+            Some("dev@example.com")
+        );
+        assert!(
+            excerpts.is_none(),
+            "interactive agy session without transcript or task leaves excerpts None so survey falls back to screen rows"
+        );
+
+        let tasks_dir = crate::task_record::tasks_dir().expect("tasks_dir");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        let task_file = tasks_dir.join(format!("test-agy-footer-{}.task", std::process::id()));
+        std::fs::write(&task_file, b"fix the footer\n").unwrap();
+        let task_env = format!("{}={}", crate::survey::TASK_FILE_ENV, task_file.display());
+        let (_, tasked_excerpts) = run_with_env(Some(&task_env));
+        let _ = std::fs::remove_file(&task_file);
+        assert_eq!(
+            tasked_excerpts.and_then(|e| e.task),
+            Some("fix the footer".to_owned())
+        );
+
+        let cid = "dfaaf1c5-98ff-4412-9226-76412af952a5";
+        let logs_dir = cfg.join("brain").join(cid).join(".system_generated/logs");
+        std::fs::create_dir_all(&logs_dir).unwrap();
+        let transcript_bytes = br#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"<USER_REQUEST>\npopulate agy survey\n</USER_REQUEST>"}
+{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"Populated agy survey excerpts.","tool_calls":[{"name":"run_command","args":{}}]}
+"#;
+        std::fs::write(logs_dir.join("transcript.jsonl"), transcript_bytes).unwrap();
+        std::fs::write(
+            cfg.join("history.jsonl"),
+            format!(
+                r#"{{"display":"populate agy survey","timestamp":1,"workspace":"{}","conversationId":"{cid}"}}"#,
+                home.display()
+            ),
+        )
+        .unwrap();
+        let (resumed_shown, transcript_excerpts) = run_with_env(None);
+        let resumed_shown = resumed_shown.expect("agy footer facts with transcript");
+        assert!(
+            resumed_shown
+                .resume
+                .as_deref()
+                .is_some_and(|r| r.ends_with(&format!("agy --conversation={cid}"))),
+            "expected agy resume line, got {:?}",
+            resumed_shown.resume
+        );
+        let transcript_excerpts = transcript_excerpts.expect("agy transcript excerpts");
+        assert_eq!(
+            transcript_excerpts.transcript_len,
+            Some(transcript_bytes.len() as u64)
+        );
+        assert_eq!(
+            transcript_excerpts.excerpts.prompts[0].text,
+            "populate agy survey"
+        );
+        assert_eq!(
+            transcript_excerpts.excerpts.said.as_deref(),
+            Some("Populated agy survey excerpts.")
+        );
+        assert_eq!(
+            transcript_excerpts.excerpts.doing.as_deref(),
+            Some("run_command")
+        );
+
+        let mut switch_tl = SessionTimeline::default();
+        switch_tl.note_foreground_group(PID);
+        switch_tl.set_program(PID, Some("agy".to_owned()));
+        let mut first_facts = resumed_shown.clone();
+        first_facts.subscription = Some(aterm_agent::harness::profile::SubscriptionDisplay {
+            email: Some("dev@example.com".to_owned()),
+            weekly: Some("weekly 78% left".to_owned()),
+            weekly_figure: None,
+            ..Default::default()
+        });
+        assert!(switch_tl.set_claude_footer(PID, None, Some(first_facts.clone())));
+        assert!(!switch_tl.muse_cards_need_account());
+
+        let mut switched_anon = first_facts.clone();
+        switched_anon.subscription.as_mut().unwrap().email = Some("second@example.com".to_owned());
+        assert!(switch_tl.set_claude_footer(PID, None, Some(switched_anon)));
+        assert!(switch_tl.muse_cards_need_account());
+        assert_eq!(
+            switch_tl
+                .claude_footer()
+                .and_then(|f| f.subscription.as_ref()?.weekly.as_deref()),
+            None,
+            "anonymous screen weekly from the previous agy account is cleared on switch"
+        );
+
+        let fig = aterm_agent::harness::profile::parse_agy_usage_json(
+            br#"{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{"name":"Gemini Models","buckets":[{"id":"gemini-weekly","name":"Weekly Limit Remaining","window":"weekly","remaining_fraction":0.91,"reset_time":"2026-10-29T16:31:22Z"}]}]}}}"#,
+            false,
+            1_792_000_000,
+        )
+        .expect("live figure");
+        let mut switched_live = first_facts;
+        switched_live.subscription = Some(aterm_agent::harness::profile::SubscriptionDisplay {
+            email: Some("second@example.com".to_owned()),
+            weekly: fig.words(1_792_000_000),
+            weekly_figure: Some(fig),
+            ..Default::default()
+        });
+        assert!(switch_tl.set_claude_footer(PID, None, Some(switched_live)));
+        assert_eq!(
+            switch_tl
+                .claude_footer()
+                .and_then(|f| f.subscription.as_ref()?.weekly.as_deref()),
+            Some("weekly 91% left"),
+            "live WeeklyFigure for the new agy account is preserved after switch"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

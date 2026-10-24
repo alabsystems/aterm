@@ -43,6 +43,13 @@ pub const fn web_typed_class(ch: char) -> TypedClass {
     match ch {
         ' ' => TypedClass::Space,
         '!' => TypedClass::Bang,
+        c if c.is_ascii() => {
+            if c.is_ascii_uppercase() {
+                TypedClass::Capital
+            } else {
+                TypedClass::Glyph
+            }
+        }
         c if c.is_uppercase() => TypedClass::Capital,
         _ => TypedClass::Glyph,
     }
@@ -563,11 +570,17 @@ impl EffectsPipeline {
         _input: &RenderInput,
         ch: char,
     ) -> bool {
-        let ctrl = ch.is_control();
+        let ctrl = if ch.is_ascii() {
+            ch.is_ascii_control()
+        } else {
+            ch.is_control()
+        };
         if !ctrl {
             self.note_console_input(PetInputKind::Text);
         }
-        let width = if term.modes().ambiguous_width_double {
+        let width = if ch.is_ascii() {
+            usize::from(!ctrl)
+        } else if term.modes().ambiguous_width_double {
             aterm_grapheme::char_width_cjk(ch)
         } else {
             aterm_grapheme::char_width(ch)
@@ -584,7 +597,7 @@ impl EffectsPipeline {
             rain.note_keystroke();
         }
         let class = web_typed_class(ch);
-        let shifted = ch.is_uppercase()
+        let shifted = class == TypedClass::Capital
             || (ch.is_ascii() && WEB_SHIFTED_SYMBOLS.as_bytes().contains(&(ch as u8)));
         self.cursor
             .glow

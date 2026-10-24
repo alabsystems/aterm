@@ -2395,7 +2395,8 @@ pub fn sweep_words(why: atpkg::build_cache::Unused) -> String {
         }
         Unused::Tooling { idle, after } => format!(
             "a pinned tool of the tooling cache nothing ran for {} (the sweep takes \
-             one unused {}); `targo --unverified verify provision` lays it again",
+             one unused {}); `targo --unverified verify provision` lays it again (`--linux` \
+             for the Linux lane's rows, `--record` for wasm-bindgen)",
             span(idle),
             span(after)
         ),

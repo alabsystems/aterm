@@ -4165,7 +4165,7 @@ fn run_to_exit_keeping_heads<F: FnOnce(u32)>(argv: &[&str], on_spawn: F) -> Devt
     }
 }
 
-/// Change the debugger rule the owner's way.
+/// Change the debugger rule for a yes: the owner's in aterm's alert, or System State's standing yes.
 pub fn run_devtools_change<F: FnOnce(DevtoolsChild)>(
     change: DebuggerChange,
     gate: ProbeGate,

@@ -1069,3 +1069,64 @@ fn machine_words_are_the_first_cpu_model_and_the_os_pretty_name() {
         crate::MachineWords::default()
     );
 }
+
+/// A clipped protocol table cannot supply a machine total, even when all rows
+/// before its cap parse. Exact-cap EOF is complete; one further valid row is not.
+#[test]
+fn clipped_tcp_tables_cannot_supply_a_complete_count() {
+    const HEADER: &str =
+        "sl local_address rem_address st tx_queue:rx_queue tr retrnsmt uid timeout inode\n";
+    const V4: &str =
+        "0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 42\n";
+    const V6: &str = "0: 00000000000000000000000001000000:1F90 00000000000000000000000000000000:0000 01 00000000:00000000 00:00000000 00000000 1000 0 43\n";
+    let v4 = format!("{HEADER}{V4}");
+    let v6 = format!("{HEADER}{V6}");
+    let root = tree(&[("proc/net/tcp", &v4), ("proc/net/tcp6", &v6)]);
+    let mut scratch = Vec::new();
+    let expected = crate::TcpCounts {
+        established: 1,
+        listen: 1,
+        ..crate::TcpCounts::default()
+    };
+    assert_eq!(
+        linux::tcp_counts_under_into(root.path(), &mut scratch),
+        Some(expected)
+    );
+
+    // Use the actual reader's buffer size, filling it with complete valid rows
+    // and then blank lines so a row never straddles the cap in this control.
+    let cap = scratch.len();
+    let capped = |row: &str| {
+        let n = (cap - HEADER.len()) / row.len();
+        let mut text = format!("{HEADER}{}", row.repeat(n));
+        text.extend(std::iter::repeat_n('\n', cap - text.len()));
+        (text, u32::try_from(n).expect("bounded fixture count"))
+    };
+    let (mut full_v4, listens) = capped(V4);
+    write(root.path(), "proc/net/tcp", &full_v4);
+    assert_eq!(
+        linux::tcp_counts_under_into(root.path(), &mut scratch),
+        Some(crate::TcpCounts {
+            listen: listens,
+            ..expected
+        }),
+        "EOF exactly at the cap still counts every complete row"
+    );
+    full_v4.push_str(V4);
+    write(root.path(), "proc/net/tcp", &full_v4);
+    assert_eq!(
+        linux::tcp_counts_under_into(root.path(), &mut scratch),
+        None,
+        "an unread valid IPv4 row must not become an exact total"
+    );
+
+    write(root.path(), "proc/net/tcp", &v4);
+    let (mut full_v6, _) = capped(V6);
+    full_v6.push_str(V6);
+    write(root.path(), "proc/net/tcp6", &full_v6);
+    assert_eq!(
+        linux::tcp_counts_under_into(root.path(), &mut scratch),
+        None,
+        "a complete IPv4 table cannot conceal clipped IPv6"
+    );
+}

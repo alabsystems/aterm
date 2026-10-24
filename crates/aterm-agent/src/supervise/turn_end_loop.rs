@@ -22,7 +22,7 @@ use crate::harness::upgrade_drive::HAND_RENEW;
 use crate::harness::usage::{
     PanelRead, PanelWindow, USAGE_COMMAND, panel_sample, usage_panel_read,
 };
-use aterm_types::control_verbs::ScreenGen;
+use aterm_types::control_verbs::{ScreenGen, TURN_SUBMIT_BUSY_REPLY};
 
 /// Usage-tap state and timing at a single wall ([`Session::tap_reset`]).
 #[derive(Debug, Clone)]
@@ -2812,7 +2812,8 @@ impl<C: Ctl> Session<'_, C> {
 
     /// Type and submit `text` using the server's guarded `turn` verb: how far it went
     /// ([`Written::Left`] where the server typed it and its Enter did not go: the guard skipped
-    /// it, a hold landed before it, or the sink took none of it).
+    /// it, a hold landed before it, or the sink took none of the first one:
+    /// [`TURN_SUBMIT_BUSY_REPLY`]).
     fn type_guarded(
         &mut self,
         point: &Turn,
@@ -2851,10 +2852,11 @@ impl<C: Ctl> Session<'_, C> {
             )));
         }
         let why = one_line(r.err_text());
-        if r.is_err("busy sink") {
-            // `turn` answers this only from its guarded Enter, after the paste and a guard that
-            // matched it: the text stands in the composer unsent, as a fenced write's refused
-            // Enter leaves it.
+        if (!r.ok() && r.err_text().starts_with(TURN_SUBMIT_BUSY_REPLY)) || r.is_err("busy sink") {
+            // `turn` answers this only from its first guarded Enter, after the paste and a guard
+            // that matched it: the text stands in the composer unsent, as a fenced write's
+            // refused Enter leaves it. An aterm before it had this reply answers `ERR busy sink`
+            // from any guarded Enter, a re-press included, so there an earlier Enter may have gone.
             review.note(&format!(
                 "SKIPPED seq={seq} rule={rule} not submitted: {why}"
             ));

@@ -1680,6 +1680,8 @@ pub(crate) mod tests {
                     actor: aterm_slog::Actor::Ctl,
                     cause: None,
                     mark: None,
+                    witness: None,
+                    refused: &|| None,
                 },
             )
         };

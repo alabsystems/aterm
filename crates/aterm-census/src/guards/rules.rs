@@ -82,101 +82,80 @@ pub(super) fn test_path(rel: &str) -> bool {
     })
 }
 
-/// Top-level out-of-line modules declared under a test-only `cfg` (`#[cfg(test)] mod rig;`) and their directories.
+/// Top-level out-of-line modules declared under a test-only `cfg` (`#[cfg(test)] mod rig;`), every file such a module loads in turn (`#[path = "x_more_tests.rs"] mod more;` in it), and their directories.
 fn declared_test_modules(corpus: &Corpus, prefixes: &[&str]) -> Vec<String> {
     let mut out = Vec::new();
+    let push = |out: &mut Vec<String>, file: String| {
+        let own = file
+            .strip_suffix("/mod.rs")
+            .or_else(|| file.strip_suffix(".rs"))
+            .unwrap_or(&file)
+            .to_string();
+        out.push(format!("{own}/"));
+        out.push(file);
+    };
     for parent in corpus.under(prefixes) {
-        if !parent.mentions(&["mod "]) {
+        if !parent.mentions(&["mod"]) {
             continue;
         }
-        let shipped: std::collections::BTreeSet<usize> =
-            parent.shipped_lines().map(|l| l.no).collect();
-        let lines: Vec<Line<'_>> = parent.lines().collect();
-        for (at, line) in lines.iter().enumerate() {
-            if shipped.contains(&line.no) || line.code.starts_with([' ', '\t']) {
+        for load in parent.loads().into_iter().filter(|l| l.gated && l.top) {
+            if let Some(file) = load.files.into_iter().find(|f| corpus.get(f).is_some()) {
+                push(&mut out, file);
+            }
+        }
+    }
+    loop {
+        let before = out.len();
+        for parent in corpus.under(prefixes) {
+            if !in_declared(&out, &parent.rel) || !parent.mentions(&["mod", "include"]) {
                 continue;
             }
-            let Some(name) = out_of_line_mod(line.code) else {
-                continue;
-            };
-            let attrs = lines[..at]
-                .iter()
-                .rev()
-                .take_while(|l| l.code.trim_start().starts_with("#["));
-            let path = attrs.filter_map(|l| path_attr(l.text)).next();
-            if let Some(file) = module_file(corpus, &parent.rel, name, path) {
-                let own = file
-                    .strip_suffix("/mod.rs")
-                    .or_else(|| file.strip_suffix(".rs"))
-                    .unwrap_or(&file);
-                out.push(format!("{own}/"));
-                out.push(file);
+            for load in parent.loads() {
+                if let Some(file) = load.files.into_iter().find(|f| corpus.get(f).is_some())
+                    && !in_declared(&out, &file)
+                {
+                    push(&mut out, file);
+                }
             }
         }
-    }
-    out
-}
-
-/// The module a body-less `mod` item declares (`pub(crate) mod rig;` gives `rig`), when `code` is one.
-fn out_of_line_mod(code: &str) -> Option<&str> {
-    let mut rest = code.trim();
-    if let Some(after) = rest.strip_prefix("pub") {
-        rest = after.trim_start();
-        if rest.starts_with('(') {
-            rest = rest.split_once(')')?.1.trim_start();
+        if out.len() == before {
+            return out;
         }
     }
-    let name = rest
-        .strip_prefix("mod ")?
-        .trim_start()
-        .strip_suffix(';')?
-        .trim_end();
-    (!name.is_empty() && name.bytes().all(is_word)).then_some(name)
 }
 
-/// The path a `#[path = "…"]` attribute line names (the TEXT view keeps it).
-fn path_attr(text: &str) -> Option<&str> {
-    let rest = text
-        .trim()
-        .strip_prefix("#[path")?
-        .trim_start()
-        .strip_prefix('=')?;
-    rest.trim_start()
-        .strip_prefix('"')?
-        .split_once('"')
-        .map(|(p, _)| p)
+/// Which files under some prefixes are test code, and which ship whatever their names or their parents say.
+pub(super) struct TestCode {
+    /// [`declared_test_modules`].
+    declared: Vec<String>,
+    /// What a shipped line of a shipped file loads ([`Corpus::shipped_loads`]).
+    shipped: std::collections::BTreeSet<String>,
 }
 
-/// Resolves the corpus file that `mod name;` in `parent` loads.
-fn module_file(corpus: &Corpus, parent: &str, name: &str, path: Option<&str>) -> Option<String> {
-    let (dir, file) = parent.rsplit_once('/')?;
-    let candidates = match path {
-        Some(path) => vec![normal_path(&format!("{dir}/{path}"))?],
-        None => {
-            let base = if matches!(file, "lib.rs" | "main.rs" | "mod.rs") {
-                dir.to_string()
-            } else {
-                format!("{dir}/{}", file.strip_suffix(".rs")?)
-            };
-            vec![format!("{base}/{name}.rs"), format!("{base}/{name}/mod.rs")]
-        }
-    };
-    candidates.into_iter().find(|c| corpus.get(c).is_some())
-}
-
-/// `rel` with its `.` and `..` segments resolved; `None` when `..` climbs out.
-fn normal_path(rel: &str) -> Option<String> {
-    let mut parts: Vec<&str> = Vec::new();
-    for part in rel.split('/') {
-        match part {
-            "" | "." => {}
-            ".." => {
-                parts.pop()?;
-            }
-            _ => parts.push(part),
-        }
+impl TestCode {
+    pub(super) fn read(corpus: &Corpus, prefixes: &[&str]) -> Self {
+        let declared = declared_test_modules(corpus, prefixes);
+        let named = |rel: &str| in_declared(&declared, rel);
+        let shipped = corpus.shipped_loads(prefixes, &named);
+        Self { declared, shipped }
     }
-    Some(parts.join("/"))
+
+    /// Is `rel` test code by its parent's say ([`declared_test_modules`]: the file a test-only `mod` loads, or one in that module's own directory) that nothing ships? A file a shipped `mod` or `include!` of a shipped file also loads (`#[cfg(test)] mod tests;` beside `#[path = "x/tests.rs"] mod shipped;`) ships, and is read.
+    pub(super) fn holds(&self, rel: &str) -> bool {
+        in_declared(&self.declared, rel) && !self.shipped.contains(rel)
+    }
+
+    /// Does a shipped line of a shipped file load `rel`, whatever its name?
+    pub(super) fn ships(&self, rel: &str) -> bool {
+        self.shipped.contains(rel)
+    }
+}
+
+/// Is `rel` one of `declared`'s files, or under one of its directories?
+fn in_declared(declared: &[String], rel: &str) -> bool {
+    declared
+        .iter()
+        .any(|t| rel == t || (t.ends_with('/') && rel.starts_with(t.as_str())))
 }
 
 pub(super) const ENGINE_PLATFORM: Rule = Rule {
@@ -189,14 +168,9 @@ pub(super) const ENGINE_PLATFORM: Rule = Rule {
 };
 
 fn engine_platform(tree: &Tree<'_>, out: &mut Vec<Finding>) {
-    let test_modules = declared_test_modules(tree.corpus, ENGINE_CRATES);
-    let declared_test = |rel: &str| {
-        test_modules
-            .iter()
-            .any(|t| rel == t || (t.ends_with('/') && rel.starts_with(t.as_str())))
-    };
+    let test_code = TestCode::read(tree.corpus, ENGINE_CRATES);
     for file in tree.corpus.under(ENGINE_CRATES) {
-        if !engine_shipped(&file.rel) || declared_test(&file.rel) {
+        if !engine_shipped(&file.rel) || test_code.holds(&file.rel) {
             continue;
         }
         let needles: Vec<&str> = ENGINE_BANNED
@@ -457,8 +431,13 @@ fn protected_folder(tree: &Tree<'_>, out: &mut Vec<Finding>) {
         .copied()
         .chain(["Volumes", "Containers", "CloudStorage"])
         .collect();
+    // Test code by its name (`_tests.rs`) or by its parent's say (the file a
+    // `#[cfg(test)] mod tests;` loads): neither ships, unless a shipped line
+    // loads it too.
+    let test_code = TestCode::read(tree.corpus, PROTECTED_SCOPE);
     for file in tree.corpus.under(PROTECTED_SCOPE) {
-        if file.rel.ends_with("_tests.rs") || !file.mentions(&needles) {
+        let named_test = file.rel.ends_with("_tests.rs") && !test_code.ships(&file.rel);
+        if named_test || test_code.holds(&file.rel) || !file.mentions(&needles) {
             continue;
         }
         for line in file.shipped_lines() {
@@ -2350,14 +2329,6 @@ mod tests {
             ],
             "{found:?}"
         );
-        assert_eq!(out_of_line_mod("pub(crate) mod rig;"), Some("rig"));
-        assert_eq!(out_of_line_mod("mod rig {"), None);
-        assert_eq!(path_attr("#[path = \"a/b.rs\"]"), Some("a/b.rs"));
-        assert_eq!(
-            normal_path("crates/x/src/../t/./y.rs").as_deref(),
-            Some("crates/x/t/y.rs")
-        );
-        assert_eq!(normal_path("../y.rs"), None);
     }
 
     #[test]
@@ -2460,6 +2431,116 @@ mod tests {
                 "crates/aterm-gui/src/lib.rs:8",
             ]
         );
+    }
+
+    /// A module its parent declares test-only (`#[cfg(test)] mod tests;`) is
+    /// test code whatever its name, and is not read; its shipped sibling is.
+    #[test]
+    fn a_protected_folder_literal_in_a_declared_test_module_is_test_code() {
+        let parent = "#[cfg(test)]\nmod tests;\nmod shipped;\n";
+        let literal = "const P: &str = \"/Volumes/aterm/aterm.app\";\n";
+        let found = run(
+            &PROTECTED_FOLDER,
+            &[
+                ("crates/aterm-gui/src/page.rs", parent),
+                ("crates/aterm-gui/src/page/tests.rs", literal),
+                ("crates/aterm-gui/src/page/shipped.rs", literal),
+            ],
+        );
+        assert_eq!(spots(&found), ["crates/aterm-gui/src/page/shipped.rs:1"]);
+    }
+
+    /// A file is test code only while no shipped line loads it: the file a
+    /// `#[cfg(test)] mod tests;` names, mounted again by a shipped `#[path]`
+    /// (on its own line, on the `mod`'s line, or through `cfg_attr`), one in
+    /// its directory mounted so, one a shipped `include!` brings in, and a
+    /// `_tests.rs` a shipped `mod` loads are each read, and so is what a
+    /// shipped mount of them loads in turn. CONTROLS: the test module's own
+    /// child, and a `_tests.rs` only a test `mod` loads, stay test code.
+    #[test]
+    fn a_test_module_a_shipped_line_also_loads_is_read() {
+        let literal = "const P: &str = \"/Volumes/aterm/aterm.app\";\n";
+        // The parent, three files that spell the literal, and `extra` over them.
+        let found = |parent: &str, extra: &[(&str, &str)]| {
+            let mut files: std::collections::BTreeMap<&str, &str> = [
+                ("crates/aterm-gui/src/page/tests.rs", literal),
+                ("crates/aterm-gui/src/page/tests/forge.rs", literal),
+                ("crates/aterm-gui/src/page_rig_tests.rs", literal),
+            ]
+            .into_iter()
+            .chain(extra.iter().copied())
+            .collect();
+            files.insert("crates/aterm-gui/src/page.rs", parent);
+            let files: Vec<(&str, &str)> = files.into_iter().collect();
+            spots(&run(&PROTECTED_FOLDER, &files))
+        };
+        let tests =
+            "#[cfg(test)]\nmod tests;\n#[cfg(test)]\n#[path = \"page_rig_tests.rs\"]\nmod rig;\n";
+        assert!(found(tests, &[]).is_empty(), "{:?}", found(tests, &[]));
+        // What a test module mounts by `#[path]`, at any depth, is test code too.
+        let nested = [
+            (
+                "crates/aterm-gui/src/page_rig_tests.rs",
+                "#[path = \"page_rig_more.rs\"]\nmod more;\n",
+            ),
+            (
+                "crates/aterm-gui/src/page_rig_more.rs",
+                "const P: &str = \"/Volumes/aterm/aterm.app\";\n\
+                 #[path = \"page_rig_deep_tests.rs\"]\nmod deep;\n",
+            ),
+            ("crates/aterm-gui/src/page_rig_deep_tests.rs", literal),
+        ];
+        assert!(
+            found(tests, &nested).is_empty(),
+            "{:?}",
+            found(tests, &nested)
+        );
+        for (mount, read) in [
+            (
+                "#[path = \"page/tests.rs\"]\nmod shipped;\n",
+                "crates/aterm-gui/src/page/tests.rs:1",
+            ),
+            (
+                "#[path = \"page/tests.rs\"] mod shipped;\n",
+                "crates/aterm-gui/src/page/tests.rs:1",
+            ),
+            (
+                "#[cfg_attr(unix, path = \"page/tests.rs\")]\nmod shipped;\n",
+                "crates/aterm-gui/src/page/tests.rs:1",
+            ),
+            (
+                "mod outer {\n    #[path = \"../tests/forge.rs\"]\n    mod shipped;\n}\n",
+                "crates/aterm-gui/src/page/tests/forge.rs:1",
+            ),
+            (
+                "#[path = \"page/tests/forge.rs\"]\nmod forge;\n",
+                "crates/aterm-gui/src/page/tests/forge.rs:1",
+            ),
+            (
+                "include!(\"page/tests.rs\");\n",
+                "crates/aterm-gui/src/page/tests.rs:1",
+            ),
+            (
+                "#[path = \"page_rig_tests.rs\"]\nmod shipped_rig;\n",
+                "crates/aterm-gui/src/page_rig_tests.rs:1",
+            ),
+        ] {
+            assert_eq!(found(&format!("{tests}{mount}"), &[]), [read], "{mount}");
+        }
+        // A shipped mount of a shipped test file ships what it declares.
+        let chain = format!("{tests}#[path = \"page/tests/forge.rs\"]\nmod forge;\n");
+        let forge = "mod deep;\n";
+        let deep = ("crates/aterm-gui/src/page/tests/forge/deep.rs", literal);
+        assert_eq!(
+            found(
+                &chain,
+                &[("crates/aterm-gui/src/page/tests/forge.rs", forge), deep]
+            ),
+            ["crates/aterm-gui/src/page/tests/forge/deep.rs:1"]
+        );
+        // CONTROL: the test module declares the same child, and it stays test.
+        let own = ("crates/aterm-gui/src/page/tests.rs", "mod forge;\n");
+        assert!(found(tests, &[own]).is_empty());
     }
 
     #[test]

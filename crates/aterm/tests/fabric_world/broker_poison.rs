@@ -22,8 +22,7 @@ struct BrokerProcess {
 
 impl Drop for BrokerProcess {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        aterm_uds::deadline::kill_within(&mut self.child, harness::DEADLINE);
     }
 }
 
@@ -81,8 +80,8 @@ impl Supervised {
             child: started.child,
             lifeline: Some(started.lifeline),
         };
-        let first = rx.recv_timeout(harness::DEADLINE).unwrap_or_else(|_| {
-            panic!(
+        let first = harness::recv_within(&rx, std::time::Instant::now(), broker.child.id(), || {
+            format!(
                 "the broker printed no readiness line; broker.err:\n{}",
                 read(&self.err)
             )

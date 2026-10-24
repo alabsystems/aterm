@@ -22,14 +22,6 @@ fn term() -> Host {
     .expect("the bundled font")
 }
 
-static GLOBAL_BUDGET: std::sync::RwLock<()> = std::sync::RwLock::new(());
-
-fn global_budget_unset() -> std::sync::RwLockReadGuard<'static, ()> {
-    GLOBAL_BUDGET
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
 fn feed_lines(t: &mut AtermTerminal, n: usize) {
     let mut buf = Vec::new();
     for i in 0..n {
@@ -40,7 +32,6 @@ fn feed_lines(t: &mut AtermTerminal, n: usize) {
 
 #[test]
 fn ingest_stages_and_render_promotes() {
-    let _global = global_budget_unset();
     let mut t = term();
     feed_lines(&mut t, 4_000);
     assert!(
@@ -66,7 +57,6 @@ fn ingest_stages_and_render_promotes() {
 
 #[test]
 fn a_flood_between_frames_leaves_one_marker() {
-    let _global = global_budget_unset();
     let mut t = term();
     t.set_scrollback_budget(2_000_000);
     for _ in 0..8 {
@@ -85,7 +75,6 @@ fn a_flood_between_frames_leaves_one_marker() {
 
 #[test]
 fn set_scrollback_limit_caps_the_total_across_tiers() {
-    let _global = global_budget_unset();
     let mut t = term();
     t.set_scrollback_limit(1_500);
     feed_lines(&mut t, 5_000);
@@ -104,7 +93,6 @@ fn set_scrollback_limit_caps_the_total_across_tiers() {
 
 #[test]
 fn pane_budget_evicts_and_reports() {
-    let _global = global_budget_unset();
     let mut t = term();
     feed_lines(&mut t, 3_000);
     while t.drain_scrollback_backlog(0) > 0 {}
@@ -126,28 +114,7 @@ fn pane_budget_evicts_and_reports() {
 }
 
 #[test]
-fn global_budget_caps_the_effective_share() {
-    let _global = GLOBAL_BUDGET
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut t = term();
-    AtermTerminal::set_scrollback_global_budget(8_192);
-    assert!(
-        t.scrollback_budget_effective() <= 8_192,
-        "global cap bounds the effective share"
-    );
-    t.render().expect("renderable frame");
-    AtermTerminal::set_scrollback_global_budget(0);
-    assert_eq!(
-        t.scrollback_budget_effective() as usize,
-        t.budget_share.configured().max(1),
-        "unset global restores the configured per-pane budget"
-    );
-}
-
-#[test]
 fn truncation_and_pressure_are_observable_out_of_band() {
-    let _global = global_budget_unset();
     let mut t = term();
     assert_eq!(t.scrollback_truncated_lines(), 0.0);
     t.set_scrollback_budget(4_096);

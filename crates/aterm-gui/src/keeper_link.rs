@@ -1055,6 +1055,7 @@ fn admit_recovered_journaled(
         journal_key: None,
         task: None,
         autopilot_end: None,
+        wakes: None,
     })
 }
 

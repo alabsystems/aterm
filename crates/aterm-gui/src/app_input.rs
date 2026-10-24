@@ -10479,6 +10479,12 @@ mod native_ime_selection_tests {
             }
         };
         assert!(app.open_system_state_tab());
+        // The worker's read names the plan in force; a page opened by hand
+        // submits nothing before it.
+        app.publish_system_state(crate::system_state::SetupStatus {
+            plan: Some(aterm_types::macos_setup::Plan::default()),
+            ..crate::system_state::SetupStatus::default()
+        });
         let (instance, _) = app.active_native_view(wid).unwrap();
         for field in ["system-state/url", "system-state/password"] {
             app.dispatch_native_event(
@@ -10524,25 +10530,30 @@ mod native_ime_selection_tests {
                 "committed and non-composing input reaches {field} exactly once"
             );
         }
+        thread_local! {
+            static JOINED: std::cell::RefCell<Vec<(aterm_types::macos_setup::Plan, Option<aterm_secrets::SecretBytes>)>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        app.set_system_state_handlers_for_test(crate::system_state_host::InitialSetupHandlers {
+            apply: |plan, _, password, receipt| {
+                JOINED.with(|joined| joined.borrow_mut().push((plan, password)));
+                receipt.accept();
+                true
+            },
+            ..crate::system_state_host::InitialSetupHandlers::inert_for_test()
+        });
         app.dispatch_native_event(
             wid,
             AppEvent::Action(ActionInvocation {
-                id: crate::native_ui::ActionId::new("system-state/apply"),
+                id: crate::native_ui::ActionId::new("system-state/vault/join"),
                 value: None,
             }),
         )
         .unwrap();
-        let Some(crate::system_state::SystemStateAction::Apply(answer)) =
-            app.native_runtime.take_system_state_action()
-        else {
-            panic!("reviewed form queues its one answer");
-        };
-        let crate::workstation_setup::WorkstationSetupDecision::Begin(plan) = answer.decision
-        else {
-            panic!("Apply carries the edited plan");
-        };
+        let mut joined = JOINED.with(|joined| std::mem::take(&mut *joined.borrow_mut()));
+        assert_eq!(joined.len(), 1, "Join delivers one edited plan");
+        let (plan, password) = joined.pop().unwrap();
         assert_eq!(plan.vault_url, "語nn");
-        assert_eq!(answer.password.unwrap().as_str(), Some("語nn"));
+        assert_eq!(password.unwrap().as_str(), Some("語nn"));
     }
 }
 

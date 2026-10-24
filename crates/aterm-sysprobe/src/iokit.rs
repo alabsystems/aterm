@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! IOKit and CoreFoundation declarations for reading macOS GPU and CPU IORegistry entries.
+//! IOKit and CoreFoundation declarations for reading macOS GPU and CPU IORegistry entries, and the GPU's user clients.
 
 #![allow(non_camel_case_types, non_snake_case, non_upper_case_globals)]
 
@@ -19,7 +19,7 @@ macro_rules! opaque {
         }
     )*};
 }
-opaque! { __CFAllocator, __CFData, __CFDictionary, __CFNumber, __CFString }
+opaque! { __CFAllocator, __CFArray, __CFData, __CFDictionary, __CFNumber, __CFString }
 
 pub type CFIndex = isize;
 pub type CFTypeID = usize;
@@ -29,6 +29,7 @@ pub type CFNumberType = CFIndex;
 
 pub type CFTypeRef = *const c_void;
 pub type CFAllocatorRef = *const __CFAllocator;
+pub type CFArrayRef = *const __CFArray;
 pub type CFDataRef = *const __CFData;
 pub type CFDictionaryRef = *const __CFDictionary;
 pub type CFMutableDictionaryRef = *mut __CFDictionary;
@@ -36,6 +37,12 @@ pub type CFNumberRef = *const __CFNumber;
 pub type CFStringRef = *const __CFString;
 
 pub type kern_return_t = i32;
+/// `mach/arm/boolean.h`: `int`.
+#[cfg(target_arch = "aarch64")]
+pub type boolean_t = i32;
+/// `mach/i386/boolean.h`: `unsigned int` in user space.
+#[cfg(target_arch = "x86_64")]
+pub type boolean_t = u32;
 pub type mach_port_t = u32;
 pub type io_object_t = mach_port_t;
 pub type io_iterator_t = io_object_t;
@@ -70,8 +77,16 @@ unsafe extern "C" {
         iterator: *mut io_iterator_t,
     ) -> kern_return_t;
     pub fn IOIteratorNext(iterator: io_iterator_t) -> io_object_t;
+    /// False once the structure the iterator walks changed under it: an `IOIteratorNext` that
+    /// returned 0 then ended the walk early, not at its end.
+    pub fn IOIteratorIsValid(iterator: io_iterator_t) -> boolean_t;
     pub fn IOObjectGetClass(object: io_object_t, className: *mut c_char) -> kern_return_t;
     pub fn IOObjectRelease(object: io_object_t) -> kern_return_t;
+    /// The entry's registry-wide id, stable while it lives.
+    pub fn IORegistryEntryGetRegistryEntryID(
+        entry: io_registry_entry_t,
+        entryID: *mut u64,
+    ) -> kern_return_t;
     /// A +1 CF object (the Create rule), or NULL.
     pub fn IORegistryEntryCreateCFProperty(
         entry: io_registry_entry_t,
@@ -85,6 +100,10 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub fn CFRelease(cf: CFTypeRef);
     pub fn CFGetTypeID(cf: CFTypeRef) -> CFTypeID;
+    pub fn CFArrayGetTypeID() -> CFTypeID;
+    pub fn CFArrayGetCount(theArray: CFArrayRef) -> CFIndex;
+    /// Borrowed (the Get rule) while the array lives.
+    pub fn CFArrayGetValueAtIndex(theArray: CFArrayRef, idx: CFIndex) -> *const c_void;
     pub fn CFDataGetTypeID() -> CFTypeID;
     pub fn CFDictionaryGetTypeID() -> CFTypeID;
     pub fn CFNumberGetTypeID() -> CFTypeID;

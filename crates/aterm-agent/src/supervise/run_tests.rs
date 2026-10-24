@@ -327,6 +327,11 @@ struct Mock {
     task_lost: usize,
     hang_up_at: Option<&'static str>,
     hung_up: bool,
+    /// A host that keeps a session log (6H-5): its `status` prints the log's head, and `await
+    /// log` answers from here ([`LogWorld`]). `None` is a host with no log.
+    log: Option<LogWorld>,
+    /// How many screens had been served when each `turn` request arrived.
+    turns_served: Vec<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -681,6 +686,196 @@ fn failed(code: i32, text: &str) -> CtlReply {
     }
 }
 
+/// THE MOCK HOST'S SESSION LOG (6H-5): what its `status` prints of the log, and how it
+/// answers `await log`. A wait sleeps through the turn's frames to the first that ends it,
+/// as the host's tracker does, and answers that frame's record: a turn's close at a rest,
+/// a step's open at a box, a question or a wall.
+#[derive(Debug)]
+struct LogWorld {
+    /// The newest record (`log_seq=`); each answer is one more.
+    seq: u64,
+    /// This many answers come while the next frame still shows the turn running: a turn a
+    /// measured build's transcript closed before its screen rested.
+    early: usize,
+    /// The log closed the turn the screen still shows running: `turn=-` until a frame rests.
+    closed: bool,
+    /// `await log` is refused as an older build refuses the comma list (`ERR usage`).
+    refused: bool,
+    /// This many waits run out (`OK timeout`) with nothing past their cursor.
+    timeouts: usize,
+    /// This many `status` replies find the next frame a box the host has already drawn and
+    /// recorded (the box raised between the loop's busy read and its `status`): the head
+    /// prints its need and the reader's `prompt`, and the box's record stands at the cursor.
+    races: usize,
+    /// The frame whose record a head already holds ([`Self::races`]): a wait from that head
+    /// finds nothing past its cursor when that frame comes, and runs out.
+    drawn: Option<usize>,
+    /// The waits that ran out because the record they waited for stood before their cursor.
+    ran_out: usize,
+    /// The reader's word `status` prints in place of the served frame's (`agent=`).
+    reader: Option<&'static str>,
+    /// Every record the log answered with, by its seq: a wait from before one answers it again.
+    records: Vec<(u64, String)>,
+    /// The frames a wait slept through (never read by the loop).
+    slept: usize,
+    /// Every `await log` request, its words after `await`.
+    asked: Vec<String>,
+    /// The `log_seq=` each `status` printed.
+    heads: Vec<u64>,
+}
+
+impl LogWorld {
+    fn new() -> Self {
+        Self {
+            seq: 40,
+            early: 0,
+            closed: false,
+            refused: false,
+            timeouts: 0,
+            races: 0,
+            drawn: None,
+            ran_out: 0,
+            reader: None,
+            records: Vec::new(),
+            slept: 0,
+            asked: Vec::new(),
+            heads: Vec::new(),
+        }
+    }
+
+    /// A new record, answered.
+    fn answer(&mut self, record: &str) -> CtlReply {
+        self.seq += 1;
+        self.records.push((self.seq, record.to_string()));
+        ok(&format!("OK seq={0} ep=1 {0} {record}\n", self.seq))
+    }
+}
+
+/// The screen reader's word for a frame, as `status` prints it (`agent=`).
+fn reader_word(phase: Phase) -> &'static str {
+    match phase {
+        Phase::Busy => "busy",
+        Phase::Idle => "idle",
+        Phase::Prompt => "prompt",
+        Phase::Question => "question",
+        Phase::Limited { .. } => "wall:usage-session",
+    }
+}
+
+impl Mock {
+    /// The reader's word and the log's words in `status` (`agent=`, then ` log_seq= log_ep=
+    /// run= turn= step= need= need_since_ms=`), or the mock's own `agent` and no log words
+    /// for a host with no log. A turn is open from its first frame to the frame that rests (a
+    /// box, a question or a wall stands inside it). A race ([`LogWorld::races`]) records the
+    /// next frame's box before the head is printed.
+    fn log_head(&mut self) -> (&'static str, String) {
+        if self.log.is_none() {
+            return (self.agent, String::new());
+        }
+        let next = (self.served < self.screens.len() && !self.held())
+            .then(|| worker_phase(&self.screens[self.served]));
+        let mut phase = worker_phase(self.last_served());
+        let at = self.served;
+        let log = self.log.as_mut().expect("the log");
+        let mut need = "-";
+        if log.races > 0
+            && let Some(boxed @ (Phase::Prompt | Phase::Question)) = next
+        {
+            log.races -= 1;
+            log.seq += 1;
+            log.records.push((
+                log.seq,
+                "open p1 step approval tool=bash src=screen".to_string(),
+            ));
+            log.drawn = Some(at);
+            need = if boxed == Phase::Prompt {
+                "approval:bash"
+            } else {
+                "question"
+            };
+            phase = boxed;
+        }
+        let running = phase != Phase::Idle;
+        if !running {
+            log.closed = false;
+        }
+        log.heads.push(log.seq);
+        let turn = if running && !log.closed { "t1" } else { "-" };
+        (
+            log.reader.unwrap_or_else(|| reader_word(phase)),
+            format!(
+                " log_seq={} log_ep=1 run=r1 turn={turn} step=- need={need} need_since_ms=-",
+                log.seq
+            ),
+        )
+    }
+
+    /// `await log …` on the mock host's log ([`LogWorld`]).
+    fn log_wait(&mut self, tail: &[&str]) -> CtlReply {
+        let line = tail.join(" ");
+        let early = {
+            let Some(log) = self.log.as_mut() else {
+                return usage("await idle <ms> | seq [<n>]");
+            };
+            log.asked.push(line);
+            if log.refused {
+                return usage(
+                    "await idle <ms> | seq [<n>] | match <re> | gone <re> | agent <word> | \
+                     log <need|open=<lvl>|close=<lvl>|kind=<k>> [since=<seq>]",
+                );
+            }
+            let since = tail
+                .iter()
+                .find_map(|w| w.strip_prefix("since="))
+                .and_then(|n| n.parse::<u64>().ok());
+            if let Some(since) = since
+                && let Some((seq, record)) = log.records.iter().find(|(seq, _)| *seq > since)
+            {
+                return ok(&format!("OK seq={seq} ep=1 {seq} {record}\n"));
+            }
+            if log.timeouts > 0 {
+                log.timeouts -= 1;
+                return timeout();
+            }
+            log.early > 0
+        };
+        if early && self.served < self.screens.len() {
+            let log = self.log.as_mut().expect("the log");
+            log.early -= 1;
+            log.closed = true;
+            return log.answer("close t1 turn out=done by=vendor src=transcript conf=exact");
+        }
+        let mut slept = 0;
+        while self.served + 1 < self.screens.len()
+            && !self.held()
+            && worker_phase(&self.screens[self.served]) == Phase::Busy
+        {
+            self.served += 1;
+            self.seq += 1;
+            slept += 1;
+        }
+        let next = (self.served < self.screens.len() && !self.held())
+            .then(|| worker_phase(&self.screens[self.served]));
+        let at = self.served;
+        if let Some(log) = self.log.as_mut() {
+            log.slept += slept;
+            if next.is_some() && log.drawn == Some(at) {
+                // The frame's record stands before the cursor: nothing comes past it.
+                log.ran_out += 1;
+                return timeout();
+            }
+        }
+        let record = match next {
+            Some(Phase::Idle) => "close t1 turn out=done src=screen conf=strong",
+            Some(Phase::Prompt) => "open p1 step approval tool=bash src=screen conf=strong",
+            Some(Phase::Question) => "open p1 step question src=screen conf=strong",
+            Some(Phase::Limited { .. }) => "open p1 step wall kind=usage-session src=screen",
+            Some(Phase::Busy) | None => return self.stall(tail),
+        };
+        self.log.as_mut().expect("the log").answer(record)
+    }
+}
+
 impl Mock {
     fn new(screens: Vec<Vec<String>>) -> Self {
         Self {
@@ -870,6 +1065,8 @@ impl Mock {
             task_lost: 0,
             hang_up_at: None,
             hung_up: false,
+            log: None,
+            turns_served: Vec::new(),
         }
     }
     fn task_call(&mut self, words: &[&str]) -> CtlReply {
@@ -1065,10 +1262,11 @@ impl Mock {
         } else {
             String::new()
         };
+        let (agent, log) = self.log_head();
         format!(
-            "OK schema=1 sid={} phase=running hold={} fabric={} program={} agent={}{input} \
+            "OK schema=1 sid={} phase=running hold={} fabric={} program={} agent={agent}{input}{log} \
              seq={}{generation} hand={hand}{human}{title}\n",
-            self.status_sid, self.hold, self.fabric, self.program, self.agent, self.seq
+            self.status_sid, self.hold, self.fabric, self.program, self.seq
         )
     }
     fn measured_cell(&self, tail: &[&str]) -> Option<String> {
@@ -2080,6 +2278,7 @@ impl Mock {
         if verb == "turn" {
             self.turned = true;
             self.turns += 1;
+            self.turns_served.push(self.served);
         }
         if verb == "await"
             && tail.first() == Some(&"idle")
@@ -2152,6 +2351,9 @@ impl Mock {
                         self.alt_screen.unwrap_or(false)
                     ),
                 ))
+            }
+            "await" if tail.first() == Some(&"log") && self.log.is_some() => {
+                Ok(self.log_wait(tail))
             }
             "await" if self.panel_holds() => Ok(self.panel_wait(tail)),
             "await" if self.reset_holds() => Ok(self.reset_wait(tail)),
@@ -3407,6 +3609,7 @@ fn a_dead_footer_above_the_live_zone_holds_no_wait() {
         [
             "@s-1 await gone esc.to.interrupt timeout 3000",
             "@s-1 text --json tail=40",
+            "@s-1 status",
             "@s-1 await gone esc.to.interrupt rows 33 49 timeout 20000",
             "@s-1 text --json tail=40",
         ]
@@ -3464,10 +3667,11 @@ fn a_tail_whose_live_zone_starts_at_its_first_row_is_still_scoped() {
     };
     let m = run(vec![busy.clone(), dialog.clone()]);
     assert_eq!(
-        m.requests[..3],
+        m.requests[..4],
         [
             "await gone esc.to.interrupt timeout 3000",
             "text --json tail=40",
+            "status",
             "await gone esc.to.interrupt rows 33 72 timeout 20000",
         ],
         "{:#?}",
@@ -3476,8 +3680,11 @@ fn a_tail_whose_live_zone_starts_at_its_first_row_is_still_scoped() {
     assert_eq!(m.gone_held, 1, "{:#?}", m.requests);
     let m = run(vec![busy.clone(), busy, dialog]);
     assert_eq!(
-        m.requests[2],
-        "await gone esc.to.interrupt rows 33 72 timeout 20000"
+        m.requests[2..4],
+        [
+            "status",
+            "await gone esc.to.interrupt rows 33 72 timeout 20000"
+        ]
     );
     assert_eq!(m.gone_held, 2, "{:#?}", m.requests);
 }
@@ -3496,6 +3703,7 @@ fn a_span_the_grid_no_longer_has_is_read_again() {
     assert_eq!(
         m.requests[2..],
         [
+            "status",
             "await gone esc.to.interrupt rows 33 49 timeout 20000",
             "text --json tail=40",
         ]
@@ -3560,8 +3768,9 @@ fn an_idle_read_torn_mid_repaint_is_read_again_after_the_settle() {
             "{bottom}: the reply's end decides, never the torn read: {requests:#?}"
         );
         assert_eq!(
-            requests[2..6],
+            requests[2..7],
             [
+                "status",
                 "await gone esc.to.interrupt rows 1 28 timeout 20000",
                 "text --json tail=40",
                 "await idle 500 timeout 1500",
@@ -3587,6 +3796,7 @@ fn an_idle_read_torn_mid_repaint_is_read_again_after_the_settle() {
     assert_eq!(
         requests[2..],
         [
+            "status",
             "await gone esc.to.interrupt rows 1 28 timeout 20000",
             "text --json tail=40",
         ],
@@ -3921,10 +4131,11 @@ fn a_title_hold_is_counted_from_the_review_it_holds() {
         r.requests
     );
     assert!(r.took > TITLE_HOLD, "{:?}", r.took);
+    let statuses = r.requests.iter().filter(|q| *q == "status").count();
     assert_eq!(
-        (r.unread, title_reads(&r.requests)),
-        (0, 4),
-        "{:#?}",
+        (r.unread, title_reads(&r.requests), statuses),
+        (0, 3, 1),
+        "the busy wait's `status` (the session log's head) read the first title: {:#?}",
         r.requests
     );
     assert!(r.noted.is_empty(), "{:#?}", r.noted);
@@ -6606,7 +6817,9 @@ fn await_turn_on_the_per_request_client_rides_out_exit_75() {
 #[test]
 fn watch_rides_out_a_lost_connection_to_the_next_event() {
     let mut m = Mock::new(vec![busy_screen(), busy_screen(), question_screen()]);
-    for i in 2..=4 {
+    // The busy wait's own `await gone` is lost: request 2 is its `status`, the session log's
+    // head, which a host with no log answers.
+    for i in 3..=5 {
         m.by_index.insert(i, closed());
     }
     m.handoff_seq = Some(20);
@@ -6632,6 +6845,7 @@ fn watch_rides_out_a_lost_connection_to_the_next_event() {
             "meta",
             "await gone esc.to.interrupt timeout 3000",
             "text --json tail=40",
+            "status",
             "await gone esc.to.interrupt rows 2 7 timeout 20000",
             "text --json tail=40",
             "text --json tail=40",
@@ -6665,7 +6879,9 @@ fn fx_virtual_clock_rides_out_an_hour_long_outage() {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut m = Mock::new(vec![busy_screen(), busy_screen(), question_screen()]);
-        for i in 2..=FAILED {
+        // Request 2 is the busy wait's `status` (the session log's head); its `await gone`
+        // and the probes after it are lost.
+        for i in 3..=FAILED + 1 {
             m.by_index.insert(i, closed());
         }
         m.handoff_seq = Some(20);
@@ -6750,6 +6966,7 @@ fn after_an_outage_the_point_is_reported_again_and_waited_past_on_the_new_seq() 
             "await seq 12 timeout 20000",
             "await idle 500 timeout 1500",
             "text --json tail=40",
+            "status",
             "await gone esc.to.interrupt rows 2 7 timeout 20000",
             "text --json tail=40",
             "modes",
@@ -7055,10 +7272,12 @@ fn a_budget_spent_in_an_outage_is_the_timeout() {
         .expect("supervise");
     assert_eq!(code, EXIT_TIMEOUT);
     assert!(out.starts_with("TIMEOUT\nbusy\n"), "{out}");
+    // The busy wait's first request, the `status` that reads the session log's head, meets
+    // the outage, and the loop rides it out as it rides out its `await gone`.
     assert!(
         String::from_utf8(log)
             .expect("utf-8")
-            .starts_with("RECONNECT await gone esc.to.interrupt rows 2 7 failed: "),
+            .starts_with("RECONNECT status failed: "),
     );
 
     let mut m = Mock::new(vec![busy_screen()]);
@@ -7155,7 +7374,8 @@ fn a_busy_read_before_a_lost_connection_still_counts() {
     ]);
     m.by_index.insert(2, closed());
     m.by_index.insert(6, closed());
-    m.by_index.insert(10, closed());
+    // Request 10 is the busy wait's `status` (the session log's head); its `await gone` is lost.
+    m.by_index.insert(11, closed());
     m.vanish_after = Some(0);
     let (lines, code) = watch_quick(&mut m, Duration::from_secs(5));
     assert_eq!(lines.len(), 6, "{lines:?}");
@@ -7175,8 +7395,9 @@ fn a_busy_read_before_a_lost_connection_still_counts() {
     );
     assert_eq!(code, 1, "{:?}", m.requests);
     assert_eq!(m.requests[10], "text --json tail=40", "{:?}", m.requests);
+    assert_eq!(m.requests[11], "status", "{:?}", m.requests);
     assert_eq!(
-        m.requests[11],
+        m.requests[12],
         "await gone esc.to.interrupt rows 2 7 timeout 20000"
     );
 }
@@ -7184,7 +7405,8 @@ fn a_busy_read_before_a_lost_connection_still_counts() {
 #[test]
 fn await_turn_and_supervise_ride_it_out_with_the_lines_on_stderr() {
     let mut m = Mock::new(vec![busy_screen(), write_prompt()]);
-    m.by_index.insert(2, closed());
+    // Request 2 is the busy wait's `status` (the session log's head); its `await gone` is lost.
+    m.by_index.insert(3, closed());
     let mut log: Vec<u8> = Vec::new();
     let (out, code) = quick(&mut m, Duration::from_secs(5))
         .supervise_to(&auto(30), &mut log)

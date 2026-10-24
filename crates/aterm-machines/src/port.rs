@@ -56,6 +56,47 @@ impl std::fmt::Debug for GithubResponse {
     }
 }
 
+/// A GitHub read that handed back no answer ([`System::github_api`]): the line a report
+/// carries, which never holds the credential, and what kind of failure it was, which a
+/// reader words for a person (System State's `init_observe::Wait`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GithubError {
+    /// What kind of failure.
+    pub failure: GithubFailure,
+    /// One line, with no credential.
+    pub why: String,
+}
+
+/// What kind of failure a [`GithubError`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GithubFailure {
+    /// The request reached no answer: the network, a proxy, the trust store or a deadline
+    /// (agh's `CouldNotRun`).
+    Unreached,
+    /// The token is not one that signs in: GitHub answered 401, or agh found it unusable
+    /// (agh's `Unauthenticated`).
+    Unauthenticated,
+    /// Anything else: a refused route, a GitHub error, an answer outside its bounds.
+    Other,
+}
+
+impl GithubError {
+    /// A failure of no particular kind.
+    #[must_use]
+    pub fn other(why: impl Into<String>) -> Self {
+        Self {
+            failure: GithubFailure::Other,
+            why: why.into(),
+        }
+    }
+}
+
+impl From<GithubError> for String {
+    fn from(error: GithubError) -> Self {
+        error.why
+    }
+}
+
 /// One tool run.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Cmd {
@@ -360,13 +401,18 @@ pub trait Relaying {
 /// The operating system, as items see it.
 pub trait System: Sync {
     /// Read one GitHub API endpoint through `agh` as `user` using the admitted development credential.
+    ///
+    /// # Errors
+    /// The read's failure and its kind ([`GithubFailure`]).
     fn github_api(
         &self,
         _user: &User,
         _token: &Secret,
         _endpoint: &str,
-    ) -> Result<GithubResponse, String> {
-        Err("GitHub reads are not implemented by this backend".into())
+    ) -> Result<GithubResponse, GithubError> {
+        Err(GithubError::other(
+            "GitHub reads are not implemented by this backend",
+        ))
     }
 
     /// Send one GitHub REST request as the controller account with `token` in `Authorization` and optional JSON `body`, refusing redirects.
@@ -862,9 +908,11 @@ impl System for Live {
         user: &User,
         token: &Secret,
         endpoint: &str,
-    ) -> Result<GithubResponse, String> {
+    ) -> Result<GithubResponse, GithubError> {
         if self.euid() != user.uid {
-            return Err("GitHub reads must run as their local user".into());
+            return Err(GithubError::other(
+                "GitHub reads must run as their local user",
+            ));
         }
         github_api::read(token, endpoint)
     }
@@ -1510,8 +1558,8 @@ pub use fake::Fake;
 mod fake {
     use super::scratch::{OwnedDirectory, prefix};
     use super::{
-        Cmd, GithubResponse, Ran, Relaying, RunFailed, Scratch, Secret, StagedChild, Stat, System,
-        User,
+        Cmd, GithubError, GithubFailure, GithubResponse, Ran, Relaying, RunFailed, Scratch, Secret,
+        StagedChild, Stat, System, User,
     };
     use std::collections::BTreeMap;
     use std::io;
@@ -1529,7 +1577,7 @@ mod fake {
         scroll_set_error: Mutex<Option<String>>,
         scroll_set_readback: Mutex<Option<bool>>,
         replies: Mutex<BTreeMap<String, Vec<Ran>>>,
-        github_replies: Mutex<BTreeMap<String, Vec<Result<GithubResponse, String>>>>,
+        github_replies: Mutex<BTreeMap<String, Vec<Result<GithubResponse, GithubError>>>>,
         outputs: Mutex<BTreeMap<String, Vec<Output>>>,
         strict_refusals: Mutex<BTreeMap<String, String>>,
         /// The commands whose [`System::run`] gives no answer within its budget ([`Fake::time_out`]).
@@ -1898,7 +1946,8 @@ mod fake {
             self
         }
 
-        /// Script a GitHub read without retaining its credential or opening a socket.
+        /// Script a GitHub read without retaining its credential or opening a socket. A
+        /// failure is of no particular kind ([`Fake::fail_github_api`] names one).
         pub fn on_github_api(
             &self,
             user: &User,
@@ -1910,7 +1959,26 @@ mod fake {
                 .unwrap()
                 .entry(format!("{}$ agh GET {endpoint}", user.name))
                 .or_default()
-                .push(reply);
+                .push(reply.map_err(GithubError::other));
+            self
+        }
+
+        /// Script a GitHub read that fails as `failure`.
+        pub fn fail_github_api(
+            &self,
+            user: &User,
+            endpoint: &str,
+            failure: GithubFailure,
+        ) -> &Self {
+            self.github_replies
+                .lock()
+                .unwrap()
+                .entry(format!("{}$ agh GET {endpoint}", user.name))
+                .or_default()
+                .push(Err(GithubError {
+                    failure,
+                    why: format!("fake: GitHub read failed ({failure:?})"),
+                }));
             self
         }
 
@@ -1926,7 +1994,7 @@ mod fake {
                 .unwrap()
                 .entry(format!("github {method} {endpoint}"))
                 .or_default()
-                .push(reply);
+                .push(reply.map_err(GithubError::other));
             self
         }
 
@@ -2063,14 +2131,14 @@ mod fake {
             user: &User,
             _token: &Secret,
             endpoint: &str,
-        ) -> Result<GithubResponse, String> {
+        ) -> Result<GithubResponse, GithubError> {
             let key = format!("{}$ agh GET {endpoint}", user.name);
             self.calls.lock().unwrap().push(key.clone());
             let mut replies = self.github_replies.lock().unwrap();
             match replies.get_mut(&key) {
                 Some(list) if list.len() > 1 => list.remove(0),
                 Some(list) if list.len() == 1 => list[0].clone(),
-                _ => Err("fake: no GitHub response was scripted".into()),
+                _ => Err(GithubError::other("fake: no GitHub response was scripted")),
             }
         }
 
@@ -2089,8 +2157,8 @@ mod fake {
             self.calls.lock().unwrap().push(call);
             let mut replies = self.github_replies.lock().unwrap();
             match replies.get_mut(&key) {
-                Some(list) if list.len() > 1 => list.remove(0),
-                Some(list) if list.len() == 1 => list[0].clone(),
+                Some(list) if list.len() > 1 => list.remove(0).map_err(String::from),
+                Some(list) if list.len() == 1 => list[0].clone().map_err(String::from),
                 _ => Err(format!("fake: no GitHub response was scripted for `{key}`")),
             }
         }

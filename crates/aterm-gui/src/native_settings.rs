@@ -1514,8 +1514,13 @@ pub(crate) struct SettingsViewState {
     navigation_revealed: RefCell<Option<UiKey>>,
     scroll_record: RefCell<Option<scroll::ScrollRecord>>,
     page_chrome: Cell<PageChrome>,
-    page_chrome_at: Cell<Option<(LogicalRect, f32)>>,
+    page_chrome_at: Cell<Option<ChromeAt>>,
+    /// The chrome the page last drew its list in at each window, text size and bars ([`page`]).
+    page_chromes: RefCell<Vec<(ChromeAt, PageChrome)>>,
     page_chrome_memo: RefCell<Option<(ChromeInputs, PageChrome)>>,
+    /// Whether the least bar won the landing ([`page`]), by the inputs, chrome, bar and record of
+    /// the frame that tried it, kept for the frame's inputs and record.
+    least_bars: RefCell<Vec<(LeastAt, bool)>>,
     /// The chooser's rows each width built while [`page`] builds the page, which every seat of it shares.
     showcase_blocks: RefCell<Option<Vec<showcase_page::SharedBlocks>>>,
     /// The Customize sheet's rows each width and room built while [`page`] builds the page.
@@ -1704,7 +1709,9 @@ impl SettingsViewState {
             scroll_record: RefCell::new(None),
             page_chrome: Cell::new(PageChrome::FULL),
             page_chrome_at: Cell::new(None),
+            page_chromes: RefCell::new(Vec::new()),
             page_chrome_memo: RefCell::new(None),
+            least_bars: RefCell::new(Vec::new()),
             showcase_blocks: RefCell::new(None),
             showcase_sheet: RefCell::new(None),
             pinned_place: Cell::new(None),
@@ -5050,7 +5057,7 @@ impl SettingsApp {
                     let takes_page = view
                         .page_chrome_at
                         .get()
-                        .is_some_and(|(viewport, _)| reset_all_question_takes_page(view, viewport));
+                        .is_some_and(|at| reset_all_question_takes_page(view, at.viewport));
                     if view.presented_width.get() == Some(SettingsWidth::Compact) || takes_page {
                         view.open_question_scroll();
                     }
@@ -5337,8 +5344,7 @@ impl SettingsApp {
                         .macos_access
                         .as_ref()
                         .map_or(SpikeEvidence::MEASURED, |access| access.evidence);
-                    let (title, body, proceed) =
-                        debugger_access_alert(change, &facts, evidence, DebuggerAlertFrom::Press);
+                    let (title, body, proceed) = debugger_access_alert(change, &facts, evidence);
                     match view.owner_confirms(&title, &body, proceed) {
                         yes @ OwnerAnswer::Yes(_) => {
                             view.debugger_change_request = Some((change, yes));
@@ -11101,7 +11107,7 @@ impl SettingsWidth {
     }
 }
 
-fn settings_text_scale() -> f32 {
+pub(crate) fn settings_text_scale() -> f32 {
     crate::native_appearance::text_scale().clamp(0.85, 2.0)
 }
 
@@ -11180,6 +11186,7 @@ fn settings_tree(
     state.page_window.set(None);
     state.observe_semantic_font(cx.semantic_font.as_ref());
     state.status_bar_most.set(None);
+    let _bars = BarsShared::open();
     #[cfg(test)]
     if STATUS_BAR_LEAST.with(Cell::get) {
         state.status_bar_most.set(Some(0.0));
@@ -12389,6 +12396,19 @@ fn feedback_bar_height(
     width: SettingsWidth,
     viewport: LogicalRect,
 ) -> f32 {
+    let most = state.status_bar_most.get();
+    weighed(
+        |bars| &mut bars.heights,
+        (width, viewport, most),
+        || feedback_bar_laid_height(state, width, viewport),
+    )
+}
+
+fn feedback_bar_laid_height(
+    state: &SettingsViewState,
+    width: SettingsWidth,
+    viewport: LogicalRect,
+) -> f32 {
     let viewport_width = viewport.width;
     if state.has_unsaved_field_drafts() {
         let bar = DraftBar::of(state);
@@ -12529,6 +12549,8 @@ fn plain_bar_layout(
     width: SettingsWidth,
     viewport: LogicalRect,
 ) -> PlainBarLayout {
+    #[cfg(test)]
+    crate::work_counts::bar_laid_out();
     let full = (viewport.width - settings_navigation_width(width) - 32.0).max(0.0);
     let undo = state.undo_offer().is_some();
     let beside = if undo {
@@ -12538,8 +12560,16 @@ fn plain_bar_layout(
     };
     let undo_under = undo && broken_words(feedback, beside) > broken_words(feedback, full);
     let words_width = if undo_under { full } else { beside };
+    // A STATUS NEVER COVERS THE TOOLBAR'S SEARCH THE KEYBOARD IS ON, the
+    // reload warning's bar under it too: at 178x348 at 2x text the two took
+    // the toolbar out of view.
     let over = if width == SettingsWidth::Compact {
         compact_toolbar_height()
+            + if keyboard_on_toolbar_search(state) {
+                config_watch_status_bar_height(state)
+            } else {
+                0.0
+            }
     } else {
         0.0
     };
@@ -12831,6 +12861,8 @@ fn compact_dock_layout(
     plain: bool,
     words: Option<&str>,
 ) -> CompactDockLayout {
+    #[cfg(test)]
+    crate::work_counts::dock_laid_out();
     let (_, leading) = compact_toolbar_leading(state, viewport, true);
     let dock_width = (viewport.width - 20.0 - leading - 8.0).max(0.0);
     let scale = settings_text_scale();
@@ -12933,7 +12965,129 @@ fn dock_search_button() -> UiNode {
 }
 
 fn compact_status_dock_required(state: &SettingsViewState, viewport: LogicalRect) -> bool {
-    compact_status_dock_wanted(state, viewport) && !reset_all_question_takes_page(state, viewport)
+    #[cfg(test)]
+    if STATUS_UNDOCKED.with(Cell::get) {
+        return false;
+    }
+    let at = (
+        viewport,
+        state.status_bar_most.get(),
+        state.measuring_calm.get(),
+    );
+    weighed(
+        |bars| &mut bars.docked,
+        at,
+        || {
+            compact_status_dock_wanted(state, viewport)
+                && !reset_all_question_takes_page(state, viewport)
+                && !keyboard_on_toolbar_search(state)
+                && !stacked_bars_leave_more_room(state, viewport)
+        },
+    )
+}
+
+/// A STATUS DOCKS IN THE TOOLBAR ONLY WHERE THAT LEAVES THE PAGE MORE ROOM than its bars stacked
+/// under the page at their least, which they shorten to for the keyboard's control (R2 of
+/// seat_scroll): docked under the reload warning at 300x360 at 2x text, the toolbar took 336pt of
+/// the window and the Customize sheet's colour wheel went out of view.
+fn stacked_bars_leave_more_room(state: &SettingsViewState, viewport: LogicalRect) -> bool {
+    if state.common.last_focus.is_none() {
+        return false;
+    }
+    let calm = state.measuring_calm.get();
+    weighed(
+        |bars| &mut bars.roomier,
+        (viewport, calm),
+        || {
+            let docked = compact_docked_header_height(state, viewport) - compact_toolbar_height();
+            docked > 0.5 && {
+                let most = state.status_bar_most.replace(Some(0.0));
+                let least = settings_status_bars_height(state, SettingsWidth::Compact, viewport);
+                state.status_bar_most.set(most);
+                least < docked - 0.5
+            }
+        },
+    )
+}
+
+/// What a render weighed of its status's bars ([`BarsShared`]), each by what it reads that a
+/// render's seats and measures move: the window, the bar's height and a calm measure.
+#[derive(Default)]
+struct BarsWeighed {
+    docked: Weighed<(LogicalRect, Option<f32>, bool), bool>,
+    roomier: Weighed<(LogicalRect, bool), bool>,
+    headers: Weighed<LogicalRect, f32>,
+    costs: Weighed<(SettingsWidth, LogicalRect, bool), f32>,
+    heights: Weighed<(SettingsWidth, LogicalRect, Option<f32>), f32>,
+}
+
+/// What a render weighed of one of its bars, by what it was weighed at.
+type Weighed<K, V> = Vec<(K, V)>;
+
+thread_local! {
+    static BARS_WEIGHED: RefCell<Option<BarsWeighed>> = const { RefCell::new(None) };
+}
+
+/// A RENDER WEIGHS ITS STATUS'S BARS ONCE: while open, the bar's height, the dock's decision and
+/// what docking would cost are each laid out once a render for each window, bar height and
+/// measure, which is all of a render's state they read that its seats move.
+struct BarsShared;
+
+impl BarsShared {
+    fn open() -> Self {
+        BARS_WEIGHED.with(|bars| bars.replace(Some(BarsWeighed::default())));
+        Self
+    }
+}
+
+impl Drop for BarsShared {
+    fn drop(&mut self) {
+        BARS_WEIGHED.with(|bars| bars.replace(None));
+    }
+}
+
+/// `check`, a check only test builds make, with its page work uncounted and its bars weighed
+/// apart from the render's.
+#[cfg(test)]
+fn unseen<R>(check: impl FnOnce() -> R) -> R {
+    let bars = BARS_WEIGHED.with(|bars| {
+        let open = bars.borrow().is_some();
+        bars.replace(open.then(BarsWeighed::default))
+    });
+    let out = crate::work_counts::page_work_uncounted(check);
+    BARS_WEIGHED.with(|was| was.replace(bars));
+    out
+}
+
+/// `weigh`, once a render for `key` while [`BarsShared`] is open.
+fn weighed<K: PartialEq, V: Copy>(
+    of: fn(&mut BarsWeighed) -> &mut Weighed<K, V>,
+    key: K,
+    weigh: impl FnOnce() -> V,
+) -> V {
+    let seen = BARS_WEIGHED.with(|bars| {
+        bars.borrow_mut()
+            .as_mut()
+            .and_then(|bars| of(bars).iter().find(|(at, _)| *at == key).map(|(_, v)| *v))
+    });
+    seen.unwrap_or_else(|| {
+        let weighed = weigh();
+        BARS_WEIGHED.with(|bars| {
+            if let Some(bars) = bars.borrow_mut().as_mut() {
+                of(bars).push((key, weighed));
+            }
+        });
+        weighed
+    })
+}
+
+/// WHAT THE PERSON IS ON IN THE TOOLBAR NO STATUS TAKES THE PLACE OF (R2 of seat_scroll): the
+/// keyboard on the compact toolbar's search, which a docked status or reload warning replaces.
+fn keyboard_on_toolbar_search(state: &SettingsViewState) -> bool {
+    state.common.last_focus.as_ref().is_some_and(|key| {
+        let key = key.as_str();
+        key == "settings/search" || key.starts_with("settings/search-")
+    })
 }
 
 fn compact_status_dock_wanted(state: &SettingsViewState, viewport: LogicalRect) -> bool {
@@ -13161,9 +13315,22 @@ const fn compact_page_floor(state: &SettingsViewState) -> f32 {
 const COMPACT_BODY_LEAST: f32 = 220.0;
 
 fn compact_header_height(state: &SettingsViewState, viewport: LogicalRect) -> f32 {
-    if !compact_status_dock_required(state, viewport) {
-        return compact_toolbar_height();
+    if compact_status_dock_required(state, viewport) {
+        compact_docked_header_height(state, viewport)
+    } else {
+        compact_toolbar_height()
     }
+}
+
+fn compact_docked_header_height(state: &SettingsViewState, viewport: LogicalRect) -> f32 {
+    weighed(
+        |bars| &mut bars.headers,
+        viewport,
+        || compact_docked_header_laid(state, viewport),
+    )
+}
+
+fn compact_docked_header_laid(state: &SettingsViewState, viewport: LogicalRect) -> f32 {
     let layout = compact_dock_layout(
         state,
         viewport,
@@ -13901,19 +14068,32 @@ fn page(
     let _shared = showcase_page::BlocksShared::open(state);
     let _words = scroll::KeyboardWords::watch(state.common.last_focus.clone());
     let _status = StatusWordsShared::open();
-    let bars = settings_status_bars_height(state, width, cx.viewport) > 0.0;
-    let seat = |chrome: PageChrome, calm: bool| {
-        state.scroll_record.replace(record.clone());
+    let bars_height = settings_status_bars_height(state, width, cx.viewport);
+    let bars = bars_height > 0.0;
+    let chrome_at = ChromeAt {
+        viewport: cx.viewport,
+        scale: settings_text_scale(),
+        warning: state.config_watch_status.is_some(),
+        status: bars_height > config_watch_status_bar_height(state) + 0.01,
+    };
+    let drawn_at = state.page_chrome_at.get();
+    let bar_most = state.status_bar_most.get();
+    // What a seat in `chrome` lays the page out by: the rows' and fields' room, and what a
+    // status's bar takes of the list.
+    let ready = |chrome: PageChrome, calm: bool| {
         state.page_chrome.set(chrome);
         state.measuring_calm.set(true);
         let list = settings_list_body_height(state, width, cx.viewport);
-        let _rows = RowsTooTallToStack::set(
-            (width == SettingsWidth::Compact && SettingsWidth::Compact.row_height() > list + 0.01)
-                .then_some(list),
+        let rooms = (
+            RowsTooTallToStack::set(
+                (width == SettingsWidth::Compact
+                    && SettingsWidth::Compact.row_height() > list + 0.01)
+                    .then_some(list),
+            ),
+            FieldListRoom::set(Some(
+                (list - page_heading_height()).max(scaled_control_height()),
+            )),
         );
-        let _fields = FieldListRoom::set(Some(
-            (list - page_heading_height()).max(scaled_control_height()),
-        ));
         state.measuring_calm.set(calm);
         state
             .status_extra
@@ -13921,7 +14101,13 @@ fn page(
         state
             .status_slack
             .set(plain_status_slack(state, width, cx.viewport));
+        rooms
+    };
+    let seat = |chrome: PageChrome, calm: bool| {
+        state.scroll_record.replace(record.clone());
+        let rooms = ready(chrome, calm);
         let built = page_children(state, update, packages, messages, harness, cx, width);
+        drop(rooms);
         state.status_extra.set(0.0);
         state.status_slack.set(0.0);
         let (holds, cuts) = if state.route == SettingsRoute::Messages
@@ -13954,29 +14140,73 @@ fn page(
         state.measuring_calm.set(false);
         (built, holds, cuts)
     };
-    let seated_at = (cx.viewport, settings_text_scale());
+    // HOW THE PAGE LAYS ITS LIST OUT IN `chrome` UNDER THE BAR AT `most`, measured with no seat
+    // built ([`showcase_page::list_room`]), where the page has a measure: a seat the measure
+    // says cannot show what is owed is not built.
+    let laid = |chrome: PageChrome, most: Option<f32>| {
+        if !lists_themes(state, width) {
+            return None;
+        }
+        let was = (state.page_chrome.get(), state.status_bar_most.replace(most));
+        let rooms = ready(chrome, false);
+        let laid = showcase_page::list_room(state, width, cx);
+        drop(rooms);
+        state.status_extra.set(0.0);
+        state.status_slack.set(0.0);
+        state.page_chrome.set(was.0);
+        state.status_bar_most.set(was.1);
+        laid
+    };
+    // A page under a bar is built again under it, so a chrome decided
+    // without a seat's measures is not seated calm first.
     let decide = || {
         #[cfg(test)]
         if let Some(chrome) = PAGE_CHROME_HELD.with(Cell::get) {
-            return (chrome, seat(chrome, bars).0);
+            return (chrome, (!bars).then(|| seat(chrome, false).0));
         }
-        let kept = record
+        // A PAGE BACK AT A WINDOW, TEXT SIZE AND BARS IT WAS DRAWN AT DRAWS
+        // ITS LIST IN THE CHROME IT LAST DREW THERE, and a bar that comes or
+        // goes keeps the chrome, whatever the scroll (R1 and R4 of
+        // seat_scroll). Chosen again, a wheel and the text size there and
+        // back at 444x420 seated the Customize sheet under its full chrome,
+        // 7pt lower than the wheel's frame had drawn it under the leanest.
+        let same_context = record
             .as_ref()
-            .filter(|record| {
-                (record.top() > 0 || state.page_reveal.is_some()) && record.same_context(state)
+            .is_some_and(|record| record.same_context(state));
+        if !same_context {
+            state.page_chromes.borrow_mut().clear();
+        }
+        let last = drawn_at.filter(|_| same_context);
+        let kept = if last == Some(chrome_at) {
+            Some(state.page_chrome.get())
+        } else {
+            let recalled = same_context
+                .then(|| {
+                    state
+                        .page_chromes
+                        .borrow()
+                        .iter()
+                        .find(|(at, _)| *at == chrome_at)
+                        .map(|(_, chrome)| *chrome)
+                })
+                .flatten();
+            recalled.or_else(|| {
+                last.filter(|at| at.same_page(&chrome_at))
+                    .map(|_| state.page_chrome.get())
             })
-            .and_then(|_| state.page_chrome_at.get())
-            .filter(|at| *at == seated_at)
-            .map(|_| state.page_chrome.get());
+        };
         // The seat built last, while no other has been since: a seat starts
         // from the same record, so the same chrome seated again builds the
         // same page and leaves the same state, and is not built twice.
         let mut spare = None;
         if let Some(chrome) = kept {
-            let seated = seat(chrome, bars);
             let scrolled = record.as_ref().is_some_and(|record| record.top() > 0);
+            if bars && (scrolled || state.page_reveal.is_none()) {
+                return (chrome, None);
+            }
+            let seated = seat(chrome, bars);
             if scrolled || state.revealed_stop_fits() {
-                return (chrome, seated.0);
+                return (chrome, Some(seated.0));
             }
             spare = Some((chrome, seated));
         }
@@ -14009,7 +14239,7 @@ fn page(
             }
         });
         if let (Some(built), (0, 0)) = (built, cuts) {
-            return (chrome, built);
+            return (chrome, Some(built));
         }
         let ladder = PageChrome::ladder(width, cx.viewport);
         let further = ladder
@@ -14051,11 +14281,11 @@ fn page(
             }
         }
         match best {
-            (taken, Some(built), _) if taken == last => (taken, built),
-            (taken, _, _) => (taken, seat(taken, bars).0),
+            (taken, Some(built), _) if taken == last => (taken, Some(built)),
+            (taken, _, _) => (taken, (!bars).then(|| seat(taken, false).0)),
         }
     };
-    let inputs = ChromeInputs::of(state, cx);
+    let inputs = ChromeInputs::of(state, cx, (chrome_at.warning, chrome_at.status));
     let remembered = state
         .page_chrome_memo
         .borrow()
@@ -14064,12 +14294,12 @@ fn page(
         .map(|(_, chrome)| *chrome);
     #[cfg(test)]
     let remembered = remembered.filter(|_| PAGE_CHROME_HELD.with(Cell::get).is_none());
-    let (chrome, built) = match remembered {
+    let (mut chrome, built) = match remembered {
         Some(chrome) => {
             #[cfg(test)]
             {
                 CHROME_REMEMBERED.with(|count| count.set(count.get() + 1));
-                let (decided, _) = decide();
+                let (decided, _) = unseen(decide);
                 assert_eq!(
                     decided, chrome,
                     "the chrome remembered for these inputs is the chrome the page chooses"
@@ -14077,32 +14307,209 @@ fn page(
             }
             (chrome, None)
         }
-        None => {
-            let (chrome, built) = decide();
-            state.page_chrome_memo.replace(Some((inputs, chrome)));
-            (chrome, Some(built))
-        }
+        None => decide(),
     };
-    let (mut children, layout) = match built {
-        Some(built) if !bars => built,
-        _ => {
-            state.status_overrun.set(0.0);
-            let mut seated = seat(chrome, false).0;
-            loop {
-                let overrun = state.status_overrun.replace(0.0);
-                if overrun <= 0.01 {
-                    break seated;
-                }
-                let height = feedback_bar_height(state, width, cx.viewport);
-                state.status_bar_most.set(Some((height - overrun).max(0.0)));
-                if feedback_bar_height(state, width, cx.viewport) >= height - 0.01 {
-                    break seated;
-                }
-                seated = seat(chrome, false).0;
+    // The page seated under its bar in `chrome`, and whether the bar's least won the landing,
+    // where it was tried; a least bar already decided at the frame's inputs is not tried again.
+    let seat_bar = |chrome: PageChrome, decided: Option<bool>| {
+        state.status_overrun.set(0.0);
+        if decided == Some(true) {
+            state.status_bar_most.set(Some(0.0));
+            return (seat(chrome, false).0, decided);
+        }
+        state.status_bar_most.set(bar_most);
+        let mut seated = seat(chrome, false).0;
+        loop {
+            let overrun = state.status_overrun.replace(0.0);
+            if overrun <= 0.01 {
+                break;
             }
+            let height = feedback_bar_height(state, width, cx.viewport);
+            state.status_bar_most.set(Some((height - overrun).max(0.0)));
+            if feedback_bar_height(state, width, cx.viewport) >= height - 0.01 {
+                break;
+            }
+            seated = seat(chrome, false).0;
+        }
+        // BEFORE THE FIRST EVENT THE BAR SHORTENS TO ITS LEAST FOR THE
+        // LANDING TOO, where that shows it whole and the keyboard's control no
+        // less (R3 of seat_scroll), tried only where the room the bar gives
+        // back holds the landing: the chooser's head pinned only under a
+        // shorter bar, Tokyo Night at 339x920 at 2× text under the warning and
+        // a status lay off the list's screen.
+        let most = state.status_bar_most.get();
+        if decided.is_some() || most == Some(0.0) || !state.landing_cut() {
+            return (seated, decided);
+        }
+        // The room the bar gives back bounds what its list gains: the list is measured under the
+        // bar's least only where that room could land it.
+        let bar = feedback_bar_height(state, width, cx.viewport);
+        state.status_bar_most.set(Some(0.0));
+        let given = bar - feedback_bar_height(state, width, cx.viewport);
+        state.status_bar_most.set(most);
+        let measured = (given > 0.01 && state.landing_fits(given, false))
+            .then(|| laid(chrome, most).zip(laid(chrome, Some(0.0))));
+        let fits = |keyboard: bool| {
+            measured.is_some_and(|measured| {
+                measured.is_none_or(|(now, least)| {
+                    least != now
+                        && state.landing_fits(
+                            least.stops() - now.stops(),
+                            keyboard && least.stops_as(now),
+                        )
+                })
+            })
+        };
+        let left = state.keyboard_left();
+        let least = || {
+            state.status_bar_most.set(Some(0.0));
+            let least = seat(chrome, false).0;
+            let lands = !state.landing_cut() && state.keyboard_kept(left.as_ref());
+            if !lands {
+                state.status_bar_most.set(most);
+            }
+            (least, lands)
+        };
+        if !fits(true) {
+            // Turned away by the keyboard's control alone, it is seated in a test build to check.
+            #[cfg(test)]
+            if fits(false) {
+                unseen(|| {
+                    let (_, lands) = least();
+                    assert!(
+                        !lands,
+                        "a least bar the keyboard's control turns away loses the landing"
+                    );
+                    let _ = seat(chrome, false);
+                });
+            }
+            return (seated, Some(false));
+        }
+        match least() {
+            (least, true) => (least, Some(true)),
+            _ => (seat(chrome, false).0, Some(false)),
         }
     };
-    state.page_chrome_at.set(Some(seated_at));
+    // A FRAME AT THE INPUTS, CHROME, BAR AND RECORD OF ONE BEFORE TAKES ITS LEAST BAR'S
+    // DECISION: a least bar that won is seated once, one that lost is not tried.
+    let seat_drawn = |chrome: PageChrome| {
+        if !bars {
+            return seat(chrome, false).0;
+        }
+        let at = (inputs.clone(), chrome, bar_most, record.clone());
+        let decided = state
+            .least_bars
+            .borrow()
+            .iter()
+            .find(|(was, _)| *was == at)
+            .map(|(_, won)| *won);
+        #[cfg(test)]
+        if let Some(won) = decided {
+            LEAST_DECIDED.with(|count| count.set(count.get() + 1));
+            let (_, again) = unseen(|| seat_bar(chrome, None));
+            assert_eq!(
+                again,
+                Some(won),
+                "a least bar decided at these inputs, chrome, bar and record is decided the same again"
+            );
+        }
+        let (seated, tried) = seat_bar(chrome, decided);
+        if let (None, Some(won)) = (decided, tried) {
+            let mut bars = state.least_bars.borrow_mut();
+            bars.retain(|(was, _)| was.0 == at.0 && was.3 == at.3);
+            bars.push((at, won));
+        }
+        seated
+    };
+    let (mut children, mut layout) = match built {
+        Some(built) if !bars => built,
+        _ => seat_drawn(chrome),
+    };
+    // A CHROME THAT CUTS THE KEYBOARD'S CONTROL GIVES WAY TO THE FIRST
+    // RUNG THAT SHOWS IT WHOLE, OR NO LESS THAN THE LAST SCREEN DID (R2 of
+    // seat_scroll), where the window, text size or bars moved, or the
+    // keyboard did: the bars' room given on its own rung first, then the
+    // leaner rungs, then the richer, nearest first. Kept under a reload
+    // warning at 1268x165, the Customize sheet's list had no room left and
+    // its colour well went out of view; recalled at 380x300 under a status,
+    // its leanest chrome left the list 26pt, where the full one lists the
+    // demo and leaves it 123pt; made 380x302 under a status, the colour
+    // wheel showed 28pt of the 32pt the screen before did.
+    #[cfg(test)]
+    let held = PAGE_CHROME_HELD.with(Cell::get).is_some();
+    #[cfg(not(test))]
+    let held = false;
+    let keyboard_moved = record
+        .as_ref()
+        .is_some_and(|record| record.keyboard() != state.common.last_focus.as_ref());
+    if (drawn_at != Some(chrome_at) || keyboard_moved)
+        && !held
+        && state.keyboard_short_of(record.as_ref())
+        && state.keyboard_cut()
+    {
+        let ladder = PageChrome::ladder(width, cx.viewport);
+        let at = ladder
+            .iter()
+            .position(|rung| rung.giving_bar_room() == chrome.giving_bar_room())
+            .unwrap_or_default();
+        let mut tried = false;
+        let owed = state.keyboard_owed(record.as_ref());
+        // A rung holds what is owed only where its list's body, and the list measured in it, has
+        // room for it under the bar's least.
+        let holds_owed = |trial: PageChrome| {
+            owed.is_none_or(|owed| {
+                let was = (
+                    state.page_chrome.replace(trial),
+                    state.status_bar_most.replace(Some(0.0)),
+                );
+                let body = settings_list_body_height(state, width, cx.viewport);
+                state.page_chrome.set(was.0);
+                state.status_bar_most.set(was.1);
+                let held = |laid: showcase_page::ListRoom| owed <= laid.stops() + 0.5;
+                if owed > body + 0.5 {
+                    #[cfg(test)]
+                    assert!(
+                        !unseen(|| laid(trial, Some(0.0))).is_some_and(held),
+                        "a list holds no more than its body"
+                    );
+                    return false;
+                }
+                laid(trial, Some(0.0)).is_none_or(held)
+            })
+        };
+        let taken = (at..ladder.len())
+            .chain((0..at).rev())
+            .flat_map(|index| {
+                [
+                    Some(ladder[index]),
+                    bars.then(|| ladder[index].giving_bar_room()),
+                ]
+            })
+            .flatten()
+            .filter(|trial| *trial != chrome && holds_owed(*trial))
+            .find_map(|trial| {
+                tried = true;
+                let built = seat_drawn(trial);
+                (!state.keyboard_short_of(record.as_ref()) || !state.keyboard_cut())
+                    .then_some((trial, built))
+            });
+        // A trial seated last: the chrome kept is seated again.
+        match taken {
+            Some(taken) => (chrome, (children, layout)) = taken,
+            None if tried => (children, layout) = seat_drawn(chrome),
+            None => {}
+        }
+    }
+    if remembered != Some(chrome) {
+        state.page_chrome_memo.replace(Some((inputs, chrome)));
+    }
+    state.page_chrome_at.set(Some(chrome_at));
+    {
+        let mut chromes = state.page_chromes.borrow_mut();
+        chromes.retain(|(at, _)| *at != chrome_at);
+        chromes.insert(0, (chrome_at, chrome));
+        chromes.truncate(PAGE_CHROMES_KEPT);
+    }
     let global_search = !state.search.trim().is_empty();
     let insets = page_frame_insets(state, cx.viewport, width, layout.maximum(width));
     scroll::seat_page_scroller(&mut children, insets.right);
@@ -14128,6 +14535,13 @@ fn page(
         .children(children)
 }
 
+/// Whether [`page_children`] lays the themes page out.
+fn lists_themes(state: &SettingsViewState, width: SettingsWidth) -> bool {
+    state.route == SettingsRoute::Themes
+        && state.search.trim().is_empty()
+        && !(width == SettingsWidth::Compact && state.compact_navigation)
+}
+
 fn page_children(
     state: &SettingsViewState,
     update: &UpdateProjection,
@@ -14137,6 +14551,8 @@ fn page_children(
     cx: &ViewCx<'_>,
     width: SettingsWidth,
 ) -> (Vec<UiNode>, PageLayout) {
+    #[cfg(test)]
+    crate::work_counts::settings_page_built();
     let global_search = !state.search.trim().is_empty();
     let shown = PageLayout::shown(state);
     if global_search {
@@ -14549,11 +14965,45 @@ thread_local! {
     /// would choose: the chrome a frame held, which a test measures the
     /// screens of.
     pub(crate) static PAGE_CHROME_HELD: Cell<Option<PageChrome>> = const { Cell::new(None) };
+    /// Whether this thread's renders stack a compact window's statuses under
+    /// the page rather than dock them in the toolbar.
+    pub(crate) static STATUS_UNDOCKED: Cell<bool> = const { Cell::new(false) };
+    /// How many of this thread's seats under a bar took the least bar's decision from a frame
+    /// before; a test build also decides again, uncounted, and checks it decides the same.
+    pub(crate) static LEAST_DECIDED: Cell<usize> = const { Cell::new(0) };
 }
+
+/// What the page's chrome is held for ([`page`]): its window, text size and bars.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ChromeAt {
+    viewport: LogicalRect,
+    scale: f32,
+    warning: bool,
+    status: bool,
+}
+
+impl ChromeAt {
+    /// Whether `other` is this window at this text size, whatever its bars.
+    fn same_page(&self, other: &Self) -> bool {
+        self.viewport == other.viewport && (self.scale - other.scale).abs() < 0.001
+    }
+}
+
+/// What a least bar is decided at ([`page`]): the page's inputs, chrome, bar and record.
+type LeastAt = (
+    ChromeInputs,
+    PageChrome,
+    Option<f32>,
+    Option<scroll::ScrollRecord>,
+);
+
+/// How many windows, text sizes and bars a page remembers its chrome at ([`page`]).
+const PAGE_CHROMES_KEPT: usize = 64;
 
 #[derive(Clone, Debug, PartialEq)]
 struct ChromeInputs {
     content: u64,
+    bars: (bool, bool),
     viewport: LogicalRect,
     appearance: crate::native_appearance::AppearancePreferences,
     terminal: (f32, f32),
@@ -14563,9 +15013,10 @@ struct ChromeInputs {
 }
 
 impl ChromeInputs {
-    fn of(state: &SettingsViewState, cx: &ViewCx<'_>) -> Self {
+    fn of(state: &SettingsViewState, cx: &ViewCx<'_>, bars: (bool, bool)) -> Self {
         Self {
             content: state.common.content_epoch,
+            bars,
             viewport: cx.viewport,
             appearance: crate::native_appearance::current_preferences(),
             terminal: (cx.terminal_font_px, cx.terminal_scale),
@@ -14748,6 +15199,19 @@ fn settings_status_bar_cost(
     width: SettingsWidth,
     viewport: LogicalRect,
 ) -> f32 {
+    let calm = state.measuring_calm.get();
+    weighed(
+        |bars| &mut bars.costs,
+        (width, viewport, calm),
+        || settings_status_bar_laid_cost(state, width, viewport),
+    )
+}
+
+fn settings_status_bar_laid_cost(
+    state: &SettingsViewState,
+    width: SettingsWidth,
+    viewport: LogicalRect,
+) -> f32 {
     let bar = scaled_control_height();
     let watcher = state.config_watch_status.is_some() && !state.measuring_calm.get();
     let docks = width == SettingsWidth::Compact
@@ -14865,7 +15329,7 @@ fn noncompact_page_content_height(
         .max(0.0)
 }
 
-fn page_heading(title: &str, subtitle: &str) -> Vec<UiNode> {
+pub(crate) fn page_heading(title: &str, subtitle: &str) -> Vec<UiNode> {
     let mut out = vec![
         UiNode::new(
             format!("settings/page-heading/{}", key_fragment(title)),
@@ -14973,7 +15437,7 @@ fn elide_wrapped_copy_tail(
     }
 }
 
-fn wrapped_copy_node(
+pub(crate) fn wrapped_copy_node(
     key: &str,
     text: &str,
     role: SemanticRole,
@@ -24231,7 +24695,9 @@ impl MacosAccess {
 pub(crate) struct ConsentGestures {
     open_settings: fn(crate::menu::PrivacyPane) -> crate::menu::SettingsOpen,
     run_reset: fn(&ResetPlan) -> Vec<ResetAttempt>,
-    confirm: fn(&str, &str, &str) -> Option<bool>,
+    /// aterm's alert or nobody ([`ConfirmArm`]): a shipped build has no arm
+    /// that answers for the owner.
+    confirm: ConfirmArm,
     run_devtools: fn(crate::debugger_access::DevtoolsJob) -> crate::debugger_access::DevtoolsSpawn,
     asks_devtools_hand_over: fn() -> bool,
     live: bool,
@@ -24243,7 +24709,7 @@ impl ConsentGestures {
         Self {
             open_settings: crate::menu::open_privacy_settings,
             run_reset: run_tccutil_reset,
-            confirm: live_confirm,
+            confirm: ConfirmArm::Alert,
             run_devtools: crate::debugger_access::spawn_devtools_worker,
             asks_devtools_hand_over: gesture_yes,
             live: true,
@@ -24267,7 +24733,7 @@ impl ConsentGestures {
         Self {
             open_settings: inert_open_settings,
             run_reset: inert_run_reset,
-            confirm: inert_confirm,
+            confirm: ConfirmArm::Nobody,
             run_devtools: crate::debugger_access::inert_run_devtools,
             asks_devtools_hand_over: gesture_no,
             live: false,
@@ -24278,7 +24744,7 @@ impl ConsentGestures {
     #[cfg(test)]
     pub(crate) const fn confirming() -> Self {
         Self {
-            confirm: test_confirm_yes,
+            confirm: ConfirmArm::StandIn(test_confirm_yes),
             asks_devtools_hand_over: gesture_yes,
             ..Self::inert()
         }
@@ -24301,14 +24767,10 @@ impl ConsentGestures {
         ) -> crate::debugger_access::DevtoolsSpawn,
     ) -> Self {
         Self {
-            confirm,
+            confirm: ConfirmArm::StandIn(confirm),
             run_devtools,
             ..Self::inert()
         }
-    }
-
-    fn confirm(&self, title: &str, body: &str, proceed: &str) -> Option<bool> {
-        (self.confirm)(title, body, proceed)
     }
 
     /// `live()` for a windowed instance, `inert()` for a headless one.
@@ -24439,22 +24901,6 @@ impl PartialEq for ConsentGestures {
 }
 
 impl Eq for ConsentGestures {}
-
-fn live_confirm(title: &str, body: &str, proceed: &str) -> Option<bool> {
-    #[cfg(target_os = "macos")]
-    {
-        crate::menu::confirm_owner(title, body, proceed)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (title, body, proceed);
-        None
-    }
-}
-
-const fn inert_confirm(_title: &str, _body: &str, _proceed: &str) -> Option<bool> {
-    None
-}
 
 const fn gesture_yes() -> bool {
     true
@@ -25339,13 +25785,6 @@ fn debugger_press_refusal(
     })
 }
 
-/// Who raises [`debugger_access_alert`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DebuggerAlertFrom {
-    Press,
-    Launch,
-}
-
 const fn debugger_alert_not_hardened_bullet(
     hardening: aterm_containment::consent::SelfHardening,
 ) -> Option<&'static str> {
@@ -25363,12 +25802,11 @@ const fn debugger_alert_not_hardened_bullet(
     }
 }
 
-/// aterm's own alert before a debugger-access change (debugger design §3.4 step 1).
+/// aterm's own alert before a debugger-access change pressed on Settings ▸ Security (debugger design §3.4 step 1): only that press raises it; System State's debugger step asks nothing of aterm's own. Returns `(title, body, proceed)`.
 pub(crate) fn debugger_access_alert(
     change: aterm_containment::consent::DebuggerChange,
     facts: &crate::debugger_access::DebuggerFacts,
     evidence: SpikeEvidence,
-    from: DebuggerAlertFrom,
 ) -> (String, String, &'static str) {
     use aterm_containment::consent::{
         DEBUGGER_ACCESS_REVERT, DebuggerChange, DebuggerMember, SelfHardening,
@@ -25404,24 +25842,15 @@ pub(crate) fn debugger_access_alert(
             ];
             bullets.extend(debugger_alert_not_hardened_bullet(facts.self_hardened));
             bullets.push("\u{2022} Apple advises administrators not to change this rule");
-            let undo = match from {
-                DebuggerAlertFrom::Press => "press Turn Off Debugger Access\u{2026} here",
-                DebuggerAlertFrom::Launch => {
-                    "aterm's Settings \u{25b8} Security \u{25b8} Turn Off Debugger Access\u{2026}"
-                }
-            };
-            let mut paragraphs = Vec::new();
-            if from == DebuggerAlertFrom::Launch {
-                paragraphs.push("aterm asks you this once on this Mac.".to_owned());
-            }
-            paragraphs.extend([
+            let undo = "press Turn Off Debugger Access\u{2026} here";
+            let paragraphs = [
                 "Afterwards, programs you run can debug your other programs without a password, \
                  and read or change their memory."
                     .to_owned(),
                 bullets.join("\n"),
                 password,
                 format!("To undo: {undo}, or run {DEBUGGER_ACCESS_REVERT}."),
-            ]);
+            ];
             (
                 "Allow debugger access on this Mac?".to_owned(),
                 paragraphs.join("\n\n"),
@@ -25699,12 +26128,6 @@ impl OwnerQuiet {
         self.debugger_answered
     }
 
-    /// The App's launch ask took the owner's yes to a debugger-access change.
-    pub(crate) const fn note_debugger_confirmed(&mut self) {
-        self.debugger_answered = true;
-        self.debugger_confirmed = true;
-    }
-
     /// The park has taken up every confirmed gesture (started it, or said why not).
     pub(crate) const fn settle_confirmed(&mut self) {
         self.warmup_confirmed = false;
@@ -25736,47 +26159,10 @@ impl OwnerQuiet {
     }
 }
 
-/// The owner's yes in one of aterm's own alerts.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct OwnerYes(());
-
-impl OwnerYes {
-    /// A yes minted outside an alert, for tests only.
-    #[cfg(test)]
-    pub(crate) const fn for_test() -> Self {
-        Self(())
-    }
-}
-
-/// Ask the owner in aterm's alert.
-pub(crate) fn owner_confirms_with(
-    quiet: &SharedOwnerQuiet,
-    gestures: &ConsentGestures,
-    title: &str,
-    body: &str,
-    proceed: &str,
-) -> OwnerAnswer {
-    if quiet
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .quiet_at(QuietStamp::now())
-    {
-        return OwnerAnswer::Quiet;
-    }
-    let answer = gestures.confirm(title, body, proceed);
-    let mut quiet = quiet.lock().unwrap_or_else(|p| p.into_inner());
-    match answer {
-        Some(true) => {
-            quiet.accepted();
-            OwnerAnswer::Yes(OwnerYes(()))
-        }
-        Some(false) => {
-            quiet.declined(QuietStamp::now());
-            OwnerAnswer::No
-        }
-        None => OwnerAnswer::NotAsked,
-    }
-}
+/// The owner's yes ([`OwnerYes`]), its doors ([`owner_confirms_with`], `OwnerYes::from_admitted`) and the alert's arm ([`ConfirmArm`]) live in a leaf module whose private field nothing else in the crate can reach (the aterm-census guard `devtools-door` holds the leaf to that shape).
+#[path = "native_settings_owner_yes.rs"]
+mod owner_yes;
+pub(crate) use owner_yes::{ConfirmArm, OwnerYes, owner_confirms_with};
 
 /// How [`owner_confirms_with`] came out.
 #[derive(Debug, PartialEq, Eq)]
@@ -30736,14 +31122,34 @@ fn wrapped_words_node(
     width: f32,
     line_height: f32,
 ) -> (UiNode, f32) {
+    let lines = wrapped_words_lines(text, (role, style), width);
+    words_node_of_lines(key, text, (role, style), lines, line_height)
+}
+
+/// The lines [`wrapped_words_node`] sets `text` on at `width`.
+fn wrapped_words_lines(
+    text: &str,
+    (role, style): (SemanticRole, StyleRef),
+    width: f32,
+) -> Vec<String> {
     let (px, face) = crate::native_ui::text_paint_metrics(role, style);
-    let lines = wrap_to_box(text, width, &|line| {
+    wrap_to_box(text, width, &|line| {
         if face == crate::widget::TextFace::Mono {
             crate::tray_raster::measure_text(line, px, crate::widget::TextWeight::Regular)
         } else {
             crate::tray_raster::ui_text_width_for(face, line, px)
         }
-    });
+    })
+}
+
+/// [`wrapped_words_node`] of the `lines` [`wrapped_words_lines`] set.
+fn words_node_of_lines(
+    key: &str,
+    text: &str,
+    (role, style): (SemanticRole, StyleRef),
+    lines: Vec<String>,
+    line_height: f32,
+) -> (UiNode, f32) {
     let height = lines.len().max(1) as f32 * line_height;
     let line_node = |key: String, text: String| {
         UiNode::new(key, UiContent::Text(TextSpec { text, role, style }))

@@ -11,7 +11,7 @@ use aterm_update_core::roster::{self, Roster, verify_roster};
 use aterm_update_core::tag::{TagKind, parse_release_tag};
 use ring::signature::{Ed25519KeyPair, KeyPair as _};
 
-use crate::support::{Lib, Rec, Rng, Scratch, chmod, q, s, symlink, write};
+use crate::support::{Lib, Rec, Rng, Scratch, chmod, q, run, s, symlink, write};
 
 pub const TAG: &str = "v0.100.0";
 pub const SLUG: &str = "example/aterm";
@@ -1660,6 +1660,56 @@ pub fn what_the_installer_makes_its_verifier_admits_under_any_umask(
     let stores: Vec<&Path> = made.iter().map(|(_, store)| store.as_path()).collect();
     for (store, policy) in stores.iter().zip(v.policies(scratch, &stores)) {
         assert!(policy.is_ok(), "{}: {policy:?}", store.display());
+    }
+    // Default ACLs, and `setfacl`, are Linux's: macOS (where aterm-bootstrap-verify runs
+    // this too) has neither.
+    if cfg!(target_os = "linux") {
+        // Below a folder with a default ACL, Linux makes a folder with the modes that ACL
+        // passes on, whatever the umask (0777 under one that lets every account write), and
+        // the installer then takes group and other write back, the ACL's mask with them. The
+        // pre-flight's answer while the folders are still to be made, a dry run's, stands.
+        let inherited: Vec<PathBuf> = ["g::rwx,o::rwx", "u:nobody:rwx"]
+            .iter()
+            .enumerate()
+            .map(|(n, spec)| {
+                let parent = open_root.join(format!("acl{n}"));
+                std::fs::create_dir(&parent).expect("mkdir");
+                chmod(&parent, 0o755);
+                let set = run(aterm_uds::spawnfd::command("setfacl")
+                    .args(["-d", "-m", spec])
+                    .arg(&parent));
+                assert_eq!(set.code(), 0, "setfacl -d -m {spec}: {}", set.all());
+                parent.join(".local/lib/aterm/bin")
+            })
+            .collect();
+        let inherited: Vec<&Path> = inherited.iter().map(PathBuf::as_path).collect();
+        for answer in v.preflights(scratch, &inherited) {
+            assert!(answer.starts_with("ok\t"), "still to be made: {answer}");
+        }
+        let mut lib = Lib::new();
+        let calls: Vec<usize> = inherited
+            .iter()
+            .map(|store| {
+                lib.call(
+                    format!("umask 022; ensure_dirs_writable {}", q(s(store))),
+                    &[],
+                )
+            })
+            .collect();
+        let recs = lib.run(scratch);
+        for (store, call) in inherited.iter().zip(calls) {
+            assert_eq!(recs[call].rc, 0, "{}: {}", store.display(), recs[call].err);
+            for dir in store.ancestors().take(4) {
+                let got = std::fs::metadata(dir).expect("made").mode() & 0o7777;
+                assert_eq!(format!("{got:o}"), "755", "{}", dir.display());
+            }
+        }
+        for answer in v.preflights(scratch, &inherited) {
+            assert!(answer.starts_with("ok\t"), "made: {answer}");
+        }
+        for (store, policy) in inherited.iter().zip(v.policies(scratch, &inherited)) {
+            assert!(policy.is_ok(), "{}: {policy:?}", store.display());
+        }
     }
     let shared = open_root.join("shared");
     std::fs::create_dir(&shared).expect("mkdir");

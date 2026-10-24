@@ -253,10 +253,10 @@ Run aterm's checks in place, alone or in any combination.
   verify glue <in.wasm> <out-dir>
                                   a wasm module's ES module glue (`verify glue --help`)
   verify provision [--linux] [--record] [--check] [ROW...]
-                                  the tools this checkout pins (fish, pwsh,
-                                  binaryen, the browsers, rustup's stock
-                                  exceptions; lima, wasm-bindgen), fetched or
-                                  built into this user's cache
+                                  the tools this checkout pins (fish, bash
+                                  5.3, pwsh, binaryen, the browsers, rustup's
+                                  stock exceptions; lima, wasm-bindgen),
+                                  fetched or built into this user's cache
   verify browser-site DIR         the browser check's first half: both web
                                   modules built and the site laid in DIR
   verify browser-drive SITE OUT [--engine metal|swiftshader|firefox|webkit]...

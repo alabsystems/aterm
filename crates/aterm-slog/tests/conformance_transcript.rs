@@ -33,6 +33,8 @@ pub enum Broken {
     AttachEarly,
     /// A prompt row dated in the past is handed on dated now.
     PromptAtNow,
+    /// A turn end dated before the open turn opened is handed on dated now.
+    EndAtNow,
 }
 
 /// The real tracker and its log, the transcript file the join reads, and the model ghost.
@@ -299,6 +301,14 @@ pub fn project_parts(
     let pend = view
         .settle
         .is_some_and(|(c, _)| matches!(c, SettleCause::Wall(_)));
+    let vc = open_turn(log, run).is_some_and(|(n, t)| {
+        tv.mapped == Some(n)
+            && tv.prompt_ms <= t
+            && st
+                .turn()
+                .filter(|o| o.node == n)
+                .is_some_and(|o| o.f.get(Key::Vref).is_none() && o.f.get(Key::Cont).is_some())
+    });
     [
         ("wm", i64::from(tv.through.is_some())),
         ("pt", i64::from(partial)),
@@ -318,6 +328,7 @@ pub fn project_parts(
         ("wd", i64::from(view.word == Verdict::Idle)),
         ("rf", i64::from(tv.refuted.is_some())),
         ("ts", open_tools(log, run).len() as i64),
+        ("vc", i64::from(vc)),
         ("g", if turns > 1 { 1 } else { g }),
     ]
     .into_iter()
@@ -395,6 +406,8 @@ pub enum Step {
     Tool,
     Result,
     End,
+    /// A turn end dated just before the open turn opened.
+    EarlyEnd,
     Interrupt,
     Refute,
     Confirm,
@@ -652,6 +665,36 @@ pub fn apply(m: &Model, j: &mut Join, step: Step) -> Result<Option<Vec<&'static 
                 .filter(|a| on(a))
                 .collect()
         }
+        Step::EarlyEnd => {
+            let Some((node, opened)) = j.open_turn() else {
+                return Ok(None);
+            };
+            let Some(dated) = opened.checked_sub(1).filter(|&t| t >= j.floor) else {
+                return Ok(None);
+            };
+            let end = TxEvent::TurnEnd {
+                vdur_ms: 4200,
+                tok_in: 900,
+                tok_out: 120,
+            };
+            let dated = if j.broken == Broken::EndAtNow {
+                wall
+            } else {
+                dated
+            };
+            let recs = j.row(end, dated);
+            if prev["vc"] == 1 && recs.iter().any(|r| r.op == Op::Close && r.node == node) {
+                j.ghost(10);
+            }
+            if on("TxEndBeforeCont") {
+                vec!["TxEndBeforeCont"]
+            } else {
+                ["TxEndCloses", "TxEndHeld"]
+                    .into_iter()
+                    .filter(|a| on(a))
+                    .collect()
+            }
+        }
         Step::Interrupt => {
             j.row(TxEvent::Interrupt, wall);
             if on("Interrupt") {
@@ -740,6 +783,8 @@ const POOL: &[Step] = &[
     Step::Result,
     Step::End,
     Step::End,
+    Step::EarlyEnd,
+    Step::EarlyEnd,
     Step::Interrupt,
     Step::Refute,
     Step::Confirm,
@@ -794,6 +839,7 @@ fn transcript_join_conforms_to_derived_model() {
         "TxCloseTakesWall",
         "RefuteLeavesSettle",
         "PartialCloses",
+        "EarlyEndClosesCont",
     ]
     .into_iter()
     .collect();
@@ -812,6 +858,7 @@ fn transcript_join_conformance_rejects_each_broken_join() {
         (Broken::ToolUnderRun, "StepsUnderOpenTurn"),
         (Broken::AttachEarly, "AttachOnlyWithinWindow"),
         (Broken::PromptAtNow, "PromptNamesNearestTurn"),
+        (Broken::EndAtNow, "EndClosesOnlyItsOwnTurn"),
     ] {
         let caught: Vec<String> = (1..=160u64)
             .filter_map(|seed| walk(seed, 160, broken).err())
@@ -836,7 +883,7 @@ fn transcript_join_conformance_rejects_each_mutant_state() {
         }
         s
     };
-    let cases: [(&str, &[&str], &str); 13] = [
+    let cases: [(&str, &[&str], &str); 14] = [
         (
             "PromptOpensBeside",
             &["Bind", "ScreenBusy", "PromptAttach"],
@@ -893,6 +940,17 @@ fn transcript_join_conformance_rejects_each_mutant_state() {
             "PartialCloses",
             &["Bind", "SetPartial", "ScreenBusy", "PromptAttach"],
             "PartialNeverOverrules",
+        ),
+        (
+            "EarlyEndClosesCont",
+            &[
+                "Bind",
+                "ScreenBusy",
+                "PromptAttach",
+                "ScreenRest",
+                "ScreenBusy",
+            ],
+            "EndClosesOnlyItsOwnTurn",
         ),
     ];
     for (mutant, path, law) in cases {

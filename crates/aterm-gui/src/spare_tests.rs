@@ -589,61 +589,6 @@ fn a_window_coming_to_the_front_is_a_person() {
     );
 }
 
-/// `sweep_dead_fifos` removes only FIFOs and symlinks belonging to dead owners.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-#[test]
-fn the_fifo_sweep_removes_only_a_dead_owners_fifo_and_its_link() {
-    use std::os::unix::ffi::OsStrExt as _;
-    let dir = aterm_tempfile::tempdir().expect("tempdir");
-    let at = |name: &str| dir.path().join(name);
-    let mkfifo = |name: &str| {
-        let c = std::ffi::CString::new(at(name).as_os_str().as_bytes()).expect("path");
-        // SAFETY: `c` is a NUL-terminated path that lives across the call.
-        assert_eq!(
-            unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
-            0,
-            "mkfifo {name}"
-        );
-    };
-    let link = |to: &str, sid: &str| std::os::unix::fs::symlink(to, at(sid)).expect("link");
-    let mut gone = aterm_uds::spawnfd::command("/bin/sleep")
-        .arg("600")
-        .spawn()
-        .expect("sleep");
-    let gone_pid = i32::try_from(gone.id()).expect("pid");
-    let gone_birth = aterm_pty::process_birth(gone_pid).expect("its birth");
-    gone.kill().expect("kill");
-    gone.wait().expect("reap");
-    let me = i32::try_from(std::process::id()).expect("pid");
-    let my_birth = aterm_pty::process_birth(me).expect("this process's birth");
-
-    let dead = format!("{gone_pid}-{gone_birth}-s-0a");
-    mkfifo(&dead);
-    link(&dead, "s-0a");
-    let reused = format!("{me}-{}-s-0b", my_birth + 1);
-    mkfifo(&reused);
-    let live = format!("{me}-{my_birth}-s-0c");
-    mkfifo(&live);
-    link(&live, "s-0c");
-    mkfifo("s-0d");
-    let not_fifo = format!("{gone_pid}-{gone_birth}-s-0e");
-    std::fs::write(at(&not_fifo), b"").expect("file");
-    let unread = format!("{me}-0-s-0f");
-    mkfifo(&unread);
-    mkfifo(&format!("{gone_pid}-0-s-10"));
-
-    sweep_dead_fifos(dir.path());
-    let mut left: Vec<String> = std::fs::read_dir(dir.path())
-        .expect("read")
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
-    left.sort();
-    let mut kept = vec![live, "s-0c".to_owned(), "s-0d".to_owned(), not_fifo, unread];
-    kept.sort();
-    assert_eq!(left, kept);
-}
-
 /// `spawn_fingerprint` changes with shell-shaping fields and ignores terminal colors.
 #[test]
 fn the_spawn_fingerprint_moves_with_what_shapes_a_shell_and_not_with_colours() {

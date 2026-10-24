@@ -199,8 +199,15 @@ enum Kind {
 /// vocabulary was segmented at load.
 #[inline]
 fn kind_of(c: char) -> Kind {
-    if c == ' ' {
-        return Kind::Space;
+    if c.is_ascii() {
+        return match c {
+            ' ' => Kind::Space,
+            '0'..='9' | 'A'..='Z' | 'a'..='z' | '_' => Kind::Word,
+            '\'' | '-' => Kind::Joiner,
+            '.' | '!' | '?' | ',' => Kind::Stop,
+            c if c.is_ascii_control() => Kind::Alien,
+            _ => Kind::Code,
+        };
     }
     if is_token_char(c) || is_no_space_script(c) {
         return Kind::Word;
@@ -215,7 +222,7 @@ fn kind_of(c: char) -> Kind {
         return Kind::Space;
     }
     match c {
-        '.' | '!' | '?' | ',' | '\u{2026}' => Kind::Stop,
+        '\u{2026}' => Kind::Stop,
         '\u{3002}' | '\u{FF01}' | '\u{FF1F}' | '\u{3001}' | '\u{FF0C}' => Kind::WideStop,
         _ => Kind::Code,
     }
@@ -232,6 +239,9 @@ const fn is_unspaced_script(c: char) -> bool {
 const GLUED_NAME_CHARS: usize = 2;
 
 fn glued(lexicon: &TrickLexicon, token: &str, scratch: &mut String) -> Option<(Trick, Cuts)> {
+    if token.as_bytes().first().is_none_or(u8::is_ascii) {
+        return None;
+    }
     let mut chars = 0usize;
     for c in token.chars() {
         if !is_unspaced_script(c) {
@@ -851,6 +861,7 @@ impl TrickListener {
         let kind = kind_of(c);
         if kind == Kind::Word
             && self.line.token_chars as usize >= TOKEN_CHARS
+            && !c.is_ascii()
             && aterm_grapheme::char_width(c) == 0
         {
             return None;
@@ -902,7 +913,7 @@ impl TrickListener {
     fn push_token_char(&mut self, c: char) -> Option<Outcome> {
         let mut out = None;
         if self.line.token_chars == 0 {
-            if aterm_grapheme::char_width(c) == 0 {
+            if !c.is_ascii() && aterm_grapheme::char_width(c) == 0 {
                 return self.poison();
             }
             let glued = self.line.tail.is_some()
@@ -1238,7 +1249,7 @@ impl TrickListener {
         while let Some(c) = self.line.token.pop() {
             popped = popped.saturating_add(1);
             self.line.token_chars = self.line.token_chars.saturating_sub(1);
-            if aterm_grapheme::char_width(c) != 0 {
+            if c.is_ascii() || aterm_grapheme::char_width(c) != 0 {
                 break;
             }
         }

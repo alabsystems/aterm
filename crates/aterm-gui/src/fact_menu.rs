@@ -852,8 +852,7 @@ pub(crate) fn account_menu_rows_from(
                     let own = session
                         .figure
                         .filter(|_| session_label == Some(row.label.as_str()));
-                    WeeklyFigure::newer(tapped, sampled)
-                        .and_then(|store| WeeklyFigure::newer(Some(store), own))
+                    WeeklyFigure::newer(WeeklyFigure::newer(tapped, sampled), own)
                         .map(|figure| row_figure(figure, now))
                         .or_else(|| {
                             acct.warned_week
@@ -938,6 +937,21 @@ impl App {
         let mut session_week = SessionWeek::default();
         if let Some(entry) = self.pool.get(session) {
             let timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+            let non_claude = match timeline
+                .agent()
+                .program
+                .as_deref()
+                .and_then(aterm_phase::program_of)
+            {
+                Some(aterm_phase::Program::Claude) | None => false,
+                Some(
+                    aterm_phase::Program::Agy
+                    | aterm_phase::Program::Muse
+                    | aterm_phase::Program::Codex
+                    | aterm_phase::Program::Gemini
+                    | aterm_phase::Program::Generic,
+                ) => true,
+            };
             if let Some(facts) = timeline.claude_footer() {
                 let pgid = timeline.agent().program_pgid;
                 let latched = state
@@ -950,9 +964,13 @@ impl App {
                         .as_deref()
                         .is_some_and(crate::claude_slash::takes_key_toggle);
                 let facts = facts.filled_from(timeline.claude_card());
-                session_acct.clone_from(&facts.account);
+                if !non_claude {
+                    session_acct.clone_from(&facts.account);
+                }
                 if let Some(sub) = &facts.subscription {
-                    session_email.clone_from(&sub.email);
+                    if !non_claude {
+                        session_email.clone_from(&sub.email);
+                    }
                     let email_str = sub.email.as_deref().filter(|s| !s.is_empty());
                     let plan_str = sub.plan.as_deref().filter(|s| !s.is_empty());
                     let summary = match (email_str, plan_str) {
@@ -972,10 +990,14 @@ impl App {
                     let now = aterm_time::unix_secs()
                         .and_then(|n| i64::try_from(n).ok())
                         .unwrap_or(0);
-                    (session_week.left, out.weekly_meter, out.weekly_gap) =
-                        weekly_facts(sub, walled, now);
-                    session_week.figure = session_figure(sub, now);
-                    session_week.label.clone_from(&sub.label);
+                    let (left, weekly_meter, weekly_gap) = weekly_facts(sub, walled, now);
+                    out.weekly_meter = weekly_meter;
+                    out.weekly_gap = weekly_gap;
+                    if !non_claude {
+                        session_week.left = left;
+                        session_week.figure = session_figure(sub, now);
+                        session_week.label.clone_from(&sub.label);
+                    }
                 }
                 (out.model, out.effort, out.path, out.branch, out.context) = (
                     facts.model,

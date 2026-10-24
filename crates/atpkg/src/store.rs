@@ -634,7 +634,10 @@ pub fn declared_modes(build_dir: &Path) -> std::io::Result<crate::tree::Declared
         crate::metadata_io::read_bounded_regular(&path, MAX_DECLARED_MODES_BYTES).map_err(|e| {
             let mut m = String::from("no declared-mode record beside the build (");
             m.push_str(&e.to_string());
-            m.push_str("): staged before this platform kept one; `aterm pkg install` re-stages it");
+            m.push_str(
+                "): staged before this platform kept one; `aterm pkg uninstall <program>`, then \
+                 `aterm pkg install <program>`, re-stages it",
+            );
             std::io::Error::new(e.kind(), m)
         })?;
     parse_declared_modes(&bytes).ok_or_else(|| {

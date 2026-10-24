@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Seamless-update carry for a supervised session's task end and worked time ([`EndCarry::row`]).
+//! Seamless-update carry for a supervised session's task end, a proven self-claim's face, and worked time ([`EndCarry::row`]).
 
 use aterm_agent::harness::acts::TaskFace;
 
@@ -12,6 +12,8 @@ use crate::harness_glass::EndFace;
 pub(crate) struct EndCarry {
     /// The end standing on the glass at the park, if one did.
     pub(crate) end: Option<CarriedEnd>,
+    /// A proven self-claim's face where no end stood on the glass (a landing under the work floor, a turn begun since one), and the wall time (unix ms) it moved there: nothing restates it at the successor, whose status sweep marks the task record by it (`App::reconcile_self_claim_task`).
+    pub(crate) face: Option<(TaskFace, i64)>,
     /// The agent's busy time since the task opened, ledger ms
     /// (`AbBook::worked` at the park).
     pub(crate) worked_ms: u64,
@@ -49,23 +51,28 @@ impl EndCarry {
     #[cfg(any(unix, test))]
     #[must_use]
     pub(crate) fn row(&self) -> Option<String> {
-        match self.end {
-            Some(end) => Some(format!(
+        match (self.end, self.face) {
+            (Some(end), _) => Some(format!(
                 "end={}@{} seen={} worked={}",
                 word(end.face),
                 end.at_ms,
                 u8::from(end.seen),
                 self.worked_ms
             )),
-            None if self.worked_ms > 0 => Some(format!("end=- worked={}", self.worked_ms)),
-            None => None,
+            (None, Some((face, at_ms))) => Some(format!(
+                "end=- face={}@{at_ms} worked={}",
+                face.status(),
+                self.worked_ms
+            )),
+            (None, None) if self.worked_ms > 0 => Some(format!("end=- worked={}", self.worked_ms)),
+            (None, None) => None,
         }
     }
 
     /// READ A CARRIED ROW ([`Self::row`]), or `None` where it does not read.
     #[must_use]
     pub(crate) fn parse(row: &str) -> Option<Self> {
-        let (mut end, mut seen, mut worked) = (None, None, None);
+        let (mut end, mut face, mut seen, mut worked) = (None, None, None, None);
         for field in row.split_whitespace() {
             let (key, value) = field.split_once('=')?;
             match key {
@@ -75,6 +82,7 @@ impl EndCarry {
                         _ => Some(face_at(value)?),
                     });
                 }
+                "face" if face.is_none() => face = Some(task_face_at(value)?),
                 "seen" if seen.is_none() => {
                     seen = Some(match value {
                         "0" => false,
@@ -83,7 +91,7 @@ impl EndCarry {
                     });
                 }
                 "worked" if worked.is_none() => worked = Some(value.parse::<u64>().ok()?),
-                "end" | "seen" | "worked" => return None,
+                "end" | "face" | "seen" | "worked" => return None,
                 _ => {}
             }
         }
@@ -97,6 +105,7 @@ impl EndCarry {
         };
         Some(Self {
             end,
+            face,
             worked_ms: worked.unwrap_or(0),
         })
     }
@@ -108,8 +117,21 @@ fn face_at(value: &str) -> Option<(EndFace, i64)> {
         "landed" => EndFace::Landed,
         _ => return None,
     };
-    let at_ms = at.parse::<i64>().ok().filter(|at| *at > 0)?;
-    Some((face, at_ms))
+    Some((face, unix_ms(at)?))
+}
+
+/// A carried `face=` value: a task face by its `status` word, at a wall time.
+fn task_face_at(value: &str) -> Option<(TaskFace, i64)> {
+    let (word, at) = value.split_once('@')?;
+    let face = TaskFace::ALL
+        .into_iter()
+        .find(|face| face.status() == word)?;
+    Some((face, unix_ms(at)?))
+}
+
+/// A wall time after the epoch, unix ms.
+fn unix_ms(at: &str) -> Option<i64> {
+    at.parse::<i64>().ok().filter(|at| *at > 0)
 }
 
 #[cfg(test)]

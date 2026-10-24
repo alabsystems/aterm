@@ -745,12 +745,7 @@ pub fn act_feedback(intent: &Intent, performed: bool, applies: bool) -> String {
         (Intent::EndRecovered, false) => "The reattached sessions had already ended".to_string(),
         (Intent::StopPaste { .. }, true) => "Stopped the paste".to_string(),
         (Intent::StopPaste { .. }, false) => "The paste had already finished".to_string(),
-        (Intent::ReviewVaultSync, true) if applies => {
-            "Opened System State with the vault row on and the Mac settings rows off".to_string()
-        }
-        (Intent::ReviewVaultSync, true) => {
-            "Opened System State; check its vault and Mac settings rows before Apply".to_string()
-        }
+        (Intent::ReviewVaultSync, true) => "Opened System State".to_string(),
         (Intent::ReviewVaultSync, false) => "Could not open System State".to_string(),
         (Intent::ShowTab { tab, .. }, true) => format!("Showed tab {tab}"),
         (Intent::ShowTab { .. }, false) => "That tab is gone".to_string(),

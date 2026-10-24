@@ -249,7 +249,14 @@ fn the_tty_probes_leave_the_shell_at_its_last_prompt() {
         ("Ctrl-C into `head -c 1`", LiveShell::ctrl_c_interrupts),
         ("a CR into `read`", LiveShell::cr_ends_read),
     ];
-    for (shell, program) in [(ShellType::Bash, bash_shell()), (ShellType::Zsh, zsh)] {
+    let mut shells = ShellLanes::default();
+    let mut lanes: Vec<_> = shells
+        .bashes()
+        .into_iter()
+        .map(|bash| (ShellType::Bash, bash))
+        .collect();
+    lanes.push((ShellType::Zsh, zsh));
+    for (shell, program) in lanes {
         let mut sh = spawn_pty_shell(shell, program, &fx, &ours, &[]);
         for (probe, ends) in probes {
             assert!(
@@ -381,7 +388,7 @@ fn spawn_pty_shell_unwaited(
     }
     let label = match shell {
         ShellType::Zsh => "zsh",
-        _ => "bash",
+        _ => program,
     };
     LiveShell::spawn_on_pty(label, &mut cmd).holding(hermetic.into_home())
 }
@@ -594,31 +601,33 @@ fn a_running_zsh_with_a_broken_tty_is_repaired_by_the_body_the_loader_delivers()
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_repairs_its_tty_after_a_raw_program_fails() {
-    let bash = bash_shell();
-    let fx = LiveFixture::new();
-    std::fs::write(fx.home.join(".bashrc"), "").expect(".bashrc");
-    let ours = install_script_set(&fx.base).expect("install");
+    let mut shells = ShellLanes::default();
+    for bash in shells.bashes() {
+        let fx = LiveFixture::new();
+        std::fs::write(fx.home.join(".bashrc"), "").expect(".bashrc");
+        let ours = install_script_set(&fx.base).expect("install");
 
-    let unfixed = unfixed_folder(&fx.base);
-    let mut sh = spawn_pty_shell(ShellType::Bash, bash, &fx, &unfixed, &[]);
-    sh.kill_raw_child(RawEnd::Exit1);
-    assert_tty_broken(&mut sh, "unfixed, after a raw child's exit 1");
-    sh.finish();
+        let unfixed = unfixed_folder(&fx.base);
+        let mut sh = spawn_pty_shell(ShellType::Bash, bash, &fx, &unfixed, &[]);
+        sh.kill_raw_child(RawEnd::Exit1);
+        assert_tty_broken(&mut sh, "unfixed, after a raw child's exit 1");
+        sh.finish();
 
-    let mut sh = spawn_pty_shell(ShellType::Bash, bash, &fx, &ours, &[]);
-    for (end, ixon) in [
-        (RawEnd::Sigkill, true),
-        (RawEnd::Exit1, false),
-        (RawEnd::Exit0Late, false),
-    ] {
-        sh.kill_raw_child(end);
-        assert_tty_usable(&mut sh, &format!("after a raw child's {end:?}"), ixon);
+        let mut sh = spawn_pty_shell(ShellType::Bash, bash, &fx, &ours, &[]);
+        for (end, ixon) in [
+            (RawEnd::Sigkill, true),
+            (RawEnd::Exit1, false),
+            (RawEnd::Exit0Late, false),
+        ] {
+            sh.kill_raw_child(end);
+            assert_tty_usable(&mut sh, &format!("after a raw child's {end:?}"), ixon);
+        }
+        sh.run_line("stty ixon", "0");
+        sh.run_line("stty -ixon", "0");
+        sh.kill_raw_child(RawEnd::Exit1);
+        assert_tty_usable(&mut sh, "stty -ixon, then a raw child's exit 1", false);
+        sh.finish();
     }
-    sh.run_line("stty ixon", "0");
-    sh.run_line("stty -ixon", "0");
-    sh.kill_raw_child(RawEnd::Exit1);
-    assert_tty_usable(&mut sh, "stty -ixon, then a raw child's exit 1", false);
-    sh.finish();
 }
 
 #[cfg(unix)]
@@ -1057,205 +1066,213 @@ fn cut_osc(raw: &str) -> String {
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_under_xtrace_traces_the_users_commands_and_not_aterms() {
-    let fx = LiveFixture::new();
-    let dir = install_script_set(&fx.base).expect("install");
-    std::fs::write(
-        fx.home.join(".bashrc"),
-        "PS4='+${FUNCNAME[0]-}> '\nset -x\nPROMPT_COMMAND='echo pc$((40+2))'\n",
-    )
-    .expect(".bashrc");
-    let mut sh = spawn_pty_shell(
-        ShellType::Bash,
-        bash_shell(),
-        &fx,
-        &dir,
-        &[("ATERM_SHELL_NONCE", REKEY_OLD), ("ATERM_CHILD", "1")],
-    );
-    for (line, status) in [("false", "1"), ("echo traced$((40+2))", "0"), ("cd /", "0")] {
-        sh.run_line(line, status);
-    }
-    let text = cut_osc(&stdout_between(&sh, 0, sh.len()));
-    assert!(
-        !text.contains(REKEY_OLD),
-        "bash: the capability nonce reached the trace\n{text}"
-    );
-    let traced: Vec<(&str, &str)> = text
-        .lines()
-        .filter_map(|line| line.rsplit('\r').next()?.strip_prefix('+'))
-        .filter_map(|line| line.trim_start_matches('+').split_once("> "))
-        .map(|(frame, line)| (frame, line.trim_end()))
-        .collect();
-    for line in ["echo traced42", "cd /", "echo pc42"] {
-        assert!(
-            traced.iter().any(|(_, traced)| *traced == line),
-            "bash: the user's `{line}` is traced\n{text}"
+    let mut shells = ShellLanes::default();
+    for bash in shells.bashes() {
+        let fx = LiveFixture::new();
+        let dir = install_script_set(&fx.base).expect("install");
+        std::fs::write(
+            fx.home.join(".bashrc"),
+            "PS4='+${FUNCNAME[0]-}> '\nset -x\nPROMPT_COMMAND='echo pc$((40+2))'\n",
+        )
+        .expect(".bashrc");
+        let mut sh = spawn_pty_shell(
+            ShellType::Bash,
+            bash,
+            &fx,
+            &dir,
+            &[("ATERM_SHELL_NONCE", REKEY_OLD), ("ATERM_CHILD", "1")],
         );
-    }
-    for (frame, line) in &traced {
-        let users = if frame.starts_with("__aterm") {
-            matches!(*line, "eval 'echo pc$((40+2))'" | "echo pc42")
-        } else {
-            !line.contains("__aterm")
-                || matches!(
-                    line.split_whitespace().next(),
-                    Some("__aterm_preexec" | "__aterm_prompt_command" | "__aterm_ps0")
-                )
-        };
+        for (line, status) in [("false", "1"), ("echo traced$((40+2))", "0"), ("cd /", "0")] {
+            sh.run_line(line, status);
+        }
+        let text = cut_osc(&stdout_between(&sh, 0, sh.len()));
         assert!(
-            users,
-            "bash: aterm's code in the trace: +{frame}> {line}\n{text}"
+            !text.contains(REKEY_OLD),
+            "{bash}: the capability nonce reached the trace\n{text}"
         );
+        let traced: Vec<(&str, &str)> = text
+            .lines()
+            .filter_map(|line| line.rsplit('\r').next()?.strip_prefix('+'))
+            .filter_map(|line| line.trim_start_matches('+').split_once("> "))
+            .map(|(frame, line)| (frame, line.trim_end()))
+            .collect();
+        for line in ["echo traced42", "cd /", "echo pc42"] {
+            assert!(
+                traced.iter().any(|(_, traced)| *traced == line),
+                "{bash}: the user's `{line}` is traced\n{text}"
+            );
+        }
+        for (frame, line) in &traced {
+            let users = if frame.starts_with("__aterm") {
+                matches!(*line, "eval 'echo pc$((40+2))'" | "echo pc42")
+            } else {
+                !line.contains("__aterm")
+                    || matches!(
+                        line.split_whitespace().next(),
+                        Some("__aterm_preexec" | "__aterm_prompt_command" | "__aterm_ps0")
+                    )
+            };
+            assert!(
+                users,
+                "{bash}: aterm's code in the trace: +{frame}> {line}\n{text}"
+            );
+        }
+        sh.finish();
     }
-    sh.finish();
 }
 
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_keeps_the_users_err_trap_errexit_and_functrace_as_bare_bash_does() {
-    let fx = LiveFixture::new();
-    let dir = install_script_set(&fx.base).expect("install");
-    fx.lay_dirs();
-    std::fs::write(
-        fx.home.join(".bashrc"),
-        "trap 'echo err$((40+2))' ERR\nPROMPT_COMMAND='echo \"pc=$?\"'\n",
-    )
-    .expect(".bashrc");
-    let mut sh = spawn_pty_shell(
-        ShellType::Bash,
-        bash_shell(),
-        &fx,
-        &dir,
-        &[
-            ("ATERM_CHILD", "1"),
-            ("ATPKG_AGENTS", fx.agents.to_str().expect("UTF-8")),
-        ],
-    );
-    let from = sh.len();
-    sh.run_line("false", "1");
-    sh.run_line("echo next$((40+2))", "0");
-    let upto = sh.wait_for_after("next42", from);
-    let text = stdout_between(&sh, from, upto);
-    assert_eq!(
-        text.matches("err42").count(),
-        1,
-        "bash: the ERR trap fires once for one `false`\n{}",
-        sh.transcript()
-    );
-    assert!(
-        text.contains("pc=1"),
-        "bash: the user's PROMPT_COMMAND reads the command's `$?`\n{}",
-        sh.transcript()
-    );
-    sh.run_line("set -e", "0");
-    sh.run_line("false && true", "1");
-    sh.run_line("ls -d / >/dev/null", "0");
-    fx.lay_hook("bash", ATPKG_HOOK_POSIX_GOLDEN);
-    sh.run_line("echo alive$((40+2))", "0");
-    let from = sh.run_line("set -o functrace", "0");
-    sh.type_at_prompt(b"\r");
-    sh.wait_for_after("\x1b]133;A", from);
-    sh.run_line("f() { echo in-f; }; f", "0");
-    sh.run_line("echo hi", "0");
-    let reported = |text: String| -> Vec<String> {
-        text.split("\x1b]633;E;")
-            .skip(1)
-            .map(|rest| rest.split([';', '\x07']).next().unwrap_or("").to_owned())
-            .collect()
-    };
-    assert_eq!(
-        reported(stdout_between(&sh, from, sh.len())),
-        [
-            "f()\\x20{\\x20echo\\x20in-f\\x3b\\x20}\\x3b\\x20f",
-            "echo\\x20hi"
-        ],
-        "bash: the commands 633;E reported under functrace\n{}",
-        stdout_between(&sh, from, sh.len())
-    );
-    sh.run_line("set +o functrace", "0");
-    let from = sh.run_line(
-        r#"w() { local a=$1; eval -- "$T"; : "$a"; }; eval "T=($(trap -p DEBUG))"; T=("${T[2]}"); trap 'w "$_"' DEBUG"#,
-        "0",
-    );
-    sh.type_at_prompt(b"echo wrapped$((40+2))\r");
-    let at = sh.wait_for_after("wrapped42", from);
-    let end = sh.wait_for_after("\x1b]133;A", at);
-    assert_eq!(
-        reported(stdout_between(&sh, from, end)),
-        ["echo\\x20wrapped$((40+2))"],
-        "bash: the command 633;E reported behind a function wrapping the trap\n{}",
-        stdout_between(&sh, from, end)
-    );
-    sh.finish();
+    let mut shells = ShellLanes::default();
+    for bash in shells.bashes() {
+        let fx = LiveFixture::new();
+        let dir = install_script_set(&fx.base).expect("install");
+        fx.lay_dirs();
+        std::fs::write(
+            fx.home.join(".bashrc"),
+            "trap 'echo err$((40+2))' ERR\nPROMPT_COMMAND='echo \"pc=$?\"'\n",
+        )
+        .expect(".bashrc");
+        let mut sh = spawn_pty_shell(
+            ShellType::Bash,
+            bash,
+            &fx,
+            &dir,
+            &[
+                ("ATERM_CHILD", "1"),
+                ("ATPKG_AGENTS", fx.agents.to_str().expect("UTF-8")),
+            ],
+        );
+        let from = sh.len();
+        sh.run_line("false", "1");
+        sh.run_line("echo next$((40+2))", "0");
+        let upto = sh.wait_for_after("next42", from);
+        let text = stdout_between(&sh, from, upto);
+        assert_eq!(
+            text.matches("err42").count(),
+            1,
+            "{bash}: the ERR trap fires once for one `false`\n{}",
+            sh.transcript()
+        );
+        assert!(
+            text.contains("pc=1"),
+            "{bash}: the user's PROMPT_COMMAND reads the command's `$?`\n{}",
+            sh.transcript()
+        );
+        sh.run_line("set -e", "0");
+        sh.run_line("false && true", "1");
+        sh.run_line("ls -d / >/dev/null", "0");
+        fx.lay_hook("bash", ATPKG_HOOK_POSIX_GOLDEN);
+        sh.run_line("echo alive$((40+2))", "0");
+        let from = sh.run_line("set -o functrace", "0");
+        sh.type_at_prompt(b"\r");
+        sh.wait_for_after("\x1b]133;A", from);
+        sh.run_line("f() { echo in-f; }; f", "0");
+        sh.run_line("echo hi", "0");
+        let reported = |text: String| -> Vec<String> {
+            text.split("\x1b]633;E;")
+                .skip(1)
+                .map(|rest| rest.split([';', '\x07']).next().unwrap_or("").to_owned())
+                .collect()
+        };
+        assert_eq!(
+            reported(stdout_between(&sh, from, sh.len())),
+            [
+                "f()\\x20{\\x20echo\\x20in-f\\x3b\\x20}\\x3b\\x20f",
+                "echo\\x20hi"
+            ],
+            "{bash}: the commands 633;E reported under functrace\n{}",
+            stdout_between(&sh, from, sh.len())
+        );
+        sh.run_line("set +o functrace", "0");
+        let from = sh.run_line(
+            r#"w() { local a=$1; eval -- "$T"; : "$a"; }; eval "T=($(trap -p DEBUG))"; T=("${T[2]}"); trap 'w "$_"' DEBUG"#,
+            "0",
+        );
+        sh.type_at_prompt(b"echo wrapped$((40+2))\r");
+        let at = sh.wait_for_after("wrapped42", from);
+        let end = sh.wait_for_after("\x1b]133;A", at);
+        assert_eq!(
+            reported(stdout_between(&sh, from, end)),
+            ["echo\\x20wrapped$((40+2))"],
+            "{bash}: the command 633;E reported behind a function wrapping the trap\n{}",
+            stdout_between(&sh, from, end)
+        );
+        sh.finish();
+    }
 }
 
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_chains_the_debug_trap_its_rc_set() {
-    let bash = bash_shell();
-    let fx = LiveFixture::new();
-    std::fs::write(
-        fx.home.join(".bashrc"),
-        "HISTCONTROL=ignorespace\n\
-         trap '[[ $BASH_COMMAND != \"echo typed\"* ]] ||\n  echo \"DBG'\\''$((40+2))\"' DEBUG\n",
-    )
-    .expect(".bashrc");
-    let ours = install_script_set(&fx.base).expect("install");
-    let unhanded = folder_with_edits(&fx.base, "00000000000000ac", &[]);
-    let rcfile = unhanded.join("bash").join(BASH_LOADER_FILE);
-    let wrapper = std::fs::read_to_string(&rcfile).expect("the control's loader");
-    assert_eq!(
-        wrapper.matches(bash_debug_trap_handover!()).count(),
-        1,
-        "the hand-over moved — keep the control in step"
-    );
-    std::fs::write(&rcfile, wrapper.replace(bash_debug_trap_handover!(), "")).expect("rcfile");
-    let rekey_dir = fx.base.join("rekey");
-    std::fs::create_dir_all(&rekey_dir).expect("re-key dir");
-    let sid = "s-0123456789abcdef0123";
-    let rekey = rekey_dir.join(sid);
-    let trap_file = rekey_dir.join(format!("{sid}{DEBUG_TRAP_SUFFIX}"));
-    let rekey = rekey.to_str().expect("UTF-8");
-    for (dir, channel, fixed) in [
-        (&unhanded, true, false),
-        (&ours, true, true),
-        (&ours, false, true),
-    ] {
-        let _ = std::fs::remove_file(&trap_file);
-        let extra: &[(&str, &str)] = if channel {
-            &[(REKEY_PATH_VAR, rekey)]
-        } else {
-            &[]
-        };
-        let mut sh = spawn_pty_shell(ShellType::Bash, bash, &fx, dir, extra);
-        let from = sh.type_at_prompt(b" echo typed$((6*7))\r");
-        let ran = sh.wait_for_after("typed42", from);
-        let done = sh.wait_for_after("\x1b]133;A", ran);
-        let text = stdout_between(&sh, from, done);
-        let (chained, marked) = (text.contains("DBG'42"), text.contains("\x1b]133;C"));
-        if fixed {
-            assert!(
-                chained && marked,
-                "bash (channel {channel}): the rc's DEBUG trap ran (chained {chained}) and \
-                 aterm marked the command (marked {marked})\n{}",
-                sh.transcript()
-            );
-            let handed = std::fs::read_to_string(&trap_file).ok();
-            assert_eq!(
-                handed.as_deref(),
-                channel.then_some(
-                    "trap -- '[[ $BASH_COMMAND != \"echo typed\"* ]] ||\n  echo \"DBG'\\''$((40+2))\"' DEBUG\n"
-                ),
-                "bash (channel {channel}): the wrapper hands the trap over in the session \
-                 file exactly when there is one"
-            );
-        } else {
-            assert!(
-                !(chained && marked),
-                "bash: the control must lose the rc's trap or aterm's mark\n{}",
-                sh.transcript()
-            );
+    let mut shells = ShellLanes::default();
+    for bash in shells.bashes() {
+        let fx = LiveFixture::new();
+        std::fs::write(
+            fx.home.join(".bashrc"),
+            "HISTCONTROL=ignorespace\n\
+             trap '[[ $BASH_COMMAND != \"echo typed\"* ]] ||\n  echo \"DBG'\\''$((40+2))\"' DEBUG\n",
+        )
+        .expect(".bashrc");
+        let ours = install_script_set(&fx.base).expect("install");
+        let unhanded = folder_with_edits(&fx.base, "00000000000000ac", &[]);
+        let rcfile = unhanded.join("bash").join(BASH_LOADER_FILE);
+        let wrapper = std::fs::read_to_string(&rcfile).expect("the control's loader");
+        assert_eq!(
+            wrapper.matches(bash_debug_trap_handover!()).count(),
+            1,
+            "the hand-over moved — keep the control in step"
+        );
+        std::fs::write(&rcfile, wrapper.replace(bash_debug_trap_handover!(), "")).expect("rcfile");
+        let rekey_dir = fx.base.join("rekey");
+        std::fs::create_dir_all(&rekey_dir).expect("re-key dir");
+        let sid = "s-0123456789abcdef0123";
+        let rekey = rekey_dir.join(sid);
+        let trap_file = rekey_dir.join(format!("{sid}{DEBUG_TRAP_SUFFIX}"));
+        let rekey = rekey.to_str().expect("UTF-8");
+        for (dir, channel, fixed) in [
+            (&unhanded, true, false),
+            (&ours, true, true),
+            (&ours, false, true),
+        ] {
+            let _ = std::fs::remove_file(&trap_file);
+            let extra: &[(&str, &str)] = if channel {
+                &[(REKEY_PATH_VAR, rekey)]
+            } else {
+                &[]
+            };
+            let mut sh = spawn_pty_shell(ShellType::Bash, bash, &fx, dir, extra);
+            let from = sh.type_at_prompt(b" echo typed$((6*7))\r");
+            let ran = sh.wait_for_after("typed42", from);
+            let done = sh.wait_for_after("\x1b]133;A", ran);
+            let text = stdout_between(&sh, from, done);
+            let (chained, marked) = (text.contains("DBG'42"), text.contains("\x1b]133;C"));
+            if fixed {
+                assert!(
+                    chained && marked,
+                    "{bash} (channel {channel}): the rc's DEBUG trap ran (chained {chained}) and \
+                     aterm marked the command (marked {marked})\n{}",
+                    sh.transcript()
+                );
+                let handed = std::fs::read_to_string(&trap_file).ok();
+                assert_eq!(
+                    handed.as_deref(),
+                    channel.then_some(
+                        "trap -- '[[ $BASH_COMMAND != \"echo typed\"* ]] ||\n  echo \"DBG'\\''$((40+2))\"' DEBUG\n"
+                    ),
+                    "{bash} (channel {channel}): the wrapper hands the trap over in the session \
+                     file exactly when there is one"
+                );
+            } else {
+                assert!(
+                    !(chained && marked),
+                    "{bash}: the control must lose the rc's trap or aterm's mark\n{}",
+                    sh.transcript()
+                );
+            }
+            sh.finish();
         }
-        sh.finish();
     }
 }
 
@@ -1265,51 +1282,94 @@ const BASH_HANDOVER_GUARD: &str = "if [ -z \"${ATERM_SHELL_INTEGRATION_INSTALLED
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_whose_rc_sources_the_integration_keeps_its_marks() {
-    let bash = bash_shell();
-    let fx = LiveFixture::new();
-    std::fs::write(
-        fx.home.join(".bashrc"),
-        "HISTCONTROL=ignorespace\n\
-         . \"$ATERM_SHELL_INTEGRATION_DIR/aterm_shell_integration.bash\"\n",
-    )
-    .expect(".bashrc");
-    let ours = install_script_set(&fx.base).expect("install");
-    let unguarded = folder_with_edits(&fx.base, "00000000000000ad", &[]);
-    let rcfile = unguarded.join("bash").join(BASH_LOADER_FILE);
-    let wrapper = std::fs::read_to_string(&rcfile).expect("the control's loader");
-    assert_eq!(
-        wrapper.matches(BASH_HANDOVER_GUARD).count(),
-        1,
-        "the guard moved — keep the control in step"
-    );
-    std::fs::write(
-        &rcfile,
-        wrapper.replace(BASH_HANDOVER_GUARD, "if :; then\n"),
-    )
-    .expect("rcfile");
-    let rekey_dir = fx.base.join("rekey");
-    std::fs::create_dir_all(&rekey_dir).expect("re-key dir");
-    let rekey = rekey_dir.join("s-0123456789abcdef0124");
-    let rekey = rekey.to_str().expect("UTF-8");
-    for (dir, channel, fixed) in [
-        (&unguarded, true, false),
-        (&ours, true, true),
-        (&ours, false, true),
-    ] {
-        let extra: &[(&str, &str)] = if channel {
-            &[(REKEY_PATH_VAR, rekey)]
-        } else {
-            &[]
-        };
-        let mut sh = spawn_pty_shell(ShellType::Bash, bash, &fx, dir, extra);
-        let from = sh.type_at_prompt(b" echo typed$((6*7))\r");
-        let ran = sh.wait_for_after("typed42", from);
-        let done = sh.wait_for_after("\x1b]133;A", ran);
-        let marked = stdout_between(&sh, from, done).contains("\x1b]133;C");
+    let mut shells = ShellLanes::default();
+    for bash in shells.bashes() {
+        let fx = LiveFixture::new();
+        std::fs::write(
+            fx.home.join(".bashrc"),
+            "HISTCONTROL=ignorespace\n\
+             . \"$ATERM_SHELL_INTEGRATION_DIR/aterm_shell_integration.bash\"\n",
+        )
+        .expect(".bashrc");
+        let ours = install_script_set(&fx.base).expect("install");
+        let unguarded = folder_with_edits(&fx.base, "00000000000000ad", &[]);
+        let rcfile = unguarded.join("bash").join(BASH_LOADER_FILE);
+        let wrapper = std::fs::read_to_string(&rcfile).expect("the control's loader");
         assert_eq!(
-            marked,
-            fixed,
-            "bash (channel {channel}, guarded {fixed}): aterm marked the typed command\n{}",
+            wrapper.matches(BASH_HANDOVER_GUARD).count(),
+            1,
+            "the guard moved — keep the control in step"
+        );
+        std::fs::write(
+            &rcfile,
+            wrapper.replace(BASH_HANDOVER_GUARD, "if :; then\n"),
+        )
+        .expect("rcfile");
+        let rekey_dir = fx.base.join("rekey");
+        std::fs::create_dir_all(&rekey_dir).expect("re-key dir");
+        let rekey = rekey_dir.join("s-0123456789abcdef0124");
+        let rekey = rekey.to_str().expect("UTF-8");
+        for (dir, channel, fixed) in [
+            (&unguarded, true, false),
+            (&ours, true, true),
+            (&ours, false, true),
+        ] {
+            let extra: &[(&str, &str)] = if channel {
+                &[(REKEY_PATH_VAR, rekey)]
+            } else {
+                &[]
+            };
+            let mut sh = spawn_pty_shell(ShellType::Bash, bash, &fx, dir, extra);
+            let from = sh.type_at_prompt(b" echo typed$((6*7))\r");
+            let ran = sh.wait_for_after("typed42", from);
+            let done = sh.wait_for_after("\x1b]133;A", ran);
+            let marked = stdout_between(&sh, from, done).contains("\x1b]133;C");
+            assert_eq!(
+                marked,
+                fixed,
+                "{bash} (channel {channel}, guarded {fixed}): aterm marked the typed command\n{}",
+                sh.transcript()
+            );
+            sh.finish();
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn an_integrated_bash_whose_rc_set_errexit_and_an_err_trap_loads_quietly() {
+    let mut shells = ShellLanes::default();
+    for bash in shells.bashes() {
+        let fx = LiveFixture::new();
+        std::fs::write(
+            fx.home.join(".bashrc"),
+            "trap 'echo ERR$((40+2))' ERR\nset -e\n\
+             trap '[[ $BASH_COMMAND != \"echo typed\"* ]] || echo DBG$((40+2))' DEBUG\n",
+        )
+        .expect(".bashrc");
+        let dir = install_script_set(&fx.base).expect("install");
+        let rekey_dir = fx.base.join("rekey");
+        std::fs::create_dir_all(&rekey_dir).expect("re-key dir");
+        let rekey = rekey_dir.join("s-0123456789abcdef0125");
+        let mut sh = spawn_pty_shell(
+            ShellType::Bash,
+            bash,
+            &fx,
+            &dir,
+            &[(REKEY_PATH_VAR, rekey.to_str().expect("UTF-8"))],
+        );
+        let loaded = sh.type_at_prompt(b"echo typed$((6*7))\r");
+        let ran = sh.wait_for_after("typed42", loaded);
+        sh.wait_for_after("\x1b]133;A", ran);
+        let load = stdout_between(&sh, 0, loaded);
+        assert!(
+            !load.contains("ERR42"),
+            "{bash}: the load reported a failed command to the rc's ERR trap\n{}",
+            sh.transcript()
+        );
+        assert!(
+            stdout_between(&sh, loaded, ran).contains("DBG42"),
+            "{bash}: the rc's DEBUG trap chained\n{}",
             sh.transcript()
         );
         sh.finish();
@@ -1318,98 +1378,59 @@ fn an_integrated_bash_whose_rc_sources_the_integration_keeps_its_marks() {
 
 #[cfg(unix)]
 #[test]
-fn an_integrated_bash_whose_rc_set_errexit_and_an_err_trap_loads_quietly() {
-    let bash = bash_shell();
-    let fx = LiveFixture::new();
-    std::fs::write(
-        fx.home.join(".bashrc"),
-        "trap 'echo ERR$((40+2))' ERR\nset -e\n\
-         trap '[[ $BASH_COMMAND != \"echo typed\"* ]] || echo DBG$((40+2))' DEBUG\n",
-    )
-    .expect(".bashrc");
-    let dir = install_script_set(&fx.base).expect("install");
-    let rekey_dir = fx.base.join("rekey");
-    std::fs::create_dir_all(&rekey_dir).expect("re-key dir");
-    let rekey = rekey_dir.join("s-0123456789abcdef0125");
-    let mut sh = spawn_pty_shell(
-        ShellType::Bash,
-        bash,
-        &fx,
-        &dir,
-        &[(REKEY_PATH_VAR, rekey.to_str().expect("UTF-8"))],
-    );
-    let loaded = sh.type_at_prompt(b"echo typed$((6*7))\r");
-    let ran = sh.wait_for_after("typed42", loaded);
-    sh.wait_for_after("\x1b]133;A", ran);
-    let load = stdout_between(&sh, 0, loaded);
-    assert!(
-        !load.contains("ERR42"),
-        "bash: the load reported a failed command to the rc's ERR trap\n{}",
-        sh.transcript()
-    );
-    assert!(
-        stdout_between(&sh, loaded, ran).contains("DBG42"),
-        "bash: the rc's DEBUG trap chained\n{}",
-        sh.transcript()
-    );
-    sh.finish();
-}
-
-#[cfg(unix)]
-#[test]
 fn an_integrated_bash_reports_the_line_as_typed() {
-    let fx = LiveFixture::new();
-    let dir = install_script_set(&fx.base).expect("install");
-    std::fs::write(
-        fx.home.join(".bashrc"),
-        "alias ll='ls -alF'\nHISTCONTROL=ignorespace\n\
-         PROMPT_COMMAND='history -a; history -c; history -r'\n",
-    )
-    .expect(".bashrc");
-    let mut sh = spawn_pty_shell(
-        ShellType::Bash,
-        bash_shell(),
-        &fx,
-        &dir,
-        &[("ATERM_CHILD", "1")],
-    );
-    let reported = |text: &str| -> Vec<String> {
-        text.split("\x1b]633;E;")
-            .skip(1)
-            .map(|rest| rest.split([';', '\x07']).next().unwrap_or("").to_owned())
-            .collect()
-    };
-    let from = sh.len();
-    sh.run_line("true && echo a$((40+2))", "0");
-    sh.run_line("echo b | cat", "0");
-    sh.run_line("echo c; (exit 7)", "7");
-    sh.run_line("ll -d / >/dev/null", "0");
-    let end = sh.run_line(" echo hidden && true", "0");
-    let text = stdout_between(&sh, from, end);
-    assert_eq!(
-        reported(&text),
-        [
-            "true\\x20&&\\x20echo\\x20a$((40+2))",
-            "echo\\x20b\\x20|\\x20cat",
-            "echo\\x20c\\x3b\\x20(exit\\x207)",
-            "ll\\x20-d\\x20/\\x20>/dev/null",
-            "echo\\x20hidden",
-        ],
-        "bash: the lines 633;E reported\n{}",
-        sh.transcript()
-    );
-    assert!(
-        text.contains("\x1b]0;true && echo a$((40+2))\x07"),
-        "bash: the title while the line runs is the line\n{}",
-        sh.transcript()
-    );
-    sh.finish();
+    let mut shells = ShellLanes::default();
+    for bash in shells.bashes() {
+        let fx = LiveFixture::new();
+        let dir = install_script_set(&fx.base).expect("install");
+        std::fs::write(
+            fx.home.join(".bashrc"),
+            "alias ll='ls -alF'\nHISTCONTROL=ignorespace\n\
+             PROMPT_COMMAND='history -a; history -c; history -r'\n",
+        )
+        .expect(".bashrc");
+        let mut sh = spawn_pty_shell(ShellType::Bash, bash, &fx, &dir, &[("ATERM_CHILD", "1")]);
+        let reported = |text: &str| -> Vec<String> {
+            text.split("\x1b]633;E;")
+                .skip(1)
+                .map(|rest| rest.split([';', '\x07']).next().unwrap_or("").to_owned())
+                .collect()
+        };
+        let from = sh.len();
+        sh.run_line("true && echo a$((40+2))", "0");
+        sh.run_line("echo b | cat", "0");
+        sh.run_line("echo c; (exit 7)", "7");
+        sh.run_line("ll -d / >/dev/null", "0");
+        let end = sh.run_line(" echo hidden && true", "0");
+        let text = stdout_between(&sh, from, end);
+        assert_eq!(
+            reported(&text),
+            [
+                "true\\x20&&\\x20echo\\x20a$((40+2))",
+                "echo\\x20b\\x20|\\x20cat",
+                "echo\\x20c\\x3b\\x20(exit\\x207)",
+                "ll\\x20-d\\x20/\\x20>/dev/null",
+                "echo\\x20hidden",
+            ],
+            "{bash}: the lines 633;E reported\n{}",
+            sh.transcript()
+        );
+        assert!(
+            text.contains("\x1b]0;true && echo a$((40+2))\x07"),
+            "{bash}: the title while the line runs is the line\n{}",
+            sh.transcript()
+        );
+        sh.finish();
+    }
 }
 
 #[cfg(target_os = "macos")]
 const NO_TEMP_FOLDER: &str = "(version 1)(allow default)(deny file-write* \
      (subpath \"/private/tmp\") (subpath \"/private/var/tmp\") (subpath \"/private/var/folders\"))";
 
+/// Runs on every bash ([`ShellLanes::bashes`]): macOS's 3.2 forks every read and has no PS0
+/// hook, so it checks only that the blocks need no temp folder; the `${ ...; }` read and
+/// PS0's file-free hook, which bash 5.3 keeps in a file, are judged by the pinned 5.3.
 #[cfg(target_os = "macos")]
 #[test]
 fn an_integrated_bash_with_no_writable_temp_folder_runs_every_line_with_its_block() {
@@ -1424,49 +1445,143 @@ fn an_integrated_bash_with_no_writable_temp_folder_runs_every_line_with_its_bloc
              another sandbox?): {taken:?}"
         ));
     }
-    for (start, rc) in [
-        ("naming Linux", "OSTYPE=linux-gnu\n"),
-        (
-            "in place over v0.108.0's PS0",
-            ". \"$ATERM_SHELL_INTEGRATION_DIR/aterm_shell_integration.bash\"\n\
-             if (( BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] >= 503 )); then \
-             PS0='${ __aterm_ps0; }'; fi\n",
-        ),
-    ] {
+    let mut shells = ShellLanes::default();
+    for bash in shells.bashes() {
+        for (start, rc) in [
+            ("naming Linux", "OSTYPE=linux-gnu\n"),
+            (
+                "in place over v0.108.0's PS0",
+                ". \"$ATERM_SHELL_INTEGRATION_DIR/aterm_shell_integration.bash\"\n\
+                 if (( BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] >= 503 )); then \
+                 PS0='${ __aterm_ps0; }'; fi\n",
+            ),
+        ] {
+            let fx = LiveFixture::new();
+            let dir = install_script_set(&fx.base).expect("install");
+            std::fs::write(fx.home.join(".bashrc"), format!("unset TMPDIR\ncd /\n{rc}"))
+                .expect(".bashrc");
+            let mut sh = spawn_pty_shell_unwaited(
+                &[sandbox, "-p", NO_TEMP_FOLDER],
+                ShellType::Bash,
+                bash,
+                &fx,
+                &dir,
+                &[("ATERM_SHELL_NONCE", REKEY_OLD), ("ATERM_CHILD", "1")],
+            );
+            sh.wait_for_after("\x1b]133;A", 0);
+            for (line, status) in [
+                ("echo a$((40+2))", "0"),
+                ("false", "1"),
+                ("true | cat", "0"),
+            ] {
+                let from = sh.type_at_prompt(format!("{line}\r").as_bytes());
+                let end = sh.wait_for_after("\x1b]133;A", from);
+                let text = stdout_between(&sh, from, end);
+                let marks = [
+                    format!(
+                        "\x1b]633;E;{};id={REKEY_OLD}\x07",
+                        line.replace(' ', "\\x20")
+                    ),
+                    format!("\x1b]133;C;id={REKEY_OLD}\x07"),
+                    format!("\x1b]133;D;{status};id={REKEY_OLD}\x07"),
+                ];
+                assert!(
+                    !text.contains("function_substitute") && marks.iter().all(|m| text.contains(m)),
+                    "{bash} ({start}): `{line}` ran without its block {marks:?}\n{}",
+                    sh.transcript()
+                );
+            }
+            sh.finish();
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn an_integrated_bash_with_an_array_prompt_command_reports_only_typed_lines() {
+    let mut shells = ShellLanes::default();
+    for bash in shells.bashes() {
         let fx = LiveFixture::new();
         let dir = install_script_set(&fx.base).expect("install");
-        std::fs::write(fx.home.join(".bashrc"), format!("unset TMPDIR\ncd /\n{rc}"))
-            .expect(".bashrc");
-        let mut sh = spawn_pty_shell_unwaited(
-            &[sandbox, "-p", NO_TEMP_FOLDER],
-            ShellType::Bash,
-            bash_shell(),
-            &fx,
-            &dir,
-            &[("ATERM_SHELL_NONCE", REKEY_OLD), ("ATERM_CHILD", "1")],
+        let history = fx.home.join(".bash_history");
+        std::fs::write(
+            fx.home.join(".bashrc"),
+            "HISTFILE=~/.bash_history\nHISTCONTROL=ignoreboth\n\
+             PROMPT_COMMAND=('__x=1; __y=2' 'history -a; history -c; history -r')\n",
+        )
+        .expect(".bashrc");
+        let mut sh = spawn_pty_shell(ShellType::Bash, bash, &fx, &dir, &[("ATERM_CHILD", "1")]);
+        let reported = |text: &str| -> Vec<String> {
+            text.split("\x1b]633;E;")
+                .skip(1)
+                .map(|rest| rest.split([';', '\x07']).next().unwrap_or("").to_owned())
+                .collect()
+        };
+        let other_tab_appends = || {
+            use std::io::Write as _;
+            std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(&history)
+                .and_then(|mut file| file.write_all(b"echo OTHER-TAB-LINE\n"))
+                .expect("append to the history file");
+        };
+        let enter = |sh: &mut LiveShell| {
+            let at = sh.type_at_prompt(b"\r");
+            sh.wait_for_after("\x1b]133;A", at)
+        };
+        let from = sh.len();
+        sh.run_line("echo a$((40+2)) && true", "0");
+        enter(&mut sh);
+        other_tab_appends();
+        sh.run_line(" echo hidden && true", "0");
+        other_tab_appends();
+        enter(&mut sh);
+        sh.run_line(" echo hidden2 && true", "0");
+        let end = sh.run_line("echo z | cat", "0");
+        let text = stdout_between(&sh, from, end);
+        assert_eq!(
+            reported(&text),
+            [
+                "echo\\x20a$((40+2))\\x20&&\\x20true",
+                "echo\\x20hidden",
+                "echo\\x20hidden2",
+                "echo\\x20z\\x20|\\x20cat",
+            ],
+            "{bash}: the lines 633;E reported\n{}",
+            sh.transcript()
         );
-        sh.wait_for_after("\x1b]133;A", 0);
-        for (line, status) in [
-            ("echo a$((40+2))", "0"),
-            ("false", "1"),
-            ("true | cat", "0"),
-        ] {
-            let from = sh.type_at_prompt(format!("{line}\r").as_bytes());
-            let end = sh.wait_for_after("\x1b]133;A", from);
-            let text = stdout_between(&sh, from, end);
-            let marks = [
-                format!(
-                    "\x1b]633;E;{};id={REKEY_OLD}\x07",
-                    line.replace(' ', "\\x20")
-                ),
-                format!("\x1b]133;C;id={REKEY_OLD}\x07"),
-                format!("\x1b]133;D;{status};id={REKEY_OLD}\x07"),
-            ];
-            assert!(
-                !text.contains("function_substitute") && marks.iter().all(|m| text.contains(m)),
-                "bash ({start}): `{line}` ran without its block {marks:?}\n{}",
-                sh.transcript()
-            );
+        assert!(
+            !text.contains("OTHER-TAB-LINE"),
+            "{bash}: another tab's line reported or titled\n{}",
+            sh.transcript()
+        );
+        sh.finish();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn an_integrated_bash_keeps_the_users_last_argument() {
+    let mut shells = ShellLanes::default();
+    for bash in shells.bashes() {
+        let fx = LiveFixture::new();
+        let dir = install_script_set(&fx.base).expect("install");
+        std::fs::write(
+            fx.home.join(".bashrc"),
+            "PROMPT_COMMAND='echo \"pc_=[$_]\"'\n",
+        )
+        .expect(".bashrc");
+        let mut sh = spawn_pty_shell(ShellType::Bash, bash, &fx, &dir, &[("ATERM_CHILD", "1")]);
+        sh.run_line(
+            "cd \"$HOME\" && mkdir -p last42 && cd \"$_\"; echo \"in=${PWD##*/}\"",
+            "0",
+        );
+        sh.run_line("echo one last$((40+1))", "0");
+        let end = sh.run_line("echo \"was=[$_]\"", "0");
+        let text = stdout_between(&sh, 0, end);
+        for said in ["in=last42", "pc_=[last41]", "was=[last41]"] {
+            assert!(text.contains(said), "{bash}: {said}\n{}", sh.transcript());
         }
         sh.finish();
     }
@@ -1474,204 +1589,110 @@ fn an_integrated_bash_with_no_writable_temp_folder_runs_every_line_with_its_bloc
 
 #[cfg(unix)]
 #[test]
-fn an_integrated_bash_with_an_array_prompt_command_reports_only_typed_lines() {
-    let fx = LiveFixture::new();
-    let dir = install_script_set(&fx.base).expect("install");
-    let history = fx.home.join(".bash_history");
-    std::fs::write(
-        fx.home.join(".bashrc"),
-        "HISTFILE=~/.bash_history\nHISTCONTROL=ignoreboth\n\
-         PROMPT_COMMAND=('__x=1; __y=2' 'history -a; history -c; history -r')\n",
-    )
-    .expect(".bashrc");
-    let mut sh = spawn_pty_shell(
-        ShellType::Bash,
-        bash_shell(),
-        &fx,
-        &dir,
-        &[("ATERM_CHILD", "1")],
-    );
-    let reported = |text: &str| -> Vec<String> {
-        text.split("\x1b]633;E;")
-            .skip(1)
-            .map(|rest| rest.split([';', '\x07']).next().unwrap_or("").to_owned())
-            .collect()
-    };
-    let other_tab_appends = || {
-        use std::io::Write as _;
-        std::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(&history)
-            .and_then(|mut file| file.write_all(b"echo OTHER-TAB-LINE\n"))
-            .expect("append to the history file");
-    };
-    let enter = |sh: &mut LiveShell| {
-        let at = sh.type_at_prompt(b"\r");
-        sh.wait_for_after("\x1b]133;A", at)
-    };
-    let from = sh.len();
-    sh.run_line("echo a$((40+2)) && true", "0");
-    enter(&mut sh);
-    other_tab_appends();
-    sh.run_line(" echo hidden && true", "0");
-    other_tab_appends();
-    enter(&mut sh);
-    sh.run_line(" echo hidden2 && true", "0");
-    let end = sh.run_line("echo z | cat", "0");
-    let text = stdout_between(&sh, from, end);
-    assert_eq!(
-        reported(&text),
-        [
-            "echo\\x20a$((40+2))\\x20&&\\x20true",
-            "echo\\x20hidden",
-            "echo\\x20hidden2",
-            "echo\\x20z\\x20|\\x20cat",
-        ],
-        "bash: the lines 633;E reported\n{}",
-        sh.transcript()
-    );
-    assert!(
-        !text.contains("OTHER-TAB-LINE"),
-        "bash: another tab's line reported or titled\n{}",
-        sh.transcript()
-    );
-    sh.finish();
-}
-
-#[cfg(unix)]
-#[test]
-fn an_integrated_bash_keeps_the_users_last_argument() {
-    let fx = LiveFixture::new();
-    let dir = install_script_set(&fx.base).expect("install");
-    std::fs::write(
-        fx.home.join(".bashrc"),
-        "PROMPT_COMMAND='echo \"pc_=[$_]\"'\n",
-    )
-    .expect(".bashrc");
-    let mut sh = spawn_pty_shell(
-        ShellType::Bash,
-        bash_shell(),
-        &fx,
-        &dir,
-        &[("ATERM_CHILD", "1")],
-    );
-    sh.run_line(
-        "cd \"$HOME\" && mkdir -p last42 && cd \"$_\"; echo \"in=${PWD##*/}\"",
-        "0",
-    );
-    sh.run_line("echo one last$((40+1))", "0");
-    let end = sh.run_line("echo \"was=[$_]\"", "0");
-    let text = stdout_between(&sh, 0, end);
-    for said in ["in=last42", "pc_=[last41]", "was=[last41]"] {
-        assert!(text.contains(said), "bash: {said}\n{}", sh.transcript());
-    }
-    sh.finish();
-}
-
-#[cfg(unix)]
-#[test]
 fn an_integrated_bash_keeps_its_marks_out_of_a_redirected_compound_command() {
-    let compounds = [
-        ("{ echo a; } > out-group", "out-group", "a\n"),
-        (
-            "for i in 1 2; do echo for-$i; done > out-for",
-            "out-for",
-            "for-1\nfor-2\n",
-        ),
-        (
-            "if true; then echo if-body; fi > out-if",
-            "out-if",
-            "if-body\n",
-        ),
-        (
-            "while read -r l; do echo got-$l; done <<< x > out-while",
-            "out-while",
-            "got-x\n",
-        ),
-        ("{ echo both; } > out-both 2>&1", "out-both", "both\n"),
-    ];
-    let fx = LiveFixture::new();
-    std::fs::write(
-        fx.home.join(".bashrc"),
-        "HISTCONTROL=ignorespace\ncd \"$HOME\"\n",
-    )
-    .expect(".bashrc");
-    let nonce = [("ATERM_SHELL_NONCE", REKEY_OLD), ("ATERM_CHILD", "1")];
-    let read = |file: &str| {
-        let path = fx.home.join(file);
-        let text =
-            std::fs::read(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
-        String::from_utf8_lossy(&text).into_owned()
-    };
+    let mut shells = ShellLanes::default();
+    for bash in shells.bashes() {
+        let compounds = [
+            ("{ echo a; } > out-group", "out-group", "a\n"),
+            (
+                "for i in 1 2; do echo for-$i; done > out-for",
+                "out-for",
+                "for-1\nfor-2\n",
+            ),
+            (
+                "if true; then echo if-body; fi > out-if",
+                "out-if",
+                "if-body\n",
+            ),
+            (
+                "while read -r l; do echo got-$l; done <<< x > out-while",
+                "out-while",
+                "got-x\n",
+            ),
+            ("{ echo both; } > out-both 2>&1", "out-both", "both\n"),
+        ];
+        let fx = LiveFixture::new();
+        std::fs::write(
+            fx.home.join(".bashrc"),
+            "HISTCONTROL=ignorespace\ncd \"$HOME\"\n",
+        )
+        .expect(".bashrc");
+        let nonce = [("ATERM_SHELL_NONCE", REKEY_OLD), ("ATERM_CHILD", "1")];
+        let read = |file: &str| {
+            let path = fx.home.join(file);
+            let text = std::fs::read(&path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+            String::from_utf8_lossy(&text).into_owned()
+        };
 
-    let unfixed = folder_with_edits(
-        &fx.base,
-        UNFIXED_REV,
-        &[(
-            "bash",
-            scripts::BASH,
+        let unfixed = folder_with_edits(
+            &fx.base,
+            UNFIXED_REV,
             &[(
-                "    if [[ -t 1 || ${__aterm_osc_tty-} != 1 ]]; then\n",
-                "    if :; then\n",
+                "bash",
+                scripts::BASH,
+                &[(
+                    "    if [[ -t 1 || ${__aterm_osc_tty-} != 1 ]]; then\n",
+                    "    if :; then\n",
+                )],
             )],
-        )],
-    );
-    let mut sh = spawn_pty_shell(ShellType::Bash, bash_shell(), &fx, &unfixed, &nonce);
-    for (line, file, _) in compounds {
-        sh.run_line(&format!(" {line}"), "0");
-        assert!(
-            read(file).contains("\x1b]133;C"),
-            "unfixed: ` {line}` should show the defect, its marks in {file}: {:?}\n{}",
-            read(file),
-            sh.transcript()
         );
-    }
-    sh.finish();
-
-    let ours = install_script_set(&fx.base).expect("install");
-    let mut sh = spawn_pty_shell(ShellType::Bash, bash_shell(), &fx, &ours, &nonce);
-    let block = |sh: &mut LiveShell, line: &str| {
-        let from = sh.len();
-        let end = sh.run_line(line, "0");
-        let text = stdout_between(sh, from, end);
-        let typed = line
-            .replace('\\', "\\\\")
-            .replace(';', "\\x3b")
-            .replace(' ', "\\x20");
-        let mut at = 0;
-        for mark in [
-            format!("\x1b]633;E;{typed};id={REKEY_OLD}\x07"),
-            format!("\x1b]0;{line}\x07"),
-            format!("\x1b]133;C;id={REKEY_OLD}\x07"),
-            format!("\x1b]133;D;0;id={REKEY_OLD}\x07"),
-        ] {
-            let Some(found) = text[at..].find(&mark) else {
-                panic!(
-                    "bash: `{line}`: {mark:?} did not reach the terminal after the marks before it\n{}",
-                    sh.transcript()
-                );
-            };
-            at += found + mark.len();
+        let mut sh = spawn_pty_shell(ShellType::Bash, bash, &fx, &unfixed, &nonce);
+        for (line, file, _) in compounds {
+            sh.run_line(&format!(" {line}"), "0");
+            assert!(
+                read(file).contains("\x1b]133;C"),
+                "unfixed: ` {line}` should show the defect, its marks in {file}: {:?}\n{}",
+                read(file),
+                sh.transcript()
+            );
         }
-    };
-    for (line, file, want) in compounds {
-        let from = sh.len();
-        let end = sh.run_line(&format!(" {line}"), "0");
-        assert_eq!(read(file), want, "bash: ` {line}` wrote into {file}");
-        assert!(
-            stdout_between(&sh, from, end).contains(&format!("\x1b]133;C;id={REKEY_OLD}\x07")),
-            "bash: ` {line}`: its 133;C did not reach the terminal\n{}",
-            sh.transcript()
-        );
-        block(&mut sh, line);
-        assert_eq!(read(file), want, "bash: `{line}` wrote into {file}");
+        sh.finish();
+
+        let ours = install_script_set(&fx.base).expect("install");
+        let mut sh = spawn_pty_shell(ShellType::Bash, bash, &fx, &ours, &nonce);
+        let block = |sh: &mut LiveShell, line: &str| {
+            let from = sh.len();
+            let end = sh.run_line(line, "0");
+            let text = stdout_between(sh, from, end);
+            let typed = line
+                .replace('\\', "\\\\")
+                .replace(';', "\\x3b")
+                .replace(' ', "\\x20");
+            let mut at = 0;
+            for mark in [
+                format!("\x1b]633;E;{typed};id={REKEY_OLD}\x07"),
+                format!("\x1b]0;{line}\x07"),
+                format!("\x1b]133;C;id={REKEY_OLD}\x07"),
+                format!("\x1b]133;D;0;id={REKEY_OLD}\x07"),
+            ] {
+                let Some(found) = text[at..].find(&mark) else {
+                    panic!(
+                        "{bash}: `{line}`: {mark:?} did not reach the terminal after the marks before it\n{}",
+                        sh.transcript()
+                    );
+                };
+                at += found + mark.len();
+            }
+        };
+        for (line, file, want) in compounds {
+            let from = sh.len();
+            let end = sh.run_line(&format!(" {line}"), "0");
+            assert_eq!(read(file), want, "{bash}: ` {line}` wrote into {file}");
+            assert!(
+                stdout_between(&sh, from, end).contains(&format!("\x1b]133;C;id={REKEY_OLD}\x07")),
+                "{bash}: ` {line}`: its 133;C did not reach the terminal\n{}",
+                sh.transcript()
+            );
+            block(&mut sh, line);
+            assert_eq!(read(file), want, "{bash}: `{line}` wrote into {file}");
+        }
+        block(&mut sh, "exec 3>&1 >out-exec");
+        block(&mut sh, "echo in-log");
+        block(&mut sh, "exec >&3 3>&-");
+        assert_eq!(read("out-exec"), "in-log\n", "{bash}: `exec >out-exec`");
+        sh.finish();
     }
-    block(&mut sh, "exec 3>&1 >out-exec");
-    block(&mut sh, "echo in-log");
-    block(&mut sh, "exec >&3 3>&-");
-    assert_eq!(read("out-exec"), "in-log\n", "bash: `exec >out-exec`");
-    sh.finish();
 }
 
 #[cfg(unix)]

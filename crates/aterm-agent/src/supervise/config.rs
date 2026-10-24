@@ -981,6 +981,11 @@ impl SupervisorConfig {
 
     fn set_value(&mut self, key: &str, value: &aterm_toml::Value) -> Result<(), String> {
         use aterm_toml::Value;
+        if let Some((program, leaf)) = agent_key(key)
+            && own_keys(program).contains(&leaf)
+        {
+            return Ok(());
+        }
         match value {
             Value::String(text) => self.set_scalar(key, text, true),
             Value::Boolean(_) | Value::Integer(_) => {
@@ -1374,6 +1379,17 @@ fn per_agent_only(key: &str) -> String {
 
 fn agent_named(id: &str) -> Option<Program> {
     aterm_phase::program_of(id).filter(|p| p.name() == id && p.harness_table())
+}
+
+/// The keys an agent's `[harness.<agent>]` table holds beyond `enabled`, which their own reader
+/// reads: agy's model rotation ([`crate::harness::agy_quota::Rotation::from_aterm_toml`]).
+fn own_keys(program: Program) -> &'static [&'static str] {
+    match program {
+        Program::Agy => crate::harness::agy_quota::ROTATION_KEYS,
+        Program::Claude | Program::Codex | Program::Gemini | Program::Muse | Program::Generic => {
+            &[]
+        }
+    }
 }
 
 fn agent_key(key: &str) -> Option<(Program, &str)> {
