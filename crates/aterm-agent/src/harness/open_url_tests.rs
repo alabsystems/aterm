@@ -1147,7 +1147,12 @@ password_file = '{}'
                         "* 2 EXISTS\r\n{tag} OK [READ-WRITE] SELECT completed\r"
                     );
                 } else if trimmed.contains("SEARCH ") {
-                    let _ = writeln!(writer, "* SEARCH 1 2\r\n{tag} OK SEARCH completed\r");
+                    // Unknown UTF-8 lines can split a byte-counted tag or SEARCH
+                    // prefix. Ignore them, then read the mixed-case valid result.
+                    let _ = writeln!(
+                        writer,
+                        "ééééé\r\n* 12345é\r\n* SeArCh 1 2\r\n{tag} OK SEARCH completed\r"
+                    );
                 } else if trimmed.contains("FETCH 2 ") {
                     let msg = concat!(
                         "From: Anthropic <no-reply@claude.com>\r\n",
@@ -3416,4 +3421,394 @@ fn approval_attributes_ignore_names_inside_quoted_values() {
         )]
     );
     assert!(replies.next().is_none());
+}
+
+#[test]
+fn html_comments_and_gt_inside_quoted_attributes_are_handled_cleanly() {
+    use super::super::headless_oauth::extract_otp_from_email;
+
+    let base = "https://claude.ai/oauth/authorize";
+    let html = r#"
+      <!--
+        <form method="POST" action="/oauth/approve">
+          <input type="hidden" name="csrf" value="commented-out">
+        </form>
+        <a href="https://claude.ai/oauth/approve?commented=1">Old approve</a>
+      -->
+      <form data-rule="1 > 0" method="POST" action="/oauth/approve">
+        <!-- <input type="hidden" name="csrf" value="stale"> -->
+        <input title="step 1 > step 2" type="hidden" name="csrf" value="live">
+        <button data-label="go > now" type="submit" name="decision" value="allow">Allow</button>
+      </form>
+    "#;
+    assert_eq!(
+        parse_html_approval_action(html, base),
+        Some((
+            "POST".to_owned(),
+            "https://claude.ai/oauth/approve".to_owned(),
+            Some("csrf=live&decision=allow".to_owned()),
+        ))
+    );
+
+    let anchor_html = r#"
+      <!-- <a href="/oauth/approve?bad=1">Bad</a> -->
+      <a data-hint="Click > Continue" href="/oauth/approve?good=1">Approve</a>
+    "#;
+    assert_eq!(
+        parse_html_approval_action(anchor_html, base),
+        Some((
+            "GET".to_owned(),
+            "https://claude.ai/oauth/approve?good=1".to_owned(),
+            None,
+        ))
+    );
+
+    let magic_email = concat!(
+        "To: sol-m27@example.test\r\n\r\n",
+        "<!-- https://claude.ai/magic-link?token=commented-out -->\r\n",
+        "<!-- <iframe srcdoc=\"<a href='https://claude.ai/magic-link?token=commented-iframe'>Old</a>\"></iframe> -->\r\n",
+        "<a href=\"https://claude.ai/magic-link?token=live-token\">Sign in</a>\r\n"
+    );
+    assert_eq!(
+        extract_magic_link_from_email(magic_email, Some("sol-m27@example.test")).as_deref(),
+        Some("https://claude.ai/magic-link?token=live-token")
+    );
+
+    let otp_email = concat!(
+        "To: sol-m27@example.test\r\n\r\n",
+        "<!-- if x > 0: verification code is 111111 -->\r\n",
+        "<div data-expr=\"x > 0 && code == 222222\">Your verification code is 654321</div>\r\n"
+    );
+    assert_eq!(
+        extract_otp_from_email(otp_email, Some("sol-m27@example.test")).as_deref(),
+        Some("654321")
+    );
+}
+
+#[test]
+fn http_103_early_hints_307_redirects_and_subaddressed_lookup_work() {
+    use super::super::accounts_sync::parse_accounting_csv;
+    use super::super::headless_oauth::{MailboxConfig, derive_account_label_from_email};
+
+    let mut cookies = BTreeMap::from([
+        ("pre_auth".to_owned(), "temp".to_owned()),
+        ("legacy".to_owned(), "old".to_owned()),
+    ]);
+    let raw = concat!(
+        "HTTP/2 103 Early Hints\r\nLink: </app.css>; rel=preload\r\n\r\n",
+        "HTTP/2 200 OK\r\n",
+        "Set-Cookie: pre_auth=deleted; Max-Age=0; Path=/\r\n",
+        "Set-Cookie: legacy=; Path=/\r\n",
+        "Set-Cookie: session=active; Path=/; HttpOnly\r\n\r\n",
+        "Check your email"
+    );
+    let resp = parse_raw_http_response(raw, &mut cookies).expect("skip 103 Early Hints");
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, "Check your email");
+    assert_eq!(cookies.get("session").map(String::as_str), Some("active"));
+    assert!(!cookies.contains_key("pre_auth"));
+    assert!(!cookies.contains_key("legacy"));
+
+    let authorize =
+        "https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2F127.0.0.1%3A9123&state=s307";
+    let mut requests = Vec::new();
+    authorize_using(
+        authorize,
+        Some("owner@example.test"),
+        |_| Ok("https://claude.ai/oauth/magic?token=t307".to_owned()),
+        &mut |method, url, cookies, body| {
+            requests.push((method.to_owned(), url.to_owned(), body.map(str::to_owned)));
+            let raw_resp = match requests.len() {
+                1 => "HTTP/1.1 200 OK\r\n\r\nCheck your email",
+                2 => concat!(
+                    "HTTP/1.1 200 OK\r\n\r\n",
+                    "<form method=\"POST\" action=\"/oauth/approve\">",
+                    "<input type=\"hidden\" name=\"csrf\" value=\"k1\">",
+                    "<button type=\"submit\" name=\"decision\" value=\"allow\">Allow</button>",
+                    "</form>"
+                ),
+                3 => {
+                    "HTTP/1.1 307 Temporary Redirect\r\nLocation: https://claude.ai/oauth/approve-v2\r\n\r\n"
+                }
+                4 => {
+                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9123?code=ok&state=s307\r\n\r\n"
+                }
+                5 => "HTTP/1.1 200 OK\r\n\r\nOK",
+                _ => unreachable!("unexpected HTTP request"),
+            };
+            parse_raw_http_response(raw_resp, cookies).ok_or("response")
+        },
+    )
+    .expect("307 preserves POST method and body");
+    assert_eq!(
+        requests[2],
+        (
+            "POST".to_owned(),
+            "https://claude.ai/oauth/approve".to_owned(),
+            Some("csrf=k1&decision=allow".to_owned()),
+        )
+    );
+    assert_eq!(
+        requests[3],
+        (
+            "POST".to_owned(),
+            "https://claude.ai/oauth/approve-v2".to_owned(),
+            Some("csrf=k1&decision=allow".to_owned()),
+        )
+    );
+
+    assert_eq!(
+        derive_account_label_from_email("sol_m27_2+claude@proton.me").as_deref(),
+        Some("m27-2")
+    );
+    assert_eq!(
+        derive_account_label_from_email("sol_m27+claude@proton.me").as_deref(),
+        Some("m27")
+    );
+    let cfg = MailboxConfig::from_toml_str(
+        "[passwords]\n\"sol_m27_2@proton.me\" = \"base-pw\"\nm27_3 = \"slot3-pw\"\n",
+        None,
+    )
+    .expect("parse mailbox config");
+    assert_eq!(
+        cfg.password_for(Some("sol_m27_2+claude@proton.me"))
+            .as_deref(),
+        Some("base-pw")
+    );
+    assert_eq!(cfg.password_for(Some("m27-3")).as_deref(), Some("slot3-pw"));
+
+    let roster = parse_accounting_csv(
+        "email,computer,claude\nsol_m27_2+claude@proton.me,m27,1\n",
+        "m27",
+    )
+    .expect("parse accounting csv");
+    assert_eq!(roster.accounts.len(), 1);
+    assert_eq!(roster.accounts[0].label, "m27-2");
+}
+
+#[test]
+fn approval_formaction_meta_refresh_and_multi_link_fallback() {
+    let base = "https://claude.ai/oauth/consent?req=1";
+
+    // Button inner text ("Deny" vs "Allow") disambiguates numeric/opaque values.
+    let button_text_html = r#"
+      <form method="post" action="/oauth/decision">
+        <input type="hidden" name="csrf" value="tok_1">
+        <button type="submit" name="decision" value="0"><span>Deny</span></button>
+        <button type="submit" name="decision" value="1"><span>Allow</span></button>
+      </form>
+    "#;
+    assert_eq!(
+        parse_html_approval_action(button_text_html, base),
+        Some((
+            "POST".to_owned(),
+            "https://claude.ai/oauth/decision".to_owned(),
+            Some("csrf=tok_1&decision=1".to_owned()),
+        ))
+    );
+
+    // HTML5 `formaction` and `formmethod` on the positive submit button override the form tag.
+    let formaction_html = r#"
+      <form method="get" action="/oauth/default">
+        <input type="hidden" name="state" value="st_fa">
+        <button type="submit" formaction="/oauth/deny" formmethod="post">Deny</button>
+        <button type="submit" formaction="approve" formmethod="post">Authorize</button>
+      </form>
+    "#;
+    assert_eq!(
+        parse_html_approval_action(formaction_html, base),
+        Some((
+            "POST".to_owned(),
+            "https://claude.ai/oauth/approve".to_owned(),
+            Some("state=st_fa".to_owned()),
+        ))
+    );
+
+    // A standalone form whose only submit controls are negative is skipped.
+    let cancel_first_html = r#"
+      <form method="post" action="/oauth/session">
+        <button type="submit" name="op" value="cancel">Cancel</button>
+      </form>
+      <form method="post" action="/oauth/session">
+        <input type="hidden" name="csrf" value="c_ok">
+        <button type="submit" name="op" value="proceed">Submit</button>
+      </form>
+    "#;
+    assert_eq!(
+        parse_html_approval_action(cancel_first_html, base),
+        Some((
+            "POST".to_owned(),
+            "https://claude.ai/oauth/session".to_owned(),
+            Some("csrf=c_ok&op=proceed".to_owned()),
+        ))
+    );
+
+    // Negative `<a>` links with `authorize` in their URL are skipped in favor of positive ones.
+    let anchor_html = r#"
+      <a href="https://claude.ai/oauth/authorize?decision=deny">Deny</a>
+      <a href="/oauth/step2?tok=abc">Allow access</a>
+    "#;
+    assert_eq!(
+        parse_html_approval_action(anchor_html, base),
+        Some((
+            "GET".to_owned(),
+            "https://claude.ai/oauth/step2?tok=abc".to_owned(),
+            None,
+        ))
+    );
+
+    // `<meta http-equiv="refresh">` landing pages resolve their redirect URL.
+    let meta_html = r#"<html><head><meta http-equiv="Refresh" content="0; url='/oauth/consent?step=2'"></head></html>"#;
+    assert_eq!(
+        parse_html_approval_action(meta_html, base),
+        Some((
+            "GET".to_owned(),
+            "https://claude.ai/oauth/consent?step=2".to_owned(),
+            None,
+        ))
+    );
+
+    // JSON redirect_url and nested data.approve_url responses.
+    assert_eq!(
+        parse_html_approval_action(r#"{"redirect_url":"/oauth/callback?code=c1"}"#, base),
+        Some((
+            "GET".to_owned(),
+            "https://claude.ai/oauth/callback?code=c1".to_owned(),
+            None,
+        ))
+    );
+    assert_eq!(
+        parse_html_approval_action(r#"{"data":{"approve_url":"approve"}}"#, base),
+        Some((
+            "POST".to_owned(),
+            "https://claude.ai/oauth/approve".to_owned(),
+            None,
+        ))
+    );
+
+    // HTML OTP email with standard header/footer/font links must extract the 6-digit OTP
+    // rather than treating template links as magic links.
+    let html_otp_email = concat!(
+        "From: Claude <no-reply@anthropic.com>\r\n",
+        "To: <sol-m27@proton.me>\r\n",
+        "Subject: Your Claude verification code\r\n\r\n",
+        "<html><head>",
+        "<link href=\"https://fonts.googleapis.com/css2?family=Inter\" rel=\"stylesheet\">",
+        "</head><body>",
+        "<a href=\"https://claude.ai\">Claude</a>",
+        "<a href=\"https://claude.ai/login\">Log in</a>",
+        "<p>Your verification code is <strong>482910</strong></p>",
+        "<a href=\"https://www.anthropic.com/privacy\">Privacy Policy</a>",
+        "<a href=\"https://support.anthropic.com/en/articles/123456\">Help Center</a>",
+        "</body></html>\r\n"
+    );
+    assert!(
+        extract_magic_link_from_email(html_otp_email, Some("sol-m27@proton.me")).is_none(),
+        "static template/footer links in an OTP email must not be mistaken for magic links"
+    );
+    assert_eq!(
+        super::super::headless_oauth::extract_all_credentials_from_email(
+            html_otp_email,
+            Some("sol-m27@proton.me")
+        ),
+        vec![super::super::headless_oauth::MailboxCredential::Otp(
+            "482910".to_owned()
+        )]
+    );
+
+    // JSON email with a REST API message self-link (`"url"`) and an HTML magic link or OTP.
+    let json_with_self_url_and_magic = r#"{
+        "id": "msg_1",
+        "url": "https://mail.example.test/api/v1/messages/msg_1",
+        "to": "sol-m27@proton.me",
+        "html": "<p><a href=\"https://claude.ai/magic?token=real_tok\">Sign in</a></p>"
+    }"#;
+    assert_eq!(
+        extract_magic_link_from_email(json_with_self_url_and_magic, Some("sol-m27@proton.me"))
+            .as_deref(),
+        Some("https://claude.ai/magic?token=real_tok")
+    );
+    let json_with_self_url_and_otp = r#"{
+        "id": "msg_2",
+        "url": "https://mail.example.test/api/v1/messages/msg_2",
+        "to": "sol-m27@proton.me",
+        "text": "Your verification code is 654321"
+    }"#;
+    assert_eq!(
+        super::super::headless_oauth::extract_all_credentials_from_email(
+            json_with_self_url_and_otp,
+            Some("sol-m27@proton.me")
+        ),
+        vec![super::super::headless_oauth::MailboxCredential::Otp(
+            "654321".to_owned()
+        )]
+    );
+
+    // Multi-link fallback in `authorize_using_with_page`: if the first candidate link has no
+    // approval action, it automatically advances to the second candidate link in the email.
+    let authorize_url = "https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2F127.0.0.1%3A9124%2Fcb&state=st_multi";
+    let mut candidate_links = [
+        "https://claude.ai/login?return_to=home".to_owned(),
+        "https://claude.ai/magic?token=good_second".to_owned(),
+    ]
+    .into_iter();
+    let http_replies = [
+        "HTTP/1.1 200 OK\r\n\r\nCheck your email",
+        "HTTP/1.1 200 OK\r\n\r\n<html><body>Static info page without form</body></html>",
+        "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9124/cb?code=multi_ok&state=st_multi\r\n\r\n",
+        "HTTP/1.1 200 OK\r\n\r\nOK",
+    ];
+    let mut reply_iter = http_replies.iter();
+    super::authorize_using_with_page(
+        authorize_url,
+        Some("sol-m27@proton.me"),
+        |_, _| candidate_links.next().ok_or("no more links"),
+        &mut |_m, _u, cookies, _b| {
+            parse_raw_http_response(reply_iter.next().expect("http reply"), cookies)
+                .ok_or("bad reply")
+        },
+    )
+    .expect("second candidate link in email should complete OAuth flow");
+}
+
+#[test]
+fn webmail_user_for_and_all_webmail_ui_urls_route_cleanly() {
+    use super::super::headless_oauth::{MailboxConfig, oauth_step_js};
+
+    let default_cfg = MailboxConfig::default();
+    assert_eq!(
+        default_cfg
+            .webmail_user_for(Some("sol_m27_2+claude@proton.me"))
+            .as_deref(),
+        Some("sol_m27_2@proton.me")
+    );
+    let explicit_cfg = MailboxConfig {
+        user: Some("master@proton.me".to_owned()),
+        ..MailboxConfig::default()
+    };
+    assert_eq!(
+        explicit_cfg
+            .webmail_user_for(Some("sol_m27_2+claude@proton.me"))
+            .as_deref(),
+        Some("master@proton.me")
+    );
+
+    for ui_url in [
+        "https://mail.proton.me/u/0/inbox",
+        "https://app.fastmail.com/mail/Inbox",
+        "https://mail.zoho.com/zm/",
+        "https://outlook.live.com/mail/0/inbox",
+        "https://purelymail.com/webmail/",
+        "https://webmail.migadu.com/",
+        "https://app.tuta.com/mail",
+    ] {
+        let cfg = MailboxConfig::from_toml_str(&format!("url = \"{ui_url}\"\n"), None)
+            .expect("parse webmail ui url");
+        assert_eq!(cfg.webmail_url.as_deref(), Some(ui_url));
+        assert!(cfg.http_url.is_none());
+    }
+
+    let step_js = oauth_step_js(Some("sol_m27_2+claude@proton.me"), None, false, false);
+    assert!(step_js.contains("const canonEmail ="));
+    assert!(step_js.contains("canonEmail(e) === targetCanon"));
 }

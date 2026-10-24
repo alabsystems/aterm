@@ -12,6 +12,9 @@
 //           thousand reads, and its span across a 20 ms wait lies within the
 //           performance.now() reads that bracket it; SystemTime is within
 //           1 ms of the Date.now() reads that bracket it.
+//   notices actual CPU/GPU constructors and restore share one random source despite
+//           equal wall times; missing or throwing Web Crypto disables conditional
+//           settlement without blocking posting, and never re-enables that source.
 //   panic   a constructor installs aterm_wasm_abi::panic_hook; a panic then
 //           reaches console.error ONCE with the panic message, then
 //           "\n\nStack:\n\n", a JS stack that names a wasm frame, then "\n\n"
@@ -65,6 +68,82 @@ function clockSmoke(label, mod) {
   check(`${label} SystemTime is within 1 ms of Date.now()`, wall >= before - 1 && wall <= after + 1, `Date.now() ${before}..${after}, SystemTime ${wall}`)
 }
 
+// Exercise actual generated imports and terminal factories, before any constructor
+// has initialized a module's shared confirmation source. The page is this run's alone.
+function confirmationSmoke(label, mod, Terminal) {
+  const originalCrypto = Object.getOwnPropertyDescriptor(globalThis, 'crypto')
+  const originalNow = Date.now
+  const terminals = []
+  let fills = 0
+  try {
+    Date.now = () => 1790000000000
+    Object.defineProperty(globalThis, 'crypto', { configurable: true, value: {
+      getRandomValues(bytes) { fills++; bytes.fill(0); bytes[0] = 10; return bytes }
+    } })
+    const make = () => { const t = new Terminal(2, 20, font, 16.0, ...THEME); terminals.push(t); return t }
+    const post = t => t.notice('later incarnation Owner action -- only you have access -- Resolve this in settings')
+    const observation = t => {
+      const row = t.messages_read('live need=later')
+      return { id: /message (\d+) /.exec(row)?.[1], rev: / rev=(\d+)/.exec(row)?.[1] }
+    }
+    const parent = make()
+    post(parent)
+    const old = observation(parent)
+    const next = make()
+    post(next)
+    const current = observation(next)
+    check(`${label} host entropy seeds the actual constructor`, old.rev === '10' && fills === 1, `${JSON.stringify(old)} fills=${fills}`)
+    check(`${label} same-wall reused id has a fresh token`, old.id === current.id && old.rev !== current.rev, JSON.stringify({ old, current }))
+    check(`${label} stale settlement is refused`, next.notice(`settle incarnation ${old.id} ${old.rev}`) === 'OK settled=- how=gone', '')
+    const restored = make()
+    restored.messages_restore(parent.messages_log_since(0))
+    post(restored)
+    const afterRestore = observation(restored)
+    check(`${label} restore shares the existing source`, fills === 1 && afterRestore.rev !== old.rev && afterRestore.rev !== current.rev, `${JSON.stringify(afterRestore)} fills=${fills}`)
+    check(`${label} current settlement succeeds`, next.notice(`settle incarnation ${current.id} ${current.rev}`) === `OK settled=${current.id} how=resolved-ok`, '')
+  } finally {
+    for (const terminal of terminals) terminal.free()
+    Date.now = originalNow
+    if (originalCrypto) Object.defineProperty(globalThis, 'crypto', originalCrypto)
+    else delete globalThis.crypto
+  }
+}
+
+async function unavailableConfirmationSmoke(label, url, className) {
+  const originalCrypto = Object.getOwnPropertyDescriptor(globalThis, 'crypto')
+  try {
+    for (const mode of ['absent', 'throws']) {
+      Object.defineProperty(globalThis, 'crypto', { configurable: true, value: mode === 'absent' ? undefined : {
+        getRandomValues(bytes) { bytes.fill(7); throw new Error('private entropy refusal') }
+      } })
+      const freshUrl = new URL(url, import.meta.url)
+      freshUrl.searchParams.set('confirmation-entropy', mode)
+      const mod = await import(freshUrl.href)
+      await mod.default()
+      const terminal = new mod[className](2, 20, font, 16.0, ...THEME)
+      try {
+        const posted = terminal.notice('later incarnation Owner action -- only you have access -- Resolve this in settings')
+        const row = terminal.messages_read('live need=later')
+        const id = /message (\d+) /.exec(row)?.[1]
+        const revision = / rev=(\d+)/.exec(row)?.[1]
+        check(`${label} ${mode} entropy keeps ordinary notices`, posted.startsWith('OK later=') && id !== undefined, row)
+        check(`${label} ${mode} entropy refuses conditional settlement`, revision === '18446744073709551615' && terminal.notice(`settle incarnation ${id} ${revision}`) === 'OK settled=- how=gone', row)
+      } finally { terminal.free() }
+      Object.defineProperty(globalThis, 'crypto', { configurable: true, value: {
+        getRandomValues(bytes) { bytes.fill(1); return bytes }
+      } })
+      const later = new mod[className](2, 20, font, 16.0, ...THEME)
+      try {
+        later.notice('later incarnation Owner action -- only you have access -- Resolve this in settings')
+        check(`${label} ${mode} source never re-enables`, / rev=18446744073709551615(?:\s|$)/.test(later.messages_read('live need=later')), '')
+      } finally { later.free() }
+    }
+  } finally {
+    if (originalCrypto) Object.defineProperty(globalThis, 'crypto', originalCrypto)
+    else delete globalThis.crypto
+  }
+}
+
 function panicSmoke(label, mod, Terminal) {
   if (typeof mod.atermSmokePanic !== 'function') {
     check(`${label} panic`, false, 'no atermSmokePanic export: is this a debug build?')
@@ -111,6 +190,10 @@ export async function run(urls) {
   // Clocks first: a panic traps, and a module is not called again after one.
   clockSmoke('cpu', cpu)
   clockSmoke('gpu', gpu)
+  confirmationSmoke('cpu', cpu, cpu.AtermTerminal)
+  confirmationSmoke('gpu', gpu, gpu.AtermGpuTerminal)
+  await unavailableConfirmationSmoke('cpu', urls.cpu, 'AtermTerminal')
+  await unavailableConfirmationSmoke('gpu', urls.gpu, 'AtermGpuTerminal')
   panicSmoke('cpu', cpu, cpu.AtermTerminal)
   panicSmoke('gpu', gpu, gpu.AtermGpuTerminal)
   console.error(`wasm-smoke: ${failures === 0 ? 'PASS' : `FAIL (${failures})`}`)

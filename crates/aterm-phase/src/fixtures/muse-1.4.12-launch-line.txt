@@ -1,0 +1,4 @@
+# muse 1.4.12 · MEASURED 2026-10-22, the harness tape of the spawned worker in the forever lab's r11 cover run (`r11cv-muse`, tape s-e6691b0fbf1d3c573b35, aterm 22871f4d10, 144x50), its first decision's screen (seq 33) · the shell's echo of the line that launched Muse Code, nothing of Muse Code's under it
+lab$  XDG_DATA_HOME=/private/tmp/at.lab-501/aterm-r11-b1d1d966/runs/r11cv-muse/scratch/home/.local/share XDG_CONFIG_HOME=/private/tmp/at.lab-501
+/aterm-r11-b1d1d966/runs/r11cv-muse/scratch/home/.config '/private/tmp/at.lab-501/aterm-r11-b1d1d966/runs/r11cv-muse/scratch/home/Library/Applic
+ation Support/aterm/pkg/agents/muse' '--base-url' 'http://127.0.0.1:61617' '--trust-workspace' -- "$(command cat -- "$ATERM_TASK_FILE")"

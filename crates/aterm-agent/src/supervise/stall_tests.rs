@@ -521,9 +521,8 @@ fn the_windows_host_withdraws_the_badge_of_a_worker_that_freezes_under_it() {
     m.input_after = vec![(1, INPUT_STALLED)];
     let (lines, end, journal) = hosted_journaled(&mut m, "hosted-freezes");
     assert!(writes(&m).is_empty(), "{:?}", m.requests);
-    assert_eq!(
-        before_the_badge(&m).last().map(String::as_str),
-        Some("status"),
+    assert!(
+        before_the_badge(&m).ends_with(&["status".to_string(), "meta".to_string()]),
         "{:#?}",
         m.requests
     );
@@ -580,9 +579,8 @@ fn the_windows_host_asks_a_host_that_does_not_measure_input_once() {
         m.input = input;
         let (lines, end, journal) = hosted_journaled(&mut m, "hosted-none");
         assert_eq!(count(&m, "status"), 1, "input={input:?}: {:#?}", m.requests);
-        assert_eq!(
-            before_the_badge(&m).last().map(String::as_str),
-            Some("status"),
+        assert!(
+            before_the_badge(&m).ends_with(&["status".to_string(), "meta".to_string()]),
             "input={input:?}: {:#?}",
             m.requests
         );

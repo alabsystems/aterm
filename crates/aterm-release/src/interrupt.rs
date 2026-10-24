@@ -12,12 +12,9 @@ mod imp {
     pub const SIGINT: i32 = 2;
     pub const SIGKILL: i32 = 9;
     pub const SIGTERM: i32 = 15;
-    /// `SIG_IGN` as `signal` takes and answers it.
     const SIG_IGN: usize = 1;
 
-    /// The first signal caught (0: none).
     static SIGNAL: AtomicI32 = AtomicI32::new(0);
-    /// How many were caught.
     static COUNT: AtomicU32 = AtomicU32::new(0);
 
     unsafe extern "C" {
@@ -109,9 +106,6 @@ mod imp {
         }
     }
 
-    /// `sig` to every member of `group` that is not a trustd's ([`super::group_members`]);
-    /// SIGKILL is sent twice, the group listed again between, for what forked meanwhile.
-    /// A listing that cannot be read signals the group's leader alone: never a trustd.
     fn signal_group(group: i32, sig: i32) {
         let passes = if sig == SIGKILL { 2 } else { 1 };
         for _ in 0..passes {
@@ -147,7 +141,7 @@ mod imp {
 
 pub use imp::*;
 
-/// Returns the signalable members of process group `group` from a `ps` listing, sparing `trustd` and its descendants.
+/// Returns signalable members of process group `group`, sparing `trustd` and its descendants.
 #[must_use]
 pub fn group_members(listing: &str, group: i32) -> Vec<i32> {
     let rows: Vec<(i32, i32, i32, &str)> = listing
@@ -190,9 +184,6 @@ pub fn group_members(listing: &str, group: i32) -> Vec<i32> {
 mod tests {
     use super::*;
 
-    /// The interrupt signals a step's group member by member, and never a Trust trustd
-    /// or what it runs — even one living in the step's group (a seal before trust
-    /// `41f912aa5f4` leaves it in its launcher's) — nor anything outside the group.
     #[test]
     fn the_interrupt_spares_a_trustd_and_its_solvers() {
         let listing = "\

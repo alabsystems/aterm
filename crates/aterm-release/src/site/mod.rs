@@ -647,20 +647,67 @@ pub(crate) fn private_dir(prefix: &str) -> Result<PathBuf, String> {
     ))
 }
 
-/// A private scratch directory, removed on drop.
-struct Scratch(PathBuf);
+/// How a [`World::build_module`] refusal begins when the build showed no exit of its own
+/// (a signal ended it or reached its build scripts): what it started never showed it ran,
+/// so the sync's scratch is kept ([`Scratch`]).
+pub const ENGINE_UNPROVEN: &str = "the wasm32 build showed no exit of its own";
+
+/// The prefix of the sync's scratch directories ([`private_dir`]).
+const SCRATCH: &str = "aterm-site";
+
+/// A private scratch directory, removed on drop unless `kept`: then it is stamped and stays
+/// until macOS is done assessing what a build started from it, and a later sync removes it
+/// ([`reclaim_kept`]).
+struct Scratch {
+    dir: PathBuf,
+    kept: bool,
+}
 
 impl Scratch {
     fn new() -> Result<Self, Failure> {
-        private_dir("aterm-site")
-            .map(Self)
+        reclaim_kept(&std::env::temp_dir());
+        private_dir(SCRATCH)
+            .map(|dir| Self { dir, kept: false })
             .map_err(|e| refusal(Refusal::Io, format!("cannot make a scratch directory: {e}")))
     }
 }
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        if self.kept {
+            aterm_uds::deadline::stamp_exec(&self.dir);
+        } else {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
+/// Remove each scratch directory under `base` an earlier sync kept ([`Scratch`]) once its
+/// first-exec hold is spent.
+fn reclaim_kept(base: &Path) {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let ours = name
+            .to_string_lossy()
+            .strip_prefix(SCRATCH)
+            .and_then(|rest| rest.strip_prefix('-'))
+            .and_then(|rest| rest.split_once('-'))
+            .is_some_and(|(pid, n)| {
+                [pid, n]
+                    .iter()
+                    .all(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+            });
+        let path = entry.path();
+        if ours
+            && entry.file_type().is_ok_and(|kind| kind.is_dir())
+            && path.join(aterm_uds::deadline::EXEC_STAMP).is_file()
+            && crate::gates::first_exec_hold(&path).is_none()
+        {
+            let _ = std::fs::remove_dir_all(&path);
+        }
     }
 }
 
@@ -952,7 +999,7 @@ fn steps(
             format!("PUB_PUBLIC_COMMIT must be a full hex commit sha, got: {commit}"),
         );
     }
-    let scratch = Scratch::new()?;
+    let mut scratch = Scratch::new()?;
     let v_note = env
         .version
         .as_deref()
@@ -972,12 +1019,12 @@ fn steps(
             &format!("DRY RUN — nothing in {} will change", site_dir.display()),
         );
     }
-    let clone = scratch.0.join("clone");
+    let clone = scratch.dir.join("clone");
     halt(launch, "the clone")?;
     say(out, &format!("cloning {} (shallow)", env.clone_url));
     let clone_arg = clone.to_string_lossy().into_owned();
     git.out(
-        &scratch.0,
+        &scratch.dir,
         &[
             "clone",
             "--quiet",
@@ -1273,19 +1320,34 @@ fn steps(
             out,
             &format!("engine: rebuilding from {} on {with}", short(&commit)),
         );
-        let pair = engine::build(
+        // Kept unless the build ends showing what it started ran (an exit of its own).
+        scratch.kept = true;
+        let built = engine::build(
             world,
             &clone,
             pin,
             env.home.as_deref(),
-            &scratch.0.join("engine"),
+            &scratch.dir.join("engine"),
             &term,
             out,
-        )
-        .map_err(|e| {
+        );
+        scratch.kept = built
+            .as_ref()
+            .is_err_and(|e| e.starts_with(ENGINE_UNPROVEN));
+        let pair = built.map_err(|e| {
+            let kept = if scratch.kept {
+                format!(
+                    "; {} stays while macOS may still be assessing a program the build \
+                     started there (a sync {} min from now removes it)",
+                    scratch.dir.display(),
+                    aterm_uds::deadline::FIRST_EXEC_HANG.as_secs() / 60
+                )
+            } else {
+                String::new()
+            };
             child_failed(
                 "the /terminal engine build",
-                format!("the /terminal engine build failed: {e}"),
+                format!("the /terminal engine build failed: {e}{kept}"),
             )
         })?;
         say(
@@ -1851,6 +1913,32 @@ pub fn report(ended: &Result<Outcome, Failure>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sync removes a scratch an earlier one kept only once its hold is spent (a restart
+    /// here); a kept one still held, one with no stamp (a sync's live scratch) and a
+    /// directory named otherwise stay.
+    #[test]
+    fn a_kept_scratch_goes_once_its_hold_is_spent() {
+        let base = aterm_tempfile::tempdir().unwrap();
+        let dir = |name: &str, stamp: Option<String>| {
+            let path = base.path().join(name);
+            std::fs::create_dir_all(path.join("clone/target")).unwrap();
+            if let Some(stamp) = stamp {
+                std::fs::write(path.join(aterm_uds::deadline::EXEC_STAMP), stamp).unwrap();
+            }
+            path
+        };
+        let spent = dir("aterm-site-41-0", Some(u64::MAX.to_string()));
+        let held = dir("aterm-site-41-1", None);
+        aterm_uds::deadline::stamp_exec(&held);
+        let live = dir("aterm-site-42-0", None);
+        let other = dir("aterm-site-sync-x", Some(u64::MAX.to_string()));
+        reclaim_kept(base.path());
+        assert!(!spent.exists());
+        for stays in [&held, &live, &other] {
+            assert!(stays.join("clone/target").is_dir(), "{}", stays.display());
+        }
+    }
 
     #[test]
     fn firebase_login_failures_are_recognised_and_others_are_not() {

@@ -13,6 +13,7 @@ use crate::autopilot_menu::{
     self, AutopilotMenu, MenuAct, MenuOwner, MenuRow, PlotCell, PlotInk, PointerRest,
     TRAFFIC_MAX_CONTENT, content_room, content_room_up_to, step,
 };
+use crate::claude_facts::{runtime_spoken, tokens_spoken};
 use crate::claude_lights::{Clock, Fact, FactNotice, GlassAt};
 use crate::claude_slash::Slash;
 use crate::{App, WindowId};
@@ -362,12 +363,12 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
     let typed = facts.note.is_none() && !facts.typing;
     let note = |out: &mut Vec<MenuRow>| {
         if let Some(note) = &facts.note {
-            out.push(MenuRow::Note(note.clone()));
+            out.push(MenuRow::note(note.as_str()));
         }
     };
     match fact {
         Fact::Model => {
-            out.push(MenuRow::Note(format!("\u{25c6}  {}", value(&facts.model))));
+            out.push(MenuRow::note(format!("\u{25c6}  {}", value(&facts.model))));
             note(&mut out);
             out.push(item(
                 fact,
@@ -378,7 +379,7 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
             ));
         }
         Fact::Effort | Fact::TopEffort => {
-            out.push(MenuRow::Note(format!("\u{25c9}  {}", value(&facts.effort))));
+            out.push(MenuRow::note(format!("\u{25c9}  {}", value(&facts.effort))));
             note(&mut out);
             if let Some(on) = facts.key_row {
                 out.push(item(
@@ -402,18 +403,18 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
             ));
         }
         Fact::Path => {
-            out.push(MenuRow::Note(format!("\u{2302}  {}", value(&facts.path))));
+            out.push(MenuRow::note(format!("\u{2302}  {}", value(&facts.path))));
             for line in &facts.folder_hygiene {
-                out.push(MenuRow::Note(line.clone()));
+                out.push(MenuRow::note(line.as_str()));
             }
             let here = facts.cwd.is_some();
             out.push(item(fact, "+", "New tab here", FactAct::NewTabHere, here));
             out.push(item(fact, "\u{29c9}", "Copy path", FactAct::CopyPath, here));
         }
         Fact::Branch => {
-            out.push(MenuRow::Note(format!("\u{2387}  {}", value(&facts.branch))));
+            out.push(MenuRow::note(format!("\u{2387}  {}", value(&facts.branch))));
             for line in &facts.git_hygiene {
-                out.push(MenuRow::Note(line.clone()));
+                out.push(MenuRow::note(line.as_str()));
             }
             out.push(item(
                 fact,
@@ -433,7 +434,7 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
             }
         }
         Fact::Context => {
-            out.push(MenuRow::Note(format!(
+            out.push(MenuRow::note(format!(
                 "{}  {}",
                 aterm_agent::harness::footer::CONTEXT_MARK,
                 value(&facts.context)
@@ -449,30 +450,37 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
         }
         Fact::Account => {
             if let Some(sub) = &facts.subscription {
-                out.push(MenuRow::Note(format!(
+                out.push(MenuRow::note(format!(
                     "{}  {sub}",
                     aterm_agent::harness::footer::ACCOUNT_MARK
                 )));
             }
             if let Some(meter) = &facts.weekly_meter {
-                out.push(MenuRow::Note(format!(
+                out.push(MenuRow::note(format!(
                     "{}  {meter}",
                     aterm_agent::harness::footer::WEEKLY_MARK
                 )));
             } else if let Some(gap) = facts.weekly_gap {
-                out.push(MenuRow::Note(format!(
-                    "{}  {}",
-                    aterm_agent::harness::footer::WEEKLY_MARK,
-                    gap.words()
-                )));
-                for line in weekly_gap_why(gap) {
-                    out.push(MenuRow::Note((*line).to_string()));
+                out.push(MenuRow::note_spoken(
+                    format!(
+                        "{}  {}",
+                        aterm_agent::harness::footer::WEEKLY_MARK,
+                        gap.words()
+                    ),
+                    gap.spoken(),
+                ));
+                // The why is prose wrapped to the card: a reader hears it whole,
+                // on its first line, not cut at each wrap.
+                let why = weekly_gap_why(gap);
+                let mut said = Some(why.join(" "));
+                for line in why {
+                    out.push(MenuRow::note_spoken(*line, said.take().unwrap_or_default()));
                 }
             }
             note(&mut out);
             if facts.accounts.is_empty() {
-                out.push(MenuRow::Note(
-                    "No rotation accounts configured \u{2014} run aterm init".to_string(),
+                out.push(MenuRow::note(
+                    "No rotation accounts configured \u{2014} run aterm init",
                 ));
                 out.push(MenuRow::Rule);
                 out.push(MenuRow::Item {
@@ -616,9 +624,9 @@ pub(crate) fn traffic_rows(
     cols: usize,
 ) -> Vec<MenuRow> {
     let unread =
-        (view.unread > 0).then(|| MenuRow::Note(format!("+{} unread not graphed", view.unread)));
+        (view.unread > 0).then(|| MenuRow::note(format!("+{} unread not graphed", view.unread)));
     if view.is_empty() || view.width_s <= 0 {
-        return std::iter::once(MenuRow::Note("No traffic yet".to_string()))
+        return std::iter::once(MenuRow::note("No traffic yet"))
             .chain(unread)
             .collect();
     }
@@ -697,17 +705,36 @@ pub(crate) fn traffic_rows(
         tokens_short(total_in),
         tokens_short(total_out)
     );
-    out.push(MenuRow::Note(match view.runtime_s {
-        Some(secs) => format!("{} working \u{b7} {tokens}", runtime_short(secs)),
-        None => tokens,
-    }));
+    let said = format!(
+        "{} in, {} out",
+        tokens_spoken(total_in),
+        tokens_spoken(total_out)
+    );
+    out.push(match view.runtime_s {
+        Some(secs) => MenuRow::note_spoken(
+            format!("{} working \u{b7} {tokens}", runtime_short(secs)),
+            format!("{} working, {said}", runtime_spoken(secs)),
+        ),
+        None => MenuRow::note_spoken(tokens, said),
+    });
     let per = span_s.div_ceil(u64::try_from(plot).unwrap_or(1));
-    out.push(MenuRow::Note(format!(
-        "peak \u{2191}{} \u{b7} \u{2193}{} per {}",
-        tokens_short(peak.0),
-        tokens_short(peak.1),
-        runtime_short(per)
-    )));
+    // The graph has no words of its own: its caption, the peak, says what
+    // it spans for a reader.
+    out.push(MenuRow::note_spoken(
+        format!(
+            "peak \u{2191}{} \u{b7} \u{2193}{} per {}",
+            tokens_short(peak.0),
+            tokens_short(peak.1),
+            runtime_short(per)
+        ),
+        format!(
+            "graph from {} to now, peak {} in, {} out per {}",
+            start.as_str(),
+            tokens_spoken(peak.0),
+            tokens_spoken(peak.1),
+            runtime_spoken(per)
+        ),
+    ));
     out.extend(unread);
     out
 }

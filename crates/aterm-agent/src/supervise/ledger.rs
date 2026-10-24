@@ -3,10 +3,10 @@
 
 //! `aterm drive ledger`: multi-source timeline joining worker turn history, watcher journal, fabric mail, and reply row counts.
 //!
-//! The session log places every time by default ([`LedgerSource::Log`]): each turn by its
-//! record's `t=` joined by `ledger=`, each message by its `mail` mark joined by `inbox=`.
-//! [`LedgerSource::Anchor`] (`--source anchor`) is deprecated: it is kept until the release
-//! after the one that ships the log default, and removed then.
+//! The session log places every time: each turn by its record's `t=` joined by `ledger=`,
+//! each message by its `mail` mark joined by `inbox=`. The clock anchor (`--source anchor`),
+//! which guessed them from when the instance's control socket was made, was removed on
+//! [`ANCHOR_REMOVED`].
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -88,57 +88,17 @@ pub struct LedgerOpts {
     pub journal: Option<PathBuf>,
     /// `--since`: nothing before this Unix time (ms).
     pub since_ms: Option<i64>,
-    /// `--source`: where the times come from.
-    pub source: LedgerSource,
 }
 
-/// Clock source used to place turns and mail on the wall clock.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum LedgerSource {
-    /// Session-log wall-clock timestamps joined by `ledger=` and `inbox=` (the default).
-    #[default]
-    Log,
-    /// Process-clock timestamps anchored via [`ClockAnchor`]: deprecated, kept until the
-    /// release after the one that ships the log default, and removed then.
-    Anchor,
-}
+/// The day `--source anchor` (the ledger's clock anchor) was removed, as its refusal names it.
+pub const ANCHOR_REMOVED: &str = "2026-10-23";
 
-/// What the SOURCES clock row says of `--source anchor` whenever it is read.
-pub const ANCHOR_DEPRECATED: &str = "`--source anchor` is deprecated: kept until the release \
-                                     after the one that ships the log default, removed then";
-
-impl LedgerSource {
-    /// Parse `"log"` or `"anchor"`.
-    #[must_use]
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "log" => Some(Self::Log),
-            "anchor" => Some(Self::Anchor),
-            _ => None,
-        }
-    }
-}
-
-/// Wall-clock anchor for an aterm instance's monotonic process clock.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClockAnchor {
-    /// The instance's pid.
-    pub pid: u32,
-    /// The Unix time (ms) of its clock's zero.
-    pub epoch_ms: i64,
-    /// How that was found, for SOURCES.
-    pub how: String,
-}
-
-/// Host clock and process-anchor callback for [`gather`].
-pub struct LedgerHost<'a> {
+/// Host clock for [`gather`].
+pub struct LedgerHost {
     /// The time now, Unix ms.
     pub now_ms: i64,
     /// The local time's offset from UTC, seconds (times print in it).
     pub tz_offset_s: i64,
-    /// Where the process hosting a session (by sid, no `@`) started its
-    /// clock.
-    pub anchor: &'a mut dyn FnMut(&str) -> Result<ClockAnchor, String>,
 }
 
 /// Diagnostic status of one ledger data source.
@@ -268,29 +228,6 @@ fn inbox_rows(body: &str, worker: &str) -> (Vec<(u64, u64, Mail)>, Vec<u64>) {
     (got, pending)
 }
 
-/// The `timeline` rows that posted to `worker` (`event <n> t=<ms> kind=post
-/// <id> to=<@sid> kind=<k>`): process-clock `t`, post id, message kind.
-fn timeline_posts(body: &str, worker: &str) -> Vec<(u64, u64, String)> {
-    body.lines()
-        .filter_map(|row| {
-            let rest = row.strip_prefix("event ")?;
-            let (_, rest) = rest.split_once(' ')?;
-            let (t, rest) = rest.split_once(' ')?;
-            let t = decimal(t.strip_prefix("t=")?)?;
-            let rest = rest.strip_prefix("kind=post ")?;
-            let (id, rest) = rest.split_once(' ')?;
-            if field(rest, "to").map(bare_sid) != Some(worker) {
-                return None;
-            }
-            Some((
-                t,
-                decimal(id)?,
-                field(rest, "kind").unwrap_or("-").to_string(),
-            ))
-        })
-        .collect()
-}
-
 /// One record line of a `log` reply (`<seq> <op> <node> <kind> [par=…]
 /// <key>=<value>… t=<ms>`): its op, node and kind words, and its `t=`.
 fn log_record(line: &str) -> Option<(&str, &str, &str, Option<i64>)> {
@@ -406,10 +343,6 @@ pub struct TurnRow {
     pub submitted: bool,
     pub dur_ms: u64,
     pub carried: bool,
-    /// Whether `t` is when the worker's session log saw the turn BEGIN (its
-    /// open record, `--source log`), which is after the press, rather than
-    /// when the exchange that typed it started (`history`'s `started_ms`).
-    pub began: bool,
     pub text: String,
     /// The worker's reply, in rows, or why it is not known.
     pub rows: Result<usize, String>,
@@ -442,13 +375,8 @@ pub struct Ledger {
     /// instead of `0`.
     pub journal_unreadable: bool,
     pub mail: Vec<Mail>,
-    /// Whether the turns are placed on the wall clock (the session log read, or the deprecated
-    /// anchor found): the manager's latency is measured only then.
+    /// Whether the session log could be read to place the turns.
     pub aligned: bool,
-    /// Whether the times shown are guessed: only `--source anchor` with no anchor, which
-    /// places its times as if the newest record were now, each printed after a `~`. The log's
-    /// times, the journal's and the mail marks' are wall times, so the default never guesses.
-    pub guessed: bool,
 }
 
 /// One control request's reply, or the reason there is none.
@@ -486,7 +414,7 @@ fn cut(s: &str, n: usize) -> String {
 }
 
 /// Gather turn history, mail, reply sizes, and optional journal records into a [`Ledger`].
-pub fn gather<C: Ctl>(ctl: &mut C, opts: &LedgerOpts, host: &mut LedgerHost<'_>) -> Ledger {
+pub fn gather<C: Ctl>(ctl: &mut C, opts: &LedgerOpts, host: &LedgerHost) -> Ledger {
     let worker = bare_sid(&opts.worker).to_string();
     let at = format!("@{worker}");
     let mut sources = Vec::new();
@@ -494,51 +422,19 @@ pub fn gather<C: Ctl>(ctl: &mut C, opts: &LedgerOpts, host: &mut LedgerHost<'_>)
     let manager = ask(ctl, &["whoami"])
         .ok()
         .and_then(|r| r.stdout.split_whitespace().nth(1).map(str::to_string));
-    let from_log = opts.source == LedgerSource::Log;
-    let worker_anchor = if from_log {
-        Err("the session log's own times are read instead".to_string())
-    } else {
-        (host.anchor)(&worker)
-    };
-    let manager_anchor = if from_log {
-        None
-    } else {
-        manager.as_deref().map(|m| (host.anchor)(m))
-    };
-    let mut aligned = worker_anchor.is_ok();
-    let guessed = !from_log && worker_anchor.is_err();
     sources.push(Source {
         name: "clock",
-        ok: aligned || from_log,
-        detail: match &worker_anchor {
-            _ if from_log => "the session log's own wall times: each turn by its record's t= \
-                              joined by ledger=, each message by its mail mark's joined by \
-                              inbox=; no clock anchor is read"
-                .to_string(),
-            Ok(a) => format!(
-                "{ANCHOR_DEPRECATED}; instance {}'s clock started {} ({}); history, inbox and \
-                 timeline times are placed by it",
-                a.pid,
-                stamp(a.epoch_ms, host.tz_offset_s, true),
-                a.how
-            ),
-            Err(e) => format!(
-                "{ANCHOR_DEPRECATED}; not placed on the wall clock ({e}): worker and mail times \
-                 are shown as if its newest record were now, and no latency is measured"
-            ),
-        },
+        ok: true,
+        detail: "the session log's own wall times: each turn by its record's t= joined by \
+                 ledger=, each message by its mail mark's joined by inbox=; no clock anchor is \
+                 read"
+            .to_string(),
     });
 
     let mut hist: Vec<HistTurn> = Vec::new();
-    let mut newest = None;
     match ask(ctl, &[&at, "history"]) {
         Ok(r) => {
             hist = parse_history_records(&r.stdout);
-            newest = hist
-                .iter()
-                .filter(|t| !t.carried)
-                .map(|t| t.started_ms)
-                .max();
             let typed = hist.len();
             hist.retain(|t| t.by != "harness");
             let harness = match typed - hist.len() {
@@ -568,10 +464,10 @@ pub fn gather<C: Ctl>(ctl: &mut C, opts: &LedgerOpts, host: &mut LedgerHost<'_>)
                     (false, lost) => format!(
                         "{} turn(s) from {at}{}{}{harness}",
                         hist.len(),
-                        match carried {
-                            0 => String::new(),
-                            _ if from_log => format!(", {carried} carried from an earlier aterm"),
-                            _ => format!(", {carried} carried from an earlier aterm (no time)"),
+                        if carried > 0 {
+                            format!(", {carried} carried from an earlier aterm")
+                        } else {
+                            String::new()
                         },
                         lost.map(|lost| format!("; {lost}")).unwrap_or_default()
                     ),
@@ -585,7 +481,8 @@ pub fn gather<C: Ctl>(ctl: &mut C, opts: &LedgerOpts, host: &mut LedgerHost<'_>)
         }),
     }
 
-    let log_starts = from_log.then(|| match ask(ctl, &[&at, "log", "class=turn"]) {
+    let mut aligned = false;
+    let log_starts = match ask(ctl, &[&at, "log", "class=turn"]) {
         Ok(r) => {
             let lt = log_turns(&r.stdout);
             let placed = hist.iter().filter(|h| lt.start.contains_key(&h.id)).count();
@@ -638,15 +535,7 @@ pub fn gather<C: Ctl>(ctl: &mut C, opts: &LedgerOpts, host: &mut LedgerHost<'_>)
             });
             BTreeMap::new()
         }
-    });
-
-    let fallback = host.now_ms - i64::try_from(newest.unwrap_or(0)).unwrap_or(0);
-    let worker_epoch = worker_anchor.as_ref().map_or(fallback, |a| a.epoch_ms);
-    let manager_epoch = match &manager_anchor {
-        Some(Ok(a)) => a.epoch_ms,
-        _ => worker_epoch,
     };
-    let place = |epoch: i64, ms: u64| epoch.saturating_add(i64::try_from(ms).unwrap_or(i64::MAX));
 
     let sizes = reply_sizes(ctl, &at, &hist, &mut sources);
 
@@ -655,15 +544,11 @@ pub fn gather<C: Ctl>(ctl: &mut C, opts: &LedgerOpts, host: &mut LedgerHost<'_>)
         .zip(sizes)
         .map(|(h, (rows, swallowed))| TurnRow {
             id: h.id,
-            t: match &log_starts {
-                Some(starts) => starts.get(&h.id).copied(),
-                None => (!h.carried).then(|| place(worker_epoch, h.started_ms)),
-            },
+            t: log_starts.get(&h.id).copied(),
             status: h.status.clone(),
             submitted: h.submitted,
             dur_ms: h.dur_ms,
             carried: h.carried,
-            began: log_starts.is_some(),
             text: h.text.clone(),
             rows,
             swallowed,
@@ -724,29 +609,7 @@ pub fn gather<C: Ctl>(ctl: &mut C, opts: &LedgerOpts, host: &mut LedgerHost<'_>)
             mail_ok = true;
             let (got, pending) = inbox_rows(&r.stdout, &opts.worker);
             mail_notes.push(format!("{} message(s) from {at} in the inbox", got.len()));
-            if from_log {
-                log_placed_mail(ctl, &worker, got, &pending, &mut mail, &mut mail_notes);
-            } else {
-                mail.extend(got.into_iter().map(|(_, t, m)| Mail {
-                    t: Some(place(manager_epoch, t)),
-                    ..m
-                }));
-                match ask(ctl, &["@self", "timeline"]) {
-                    Ok(r) => {
-                        let posts = timeline_posts(&r.stdout, &worker);
-                        mail_notes.push(format!("{} post(s) to it in the timeline", posts.len()));
-                        mail.extend(posts.into_iter().map(|(t, id, kind)| Mail {
-                            t: Some(place(manager_epoch, t)),
-                            dir: Dir::Out,
-                            kind,
-                            len: None,
-                            trust: None,
-                            pending: pending.contains(&id),
-                        }));
-                    }
-                    Err(e) => mail_notes.push(format!("timeline: {e} (posts to it not shown)")),
-                }
-            }
+            log_placed_mail(ctl, &worker, got, &pending, &mut mail, &mut mail_notes);
         }
         Err(e) => mail_notes.push(format!("inbox: {e}")),
     }
@@ -793,11 +656,10 @@ pub fn gather<C: Ctl>(ctl: &mut C, opts: &LedgerOpts, host: &mut LedgerHost<'_>)
         journal_unreadable,
         mail,
         aligned,
-        guessed,
     }
 }
 
-/// `--source log`'s mail (plan 5F-4): the inbox's messages from the worker
+/// The ledger's mail: the inbox's messages from the worker
 /// (`got`: id, process-clock `t`, row), each placed by its `mail dir=in`
 /// mark's wall time joined by `inbox=` — one the log no longer holds keeps
 /// no time, counted — and this session's posts to the worker from its `mail
@@ -1095,7 +957,6 @@ impl Ledger {
     pub fn items(&self) -> Vec<Item> {
         let mut items = Vec::new();
         for t in &self.turns {
-            let sent = if t.began { "began" } else { "sent" };
             let settle = if !t.submitted {
                 format!("not submitted ({})", ms(t.dur_ms))
             } else if t.status == "settled" {
@@ -1107,9 +968,9 @@ impl Ledger {
                 t: t.t,
                 lane: Lane::Manager,
                 mark: MarkKind::Turn,
-                what: format!("turn {} {sent}: {}", t.id, cut(&t.text, TURN_CHARS)),
+                what: format!("turn {} began: {}", t.id, cut(&t.text, TURN_CHARS)),
                 full: format!(
-                    "turn {} {sent}{}: {}",
+                    "turn {} began{}: {}",
                     t.id,
                     if t.carried { " (carried)" } else { "" },
                     t.text
@@ -1588,16 +1449,9 @@ pub fn parse_since(s: &str, local_offset_s: i64) -> Option<i64> {
 }
 
 /// The time column: `HH:MM:SS`, with the date when the rows span more than
-/// one local day; `-` for none; `~` before a time the clock could only guess
-/// ([`Ledger::guessed`]).
+/// one local day; `-` for none.
 fn time_cell(t: Option<i64>, l: &Ledger, dated: bool) -> String {
-    match t {
-        None => "-".to_string(),
-        Some(t) => {
-            let s = stamp(t, l.tz_offset_s, dated);
-            if l.guessed { format!("~{s}") } else { s }
-        }
-    }
+    t.map_or_else(|| "-".to_string(), |t| stamp(t, l.tz_offset_s, dated))
 }
 
 fn spans_days(items: &[Item], offset_s: i64) -> bool {
@@ -1635,8 +1489,6 @@ pub fn summary_rows(l: &Ledger, s: &Summary) -> Vec<(&'static str, String)> {
     }
     let latency = if !l.journaled {
         nj.clone()
-    } else if l.guessed {
-        "- (the clock could not be placed)".to_string()
     } else if !l.aligned {
         "- (the session log could not be read)".to_string()
     } else {
@@ -1723,7 +1575,7 @@ pub fn render_text(l: &Ledger) -> String {
         out.push_str("  nothing to show\n");
         return out;
     }
-    let tw = if dated { 20 } else { 9 } + usize::from(l.guessed);
+    let tw = if dated { 20 } else { 9 };
     let _ = writeln!(
         out,
         "  {}  {}  {}  DURATION/LATENCY",

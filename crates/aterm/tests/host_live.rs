@@ -637,13 +637,24 @@ fn run_fake_attached(inst: &Instance, keys: &str, screens: &[&str]) {
     let mark = timeline_since(inst, 0).last().map_or(0, |e| e.0);
     let started = Instant::now();
     start_fake(inst, keys, screens);
+    until_attached(inst, keys, mark);
+    eprintln!(
+        "measured, not judged: the host attached to {keys} {:?} after its start",
+        started.elapsed()
+    );
+    std::fs::write(&go, b"").expect("start the fake's clock");
+}
+
+/// Waits for the host to attach to `keys`' fake: a `supervisor=aterm-harness` meta change on
+/// the timeline after `mark`.
+fn until_attached(inst: &Instance, keys: &str, mark: u64) {
     let deadline = Instant::now() + HANG;
     loop {
         let events = timeline_since(inst, mark);
         if events.iter().any(|e| {
             e.1 == "meta-change" && e.2.starts_with("field=supervisor value=aterm-harness")
         }) {
-            break;
+            return;
         }
         assert!(
             Instant::now() < deadline,
@@ -653,11 +664,6 @@ fn run_fake_attached(inst: &Instance, keys: &str, screens: &[&str]) {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    eprintln!(
-        "measured, not judged: the host attached to {keys} {:?} after its start",
-        started.elapsed()
-    );
-    std::fs::write(&go, b"").expect("start the fake's clock");
 }
 
 fn no_earlier_claim(inst: &Instance) {
@@ -679,33 +685,40 @@ fn journal_records(inst: &Instance) -> Vec<aterm_agent::supervise::journal::Jour
 fn run_fake_looked(inst: &Instance, keys: &str, screens: &[&str]) -> usize {
     no_earlier_claim(inst);
     let mut mark = journal_records(inst).len();
+    let attach = timeline_since(inst, 0).last().map_or(0, |e| e.0);
     start_fake(inst, keys, screens);
     for scene in screens
         .iter()
         .take_while(|s| s.ends_with(".late") || s.ends_with(".look"))
     {
-        mark = let_go_once_looked(inst, keys, mark, scene.ends_with(".late"));
+        if scene.ends_with(".late") {
+            // A screen the agent has not drawn on is no point (it is still starting), so the
+            // host looks at none: the agent draws once the host has attached to it.
+            until_attached(inst, keys, attach);
+            std::fs::write(inst.tmp.join(format!("{keys}.next")), b"").expect("let the fake go on");
+        } else {
+            mark = let_go_once_looked(inst, keys, mark);
+        }
     }
     mark
 }
 
-fn let_go_once_looked(inst: &Instance, keys: &str, mark: usize, blank: bool) -> usize {
+fn let_go_once_looked(inst: &Instance, keys: &str, mark: usize) -> usize {
     let deadline = Instant::now() + HANG;
     loop {
         let records = journal_records(inst);
         if let Some(at) = records
             .iter()
             .skip(mark)
-            .position(|r| r.kind == "event" && (r.summary == "-") == blank)
+            .position(|r| r.kind == "event" && r.summary != "-")
         {
             std::fs::write(inst.tmp.join(format!("{keys}.next")), b"").expect("let the fake go on");
             return mark + at + 1;
         }
         assert!(
             Instant::now() < deadline,
-            "the host's look at {keys}'s {} scene: not within {HANG:?} (a hang); journal:\n{}\n\
+            "the host's look at {keys}'s drawn scene: not within {HANG:?} (a hang); journal:\n{}\n\
              harness log:\n{}",
-            if blank { "blank" } else { "drawn" },
             journal(inst),
             harness_lines(inst)
         );
@@ -1036,7 +1049,7 @@ fn told_by_the_worker(inst: &Instance, rule: &str, word: &str, approvals: usize)
         .position(|r| r.kind == "chose")
         .expect("the CHOSE record just read");
     release_fake(inst, "k1");
-    let_go_once_looked(inst, "k1", told + 1, false);
+    let_go_once_looked(inst, "k1", told + 1);
     assert!(
         line.contains(&format!("rule={rule} policy={word} ")),
         "{line}"

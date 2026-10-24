@@ -1,0 +1,384 @@
+schema = 2
+
+[[windows]]
+rows = 30
+cols = 201
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [1407, 462]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 0
+key = true
+
+[[windows.tabs]]
+kind = "split"
+dir = "horizontal"
+ratio = 0.5
+
+[windows.tabs.first]
+kind = "leaf"
+cwd = "/home/dev/src/aterm"
+title = "zsh"
+focused = true
+local_id = 0
+
+[windows.tabs.second]
+kind = "leaf"
+cwd = "/home/dev/src/aterm"
+title = "zsh"
+focused = false
+local_id = 1
+
+[[windows.tabs]]
+kind = "split"
+dir = "horizontal"
+ratio = 0.5
+
+[windows.tabs.first]
+kind = "leaf"
+cwd = "/home/dev/src/aterm"
+title = "zsh"
+focused = true
+local_id = 3
+
+[windows.tabs.second]
+kind = "leaf"
+cwd = "/home/dev/src/aterm"
+title = "zsh"
+focused = false
+local_id = 4
+
+[[windows.tabs]]
+kind = "split"
+dir = "horizontal"
+ratio = 0.5
+
+[windows.tabs.first]
+kind = "leaf"
+cwd = "/home/dev/src/aterm"
+title = "zsh"
+focused = true
+local_id = 5
+
+[windows.tabs.second]
+kind = "leaf"
+cwd = "/home/dev/src/aterm"
+title = "zsh"
+focused = false
+local_id = 6
+
+[[windows.tab_order]]
+kind = "terminal"
+index = 0
+
+[[windows.tab_order]]
+kind = "terminal"
+index = 1
+
+[[windows.tab_order]]
+kind = "terminal"
+index = 2
+
+[[windows.restored_tabs]]
+focused_path = ["first"]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "split"
+axis = "vertical"
+ratio = 0.5
+
+[windows.restored_tabs.root.first]
+node = "leaf"
+
+[windows.restored_tabs.root.first.view]
+kind = "terminal"
+cwd = "/home/dev/src/aterm"
+title = "zsh"
+local_id = 0
+user_title = "release"
+icon = "rocket"
+attention = "look at the failing test"
+autopilot = "cruise"
+land_at = 1792805767000
+autopilot_by = "ctl 1792802167000"
+theme = "Nord"
+sid = "s-00000000010000000000"
+lineage = "s-0000000000ff00000007"
+log_ep = 1792798909
+
+[windows.restored_tabs.root.second]
+node = "leaf"
+
+[windows.restored_tabs.root.second.view]
+kind = "terminal"
+cwd = "/home/dev/src/aterm"
+title = "zsh"
+local_id = 1
+sid = "s-00000000010000010101"
+log_ep = 1792798910
+
+[windows.restored_tabs.root.second.view.agent]
+pid = 48213
+start = "Mon Oct 19 09:14:02 2026"
+program = "/home/dev/.local/bin/codex-alab"
+argv = ["codex-alab"]
+session = "019a4c2e-7d10-7c3a-9e51-3f2b6d8a0c41"
+cwd = "/home/dev/src/aterm"
+version = "0.157.0"
+word = "codex"
+
+[windows.restored_tabs.root.second.view.agent.codex]
+home = "/home/dev/.codex-work"
+home_env = "/home/dev/.codex-work"
+embedded = true
+started_ms = 0
+
+[windows.restored_tabs.root.second.view.agent.codex.alab]
+argv = ["/home/dev/.local/bin/codex-alab", "resume", "019a4c2e-7d10-7c3a-9e51-3f2b6d8a0c41"]
+session = "019a4c2e-7d10-7c3a-9e51-3f2b6d8a0c41"
+codex_home = "/home/dev/.codex-work"
+cwd = "/home/dev/src/aterm"
+
+[[windows.restored_tabs]]
+focused_path = ["first"]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "split"
+axis = "vertical"
+ratio = 0.5
+
+[windows.restored_tabs.root.first]
+node = "leaf"
+
+[windows.restored_tabs.root.first.view]
+kind = "terminal"
+cwd = "/home/dev/src/aterm"
+title = "zsh"
+local_id = 3
+sid = "s-00000000010000030303"
+log_ep = 1792798911
+
+[windows.restored_tabs.root.first.view.agent]
+pid = 48301
+start = "Mon Oct 19 09:14:02 2026"
+program = "/home/dev/.local/bin/muse"
+argv = ["muse"]
+cwd = "/home/dev/src/aterm"
+version = "1.4.0"
+word = "muse"
+
+[windows.restored_tabs.root.first.view.agent.muse]
+session = "5b1e7a52-3c0d-4f8e-9a61-0d2c4b7e9f13"
+workspace = "/home/dev/src/aterm"
+data = "/home/dev/.local/share/muse"
+env = ["XDG_DATA_HOME=/home/dev/.local/share"]
+
+[windows.restored_tabs.root.second]
+node = "leaf"
+
+[windows.restored_tabs.root.second.view]
+kind = "terminal"
+cwd = "/home/dev/src/aterm"
+title = "zsh"
+local_id = 4
+sid = "s-00000000010000040404"
+log_ep = 1792798912
+
+[windows.restored_tabs.root.second.view.agent]
+pid = 48402
+start = "Mon Oct 19 09:14:02 2026"
+program = "/home/dev/.local/bin/agy"
+argv = ["agy"]
+cwd = "/home/dev/src/aterm"
+version = "1.4.0"
+word = "agy"
+
+[windows.restored_tabs.root.second.view.agent.agy]
+conversation = "8f3c2a1e-6b4d-4e7f-9c2a-1d5e8b3f7a60"
+config = "/home/dev/agy/.gemini/antigravity"
+env = ["HOME=/home/dev/agy"]
+
+[[windows.restored_tabs]]
+focused_path = ["first"]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "split"
+axis = "vertical"
+ratio = 0.5
+
+[windows.restored_tabs.root.first]
+node = "leaf"
+
+[windows.restored_tabs.root.first.view]
+kind = "terminal"
+cwd = "/home/dev/src/aterm"
+title = "zsh"
+local_id = 5
+sid = "s-00000000010000050505"
+log_ep = 1792798913
+
+[windows.restored_tabs.root.first.view.agent]
+pid = 48503
+start = "Mon Oct 19 09:14:02 2026"
+program = "/home/dev/.local/bin/gemini"
+argv = ["gemini"]
+cwd = "/home/dev/src/aterm"
+version = "1.4.0"
+word = "gemini"
+
+[windows.restored_tabs.root.first.view.agent.gemini]
+session = "c2d9e4f1-7a3b-4c5d-8e6f-0a1b2c3d4e5f"
+home = "/home/dev/.gemini"
+chats = "/home/dev/.gemini/tmp/7f3a9c/chats"
+env = ["GEMINI_CLI_HOME=/home/dev"]
+started_ms = 1792800367000
+
+[windows.restored_tabs.root.second]
+node = "leaf"
+
+[windows.restored_tabs.root.second.view]
+kind = "terminal"
+cwd = "/home/dev/src/aterm"
+title = "zsh"
+local_id = 6
+sid = "s-00000000010000060606"
+log_ep = 1792798914
+
+[windows.restored_tabs.root.second.view.agent]
+pid = 48604
+start = "Mon Oct 19 09:14:02 2026"
+program = "/home/dev/.local/bin/claude"
+argv = ["claude"]
+session = "a7e3c1d9-2b4f-4a6e-8c0d-3f5b7d9e1a24"
+cwd = "/home/dev/src/aterm"
+version = "2.1.302"
+home = "/home/dev/.claude-work"
+login = ""
+cause = "asked"
+tab = "s-0000000000ff00000006"
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 1
+key = false
+
+[[windows.tabs]]
+kind = "leaf"
+cwd = "/home/dev/src/aterm"
+title = "zsh"
+focused = true
+local_id = 0
+
+[[windows.tabs]]
+kind = "leaf"
+cwd = "/home/dev/src/aterm"
+title = "claude"
+focused = true
+local_id = 2
+
+[[windows.tabs]]
+kind = "leaf"
+cwd = "/home/dev/src/aterm"
+title = "zsh"
+focused = true
+local_id = 7
+
+[[windows.tab_order]]
+kind = "terminal"
+index = 0
+
+[[windows.tab_order]]
+kind = "terminal"
+index = 1
+
+[[windows.tab_order]]
+kind = "terminal"
+index = 2
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "terminal"
+cwd = "/home/dev/src/aterm"
+title = "zsh"
+local_id = 0
+user_title = "release"
+icon = "rocket"
+attention = "look at the failing test"
+autopilot = "cruise"
+land_at = 1792805767000
+theme = "Nord"
+sid = "s-00000000010000000000"
+lineage = "s-0000000000ff00000007"
+log_ep = 1792798909
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "terminal"
+cwd = "/home/dev/src/aterm"
+title = "claude"
+local_id = 2
+sid = "s-00000000010000020202"
+log_ep = 1792798908
+
+[windows.restored_tabs.root.view.supervised]
+pid = 51200
+start = "Mon Oct 19 09:14:02 2026"
+program = "/home/dev/.local/bin/claude"
+argv = ["claude"]
+session = "e4b8f2a6-1c3d-4e5f-a7b9-c0d1e2f3a4b5"
+cwd = "/home/dev/src/aterm"
+version = "2.1.302"
+home = "/home/dev/.claude-work"
+login = ""
+tab = "s-00000000010000020202"
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "terminal"
+cwd = "/home/dev/src/aterm"
+title = "zsh"
+local_id = 7
+attention = "Cannot bring the agent back (its conversation could not be resumed); run claude --resume 1057c0de-6e66-4f1e-9c0d-8e4f5a6b7c8d in this tab"
+sid = "s-00000000010000070707"
+log_ep = 1792798915
+
+[windows.restored_tabs.root.view.lost]
+session = "1057c0de-6e66-4f1e-9c0d-8e4f5a6b7c8d"
+pid = 4242
+marked = true
+reason = "its conversation could not be resumed"
+restarted = true
+command = "claude --resume 1057c0de-6e66-4f1e-9c0d-8e4f5a6b7c8d"

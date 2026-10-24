@@ -2145,9 +2145,8 @@ fn a_failed_read_of_the_rule_at_the_spend_is_read_again() {
 /// First-launch setup's hold does not strand an offer admitted before it armed.
 #[test]
 fn a_setup_hold_armed_while_the_offer_records_does_not_strand_it() {
-    use crate::metrics::DeadlineOwner;
     let fold = |app: &App, now: Instant| {
-        let (mut deadline, mut owner) = (None, DeadlineOwner::None);
+        let (mut deadline, mut owner) = (None, crate::deadline_heal::DeadlineFold::default());
         app.fold_consent_lane_deadlines(now, &mut deadline, &mut owner);
         deadline
     };

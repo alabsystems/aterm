@@ -101,19 +101,17 @@ impl AgyKernel for Live {
     }
 
     fn lockless_openers(&self, config: &Path, conversation: &str) -> Option<Vec<u32>> {
+        let db = ag::conversation_db(config, conversation);
         let agys: BTreeSet<u32> = table()
             .into_iter()
             .filter(|(_, _, name)| name == ag::PROGRAM)
             .map(|(pid, _, _)| pid)
             .collect();
         let mut out = Vec::new();
-        for pid in file_holders(&ag::conversation_db(config, conversation))?
-            .into_iter()
-            .filter(|pid| agys.contains(pid))
-        {
+        for pid in agys {
             match open_files(pid) {
                 Some(files) => {
-                    if ag::holds_no_lock(config, &files) {
+                    if files.iter().any(|f| f == &db) && ag::holds_no_lock(config, &files) {
                         out.push(pid);
                     }
                 }

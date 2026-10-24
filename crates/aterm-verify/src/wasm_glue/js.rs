@@ -609,6 +609,7 @@ fn imports(needs: &mut Needs, hosts: &[Host]) -> String {
             }
             Host::PerformanceNow => t::PERFORMANCE_NOW_SHIM.to_string(),
             Host::DateNow => t::DATE_NOW_SHIM.to_string(),
+            Host::RandomFill => t::RANDOM_FILL_SHIM.to_string(),
             Host::ObjectDrop => {
                 needs.heap = true;
                 t::OBJECT_DROP_SHIM.to_string()

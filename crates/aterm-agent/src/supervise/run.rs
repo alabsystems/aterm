@@ -788,6 +788,10 @@ const WRITING_CAP: Duration = Duration::from_secs(3);
 const NO_EVIDENCE_HOLD: Duration = Duration::from_secs(1);
 /// Hang-detector cap for an idle read held while the program's window title still reports a running turn.
 const TITLE_HOLD: Duration = Duration::from_secs(60);
+/// A hang detector for a read held while the agent has drawn nothing of its own
+/// ([`Session::first_frame_owed`]): a minute in which the screen did not move, never a
+/// latency budget, since a starved program may draw its first frame long after it started.
+const FIRST_FRAME_HANG: Duration = Duration::from_secs(60);
 const UNSCOPED_CAP: Duration = WRITING_CAP;
 const BOXED_BUSY_CAP: Duration = Duration::from_secs(2);
 const COMPACTED_RISE: u8 = 30;
@@ -873,6 +877,33 @@ enum Next {
     Gone(BusyWait),
     Settle,
     Idle,
+    /// Past the content seq of a read the agent had drawn nothing on.
+    Moved(u64),
+}
+
+/// The agent's first frame, as this loop has read it ([`Session::first_frame_owed`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FirstFrame {
+    /// No read since the loop began showed anything the agent drew.
+    Owed {
+        /// A read was held as the agent still starting: this loop saw it before its first frame.
+        held: bool,
+    },
+    /// A read showed it, or a hold on an unmoved screen ran out ([`FIRST_FRAME_HANG`]).
+    Drawn {
+        /// Whether a read was held before it ([`Self::Owed`]'s `held`).
+        held: bool,
+    },
+}
+
+impl FirstFrame {
+    /// Whether this loop held a read as the agent still starting: it saw the agent before its
+    /// first frame, so the agent started under it.
+    pub(super) const fn saw_start(self) -> bool {
+        match self {
+            Self::Owed { held } | Self::Drawn { held } => held,
+        }
+    }
 }
 
 fn box_anchor(reader: &dyn ScreenReader, rows: &[String]) -> Option<String> {
@@ -1953,6 +1984,7 @@ pub struct Session<'a, C: Ctl> {
     turn_end_seeded: bool,
     first_books: bool,
     books_last_ms: Option<i64>,
+    pub(super) first_frame: FirstFrame,
     pub(super) left_keys: Vec<String>,
     pub(super) repo_seen: Option<(Option<u64>, Instant, crate::harness::repo_work::RepoRead)>,
     /// A fresh repository probe read [`crate::harness::repo_work::RepoRead::Unread`], not yet journaled.
@@ -2024,9 +2056,20 @@ pub struct Session<'a, C: Ctl> {
     agent_woke: Option<String>,
     draft_held: Option<super::policy::turn_end::Composer>,
     claim: claim::Claim,
+    // Once lease support was confirmed, never downgrade retained custody to
+    // the initial unsupported-host metadata path after a refusal or release.
+    claim_managed: bool,
     claim_said: Vec<String>,
     claimed_at_naming: bool,
     attention_ours: Option<String>,
+    attention_desired: Option<escalate::AttentionTarget>,
+    attention_pending: bool,
+    attention_retry_at: Option<Instant>,
+    metadata_context: claim::MetadataContext,
+    /// Fresh mode: unknown, recognized global override, or recognized session mode.
+    metadata_mode: Option<Option<Autopilot>>,
+    /// Global mode used when a fresh reply explicitly unsets the session override.
+    metadata_global: Autopilot,
     turn_end_badge: bool,
     badge_parked: Option<String>,
     exception_now: Option<Exception>,
@@ -2038,6 +2081,11 @@ pub struct Session<'a, C: Ctl> {
     point_said: Option<(aterm_phase::Program, String)>,
     land_report: Option<(aterm_phase::Program, String)>,
     task_seeded: bool,
+    /// Whether this loop tracks task records ([`SuperviseOpts::tasks`]), as its start set it.
+    tasks_tracked: bool,
+    /// Whether a line's write read the task record before the loop's first fold did
+    /// ([`Self::managed_at_write`]).
+    managed_read: bool,
     needs_told: Option<u64>,
     needs_told_text: String,
     /// A needs write lacks acknowledgement; its entry may need restoring or clearing.
@@ -2217,6 +2265,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             turn_end_seeded: false,
             first_books: false,
             books_last_ms: None,
+            first_frame: FirstFrame::Owed { held: false },
             left_keys: Vec::new(),
             repo_seen: None,
             repo_unread_unsaid: false,
@@ -2273,9 +2322,16 @@ impl<'a, C: Ctl> Session<'a, C> {
             box_proved: None,
             calls_spent: Vec::new(),
             claim: claim::Claim::Off,
+            claim_managed: false,
             claim_said: Vec::new(),
             claimed_at_naming: false,
             attention_ours: None,
+            attention_desired: None,
+            attention_pending: false,
+            attention_retry_at: None,
+            metadata_context: claim::MetadataContext::Normal,
+            metadata_mode: None,
+            metadata_global: Autopilot::default(),
             turn_end_badge: false,
             badge_parked: None,
             exception_now: None,
@@ -2287,6 +2343,8 @@ impl<'a, C: Ctl> Session<'a, C> {
             point_said: None,
             land_report: None,
             task_seeded: false,
+            tasks_tracked: false,
+            managed_read: false,
             needs_told: None,
             needs_told_text: String::new(),
             needs_pending: false,
@@ -2668,6 +2726,22 @@ impl<'a, C: Ctl> Session<'a, C> {
     }
 
     pub(super) fn call(&mut self, args: &[&str]) -> Result<CtlReply, Fail> {
+        if let Some(operation) = claim::attention_operation(args)
+            && (self.handing_over() || (operation == "set" && self.stopped()))
+        {
+            return Err(Fail::Hard(
+                "the watcher stopped before the attention write".to_string(),
+            ));
+        }
+        if self.metadata_context != claim::MetadataContext::Normal
+            && (claim::is_input(args)
+                || self.handing_over()
+                || (self.stopped() && self.metadata_context == claim::MetadataContext::Retry))
+        {
+            return Err(Fail::Lost(
+                "the metadata-only attempt cannot send this request".to_string(),
+            ));
+        }
         // Nor does a stopped loop begin a wait: some steps wait twice with no stop check
         // between, and every wait goes through here, so a stop ends the run within one wait.
         if self.stopped() {
@@ -2678,7 +2752,9 @@ impl<'a, C: Ctl> Session<'a, C> {
                 return Err(Fail::Hard(STOPPED_WAIT.to_string()));
             }
         }
-        self.renew_claim_if_due();
+        if self.metadata_context == claim::MetadataContext::Normal {
+            self.renew_claim_if_due();
+        }
         if let Some(refused) = self.claim_refuses(args) {
             return Ok(refused);
         }
@@ -2703,8 +2779,15 @@ impl<'a, C: Ctl> Session<'a, C> {
         if claim::is_input(args) && r.warned_input_unread() {
             self.stall_suspect = true;
         }
+        self.note_exchange(args, Some(&r));
+        Ok(r)
+    }
+
+    /// Track the failed request's recovery window, including direct metadata
+    /// reads which must bypass ordinary claim renewal. `None` is a transport loss.
+    pub(super) fn note_exchange(&mut self, args: &[&str], reply: Option<&CtlReply>) {
         let kind = || args[..args.len().min(2)].join(" ");
-        if self.unserved(&r) {
+        if reply.is_none_or(|r| self.unserved(r)) {
             if self.outage.is_none() {
                 let kind = kind();
                 self.outage = Some(Outage {
@@ -2718,12 +2801,11 @@ impl<'a, C: Ctl> Session<'a, C> {
         } else if !self.probing
             && self.outage.as_ref().is_some_and(|o| {
                 let kind = kind();
-                o.kind == kind || (kind == "await seq" && r.ok())
+                o.kind == kind || (kind == "await seq" && reply.is_some_and(CtlReply::ok))
             })
         {
             self.outage = None;
         }
-        Ok(r)
     }
 
     pub(super) fn unserved(&self, r: &CtlReply) -> bool {
@@ -2786,6 +2868,48 @@ impl<'a, C: Ctl> Session<'a, C> {
             return &aterm_phase::ClaudeReader;
         }
         by_screen
+    }
+
+    /// WHETHER THE AGENT'S FIRST FRAME IS STILL OWED ON `screen`, for a hosted loop (one an
+    /// [`IdleHost`] runs, beside an agent it saw in the tab): no read since the loop began
+    /// showed anything the agent drew, and this one shows nothing either: the screen could be
+    /// the shell's alone ([`aterm_phase::shell_alone`]: blank, or one unbroken run of rows,
+    /// a prompt and the line it echoed), and the agent's reader finds nothing of its own on
+    /// it ([`aterm_phase::ScreenReader::program_drawn`]). The agent is the one `status` last
+    /// named, else the one `meta` says the session's task started (`worker=`), else the one
+    /// the screen names ([`aterm_phase::identify`]); when nothing names one (Gemini CLI's
+    /// process is `node`, and the loop reads `status` only after its first point), every
+    /// reader that knows its program's frame is asked. A read that shows something of the
+    /// agent's settles it, and every read after it is judged as it stands. A loop with no
+    /// host owes none.
+    fn first_frame_owed(&mut self, screen: &Screen, hosted: bool) -> bool {
+        if matches!(self.first_frame, FirstFrame::Drawn { .. }) {
+            return false;
+        }
+        let rows = screen.rows.as_slice();
+        let named = self
+            .program
+            .as_deref()
+            .and_then(aterm_phase::program_of)
+            .or(self.worker_agent);
+        let drawn = !hosted
+            || !aterm_phase::shell_alone(rows)
+            || match named.unwrap_or_else(|| aterm_phase::identify(None, rows).program()) {
+                Program::Generic => Program::ALL.iter().any(|p| {
+                    let knows_its_frame = match p {
+                        Program::Claude | Program::Agy | Program::Muse | Program::Gemini => true,
+                        Program::Codex | Program::Generic => false,
+                    };
+                    knows_its_frame && p.reader().program_drawn(rows)
+                }),
+                agent => agent.reader().program_drawn(rows),
+            };
+        if drawn {
+            self.first_frame = FirstFrame::Drawn {
+                held: self.first_frame.saw_start(),
+            };
+        }
+        !drawn
     }
 
     fn busy_up(&mut self, guard: &str, rows: &[String]) -> bool {
@@ -3401,6 +3525,8 @@ impl<'a, C: Ctl> Session<'a, C> {
         let mut footer_seen = false;
         let mut title_held: Option<Instant> = None;
         let mut unvouched_since: Option<Instant> = None;
+        // The last read held as still starting (its seq), and since when ([`FIRST_FRAME_HANG`]).
+        let mut first_frame_still: Option<(u64, Instant)> = None;
         let mut settle_cap = SETTLE_CAP;
         loop {
             // The hosted loop's stop ends a turn that may run for hours:
@@ -3433,6 +3559,10 @@ impl<'a, C: Ctl> Session<'a, C> {
                         Wait::Latched
                     );
                 }
+                Next::Moved(seq) => {
+                    self.wait(&["seq", &seq.to_string()], step)?;
+                    unsettled = true;
+                }
             }
             let mut screen = self.screen()?;
             let reader = self.reader(&screen.rows);
@@ -3440,6 +3570,37 @@ impl<'a, C: Ctl> Session<'a, C> {
                 self.watch_context(&screen, reader, &mut |line| review.say(line))?;
             }
             let mut phase = reader.phase(&screen.rows);
+            // A PROGRAM STILL STARTING IS NOT IDLE, NOR BUSY. Until the agent has drawn
+            // something of its own ([`Self::first_frame_owed`]), a read of a screen it has not
+            // drawn on (blank, or the shell's echo of the line that launched it) is no point
+            // and no turn running: the loop waits for the screen to move and reads again. A
+            // screen that stands unmoved FIRST_FRAME_HANG ends the hold, read as it stands,
+            // and the agent is taken as drawn. Not for a box or a wall, which the agent drew.
+            if !matches!(phase, Phase::Prompt | Phase::Limited { .. })
+                && self.fx.mono() < deadline
+                && self.first_frame_owed(&screen, opts.is_some_and(|o| o.idle_host.is_some()))
+            {
+                let since = match first_frame_still {
+                    Some((seq, since)) if seq == screen.seq => since,
+                    _ => self.fx.mono(),
+                };
+                if self.fx.since(since) < FIRST_FRAME_HANG {
+                    first_frame_still = Some((screen.seq, since));
+                    self.first_frame = FirstFrame::Owed { held: true };
+                    next = Next::Moved(screen.seq);
+                    footer_seen = false;
+                    continue;
+                }
+                self.first_frame = FirstFrame::Drawn {
+                    held: self.first_frame.saw_start(),
+                };
+                review.note(&format!(
+                    "NOTE seq={} the agent drew nothing of its own on a screen that stood {} s \
+                     unmoved: read as it stands",
+                    screen.seq,
+                    FIRST_FRAME_HANG.as_secs()
+                ));
+            }
             if phase != Phase::Prompt {
                 self.box_gone();
                 self.offer_gone(aterm_phase::phase::has_composer_frame(&screen.rows));
@@ -4148,6 +4309,7 @@ impl<'a, C: Ctl> Session<'a, C> {
     }
 
     fn drive_loop(&mut self, opts: &SuperviseOpts, review: &mut dyn Review) -> Result<End, String> {
+        self.metadata_global = opts.policy.autopilot;
         let start = self.fx.mono();
         let mut deadline = deadline_after(start, opts.max);
         let allow = opts.allow();
@@ -4158,6 +4320,7 @@ impl<'a, C: Ctl> Session<'a, C> {
         self.resume_limits = opts.policy.resume_limits;
         self.context_warn = opts.context_warn;
         self.context = Context::Armed;
+        self.tasks_tracked = opts.tasks.is_some();
         if !self.turn_end_seeded
             && let Some(path) = self.setup.ledger_path.as_deref()
         {
@@ -4373,10 +4536,12 @@ impl<'a, C: Ctl> Session<'a, C> {
             // (`/login` typed): the worker works again, so it is done.
             if std::mem::take(&mut self.turn_end_badge) {
                 let said = self.unset_if_ours(|_| true)?;
-                review.note(&format!(
-                    "CLEARED seq={} {CLEARED_TURN_END} attention={said}",
-                    turn.screen.seq
-                ));
+                self.note_attention_clear(
+                    turn.screen.seq,
+                    &format!("{CLEARED_TURN_END} "),
+                    &said,
+                    review,
+                );
             }
         }
         if self
@@ -5325,6 +5490,7 @@ impl<C: Ctl> Session<'_, C> {
                 .into_iter()
                 .chain(self.look_at)
                 .chain(self.needs_retry_at)
+                .chain(self.attention_retry_at)
                 .min();
             let until = due.map_or(*deadline, |t| t.min(*deadline));
             let now = self.fx.mono();
@@ -5396,6 +5562,13 @@ impl<C: Ctl> Session<'_, C> {
                 || self.look_at.is_some_and(|at| now >= at);
             if !policy_due && self.needs_retry_at.is_some_and(|at| now >= at) {
                 self.retry_needs(&seen.screen, opts, review)?;
+                if self.autopilot(opts) == Autopilot::Off {
+                    return Ok(None);
+                }
+                continue;
+            }
+            if !policy_due && self.attention_retry_at.is_some_and(|at| now >= at) {
+                self.retry_supervisor_attention(&seen.screen, opts, review)?;
                 if self.autopilot(opts) == Autopilot::Off {
                     return Ok(None);
                 }
@@ -5663,11 +5836,20 @@ impl<C: Ctl> Session<'_, C> {
             self.box_ask = None;
             self.adopted_box = false;
             let said = self.unset_if_ours(|t| !t.starts_with(ATTENTION_PREFIX))?;
-            review.note(&format!(
-                "CLEARED seq={} {CLEARED_MEMORY} attention={said}: the measure is no longer \
-                 acted on",
-                seen.screen.seq
-            ));
+            if self.attention_pending {
+                self.note_attention_clear(
+                    seen.screen.seq,
+                    &format!("{CLEARED_MEMORY} "),
+                    &said,
+                    review,
+                );
+            } else {
+                review.note(&format!(
+                    "CLEARED seq={} {CLEARED_MEMORY} attention={said}: the measure is no longer \
+                     acted on",
+                    seen.screen.seq
+                ));
+            }
         }
         Ok(wall || badge)
     }

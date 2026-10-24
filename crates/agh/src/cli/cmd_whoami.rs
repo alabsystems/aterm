@@ -2,8 +2,8 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! `agh whoami` (design §6.7): the identities agh knows, or how a request would be routed. The
-//! identity rows are shared with `agh auth status`.
+//! `agh whoami`: the identities agh knows, or how a request would be routed. The identity rows
+//! are shared with `agh auth status`.
 
 use std::path::Path;
 
@@ -17,9 +17,7 @@ use crate::identity::{self, EnvSource, Profile, Source, tilde};
 use crate::policy::{Access, Presence, RouteRequest, RouteTarget};
 use crate::redact::Redactor;
 
-/// A presence as one word: `present`, `absent` or `unusable`. An unusable row's `why` starts
-/// with the load error's slug (`loose: …`), as `login_mismatch: …` and `github_refused: 401`
-/// do.
+/// A presence as one word: `present`, `absent`, or `unusable`.
 const fn presence_word(presence: Presence) -> &'static str {
     match presence {
         Presence::Present => "present",
@@ -78,9 +76,7 @@ pub(super) fn profile_row(
 }
 
 /// One row per ambient token (`GH_TOKEN`, then `GITHUB_TOKEN`), never used as ambient. Its
-/// remedy names the profile it matches (design §6): one whose `source` is `env:{VAR}` uses
-/// it, and one whose present token has the same fingerprint already holds it. `profiles` are
-/// the profile rows ([`profile_row`]).
+/// remedy names the matching profile in `profiles` ([`profile_row`]).
 pub(super) fn ambient_rows(env: &dyn EnvSource, profiles: &[Value]) -> Vec<Value> {
     let field = |row: &Value, key: &str| row.get(key).and_then(Value::as_str).map(str::to_string);
     identity::ambient(env)
@@ -149,7 +145,6 @@ pub(crate) fn whoami(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     let gh = ctx.github()?;
     let receipt = Receipt::new(&inv.verb_name());
     if let Some(text) = target {
-        // Its usage errors get `agh help whoami` from `run_verb`.
         let (slug, named) = super::args::resolve_repo(text, gh.router())?;
         let request = RouteRequest {
             target: RouteTarget::Repo(slug),
@@ -173,7 +168,6 @@ pub(crate) fn whoami(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
         .map(|dirs| dirs.home.clone())
         .unwrap_or_default();
     let verifying = inv.has("--verify");
-    // --verify sends each profile's token: never under --anonymous, and under --as P only P's.
     if verifying && inv.global.anonymous {
         return Err(usage(
             "--verify sends each profile's token: drop --anonymous",

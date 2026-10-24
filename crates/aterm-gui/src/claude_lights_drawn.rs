@@ -22,6 +22,8 @@ pub(crate) enum Drawn {
     NoHost,
     /// The program has no composer footer to draw a chip in.
     NoFooter,
+    /// The last frame drew only the pane's harness switch over a footer [`crate::claude_footer::bare_while_off`] leaves bare.
+    SwitchOnly,
 }
 
 impl Drawn {
@@ -33,6 +35,7 @@ impl Drawn {
             Drawn::NoRoom => Some("no-room"),
             Drawn::NoHost => Some("no-host"),
             Drawn::NoFooter => Some("no-footer"),
+            Drawn::SwitchOnly => Some("switch-only"),
         }
     }
 }
@@ -108,6 +111,12 @@ impl WindowLights {
         else {
             return if self.footers.iter().any(|(s, _)| *s == session) {
                 Drawn::NoRoom
+            } else if self.border_toggles.iter().any(|b| {
+                b.session == session
+                    && !covered(b.term_row)
+                    && crate::claude_footer::bare_while_off(Some(b.program), Some(b.face))
+            }) {
+                Drawn::SwitchOnly
             } else {
                 Drawn::NoRule
             };

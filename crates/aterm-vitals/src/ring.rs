@@ -281,6 +281,16 @@ impl BucketRing {
         self.b.iter().map(Bucket::cell).collect()
     }
 
+    /// The newest `n` buckets as cells, oldest first; the last is the open bucket.
+    #[must_use]
+    pub fn tail_cells(&self, n: usize) -> Vec<Cell> {
+        self.b
+            .iter()
+            .skip(self.b.len().saturating_sub(n))
+            .map(Bucket::cell)
+            .collect()
+    }
+
     /// Computes `ncols` wall-clock-aligned columns of `per_s` seconds ending at `now_unix_ms`.
     #[must_use]
     pub fn columns(&self, per_s: u32, ncols: usize, now_unix_ms: i64) -> Vec<Cell> {
@@ -368,6 +378,33 @@ mod tests {
         assert_eq!(cells[3].mean, Some(6.0));
         let _ = r.push(T0 + 40_000, None, false);
         assert_eq!(r.cells()[4].mean, None);
+    }
+
+    #[test]
+    fn the_tail_is_the_newest_buckets_with_the_open_one_last() {
+        let mut r = BucketRing::default();
+        assert!(r.tail_cells(3).is_empty());
+        for i in [0, 1, 3, 4] {
+            let _ = r.push(T0 + i * 10_000, Some(i as f64), false);
+        }
+        let means = |cells: Vec<Cell>| cells.into_iter().map(|c| c.mean).collect::<Vec<_>>();
+        assert_eq!(
+            means(r.tail_cells(3)),
+            [None, Some(3.0), Some(4.0)],
+            "a gap bucket is unread, never 0"
+        );
+        assert_eq!(
+            r.tail_cells(99),
+            r.cells(),
+            "asking past its length gives all"
+        );
+        assert!(r.tail_cells(0).is_empty());
+        let _ = r.push(T0 + 45_000, Some(8.0), false);
+        assert_eq!(
+            means(r.tail_cells(1)),
+            [Some(6.0)],
+            "the open bucket is last"
+        );
     }
 
     #[test]

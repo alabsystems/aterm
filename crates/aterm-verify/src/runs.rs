@@ -11,9 +11,10 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use aterm_uds::process::{
-    Birth, END_GRACE, EndControlLive, EndRefusal, Ended, GroupMembers, Identity, Lineage, Markers,
-    ProcessPresence, boot_id, end_proven, group_members, launchd_idversion, process_presence,
-    read_birth, read_lineage, read_process_markers, read_process_path, thread_ran,
+    Birth, END_GRACE, EndControlLive, EndRefusal, Ended, GroupMembers, HeldNow, Identity, Lineage,
+    Markers, ProcessPresence, boot_id, end_proven, group_members, held_age, held_programs,
+    launchd_idversion, process_presence, read_birth, read_lineage, read_process_markers,
+    read_process_path, thread_ran,
 };
 
 use crate::Ctx;
@@ -41,6 +42,8 @@ pub trait Kernel {
     fn markers(&self, pid: i32) -> Option<Markers>;
     /// Whether macOS's program check may hold `pid`: `Some(false)` only once its one thread ran ([`thread_ran`]), so a lone unstarted thread at any age, arch or volume reads `Some(true)`: its environment is never read, and it is never signalled. `None` when unreadable.
     fn held(&self, pid: i32) -> Option<bool>;
+    /// This user's programs macOS's program check holds now by its whole predicate ([`held_programs`], doctor's reader: one thread list per process of this uid, a lone unstarted thread 20 s or more past its fork, not stopped, not traced, native, on a local volume, with one mount table for them all and each age its own start record's): what the run-start line counts ([`program_check_line`]), never what a pass acts on ([`Self::held`] is that). `None` when the listing fails, and off macOS.
+    fn held_now(&self) -> Option<HeldNow>;
     /// launchd's pid version; `None` when unreadable.
     fn launchd_version(&self) -> Option<i32>;
     /// Whether a live process of this uid holds the master of the PTY whose slave is `dev`.
@@ -86,6 +89,9 @@ impl Kernel for LiveKernel {
     }
     fn held(&self, pid: i32) -> Option<bool> {
         thread_ran(pid).map(|ran| !ran)
+    }
+    fn held_now(&self) -> Option<HeldNow> {
+        held_programs()
     }
     fn launchd_version(&self) -> Option<i32> {
         launchd_idversion()
@@ -990,6 +996,27 @@ fn read_records(dir: &Path) -> std::io::Result<Vec<(PathBuf, Record)>> {
         records.push((path, rec));
     }
     Ok(records)
+}
+
+/// The run-start line for macOS's program check: "macOS's program check: N programs waiting, the oldest started X ago (aterm listed: no)", over this user's programs [`Kernel::held_now`] counts held. A one-shot reading has no first sighting, so the age is the oldest one's fork age, an upper bound. `listed` names the app macOS holds responsible for verify, which takes aterm's place in the words, and its word (`yes`, `no` or `unknown`). `None`, with `listed` never called, when the listing fails or nothing is held.
+pub fn program_check_line(
+    kernel: &impl Kernel,
+    listed: impl FnOnce() -> (Option<String>, &'static str),
+) -> Option<String> {
+    let held = kernel.held_now().filter(|held| held.count > 0)?;
+    let (app, word) = listed();
+    let app = app.unwrap_or_else(|| "aterm".to_owned());
+    let programs = if held.count == 1 {
+        "program"
+    } else {
+        "programs"
+    };
+    Some(format!(
+        "macOS's program check: {} {programs} waiting, the oldest started {} ago ({app} listed: \
+         {word})",
+        held.count,
+        held_age(held.oldest_ms)
+    ))
 }
 
 /// Sweep processes left behind by dead verify runs recorded in `dir`.

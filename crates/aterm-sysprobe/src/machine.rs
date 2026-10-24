@@ -908,6 +908,94 @@ pub fn net_links_into(scratch: &mut Vec<u8>) -> Option<Vec<LinkReading>> {
     }
 }
 
+/// Point-in-time TCP socket counts across the machine's protocol table, grouped by state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TcpCounts {
+    /// `ESTABLISHED` connections.
+    pub established: u32,
+    /// `SYN_SENT` connections.
+    pub syn_sent: u32,
+    /// `SYN_RECEIVED` connections.
+    pub syn_recv: u32,
+    /// `FIN_WAIT_1` connections.
+    pub fin_wait1: u32,
+    /// `FIN_WAIT_2` connections.
+    pub fin_wait2: u32,
+    /// `TIME_WAIT` connections.
+    pub time_wait: u32,
+    /// `CLOSED` sockets in the table.
+    pub close: u32,
+    /// `CLOSE_WAIT` connections.
+    pub close_wait: u32,
+    /// `LAST_ACK` connections.
+    pub last_ack: u32,
+    /// `LISTEN` sockets.
+    pub listen: u32,
+    /// `CLOSING` connections.
+    pub closing: u32,
+}
+
+impl TcpCounts {
+    /// Total TCP sockets counted across all states.
+    #[must_use]
+    pub const fn total(&self) -> u32 {
+        self.established
+            .saturating_add(self.syn_sent)
+            .saturating_add(self.syn_recv)
+            .saturating_add(self.fin_wait1)
+            .saturating_add(self.fin_wait2)
+            .saturating_add(self.time_wait)
+            .saturating_add(self.close)
+            .saturating_add(self.close_wait)
+            .saturating_add(self.last_ack)
+            .saturating_add(self.listen)
+            .saturating_add(self.closing)
+    }
+
+    /// Increment the counter for `state`.
+    pub const fn record(&mut self, state: crate::jobs::TcpState) {
+        use crate::jobs::TcpState;
+        match state {
+            TcpState::Established => self.established = self.established.saturating_add(1),
+            TcpState::SynSent => self.syn_sent = self.syn_sent.saturating_add(1),
+            TcpState::SynReceived => self.syn_recv = self.syn_recv.saturating_add(1),
+            TcpState::FinWait1 => self.fin_wait1 = self.fin_wait1.saturating_add(1),
+            TcpState::FinWait2 => self.fin_wait2 = self.fin_wait2.saturating_add(1),
+            TcpState::TimeWait => self.time_wait = self.time_wait.saturating_add(1),
+            TcpState::Closed => self.close = self.close.saturating_add(1),
+            TcpState::CloseWait => self.close_wait = self.close_wait.saturating_add(1),
+            TcpState::LastAck => self.last_ack = self.last_ack.saturating_add(1),
+            TcpState::Listen => self.listen = self.listen.saturating_add(1),
+            TcpState::Closing => self.closing = self.closing.saturating_add(1),
+            TcpState::Other => {}
+        }
+    }
+}
+
+/// Read machine-wide TCP connection counts using a temporary scratch buffer.
+#[must_use]
+pub fn tcp_counts() -> Option<TcpCounts> {
+    tcp_counts_into(&mut Vec::new())
+}
+
+/// Read machine-wide TCP connection counts using caller-provided `scratch` storage.
+#[must_use]
+pub fn tcp_counts_into(scratch: &mut Vec<u8>) -> Option<TcpCounts> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos::tcp_counts_into(scratch)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux::tcp_counts_under_into(Path::new("/"), scratch)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = scratch;
+        None
+    }
+}
+
 /// System-wide and per-user process/task table ceilings.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ProcessLimits {

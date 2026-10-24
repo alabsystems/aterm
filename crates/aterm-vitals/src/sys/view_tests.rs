@@ -6,8 +6,8 @@
 use super::*;
 use crate::events::{Event, EventKind};
 use crate::model::{
-    ClusterSpec, GpuSample, MemCounters, MemSample, Pressure, ProcSample, ProcState, Sample,
-    TabRoot, Thermal, Ticks, Vitals, VolumeSample,
+    ClusterSpec, GpuSample, LinkKind, LinkSample, MemCounters, MemSample, Pressure, ProcSample,
+    ProcState, Sample, TabRoot, TcpCounts, Thermal, Ticks, Vitals, VolumeSample,
 };
 use crate::sys::json::{SPLIT_PARTS, contract_violations, part_value};
 use crate::sys::{
@@ -119,6 +119,44 @@ fn sample(at_s: u64, busy: &[u64], k: u64) -> Sample {
             exact: true,
         }),
         load: Some([2.5, 2.0, 1.5]),
+        links: Some(vec![
+            LinkSample {
+                name: "en0".into(),
+                kind: LinkKind::Wifi,
+                up: true,
+                counts: true,
+                rx: 2_000_000 * k,
+                tx: 500_000 * k,
+                rx_packets: 1_500 * k,
+                tx_packets: 400 * k,
+                rx_errors: 0,
+                tx_errors: 0,
+                rx_drops: 2 * k,
+                tx_drops: None,
+                rate_bps: Some(1_000_000_000),
+                ..LinkSample::default()
+            },
+            LinkSample {
+                name: "lo0".into(),
+                kind: LinkKind::Other,
+                up: true,
+                loopback: true,
+                counts: false,
+                rx: 100_000 * k,
+                tx: 100_000 * k,
+                rx_packets: 200 * k,
+                tx_packets: 200 * k,
+                ..LinkSample::default()
+            },
+        ]),
+        tcp: Some(TcpCounts {
+            established: 12,
+            listen: 4,
+            time_wait: 2,
+            close_wait: 1,
+            syn_sent: 1,
+            ..TcpCounts::default()
+        }),
         procs_truncated: false,
         at_unix_ms: 1_760_000_000_000 + i64::try_from(at_s).unwrap_or(0) * 1000,
         mono_ms: at_s * 1000,
@@ -1244,4 +1282,64 @@ fn a_first_sweeps_procs_are_warming_never_zero() {
         "{}",
         j.to_text()
     );
+}
+
+#[test]
+fn sys_net_reports_links_rates_and_tcp_connections_in_both_shapes() {
+    let s = snapshot();
+    let w = world();
+    let c = ctx(&w, Some(&s), true, true);
+    let text = all_text(&render_text(&query(View::Net, false), &c));
+    assert!(
+        text.contains("net     down 2.0 MB/s (1500 pkt/s), up 500 KB/s (400 pkt/s) · err 0.0/s, drop 2.0/s · primary en0 (wifi), link 125.0 MB/s · tcp 20 total (12 established, 4 listen, 2 time_wait, 1 close_wait, 1 connecting)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("tcp     total=20 established=12 listen=4 time_wait=2 close_wait=1 syn_sent=1 syn_recv=0 fin_wait1=0 fin_wait2=0 closing=0 last_ack=0 close=0"),
+        "{text}"
+    );
+    assert!(
+        text.contains("link name=en0 kind=wifi up=1 loopback=0 counted=1 primary=1 rx_bps=2000000 tx_bps=500000 rx_pps=1500 tx_pps=400 rx_err_ps=0 tx_err_ps=0 rx_drop_ps=2 tx_drop_ps=unavailable(unsupported) rx_bytes=2000000 tx_bytes=500000 rx_packets=1500 tx_packets=400 rx_errors=0 tx_errors=0 rx_drops=2 tx_drops=unavailable(unsupported) link_bps=1000000000"),
+        "{text}"
+    );
+    assert!(
+        text.contains("link name=lo0 kind=other up=1 loopback=1 counted=0 primary=0 rx_bps=100000 tx_bps=100000"),
+        "{text}"
+    );
+
+    let overview = all_text(&render_text(&query(View::Overview, false), &c));
+    assert!(
+        overview.contains("net down 2.0 MB/s, up 500 KB/s, 20 TCP (12 established, 4 listen)"),
+        "{overview}"
+    );
+    let global = all_text(&render_text(&query(View::Global, false), &c));
+    assert!(
+        global.contains("net      down 2.0 MB/s (1500 pkt/s), up 500 KB/s (400 pkt/s)"),
+        "{global}"
+    );
+
+    let j = render_json(&query(View::Net, true), &c);
+    assert!(contract_violations(&j).is_empty(), "{}", j.to_text());
+    let net = j.get("net").expect("net");
+    assert_eq!(net.get("primary_link"), Some(&Jv::s("en0")));
+    assert_eq!(
+        net.get("per_s").and_then(|p| p.get("rx_bytes_per_s")),
+        Some(&Jv::u(2_000_000))
+    );
+    assert_eq!(
+        net.get("per_s").and_then(|p| p.get("tx_bytes_per_s")),
+        Some(&Jv::u(500_000))
+    );
+    assert_eq!(
+        net.get("per_s").and_then(|p| p.get("rx_drops_per_s")),
+        Some(&Jv::u(2))
+    );
+    let tcp = net.get("tcp").expect("tcp");
+    assert_eq!(tcp.get("total"), Some(&Jv::u(20)));
+    assert_eq!(tcp.get("established"), Some(&Jv::u(12)));
+    assert_eq!(tcp.get("listen"), Some(&Jv::u(4)));
+    assert_eq!(tcp.get("time_wait"), Some(&Jv::u(2)));
+    assert_eq!(tcp.get("close_wait"), Some(&Jv::u(1)));
+    assert_eq!(tcp.get("connecting"), Some(&Jv::u(1)));
+    assert_eq!(tcp.get("closing_total"), Some(&Jv::u(3)));
 }

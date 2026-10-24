@@ -175,6 +175,8 @@ enum EngineFault {
     None,
     /// The build exits non-zero.
     BuildFails,
+    /// A signal ends the build: what it started never showed it ran.
+    Killed,
     /// A module with no `aterm_abi` descriptor (a wasm-bindgen-era build, say).
     NoDescriptor,
     /// The builder's home survives in the module.
@@ -367,6 +369,9 @@ impl World for Fake {
         }
         let mut module = match self.engine {
             EngineFault::BuildFails => return Err("the wasm32 build exited 101".into()),
+            EngineFault::Killed => {
+                return Err(format!("{}: exited -1", crate::site::ENGINE_UNPROVEN));
+            }
             EngineFault::NoDescriptor => b"\0asm\x01\0\0\0".to_vec(),
             _ => toy_module(),
         };
@@ -1705,6 +1710,53 @@ fn an_engine_that_cannot_ship_fails_the_sync_and_writes_nothing() {
         assert!(!term.join("ENGINE_SOURCE").exists(), "{fault:?}");
         assert!(world.deploys().is_empty(), "{fault:?}");
     }
+}
+
+/// AN ENGINE BUILD A SIGNAL ENDED KEEPS ITS SCRATCH: what it started never showed it ran,
+/// so the sync fails naming the scratch it keeps, stamped for a later sync to remove; one
+/// that exited on its own takes its scratch with it.
+#[test]
+fn an_engine_build_a_signal_ended_keeps_its_scratch() {
+    let scratch_of = |world: &Fake| {
+        world
+            .calls
+            .iter()
+            .find_map(|c| match c {
+                Call::Build { sources, .. } => sources.parent().map(Path::to_path_buf),
+                _ => None,
+            })
+            .expect("the engine was built")
+    };
+    let lab = Lab::new();
+    let mut world = lab.fake("releases-fat.json");
+    world.engine = EngineFault::Killed;
+    let (ended, out) = lab.run(&mut world);
+    let (child, why) = failed_child(ended, &out);
+    assert_eq!(child, "the /terminal engine build", "{why}");
+    let kept = scratch_of(&world);
+    let named = why
+        .split("; ")
+        .nth(1)
+        .and_then(|rest| rest.split(" stays while").next())
+        .unwrap_or_else(|| panic!("no kept scratch named: {why}"));
+    assert_eq!(
+        std::fs::canonicalize(named).ok(),
+        Some(kept.clone()),
+        "{why}"
+    );
+    assert!(kept.join("clone").is_dir(), "{why}");
+    assert!(
+        kept.join(aterm_uds::deadline::EXEC_STAMP).is_file(),
+        "{why}"
+    );
+    std::fs::remove_dir_all(&kept).unwrap();
+
+    let mut world = lab.fake("releases-fat.json");
+    world.engine = EngineFault::BuildFails;
+    let (ended, out) = lab.run(&mut world);
+    let (_, why) = failed_child(ended, &out);
+    assert!(!why.contains(" stays while"), "{why}");
+    assert!(!scratch_of(&world).exists(), "{why}");
 }
 
 #[test]

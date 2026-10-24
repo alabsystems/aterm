@@ -2907,9 +2907,9 @@ mod tests {
             DevtoolsChangeRun, DevtoolsChild,
         };
         let fold = |app: &App, now: std::time::Instant| {
-            let (mut deadline, mut owner) = (None, DeadlineOwner::None);
+            let (mut deadline, mut owner) = (None, crate::deadline_heal::DeadlineFold::default());
             app.fold_consent_lane_deadlines(now, &mut deadline, &mut owner);
-            (deadline, owner)
+            (deadline, owner.owner())
         };
         let mut app = App::headless_for_test();
         app.debugger_change = DebuggerChangeLane::with_liveness(|_| false);
@@ -2979,9 +2979,9 @@ mod tests {
         use crate::devtools_helper::{DONE_FOR, HandOver, Origin, PANEL_TICK, Phase, test_arms};
         use crate::metrics::DeadlineOwner;
         let fold = |app: &App, now: std::time::Instant| {
-            let (mut deadline, mut owner) = (None, DeadlineOwner::None);
+            let (mut deadline, mut owner) = (None, crate::deadline_heal::DeadlineFold::default());
             app.fold_consent_lane_deadlines(now, &mut deadline, &mut owner);
-            (deadline, owner)
+            (deadline, owner.owner())
         };
         let mut app = App::headless_for_test();
         let now = std::time::Instant::now();
@@ -2997,6 +2997,7 @@ mod tests {
             .observe(aterm_containment::DevToolGrant::NotGranted, true);
         app.except(&crate::message_reporters::devtools_entry(
             atpkg::devtools::Step::Add,
+            None,
         ));
         assert_eq!(fold(&app, now).0, None, "nothing waits");
         assert_eq!(

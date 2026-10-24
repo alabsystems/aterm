@@ -12,23 +12,21 @@ use crate::kitty_sing::{KittySing, MusicNotes};
 use crate::kitty_summon::{TypedHit, TypedKittySummon};
 use crate::tone_infer::ToneTracker;
 
-/// One classified key press from the host's committed key path, the only input the typed detectors
-/// have.
+/// Classified key press from the committed key path.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TypedPress<'ev> {
-    /// A key that edits or moves beyond one glyph (Enter, Tab, Escape, Delete, navigation, a kill
-    /// or nav chord, raw controller bytes): every detector's window resets.
+    /// Key that edits or moves beyond one glyph, resetting detector windows.
     pub brk: bool,
-    /// A plain Backspace: each window pops one glyph.
+    /// Plain Backspace, popping one glyph from each window.
     pub backspace: bool,
     /// The bare printed glyph.
     pub typed: Option<char>,
-    /// A committed IME run, fed char by char after `typed`.
+    /// Committed IME text, fed after `typed`.
     pub ime: Option<&'ev str>,
 }
 
 impl<'ev> TypedPress<'ev> {
-    /// The brk → backspace → glyphs cascade every feed takes.
+    /// Apply the `brk` -> `backspace` -> `chars` cascade to `target`.
     #[inline]
     pub fn feed<T>(
         self,
@@ -57,21 +55,21 @@ impl<'ev> TypedPress<'ev> {
     }
 }
 
-/// What the host lends one press's feed.
+/// Context for [`Companions::note_typed_press`].
 #[derive(Clone, Copy)]
 pub struct PressFeed<'a> {
     /// The session the press went to.
     pub session: u64,
     pub now: Instant,
-    /// The compiled vocabulary and its scan options, while sparkle words are on.
+    /// Compiled vocabulary and scan options when sparkle words are enabled.
     pub words: Option<(&'a Lexicon, &'a ScanOptions<'a>)>,
     /// Tone inference may run (the host's `tone_infer_active`).
     pub tone_active: bool,
-    /// The press was a keyed Enter — the edge an armed `on=enter` celebration waits for.
+    /// Whether the press was a keyed Enter (for `on=enter` celebrations).
     pub keyed_enter: bool,
 }
 
-/// One window's companions, reached through [`crate::pipeline::EffectsPipeline::companions_mut`].
+/// Per-window companion detectors and cameo state.
 #[derive(Default)]
 pub struct Companions {
     /// The earned cursor cat's decision layer ([`crate::kitty_cursor`]).
@@ -89,13 +87,12 @@ pub struct Companions {
     pub sing_riff_bar: Option<u64>,
     /// Typed-word dog cameo lifecycle ([`crate::dog_cameo`]), summoned by `kitty_summon`.
     pub dog_cameo: DogCameo,
-    /// The session the live dog visit was summoned in.
+    /// Session in which the active dog cameo was summoned.
     pub dog_cameo_session: Option<u64>,
 }
 
 impl Companions {
-    /// Feed one classified press to the tone tracker, the sing-along (with its Enter edge) and the
-    /// summon detector.
+    /// Feed a classified key press to the tone, sing-along, and summon detectors.
     pub fn note_typed_press(&mut self, press: TypedPress<'_>, feed: PressFeed<'_>) -> TypedHit {
         let PressFeed {
             session,
@@ -133,7 +130,7 @@ impl Companions {
         fired
     }
 
-    /// Serious Mode's drain, the companions' half.
+    /// Reset transient companion state for Serious Mode.
     #[inline]
     pub fn drain_serious(&mut self) {
         self.cursor_cat = CursorCat::default();

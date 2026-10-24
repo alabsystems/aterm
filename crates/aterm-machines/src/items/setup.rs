@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Setup Assistant's per-user panes: the DidSee*/LastSeen* keys at this build's versions (design
-//! §5.1).
+//! Setup Assistant's per-user panes (`DidSee*`/`LastSeen*` keys).
 
 use super::defaults::{Pref, Target, Unmet, Want};
 use super::{Ctx, Item};
@@ -157,13 +156,9 @@ mod tests {
     use crate::model::{Mode, Outcome, Probe};
     use crate::port::{Fake, Ran};
 
-    /// The 27.0 VM admin's `com.apple.SetupAssistant` after every key below was written
-    /// (`defaults export`, captured before they were deleted again).
     const VM_SKIPPED: &[u8] =
         include_bytes!("../../fixtures/prefs/vm-27.0-setupassistant-skipped.plist");
 
-    /// The DidSee*/LastSeen* entries of a 27.0.1 (26A434) user's domain whose panes
-    /// were partly seen at setup on 26.5 and some since (read only).
     const SEEN_ON_27_0_1: &str = "<dict>\n\t<key>DidSeeAccessibility</key>\n\t<true/>\n\t<key>DidSeeAppStore</key>\n\t<false/>\n\t<key>DidSeeNewFeaturesProductVersion</key>\n\t<string>26.5</string>\n\t<key>LastSeenSiriProductVersion</key>\n\t<string>27.0.1</string>\n\t<key>LastSeenBuddyBuildVersion</key>\n\t<string>22F2083</string>\n</dict>";
 
     const EXPORT: &str = "admin$ /usr/bin/defaults export com.apple.SetupAssistant -";

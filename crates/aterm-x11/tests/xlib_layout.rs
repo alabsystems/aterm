@@ -1,17 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! aterm-x11's Xlib, XKB, XIM, XInput 2 and Xcursor declarations against the
-//! C headers, on the architecture the test runs on: a probe printing the
-//! size, alignment and every field offset of each struct, and the value of
-//! each constant, is written here, compiled with that architecture's C
-//! compiler (`CC_<target>`, which the Linux lane sets for its x86_64 cross
-//! builds, else `cc`) and run; its answers must be this crate's.
-//!
-//! Negative controls: the probe must say it was built for this architecture
-//! (a probe of another target's layout cannot pass), and a declaration one
-//! field off is told apart. Without a C compiler or the X development headers
-//! the test says SKIP and returns.
+//! Checks `aterm-x11` struct layouts and constants against the C headers.
 
 #![cfg(target_os = "linux")]
 
@@ -162,7 +152,6 @@ fn layouts() -> Vec<Layout> {
     ]
 }
 
-/// (C expression, its value here): the numeric constants.
 fn constants() -> Vec<(&'static str, i64)> {
     use event_type as e;
     vec![
@@ -259,7 +248,6 @@ fn constants() -> Vec<(&'static str, i64)> {
     ]
 }
 
-/// (C macro, its string here): the XIM value names.
 fn strings() -> Vec<(&'static str, &'static str)> {
     let s = |c: &'static std::ffi::CStr| c.to_str().unwrap();
     vec![
@@ -284,7 +272,6 @@ const ARCH: &str = if cfg!(target_arch = "x86_64") {
     "other"
 };
 
-/// What this crate says: one line per fact, as the probe prints them.
 fn ours(layouts: &[Layout]) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     out.insert("arch".to_owned(), ARCH.to_owned());
@@ -304,7 +291,6 @@ fn ours(layouts: &[Layout]) -> BTreeMap<String, String> {
     out
 }
 
-/// The probe's C source.
 fn probe(layouts: &[Layout]) -> String {
     let mut c = String::from(
         "#include <stddef.h>\n#include <stdio.h>\n#include <X11/Xlib.h>\n#include <X11/Xutil.h>\n\
@@ -346,8 +332,6 @@ fn compiler() -> String {
     std::env::var(format!("CC_{target}")).unwrap_or_else(|_| "cc".to_owned())
 }
 
-/// Compile and run the probe: its facts, or `None` (SKIP) without a compiler
-/// or headers.
 fn theirs(layouts: &[Layout]) -> Option<BTreeMap<String, String>> {
     let dir = aterm_tempfile::tempdir().expect("a scratch directory");
     let src = dir.path().join("probe.c");
@@ -410,7 +394,6 @@ fn every_layout_and_constant_is_the_headers() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 
-    // Negative control: a declaration one field off is told apart.
     let shifted = ours
         .iter()
         .find(|(k, _)| k.as_str() == "offset XKeyEvent.keycode")

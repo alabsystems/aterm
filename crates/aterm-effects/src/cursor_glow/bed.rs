@@ -58,15 +58,22 @@ pub(crate) fn dark_bed_ink(rgb: u32, bg: u32, budget: f32, sat: f32) -> u32 {
         )
     };
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
+    let (mut lo_rgb, mut hi_rgb) = (pick_rgb(0.0), pick_rgb(1.0));
     for _ in 0..20 {
+        if lo_rgb == hi_rgb {
+            break;
+        }
         let mid = 0.5 * (lo + hi);
-        if seen(pick_rgb(mid)) <= budget {
+        let mid_rgb = pick_rgb(mid);
+        if seen(mid_rgb) <= budget {
             lo = mid;
+            lo_rgb = mid_rgb;
         } else {
             hi = mid;
+            hi_rgb = mid_rgb;
         }
     }
-    let [r, g, b] = pick_rgb(lo);
+    let [r, g, b] = lo_rgb;
     ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 }
 

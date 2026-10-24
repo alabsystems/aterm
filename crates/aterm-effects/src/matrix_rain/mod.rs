@@ -6,6 +6,7 @@
 pub mod bake;
 mod bitmap_font;
 pub mod field;
+mod layers;
 pub mod rom;
 pub mod step;
 pub use step::{RainClock, RainFrame, RainLatches, RainScan};
@@ -16,20 +17,22 @@ use aterm_time::Instant;
 
 use aterm_core::grid::LineSize;
 use aterm_core::grid::extra::ImageRef;
+use aterm_core::render::FxArt;
 use aterm_core::terminal::{RenderCell, UnderlineStyle};
 use aterm_hash::{FNV64_OFFSET, fnv_mix_u64};
-use aterm_render::{RainHalo, SceneAtlas, SpriteQuad, premul_rgb};
+use aterm_render::{RainHalo, premul_rgb};
 
 use crate::color_math::{hsv2rgb, relative_luminance, rgb2hsv};
 use crate::genome::mix;
 pub use crate::word_decorations::{EffectGeom, SelView};
 
-pub use bake::{MAX_RAIN_BAKES_PER_TICK, RAIN_TILE_GRID, RainBaker};
+pub use bake::{MAX_RAIN_BAKES_PER_TICK, RainBaker};
 use field::{
     ColParams, DensityRing, FieldParams, col_params, cycle_active, cycle_at, cycle_start_tick,
     dither, dither_epoch, glyph_epoch, glyph_from_epoch, trail_level,
 };
 pub use field::{MAX_RAIN_ADD, MAX_RAIN_QUADS, MAX_RAIN_TEXELS, quad_cap};
+pub use layers::{RainCell, RainLayers, is_rain_row};
 use rom::{RomMaster, decorative_master};
 
 /// Readability ceiling on any rain coverage (body, head, halo) — the
@@ -460,7 +463,7 @@ pub struct MatrixRain {
     reading_gated: bool,
     halo_cands: Vec<(u16, u16)>,
     /// Stable row-sort scratch (counting sort): the emitted quads copied out…
-    sort_scratch: Vec<SpriteQuad>,
+    sort_scratch: Vec<RainCell>,
     /// …and the per-row scatter offsets (rows + 1 entries).
     row_starts: Vec<u32>,
     last_emit_nonempty: bool,
@@ -521,8 +524,8 @@ impl MatrixRain {
             occ_cols: 0,
             have_scanned: false,
             last_epoch: 0,
-            frame_candidates: Vec::with_capacity(MAX_FRAME_CANDIDATES),
-            frame_regions: Vec::with_capacity(MAX_FRAME_REGIONS),
+            frame_candidates: Vec::new(),
+            frame_regions: Vec::new(),
             frame_horizontal_prefix: Vec::new(),
             col_order: Vec::new(),
             order_cols: 0,
@@ -994,7 +997,7 @@ impl MatrixRain {
         now: Instant,
         geom: EffectGeom,
         input: &RainTickInput<'_>,
-        quads: &mut Vec<SpriteQuad>,
+        quads: &mut Vec<RainCell>,
         add: &mut Vec<RainHalo>,
     ) -> u64 {
         self.sync_clock(now);
@@ -1035,7 +1038,7 @@ impl MatrixRain {
         &mut self,
         geom: EffectGeom,
         input: &RainTickInput<'_>,
-        quads: &mut Vec<SpriteQuad>,
+        quads: &mut Vec<RainCell>,
         add: &mut Vec<RainHalo>,
     ) -> u64 {
         quads.clear();
@@ -1101,13 +1104,21 @@ impl MatrixRain {
         }
     }
 
-    /// The versioned 64-tile atlas for this frame's `rain_quads`.
+    /// `glyph`'s baked tile, the art a [`RainCell`] of that glyph draws (`None` until baked).
+    #[must_use]
     #[inline]
-    pub fn rain_atlas(&mut self) -> Option<Arc<SceneAtlas>> {
-        self.baker.atlas()
+    pub fn tile(&self, glyph: u8) -> Option<&Arc<FxArt>> {
+        self.baker.tile(glyph)
     }
 
-    /// The atlas version (folded into the fingerprint; exposed for hosts).
+    /// The glyph tiles a frame's [`RainCell`]s draw ([`RainLayers::publish`]).
+    #[must_use]
+    #[inline]
+    pub const fn baker(&self) -> &RainBaker {
+        &self.baker
+    }
+
+    /// The tile-set version (folded into the fingerprint; exposed for hosts).
     #[must_use]
     #[inline]
     pub const fn atlas_version(&self) -> u64 {
@@ -1426,7 +1437,7 @@ impl MatrixRain {
         }
     }
 
-    fn row_sort_stable(&mut self, quads: &mut [SpriteQuad], rows: usize) {
+    fn row_sort_stable(&mut self, quads: &mut [RainCell], rows: usize) {
         if quads.len() < 2 || rows == 0 {
             return;
         }
@@ -1451,7 +1462,7 @@ impl MatrixRain {
         &mut self,
         geom: EffectGeom,
         input: &RainTickInput<'_>,
-        quads: &mut Vec<SpriteQuad>,
+        quads: &mut Vec<RainCell>,
         add: &mut Vec<RainHalo>,
     ) {
         let ctx = EmitCtx {
@@ -1487,7 +1498,7 @@ impl MatrixRain {
         self.emit_halos(&ctx, add);
     }
 
-    fn emit_column(&mut self, ctx: &EmitCtx<'_>, col: u16, quads: &mut Vec<SpriteQuad>) -> bool {
+    fn emit_column(&mut self, ctx: &EmitCtx<'_>, col: u16, quads: &mut Vec<RainCell>) -> bool {
         let cw = u32::from(ctx.geom.cell_w);
         let rows = u32::from(ctx.geom.rows);
         let x0 = u32::from(col) * cw;
@@ -1574,7 +1585,7 @@ impl MatrixRain {
         lvl: u32,
         head: bool,
         material_start: Option<usize>,
-    ) -> SpriteQuad {
+    ) -> RainCell {
         let (cw, ch) = (ctx.geom.cell_w, ctx.geom.cell_h);
         let (g, flip_x) = match material_start {
             None => glyph_from_epoch(self.seed32, row, u32::from(col), ctx.glyph_epoch),
@@ -1583,22 +1594,18 @@ impl MatrixRain {
                 (u32::from(self.material[ix]), false)
             }
         };
-        let (ax, ay) = self.baker.tile_origin(g);
         let alpha = if head {
             self.head_alpha
         } else {
             self.alpha_of(lvl)
         };
-        SpriteQuad {
+        RainCell {
             row: row as u16,
             x: col.wrapping_mul(cw),
             y: (row as u16).wrapping_mul(ch),
             w: cw,
             h: ch,
-            ax,
-            ay,
-            aw: cw,
-            ah: ch,
+            glyph: (g % rom::ROM_GLYPHS as u32) as u8,
             tint: ctx.ramp[(lvl as usize).min(15)],
             alpha,
             flip_x,
@@ -1674,21 +1681,23 @@ impl MatrixRain {
             let row = cells.get(r).map(Vec::as_slice).unwrap_or(&[]);
             let ch_at = |col: usize| row.get(col).map_or(' ', |cell| cell.ch);
 
-            if !self.frame_candidates.is_empty() {
-                self.frame_horizontal_prefix.resize(cols + 1, 0);
-                self.frame_horizontal_prefix[0] = 0;
-                for col in 0..cols {
-                    self.frame_horizontal_prefix[col + 1] = self.frame_horizontal_prefix[col]
-                        + usize::from(frame_horizontal(ch_at(col)));
-                }
-            }
-
+            let mut prefix_built = false;
             let mut write = 0usize;
             for i in 0..self.frame_candidates.len() {
                 let mut candidate = self.frame_candidates[i];
                 let left = ch_at(candidate.left);
                 let right = ch_at(candidate.right);
                 if frame_bottom_left(left) && frame_bottom_right(right) && r > candidate.top + 1 {
+                    if !prefix_built {
+                        self.frame_horizontal_prefix.resize(cols + 1, 0);
+                        self.frame_horizontal_prefix[0] = 0;
+                        for col in 0..cols {
+                            self.frame_horizontal_prefix[col + 1] = self.frame_horizontal_prefix
+                                [col]
+                                + usize::from(frame_horizontal(ch_at(col)));
+                        }
+                        prefix_built = true;
+                    }
                     let interior_rows = r - candidate.top - 1;
                     let interior_cols = candidate.right - candidate.left - 1;
                     let horizontal_cols = self.frame_horizontal_prefix[candidate.right]
@@ -1729,8 +1738,8 @@ impl MatrixRain {
 
             let mut open_left = None;
             let mut has_horizontal = false;
-            for col in 0..cols {
-                let ch = ch_at(col);
+            for (col, cell) in row.iter().enumerate().take(cols) {
+                let ch = cell.ch;
                 if !in_box_drawing_block(ch) {
                     continue;
                 }
@@ -2053,7 +2062,7 @@ fn derive_alphas(cfg: &RainConfig, ramp: &[u32; 16]) -> (u8, u8) {
         (crate::color_math::relative_luminance_with(table, faint_ink(cfg.theme_fg, bg)) - lb).abs();
     let bound = plain.min(faint);
     let level_ok = |body: u8| {
-        (0..=15u32).all(|lvl| {
+        (0..=15u32).rev().all(|lvl| {
             let a = ((u32::from(body) * (lvl + 1)) / 16).max(1) as u8;
             (crate::color_math::relative_luminance_with(
                 table,
@@ -2100,7 +2109,7 @@ fn slot_change_mask(old: &[char], new: &[char]) -> u64 {
     mask
 }
 
-fn fingerprint(quads: &[SpriteQuad], add: &[RainHalo], tick: u64, atlas_version: u64) -> u64 {
+fn fingerprint(quads: &[RainCell], add: &[RainHalo], tick: u64, atlas_version: u64) -> u64 {
     if quads.is_empty() && add.is_empty() {
         return 0;
     }
@@ -2110,14 +2119,8 @@ fn fingerprint(quads: &[SpriteQuad], add: &[RainHalo], tick: u64, atlas_version:
             | (u64::from(q.x) << 16)
             | (u64::from(q.y) << 32)
             | (u64::from(q.w) << 48);
-        let b = u64::from(q.h)
-            | (u64::from(q.ax) << 16)
-            | (u64::from(q.ay) << 32)
-            | (u64::from(q.aw) << 48);
-        let c = u64::from(q.ah)
-            | (u64::from(q.tint) << 16)
-            | (u64::from(q.alpha) << 48)
-            | (u64::from(q.flip_x) << 56);
+        let b = u64::from(q.h) | (u64::from(q.glyph) << 16);
+        let c = u64::from(q.tint) | (u64::from(q.alpha) << 48) | (u64::from(q.flip_x) << 56);
         h = fnv_mix_u64(h, a);
         h = fnv_mix_u64(h, b);
         h = fnv_mix_u64(h, c);
@@ -2253,7 +2256,7 @@ mod tests {
         g: EffectGeom,
         input: &RainTickInput<'_>,
         dt: u64,
-        q: &mut Vec<SpriteQuad>,
+        q: &mut Vec<RainCell>,
         a: &mut Vec<RainHalo>,
     ) -> u64 {
         e.advance_ms(dt);
@@ -2362,8 +2365,8 @@ mod tests {
             step(&mut e, g, &idle(), 33, &mut q, &mut a);
             assert!(seq < 1200, "never found an aligned raining tick");
         }
-        let snap = |quads: &[SpriteQuad]| {
-            let mut m: HashMap<u16, HashMap<u16, SpriteQuad>> = HashMap::new();
+        let snap = |quads: &[RainCell]| {
+            let mut m: HashMap<u16, HashMap<u16, RainCell>> = HashMap::new();
             for s in quads {
                 m.entry(s.x / 8).or_default().insert(s.row, *s);
             }
@@ -2583,16 +2586,13 @@ mod tests {
 
     #[test]
     fn even_quad_counts_do_not_cancel() {
-        let quad = SpriteQuad {
+        let quad = RainCell {
             row: 3,
             x: 8,
             y: 48,
             w: 8,
             h: 16,
-            ax: 0,
-            ay: 0,
-            aw: 8,
-            ah: 16,
+            glyph: 0,
             tint: 0x0022_CC44,
             alpha: 90,
             flip_x: true,
@@ -3225,13 +3225,8 @@ mod tests {
             step(&mut e, g, &idle(), 33, &mut q, &mut a);
         }
         assert!(!q.is_empty(), "field emits under pour");
-        let (ax7, ay7) = e.baker.tile_origin(0);
         for quad in &q {
-            assert_eq!(
-                (quad.ax, quad.ay),
-                (ax7, ay7),
-                "every rained glyph is the material tile"
-            );
+            assert_eq!(quad.glyph, 0, "every rained glyph is the material tile");
             assert!(!quad.flip_x, "exact-form tiles are never mirrored");
         }
 
@@ -3244,9 +3239,8 @@ mod tests {
         for _ in 0..30 {
             step(&mut e, g, &idle(), 33, &mut q2, &mut a2);
         }
-        let (ax2, ay2) = e.baker.tile_origin(1);
-        let front = q2.iter().any(|qd| (qd.ax, qd.ay) == (ax7, ay7));
-        let back = q2.iter().any(|qd| (qd.ax, qd.ay) == (ax2, ay2));
+        let front = q2.iter().any(|qd| qd.glyph == 0);
+        let back = q2.iter().any(|qd| qd.glyph == 1);
         assert!(
             front && back,
             "both table halves must rain (front={front}, back={back}, n={})",
@@ -3284,8 +3278,8 @@ mod tests {
         let start = Some(e.material_start(3));
         let a = e.cell_quad(&ctx, 3, 2, 10, false, start);
         let b = e.cell_quad(&ctx, 3, 3, 10, false, start);
-        let slot_a = usize::from(a.ax) / 8;
-        let slot_b = usize::from(b.ax) / 8;
+        let slot_a = usize::from(a.glyph);
+        let slot_b = usize::from(b.glyph);
         assert_eq!(slot_b, (slot_a + 1) % 3);
         assert!(!a.flip_x && !b.flip_x, "literal text is never mirrored");
     }
@@ -3642,7 +3636,7 @@ mod tests {
                 assert!(!e.is_active(), "disabled={disabled}");
             }
             if disabled {
-                assert!(e.rain_atlas().is_none(), "no atlas is baked while disabled");
+                assert!(e.tile(0).is_none(), "no tile is baked while disabled");
             }
         }
     }
@@ -3721,8 +3715,8 @@ mod tests {
         step(&mut e, g, &idle(), 0, &mut q, &mut a);
         let v1 = e.atlas_version();
         assert!(
-            e.rain_atlas().is_some(),
-            "first tick publishes a partial atlas"
+            e.tile(0).is_some() && !e.baker.complete(),
+            "the first tick bakes a first batch of tiles"
         );
         for _ in 0..8 {
             e.note_keystroke();
@@ -3755,9 +3749,10 @@ mod tests {
         assert!(!q.is_empty());
         for s in &q {
             assert_eq!((s.w, s.h), (8, 16));
-            assert_eq!((s.aw, s.ah), (8, 16));
-            assert_eq!(s.ax % 8, 0, "tile-aligned atlas x");
-            assert_eq!(s.ay % 16, 0, "tile-aligned atlas y");
+            assert!(
+                e.tile(s.glyph).is_some_and(|t| (t.w(), t.h()) == (8, 16)),
+                "every cell draws a baked cell-sized tile 1:1"
+            );
             assert_eq!(
                 u32::from(s.y),
                 u32::from(s.row) * 16,

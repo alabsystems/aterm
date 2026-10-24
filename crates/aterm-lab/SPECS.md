@@ -525,7 +525,7 @@ A review of `b9/lab-hygiene` found behaviour no test held: the refusal of a wind
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
 lab-opts-refused	contract	lab::opts_refused, lab::up, forever::lab_opts	∀ o: opts_refused(o) = Some(why) ⇔ o.window ∧ o.restore. up(tag, o) with opts_refused(o) = Some(why) returns Err(Fail{code: 2, msg: why}) before it judges tag or makes anything; lab_opts(base, mode, keep, (surfaces, window)) returns Err(Fail{code: 2, msg: "forever: " ++ why}) where the options it builds are refused, so `forever --window` under LAB_RESTORE=1 is a usage error, never a harness's COULD NOT RUN; otherwise it returns base with trust, lifeline = ¬keep, window, the person's seam iff surfaces, and the cap's rate iff mode = Cap.	lab.rs::a_windowed_lab_under_the_restore_seam_is_refused_before_anything_is_made, forever_tests.rs::forever_window_under_the_restore_seam_is_a_usage_error_not_could_not_run	a bool conjunction, early returns, struct update	1,5
-lab-window-ready	contract	lab::until_answered	∀ answers, alive, hang, pause: until_answered returns Ok(()) iff some ask of answers returns true; each round asks answers, then alive, then the clock: Err("… ended before its control socket answered") when alive is false first, Err("… hang detector") once hang has passed, and pause's Err unchanged (an interrupt). So an answer stands even when the child has ended since.	lab.rs::a_window_is_ready_once_its_socket_answers_and_never_on_a_dead_child_or_a_hang	closures (FnMut), Instant arithmetic, a loop with early returns	1,3,7,8
+lab-window-ready	contract	lab::while_starting	∀ look, progress, hang, start, pause: while_starting returns Ok(()) iff some look returns Ok(true) before a look's Err, a pause's Err, or hang passing with progress unmoved; each round asks look, then progress, then the clock: look's Err unchanged (the child ended before it was ready), Err("… the hang detector") once progress stood still for hang, and pause's Err unchanged (an interrupt). A start whose progress keeps moving is never a hang, however long it takes.	lab.rs::a_starting_child_is_waited_for_while_it_makes_progress	closures (FnMut), Instant arithmetic, a loop with early returns	1,3,7,8
 arm-awaits-witness	contract	scn::Ctx::arm, scn::Ctx::arm_with_wait, settings_witness::set_env_reread_with_wait	∀ ctx: ctx.arm() returns Ok only after the witness's log holds a ConfigChange line naming ctx.run.settings() that was appended after a write of CLAUDE_FORCE_DISPLAY_SURVEY = "1"; the flag stands in the settings' env, and sumd.arm_writes counts the writes made (more than one where the first went unanswered), one every settings_witness::REWRITE_EVERY on the arm's clock while no line answers. Where no such line comes within settings_witness::HANG on that clock the result is Err(Failed("the survey flag was not armed: …no re-read… (n writes)…")) with those writes counted, and arm_writes is not set. Uses witness-until-reread and witness-rereads.	scn.rs::the_survey_arm_returns_only_once_claude_code_reported_a_reread	a SteppedWait whose pauses step the clock and stand in for the watcher on the arm's thread, the file system (effects), J summary	1,3,8,13
 survey-words	contract	verbs::survey_words	∀ words: survey_words(words) = Ok((Some("1"), r)) ⇔ words = ["on"] ++ (r ? ["--reread"] : []); Ok((None, r)) likewise for "off"; every other list of words is Err("survey: on|off [--reread]").	verbs.rs::survey_takes_on_or_off_and_reread_after_it	slice patterns	1
 ```
@@ -534,7 +534,7 @@ survey-words	contract	verbs::survey_words	∀ words: survey_words(words) = Ok((S
 file	test	primary	also
 src/lab.rs	a_windowed_lab_under_the_restore_seam_is_refused_before_anything_is_made	lab-opts-refused	
 src/forever_tests.rs	forever_window_under_the_restore_seam_is_a_usage_error_not_could_not_run	lab-opts-refused	
-src/lab.rs	a_window_is_ready_once_its_socket_answers_and_never_on_a_dead_child_or_a_hang	lab-window-ready	
+src/lab.rs	a_starting_child_is_waited_for_while_it_makes_progress	lab-window-ready	
 src/scn.rs	the_survey_arm_returns_only_once_claude_code_reported_a_reread	arm-awaits-witness	witness-until-reread
 src/verbs.rs	survey_takes_on_or_off_and_reread_after_it	survey-words	
 ```
@@ -555,4 +555,24 @@ ps-line-fields	contract	codex_rig::{ps_line,ps_rows}, sys::tty_name	∀ r: kproc
 file	test	primary	also
 src/codex_rig.rs	a_ps_line_reads_the_kernel_record	ps-line-fields	
 src/codex_rig.rs	the_pid_list_chooses_exactly_its_pids	ps-line-fields	
+```
+
+## 13. Added 2026-10-23: a jail listing that was not read
+
+`jail_pids` lists this user's processes through `aterm_uds::holders::uid_pids`, and a listing that
+fails is an error, never an empty jail. The four proofs that print the jail's members (`selftest`,
+`codex-selftest`, `gemini-selftest`, `muse-selftest`) print that error in the table's place
+instead of an empty table; their checks still read no member, so the orphan's check fails. Two
+new tests, read the same way as §1.
+
+```tsv
+id	kind	functions	statement	subsumes	difficulty	blocking_gaps
+jail-members	contract	sys::{jail_pids,jail_members}	∀ listed, me, in_jail: jail_members(Err(e), me, in_jail) = Err("jailpids: the process list could not be read: " ++ e); jail_members(Ok(pids), me, in_jail) = Ok(the distinct p ∈ pids that fit i32 with p > 1, p ≠ me and in_jail(p), ascending). jail_pids(mark) is jail_members over holders::uid_pids() with in_jail(p) ⇔ sandbox_check(p) = 1 ∧ p is denied mark's mach-lookup ∧ p is not denied mark.none's, after its own refusal when this process is sandboxed or denied mark.	src/sys.rs::a_listing_that_fails_is_an_error_and_never_an_empty_jail	Result map_err, filter_map, sort_unstable, dedup, a closure seam	0,1,3
+jail-members-table	contract	selftest::members_table	∀ why: members_table(Err(why)) = "  not read: " ++ why ++ "\n"; members_table(Ok([])) = ""; for a nonempty list it is ps's rows for those pids, each cut at 120 chars and indented two spaces (an effect, not sampled).	src/selftest.rs::a_member_table_that_was_not_read_says_why	Result match, format!	0,1
+```
+
+```tsv
+file	test	primary	also
+src/sys.rs	a_listing_that_fails_is_an_error_and_never_an_empty_jail	jail-members	
+src/selftest.rs	a_member_table_that_was_not_read_says_why	jail-members-table	
 ```

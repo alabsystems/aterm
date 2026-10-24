@@ -8,9 +8,9 @@ use crate::{App, WindowId, term_lock};
 use aterm_effects::pane::{
     translate_free_into_pane, translate_ink_into_pane, translate_nova_into_pane,
 };
+use aterm_render::sprites::{FreeSprite, FreeZ, published};
 use std::time::{Duration, Instant};
 
-/// Sets the headless theme background on stub terminals so perches are certified blank.
 fn configure_pane_backgrounds(app: &App, sid: u64) {
     let bg = aterm_render::Theme::default().bg;
     for session in [0, sid] {
@@ -36,7 +36,6 @@ fn place(col_off: u16, cols: u16) -> PanePlace {
     }
 }
 
-/// Builds a 2-pane vertical split with freshly typed text in both panes after the initial compose.
 fn split_app(now: Instant) -> (App, WindowId, u64) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
@@ -59,18 +58,16 @@ fn split_app(now: Instant) -> (App, WindowId, u64) {
     (app, wid, sid)
 }
 
-/// Everything the split frame emitted, for failure messages.
 fn channels(app: &App, wid: WindowId, now: Instant) -> String {
     let ws = app.windows.get(&wid).expect("window");
     format!(
-        "cells={:?} sparkle_on={} deco={} ink={} free={} nova={} atlas={} active={}",
+        "cells={:?} sparkle_on={} deco={} ink={} sprites={} nova={} active={}",
         app.win_cell_size(wid),
         app.sparkle.is_some(),
         ws.input_scratch.word_decorations.len(),
         ws.input_scratch.ink.len(),
-        ws.input_scratch.free_sprites.len(),
+        published(&ws.input_scratch.fx_layers).len(),
         ws.input_scratch.nova_add.len(),
-        ws.input_scratch.free_atlas.is_some(),
         ws.fx.decos().is_active(now),
     )
 }
@@ -79,7 +76,6 @@ fn compose(app: &mut App, wid: WindowId, now: Instant) -> Option<std::sync::Arc<
     app.redraw_compose(wid, 24, 80, false, false, None, 0, now)
 }
 
-/// A split frame emits peeking cats on both sides of the divider.
 #[test]
 fn split_compose_emits_cats_in_every_visible_pane() {
     let t0 = Instant::now();
@@ -93,32 +89,23 @@ fn split_compose_emits_cats_in_every_visible_pane() {
     let diag = channels(&app, wid, t1);
     let ws = app.windows.get(&wid).expect("window");
     let (cw, _) = app.win_cell_size(wid);
+    let sprites = published(&ws.input_scratch.fx_layers);
+    assert!(!sprites.is_empty(), "a split window draws cats ({diag})");
     assert!(
-        !ws.input_scratch.free_sprites.is_empty(),
-        "a split window draws cats ({diag})"
-    );
-    assert!(
-        ws.input_scratch.free_atlas.is_some(),
-        "and ships the atlas they address"
+        sprites.iter().all(|s| s.art.w() > 0 && s.art.h() > 0),
+        "and each carries the art it draws"
     );
     let divider_x = 40 * cw as i32;
     assert!(
-        ws.input_scratch
-            .free_sprites
-            .iter()
-            .any(|s| s.x < divider_x),
+        sprites.iter().any(|s| s.visible().x0 < divider_x),
         "cats in the LEFT pane"
     );
     assert!(
-        ws.input_scratch
-            .free_sprites
-            .iter()
-            .any(|s| s.x >= (41 * cw) as i32),
+        sprites.iter().any(|s| s.visible().x0 >= (41 * cw) as i32),
         "and cats in the RIGHT pane — the fix is not the focused pane only"
     );
 }
 
-/// The merged ink stream is non-empty and strictly increasing by `(row, col)`.
 #[test]
 fn split_compose_ink_is_non_empty_and_sorted() {
     let t0 = Instant::now();
@@ -140,7 +127,6 @@ fn split_compose_ink_is_non_empty_and_sorted() {
     );
 }
 
-/// Without the cadence a correct emitter renders one frame and freezes.
 #[test]
 fn split_layout_arms_the_effect_frame_cadence() {
     let t0 = Instant::now();
@@ -157,7 +143,6 @@ fn split_layout_arms_the_effect_frame_cadence() {
     );
 }
 
-/// The cursor companion rides only the focused pane and translates into its window coordinates.
 #[test]
 fn split_companion_rides_only_the_focused_pane() {
     let t0 = Instant::now();
@@ -190,21 +175,20 @@ fn split_companion_rides_only_the_focused_pane() {
     let (cw, _) = app.win_cell_size(wid);
     let diag = channels(&app, wid, t1);
     let ws = app.windows.get(&wid).expect("window");
-    let sprites = &ws.input_scratch.free_sprites;
+    let sprites = published(&ws.input_scratch.fx_layers);
     assert!(
         !sprites.is_empty(),
         "the summoned companion is drawn on a split frame ({diag})"
     );
     let pane_x0 = (41 * cw) as i32;
     assert!(
-        sprites.iter().all(|s| s.x >= pane_x0),
+        sprites.iter().all(|s| s.visible().x0 >= pane_x0),
         "every companion sprite sits in the FOCUSED pane, not at un-shifted \
          pane-local coords: {:?} (pane starts at x={pane_x0})",
-        sprites.iter().map(|s| (s.x, s.y, s.w)).collect::<Vec<_>>()
+        sprites.iter().map(FreeSprite::visible).collect::<Vec<_>>()
     );
 }
 
-/// Fading the resident pet on a hidden caret does not claim a word under the relocated raw cursor.
 #[test]
 fn split_present_hidden_pet_fade_does_not_claim_program_relocated_word() {
     let t0 = Instant::now();
@@ -221,11 +205,9 @@ fn split_present_hidden_pet_fade_does_not_claim_program_relocated_word() {
     term_lock(&term).process(b"\x1b[11;3Hkitty\x1b[4;31H");
     assert!(compose(&mut app, wid, t0 + Duration::from_millis(16)).is_some());
     assert!(compose(&mut app, wid, t0 + Duration::from_millis(616)).is_some());
-    let ambient_before = app.windows[&wid]
-        .input_scratch
-        .free_sprites
+    let ambient_before = published(&app.windows[&wid].input_scratch.fx_layers)
         .iter()
-        .filter(|sprite| matches!(sprite.z, aterm_core::render::FreeZ::UnderText))
+        .filter(|sprite| sprite.z == FreeZ::UnderText)
         .count();
     assert_eq!(
         ambient_before,
@@ -242,17 +224,13 @@ fn split_present_hidden_pet_fade_does_not_claim_program_relocated_word() {
         assert_eq!((term.cursor().row, term.cursor().col), (10, 2));
     }
     let ws = &app.windows[&wid];
-    let ambient_after = ws
-        .input_scratch
-        .free_sprites
+    let ambient_after = published(&ws.input_scratch.fx_layers)
         .iter()
-        .filter(|sprite| matches!(sprite.z, aterm_core::render::FreeZ::UnderText))
+        .filter(|sprite| sprite.z == FreeZ::UnderText)
         .count();
-    let resident_after = ws
-        .input_scratch
-        .free_sprites
+    let resident_after = published(&ws.input_scratch.fx_layers)
         .iter()
-        .filter(|sprite| matches!(sprite.z, aterm_core::render::FreeZ::OverText))
+        .filter(|sprite| sprite.z == FreeZ::OverText)
         .count();
     assert!(
         resident_after >= 1 && ws.fx.companion().brain().is_active(),
@@ -264,10 +242,8 @@ fn split_present_hidden_pet_fade_does_not_claim_program_relocated_word() {
     );
 }
 
-/// The pet's drawn body, `(x0, x1, y0, y1)` frame px.
 type BodyPx = (i32, i32, i32, i32);
 
-/// Steps a mid-flight resident pet through one frame with or without a DECTCEM hide and returns `[before, hidden, returned]`.
 fn split_midflight_pet_through_a_hide(hide: bool) -> ([BodyPx; 3], (i32, i32)) {
     let t0 = Instant::now();
     let mut app = App::headless_for_test();
@@ -337,11 +313,9 @@ fn split_midflight_pet_through_a_hide(hide: bool) -> ([BodyPx; 3], (i32, i32)) {
         .hit_rect()
         .expect("the hidden frame keeps the resident on glass");
     assert!(
-        app.windows[&wid]
-            .input_scratch
-            .free_sprites
+        published(&app.windows[&wid].input_scratch.fx_layers)
             .iter()
-            .any(|sprite| matches!(sprite.z, aterm_core::render::FreeZ::OverText)),
+            .any(|sprite| sprite.z == FreeZ::OverText),
         "the inspected frame really emitted the resident body"
     );
 
@@ -356,7 +330,6 @@ fn split_midflight_pet_through_a_hide(hide: bool) -> ([BodyPx; 3], (i32, i32)) {
     ([before, hidden, returned], (cw as i32, ch as i32))
 }
 
-/// A brief DECTCEM hide inside `HIDDEN_HOLD_MAX` preserves a mid-flight pet's trajectory and resumes walking on return.
 #[test]
 fn split_present_holds_a_hidden_midflight_pet_and_quick_return_walks() {
     let ([before, painted, _], _) = split_midflight_pet_through_a_hide(false);
@@ -373,7 +346,6 @@ fn split_present_holds_a_hidden_midflight_pet_and_quick_return_walks() {
     );
 }
 
-/// Switching focus across split panes crossfades the old pet body in its own pane while the new pane's pet arrives.
 #[test]
 fn split_focus_switch_fades_the_old_body_in_its_own_pane() {
     let t0 = Instant::now();
@@ -390,11 +362,8 @@ fn split_focus_switch_fades_the_old_body_in_its_own_pane() {
     let (cw, _) = app.win_cell_size(wid);
     let (left_x1, right_x0) = ((40 * cw) as i32, (41 * cw) as i32);
     let body = |app: &App| {
-        app.windows[&wid]
-            .input_scratch
-            .free_sprites
-            .iter()
-            .copied()
+        published(&app.windows[&wid].input_scratch.fx_layers)
+            .into_iter()
             .max_by_key(|s| u32::from(s.w) * u32::from(s.h))
     };
     let mut now = t0;
@@ -404,7 +373,7 @@ fn split_focus_switch_fades_the_old_body_in_its_own_pane() {
     }
     let before = body(&app).expect("fixture: the resident settled on glass");
     assert!(
-        before.x >= right_x0 && app.windows[&wid].fx.companion().alpha() == 255,
+        before.visible().x0 >= right_x0 && app.windows[&wid].fx.companion().alpha() == 255,
         "fixture: the resident stands in the focused right pane: {before:?}"
     );
 
@@ -412,19 +381,19 @@ fn split_focus_switch_fades_the_old_body_in_its_own_pane() {
     let route = app.active_visible_content_route(wid).expect("route");
     assert!(app.prepare_layout_coordinate_space(wid, route));
     assert!(compose(&mut app, wid, now).is_some());
-    let sprites = app.windows[&wid].input_scratch.free_sprites.clone();
+    let sprites = published(&app.windows[&wid].input_scratch.fx_layers);
     let ghost = sprites
         .iter()
-        .find(|s| s.x >= right_x0)
+        .find(|s| s.visible().x0 >= right_x0)
         .unwrap_or_else(|| panic!("the old body fades in its own pane: {sprites:?}"));
-    assert_eq!(ghost.z, aterm_core::render::FreeZ::UnderText, "{ghost:?}");
+    assert_eq!(ghost.z, FreeZ::UnderText, "{ghost:?}");
     assert!(
         (ghost.x - before.x).abs() <= 1
             && (ghost.y + i32::from(ghost.h) - before.y - i32::from(before.h)).abs() <= 1,
         "…where the body was drawn: {ghost:?} vs {before:?}"
     );
     assert!(
-        sprites.iter().any(|s| s.x + i32::from(s.w) <= left_x1),
+        sprites.iter().any(|s| s.visible().x1 <= left_x1),
         "the arriver is drawn in the newly focused left pane: {sprites:?}"
     );
 
@@ -433,18 +402,14 @@ fn split_focus_switch_fades_the_old_body_in_its_own_pane() {
         compose(&mut app, wid, now);
     }
     let ws = &app.windows[&wid];
+    let sprites = published(&ws.input_scratch.fx_layers);
     assert!(
-        ws.input_scratch
-            .free_sprites
-            .iter()
-            .all(|s| s.x + i32::from(s.w) <= left_x1),
-        "the crossfade is spent: {:?}",
-        ws.input_scratch.free_sprites
+        sprites.iter().all(|s| s.visible().x1 <= left_x1),
+        "the crossfade is spent: {sprites:?}"
     );
     assert_eq!(ws.fx.companion().alpha(), 255, "the arriver is full");
 }
 
-/// Under per-pane state a split keeps the untouched pane's episodes.
 #[test]
 fn splitting_does_not_reset_the_untouched_panes_episodes() {
     let t0 = Instant::now();
@@ -466,44 +431,55 @@ fn splitting_does_not_reset_the_untouched_panes_episodes() {
     );
 }
 
-/// `translate_free_into_pane` crops interior-edge straddlers in dest and atlas source, drops out-of-pane sprites, and keeps window-edge overhang.
+/// A straight-RGBA art of `w × h` distinct texels.
+fn pane_art(w: u16, h: u16) -> std::sync::Arc<aterm_core::render::FxArt> {
+    let data: Vec<u8> = (0..u32::from(w) * u32::from(h))
+        .flat_map(|i| [i as u8, (i >> 8) as u8, 0x5A, 0xFF])
+        .collect();
+    aterm_render::fx::bitmap(aterm_core::render::FxTexels::Rgba8Straight, w, h, data)
+        .expect("a sized art")
+}
+
+/// `translate_free_into_pane` cuts an interior-edge straddler by its clip
+/// (its box and art stay whole, so the surviving pixels sample the texels
+/// they sampled uncut), drops a sprite wholly outside its pane, and leaves a
+/// window-edge overhang open.
 #[test]
-fn translate_free_sprites_into_pane_crops_source_and_dest() {
-    let sprite = |x: i32, y: i32, w: u16, h: u16| aterm_core::render::FreeSprite {
-        x,
-        y,
-        w,
-        h,
-        ax: 100,
-        ay: 200,
-        aw: w,
-        ah: h,
-        tint: 0x00FF_FFFF,
-        alpha: 255,
-        flip_x: false,
-        z: aterm_core::render::FreeZ::UnderText,
-        sampler: aterm_core::render::FreeSampler::Nearest,
+fn translate_free_sprites_into_pane_clips_at_dividers_and_keeps_art_whole() {
+    let sprite = |x: i32, y: i32, w: u16, h: u16| FreeSprite {
+        z: FreeZ::UnderText,
+        ..FreeSprite::whole(x, y, pane_art(w, h))
     };
-    let mut free = vec![sprite(380, 40, 40, 20)];
+    let px = aterm_core::render::PxRect::new;
+
+    let straddler = sprite(380, 40, 40, 20);
+    let mut free = vec![straddler.clone()];
     translate_free_into_pane(&mut free, place(0, 40));
     assert_eq!(free.len(), 1, "the visible half survives");
     assert_eq!(
-        (free[0].x, free[0].w),
-        (380, 20),
-        "dest cropped at the divider"
+        (free[0].x, free[0].y, free[0].w, free[0].h),
+        (380, 40, 40, 20),
+        "the box stays whole"
     );
+    assert_eq!(free[0].art.id(), straddler.art.id(), "and so does its art");
     assert_eq!(
-        (free[0].ax, free[0].aw),
-        (100, 20),
-        "and the atlas source rect cropped in lockstep"
+        free[0].visible(),
+        px(380, 40, 400, 60),
+        "cut at the divider"
     );
-    assert_eq!(free[0].ay, 200, "an untouched axis keeps its texel origin");
 
     let mut free = vec![sprite(-30, 0, 40, 20)];
     translate_free_into_pane(&mut free, place(41, 39));
-    assert_eq!(free[0].x, 410, "clipped to the pane's own left edge");
-    assert_eq!((free[0].w, free[0].aw), (10, 10), "dest and source agree");
-    assert_eq!(free[0].ax, 100 + 30, "the cropped-away texels are skipped");
+    assert_eq!(
+        free[0].x, 380,
+        "shifted into the right pane's window coords"
+    );
+    assert_eq!(
+        free[0].visible(),
+        px(410, 0, 420, 20),
+        "cut at the pane's own left edge: its last 10 columns draw, at the \
+         places they drew uncut"
+    );
 
     let mut free = vec![sprite(600, 0, 20, 20)];
     translate_free_into_pane(&mut free, place(0, 40));
@@ -512,64 +488,52 @@ fn translate_free_sprites_into_pane_crops_source_and_dest() {
     let mut free = vec![sprite(-8, -6, 20, 20)];
     translate_free_into_pane(&mut free, place(0, 40));
     assert_eq!(
-        (free[0].x, free[0].y, free[0].w, free[0].h),
-        (-8, -6, 20, 20),
+        free[0].visible(),
+        px(-8, -6, 12, 14),
         "an edge pane keeps its off-grid peek, untouched"
     );
 }
 
-/// A pose-scaled companion straddling an interior divider is cropped proportionally in source and dest.
+/// A pose-scaled companion straddling an interior divider is cut by its clip,
+/// not deleted, and keeps its scale: the box and the art stay whole.
 #[test]
-fn a_scaled_companion_is_cropped_at_a_divider_not_deleted() {
-    let companion = aterm_core::render::FreeSprite {
-        x: 380,
-        y: 40,
+fn a_scaled_companion_is_clipped_at_a_divider_not_deleted() {
+    let companion = FreeSprite {
         w: 40,
         h: 20,
-        ax: 100,
-        ay: 200,
-        aw: 20,
-        ah: 10,
-        tint: 0x00FF_FFFF,
-        alpha: 255,
-        flip_x: false,
-        z: aterm_core::render::FreeZ::OverText,
-        sampler: aterm_core::render::FreeSampler::Nearest,
+        ..FreeSprite::whole(380, 40, pane_art(20, 10))
     };
-    let mut free = vec![companion];
+    let mut free = vec![companion.clone()];
     translate_free_into_pane(&mut free, place(0, 40));
     assert_eq!(
         free.len(),
         1,
         "the companion SURVIVES the divider — dropping it is the bug"
     );
-    assert_eq!((free[0].x, free[0].w), (380, 20), "dest cropped at 400");
     assert_eq!(
-        (free[0].ax, free[0].aw),
-        (100, 10),
-        "source cropped PROPORTIONALLY (aw/w = 1/2), not texel-for-pixel"
+        (free[0].x, free[0].w, free[0].h),
+        (380, 40, 20),
+        "the box keeps its 2x scale, so each texel keeps its 2x2 pixels"
     );
+    assert_eq!(free[0].art.id(), companion.art.id());
     assert_eq!(
-        (free[0].ay, free[0].ah),
-        (200, 10),
-        "the untouched axis keeps its whole source span"
+        free[0].visible(),
+        aterm_core::render::PxRect::new(380, 40, 400, 60),
+        "cut at 400"
     );
 
-    let mut sliver = vec![aterm_core::render::FreeSprite {
+    let mut sliver = vec![FreeSprite {
         x: 399,
         ..companion
     }];
     translate_free_into_pane(&mut sliver, place(0, 40));
-    assert_eq!(sliver.len(), 1);
-    assert!(
-        sliver[0].aw >= 1 && sliver[0].ah >= 1,
-        "a cropped source never collapses to zero texels, got {}x{}",
-        sliver[0].aw,
-        sliver[0].ah
+    assert_eq!(sliver.len(), 1, "a one-pixel sliver still draws");
+    assert_eq!(
+        sliver[0].visible(),
+        aterm_core::render::PxRect::new(399, 40, 400, 60)
     );
 }
 
-/// The ink/nova translators shift into window coords and clip at interior dividers.
 #[test]
 fn translate_ink_and_nova_shift_and_clip_at_the_divider() {
     let mut ink = vec![

@@ -323,9 +323,43 @@ pub(crate) fn paint_rainbow_banner(
     prims.push(DrawPrim::ClipPop);
 }
 
-/// The System State animated hero.
+/// Parse the extensible `phase=...;busy=...;done=...;total=...;states=...` village spec.
+pub(crate) fn parse_rainbow_kitty_village_spec(spec: &str) -> (u64, bool, usize, usize, Vec<char>) {
+    let mut phase_ms = 0u64;
+    let mut busy = false;
+    let mut done = None;
+    let mut total = None;
+    let mut states = Vec::new();
+    for part in spec.split(';') {
+        if let Some(val) = part.strip_prefix("phase=") {
+            phase_ms = val.parse::<u64>().unwrap_or(0);
+        } else if let Some(val) = part.strip_prefix("busy=") {
+            busy = val == "1";
+        } else if let Some(val) = part.strip_prefix("done=") {
+            done = val.parse::<usize>().ok();
+        } else if let Some(val) = part.strip_prefix("total=") {
+            total = val.parse::<usize>().ok();
+        } else if let Some(val) = part.strip_prefix("states=") {
+            states.extend(val.chars());
+        }
+    }
+    if states.is_empty() {
+        states.resize(12, 'G');
+    }
+    let total = total
+        .filter(|&t| t > 0)
+        .unwrap_or_else(|| states.iter().filter(|&&c| c != '_').count().max(1));
+    let done = done.unwrap_or_else(|| states.iter().filter(|&&c| c == 'G').count());
+    (phase_ms, busy, done, total, states)
+}
+
+/// Paint the village ground, progress state bar, paths, synergy connectors, gardens, and buildings.
+///
+/// When no station is actively transitioning (`'W'`), the entire village layout and every building,
+/// garden, path, bridge, lantern garland, and plaza fountain is 100% invariant with respect to
+/// `phase_ms`—only changing when the system state configuration (`states`) changes.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn paint_rainbow_kitty_village(
+pub(crate) fn paint_rainbow_kitty_village_architecture(
     prims: &mut Vec<DrawPrim>,
     x: f32,
     y: f32,
@@ -333,26 +367,12 @@ pub(crate) fn paint_rainbow_kitty_village(
     h: f32,
     sky: [u8; 3],
     rim: [u8; 3],
-    spec: &str,
+    phase_ms: u64,
+    busy: bool,
+    done: usize,
+    total: usize,
+    states: &[char],
 ) {
-    paint_rainbow_banner(prims, x, y, w, h, sky, rim);
-    if w <= 40.0 || h <= 20.0 {
-        return;
-    }
-    let mut phase_ms = 0u64;
-    let mut busy = false;
-    let mut states = ['G'; 12];
-    for part in spec.split(';') {
-        if let Some(val) = part.strip_prefix("phase=") {
-            phase_ms = val.parse::<u64>().unwrap_or(0);
-        } else if let Some(val) = part.strip_prefix("busy=") {
-            busy = val == "1";
-        } else if let Some(val) = part.strip_prefix("states=") {
-            for (idx, ch) in val.chars().take(12).enumerate() {
-                states[idx] = ch;
-            }
-        }
-    }
     let dark_sky = crate::native_appearance::surface_is_dark(sky);
     let stripes = [
         BLOB_CORAL,
@@ -362,51 +382,230 @@ pub(crate) fn paint_rainbow_kitty_village(
         BLOB_COBALT,
         BLOB_VIOLET,
     ];
-    prims.push(DrawPrim::ClipPush { x, y, w, h });
-
+    let n = states.len().max(1);
     let ground_h = (h * 0.16).clamp(5.0, 9.0);
     let ground_y = y + h - ground_h;
+    let track_w = (w - 8.0).max(1.0);
+
+    // Base meadow & path bed.
     prims.push(DrawPrim::Panel {
         x: x + 4.0,
         y: ground_y,
-        w: (w - 8.0).max(1.0),
+        w: track_w,
         h: ground_h,
         radius: ground_h * 0.45,
         fill: rgba(rim, if dark_sky { 0xD8 } else { 0xB8 }),
     });
-    let roller_step = 18.0_f32;
-    let speed = if busy { 0.045 } else { 0.015 };
-    let roller_shift = ((phase_ms as f32 * speed) % roller_step).max(0.0);
-    let mut rx = x + 8.0 + roller_shift;
-    let mut r_idx = 0usize;
-    while rx < x + w - 8.0 {
-        let c = stripes[r_idx % stripes.len()];
-        prims.push(DrawPrim::Dot {
-            cx: rx,
-            cy: ground_y + ground_h * 0.5,
-            r: (ground_h * 0.28).max(1.4),
-            color: rgba(c, if dark_sky { 0xE0 } else { 0xC8 }),
+
+    // Progress state bar fill inside the village ground: advances as stations transition D -> W -> G.
+    let assembling = states.iter().filter(|&&c| c == 'W').count();
+    let progress =
+        ((done as f32 + assembling as f32 * 0.45) / (total.max(1) as f32)).clamp(0.0, 1.0);
+    if progress > 0.0 {
+        let fill_w = (track_w * progress).max(ground_h);
+        prims.push(DrawPrim::Panel {
+            x: x + 4.0,
+            y: ground_y + 1.0,
+            w: fill_w.min(track_w),
+            h: (ground_h - 2.0).max(2.0),
+            radius: (ground_h - 2.0).max(2.0) * 0.45,
+            fill: rgba(
+                crate::native_appearance::mix_srgb(BLOB_LEAF, RAINBOW_TEAL, 0.45),
+                if dark_sky { 0xB8 } else { 0x98 },
+            ),
         });
-        rx += roller_step;
-        r_idx += 1;
+    }
+
+    // Static cobblestone stepping stones along the village path (never jittering on phase_ms).
+    let stone_step = 16.0_f32;
+    let mut sx = x + 10.0;
+    let mut s_idx = 0usize;
+    while sx < x + w - 10.0 {
+        let c = stripes[s_idx % stripes.len()];
+        prims.push(DrawPrim::Dot {
+            cx: sx,
+            cy: ground_y + ground_h * 0.5,
+            r: (ground_h * 0.24).max(1.2),
+            color: rgba(c, if dark_sky { 0xC8 } else { 0xA8 }),
+        });
+        sx += stone_step;
+        s_idx += 1;
     }
 
     let pad_x = 14.0_f32;
     let usable_w = (w - pad_x * 2.0).max(48.0);
-    let slot_w = usable_w / 12.0;
-    let house_w = (slot_w * 0.62).clamp(8.0, 22.0);
+    let slot_w = usable_w / (n as f32);
+    let house_w = (slot_w * 0.62).clamp(6.0, 22.0);
     let max_house_h = (h - ground_h - 12.0).clamp(10.0, 22.0);
 
+    // 1. Paint inter-building paths, gardens, and neighbor/district synergies first.
+    for i in 0..n.saturating_sub(1) {
+        let s_left = states[i];
+        let s_right = states[i + 1];
+        let cx_left = x + pad_x + (i as f32 + 0.5) * slot_w;
+        let cx_right = x + pad_x + ((i + 1) as f32 + 0.5) * slot_w;
+        let mid_x = (cx_left + cx_right) * 0.5;
+        let gap_left = cx_left + house_w * 0.48;
+        let gap_right = cx_right - house_w * 0.48;
+        let gap_w = (gap_right - gap_left).max(2.0);
+
+        if s_left == 'G' && s_right == 'G' {
+            // Connected golden cobblestone path linking two verified neighbor houses.
+            prims.push(DrawPrim::Panel {
+                x: cx_left,
+                y: ground_y - 1.5,
+                w: (cx_right - cx_left).max(2.0),
+                h: 2.6,
+                radius: 1.2,
+                fill: rgba(BLOB_MARIGOLD, if dark_sky { 0xE4 } else { 0xCC }),
+            });
+
+            // Tri-house district synergy: blooming courtyard tree behind a 3-house verified cluster.
+            if i >= 1 && states[i - 1] == 'G' {
+                let trunk_h = (max_house_h * 0.48).clamp(5.0, 11.0);
+                prims.push(DrawPrim::Panel {
+                    x: mid_x - 1.0,
+                    y: ground_y - trunk_h,
+                    w: 2.0,
+                    h: trunk_h,
+                    radius: 0.8,
+                    fill: rgba(BLOB_MARIGOLD, 0xD0),
+                });
+                let crown_y = ground_y - trunk_h - 1.5;
+                prims.push(DrawPrim::Dot {
+                    cx: mid_x,
+                    cy: crown_y,
+                    r: (house_w * 0.24).clamp(2.2, 4.2),
+                    color: rgba(BLOB_LEAF, 0xEC),
+                });
+                prims.push(DrawPrim::Dot {
+                    cx: mid_x - 1.4,
+                    cy: crown_y - 0.8,
+                    r: 1.2,
+                    color: rgba(BLOB_CORAL, 0xF8),
+                });
+            }
+
+            // Pairwise synergy connector between adjacent verified houses.
+            match i % 3 {
+                0 => {
+                    // Synergy 0: Shared botanical garden hedge, blossoms, and vine pergola arch.
+                    let garden_h = (max_house_h * 0.22).clamp(2.6, 4.8);
+                    prims.push(DrawPrim::Panel {
+                        x: gap_left,
+                        y: ground_y - garden_h,
+                        w: gap_w,
+                        h: garden_h,
+                        radius: 1.6,
+                        fill: rgba(BLOB_LEAF, 0xEA),
+                    });
+                    for (f_idx, frac) in [0.25_f32, 0.5, 0.75].into_iter().enumerate() {
+                        prims.push(DrawPrim::Dot {
+                            cx: gap_left + gap_w * frac,
+                            cy: ground_y - garden_h - 0.8,
+                            r: 1.3,
+                            color: rgba(stripes[(i + f_idx + 1) % stripes.len()], 0xFA),
+                        });
+                    }
+                    prims.push(DrawPrim::Stroke {
+                        x: gap_left,
+                        y: ground_y - max_house_h * 0.62,
+                        w: gap_w,
+                        h: max_house_h * 0.42,
+                        radius: (gap_w * 0.45).max(2.0),
+                        width: 1.1,
+                        color: rgba(BLOB_LEAF, 0xD8),
+                    });
+                }
+                1 => {
+                    // Synergy 1: Arched kitty skybridge connecting upper stories.
+                    let bridge_y = ground_y - max_house_h * 0.52;
+                    prims.push(DrawPrim::Panel {
+                        x: gap_left - 1.0,
+                        y: bridge_y,
+                        w: gap_w + 2.0,
+                        h: 2.2,
+                        radius: 1.0,
+                        fill: rgba(RAINBOW_TEAL, 0xE6),
+                    });
+                    prims.push(DrawPrim::Stroke {
+                        x: gap_left,
+                        y: bridge_y - 3.2,
+                        w: gap_w,
+                        h: 3.4,
+                        radius: 2.0,
+                        width: 1.0,
+                        color: rgba(BLOB_MARIGOLD, 0xDC),
+                    });
+                    prims.push(DrawPrim::Dot {
+                        cx: mid_x,
+                        cy: bridge_y - 3.8,
+                        r: 1.4,
+                        color: rgba(BLOB_MARIGOLD, 0xFA),
+                    });
+                }
+                _ => {
+                    // Synergy 2: Overhead festival lantern garland & courtyard plaza fountain.
+                    let cord_y = ground_y - max_house_h * 0.74;
+                    for (l_idx, frac) in [0.25_f32, 0.5, 0.75].into_iter().enumerate() {
+                        let sag = if l_idx == 1 { 1.6 } else { 0.6 };
+                        prims.push(DrawPrim::Dot {
+                            cx: gap_left + gap_w * frac,
+                            cy: cord_y + sag,
+                            r: 1.35,
+                            color: rgba(stripes[(i + l_idx) % stripes.len()], 0xF6),
+                        });
+                    }
+                    let basin_w = (gap_w * 0.68).clamp(3.0, 9.0);
+                    prims.push(DrawPrim::Panel {
+                        x: mid_x - basin_w * 0.5,
+                        y: ground_y - 3.2,
+                        w: basin_w,
+                        h: 3.2,
+                        radius: 1.4,
+                        fill: rgba(RAINBOW_TEAL, 0xEA),
+                    });
+                    prims.push(DrawPrim::Dot {
+                        cx: mid_x,
+                        cy: ground_y - 4.8,
+                        r: 1.5,
+                        color: rgba(BLOB_COBALT, 0xF2),
+                    });
+                }
+            }
+        } else if (s_left == 'G' && s_right == 'W') || (s_left == 'W' && s_right == 'G') {
+            // Emerging stepping-stone path between a completed house and an assembling neighbor.
+            for frac in [0.3_f32, 0.65] {
+                prims.push(DrawPrim::Dot {
+                    cx: gap_left + gap_w * frac,
+                    cy: ground_y - 0.8,
+                    r: 1.1,
+                    color: rgba(BLOB_MARIGOLD, 0xB8),
+                });
+            }
+        }
+    }
+
+    // 2. Paint each station's building archetype and side garden.
     for (i, state) in states.iter().copied().enumerate() {
         let hue = stripes[i % stripes.len()];
         let cx = x + pad_x + (i as f32 + 0.5) * slot_w;
-        let pulse = ((phase_ms as f32 * 0.008 + i as f32 * 0.7).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
+        // Archetype height variation is deterministic by station index, never pulsing when stable.
+        let archetype = i % 6;
+        let arch_tallness = match archetype {
+            0 => 0.96, // Observatory Dome
+            1 => 0.90, // Artisan Forge Workshop
+            2 => 0.86, // Cozy Bakery & Cafe
+            3 => 1.00, // Clocktower Library
+            4 => 0.94, // Zen Pagoda Dojo
+            _ => 0.92, // Botanical Glass Greenhouse
+        };
         let build_scale = match state {
-            'G' => 1.0,
-            'W' => 0.58 + 0.28 * pulse,
-            'D' => 0.45,
-            'E' => 0.75,
-            _ => 0.30,
+            'G' => arch_tallness,
+            'W' => 0.68 * arch_tallness,
+            'D' => 0.42,
+            'E' => 0.76,
+            _ => 0.28,
         };
         let hh = (max_house_h * build_scale).max(5.0);
         let hx = cx - house_w * 0.5;
@@ -414,25 +613,26 @@ pub(crate) fn paint_rainbow_kitty_village(
         let body_alpha = match state {
             'G' => {
                 if dark_sky {
-                    0xEC
+                    0xF0
                 } else {
-                    0xDC
+                    0xE2
                 }
             }
             'W' => {
                 if dark_sky {
-                    0xC8
+                    0xCC
                 } else {
-                    0xB4
+                    0xB8
                 }
             }
-            'E' => 0xE0,
-            'D' => 0x78,
-            _ => 0x42,
+            'E' => 0xE6,
+            'D' => 0x7E,
+            _ => 0x44,
         };
         let body_color = if state == 'E' { BLOB_CORAL } else { hue };
 
         if matches!(state, 'G' | 'W' | 'E') {
+            // Main building wall.
             prims.push(DrawPrim::Panel {
                 x: hx,
                 y: hy + hh * 0.28,
@@ -441,18 +641,19 @@ pub(crate) fn paint_rainbow_kitty_village(
                 radius: 3.0,
                 fill: rgba(body_color, body_alpha),
             });
+            // Roof eave / cornice.
+            let roof_color =
+                crate::native_appearance::mix_srgb(body_color, [0xFF, 0xFF, 0xFF], 0.24);
             prims.push(DrawPrim::Panel {
                 x: hx - 1.5,
                 y: hy + hh * 0.16,
                 w: house_w + 3.0,
                 h: (hh * 0.22).max(2.5),
                 radius: 2.0,
-                fill: rgba(
-                    crate::native_appearance::mix_srgb(body_color, [0xFF, 0xFF, 0xFF], 0.22),
-                    body_alpha,
-                ),
+                fill: rgba(roof_color, body_alpha),
             });
-            let ear_r = (house_w * 0.16).clamp(1.6, 3.2);
+            // Signature kitty-ear roof finials.
+            let ear_r = (house_w * 0.16).clamp(1.5, 3.1);
             for ex in [hx + ear_r * 1.1, hx + house_w - ear_r * 1.1] {
                 prims.push(DrawPrim::Dot {
                     cx: ex,
@@ -461,12 +662,97 @@ pub(crate) fn paint_rainbow_kitty_village(
                     color: rgba(body_color, body_alpha),
                 });
             }
-            if hh >= 10.0 {
+
+            // Distinct architectural crowning details per archetype.
+            match archetype {
+                0 => {
+                    // Observatory dome + star-gazing telescope.
+                    prims.push(DrawPrim::Dot {
+                        cx,
+                        cy: hy + hh * 0.12,
+                        r: (house_w * 0.26).clamp(2.0, 4.4),
+                        color: rgba(RAINBOW_TEAL, body_alpha),
+                    });
+                    prims.push(DrawPrim::Panel {
+                        x: cx + 1.0,
+                        y: hy - 1.5,
+                        w: (house_w * 0.28).clamp(2.2, 4.5),
+                        h: 1.8,
+                        radius: 0.8,
+                        fill: rgba(BLOB_MARIGOLD, body_alpha),
+                    });
+                }
+                1 => {
+                    // Forge chimney stack + anvil hearth glow.
+                    prims.push(DrawPrim::Panel {
+                        x: hx + house_w * 0.68,
+                        y: hy - 2.0,
+                        w: (house_w * 0.20).clamp(2.0, 3.6),
+                        h: hh * 0.28,
+                        radius: 1.0,
+                        fill: rgba(BLOB_CORAL, body_alpha),
+                    });
+                }
+                2 => {
+                    // Cozy Bakery striped cafe awning over the front window.
+                    prims.push(DrawPrim::Panel {
+                        x: hx - 1.0,
+                        y: hy + hh * 0.44,
+                        w: house_w + 2.0,
+                        h: (hh * 0.16).clamp(2.0, 3.4),
+                        radius: 1.4,
+                        fill: rgba(BLOB_MARIGOLD, body_alpha),
+                    });
+                }
+                3 => {
+                    // Clocktower Library central spire & clock roundel.
+                    prims.push(DrawPrim::Panel {
+                        x: cx - 1.1,
+                        y: hy - 2.8,
+                        w: 2.2,
+                        h: hh * 0.26,
+                        radius: 1.0,
+                        fill: rgba(roof_color, body_alpha),
+                    });
+                    prims.push(DrawPrim::Dot {
+                        cx,
+                        cy: hy + hh * 0.27,
+                        r: (house_w * 0.15).clamp(1.4, 2.6),
+                        color: rgba([0xFF, 0xFA, 0xE8], body_alpha),
+                    });
+                }
+                4 => {
+                    // Zen Pagoda upper tier eave.
+                    prims.push(DrawPrim::Panel {
+                        x: hx + house_w * 0.12,
+                        y: hy + hh * 0.02,
+                        w: house_w * 0.76,
+                        h: (hh * 0.16).max(2.0),
+                        radius: 1.6,
+                        fill: rgba(roof_color, body_alpha),
+                    });
+                }
+                _ => {
+                    // Botanical Greenhouse crystal skylight frame.
+                    prims.push(DrawPrim::Stroke {
+                        x: hx + house_w * 0.14,
+                        y: hy + hh * 0.04,
+                        w: house_w * 0.72,
+                        h: hh * 0.22,
+                        radius: 2.0,
+                        width: 1.0,
+                        color: rgba(RAINBOW_TEAL, body_alpha),
+                    });
+                }
+            }
+
+            // Windows and cozy doorway.
+            if hh >= 9.0 {
                 let win_w = (house_w * 0.34).clamp(2.5, 6.0);
-                let win_h = (hh * 0.28).clamp(2.5, 5.5);
+                let win_h = (hh * 0.24).clamp(2.2, 5.0);
                 prims.push(DrawPrim::Panel {
                     x: cx - win_w * 0.5,
-                    y: hy + hh * 0.48,
+                    y: hy + hh * 0.46,
                     w: win_w,
                     h: win_h,
                     radius: 1.2,
@@ -479,20 +765,64 @@ pub(crate) fn paint_rainbow_kitty_village(
                         if state == 'G' { 0xF8 } else { 0xB8 },
                     ),
                 });
+                let door_w = (house_w * 0.24).clamp(2.0, 4.2);
+                let door_h = (hh * 0.24).clamp(2.4, 4.8);
+                prims.push(DrawPrim::Panel {
+                    x: cx - door_w * 0.5,
+                    y: ground_y - door_h,
+                    w: door_w,
+                    h: door_h,
+                    radius: 1.0,
+                    fill: rgba(
+                        crate::native_appearance::mix_srgb(body_color, [0x1A, 0x16, 0x22], 0.48),
+                        body_alpha,
+                    ),
+                });
             }
-            if state == 'G' || (state == 'W' && busy) {
-                let puff_phase =
-                    ((phase_ms as f32 * 0.004 + i as f32 * 0.31) % 1.0).clamp(0.0, 1.0);
+
+            if state == 'G' {
+                // Completed station side flower planter box (100% static when state is 'G').
+                let planter_w = (house_w * 0.28).clamp(2.4, 4.8);
+                let planter_x = hx + house_w - planter_w * 0.35;
+                prims.push(DrawPrim::Panel {
+                    x: planter_x,
+                    y: ground_y - 2.6,
+                    w: planter_w,
+                    h: 2.6,
+                    radius: 1.0,
+                    fill: rgba(BLOB_LEAF, 0xF0),
+                });
+                prims.push(DrawPrim::Dot {
+                    cx: planter_x + planter_w * 0.5,
+                    cy: ground_y - 3.4,
+                    r: 1.25,
+                    color: rgba(stripes[(i + 2) % stripes.len()], 0xFC),
+                });
+            } else if state == 'W' {
+                // Assembling station: timber scaffolding + animated crane boom & rising puff.
+                prims.push(DrawPrim::Stroke {
+                    x: hx - 1.2,
+                    y: hy + hh * 0.14,
+                    w: house_w + 2.4,
+                    h: hh * 0.86,
+                    radius: 2.0,
+                    width: 1.0,
+                    color: rgba(BLOB_MARIGOLD, 0xD8),
+                });
+                let puff_phase = (((phase_ms % 86_400_000) as f64 * 0.004 + i as f64 * 0.31)
+                    .rem_euclid(1.0) as f32)
+                    .clamp(0.0, 1.0);
                 let puff_y = (hy - 2.0 - puff_phase * 6.0).max(y + 2.5);
                 let puff_a = ((1.0 - puff_phase) * 210.0) as u8;
                 prims.push(DrawPrim::Dot {
                     cx: cx + house_w * 0.22,
                     cy: puff_y,
                     r: 1.6 + puff_phase * 1.1,
-                    color: rgba(if state == 'W' { BLOB_MARIGOLD } else { hue }, puff_a),
+                    color: rgba(BLOB_MARIGOLD, puff_a),
                 });
             }
-        } else {
+        } else if state == 'D' {
+            // Pending / drift station: blueprint foundation outline & corner surveyor stakes.
             prims.push(DrawPrim::Stroke {
                 x: hx,
                 y: hy + hh * 0.25,
@@ -502,23 +832,62 @@ pub(crate) fn paint_rainbow_kitty_village(
                 width: 1.0,
                 color: rgba(body_color, body_alpha),
             });
+            for stake_x in [hx + 1.0, hx + house_w - 1.8] {
+                prims.push(DrawPrim::Panel {
+                    x: stake_x,
+                    y: ground_y - 3.5,
+                    w: 1.2,
+                    h: 3.5,
+                    radius: 0.5,
+                    fill: rgba(BLOB_MARIGOLD, 0xA8),
+                });
+            }
+        } else {
+            // Skipped station ('_'): quiet low garden stone along the path.
+            prims.push(DrawPrim::Stroke {
+                x: hx,
+                y: hy + hh * 0.45,
+                w: house_w,
+                h: hh * 0.55,
+                radius: 2.0,
+                width: 1.0,
+                color: rgba(body_color, body_alpha),
+            });
         }
+        let _ = busy;
     }
+}
 
+/// Paint the wandering village kitties that stroll along paths and visit gardens.
+pub(crate) fn paint_rainbow_kitty_village_kitties(
+    prims: &mut Vec<DrawPrim>,
+    x: f32,
+    w: f32,
+    ground_y: f32,
+    phase_ms: u64,
+    busy: bool,
+) {
     let kitty_colors: [[u8; 3]; 4] = [BLOB_CORAL, BLOB_MARIGOLD, RAINBOW_TEAL, BLOB_VIOLET];
-    let kitty_speed = if busy { 0.055 } else { 0.018 };
+    let kitty_speed = if busy { 0.052_f64 } else { 0.018_f64 };
     let path_w = (w - 36.0).max(24.0);
+    let path_w64 = f64::from(path_w);
+    let phase_f64 = (phase_ms % 604_800_000) as f64;
     for (k, &kcol) in kitty_colors.iter().enumerate() {
-        let raw = (phase_ms as f32 * kitty_speed + (k as f32) * (path_w * 0.27)) % (path_w * 2.0);
+        let kf = k as f64;
+        // Gentle garden-sniffing pause modulation as kitties stroll between village houses.
+        let stroll = phase_f64 * kitty_speed
+            + (phase_f64 * 0.003 + kf * 1.9).sin() * 4.5
+            + kf * (path_w64 * 0.27);
+        let raw = stroll.rem_euclid(path_w64 * 2.0) as f32;
         let (kx, dir) = if raw <= path_w {
             (x + 18.0 + raw, 1.0_f32)
         } else {
             (x + 18.0 + (path_w * 2.0 - raw), -1.0_f32)
         };
-        let hop = ((phase_ms as f32 * (if busy { 0.022 } else { 0.009 }) + k as f32 * 1.7)
+        let hop = (((phase_f64 * (if busy { 0.022 } else { 0.009 }) + kf * 1.7)
             .sin()
             .abs())
-            * (if busy { 3.2 } else { 1.4 });
+            * (if busy { 3.0 } else { 1.3 })) as f32;
         let ky = ground_y - 4.2 - hop;
         let coat = crate::native_appearance::mix_srgb(kcol, [0xFF, 0xFF, 0xFF], 0.28);
 
@@ -558,7 +927,7 @@ pub(crate) fn paint_rainbow_kitty_village(
             r: 0.75,
             color: rgba(BLOB_CORAL, 0xFF),
         });
-        let wag = (phase_ms as f32 * 0.016 + k as f32).sin() * 1.8;
+        let wag = ((phase_f64 * 0.016 + kf).sin() * 1.8) as f32;
         prims.push(DrawPrim::Dot {
             cx: kx - dir * 5.6,
             cy: ky - 1.8 + wag * 0.5,
@@ -572,7 +941,33 @@ pub(crate) fn paint_rainbow_kitty_village(
             color: rgba(kcol, 0xE8),
         });
     }
+}
 
+/// The System State animated hero.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn paint_rainbow_kitty_village(
+    prims: &mut Vec<DrawPrim>,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    sky: [u8; 3],
+    rim: [u8; 3],
+    spec: &str,
+) {
+    paint_rainbow_banner(prims, x, y, w, h, sky, rim);
+    if w <= 40.0 || h <= 20.0 {
+        return;
+    }
+    let (phase_ms, busy, done, total, states) = parse_rainbow_kitty_village_spec(spec);
+    let ground_h = (h * 0.16).clamp(5.0, 9.0);
+    let ground_y = y + h - ground_h;
+
+    prims.push(DrawPrim::ClipPush { x, y, w, h });
+    paint_rainbow_kitty_village_architecture(
+        prims, x, y, w, h, sky, rim, phase_ms, busy, done, total, &states,
+    );
+    paint_rainbow_kitty_village_kitties(prims, x, w, ground_y, phase_ms, busy);
     prims.push(DrawPrim::ClipPop);
 }
 
@@ -724,5 +1119,25 @@ mod tests {
             SettingsState::display_value(&custom),
             "future multi word value"
         );
+    }
+
+    #[test]
+    fn rainbow_kitty_village_preserves_smooth_motion_at_large_phase_ms() {
+        let mut prims_a = Vec::new();
+        let mut prims_b = Vec::new();
+        let mut prims_max = Vec::new();
+        paint_rainbow_kitty_village_kitties(&mut prims_a, 10.0, 320.0, 50.0, 100_000_000, false);
+        paint_rainbow_kitty_village_kitties(&mut prims_b, 10.0, 320.0, 50.0, 100_000_120, false);
+        paint_rainbow_kitty_village_kitties(&mut prims_max, 10.0, 320.0, 50.0, u64::MAX, true);
+        assert_ne!(
+            format!("{prims_a:?}"),
+            format!("{prims_b:?}"),
+            "kitties continue moving smoothly past 2^24 ms"
+        );
+        for p in &prims_max {
+            if let DrawPrim::Dot { cx, cy, r, .. } = p {
+                assert!(cx.is_finite() && cy.is_finite() && r.is_finite());
+            }
+        }
     }
 }

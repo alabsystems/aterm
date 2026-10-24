@@ -52,6 +52,16 @@ impl<C: Ctl> Session<'_, C> {
         })
     }
 
+    /// The hosted loop is ending specifically to hand its badges to a successor.
+    pub(super) fn handing_over(&self) -> bool {
+        self.stopped()
+            && self
+                .fx
+                .raised(super::super::tape::doors::RAISED_HANDOVER, || {
+                    self.setup.handover.raised()
+                })
+    }
+
     /// Record the session's working directory from a bare `meta` reply (`cwd=<pct>`; `-` is unknown).
     pub(super) fn note_cwd(&mut self, meta: &str) {
         let Some(line) = meta.lines().find(|l| crate::is_ok_reply(l)) else {
@@ -285,13 +295,14 @@ impl<C: Ctl> Session<'_, C> {
                 .and_then(|n| n.parse::<usize>().ok())
                 .is_some_and(|n| n > 1);
             if hidden {
-                let owner = format!("owner={ATTENTION_OWNER}");
-                let r = self.call(&["meta", "unset", "attention", &owner])?;
-                review.note(&format!(
-                    "CLEARED seq=- {CLEARED_HIDDEN} attention={} (an entry of ours may sit \
-                     under another owner's)",
-                    reply_word(&r)
-                ));
+                let said = self.clear_attention_entry()?;
+                if self.attention_pending {
+                    review.note(&format!(
+                        "SKIPPED seq=- {CLEARED_HIDDEN} attention={said}; take-down still owed"
+                    ));
+                } else {
+                    review.note(&format!("CLEARED seq=- {CLEARED_HIDDEN} attention={said} (an entry of ours may sit under another owner's)"));
+                }
             }
             return Ok(());
         }
@@ -325,12 +336,14 @@ impl<C: Ctl> Session<'_, C> {
             self.attention_ours = Some(text.clone());
             review.note(&format!("{ADOPTED} seq={seq} attention={}", clip(&text)));
         } else {
-            let owner = format!("owner={ATTENTION_OWNER}");
-            let r = self.call(&["meta", "unset", "attention", &owner])?;
-            review.note(&format!(
-                "CLEARED seq={seq} {CLEARED_STALE} attention={} (its point is not on the screen)",
-                reply_word(&r)
-            ));
+            let said = self.clear_attention_entry()?;
+            if self.attention_pending {
+                review.note(&format!(
+                    "SKIPPED seq={seq} {CLEARED_STALE} attention={said}; take-down still owed"
+                ));
+            } else {
+                review.note(&format!("CLEARED seq={seq} {CLEARED_STALE} attention={said} (its point is not on the screen)"));
+            }
         }
         Ok(())
     }
@@ -347,11 +360,10 @@ impl<C: Ctl> Session<'_, C> {
         if std::mem::take(&mut self.turn_end_badge)
             && let Ok(said) = self.unset_if_ours(|_| true)
         {
-            review.note(&format!(
-                "CLEARED seq={seq} {CLEARED_TURN_END} attention={said}"
-            ));
+            self.note_attention_clear(seq, &format!("{CLEARED_TURN_END} "), &said, review);
         }
         let _ = self.needs_down(seq, "the loop ended", review);
+        let _ = self.finish_supervisor_attention(seq, review);
         self.tell_hold_ended();
         self.release_claim();
     }
@@ -367,14 +379,13 @@ impl<C: Ctl> Session<'_, C> {
             self.lower_adopted_limit(seq, PARKED_OFF, review)?;
         }
         if std::mem::take(&mut self.turn_end_badge) {
-            let text = self.attention_ours.clone();
+            let text = self.attention_text().map(str::to_string);
             let said = self.unset_if_ours(|_| true)?;
-            review.note(&format!(
-                "CLEARED seq={seq} {CLEARED_TURN_END} attention={said}"
-            ));
+            self.note_attention_clear(seq, &format!("{CLEARED_TURN_END} "), &said, review);
             self.badge_parked = text;
         }
         self.needs_down(seq, PARKED_OFF, review)?;
+        self.finish_supervisor_attention(seq, review)?;
         Ok(())
     }
 
@@ -400,15 +411,15 @@ impl<C: Ctl> Session<'_, C> {
         if self.withhold_badge(seq, super::escalate::Escalation::Ask, review)? {
             return Ok(());
         }
-        let owner = format!("owner={ATTENTION_OWNER}");
-        let r = self.call(&["meta", "set", "attention", &owner, &text])?;
-        if r.ok() {
-            self.attention_ours = Some(text);
-            self.turn_end_badge = true;
-        }
+        self.attention_desired = Some(super::escalate::AttentionTarget::Set {
+            text,
+            kind: super::escalate::Escalation::Ask,
+        });
+        let said = self.write_attention_target()?;
+        self.turn_end_badge = true;
         review.note(&format!(
             "ESCALATED seq={seq} attention={} again={AGAIN_UNPARKED}",
-            reply_word(&r)
+            said
         ));
         Ok(())
     }
@@ -450,12 +461,7 @@ impl<C: Ctl> Session<'_, C> {
         };
         let end = self.drive(opts, &mut review);
         let end = if self.stopped() { Ok(End::Quit) } else { end };
-        let handed_over = self.stopped()
-            && self
-                .fx
-                .raised(super::super::tape::doors::RAISED_HANDOVER, || {
-                    self.setup.handover.raised()
-                });
+        let handed_over = self.handing_over();
         if handed_over {
             // The next loop adopts what this one raised: only the claim goes.
             if self.box_ask.is_some() || self.turn_end_badge || self.limit.is_some() {

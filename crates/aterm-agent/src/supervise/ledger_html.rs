@@ -104,14 +104,7 @@ pub fn render_html(l: &Ledger) -> String {
             "<tr class=\"lane-{}\"><td class=\"t\">{}</td><td>{}</td><td>{}</td>\
              <td class=\"d\">{}</td></tr>",
             i.lane.name(),
-            html_text(&match i.t {
-                None => "-".to_string(),
-                Some(t) => format!(
-                    "{}{}",
-                    if l.guessed { "~" } else { "" },
-                    stamp(t, l.tz_offset_s, dated)
-                ),
-            }),
+            html_text(&i.t.map_or_else(|| "-".to_string(), |t| stamp(t, l.tz_offset_s, dated))),
             html_text(i.lane.name()),
             html_text(&i.full),
             html_text(&i.dur)

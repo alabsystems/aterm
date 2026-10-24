@@ -84,7 +84,7 @@ aterm ctl "@$SID" blocks                # shell-integration command blocks (OSC-
 
 ```sh
 aterm ctl "@$SID" brief                  # what it did and needs, in about 600 tokens
-aterm ctl "@$SID" log class=turn         # the record: commands with exit codes, turns, steps
+aterm ctl "@$SID" log class=turn         # the record: commands with exit codes and turns (no steps)
 aterm ctl "@$SID" await log need since=<log_seq> ep=<log_ep> timeout=600000
 aterm ctl subscribe "@$SID" log          # every new record, live
 ```
@@ -107,7 +107,7 @@ aterm ctl subscribe "@$SID" log          # every new record, live
   every instance; `aterm fabric brief` reads the bridge's log mirror (on while the broker
   retains logs; `[fabric] log = "off"` opts out). The session journal (`[session_log]
   journal`, on by default; off with `restore_session = false`, on Windows and headless)
-  lets `log @<sid>` and `brief @<sid>` answer sessions of earlier aterm processes.
+  lets `@<sid> log` and `@<sid> brief` answer sessions of earlier aterm processes.
 - Pass `log_seq=` and `log_ep=` from `status` as `since=` and `ep=`, and always re-arm from
   each reply's `seq=`/`ep=` (without `since=`, `await log need` returns immediately with
   `latched=1` while a need stays open). `await log need` wakes on an approval box, question,
@@ -164,7 +164,8 @@ settle=submitted` types key by key, returns `task_rev=<n>` once the composer cle
   re-arms up to `timeout=`, default 1h).
 - `await seq <n> timeout=0` checks whether the grid changed (`seq` resets on alt-screen
   re-entry). `wait`, `await block` and `blocks` require OSC-133; on a plain shell use
-  `<cmd>; echo SENTINEL` and `await match SENTINEL`.
+  `<cmd>; echo SENTINEL` and `await match '^SENTINEL$'` (anchored: the echoed command line
+  contains it too).
 - Park at most one wait (every tab shares the slot pool; no sleep loops), and run waits >2m
   (`timeout=600000`, `await task|inbox|agent`) in the background.
 - Exit 75 means the instance vanished mid-exchange (crash, quit or self-update): locate the
@@ -178,7 +179,7 @@ settle=submitted` types key by key, returns `task_rev=<n>` once the composer cle
   and `key`. Append `hard` to refuse every other connection's `send`, `key`, `paste`, `feed`
   and `mouse` too, your own later `aterm ctl` calls included (the keyboard at the window is
   never blocked). A harness lease during a live agent upgrade clears on its own.
-- `close` closes one pane (refused while a job is running).
+- `close` closes one pane (refused while a job is running, except under `--headless`).
 
 ## `aterm drive`
 

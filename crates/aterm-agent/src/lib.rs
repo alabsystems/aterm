@@ -481,6 +481,11 @@ COMMANDS
                        `survey`, …), bare `meta` and `task`, and drive's `phase`,
                        `classify` and `ledger` without `--out` read; `meta set`,
                        `task mark`, `spawn` and `answer` write.
+                       Then refuses a read of a path the default secret list names
+                       (`~/.ssh`, `~/.aws`, `.env`, `*.pem`, `id_rsa*`, `credentials*`,
+                       `~/.config/gh`, `~/Library`, …, under this shell's HOME), but not
+                       a pattern, a filter or a file `ls`/`wc` only lists or measures:
+                       `not-read-only a read of a secret (<rule>) …`.
     phase [@sid] [--allow-python GLOB]...
                        Read @sid (default: the active tab) once with its program's reader
                        (`status program=`, else the screen) and print its phase,
@@ -524,7 +529,6 @@ COMMANDS
                          `REFUSED @sid <why>` (exit 2, nothing typed)
                          `NOT-SERVED @sid <why> (enters=<k>)` (exit 3)
     ledger [@sid] [--journal FILE] [--since TIME] [--format text|md|html] [--out PATH]
-           [--source log|anchor]
                        @sid's run on one time axis, joined from its `history` (turns),
                        reply sizes (`offscreen`), the window's journal (`--journal FILE`:
                        `<state>/drive/<sid>.journal.jsonl`) and fabric mail (`@self`'s
@@ -536,15 +540,11 @@ COMMANDS
                        `open_ledger` (⇧⌘L, Ctrl+Shift+L) opens the focused tab's HTML page.
                        `--since TIME` keeps what happened from TIME on: Unix ms or
                        `YYYY-MM-DD[THH:MM[:SS]][Z|±HH:MM]`.
-                       `--source log` (default) places turns and mail by the session
-                       log's own records: a turn by its record's time, joined by
-                       `ledger=`, a message by its `mail` mark, joined by `inbox=`; one
-                       the log no longer holds has no time, and is counted.
-                       `--source anchor` is deprecated, kept until the release after the
-                       one that ships the log default and removed then: it places turns
-                       and mail (`@self`'s `timeline`) by the instance's clock, anchored
-                       at its control socket's birth (`~` marks a time it could not
-                       place; turns carried from an earlier aterm have none).
+                       The session log's own records place turns and mail: a turn by its
+                       record's time, joined by `ledger=`, a message by its `mail` mark,
+                       joined by `inbox=`; one the log no longer holds has no time, and is
+                       counted. `--source log` is accepted and changes nothing; `--source
+                       anchor` (the clock anchor) was removed on 2026-10-23.
                        No @sid: the one session `--journal` names.
     tape cat FILE [--text] [--salvage] | tape show FILE --decisions [--salvage]
     tape stats FILE [--salvage]

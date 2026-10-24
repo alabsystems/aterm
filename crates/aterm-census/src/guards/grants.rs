@@ -1,27 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! prompt-grant: a `PromptGrant`, the token every typed occupancy line needs, is minted from the
-//! owner's configured policy alone, and asked for only where the loop writes.
+//! Census guard ensuring `PromptGrant` is minted only from configured policy.
 
 use super::rules::{CENSUS_CRATE, PRODUCT, test_path};
 use super::{Bound, Finding, Rule, Tree, after_ws, calls, has, hits};
 
-/// The grant's home: its type, its sealed field and its one mint, `Occupancy::grant`.
 const HOME: &str = "crates/aterm-agent/src/supervise/config.rs";
-/// The mint's crate. The mint is crate-private, so the compiler refuses a grant asked anywhere
-/// else; inside it, a file that names a mode or the grant has every `grant(` call fenced, a
-/// variable's and a wrapped chain's too.
 const MINT_CRATE: &str = "crates/aterm-agent/";
-/// The loop's writers, the files that may ask the configured policy for a grant
-/// (`cfg.occupancy.grant()`): the door's break write and the turn-end loop's typed fact.
 const WRITERS: &[&str] = &[
     "crates/aterm-agent/src/supervise/occupancy_loop.rs",
     "crates/aterm-agent/src/supervise/turn_end_loop.rs",
 ];
-/// A writer file of the door's own beside them (`occupancy_door*.rs` in the loop's directory).
 const DOOR_FILES: &str = "crates/aterm-agent/src/supervise/occupancy_door";
-/// The grant's type.
 const GRANT: &str = "PromptGrant";
 
 pub(super) const PROMPT_GRANT: Rule = Rule {
@@ -68,26 +59,19 @@ fn prompt_grant(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     }
 }
 
-/// Whether a line (CODE view) names the grant's type before a brace: a struct literal, or a block
-/// of its own.
 fn builds_the_type(code: &str) -> bool {
     hits(code, GRANT, Bound::Word).any(|at| after_ws(&code[at + GRANT.len()..], "{").is_some())
 }
 
-/// Whether a line (CODE view) calls `grant` on what names an occupancy mode or the grant: a
-/// policy's `occupancy`, an `Occupancy` value or path (`Occupancy::grant(mode)`), a `PromptGrant`.
 fn asks_a_mode(code: &str) -> bool {
     calls_grant(code)
         && (code.to_ascii_lowercase().contains("occupancy") || has(code, GRANT, Bound::Word))
 }
 
-/// Whether a line (CODE view) calls a `grant`, as a method or a path, not declares one.
 fn calls_grant(code: &str) -> bool {
     calls(code).contains(&"grant") && !has(code, "fn grant", Bound::Word)
 }
 
-/// Whether a line (CODE view) declares a fn other crates may call that returns a `PromptGrant`:
-/// `pub` with no scope of its own.
 fn hands_one_out(code: &str) -> bool {
     hits(code, "fn", Bound::Word).any(|at| {
         let vis = &code[..at];
@@ -104,15 +88,6 @@ mod tests {
     use super::super::tests::{run, spots};
     use super::*;
 
-    /// THE GRANT IS MINTED FROM CONFIGURED POLICY ALONE: a planted `Occupancy::Prompt.grant()`, a
-    /// `PromptGrant { … }` and a policy's grant asked in a GUI file are each found (a file that
-    /// names no `PromptGrant` too, `Occupancy::grant(mode)` too), and so is a literal mint in
-    /// config.rs itself, or a `pub` fn there that hands a grant out. In the mint's own crate a
-    /// file that names a mode has a variable's grant and a wrapped chain's found. NEGATIVE
-    /// CONTROLS: the same plants under a test path, in an inline test module, in a comment or a
-    /// literal are not; config.rs builds its type and keeps its mint crate-private, and the
-    /// loop's writers ask `cfg.occupancy.grant()`, wrapped or not; another type's `grant()` (the
-    /// debugger row's) is no mode's, in the mint's crate too.
     #[test]
     fn a_grant_is_minted_from_configured_policy_alone() {
         let plants = "fn a() { let g = Occupancy::Prompt.grant(); }\n\

@@ -147,17 +147,20 @@ impl FxAtlasKind {
     }
 }
 
-/// One shelf of a [`ShelfPack`]: its top, its height, and the next free x.
-#[derive(Clone, Copy, Debug)]
+/// One shelf of a [`ShelfPack`]: its top, its height, and its free columns.
+#[derive(Clone, Debug)]
 struct Shelf {
     y: u32,
     h: u32,
-    x: u32,
+    /// The free `[x0, x1)` column spans, sorted, disjoint and never adjacent
+    /// (a release merges a span into its neighbours).
+    free: Vec<(u32, u32)>,
 }
 
 /// A best-fit shelf packer over a `side × side` square. No gutter: the
 /// fragment reads texels by integer address, never filtered, so a neighbour's
-/// texel is never sampled.
+/// texel is never sampled. A released region's columns go back to its shelf,
+/// and the trailing shelves left wholly free go back to the square.
 #[derive(Debug, Default)]
 struct ShelfPack {
     side: u32,
@@ -175,21 +178,28 @@ impl ShelfPack {
         }
     }
 
-    /// Place a `w × h` region: on the lowest shelf tall enough with room, else
-    /// on a new shelf, else `None`.
+    /// Place a `w × h` region: on the lowest shelf tall enough with room (in
+    /// its leftmost free span wide enough), else on a new shelf, else `None`.
     fn place(&mut self, w: u32, h: u32) -> Option<(u32, u32)> {
         let side = self.side;
-        let mut best: Option<usize> = None;
+        let mut best: Option<(usize, usize)> = None;
         for (i, s) in self.shelves.iter().enumerate() {
-            if s.h >= h && s.x + w <= side && best.is_none_or(|b| s.h < self.shelves[b].h) {
-                best = Some(i);
+            if s.h < h || best.is_some_and(|(b, _)| self.shelves[b].h <= s.h) {
+                continue;
+            }
+            if let Some(k) = s.free.iter().position(|&(x0, x1)| x1 - x0 >= w) {
+                best = Some((i, k));
             }
         }
-        if let Some(i) = best {
+        if let Some((i, k)) = best {
             let s = &mut self.shelves[i];
-            let at = (s.x, s.y);
-            s.x += w;
-            return Some(at);
+            let (x0, x1) = s.free[k];
+            if x0 + w == x1 {
+                s.free.remove(k);
+            } else {
+                s.free[k].0 = x0 + w;
+            }
+            return Some((x0, s.y));
         }
         if w > side || self.bottom + h > side {
             return None;
@@ -198,14 +208,68 @@ impl ShelfPack {
         self.shelves.push(Shelf {
             y: self.bottom,
             h,
-            x: w,
+            free: if w < side {
+                vec![(w, side)]
+            } else {
+                Vec::new()
+            },
         });
         self.bottom += h;
         Some(at)
     }
+
+    /// Give back the `w` columns at `x` of the shelf at `y`, then every
+    /// trailing shelf left wholly free.
+    fn release(&mut self, x: u32, y: u32, w: u32) {
+        let side = self.side;
+        let Some(s) = self.shelves.iter_mut().find(|s| s.y == y) else {
+            return;
+        };
+        let at = s.free.partition_point(|&(x0, _)| x0 < x);
+        s.free.insert(at, (x, x + w));
+        if s.free.get(at + 1).is_some_and(|&(x0, _)| x0 == x + w) {
+            s.free[at].1 = s.free[at + 1].1;
+            s.free.remove(at + 1);
+        }
+        if at > 0 && s.free[at - 1].1 == x {
+            s.free[at - 1].1 = s.free[at].1;
+            s.free.remove(at);
+        }
+        while self
+            .shelves
+            .last()
+            .is_some_and(|s| s.free.as_slice() == [(0, side)])
+        {
+            if let Some(s) = self.shelves.pop() {
+                self.bottom = s.y;
+            }
+        }
+    }
 }
 
-/// One of the two fx atlases, CPU side.
+/// One resident art: its texels, its region, the write that put it there,
+/// and the last admission that drew or prefetched it.
+#[derive(Debug)]
+struct Resident {
+    art: Arc<FxArt>,
+    region: [u16; 4],
+    seq: u64,
+    used: u64,
+}
+
+/// One of the two fx atlases, CPU side: an LRU residency over one texture.
+///
+/// An art the frame draws (or prefetches) and that is not resident takes a
+/// free region; when none is free, the least recently used run of arts no
+/// admission of this frame asked for that frees a region whole gives theirs
+/// back (eviction, [`FxAtlasSide::victims`]); when no run can make room, a
+/// new generation is minted holding the frame's arts (compaction). Every region
+/// write gets the next sequence number, and an arm's texture brings itself
+/// up to date by uploading the resident arts written after its last sync
+/// ([`sync_fx_tex`]): resident regions are disjoint, so the order of those
+/// uploads cannot matter, and an evicted region is never read again before
+/// a write puts a resident art there. A write into a region a frame in
+/// flight may read waits for those frames on Metal (`before_write`).
 #[derive(Debug)]
 pub(crate) struct FxAtlasSide {
     kind: FxAtlasKind,
@@ -213,10 +277,13 @@ pub(crate) struct FxAtlasSide {
     /// Bumped at every mint; `0` before the first (nothing resident, no
     /// texture: an arm binds a 1×1 placeholder).
     generation: u64,
-    resident: FxHashMap<u128, [u16; 4]>,
-    /// Every art of this generation in placement order: an arm's texture of
-    /// this generation holds a prefix of it ([`FxArmTex::uploaded`]).
-    log: Vec<(Arc<FxArt>, [u16; 4])>,
+    resident: FxHashMap<u128, Resident>,
+    /// The last region write's sequence number (`0`: none yet).
+    seq: u64,
+    /// The admission clock, stamped on every art an admission asks for.
+    clock: u64,
+    /// Regions given back by eviction, over the side's life.
+    evictions: u64,
     /// Prefetched arts this generation's mint could not place beside the
     /// arts the frame drew; skipped as hints until the next mint, so an
     /// overfull prefetch cannot re-mint every frame.
@@ -234,7 +301,9 @@ impl FxAtlasSide {
             pack: ShelfPack::default(),
             generation: 0,
             resident: FxHashMap::default(),
-            log: Vec::new(),
+            seq: 0,
+            clock: 0,
+            evictions: 0,
             unfit_hint: FxHashSet::default(),
             unfit_drawn: FxHashSet::default(),
         }
@@ -252,33 +321,65 @@ impl FxAtlasSide {
         self.generation
     }
 
-    /// This generation's arts and regions, in placement order.
+    /// The last region write's sequence number.
     #[inline]
-    pub(crate) fn log(&self) -> &[(Arc<FxArt>, [u16; 4])] {
-        &self.log
+    pub(crate) const fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// Regions given back by eviction so far.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) const fn evictions(&self) -> u64 {
+        self.evictions
+    }
+
+    /// How many arts are resident.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.resident.len()
+    }
+
+    /// The resident arts written after write `after`, in write order.
+    pub(crate) fn written_after(&self, after: u64) -> Vec<(&Arc<FxArt>, [u16; 4])> {
+        let mut out: Vec<(u64, &Arc<FxArt>, [u16; 4])> = self
+            .resident
+            .values()
+            .filter(|r| r.seq > after)
+            .map(|r| (r.seq, &r.art, r.region))
+            .collect();
+        out.sort_unstable_by_key(|&(seq, ..)| seq);
+        out.into_iter()
+            .map(|(_, art, region)| (art, region))
+            .collect()
     }
 
     /// The resident region of art `id`.
     #[inline]
     pub(crate) fn region(&self, id: u128) -> Option<[u16; 4]> {
-        self.resident.get(&id).copied()
+        self.resident.get(&id).map(|r| r.region)
     }
 
     /// Make every art of `draw` (the arts this frame's sprites draw, unique,
     /// within the frame budget) and of `hint` (the prefetched ones, unique,
-    /// none in `draw`) resident: append what fits into the current
-    /// generation; when anything does not, mint a new generation holding
-    /// `draw` and what of `hint` fits beside it.
+    /// none in `draw`) resident: each takes a free region or one eviction
+    /// frees; when one cannot, mint a new generation holding `draw` and what
+    /// of `hint` fits beside it.
     fn admit(&mut self, draw: &[Arc<FxArt>], hint: &[Arc<FxArt>], cap: u32) {
+        self.clock += 1;
+        let clock = self.clock;
+        for art in draw.iter().chain(hint) {
+            if let Some(r) = self.resident.get_mut(&art.id()) {
+                r.used = clock;
+            }
+        }
         let mut overflow = false;
         for art in draw {
             if self.resident.contains_key(&art.id()) || self.unfit_drawn.contains(&art.id()) {
                 continue;
             }
-            match self.pack.place(u32::from(art.w()), u32::from(art.h())) {
-                Some((x, y)) => self.record(art, x, y),
-                None => overflow = true,
-            }
+            overflow |= !self.place_evicting(art);
         }
         for art in hint {
             if overflow {
@@ -288,20 +389,154 @@ impl FxAtlasSide {
             if self.resident.contains_key(&id) || self.unfit_hint.contains(&id) {
                 continue;
             }
-            match self.pack.place(u32::from(art.w()), u32::from(art.h())) {
-                Some((x, y)) => self.record(art, x, y),
-                None => overflow = true,
-            }
+            overflow |= !self.place_evicting(art);
         }
         if overflow {
             self.mint(draw, hint, cap);
         }
     }
 
+    /// Place `art`: in a free region, else in the room the cheapest
+    /// [`Self::victims`] give back: whether it did.
+    fn place_evicting(&mut self, art: &Arc<FxArt>) -> bool {
+        let (w, h) = (u32::from(art.w()), u32::from(art.h()));
+        if let Some((x, y)) = self.pack.place(w, h) {
+            self.record(art, x, y);
+            return true;
+        }
+        let Some(victims) = self.victims(w, h) else {
+            return false;
+        };
+        for id in victims {
+            if let Some(r) = self.resident.remove(&id) {
+                let [x, y, w, _] = r.region;
+                self.pack.release(u32::from(x), u32::from(y), u32::from(w));
+                self.evictions += 1;
+            }
+        }
+        match self.pack.place(w, h) {
+            Some((x, y)) => {
+                self.record(art, x, y);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The arts whose eviction makes room for a `w × h` region, chosen
+    /// among the runs that free it whole: a run of neighbouring columns on a
+    /// shelf at least `h` tall, at least `w` wide, or the shelves from one to
+    /// the bottom, whose giving back leaves `h` rows under the last kept one.
+    /// A run may hold only arts no admission of this frame asked for. Of
+    /// those runs, the one whose most recently used art is least recently
+    /// used (LRU: no art goes while an older one would do), then the fewest
+    /// arts, then the shortest shelf, then the oldest writes. `None` when no
+    /// run frees the room (the caller mints).
+    fn victims(&self, w: u32, h: u32) -> Option<Vec<u128>> {
+        /// A shelf's columns: a free span or a resident's region.
+        struct Seg {
+            x0: u32,
+            x1: u32,
+            held: Option<(u64, u64, u128)>,
+        }
+        let side = self.pack.side;
+        if w > side || h > side {
+            return None;
+        }
+        let clock = self.clock;
+        let shelves = &self.pack.shelves;
+        let mut by_shelf: Vec<Vec<Seg>> = shelves
+            .iter()
+            .map(|s| {
+                s.free
+                    .iter()
+                    .map(|&(x0, x1)| Seg { x0, x1, held: None })
+                    .collect()
+            })
+            .collect();
+        for (&id, r) in &self.resident {
+            let y = u32::from(r.region[1]);
+            if let Some(k) = shelves.iter().position(|s| s.y == y) {
+                let x0 = u32::from(r.region[0]);
+                by_shelf[k].push(Seg {
+                    x0,
+                    x1: x0 + u32::from(r.region[2]),
+                    held: Some((r.used, r.seq, id)),
+                });
+            }
+        }
+        // (newest use, arts, shelf height, newest write) of a run, and its arts.
+        type RunKey = (u64, usize, u32, u64);
+        let mut best: Option<(RunKey, Vec<u128>)> = None;
+        let mut offer = |key: RunKey, run: &mut dyn Iterator<Item = u128>| {
+            if best.as_ref().is_none_or(|(k, _)| key < *k) {
+                best = Some((key, run.collect()));
+            }
+        };
+        for (shelf, segs) in shelves.iter().zip(&mut by_shelf) {
+            segs.sort_unstable_by_key(|s| s.x0);
+            if shelf.h < h {
+                continue;
+            }
+            for i in 0..segs.len() {
+                let (mut used, mut seq, mut arts) = (0, 0, 0);
+                for j in i..segs.len() {
+                    let seg = &segs[j];
+                    if j > i && segs[j - 1].x1 != seg.x0 {
+                        break;
+                    }
+                    if let Some((u, q, _)) = seg.held {
+                        if u >= clock {
+                            break;
+                        }
+                        (used, seq, arts) = (used.max(u), seq.max(q), arts + 1);
+                    }
+                    if seg.x1 - segs[i].x0 >= w {
+                        offer(
+                            (used, arts, shelf.h, seq),
+                            &mut segs[i..=j].iter().filter_map(|s| s.held.map(|(.., id)| id)),
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+        // The shelves from `k` down, given back whole.
+        let (mut used, mut seq, mut arts) = (0, 0, 0);
+        for k in (0..shelves.len()).rev() {
+            let held = by_shelf[k].iter().filter_map(|s| s.held);
+            if held.clone().any(|(u, ..)| u >= clock) {
+                break;
+            }
+            for (u, q, _) in held {
+                (used, seq, arts) = (used.max(u), seq.max(q), arts + 1);
+            }
+            if shelves[k].y + h <= side {
+                offer(
+                    (used, arts, h, seq),
+                    &mut by_shelf[k..]
+                        .iter()
+                        .flatten()
+                        .filter_map(|s| s.held.map(|(.., id)| id)),
+                );
+                break;
+            }
+        }
+        best.map(|(_, run)| run)
+    }
+
     fn record(&mut self, art: &Arc<FxArt>, x: u32, y: u32) {
+        self.seq += 1;
         let region = [x as u16, y as u16, art.w(), art.h()];
-        self.resident.insert(art.id(), region);
-        self.log.push((Arc::clone(art), region));
+        self.resident.insert(
+            art.id(),
+            Resident {
+                art: Arc::clone(art),
+                region,
+                seq: self.seq,
+                used: self.clock,
+            },
+        );
     }
 
     /// Mint a new generation holding `draw`, then what of `hint` fits beside
@@ -336,7 +571,6 @@ impl FxAtlasSide {
         self.pack = pack;
         self.generation += 1;
         self.resident.clear();
-        self.log.clear();
         self.unfit_hint.clear();
         self.unfit_drawn.clear();
         for (i, (art, at)) in draw.iter().chain(&hint).zip(placed).enumerate() {
@@ -388,11 +622,15 @@ impl FxAtlas {
 #[derive(Debug, Default)]
 pub(crate) struct FxGpu {
     pub(crate) atlas: FxAtlas,
-    /// The instances' slicer, whose frame art budget is ruled once a frame:
-    /// by [`Self::admit`], then read by [`Self::build`]'s slice of the same
-    /// layers. Nothing else rules it, so a ruling afresh is the admission's
-    /// sign that the layers changed.
+    /// The frame's one slicer, whose frame art budget is ruled once a frame
+    /// by whichever reader of the frame's layers comes first (the knock-out's
+    /// [`Self::knock_rects`], [`Self::admit`], [`Self::build`],
+    /// [`Self::bloom_source`]); the others read that ruling.
     slicer: FxSlicer,
+    /// The budget epoch ([`aterm_render::FxBudget::epoch`]) the last
+    /// admission acted on: a different one is the sign that the layers
+    /// changed, whoever ruled them.
+    admitted: Option<u64>,
     /// This frame's palette words.
     pub(crate) palette: Vec<u32>,
     /// `(content pointer, base)` of the contents drawn this frame: each
@@ -410,19 +648,26 @@ pub(crate) struct FxGpu {
     pub(crate) refused: u64,
     /// Atlas bytes the arm uploaded for this frame (set by the arm's sync).
     pub(crate) atlas_bytes: u64,
+    /// The frames in flight the arm's sync waited for before a region
+    /// rewrite, and the nanoseconds it parked (Metal's sync sets it).
+    pub(crate) reader_wait: (u64, u64),
     /// The bloom layers' source quads, and their scratch.
     bloom_src: Vec<GlowQuad>,
     bloom_cols: aterm_render::SpriteCols,
-    bloom_slicer: FxSlicer,
+    /// The knock-out's rects ([`Self::knock_rects`]), kept across frames.
+    pub(crate) knocks: Vec<[i32; 4]>,
 }
 
 impl FxGpu {
     /// Make every art this frame's layers draw, and every prefetched art, resident in the CPU atlases.
     pub(crate) fn admit(&mut self, layers: &[FxLayer], prefetch: &[Arc<FxArt>], cap: u32) {
-        let changed = self.slicer.rule(layers);
+        self.slicer.rule(layers);
+        let epoch = self.slicer.budget().epoch();
+        let changed = self.admitted != Some(epoch);
         if !changed && self.memo_cap == cap && self.prefetch_admitted(prefetch) {
             return;
         }
+        self.admitted = Some(epoch);
         for w in self.want.iter_mut().chain(&mut self.hint) {
             w.clear();
         }
@@ -500,6 +745,18 @@ impl FxGpu {
         self.refused = sink.refused + self.slicer.budget().refused_items();
     }
 
+    /// The knock-out's bodies ([`aterm_render::knock_rects`]) of `layers`
+    /// into `out`, sliced on the frame's one slicer.
+    pub(crate) fn knock_rects(
+        &mut self,
+        f: &FxFrame,
+        layers: &[FxLayer],
+        occluders: &[aterm_core::render::PxRect],
+        out: &mut Vec<[i32; 4]>,
+    ) {
+        aterm_render::knock_rects(f, layers, occluders, &mut self.slicer, out);
+    }
+
     /// Append this frame's `bloom` layers to `cursor_glow_add`, or return `None` when no layer blooms.
     pub(crate) fn bloom_source<'s>(
         &'s mut self,
@@ -515,7 +772,7 @@ impl FxGpu {
             f,
             &input.fx_layers,
             &input.fx_occluders,
-            &mut self.bloom_slicer,
+            &mut self.slicer,
             &mut self.bloom_cols,
             &mut self.bloom_src,
         );
@@ -709,16 +966,20 @@ impl<'a> FxSliceSink<'a> for FxBuild<'_, 'a> {
 pub(crate) struct FxArmTex {
     pub(crate) tex: crate::device_layer::LayerTexture,
     generation: u64,
-    uploaded: usize,
+    /// The last region write this texture holds ([`FxAtlasSide::seq`]).
+    synced: u64,
 }
 
-/// Bring an arm's texture of `side` up to date.
+/// Bring an arm's texture of `side` up to date: re-minted on a new
+/// generation (or when `fresh` says the texture is gone), then every resident
+/// art written since its last sync uploaded into its region; `before_write`
+/// runs first when those writes land in a texture earlier frames may sample.
 pub(crate) fn sync_fx_tex(
     handle: crate::device_layer::DeviceHandle<'_>,
     slot: &mut Option<FxArmTex>,
     side: &FxAtlasSide,
     fresh: impl Fn(&FxArmTex) -> bool,
-    before_append: impl FnOnce(),
+    before_write: impl FnOnce(),
 ) -> Result<FxSynced, String> {
     let generation = side.generation();
     let stale = slot
@@ -737,12 +998,11 @@ pub(crate) fn sync_fx_tex(
         *slot = Some(FxArmTex {
             tex,
             generation,
-            uploaded: 0,
+            synced: 0,
         });
     }
     let t = slot.as_mut().expect("minted above");
-    let pending = &side.log()[t.uploaded.min(side.log().len())..];
-    if pending.is_empty() {
+    if t.synced >= side.seq() {
         return Ok(FxSynced {
             bytes: 0,
             minted: stale,
@@ -750,11 +1010,11 @@ pub(crate) fn sync_fx_tex(
         });
     }
     if !stale {
-        before_append();
+        before_write();
     }
     let bpp = side.kind.bytes_per_texel();
     let mut bytes = 0u64;
-    for (art, r) in pending {
+    for (art, r) in side.written_after(t.synced) {
         let (x, y, w, h) = (
             u32::from(r[0]),
             u32::from(r[1]),
@@ -764,7 +1024,7 @@ pub(crate) fn sync_fx_tex(
         handle.upload_texture_region(&t.tex, x, y, w, h, art.data(), w * bpp);
         bytes += art.data().len() as u64;
     }
-    t.uploaded = side.log().len();
+    t.synced = side.seq();
     Ok(FxSynced {
         bytes,
         minted: stale,
@@ -779,7 +1039,7 @@ pub(crate) struct FxSynced {
     pub(crate) bytes: u64,
     /// Whether the texture was (re-)minted (a bind over it is stale).
     pub(crate) minted: bool,
-    /// Whether arts were appended to a texture earlier frames may sample.
+    /// Whether arts were written into a texture earlier frames may sample.
     pub(crate) appended: bool,
 }
 
@@ -790,7 +1050,7 @@ pub(crate) fn fx_tex_due(slot: &Option<FxArmTex>, side: &FxAtlasSide, drawing: b
         || (side.generation() > 0
             && slot
                 .as_ref()
-                .is_none_or(|t| t.generation != side.generation() || t.uploaded < side.log().len()))
+                .is_none_or(|t| t.generation != side.generation() || t.synced < side.seq()))
 }
 
 #[cfg(test)]
@@ -873,7 +1133,7 @@ mod tests {
         assert_eq!(side.generation(), 2);
         assert_eq!(side.side(), 1024);
         assert_eq!(
-            side.log().len(),
+            side.len(),
             big.len(),
             "compaction keeps only the frame's arts"
         );
@@ -914,12 +1174,54 @@ mod tests {
         assert!(out[FxStream::Over as usize].iter().all(|i| i.src[2] == 40));
     }
 
-    /// ONE RULING A FRAME: the atlas admission and the instances' slice read
-    /// one frame art budget, ruled once when the frame's layers change and
-    /// not at all while they stand.
+    /// A Linear Under knock layer (an under-text companion) and a blooming
+    /// Exact Over layer beside `arts`' layer.
+    fn knock_and_bloom(arts: &[Arc<FxArt>]) -> [FxLayer; 3] {
+        let straight = Arc::new(
+            FxArt::new(4, 4, FxTexels::Rgba8Straight, vec![200; 4 * 4 * 4]).expect("sized"),
+        );
+        let mut knock = FxLayer::new(
+            2,
+            Arc::new(FxContent::new(
+                vec![FxItem::Sprite(FxSprite {
+                    x: 0,
+                    y: 20,
+                    dw: 8,
+                    dh: 8,
+                    flip_x: false,
+                    art: straight,
+                    ink: 0,
+                    clip: PxRect::EVERYWHERE,
+                })],
+                vec![FxInk::over(0x00FF_FFFF, 255)],
+            )),
+            FxSlot::Under,
+            FxSpace::Window,
+            FxBlend::Linear,
+        );
+        knock.knock = true;
+        let mut bloom = sprite_layer(&arts[..1]);
+        bloom.id = 3;
+        bloom.bloom = true;
+        [sprite_layer(arts), knock, bloom]
+    }
+
+    /// ONE RULING A FRAME: every reader of a frame's layers (the knock-out,
+    /// the atlas admission, the instances' slice, the bloom source) reads one
+    /// frame art budget, ruled once when the frame's layers change, by
+    /// whichever reads first, and not at all while they stand.
     #[test]
     fn a_frame_rules_its_art_budget_once() {
-        let mut fx = FxGpu::default();
+        struct Rig {
+            fx: FxGpu,
+            out: [Vec<FxInstance>; FX_STREAM_COUNT],
+            knocks: Vec<[i32; 4]>,
+        }
+        let mut rig = Rig {
+            fx: FxGpu::default(),
+            out: Default::default(),
+            knocks: Vec::new(),
+        };
         let f = FxFrame {
             w: 800,
             h: 64,
@@ -928,26 +1230,64 @@ mod tests {
             cell_h: 16,
             rows: 4,
         };
-        let mut out: [Vec<FxInstance>; FX_STREAM_COUNT] = Default::default();
-        let mut frame = |layers: &[FxLayer]| {
+        // In the renderer's order: the knock-out's bodies before the
+        // admission, the bloom source after the build.
+        let frame = |rig: &mut Rig, layers: &[FxLayer]| {
             let _ = aterm_render::test_counters::take_budget_rulings();
-            fx.admit(layers, &[], FX_ATLAS_CAP);
-            fx.build(&f, layers, &[], |_| true, &mut out);
+            rig.fx.knock_rects(&f, layers, &[], &mut rig.knocks);
+            rig.fx.admit(layers, &[], FX_ATLAS_CAP);
+            rig.fx.build(&f, layers, &[], |_| true, &mut rig.out);
+            let input = RenderInput {
+                fx_layers: layers.to_vec(),
+                ..RenderInput::default()
+            };
+            let _ = rig.fx.bloom_source(&f, &input);
             aterm_render::test_counters::take_budget_rulings()
         };
         let arts = vec![art(40, 40, 1), art(20, 10, 2)];
         let layers = [sprite_layer(&arts)];
-        assert_eq!(frame(&layers), 1, "a new frame is ruled once");
-        assert_eq!(frame(&layers), 0, "a standing frame is not ruled");
+        assert_eq!(frame(&mut rig, &layers), 1, "a new frame is ruled once");
+        assert_eq!(frame(&mut rig, &layers), 0, "a standing frame is not ruled");
         assert_eq!(
-            frame(&[sprite_layer(&arts)]),
+            frame(&mut rig, &[sprite_layer(&arts)]),
             1,
             "a new content is ruled once"
         );
         assert_eq!(
-            out[FxStream::Over as usize].len(),
+            rig.out[FxStream::Over as usize].len(),
             3 + 1,
             "CONTROL: both sprites drawn, the 40-tall one in its three bands"
+        );
+        let all = knock_and_bloom(&arts);
+        assert_eq!(
+            frame(&mut rig, &all),
+            1,
+            "a frame with a knock and a bloom layer is ruled once"
+        );
+        assert_eq!(
+            rig.knocks,
+            [[0, 20, 8, 28]],
+            "the knock-out read the ruling"
+        );
+        assert_eq!(frame(&mut rig, &all), 0, "and not at all while it stands");
+        let fresh = knock_and_bloom(&[art(12, 12, 9)]);
+        assert_eq!(frame(&mut rig, &fresh), 1);
+        assert!(
+            rig.fx
+                .atlas
+                .region(
+                    &fresh[0]
+                        .content
+                        .items()
+                        .first()
+                        .and_then(|i| match i {
+                            FxItem::Sprite(sp) => Some(Arc::clone(&sp.art)),
+                            _ => None,
+                        })
+                        .expect("a sprite")
+                )
+                .is_some(),
+            "a new frame's art is admitted though the knock-out ruled the frame first"
         );
     }
 
@@ -975,13 +1315,13 @@ mod tests {
             Arc::new(FxArt::new(w as u16, h as u16, FxTexels::Index8, data).expect("sized"))
         };
         let disjoint_and_inside = |side: &FxAtlasSide, arts: &[Arc<FxArt>], frame: usize| {
-            let regions: Vec<[u16; 4]> = arts
-                .iter()
-                .map(|a| {
-                    side.region(a.id())
-                        .unwrap_or_else(|| panic!("frame {frame}: a drawn art is not resident"))
-                })
-                .collect();
+            for a in arts {
+                assert!(
+                    side.region(a.id()).is_some(),
+                    "frame {frame}: a drawn art is not resident"
+                );
+            }
+            let regions: Vec<[u16; 4]> = side.resident.values().map(|r| r.region).collect();
             for (i, a) in regions.iter().enumerate() {
                 let (ax1, ay1) = (
                     u32::from(a[0]) + u32::from(a[2]),
@@ -1038,11 +1378,11 @@ mod tests {
                 .into_iter()
                 .filter(|a| !drawn.contains(&a.id()))
                 .collect();
-            let (generation, logged) = (side.generation(), side.log().len());
+            let (generation, written) = (side.generation(), side.seq());
             side.admit(&draw, &hint, cap);
             if side.generation() != generation {
                 mints += 1;
-            } else if side.log().len() > logged {
+            } else if side.seq() > written {
                 appends += 1;
             }
             disjoint_and_inside(&side, &draw, frame);
@@ -1069,6 +1409,176 @@ mod tests {
             side.admit(draw, &hint, FX_ATLAS_CAP);
             disjoint_and_inside(&side, draw, 1000 + k);
         }
+    }
+
+    fn tile(w: u16, h: u16, seed: u32) -> Arc<FxArt> {
+        let mut data = vec![0x80u8; usize::from(w) * usize::from(h) * 4];
+        for (b, s) in data.iter_mut().zip(seed.to_le_bytes()) {
+            *b = s;
+        }
+        Arc::new(FxArt::new(w, h, FxTexels::Rgba8Straight, data).expect("sized"))
+    }
+
+    /// BAKED TILES LIVE BY LRU: a companion that bakes two new tiles a frame
+    /// and holds one tile all along runs through a full atlas without a mint:
+    /// each new tile takes the region of the least recently used one, the
+    /// held tile and the frame's own tiles are never evicted, the resident
+    /// set is always the newest tiles, and an arm's sync uploads only the
+    /// tiles written since it last synced.
+    #[test]
+    fn an_eviction_gives_back_one_run_not_the_cache() {
+        // A 512 square of 100 × 100 tiles: five shelves of five, the first
+        // shelf's tiles used in the order t0, t2, t4, t1, t3, every other
+        // tile since.
+        let mut side = FxAtlasSide::new(FxAtlasKind::Rgba);
+        let tiles: Vec<Arc<FxArt>> = (0..25).map(|i| tile(100, 100, 7000 + i)).collect();
+        side.admit(&tiles, &[], 512);
+        assert_eq!((side.generation(), side.len()), (1, 25));
+        let mut first: Vec<&Arc<FxArt>> = tiles
+            .iter()
+            .filter(|t| side.region(t.id()).is_some_and(|r| r[1] == 0))
+            .collect();
+        first.sort_unstable_by_key(|t| side.region(t.id()).map(|r| r[0]));
+        assert_eq!(first.len(), 5, "one shelf of five");
+        for k in [2, 4, 1, 3] {
+            side.admit(&[Arc::clone(first[k])], &[], 512);
+        }
+        let rest: Vec<Arc<FxArt>> = tiles
+            .iter()
+            .filter(|t| !first.iter().any(|f| f.id() == t.id()))
+            .cloned()
+            .collect();
+        side.admit(&rest, &[], 512);
+        // A 120-wide art fits no single tile's columns. Plain LRU would give
+        // back t0, t2 and t4 (spans of 100, 100 and 112, none 120 wide) and
+        // then t1: four tiles where two neighbours do.
+        let wide = tile(120, 100, 9000);
+        side.admit(std::slice::from_ref(&wide), &[], 512);
+        assert_eq!(side.generation(), 1, "no mint");
+        assert_eq!(side.evictions(), 2, "one run of two neighbours goes");
+        let kept: Vec<bool> = first
+            .iter()
+            .map(|t| side.region(t.id()).is_some())
+            .collect();
+        assert_eq!(
+            kept,
+            [false, false, true, true, true],
+            "the run whose newest use is oldest: t0 and t1"
+        );
+        assert_eq!(side.region(wide.id()).map(|r| [r[0], r[1]]), Some([0, 0]));
+        // An art taller than every shelf needs rows under the last kept
+        // shelf: the bottom shelf's five go whole, and nothing above it.
+        let tall = tile(200, 112, 9001);
+        side.admit(std::slice::from_ref(&tall), &[], 512);
+        assert_eq!(side.generation(), 1, "no mint");
+        assert_eq!(side.evictions(), 2 + 5, "the bottom shelf's five");
+        assert_eq!(side.region(tall.id()).map(|r| [r[0], r[1]]), Some([0, 400]));
+        assert!(
+            first[2..].iter().all(|t| side.region(t.id()).is_some())
+                && side.region(wide.id()).is_some(),
+            "the first shelf keeps t2, t3, t4 and the wide art"
+        );
+        assert_eq!(side.len(), 25 - 2 + 1 - 5 + 1);
+    }
+
+    #[test]
+    fn baked_tiles_cycle_through_a_full_atlas_by_lru() {
+        let mut side = FxAtlasSide::new(FxAtlasKind::Rgba);
+        let held = tile(100, 100, 0);
+        let mut baked: Vec<Arc<FxArt>> = Vec::new();
+        let capacity = (512 / 100) * (512 / 100);
+        for frame in 0..200u32 {
+            let fresh = [tile(100, 100, 2 * frame + 1), tile(100, 100, 2 * frame + 2)];
+            baked.extend(fresh.iter().cloned());
+            let synced = side.seq();
+            let draw: Vec<_> = [Arc::clone(&held)].into_iter().chain(fresh).collect();
+            side.admit(&draw, &[], 512);
+            assert_eq!(
+                (side.generation(), side.side()),
+                (1, 512),
+                "frame {frame}: no mint"
+            );
+            let mut written: Vec<u128> = side
+                .written_after(synced)
+                .iter()
+                .map(|(a, _)| a.id())
+                .collect();
+            let mut want: Vec<u128> = draw
+                .iter()
+                .skip(usize::from(frame > 0))
+                .map(|a| a.id())
+                .collect();
+            if frame == 0 {
+                // The first admission mints, placing tallest first.
+                written.sort_unstable();
+                want.sort_unstable();
+            }
+            assert_eq!(written, want, "frame {frame}: a sync uploads the new tiles");
+            let newest = baked.len().min(capacity - 1);
+            let mut resident: Vec<u128> = side.resident.keys().copied().collect();
+            let mut expect: Vec<u128> = baked[baked.len() - newest..]
+                .iter()
+                .chain([&held])
+                .map(|a| a.id())
+                .collect();
+            resident.sort_unstable();
+            expect.sort_unstable();
+            assert_eq!(
+                resident, expect,
+                "frame {frame}: the resident set is the held tile and the newest"
+            );
+            let regions: Vec<[u16; 4]> = side.resident.values().map(|r| r.region).collect();
+            for (i, a) in regions.iter().enumerate() {
+                for b in &regions[..i] {
+                    let apart = a[0] + a[2] <= b[0]
+                        || b[0] + b[2] <= a[0]
+                        || a[1] + a[3] <= b[1]
+                        || b[1] + b[3] <= a[1];
+                    assert!(apart, "frame {frame}: {a:?} overlaps {b:?}");
+                }
+            }
+        }
+        assert_eq!(side.evictions(), 400 + 1 - capacity as u64);
+        let crowd: Vec<_> = (0..=capacity as u32)
+            .map(|i| tile(100, 100, 1000 + i))
+            .collect();
+        side.admit(&crowd, &[], 512);
+        for art in &crowd {
+            assert!(
+                side.region(art.id()).is_some() || side.unfit_drawn.contains(&art.id()),
+                "a frame's own tile is never evicted for another of its tiles"
+            );
+        }
+        assert_eq!(
+            (side.generation(), side.len(), side.unfit_drawn.len()),
+            (2, capacity, 1),
+            "a frame past the cap mints, and its one unfit tile fails closed"
+        );
+    }
+
+    /// A released region's columns return to its shelf, merged with their
+    /// free neighbours, and a trailing shelf left wholly free returns to the
+    /// square, so a taller art can take its rows.
+    #[test]
+    fn released_columns_merge_and_free_trailing_shelves_return() {
+        let mut pack = ShelfPack::new(100);
+        let a = pack.place(30, 10).expect("a");
+        let b = pack.place(30, 10).expect("b");
+        let c = pack.place(30, 10).expect("c");
+        assert_eq!((a, b, c), ((0, 0), (30, 0), (60, 0)));
+        pack.release(30, 0, 30);
+        assert_eq!(
+            pack.shelves[0].free,
+            vec![(30, 60), (90, 100)],
+            "a hole and the tail"
+        );
+        pack.release(0, 0, 30);
+        assert_eq!(pack.shelves[0].free, vec![(0, 60), (90, 100)]);
+        assert_eq!(pack.place(60, 5), Some((0, 0)), "the merged hole");
+        pack.release(0, 0, 60);
+        pack.release(60, 0, 30);
+        assert!(pack.shelves.is_empty() && pack.bottom == 0);
+        assert_eq!(pack.place(100, 100), Some((0, 0)), "the whole square");
     }
 
     /// Instances carry the origin mod 2¹⁶ and the absolute palette base; a

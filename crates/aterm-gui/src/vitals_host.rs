@@ -76,8 +76,7 @@ fn job_demand_after(view: &aterm_vitals::jobs::JobsView) -> Option<Duration> {
         .rows
         .iter()
         .any(|r| r.verdict != aterm_vitals::jobs::Verdict::Exited);
-    let held =
-        !view.findings.program_check.is_empty() || view.findings.program_check_episode.is_some();
+    let held = crate::vitals_jobs::holds_a_wait(view);
     let every = [
         view.demand.every_ms().filter(|_| live),
         aterm_vitals::jobs::Demand::Slow.every_ms().filter(|_| held),
@@ -86,6 +85,27 @@ fn job_demand_after(view: &aterm_vitals::jobs::JobsView) -> Option<Duration> {
     .flatten()
     .min()?;
     Some(Duration::from_millis(every).max(JOBS_FLOOR))
+}
+
+/// THE EPISODE EDGE `after`'s findings make against `before`'s (leftover §5.1): `Opened` when `after` stands in a backed-up episode that `before` did not (another opening, or none); else `Drained` when `after` names the episode that closed at it and `before` did not, or `before` stood in an episode and `after` stands in none (the drained view itself skipped); else `None`, so a view adopted again makes no edge.
+pub(crate) fn held_edge(
+    before: Option<&aterm_vitals::jobs::Findings>,
+    after: &aterm_vitals::jobs::Findings,
+) -> Option<crate::message_reporters::HeldEdge> {
+    use crate::message_reporters::HeldEdge;
+    let was = before.and_then(|f| f.program_check_episode);
+    if let Some(now) = after.program_check_episode {
+        return (was.map(|w| w.opened_ms) != Some(now.opened_ms)).then_some(HeldEdge::Opened(now));
+    }
+    after
+        .program_check_drained
+        .filter(|d| before.and_then(|f| f.program_check_drained) != Some(*d))
+        .or(was)
+        .map(HeldEdge::Drained)
+}
+
+fn age_ms(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Kernel process-event edge (`NOTE_EXIT`, `NOTE_FORK`).
@@ -506,6 +526,8 @@ pub(crate) struct VitalsHost {
     /// age from (`App::post_jobs_reading`).
     read_began: Option<Instant>,
     full_adopted_at: Option<Instant>,
+    /// The devtools Entry's live count as it was last told ([`crate::App::devtools_entry_now`]), and when; `None` when it was last told none.
+    pub(crate) live_told: Option<(u32, Instant)>,
     /// When the next reading is due: the bars' cadence while a window in view shows them.
     pub(crate) next_due: Option<Instant>,
     asked_at: Option<Instant>,
@@ -546,6 +568,7 @@ impl Default for VitalsHost {
             adopted_at: None,
             read_began: None,
             full_adopted_at: None,
+            live_told: None,
             next_due: None,
             asked_at: None,
             jobs_due: None,
@@ -1577,6 +1600,7 @@ pub(crate) struct Reader {
 #[derive(Debug)]
 pub(crate) struct TabReads {
     at_ms: u64,
+    epoch: Instant,
     feeds: Vec<(u64, crate::vitals_jobs::TabFeed)>,
     ttys: Vec<(u64, aterm_vitals::jobs::TtyMode)>,
 }
@@ -1598,7 +1622,20 @@ impl Request {
             .map(|(key, f)| (*key, f.at(epoch)))
             .collect();
         let ttys = self.ttys.iter().filter_map(TtyWord::current).collect();
-        TabReads { at_ms, feeds, ttys }
+        TabReads {
+            at_ms,
+            epoch,
+            feeds,
+            ttys,
+        }
+    }
+}
+
+impl TabReads {
+    /// The reader's clock now, ms past its zero, rounded up: no earlier than anything read
+    /// before it.
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX)
     }
 }
 
@@ -1613,6 +1650,7 @@ pub(crate) fn jobs_step(
 ) -> Option<Arc<aterm_vitals::jobs::JobsView>> {
     pass.tick(
         reads.at_ms,
+        || reads.now_ms(),
         sweep,
         &req.tabs,
         &reads.ttys,
@@ -1814,6 +1852,7 @@ impl Reader {
         self.set_occupancy_facts(&mut snap);
         snap.jobs = self.jobs.tick(
             sample.at_ns / 1_000_000,
+            || sample.at_ns / 1_000_000,
             None,
             &req.tabs,
             &[],
@@ -1867,6 +1906,7 @@ impl Reader {
             swapped_kib: aterm_sysprobe::swapped_kib(),
             links: aterm_sysprobe::net_links_into(&mut self.scratch)
                 .map(|links| links.iter().map(link_sample).collect()),
+            tcp: aterm_sysprobe::tcp_counts_into(&mut self.scratch).map(tcp_counts),
             proc_limits: proc_limits(aterm_sysprobe::process_limits()),
             pid_counts: aterm_sysprobe::pid_counts(self.uid.unwrap_or(0)),
             self_uid: self.uid,
@@ -1995,10 +2035,38 @@ fn link_sample(l: &aterm_sysprobe::LinkReading) -> LinkSample {
             }
             aterm_sysprobe::LinkKind::Other => LinkKind::Other,
         },
+        up: l.up,
+        loopback: l.loopback,
         counts: aterm_sysprobe::counts_toward_machine(l),
         rx: l.rx.bytes,
         tx: l.tx.bytes,
+        rx_packets: l.rx.packets,
+        tx_packets: l.tx.packets,
+        rx_errors: l.rx.errors,
+        tx_errors: l.tx.errors,
+        rx_drops: l.rx.drops,
+        tx_drops: if cfg!(target_os = "macos") {
+            None
+        } else {
+            Some(l.tx.drops)
+        },
         rate_bps: l.rate_bps,
+    }
+}
+
+const fn tcp_counts(t: aterm_sysprobe::TcpCounts) -> aterm_vitals::TcpCounts {
+    aterm_vitals::TcpCounts {
+        established: t.established,
+        syn_sent: t.syn_sent,
+        syn_recv: t.syn_recv,
+        fin_wait1: t.fin_wait1,
+        fin_wait2: t.fin_wait2,
+        time_wait: t.time_wait,
+        close: t.close,
+        close_wait: t.close_wait,
+        last_ack: t.last_ack,
+        listen: t.listen,
+        closing: t.closing,
     }
 }
 
@@ -2588,12 +2656,14 @@ impl crate::App {
     }
 
     fn adopt_vitals(&mut self, audience: Audience, now: Instant, delegated: bool) -> bool {
+        let before = self.vitals.snapshot.as_ref().and_then(|s| s.jobs.clone());
         let adopted = self.vitals.adopt(now);
         self.record_job_events();
         if !adopted {
             return false;
         }
         self.post_jobs_reading();
+        self.note_held_episode(before.as_deref());
         if !audience.in_view() {
             if self
                 .vitals
@@ -2621,6 +2691,85 @@ impl crate::App {
         if self.tabs_page_shown() {
             self.publish_native_harness_state();
         }
+    }
+
+    /// WHAT THE VIEW JUST ADOPTED SAYS OF MACOS'S PROGRAM CHECK (leftover §5.1, §6.5): one `program-check.` record per episode edge it makes against `before` ([`held_edge`]); a verdict refresh an episode held back ([`Self::refresh_devtools_verdict`]) started once the view stands in none; and, while the last Developer Tools reading says aterm is not granted, the standing devtools Entry told again at once whenever its live line ([`Self::held_line`]) differs in count from the one it was last told (to a count, between counts, back to none: inside an episode as at its edges), and when only its oldest moved, at most once a [`RESTATE_QUIET`](aterm_messages::need::RESTATE_QUIET). It never raises an Entry that is not standing (§13: no second ask).
+    fn note_held_episode(&mut self, before: Option<&aterm_vitals::jobs::JobsView>) {
+        let Some(after) = self.vitals.snapshot.as_ref().and_then(|s| s.jobs.clone()) else {
+            return;
+        };
+        if let Some(edge) = held_edge(before.map(|v| &v.findings), &after.findings) {
+            let _ = self.post_message(crate::message_reporters::program_check_episode(
+                edge,
+                after.findings.program_check_aterm.0,
+            ));
+        }
+        if after.findings.program_check_episode.is_none() && self.devtools_watch.take_held_prime() {
+            let _ = self.devtools_helper.refresh_verdict();
+        }
+        let live = self.held_line().map(|l| l.count);
+        let told = self.vitals.live_told;
+        let aged = told.is_some_and(|(_, at)| at.elapsed() >= aterm_messages::need::RESTATE_QUIET);
+        let not_granted = self
+            .devtools_helper
+            .reading()
+            .is_some_and(|r| r.grant == aterm_containment::DevToolGrant::NotGranted);
+        let standing = !self
+            .messages
+            .digest_keys_under(crate::message_reporters::DEVTOOLS_KEY)
+            .is_empty();
+        if (live != told.map(|(n, _)| n) || (live.is_some() && aged))
+            && not_granted
+            && standing
+            && !self.workstation_setup.suppresses_permissions()
+        {
+            let entry = self.devtools_entry_now().restated_at_once();
+            self.except(&entry);
+        }
+    }
+
+    /// The devtools Entry at the step the last reading names, its first line the live wait's while one stands ([`Self::held_line`]); its live count noted as told ([`VitalsHost::live_told`]). Every raise builds it here.
+    pub(crate) fn devtools_entry_now(&mut self) -> aterm_messages::exceptions::Entry {
+        let live = self.held_line();
+        self.vitals.live_told = live.map(|l| (l.count, Instant::now()));
+        crate::message_reporters::devtools_entry(self.devtools_step(), live)
+    }
+
+    /// ASKS MACOS ABOUT ATERM AGAIN ([`crate::devtools_helper::Lane::refresh_verdict`]) unless the adopted jobs view stands in a backed-up episode of macOS's program check: the prime is itself a new program and would wait in that line (leftover §5.1, §13), so it is held until the next view that stands in none ([`Self::note_held_episode`]).
+    pub(crate) fn refresh_devtools_verdict(&mut self) {
+        let backed_up = self
+            .jobs_view_now(Instant::now())
+            .is_some_and(|(view, _)| view.findings.program_check_episode.is_some());
+        if backed_up {
+            aterm_log::info!(
+                "devtools: macOS's program check is backed up; asking macOS about aterm again \
+                 waits until it catches up"
+            );
+            self.devtools_watch.hold_prime();
+        } else {
+            let _ = self.devtools_helper.refresh_verdict();
+        }
+    }
+
+    /// The adopted jobs view while it speaks for now ([`crate::vitals_jobs::speaks_for_now`]), and its age at `now`.
+    fn jobs_view_now(&self, now: Instant) -> Option<(&aterm_vitals::jobs::JobsView, Duration)> {
+        let view = self.vitals.snapshot.as_ref()?.jobs.as_deref()?;
+        let age = now.saturating_duration_since(self.vitals.adopted_at?);
+        crate::vitals_jobs::speaks_for_now(view, age, self.vitals.reader_runs())
+            .then_some((view, age))
+    }
+
+    /// The devtools Entry's live line: the programs aterm started that macOS's program check holds, while a backed-up episode stands in a view that speaks for now, and the longest held to now; `None` otherwise, and while only others' programs are held (aterm's grant does not reach them).
+    pub(crate) fn held_line(&self) -> Option<crate::message_reporters::HeldLine> {
+        let (view, age) = self.jobs_view_now(Instant::now())?;
+        let findings = &view.findings;
+        let (count, oldest_ms) = findings.program_check_aterm;
+        (findings.program_check_episode.is_some() && count > 0).then(|| {
+            crate::message_reporters::HeldLine {
+                count,
+                oldest_ms: oldest_ms.saturating_add(age_ms(age)),
+            }
+        })
     }
 
     fn post_jobs_reading(&self) {

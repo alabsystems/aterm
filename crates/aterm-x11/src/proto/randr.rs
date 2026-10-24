@@ -154,7 +154,7 @@ pub struct ModeInfo {
     pub mode_flags: u32,
 }
 
-/// GetScreenResources' and GetScreenResourcesCurrent's reply (one layout).
+/// Reply for `GetScreenResources` and `GetScreenResourcesCurrent`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScreenResourcesReply {
     pub timestamp: Timestamp,
@@ -162,7 +162,7 @@ pub struct ScreenResourcesReply {
     pub crtcs: Vec<Crtc>,
     pub outputs: Vec<Output>,
     pub modes: Vec<ModeInfo>,
-    /// The modes' names, back to back.
+    /// Concatenated mode names.
     pub names: Vec<u8>,
 }
 

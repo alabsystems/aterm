@@ -16,7 +16,6 @@ use aterm_uds::CtlStream;
 use super::super::{Request, Scope, ServeDisposition};
 use super::{Census, LaneLimits, LaneReader, LaneService, Lanes, Outbox};
 
-/// How long any settle may take before the test calls the lanes wedged.
 const SETTLE: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 #[derive(Default)]
@@ -42,10 +41,8 @@ struct Stub {
     panic_release: Mutex<Vec<u64>>,
 }
 
-/// The length of the stub's ` big` answer.
 const BIG_ANSWER: usize = 4 << 20;
 
-/// The busy reply, as the lanes write it.
 const BUSY: &str = aterm_types::control_verbs::CONTROL_BUSY_REPLY;
 
 fn on_wait_lane() -> bool {
@@ -87,7 +84,6 @@ impl Stub {
         self.moved.notify_all();
     }
 
-    /// Let one blocked request finish on a request lane (`wait = false`) or a wait lane.
     fn let_finish(&self, wait: bool) {
         let mut gate = self.gate.lock().unwrap_or_else(PoisonError::into_inner);
         if wait {
@@ -98,14 +94,12 @@ impl Stub {
         self.moved.notify_all();
     }
 
-    /// End one push stream the stub holds.
     fn end_push(&self) {
         let mut gate = self.gate.lock().unwrap_or_else(PoisonError::into_inner);
         gate.push_open += 1;
         self.moved.notify_all();
     }
 
-    /// Push streams the stub holds on their subscription lanes.
     fn pushes(&self) -> usize {
         self.gate
             .lock()
@@ -244,7 +238,6 @@ impl LaneService for Stub {
     }
 }
 
-/// Whether `stream` blocks.
 fn blocks(stream: &CtlStream) -> bool {
     use std::os::fd::AsRawFd;
 
@@ -254,7 +247,6 @@ fn blocks(stream: &CtlStream) -> bool {
     flags & libc::O_NONBLOCK == 0
 }
 
-/// A client end of an admitted connection.
 struct Client {
     stream: CtlStream,
     reader: BufReader<CtlStream>,
@@ -302,7 +294,6 @@ impl Rig {
         Self { lanes, stub }
     }
 
-    /// Dial: `Some` when the lanes admitted the connection, `None` when they handed it back.
     fn dial(&self) -> Option<Client> {
         let (client, server) = CtlStream::pair().expect("real control socket pair");
         client
@@ -316,7 +307,6 @@ impl Rig {
         })
     }
 
-    /// A connection that authenticated and is idle.
     fn idle(&self) -> Option<Client> {
         let mut client = self.dial()?;
         client.send("AUTH ok\nping\n");
@@ -324,7 +314,6 @@ impl Rig {
         Some(client)
     }
 
-    /// Wait until the lanes are quiescent in the shape `want` names.
     fn settle(&self, what: &str, want: impl Fn(Census, (usize, usize)) -> bool) -> Census {
         let deadline = Instant::now() + SETTLE;
         loop {
@@ -356,7 +345,7 @@ fn count(n: usize) -> i64 {
     i64::try_from(n).expect("small counts fit i64")
 }
 
-/// Project the shipping lanes onto the model at a quiescent point.
+/// Project `census`, `flight`, and `facts` onto a model [`State`].
 fn project(census: Census, flight: (usize, usize), facts: Facts) -> State {
     assert_eq!(
         census.waits, flight.1,
@@ -381,7 +370,7 @@ fn project(census: Census, flight: (usize, usize), facts: Facts) -> State {
     state
 }
 
-/// The model reaches `after` from `before` through exactly `path`.
+/// Assert `model` reaches `after` from `before` along `path`.
 fn assert_path(model: &Model, before: &State, path: &[&'static str], after: &State) {
     let mut at = before.clone();
     for (index, action) in path.iter().enumerate() {
@@ -413,7 +402,6 @@ fn assert_path(model: &Model, before: &State, path: &[&'static str], after: &Sta
     }
 }
 
-/// The model's constants, the lanes' limits.
 fn model_limits() -> LaneLimits {
     LaneLimits {
         rpc: 2,
@@ -883,7 +871,6 @@ fn subscriptions_grow_to_their_cap_and_one_past_it_is_refused_at_once() {
     });
 }
 
-/// Everything `client` reads until its connection is closed.
 fn rest_until_closed(client: &mut Client) -> Vec<u8> {
     let mut rest = Vec::new();
     match client.reader.read_to_end(&mut rest) {
@@ -1453,7 +1440,7 @@ fn the_parked_hold_no_more_than_their_budget() {
     }
 }
 
-/// What a reader owed a large answer (`answer` bytes, newline included) reads of it.
+/// Whether `reader` reads a full `answer`-byte line (`true`) or is cut short and closed.
 fn whole_or_cut(reader: &mut Client, answer: usize) -> bool {
     let mut got = Vec::new();
     match reader.reader.read_until(b'\n', &mut got) {
@@ -1474,7 +1461,6 @@ fn whole_or_cut(reader: &mut Client, answer: usize) -> bool {
     false
 }
 
-/// What the steady reader takes of its answer before the later one parks beside it.
 const TAKEN_BEFORE_THE_LATER_ONE: usize = 256 << 10;
 
 #[test]
@@ -1665,7 +1651,6 @@ fn pipelined_requests_answer_in_order() {
     assert_eq!(driver.request("lane"), "OK rpc");
 }
 
-/// Read one line within `within`, or say that none came.
 fn line_within(client: &mut Client, within: Duration) -> Option<String> {
     let _ = client.stream.set_read_timeout(Some(within));
     let mut reply = String::new();
@@ -1885,7 +1870,7 @@ fn pipelined_waits_move_with_the_requests_behind_them() {
     }
 }
 
-/// A wait lane's spawn, held in [`Lanes::before_wait_spawn`] until the test rules on it.
+/// Wait-lane spawn gate for [`Lanes::before_wait_spawn`].
 #[derive(Default)]
 struct HeldSpawn {
     state: Mutex<HeldState>,
@@ -1895,7 +1880,7 @@ struct HeldSpawn {
 #[derive(Default)]
 struct HeldState {
     entered: usize,
-    /// `Some(true)`: the spawn goes on; `Some(false)`: it fails.
+    /// `Some(true)` to allow the spawn, `Some(false)` to fail it.
     ruling: Option<bool>,
 }
 
@@ -1922,7 +1907,6 @@ impl HeldSpawn {
         }
     }
 
-    /// Wait (the hang detector) until `count` spawns have entered the hold.
     fn entered(&self, count: usize) {
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let (state, waited) = self

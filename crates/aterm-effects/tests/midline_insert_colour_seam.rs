@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A key typed inside a lit line leaves no colour seam at the tail it pushes: `Ribbon::shift_run`
-//! re-reads each pushed cell's stop at the column it moved to and leaves the walk's anchor put.
-//! Along one phrase the walk position (`Cell::t`) never steps backward between neighbouring lit
-//! glyphs and never steps forward by more than one fast-leg step (`1/16`).
+//! Mid-line insert colour continuity tests: `Ribbon::shift_run` re-reads each pushed cell's stop
+//! at its new column so `Cell::t` never steps backward or jumps by more than `1/16` per column.
 
 use crate::common::{
     LIT_COV, caret_sample, class_of, geom, note_blink, observe_caret_row, observe_ribbon_rows,
@@ -81,7 +79,7 @@ struct Snap {
 }
 
 impl Snap {
-    /// Walk steps `(left col, right col, dt)` between neighbouring live cells in column order.
+    /// Walk steps `(left col, right col, dt)` between neighbouring live cells.
     fn cell_steps(&self) -> Vec<(u16, u16, f32)> {
         let live: Vec<(u16, f32)> = self
             .cols
@@ -109,7 +107,7 @@ impl Snap {
             .fold((0, 0.0), |m, s| if s.1 < m.1 { s } else { m })
     }
 
-    /// Largest forward cell step per column crossed: `(left, right, dt / (right − left))`.
+    /// Largest forward cell step per column: `(left, right, dt / (right - left))`.
     fn worst_jump(&self) -> (u16, u16, f32) {
         self.cell_steps()
             .into_iter()
@@ -447,7 +445,6 @@ impl Host {
     }
 }
 
-/// Types [`LINE`] at 12 cps, moves left `back` cells at `left_ms`, rests 300 ms, then inserts [`MID`].
 fn take(shape: Shape, back: usize, left_ms: u64) -> (Host, Snap, Vec<Snap>) {
     let mut h = Host::new(shape);
     for ch in LINE.chars() {
@@ -467,7 +464,7 @@ fn take(shape: Shape, back: usize, left_ms: u64) -> (Host, Snap, Vec<Snap>) {
     (h, before, after)
 }
 
-/// Insert depths across the walk's fast leg (`30`), slow leg (`8`, `15`), and first glyph (`LINE.len()`).
+/// Insert depths across the fast leg (`30`), slow leg (`8`, `15`), and leading edge (`LINE.len()`).
 const BACKS: [usize; 4] = [8, 15, 30, LINE.len()];
 
 const HOP_BACKS: [usize; 3] = [8, 15, 30];
@@ -480,7 +477,6 @@ struct Shared {
     hop: Option<Result<Vec<Snap>, String>>,
 }
 
-/// Cached replay of `(shape, back)` shared across the walk, hop, and C2 tests.
 fn shared(shape: Shape, back: usize) -> &'static Shared {
     static TAKES: [OnceLock<Shared>; SHAPES.len() * BACKS.len()] =
         [const { OnceLock::new() }; SHAPES.len() * BACKS.len()];
@@ -539,8 +535,6 @@ fn max_step() -> f32 {
     1.0 / WALK_FAST_CELLS + EPS
 }
 
-/// Every settled frame after a mid-line insert reads one continuous walk along the phrase:
-/// no live cell steps backward or jumps past one fast-leg step per column.
 #[test]
 fn typing_inside_a_lit_line_keeps_the_walk_continuous_at_the_pushed_tail() {
     let mut report = String::new();
@@ -608,8 +602,6 @@ fn typing_inside_a_lit_line_keeps_the_walk_continuous_at_the_pushed_tail() {
     );
 }
 
-/// An End hop over the pushed tail lays its corridor on `Ribbon::wake_origin`, so no tail glyph
-/// changes colour on the End's echo frame.
 #[test]
 fn a_hop_over_the_pushed_tail_does_not_repaint_it() {
     let mut report = String::new();
@@ -675,7 +667,6 @@ fn a_hop_over_the_pushed_tail_does_not_repaint_it() {
     );
 }
 
-/// Every live cell left after a mid-line or leading insert sits on its cohort's walk (C2).
 #[test]
 fn every_cell_a_mid_line_insert_leaves_is_on_its_cohorts_walk() {
     let mut report = String::new();
@@ -729,8 +720,6 @@ fn every_cell_a_mid_line_insert_leaves_is_on_its_cohorts_walk() {
     );
 }
 
-/// A mid-line Backspace marks the pulled tail leaving on its settled frame and dark within 400 ms,
-/// while the prefix keeps its walk.
 #[test]
 fn a_mid_line_backspace_takes_the_tail_s_light_and_leaves_no_seam() {
     crate::common::par_map(&SHAPES, |&shape| {

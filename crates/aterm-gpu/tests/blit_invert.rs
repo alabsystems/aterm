@@ -3,13 +3,11 @@
 //
 // Present-path blit with `BlitUniform.flag != 0` (visual-bell flash) inverts RGB.
 
-use std::sync::Arc;
-
-use aterm_core::render::{FreeSampler, FreeSprite, FreeZ};
 use aterm_core::terminal::Terminal;
 use aterm_gpu::GpuRenderer;
-use aterm_render::{Frame, RenderInput, SceneAtlas, Theme};
+use aterm_render::{Frame, RenderInput, Theme};
 
+use crate::common::sprites::{art_of, over, put};
 use crate::common::{self, bb, gg, rr};
 
 const ROWS: usize = 6;
@@ -45,34 +43,15 @@ fn inject_offscreen(
     w: usize,
     h: usize,
 ) -> Frame {
-    let mut rgba = Vec::with_capacity(w * h * 4);
-    for &p in pixels {
-        rgba.extend_from_slice(&[rr(p) as u8, gg(p) as u8, bb(p) as u8, 255]);
-    }
+    let art = art_of(w as u16, h as u16, |x, y| {
+        let p = pixels[usize::from(y) * w + usize::from(x)];
+        [rr(p) as u8, gg(p) as u8, bb(p) as u8, 255]
+    });
     let mut term = Terminal::new(ROWS as u16, COLS as u16);
     term.process(b"\x1b[?25l"); // no cursor pixels over the injected art
     let mut input = term.cell_frame(ROWS, COLS);
-    input.free_atlas = Some(Arc::new(SceneAtlas {
-        width: w as u32,
-        height: h as u32,
-        rgba,
-        version: 1,
-    }));
-    input.free_sprites.push(FreeSprite {
-        x: 0,
-        y: 0,
-        w: w as u16,
-        h: h as u16,
-        ax: 0,
-        ay: 0,
-        aw: w as u16, // bake == dest: the NEAREST 1:1 contract
-        ah: h as u16,
-        tint: 0x00FF_FFFF, // no tint
-        alpha: 255,        // fully opaque: src-over is a replacement
-        flip_x: false,
-        z: FreeZ::OverText,
-        sampler: FreeSampler::Nearest,
-    });
+    // 1:1, opaque, untinted: a Linear sprite over is a replacement.
+    put(&mut input, &[over(0, 0, art)]);
     let got = gpu.render_input(win, &input, None);
     assert_eq!(
         (got.width, got.height),
@@ -83,7 +62,7 @@ fn inject_offscreen(
         assert_eq!(
             have & 0x00ff_ffff,
             want,
-            "PREMISE: the 1:1 opaque free sprite must inject bytes verbatim — \
+            "PREMISE: the 1:1 opaque sprite must inject bytes verbatim — \
              pixel {i} wanted {want:#08x}, offscreen has {have:#08x}"
         );
     }

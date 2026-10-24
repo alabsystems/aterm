@@ -616,11 +616,8 @@ fn bar_fill(res: Resource, view: &ResourceView, snap: &Snapshot) -> Option<BarFi
         (c > 0.0).then(|| (v / c).clamp(0.0, 1.0) as f32)
     };
     let machine = view.heat_now.filter(|h| !h.is_nan()).map(|h| h.min(1.0));
-    let (global, scoped) = match res {
-        Resource::Cpu | Resource::Memory | Resource::Processes => (machine, true),
-        Resource::Gpu | Resource::Disk | Resource::Network => (machine, false),
-        Resource::Tokens => (None, true),
-    };
+    let global = machine.filter(|_| res != Resource::Tokens);
+    let scoped = res.scope_shares_capacity();
     let aterm = if scoped { share(&view.aterm) } else { None };
     let tab = if scoped { share(&view.tab) } else { None };
     if global.is_none() && aterm.is_none() {
@@ -3146,8 +3143,8 @@ pub(crate) mod tests {
         );
 
         let no_agent = ScopeFig {
-            now: None,
             missing: Some(NoFigure::NoAgent),
+            ..ScopeFig::default()
         };
         first.resources[Resource::Tokens.index()].tabs = vec![(FRONT, no_agent)];
         assert_eq!(

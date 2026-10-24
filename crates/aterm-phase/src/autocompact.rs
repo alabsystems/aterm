@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Claude Code autocompact offer reader ([`crate::prompt`], [`offer_box`], [`accept_size`],
-//! [`LADDER`]).
+//! Claude Code autocompact offer reader.
 
 use crate::prompt::{Opt, PromptKind, PromptV2, Role, Select};
 
@@ -76,7 +75,6 @@ pub fn size_words(tokens: u32) -> String {
     }
 }
 
-/// `Keep auto` → `auto`; `Keep 500k tokens` → `500k tokens`: the keep row's label exactly.
 fn keep_current(label: &str) -> Option<&str> {
     let rest = label.strip_prefix("Keep ")?;
     let amount = |t: &str| {
@@ -98,10 +96,8 @@ fn keep_current(label: &str) -> Option<&str> {
     ok.then_some(rest)
 }
 
-/// How the description the vendor draws under the accept row opens.
 const DESCRIPTION: &str = "This conversation is at ";
 
-/// An option's label less a description drawn on its own row after two spaces or more.
 fn strip_inline(drawn: &str) -> (&str, Option<&str>) {
     match drawn.find(&format!("  {DESCRIPTION}")) {
         Some(at) => (
@@ -112,7 +108,6 @@ fn strip_inline(drawn: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// One option row: `(pointer column, focused, label)`.
 fn option_row(row: &str) -> Option<(usize, bool, &str)> {
     let col = crate::phase::leading_spaces(row);
     let t = crate::text::trim(row);
@@ -123,7 +118,6 @@ fn option_row(row: &str) -> Option<(usize, bool, &str)> {
     Some((col.checked_sub(2)?, false, t))
 }
 
-/// The title row less a position label `n of m` the frame may draw beside it.
 fn is_title_row(row: &str) -> bool {
     let title = const { crate::anchors::anchor_text("autocompact.title") };
     let t = crate::text::trim(row);

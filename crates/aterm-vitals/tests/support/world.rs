@@ -6,7 +6,7 @@
 
 #![allow(dead_code, reason = "each test binary mounting this uses part of it")]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use aterm_vitals::jobs::{
     Block, CallHint, Consumer, Fault, Fd, FdKind, GateWord, InputGate, JobCounters, JobProc,
@@ -138,6 +138,10 @@ pub struct World {
     pub limit: Option<u64>,
     /// Named pids a scenario keeps.
     pub vars: HashMap<&'static str, u32>,
+    /// How long after its clock a tick reads its processes (the shells' terminal groups).
+    pub read_lag_ms: u64,
+    /// Pids a tick's sweep lists that exit before it reads them: they have no reading.
+    pub unread: BTreeSet<u32>,
     looked: HashMap<(u32, u64, u64), u64>,
 }
 
@@ -158,6 +162,8 @@ impl World {
             machine: Machine::default(),
             lanes: LanesSeen::default(),
             jobs: Jobs::new(),
+            read_lag_ms: 0,
+            unread: BTreeSet::new(),
             limit: Some(5333),
             vars: HashMap::new(),
             looked: HashMap::new(),
@@ -408,13 +414,19 @@ impl World {
         let wants = self.jobs.plan(&sweep, &tabs);
         let mut read = Vec::new();
         for w in wants {
-            let Some(p) = self.procs.get(&w.pid).cloned() else {
+            let Some(p) = self
+                .procs
+                .get(&w.pid)
+                .filter(|_| !self.unread.contains(&w.pid))
+                .cloned()
+            else {
                 continue;
             };
             read.push(self.facts_of(&p, w.fds));
         }
         let tick = JobTick {
             at_ms: self.at,
+            read_ms: self.at + self.read_lag_ms,
             self_uid: Some(UID),
             sweep,
             procs: read,

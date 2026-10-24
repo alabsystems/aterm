@@ -161,6 +161,10 @@ pub(crate) struct PrivacySnapshot {
     /// for this bundle id from tccd's log, the switch's row in the system
     /// TCC.db, and the two joined (`grant=`).
     devtools: DevToolsRow,
+    /// This user's programs macOS's program check holds now: how many, and the longest held to
+    /// now, ms ([`crate::sys_host::Shared::program_check_now`]); `None` off macOS or with no
+    /// view that speaks for now.
+    program_check: Option<(u32, u64)>,
     /// Per-service folder state, in `folder_names` order, and its source.
     folders: Vec<(&'static str, &'static str)>,
     folder_source: String,
@@ -380,6 +384,14 @@ impl PrivacySnapshot {
         REMEDIATE.map(|place| self.os_consent().then_some(place))
     }
 
+    /// `program_check=` and `program_check_oldest_ms=`: the count and the longest held, or
+    /// neither with none read; no oldest with none held.
+    fn program_check_fields(&self) -> (Option<u64>, Option<u64>) {
+        self.program_check.map_or((None, None), |(n, oldest)| {
+            (Some(u64::from(n)), (n > 0).then_some(oldest))
+        })
+    }
+
     fn protected(&self) -> &[String] {
         if self.os_consent() {
             &self.protected
@@ -520,9 +532,11 @@ impl PrivacySnapshot {
         ));
         let num = |value: Option<u64>| value.map_or_else(|| "-".to_string(), |n| n.to_string());
         let devtools = self.devtools.probe;
+        let (held, oldest) = self.program_check_fields();
         out.push(format!(
             "devtools state={} subject={} requests={} not_allowed={} answer_age_ms={} \
-             window_s={} probe={} probe_age_ms={} grant={} list={} list_probe={}",
+             window_s={} probe={} probe_age_ms={} grant={} list={} list_probe={} \
+             program_check={} program_check_oldest_ms={}",
             devtools.state.as_str(),
             opt(self.devtools.subject),
             num(devtools.requests.map(u64::from)),
@@ -536,6 +550,8 @@ impl PrivacySnapshot {
             self.devtools.grant().as_str(),
             self.devtools.list.listing.as_str(),
             self.devtools.list.label.as_str(),
+            num(held),
+            num(oldest),
         ));
         out.push(format!(
             "observer fda={} responsible={} log={} taskport={TASKPORT_WATCH}",
@@ -790,10 +806,12 @@ pub(crate) fn cmd_privacy_json(snapshot: &PrivacySnapshot) -> String {
     );
     let num = |value: Option<u64>| value.map_or_else(|| "null".to_string(), |n| n.to_string());
     let devtools = snapshot.devtools.probe;
+    let (held, oldest) = snapshot.program_check_fields();
     let _ = write!(
         body,
         "\"devtools\":{{{},\"subject\":{},\"requests\":{},\"not_allowed\":{},\
-         \"answer_age_ms\":{},\"window_s\":{},{},\"probe_age_ms\":{},{},{},{}}},",
+         \"answer_age_ms\":{},\"window_s\":{},{},\"probe_age_ms\":{},{},{},{},\
+         \"program_check\":{},\"program_check_oldest_ms\":{}}},",
         json_str_field("state", devtools.state.as_str()),
         json_opt(snapshot.devtools.subject),
         num(devtools.requests.map(u64::from)),
@@ -808,6 +826,8 @@ pub(crate) fn cmd_privacy_json(snapshot: &PrivacySnapshot) -> String {
         json_str_field("grant", snapshot.devtools.grant().as_str()),
         json_str_field("list", snapshot.devtools.list.listing.as_str()),
         json_str_field("list_probe", snapshot.devtools.list.label.as_str()),
+        num(held),
+        num(oldest),
     );
     let _ = write!(body, "\"access_card\":{},", snapshot.access_card.json());
     let _ = write!(
@@ -894,9 +914,17 @@ pub(crate) struct PrivacyAppFacts {
     /// The `observer log=` token.
     observer_log: &'static str,
     access_card: AccessCardInputs,
+    /// This user's programs macOS's program check holds now: the control worker's read ([`Self::with_program_check`]), `None` from the main hop.
+    program_check: Option<(u32, u64)>,
 }
 
 impl PrivacyAppFacts {
+    /// These facts with `held`, this user's programs macOS's program check holds now and the longest held, ms ([`crate::sys_host::Shared::program_check_now`], read on the control worker: it may pull a reading).
+    pub(crate) fn with_program_check(mut self, held: Option<(u32, u64)>) -> Self {
+        self.program_check = held;
+        self
+    }
+
     fn responsible_answers(&self) -> Vec<Result<i32, ResponsibleError>> {
         if !self.policy.report_attribution {
             return vec![Err(ResponsibleError::Unsupported); self.sessions.len()];
@@ -993,6 +1021,7 @@ impl PrivacySnapshot {
             warmup_last_ms: facts.warmup_last_ms,
             debugger: slots.debugger,
             devtools: slots.devtools,
+            program_check: facts.program_check,
             folders,
             folder_source,
             claimants: slots.census.0,
@@ -1038,6 +1067,7 @@ impl App {
             warmup_last_ms: self.consent_warmup.last_pass_ms(),
             observer_log: self.privacy_observer_log(),
             access_card: self.access_card_inputs(),
+            program_check: None,
         }
     }
 
@@ -1443,6 +1473,7 @@ mod tests {
             warmup_last_ms: None,
             debugger: FIXTURE_DEBUGGER,
             devtools: FIXTURE_DEVTOOLS,
+            program_check: Some((0, 0)),
             observer_fda: "ok",
             observer_responsible: "ok",
             observer_log: "off",
@@ -1588,6 +1619,55 @@ mod tests {
         }
     }
 
+    /// THE DEVTOOLS LINE COUNTS THE LIVE WAIT: it ends with how many of this user's programs
+    /// macOS's program check holds now and the longest held, `0` with no oldest when none is
+    /// held, and `-` for both when nothing was read; the JSON's `devtools` object carries the same
+    /// two values, `null` for `-`.
+    #[test]
+    fn the_devtools_line_counts_the_live_wait() {
+        let mut snap = snapshot(0, FdaState::Granted, SpikeEvidence::MEASURED);
+        for (held, end, json) in [
+            (
+                Some((2, 35_940_000)),
+                " program_check=2 program_check_oldest_ms=35940000",
+                (Some(2), Some(35_940_000)),
+            ),
+            (
+                Some((0, 0)),
+                " program_check=0 program_check_oldest_ms=-",
+                (Some(0), None),
+            ),
+            (
+                None,
+                " program_check=- program_check_oldest_ms=-",
+                (None, None),
+            ),
+        ] {
+            snap.program_check = held;
+            let line = snap
+                .lines()
+                .into_iter()
+                .find(|l| l.starts_with("devtools "))
+                .expect("a devtools row");
+            assert!(line.ends_with(end), "{held:?}: {line}");
+            let body = cmd_privacy_json(&snap);
+            let parsed: aterm_json::Value =
+                aterm_json::from_str(body.lines().nth(1).expect("a body line")).expect("JSON");
+            let devtools = &parsed["devtools"];
+            assert_eq!(
+                (
+                    devtools["program_check"].as_u64(),
+                    devtools["program_check_oldest_ms"].as_u64()
+                ),
+                json,
+                "{held:?}: {devtools:?}"
+            );
+            for key in ["program_check", "program_check_oldest_ms"] {
+                assert!(devtools.get(key).is_some(), "{key} is always present");
+            }
+        }
+    }
+
     #[test]
     fn the_line_body_is_the_documented_shape() {
         let keys = |line: &String| -> String {
@@ -1628,7 +1708,7 @@ mod tests {
             "debugger mode member self_hardened right probe probe_age_ms pending pending_right \
              pending_age_ms last watch_ms",
             "devtools state subject requests not_allowed answer_age_ms window_s probe \
-             probe_age_ms grant list list_probe",
+             probe_age_ms grant list list_probe program_check program_check_oldest_ms",
             "observer fda responsible log taskport",
             "access_card state asked_at opened_at verified_at renew_at needs",
             "remediate fda files debugger devtools",

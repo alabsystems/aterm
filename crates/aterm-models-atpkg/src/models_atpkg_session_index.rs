@@ -1,16 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A seated headless session's index worker and its host handoff. The index cooldown model
-//! owns the cross-process HEAD bound; this model binds the worker's near/final answers to the
-//! real host claim and pass decision.
+//! A seated headless session's index worker and its host handoff.
 
 use aterm_spec::derive::*;
 
-/// An empty store makes no network request. One five-second park after work appears, the
-/// seated session may start its first index HEAD; an empty local look must not consume the
-/// thirty-second completed-network cooldown, which `Buggy = 1` stamps on an empty look. Tier 1
-/// drives the runner with an injected eligibility flag and clock.
+/// An empty store makes no network request.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn atpkg_session_index_eligibility_model() -> Model {
@@ -19,8 +14,6 @@ pub fn atpkg_session_index_eligibility_model() -> Model {
             const Buggy = 0;
             const Interval = 6;
             const MaxAge = 7;
-            // Ages count five-second runner parks. No network probe has run,
-            // so the network age starts past its completed-probe cooldown.
             var local_age = 1;
             var network_age = 6;
             var eligible = 0;
@@ -52,18 +45,13 @@ pub fn atpkg_session_index_eligibility_model() -> Model {
     }
 }
 
-/// One published build, one session seat and a window which can arrive after
-/// the HEAD starts. `Buggy=1` replays three mistakes: another session starts a
-/// network worker, a stale claim launches behind a window, and the far answer
-/// launches the same build twice. Tier-1 drives `Runner::step` and the real
-/// `HostClaim` over these transitions.
+/// One published build.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn atpkg_session_index_handoff_model() -> Model {
     aterm_spec::ty_model! {
         AtpkgSessionIndexHandoff {
             const Buggy = 0;
-            // 0 idle, 1 HEAD worker pending, 2 completed.
             var probe = 0;
             var requests = 0;
             var near = 0;

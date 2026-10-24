@@ -16,7 +16,8 @@ use super::super::occupancy::hold::{self, Close, HoldChange, HoldClock, HoldEven
 use super::super::occupancy::rules::{self, Books, Guards, HoldSeen, RuleId, Verdict};
 use super::super::occupancy::said;
 use super::super::occupancy::{
-    FactLine, OccupancyReading, OccupancySaid, SaidHold, SaidReadyIdle, SaidRule, SaidVerdict,
+    FactLine, FactWord, NoteOutcome, OccupancyReading, OccupancySaid, SaidHold, SaidReadyIdle,
+    SaidRule, SaidVerdict,
 };
 use super::super::policy::turn_end::{HostTurn, Reach};
 use super::approvals::Outcome;
@@ -89,6 +90,23 @@ struct DoorWatch {
     k_due: Vec<(RuleId, EpisodeKey, Option<Guard>)>,
     /// What the K clock last raised: the told word's `ready_idle` while the hold stands.
     ready_idle: Option<SaidReadyIdle>,
+    /// THE TASK DOOR'S WORD (the slice-2 plan's D1): the fact word its host took that stands on
+    /// the session's task record, as far as this loop knows (a seed's too,
+    /// [`Session::door_task_seed`]): cleared at the hold's close.
+    task_word: Option<FactWord>,
+    /// The hold closed with [`Self::task_word`] standing: its clear, owed at the next step under
+    /// a grant ([`Session::door_task_owed`]).
+    task_clear: Option<FactWord>,
+}
+
+/// A line the managed guard alone holds at a break: the episode the task door notes
+/// ([`Session::door_task_due`]).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct TaskDue {
+    rule: RuleId,
+    /// The episode's ordinal in the hold ([`rules::Books::this_hold`]).
+    ordinal: usize,
+    episode: u64,
 }
 
 /// A held verdict of the open hold, as [`DoorWatch::held`] keeps it: the rule, the episode's
@@ -343,12 +361,20 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// One event, with the seed taken up first and the change said.
-    fn hold_step(&mut self, seq: u64, event: HoldEvent, review: &mut dyn Review) {
+    /// One event, with the seed taken up first and the change said, and a clear the hold's close
+    /// left owed made ([`Self::door_task_owed`]).
+    fn hold_step(
+        &mut self,
+        seq: u64,
+        event: HoldEvent,
+        cfg: Option<&SupervisorConfig>,
+        review: &mut dyn Review,
+    ) {
         self.hold_take_seed(seq, review);
         if let Some(change) = self.hold.clock.step(event) {
             self.hold_said(seq, change, review);
         }
+        self.door_task_owed(seq, cfg);
     }
 
     /// A read of the agent's own background work at a break begun at `at`, standing `waited`,
@@ -375,6 +401,7 @@ impl<C: Ctl> Session<'_, C> {
                 now_ms,
                 settled,
             },
+            cfg,
             review,
         );
         if settled && self.hold.clock.wants_tail() {
@@ -382,7 +409,7 @@ impl<C: Ctl> Session<'_, C> {
                 .reader(&screen.rows)
                 .said_tail(&screen.rows)
                 .is_some_and(|said| hold::waiting_declared(&said));
-            self.hold_step(seq, HoldEvent::AnswerTail { waiting_line }, review);
+            self.hold_step(seq, HoldEvent::AnswerTail { waiting_line }, cfg, review);
         }
         if !self.hold.booked
             && let Some(held_ms) = self.hold.clock.held_ms(now_ms)
@@ -450,12 +477,20 @@ impl<C: Ctl> Session<'_, C> {
             && !self.fx.replay_lacks_host_door("host.occupancy_pace");
         let ready = rules::ready(&reading, Some(hold), now_ms);
         self.hold.door.k_due = self.k_due_of(&verdicts, hold);
+        let task = self.door_task_due(&verdicts, &guards, hold);
         for (rule, verdict) in verdicts {
             if prompt && let Verdict::Due(line) = &verdict {
                 self.occupancy_due(screen.seq, rule, line, hold, (now_ms, now));
                 continue;
             }
             self.occupancy_said(screen.seq, rule, verdict, hold, now_ms, review);
+        }
+        if let Some(task) = task {
+            let grant = cfg.occupancy.grant().filter(|_| prompt);
+            match grant {
+                Some(grant) => self.door_task(&grant, screen.seq, task, hold, now_ms, review),
+                None => self.door_task_would(screen.seq, task, hold, now_ms, review),
+            }
         }
         // A line the write takes at this break is looked at by the write, past its `status`
         // read (`door_k_wrote`): a person it finds there holds the raise (S15).
@@ -645,10 +680,12 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// THE WRITE'S GUARDS, judged again on the one `status` read just before it (whose hands
-    /// are on the session, the halt, unread input), the composer's read (a composer the read
-    /// cannot judge is a draft) and the host's `taskless`; `Err` with the guard that holds where
-    /// the read itself says nothing (`Guard::Person`). Every line at a break goes through it: the
-    /// door's ([`Self::door_holds`]) and the stuck fact's (`Session::stuck_break`, through `door::stuck_at_break`).
+    /// are on the session, the halt, unread input), the task record before the loop's first fold
+    /// read it (`Session::managed_at_write`), the composer's read (a composer the read cannot
+    /// judge is a draft) and the host's `taskless`; `Err` with the guard that holds where a read
+    /// itself says nothing (`Guard::Person` for the status, `Guard::Managed` for the record).
+    /// Every line at a break goes through it: the door's ([`Self::door_holds`]) and the stuck
+    /// fact's (`Session::stuck_break`, through `door::stuck_at_break`).
     pub(super) fn write_guards(
         &mut self,
         screen: &Screen,
@@ -673,6 +710,9 @@ impl<C: Ctl> Session<'_, C> {
             };
             seen
         };
+        if let Some(guard) = self.managed_at_write()? {
+            return Ok(Err(guard));
+        }
         let mut guards = self.occupancy_guards(now, cfg, &screen.rows);
         guards.person |= seen.person(cfg.human_grace_s);
         guards.halted |= seen.halted;
@@ -995,7 +1035,7 @@ impl<C: Ctl> Session<'_, C> {
             draft: self.draft_seen.is_some(),
             taskless: reader.fresh(rows),
             exchange: self.turn_end.left_to_person(),
-            managed: self.turn_end.managed(),
+            managed: self.turn_end.managed() && !armed(Fault::NoteAndType),
             memory: self.memory_seen.is_some()
                 || matches!(
                     self.memory_told,
@@ -1081,6 +1121,212 @@ impl<C: Ctl> Session<'_, C> {
         );
     }
 
+    /// THE TASK DOOR'S LINE at a break (the slice-2 plan's D1): the first rule whose line the
+    /// managed guard alone holds (`Guards::held_except`: every other guard clear, so the line
+    /// would have been typed but for the manager), in an episode the door has not booked
+    /// ([`super::super::facts::FactsState::is_noted`]); `None` where none, and on a tape a build
+    /// before slice 2's doors recorded.
+    pub(super) fn door_task_due(
+        &self,
+        verdicts: &[(RuleId, Verdict)],
+        guards: &Guards,
+        hold: HoldSeen,
+    ) -> Option<TaskDue> {
+        if !self.fx.slice2_recorded() {
+            return None;
+        }
+        let hold_key = self.hold_wall_ms(hold.since_ms);
+        verdicts.iter().find_map(|(rule, verdict)| {
+            let managed = match verdict {
+                Verdict::Held(Guard::Managed) => true,
+                Verdict::Due(_) => armed(Fault::NoteAndType) && self.turn_end.managed(),
+                _ => false,
+            };
+            let alone = guards.held_except(Guard::Managed, *rule).is_none()
+                || armed(Fault::NoteOnManagedAlone);
+            if !managed || !alone {
+                return None;
+            }
+            let ordinal = self.hold.door.books.this_hold(*rule);
+            let episode = rules::episode(*rule, hold_key, ordinal);
+            let key = EpisodeKey {
+                kind: FactKind::Hold,
+                id: episode,
+            };
+            (!self.facts.state.is_noted(key) || armed(Fault::NoteEachBreak)).then_some(TaskDue {
+                rule: *rule,
+                ordinal,
+                episode,
+            })
+        })
+    }
+
+    /// THE TASK DOOR under `prompt` (W3: the one caller of `IdleHost::task_fact` with a word,
+    /// its `PromptGrant` the gate): the intent row (`fact-intent@v1 … door=task`), the host asked
+    /// to note the episode's fact word on the session's task record, and the outcome row
+    /// (`fact-hold@v1`, `waiting … door=task noted`, or `skipped … door=task why=<word>`). The
+    /// episode is booked once, but a `fenced` answer is tried again at the next break. Nothing is
+    /// typed: the line stays held by the manager.
+    fn door_task(
+        &mut self,
+        _grant: &super::super::config::PromptGrant,
+        seq: u64,
+        task: TaskDue,
+        hold: HoldSeen,
+        now_ms: i64,
+        review: &mut dyn Review,
+    ) {
+        let (Some(host), Some(word)) = (
+            self.stall_host.clone(),
+            FactWord::new(task.rule, task.ordinal.saturating_add(1)),
+        ) else {
+            return;
+        };
+        let held_ms = now_ms.saturating_sub(hold.since_ms);
+        let (rule, episode, declared) = (task.rule, task.episode, hold.declared);
+        self.ledger_row(
+            door::INTENT_RULE,
+            Outcome::Waiting,
+            "",
+            &door::task_intent_reason(rule, episode, held_ms, declared),
+            seq,
+        );
+        let outcome = host.task_fact(Some(word));
+        let (decision, words) = match outcome {
+            NoteOutcome::Noted => (Outcome::Waiting, outcome.word().to_string()),
+            refused => (Outcome::Skipped, format!("skipped why={}", refused.word())),
+        };
+        self.ledger_row(
+            FactKind::Hold.rule(),
+            decision,
+            &word.word(),
+            &door::task_outcome_reason(rule, episode, held_ms, declared, outcome),
+            seq,
+        );
+        if outcome == NoteOutcome::Noted {
+            self.hold.door.task_word = Some(word);
+        }
+        if outcome != NoteOutcome::Fenced {
+            let key = EpisodeKey {
+                kind: FactKind::Hold,
+                id: episode,
+            };
+            self.facts.state.note(key, self.hold_wall_ms(now_ms));
+        }
+        review.note(&format!(
+            "OCCUPANCY seq={seq} rule={} rev=builtin episode={episode:016x} door=task {words}",
+            rule.name()
+        ));
+    }
+
+    /// The task door under `observe` (F2: on a tape slice 2's doors recorded, as every live
+    /// loop's): the would-be note's row (`fact-would@v1 … door=task`), once an episode, and
+    /// nothing asked of the host.
+    fn door_task_would(
+        &mut self,
+        seq: u64,
+        task: TaskDue,
+        hold: HoldSeen,
+        now_ms: i64,
+        review: &mut dyn Review,
+    ) {
+        let held_ms = now_ms.saturating_sub(hold.since_ms);
+        let (rule, episode) = (task.rule, task.episode);
+        self.ledger_row(
+            rules::WOULD_RULE,
+            Outcome::Waiting,
+            "",
+            &door::task_intent_reason(rule, episode, held_ms, hold.declared),
+            seq,
+        );
+        let key = EpisodeKey {
+            kind: FactKind::Hold,
+            id: episode,
+        };
+        self.facts.state.note(key, self.hold_wall_ms(now_ms));
+        review.note(&format!(
+            "OCCUPANCY seq={seq} rule={} rev=builtin episode={episode:016x} door=task would",
+            rule.name()
+        ));
+        if armed(Fault::NoteUnderObserve)
+            && let Some(host) = self.stall_host.clone()
+        {
+            let _ = host.task_fact(FactWord::new(rule, task.ordinal.saturating_add(1)));
+        }
+    }
+
+    /// The clear the hold's close left owed ([`DoorWatch::task_clear`]), made under a grant
+    /// ([`Self::door_task_clear`]); with none (the owner's mode left `prompt`) it is dropped,
+    /// since nothing is written to a task record under `observe` or `off`: the word stands until
+    /// a later note replaces it or a later loop's seed under a grant clears it
+    /// ([`Self::door_task_seed`]).
+    fn door_task_owed(&mut self, seq: u64, cfg: Option<&SupervisorConfig>) {
+        let Some(word) = self.hold.door.task_clear else {
+            return;
+        };
+        let grant = cfg
+            .and_then(|cfg| cfg.occupancy.grant())
+            .filter(|_| !self.fx.replay_lacks_host_door("host.occupancy_pace"));
+        match grant {
+            Some(grant) => self.door_task_clear(&grant, seq, word),
+            None => self.hold.door.task_clear = None,
+        }
+    }
+
+    /// The fact word `word` cleared from the session's task record (`IdleHost::task_fact(None)`,
+    /// under its `PromptGrant`): its row (`fact-hold@v1`, `waiting … door=task cleared`, or
+    /// `skipped … why=<word>`); a `fenced` answer leaves the clear owed, tried again at the next
+    /// step, with no row.
+    fn door_task_clear(
+        &mut self,
+        _grant: &super::super::config::PromptGrant,
+        seq: u64,
+        word: FactWord,
+    ) {
+        let Some(host) = self.stall_host.clone() else {
+            self.hold.door.task_clear = None;
+            return;
+        };
+        let outcome = host.task_fact(None);
+        if outcome == NoteOutcome::Fenced {
+            return;
+        }
+        self.hold.door.task_clear = None;
+        let decision = if outcome == NoteOutcome::Cleared {
+            Outcome::Waiting
+        } else {
+            Outcome::Skipped
+        };
+        self.ledger_row(
+            FactKind::Hold.rule(),
+            decision,
+            &word.word(),
+            &door::task_clear_reason(word, outcome),
+            seq,
+        );
+    }
+
+    /// The fact word the session's task record carries at the loop's first read of it
+    /// (`Session::task_seed`, `fact` as `task` gave it), in a loop that measures the hold (its
+    /// start placed the wall, [`Self::hold_seed_from`]) and under a grant: with no hold open it
+    /// stands for no episode and is cleared now; with one open, this loop clears it at that hold's
+    /// close (a predecessor's word, which this loop's own note of the episode replaces).
+    pub(super) fn door_task_seed(&mut self, fact: Option<FactWord>, cfg: &SupervisorConfig) {
+        let Some(word) = fact else {
+            return;
+        };
+        let measures = self.hold.door.wall.is_some();
+        if !measures || !self.fx.slice2_recorded() || self.stall_host.is_none() {
+            return;
+        }
+        if self.hold.clock.since_ms().is_some() {
+            self.hold.door.task_word.get_or_insert(word);
+            return;
+        }
+        self.hold.door.task_clear = Some(word);
+        self.door_task_owed(0, Some(cfg));
+    }
+
     /// A line of the stuck fact's went at `at_ms` (the clock's): it counts toward the session's
     /// pace as the door's own lines do.
     pub(super) fn door_lined(&mut self, at_ms: i64) {
@@ -1103,7 +1349,7 @@ impl<C: Ctl> Session<'_, C> {
         review: &mut dyn Review,
     ) {
         if self.occupancy_observes(cfg, review) {
-            self.hold_step(seq, HoldEvent::HarnessLine, review);
+            self.hold_step(seq, HoldEvent::HarnessLine, cfg, review);
         }
     }
 
@@ -1118,7 +1364,7 @@ impl<C: Ctl> Session<'_, C> {
     ) {
         if self.occupancy_observes(cfg, review) {
             let ours = self.turn_end.typed_untaken();
-            self.hold_step(seq, HoldEvent::LiveTurn { ours }, review);
+            self.hold_step(seq, HoldEvent::LiveTurn { ours }, cfg, review);
         }
     }
 
@@ -1140,6 +1386,7 @@ impl<C: Ctl> Session<'_, C> {
         self.hold_step(
             screen.seq,
             HoldEvent::DecidedPoint { acts, background },
+            cfg,
             review,
         );
     }
@@ -1219,6 +1466,9 @@ impl<C: Ctl> Session<'_, C> {
         if let HoldChange::Closed { .. } = change {
             self.facts.state.observe_closed(FactKind::Hold, &[]);
             self.hold.door.ready_idle = None;
+            if let Some(word) = self.hold.door.task_word.take() {
+                self.hold.door.task_clear = Some(word);
+            }
         }
         review.note(&format!("OCCUPANCY seq={seq} {words}"));
         let row = match change {

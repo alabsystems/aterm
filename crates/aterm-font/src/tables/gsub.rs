@@ -5,15 +5,13 @@
 // project in 2026.
 // See ../../LICENSE-MIT and ../../LICENSE-APACHE for the upstream licenses.
 
-//! A [Glyph Substitution Table](https://docs.microsoft.com/en-us/typography/opentype/spec/gsub)
-//! implementation.
+//! OpenType Glyph Substitution (`GSUB`) table implementation.
 
 use crate::GlyphId;
 use crate::ggg::{ChainedContextLookup, ContextLookup, Coverage, LookupSubtable};
 use crate::parser::{FromSlice, LazyArray16, LazyOffsetArray16, Stream};
 
-/// A [Single Substitution
-/// Subtable](https://docs.microsoft.com/en-us/typography/opentype/spec/gsub#SS).
+/// OpenType Single Substitution subtable (`GSUB` LookupType 1).
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug)]
 pub enum SingleSubstitution<'a> {
@@ -59,8 +57,7 @@ impl<'a> SingleSubstitution<'a> {
     }
 }
 
-/// A sequence of glyphs for [Multiple Substitution
-/// Subtable](https://docs.microsoft.com/en-us/typography/opentype/spec/gsub#MS).
+/// Sequence of glyphs for a `GSUB` Multiple Substitution subtable.
 #[derive(Clone, Copy, Debug)]
 pub struct Sequence<'a> {
     /// A list of substitute glyphs.
@@ -79,8 +76,7 @@ impl<'a> FromSlice<'a> for Sequence<'a> {
 /// A list of [`Sequence`] tables.
 pub type SequenceList<'a> = LazyOffsetArray16<'a, Sequence<'a>>;
 
-/// A [Multiple Substitution
-/// Subtable](https://docs.microsoft.com/en-us/typography/opentype/spec/gsub#MS).
+/// OpenType Multiple Substitution subtable (`GSUB` LookupType 2).
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug)]
 pub struct MultipleSubstitution<'a> {
@@ -106,8 +102,7 @@ impl<'a> MultipleSubstitution<'a> {
     }
 }
 
-/// A list of glyphs for [Alternate Substitution
-/// Subtable](https://docs.microsoft.com/en-us/typography/opentype/spec/gsub#AS).
+/// List of glyphs for a `GSUB` Alternate Substitution subtable.
 #[derive(Clone, Copy, Debug)]
 pub struct AlternateSet<'a> {
     /// Array of alternate glyph IDs, in arbitrary order.
@@ -126,8 +121,7 @@ impl<'a> FromSlice<'a> for AlternateSet<'a> {
 /// A set of [`AlternateSet`].
 pub type AlternateSets<'a> = LazyOffsetArray16<'a, AlternateSet<'a>>;
 
-/// A [Alternate Substitution
-/// Subtable](https://docs.microsoft.com/en-us/typography/opentype/spec/gsub#AS).
+/// OpenType Alternate Substitution subtable (`GSUB` LookupType 3).
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug)]
 pub struct AlternateSubstitution<'a> {
@@ -184,8 +178,7 @@ impl<'a> FromSlice<'a> for LigatureSet<'a> {
 /// A list of [`Ligature`] sets.
 pub type LigatureSets<'a> = LazyOffsetArray16<'a, LigatureSet<'a>>;
 
-/// A [Ligature Substitution
-/// Subtable](https://docs.microsoft.com/en-us/typography/opentype/spec/gsub#LS).
+/// OpenType Ligature Substitution subtable (`GSUB` LookupType 4).
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug)]
 pub struct LigatureSubstitution<'a> {
@@ -211,8 +204,7 @@ impl<'a> LigatureSubstitution<'a> {
     }
 }
 
-/// A [Reverse Chaining Contextual Single Substitution Subtable](
-/// https://docs.microsoft.com/en-us/typography/opentype/spec/gsub#RCCS).
+/// OpenType Reverse Chaining Contextual Single Substitution subtable (`GSUB` LookupType 8).
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug)]
 pub struct ReverseChainSingleSubstitution<'a> {
@@ -246,9 +238,7 @@ impl<'a> ReverseChainSingleSubstitution<'a> {
     }
 }
 
-/// A glyph substitution [lookup
-/// subtable](https://docs.microsoft.com/en-us/typography/opentype/spec/gsub#table-organization)
-/// enumeration.
+/// Glyph substitution lookup subtable enumeration (`GSUB`).
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug)]
 pub enum SubstitutionSubtable<'a> {

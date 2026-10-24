@@ -51,10 +51,8 @@ impl Interleave {
     }
 }
 
-/// The same vendor documents in either execution mode. Only a dispatch that borrows the
-/// shared fetcher enables the parallel schedule: Codex's head waits until Claude's real
-/// rollback reconcile has captured Codex's old target, then its primary write releases
-/// that reconcile. A serial dispatch performs the identical policy moves in table order.
+/// Shared-fetcher harness that interleaves Codex's head fetch with Claude's rollback
+/// reconcile when parallel dispatch is enabled.
 struct ScheduledVendors {
     vendors: world::Fake,
     interleave: Arc<Interleave>,
@@ -327,10 +325,8 @@ impl Fetcher for FreshBesideDangling {
     }
 }
 
-/// An emptied store can still have shims naming its old missing trees. The real first-run
-/// rider repairs one while the ALab set reconciles its captured old target. The lane's
-/// write either completes before that read publishes, or waits behind the read's turn;
-/// neither ordering may restore the missing target over the newly landed program.
+/// First-run agent repair must not be overwritten by the ALab set reconciling a captured
+/// dangling primary target.
 #[test]
 fn a_first_runs_agent_repair_survives_a_dangling_primary_read_by_the_set() {
     let registry = crate::testdir::dir("atpkg-dangling-rider-registry-");
@@ -384,9 +380,7 @@ fn a_first_runs_agent_repair_survives_a_dangling_primary_read_by_the_set() {
     let trust = world::trust();
     let mut seams = world_seams(&trust);
     seams.path = Some(std::ffi::OsString::new());
-    // This checkpoint deliberately parks the set's publication turn. Keep the
-    // repairing program first in its lane so no unrelated agent waits behind that
-    // turn before the repair can announce its own publication attempt.
+    // Exclude other agents so `codex` runs first without waiting behind the parked turn.
     let cfg = crate::config::PackagesConfig {
         exclude: Some(agents_except(&["codex"])),
         ..Default::default()

@@ -673,6 +673,7 @@ fn sweep_opts(home: &Path, harness_state: &Path) -> Opts {
         home: home.to_path_buf(),
         state: harness_state.to_path_buf(),
         sock: None,
+        token: None,
         only_sid: None,
         dry_run: false,
         human_grace_s: 120,
@@ -2549,4 +2550,55 @@ fn the_fact_lines_count_by_kind() {
     assert_eq!(acc.facts_told, one(1), "{acc:#?}");
     assert_eq!(acc.by_rule.get(hold), None, "still no act");
     assert_eq!(acc.by_rule.get(HELD_RULE), None, "a held row is no act");
+}
+
+/// The task door's rows (`door=task`) are no line on the Harness page: under `observe` a managed
+/// worker's would-be note, and under `prompt` its intent and outcome, count toward neither
+/// `facts_would` nor `facts_told`. CONTROL: the same would-be row with no task door's mark counts
+/// as a line that would have been typed.
+#[test]
+fn the_task_doors_rows_count_no_line() {
+    use crate::supervise::occupancy::door::{INTENT_RULE, TASK_DOOR};
+    use crate::supervise::occupancy::rules::WOULD_RULE;
+    let hold = crate::supervise::facts::FactKind::Hold.rule();
+    let words = "rule=wait-nudge@v1 episode=00000000000000aa held_ms=1800000";
+    let would = |reason: &str| said(500, WOULD_RULE, Outcome::Waiting, reason);
+    let noted = [
+        would(&format!("{words} {TASK_DOOR}")),
+        said(
+            600,
+            INTENT_RULE,
+            Outcome::Waiting,
+            &format!("{words} {TASK_DOOR}"),
+        ),
+        said(
+            700,
+            hold,
+            Outcome::Waiting,
+            &format!("{words} {TASK_DOOR} noted"),
+        ),
+        said(
+            800,
+            hold,
+            Outcome::Skipped,
+            &format!("{words} {TASK_DOOR} why=no-task"),
+        ),
+    ];
+    let acc = fold_ledger(&noted, 0);
+    assert_eq!(
+        acc.facts_would,
+        std::collections::BTreeMap::new(),
+        "{acc:#?}"
+    );
+    assert_eq!(
+        acc.facts_told,
+        std::collections::BTreeMap::new(),
+        "{acc:#?}"
+    );
+    let acc = fold_ledger(&[would(words)], 0);
+    assert_eq!(
+        acc.facts_would,
+        std::collections::BTreeMap::from([("hold".to_string(), 1)]),
+        "CONTROL: a would-be line's row counts"
+    );
 }

@@ -9,8 +9,21 @@ use std::fmt;
 use crate::prompt::parse_prompt;
 use crate::wall::{Placement, Wall, WallKind, classify_wall};
 
+/// Major component of the Claude Code (`claude`) harness version, starting at `0.1`.
+pub const HARNESS_VERSION_MAJOR: u16 = 0;
+
+/// Minor component of the Claude Code (`claude`) harness version, starting at `0.1`.
+pub const HARNESS_VERSION_MINOR: u16 = 1;
+
 /// Version of the Claude Code harness, tracked independently per harness starting at `"0.1"`.
 pub const HARNESS_VERSION: &str = "0.1";
+
+/// Structured incremental numeric version of the Claude Code (`claude`) harness.
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(
+    HARNESS_VERSION_MAJOR,
+    HARNESS_VERSION_MINOR,
+    HARNESS_VERSION,
+);
 
 /// The worker's phase.
 #[derive(Debug, Clone, PartialEq, Eq)]

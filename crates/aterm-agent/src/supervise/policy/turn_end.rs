@@ -11518,6 +11518,16 @@ impl TurnEndState {
         self.waited_limit().is_some()
     }
 
+    /// The standing retry wall's kind when its notice left the screen ([`left_retry_kind`]).
+    #[must_use]
+    pub(crate) fn standing_retry_wall(&self) -> Option<WallKind> {
+        let retry_taken = self.awaiting.is_some_and(|a| a.wall_retry && a.taken);
+        self.wall
+            .as_ref()
+            .filter(|t| !retry_taken && !t.owed)
+            .and_then(left_retry_kind)
+    }
+
     fn limit_elsewhere(&self, reading: &TurnEndReading) -> bool {
         if self.wall.as_ref().is_some_and(|t| {
             matches!((&t.conversation, &reading.conversation),

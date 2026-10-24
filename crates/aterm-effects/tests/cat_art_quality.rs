@@ -2,9 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Asset-level quality gates for the cursor cat's high-visibility glyphs.
-//!
-//! They read the TOML sources, not the generated drawlist, so art review
-//! works before codegen is committed.
 
 use std::path::PathBuf;
 
@@ -205,9 +202,6 @@ fn luma(layer: &aterm_toml::Value) -> f32 {
     0.2126 * r + 0.7152 * g + 0.0722 * b
 }
 
-/// The budget every authored glyph meets: at most `max_layers` layers, one
-/// outer silhouette painted first, every role in `roles`, and at most
-/// `max_commands` path commands.
 fn assert_clean_and_bounded(asset: &Asset, max_layers: usize, roles: &[&str], max_commands: usize) {
     let id = &asset.id;
     assert!(
@@ -240,8 +234,6 @@ fn assert_clean_and_bounded(asset: &Asset, max_layers: usize, roles: &[&str], ma
     );
 }
 
-/// At a 16 px bake the outline+coat silhouette covers at least
-/// `silhouette` px and each `(role, minimum)` feature at least its minimum.
 fn assert_legible_at_16(asset: &Asset, silhouette: f32, features: &[(&str, f32)]) {
     let id = &asset.id;
     let core = coverage(&render_roles(asset, &["outline", "coat"], 16));

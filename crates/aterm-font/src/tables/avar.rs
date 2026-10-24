@@ -5,7 +5,7 @@
 // project in 2026.
 // See ../../LICENSE-MIT and ../../LICENSE-APACHE for the upstream licenses.
 
-//! An [Axis Variations Table]( https://docs.microsoft.com/en-us/typography/opentype/spec/avar)
+//! An [Axis Variations Table](https://docs.microsoft.com/en-us/typography/opentype/spec/avar)
 //! implementation.
 
 use core::convert::TryFrom;
@@ -87,7 +87,7 @@ impl<'a> Iterator for SegmentMapsIter<'a> {
     }
 }
 
-/// An [Axis Variations Table]( https://docs.microsoft.com/en-us/typography/opentype/spec/avar).
+/// An [Axis Variations Table](https://docs.microsoft.com/en-us/typography/opentype/spec/avar).
 #[derive(Clone, Copy, Debug)]
 pub struct Table<'a> {
     /// The segment maps array, one per axis in `fvar` order.

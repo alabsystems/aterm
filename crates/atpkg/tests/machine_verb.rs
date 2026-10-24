@@ -2,11 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Process-level integration tests for `atpkg machine` on macOS.
-//!
-//! Runs `atpkg machine` with a temporary `HOME` to verify stdout record
-//! parsing (`MachineState::parse`), synthetic-home refusal on `--apply`
-//! (since `defaults` writes to the account's per-host domain regardless of
-//! `$HOME`), and non-zero exit on malformed config files.
 #![cfg(target_os = "macos")]
 #![allow(
     clippy::disallowed_types,
@@ -15,7 +10,6 @@
 
 use std::process::{Command, Stdio};
 
-/// A temp `HOME` with nothing in it: no config, no store.
 struct Fixture {
     root: aterm_tempfile::TempDir,
     home: std::path::PathBuf,
@@ -53,7 +47,6 @@ impl Fixture {
     }
 }
 
-/// Verify `atpkg machine` output parses via `MachineState::parse`.
 #[test]
 fn the_read_prints_exactly_one_parseable_record_and_exits_zero() {
     let fx = Fixture::new("read");
@@ -75,15 +68,12 @@ fn the_read_prints_exactly_one_parseable_record_and_exits_zero() {
     );
     let state = &records[0];
     assert!(!state.config_unreadable, "{stdout:?}");
-    // Rosetta 2 is read where it applies (Apple silicon) and nowhere else, and the read
-    // says it in words too.
     assert_eq!(
         state.rosetta == atpkg::machine::RosettaPosture::NotApplicable,
         !atpkg::machine::ROSETTA_APPLIES,
         "{stdout:?}"
     );
     assert!(stdout.iter().any(|l| l.contains("Rosetta 2")), "{stdout:?}");
-    // And the prose above it: the verdict prefix the card quotes, on its own lines.
     assert!(
         stdout
             .iter()
@@ -92,8 +82,6 @@ fn the_read_prints_exactly_one_parseable_record_and_exits_zero() {
     );
 }
 
-/// The apply REFUSES under a synthetic home, exits 0, and writes nothing —
-/// the guard that keeps every integration suite off the developer's real machine.
 #[test]
 fn the_apply_refuses_a_synthetic_home_and_writes_nothing() {
     let fx = Fixture::new("apply");
@@ -114,7 +102,6 @@ fn the_apply_refuses_a_synthetic_home_and_writes_nothing() {
     );
 }
 
-/// An unparseable config causes `atpkg machine` (with or without `--apply`) to exit non-zero.
 #[test]
 fn an_unparseable_config_refuses_on_both_spellings() {
     let fx = Fixture::new("badconfig");

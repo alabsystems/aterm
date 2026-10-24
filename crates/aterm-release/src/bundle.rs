@@ -159,7 +159,20 @@ pub fn live_staging_dirs(dist: &Path, processes: &[RunningProcess]) -> Vec<(Path
     live.into_iter().collect()
 }
 
-/// Remove every cut staging directory under `dist` except `keep`, each only when `processes` proves nothing executes out of it.
+/// Why the staging directory `dir` stays: the self-check started its copy and that never
+/// showed it ran, so macOS may still be assessing its first exec ([`crate::gates::first_exec_hold`]).
+fn unproven(dir: &Path) -> Option<String> {
+    crate::gates::first_exec_hold(dir).map(|left| {
+        format!(
+            "the self-check started {} and it never showed it ran, so macOS may still be \
+             assessing its first exec; it stays {} s more (or until a restart)",
+            dir.join("aterm.app").display(),
+            left.as_secs()
+        )
+    })
+}
+
+/// Remove every cut staging directory under `dist` except `keep`, each only when `processes` proves nothing executes out of it and [`unproven`] does not hold it.
 pub fn prune_staging_dirs(
     dist: &Path,
     keep: &Path,
@@ -196,6 +209,9 @@ pub fn prune_staging_dirs(
                     dir.display(),
                     pids.join(", ")
                 );
+            }
+            if let Some(why) = unproven(dir) {
+                return format!("kept {}: {why}", dir.display());
             }
             match std::fs::remove_dir_all(dir) {
                 Ok(()) => format!("pruned {} (nothing runs out of it)", dir.display()),
@@ -237,6 +253,9 @@ fn discard_staged_dir(
             dir.join("aterm.app").display()
         ));
     }
+    if let Some(why) = unproven(&dir) {
+        return Err(format!("{why}; the next cut's staging removes it then"));
+    }
     std::fs::remove_dir_all(&dir).map_err(|e| format!("rm -rf {}: {e}", dir.display()))
 }
 
@@ -268,6 +287,9 @@ pub fn prepare_staging(dist: &Path, build: u64) -> Result<PathBuf, String> {
                     ));
                 }
             }
+        }
+        if let Some(why) = unproven(&staging_dir) {
+            return Err(format!("{why} — resume then"));
         }
     }
     for line in prune_staging_dirs(dist, &staging_dir, processes.as_deref()) {
@@ -522,6 +544,17 @@ mod staging_tests {
         }
     }
 
+    /// A staging the self-check started a copy in: [`aterm_uds::deadline::stamp_exec`], and
+    /// [`aterm_uds::deadline::RAN`] when `ran`.
+    fn started_in(dist: &Path, build: u64, ran: bool) -> PathBuf {
+        let dir = bundle_in(dist, &staging_dir_name(build));
+        aterm_uds::deadline::stamp_exec(&dir);
+        if ran {
+            std::fs::write(dir.join(aterm_uds::deadline::RAN), "").unwrap();
+        }
+        dir
+    }
+
     #[test]
     fn pruning_removes_only_what_is_provably_unused() {
         let dist = scratch("prune");
@@ -529,6 +562,8 @@ mod staging_tests {
         let legacy = bundle_in(&dist, "cut-app");
         let old = bundle_in(&dist, &staging_dir_name(1));
         let live = bundle_in(&dist, &staging_dir_name(2));
+        let unproven = started_in(&dist, 4, false);
+        let proven = started_in(&dist, 5, true);
         std::fs::write(dist.join("cut-state.toml"), "journal").unwrap();
         let dev = dist.join("aterm.app");
         std::fs::create_dir_all(&dev).unwrap();
@@ -547,13 +582,18 @@ mod staging_tests {
         );
         assert!(!old.exists(), "an unused older claim is pruned: {lines:?}");
         assert!(live.is_dir(), "a live one is KEPT: {lines:?}");
+        assert!(
+            unproven.is_dir() && lines.iter().any(|l| l.contains("never showed it ran")),
+            "one whose copy never showed it ran is KEPT: {lines:?}"
+        );
+        assert!(!proven.exists(), "one whose copy ran is pruned: {lines:?}");
         assert!(keep.is_dir(), "this claim's own directory is never pruned");
         assert!(dist.join("cut-state.toml").is_file() && dev.is_dir());
         let _ = std::fs::remove_dir_all(&dist);
     }
 
     /// A finished cut removes its own staging directory, but never from under a live
-    /// process or on a process list it could not read.
+    /// process, on a process list it could not read, or while its copy never showed it ran.
     #[test]
     fn a_finished_cut_discards_its_staging_bundle_only_when_provably_unused() {
         let dist = scratch("discard");
@@ -568,6 +608,15 @@ mod staging_tests {
         let refused = discard_staged_dir(&dist, 7, Some(&live));
         assert!(refused.is_err() && own.is_dir(), "{refused:?}");
 
+        aterm_uds::deadline::stamp_exec(&own);
+        let held = discard_staged_dir(&dist, 7, Some(&[]));
+        assert!(
+            held.as_ref()
+                .is_err_and(|why| why.contains("never showed it ran"))
+                && own.is_dir(),
+            "{held:?}"
+        );
+        std::fs::write(own.join(aterm_uds::deadline::RAN), "").unwrap();
         assert_eq!(discard_staged_dir(&dist, 7, Some(&[])), Ok(()));
         assert!(!own.exists(), "the finished claim's bundle is gone");
         assert!(

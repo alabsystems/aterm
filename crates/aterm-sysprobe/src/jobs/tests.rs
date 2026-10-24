@@ -46,6 +46,23 @@ fn put(b: &mut [u8], at: usize, v: &[u8]) {
     b[at..at + v.len()].copy_from_slice(v);
 }
 
+/// Device paths, and whether each names a terminal: both platforms' readers judge a device by
+/// this one table (a macOS vnode's path, a Linux `fd/<n>` link).
+const TERMINAL_PATHS: [(&str, bool); 12] = [
+    ("/dev/ttys003", true),
+    ("/dev/tty", true),
+    ("/dev/tty.usbserial-10", true),
+    ("/dev/cu.usbserial-10", true),
+    ("/dev/ptyp0", true),
+    ("/dev/ptmx", true),
+    ("/dev/pts/3", true),
+    ("/dev/console", true),
+    ("/dev/null", false),
+    ("/dev/zero", false),
+    ("/dev/consoles", false),
+    ("/dev/ptmx0", false),
+];
+
 #[test]
 fn a_vnode_answer_gives_mode_size_identity_and_path() {
     let mut b = vec![0u8; darwin::VNODE_PATH_SIZE];
@@ -79,7 +96,27 @@ fn a_vnode_answer_gives_mode_size_identity_and_path() {
         darwin::VNODE_MODE_AT,
         &(darwin::S_IFCHR | 0o620).to_ne_bytes(),
     );
-    assert!(darwin::vnode(&b).unwrap().char_device());
+    let v = darwin::vnode(&b).unwrap();
+    assert!(
+        v.char_device() && !v.terminal(),
+        "a device at a file's path"
+    );
+    for (path, terminal) in TERMINAL_PATHS {
+        let mut at = path.as_bytes().to_vec();
+        at.push(0);
+        put(&mut b, darwin::VNODE_PATH_AT, &at);
+        assert_eq!(darwin::vnode(&b).unwrap().terminal(), terminal, "{path}");
+    }
+    put(
+        &mut b,
+        darwin::VNODE_MODE_AT,
+        &(darwin::S_IFREG | 0o644).to_ne_bytes(),
+    );
+    put(&mut b, darwin::VNODE_PATH_AT, b"/dev/ttys003\0");
+    assert!(
+        !darwin::vnode(&b).unwrap().terminal(),
+        "a file is no terminal"
+    );
 }
 
 #[test]
@@ -486,8 +523,14 @@ fn fd_links_and_fdinfo_parse() {
         FdLink::EventPoll
     );
     assert_eq!(linux::parse_fd_link("anon_inode:inotify"), FdLink::Inotify);
-    assert_eq!(linux::parse_fd_link("/dev/pts/3"), FdLink::Tty);
-    assert_eq!(linux::parse_fd_link("/dev/null"), FdLink::Device);
+    for (path, terminal) in TERMINAL_PATHS {
+        let device = if terminal {
+            FdLink::Tty
+        } else {
+            FdLink::Device
+        };
+        assert_eq!(linux::parse_fd_link(path), device, "{path}");
+    }
     assert_eq!(
         linux::parse_fd_link("/tmp/out.log"),
         FdLink::Path("/tmp/out.log".into())

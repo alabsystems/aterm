@@ -691,6 +691,48 @@ fn a_worker_is_refused_exactly_where_the_host_would_not_carry_it() {
     }
 }
 
+/// A CODEX WORKER IS REFUSED where nothing in this instance would see its task through:
+/// the master switch, headless, its own `[harness.codex]` switch, Autopilot off — never by
+/// another agent's switch. codex-alab carries itself, so the host carries no codex: the
+/// refusal is the gate's alone.
+#[test]
+fn a_codex_worker_is_refused_exactly_where_its_switches_say() {
+    let table = |agent: Program| format!("[harness.{}]\nenabled = false\n", agent.name());
+    for (text, headless, refused) in [
+        (
+            "[harness]\nenabled = false\n".to_string(),
+            false,
+            Some("[harness] enabled = false"),
+        ),
+        (
+            "[harness]\nheadless = false\n".to_string(),
+            true,
+            Some("[harness] headless = false"),
+        ),
+        (
+            table(Program::Codex),
+            false,
+            Some("[harness.codex] enabled = false"),
+        ),
+        (
+            "[harness]\nautopilot = \"off\"\n".to_string(),
+            false,
+            Some("[harness] autopilot = \"off\""),
+        ),
+        (table(Program::Claude), false, None),
+        (String::new(), false, None),
+        (String::new(), true, None),
+    ] {
+        let (cfg, notes) = SupervisorConfig::from_aterm_toml(&text);
+        assert!(notes.is_empty(), "{text:?}: {notes:?}");
+        assert_eq!(
+            worker_unsupervised(&cfg, headless, Program::Codex),
+            refused,
+            "{text:?} headless={headless}"
+        );
+    }
+}
+
 #[test]
 fn an_agent_switched_off_overtakes_a_restored_relaunch_of_its_tab() {
     for named in [true, false] {

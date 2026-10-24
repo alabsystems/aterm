@@ -2081,7 +2081,7 @@ mod tests {
             assert!(
                 row.starts_with("devtools state=unknown ")
                     && row.contains(&format!(" probe={label} "))
-                    && row.ends_with(&format!(" list_probe={label}")),
+                    && row.contains(&format!(" list_probe={label} ")),
                 "{row}"
             );
         };

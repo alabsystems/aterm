@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A lab's own bus: a guarded broker the lab starts outside any jail on a Unix socket in its scratch, under a mint secret only the scratch holds, and the node ring an instance's bridge attaches with (THE ring `aterm fabric on` mints, `aterm_link::enable::node_grants`). `codex-alab-proof`'s mail step and `seamless`'s mail, topic and GAP legs stand theirs up with it.
+//! Guarded lab fabric broker in scratch state.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -11,7 +11,7 @@ use aterm_uds::spawnfd::Stdio;
 /// The fleet a lab's bus names (`/f/lab/…`).
 pub const FLEET: &str = "lab";
 
-/// The bus: its broker, the `[fabric]` table an instance's `aterm.toml` gets, and the bridge's state dir. The broker ends with the lab's run (its pid, the lab's own child) and with this process however it ends (its lifeline).
+/// The bus: its broker.
 pub struct Fabric {
     broker: Option<aterm_uds::spawnfd::Child>,
     /// The broker's lifeline (`aterm_uds::lifeline`): it ends itself once this is
@@ -27,7 +27,8 @@ pub struct Fabric {
 impl Fabric {
     /// Lay the bus out under `dir` and start its broker with `aterm`'s own `link broker`.
     /// # Errors
-    /// A file could not be made, a grant could not be minted, or the broker never listened (within a minute: a hang detector).
+    /// A file could not be made, a grant could not be minted, or the broker never listened (within
+    /// a minute: a hang detector).
     pub fn start(aterm: &Path, dir: &Path) -> Result<Fabric, String> {
         use std::os::unix::fs::PermissionsExt as _;
         let state = dir.join("state");
@@ -94,8 +95,6 @@ impl Fabric {
             .arg(&secret)
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(err));
-        // Its stdin is the lifeline, whose FIFO lives in this private scratch only
-        // until both ends are open.
         let lifeline = aterm_uds::lifeline::Lifeline::arm(&mut broker, dir)
             .map_err(|e| format!("the broker's lifeline in {}: {e}", dir.display()))?;
         let broker = broker
@@ -143,7 +142,7 @@ impl Fabric {
             .map_err(|e| format!("cannot name the bridge in {}: {e}", config.display()))
     }
 
-    /// End the broker (`SIGTERM`, then `SIGKILL`): only the pid the lab started.
+    /// End the broker (`SIGTERM`, then `SIGKILL`).
     pub fn stop(&mut self) {
         let Some(mut broker) = self.broker.take() else {
             return;

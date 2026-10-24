@@ -24,6 +24,19 @@ pub(crate) fn macos_vnode_ids(pid: u32) -> Option<(Vec<(u32, u64)>, bool)> {
     macos::vnode_ids(pid)
 }
 
+/// Whether a device's path names a terminal, on either platform: a pty's terminal end
+/// (`/dev/ttys003`, `/dev/pts/3`) or its master (`/dev/ptmx`, a BSD `/dev/ptyp0`), a serial line
+/// (`/dev/tty.usbserial-10`, `/dev/cu.usbserial-10`, `/dev/ttyS0`), a virtual console, the
+/// console, or a process's own terminal (`/dev/tty`).
+#[must_use]
+pub fn terminal_path(path: &[u8]) -> bool {
+    [&b"/dev/tty"[..], b"/dev/pty", b"/dev/pts/", b"/dev/cu."]
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+        || path == b"/dev/ptmx"
+        || path == b"/dev/console"
+}
+
 /// At most this many threads are read per process.
 pub const MAX_THREADS: usize = 256;
 /// At most this many descriptors are listed per process.

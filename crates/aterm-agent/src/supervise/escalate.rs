@@ -226,7 +226,235 @@ impl Escalation {
     }
 }
 
+/// The supervisor's current intent, independent of its last acknowledged write.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum AttentionTarget {
+    Set { text: String, kind: Escalation },
+    Clear,
+}
+
 impl<C: Ctl> Session<'_, C> {
+    /// Current desired text, or an adopted entry before this loop changed it.
+    pub(super) fn attention_text(&self) -> Option<&str> {
+        match self.attention_desired.as_ref() {
+            Some(AttentionTarget::Set { text, .. }) => Some(text),
+            Some(AttentionTarget::Clear) => None,
+            None => self.attention_ours.as_deref(),
+        }
+    }
+
+    fn forget_attention(&mut self) {
+        self.attention_desired = None;
+        self.attention_ours = None;
+        self.attention_pending = false;
+        self.attention_retry_at = None;
+    }
+
+    fn arm_attention_retry(&mut self) {
+        self.attention_pending = true;
+        self.attention_retry_at = Some(
+            self.fx.mono()
+                + self
+                    .setup
+                    .redecide_after_skip
+                    .max(Duration::from_millis(100)),
+        );
+    }
+
+    pub(super) fn write_attention_target(&mut self) -> Result<String, Fail> {
+        if self.handing_over() {
+            self.arm_attention_retry();
+            return Ok("skipped: the watcher is handing its badges over".to_string());
+        }
+        if self.metadata_context == claim::MetadataContext::Normal && self.metadata_requires_proof()
+        {
+            self.arm_attention_retry();
+            match self.metadata_authority(true) {
+                Ok(claim::MetadataAuthority::Ours) => {
+                    return self.metadata_only(true, |s| s.write_attention_target());
+                }
+                Ok(claim::MetadataAuthority::Gone) => {
+                    self.forget_attention();
+                    return Ok(ATTENTION_KEPT.to_string());
+                }
+                Ok(claim::MetadataAuthority::Unknown) => {
+                    self.arm_attention_retry();
+                    return Ok("unconfirmed ownership".to_string());
+                }
+                Err(why) => {
+                    self.arm_attention_retry();
+                    return Err(why);
+                }
+            }
+        }
+        if self.metadata_context != claim::MetadataContext::Normal
+            && self.metadata_mode() == Some(Autopilot::Off)
+            && matches!(self.attention_desired, Some(AttentionTarget::Set { .. }))
+        {
+            self.attention_desired = Some(AttentionTarget::Clear);
+            let said = self.write_attention_target()?;
+            return Ok(format!(
+                "skipped: the session's autopilot is off; cleanup {said}"
+            ));
+        }
+        if self.stopped() && matches!(self.attention_desired, Some(AttentionTarget::Set { .. })) {
+            self.arm_attention_retry();
+            return Ok("the watcher stopped before publication".to_string());
+        }
+        let Some(target) = self.attention_desired.clone() else {
+            return Ok("none".to_string());
+        };
+        self.arm_attention_retry();
+        let owner = format!("owner={ATTENTION_OWNER}");
+        let request = |text: &str, kind: Escalation| {
+            ["meta", "set", "attention", owner.as_str()]
+                .into_iter()
+                .map(str::to_string)
+                .chain(kind.kind_token())
+                .chain(std::iter::once(text.to_string()))
+                .collect::<Vec<_>>()
+        };
+        let result = (|| match target {
+            AttentionTarget::Set { mut text, kind } => {
+                let args = request(&text, kind);
+                let mut r = self.call(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
+                if let Some(cap) = refused_cap(&r, &text) {
+                    text = fit_bytes(&text, cap);
+                    self.attention_desired = Some(AttentionTarget::Set {
+                        text: text.clone(),
+                        kind,
+                    });
+                    let args = request(&text, kind);
+                    r = self.call(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
+                }
+                if r.ok() {
+                    self.attention_ours = Some(text);
+                }
+                Ok(r)
+            }
+            AttentionTarget::Clear => {
+                let r = self.call(&["meta", "unset", "attention", &owner])?;
+                if r.ok() {
+                    self.attention_ours = None;
+                }
+                Ok(r)
+            }
+        })();
+        match result {
+            Ok(r) => {
+                if r.ok() {
+                    self.attention_pending = false;
+                    self.attention_retry_at = None;
+                } else if self.claim.watching_behind().is_some() {
+                    self.forget_attention();
+                } else {
+                    self.arm_attention_retry();
+                }
+                Ok(reply_word(&r))
+            }
+            Err(why) => {
+                self.arm_attention_retry();
+                Err(why)
+            }
+        }
+    }
+
+    /// Request cleanup even where the original SET was never acknowledged.
+    pub(super) fn clear_attention_entry(&mut self) -> Result<String, Fail> {
+        self.attention_desired = Some(AttentionTarget::Clear);
+        self.write_attention_target()
+    }
+
+    /// Final cleanup remains owed even after the box, limit or turn-end flag
+    /// was consumed by an earlier unsuccessful close.
+    pub(super) fn finish_supervisor_attention(
+        &mut self,
+        seq: u64,
+        review: &mut dyn Review,
+    ) -> Result<(), Fail> {
+        if !self.attention_pending
+            && !matches!(self.attention_desired, Some(AttentionTarget::Set { .. }))
+        {
+            return Ok(());
+        }
+        let said = self.clear_attention_entry()?;
+        self.note_attention_clear(seq, "", &said, review);
+        Ok(())
+    }
+
+    /// Journal cleanup only as acknowledged once its native entry is down.
+    pub(super) fn note_attention_clear(
+        &self,
+        seq: u64,
+        what: &str,
+        said: &str,
+        review: &mut dyn Review,
+    ) {
+        if self.attention_pending && matches!(self.attention_desired, Some(AttentionTarget::Clear))
+        {
+            review.note(&format!(
+                "SKIPPED seq={seq} {what} attention={said}; take-down still owed"
+            ));
+        } else {
+            review.note(&format!("CLEARED seq={seq} {what}attention={said}"));
+        }
+    }
+
+    /// Retry metadata at the point still showing, under a freshly verified
+    /// existing lease. It acquires no claim and asks no program question again.
+    pub(super) fn retry_supervisor_attention(
+        &mut self,
+        screen: &Screen,
+        opts: &SuperviseOpts,
+        review: &mut dyn Review,
+    ) -> Result<(), Fail> {
+        self.metadata_global = opts.policy.autopilot;
+        self.arm_attention_retry();
+        match self.metadata_authority(false) {
+            Ok(claim::MetadataAuthority::Ours) => {}
+            Ok(claim::MetadataAuthority::Gone) => {
+                self.forget_attention();
+                return Ok(());
+            }
+            Ok(claim::MetadataAuthority::Unknown) => {
+                self.arm_attention_retry();
+                return Ok(());
+            }
+            Err(why) => {
+                self.arm_attention_retry();
+                return Err(why);
+            }
+        }
+        self.metadata_only(false, |s| {
+            if matches!(s.attention_desired, Some(AttentionTarget::Set { .. }))
+                && s.metadata_mode().is_none()
+            {
+                s.arm_attention_retry();
+                return Ok(());
+            }
+            if s.metadata_mode() == Some(Autopilot::Off) {
+                s.attention_desired = Some(AttentionTarget::Clear);
+            }
+            if let Some(AttentionTarget::Set { kind, .. }) = s.attention_desired.as_ref()
+                && s.withhold_badge(screen.seq, *kind, review)?
+            {
+                s.arm_attention_retry();
+                return Ok(());
+            }
+            let clearing = matches!(s.attention_desired, Some(AttentionTarget::Clear));
+            let said = s.write_attention_target()?;
+            if clearing {
+                s.note_attention_clear(screen.seq, "", &said, review);
+            } else {
+                review.note(&format!(
+                    "ESCALATED seq={} attention={said} again={AGAIN_RETRY}, the pending metadata",
+                    screen.seq
+                ));
+            }
+            Ok(())
+        })
+    }
+
     /// Pace needs metadata recovery separately from the policy's own deadline.
     fn arm_needs_retry(&mut self) {
         self.needs_pending = true;
@@ -239,15 +467,85 @@ impl<C: Ctl> Session<'_, C> {
         );
     }
 
-    /// A needs write retains cleanup before transport, and waits from the
-    /// completion of any refusal or lost request before another attempt.
-    fn request_needs(&mut self, args: &[&str]) -> Result<CtlReply, Fail> {
+    /// A needs write retains cleanup before transport and publishes its host
+    /// projection only after authority and mode checks, before the native write.
+    /// A refusal or lost request waits from completion before another attempt.
+    fn request_needs(
+        &mut self,
+        args: &[&str],
+        key: u64,
+        needs: &[String],
+        entry: &str,
+    ) -> Result<CtlReply, Fail> {
         self.arm_needs_retry();
+        let refused = |why: &str| CtlReply {
+            code: 1,
+            stdout: String::new(),
+            stderr: format!("ERR {why}"),
+        };
+        if self.handing_over() {
+            return Ok(refused("the watcher is handing its needs entry over"));
+        }
+        if self.metadata_context == claim::MetadataContext::Normal && self.metadata_requires_proof()
+        {
+            match self.metadata_authority(true) {
+                Ok(claim::MetadataAuthority::Ours) => {
+                    return self.metadata_only(true, |s| s.request_needs(args, key, needs, entry));
+                }
+                Ok(claim::MetadataAuthority::Gone) => {
+                    self.forget_needs();
+                    return Ok(CtlReply {
+                        code: 1,
+                        stdout: String::new(),
+                        stderr: "ERR metadata ownership changed".to_string(),
+                    });
+                }
+                Ok(claim::MetadataAuthority::Unknown) => {
+                    self.arm_needs_retry();
+                    return Ok(CtlReply {
+                        code: 1,
+                        stdout: String::new(),
+                        stderr: "ERR unconfirmed metadata ownership".to_string(),
+                    });
+                }
+                Err(why) => {
+                    self.arm_needs_retry();
+                    return Err(why);
+                }
+            }
+        }
+        let inactive = |s: &Self| {
+            args.get(1) == Some(&"set")
+                && (s.stopped()
+                    || s.autopilot.word() == Some(Autopilot::Off)
+                    || s.metadata_mode() == Some(Autopilot::Off))
+        };
+        if inactive(self) {
+            self.arm_needs_retry();
+            return Ok(refused("the needs publication is no longer active"));
+        }
+        self.tell_needs(key, needs, entry);
+        if self.handing_over() {
+            self.arm_needs_retry();
+            return Ok(refused("the watcher is handing its needs entry over"));
+        }
+        if inactive(self) {
+            self.arm_needs_retry();
+            return Ok(refused("the needs publication is no longer active"));
+        }
         let reply = self.call(args);
         if !matches!(&reply, Ok(r) if r.ok()) {
             self.arm_needs_retry();
         }
         reply
+    }
+
+    fn forget_needs(&mut self) {
+        self.needs_told = None;
+        self.needs_told_text.clear();
+        self.needs_pending = false;
+        self.needs_retry_at = None;
+        self.tell_needs(0, &[], "");
     }
 
     /// Retry only needs metadata on an unchanged point. The session's fresh
@@ -258,33 +556,35 @@ impl<C: Ctl> Session<'_, C> {
         opts: &SuperviseOpts,
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
+        self.metadata_global = opts.policy.autopilot;
         // A refused or lost policy read also waits before another attempt.
         self.arm_needs_retry();
-        if self.needs_not_ours() {
-            return self.needs_down(
-                screen.seq,
-                "another supervisor holds the needs entry",
-                review,
-            );
-        }
-        if self.turn_end.needs_key() == 0 {
-            return self.sync_needs(screen, opts, review);
-        }
-        let allowed = match self.autopilot_allows_busy(opts) {
-            Ok(allowed) => allowed,
+        match self.metadata_authority(false) {
+            Ok(claim::MetadataAuthority::Ours) => {}
+            Ok(claim::MetadataAuthority::Gone) => {
+                self.forget_needs();
+                return Ok(());
+            }
+            Ok(claim::MetadataAuthority::Unknown) => {
+                self.arm_needs_retry();
+                return Ok(());
+            }
             Err(why) => {
                 self.arm_needs_retry();
                 return Err(why);
             }
-        };
-        if self.autopilot(opts) == Autopilot::Off {
-            return self.needs_down(screen.seq, "the session's autopilot is off", review);
         }
-        if !allowed {
-            self.arm_needs_retry();
-            return Ok(());
-        }
-        self.sync_needs(screen, opts, review)
+        self.metadata_only(false, |s| {
+            if s.turn_end.needs_key() != 0 && s.metadata_mode().is_none() {
+                s.arm_needs_retry();
+                return Ok(());
+            }
+            if s.metadata_mode() == Some(Autopilot::Off) {
+                s.needs_down(screen.seq, "the session's autopilot is off", review)
+            } else {
+                s.sync_needs(screen, opts, review)
+            }
+        })
     }
 
     /// Escalate via `meta set attention <text>` on the worker (bounded to the server cap) and append `ESCALATED seq=<n> attention=<reply>`.
@@ -306,27 +606,11 @@ impl<C: Ctl> Session<'_, C> {
         if self.withhold_badge(seq, kind, review)? {
             return Ok(());
         }
-        let mut attention = fit_bytes(text, ATTENTION_BYTES);
-        let owner = format!("owner={ATTENTION_OWNER}");
-        let kind_token = kind.kind_token();
-        let set = |attention: &str| -> Vec<String> {
-            ["meta", "set", "attention", owner.as_str()]
-                .into_iter()
-                .map(str::to_string)
-                .chain(kind_token.clone())
-                .chain(std::iter::once(attention.to_string()))
-                .collect()
-        };
-        let args = set(&attention);
-        let mut r = self.call(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
-        if let Some(cap) = refused_cap(&r, &attention) {
-            attention = fit_bytes(&attention, cap);
-            let args = set(&attention);
-            r = self.call(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
-        }
-        if r.ok() {
-            self.attention_ours = Some(attention.clone());
-        }
+        self.attention_desired = Some(AttentionTarget::Set {
+            text: fit_bytes(text, ATTENTION_BYTES),
+            kind,
+        });
+        let said = self.write_attention_target()?;
         let adopted =
             matches!(kind, Escalation::Limit { .. }) && std::mem::take(&mut self.adopted_limit);
         let again = match again {
@@ -334,10 +618,7 @@ impl<C: Ctl> Session<'_, C> {
             None if adopted => format!(" again={AGAIN_ADOPTED}"),
             None => String::new(),
         };
-        review.note(&format!(
-            "ESCALATED seq={seq} attention={}{again}",
-            reply_word(&r)
-        ));
+        review.note(&format!("ESCALATED seq={seq} attention={}{again}", said));
         Ok(())
     }
 
@@ -381,16 +662,14 @@ impl<C: Ctl> Session<'_, C> {
 
     /// Unset this loop's own attention entry (`meta unset attention owner=supervisor`) when `ours` says its text is the kind being closed.
     pub(super) fn unset_if_ours(&mut self, ours: fn(&str) -> bool) -> Result<String, Fail> {
-        Ok(match self.attention_ours.as_deref() {
-            Some(text) if ours(text) => {
-                let owner = format!("owner={ATTENTION_OWNER}");
-                let r = self.call(&["meta", "unset", "attention", &owner])?;
-                if r.ok() || !self.unserved(&r) {
-                    self.attention_ours = None;
-                }
-                reply_word(&r)
-            }
+        Ok(match self.attention_text() {
+            Some(text) if ours(text) => return self.clear_attention_entry(),
             Some(_) => ATTENTION_KEPT.to_string(),
+            None if self.attention_pending
+                && matches!(self.attention_desired, Some(AttentionTarget::Clear)) =>
+            {
+                return self.write_attention_target();
+            }
             None => "none".to_string(),
         })
     }
@@ -402,7 +681,7 @@ impl<C: Ctl> Session<'_, C> {
             return Ok(());
         }
         let said = self.unset_if_ours(|t| !t.starts_with(ATTENTION_PREFIX))?;
-        review.note(&format!("CLEARED seq={seq} {CLEARED_BOX} attention={said}"));
+        self.note_attention_clear(seq, &format!("{CLEARED_BOX} "), &said, review);
         Ok(())
     }
 
@@ -420,7 +699,14 @@ impl<C: Ctl> Session<'_, C> {
             host.limited(false);
         }
         let said = self.unset_if_ours(|t| t.starts_with(ATTENTION_PREFIX))?;
-        review.note(&format!("CLEARED seq={seq} attention={said} {why}"));
+        if self.attention_pending && matches!(self.attention_desired, Some(AttentionTarget::Clear))
+        {
+            review.note(&format!(
+                "SKIPPED seq={seq} attention={said} {why}; take-down still owed"
+            ));
+        } else {
+            review.note(&format!("CLEARED seq={seq} attention={said} {why}"));
+        }
         Ok(())
     }
 
@@ -432,14 +718,19 @@ impl<C: Ctl> Session<'_, C> {
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
         if !self
-            .attention_ours
-            .as_deref()
+            .attention_text()
             .is_some_and(|t| t.starts_with(ATTENTION_PREFIX))
         {
             return Ok(());
         }
         let said = self.unset_if_ours(|t| t.starts_with(ATTENTION_PREFIX))?;
-        review.note(&format!("CLEARED seq={seq} attention={said} {why}"));
+        if self.attention_pending {
+            review.note(&format!(
+                "SKIPPED seq={seq} attention={said} {why}; take-down still owed"
+            ));
+        } else {
+            review.note(&format!("CLEARED seq={seq} attention={said} {why}"));
+        }
         Ok(())
     }
 
@@ -492,6 +783,7 @@ impl<C: Ctl> Session<'_, C> {
         opts: &SuperviseOpts,
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
+        self.metadata_global = opts.policy.autopilot;
         if self.needs_not_ours() {
             return self.needs_down(
                 screen.seq,
@@ -522,12 +814,20 @@ impl<C: Ctl> Session<'_, C> {
         let owner = format!("owner={NEEDS_ATTENTION_OWNER}");
         let kind = format!("kind={}", aterm_types::needs::AttentionKind::Ask.word());
         self.arm_needs_retry();
-        self.tell_needs(key, &needs, &text);
-        let mut r = self.request_needs(&["meta", "set", "attention", &owner, &kind, &text])?;
+        let mut r = self.request_needs(
+            &["meta", "set", "attention", &owner, &kind, &text],
+            key,
+            &needs,
+            &text,
+        )?;
         if let Some(cap) = refused_cap(&r, &text) {
             text = fit_bytes(&text, cap);
-            self.tell_needs(key, &needs, &text);
-            r = self.request_needs(&["meta", "set", "attention", &owner, &kind, &text])?;
+            r = self.request_needs(
+                &["meta", "set", "attention", &owner, &kind, &text],
+                key,
+                &needs,
+                &text,
+            )?;
         }
         if r.lost() {
             return Ok(());
@@ -555,6 +855,9 @@ impl<C: Ctl> Session<'_, C> {
         why: &str,
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
+        if self.handing_over() {
+            return Ok(());
+        }
         if self.needs_told.is_none() && !self.needs_pending {
             self.needs_retry_at = None;
             if self.needs_heard.is_some() {
@@ -572,11 +875,10 @@ impl<C: Ctl> Session<'_, C> {
             }
             return Ok(());
         }
-        self.tell_needs(0, &[], "");
         let owner = format!("owner={NEEDS_ATTENTION_OWNER}");
-        let r = self.request_needs(&["meta", "unset", "attention", &owner])?;
+        let r = self.request_needs(&["meta", "unset", "attention", &owner], 0, &[], "")?;
         if !r.ok() {
-            if !r.lost() {
+            if !r.lost() && self.needs_pending {
                 review.note(&format!(
                     "SKIPPED seq={seq} needs attention={} {why}; take-down still owed",
                     reply_word(&r)
@@ -597,6 +899,9 @@ impl<C: Ctl> Session<'_, C> {
 
     /// THE WINDOW TOLD THE NEEDS SET ([`IdleHost::needs_standing`], [`Session::needs_heard`]).
     fn tell_needs(&mut self, key: u64, needs: &[String], entry: &str) {
+        if self.handing_over() {
+            return;
+        }
         let Some(host) = &self.stall_host else {
             return;
         };

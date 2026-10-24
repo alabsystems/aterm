@@ -6,7 +6,9 @@
 use std::hash::{Hash, Hasher};
 use std::time::Instant;
 
+use aterm_core::render::{FxBlend, FxContent, FxLayer, FxSlot, FxSpace};
 use aterm_core::terminal::{RenderCell, Terminal};
+use aterm_render::rounded_bar::{CapArts, RoundedBar};
 use aterm_render::{GlowQuad, RenderInput};
 
 use crate::scrollbar::{self, Metrics};
@@ -476,6 +478,17 @@ pub(crate) struct PaneOverlay {
     pending: Vec<GlowQuad>,
     /// The quads the last splice appended, taken back by the next.
     painted: Vec<GlowQuad>,
+    /// The scrollbars the next splice draws, each under its fx layer id.
+    bars: Vec<(u64, RoundedBar)>,
+    /// One fx layer a bar of `bars`, in their order: a bar that kept its look keeps its layer, so a settled bar is no damage.
+    bar_layers: Vec<(u64, RoundedBar, FxLayer)>,
+    /// The last build's `bar_layers`, which the next build takes its kept
+    /// layers from (kept across builds for its capacity).
+    bar_spare: Vec<(u64, RoundedBar, FxLayer)>,
+    /// The fx layer ids the last splice inserted, taken back by the next.
+    painted_bars: Vec<u64>,
+    /// The bars' cap arts.
+    caps: CapArts,
     /// The pane whose bar is under the pointer.
     pub(crate) hover: Option<u64>,
     /// The thumb being dragged.
@@ -509,6 +522,9 @@ impl PaneOverlay {
         self.facts.clear();
         self.prev.clear();
         self.pending.clear();
+        self.bars.clear();
+        self.bar_layers.clear();
+        self.bar_spare.clear();
         self.hover = None;
         self.drag = None;
         self.inputs = None;
@@ -521,10 +537,26 @@ impl PaneOverlay {
         &self.facts
     }
 
-    /// The quads this frame's overlays draw (the next splice appends them).
+    /// What this frame's overlays draw, as the quads the retired path drew:
+    /// the ring and hollow cursors as they are, and each bar as
+    /// [`scrollbar::legacy_bar_quads`] (its fx layer lands those quads'
+    /// bytes: `the_scrollbar_layers_are_the_retired_quads_byte_for_byte_on_the_cpu`).
     #[cfg(test)]
-    pub(crate) fn pending_quads(&self) -> &[GlowQuad] {
-        &self.pending
+    pub(crate) fn pending_quads(&self) -> Vec<GlowQuad> {
+        let cell_h = self
+            .inputs
+            .map_or(1, |i| u32::try_from(i.cell.1).unwrap_or(u32::MAX));
+        let mut quads = self.pending.clone();
+        for (_, b) in &self.bars {
+            scrollbar::legacy_bar_quads(&mut quads, (b.x, b.y, b.w, b.h), b.rgb, b.alpha, cell_h);
+        }
+        quads
+    }
+
+    /// The fx layers this frame's bars draw (the next splice inserts them).
+    #[cfg(test)]
+    pub(crate) fn bar_layers(&self) -> impl Iterator<Item = &FxLayer> {
+        self.bar_layers.iter().map(|(_, _, l)| l)
     }
 
     /// Returns whether `quad` was appended by the last overlay splice.
@@ -543,6 +575,7 @@ impl PaneOverlay {
     ) -> u64 {
         self.inputs = Some(inputs);
         self.pending.clear();
+        self.bars.clear();
         let (cw, ch) = inputs.cell;
         let (cw32, ch32) = (
             u32::try_from(cw).unwrap_or(0),
@@ -620,11 +653,11 @@ impl PaneOverlay {
                     let (x, w, (rgb, alpha)) = if widened {
                         let (tx, tw) = scrollbar::wide_span(lane, m, side);
                         scrollbar::push_bar(
-                            &mut self.pending,
+                            &mut self.bars,
+                            bar_layer_id(f.session, false),
                             (tx, lane.top + lift, tw, lane.len),
                             inputs.ink,
                             scrollbar::ALPHA_TRACK,
-                            ch32,
                         );
                         let w = scrollbar::span(lane, m.wide, m).1.min(tw);
                         let paint = if on_line {
@@ -660,11 +693,11 @@ impl PaneOverlay {
                         (x, w, paint)
                     };
                     scrollbar::push_bar(
-                        &mut self.pending,
+                        &mut self.bars,
+                        bar_layer_id(f.session, true),
                         (x, top + lift, w, len),
                         rgb,
                         alpha,
-                        ch32,
                     );
                 }
             }
@@ -688,7 +721,8 @@ impl PaneOverlay {
         if inputs.scrollbar {
             *shown = fading;
         }
-        self.fp = if self.pending.is_empty() {
+        self.lay_bars();
+        self.fp = if self.pending.is_empty() && self.bars.is_empty() {
             0
         } else {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -697,10 +731,47 @@ impl PaneOverlay {
                     word.hash(&mut hasher);
                 }
             }
+            self.bars.hash(&mut hasher);
             hasher.finish() | 1
         };
         self.fp
     }
+
+    /// One fx layer a bar of `bars`: the layer of a bar that kept its id and
+    /// look is the one it had, the rest are built afresh.
+    fn lay_bars(&mut self) {
+        std::mem::swap(&mut self.bar_layers, &mut self.bar_spare);
+        let kept = &mut self.bar_spare;
+        for &(id, bar) in &self.bars {
+            let layer = match kept.iter().position(|(i, b, _)| *i == id && *b == bar) {
+                Some(at) => kept.swap_remove(at).2,
+                None => {
+                    let (mut items, mut palette) = (Vec::new(), Vec::new());
+                    aterm_render::rounded_bar::push_items(
+                        bar,
+                        &mut self.caps,
+                        &mut items,
+                        &mut palette,
+                    );
+                    FxLayer::new(
+                        id,
+                        std::sync::Arc::new(FxContent::new(items, palette)),
+                        FxSlot::Over,
+                        FxSpace::Grid,
+                        FxBlend::Exact,
+                    )
+                }
+            };
+            self.bar_layers.push((id, bar, layer));
+        }
+        kept.clear();
+    }
+}
+
+/// The fx layer id of pane `session`'s scrollbar track (`thumb = false`) or thumb.
+fn bar_layer_id(session: u64, thumb: bool) -> u64 {
+    const SALT: u64 = 0x7363_726F_6C6C_6261;
+    (SALT ^ session.rotate_left(17)).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ u64::from(thumb)
 }
 
 /// The unfocused panes' hollow cursor: the pane's own cursor colour, a touch
@@ -778,7 +849,11 @@ impl App {
             return;
         };
         let overlay = &mut ws.pane_overlay;
-        if overlay.painted.is_empty() && overlay.pending.is_empty() {
+        if overlay.painted.is_empty()
+            && overlay.pending.is_empty()
+            && overlay.painted_bars.is_empty()
+            && overlay.bar_layers.is_empty()
+        {
             return;
         }
         remove_each_once(&mut ws.input_scratch.nova_add, &overlay.painted);
@@ -786,6 +861,20 @@ impl App {
             .nova_add
             .extend_from_slice(&overlay.pending);
         overlay.painted.clone_from(&overlay.pending);
+        // The bars draw first among the Over-slot Exact layers, as their quads
+        // drew in the nova pass before that slot: under every other producer's
+        // Over layer and the card's, which splices after.
+        let fx = &mut ws.input_scratch.fx_layers;
+        fx.retain(|l| !overlay.painted_bars.contains(&l.id));
+        let at = fx
+            .iter()
+            .position(|l| l.slot == FxSlot::Over && l.blend == FxBlend::Exact)
+            .unwrap_or(fx.len());
+        fx.splice(at..at, overlay.bar_layers.iter().map(|(_, _, l)| l.clone()));
+        overlay.painted_bars.clear();
+        overlay
+            .painted_bars
+            .extend(overlay.bar_layers.iter().map(|(id, ..)| *id));
     }
 
     /// Re-reads visible panes of `plan` and rebuilds overlays for headless capture.

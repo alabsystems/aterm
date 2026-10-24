@@ -1,7 +1,6 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
-
 //! Capability enums ([`crate::sbpl::profile_for`], [`crate::actuator::decide`]).
 
 /// Network capability levels.

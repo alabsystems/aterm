@@ -95,14 +95,34 @@ fn marker_matches(marker: &str, token: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('='))
 }
 
+/// A program's leading options as its parser reads them ([`word_options`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct WordOptions {
+    /// Options that take the next token as their value.
+    pub(crate) values: &'static [&'static str],
+    /// Options whose value is optional (clap's `num_args = 0..=1`, commander's `[value]`):
+    /// the next token is theirs unless it starts with `-`.
+    pub(crate) optional: &'static [&'static str],
+    /// Options that take no value.
+    pub(crate) switches: &'static [&'static str],
+    /// The program's own spellings of the posture a typed `--yolo` sets, each among the
+    /// row's markers: another name of the flag's own option (grok's
+    /// `--dangerously-skip-permissions`, an alias of `--always-approve` that its parser
+    /// refuses to see twice), or the vendor's own `--yolo` option, which the flags override
+    /// and its parser refuses beside them (kimi's `-y`, `--yes` and `--auto-approve`, its
+    /// Ask When Needed mode, which `--auto` cannot join). An explicit `--yolo` drops each
+    /// one ahead of the first word along with itself.
+    pub(crate) own_yolo: &'static [&'static str],
+}
+
 /// Leading options whose arity this word scan knows.
-pub(crate) fn word_options(program: &str) -> (&'static [&'static str], &'static [&'static str]) {
+pub(crate) fn word_options(program: &str) -> WordOptions {
     let cli = crate::vendor_direct::spec(program)
         .and_then(|row| row.aliases.iter().find(|(name, _)| *name == program))
         .map_or(program, |(_, target)| *target);
     match cli {
-        "codex" => (
-            &[
+        "codex" => WordOptions {
+            values: &[
                 "--model",
                 "-m",
                 "--cd",
@@ -110,7 +130,7 @@ pub(crate) fn word_options(program: &str) -> (&'static [&'static str], &'static 
                 "--add-dir",
                 "--local-provider",
             ],
-            &[
+            switches: &[
                 "--oss",
                 "--worktree",
                 "--search",
@@ -118,37 +138,151 @@ pub(crate) fn word_options(program: &str) -> (&'static [&'static str], &'static 
                 "--strict-config",
                 "--no-daemon",
             ],
-        ),
-        "muse" => (&["--model"], &[]),
-        "claude" => (&[], &["-p", "--print"]),
-        _ => (&[], &[]),
+            ..WordOptions::default()
+        },
+        "muse" => WordOptions {
+            values: &["--model"],
+            ..WordOptions::default()
+        },
+        "claude" => WordOptions {
+            switches: &["-p", "--print"],
+            ..WordOptions::default()
+        },
+        // grok's top-level `PagerArgs` in the 1.0.45 source (github.com/xai-org/grok-build,
+        // `crates/codegen/xai-grok-pager/src/app/cli.rs`), checked against the 1.0.67
+        // binary's strings, which add `--add-dir`; the hidden and feature-gated options are
+        // left out, so a launch typing one runs as typed. `-v`, `--version` and `-h` are
+        // left out on purpose: those launches run as typed too.
+        "grok" => WordOptions {
+            values: &[
+                "-m",
+                "--model",
+                "--cwd",
+                "-p",
+                "--single",
+                "--print",
+                "--prompt-file",
+                "--prompt-json",
+                "--load",
+                "--leader-socket",
+                "--debug-file",
+                "--output-format",
+                "--json-schema",
+                "--reasoning-effort",
+                "--effort",
+                "--rules",
+                "--append-system-prompt",
+                "--system-prompt-override",
+                "--system-prompt",
+                "-s",
+                "--session-id",
+                "--worktree-ref",
+                "--ref",
+                "--agent",
+                "--agents",
+                "--tools",
+                "--max-turns",
+                "--add-dir",
+            ],
+            optional: &["-r", "--resume", "-w", "--worktree"],
+            switches: &[
+                "-c",
+                "--continue",
+                "--no-auto-update",
+                "--debug",
+                "--verbatim",
+                "--include-partial-messages",
+                "--fork-session",
+                "--restore-code",
+                "--no-plan",
+                "--no-subagents",
+                "--disable-web-search",
+                "--no-alt-screen",
+                "--minimal",
+                "--fullscreen",
+                "--oauth",
+            ],
+            own_yolo: &["--dangerously-skip-permissions"],
+        },
+        // kimi 2.3.1's top-level options (`apps/kimi-code/src/cli/commands.ts`).
+        "kimi" => WordOptions {
+            values: &[
+                "-m",
+                "--model",
+                "-p",
+                "--prompt",
+                "--agent",
+                "--agent-file",
+                "--add-dir",
+                "--skills-dir",
+                "--output-format",
+            ],
+            optional: &["-S", "--session", "-r", "--resume"],
+            switches: &["-c", "--continue", "-C", "--plan"],
+            own_yolo: &["-y", "--yes", "--auto-approve"],
+        },
+        _ => WordOptions::default(),
     }
 }
 
+/// Why the word scan stopped short of the first word ([`first_word`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stop {
+    /// An option the scan does not know, or a value missing at the end.
+    Unknown,
+    /// A typed `--yolo`, or one of [`WordOptions::own_yolo`], sits right after a bare
+    /// optional-value option and before a bare word: removing it would hand that word to the
+    /// option as its value.
+    Joins,
+}
+
 /// The actual argument position of the first word, past known leading values.
-fn first_word(program: &str, policy: &Policy, head: &[String]) -> Result<Option<usize>, ()> {
-    let (values, switches) = word_options(program);
+fn first_word(program: &str, policy: &Policy, head: &[String]) -> Result<Option<usize>, Stop> {
+    let opts = word_options(program);
+    let removable = |a: &str| a == WORD || opts.own_yolo.contains(&a);
     let mut value = false;
+    let mut maybe = false;
+    let mut gap = false;
     for (i, arg) in head.iter().enumerate() {
+        let a = arg.as_str();
         if value {
             value = false;
-        } else if arg == WORD
-            || policy.flags.contains(&arg.as_str())
-            || switches.contains(&arg.as_str())
-        {
             continue;
-        } else if values.contains(&arg.as_str()) {
+        }
+        if maybe {
+            maybe = false;
+            if !a.starts_with('-') {
+                // The optional value.
+                continue;
+            }
+            gap = removable(a);
+        } else if gap && !removable(a) {
+            if !a.starts_with('-') {
+                return Err(Stop::Joins);
+            }
+            gap = false;
+        }
+        if removable(a) || policy.flags.contains(&a) || opts.switches.contains(&a) {
+            continue;
+        } else if opts.values.contains(&a) {
             value = true;
-        } else if values.iter().any(|flag| marker_matches(flag, arg)) {
+        } else if opts.optional.contains(&a) {
+            maybe = true;
+        } else if opts
+            .values
+            .iter()
+            .chain(opts.optional.iter())
+            .any(|flag| marker_matches(flag, a))
+        {
             // A long `=value` or attached short value is already consumed.
             continue;
-        } else if arg.starts_with('-') {
-            return Err(());
+        } else if a.starts_with('-') {
+            return Err(Stop::Unknown);
         } else {
             return Ok(Some(i));
         }
     }
-    if value { Err(()) } else { Ok(None) }
+    if value { Err(Stop::Unknown) } else { Ok(None) }
 }
 
 /// What a launch runs as ([`decide`]).
@@ -164,9 +298,12 @@ pub enum Launch {
 
 /// Decide `program args…`, reading the words ahead of a literal `--`. A program with no policy
 /// runs as typed. An unknown leading option leaves the argv as typed (with a typed `--yolo` too,
-/// when the policy has `after` words); else a typed `--yolo` becomes the policy's flags
-/// ([`Launch::Flag`]); else a marker, a `skip` word or a self-update verb leaves it as typed;
-/// else the flags go in front, or behind an `after` word ([`Launch::Default`]).
+/// when the policy has `after` words), and so does a removal that would join a bare word to an
+/// optional value ([`Stop::Joins`]); else a typed `--yolo` becomes the policy's flags, dropping
+/// the program's own spellings of that posture ahead of the first word
+/// ([`WordOptions::own_yolo`], [`Launch::Flag`]); else a marker, a `skip` word or a self-update
+/// verb leaves it as typed; else the flags go in front, or behind an `after` word
+/// ([`Launch::Default`]).
 #[must_use]
 pub fn decide(program: &str, args: &[String]) -> Launch {
     let policy = policy_of(program);
@@ -177,9 +314,19 @@ pub fn decide(program: &str, args: &[String]) -> Launch {
     let head = &args[..head_len];
     let word = first_word(program, &policy, head);
     let explicit = head.iter().any(|a| a == WORD);
-    if word.is_err() && (!explicit || !policy.after.is_empty()) {
-        return Launch::AsTyped;
+    match word {
+        Err(Stop::Joins) => return Launch::AsTyped,
+        Err(Stop::Unknown) if !explicit || !policy.after.is_empty() => return Launch::AsTyped,
+        _ => {}
     }
+    // The leading options an explicit `--yolo` may drop the program's own spellings from: none
+    // past an option the scan does not know.
+    let leading = match word {
+        Ok(Some(i)) => i,
+        Ok(None) => head_len,
+        Err(_) => 0,
+    };
+    let own_yolo = word_options(program).own_yolo;
     let word = word.ok().flatten();
     let after = word.is_some_and(|i| policy.after.contains(&head[i].as_str()));
     if explicit {
@@ -201,6 +348,8 @@ pub fn decide(program: &str, args: &[String]) -> Launch {
                 } else {
                     fresh(&mut out, &mut present);
                 }
+            } else if i < leading && own_yolo.contains(&arg.as_str()) {
+                // The vendor's own spelling of the posture the flags set.
             } else {
                 out.push(arg.clone());
                 if pending && word == Some(i) {
@@ -319,6 +468,10 @@ mod tests {
                 "--disable-request-user-input",
             ]
         );
+        assert_eq!(flags_of("grok"), &["--always-approve"]);
+        assert_eq!(flags_of("kimi"), &["--auto"]);
+        assert_eq!(policy_of("grok").after, &["agent"]);
+        assert!(policy_of("kimi").after.is_empty());
         assert_eq!(policy_of("muse").after, &["exec", "resume"]);
         assert!(policy_of("muse").skip.contains(&"skills"));
         assert_eq!(policy_of("gemini"), Policy::NONE);
@@ -333,6 +486,10 @@ mod tests {
             }
             for marker in p.markers {
                 assert!(is_shell_safe_marker(marker), "{} {marker}", row.program);
+            }
+            for own in word_options(row.program).own_yolo {
+                assert!(p.markers.contains(own), "{} {own}", row.program);
+                assert!(!p.flags.contains(own), "{} {own}", row.program);
             }
             for word in p.after.iter().chain(p.skip.iter()) {
                 assert!(
@@ -505,7 +662,7 @@ mod tests {
             matches!(decide("codex-old", &stepped), Launch::Default(_)),
             "PRECONDITION: the value is stepped over"
         );
-        assert_eq!(word_options("codex-older"), (&[][..], &[][..]));
+        assert_eq!(word_options("codex-older"), WordOptions::default());
     }
 
     /// By default: injected at the front (behind muse's session words), and
@@ -698,5 +855,229 @@ mod tests {
             None
         );
         assert_eq!(strip_no_harness("ay", &argv(&["--no-harness"])), None);
+    }
+
+    /// grok and kimi, read from their parsers (grok's 1.0.45 source checked against the
+    /// 1.0.67 binary's strings; kimi 2.3.1's `commands.ts`), never by running either: the yolo
+    /// flag lands in front (behind grok's `agent`, whose own options follow it), a typed
+    /// `--yolo` becomes the vendor flag in place, an argv that already decides permissions
+    /// runs as typed, and the management words run as typed.
+    #[test]
+    fn grok_and_kimi_take_their_one_flag_where_their_parsers_read_it() {
+        let d = |p: &str, a: &[&str]| decide(p, &argv(a));
+        assert_eq!(d("grok", &[]), Launch::Default(argv(&["--always-approve"])));
+        assert_eq!(
+            d("grok", &["-m", "grok-4", "fix it"]),
+            Launch::Default(argv(&["--always-approve", "-m", "grok-4", "fix it"]))
+        );
+        assert_eq!(
+            d("grok", &["--resume", "abc", "agent", "--json"]),
+            Launch::Default(argv(&[
+                "--resume",
+                "abc",
+                "agent",
+                "--always-approve",
+                "--json"
+            ]))
+        );
+        assert_eq!(
+            d("grok", &["agent", "-p", "hi"]),
+            Launch::Default(argv(&["agent", "--always-approve", "-p", "hi"]))
+        );
+        assert_eq!(
+            d("grok", &["--yolo", "agent", "-p", "hi"]),
+            Launch::Flag(argv(&["agent", "--always-approve", "-p", "hi"]))
+        );
+        assert_eq!(
+            d("grok", &["--cwd", "/w", "--yolo"]),
+            Launch::Flag(argv(&["--cwd", "/w", "--always-approve"]))
+        );
+        assert_eq!(d("kimi", &[]), Launch::Default(argv(&["--auto"])));
+        assert_eq!(d("kimi", &["--yolo"]), Launch::Flag(argv(&["--auto"])));
+        assert_eq!(
+            d("kimi", &["-m", "k2", "--yolo", "--", "--yolo"]),
+            Launch::Flag(argv(&["-m", "k2", "--auto", "--", "--yolo"]))
+        );
+        assert_eq!(
+            d("kimi", &["--agent", "coder", "hello"]),
+            Launch::Default(argv(&["--auto", "--agent", "coder", "hello"]))
+        );
+        for decided in [
+            &["--always-approve"][..],
+            &["--permission-mode", "plan"],
+            &["--permission-mode=default"],
+            &["--sandbox=strict"],
+            &["--allow", "Bash(ls)"],
+            &["--disallowed-tools=Bash"],
+            &["agent", "--dangerously-skip-permissions"],
+            &["-m", "grok-4", "--deny", "Write"],
+        ] {
+            assert_eq!(d("grok", decided), Launch::AsTyped, "grok {decided:?}");
+        }
+        for decided in [
+            &["--auto"][..],
+            &["-y"],
+            &["--yes"],
+            &["--auto-approve"],
+            &["--plan"],
+            &["-p", "hi"],
+            &["--prompt=hi"],
+            &["-S", "abc"],
+            &["--session=abc"],
+            &["-r"],
+            &["--resume=abc"],
+            &["-c"],
+            &["--continue"],
+            &["-C"],
+        ] {
+            assert_eq!(d("kimi", decided), Launch::AsTyped, "kimi {decided:?}");
+        }
+        for word in [
+            "login",
+            "mcp",
+            "models",
+            "doctor",
+            "update",
+            "version",
+            "worktree",
+            "worker",
+            "cursor-worker",
+            "clone",
+            "ssh",
+            "host-server",
+            "help",
+        ] {
+            assert_eq!(d("grok", &[word]), Launch::AsTyped, "grok {word}");
+        }
+        assert_eq!(
+            d("grok", &["--debug", "worker", "start"]),
+            Launch::AsTyped,
+            "a management word behind a known switch runs as typed too"
+        );
+        // Every leading option of grok's, by its arity: the flag still goes in front.
+        for typed in [
+            &["--effort", "high", "fix it"][..],
+            &["--reasoning-effort=high", "fix it"],
+            &["--add-dir", "/x", "fix it"],
+            &["-s", "6f1c", "fix it"],
+            &["--session-id", "6f1c"],
+            &["--rules", "be terse", "fix it"],
+            &["--system-prompt", "x"],
+            &["--tools", "read_file", "--max-turns", "3", "fix it"],
+            &["--agent", "agent"],
+            &["--output-format", "json", "-p", "hi"],
+            &["--debug", "fix it"],
+            &["--minimal"],
+            &["--no-alt-screen", "--fullscreen", "--verbatim"],
+            &["-c", "--fork-session"],
+            &["-w"],
+            &["-w", "feat", "fix it"],
+            &["-w", "login"],
+            &["-wfeat", "--ref", "main"],
+            &["--worktree=feat"],
+            &["-r"],
+            &["--resume", "agent"],
+            &["-r", "--no-plan"],
+        ] {
+            let mut want = argv(&["--always-approve"]);
+            want.extend(argv(typed));
+            assert_eq!(d("grok", typed), Launch::Default(want), "grok {typed:?}");
+        }
+        assert_eq!(
+            d("grok", &["-w", "feat", "agent", "-p", "hi"]),
+            Launch::Default(argv(&[
+                "-w",
+                "feat",
+                "agent",
+                "--always-approve",
+                "-p",
+                "hi"
+            ]))
+        );
+        assert_eq!(
+            d("grok", &["-w", "--yolo"]),
+            Launch::Flag(argv(&["-w", "--always-approve"]))
+        );
+        for typed in [
+            &["-w", "--yolo", "agent", "-p", "hi"][..],
+            &["-r", "--yolo", "fix it"],
+            &["--worktree", "--yolo", "--yolo", "agent"],
+        ] {
+            assert_eq!(
+                d("grok", typed),
+                Launch::AsTyped,
+                "{typed:?}: dropping the word would hand the next one to the optional value"
+            );
+        }
+        assert_eq!(
+            d(
+                "grok",
+                &[
+                    "--yolo",
+                    "--dangerously-skip-permissions",
+                    "agent",
+                    "-p",
+                    "x"
+                ]
+            ),
+            Launch::Flag(argv(&["agent", "--always-approve", "-p", "x"])),
+            "grok's own alias of the flag is dropped: its parser refuses one option twice"
+        );
+        // kimi's `-y, --yolo` (and `--yes`, `--auto-approve`) is its own weaker posture, which
+        // `--auto` cannot join: a typed `--yolo` takes that option over.
+        for typed in [
+            &["--yolo", "-y"][..],
+            &["-y", "--yolo"],
+            &["--yes", "--yolo", "--auto-approve"],
+            &["--yolo", "--auto", "-y"],
+        ] {
+            assert_eq!(
+                d("kimi", typed),
+                Launch::Flag(argv(&["--auto"])),
+                "kimi {typed:?}"
+            );
+        }
+        assert_eq!(
+            d("kimi", &["-y", "-m", "k2", "--yolo", "--add-dir", "/w"]),
+            Launch::Flag(argv(&["-m", "k2", "--auto", "--add-dir", "/w"]))
+        );
+        assert_eq!(
+            d("kimi", &["--yolo", "upgrade", "-y"]),
+            Launch::Flag(argv(&["--auto", "upgrade", "-y"])),
+            "a subcommand's own -y is its own"
+        );
+        assert_eq!(
+            d("kimi", &["--yolo", "-y", "--", "-y"]),
+            Launch::Flag(argv(&["--auto", "--", "-y"]))
+        );
+        assert_eq!(
+            d("kimi", &["--yolo", "-S", "-y", "login"]),
+            Launch::AsTyped,
+            "dropping -y would hand `login` to -S as a session id"
+        );
+        assert_eq!(
+            d("kimi", &["--yolo", "-S", "abc", "-y"]),
+            Launch::Flag(argv(&["--auto", "-S", "abc"]))
+        );
+        for word in [
+            "login", "acp", "web", "provider", "export", "upgrade", "update",
+        ] {
+            assert_eq!(d("kimi", &[word]), Launch::AsTyped, "kimi {word}");
+        }
+        assert_eq!(d("grok", &["--unknown", "x"]), Launch::AsTyped);
+        assert_eq!(
+            d("grok", &["--unknown", "--yolo"]),
+            Launch::AsTyped,
+            "an after word may hide behind an option this scan does not know"
+        );
+        assert_eq!(
+            d("kimi", &["--unknown", "--yolo"]),
+            Launch::Flag(argv(&["--unknown", "--auto"]))
+        );
+        assert_eq!(
+            d("grok", &["--model"]),
+            Launch::AsTyped,
+            "a value is missing"
+        );
     }
 }

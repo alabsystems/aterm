@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A compositor that stops reading: the client's socket fills, and `Display::try_flush`, the flush
-//! aterm-window's event loop makes, says `Flushed::Queued` where libwayland's flush says EAGAIN, so
-//! the loop keeps the rest queued and waits for the socket to take it.
+//! Tests `Display::try_flush` backpressure handling when the compositor stops reading.
 
 #![cfg(target_os = "linux")]
 
@@ -12,7 +10,6 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use aterm_wayland::protocols::wayland::wl_display;
 use aterm_wayland::proxy::{Error, Flushed, OwnedDisplay};
 
-/// `wl_display.sync`'s size on the wire: object, size and opcode, new id.
 const SYNC_BYTES: usize = 12;
 
 fn socket_pair() -> (OwnedFd, OwnedFd) {
@@ -31,8 +28,6 @@ fn socket_pair() -> (OwnedFd, OwnedFd) {
     unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
 }
 
-/// A small send buffer, so the socket fills after a few kilobytes rather
-/// than the default couple of hundred.
 fn shrink(fd: &OwnedFd, option: libc::c_int) {
     let size: libc::c_int = 4096;
     // SAFETY: a live socket and an int option value.
@@ -48,7 +43,6 @@ fn shrink(fd: &OwnedFd, option: libc::c_int) {
     assert_eq!(r, 0, "setsockopt: {}", std::io::Error::last_os_error());
 }
 
-/// Whether `fd` polls writable now.
 fn writable(fd: libc::c_int) -> bool {
     let mut p = libc::pollfd {
         fd,
@@ -60,7 +54,6 @@ fn writable(fd: libc::c_int) -> bool {
     n == 1 && p.revents & libc::POLLOUT != 0
 }
 
-/// Everything the far end holds now, appended to `into`; nonblocking.
 fn drain(fd: &OwnedFd, into: &mut Vec<u8>) {
     let mut buf = [0u8; 65536];
     loop {
@@ -80,7 +73,6 @@ fn drain(fd: &OwnedFd, into: &mut Vec<u8>) {
     }
 }
 
-/// The requests read off the wire: each `(object, opcode, size, new id)`.
 fn requests(wire: &[u8]) -> Vec<(u32, u16, u16, u32)> {
     let word = |b: &[u8]| u32::from_ne_bytes(b.try_into().unwrap());
     wire.chunks(SYNC_BYTES)

@@ -5655,3 +5655,38 @@ fn the_effort_split_survives_clusters_and_marks() {
         );
     }
 }
+
+#[test]
+fn agents_panel_under_reads_agy_active_subagents_and_skips_background_tasks() {
+    let rule = "─".repeat(80);
+    let rows = vec![
+        "● Spawned 3 subagents (ctrl+o to expand)".to_owned(),
+        String::new(),
+        rule.clone(),
+        "> ".to_owned(),
+        rule.clone(),
+        "  ● [17:50:42] sleep 30 running".to_owned(),
+        "  ● Agent(self: Cursor Trail Rendering Engineer)  Reading file · 4m36s".to_owned(),
+        "  ● Agent(self: System Monitoring Network Stats Engineer)  Running command · 4m39s".to_owned(),
+        rule,
+        "? for shortcuts                                      Gemini 4 Argon · high · 2 subagent(s)".to_owned(),
+    ];
+    let panel = agents_panel_under(&rows, 4).expect("agy subagents panel");
+    assert_eq!(panel.rows().len(), 2);
+    assert_eq!(panel.rows()[0].row, 6);
+    assert_eq!(
+        panel.rows()[0].name,
+        aterm_phase::agents_panel::Span {
+            start: 4,
+            end: 4 + "Cursor Trail Rendering Engineer".len() as u16,
+        }
+    );
+    assert_eq!(panel.rows()[1].row, 7);
+    assert_eq!(
+        panel.rows()[1].name,
+        aterm_phase::agents_panel::Span {
+            start: 4,
+            end: 4 + "System Monitoring Network Stats Engineer".len() as u16,
+        }
+    );
+}

@@ -414,3 +414,243 @@ fn the_clause_moves_no_row_and_no_label() {
     };
     assert_eq!(rows(&moved), rows(&quiet), "every other row is today's");
 }
+
+/// Open a `wall:usage-session` need (`resets 14:05`) under `turn`; the wall.
+fn open_usage_wall(timeline: &Mutex<SessionTimeline>, turn: Node) -> Node {
+    let mut g = timeline.lock().unwrap();
+    let now = g.slog().now();
+    g.slog_mut()
+        .log_mut_for_journal()
+        .open(
+            Open::new(Kind::Wall, Src::Screen, Conf::Strong)
+                .under(turn)
+                .fields(
+                    Fields::new()
+                        .word(Key::Wall, "usage-session")
+                        .expect("a wall")
+                        .tok(Key::Detail, "resets 14:05")
+                        .expect("its reset"),
+                ),
+            now,
+        )
+        .expect("the wall opens")
+}
+
+/// The supervise loop's own label, the bytes its harness token carries (`mark - label …`),
+/// written as `by`.
+fn loop_label(app: &App, by: Actor) {
+    let ctx = &app.pool.get(0).expect("session 0").ctx;
+    let mark =
+        aterm_agent::harness::acts::label_mark(aterm_agent::harness::acts::LIMIT_RESUME_LABEL);
+    let (reply, _) = super::cmd_mark(ctx, by, true, &format!("- {mark}"));
+    assert!(reply.starts_with("OK "), "{reply}");
+}
+
+/// The log's label lines by `by` (a `mark -` lands on the open node it names).
+fn labels_by(timeline: &Mutex<SessionTimeline>, by: &str) -> Vec<String> {
+    super::tests::lines_of(timeline)
+        .into_iter()
+        .filter(|l| l.contains(" label text=") && l.contains(&format!(" by={by} ")))
+        .collect()
+}
+
+/// Session 0 with a `claude` that failed (exit 143) and a second `claude` in front: the failure
+/// need open, as 6C-1's relaunch finds it. `base` is the hand clock's start.
+fn a_failed_claude_and_its_relaunch(
+    timeline: &Mutex<SessionTimeline>,
+    hand: &super::tests::Hand,
+    base: u64,
+) {
+    use super::tests::{blocks, finished, running};
+    let in_front = |ms: u64, blk: u64, start: u64, pgid: i32| {
+        hand.set(ms);
+        let mut g = timeline.lock().unwrap();
+        assert!(g.note_foreground_group(pgid));
+        assert!(g.set_program(pgid, Some("claude".into())));
+        let _ = g.sweep_slog(&running(blk, base + start, "claude"), false, 100, pgid);
+    };
+    timeline.lock().unwrap().note_root_group(100);
+    blocks(timeline, hand, 150, &running(0, base + 100, "claude"));
+    in_front(160, 0, 100, 300);
+    blocks(
+        timeline,
+        hand,
+        400,
+        &finished(0, Some(143), base + 100, base + 300, "claude"),
+    );
+    blocks(timeline, hand, 600, &running(1, base + 500, "claude"));
+    in_front(650, 1, 500, 301);
+}
+
+/// 6H-6 (U22, C-4): a relaunch whose failure the harness lifted (6C-1's seen) shows the
+/// harness's own word with its author, `now: restarting · by the harness`, until its ttl.
+#[test]
+fn a_lifted_relaunch_shows_the_harness_restarting_until_its_ttl() {
+    let (mut app, timeline) = clause_app(true);
+    let base = crate::turn_ledger::now_ms();
+    let hand = super::tests::hand_clock_from(&timeline, base);
+    a_failed_claude_and_its_relaunch(&timeline, &hand, base);
+    let need = |tl: &Mutex<SessionTimeline>| {
+        tl.lock()
+            .unwrap()
+            .slog()
+            .log()
+            .state()
+            .top_need()
+            .map(|n| n.word)
+    };
+    assert_eq!(
+        need(&timeline),
+        Some("failure"),
+        "PRECONDITION: {:?}",
+        super::tests::lines_of(&timeline)
+    );
+    let failed = chrome(&mut app);
+    assert!(tooltip(&failed).contains("\nnow: failed"), "{failed:?}");
+    hand.set(700);
+    let sid = app
+        .pool
+        .get(0)
+        .expect("session 0")
+        .ctx
+        .self_id
+        .as_str()
+        .to_string();
+    let report = aterm_agent::harness::upgrade_drive::Report {
+        pid: 4242,
+        tab: sid.clone(),
+        session: "c0ffee".to_string(),
+        from: "2.1.0".to_string(),
+        to: "2.1.0".to_string(),
+        step: "relaunched".to_string(),
+    };
+    crate::harness_host::log_act(&app.store, &sid, "relaunch", &report);
+    assert_eq!(need(&timeline), None, "6C-1 lifted it");
+    assert_eq!(labels_by(&timeline, "harness").len(), 1);
+    let shown = chrome(&mut app);
+    assert!(
+        tooltip(&shown).contains("\nnow: restarting \u{b7} by the harness"),
+        "{shown:?}"
+    );
+    assert!(
+        menu_words(&shown)
+            .iter()
+            .any(|w| w.starts_with("now: restarting \u{b7} by the harness \u{b7} ")),
+        "{:?}",
+        menu_words(&shown)
+    );
+    let until = app.session_chrome[&0]
+        .expires_ms
+        .expect("the harness's label arms its until");
+    hand.set(700 + 29_000);
+    let still = chrome(&mut app);
+    assert!(
+        tooltip(&still).contains("\nnow: restarting \u{b7} by the harness"),
+        "inside its ttl: {still:?}"
+    );
+    hand.set(700 + 30_001);
+    let progress = app.advance_session_chrome_expiry(until);
+    assert_eq!(progress.admitted_session, Some(0), "due at its until");
+    let after = app.session_chrome[&0].ext.clone();
+    assert!(
+        !tooltip(&after).contains("restarting"),
+        "NEGATIVE CONTROL: past its ttl the label is gone: {after:?}"
+    );
+}
+
+/// 6H-6 (U22): the loop's `resuming after limit`, typed while the usage wall it answers is
+/// still open, is the log's at once, but the chrome shows the wall's need row with no author;
+/// once the wall closes the harness's words show with their author, until their ttl.
+#[test]
+fn the_loops_limit_label_waits_under_the_open_wall_and_shows_once_it_closes() {
+    let (mut app, timeline, hand) = hand_app(true);
+    let turn = open_turn(&timeline);
+    let wall = open_usage_wall(&timeline, turn);
+    loop_label(&app, Actor::Harness);
+    let logged = labels_by(&timeline, "harness");
+    assert!(
+        logged.len() == 1 && logged[0].contains(" text=resuming%20after%20limit "),
+        "the label is the log's: {:?}",
+        super::tests::lines_of(&timeline)
+    );
+    let ext = chrome(&mut app);
+    assert!(
+        tooltip(&ext).contains("\nnow: limit \u{b7} resets 14:05"),
+        "{ext:?}"
+    );
+    assert!(!tooltip(&ext).contains("resuming"), "{ext:?}");
+    assert!(
+        !tooltip(&ext).contains("\u{b7} by "),
+        "a need names no author: {ext:?}"
+    );
+    let menu = menu_words(&ext);
+    assert!(
+        menu.iter()
+            .any(|w| w.starts_with("now: limit \u{b7} resets 14:05")),
+        "{menu:?}"
+    );
+    assert!(
+        menu.iter()
+            .all(|w| !w.contains("resuming") && !w.contains("\u{b7} by ")),
+        "{menu:?}"
+    );
+    hand.advance(5_000);
+    close_step(&timeline, wall);
+    let ext = chrome(&mut app);
+    assert!(
+        tooltip(&ext).contains("\nnow: resuming after limit \u{b7} by the harness"),
+        "{ext:?}"
+    );
+    assert!(
+        menu_words(&ext)
+            .iter()
+            .any(|w| w.starts_with("now: resuming after limit \u{b7} by the harness \u{b7} ")),
+        "{:?}",
+        menu_words(&ext)
+    );
+    let until = app.session_chrome[&0]
+        .expires_ms
+        .expect("the label arms its until");
+    hand.advance(25_001);
+    let progress = app.advance_session_chrome_expiry(until);
+    assert_eq!(progress.admitted_session, Some(0), "due at its until");
+    let after = app.session_chrome[&0].ext.clone();
+    assert!(!tooltip(&after).contains("resuming"), "{after:?}");
+    assert!(tooltip(&after).contains("\nnow: working"), "{after:?}");
+}
+
+/// 6H-6: the wall closed first, then the loop typed its carry-on: `now: resuming after limit ·
+/// … by the harness` shows at once. The same words by `ctl` never show.
+#[test]
+fn after_the_wall_closes_the_loops_label_names_the_harness_and_a_ctl_one_never_shows() {
+    for (by, shows) in [(Actor::Harness, true), (Actor::Ctl, false)] {
+        let (mut app, timeline, _hand) = hand_app(true);
+        let turn = open_turn(&timeline);
+        let wall = open_usage_wall(&timeline, turn);
+        close_step(&timeline, wall);
+        loop_label(&app, by);
+        let who = if shows { "harness" } else { "ctl" };
+        assert_eq!(labels_by(&timeline, who).len(), 1, "{by:?}: the log's");
+        let ext = chrome(&mut app);
+        let tip = tooltip(&ext);
+        let menu = menu_words(&ext);
+        if shows {
+            assert!(
+                tip.contains("\nnow: resuming after limit \u{b7} by the harness"),
+                "{ext:?}"
+            );
+            assert!(
+                menu.iter()
+                    .any(|w| w
+                        .starts_with("now: resuming after limit \u{b7} by the harness \u{b7} ")),
+                "{menu:?}"
+            );
+        } else {
+            assert!(
+                !tip.contains("resuming") && menu.iter().all(|w| !w.contains("resuming")),
+                "NEGATIVE CONTROL: a ctl label never shows: {ext:?}"
+            );
+            assert!(tip.contains("\nnow: working"), "the turn row: {ext:?}");
+        }
+    }
+}

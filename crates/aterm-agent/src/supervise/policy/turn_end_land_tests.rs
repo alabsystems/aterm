@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-/// The rows of `fixtures/land-defense-table.txt`: `(open, defense)`, a
-/// literal `\n` in a row a line break.
 fn land_table() -> Vec<(bool, String)> {
     let table = include_str!("fixtures/land-defense-table.txt");
     let mut rows = Vec::new();
@@ -21,8 +19,6 @@ fn land_table() -> Vec<(bool, String)> {
     rows
 }
 
-/// Whether `reply` reads as its row says: an OPEN row is no clean defense
-/// and names what it leaves (the nudge's suffix); a CLEAN row lands.
 fn reads_as_labelled(open: bool, reply: &str) -> bool {
     if open {
         !clean_defense(Some(reply)) && !land_open_words(Some(reply)).is_empty()
@@ -31,12 +27,6 @@ fn reads_as_labelled(open: bool, reply: &str) -> bool {
     }
 }
 
-/// LAND'S STRICT READING OVER THE TABLE: every OPEN defense — one that
-/// admits any leftover, however phrased — reads open and names it, and every
-/// CLEAN defense, the hard negations among them, lands. Both error rates are
-/// named on a failure: a false landing (an OPEN row read clean) is the worst
-/// failure Land has, a false non-landing (a CLEAN row read open) the second,
-/// so neither direction may slip. NEGATIVE CONTROLS: the CLEAN rows.
 #[test]
 fn land_reads_the_defense_table_as_labelled() {
     let rows = land_table();
@@ -68,10 +58,6 @@ fn land_reads_the_defense_table_as_labelled() {
     );
 }
 
-/// EVERY FAMILY IS LOAD-BEARING (the mutation check): with any one family
-/// of [`LAND_FAMILIES`] taken out, some OPEN defense of the table lands —
-/// so no family is dead weight, and none can be dropped without the table
-/// saying which defense it would let through.
 #[test]
 fn every_land_family_is_load_bearing() {
     let open: Vec<(String, String)> = land_table()
@@ -101,17 +87,6 @@ fn every_land_family_is_load_bearing() {
     }
 }
 
-/// THE NEEDS TABLE, READ AS LABELLED (`fixtures/needs-table.txt`): Land's
-/// whole reading of each report, with its defense and a NEEDS YOU line or
-/// block in some spelling. A NEED row names a need carrying its words, says
-/// no none and lands nothing: a need lost is a false landing, the worst
-/// failure Land has. A NONE row names no need, clears the standing set where
-/// it holds a NEEDS YOU line ([`needs::says_no_needs`]) and lands: a phantom
-/// need is a false non-landing. A HEADLESS row, an ask with no head, lands
-/// nothing, and the nudge names what it read open. Every miss is named.
-/// NEGATIVE CONTROLS: the open-work reading alone, needs left out, would
-/// land some NEED row, and a reader that took every NEEDS YOU line for a
-/// need would hold some NONE row.
 #[test]
 fn land_reads_the_needs_table_as_labelled() {
     use needs::NeedsRow;
@@ -171,11 +146,6 @@ fn land_reads_the_needs_table_as_labelled() {
     }));
 }
 
-/// A NEED WRITTEN ANY WAY HOLDS THE LANDING: a NEEDS YOU line whose head
-/// ends in a dash or carries a bracketed qualifier names a need, so the
-/// defense beside it never lands however clean it reads; one that says none
-/// stands, however it is marked, lands. NEGATIVE CONTROL: the same defense
-/// with no NEEDS YOU line lands, and a need after a none word holds it.
 #[test]
 fn a_need_however_headed_holds_the_landing() {
     let defense = "Nothing left: all on origin/main.";
@@ -206,15 +176,6 @@ fn a_need_however_headed_holds_the_landing() {
     }
 }
 
-/// A HOLDOUT, MEASURED (a tool, not a check): Land's whole reading of every
-/// case of the file `ATERM_LAND_HOLDOUT` names, or of the prior blind holdout
-/// (`fixtures/land-holdout-2026-10-20.tsv`) where it names
-/// none: one case a line, `label<TAB>id<TAB>prov<TAB>source<TAB>reply` (`#`
-/// lines skipped, a literal `\n` a line break; a label is `open`, `clean` or
-/// `debatable`). It prints each false landing (an open case read clean), each
-/// false non-landing (a clean case read open, with the words read) and how
-/// each debatable case read, then the counts. It judges nothing: a holdout
-/// that a test held to zero would be a table.
 #[test]
 #[ignore = "a measurement: run with --ignored --nocapture; ATERM_LAND_HOLDOUT names another holdout"]
 fn land_reads_a_holdout() {

@@ -140,7 +140,6 @@ pub(super) fn mono(ns: u64) -> Item {
     Item::effect(EffectRecord::Mono(ns))
 }
 
-/// Each frame of a tape, read off its heads (an oracle beside the reader).
 fn frames_of(bytes: &[u8]) -> Vec<(usize, usize, u8, u32)> {
     let mut out = Vec::new();
     let mut at = MAGIC.len();
@@ -154,7 +153,6 @@ fn frames_of(bytes: &[u8]) -> Vec<(usize, usize, u8, u32)> {
     out
 }
 
-/// A tape of a header and `frames` records frames.
 fn tape(frames: usize, rng: &mut XorShift) -> (Vec<u8>, Vec<Vec<Item>>) {
     let (mut w, sink, _) = writer();
     let mut per_frame = Vec::new();
@@ -170,7 +168,6 @@ fn tape(frames: usize, rng: &mut XorShift) -> (Vec<u8>, Vec<Vec<Item>>) {
     (sink.bytes(), per_frame)
 }
 
-/// What a recovery must hold after `whole` records frames.
 fn prefix(per_frame: &[Vec<Item>], whole: usize) -> Vec<Item> {
     per_frame[..whole].iter().flatten().cloned().collect()
 }
@@ -201,7 +198,6 @@ pub(super) fn as_format_1(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-/// A tape and the same frames as format 1 wrote them, each named.
 fn both_formats(bytes: &[u8]) -> [(&'static str, Vec<u8>); 2] {
     [
         ("format 2", bytes.to_vec()),
@@ -504,7 +500,6 @@ fn format_1_reads_whole_frames_out_of_place_clean() {
     }
 }
 
-/// The run [`GOLDEN_FORMAT_1`] holds: two records frames.
 fn golden_run() -> (Vec<u8>, Vec<Item>) {
     let ask = |last: &str| {
         let mut reply = "row of the worker's screen\n".repeat(20);
@@ -529,7 +524,6 @@ fn golden_run() -> (Vec<u8>, Vec<Item>) {
     (sink.bytes(), items)
 }
 
-/// [`golden_run`]'s tape as the format-1 writer wrote it.
 const GOLDEN_FORMAT_1: &str = concat!(
     "415441504500010a002600000000000000b9e64bf2be72f2aa61746170652031",
     "0a746170653d742d310a6275696c643d67300a656e7472793d77617463680a01",
@@ -563,7 +557,6 @@ fn a_format_1_tape_reads_as_it_always_did() {
     );
 }
 
-/// [`golden_run`]'s tape as the format-2 writer wrote it.
 const GOLDEN_FORMAT_2: &str = concat!(
     "415441504500020a002600000000000000e79143a3fda7acc061746170652031",
     "0a746170653d742d310a6275696c643d67300a656e7472793d77617463680a01",

@@ -19,7 +19,7 @@ pub struct ProcessKey {
 pub struct Process {
     /// This process's identity.
     pub key: ProcessKey,
-    /// The current parent PID; it is resolved against this same sweep.
+    /// The current parent PID.
     pub parent: u32,
 }
 

@@ -203,7 +203,6 @@ pub(crate) fn top_spoken(on: bool) -> (String, String) {
 }
 
 /// A token count as a screen reader says it: `940`, `1.2 thousand`, `20 million`, `3.1 billion`.
-#[cfg(any(a11y_tree, test))]
 #[must_use]
 pub(crate) fn tokens_spoken(n: u64) -> String {
     const UNITS: [(u64, &str); 3] = [
@@ -224,8 +223,8 @@ pub(crate) fn tokens_spoken(n: u64) -> String {
     n.to_string()
 }
 
-/// A working time as a screen reader says it.
-#[cfg(any(a11y_tree, test))]
+/// A working time as a screen reader says it: `42 seconds`, `6 minutes 33
+/// seconds`, `1 minute`, `7 hours 52 minutes`, a zero second unit left unsaid.
 #[must_use]
 pub(crate) fn runtime_spoken(secs: u64) -> String {
     let unit = |n: u64, one: &str| {
@@ -235,15 +234,25 @@ pub(crate) fn runtime_spoken(secs: u64) -> String {
             format!("{n} {one}s")
         }
     };
+    let both = |n: u64, one: &str, k: u64, other: &str| {
+        if k == 0 {
+            unit(n, one)
+        } else {
+            format!("{} {}", unit(n, one), unit(k, other))
+        }
+    };
     let (h, m, s) = (secs / 3600, secs % 3600 / 60, secs % 60);
     match secs {
         0..60 => unit(s, "second"),
-        60..3600 => format!("{} {}", unit(m, "minute"), unit(s, "second")),
-        _ => format!("{} {}", unit(h, "hour"), unit(m, "minute")),
+        60..3600 => both(m, "minute", s, "second"),
+        _ => both(h, "hour", m, "minute"),
     }
 }
 
-/// What a screen reader names a fact and says a press on it does (design §10.6.14).
+/// What a screen reader names a fact and says a press on it does (design §10.6.14). A hidden
+/// fact's greyed stub (`restores`) is named as the fact is, with `off` after it as the glass
+/// draws it: `Branch: main off` for `⎇ main off`, though the folder's names its full working
+/// directory where the glass draws the footer's short path.
 #[cfg(any(a11y_tree, test))]
 #[must_use]
 pub(crate) fn fact_spoken_of(
@@ -262,14 +271,8 @@ pub(crate) fn fact_spoken_of(
         Fact::Account => "Account",
         Fact::TopEffort => return top_spoken(facts.top_effort.unwrap_or(false)),
     };
-    if !restores.is_empty() {
-        return (
-            format!("{name}: hidden"),
-            "Activate to show it again.".to_owned(),
-        );
-    }
     let hide = "Activate to hide it.".to_owned();
-    match fact {
+    let (label, description) = match fact {
         Fact::Model => (
             format!("{name}: {}", facts.model.as_deref().unwrap_or("")),
             hide,
@@ -341,7 +344,14 @@ pub(crate) fn fact_spoken_of(
             )
         }
         Fact::TopEffort => top_spoken(facts.top_effort.unwrap_or(false)),
+    };
+    if restores.is_empty() {
+        return (label, description);
     }
+    (
+        format!("{label} {}", aterm_agent::harness::footer::OFF_STUB),
+        "Activate to show it again.".to_owned(),
+    )
 }
 
 impl App {
@@ -459,6 +469,19 @@ impl App {
         self.shown_facts(session)
             .map(|(facts, cwd)| fact_spoken_of(&facts, cwd.as_deref(), fact, restores))
             .unwrap_or_default()
+    }
+
+    /// The on/off a screen reader is told of `session`'s `fact` where it is a
+    /// two-state toggle (`Role::Switch`, as the harness switch is): the top
+    /// rule's key, on where Claude draws its tag, as [`top_spoken`] names it.
+    #[cfg(a11y_tree)]
+    #[must_use]
+    pub(crate) fn fact_toggled(
+        &self,
+        session: u64,
+        fact: Fact,
+    ) -> Option<aterm_a11y::model::Toggled> {
+        (fact == Fact::TopEffort).then(|| self.engine_top_tag(session).unwrap_or(false).into())
     }
 }
 

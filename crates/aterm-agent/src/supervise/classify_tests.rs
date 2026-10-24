@@ -2813,3 +2813,97 @@ fn a_brace_or_glob_word_that_may_become_a_write_flag_is_refused() {
         assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
     }
 }
+
+/// A grep, rg or git grep value option takes its value, so the next word is the pattern and only later operands are paths.
+#[test]
+fn a_grep_value_option_takes_its_value_not_the_pattern() {
+    for (line, paths) in [
+        ("grep -m 1 credentials src/", vec!["src/"]),
+        ("grep -m1 credentials src/", vec!["src/"]),
+        ("grep -A 2 -B 1 -C 3 id_rsa docs/", vec!["docs/"]),
+        ("grep -D skip -d skip credentials src/", vec!["src/"]),
+        ("grep --max-count 1 credentials src/", vec!["src/"]),
+        ("grep --max-count=1 credentials src/", vec!["src/"]),
+        ("grep --after-context 2 --before-context 1 x f", vec!["f"]),
+        ("grep --devices skip --directories skip x f", vec!["f"]),
+        ("grep --label in --binary-files text x f", vec!["f"]),
+        ("grep --group-separator - x f", vec!["f"]),
+        ("rg -m 1 -M 200 -j 4 -d 2 credentials src", vec!["src"]),
+        ("rg -A 1 -B 1 -C 1 -E utf8 -r X x f", vec!["f"]),
+        ("rg -t rust -T js -g '*.rs' x f", vec!["f"]),
+        (
+            "rg --max-depth 2 --max-columns 80 --threads 4 x f",
+            vec!["f"],
+        ),
+        ("rg --type-add 'web:*.html' --sort path x f", vec!["f"]),
+        ("rg --ignore-file .ignore x f", vec![".ignore", "f"]),
+        ("git grep -m 1 credentials", vec![]),
+        ("git grep -A 1 -C 2 x src", vec!["src"]),
+        (
+            "git grep --max-c 1 --max-depth 2 --threads 4 x src",
+            vec!["src"],
+        ),
+        ("git grep --cont 1 x src", vec!["src"]),
+        ("grep --binary x f", vec!["f"]),
+        ("grep --context 3 x f", vec!["x", "f"]),
+        ("grep --color always x f", vec!["x", "f"]),
+        ("grep --context=3 x f", vec!["3", "f"]),
+        ("grep -f pats.txt f", vec!["pats.txt", "f"]),
+    ] {
+        let got = path_operands(line).expect(line);
+        assert_eq!(got, paths, "{line}");
+    }
+}
+
+/// jq, git log and rg read long options by whole names only, so `jq --slurp` is never `--slurpfile`.
+#[test]
+fn a_tool_that_takes_no_abbreviation_is_read_by_whole_names() {
+    for (line, paths) in [
+        ("jq --slurp . a.json b.json", vec!["a.json", "b.json"]),
+        (
+            "jq -R --slurp . a ~/.ssh/id_rsa",
+            vec!["a", "~/.ssh/id_rsa"],
+        ),
+        ("rg --ignore token ~/.ssh/id_rsa", vec!["~/.ssh/id_rsa"]),
+        ("jq --slurpfile n f.json . a", vec!["f.json", "a"]),
+        ("rg --ignore-file .ignore x f", vec![".ignore", "f"]),
+        ("grep --max-c 1 x f", vec!["f"]),
+        ("git grep --max-c 1 x src", vec!["src"]),
+    ] {
+        let got = path_operands(line).expect(line);
+        assert_eq!(got, paths, "{line}");
+    }
+}
+
+/// Any `LESS…` assignment is a hazard: a `LESSKEYIN` file can set `LESSOPEN`, which less runs.
+#[test]
+fn a_less_variable_assignment_is_a_hazard() {
+    for line in [
+        "LESSKEYIN=evil.lesskey less README.md",
+        "LESSKEY_CONTENT='#env' less README.md",
+        "LESSHISTFILE=/tmp/h less README.md",
+        "LESSKEY=k cat README.md",
+        "env LESSKEYIN=k less README.md",
+        "export LESSKEYIN=k; less README.md",
+    ] {
+        let v = classify_command(line);
+        assert!(!v.read_only, "{line}");
+        assert!(v.reason.contains("LESS"), "{line}: {}", v.reason);
+    }
+    for line in ["less README.md", "NOTLESS=1 cat README.md"] {
+        assert!(ro(line), "{line}: {:?}", classify_command(line));
+    }
+}
+
+/// `rg --hostname-bin` runs a program, so it is refused as `--pre` is.
+#[test]
+fn rg_hostname_bin_runs_a_program() {
+    for line in [
+        "rg --hostname-bin ./h --hyperlink-format default x src",
+        "rg --hostname-bin=./h x src",
+        "rg --pre ./p x src",
+    ] {
+        assert!(!ro(line), "{line}");
+    }
+    assert!(ro("rg --hyperlink-format default x src"));
+}

@@ -48,15 +48,18 @@ pub struct Report {
 enum Item {
     /// A turn's start: the words typed (a paste read as what was pasted).
     Prompt(String),
+    /// A turn's start whose prompt is absent or not yet read.
+    Boundary,
     /// One assistant message, its rows merged by `message.id`.
     Said {
         id: Option<String>,
         texts: Vec<String>,
         uuid: String,
         session: String,
-        /// The message's last content block is a tool's call: the turn goes
-        /// on past it (its result, then more of the model's words), so
-        /// whatever it said is no turn's last word ([`ends_in_call`]).
+        /// The turn goes on past this message, so whatever it said is no
+        /// turn's last word ([`ends_in_call`]): in a Claude Code transcript,
+        /// its last content block is a tool's call (its result, then more of
+        /// the model's words); in a Codex rollout, its phase is `commentary`.
         calls: Option<bool>,
     },
 }
@@ -98,7 +101,7 @@ fn last_block_calls(content: Option<&Value>) -> Option<bool> {
 fn ends_in_call(items: &[Item]) -> bool {
     items.iter().rev().find_map(|i| match i {
         Item::Said { calls, .. } => Some(*calls),
-        Item::Prompt(_) => None,
+        Item::Prompt(_) | Item::Boundary => None,
     }) == Some(Some(true))
 }
 
@@ -245,16 +248,20 @@ fn worker_turns(items: &[Item]) -> Vec<TurnRows<'_>> {
     let mut prompt = None;
     let mut start = 0;
     for (at, item) in items.iter().enumerate() {
-        if let Item::Prompt(words) = item {
-            if at > start || prompt.is_some() {
-                out.push(TurnRows {
-                    prompt,
-                    said: &items[start..at],
-                });
-            }
-            prompt = Some(words.as_str());
-            start = at + 1;
+        let next_prompt = match item {
+            Item::Prompt(words) => Some(words.as_str()),
+            Item::Boundary => None,
+            Item::Said { .. } => continue,
+        };
+        // An empty turn still separates its landing from an older report.
+        if at > 0 {
+            out.push(TurnRows {
+                prompt,
+                said: &items[start..at],
+            });
         }
+        prompt = next_prompt;
+        start = at + 1;
     }
     out.push(TurnRows {
         prompt,
@@ -317,20 +324,7 @@ struct Reading {
 }
 
 fn read(jsonl: &str, by: DoneBy) -> Reading {
-    let items = items(jsonl);
-    let turns = worker_turns(&items);
-    let Some((newest, before)) = turns.split_last() else {
-        return Reading {
-            by,
-            report: Err("no-reply"),
-            turn: None,
-        };
-    };
-    let (by, report) = if by == DoneBy::Check || newest.is_check() {
-        (DoneBy::Check, by_check(newest, before))
-    } else {
-        (DoneBy::Turn, by_turn(newest))
-    };
+    let (by, report) = read_items(&items(jsonl), by);
     let lagged = report.as_ref().is_err_and(|why| LAG_MISSES.contains(why));
     Reading {
         by,
@@ -339,6 +333,19 @@ fn read(jsonl: &str, by: DoneBy) -> Reading {
             Opener::Row(uuid) if lagged => Some(uuid),
             _ => None,
         },
+    }
+}
+
+/// [`report`] over a conversation's `items`, and the rule it read them by.
+fn read_items(items: &[Item], by: DoneBy) -> (DoneBy, Result<Report, &'static str>) {
+    let turns = worker_turns(items);
+    let Some((newest, before)) = turns.split_last() else {
+        return (by, Err("no-reply"));
+    };
+    if by == DoneBy::Check || newest.is_check() {
+        (DoneBy::Check, by_check(newest, before))
+    } else {
+        (DoneBy::Turn, by_turn(newest))
     }
 }
 
@@ -754,6 +761,13 @@ pub enum Source {
     },
     /// THE SCREEN of a harness whose reader alone reads its turns.
     Screen { program: String },
+    /// A Codex rollout ([`snapshot_rollout`]): the conversation, the turn the
+    /// report is the last words of, and the rollout it was read from.
+    Rollout {
+        thread: String,
+        turn: String,
+        rollout: Option<PathBuf>,
+    },
 }
 
 impl Source {
@@ -790,6 +804,18 @@ impl Source {
             Source::Screen { program } => {
                 (format!("source=screen program={}", pct(program)), &none)
             }
+            Source::Rollout {
+                thread,
+                turn,
+                rollout,
+            } => {
+                let mut line = format!("source=rollout thread={} turn={}", pct(thread), pct(turn));
+                if let Some(path) = rollout {
+                    line.push_str(" rollout=");
+                    line.push_str(&pct(&path.to_string_lossy()));
+                }
+                (line, &none)
+            }
         };
         if let Some(path) = transcript {
             out.push_str(" transcript=");
@@ -821,6 +847,11 @@ impl Source {
             "screen" => Some(Source::Screen {
                 program: field("program").filter(|w| is_word(w))?,
             }),
+            "rollout" => Some(Source::Rollout {
+                thread: field("thread")?,
+                turn: field("turn")?,
+                rollout: field("rollout").map(PathBuf::from),
+            }),
             _ => None,
         }
     }
@@ -851,9 +882,16 @@ pub struct Snapshot {
     pub by: DoneBy,
 }
 
-/// THE PREVIOUS LANDING'S RESULT, PRUNED.
+/// Remove only this session's numerically older result revisions. A delayed
+/// capture preserves equal, newer or unparseable revisions.
 pub fn prune_results(tasks: &Path, stem: &str) -> usize {
     let Some((sid, rev)) = stem.rsplit_once('-') else {
+        return 0;
+    };
+    if rev.is_empty() || !rev.bytes().all(|b| b.is_ascii_digit()) {
+        return 0;
+    }
+    let Ok(rev) = rev.parse::<u64>() else {
         return 0;
     };
     let Ok(dir) = std::fs::read_dir(tasks) else {
@@ -872,15 +910,29 @@ pub fn prune_results(tasks: &Path, stem: &str) -> usize {
         else {
             continue;
         };
-        if n != rev
-            && !n.is_empty()
+        if !n.is_empty()
             && n.bytes().all(|b| b.is_ascii_digit())
+            && n.parse::<u64>().is_ok_and(|n| n < rev)
             && std::fs::remove_file(entry.path()).is_ok()
         {
             removed += 1;
         }
     }
     removed
+}
+
+/// The result file's stem for the task the record at `rev` stands for, in
+/// session `sel` (`@s-…`): `<gsid>-<rev>`, the task file's own pairing.
+#[must_use]
+pub fn result_stem(sel: Option<&str>, rev: u64) -> String {
+    let sid: String = sel
+        .unwrap_or_default()
+        .trim_start_matches('@')
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect();
+    let sid = if sid.is_empty() { "session" } else { &sid };
+    format!("{sid}-{rev}")
 }
 
 /// SNAPSHOT THE RESULT, at the done edge.
@@ -1091,7 +1143,21 @@ pub fn answer(path: &Path, full: bool) -> String {
     match source_of(path) {
         None => unavailable("no-snapshot"),
         Some(Source::Unavailable { why, .. }) => unavailable(&why),
-        Some(Source::Screen { .. }) if full => unavailable("no-transcript"),
+        Some(Source::Screen { .. } | Source::Rollout { .. }) if full => {
+            unavailable("no-transcript")
+        }
+        Some(Source::Rollout { thread, turn, .. }) => {
+            let Some(text) = super::footer::read_small(path, RESULT_READ_BYTES) else {
+                return unavailable("unreadable");
+            };
+            let pct = aterm_codec::pct::encode;
+            framed(
+                &format!("source=rollout thread={} turn={}", pct(&thread), pct(&turn)),
+                text.len(),
+                "",
+                &head_lines(&text, RESULT_MAX_CHARS, path),
+            )
+        }
         Some(Source::Screen { program }) => {
             let Some(text) = super::footer::read_small(path, RESULT_READ_BYTES) else {
                 return unavailable("unreadable");
@@ -1232,6 +1298,198 @@ pub fn reread(path: &Path) -> Option<Reread> {
     end.upto?;
     let report = read(&upto(jsonl, end), DoneBy::Turn).report.ok()?;
     Some(Reread { report, transcript })
+}
+
+/// A CODEX ROLLOUT'S CONVERSATION as [`items`] reads a transcript's, for
+/// conversation `thread`: each turn opens at its `task_started`, its prompt the
+/// first message typed into it that is no context Codex added itself
+/// ([`codex_context`]), each assistant message its words — a commentary one a
+/// turn that goes on past it.
+fn codex_items(jsonl: &str, thread: &str) -> Vec<Item> {
+    let mut out = Vec::new();
+    let mut turn = String::from("-");
+    let mut opening = None;
+    for line in jsonl.lines() {
+        if !line.contains("\"message\"") && !line.contains("\"task_started\"") {
+            continue;
+        }
+        let Ok(v) = aterm_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(payload) = v.get("payload") else {
+            continue;
+        };
+        let texts = |part: &str| -> Vec<String> {
+            payload
+                .get("content")
+                .and_then(Value::as_array)
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .filter(|p| p.get("type").and_then(Value::as_str) == Some(part))
+                        .filter_map(|p| p.get("text").and_then(Value::as_str))
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        match (
+            v.get("type").and_then(Value::as_str),
+            payload.get("type").and_then(Value::as_str),
+            payload.get("role").and_then(Value::as_str),
+        ) {
+            (Some("event_msg"), Some("task_started"), _) => {
+                payload
+                    .get("turn_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("-")
+                    .clone_into(&mut turn);
+                opening = Some(out.len());
+                out.push(Item::Boundary);
+            }
+            (Some("response_item"), Some("message"), Some("user")) if opening.is_some() => {
+                let mut parts = texts("input_text");
+                parts.retain(|p| !codex_media_label(p));
+                if parts.iter().any(|p| codex_context(p)) {
+                    continue;
+                }
+                let words = parts.join("\n").trim().to_string();
+                if !words.is_empty()
+                    && let Some(at) = opening.take()
+                {
+                    out[at] = Item::Prompt(words);
+                }
+            }
+            (Some("response_item"), Some("message"), Some("assistant")) => {
+                opening = None;
+                out.push(Item::Said {
+                    id: None,
+                    texts: texts("output_text"),
+                    uuid: turn.clone(),
+                    session: thread.to_string(),
+                    calls: Some(payload.get("phase").and_then(Value::as_str) == Some("commentary")),
+                });
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Whether a user message's text is context Codex adds to a turn itself: its
+/// tagged fragments (`<environment_context>`, `<user_shell_command>`, …), but
+/// no media label ([`codex_media_label`]), and the project's `AGENTS.md`
+/// (`# AGENTS.md instructions`, ` for <dir>` where it names one).
+fn codex_context(text: &str) -> bool {
+    let text = text.trim_start();
+    (text.starts_with('<') && !codex_media_label(text))
+        || text.starts_with("# AGENTS.md instructions")
+}
+
+/// Whether a user message's text part is a label Codex puts around a file the
+/// person attached (`<image name=…>`, `</image>`, `<audio>`, …): part of their
+/// own message, and none of its words.
+fn codex_media_label(text: &str) -> bool {
+    let text = text.trim();
+    [
+        "<image>",
+        "<image name=",
+        "</image>",
+        "<audio>",
+        "<audio name=",
+        "</audio>",
+    ]
+    .iter()
+    .any(|label| text.starts_with(label))
+}
+
+/// THE WORKER'S REPORT in the Codex rollout tail `jsonl` of conversation
+/// `thread`, read at the done edge by rule `by` as [`report`] reads a
+/// transcript's.
+/// # Errors
+/// As [`report`].
+pub fn codex_report(jsonl: &str, thread: &str, by: DoneBy) -> Result<Report, &'static str> {
+    read_items(&codex_items(jsonl, thread), by).1
+}
+
+/// Whether the newest turn in the Codex rollout tail `jsonl` has ended: a
+/// `task_complete` or `turn_aborted` after its `task_started` names that turn,
+/// with absent ids retaining the legacy boundary. A previous turn's late
+/// terminal or any message text cannot end it; a tail with no start is settled.
+#[must_use]
+pub fn codex_turn_ended(jsonl: &str) -> bool {
+    let mut terminals: Vec<Option<String>> = Vec::new();
+    for line in jsonl.lines().rev() {
+        if !line.contains("\"event_msg\"") {
+            continue;
+        }
+        let Ok(event) = aterm_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if event.get("type").and_then(Value::as_str) != Some("event_msg") {
+            continue;
+        }
+        let Some(payload) = event.get("payload") else {
+            continue;
+        };
+        let turn = payload.get("turn_id").and_then(Value::as_str);
+        match payload.get("type").and_then(Value::as_str) {
+            Some("task_started") => {
+                return terminals.iter().any(|terminal| {
+                    turn.is_none_or(|turn| terminal.as_deref().is_none_or(|ended| ended == turn))
+                });
+            }
+            Some("task_complete" | "turn_aborted") => {
+                terminals.push(turn.map(str::to_owned));
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+/// SNAPSHOT A CODEX WORKER'S RESULT, at its landing's done edge: its report in
+/// the tail of its `rollout` (the file and the text read from it), which names
+/// conversation `thread`.
+/// # Errors
+/// As [`snapshot`].
+pub fn snapshot_rollout(
+    tasks: &Path,
+    stem: &str,
+    rollout: Option<(&Path, &str)>,
+    thread: &str,
+    by: DoneBy,
+) -> std::io::Result<Snapshot> {
+    check_stem(stem)?;
+    let none = |why: &'static str, by: DoneBy| {
+        (
+            String::new(),
+            Source::Unavailable {
+                why: why.to_string(),
+                transcript: None,
+                turn: None,
+            },
+            Some(why),
+            by,
+        )
+    };
+    let (text, source, unavailable, by) = match rollout {
+        None => none("no-transcript", by),
+        Some((file, jsonl)) => match read_items(&codex_items(jsonl, thread), by) {
+            (by, Ok(r)) => (
+                r.text,
+                Source::Rollout {
+                    thread: r.session,
+                    turn: r.uuid,
+                    rollout: Some(file.to_path_buf()),
+                },
+                None,
+                by,
+            ),
+            (by, Err(why)) => none(why, by),
+        },
+    };
+    write_snapshot(tasks, stem, &text, &source, unavailable, by)
 }
 
 #[cfg(test)]

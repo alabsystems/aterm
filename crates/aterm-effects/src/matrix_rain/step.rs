@@ -6,10 +6,10 @@
 use aterm_core::grid::LineSize;
 use aterm_core::grid::extra::ImageRef;
 use aterm_core::terminal::RenderCell;
-use aterm_render::{RainHalo, SpriteQuad};
+use aterm_render::RainHalo;
 use aterm_time::Instant;
 
-use super::{EffectGeom, MatrixRain, RainSignal, RainTickInput, RainVisibility};
+use super::{EffectGeom, MatrixRain, RainCell, RainSignal, RainTickInput, RainVisibility};
 
 /// Per-surface rain latches keyed by session.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -122,7 +122,7 @@ impl MatrixRain {
         &mut self,
         f: &RainFrame<'_>,
         latches: &mut RainLatches,
-        quads: &mut Vec<SpriteQuad>,
+        quads: &mut Vec<RainCell>,
         add: &mut Vec<RainHalo>,
     ) -> u64 {
         if f.suspended {

@@ -289,8 +289,31 @@ fn global_clauses(ctx: &Ctx<'_>, s: &Snapshot) -> Vec<String> {
     if let Some(v) = s.volume.as_ref() {
         parts.push(format!("disk {} free", words::disk(v.available)));
     }
+    if let Some(net) = s.net.as_ref() {
+        parts.extend(net_clause(net));
+    }
     let _ = ctx;
     parts
+}
+
+fn net_clause(net: &crate::model::NetView) -> Option<String> {
+    let mut sub = Vec::new();
+    if let Some(r) = net.rates {
+        sub.push(format!(
+            "down {}, up {}",
+            bps_word(r.rx_bps),
+            bps_word(r.tx_bps)
+        ));
+    }
+    if let Some(tcp) = net.tcp {
+        sub.push(format!(
+            "{} TCP ({} established, {} listen)",
+            tcp.total(),
+            tcp.established,
+            tcp.listen
+        ));
+    }
+    (!sub.is_empty()).then(|| format!("net {}", sub.join(", ")))
 }
 
 /// Memory's words for a sentence: `memory 16.6 of 128 GiB used, pressure
@@ -690,6 +713,7 @@ pub fn render_text(q: &SysQuery, ctx: &Ctx<'_>) -> Reply {
             View::Gpu => gpu_text(ctx, s, &mut lines),
             View::Mem => mem_text(q, ctx, s, &mut lines),
             View::Disk => disk_text(q, ctx, s, &mut lines),
+            View::Net => net_text(q, s, &mut lines),
             View::Procs => procs_text(q, ctx, s, &mut lines),
             View::Why => why::why_text(q, ctx, s, &mut lines, &events),
         },
@@ -715,7 +739,7 @@ fn overview_text(ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
     }
     lines.push(note(
         "more",
-        "more=views:tab,aterm,global,jobs,cores,gpu,mem,disk,procs,why · aterm ctl @self sys --json",
+        "more=views:tab,aterm,global,jobs,cores,gpu,mem,disk,net,procs,why · aterm ctl @self sys --json",
     ));
 }
 
@@ -1103,6 +1127,12 @@ fn global_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>)
                 words::disk(v.available),
                 words::disk(v.total)
             ),
+        ));
+    }
+    if let Some(net) = s.net.as_ref() {
+        lines.push(line(
+            "net",
+            format!("net      {}", net_summary_words(s, net)),
         ));
     }
     top_rows(
@@ -1774,6 +1804,142 @@ fn disk_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
     lines.push(note("summary", disk_summary(ctx)));
 }
 
+fn net_summary_words(s: &Snapshot, net: &crate::model::NetView) -> String {
+    let mut parts = Vec::new();
+    match net.rates {
+        Some(r) => {
+            let mut rate = format!(
+                "down {} ({:.0} pkt/s), up {} ({:.0} pkt/s)",
+                bps_word(r.rx_bps),
+                r.rx_pps,
+                bps_word(r.tx_bps),
+                r.tx_pps
+            );
+            let errs = r.rx_err_ps + r.tx_err_ps;
+            let drops = r.rx_drop_ps + r.tx_drop_ps.unwrap_or(0.0);
+            if errs > 0.0 || drops > 0.0 {
+                rate.push_str(&format!(" · err {errs:.1}/s, drop {drops:.1}/s"));
+            }
+            parts.push(rate);
+        }
+        None if !net.links.is_empty() => {
+            parts.push(format!("rates {}", unavailable("warming")));
+        }
+        None => {}
+    }
+    if let Some(l) = s.facts.link.as_ref() {
+        let mut p = format!("primary {} ({})", pct(&l.name), l.kind.word());
+        if let Some(bps) = l.rate_bps {
+            p.push_str(&format!(", link {}", bps_word(bps as f64 / 8.0)));
+        }
+        parts.push(p);
+    }
+    if let Some(tcp) = net.tcp {
+        parts.push(format!(
+            "tcp {} total ({} established, {} listen, {} time_wait, {} close_wait, {} connecting)",
+            tcp.total(),
+            tcp.established,
+            tcp.listen,
+            tcp.time_wait,
+            tcp.close_wait,
+            tcp.connecting()
+        ));
+    }
+    if parts.is_empty() {
+        unavailable("not_sampled")
+    } else {
+        parts.join(" · ")
+    }
+}
+
+fn net_text(q: &SysQuery, s: &Snapshot, lines: &mut Vec<Line>) {
+    let Some(net) = s.net.as_ref() else {
+        lines.push(line(
+            "net",
+            format!("net     {}", unavailable("not_sampled")),
+        ));
+        return;
+    };
+    lines.push(line(
+        "net",
+        format!("net     {}", net_summary_words(s, net)),
+    ));
+    match net.tcp {
+        Some(tcp) => lines.push(line(
+            "tcp",
+            format!(
+                "tcp     total={} established={} listen={} time_wait={} close_wait={} syn_sent={} syn_recv={} fin_wait1={} fin_wait2={} closing={} last_ack={} close={}",
+                tcp.total(),
+                tcp.established,
+                tcp.listen,
+                tcp.time_wait,
+                tcp.close_wait,
+                tcp.syn_sent,
+                tcp.syn_recv,
+                tcp.fin_wait1,
+                tcp.fin_wait2,
+                tcp.closing,
+                tcp.last_ack,
+                tcp.close
+            ),
+        )),
+        None => lines.push(line(
+            "tcp",
+            format!("tcp     {}", unavailable("not_sampled")),
+        )),
+    }
+    for l in net.links.iter().take(q.top) {
+        let x = &l.sample;
+        let primary = u8::from(s.facts.link.as_ref().is_some_and(|p| p.name == x.name));
+        let tx_drop_ps = match l.rates {
+            Some(r) => rec(r.tx_drop_ps.map(|v| v.round() as u64), "unsupported"),
+            None if x.tx_drops.is_none() => unavailable("unsupported"),
+            None => unavailable("warming"),
+        };
+        lines.push(line(
+            format!("link {}", x.name),
+            format!(
+                "link name={} kind={} up={} loopback={} counted={} primary={primary} rx_bps={} tx_bps={} rx_pps={} tx_pps={} rx_err_ps={} tx_err_ps={} rx_drop_ps={} tx_drop_ps={tx_drop_ps} rx_bytes={} tx_bytes={} rx_packets={} tx_packets={} rx_errors={} tx_errors={} rx_drops={} tx_drops={} link_bps={}",
+                pct(&x.name),
+                x.kind.word(),
+                u8::from(x.up),
+                u8::from(x.loopback),
+                u8::from(x.counts),
+                rec(l.rates.map(|r| r.rx_bps.round() as u64), "warming"),
+                rec(l.rates.map(|r| r.tx_bps.round() as u64), "warming"),
+                rec(l.rates.map(|r| r.rx_pps.round() as u64), "warming"),
+                rec(l.rates.map(|r| r.tx_pps.round() as u64), "warming"),
+                rec(l.rates.map(|r| r.rx_err_ps.round() as u64), "warming"),
+                rec(l.rates.map(|r| r.tx_err_ps.round() as u64), "warming"),
+                rec(l.rates.map(|r| r.rx_drop_ps.round() as u64), "warming"),
+                x.rx,
+                x.tx,
+                x.rx_packets,
+                x.tx_packets,
+                x.rx_errors,
+                x.tx_errors,
+                x.rx_drops,
+                rec(x.tx_drops, "unsupported"),
+                rec(x.rate_bps, "unsupported"),
+            ),
+        ));
+    }
+    if net.links.len() > q.top {
+        lines.push(note(
+            "more",
+            format!(
+                "more={} links · top={}",
+                net.links.len() - q.top,
+                net.links.len().min(64)
+            ),
+        ));
+    }
+    lines.push(note(
+        "note",
+        "note    interface counters and TCP state counts are machine-wide; per-tab TCP waits appear in sys jobs",
+    ));
+}
+
 /// Default subtree depth listed by `sys disk` under each root.
 pub const DISK_DEPTH_DEFAULT: u8 = 3;
 
@@ -2052,6 +2218,41 @@ fn global_json(s: &Snapshot) -> Jv {
             |b| Jv::at_least_refused(b.round() as u64, s.global.refused),
         ),
     );
+    match s.net.as_ref().and_then(|n| n.rates) {
+        Some(r) => {
+            o.set("net_rx_bytes_per_s", Jv::u(r.rx_bps.round() as u64));
+            o.set("net_tx_bytes_per_s", Jv::u(r.tx_bps.round() as u64));
+        }
+        None => {
+            let why = if s.net.as_ref().is_some_and(|n| !n.links.is_empty()) {
+                "warming"
+            } else {
+                "not_sampled"
+            };
+            o.set("net_rx_bytes_per_s", Jv::why(why));
+            o.set("net_tx_bytes_per_s", Jv::why(why));
+        }
+    }
+    o.set(
+        "tcp_established",
+        Jv::known_or(
+            s.net
+                .as_ref()
+                .and_then(|n| n.tcp)
+                .map(|t| u64::from(t.established)),
+            "not_sampled",
+        ),
+    );
+    o.set(
+        "tcp_listen",
+        Jv::known_or(
+            s.net
+                .as_ref()
+                .and_then(|n| n.tcp)
+                .map(|t| u64::from(t.listen)),
+            "not_sampled",
+        ),
+    );
     o.set("procs", Jv::Int(i64::from(s.global.procs)));
     o.set("exact", Jv::s("exact"));
     o
@@ -2211,6 +2412,7 @@ pub fn render_json(q: &SysQuery, ctx: &Ctx<'_>) -> Jv {
             o.set("cores", cores_json(s));
             o.set("mem", mem_json(q, ctx, s));
             o.set("gpu", gpu_json(s));
+            o.set("net", net_json(q, s));
             let tab = tabs_fig(s, &scope_keys(ctx, ScopeArg::Tab), ctx.target.key);
             o.set("split_mc", split_json(s, &tab));
             o.set(
@@ -2340,6 +2542,7 @@ pub fn render_json(q: &SysQuery, ctx: &Ctx<'_>) -> Jv {
             }
         }
         View::Disk => o.set("disk", disk_json(q, ctx, s)),
+        View::Net => o.set("net", net_json(q, s)),
         View::Procs => {
             let sc = scope.unwrap_or(ScopeArg::Tab);
             o.set("procs", procs_json(q, ctx, s, sc));
@@ -2841,6 +3044,104 @@ fn disk_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
     }
     o.set("volume", volume);
     o
+}
+
+fn link_rates_json(r: crate::model::LinkRates) -> Jv {
+    Jv::obj([
+        ("rx_bytes_per_s", Jv::u(r.rx_bps.round() as u64)),
+        ("tx_bytes_per_s", Jv::u(r.tx_bps.round() as u64)),
+        ("rx_packets_per_s", Jv::u(r.rx_pps.round() as u64)),
+        ("tx_packets_per_s", Jv::u(r.tx_pps.round() as u64)),
+        ("rx_errors_per_s", Jv::u(r.rx_err_ps.round() as u64)),
+        ("tx_errors_per_s", Jv::u(r.tx_err_ps.round() as u64)),
+        ("rx_drops_per_s", Jv::u(r.rx_drop_ps.round() as u64)),
+        (
+            "tx_drops_per_s",
+            Jv::known_or(r.tx_drop_ps.map(|v| v.round() as u64), "unsupported"),
+        ),
+    ])
+}
+
+fn tcp_counts_json(t: crate::model::TcpCounts) -> Jv {
+    Jv::obj([
+        ("total", Jv::u(u64::from(t.total()))),
+        ("established", Jv::u(u64::from(t.established))),
+        ("syn_sent", Jv::u(u64::from(t.syn_sent))),
+        ("syn_recv", Jv::u(u64::from(t.syn_recv))),
+        ("fin_wait1", Jv::u(u64::from(t.fin_wait1))),
+        ("fin_wait2", Jv::u(u64::from(t.fin_wait2))),
+        ("time_wait", Jv::u(u64::from(t.time_wait))),
+        ("close", Jv::u(u64::from(t.close))),
+        ("close_wait", Jv::u(u64::from(t.close_wait))),
+        ("last_ack", Jv::u(u64::from(t.last_ack))),
+        ("listen", Jv::u(u64::from(t.listen))),
+        ("closing", Jv::u(u64::from(t.closing))),
+        ("connecting", Jv::u(u64::from(t.connecting()))),
+        ("closing_total", Jv::u(u64::from(t.closing_total()))),
+    ])
+}
+
+fn net_json(q: &SysQuery, s: &Snapshot) -> Jv {
+    let Some(net) = s.net.as_ref() else {
+        return Jv::why("not_sampled");
+    };
+    let rates_why = if net.links.is_empty() {
+        "not_sampled"
+    } else {
+        "warming"
+    };
+    let primary = s
+        .facts
+        .link
+        .as_ref()
+        .map_or_else(|| Jv::why("not_sampled"), |l| Jv::s(l.name.clone()));
+    let links: Vec<Jv> = net
+        .links
+        .iter()
+        .take(q.top)
+        .map(|l| {
+            let x = &l.sample;
+            Jv::obj([
+                ("name", Jv::s(x.name.clone())),
+                ("kind", Jv::s(x.kind.word())),
+                ("up", Jv::Bool(x.up)),
+                ("loopback", Jv::Bool(x.loopback)),
+                ("counted", Jv::Bool(x.counts)),
+                (
+                    "primary",
+                    Jv::Bool(s.facts.link.as_ref().is_some_and(|p| p.name == x.name)),
+                ),
+                ("rx_bytes", Jv::u(x.rx)),
+                ("tx_bytes", Jv::u(x.tx)),
+                ("rx_packets", Jv::u(x.rx_packets)),
+                ("tx_packets", Jv::u(x.tx_packets)),
+                ("rx_errors", Jv::u(x.rx_errors)),
+                ("tx_errors", Jv::u(x.tx_errors)),
+                ("rx_drops", Jv::u(x.rx_drops)),
+                ("tx_drops", Jv::known_or(x.tx_drops, "unsupported")),
+                ("link_bps", Jv::known_or(x.rate_bps, "unsupported")),
+                (
+                    "per_s",
+                    l.rates.map_or_else(|| Jv::why("warming"), link_rates_json),
+                ),
+            ])
+        })
+        .collect();
+    Jv::obj([
+        ("primary_link", primary),
+        (
+            "per_s",
+            net.rates
+                .map_or_else(|| Jv::why(rates_why), link_rates_json),
+        ),
+        (
+            "tcp",
+            net.tcp
+                .map_or_else(|| Jv::why("not_sampled"), tcp_counts_json),
+        ),
+        ("links", Jv::Arr(links)),
+        ("more", Jv::u(net.links.len().saturating_sub(q.top) as u64)),
+    ])
 }
 
 #[cfg(test)]

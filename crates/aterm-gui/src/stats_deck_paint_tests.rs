@@ -164,14 +164,14 @@ fn story(trouble: bool) -> Story {
 fn fig(v: f64) -> ScopeFig {
     ScopeFig {
         now: Some(v),
-        missing: None,
+        ..ScopeFig::default()
     }
 }
 
 fn not_per_app() -> ScopeFig {
     ScopeFig {
-        now: None,
         missing: Some(NoFigure::NotPerApp),
+        ..ScopeFig::default()
     }
 }
 
@@ -511,10 +511,12 @@ pub(crate) fn scene(sc: Scene) -> Snapshot {
     f.link = Some(LinkSample {
         name: if worst { "en10" } else { "en0" }.into(),
         kind: LinkKind::Wifi,
+        up: true,
         counts: true,
         rx: 0,
         tx: 0,
         rate_bps: Some(if worst { 99_999_000_000 } else { 183_200_000 }),
+        ..LinkSample::default()
     });
     f.net_read_s = if sc == Scene::FirstRun { 0 } else { 86_400 };
 

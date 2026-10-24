@@ -192,10 +192,17 @@ fn the_new_readings_reach_the_model() {
         LinkSample {
             name: "en0".into(),
             kind: LinkKind::Wifi,
+            up: true,
             counts: true,
             rx: 5_000,
             tx: 700,
+            tx_drops: if cfg!(target_os = "macos") {
+                None
+            } else {
+                Some(0)
+            },
             rate_bps: Some(183_000_000),
+            ..LinkSample::default()
         }
     );
     let kinds: Vec<(LinkKind, bool)> = [
@@ -3144,4 +3151,276 @@ fn a_held_finding_keeps_the_windowless_reading_going() {
         job_demand_after(&view(Demand::Idle, Vec::new(), Findings::default())),
         None
     );
+}
+
+/// THE EPISODE EDGE IS READ AGAINST THE VIEW BEFORE (leftover §5.1): an episode standing where
+/// none stood, or another one, opens; the view that names the drained episode, or one that stands
+/// in none after one that stood (the drained view itself skipped), drains; the same view adopted
+/// again, an episode still standing, and nothing either side make no edge.
+#[test]
+fn an_episode_edge_is_read_against_the_view_before() {
+    use crate::message_reporters::HeldEdge;
+    use aterm_vitals::jobs::{Findings, HeldEpisode};
+    let episode = |opened_ms| HeldEpisode {
+        opened_ms,
+        for_ms: 60_000,
+        peak: 2,
+        oldest_ms: 90_000,
+    };
+    let open = |opened_ms| Findings {
+        program_check_episode: Some(episode(opened_ms)),
+        ..Findings::default()
+    };
+    let drained = Findings {
+        program_check_drained: Some(episode(1)),
+        ..Findings::default()
+    };
+    let none = Findings::default();
+    for (before, after, want) in [
+        (None, &open(1), Some(HeldEdge::Opened(episode(1)))),
+        (Some(&none), &open(1), Some(HeldEdge::Opened(episode(1)))),
+        (Some(&open(1)), &open(9), Some(HeldEdge::Opened(episode(9)))),
+        (Some(&open(1)), &open(1), None),
+        (
+            Some(&open(1)),
+            &drained,
+            Some(HeldEdge::Drained(episode(1))),
+        ),
+        (Some(&none), &drained, Some(HeldEdge::Drained(episode(1)))),
+        (Some(&drained), &drained, None),
+        (Some(&open(1)), &none, Some(HeldEdge::Drained(episode(1)))),
+        (Some(&drained), &none, None),
+        (None, &none, None),
+    ] {
+        assert_eq!(held_edge(before, after), want, "{before:?} -> {after:?}");
+    }
+}
+
+/// A HELD EPISODE REWRITES THE DEVTOOLS ENTRY'S FIRST LINE AND RECORDS ITS EDGES (leftover §5.1,
+/// §6.5): while the last reading says aterm is not granted, an adopted view tells the standing
+/// Entry again at once when the count of programs aterm started that macOS's program check holds
+/// in a backed-up episode moves (from none, between counts, back to none, inside one episode as
+/// at its edges), and when only the oldest moved, at most once a `RESTATE_QUIET`; an episode in
+/// which aterm started nothing tells it nothing, so it counts no repeat. One `program-check.`
+/// record marks each edge, the opening saying when aterm started none of them. With no Entry
+/// standing nothing is raised; under a granted reading the records are posted and no Entry.
+#[test]
+fn a_held_episode_rewrites_the_entrys_first_line_and_records_its_end() {
+    use crate::devtools_helper::test_arms;
+    use crate::message_reporters as mr;
+    use aterm_containment::DevToolGrant;
+    use aterm_vitals::jobs::{Findings, HeldEpisode, Named};
+    static BOARD: JobsBoard = JobsBoard::new();
+    let episode = HeldEpisode {
+        opened_ms: 60_000,
+        for_ms: 36_300_000,
+        peak: 3,
+        oldest_ms: 35_940_000,
+    };
+    let held = |aterm: (u32, u64)| Findings {
+        program_check: vec![Named {
+            pid: 25311,
+            name: "gh".into(),
+            tab: None,
+            for_ms: 35_940_000,
+        }],
+        program_check_aterm: aterm,
+        program_check_episode: Some(episode),
+        ..Findings::default()
+    };
+    let drained = Findings {
+        program_check_drained: Some(episode),
+        ..Findings::default()
+    };
+    let adopt = |app: &mut crate::App, seq, findings: &Findings| {
+        app.vitals.latest.lock().unwrap().snap = Some(Arc::new(Snapshot {
+            seq,
+            jobs: Some(Arc::new(JobsView {
+                findings: findings.clone(),
+                ..JobsView::default()
+            })),
+            ..Snapshot::default()
+        }));
+        app.on_vitals_wake();
+    };
+    let records = |app: &crate::App| -> Vec<(String, Vec<String>)> {
+        app.messages
+            .log()
+            .records()
+            .filter(|r| r.key.as_deref() == Some(mr::PROGRAM_CHECK_EPISODE_KEY))
+            .map(|r| (r.title.clone(), r.detail.clone()))
+            .collect()
+    };
+    let entry = |app: &crate::App| {
+        app.messages
+            .digest()
+            .entries
+            .iter()
+            .find(|e| e.key == mr::DEVTOOLS_KEY)
+            .map(|e| (e.detail[2].clone(), e.repeats))
+    };
+    let first = |app: &crate::App| entry(app).map(|(line, _)| line);
+    let skips = aterm_containment::SpikeEvidence::MEASURED.devtool_skips_first_run_check;
+    let why = Some(atpkg::devtools::why(skips).to_owned());
+    let live = |n: u32, age: &str| {
+        Some(format!(
+            "now: {n} programs aterm started wait for macOS's program check, the oldest {age}"
+        ))
+    };
+    let opened = |outside: bool| {
+        let mut detail =
+            vec!["the oldest for 9 h 59 m; only this user's programs are counted".to_owned()];
+        if outside {
+            detail.push("they started outside aterm, so aterm's grant does not reach them".into());
+        }
+        (
+            "macOS's program check is holding 3 programs".to_owned(),
+            detail,
+        )
+    };
+    let ended = (
+        "macOS's program check caught up".to_owned(),
+        vec!["drained after 10 h 05 m, at most 3 programs held at once".to_owned()],
+    );
+    let not_granted = |app: &mut crate::App| {
+        app.vitals.board = &BOARD;
+        app.devtools_helper.note_reading(
+            test_arms::reading(DevToolGrant::NotGranted, test_arms::absent(1)),
+            Instant::now(),
+        );
+    };
+
+    let mut app = crate::App::headless_for_test();
+    not_granted(&mut app);
+    let _ = app.apply_devtools_step(crate::devtools_watch::Step::Raise { hand_over: false });
+    assert_eq!(first(&app), why, "the standing Entry, before any wait");
+    adopt(&mut app, 1, &held((0, 0)));
+    assert_eq!(
+        entry(&app),
+        why.clone().map(|why| (why, 1)),
+        "aterm started none of them: the Entry is not told again, so no repeat"
+    );
+    assert_eq!(records(&app), [opened(true)]);
+    adopt(&mut app, 2, &held((2, 35_940_000)));
+    assert_eq!(
+        first(&app),
+        live(2, "9 h 59 m"),
+        "inside the episode aterm's programs are held: the live line first"
+    );
+    adopt(&mut app, 3, &held((2, 35_970_000)));
+    assert_eq!(
+        first(&app),
+        live(2, "9 h 59 m"),
+        "only the oldest moved: it waits out RESTATE_QUIET"
+    );
+    app.vitals.live_told = app.vitals.live_told.and_then(|(n, at)| {
+        at.checked_sub(aterm_messages::need::RESTATE_QUIET)
+            .map(|at| (n, at))
+    });
+    assert!(app.vitals.live_told.is_some(), "the live line was told");
+    adopt(&mut app, 4, &held((2, 36_000_000)));
+    assert_eq!(
+        first(&app),
+        live(2, "10 h 00 m"),
+        "RESTATE_QUIET after the last telling: the oldest moves too"
+    );
+    adopt(&mut app, 5, &held((4, 36_000_000)));
+    assert_eq!(first(&app), live(4, "10 h 00 m"), "the count moved");
+    adopt(&mut app, 6, &held((0, 0)));
+    assert_eq!(
+        first(&app),
+        why,
+        "aterm's programs started while others' keep the episode open"
+    );
+    adopt(&mut app, 7, &drained);
+    assert_eq!(first(&app), why, "drained: why the list matters");
+    assert_eq!(records(&app), [opened(true), ended.clone()]);
+    assert_eq!(
+        app.messages.digest().entries.len(),
+        1,
+        "the one Entry, no second ask"
+    );
+    assert_eq!(entry(&app).map(|(_, n)| n), Some(1), "told, never repeated");
+
+    let mut app = crate::App::headless_for_test();
+    not_granted(&mut app);
+    adopt(&mut app, 1, &held((2, 35_940_000)));
+    adopt(&mut app, 2, &drained);
+    assert_eq!(records(&app), [opened(false), ended.clone()]);
+    assert!(
+        app.messages.digest().is_empty(),
+        "no Entry standing: none is raised"
+    );
+
+    let mut app = crate::App::headless_for_test();
+    app.vitals.board = &BOARD;
+    app.devtools_helper.note_reading(
+        test_arms::reading(DevToolGrant::Granted, test_arms::on()),
+        Instant::now(),
+    );
+    adopt(&mut app, 1, &held((2, 35_940_000)));
+    adopt(&mut app, 2, &drained);
+    assert_eq!(
+        records(&app),
+        [opened(false), ended],
+        "granted: the records"
+    );
+    assert!(app.messages.digest().is_empty(), "granted: no Entry");
+}
+
+/// THE VERDICT REFRESH WAITS OUT A BACKED-UP EPISODE (leftover §5.1, §13): its prime is a new
+/// program and would wait in the same line, so a switch-on read while the adopted view stands in
+/// an episode starts none, and the next view that stands in none starts it, once.
+#[test]
+fn the_verdict_refresh_waits_out_a_backed_up_episode() {
+    use crate::devtools_helper::test_arms;
+    use aterm_containment::DevToolGrant;
+    use aterm_vitals::jobs::{Findings, HeldEpisode};
+    static BOARD: JobsBoard = JobsBoard::new();
+    let adopt = |app: &mut crate::App, seq, findings: Findings| {
+        app.vitals.latest.lock().unwrap().snap = Some(Arc::new(Snapshot {
+            seq,
+            jobs: Some(Arc::new(JobsView {
+                findings,
+                ..JobsView::default()
+            })),
+            ..Snapshot::default()
+        }));
+        app.on_vitals_wake();
+    };
+    let backed_up = || Findings {
+        program_check_episode: Some(HeldEpisode {
+            opened_ms: 60_000,
+            for_ms: 30_000,
+            peak: 3,
+            oldest_ms: 50_000,
+        }),
+        ..Findings::default()
+    };
+    let mut app = crate::App::headless_for_test();
+    app.vitals.board = &BOARD;
+    test_arms::stand_in(&mut app, test_arms::opening());
+    adopt(&mut app, 1, backed_up());
+    let _ = app.devtools_watch.observe(DevToolGrant::NotGranted, true);
+    let step = app.devtools_watch.observe(DevToolGrant::Granted, true);
+    let _ = app.apply_devtools_step(step);
+    assert_eq!(
+        app.devtools_helper.refreshes_started(),
+        0,
+        "switched on inside an episode: macOS is asked nothing yet"
+    );
+    adopt(&mut app, 2, backed_up());
+    assert_eq!(
+        app.devtools_helper.refreshes_started(),
+        0,
+        "still backed up"
+    );
+    adopt(&mut app, 3, Findings::default());
+    assert_eq!(
+        app.devtools_helper.refreshes_started(),
+        1,
+        "the first view in no episode asks macOS again"
+    );
+    adopt(&mut app, 4, Findings::default());
+    assert_eq!(app.devtools_helper.refreshes_started(), 1, "once");
 }

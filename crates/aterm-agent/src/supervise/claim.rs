@@ -15,6 +15,22 @@ pub(super) fn ttl_ms(t: &crate::harness::Timings) -> u64 {
 /// How often the claim is renewed (and, behind another holder, tried).
 pub const CLAIM_RENEW: Duration = Duration::from_secs(20);
 
+/// What a fresh metadata read proves about the lease a timer already held.
+pub(super) enum MetadataAuthority {
+    Ours,
+    Gone,
+    Unknown,
+}
+
+/// A verified metadata operation can retry live work or finish ordinary cleanup.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum MetadataContext {
+    #[default]
+    Normal,
+    Retry,
+    Cleanup,
+}
+
 /// Where the loop stands on the session's supervisor claim.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) enum Claim {
@@ -93,6 +109,16 @@ pub(super) fn is_input(args: &[&str]) -> bool {
     )
 }
 
+/// The attention mutation a stop or handover must fence before each attempt.
+pub(super) fn attention_operation(args: &[&str]) -> Option<&'static str> {
+    let mut words = args.iter().copied().filter(|word| !word.starts_with('@'));
+    match (words.next(), words.next(), words.next()) {
+        (Some("meta"), Some("set"), Some("attention")) => Some("set"),
+        (Some("meta"), Some("unset"), Some("attention")) => Some("unset"),
+        _ => None,
+    }
+}
+
 /// The verbs a watching-only loop may not send: everything that types into the worker, every attention write, and the task record's mark (the supervisor that holds the session publishes its `done`).
 pub(crate) fn is_write(args: &[&str]) -> bool {
     let words: Vec<&str> = args
@@ -114,6 +140,108 @@ pub(super) fn default_holder() -> String {
 }
 
 impl<C: Ctl> Session<'_, C> {
+    /// Ordinary explicitly unclaimed calls, or a host that lacked leases from
+    /// the start, keep legacy metadata behavior. Timers never use this fallback.
+    pub(super) fn metadata_requires_proof(&self) -> bool {
+        self.claim_managed
+            || self.beside_self_claim()
+            || !matches!(self.claim, Claim::Off | Claim::Unavailable { .. })
+    }
+
+    /// Verify an existing lease without acquiring or renewing one. A timer's
+    /// read goes straight through the recorded transport, as claim writes do.
+    pub(super) fn metadata_authority(&mut self, ending: bool) -> Result<MetadataAuthority, Fail> {
+        self.metadata_mode = None;
+        if self.beside_self_claim()
+            || matches!(
+                self.claim,
+                Claim::Off | Claim::GivenBack { .. } | Claim::Behind { .. } | Claim::Beside { .. }
+            )
+        {
+            return Ok(MetadataAuthority::Gone);
+        }
+        if self.handing_over()
+            || (!ending && self.stopped())
+            || !matches!(self.claim, Claim::Held { .. })
+        {
+            return Ok(MetadataAuthority::Unknown);
+        }
+        let mut args = Vec::new();
+        if let Some(sid) = &self.setup.sid {
+            args.push(sid.as_str());
+        }
+        args.push("meta");
+        let r = self.ctl.call(&args);
+        self.watch_sleep();
+        self.note_exchange(&["meta"], r.as_ref().ok());
+        let r = r.map_err(Fail::Lost)?;
+        if self.handing_over() || (!ending && self.stopped()) {
+            return Ok(MetadataAuthority::Unknown);
+        }
+        if self.unserved(&r) {
+            return Err(Fail::Lost(format!(
+                "metadata ownership read failed: {}",
+                r.stderr.trim()
+            )));
+        }
+        if !r.ok() {
+            return Ok(MetadataAuthority::Unknown);
+        }
+        self.note_meta(&r.stdout);
+        self.metadata_mode = r
+            .stdout
+            .lines()
+            .find(|l| crate::is_ok_reply(l))
+            .and_then(|line| {
+                line.split_whitespace()
+                    .find_map(|w| w.strip_prefix("autopilot="))
+            })
+            .and_then(
+                |word| match super::super::report::pct_decode(word).as_str() {
+                    "-" => Some(None),
+                    word => Autopilot::parse(word).map(Some),
+                },
+            );
+        let Some(holder) =
+            super::super::screen::status_field(&r.stdout, "supervisor").filter(|h| !h.is_empty())
+        else {
+            return Ok(MetadataAuthority::Unknown);
+        };
+        let holder = super::super::report::pct_decode(holder);
+        if holder == self.setup.holder() {
+            return Ok(MetadataAuthority::Ours);
+        }
+        self.claim = Claim::Behind {
+            holder,
+            tried: self.fx.mono(),
+        };
+        Ok(MetadataAuthority::Gone)
+    }
+
+    /// Within a verified metadata attempt, ordinary calls neither renew nor
+    /// acquire a claim, and cannot send input to the program.
+    pub(super) fn metadata_only<T>(
+        &mut self,
+        ending: bool,
+        attempt: impl FnOnce(&mut Self) -> Result<T, Fail>,
+    ) -> Result<T, Fail> {
+        let context = if ending {
+            MetadataContext::Cleanup
+        } else {
+            MetadataContext::Retry
+        };
+        let previous = std::mem::replace(&mut self.metadata_context, context);
+        let result = attempt(self);
+        self.metadata_context = previous;
+        result
+    }
+
+    /// Resolve only a recognized fresh mode, including an explicitly unset override.
+    pub(super) fn metadata_mode(&self) -> Option<Autopilot> {
+        self.metadata_mode
+            .map(|mode| mode.unwrap_or(self.metadata_global))
+    }
+
     /// The name this loop claims the session under
     /// ([`Self::set_supervisor_name`]; resolved in its setup).
     fn holder(&self) -> String {
@@ -142,11 +270,13 @@ impl<C: Ctl> Session<'_, C> {
     fn claim_from(&mut self, r: &CtlReply) -> Option<String> {
         let now = self.fx.mono();
         if r.ok() {
+            self.claim_managed = true;
             let was_behind = self.claim.known_holder().map(str::to_string);
             self.claim = Claim::Held { renewed: now };
             return was_behind.map(|h| format!("CLAIMED supervisor={} (after {h})", self.holder()));
         }
         if let Some(holder) = busy_holder(r) {
+            self.claim_managed = true;
             let said = self.claim.known_holder() != Some(holder.as_str());
             self.claim = Claim::Behind {
                 holder: holder.clone(),

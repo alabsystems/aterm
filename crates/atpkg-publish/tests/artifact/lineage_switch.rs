@@ -1,10 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The lineage receipt switch over real git, with bare origins on disk: dormant, live, a
-//! mint this box has not fetched, an unrelated push, and every way of not knowing — and
-//! the quarantined fetch that moves no ref, writes no FETCH_HEAD and leaves no quarantine
-//! behind.
+//! Lineage receipt switch tests over local bare git origins.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -104,7 +101,6 @@ fn an_unrelated_push_keeps_it_dormant_read_at_the_live_main() {
     let bare = trust_repo(&repo, DORMANT_LEDGER);
     push_from_elsewhere(&bare, tmp.path(), None);
     assert_eq!(read(tmp.path(), &repo), Switch::Dormant);
-    // A second read has the commit already: no fetch at all, the same answer.
     assert_eq!(read(tmp.path(), &repo), Switch::Dormant);
 }
 
@@ -167,8 +163,6 @@ fn every_way_of_not_knowing_is_unknown_never_dormant() {
     assert!(unknown(&why).contains("no readable"), "{why:?}");
 }
 
-/// The origin names a main whose objects it cannot serve: `ls-remote` answers, the
-/// fetch fails, and the quarantine it wrote into goes with it.
 #[test]
 fn a_failed_fetch_is_unknown_and_leaves_no_quarantine_behind() {
     let tmp = scratch("switch-failed-fetch");
@@ -184,8 +178,6 @@ fn a_failed_fetch_is_unknown_and_leaves_no_quarantine_behind() {
     assert!(quarantines(&repo).is_empty(), "{:?}", quarantines(&repo));
 }
 
-/// A quarantine an hour old (a run killed outright) is swept by the next fetch; a
-/// fresh one (a concurrent fetch's) is left alone.
 #[test]
 fn a_quarantine_older_than_an_hour_is_swept_and_a_fresh_one_kept() {
     let tmp = scratch("switch-sweep");

@@ -9,8 +9,21 @@ use crate::prompt::{Cancel, CancelEffect, Opt, PromptKind, PromptV2, Role, Selec
 use crate::text::blank;
 use crate::wall::{ApiCause, Placement, Wall, WallKind};
 
+/// Major component of the Gemini CLI (`gemini`) harness version, starting at `0.1`.
+pub const HARNESS_VERSION_MAJOR: u16 = 0;
+
+/// Minor component of the Gemini CLI (`gemini`) harness version, starting at `0.1`.
+pub const HARNESS_VERSION_MINOR: u16 = 1;
+
 /// Version of the Gemini CLI (`gemini`) harness, tracked independently per harness starting at `"0.1"`.
 pub const HARNESS_VERSION: &str = "0.1";
+
+/// Structured incremental numeric version of the Gemini CLI (`gemini`) harness.
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(
+    HARNESS_VERSION_MAJOR,
+    HARNESS_VERSION_MINOR,
+    HARNESS_VERSION,
+);
 
 const SPINNER: std::ops::RangeInclusive<char> = '\u{2801}'..='\u{28FF}';
 
@@ -390,6 +403,12 @@ pub fn message_drawn(rows: &[String]) -> bool {
     last_user(rows, end).is_some()
 }
 
+/// GEMINI CLI HAS DRAWN ON `rows` ([`crate::ScreenReader::program_drawn`]): its frame, a box of its own, or a row of its banner.
+#[must_use]
+pub fn program_drawn(rows: &[String]) -> bool {
+    is_gemini_screen(rows) || rows.iter().any(|r| is_banner_row(r))
+}
+
 fn is_tool_row(row: &str) -> bool {
     leading_spaces(row) == 2
         && ["✓  ", "✕  ", "⊷  ", "?  "]
@@ -519,10 +538,17 @@ fn error_kind(message: &str) -> WallKind {
     if code == Some(401) || squeezed.contains(KEY_INVALID) {
         return WallKind::Auth;
     }
+    let unreachable = code.is_none()
+        && (crate::wall::is_unreachable(message)
+            || message.to_lowercase().contains("fetch failed"));
     WallKind::ApiError {
         code,
-        retryable: code.is_some_and(|c| c == 429 || c >= 500),
-        cause: ApiCause::Server,
+        retryable: unreachable || code.is_some_and(|c| c == 429 || c >= 500),
+        cause: if unreachable {
+            ApiCause::Unreachable
+        } else {
+            ApiCause::Server
+        },
     }
 }
 

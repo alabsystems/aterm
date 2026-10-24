@@ -44,7 +44,10 @@
 # In the Linux lane, from the checkout: `targo --unverified lab linux exec --
 # cargo run --manifest-path crates/aterm-render/tests/font_oracle/recorder/Cargo.toml
 # -- <mode> crates/aterm-render ...`; the checkout is read-only there, so a
-# record writes under the guest's /tmp and is copied out.
+# record writes under the guest's /tmp and is copied out. In the Windows lane
+# the guest's copy is writable: `lab windows exec -- cmd /d /c "cargo run
+# --manifest-path ... -- shape crates\aterm-render <corpus> && type <corpus>"`
+# prints the merged corpus, which is copied out.
 # It includes ../probe.rs, ../reader.rs, ../shaper.rs, ../hint_raster.rs and
 # aterm-render's src/raster.rs by path, so it answers with the same code the
 # pin tests and the renderer run (reader.rs on ttf-parser here, on aterm-font

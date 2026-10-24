@@ -1320,3 +1320,88 @@ fn a_regrid_brings_the_hover_title_under_a_still_pointer() {
         "the title: {titled:?}"
     );
 }
+
+/// AGY'S LIT SWITCH IS ONE SWITCH (review 13): agy's lit face, `alab
+/// harness v0.1 ▐ ● on ▌`, draws its state as a pill, and the pill is the
+/// switch's own cells, never the off face's `on` button. A screen reader
+/// meets one `Role::Switch` over the words and the pill, toggled on and
+/// named as drawn, and its press does what a click on the pill does: the
+/// harness turns off. NEGATIVE CONTROL: the off face keeps its `on`
+/// button, a second node named for what a press on it does.
+#[cfg(a11y_tree)]
+#[test]
+fn agys_lit_switch_is_one_switch_and_its_press_turns_it_off() {
+    use crate::a11y_tree::HarnessChip;
+    use crate::autopilot::AutopilotView;
+    use aterm_a11y::model::Toggled;
+    let rows = fixture_rows(include_str!(
+        "../../aterm-phase/src/fixtures/agy-1.4.0-idle.txt"
+    ));
+    let (mut app, wid, session) = pane_of(40, 120, "agy");
+    let _host = held(&mut app, session);
+    feed(&app, session, &rows);
+    for _ in 0..2 {
+        refill(&mut app, wid);
+        let _ = pass(&mut app, wid);
+    }
+    let nodes = |app: &App| -> Vec<crate::a11y_tree::GridChip> {
+        app.claude_chips_a11y(wid)
+            .into_iter()
+            .filter(|c| matches!(c.chip, HarnessChip::Switch | HarnessChip::SwitchOn))
+            .collect()
+    };
+    let b = switch_of(&app, wid, session).expect("agy's switch");
+    assert_eq!(b.face, HarnessSwitch::On, "CONTROL: agy carried, lit");
+    let drawn: String = app.windows[&wid].input_scratch.cells[b.frame_row][b.switch.clone()]
+        .iter()
+        .map(|c| c.ch)
+        .collect();
+    assert_eq!(drawn, "alab harness v0.1 \u{2590} \u{25cf} on \u{258c}");
+    assert_eq!(b.button, None, "a lit switch has no `on` button");
+    let lit = nodes(&app);
+    assert_eq!(lit.len(), 1, "{lit:?}");
+    assert_eq!(
+        (lit[0].chip, lit[0].toggled, lit[0].col, lit[0].width),
+        (
+            HarnessChip::Switch,
+            Some(Toggled::True),
+            b.switch.start,
+            b.switch.len()
+        )
+    );
+    assert_eq!(lit[0].label, "alab harness v0.1 on: Antigravity CLI");
+    let carried = app.session_autopilot(session).1;
+    assert!(
+        matches!(carried, AutopilotView::Cruise | AutopilotView::Land),
+        "CONTROL: {carried:?}"
+    );
+    app.press_claude_chip_for_reader(wid, session, HarnessChip::Switch);
+    assert_eq!(
+        app.session_autopilot(session).1,
+        AutopilotView::Off,
+        "the reader's press is the pill's click"
+    );
+    for _ in 0..2 {
+        refill(&mut app, wid);
+        let _ = pass(&mut app, wid);
+    }
+    let off = nodes(&app);
+    assert_eq!(
+        off.iter()
+            .map(|n| (n.chip, n.toggled, n.label.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (
+                HarnessChip::Switch,
+                Some(Toggled::False),
+                "alab harness v0.1 off: Antigravity CLI"
+            ),
+            (
+                HarnessChip::SwitchOn,
+                None,
+                "on: turn the Antigravity CLI harness on"
+            ),
+        ],
+        "NEGATIVE CONTROL: the off face's `on` button"
+    );
+}

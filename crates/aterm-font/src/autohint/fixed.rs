@@ -22,10 +22,8 @@ macro_rules! fixed_impl {
         impl $name {
             /// Representation of 0.0.
             pub const ZERO: Self = Self(0);
-
             /// Representation of 1.0.
             pub const ONE: Self = Self(1 << $fract_bits);
-
             /// Representation of -1.0.
             pub const NEG_ONE: Self = Self((!0 << $fract_bits) as $ty);
 

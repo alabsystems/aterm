@@ -155,7 +155,19 @@ fn roster() -> Vec<Entry> {
         atpkg::devtools::Step::SwitchOn,
         atpkg::devtools::Step::ListedOn,
     ] {
-        all.push(mr::devtools_entry(step));
+        for live in [
+            None,
+            Some(mr::HeldLine {
+                count: 1,
+                oldest_ms: 20_000,
+            }),
+            Some(mr::HeldLine {
+                count: 9,
+                oldest_ms: 35_940_000,
+            }),
+        ] {
+            all.push(mr::devtools_entry(step, live));
+        }
     }
     all.push(mr::palette_refused_entry());
     for labels in [

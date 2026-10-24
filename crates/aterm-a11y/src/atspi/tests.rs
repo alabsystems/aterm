@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for the AT-SPI publisher against recorded zbus bytes and scripted session/accessibility buses.
+//! Tests for the AT-SPI publisher against recorded zbus bytes and scripted buses.
 
 use std::collections::VecDeque;
 use std::io::{Read as _, Write as _};
@@ -28,7 +28,6 @@ use super::{
     ActionHandler, ActivationHandler, Buses, DeactivationHandler, Publisher, events, proxies,
 };
 
-/// Hang-detector timeout for operations that must complete.
 const HANG: Duration = Duration::from_secs(60);
 
 const ACCESSIBLE: &str = "org.a11y.atspi.Accessible";
@@ -51,7 +50,6 @@ fn run(text: &str) -> Node {
     node
 }
 
-/// Build a window fixture with a two-row terminal, button, link, and slider.
 fn fixture(second: &str) -> TreeUpdate {
     let mut window = Node::new(Role::Window);
     window.set_label("~");
@@ -437,7 +435,6 @@ fn a_link_is_a_hyperlink_and_a_slider_a_value() {
     );
 }
 
-/// `Role::Meter` maps to an AT-SPI level bar with `Value`, and `Role::Grid` maps to a table.
 #[test]
 fn a_meter_is_a_level_bar_and_a_grid_a_table() {
     const METER: LocalId = LocalId(30);
@@ -478,7 +475,6 @@ fn a_meter_is_a_level_bar_and_a_grid_a_table() {
     );
 }
 
-/// Build a window fixture with a button and a two-option list box whose second option may be offscreen.
 fn list_fixture(offscreen: bool) -> TreeUpdate {
     const LIST: LocalId = LocalId(20);
     let mut window = Node::new(Role::Window);
@@ -519,7 +515,6 @@ fn list_fixture(offscreen: bool) -> TreeUpdate {
     }
 }
 
-/// An offscreen list option remains visible and selectable in the tree without `Showing` or hit-testing.
 #[test]
 fn an_offscreen_option_is_listed_not_showing_and_owns_no_point() {
     const LIST: LocalId = LocalId(20);
@@ -819,7 +814,6 @@ fn recorded(name: &str) -> Vec<u8> {
         .collect()
 }
 
-/// Encode `msg` at `path` with `serial`.
 fn bytes(mut msg: Message, path: &str, serial: u32) -> Vec<u8> {
     msg.path = Some(aterm_dbus::ObjectPath::new(path).unwrap());
     msg.serial = serial;
@@ -925,7 +919,6 @@ fn line(s: &mut CtlStream) -> Vec<u8> {
     out
 }
 
-/// Bus-side connection peer simulating the bus daemon and assistive technology.
 struct Peer {
     stream: CtlStream,
     buf: Vec<u8>,
@@ -934,7 +927,6 @@ struct Peer {
 }
 
 impl Peer {
-    /// Run the server half of the handshake on another thread, assigning `unique`.
     fn accept(mut stream: CtlStream, unique: &'static str) -> std::thread::JoinHandle<Peer> {
         std::thread::spawn(move || {
             stream.set_read_timeout(Some(HANG)).unwrap();
@@ -956,7 +948,6 @@ impl Peer {
         })
     }
 
-    /// Read the next message from the publisher, or `None` on EOF.
     fn try_read(&mut self) -> Option<Message> {
         loop {
             if let Some(n) = message::frame_len(&self.buf).unwrap()
@@ -1001,7 +992,6 @@ impl Peer {
         msg
     }
 
-    /// Return the next signal named `member`, skipping other messages.
     fn expect_signal(&mut self, member: &str) -> Message {
         loop {
             let msg = self.next();
@@ -1011,7 +1001,6 @@ impl Peer {
         }
     }
 
-    /// Send a method call from the AT and wait for the reply, queuing intervening signals.
     fn ask(
         &mut self,
         to: &str,
@@ -1120,7 +1109,6 @@ impl DeactivationHandler for Window {
     }
 }
 
-/// Captured log lines written by the publisher.
 struct Captured {
     lines: Mutex<Vec<String>>,
 }
@@ -1153,7 +1141,6 @@ fn heard(rx: &Receiver<Heard>) -> Heard {
     rx.recv_timeout(HANG).expect("the window heard nothing")
 }
 
-/// Complete the session bus opening handshake and status query.
 fn open_session(session: &mut Peer, enabled: bool) {
     let rule = session.expect_call("AddMatch");
     assert_eq!(rule.body, vec![Value::from(proxies::STATUS_RULE)]);
@@ -1178,7 +1165,6 @@ fn answer_status(session: &mut Peer, enabled: bool) {
     }
 }
 
-/// Answer the registry's `Embed` call on `bus`.
 fn embedded(bus: &mut Peer, me: &str) {
     let embed = bus.expect_call("Embed");
     assert_eq!(
@@ -1189,7 +1175,6 @@ fn embedded(bus: &mut Peer, me: &str) {
     bus.answer(&embed, vec![wire::object_ref(":1.3", ObjectId::Root)]);
 }
 
-/// Build an `IsEnabled` `PropertiesChanged` signal from `at-spi2-core`.
 fn status_changed(enabled: bool) -> Message {
     let mut changed = Message::signal("/org/a11y/bus", serve::PROPERTIES, "PropertiesChanged")
         .unwrap()
@@ -1327,7 +1312,6 @@ fn a_session_survives_losing_the_bus_and_rejoins() {
     drop(publisher);
 }
 
-/// Signal members announcing a window and its focus to an AT.
 const ANNOUNCING: [&str; 4] = [
     "ChildrenChanged",
     "Activate",
@@ -1335,7 +1319,6 @@ const ANNOUNCING: [&str; 4] = [
     "ActiveDescendantChanged",
 ];
 
-/// Record `(member, kind)` announcing signals through initial focus when focused before or after the first tree.
 fn first_announcement(focus_first: bool) -> Vec<(String, String)> {
     let _log = captured();
     let (session_client, session_bus) = CtlStream::pair().unwrap();
@@ -1385,7 +1368,6 @@ fn first_announcement(focus_first: bool) -> Vec<(String, String)> {
     heard_events
 }
 
-/// A window focused before its first tree reaches the bus announces activation before focus, matching post-tree focus.
 #[test]
 fn a_window_focused_before_its_tree_is_announced_activated() {
     let event = |member: &str, kind: &str| (member.to_owned(), kind.to_owned());
@@ -1410,7 +1392,6 @@ enum Queued {
 
 const EXTRA: LocalId = LocalId(5);
 
-/// Return [`fixture`] with an extra button `EXTRA`.
 fn with_extra() -> TreeUpdate {
     let mut update = fixture("hi\n");
     let mut button = Node::new(Role::Button);
@@ -1421,7 +1402,6 @@ fn with_extra() -> TreeUpdate {
     update
 }
 
-/// Signals and replies observed on the second bus after rejoining.
 struct Rejoined {
     signals: Vec<Message>,
     text: Message,
@@ -1429,7 +1409,6 @@ struct Rejoined {
     extra_path: String,
 }
 
-/// Drop the first accessibility bus with `queued` pending, rejoin the second bus, and walk the republished tree.
 fn rejoin_after_a_loss(queued: Queued) -> Rejoined {
     let _log = captured();
     let (session_client, session_bus) = CtlStream::pair().unwrap();
@@ -1521,7 +1500,6 @@ fn rejoin_after_a_loss(queued: Queued) -> Rejoined {
     }
 }
 
-/// Assert the second bus received only the live tree's `ChildrenChanged` addition at the root.
 fn only_the_live_tree_arrived(r: &Rejoined) {
     let at_root: Vec<_> = r
         .signals
@@ -1575,10 +1553,8 @@ fn a_node_queued_when_the_bus_dies_is_served_live_on_the_next() {
     only_the_live_tree_arrived(&r);
 }
 
-/// Write timeout used when testing a bus that stops reading.
 const STALL: Duration = Duration::from_millis(100);
 
-/// Push text updates until `window_heard` receives `until`, or `count` updates when `until` is `None`.
 fn keep_changing(
     adapter: &mut super::Adapter,
     window_heard: &Receiver<Heard>,
@@ -1606,7 +1582,6 @@ fn keep_changing(
     }
 }
 
-/// Session fixture over accessibility buses configured with `write_timeout`.
 struct Stalling {
     publisher: Publisher,
     adapter: super::Adapter,
@@ -1766,7 +1741,6 @@ fn a_join_that_fails_is_tried_again() {
     drop(publisher);
 }
 
-/// A failed status read during rejoin backoff extends the backoff rather than stopping retries.
 #[test]
 fn a_status_unanswered_during_the_backoff_keeps_it() {
     let (session_client, session_bus) = CtlStream::pair().unwrap();
@@ -1805,7 +1779,6 @@ fn a_status_unanswered_during_the_backoff_keeps_it() {
     drop(publisher);
 }
 
-/// `SessionBuses::joining_within` times out within its own bound when a bus listener accepts without answering.
 #[test]
 fn the_desktop_s_join_gives_up_on_a_silent_bus_within_its_bound() {
     let path = std::env::temp_dir().join(format!("aterm-a11y-frozen-{}", std::process::id()));

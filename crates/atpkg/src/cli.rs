@@ -331,7 +331,7 @@ const TABLE: &[Verb] = &[
         name: "abrew",
         tier: Tier::Daily,
         usage: "aterm pkg abrew <brew-command> [args…]  — aterm's Homebrew (`aterm help abrew`): \
-                relocation-free bottles and simple casks natively over abrew's own prefix, the rest delegated to real brew before effects; \
+                bottles and tar/zip/DMG/single-file casks natively over abrew's own prefix, the rest delegated to real brew before effects; \
                 abrew bundle lays the bundled Homebrew; abrew on|off toggles the `brew` reroute; \
                 brew --real … runs real Homebrew unchanged",
         arity: Arity::Own,
@@ -2923,6 +2923,9 @@ fn which_line_in(
     }
     if let Some(line) = crate::builtin::which_line(tool, path_var) {
         return Ok(line);
+    }
+    if is_clt_alias(tool) {
+        return clt_which_line(tool, path_var, &crate::prereq::CcHost::this_machine());
     }
     let Some(tn) = crate::store::ToolName::new(tool) else {
         return Err(format!("atpkg: {tool:?} is not a tool name"));
@@ -7221,6 +7224,68 @@ fn parse_install_argv(rest: &[String]) -> Result<Option<&String>, ExitCode> {
     Ok(rest.first())
 }
 
+pub(crate) fn is_clt_alias(program: &str) -> bool {
+    matches!(program, "clt" | "base.clt" | "command-line-tools")
+}
+
+pub(crate) fn clt_which_line(
+    tool: &str,
+    path_var: Option<&std::ffi::OsStr>,
+    host: &crate::prereq::CcHost,
+) -> Result<String, String> {
+    let verdict = crate::prereq::probe_with(path_var, host);
+    if !verdict.blocks_builds() {
+        Ok(format!("{tool} → {}", verdict.line()))
+    } else {
+        Err(format!(
+            "atpkg: {tool}: {} — next: `aterm pkg install clt` ({})",
+            verdict.line(),
+            crate::prereq::act()
+        ))
+    }
+}
+
+fn cmd_install_clt() -> ExitCode {
+    let host = crate::prereq::CcHost::this_machine();
+    let verdict = crate::prereq::probe_with(std::env::var_os("PATH").as_deref(), &host);
+    if !verdict.blocks_builds() {
+        println!("atpkg: clt: already ready — {}", verdict.line());
+        if let Some(line) = c_toolchain_marker(&verdict) {
+            emit_marker_line(&line);
+        }
+        return ExitCode::SUCCESS;
+    }
+    if cfg!(target_os = "macos")
+        && let Ok(exe) = std::env::current_exe()
+        && exe.file_name().and_then(|s| s.to_str()) == Some("aterm")
+    {
+        match aterm_uds::spawnfd::command(&exe)
+            .args(["init", "--only", crate::converge::CLT])
+            .status()
+        {
+            Ok(status) if status.success() => return ExitCode::SUCCESS,
+            Ok(status) => {
+                return ExitCode::from(
+                    status
+                        .code()
+                        .and_then(|c| u8::try_from(c).ok())
+                        .unwrap_or(1),
+                );
+            }
+            Err(err) => {
+                eprintln!(
+                    "atpkg: clt: failed to invoke `{}`: {err}",
+                    crate::prereq::act()
+                );
+                return ExitCode::from(1);
+            }
+        }
+    }
+    eprintln!("atpkg: {}", verdict.line());
+    eprintln!("atpkg:   next — {}", crate::prereq::act());
+    ExitCode::from(1)
+}
+
 fn cmd_install_for_update(program: &String) -> ExitCode {
     cmd_install(Some(program), "update")
 }
@@ -7235,6 +7300,9 @@ fn cmd_install(program: Option<&String>, invoked_as: &str) -> ExitCode {
     };
     if program == "--default-set" {
         return cmd_install_default_set();
+    }
+    if is_clt_alias(program) {
+        return cmd_install_clt();
     }
     if program.starts_with('-') {
         eprintln!("atpkg: {program:?} is a command-line flag, not a program name");
@@ -11246,13 +11314,17 @@ struct VendorLanes {
     complete_the_set: bool,
 }
 
-/// Whether `[packages].exclude` and this machine's removals leave `program` wanted.
+/// Whether the default set holds `program` and `[packages].exclude` and this machine's
+/// removals leave it wanted. A vendor row outside the default set (grok, kimi) is never
+/// wanted: it lands only when a person installs it, and is updated once installed.
 pub(crate) fn vendor_wanted(
     cfg: &crate::config::PackagesConfig,
     removed: &std::collections::BTreeSet<String>,
     program: &str,
 ) -> bool {
-    !cfg.exclude().iter().any(|p| p == program) && !removed.contains(program)
+    crate::vendor_direct::spec(program).is_none_or(|s| s.default_set)
+        && !cfg.exclude().iter().any(|p| p == program)
+        && !removed.contains(program)
 }
 
 fn vendor_set_wanted_on(

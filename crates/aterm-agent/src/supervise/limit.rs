@@ -64,6 +64,7 @@ pub fn parse_reset(text: &str) -> Option<ResetSpec> {
         .filter(|w| !w.is_empty() && !w.eq_ignore_ascii_case("at"))
         .collect();
     let (date, time) = match words.as_slice() {
+        [ymd, time @ ..] if iso_month_day(ymd).is_some() => (iso_month_day(ymd), time),
         [month, day, time @ ..] if month_of(month).is_some() => {
             let m = month_of(month)?;
             let d: u32 = day
@@ -84,6 +85,18 @@ pub fn parse_reset(text: &str) -> Option<ResetSpec> {
             (Some((m, d)), time)
         }
         time => (None, time),
+    };
+    let (time, zone) = match (zone, time) {
+        (None, [rest @ .., tz])
+            if !rest.is_empty()
+                && !tz.eq_ignore_ascii_case("am")
+                && !tz.eq_ignore_ascii_case("pm")
+                && (3..=5).contains(&tz.len())
+                && tz.bytes().all(|b| b.is_ascii_alphabetic()) =>
+        {
+            (rest, tz_abbrev_zone(tz).map(str::to_owned))
+        }
+        (z, t) => (t, z),
     };
     let (hour, minute) = parse_clock(&time.join(" "))?;
     Some(ResetSpec::At {
@@ -229,6 +242,33 @@ fn month_of(word: &str) -> Option<u32> {
         .iter()
         .position(|m| w.starts_with(m))
         .map(|i| u32::try_from(i + 1).unwrap_or(1))
+}
+
+/// `2026-10-29` → `(10, 29)`.
+fn iso_month_day(word: &str) -> Option<(u32, u32)> {
+    let mut parts = word.split('-');
+    let year = parts.next()?;
+    if year.len() != 4 || !year.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let m: u32 = parts.next()?.parse().ok()?;
+    let d: u32 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    Some((m, d))
+}
+
+/// Map a trailing timezone abbreviation (`PDT`, `UTC`, …) to an IANA zone where unambiguous.
+fn tz_abbrev_zone(tz: &str) -> Option<&'static str> {
+    match tz.to_ascii_uppercase().as_str() {
+        "UTC" | "GMT" => Some("UTC"),
+        "PDT" | "PST" => Some("America/Los_Angeles"),
+        "EDT" | "EST" => Some("America/New_York"),
+        "CDT" | "CST" => Some("America/Chicago"),
+        "MDT" | "MST" => Some("America/Denver"),
+        _ => None,
+    }
 }
 
 /// Resolve the reset time in `message` to a Unix timestamp using a fixed `zone_offset` lookup.
@@ -606,6 +646,33 @@ mod tests {
                 zone: None,
             })
         );
+        assert_eq!(
+            parse_reset("2026-10-29 09:31 PDT"),
+            Some(ResetSpec::At {
+                date: Some((10, 29)),
+                hour: 9,
+                minute: 31,
+                zone: Some("America/Los_Angeles".to_string()),
+            })
+        );
+        assert_eq!(
+            parse_reset("2026-10-29 16:31 UTC"),
+            Some(ResetSpec::At {
+                date: Some((10, 29)),
+                hour: 16,
+                minute: 31,
+                zone: Some("UTC".to_string()),
+            })
+        );
+        assert_eq!(
+            parse_reset("2026-10-29 11:31 CEST"),
+            Some(ResetSpec::At {
+                date: Some((10, 29)),
+                hour: 11,
+                minute: 31,
+                zone: None,
+            })
+        );
         for bad in [
             "",
             "soon",
@@ -614,6 +681,7 @@ mod tests {
             "25pm",
             "13pm",
             "Sep 40 at 1am",
+            "2026-13-29 09:31 PDT",
             "7:60pm",
         ] {
             assert_eq!(parse_reset(bad), None, "{bad:?}");

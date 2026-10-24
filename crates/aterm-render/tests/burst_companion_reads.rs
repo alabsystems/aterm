@@ -3,10 +3,9 @@
 
 //! Tests glyph-pixel contrast of typing bursts rendered with the companion sprite.
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aterm_core::render::{FreeZ, RenderInput};
+use aterm_core::render::RenderInput;
 use aterm_core::terminal::{ClockReading, Terminal};
 use aterm_effects::companion::{CompanionOwner, ContrastFallback, GlowOwnership, PetFacts};
 use aterm_effects::cursor_glow::GlowStyle;
@@ -16,6 +15,7 @@ use aterm_effects::host::{
 use aterm_effects::kitty_pet::{PetAction, PetInputKind};
 use aterm_effects::pet_world::{PetPane, PetReserve, PetWorldFacts};
 use aterm_effects::word_decorations::WordDecorations;
+use aterm_render::sprites::FreeZ;
 use aterm_render::{Renderer, Theme};
 
 const ROWS: u16 = 14;
@@ -239,9 +239,8 @@ impl Replay {
             let clean = self.rend.render_input(&input).pixels.clone();
             self.clean = Some((seq, clean));
         }
-        input.free_atlas = self.decos.free_atlas().map(|a| Arc::clone(&a));
         let under = free.iter().any(|s| s.z == FreeZ::UnderText);
-        input.free_sprites = free;
+        crate::sprites::put(&mut input, &free);
         let frame = self.rend.render_input(&input).pixels.clone();
         let width = usize::from(COLS) * usize::from(cw);
         let clean = &self.clean.as_ref().expect("rendered above").1;

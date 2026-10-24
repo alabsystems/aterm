@@ -62,7 +62,12 @@ impl MenuAct {
 pub(crate) enum MenuRow {
     Header(String),
     Name(String),
-    Note(String),
+    /// A line of words the card states (`◆  Opus 5.5`), and those words as
+    /// a screen reader is told them, part of the card's name.
+    Note {
+        text: String,
+        spoken: String,
+    },
     /// Provenance note (`set 14:05 …`), with `floor` width preserved across rebuilds.
     SetBy {
         text: String,
@@ -83,6 +88,23 @@ pub(crate) enum MenuRow {
 }
 
 impl MenuRow {
+    /// A note of `text`, spoken in its words ([`spoken_words`]).
+    #[must_use]
+    pub(crate) fn note(text: impl Into<String>) -> Self {
+        let text = text.into();
+        let spoken = spoken_words(&text);
+        Self::Note { text, spoken }
+    }
+
+    /// A note of `text` a screen reader is told as `spoken`.
+    #[must_use]
+    pub(crate) fn note_spoken(text: impl Into<String>, spoken: impl Into<String>) -> Self {
+        Self::Note {
+            text: text.into(),
+            spoken: spoken.into(),
+        }
+    }
+
     /// Whether a click or Return can choose this row.
     #[must_use]
     pub(crate) const fn selectable(&self) -> bool {
@@ -91,7 +113,7 @@ impl MenuRow {
 
     fn text(&self) -> String {
         match self {
-            Self::Header(text) | Self::Note(text) | Self::SetBy { text, .. } => text.clone(),
+            Self::Header(text) | Self::Note { text, .. } | Self::SetBy { text, .. } => text.clone(),
             Self::Name(name) => quoted(name),
             Self::Rule | Self::Gap(_) => String::new(),
             Self::Plot(cells) => cells.iter().map(|cell| cell.ch).collect(),
@@ -101,6 +123,32 @@ impl MenuRow {
             }
         }
     }
+}
+
+/// `text` as a screen reader is told it: its words, the glyphs that mark or
+/// draw (`◆`, `⎇`, `▱▱▱`, an arrow) left out, and a `·` or `—` between two
+/// parts a comma: `⎆  sol@example.test · max 20x` is `sol@example.test, max 20x`.
+#[must_use]
+pub(crate) fn spoken_words(text: &str) -> String {
+    let glyph = |c: char| !c.is_ascii() && !c.is_alphanumeric();
+    let mut out = String::with_capacity(text.len());
+    let mut part = false;
+    for token in text.split_whitespace() {
+        if matches!(token, "\u{b7}" | "\u{2014}" | "\u{2013}") {
+            part = !out.is_empty();
+            continue;
+        }
+        let word = token.trim_matches(glyph);
+        if word.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push_str(if part { ", " } else { " " });
+        }
+        part = false;
+        out.push_str(word);
+    }
+    out
 }
 
 /// One cell of a [`MenuRow::Plot`].
@@ -174,7 +222,7 @@ pub(crate) fn rows(facts: &MenuFacts) -> Vec<MenuRow> {
             AutopilotView::AgentOff(agent) => crate::autopilot::agent_switch_off(agent),
             _ => "harness off in Settings",
         };
-        out.push(MenuRow::Note(why.to_string()));
+        out.push(MenuRow::note(why));
     }
     for (mode, glyph, label) in [
         (Autopilot::Cruise, "\u{221e}", "Cruise"),
@@ -402,7 +450,7 @@ fn same_place(shown: &MenuRow, fresh: &MenuRow) -> bool {
     match (shown, fresh) {
         (MenuRow::Header(_), MenuRow::Header(_))
         | (MenuRow::Name(_), MenuRow::Name(_))
-        | (MenuRow::Note(_), MenuRow::Note(_))
+        | (MenuRow::Note { .. }, MenuRow::Note { .. })
         | (MenuRow::Plot(_), MenuRow::Plot(_))
         | (MenuRow::SetBy { .. }, MenuRow::SetBy { .. })
         | (MenuRow::Rule, MenuRow::Rule) => true,
@@ -587,7 +635,7 @@ pub(crate) fn paint(
         let bg = if selected { c.sel_bg } else { c.card_bg };
         let (fg, bold) = match row {
             MenuRow::Header(_) | MenuRow::Name(_) => (c.band.value, true),
-            MenuRow::Note(_) | MenuRow::SetBy { .. } | MenuRow::Item { enabled: false, .. } => {
+            MenuRow::Note { .. } | MenuRow::SetBy { .. } | MenuRow::Item { enabled: false, .. } => {
                 (c.disabled, false)
             }
             MenuRow::Item { .. } if selected => (c.sel_fg, true),
@@ -791,7 +839,9 @@ impl AutopilotMenu {
                 )),
                 MenuRow::Rule => out.push(format!("{target} rule index={i}")),
                 MenuRow::Gap(_) => out.push(format!("{target} gap index={i}")),
-                MenuRow::Header(text) | MenuRow::Note(text) | MenuRow::SetBy { text, .. } => {
+                MenuRow::Header(text)
+                | MenuRow::Note { text, .. }
+                | MenuRow::SetBy { text, .. } => {
                     out.push(format!("{target} label index={i} text={text:?}"));
                 }
                 MenuRow::Name(_) => {
@@ -835,7 +885,7 @@ impl std::hash::Hash for MenuRow {
         match self {
             Self::Header(t) => (0u8, t).hash(h),
             Self::Name(t) => (5u8, t).hash(h),
-            Self::Note(t) => (1u8, t).hash(h),
+            Self::Note { text, .. } => (1u8, text).hash(h),
             Self::Rule => 2u8.hash(h),
             Self::Gap(cells) => (4u8, cells).hash(h),
             Self::SetBy { text, floor } => (6u8, text, floor).hash(h),
@@ -1475,11 +1525,11 @@ impl App {
         let top = rect.row.checked_sub(usize::from(self.chrome_rows(wid)))?;
         let mut items = Vec::new();
         let mut selected = None;
-        let mut note = None;
+        let mut notes: Vec<&str> = Vec::new();
         let mut set_by: Vec<&str> = Vec::new();
         for (i, row) in menu.rows.iter().enumerate().take(shown_rows(rect)) {
             match row {
-                MenuRow::Note(text) => note = Some(text.as_str()),
+                MenuRow::Note { spoken, .. } => notes.push(spoken.as_str()),
                 MenuRow::SetBy { text, .. } => set_by.push(text.as_str()),
                 MenuRow::Item {
                     spoken,
@@ -1510,7 +1560,7 @@ impl App {
             label.push_str(", ");
             label.push_str(&set_by.join(" "));
         }
-        if let Some(note) = note {
+        for note in notes.into_iter().filter(|note| !note.is_empty()) {
             label.push_str(", ");
             label.push_str(note);
         }

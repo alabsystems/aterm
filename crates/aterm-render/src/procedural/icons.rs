@@ -52,7 +52,7 @@ pub fn band_icon_coverage(
     }
     buf
 }
-/// The most of an icon's half height its stroke may take (about a fifth of the icon), whole pixels: [`Shape::fit`] holds the face's stem to it at the capitals and [`Shape::mark_t`] at the ring family's own radius.
+/// The most of an icon's half height its stroke may take (about a fifth of the icon), whole pixels: [`Shape::fit`] holds the face's stem to it at the icon's own half height (the capitals', held to the cell's width, or `⤓`'s [`Shape::tall`]) and [`Shape::mark_t`] at the ring family's own radius.
 const STROKE_SHARE: f32 = 0.44;
 
 /// One icon's frame on its raster: its centre, half height, stroke, the horizontal room it may use on each side of the centre, the row it stands on and the highest row it may ink.
@@ -69,7 +69,9 @@ struct Shape {
     /// The half height an icon narrower than it is tall may keep in a cell of its own (`⤓`):
     /// the capitals' where the row up to the ceiling allows, whatever the cell's width. Like
     /// [`Self::flat`] it keeps none of the pixel and a half [`Self::half`] leaves under the
-    /// ceiling: its stem's round end stops at its half height.
+    /// ceiling: its stem's round end stops at its half height. Its stroke is held to its share
+    /// of this, not of `half`: in a narrow cell (Iosevka's half-em) `half`'s share was under
+    /// both weights' stems, and a bold `⤓` drew the regular one.
     tall: f32,
     /// The half height `⏸`'s and `!`'s bars span: the capitals' where the row up to the ceiling
     /// allows, held to the room as [`Self::half`] is. `half` leaves a pixel and a half under the
@@ -114,9 +116,11 @@ impl Shape {
             cap
         };
         let ring = (disc * 0.5).max(1.0);
+        let tall = (cap * 0.5).min(cy - top).max(half0);
+        let own_half = if icon == BandIcon::ToBar { tall } else { half0 };
         let t = stem
             .round()
-            .clamp(1.0, (half0 * STROKE_SHARE).round().max(1.0));
+            .clamp(1.0, (own_half * STROKE_SHARE).round().max(1.0));
         let crisp = |odd: bool| {
             ox + if odd {
                 (fw * 0.5).floor() + 0.5
@@ -150,7 +154,7 @@ impl Shape {
             bot: cy + half,
             top,
             ring,
-            tall: (cap * 0.5).min(cy - top).max(half),
+            tall,
             flat: (cap * 0.5).min(cy - top).min(room - 0.5).max(half),
         }
     }
@@ -1021,6 +1025,57 @@ mod tests {
                     let (_, _, b0, b1) = ink_box(&band, w);
                     assert!(b1 - b0 < y1 - y0, "{at}: control, the band's ⇣ is shorter");
                 }
+            }
+        }
+    }
+
+    /// Windows' default face, Iosevka Term Semibold (its bold slot ExtraBold), measured in the Windows lane at 24, 32, 40 and 48 px under its default hinting (`Renderer::icon_metrics`, regular and bold): `[cell w, cell h, baseline, cap, head, disc, regular stem, bold stem]`. Its cells are half an em wide, so the capitals' half height outruns the cell's.
+    const IOSEVKA_WINDOWS: [[f32; 8]; 4] = [
+        [12.0, 30.0, 23.0, 18.0, 2.0, 11.0, 2.408, 2.969],
+        [16.0, 40.0, 31.0, 24.0, 3.0, 14.0, 3.204, 3.969],
+        [20.0, 50.0, 39.0, 29.0, 5.0, 17.0, 4.0, 4.953],
+        [24.0, 60.0, 46.0, 35.0, 6.0, 21.0, 4.796, 5.953],
+    ];
+
+    /// `⤓` in a cell of its own is drawn at the face's stem, whole pixels, in a cell narrower than its capitals are tall: a bold `⤓` takes the bold stem and draws heavier, as the face's bold letters beside it do. Every other icon keeps its stroke held to its share of the cell's half width (the ring family's, of its radius), which here is under both stems, so each draws one raster at either weight: `✓` would draw 2 px against 3 at 12x30 if its stroke took `⤓`'s height.
+    #[test]
+    fn a_bold_land_arrow_takes_the_bold_stem_in_a_narrow_cell() {
+        for [cw, ch, baseline, cap, head, disc, regular, bold] in IOSEVKA_WINDOWS {
+            let (cw, ch) = (cw as usize, ch as usize);
+            let draw = |icon, stem| {
+                let m = IconMetrics {
+                    baseline,
+                    cap,
+                    stem,
+                    head,
+                    disc,
+                };
+                band_icon_coverage(icon, cw, ch, m, false)
+            };
+            let stroke = |buf: &[u8]| {
+                let (_, _, y0, y1) = ink_box(buf, cw);
+                let row = &buf[(y0 + (y1 - y0) / 4) * cw..][..cw];
+                row.iter().filter(|&&c| c == 255).count()
+            };
+            let ink = |b: &[u8]| b.iter().map(|&c| u32::from(c)).sum::<u32>();
+            let (light, heavy) = (draw(BandIcon::ToBar, regular), draw(BandIcon::ToBar, bold));
+            let at = format!("{cw}x{ch} stems {regular} and {bold}");
+            assert_eq!(
+                stroke(&light),
+                regular.round() as usize,
+                "{at}: the regular ⤓'s stroke"
+            );
+            assert_eq!(
+                stroke(&heavy),
+                bold.round() as usize,
+                "{at}: the bold ⤓'s stroke"
+            );
+            assert!(ink(&heavy) > ink(&light), "{at}: the bold ⤓ draws heavier");
+            for icon in BandIcon::ALL.into_iter().filter(|&i| i != BandIcon::ToBar) {
+                assert!(
+                    draw(icon, regular) == draw(icon, bold),
+                    "{at}: {icon:?} keeps its stroke held to the cell's width or the ring's radius"
+                );
             }
         }
     }

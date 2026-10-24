@@ -14,7 +14,7 @@ use aterm_x11::proto::{atom, sync, xproto};
 use super::atoms::_NET_WM_SYNC_REQUEST_COUNTER;
 use super::{IgnoreError as _, ReportExt as _, XConnection};
 
-/// The longest a request is held (step 5).
+/// Maximum duration a sync request is held.
 pub(super) const HOLD_CAP: Duration = Duration::from_millis(200);
 
 /// What a pending request waits for (steps 2 and 3).
@@ -35,12 +35,10 @@ struct Pending {
 }
 
 impl Pending {
-    /// When it must be answered, whatever it waits for (step 5).
     fn deadline(&self) -> Instant {
         self.since + HOLD_CAP
     }
 
-    /// Whether a turn that ends at `now` holds this request (steps 4 and 5).
     fn held(&self, now: Instant, redraw_queued: impl FnOnce() -> bool) -> bool {
         now < self.deadline()
             && match self.wait {
@@ -82,12 +80,12 @@ impl SyncCounter {
         self.pending.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Step 1: the window manager asked for `value`.
+    /// Records a sync request for `value` from the window manager.
     pub(super) fn requested(&self, value: i64) {
         *self.pending() = Some(Pending { value, wait: Wait::Configure, since: Instant::now() });
     }
 
-    /// Step 2: a `ConfigureNotify` arrived, whether or not it changed the window's size.
+    /// Records a `ConfigureNotify` event and whether it resized the window.
     pub(super) fn configured(&self, xconn: &XConnection, resized: bool) {
         let mut pending = self.pending();
         match pending.as_mut() {
@@ -102,7 +100,7 @@ impl SyncCounter {
         }
     }
 
-    /// Step 3: the application presented a frame of the window.
+    /// Marks the pending frame presented and answers the sync request if due.
     pub(super) fn presented(&self, xconn: &XConnection) {
         let mut pending = self.pending();
         if let Some(p) = pending.take_if(|p| p.wait == Wait::Frame) {
@@ -111,7 +109,7 @@ impl SyncCounter {
         }
     }
 
-    /// Steps 4 and 5: an event-loop turn ended at `now`, or the loop woke for [`Self::deadline`].
+    /// Answers any pending request whose wait or deadline is satisfied at `now`.
     pub(super) fn turn_ended(
         &self,
         xconn: &XConnection,
@@ -125,12 +123,11 @@ impl SyncCounter {
         }
     }
 
-    /// When the event loop must wake to answer the pending request, if one is (step 5).
+    /// When the event loop must wake to answer the pending request, if any.
     pub(super) fn deadline(&self) -> Option<Instant> {
         self.pending().as_ref().map(Pending::deadline)
     }
 
-    /// Set the counter to `value`, and send it at once.
     fn answer(&self, xconn: &XConnection, value: i64) {
         let Some(major) = xconn.sync_major() else {
             return;

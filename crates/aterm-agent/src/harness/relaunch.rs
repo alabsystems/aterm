@@ -2873,7 +2873,7 @@ pub struct AgyRun {
     pub block: Option<u64>,
 }
 
-/// What a Gemini CLI TUI's relaunch on exit needs beside the [`Snapshot`], whose `pid` is the parent node (the tab's foreground job, `node <gemini script>`), whose `session` is the session the start-time rule named (the one session header of its project begun since it started, `upgrade_drive`'s `gemini::witness_of`; `None`: none named, and no relaunch then resumes anything) and whose `cwd` is its project (the directory its sessions are kept under).
+/// What a Gemini CLI TUI's relaunch on exit needs beside the [`Snapshot`], whose `pid` is the parent node (the tab's foreground job, `node <gemini script>`), whose `session` is the session the start-time rule named (the one session header of its project begun since it started, `upgrade_drive`'s `gemini::witness_read` as a running process reads it; `None`: none named, and no relaunch then resumes anything) and whose `cwd` is its project (the directory its sessions are kept under).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GeminiRun {
     /// The gemini directory its sessions are under (canonical).
@@ -3165,7 +3165,9 @@ pub fn snapshot_of_copy(
 pub(super) fn snapshot_with(opts: &Opts, k: &dyn Kernel) -> Result<Snapshot, &'static str> {
     let tab = opts.only_sid.as_deref().ok_or("no-tab")?;
     let mut c = connect(opts, tab).map_err(|_| "no-socket")?;
+    super::laps::lap("connect");
     let tabs = host_roster(&mut c).ok_or("roster")?;
+    super::laps::lap("roster");
     let group = tabs
         .iter()
         .find(|t| t.sid == tab)
@@ -3188,7 +3190,9 @@ pub(super) fn snapshot_with(opts: &Opts, k: &dyn Kernel) -> Result<Snapshot, &'s
     {
         return Err("terminal");
     }
+    super::laps::lap("job");
     let args = atpkg::caller_shell::process_args(pid).ok_or("argv-unreadable")?;
+    super::laps::lap("args");
     if args
         .env_var("ATERM_PARENT_SESSION_ID")
         .is_some_and(|env_tab| env_tab != tab)
@@ -3197,6 +3201,7 @@ pub(super) fn snapshot_with(opts: &Opts, k: &dyn Kernel) -> Result<Snapshot, &'s
     }
     let start = kernel_start(pid).ok_or("start")?;
     let image = exe_of(pid);
+    super::laps::lap("process");
     match snapshot_lane(image.as_deref(), &args.argv) {
         SnapshotLane::CodexAlab => {
             return super::upgrade_drive::codex_alab_snapshot(opts, tab, pid, start, shell, &args);
@@ -3223,6 +3228,7 @@ pub(super) fn snapshot_with(opts: &Opts, k: &dyn Kernel) -> Result<Snapshot, &'s
     let file = records
         .session_file(pid)
         .filter(|sf| squash(&sf.proc_start) == start);
+    super::laps::lap("claude.records");
     let (program, argv) = launched(
         &args.argv,
         image.as_deref(),

@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Digital rain tests for the CPU renderer.
+//! Digital rain tests for the CPU renderer: the rain's cells as one Linear
+//! Under fx layer a grid row (`aterm_effects::matrix_rain::RainLayers`), and
+//! its additive halos.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use aterm_core::render::{RainHalo, SceneAtlas, SpriteQuad};
+use aterm_core::render::{
+    FxArt, FxBlend, FxContent, FxInk, FxItem, FxLayer, FxSlot, FxSpace, FxSprite, PxRect, RainHalo,
+    RenderInput,
+};
 use aterm_core::terminal::Terminal;
+use aterm_effects::matrix_rain::{RainBaker, RainCell, RainLayers, rom};
 use aterm_render::{
     DirtyDecision, Frame, Renderer, Theme, WindowCpu, compute_dirty_rows, rgb_to_u32,
 };
+
+use crate::sprites::{art_of, patterned, solid, under};
 
 fn renderer() -> Renderer {
     Renderer::from_system(18.0, Theme::default())
@@ -26,57 +35,70 @@ fn cell_pixels(f: &Frame, cw: usize, ch: usize, row: usize, col: usize) -> Vec<u
     out
 }
 
-fn patterned_atlas(w: u32, h: u32, version: u64) -> SceneAtlas {
-    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-    for y in 0..h {
-        for x in 0..w {
-            rgba.extend_from_slice(&[
-                (x * 37 + y * 11) as u8,
-                (x * 5 + y * 53) as u8,
-                (x * 29 + y * 3) as u8,
-                255,
-            ]);
-        }
-    }
-    SceneAtlas {
-        width: w,
-        height: h,
-        rgba,
-        version,
-    }
+/// One layer of the rain's kind (Linear, Under, no knock-out) drawing `art`
+/// 1:1 at `(x, y)`, tinted and faded.
+fn rain_layer(x: i32, y: i32, art: Arc<FxArt>, tint: u32, alpha: u8, flip_x: bool) -> FxLayer {
+    let (w, h) = (art.w(), art.h());
+    rain_layer_sized(x, y, w, h, art, tint, alpha, flip_x)
 }
 
-fn solid_atlas(w: u32, h: u32, rgb: [u8; 3], alpha: u8, version: u64) -> SceneAtlas {
-    let rgba = (0..w * h)
-        .flat_map(|_| [rgb[0], rgb[1], rgb[2], alpha])
-        .collect();
-    SceneAtlas {
-        width: w,
-        height: h,
-        rgba,
-        version,
-    }
+/// [`rain_layer`] with `art` stretched to `w × h`.
+#[allow(clippy::too_many_arguments)]
+fn rain_layer_sized(
+    x: i32,
+    y: i32,
+    w: u16,
+    h: u16,
+    art: Arc<FxArt>,
+    tint: u32,
+    alpha: u8,
+    flip_x: bool,
+) -> FxLayer {
+    FxLayer::new(
+        1,
+        Arc::new(FxContent::new(
+            vec![FxItem::Sprite(FxSprite {
+                x,
+                y,
+                dw: w,
+                dh: h,
+                flip_x,
+                art,
+                ink: 0,
+                clip: PxRect::EVERYWHERE,
+            })],
+            vec![FxInk::over(tint, alpha)],
+        )),
+        FxSlot::Under,
+        FxSpace::Grid,
+        FxBlend::Linear,
+    )
 }
 
-fn quad(row: u16, dest: [u16; 4], src: [u16; 4]) -> SpriteQuad {
-    SpriteQuad {
+/// A tile set baked whole at `cw × ch`.
+fn baker(cw: u16, ch: u16) -> RainBaker {
+    let master = rom::rasterize_master();
+    let mut b = RainBaker::default();
+    b.begin_frame(cw, ch);
+    while !b.complete() {
+        b.bake_tiles(&master);
+    }
+    b
+}
+
+/// Glyph `glyph` in cell `(row, col)` of a `cw × ch` grid.
+fn rain_cell(row: u16, col: u16, glyph: u8, (cw, ch): (u16, u16)) -> RainCell {
+    RainCell {
         row,
-        x: dest[0],
-        y: dest[1],
-        w: dest[2],
-        h: dest[3],
-        ax: src[0],
-        ay: src[1],
-        aw: src[2],
-        ah: src[3],
-        tint: 0x00FF_FFFF,
-        alpha: 255,
+        x: col * cw,
+        y: row * ch,
+        w: cw,
+        h: ch,
+        glyph,
+        tint: 0x0040_E070,
+        alpha: 200,
         flip_x: false,
     }
-}
-
-fn band_quad(row: u16, x: u16, cw: u16, ch: u16, ax: u16, ay: u16) -> SpriteQuad {
-    quad(row, [x, row * ch, cw, ch], [ax, ay, cw, ch])
 }
 
 fn halo(row: u16, x: u16, y: u16, w: u16, h: u16, color: u32) -> RainHalo {
@@ -113,18 +135,15 @@ fn rain_stamp_mul8_tint_alpha_flip_and_band_containment() {
     let base = rend.render_input(&term.cell_frame(4, 12)).pixels.clone();
 
     let mut input = term.cell_frame(4, 12);
-    input.rain_atlas = Some(Arc::new(solid_atlas(64, 64, [200, 200, 200], 255, 1)));
-    let mut q = band_quad(1, 0, cw as u16, ch.min(64) as u16, 0, 0);
-    q.tint = 0x0080_40C0;
-    input.rain_quads = vec![q];
+    let grey = solid([200, 200, 200, 255], cw as u16, ch as u16);
+    input.fx_layers = vec![rain_layer(0, ch as i32, grey, 0x0080_40C0, 255, false)];
     let f = rend.render_input(&input);
     let want = (mul8(200, 0x80) << 16) | (mul8(200, 0x40) << 8) | mul8(200, 0xC0);
-    let band_h = ch.min(64);
-    for dy in 0..band_h {
+    for dy in 0..ch {
         for dx in 0..cw {
-            let got = f.pixels[(ch + dy) * f.width + dx];
             assert_eq!(
-                got, want,
+                f.pixels[(ch + dy) * f.width + dx],
+                want,
                 "tinted opaque stamp must be the exact mul8 product at ({dx},{dy})"
             );
         }
@@ -133,49 +152,48 @@ fn rain_stamp_mul8_tint_alpha_flip_and_band_containment() {
         if b != p {
             let y = i / f.width;
             assert!(
-                (ch..ch + band_h).contains(&y),
+                (ch..2 * ch).contains(&y),
                 "rain stamp must stay inside its cell band: pixel row {y} changed"
             );
         }
     }
 
+    let faint = |a: u8| solid([255, 255, 255, a], cw as u16, ch as u16);
     let mut input = term.cell_frame(4, 12);
-    input.rain_atlas = Some(Arc::new(solid_atlas(64, 64, [255, 255, 255], 127, 2)));
-    let mut q = band_quad(1, 0, cw as u16, ch.min(64) as u16, 0, 0);
-    q.alpha = 1;
-    input.rain_quads = vec![q];
-    let f = rend.render_input(&input);
+    input.fx_layers = vec![rain_layer(0, ch as i32, faint(127), 0x00FF_FFFF, 1, false)];
     assert_eq!(
-        base, f.pixels,
+        base,
+        rend.render_input(&input).pixels,
         "mul8(127, 1) == 0: a fully-rounded-away alpha must paint nothing"
     );
     let mut input = term.cell_frame(4, 12);
-    input.rain_atlas = Some(Arc::new(solid_atlas(64, 64, [255, 255, 255], 128, 3)));
-    input.rain_quads = vec![q];
-    let f = rend.render_input(&input);
+    input.fx_layers = vec![rain_layer(0, ch as i32, faint(128), 0x00FF_FFFF, 1, false)];
     assert_ne!(
-        base, f.pixels,
+        base,
+        rend.render_input(&input).pixels,
         "mul8(128, 1) == 1: one unit of coverage must survive the rounding"
     );
 
-    let atlas = patterned_atlas(64, 64, 4);
     let (aw, ah) = (cw.min(64) as u16, ch.min(64) as u16);
+    let art = patterned(aw, ah);
     let mut input = term.cell_frame(4, 12);
-    input.rain_atlas = Some(Arc::new(patterned_atlas(64, 64, 4)));
-    let mut q = quad(2, [3, 2 * ch as u16, aw, ah], [5, 7, aw, ah]);
-    q.flip_x = true;
-    input.rain_quads = vec![q];
+    input.fx_layers = vec![rain_layer(
+        3,
+        2 * ch as i32,
+        art.clone(),
+        0x00FF_FFFF,
+        255,
+        true,
+    )];
     let f = rend.render_input(&input);
-    for dy in 0..ah as usize {
-        for dx in 0..aw as usize {
-            let sx = 5 + (aw as usize - 1 - dx);
-            let i = ((7 + dy) * 64 + sx) * 4;
-            let want = ((atlas.rgba[i] as u32) << 16)
-                | ((atlas.rgba[i + 1] as u32) << 8)
-                | atlas.rgba[i + 2] as u32;
-            let got = f.pixels[(2 * ch + dy) * f.width + 3 + dx];
+    let d = art.data();
+    for dy in 0..usize::from(ah) {
+        for dx in 0..usize::from(aw) {
+            let i = (dy * usize::from(aw) + usize::from(aw) - 1 - dx) * 4;
+            let want = (u32::from(d[i]) << 16) | (u32::from(d[i + 1]) << 8) | u32::from(d[i + 2]);
             assert_eq!(
-                got, want,
+                f.pixels[(2 * ch + dy) * f.width + 3 + dx],
+                want,
                 "flip_x must mirror the source column at ({dx},{dy})"
             );
         }
@@ -183,7 +201,7 @@ fn rain_stamp_mul8_tint_alpha_flip_and_band_containment() {
 }
 
 #[test]
-fn rain_under_text_and_under_cats() {
+fn rain_under_text_and_under_the_companions() {
     let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let mut term = Terminal::new(2, 8);
@@ -192,14 +210,25 @@ fn rain_under_text_and_under_cats() {
     let rain_green = 0x0020_C840;
     let cat_red = 0x00C8_2020;
     let mut input = term.cell_frame(2, 8);
-    input.rain_atlas = Some(Arc::new(solid_atlas(8, 8, [0x20, 0xC8, 0x40], 255, 1)));
-    input.rain_quads = vec![quad(0, [0, 0, (3 * cw) as u16, ch as u16], [0, 0, 8, 8])];
-    input.cat_atlas = Some(Arc::new(solid_atlas(8, 8, [0xC8, 0x20, 0x20], 255, 1)));
-    input.cat_quads = vec![quad(
+    let rain = art_of(8, 8, |_, _| [0x20, 0xC8, 0x40, 255]);
+    input.fx_layers.push(rain_layer_sized(
         0,
-        [(2 * cw) as u16, 0, cw as u16, ch as u16],
-        [0, 0, 8, 8],
-    )];
+        0,
+        (3 * cw) as u16,
+        ch as u16,
+        rain,
+        0x00FF_FFFF,
+        255,
+        false,
+    ));
+    crate::sprites::put(
+        &mut input,
+        &[aterm_render::sprites::FreeSprite {
+            w: cw as u16,
+            h: ch as u16,
+            ..under((2 * cw) as i32, 0, solid([0xC8, 0x20, 0x20, 255], 8, 8))
+        }],
+    );
 
     let f = rend.render_input(&input);
     let fg = rgb_to_u32(input.cells[0][0].fg);
@@ -215,7 +244,7 @@ fn rain_under_text_and_under_cats() {
     );
     assert!(
         cell_pixels(&f, cw, ch, 0, 2).iter().all(|&p| p == cat_red),
-        "the cat must draw OVER the rain (cell 2 pure red — cats walk on rain)"
+        "the companion must draw OVER the rain (cell 2 pure red: cats walk on rain)"
     );
 }
 
@@ -282,50 +311,57 @@ fn damaged_path_no_ghosting_as_rain_animates() {
     let rows = 6usize;
     let mut term = Terminal::new(rows as u16, 12);
     term.process(b"\x1b[?25l");
-    let (cw16, ch16) = (cw as u16, ch.min(48) as u16);
-
-    let mut make = |quads: Vec<SpriteQuad>, add: Vec<RainHalo>, atlas: &Arc<SceneAtlas>| {
-        let mut input = term.cell_frame(rows, 12);
-        input.rain_atlas = Some(atlas.clone());
-        input.rain_quads = quads;
-        input.rain_add = add;
-        input
-    };
-    let atlas_v1 = Arc::new(patterned_atlas(64, 64, 1));
-
+    let px = (cw as u16, ch as u16);
+    let master = rom::rasterize_master();
+    let mut tiles = baker(px.0, px.1);
+    let mut rain = RainLayers::default();
+    let mut make =
+        |term: &mut Terminal, tiles: &RainBaker, cells: &[RainCell], add: Vec<RainHalo>| {
+            let mut input = term.cell_frame(rows, 12);
+            rain.publish(cells, tiles, &mut input.fx_layers);
+            input.rain_add = add;
+            input
+        };
+    let (cw16, ch16) = px;
     let in_a = make(
-        vec![
-            band_quad(1, 0, cw16, ch16, 0, 0),
-            band_quad(1, 3 * cw16, cw16, ch16, 8, 0),
-            band_quad(2, 3 * cw16, cw16, ch16, 8, 16),
+        &mut term,
+        &tiles,
+        &[
+            rain_cell(1, 0, 0, px),
+            rain_cell(1, 3, 1, px),
+            rain_cell(2, 3, 2, px),
         ],
         vec![halo(2, 3 * cw16, 2 * ch16, cw16, ch16, 0x0030_6030)],
-        &atlas_v1,
     );
     let in_b = make(
-        vec![
-            band_quad(2, 0, cw16, ch16, 0, 0),
-            band_quad(2, 3 * cw16, cw16, ch16, 8, 16),
-            band_quad(3, 3 * cw16, cw16, ch16, 8, 32),
+        &mut term,
+        &tiles,
+        &[
+            rain_cell(2, 0, 0, px),
+            rain_cell(2, 3, 2, px),
+            rain_cell(3, 3, 4, px),
         ],
         vec![halo(3, 3 * cw16, 3 * ch16, cw16, ch16, 0x0030_6030)],
-        &atlas_v1,
     );
+    let column: Vec<RainCell> = (0..rows as u16)
+        .map(|r| rain_cell(r, 1, (16 + r) as u8, px))
+        .collect();
     let in_c = make(
-        (0..rows as u16)
-            .map(|r| band_quad(r, cw16, cw16, ch16, 16 + r, 8))
-            .collect(),
+        &mut term,
+        &tiles,
+        &column,
         vec![halo(5, cw16, 5 * ch16, cw16, ch16, 0x0018_4018)],
-        &atlas_v1,
     );
-    let atlas_v2 = {
-        let mut a = patterned_atlas(64, 64, 2);
-        for px in a.rgba.as_chunks_mut::<4>().0 {
-            px[0] = px[0].wrapping_add(64);
-        }
-        Arc::new(a)
-    };
-    let in_d = make(in_c.rain_quads.clone(), in_c.rain_add.clone(), &atlas_v2);
+    assert!(tiles.can_rebake(), "fixture: a whole tile set can rebake");
+    assert!(tiles.rebake_tiles(&master, u64::MAX));
+    let in_d = make(&mut term, &tiles, &column, in_c.rain_add.clone());
+    assert!(
+        in_d.fx_layers
+            .iter()
+            .zip(&in_c.fx_layers)
+            .all(|(d, c)| !Arc::ptr_eq(&d.content, &c.content)),
+        "fixture: a rebake rebuilds every row"
+    );
 
     let mut wc = WindowCpu::new();
     for (name, input) in [("A", &in_a), ("B", &in_b), ("C", &in_c), ("D", &in_d)] {
@@ -339,40 +375,11 @@ fn damaged_path_no_ghosting_as_rain_animates() {
     }
 }
 
-#[test]
-fn rain_dirty_gate_and_merge_diff_row_marking() {
-    let mut term = Terminal::new(6, 8);
-    term.process(b"\x1b[?25l"); // hidden cursor: no cursor rows in the dirty set
-    let atlas_v1 = Arc::new(patterned_atlas(16, 16, 1));
-    let settled = vec![
-        quad(1, [0, 16, 8, 16], [0, 0, 8, 16]),
-        quad(2, [0, 32, 8, 16], [0, 0, 8, 16]),
-        quad(2, [24, 32, 8, 16], [8, 0, 8, 16]),
-        quad(3, [8, 48, 8, 16], [0, 0, 8, 16]),
-    ];
-    let halos = vec![halo(4, 0, 64, 8, 16, 0x0010_2010)];
-
-    let mut frame = |quads: &[SpriteQuad], add: &[RainHalo], atlas: &Arc<SceneAtlas>| {
-        let mut input = term.cell_frame(6, 8);
-        input.rain_atlas = Some(atlas.clone());
-        input.rain_quads = quads.to_vec();
-        input.rain_add = add.to_vec();
-        input
-    };
-    let marked = |dirty: &[bool]| -> Vec<usize> {
-        dirty
-            .iter()
-            .enumerate()
-            .filter_map(|(r, &b)| b.then_some(r))
-            .collect()
-    };
-
-    let prev = frame(&settled, &halos, &atlas_v1);
-    let cur = frame(&settled, &halos, &atlas_v1);
+fn marked(prev: &RenderInput, cur: &RenderInput) -> (aterm_render::DirtyRows, Vec<usize>) {
     let mut dirty = Vec::new();
     let DirtyDecision::Rows(d) = compute_dirty_rows(
-        &prev,
-        &cur,
+        prev,
+        cur,
         false,
         None,
         false,
@@ -382,7 +389,40 @@ fn rain_dirty_gate_and_merge_diff_row_marking() {
     ) else {
         panic!("identical-geometry frames must take the row-damage path");
     };
-    assert!(!d.rain_changed, "settled rain must not set rain_changed");
+    let rows = dirty
+        .iter()
+        .enumerate()
+        .filter_map(|(r, &b)| b.then_some(r))
+        .collect();
+    (d, rows)
+}
+
+#[test]
+fn rain_dirty_gate_and_per_row_marking() {
+    let mut term = Terminal::new(6, 8);
+    term.process(b"\x1b[?25l"); // hidden cursor: no cursor rows in the dirty set
+    let px = (8u16, 16u16);
+    let master = rom::rasterize_master();
+    let mut tiles = baker(px.0, px.1);
+    let settled = vec![
+        rain_cell(1, 0, 0, px),
+        rain_cell(2, 0, 0, px),
+        rain_cell(2, 3, 1, px),
+        rain_cell(3, 1, 0, px),
+    ];
+    let halos = vec![halo(4, 0, 64, 8, 16, 0x0010_2010)];
+    let mut rain = RainLayers::default();
+    let mut frame = |tiles: &RainBaker, cells: &[RainCell], add: &[RainHalo]| {
+        let mut input = term.cell_frame(6, 8);
+        rain.publish(cells, tiles, &mut input.fx_layers);
+        input.rain_add = add.to_vec();
+        input
+    };
+
+    let prev = frame(&tiles, &settled, &halos);
+    let cur = frame(&tiles, &settled, &halos);
+    let (d, rows) = marked(&prev, &cur);
+    assert!(!d.fx_changed, "settled rain must not set fx_changed");
     assert!(
         !d.rain_add_changed,
         "settled halos must not set rain_add_changed"
@@ -391,109 +431,60 @@ fn rain_dirty_gate_and_merge_diff_row_marking() {
         d.is_gate_hit(),
         "settled rain must gate-hit: steady state is free"
     );
-    assert!(dirty.iter().all(|&b| !b), "settled rain must mark no rows");
+    assert!(rows.is_empty(), "settled rain must mark no rows");
 
-    let moved = vec![
-        settled[0],
-        settled[1],
-        settled[3],
-        quad(4, [8, 64, 8, 16], [8, 0, 8, 16]),
-    ];
-    let cur = frame(&moved, &halos, &atlas_v1);
-    let DirtyDecision::Rows(d) = compute_dirty_rows(
-        &prev,
-        &cur,
-        false,
-        None,
-        false,
-        None,
-        aterm_render::RowBands::new(0, 16),
-        &mut dirty,
-    ) else {
-        panic!("identical-geometry frames must take the row-damage path");
-    };
-    assert!(d.rain_changed, "moved quads must set rain_changed");
-    assert!(!d.is_gate_hit(), "changed rain must NOT gate-hit");
+    let moved = vec![settled[0], settled[1], settled[3], rain_cell(4, 1, 1, px)];
+    let prev = cur;
+    let cur = frame(&tiles, &moved, &halos);
+    let (d, rows) = marked(&prev, &cur);
+    assert!(d.fx_changed && !d.is_gate_hit(), "moved cells must repaint");
     assert_eq!(
-        marked(&dirty),
-        vec![2, 3, 4],
-        "merge-diff marks the differing rows; the band fill adds only the \
-         settled in-band row — the out-of-band settled row 1 stays clean"
+        rows,
+        vec![2, 4],
+        "one layer a row: exactly the rows whose cells changed (the settled rows \
+         1 and 3 stay clean)"
     );
 
+    let prev = frame(&tiles, &settled, &halos);
     let mut mutated = settled.clone();
-    mutated[3].ax = 8;
-    let cur = frame(&mutated, &halos, &atlas_v1);
-    let DirtyDecision::Rows(d) = compute_dirty_rows(
-        &prev,
-        &cur,
-        false,
-        None,
-        false,
-        None,
-        aterm_render::RowBands::new(0, 16),
-        &mut dirty,
-    ) else {
-        panic!("identical-geometry frames must take the row-damage path");
-    };
-    assert!(d.rain_changed);
+    mutated[3].glyph = 1;
+    let cur = frame(&tiles, &mutated, &halos);
     assert_eq!(
-        marked(&dirty),
+        marked(&prev, &cur).1,
         vec![3],
-        "a within-row slice change must mark exactly that row"
+        "a within-row glyph change must mark exactly that row"
     );
 
-    let cur = frame(&settled, &halos, &Arc::new(patterned_atlas(16, 16, 2)));
-    let DirtyDecision::Rows(d) = compute_dirty_rows(
-        &prev,
-        &cur,
-        false,
-        None,
-        false,
-        None,
-        aterm_render::RowBands::new(0, 16),
-        &mut dirty,
-    ) else {
-        panic!("identical-geometry frames must take the row-damage path");
-    };
-    assert!(
-        d.rain_changed,
-        "an atlas-version bump alone must set rain_changed (a rebake repaints)"
-    );
-    assert!(!d.is_gate_hit(), "a rebaked atlas must NOT gate-hit");
+    let prev = frame(&tiles, &settled, &halos);
+    assert!(tiles.rebake_tiles(&master, u64::MAX));
+    let cur = frame(&tiles, &settled, &halos);
+    let (d, rows) = marked(&prev, &cur);
+    assert!(d.fx_changed && !d.is_gate_hit(), "a rebake must repaint");
     assert_eq!(
-        marked(&dirty),
+        rows,
         vec![1, 2, 3],
-        "the rebake must mark every (unmoved) quad row"
+        "the rebake must mark every (unmoved) rain row"
     );
 
-    let cur = frame(&settled, &[halo(5, 0, 80, 8, 16, 0x0010_2010)], &atlas_v1);
-    let DirtyDecision::Rows(d) = compute_dirty_rows(
-        &prev,
-        &cur,
-        false,
-        None,
-        false,
-        None,
-        aterm_render::RowBands::new(0, 16),
-        &mut dirty,
-    ) else {
-        panic!("identical-geometry frames must take the row-damage path");
-    };
-    assert!(!d.rain_changed, "settled quads must not set rain_changed");
-    assert!(d.rain_add_changed, "a moved halo must set rain_add_changed");
-    assert!(!d.is_gate_hit());
+    let prev = frame(&tiles, &settled, &halos);
+    let cur = frame(&tiles, &settled, &[halo(5, 0, 80, 8, 16, 0x0010_2010)]);
+    let (d, rows) = marked(&prev, &cur);
+    assert!(!d.fx_changed, "settled cells must not set fx_changed");
+    assert!(
+        d.rain_add_changed && !d.is_gate_hit(),
+        "a moved halo must repaint"
+    );
     assert_eq!(
-        marked(&dirty),
+        rows,
         vec![4, 5],
         "a moved halo must mark exactly its prev∪cur rows"
     );
 }
 
-fn rows_of(quads: &[SpriteQuad]) -> std::collections::BTreeMap<u16, Vec<SpriteQuad>> {
-    let mut rows = std::collections::BTreeMap::<u16, Vec<SpriteQuad>>::new();
-    for q in quads {
-        rows.entry(q.row).or_default().push(*q);
+fn rows_of(cells: &[RainCell]) -> BTreeMap<u16, Vec<RainCell>> {
+    let mut rows = BTreeMap::<u16, Vec<RainCell>>::new();
+    for c in cells {
+        rows.entry(c.row).or_default().push(*c);
     }
     rows
 }
@@ -515,16 +506,19 @@ fn rain_marking_conforms_to_the_rain_band_containment_model() {
     };
     let mut term = Terminal::new(rows as u16, COLS as u16);
     term.process(b"\x1b[?25l"); // hidden cursor: no cursor rows in the dirty set
-    let glyph = |row: i64, window: i64| ((row * 3 + window * 5) % 8) as u16;
-    let mut column = |lit: std::ops::RangeInclusive<i64>, window: i64| {
-        let mut input = term.cell_frame(rows, COLS);
-        input.rain_quads = lit
-            .filter(|&r| r < viewport)
-            .map(|r| band_quad(r as u16, 8, 8, 16, glyph(r, window) * 8, 0))
-            .collect();
-        input
+    let tiles = baker(8, 16);
+    // The same tiles under the next version (`vb`): a re-bake of one glyph.
+    let mut rebaked = baker(8, 16);
+    assert!(rebaked.rebake_tiles(&rom::rasterize_master(), 1));
+    assert_ne!(rebaked.version(), tiles.version());
+    let mut rain = RainLayers::default();
+    let glyph = |row: i64, window: i64| ((row * 3 + window * 5) % 8) as u8;
+    let column = |lit: std::ops::RangeInclusive<i64>, window: i64| -> Vec<RainCell> {
+        lit.filter(|&r| r < viewport)
+            .map(|r| rain_cell(r as u16, 1, glyph(r, window), (8, 16)))
+            .collect()
     };
-    let (mut marked_rows, mut separating) = (0usize, 0usize);
+    let (mut marked_rows, mut separating, mut rebuilt) = (0usize, 0usize, 0usize);
     for head in 2..=viewport + 2 {
         let headed = pick(&model.init_state(), "PickHead", "head", head)
             .unwrap_or_else(|| panic!("PickHead cannot reach head = {head}"));
@@ -533,10 +527,21 @@ fn rain_marking_conforms_to_the_rain_band_containment_model() {
                 assert!(head - l >= viewport, "only an off-screen tail is refused");
                 continue;
             };
-            for mt in 0..=1i64 {
-                let ticked = pick(&trailed, "PickTick", "mt", mt).expect("both ticks");
-                let prev = column(head - l..=head - 1, 0);
-                let cur = column(head - l + 1..=head, mt);
+            for (mt, vb) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+                let ticked = model
+                    .successors("PickTick", &trailed)
+                    .into_iter()
+                    .find(|s| s.get("mt") == Some(&mt) && s.get("vb") == Some(&vb))
+                    .expect("every tick");
+                let (was_cells, now_cells) = (
+                    column(head - l..=head - 1, 0),
+                    column(head - l + 1..=head, mt),
+                );
+                let mut prev = term.cell_frame(rows, COLS);
+                rain.publish(&was_cells, &tiles, &mut prev.fx_layers);
+                let mut cur = term.cell_frame(rows, COLS);
+                let now_tiles = if vb == 1 { &rebaked } else { &tiles };
+                rain.publish(&now_cells, now_tiles, &mut cur.fx_layers);
                 let mut dirty = Vec::new();
                 let DirtyDecision::Rows(_) = compute_dirty_rows(
                     &prev,
@@ -550,7 +555,7 @@ fn rain_marking_conforms_to_the_rain_band_containment_model() {
                 ) else {
                     panic!("identical-geometry frames must take the row-damage path");
                 };
-                let (was, now) = (rows_of(&prev.rain_quads), rows_of(&cur.rain_quads));
+                let (was, now) = (rows_of(&was_cells), rows_of(&now_cells));
                 for r in head - l..=head.min(viewport - 1) {
                     let probed = pick(&ticked, "PickRow", "r", r).expect("a visible band row");
                     let row = r as u16;
@@ -561,9 +566,10 @@ fn rain_marking_conforms_to_the_rain_band_containment_model() {
                     assert_eq!(
                         model.successors("Mark", &probed),
                         vec![after.clone()],
-                        "row {r} of head={head} l={l} mt={mt}: the real verdict is not the \
-                         model's Mark (dirty={dirty:?})"
+                        "row {r} of head={head} l={l} mt={mt} vb={vb}: the real verdict is \
+                         not the model's Mark (dirty={dirty:?})"
                     );
+                    rebuilt += usize::from(after["marked"] == 1 && after["changed"] == 0);
                     if buggy.successors("Mark", &probed) != vec![after] {
                         separating += 1;
                     }
@@ -579,6 +585,10 @@ fn rain_marking_conforms_to_the_rain_band_containment_model() {
     assert!(
         separating > 0,
         "the lattice must reach rows the Buggy = 1 marker decides differently"
+    );
+    assert!(
+        rebuilt > 0,
+        "the lattice must reach rows a re-bake rebuilds with the same cells ({rebuilt})"
     );
 }
 
@@ -612,7 +622,18 @@ fn real_rain_emission_leaves_no_changed_row_unmarked() {
         base.default_bg,
         1,
     );
-    let (mut prev, mut changed_total, mut row_frames) = (base.clone(), 0usize, 0usize);
+    let mut rain = RainLayers::default();
+    let mut cells = Vec::new();
+    // The cells that draw: a cell whose glyph is not baked yet draws nothing.
+    let drawn = |cells: &[RainCell], tiles: &RainBaker| -> Vec<RainCell> {
+        cells
+            .iter()
+            .filter(|c| c.alpha > 0 && tiles.tile(c.glyph).is_some())
+            .copied()
+            .collect()
+    };
+    let (mut prev, mut prev_cells, mut prev_version) = (base.clone(), Vec::new(), 0u64);
+    let (mut changed_total, mut row_frames) = (0usize, 0usize);
     for tick in 0..240u64 {
         engine.note_activity(tick + 1);
         engine.advance_ms(33);
@@ -620,10 +641,10 @@ fn real_rain_emission_leaves_no_changed_row_unmarked() {
         engine.emit(
             geom,
             &RainTickInput::default(),
-            &mut cur.rain_quads,
+            &mut cells,
             &mut cur.rain_add,
         );
-        cur.rain_atlas = engine.rain_atlas();
+        rain.publish(&cells, engine.baker(), &mut cur.fx_layers);
         let mut dirty = Vec::new();
         if let DirtyDecision::Rows(_) = compute_dirty_rows(
             &prev,
@@ -636,9 +657,9 @@ fn real_rain_emission_leaves_no_changed_row_unmarked() {
             &mut dirty,
         ) {
             row_frames += 1;
-            let rebaked = prev.rain_atlas.as_ref().map(Arc::as_ptr)
-                != cur.rain_atlas.as_ref().map(Arc::as_ptr);
-            let (was, now) = (rows_of(&prev.rain_quads), rows_of(&cur.rain_quads));
+            let rebaked = prev_version != engine.atlas_version();
+            let now_cells = drawn(&cells, engine.baker());
+            let (was, now) = (rows_of(&prev_cells), rows_of(&now_cells));
             for row in was.keys().chain(now.keys()) {
                 if rebaked || was.get(row) != now.get(row) {
                     changed_total += 1;
@@ -650,6 +671,8 @@ fn real_rain_emission_leaves_no_changed_row_unmarked() {
             }
         }
         prev = cur;
+        prev_cells = drawn(&cells, engine.baker());
+        prev_version = engine.atlas_version();
     }
     assert!(row_frames > 0, "the downpour must take the row-damage path");
     assert!(changed_total > 0, "the downpour must actually change rows");

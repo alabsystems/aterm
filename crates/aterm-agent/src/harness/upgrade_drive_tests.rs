@@ -2506,6 +2506,7 @@ fn drive(dir: &Path) -> Opts {
         home: dir.join("home"),
         state: dir.join("state"),
         sock: Some(dir.join("no.sock").to_string_lossy().into_owned()),
+        token: None,
         only_sid: None,
         dry_run: false,
         human_grace_s: 120,
@@ -26969,4 +26970,160 @@ fn a_bounded_reader_requires_complete_successful_utf8_evidence() {
     assert_eq!(read("printf '\\377'", 64), None);
     assert_eq!(read("printf ''", 0).as_deref(), Some(""));
     assert_eq!(read("printf 'x'", 0), None);
+}
+
+/// The token [`token_server`] closes a connection on after reading its first line, writing
+/// nothing: the connection a refusal closed before its `ERR auth` could be read.
+#[cfg(unix)]
+const CLOSED_TOKEN: &str = "closed-tok";
+
+/// A control server at `<dir>/a.sock` with `beside-tok` beside it, serving one connection after
+/// another until one presents `stop` ([`token_server_seen`]): a connection whose `AUTH` names
+/// `refused` is answered `ERR auth` and closed at its first line, as a seamless successor that
+/// rebound the socket answers the window's old token; one that names [`CLOSED_TOKEN`] is closed
+/// at its first line with nothing written; every other line is answered `ERR busy` when it asks
+/// for the hand and `OK` otherwise. It sends what it was sent, `(token, line)` in order.
+#[cfg(unix)]
+fn token_server(
+    dir: &Path,
+    refused: &'static str,
+) -> (String, std::sync::mpsc::Receiver<Vec<(String, String)>>) {
+    use std::io::BufRead as _;
+    let names = aterm_types::control_socket::token_names_for_sock("a.sock");
+    std::fs::write(dir.join(&names[0]), "beside-tok\n").expect("the token beside the socket");
+    let sock = dir.join("a.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        while let Ok((stream, _)) = listener.accept() {
+            let mut w = stream.try_clone().expect("clone");
+            let mut r = std::io::BufReader::new(stream);
+            let mut auth = String::new();
+            let _ = r.read_line(&mut auth);
+            let token = auth.trim_end().trim_start_matches("AUTH ").to_string();
+            if token == "stop" {
+                break;
+            }
+            loop {
+                let mut line = String::new();
+                if r.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                let line = line.trim_end().to_string();
+                seen.push((token.clone(), line.clone()));
+                if token == CLOSED_TOKEN {
+                    break;
+                }
+                if token == refused {
+                    let _ = w.write_all(b"ERR auth\n");
+                    break;
+                }
+                let reply: &[u8] = if line.contains(" lease acquire ") {
+                    b"ERR busy\n"
+                } else {
+                    b"OK\n"
+                };
+                let _ = w.write_all(reply);
+            }
+        }
+        let _ = tx.send(seen);
+    });
+    (sock.to_string_lossy().into_owned(), rx)
+}
+
+/// What [`token_server`] at `sock` was sent, once a last connection tells it to stop.
+#[cfg(unix)]
+fn token_server_seen(
+    sock: &str,
+    rx: &std::sync::mpsc::Receiver<Vec<(String, String)>>,
+) -> Vec<(String, String)> {
+    let mut stop = std::os::unix::net::UnixStream::connect(sock).expect("the server");
+    stop.write_all(b"AUTH stop\n").expect("stop");
+    drop(stop);
+    rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .expect("the server read every connection")
+}
+
+/// The window's drive presents the harness's own token on the window's socket, probed once with
+/// `version`, so what it types reads `by=harness`; a refused token, answered `ERR auth` or with
+/// the connection closed and nothing written, is replaced once by the one beside the socket, and
+/// the request after it goes once, on that connection. With no token the token beside the socket
+/// goes, unprobed, as it always did, and so it does on any other socket.
+#[cfg(unix)]
+#[test]
+fn the_window_drive_presents_the_harness_token_and_falls_back_beside_once() {
+    let dir = scratch("harness-token");
+    let (sock, server) = token_server(&dir, "stale-tok");
+    let pair = |t: &str, l: &str| (t.to_string(), l.to_string());
+    let memory = HarnessToken::new("memory-tok");
+    let mut c = harness_client(&sock, Some(&memory)).expect("the harness's connection");
+    c.request_line("@s-1 send x").expect("sent");
+    drop(c);
+    let stale = HarnessToken::new("stale-tok");
+    let mut c = harness_client(&sock, Some(&stale)).expect("the fallback's connection");
+    c.request_line("@s-1 send y").expect("sent");
+    drop(c);
+    let closed = HarnessToken::new(CLOSED_TOKEN);
+    let mut c = harness_client(&sock, Some(&closed)).expect("the closed connection's fallback");
+    c.request_line("@s-1 send u").expect("sent");
+    drop(c);
+    let mut c = harness_client(&sock, None).expect("the CLI's connection");
+    c.request_line("@s-1 send z").expect("sent");
+    drop(c);
+    let opts = Opts {
+        sock: Some(sock.clone()),
+        token: Some(memory.clone()),
+        ..drive(&dir)
+    };
+    let mut c = connect(&opts, "s-1").expect("the sweep's connection");
+    c.request_line("@s-1 send v").expect("sent");
+    drop(c);
+    let elsewhere = Opts {
+        sock: Some(dir.join("other.sock").to_string_lossy().into_owned()),
+        ..opts.clone()
+    };
+    let mut c = connect_at(&elsewhere, &sock).expect("another socket's connection");
+    c.request_line("@s-1 send w").expect("sent");
+    drop(c);
+    let typed = super::super::disk::type_resume(&sock, Some(&memory), "s-1", "carry on");
+    assert_eq!(typed, "wait:held", "the hand was refused");
+    let typed = super::super::disk::type_resume(&sock, None, "s-1", "carry on");
+    assert_eq!(typed, "wait:held", "the hand was refused");
+    let seen = token_server_seen(&sock, &server);
+    let lease = format!("@s-1 {}", hand_take_request());
+    assert_eq!(
+        seen,
+        [
+            pair("memory-tok", "version"),
+            pair("memory-tok", "@s-1 send x"),
+            pair("stale-tok", "version"),
+            pair("beside-tok", "@s-1 send y"),
+            pair(CLOSED_TOKEN, "version"),
+            pair("beside-tok", "@s-1 send u"),
+            pair("beside-tok", "@s-1 send z"),
+            pair("memory-tok", "version"),
+            pair("memory-tok", "@s-1 send v"),
+            pair("beside-tok", "@s-1 send w"),
+            pair("memory-tok", "version"),
+            pair("memory-tok", &lease),
+            pair("beside-tok", &lease),
+        ]
+    );
+}
+
+/// The harness's token is never printed with the sweep's options.
+#[test]
+fn the_harness_token_is_never_in_the_options_debug() {
+    let dir = scratch("harness-token-debug");
+    let opts = Opts {
+        token: Some(HarnessToken::new("QZP6SECRET7")),
+        ..drive(&dir)
+    };
+    let shown = format!("{opts:?}");
+    assert!(!shown.contains("QZP6SECRET7"), "{shown}");
+    assert!(
+        shown.contains("token: Some(HarnessToken(redacted))"),
+        "{shown}"
+    );
 }

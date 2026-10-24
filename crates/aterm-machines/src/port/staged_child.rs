@@ -111,7 +111,6 @@ fn signal_owned(child: &mut Child) {
     let _ = child.kill();
 }
 
-/// Reuse the existing reaper while retaining the exact Child object.
 fn to_reaper(mut child: Child) {
     aterm_uds::reaper::hand_off(move || matches!(child.try_wait(), Ok(Some(_))));
 }
@@ -218,7 +217,6 @@ impl Drop for LiveStaged {
     }
 }
 
-/// One inherited pipe endpoint, duplicated and kept alive through poll/read.
 struct StartPipe {
     fd: std::os::fd::OwnedFd,
     flags: i32,

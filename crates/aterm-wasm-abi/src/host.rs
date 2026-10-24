@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The JS calls a module makes, as raw `aterm_host` imports the generated glue provides: the two
-//! the panic hook needs, the two browser clocks and `object_drop`.
+//! the panic hook needs, browser clocks and entropy, and `object_drop`.
 
 use crate::panic_hook::Console;
 
@@ -16,6 +16,8 @@ unsafe extern "C" {
     safe fn host_performance_now() -> f64;
     #[link_name = "date_now"]
     safe fn host_date_now() -> f64;
+    #[link_name = "random_fill"]
+    fn host_random_fill(ptr: *mut u8, len: usize) -> u32;
     #[link_name = "object_drop"]
     safe fn host_object_drop(index: u32);
 }
@@ -50,6 +52,15 @@ pub fn performance_now() -> f64 {
 #[must_use]
 pub fn date_now() -> f64 {
     host_date_now()
+}
+
+/// Fill bytes using the browser CSPRNG. Missing Web Crypto, invalid bounds or a
+/// host exception returns false; callers must discard the entire buffer on failure.
+#[must_use]
+pub fn random_fill(bytes: &mut [u8]) -> bool {
+    // SAFETY: `bytes` is writable for its full length until the synchronous host returns;
+    // the glue bounds-checks the view and writes only that range of this module's memory.
+    unsafe { host_random_fill(bytes.as_mut_ptr(), bytes.len()) == 1 }
 }
 
 /// Release slot `index` of the glue's object table (a dropped [`crate::js::JsObject`]).

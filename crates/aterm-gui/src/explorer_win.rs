@@ -50,8 +50,7 @@ fn set_string(hk: Hkey, name: Option<&str>, value: &str) -> io::Result<()> {
     let name_w = name.map(wide);
     let name_ptr = name_w.as_ref().map_or(ptr::null(), |w| w.as_ptr());
     let cb = (data.len() * std::mem::size_of::<u16>()) as u32;
-    // SAFETY: `hk` is an open key; `data`/`name_w` outlive the call; `cb` is the byte
-    // length of the NUL-terminated UTF-16 buffer, as REG_SZ requires.
+    // SAFETY: `hk` is an open key; `data`/`name_w` outlive the call; `cb` is the byte length of the NUL-terminated UTF-16 buffer, as REG_SZ requires.
     let rc = unsafe { RegSetValueExW(hk, name_ptr, 0, REG_SZ, data.as_ptr().cast::<u8>(), cb) };
     if rc != 0 {
         return Err(io::Error::from_raw_os_error(rc));
@@ -59,10 +58,6 @@ fn set_string(hk: Hkey, name: Option<&str>, value: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Build the verb's registry command line: `"<exe>" -d "<token>."`.
-///
-/// The trailing dot prevents a drive root (`C:\`) from escaping the closing quote under MSVCRT
-/// argv rules.
 fn verb_command(exe: &str, token: &str) -> String {
     format!("\"{exe}\" -d \"{token}.\"")
 }

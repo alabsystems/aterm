@@ -1,8 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `status` over a fake channel: a head past its horizon is still described (verified but for
-//! that horizon, and marked LAPSED), while a quad the client chain does not accept is refused.
+//! `status` over a fake channel.
 
 use atpkg_publish::channel::status;
 use atpkg_publish::testkit::Keys;
@@ -35,8 +34,6 @@ fn a_lapsed_head_is_described_and_marked_lapsed() {
     assert!(!lines.iter().any(|l| l.contains("LAPSED")), "{lines:?}");
 }
 
-/// Setting the horizon aside sets nothing else aside: a quad signed under another master
-/// is refused, lapsed or not.
 #[test]
 fn a_foreign_quad_is_refused_whatever_its_horizon() {
     let rig = Rig::new("status-foreign");
@@ -52,9 +49,6 @@ fn a_foreign_quad_is_refused_whatever_its_horizon() {
     }
 }
 
-/// The live head's legacy codex row is said as what it is — carried, with every client on
-/// its vendor lane until an explicit pin — never as drift the next publish would overwrite;
-/// a head whose row is ALab's already is said as nothing at all.
 #[test]
 fn the_live_codex_row_is_said_carried_not_drift() {
     let rig = Rig::new("status-codex");

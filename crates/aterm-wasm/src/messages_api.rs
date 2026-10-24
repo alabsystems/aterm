@@ -4,6 +4,7 @@
 //! Message band bindings on [`WebTerminal`].
 
 use std::collections::{BTreeSet, VecDeque};
+use std::sync::{Arc, OnceLock};
 
 use aterm_core::render::{HostRowPixels, RenderInput};
 use aterm_core::terminal::RenderCell;
@@ -21,6 +22,20 @@ use aterm_render::ChromeBleed;
 use aterm_time::Instant;
 
 use crate::WebTerminal;
+
+// Restoring a log or opening another terminal must not reset the module's source.
+fn new_center(log: MessageLog, now: Instant) -> MessageCenter {
+    static SOURCE: OnceLock<Arc<aterm_messages::ConfirmationSource>> = OnceLock::new();
+    let source = SOURCE.get_or_init(|| {
+        #[cfg(target_arch = "wasm32")]
+        let source =
+            aterm_messages::ConfirmationSource::from_entropy(aterm_wasm_abi::host::random_fill);
+        #[cfg(not(target_arch = "wasm32"))]
+        let source = aterm_messages::ConfirmationSource::new(None);
+        Arc::new(source)
+    });
+    MessageCenter::with_confirmations(log, now, Arc::clone(source))
+}
 
 const POOL_CAP: usize = MAX_ROWS as usize;
 
@@ -164,7 +179,7 @@ impl WebBand {
             cyan: hue(6),
         };
         Self {
-            center: MessageCenter::new(MessageLog::default(), now),
+            center: new_center(MessageLog::default(), now),
             gate: WireGate::default(),
             motion_ok: true,
             visible: true,
@@ -339,7 +354,7 @@ impl WebBand {
     /// native golden anchors its center the same way).
     #[cfg(test)]
     pub(crate) fn reset_at(&mut self, t0: Instant) {
-        self.center = MessageCenter::new(MessageLog::default(), t0);
+        self.center = new_center(MessageLog::default(), t0);
         self.gate = WireGate::default();
         self.now = t0;
         self.restored = false;
@@ -887,7 +902,7 @@ impl WebTerminal {
         let mut log = MessageLog::empty();
         log.replay_all(kept.lines);
         let replaced = self.band.center.revision();
-        self.band.center = MessageCenter::new(log, now);
+        self.band.center = new_center(log, now);
         self.band.center.follow_revision(replaced);
         self.band.now = now;
         self.band.restored = true;
@@ -1106,11 +1121,19 @@ mod tests {
         (field("rev="), field("total="))
     }
 
-    fn drawn_pet_body(frame: &RenderInput, m: BandMetrics) -> Option<(f32, f32, f32, f32)> {
+    /// The pet's art at cell height `cell_h`, `(w, h)` texels: what tells its
+    /// sprite from a word cat's.
+    fn pet_art_size(cell_h: usize) -> (u16, u16) {
         use aterm_effects::kitty_pet::{ART_ASPECT, ART_ROWS};
-        let nat_h = (ART_ROWS * m.cell_h as f32).round();
-        let nat = ((nat_h * ART_ASPECT).round() as u16, nat_h as u16);
-        let s = frame.free_sprites.iter().find(|s| (s.aw, s.ah) == nat)?;
+        let h = (ART_ROWS * cell_h as f32).round();
+        ((h * ART_ASPECT).round() as u16, h as u16)
+    }
+
+    fn drawn_pet_body(frame: &RenderInput, m: BandMetrics) -> Option<(f32, f32, f32, f32)> {
+        let nat = pet_art_size(m.cell_h);
+        let s = aterm_render::sprites::published(&frame.fx_layers)
+            .into_iter()
+            .find(|s| (s.art.w(), s.art.h()) == nat)?;
         let x0 = m.pad as f32 + s.x as f32;
         let y0 = m.grid_top as f32 + s.y as f32;
         Some((x0, x0 + f32::from(s.w), y0, y0 + f32::from(s.h)))

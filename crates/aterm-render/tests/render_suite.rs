@@ -5,6 +5,8 @@
 
 #[path = "common/alone.rs"]
 mod alone;
+#[path = "common/sprites.rs"]
+mod sprites;
 
 mod anchor_reuse;
 mod asymmetric_pad_layout;
@@ -12,7 +14,6 @@ mod band_seam_clearance;
 mod bg_base_elision;
 mod bg_fill_count;
 mod burst_companion_reads;
-mod cat_sprites;
 mod combining_stack;
 mod companion_knock_out;
 mod contrast_floor;
@@ -67,6 +68,8 @@ mod sealed_never_consults_coverage_index;
 mod selection_highlight;
 mod set_px_rerasterizes;
 mod shade_phase;
+mod sprite_layer_laws;
+mod sprite_oracle;
 mod styled_faces;
 mod synthetic_symbols;
 mod text_blending;

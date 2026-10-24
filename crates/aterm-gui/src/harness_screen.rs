@@ -2889,7 +2889,10 @@ fn ai_product_for_name(name: &str) -> Option<&'static str> {
     match lower.as_str() {
         "claude" | "claude-code" => Some("Claude Code"),
         "codex" | "codex-cli" => Some("Codex"),
+        "codex-alab" => Some("codex-alab"),
         "agy" | "antigravity" | "antigravity-cli" => Some("Antigravity CLI"),
+        "grok" | "grok-build" | "grok build" => Some("Grok"),
+        "kimi" | "kimi-code" | "kimi-cli" | "kimi code" => Some("Kimi Code"),
         "muse" | "muse-code" => Some("Muse Code"),
         "gemini" | "gemini-cli" => Some("Gemini CLI"),
         _ => None,

@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The sinks: [`ScaledSink`] is the renderer's own pixel arithmetic, bit for bit, and [`PointSink`]
-//! carries every point the segment stream is built from, so the TrueType and CFF contour rules
-//! rebuild that stream from it.
+//! Tests for [`ScaledSink`] and [`PointSink`] contour reconstruction.
 
 use aterm_font::{Face, GlyphId, OutlineSink, PointKind, PointSink, ScaledSink, Tag};
 
@@ -18,7 +16,6 @@ enum Seg {
 }
 
 impl Seg {
-    /// Exact bits, so `-0.0` and `0.0` differ.
     fn bits(self) -> Vec<u32> {
         let v: Vec<f32> = match self {
             Seg::M(x, y) | Seg::L(x, y) => vec![0.0, x, y],
@@ -72,9 +69,6 @@ fn face_bytes(rel: &str) -> Vec<u8> {
     std::fs::read(&path).unwrap_or_else(|e| panic!("committed face {path}: {e}"))
 }
 
-/// The TrueType contour rule (implied on-curve midpoints between adjacent
-/// off-curve points, an implicit closing segment), written out again from
-/// the spec: what a stored point stream draws.
 fn truetype_segments(contours: &[Vec<(f32, f32, PointKind)>]) -> (Vec<Seg>, Vec<bool>) {
     let mid = |a: (f32, f32), b: (f32, f32)| (a.0 + 0.5 * (b.0 - a.0), a.1 + 0.5 * (b.1 - a.1));
     let mut out = Vec::new();
@@ -146,9 +140,6 @@ fn truetype_segments(contours: &[Vec<(f32, f32, PointKind)>]) -> (Vec<Seg>, Vec<
     (out, implied)
 }
 
-/// `got` rebuilds `want`: the same segments, every stored point's bits, and
-/// each implied midpoint (`implied[i]`: segment `i` ends on one) to 1e-5
-/// relative. Returns how many midpoints differed in their bits.
 fn rebuilds(want: &[Seg], got: &[Seg], implied: &[bool]) -> Option<usize> {
     if want.len() != got.len() {
         return None;
@@ -178,8 +169,6 @@ fn rebuilds(want: &[Seg], got: &[Seg], implied: &[bool]) -> Option<usize> {
     Some(rounded)
 }
 
-/// The CFF contour rule: cubic control pairs, then the curve's end; a
-/// contour's last point left out when it repeats the start.
 fn cff_segments(contours: &[Vec<(f32, f32, PointKind)>]) -> Vec<Seg> {
     let mut out = Vec::new();
     for contour in contours {
@@ -221,8 +210,6 @@ fn cff_segments(contours: &[Vec<(f32, f32, PointKind)>]) -> Vec<Seg> {
     out
 }
 
-/// The segment stream with each contour's explicit closing line (a `line_to`
-/// back to the contour's start) left implicit, as the point stream leaves it.
 fn without_closing_lines(segs: &[Seg]) -> Vec<Seg> {
     let mut out: Vec<Seg> = Vec::new();
     let mut start = None;
@@ -238,9 +225,6 @@ fn without_closing_lines(segs: &[Seg]) -> Vec<Seg> {
     out
 }
 
-/// Every glyph's point stream rebuilds its segment stream: TrueType points
-/// by the TrueType rule (default instance and a `gvar` instance), CFF points
-/// by the CFF rule.
 #[test]
 fn points_rebuild_the_outline() {
     let mut rebuilt = 0usize;
@@ -300,8 +284,6 @@ fn points_rebuild_the_outline() {
     assert!(rebuilt > 1000, "only {rebuilt} outlines rebuilt");
 }
 
-/// `ScaledSink` is the renderer's arithmetic exactly: `x * s, y * s` for the
-/// y-up pixel outline, `x * s - left, top - y * s` for a y-down ink box.
 #[test]
 fn scaled_sink_is_the_renderers_arithmetic() {
     let bytes = face_bytes("assets/bundled/JetBrainsMono-Regular.ttf");

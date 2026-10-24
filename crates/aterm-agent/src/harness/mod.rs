@@ -29,6 +29,7 @@ pub mod flight;
 pub mod footer;
 pub mod headless_oauth;
 pub mod lanes;
+pub mod laps;
 pub mod lights;
 pub mod login_latch;
 pub mod netwatch;

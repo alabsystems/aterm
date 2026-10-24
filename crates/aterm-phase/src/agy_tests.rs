@@ -36,7 +36,7 @@ fn left(text: &str) -> bool {
 }
 
 fn unnamed(text: &str) -> bool {
-    left(text) || text == lab::SPLIT_HALF
+    left(text) || text == lab::SPLIT_HALF || text == crate::agy::fixtures::LAUNCH_LINE
 }
 
 fn captures() -> Vec<(String, String)> {
@@ -1405,6 +1405,54 @@ fn every_panel_row_and_every_count_shows_background_work() {
     ] {
         assert_eq!(background_shown(&rows), None, "{name}");
     }
+    for activity in [
+        "Reading file · 4m36s",
+        "Reading page · 12s",
+        "Running command · 4m39s",
+        "Sending message · 2s",
+        "Finding files · 5s",
+        "Searching web · 8s",
+        "Editing files · 1m12s",
+        "Using browser · 15s",
+    ] {
+        let active: Vec<String> = screen(lab::BG_SUBAGENT)
+            .iter()
+            .map(|r| {
+                r.replace("Working · 1s", activity)
+                    .replace(" · 1 subagent(s)", "")
+            })
+            .collect();
+        assert_eq!(
+            background_shown(&active),
+            Some(SUBAGENT_WORKING),
+            "{activity}"
+        );
+        assert_eq!(
+            background_wait(&active),
+            Some(SUBAGENT_WORKING),
+            "{activity}"
+        );
+        assert_eq!(phase(&active), (Phase::Busy, true), "{activity}");
+    }
+    let rows = screen(lab::BG_SUBAGENT);
+    let f = frame(&rows).expect("frame");
+    let (first, close) = panel_bounds_under(&rows, f.bottom).expect("panel bounds");
+    assert_eq!(first, f.bottom + 1);
+    assert!(rows[first].contains("● Agent("), "{:?}", rows[first]);
+    assert_eq!(
+        plain_rule_width(&rows[close]),
+        plain_rule_width(&rows[f.bottom])
+    );
+    assert_eq!(
+        unwrap_agent_token("Agent(self: Cursor Trail Rendering Engineer)"),
+        Some("Cursor Trail Rendering Engineer")
+    );
+    assert_eq!(
+        unwrap_agent_token("Agent(research: Codebase Researcher)"),
+        Some("research: Codebase Researcher")
+    );
+    assert_eq!(unwrap_agent_token("Agent(explore)"), Some("explore"));
+    assert_eq!(unwrap_agent_token("Agent()"), None);
 }
 
 #[test]
@@ -1617,6 +1665,29 @@ fn a_failed_turn_is_a_wall_by_the_status_the_api_answered() {
         assert!(r.phase_authoritative, "{what}");
     }
     assert_eq!(agy(ERROR_TURN).wall, None, "no status: the control");
+    for msg in [
+        "⚠ There was a network issue connecting to the server, please try again.",
+        "⚠ agent executor error: fetch failed (ENOTFOUND)",
+        "⚠ agent executor error: connection refused",
+    ] {
+        let net = edited(&screen(ERROR_TURN), "⚠ failed to construct", msg);
+        let r = read(Some("agy"), &net, None);
+        assert_eq!(
+            (r.phase, r.phase_authoritative),
+            (Phase::Idle, true),
+            "{msg}"
+        );
+        assert!(!r.fresh, "{msg}");
+        assert_eq!(
+            r.wall.map(|w| w.kind),
+            Some(WallKind::ApiError {
+                code: None,
+                retryable: true,
+                cause: ApiCause::Unreachable,
+            }),
+            "{msg}"
+        );
+    }
 
     let swap = |text: &str, from: &str, to: &str| -> Vec<String> {
         let rows = screen(text);
@@ -2204,4 +2275,21 @@ fn a_persons_paragraphs_are_bounded_by_the_messages_cells() {
 
 fn caret_of(rows: &[String]) -> usize {
     message_blanks(rows).expect("a message").0
+}
+
+#[test]
+fn agy_usage_card_weekly_parses_gemini_and_third_party_rows() {
+    let mut rows = screen(lab::IDLE);
+    let top = composer(&rows).expect("composer") - 1;
+    rows.insert(
+        top,
+        "  Gemini Models          Weekly Limit Remaining     78%   2026-10-29 09:31 PDT".to_owned(),
+    );
+    rows.insert(
+        top + 1,
+        "  Claude and GPT models  Weekly Limit Remaining     100%  2026-10-31 00:51 PDT".to_owned(),
+    );
+    let gemini = usage_card_weekly(&rows).expect("gemini weekly");
+    assert_eq!(gemini.text, "weekly 78% left");
+    assert_eq!(gemini.reset.as_deref(), Some("2026-10-29 09:31 PDT"));
 }

@@ -6718,6 +6718,7 @@ impl Acting {
                 program_check: Acts::inert().program_check,
                 occupancy: Acts::inert().occupancy,
                 occupancy_pace: Acts::inert().occupancy_pace,
+                task_fact: Acts::inert().task_fact,
                 resume: Arc::new(move |_, _, carry: CarryPoint| {
                     a9.landing.lock().unwrap().push(carry.land);
                     a9.onlys.lock().unwrap().push(carry.only);
@@ -6804,6 +6805,7 @@ impl Acting {
                         ..snap(sid)
                     })
                 }),
+                point_read: INERT_POINT_READ,
                 follow: Arc::new(move |sid, kept| {
                     let at = a7.agent_in(sid).map_or(snap(sid).shell, |(pid, _)| pid);
                     let fg = relaunch::foreground(kept, i64::from(at));
@@ -15352,6 +15354,19 @@ fn a_worker_measures_the_default_route_only_and_reads_it_once_per_agent() {
     codex.kept.lock().unwrap().snapshot = Some(snapshot(4545));
     assert_eq!(codex.reach(), Reach::Unknown);
     assert_eq!(*routes.lock().unwrap(), [4242, 4343, 4343]);
+    for (agent, pid) in [
+        (Program::Agy, 4646),
+        (Program::Muse, 4747),
+        (Program::Gemini, 4848),
+    ] {
+        let h = host(agent);
+        h.kept.lock().unwrap().snapshot = Some(snapshot(pid));
+        assert!(matches!(h.reach(), Reach::Down { .. }), "{agent:?}");
+    }
+    assert_eq!(
+        *routes.lock().unwrap(),
+        [4242, 4343, 4343, 4646, 4747, 4848]
+    );
     net.stop();
 }
 
@@ -15527,6 +15542,83 @@ fn a_fact_lines_pace_is_refused_where_the_worker_takes_no_step() {
     let swept = door_worker(Program::Claude, Due::No, &asked);
     with_kept_of(&swept.kept, |k| k.carry_asked = true);
     assert_eq!(pace(&swept), PaceGrant::Granted);
+}
+
+/// THE GUI'S OWN GATE ON THE TASK DOOR (the occupancy design's manager door, plan 2.4): a
+/// worker's fact word reaches its session's task record only while the owner's mode in force here
+/// is `prompt`; under `observe` and `off` the worker answers `Closed` and the act is never called,
+/// whatever word the loop asked with. NEGATIVE CONTROL: under `prompt` the same call reaches the
+/// act, with the session's own sid and the word as asked.
+#[test]
+fn a_workers_task_fact_is_refused_unless_the_owners_mode_here_is_prompt() {
+    use aterm_agent::supervise::Occupancy;
+    use aterm_agent::supervise::occupancy::{FactWord, NoteOutcome, RuleId};
+    let asked: Arc<Mutex<Vec<String>>> = Arc::default();
+    let mut hooks = hooks(
+        &Arc::new(World::default()),
+        Arc::new(|_: &WorkerJob| BodyEnd::Stopped),
+    );
+    let seen = Arc::clone(&asked);
+    hooks.acts = Acts {
+        task_fact: Arc::new(move |sid, word| {
+            let said = word.map_or_else(|| "-".to_string(), FactWord::word);
+            seen.lock().unwrap().push(format!("{sid} {said}"));
+            NoteOutcome::Noted
+        }),
+        ..Acts::inert()
+    };
+    let idle = idle_host("s-door", Program::Claude, switched(&on()), hooks);
+    let word = FactWord::new(RuleId::HoldRoom, 1);
+    assert!(word.is_some());
+    for mode in [Occupancy::Observe, Occupancy::Off] {
+        crate::occupancy_host::set_mode(mode);
+        assert_eq!(idle.task_fact(word), NoteOutcome::Closed, "{mode:?}");
+        assert_eq!(idle.task_fact(None), NoteOutcome::Closed, "{mode:?}");
+    }
+    assert!(
+        asked.lock().unwrap().is_empty(),
+        "{:?}",
+        asked.lock().unwrap()
+    );
+    crate::occupancy_host::set_mode(Occupancy::Prompt);
+    assert_eq!(idle.task_fact(word), NoteOutcome::Noted);
+    assert_eq!(idle.task_fact(None), NoteOutcome::Noted);
+    assert_eq!(
+        *asked.lock().unwrap(),
+        ["s-door hold-room@v1#1", "s-door -"]
+    );
+    crate::occupancy_host::set_mode(Occupancy::Observe);
+}
+
+/// The live task door ([`task_fact_live`]) writes the word on the record of the session with that
+/// sid and answers its outcome; a sid no session of this instance has is `NoTask`, and moves no
+/// record.
+#[test]
+fn the_live_task_fact_marks_the_session_with_that_sid_alone() {
+    use crate::task_record::{TaskMark, TaskState, mark_session_task};
+    use aterm_agent::supervise::occupancy::{FactWord, NoteOutcome, RuleId};
+    let store = crate::session_store::new_store();
+    let handle = crate::session_store::test_handle(31);
+    let sid = handle.sid.as_str().to_string();
+    let ctx = Arc::clone(&handle.ctx);
+    store.write().unwrap().register(handle);
+    let word = FactWord::new(RuleId::WaitNudge, 2);
+    assert_eq!(task_fact_live(&store, &sid, word), NoteOutcome::NoTask);
+    mark_session_task(&ctx, 31, &TaskMark::new(TaskState::Working)).expect("unfenced");
+    assert_eq!(
+        task_fact_live(&store, "s-nobody", word),
+        NoteOutcome::NoTask
+    );
+    let fact = || {
+        let timeline = ctx.timeline.lock().unwrap();
+        let task = timeline.task().expect("a task");
+        (task.fact, task.fact_rev)
+    };
+    assert_eq!(fact(), (None, 0));
+    assert_eq!(task_fact_live(&store, &sid, word), NoteOutcome::Noted);
+    assert_eq!(fact(), (word, 1));
+    assert_eq!(task_fact_live(&store, &sid, None), NoteOutcome::Cleared);
+    assert_eq!(fact(), (None, 2));
 }
 
 #[test]
@@ -27485,7 +27577,7 @@ impl HostedLog {
             tab: sid.clone(),
             session: "c0ffee".to_string(),
             from: "2.1.0".to_string(),
-            to: "2.1.0".to_string(),
+            to: "2.2.0(npm)".to_string(),
             step: step.to_string(),
         };
         live_row(self.store.clone())(&sid, kind, &r);
@@ -27498,6 +27590,20 @@ impl HostedLog {
             .window()
             .filter_map(|r| aterm_slog::encode(r, aterm_slog::Tier::Host).ok())
             .filter(|l| l.contains(" mark - act ") || l.contains(" mark - seen "))
+            .map(|l| {
+                let body = l.split_once(' ').map_or("", |(_, b)| b);
+                body.split(" t=").next().unwrap_or_default().to_string()
+            })
+            .collect()
+    }
+
+    fn labels(&self) -> Vec<String> {
+        let g = self.h.ctx.timeline.lock().unwrap();
+        g.slog()
+            .log()
+            .window()
+            .filter_map(|r| aterm_slog::encode(r, aterm_slog::Tier::Host).ok())
+            .filter(|l| l.contains(" mark - label "))
             .map(|l| {
                 let body = l.split_once(' ').map_or("", |(_, b)| b);
                 body.split(" t=").next().unwrap_or_default().to_string()
@@ -27524,13 +27630,17 @@ fn relaunch_act_line(rule: &str) -> String {
 
 const HARNESS_SEEN: &str = "mark - seen by=harness src=aterm conf=strong";
 
+fn harness_label_line(text: &str) -> String {
+    format!("mark - label text={text} ttl=30 by=harness src=aterm conf=strong")
+}
+
 #[test]
 fn a_hosted_relaunch_lifts_the_failure_it_caused() {
-    for (kind, step) in [
-        ("relaunch", "relaunched"),
-        ("relaunch", "adopted"),
-        ("carry-on-after-update", "done:fresh"),
-        ("upgrade", "done:unconfirmed"),
+    for (kind, step, words) in [
+        ("relaunch", "relaunched", "restarting"),
+        ("relaunch", "adopted", "restarting"),
+        ("carry-on-after-update", "done:fresh", "restarting"),
+        ("upgrade", "done:unconfirmed", "upgrading%20to%202.2.0"),
     ] {
         let tab = HostedLog::relaunched_claude();
         assert_eq!(
@@ -27546,6 +27656,7 @@ fn a_hosted_relaunch_lifts_the_failure_it_caused() {
             tab.acts_and_seen()
         );
         assert_eq!(tab.need(), Some("failure"), "NEGATIVE CONTROL: it stands");
+        assert!(tab.labels().is_empty(), "NEGATIVE CONTROL: no label");
         tab.row(800, kind, step);
         assert_eq!(
             tab.acts_and_seen(),
@@ -27553,6 +27664,11 @@ fn a_hosted_relaunch_lifts_the_failure_it_caused() {
             "{step}"
         );
         assert_eq!(tab.need(), None, "{step}: the relaunch lifted it");
+        assert_eq!(
+            tab.labels(),
+            [harness_label_line(words)],
+            "{kind} {step}: after the seen, the harness's own words"
+        );
         let text = tab.brief();
         assert!(!text.contains("need=failure"), "{step}: {text}");
         assert!(text.contains("acts 1 "), "{step}: {text}");
@@ -27577,12 +27693,17 @@ fn a_hosted_turn_typed_or_stop_lifts_no_failure() {
         want.push(relaunch_act_line(kind));
         assert_eq!(tab.acts_and_seen(), want, "{kind} {step}: its act, no seen");
         assert_eq!(tab.need(), Some("failure"), "{kind} {step}: it stands");
+        assert!(
+            tab.labels().is_empty(),
+            "{kind} {step}: no restart, no label"
+        );
     }
     tab.row(800, "relaunch", "adopted");
     want.push(relaunch_act_line("relaunch"));
     want.push(HARNESS_SEEN.to_string());
     assert_eq!(tab.acts_and_seen(), want, "the restart lifts it");
     assert_eq!(tab.need(), None);
+    assert_eq!(tab.labels(), [harness_label_line("restarting")]);
 }
 
 #[test]
@@ -27605,8 +27726,46 @@ fn a_hosted_restart_beside_a_command_that_ran_no_agent_lifts_nothing() {
         want.push(relaunch_act_line(kind));
         assert_eq!(tab.acts_and_seen(), want, "{kind} {step}: its act, no seen");
         assert_eq!(tab.need(), Some("failure"), "{kind} {step}: make's stands");
+        assert!(
+            tab.labels().is_empty(),
+            "{kind} {step}: under make's failure the harness labels nothing"
+        );
     }
     assert!(tab.brief().contains("need=failure"), "{}", tab.brief());
+}
+
+#[test]
+fn the_harness_labels_a_typed_disk_resume_only_while_no_need_is_open() {
+    let tab = HostedLog::new();
+    tab.block(150, (0, 100, "claude"), None);
+    tab.claude_in_front(160, (0, 100), 300);
+    assert_eq!(tab.need(), None, "PRECONDITION: nothing open");
+    let sid = tab.sid();
+    assert_eq!(
+        disk_resumed(&tab.store, &sid, "wait:held".to_string()),
+        "wait:held"
+    );
+    assert!(
+        tab.labels().is_empty(),
+        "NEGATIVE CONTROL: a resume that typed nothing labels nothing"
+    );
+    tab.ms.store(200, Ordering::SeqCst);
+    assert_eq!(disk_resumed(&tab.store, &sid, "typed".to_string()), "typed");
+    assert_eq!(
+        tab.labels(),
+        [harness_label_line("resuming%20after%20disk")]
+    );
+    let failed = HostedLog::relaunched_claude();
+    assert_eq!(failed.need(), Some("failure"), "PRECONDITION");
+    assert_eq!(
+        disk_resumed(&failed.store, &failed.sid(), "typed".to_string()),
+        "typed"
+    );
+    assert!(
+        failed.labels().is_empty(),
+        "under an open need the harness labels nothing: {:?}",
+        failed.labels()
+    );
 }
 
 /// A tapped session's fresh reading is recorded for the machine's own login (`main`, with no
@@ -28209,6 +28368,7 @@ fn held_at(word: &str, progress: Progress) -> HeldRead {
         unread: false,
         person: None,
         driver: false,
+        carried: false,
     }
 }
 
@@ -29915,6 +30075,149 @@ fn the_store_lists_each_task_record_and_reads_a_judged_workers_screen() {
     );
 }
 
+/// A SCREEN THAT READS AS STARTED STARTS NO CODEX WORKER NO CLAIM CARRIES, and a
+/// codex worker codex-alab may not claim (a halt, Autopilot off) is not judged yet;
+/// every other read, and every other worker's, is the screen's.
+#[test]
+fn an_unclaimed_codex_worker_is_never_started_by_its_screen() {
+    let trust = StartupSeen::Holds(StartupHold::Trust {
+        agent: Program::Codex,
+    });
+    assert_eq!(
+        (
+            unclaimed(StartupSeen::Started, Some(Program::Codex), true),
+            unclaimed(StartupSeen::Started, Some(Program::Claude), true),
+            unclaimed(StartupSeen::Started, None, true),
+            unclaimed(trust.clone(), Some(Program::Codex), true),
+        ),
+        (
+            StartupSeen::Holds(StartupHold::NoComposer {
+                agent: Program::Codex
+            }),
+            StartupSeen::Started,
+            StartupSeen::Started,
+            trust.clone(),
+        )
+    );
+    assert_eq!(
+        (
+            unclaimed(trust.clone(), Some(Program::Codex), false),
+            unclaimed(StartupSeen::Started, Some(Program::Claude), false),
+        ),
+        (StartupSeen::Unread, StartupSeen::Started),
+        "a halt or Autopilot off: no codex start judged, every other worker's as read"
+    );
+}
+
+/// A CODEX WORKER CARRIED BY ITS OWN PROVEN CLAIM: before the claim, its tab
+/// is read as any worker's (a shell, so no agent yet), and a Codex composer
+/// alone starts nothing (OpenAI's codex, or a codex-alab that has not carried
+/// the tab, would leave the task working forever); once codex-alab proves its
+/// claim the worker is started, and no held deadline judges it (it answers for
+/// its own screens with its own attention).
+#[test]
+fn a_codex_worker_its_proven_claim_carries_is_started_and_never_held() {
+    use crate::task_record::{TaskMark, TaskState};
+    let store = crate::session_store::new_store();
+    let worker = crate::session_store::test_handle(3);
+    {
+        let mut tl = worker.ctx.timeline.lock().unwrap();
+        tl.mark_task(&TaskMark::new(TaskState::Working), false, Instant::now(), 0);
+        tl.set_task_worker(Program::Codex, None);
+        tl.note_foreground_group(77);
+        tl.set_program(77, Some("zsh".into()));
+    }
+    worker.term.lock().unwrap().process(b"% ");
+    store.write().unwrap().register(worker.clone());
+    let read = || {
+        let w = startups_of(&store, &std::collections::HashSet::new())
+            .into_iter()
+            .next()
+            .expect("the worker's read");
+        (
+            w.state,
+            w.seen,
+            w.held.map(|h| (h.carried, h.may_be_held())),
+        )
+    };
+    let (state, seen, _) = read();
+    assert_eq!(
+        (state, seen),
+        (
+            StartupState::Working,
+            StartupSeen::Holds(StartupHold::NoAgent {
+                agent: Program::Codex,
+                program: Some("zsh".to_string()),
+            })
+        )
+    );
+    {
+        let mut tl = worker.ctx.timeline.lock().unwrap();
+        tl.note_foreground_group(78);
+        tl.set_program(78, Some("codex".into()));
+    }
+    let rows = [
+        "╭───────────────────────────────────────╮",
+        "│ >_ OpenAI Codex (v0.154.0)            │",
+        "╰───────────────────────────────────────╯",
+        "",
+        "",
+        "› Ask Codex to do anything",
+        "",
+        "  ? for shortcuts",
+    ];
+    let composer = rows.join("\r\n");
+    worker
+        .term
+        .lock()
+        .unwrap()
+        .process(format!("\x1b[H\x1b[2J{composer}").as_bytes());
+    let (state, seen, _) = read();
+    assert_eq!(
+        (state, seen),
+        (
+            StartupState::Working,
+            StartupSeen::Holds(StartupHold::NoComposer {
+                agent: Program::Codex,
+            })
+        ),
+        "a composer no claim carries"
+    );
+    worker
+        .ctx
+        .meta
+        .lock()
+        .unwrap()
+        .set("autopilot", Some("off".into()));
+    assert_eq!(
+        read().1,
+        StartupSeen::Unread,
+        "Autopilot off: codex-alab may not claim, so nothing is judged"
+    );
+    worker
+        .ctx
+        .meta
+        .lock()
+        .unwrap()
+        .set("autopilot", Some("land".into()));
+    crate::session_timeline::claim_supervisor_as(
+        &worker.ctx,
+        &format!("codex-alab@{}", std::process::id()),
+        Some(1),
+        None,
+        Some(crate::self_claim::stand_in::running()),
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl,
+    )
+    .expect("a proof takes a free session");
+    let (state, seen, held) = read();
+    assert_eq!((state, seen), (StartupState::Working, StartupSeen::Started));
+    assert!(
+        held.is_none_or(|(carried, judged)| carried && !judged),
+        "{held:?}"
+    );
+}
+
 #[test]
 fn the_startup_judge_reads_no_half_frame() {
     use crate::session_timeline::AgentStamp;
@@ -30442,6 +30745,132 @@ fn idle_of(hooks: Hooks, agent: Program, session: Option<String>) -> WorkerIdle 
         ..snap("s-idle")
     });
     idle
+}
+
+/// A relaunch snapshot read held until the test lets it go: how many reads began, and the gate.
+#[derive(Default)]
+struct GatedRead {
+    began: AtomicUsize,
+    open: Mutex<bool>,
+    opened: std::sync::Condvar,
+}
+
+impl GatedRead {
+    fn act(self: &Arc<Self>, session: &'static str) -> Arc<SnapshotFn> {
+        let held = Arc::clone(self);
+        Arc::new(move |sid| {
+            held.began.fetch_add(1, Ordering::SeqCst);
+            let open = held.open.lock().unwrap();
+            let (open, _) = held
+                .opened
+                .wait_timeout_while(open, aterm_spec::wait::MUST_HAPPEN, |open| !*open)
+                .unwrap();
+            assert!(*open, "the read was never let go");
+            Some(Snapshot {
+                session: Some(session.to_string()),
+                ..snap(sid)
+            })
+        })
+    }
+
+    fn let_go(&self) {
+        *self.open.lock().unwrap() = true;
+        self.opened.notify_all();
+    }
+
+    fn hold(&self) {
+        *self.open.lock().unwrap() = false;
+    }
+}
+
+fn kept_session(idle: &WorkerIdle) -> Option<String> {
+    with_kept_of(&idle.kept, |k| {
+        k.snapshot.as_ref().and_then(|s| s.session.clone())
+    })
+}
+
+fn read_out(idle: &WorkerIdle) -> bool {
+    with_kept_of(&idle.kept, |k| k.point_read.is_some())
+}
+
+#[test]
+fn a_slow_relaunch_read_never_holds_the_idle_point() {
+    const NAMED: &str = "0badf00d-1111-2222-3333-444455556666";
+    let point = |bound: Duration| {
+        let world = Arc::new(World::default());
+        let mut h = hooks(&world, parking_body(&world));
+        let held = Arc::new(GatedRead::default());
+        h.acts.snapshot = held.act(NAMED);
+        h.acts.point_read = bound;
+        (Arc::new(idle_of(h, Program::Gemini, None)), held)
+    };
+
+    let (idle, held) = point(Duration::ZERO);
+    let at = Arc::clone(&idle);
+    let first = std::thread::spawn(move || at.at_idle_on(IdlePoint::default()));
+    until("the point goes on while its read is held", || {
+        first.is_finished()
+    });
+    assert!(first.join().unwrap().is_none(), "nothing to step");
+    until("the read began", || held.began.load(Ordering::SeqCst) == 1);
+    assert_eq!(
+        kept_session(&idle),
+        None,
+        "the point went on with the snapshot kept"
+    );
+    assert!(
+        idle.look_at.lock().unwrap().is_some(),
+        "the conversation not named yet is looked at again"
+    );
+    assert!(read_out(&idle));
+    assert!(idle.at_idle_on(IdlePoint::default()).is_none());
+    held.let_go();
+    until("the read lands", || {
+        kept_session(&idle).as_deref() == Some(NAMED)
+    });
+    until("no read is out", || !read_out(&idle));
+    assert_eq!(
+        held.began.load(Ordering::SeqCst),
+        1,
+        "the second point waited on the read out, and started none"
+    );
+
+    held.hold();
+    let at = Arc::clone(&idle);
+    let third = std::thread::spawn(move || at.at_idle_on(IdlePoint::default()));
+    until("the third point goes on", || third.is_finished());
+    let _ = third.join().unwrap();
+    until("its read began", || held.began.load(Ordering::SeqCst) == 2);
+    let newer = Snapshot {
+        pid: 4343,
+        session: Some("0badf00d-7777-2222-3333-444455556666".to_string()),
+        ..snap("s-idle")
+    };
+    with_kept_of(&idle.kept, |k| k.snapshot = Some(newer.clone()));
+    held.let_go();
+    until("the read ends", || !read_out(&idle));
+    assert_eq!(
+        with_kept_of(&idle.kept, |k| k.snapshot.clone()),
+        Some(newer),
+        "the late read never puts the older back"
+    );
+
+    let (idle, held) = point(aterm_spec::wait::MUST_HAPPEN);
+    let at = Arc::clone(&idle);
+    let waits = std::thread::spawn(move || at.at_idle_on(IdlePoint::default()));
+    until("the read began", || held.began.load(Ordering::SeqCst) == 1);
+    assert!(!waits.is_finished(), "the control waits its read out");
+    held.let_go();
+    assert!(waits.join().unwrap().is_none());
+    assert_eq!(
+        kept_session(&idle).as_deref(),
+        Some(NAMED),
+        "the control's point returned with its read landed"
+    );
+    assert!(
+        idle.look_at.lock().unwrap().is_none(),
+        "a named conversation is not looked at again"
+    );
 }
 
 #[test]
@@ -32873,6 +33302,139 @@ fn the_hosted_loop_presents_the_in_memory_token_and_falls_back_beside() {
             (harness.to_string(), "@s-h send x".to_string()),
             ("beside".to_string(), "@s-h send x".to_string()),
         ]
+    );
+}
+
+/// The window's disk resume types through the harness's in-memory token, probed with `version`,
+/// so its carry-on reads `by=harness` ([`live_acts`]' `disk_resume`).
+#[cfg(unix)]
+#[test]
+fn the_windows_disk_resume_presents_the_in_memory_token() {
+    use std::io::{BufRead, BufReader};
+    let harness = crate::control_auth::harness_token().expect("entropy");
+    let dir_guard = crate::test_scratch::short_dir("the disk resume's socket");
+    let dir = dir_guard.path().to_path_buf();
+    let sock = dir.join("a.sock");
+    let names = aterm_types::control_socket::token_names_for_sock("a.sock");
+    std::fs::write(dir.join(&names[0]), "beside\n").unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let path = sock.to_string_lossy().into_owned();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut seen: Vec<(String, String)> = Vec::new();
+        let Ok((stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut w = stream.try_clone().unwrap();
+        let mut r = BufReader::new(stream);
+        let mut auth = String::new();
+        let _ = r.read_line(&mut auth);
+        let token = auth.trim_end().trim_start_matches("AUTH ").to_string();
+        loop {
+            let mut line = String::new();
+            if r.read_line(&mut line).unwrap_or(0) == 0 {
+                break;
+            }
+            let line = line.trim_end().to_string();
+            let reply: &[u8] = if line.contains(" lease acquire ") {
+                b"ERR busy\n"
+            } else {
+                b"OK\n"
+            };
+            seen.push((token.clone(), line));
+            let _ = w.write_all(reply);
+        }
+        let _ = tx.send(seen);
+    });
+    let acts = live_acts(crate::session_store::new_store(), path);
+    assert_eq!((acts.disk_resume)("s-d", "carry on"), "wait:held");
+    drop(acts);
+    let seen = rx
+        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .expect("the resume's one connection ended");
+    assert_eq!(
+        seen,
+        vec![
+            (harness.to_string(), "version".to_string()),
+            (
+                harness.to_string(),
+                format!("@s-d {}", upgrade_drive::hand_take_request())
+            ),
+        ]
+    );
+}
+
+/// The window's sweeps present the harness's in-memory token on the window's own socket, probed
+/// with `version`, never the token beside it: the restart and upgrade lanes' acts ([`live_acts`]'
+/// shared options, read here through `snapshot`, the look a relaunch and a restart's carry-on
+/// begin with) and the owner's view ([`live_view`]'s [`window_drive_opts`], through
+/// [`upgrade_drive::View::refresh`]). The word writer ([`crate::upgrade_host::word_writer_at`])
+/// starts from the same options and dials no socket.
+#[cfg(unix)]
+#[test]
+fn the_windows_sweeps_present_the_in_memory_token_on_its_own_socket() {
+    use std::io::{BufRead, BufReader};
+    let harness = crate::control_auth::harness_token().expect("entropy");
+    let dir_guard = crate::test_scratch::short_dir("the sweeps' socket");
+    let dir = dir_guard.path().to_path_buf();
+    let sock = dir.join("a.sock");
+    let names = aterm_types::control_socket::token_names_for_sock("a.sock");
+    std::fs::write(dir.join(&names[0]), "beside\n").unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let path = sock.to_string_lossy().into_owned();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut seen: Vec<(String, String)> = Vec::new();
+        while let Ok((stream, _)) = listener.accept() {
+            let mut w = stream.try_clone().unwrap();
+            let mut r = BufReader::new(stream);
+            let mut auth = String::new();
+            let _ = r.read_line(&mut auth);
+            let token = auth.trim_end().trim_start_matches("AUTH ").to_string();
+            if token == "stop" {
+                break;
+            }
+            loop {
+                let mut line = String::new();
+                if r.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                let line = line.trim_end().to_string();
+                let reply: &[u8] = if line == "version" {
+                    b"OK\n"
+                } else {
+                    b"ERR busy\n"
+                };
+                seen.push((token.clone(), line));
+                let _ = w.write_all(reply);
+            }
+        }
+        let _ = tx.send(seen);
+    });
+    let (home, state) = (dir.join("home"), dir.join("state"));
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let acts = with_harness_state(&state, || {
+        live_acts(crate::session_store::new_store(), path.clone())
+    });
+    assert!((acts.snapshot)("s-a").is_none(), "no roster, no snapshot");
+    drop(acts);
+    let mut view = upgrade_drive::View::default();
+    let _ = view.refresh(
+        &window_drive_opts(home, state, Some(path.clone())),
+        &mut |_: &[upgrade_drive::Row]| {},
+    );
+    let mut stop = std::os::unix::net::UnixStream::connect(&path).expect("the server");
+    stop.write_all(b"AUTH stop\n").expect("stop");
+    drop(stop);
+    let seen = rx
+        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .expect("the server read every connection");
+    let pair = |l: &str| (harness.to_string(), l.to_string());
+    assert_eq!(
+        seen,
+        vec![pair("version"), pair("who"), pair("version"), pair("who")],
+        "the acts' look, then the view's, each on the harness's token"
     );
 }
 

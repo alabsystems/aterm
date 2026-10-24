@@ -64,6 +64,67 @@ pub(crate) struct Heal {
     pub(crate) streak: bool,
 }
 
+/// What `about_to_wait`'s fold kept: the soonest deadline's owner, and each
+/// owner's own soonest deadline, which a clamp must not push out.
+#[derive(Debug)]
+pub(crate) struct DeadlineFold {
+    owner: DeadlineOwner,
+    by_owner: [Option<Instant>; DeadlineOwner::COUNT],
+}
+
+impl Default for DeadlineFold {
+    fn default() -> Self {
+        Self {
+            owner: DeadlineOwner::None,
+            by_owner: [None; DeadlineOwner::COUNT],
+        }
+    }
+}
+
+impl DeadlineFold {
+    /// Fold `owner`'s `candidate` into the turn's soonest `deadline`.
+    pub(crate) fn fold(
+        &mut self,
+        deadline: &mut Option<Instant>,
+        candidate: Instant,
+        owner: DeadlineOwner,
+    ) {
+        let own = &mut self.by_owner[owner.index()];
+        if own.is_none_or(|current| candidate < current) {
+            *own = Some(candidate);
+        }
+        if deadline.is_none_or(|current| candidate < current) {
+            *deadline = Some(candidate);
+            self.owner = owner;
+        }
+    }
+
+    /// The soonest deadline's owner.
+    pub(crate) const fn owner(&self) -> DeadlineOwner {
+        self.owner
+    }
+
+    /// What to arm for `heal`. A clamp stands in for the soonest owner's past
+    /// arm only: another owner's deadline still ahead of `now` and due before the
+    /// clamp (a window's next pet or content frame) keeps its slot.
+    pub(crate) fn armed(&self, heal: Heal, now: Instant) -> Option<Instant> {
+        if !(heal.floor || heal.streak) {
+            return heal.armed;
+        }
+        let ahead = self
+            .by_owner
+            .iter()
+            .enumerate()
+            .filter(|&(index, _)| index != self.owner.index())
+            .filter_map(|(_, deadline)| deadline.filter(|deadline| *deadline > now))
+            .min();
+        match (heal.armed, ahead) {
+            (Some(clamp), Some(ahead)) => Some(clamp.min(ahead)),
+            (armed, _) => armed,
+        }
+    }
+}
+
 impl DeadlineHealer {
     /// Decide what to arm for `owner`'s requested `deadline` (`None`: pure `Wait`).
     #[must_use = "the RETURNED instant is the healed one — arming the argument re-arms the stale deadline this fn exists to clamp"]
@@ -135,8 +196,8 @@ impl DeadlineHealer {
 #[cfg(test)]
 mod tests {
     use super::{
-        DeadlineHealer, Heal, PAST_ARM_STREAK_CLAMP, PAST_ARM_WINDOW, STALE_ARM_HEAL_FLOOR,
-        past_arm_window_step,
+        DeadlineFold, DeadlineHealer, Heal, PAST_ARM_STREAK_CLAMP, PAST_ARM_WINDOW,
+        STALE_ARM_HEAL_FLOOR, past_arm_window_step,
     };
     use crate::metrics::DeadlineOwner;
     use std::time::{Duration, Instant};
@@ -293,5 +354,59 @@ mod tests {
             },
             "the stronger (floor) clamp wins over the frame clamp, and only it is reported"
         );
+    }
+
+    #[test]
+    fn a_clamp_keeps_another_owners_deadline_due_before_it() {
+        let now = Instant::now();
+        let barely = now - Duration::from_millis(1);
+        let stale = now - Duration::from_secs(2);
+        let frame = now + Duration::from_millis(4);
+        let fold = |past: Instant, pet: Instant| {
+            let mut deadline = None;
+            let mut fold = DeadlineFold::default();
+            fold.fold(&mut deadline, pet, DeadlineOwner::CursorEffect);
+            fold.fold(&mut deadline, past, DeadlineOwner::ConsentCard);
+            (deadline, fold)
+        };
+        let arm = |healer: &mut DeadlineHealer,
+                   (deadline, fold): (Option<Instant>, DeadlineFold)| {
+            assert_eq!(
+                fold.owner(),
+                DeadlineOwner::ConsentCard,
+                "the past arm is the soonest"
+            );
+            let heal = healer.heal(fold.owner(), deadline, now);
+            (heal, fold.armed(heal, now))
+        };
+
+        let mut healer = DeadlineHealer::default();
+        for _ in 0..31 {
+            assert_eq!(arm(&mut healer, fold(barely, frame)).1, Some(barely));
+        }
+        let (heal, armed) = arm(&mut healer, fold(barely, frame));
+        assert!(heal.streak, "arm 32 of an all-past window is a streak");
+        assert_eq!(
+            armed,
+            Some(frame),
+            "the pet's frame due before the clamp keeps its slot"
+        );
+        let late = now + Duration::from_millis(40);
+        assert_eq!(
+            arm(&mut healer, fold(barely, late)).1,
+            Some(now + PAST_ARM_STREAK_CLAMP),
+            "a frame due after the clamp waits for the clamp"
+        );
+        assert_eq!(
+            arm(&mut healer, fold(barely, now - Duration::from_micros(500))).1,
+            Some(now + PAST_ARM_STREAK_CLAMP),
+            "another owner's past deadline is not kept: it would spin"
+        );
+
+        let mut healer = DeadlineHealer::default();
+        assert_eq!(arm(&mut healer, fold(stale, frame)).1, Some(stale));
+        let (heal, armed) = arm(&mut healer, fold(stale, frame));
+        assert!(heal.floor, "a second consecutive stale arm is floored");
+        assert_eq!(armed, Some(frame), "the floor keeps the pet's frame too");
     }
 }

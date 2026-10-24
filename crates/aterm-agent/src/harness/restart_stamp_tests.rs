@@ -243,6 +243,7 @@ fn the_relaunch_that_files_an_asked_exit_takes_its_stamp() {
         home: tmp.path().join("home"),
         state: tmp.path().join("state"),
         sock: None,
+        token: None,
         only_sid: Some("s-1".to_string()),
         dry_run: false,
         human_grace_s: 0,

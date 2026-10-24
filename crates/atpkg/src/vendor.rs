@@ -33,7 +33,7 @@ fn pinned_by(spec: &crate::vendor_direct::VendorSpec, url: &str) -> bool {
             url.strip_prefix(prefix)
                 .is_some_and(|rest| match rest.strip_prefix('?') {
                     Some(query) => query_is(spec.url_query, query),
-                    None => !rest.is_empty() && rest.split('/').all(plain_component),
+                    None => !rest.is_empty() && rest.split('/').all(path_component),
                 })
         })
 }
@@ -54,6 +54,17 @@ fn plain_component(s: &str) -> bool {
         && s != ".."
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// A path segment: a [`plain_component`] that may also hold `@`, as a GitHub release tag
+/// of an npm-scoped package spells it (`@moonshot-ai/kimi-code@2.3.1`). The host is never
+/// reached: [`https_host`] ends it at the first `/` and refuses an `@` in it.
+fn path_component(s: &str) -> bool {
+    s != "."
+        && s != ".."
+        && !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'@'))
 }
 
 /// Whether `program`'s vendor-direct digest document requested at `requested` may be trusted.
@@ -1068,6 +1079,33 @@ mod tests {
             "https://lookaside.facebook.com/lookaside/muse/download/?channel=muse\
              &version=1.4.9-R6297.1&file=muse-aarch64-macos",
         ),
+        ("kimi", "https://cdn.kimi.com/kimi-code/latest"),
+        (
+            "kimi",
+            "https://cdn.kimi.com/kimi-code/binaries/2.3.1/manifest.json",
+        ),
+        (
+            "kimi",
+            "https://cdn.kimi.com/kimi-code/binaries/2.3.1/kimi-code-darwin-arm64",
+        ),
+        (
+            "kimi",
+            "https://cdn.kimi.com/kimi-code/binaries/2.3.1/kimi-code-win32-x64.exe",
+        ),
+        (
+            "kimi",
+            "https://github.com/MoonshotAI/kimi-code/releases/download/\
+             @moonshot-ai/kimi-code@2.3.1/manifest.json",
+        ),
+        (
+            "grok",
+            "https://storage.googleapis.com/grok-build-public-artifacts/cli/stable",
+        ),
+        (
+            "grok",
+            "https://storage.googleapis.com/grok-build-public-artifacts/cli/\
+             grok-1.0.67-macos-aarch64",
+        ),
     ];
 
     #[test]
@@ -1171,6 +1209,22 @@ mod tests {
             "https://releases.openai.com/codex/channels/latest?redirect=https://evil",
             "https://downloads.claude.ai/claude-code-releases/lat est",
             "https://downloads.claude.ai/claude-code-releases/latest\n",
+            "https://github.com/MoonshotAI/kimi-code/releases/download/\
+             %40moonshot-ai/kimi-code%402.3.1/manifest.json",
+            "https://cdn.kimi.com@evil.com/kimi-code/latest",
+            "https://user@cdn.kimi.com/kimi-code/latest",
+            "https://evil.com/@cdn.kimi.com/kimi-code/latest",
+            "https://cdn.kimi.com/kimi-code/latest?v=2.3.1@x",
+            "https://cdn.kimi.com/kimi-code/binaries/2.3.1/@/../x",
+            "https://code.kimi.com/kimi-code/latest",
+            "https://cdn.kimi.com/kimi-cli/latest",
+            "https://github.com/MoonshotAI/kimi-cli/releases/download/v1.0/x",
+            "https://github.com/moonshotai/kimi-code/releases/download/x/y",
+            "https://x.ai/cli/stable",
+            "https://storage.googleapis.com/grok-build-public-artifacts/other/stable",
+            "https://storage.googleapis.com/grok-build-public-artifacts/cli",
+            "https://storage.googleapis.com/grok-build-public-artifacts/cli/a%2Fb",
+            "https://storage.googleapis.com/xai-org/grok-build-public-artifacts/cli/stable",
             "",
         ] {
             for program in crate::vendor_direct::VENDORS.iter().map(|s| s.program) {

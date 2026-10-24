@@ -358,6 +358,77 @@ fn the_chip_line_names_no_chip_for_gemini() {
     assert_eq!(token(&line, "face"), "cruise", "{line}");
 }
 
+#[test]
+fn a_footer_left_bare_under_an_off_switch_is_switch_only() {
+    use crate::autopilot::{HarnessSwitch, SwitchOff};
+    use aterm_phase::Program;
+    let switch = |program, face, session| crate::claude_lights::BorderSwitch {
+        frame_row: 7,
+        term_row: 7,
+        cols: 100..130,
+        switch: 101..120,
+        button: Some(121..127),
+        session,
+        face,
+        tier: 0,
+        program,
+    };
+    let read = |drew: &[crate::claude_lights::BorderSwitch], covered: Option<usize>| {
+        let mut lights = WindowLights::default();
+        lights.border_toggles.extend_from_slice(drew);
+        lights.drawn_chip(3, 0, |row| Some(row) == covered)
+    };
+    let off = HarnessSwitch::Off(SwitchOff::Session);
+    for face in [
+        off,
+        HarnessSwitch::Off(SwitchOff::Agent(Program::Agy)),
+        HarnessSwitch::Off(SwitchOff::Master),
+        HarnessSwitch::Turning,
+    ] {
+        assert_eq!(
+            read(&[switch(Program::Agy, face, 3)], None),
+            Drawn::SwitchOnly,
+            "{face:?}"
+        );
+    }
+    assert_eq!(Drawn::SwitchOnly.why(), Some("switch-only"));
+    assert_eq!(
+        read(&[], None),
+        Drawn::NoRule,
+        "no switch drawn: a tab behind"
+    );
+    assert_eq!(
+        read(&[switch(Program::Agy, HarnessSwitch::On, 3)], None),
+        Drawn::NoRule,
+        "an on switch leaves no footer bare"
+    );
+    for program in [Program::Claude, Program::Muse] {
+        assert_eq!(
+            read(&[switch(program, off, 3)], None),
+            Drawn::NoRule,
+            "{program:?} keeps its footer and its chip"
+        );
+    }
+    assert_eq!(
+        read(&[switch(Program::Agy, off, 3)], Some(7)),
+        Drawn::NoRule,
+        "a switch a band covers is not drawn"
+    );
+    assert_eq!(
+        read(&[switch(Program::Agy, off, 4)], None),
+        Drawn::NoRule,
+        "another session's switch"
+    );
+    let mut lights = WindowLights::default();
+    lights.border_toggles.push(switch(Program::Agy, off, 3));
+    lights.footers.push((3, 0));
+    assert_eq!(
+        lights.drawn_chip(3, 0, |_| false),
+        Drawn::NoRoom,
+        "a rule found with no room"
+    );
+}
+
 fn need(app: &mut App, session: u64, entry: Option<&str>) {
     let ctx = app.pool.get(session).expect("session").ctx.clone();
     ctx.meta

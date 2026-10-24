@@ -48,7 +48,7 @@ impl FontFeature {
         Self { tag, value }
     }
 
-    /// Parse a SINGLE feature token into a [`FontFeature`], or `None` if it is malformed.
+    /// Parse a single feature token into a [`FontFeature`], or `None` if malformed.
     #[must_use]
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn parse_token(token: &str) -> Option<Self> {
@@ -75,8 +75,7 @@ impl FontFeature {
     }
 }
 
-/// Parse a whitespace-separated feature spec (e.g. `"+ss01 -calt zero"`) into a list of
-/// [`FontFeature`]s.
+/// Parse a whitespace-separated feature spec (e.g. `"+ss01 -calt zero"`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn parse_font_features(spec: &str) -> Vec<FontFeature> {
@@ -104,7 +103,7 @@ pub struct TextShapingConfig {
     pub ambiguous_width: AmbiguousWidth,
     /// Per-font OpenType features.
     pub font_features: Vec<FontFeatureSet>,
-    /// Admit MERGED (Cascadia N:1) ligatures.
+    /// Admit merged (Cascadia N:1) ligatures.
     pub admit_collapsed: bool,
 }
 

@@ -1,6 +1,5 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-// Author: Andrew Yates
 
 //! Protocol-oriented grouped terminal state.
 
@@ -21,19 +20,14 @@ pub(in crate::terminal) enum DcsType {
 }
 
 /// Grouped state for DCS (Device Control String) sequence processing.
-///
-/// The fields used by `dcs_hook`/`dcs_put`/`dcs_unhook` and APC handling
-/// (which reuses the data buffer).
 pub(in crate::terminal) struct DcsState {
     /// DCS sequence type currently being processed.
     pub(in crate::terminal) dcs_type: DcsType,
     /// Accumulated DCS data bytes (also reused as scratch buffer for APC).
     pub(in crate::terminal) data: Vec<u8>,
-    /// Total bytes held in DCS buffers, held under `MAX_DCS_GLOBAL_BUDGET`
-    /// (`handler_dcs.rs`, `handler_actions.rs`).
+    /// Total bytes held in DCS buffers.
     pub(in crate::terminal) total_bytes: usize,
     /// Bytes consumed by the current DCS sequence (reset in hook, released in unhook).
-    /// Separate from `data.len()` because Sixel feeds bytes to the decoder, not `data`.
     pub(in crate::terminal) sequence_bytes: usize,
 }
 

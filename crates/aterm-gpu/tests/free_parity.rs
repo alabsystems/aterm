@@ -1,140 +1,110 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! CPU/GPU parity and damage-cache tests for the free-floating sprite layer.
+//! CPU/GPU parity and damage-cache tests for the companion sprites (the
+//! flying head, its notes, the motes, the dog, the nuke): Linear fx sprite
+//! layers drawn from the one fx atlas.
 
 use crate::common;
-use std::sync::Arc;
 
-use aterm_core::render::{FreeSampler, FreeSprite, FreeZ};
 use aterm_core::terminal::Terminal;
-use aterm_render::{SceneAtlas, SpriteQuad, Theme, WindowCpu};
+use aterm_render::sprites::{FreeSprite, FreeZ, SpriteLayers};
+use aterm_render::{Theme, WindowCpu};
 
+use crate::common::sprites::{Publisher, cut, layers_of, opaque, over, put, solid, under};
 use crate::common::{backends, bb, gg, max_channel_delta, rr};
 
-fn free_atlas(version: u64) -> SceneAtlas {
-    let (w, h) = (64u32, 128u32);
-    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-    for y in 0..h {
-        for x in 0..w {
-            let a = if y < 64 {
-                255u8
-            } else {
-                (60 + (x * 3 + y) % 180) as u8
-            };
-            rgba.extend_from_slice(&[
-                (x * 37 + y * 11) as u8,
-                (x * 5 + y * 53) as u8,
-                (x * 29 + y * 3) as u8,
-                a,
-            ]);
-        }
-    }
-    SceneAtlas {
-        width: w,
-        height: h,
-        rgba,
-        version,
-    }
-}
-
-fn free_1to1(x: i32, y: i32, w: u16, h: u16, src_xy: [u16; 2], alpha: u8) -> FreeSprite {
-    let [ax, ay] = src_xy;
-    FreeSprite {
-        x,
-        y,
-        w,
-        h,
-        ax,
-        ay,
-        aw: w,
-        ah: h,
-        tint: 0x00FF_FFFF,
-        alpha,
-        flip_x: false,
-        z: FreeZ::UnderText,
-        sampler: FreeSampler::Nearest,
-    }
-}
-
 #[test]
-fn free_effect_only_parity_pinned_over_bg_and_text() {
+fn companion_layers_match_the_cpu_across_bands_over_bg_and_text() {
     let theme = Theme::default();
-    let (mut cpu, mut gpu) = backends(18.0, theme);
-    let mut win = aterm_gpu::WindowGpu::new();
-    let (cw, ch) = cpu.cell_size();
-    let (rows, cols) = (8usize, 16usize);
-    let mut term = Terminal::new(rows as u16, cols as u16);
-    term.process("\x1b[?25l████████".as_bytes()); // procedural: byte-exact base
+    for (arm, mut cpu, mut gpu) in common::arms(18.0, theme) {
+        let mut win = aterm_gpu::WindowGpu::new();
+        let (cw, ch) = cpu.cell_size();
+        let (rows, cols) = (8usize, 16usize);
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        term.process("\x1b[?25l████████\x1b[7;3H████████".as_bytes()); // procedural: byte-exact base
 
-    let base_input = term.cell_frame(rows, cols);
-    let cpu_base = cpu.render_input(&base_input);
-    let gpu_base = gpu.render_input(&mut win, &base_input, None);
-    assert_eq!(
-        max_channel_delta(&cpu_base.pixels, &gpu_base.pixels),
-        0,
-        "procedural-block base must be byte-exact so the free delta is effect-only"
-    );
+        let base_input = term.cell_frame(rows, cols);
+        let cpu_base = cpu.render_input(&base_input);
+        let gpu_base = gpu.render_input(&mut win, &base_input, None);
+        assert_eq!(
+            max_channel_delta(&cpu_base.pixels, &gpu_base.pixels),
+            0,
+            "procedural-block base must be byte-exact so the sprite delta is effect-only"
+        );
 
-    let mh = (ch + ch / 2) as u16; // > one band: every rect crosses a boundary
-    let mut input = term.cell_frame(rows, cols);
-    input.free_atlas = Some(Arc::new(free_atlas(1)));
-    input.free_sprites = vec![
-        free_1to1(4, (2 * ch) as i32, 40, mh.min(60), [2, 0], 255),
-        free_1to1(2, (ch / 3) as i32, 48, mh.min(60), [8, 0], 255),
-        free_1to1(8, (4 * ch) as i32, 32, (ch as u16).min(56), [0, 65], 255),
-        FreeSprite {
-            flip_x: true,
-            ..free_1to1(
-                (cols * cw - 44) as i32,
-                (5 * ch) as i32,
-                40,
-                mh.min(60),
-                [12, 4],
-                140,
-            )
-        },
-        FreeSprite {
-            tint: 0x0040_C080,
-            ..free_1to1(
-                (6 * cw) as i32,
-                (6 * ch + 3) as i32,
-                36,
-                (ch as u16).min(56),
-                [5, 2],
-                255,
-            )
-        },
-        FreeSprite {
-            z: FreeZ::OverText,
-            ..free_1to1(
-                (10 * cw) as i32,
-                (ch / 2) as i32,
-                36,
-                mh.min(60),
-                [20, 0],
-                255,
-            )
-        },
-    ];
+        let mh = ((ch + ch / 2) as u16).min(60); // > one band: every box crosses a boundary
+        let opaque_set = [
+            under(4, (2 * ch) as i32, opaque(2, 0, 40, mh)),
+            under(2, (ch / 3) as i32, opaque(8, 0, 48, mh)),
+            FreeSprite {
+                flip_x: true,
+                ..under(
+                    (cols * cw - 44) as i32,
+                    (5 * ch) as i32,
+                    opaque(12, 4, 40, mh),
+                )
+            },
+            over((10 * cw) as i32, (ch / 2) as i32, opaque(20, 0, 36, mh)),
+        ];
+        let mut input = term.cell_frame(rows, cols);
+        put(&mut input, &opaque_set);
+        let cpu_op = cpu.render_input(&input);
+        let gpu_op = gpu.render_input(&mut win, &input, None);
+        assert_ne!(
+            cpu_op.pixels, cpu_base.pixels,
+            "the sprites must paint (non-vacuous)"
+        );
+        assert_eq!(
+            max_channel_delta(&cpu_op.pixels, &gpu_op.pixels),
+            0,
+            "{arm}: opaque texels under an opaque white ink, across band boundaries: \
+         byte-exact, or a band split or a texel mapping differs"
+        );
 
-    let cpu_free = cpu.render_input(&input);
-    let gpu_free = gpu.render_input(&mut win, &input, None);
-    assert_ne!(
-        cpu_free.pixels, cpu_base.pixels,
-        "the free sprites must actually paint (non-vacuous)"
-    );
-    let delta = max_channel_delta(&cpu_free.pixels, &gpu_free.pixels);
-    eprintln!("free effect-only GPU vs CPU max per-channel delta = {delta} (target <= 1)");
-    assert!(
-        delta <= 2,
-        "free NEAREST-1:1 parity broke the pinned cat bar: max per-channel \
-         delta {delta} > 2 (target <= 1)"
-    );
+        let translucent = [
+            under(8, (4 * ch) as i32, cut(0, 33, 32, (ch as u16).min(30))),
+            FreeSprite {
+                flip_x: true,
+                alpha: 140,
+                ..under((cols * cw - 44) as i32, (5 * ch) as i32, cut(12, 4, 40, mh))
+            },
+            FreeSprite {
+                tint: 0x0040_C080,
+                ..under((6 * cw) as i32, (6 * ch + 3) as i32, cut(5, 2, 36, mh))
+            },
+            FreeSprite {
+                z: FreeZ::OverText,
+                alpha: 90,
+                ..under((3 * cw) as i32, (6 * ch) as i32, cut(20, 10, 36, mh))
+            },
+        ];
+        let all: Vec<FreeSprite> = opaque_set.iter().chain(&translucent).cloned().collect();
+        let mut input = term.cell_frame(rows, cols);
+        put(&mut input, &all);
+        let cpu_t = cpu.render_input(&input);
+        let gpu_t = gpu.render_input(&mut win, &input, None);
+        assert_ne!(
+            cpu_t.pixels, cpu_op.pixels,
+            "the translucent sprites must paint"
+        );
+        let delta = max_channel_delta(&cpu_t.pixels, &gpu_t.pixels);
+        eprintln!(
+            "{arm}: companion layers GPU vs CPU max per-channel delta = {delta} (Linear bar <= {})",
+            SpriteLayers::PARITY
+        );
+        assert!(
+            delta <= i32::from(SpriteLayers::PARITY),
+            "{arm}: a translucent or tinted Linear sprite broke the companions' declared parity: \
+         max per-channel delta {delta} > {}",
+            SpriteLayers::PARITY
+        );
+        common::assert_arm(arm, &gpu);
+    }
 }
 
 #[test]
-fn free_over_text_covers_wdeco_and_additive_light_both_backends() {
+fn an_over_text_sprite_covers_wdeco_and_additive_light_both_backends() {
     use aterm_core::render::{DecoBlend, DecoGlyph, GlowQuad, WordDecoration};
     let theme = Theme::default();
     let (mut cpu, mut gpu) = backends(18.0, theme);
@@ -147,21 +117,7 @@ fn free_over_text_covers_wdeco_and_additive_light_both_backends() {
     term.process("\x1b[?25l██".as_bytes());
 
     let red = 0x00C8_2020u32;
-    let atlas = aterm_render::SceneAtlas {
-        width: 8,
-        height: 8,
-        rgba: (0..8 * 8).flat_map(|_| [0xC8u8, 0x20, 0x20, 255]).collect(),
-        version: 11,
-    };
-
     let mut input = term.cell_frame(rows, cols);
-    input.free_atlas = Some(Arc::new(atlas));
-    input.free_sprites = vec![FreeSprite {
-        z: FreeZ::OverText,
-        aw: 8,
-        ah: 8,
-        ..free_1to1(0, 0, (2 * cw) as u16, (2 * ch) as u16, [0, 0], 255)
-    }];
     input.word_decorations.push(WordDecoration {
         row: 0,
         col: 1,
@@ -194,10 +150,16 @@ fn free_over_text_covers_wdeco_and_additive_light_both_backends() {
         color2: aterm_render::premul_rgb(0x00FF_C040, 200),
         alpha2: 0,
     });
+    let bare = input.clone();
+    put(
+        &mut input,
+        &[FreeSprite {
+            w: (2 * cw) as u16,
+            h: (2 * ch) as u16,
+            ..over(0, 0, solid([0xC8, 0x20, 0x20, 255], 8, 8))
+        }],
+    );
 
-    let mut bare = input.clone();
-    bare.free_sprites.clear();
-    bare.free_atlas = None;
     let cpu_bare = cpu.render_input(&bare);
     let cpu_f = cpu.render_input(&input);
     assert_ne!(
@@ -221,113 +183,112 @@ fn free_over_text_covers_wdeco_and_additive_light_both_backends() {
                 .max((bb(g) - bb(red)).abs());
         }
     }
-    eprintln!("GPU OverText coverage max per-channel delta vs pure sprite colour = {gpu_max}");
-    assert!(
-        gpu_max <= 2,
-        "GPU FreeOver must cover glyph/wdeco/glow/nova: max delta {gpu_max} > 2"
+    assert_eq!(
+        gpu_max, 0,
+        "GPU FxLinearOver must cover glyph/wdeco/glow/nova with the opaque \
+         sprite's own colour"
     );
 }
 
+/// The rain's per-row layers and a companion's single layer are one law: a
+/// sprite cut into its band slices (each a layer clipped to its band) draws
+/// what the whole sprite draws, on the damaged path of both backends.
 #[test]
-fn free_multirow_rect_matches_legacy_slices_on_damaged_path_both_backends() {
+fn a_multirow_sprite_is_its_band_slices_on_the_damaged_path_both_backends() {
+    use aterm_core::render::PxRect;
     let theme = Theme::default();
     let (mut cpu, mut gpu) = backends(18.0, theme);
     let (_, ch) = cpu.cell_size();
     let (rows, cols) = (6usize, 12usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.process(b"\x1b[?25l");
-    let atlas = Arc::new(free_atlas(2));
 
     let (x, w) = (4i32, 40u16);
     let h = (2 * ch + ch / 2) as u16;
     let (y_a, y_b) = ((ch + ch / 2) as i32, (2 * ch + ch / 2) as i32);
-    let src = [2u16, 3u16];
+    let art = cut(2, 3, w, h);
+    let sprite = |y: i32| under(x, y, art.clone());
 
-    let make_free = |term: &mut Terminal, y: i32| {
+    let mut whole = Publisher::default();
+    let mut sliced = Publisher::default();
+    let mut make_whole = |term: &mut Terminal, y: i32| {
         let mut input = term.cell_frame(rows, cols);
-        input.free_atlas = Some(atlas.clone());
-        input.free_sprites = vec![free_1to1(x, y, w, h, src, 255)];
+        whole.put(&mut input, &[sprite(y)]);
         input
     };
-    let make_legacy = |term: &mut Terminal, y: i32| {
+    let mut make_sliced = |term: &mut Terminal, y: i32| {
         let mut input = term.cell_frame(rows, cols);
-        input.cat_atlas = Some(atlas.clone());
+        let s = sprite(y);
         let (y0, y1) = (y as usize, y as usize + h as usize);
-        for r in y0 / ch..=(y1 - 1) / ch {
-            let band_y0 = y0.max(r * ch);
-            let band_y1 = y1.min((r + 1) * ch);
-            input.cat_quads.push(SpriteQuad {
-                row: r as u16,
-                x: x as u16,
-                y: band_y0 as u16,
-                w,
-                h: (band_y1 - band_y0) as u16,
-                ax: src[0],
-                ay: src[1] + (band_y0 - y0) as u16,
-                aw: w,
-                ah: (band_y1 - band_y0) as u16,
-                tint: 0x00FF_FFFF,
-                alpha: 255,
-                flip_x: false,
-            });
-        }
-        assert!(input.cat_quads.len() >= 3, "multi-row premise");
+        let slices: Vec<FreeSprite> = (y0 / ch..=(y1 - 1) / ch)
+            .map(|r| FreeSprite {
+                clip: PxRect::new(i32::MIN, (r * ch) as i32, i32::MAX, ((r + 1) * ch) as i32),
+                ..s.clone()
+            })
+            .collect();
+        assert!(slices.len() >= 3, "multi-row premise");
+        sliced.put(&mut input, &slices);
         input
     };
 
-    let mut wc_free = WindowCpu::new();
-    let mut wc_legacy = WindowCpu::new();
-    let _ = cpu.render_input_cached(&mut wc_free, &make_free(&mut term, y_a));
-    let cpu_free = cpu
-        .render_input_cached(&mut wc_free, &make_free(&mut term, y_b))
+    let (wa, wb) = (make_whole(&mut term, y_a), make_whole(&mut term, y_b));
+    let (sa, sb) = (make_sliced(&mut term, y_a), make_sliced(&mut term, y_b));
+    let mut wc_whole = WindowCpu::new();
+    let mut wc_sliced = WindowCpu::new();
+    let _ = cpu.render_input_cached(&mut wc_whole, &wa);
+    let cpu_whole = cpu
+        .render_input_cached(&mut wc_whole, &wb)
         .pixels()
         .to_vec();
-    let _ = cpu.render_input_cached(&mut wc_legacy, &make_legacy(&mut term, y_a));
-    let cpu_legacy = cpu
-        .render_input_cached(&mut wc_legacy, &make_legacy(&mut term, y_b))
+    let _ = cpu.render_input_cached(&mut wc_sliced, &sa);
+    let cpu_sliced = cpu
+        .render_input_cached(&mut wc_sliced, &sb)
         .pixels()
         .to_vec();
     assert_eq!(
-        cpu_free, cpu_legacy,
-        "CPU damaged path: a moved multi-row free rect must equal its moved \
-         legacy per-row slices byte-for-byte"
+        cpu_whole, cpu_sliced,
+        "CPU damaged path: a moved multi-row sprite must equal its moved band \
+         slices byte-for-byte"
     );
 
-    let mut win_free = aterm_gpu::WindowGpu::new();
-    let _ = gpu.render_input_cached(&mut win_free, &make_free(&mut term, y_a));
-    let gpu_free = gpu
-        .render_input_cached(&mut win_free, &make_free(&mut term, y_b))
+    let mut win_whole = aterm_gpu::WindowGpu::new();
+    let _ = gpu.render_input_cached(&mut win_whole, &wa);
+    let gpu_whole = gpu
+        .render_input_cached(&mut win_whole, &wb)
         .pixels()
         .to_vec();
     let mut gpu2 = common::independent_gpu(18.0, theme);
-    let mut win_legacy = aterm_gpu::WindowGpu::new();
-    let _ = gpu2.render_input_cached(&mut win_legacy, &make_legacy(&mut term, y_a));
-    let gpu_legacy = gpu2
-        .render_input_cached(&mut win_legacy, &make_legacy(&mut term, y_b))
+    let mut win_sliced = aterm_gpu::WindowGpu::new();
+    let _ = gpu2.render_input_cached(&mut win_sliced, &sa);
+    let gpu_sliced = gpu2
+        .render_input_cached(&mut win_sliced, &sb)
         .pixels()
         .to_vec();
-    let delta = max_channel_delta(&gpu_free, &gpu_legacy);
-    eprintln!("free vs legacy damaged-path GPU max per-channel delta = {delta} (target <= 1)");
+    assert_eq!(
+        max_channel_delta(&gpu_whole, &gpu_sliced),
+        0,
+        "GPU damaged path: a moved multi-row sprite must equal its moved band slices"
+    );
     assert!(
-        delta <= 2,
-        "GPU damaged path: moved free rect vs moved legacy slices delta {delta} > 2"
+        max_channel_delta(&gpu_whole, &cpu_whole) <= i32::from(SpriteLayers::PARITY),
+        "and the GPU's frame is the CPU's within the companions' declared parity"
     );
 }
 
 #[test]
-fn damaged_path_free_no_ghosting_and_settled_gate_hit_both_backends() {
+fn damaged_path_sprite_no_ghosting_and_settled_gate_hit_both_backends() {
     let theme = Theme::default();
     let (mut cpu, mut gpu) = backends(18.0, theme);
     let (_, ch) = cpu.cell_size();
     let (rows, cols) = (6usize, 12usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.process(b"\x1b[?25l");
-    let atlas = Arc::new(free_atlas(3));
+    let art = cut(2, 0, 40, (2 * ch + ch / 2) as u16);
 
+    let mut publisher = Publisher::default();
     let mut make = |y: i32| {
         let mut input = term.cell_frame(rows, cols);
-        input.free_atlas = Some(atlas.clone());
-        input.free_sprites = vec![free_1to1(2, y, 40, (2 * ch + ch / 2) as u16, [2, 0], 255)];
+        publisher.put(&mut input, &[under(2, y, art.clone())]);
         input
     };
     let in_a = make((ch + ch / 2) as i32); // bands 1..=3
@@ -337,8 +298,8 @@ fn damaged_path_free_no_ghosting_and_settled_gate_hit_both_backends() {
         (&mut cpu, &mut gpu),
         (18.0, theme),
         [&in_a, &in_b, &in_c],
-        "multi-row free rect",
-        "free sprite (equal sprites, same atlas version)",
+        "multi-row sprite",
+        "sprite (the same layer: same id, same content)",
     );
 }
 
@@ -385,21 +346,19 @@ fn settled_translucent_sprite_inside_dirty_band_stays_byte_stable() {
     let (rows, cols) = (12usize, 20usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.process(b"\x1b[?25l");
-    let atlas = Arc::new(free_atlas(7));
 
-    let sprite = free_1to1(
-        6,
-        (3 * ch + ch / 4) as i32,
-        48,
-        (3 * ch + ch / 2) as u16,
-        [0, 65],
-        140,
-    );
+    let layers = layers_of(&[FreeSprite {
+        alpha: 140,
+        ..under(
+            6,
+            (3 * ch + ch / 4) as i32,
+            cut(0, 33, 48, (3 * ch + ch / 2) as u16),
+        )
+    }]);
     let make = |term: &mut Terminal, n: usize| {
         term.process(format!("\x1b[3;1Htop dirt {n}\x1b[11;1Hbottom dirt {n}").as_bytes());
         let mut input = term.cell_frame(rows, cols);
-        input.free_atlas = Some(atlas.clone());
-        input.free_sprites = vec![sprite];
+        input.fx_layers.extend(layers.iter().cloned());
         input
     };
 
@@ -425,24 +384,19 @@ fn settled_translucent_over_text_sprite_inside_dirty_band_stays_byte_stable() {
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.process(b"\x1b[?25l");
     term.process(b"\x1b[5;3Hcovered text");
-    let atlas = Arc::new(free_atlas(9));
 
-    let sprite = FreeSprite {
-        z: FreeZ::OverText,
-        ..free_1to1(
+    let layers = layers_of(&[FreeSprite {
+        alpha: 140,
+        ..over(
             6,
             (3 * ch + ch / 4) as i32,
-            48,
-            (3 * ch + ch / 2) as u16,
-            [0, 65],
-            140,
+            cut(0, 33, 48, (3 * ch + ch / 2) as u16),
         )
-    };
+    }]);
     let make = |term: &mut Terminal, n: usize| {
         term.process(format!("\x1b[3;1Htop dirt {n}\x1b[11;1Hbottom dirt {n}").as_bytes());
         let mut input = term.cell_frame(rows, cols);
-        input.free_atlas = Some(atlas.clone());
-        input.free_sprites = vec![sprite];
+        input.fx_layers.extend(layers.iter().cloned());
         input
     };
 
@@ -455,7 +409,7 @@ fn settled_translucent_over_text_sprite_inside_dirty_band_stays_byte_stable() {
          translucent OverText sprite inside the dirty bounding band",
         "GPU scissored path must be byte-stable — a settled \
          OverText sprite row inside the dirty bounding band must be fully \
-         rebuilt, not Load-preserved under the unconditional FreeOver redraw",
+         rebuilt, not Load-preserved under the FxLinearOver redraw",
     );
 }
 
@@ -501,116 +455,61 @@ fn settled_lifted_add_deco_spill_inside_dirty_band_stays_byte_stable() {
     );
 }
 
+/// The integer nearest map (`docs/DESIGN-card-engine-2026-10-19.md` §4.1):
+/// the GPU picks the CPU's texel at every scale and mirror, so an opaque art
+/// under an opaque white ink lands byte-exact; the old float sampler needed
+/// a tie bias and still parted at some scales.
 #[test]
-fn settled_translucent_cat_quad_inside_dirty_band_stays_byte_stable() {
+fn a_scaled_sprite_samples_the_cpus_texel_at_every_scale() {
     let theme = Theme::default();
-    let (cpu, mut gpu) = backends(18.0, theme);
-    let mut win_gpu = aterm_gpu::WindowGpu::new();
-    let (_, ch) = cpu.cell_size();
-    let (rows, cols) = (10usize, 20usize);
-    let mut term = Terminal::new(rows as u16, cols as u16);
-    term.process(b"\x1b[?25l");
-    let atlas = Arc::new(free_atlas(8));
+    for (arm, mut cpu, mut gpu) in common::arms(18.0, theme) {
+        let mut win = aterm_gpu::WindowGpu::new();
+        let (rows, cols) = (8usize, 20usize);
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        term.process(b"\x1b[?25l");
 
-    let quad = SpriteQuad {
-        row: 4,
-        x: 6,
-        y: (4 * ch + 2) as u16,
-        w: 40,
-        h: (ch / 2) as u16,
-        ax: 0,
-        ay: 70, // translucent texels
-        aw: 40,
-        ah: (ch / 2) as u16,
-        tint: 0x00FF_FFFF,
-        alpha: 140,
-        flip_x: false,
-    };
-    let make = |term: &mut Terminal, n: usize| {
-        term.process(format!("\x1b[3;1Htop dirt {n}\x1b[9;1Hbottom dirt {n}").as_bytes());
-        let mut input = term.cell_frame(rows, cols);
-        input.cat_atlas = Some(atlas.clone());
-        input.cat_quads = vec![quad];
-        input
-    };
-
-    let in_0 = make(&mut term, 0);
-    let _ = gpu.present_input_readback(&mut win_gpu, &in_0);
-    for n in 1..=3usize {
-        let input = make(&mut term, n);
-        let scissors_before = gpu.scissor_taken();
-        let gpu_scissored = gpu.present_input_readback(&mut win_gpu, &input).pixels;
-        assert!(
-            gpu.scissor_taken() > scissors_before,
-            "frame {n}: the two-row text edit must take the SCISSORED path"
-        );
-        let mut gpu2 = common::independent_gpu(18.0, theme);
-        let mut win2 = aterm_gpu::WindowGpu::new();
-        let gpu_fresh = gpu2.render_input(&mut win2, &input, None).pixels;
-        assert_eq!(
-            gpu_scissored, gpu_fresh,
-            "frame {n}: a settled translucent cat quad inside the dirty \
-             bounding band must be byte-stable on the GPU"
-        );
-    }
-}
-
-#[test]
-fn free_scaled_sprite_samples_the_same_texel_as_the_cpu() {
-    let theme = Theme::default();
-    let (mut cpu, mut gpu) = backends(18.0, theme);
-    let mut win = aterm_gpu::WindowGpu::new();
-    let (rows, cols) = (8usize, 20usize);
-    let mut term = Terminal::new(rows as u16, cols as u16);
-    term.process(b"\x1b[?25l");
-
-    let (nat_w, nat_h) = (40u16, 40u16);
-    let mut scaled_seen = 0usize;
-    for pct in [100u32, 50, 80, 90, 95, 105, 110, 112, 120, 125, 150, 200] {
-        for flip in [false, true] {
-            let dest =
-                |n: u16| -> u16 { ((f64::from(n) * f64::from(pct) / 100.0).round() as u16).max(1) };
-            let (dw, dh) = (dest(nat_w), dest(nat_h));
-            if dw != nat_w {
-                scaled_seen += 1;
+        let (nat_w, nat_h) = (40u16, 40u16);
+        let art = opaque(8, 8, nat_w, nat_h);
+        let mut scaled_seen = 0usize;
+        for pct in [100u32, 50, 80, 90, 95, 105, 110, 112, 120, 125, 150, 200] {
+            for flip in [false, true] {
+                let dest = |n: u16| -> u16 {
+                    ((f64::from(n) * f64::from(pct) / 100.0).round() as u16).max(1)
+                };
+                let (dw, dh) = (dest(nat_w), dest(nat_h));
+                if dw != nat_w {
+                    scaled_seen += 1;
+                }
+                let bare = term.cell_frame(rows, cols);
+                let mut input = bare.clone();
+                put(
+                    &mut input,
+                    &[FreeSprite {
+                        w: dw,
+                        h: dh,
+                        flip_x: flip,
+                        ..over(20, 20, art.clone())
+                    }],
+                );
+                let c = cpu.render_input(&input);
+                let g = gpu.render_input(&mut win, &input, None);
+                assert_ne!(
+                    cpu.render_input(&bare).pixels,
+                    c.pixels,
+                    "scale {pct}% flip={flip}: the sprite painted nothing — the pin would be vacuous"
+                );
+                let delta = max_channel_delta(&c.pixels, &g.pixels);
+                assert_eq!(
+                    delta, 0,
+                    "{arm}: scale {pct}% flip={flip} (dest {dw}x{dh} from {nat_w}x{nat_h}): the GPU \
+                 picked another texel than the CPU's integer nearest map"
+                );
             }
-            let mut input = term.cell_frame(rows, cols);
-            input.free_atlas = Some(Arc::new(free_atlas(1)));
-            input.free_sprites = vec![FreeSprite {
-                x: 20,
-                y: 20,
-                w: dw,
-                h: dh,
-                ax: 8,
-                ay: 8, // the atlas's OPAQUE half: a wrong texel is a colour, not a blend
-                aw: nat_w,
-                ah: nat_h,
-                tint: 0x00FF_FFFF,
-                alpha: 255,
-                flip_x: flip,
-                z: FreeZ::OverText,
-                sampler: FreeSampler::Nearest,
-            }];
-            let c = cpu.render_input(&input);
-            let g = gpu.render_input(&mut win, &input, None);
-            let mut bare = input.clone();
-            bare.free_sprites.clear();
-            assert_ne!(
-                cpu.render_input(&bare).pixels,
-                c.pixels,
-                "scale {pct}% flip={flip}: the sprite painted nothing — the pin would be vacuous"
-            );
-            let delta = max_channel_delta(&c.pixels, &g.pixels);
-            assert!(
-                delta <= 2,
-                "scale {pct}% flip={flip} (dest {dw}x{dh} from {nat_w}x{nat_h}): the GPU \
-                 NEAREST sample diverged from the CPU stamp — max per-channel delta {delta} \
-                 > 2. A pixel-centre tie resolved the other way; see `uv_tie_bias`."
-            );
         }
+        assert!(
+            scaled_seen >= 16,
+            "the sweep must actually exercise the SCALED arm (saw {scaled_seen} scaled cases)"
+        );
+        common::assert_arm(arm, &gpu);
     }
-    assert!(
-        scaled_seen >= 16,
-        "the sweep must actually exercise the SCALED arm (saw {scaled_seen} scaled cases)"
-    );
 }

@@ -143,16 +143,6 @@ fn inbox() -> CtlReply {
     }
 }
 
-fn timeline() -> CtlReply {
-    ok(&format!(
-        "event 1 t=0 kind=spawned state=spawning\n\
-         event 2 t=5000 kind=post 8 to=@{WORKER} kind=task\n\
-         event 3 t=5010 kind=post-landed 8 off=3\n\
-         event 4 t=209000 kind=post 9 to=@{WORKER} kind=task\n\
-         event 5 t=209500 kind=post 10 to=@s-other kind=note\n"
-    ))
-}
-
 fn journal_file(tag: &str, lines: &[String]) -> (std::path::PathBuf, std::path::PathBuf) {
     let dir = crate::supervise::test_scratch_path("ledger-journal", tag);
     std::fs::create_dir_all(&dir).expect("tmp dir");
@@ -215,37 +205,85 @@ fn journal_lines() -> Vec<String> {
     v
 }
 
-fn whole_host() -> Host {
+const SKEW: i64 = 40;
+
+fn log_turns_reply(restated: bool) -> CtlReply {
+    let t = |ms: i64| EPOCH + ms + SKEW;
+    let ledger1 = if restated { " ledger=1" } else { "" };
+    ok(&format!(
+        "gap why=evicted lost=9 resync_to=20\n\
+         1 open - spawn by=aterm src=aterm conf=exact t={}\n\
+         2 open r1 agent agent=claude by=- src=status conf=strong t={}\n\
+         24 close t1 turn out=done dur_ms=1800{ledger1} by=ctl src=screen conf=strong t={}\n\
+         27 close t2 turn out=done dur_ms=900 by=human src=screen conf=strong t={}\n\
+         30 open t3 turn par=r1 ledger=2 by=ctl src=screen conf=strong t={}\n\
+         41 close t3 turn out=done dur_ms=6005 ledger=2 by=ctl src=screen conf=strong t={}\n\
+         50 open t4 turn par=r1 ledger=3 by=ctl src=screen conf=strong t={}\n\
+         52 close t4 turn out=done dur_ms=1750 ledger=3 by=ctl src=screen conf=strong t={}\n\
+         60 open t5 turn par=r1 by=human src=screen conf=strong t={}\n",
+        t(0),
+        t(1),
+        t(10_000 + 1_800),
+        t(50_000),
+        t(100_000),
+        t(106_005),
+        t(200_000),
+        t(201_750),
+        t(250_000),
+    ))
+}
+
+fn log_mail_reply() -> CtlReply {
+    let t = |ms: i64| EPOCH + ms + SKEW;
+    ok(&format!(
+        "7 mark - mail dir=out kind=task to=@{WORKER} inbox=8 by=- src=fabric conf=exact t={}\n\
+         8 mark - mail dir=in kind=report from={WORKER}@n-1 off=4 inbox=1 by=bridge src=fabric \
+         conf=exact t={}\n\
+         9 mark - mail dir=in kind=note from=s-other@n-1 off=5 inbox=2 by=bridge src=fabric \
+         conf=exact t={}\n\
+         10 mark - mail dir=out kind=task to=@{WORKER} inbox=9 by=- src=fabric conf=exact t={}\n\
+         11 mark - mail dir=out kind=note to=@s-other inbox=10 by=- src=fabric conf=exact t={}\n",
+        t(5_000),
+        t(205_000),
+        t(206_000),
+        t(209_000),
+        t(209_500),
+    ))
+}
+
+/// A host that answers every verb the ledger asks, its log restating each close's
+/// `ledger=` when `restated`.
+fn host_with(restated: bool) -> Host {
     Host::default()
         .on("whoami", ok(&format!("OK {MANAGER} deadbeef owner\n")))
         .on("history", history())
         .on("offscreen", offscreen())
         .on("inbox", inbox())
-        .on("timeline", timeline())
+        .on("log", log_turns_reply(restated))
+        .on("log", log_mail_reply())
 }
 
-fn anchors(sid: &str) -> Result<ClockAnchor, String> {
-    match sid {
-        WORKER | MANAGER => Ok(ClockAnchor {
-            pid: 66_439,
-            epoch_ms: EPOCH,
-            how: "its control socket's birth time".to_string(),
-        }),
-        other => Err(format!("no live instance hosts @{other}")),
-    }
+fn whole_host() -> Host {
+    host_with(true)
 }
 
-fn read(
-    host: &mut Host,
-    opts: &LedgerOpts,
-    anchor: &mut dyn FnMut(&str) -> Result<ClockAnchor, String>,
-) -> Ledger {
-    let mut h = LedgerHost {
+/// A host whose log cannot be read: every other verb answers.
+fn logless_host() -> Host {
+    Host::default()
+        .on("whoami", ok(&format!("OK {MANAGER} deadbeef owner\n")))
+        .on("history", history())
+        .on("offscreen", offscreen())
+        .on("inbox", inbox())
+        .on("log", err("unknown verb (try: help)"))
+        .on("log", err("unknown verb (try: help)"))
+}
+
+fn read(host: &mut Host, opts: &LedgerOpts) -> Ledger {
+    let h = LedgerHost {
         now_ms: EPOCH + 300_000,
         tz_offset_s: 0,
-        anchor,
     };
-    gather(host, opts, &mut h)
+    gather(host, opts, &h)
 }
 
 fn opts(journal: Option<std::path::PathBuf>) -> LedgerOpts {
@@ -253,7 +291,6 @@ fn opts(journal: Option<std::path::PathBuf>) -> LedgerOpts {
         worker: format!("@{WORKER}"),
         journal,
         since_ms: None,
-        source: LedgerSource::Anchor,
     }
 }
 
@@ -261,15 +298,16 @@ fn opts(journal: Option<std::path::PathBuf>) -> LedgerOpts {
 fn the_ledger_joins_the_four_sources() {
     let (dir, path) = journal_file("whole", &journal_lines());
     let mut host = whole_host();
-    let l = read(&mut host, &opts(Some(path.clone())), &mut anchors);
+    let l = read(&mut host, &opts(Some(path.clone())));
     assert_eq!(
         host.requests,
         [
             "whoami",
             "@s-work history",
+            "@s-work log class=turn",
             "@s-work offscreen tail=20000 max=20000 screen=1",
             "@self inbox --peek --meta",
-            "@self timeline",
+            "@self log kinds=mail",
         ]
     );
     assert_eq!(l.worker, WORKER);
@@ -277,8 +315,8 @@ fn the_ledger_joins_the_four_sources() {
     assert!(l.aligned);
     let clock = l.sources.iter().find(|s| s.name == "clock").expect("row");
     assert!(
-        clock.ok && clock.detail.starts_with(ANCHOR_DEPRECATED),
-        "the anchor path says it is deprecated: {}",
+        clock.ok && clock.detail.contains("no clock anchor"),
+        "{}",
         clock.detail
     );
     type Placed = (u64, Option<i64>, Result<usize, String>, Option<i64>);
@@ -290,9 +328,19 @@ fn the_ledger_joins_the_four_sources() {
     assert_eq!(
         turns,
         [
-            (1, Some(EPOCH + 10_000), Ok(3), Some(EPOCH + 20_000)),
-            (2, Some(EPOCH + 100_000), Ok(2), Some(EPOCH + 150_000)),
-            (3, Some(EPOCH + 200_000), Ok(4), Some(EPOCH + 210_000)),
+            (1, Some(EPOCH + SKEW + 10_000), Ok(3), Some(EPOCH + 20_000)),
+            (
+                2,
+                Some(EPOCH + SKEW + 100_000),
+                Ok(2),
+                Some(EPOCH + 150_000)
+            ),
+            (
+                3,
+                Some(EPOCH + SKEW + 200_000),
+                Ok(4),
+                Some(EPOCH + 210_000)
+            ),
         ]
     );
     assert_eq!(l.journal.len(), 11);
@@ -306,7 +354,7 @@ fn the_ledger_joins_the_four_sources() {
         l.mail,
         [
             Mail {
-                t: Some(EPOCH + 5_000),
+                t: Some(EPOCH + SKEW + 5_000),
                 dir: Dir::Out,
                 kind: "task".to_string(),
                 len: None,
@@ -314,7 +362,7 @@ fn the_ledger_joins_the_four_sources() {
                 pending: false,
             },
             Mail {
-                t: Some(EPOCH + 205_000),
+                t: Some(EPOCH + SKEW + 205_000),
                 dir: Dir::In,
                 kind: "report".to_string(),
                 len: Some(2009),
@@ -322,7 +370,7 @@ fn the_ledger_joins_the_four_sources() {
                 pending: false,
             },
             Mail {
-                t: Some(EPOCH + 209_000),
+                t: Some(EPOCH + SKEW + 209_000),
                 dir: Dir::Out,
                 kind: "task".to_string(),
                 len: None,
@@ -336,12 +384,12 @@ fn the_ledger_joins_the_four_sources() {
     assert_eq!(s.turn_ms, 1_800 + 6_005 + 1_750);
     assert_eq!(
         (s.working_turns, s.working_ms),
-        (3, 10_000 + 50_000 + 10_000)
+        (3, 10_000 + 50_000 + 10_000 - 3 * SKEW)
     );
-    assert_eq!(s.latencies, [80_000, 50_000]);
+    assert_eq!(s.latencies, [80_000 + SKEW, 50_000 + SKEW]);
     assert_eq!(
         (s.median_ms(), s.max_ms(), s.waiting),
-        (Some(65_000), Some(80_000), 1)
+        (Some(65_000 + SKEW), Some(80_000 + SKEW), 1)
     );
     assert_eq!((s.approvals, s.dismissals), (1, 1));
     assert_eq!((s.context, s.compacted, s.reconnects), (1, 1, 1));
@@ -353,6 +401,32 @@ fn the_ledger_joins_the_four_sources() {
     sorted.sort();
     assert_eq!(times, sorted);
     assert_eq!(items.len(), 3 * 2 + 11 + 3);
+    for id in 1..=3 {
+        assert!(
+            items
+                .iter()
+                .any(|i| i.what.starts_with(&format!("turn {id} began: "))),
+            "turn {id} is placed where the log saw it begin"
+        );
+    }
+    let detail = &l
+        .sources
+        .iter()
+        .find(|s| s.name == "log")
+        .expect("a log source")
+        .detail;
+    assert!(
+        detail.starts_with(
+            "@s-work log class=turn: 3 of 3 turn(s) placed by ledger= (1 by its close: the \
+             open was evicted)"
+        ) && detail.contains("the ring evicted 9 record(s)")
+            && detail.contains(
+                "; 1 closed turn(s) whose open was evicted name no ledger= (no `turn` exchange \
+                 opened them, or an older aterm closed them): joined to nothing"
+            )
+            && !detail.contains("no longer holds"),
+        "{detail}"
+    );
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir(dir);
 }
@@ -361,7 +435,7 @@ fn the_ledger_joins_the_four_sources() {
 fn the_md_form_is_tables() {
     let (dir, path) = journal_file("md", &journal_lines());
     let mut host = whole_host();
-    let mut l = read(&mut host, &opts(Some(path.clone())), &mut anchors);
+    let mut l = read(&mut host, &opts(Some(path.clone())));
     l.turns[0].text = "a | b".to_string();
     let md = render_md(&l);
     assert!(md.contains("a \\| b"), "a worker's pipe is escaped:\n{md}");
@@ -373,7 +447,7 @@ fn the_md_form_is_tables() {
 fn the_html_form_is_one_self_contained_page() {
     let (dir, path) = journal_file("html", &journal_lines());
     let mut host = whole_host();
-    let mut l = read(&mut host, &opts(Some(path.clone())), &mut anchors);
+    let mut l = read(&mut host, &opts(Some(path.clone())));
     l.turns[0].text = "</script><img src=http://evil/x> & <b>bold</b>".to_string();
     let html = render(&l, Format::Html);
     assert_eq!(super::super::ledger_html::is_self_contained(&html), Ok(()));
@@ -454,20 +528,19 @@ fn well_formed(html: &str) -> Result<(), String> {
 fn a_missing_source_is_named_and_the_rest_prints() {
     let (dir, path) = journal_file("missing", &journal_lines());
     let mut host = Host::default();
-    let l = read(&mut host, &opts(Some(path.clone())), &mut anchors);
+    let l = read(&mut host, &opts(Some(path.clone())));
     let misses: Vec<&str> = l.sources.iter().filter(|s| !s.ok).map(|s| s.name).collect();
-    assert_eq!(misses, ["history", "mail"]);
+    assert_eq!(misses, ["history", "log", "mail"]);
     assert!(l.turns.is_empty() && l.mail.is_empty());
     assert_eq!(l.journal.len(), 11);
     let mut host = whole_host();
-    let l = read(&mut host, &opts(None), &mut anchors);
+    let l = read(&mut host, &opts(None));
     assert!(!l.journaled && !l.journal_unreadable);
     assert_eq!(l.turns.len(), 3);
     assert!(l.turns.iter().all(|t| t.stopped.is_none()));
     let l = read(
         &mut whole_host(),
         &opts(Some(dir.join("nothing-here.jsonl"))),
-        &mut anchors,
     );
     assert!(!l.journaled && l.journal_unreadable);
     let journal = l.sources.iter().find(|s| s.name == "journal").expect("row");
@@ -477,16 +550,14 @@ fn a_missing_source_is_named_and_the_rest_prints() {
 }
 
 #[test]
-fn without_a_clock_no_working_time_is_claimed() {
-    let (dir, path) = journal_file("clockless-spans", &journal_lines());
-    let mut host = whole_host();
-    let l = read(&mut host, &opts(Some(path.clone())), &mut |sid| {
-        Err(format!("no live instance hosts @{sid}"))
-    });
+fn without_the_log_no_working_time_is_claimed() {
+    let (dir, path) = journal_file("logless-spans", &journal_lines());
+    let mut host = logless_host();
+    let l = read(&mut host, &opts(Some(path.clone())));
     assert!(!l.aligned);
     assert!(
-        l.turns.iter().all(|t| t.stopped.is_none()),
-        "a stop read off ANOTHER clock is not this turn's stop"
+        l.turns.iter().all(|t| t.t.is_none() && t.stopped.is_none()),
+        "a turn the log did not place has no stop"
     );
     let s = l.summary();
     assert_eq!(
@@ -498,8 +569,8 @@ fn without_a_clock_no_working_time_is_claimed() {
         s.latencies.is_empty() && s.waiting == 0,
         "no latency claimed"
     );
-    let clock = l.sources.iter().find(|s| s.name == "clock").expect("row");
-    assert!(!clock.ok);
+    let log = l.sources.iter().find(|s| s.name == "log").expect("row");
+    assert!(!log.ok, "{}", log.detail);
     let text = render_text(&l);
     assert!(
         !text.contains("working"),
@@ -522,7 +593,7 @@ fn a_reply_the_archive_lost_says_so() {
     );
     host.replies
         .insert("offscreen".to_string(), VecDeque::from(vec![off]));
-    let l = read(&mut host, &opts(None), &mut anchors);
+    let l = read(&mut host, &opts(None));
     let why: Vec<String> = l
         .turns
         .iter()
@@ -539,7 +610,7 @@ fn a_reply_the_archive_lost_says_so() {
     let mut host = Host::default()
         .on("whoami", ok(&format!("OK {MANAGER} deadbeef owner\n")))
         .on("history", history());
-    let l = read(&mut host, &opts(None), &mut anchors);
+    let l = read(&mut host, &opts(None));
     assert!(
         l.turns
             .iter()
@@ -564,7 +635,7 @@ fn a_ledger_an_update_could_not_carry_is_not_blamed_on_the_person() {
     let mut host = Host::default()
         .on("whoami", ok(&format!("OK {MANAGER} deadbeef owner\n")))
         .on("history", lost);
-    let l = read(&mut host, &opts(None), &mut anchors);
+    let l = read(&mut host, &opts(None));
     let src = l.sources.iter().find(|s| s.name == "history").expect("row");
     assert!(!src.ok && src.detail.contains("48"), "{}", src.detail);
     assert_eq!(
@@ -584,7 +655,6 @@ fn since_drops_what_came_before_it() {
             since_ms: Some(EPOCH + 160_000),
             ..opts(Some(path.clone()))
         },
-        &mut anchors,
     );
     assert_eq!(l.turns.iter().map(|t| t.id).collect::<Vec<_>>(), [3]);
     assert!(l.journal.iter().all(|r| r.t >= EPOCH + 160_000));
@@ -688,12 +758,6 @@ fn a_history_record_is_read_whole() {
             },
         ]
     );
-    let mut host = whole_host();
-    host.replies
-        .insert("history".to_string(), VecDeque::from(vec![ok(body)]));
-    let l = read(&mut host, &opts(None), &mut anchors);
-    assert_eq!(l.turns[0].t, None, "a carried turn is on another clock");
-    assert!(l.turns[1].t.is_some());
 }
 
 #[test]
@@ -707,7 +771,7 @@ fn the_harness_turns_are_not_the_managers() {
         let mut host = whole_host();
         host.replies
             .insert("history".to_string(), VecDeque::from(vec![ok(&body)]));
-        read(&mut host, &opts(None), &mut anchors)
+        read(&mut host, &opts(None))
     };
     let ids = |l: &Ledger| l.turns.iter().map(|t| t.id).collect::<Vec<u64>>();
     let history_detail = |l: &Ledger| {
@@ -736,6 +800,56 @@ fn the_harness_turns_are_not_the_managers() {
     let l = with("ctl");
     assert_eq!(ids(&l), [1, 2, 3, 4]);
     assert_eq!(l.turns[2].swallowed, [4]);
+    assert_eq!(l.summary().turns, 4);
+    assert!(!history_detail(&l).contains("harness"), "{l:#?}");
+}
+
+/// The ledger leaves the drive's own carry-on after a relaunch out of the manager's turns, as it
+/// does the harness's other typing ([`the_harness_turns_are_not_the_managers`]):
+/// `history` names it `by=harness`, because the drive types it under the harness's hand, and
+/// SOURCES counts it as the harness's. A turn `history` names `by=ctl` is the manager's.
+#[test]
+fn the_drives_carry_on_turn_reads_as_the_harness_not_the_manager() {
+    let with = |by: &str| {
+        let mut body = history().stdout;
+        body.push_str(&format!(
+            "turn 4 submitted=1 status=settled started_ms=250000 dur_ms=0 seq=9 \
+             hash=0000000000000000 by={by} arch=7730:105 text={}\n",
+            aterm_codec::pct::encode(crate::harness::upgrade::CARRY_ON)
+        ));
+        let mut host = whole_host();
+        host.replies
+            .insert("history".to_string(), VecDeque::from(vec![ok(&body)]));
+        read(&mut host, &opts(None))
+    };
+    let ids = |l: &Ledger| l.turns.iter().map(|t| t.id).collect::<Vec<u64>>();
+    let history_detail = |l: &Ledger| {
+        l.sources
+            .iter()
+            .find(|s| s.name == "history")
+            .expect("row")
+            .detail
+            .clone()
+    };
+    let l = with("harness");
+    assert_eq!(ids(&l), [1, 2, 3], "{:#?}", l.turns);
+    assert_eq!(l.summary().turns, 3);
+    let detail = history_detail(&l);
+    assert!(
+        detail.starts_with("3 turn(s) from @s-work")
+            && detail.contains("1 more typed by aterm's window harness (by=harness)"),
+        "{detail}"
+    );
+    assert!(
+        render_text(&l).contains("1 more typed by aterm's window harness (by=harness)"),
+        "SOURCES says so"
+    );
+    let l = with("ctl");
+    assert_eq!(
+        ids(&l),
+        [1, 2, 3, 4],
+        "NEGATIVE CONTROL: as ctl it is the manager's"
+    );
     assert_eq!(l.summary().turns, 4);
     assert!(!history_detail(&l).contains("harness"), "{l:#?}");
 }
@@ -787,7 +901,7 @@ fn a_turn_whose_row_is_missing_is_named_in_the_span_that_holds_it() {
     ]);
     host.replies
         .insert("offscreen".to_string(), VecDeque::from(vec![off]));
-    let l = read(&mut host, &opts(None), &mut anchors);
+    let l = read(&mut host, &opts(None));
     assert_eq!(l.turns[0].rows, Ok(4), "turn 2's rows are inside turn 1's");
     assert_eq!(l.turns[0].swallowed, [2]);
     assert!(l.turns[1].rows.is_err());
@@ -816,206 +930,21 @@ fn a_turn_whose_row_is_missing_is_named_in_the_span_that_holds_it() {
     };
     host.replies
         .insert("offscreen".to_string(), VecDeque::from(vec![off]));
-    let l = read(&mut host, &opts(None), &mut anchors);
+    let l = read(&mut host, &opts(None));
     assert_eq!(l.turns[0].swallowed, [2, 3]);
     assert!(l.turns[1].rows.is_err() && l.turns[2].rows.is_err());
 }
 
-const ANCHOR_ERROR_MS: i64 = 1_000;
-const SKEW: i64 = 40;
-
-fn log_turns_reply(restated: bool) -> CtlReply {
-    let t = |ms: i64| EPOCH + ms + SKEW;
-    let ledger1 = if restated { " ledger=1" } else { "" };
-    ok(&format!(
-        "gap why=evicted lost=9 resync_to=20\n\
-         1 open - spawn by=aterm src=aterm conf=exact t={}\n\
-         2 open r1 agent agent=claude by=- src=status conf=strong t={}\n\
-         24 close t1 turn out=done dur_ms=1800{ledger1} by=ctl src=screen conf=strong t={}\n\
-         27 close t2 turn out=done dur_ms=900 by=human src=screen conf=strong t={}\n\
-         30 open t3 turn par=r1 ledger=2 by=ctl src=screen conf=strong t={}\n\
-         41 close t3 turn out=done dur_ms=6005 ledger=2 by=ctl src=screen conf=strong t={}\n\
-         50 open t4 turn par=r1 ledger=3 by=ctl src=screen conf=strong t={}\n\
-         52 close t4 turn out=done dur_ms=1750 ledger=3 by=ctl src=screen conf=strong t={}\n\
-         60 open t5 turn par=r1 by=human src=screen conf=strong t={}\n",
-        t(0),
-        t(1),
-        t(10_000 + 1_800),
-        t(50_000),
-        t(100_000),
-        t(106_005),
-        t(200_000),
-        t(201_750),
-        t(250_000),
-    ))
-}
-
-fn log_mail_reply() -> CtlReply {
-    let t = |ms: i64| EPOCH + ms + SKEW;
-    ok(&format!(
-        "7 mark - mail dir=out kind=task to=@{WORKER} inbox=8 by=- src=fabric conf=exact t={}\n\
-         8 mark - mail dir=in kind=report from={WORKER}@n-1 off=4 inbox=1 by=bridge src=fabric \
-         conf=exact t={}\n\
-         9 mark - mail dir=in kind=note from=s-other@n-1 off=5 inbox=2 by=bridge src=fabric \
-         conf=exact t={}\n\
-         10 mark - mail dir=out kind=task to=@{WORKER} inbox=9 by=- src=fabric conf=exact t={}\n\
-         11 mark - mail dir=out kind=note to=@s-other inbox=10 by=- src=fabric conf=exact t={}\n",
-        t(5_000),
-        t(205_000),
-        t(206_000),
-        t(209_000),
-        t(209_500),
-    ))
-}
-
-fn log_host(restated: bool) -> Host {
-    whole_host()
-        .on("log", log_turns_reply(restated))
-        .on("log", log_mail_reply())
-}
-
-fn log_opts() -> LedgerOpts {
-    LedgerOpts {
-        source: LedgerSource::Log,
-        ..opts(None)
-    }
-}
-
-fn read_log(host: &mut Host) -> Ledger {
-    read(host, &log_opts(), &mut |sid| {
-        panic!("--source log asked for @{sid}'s clock anchor")
-    })
-}
-
-fn near(a: Option<i64>, b: Option<i64>) -> bool {
-    match (a, b) {
-        (Some(a), Some(b)) => (a - b).abs() <= ANCHOR_ERROR_MS,
-        (None, None) => true,
-        _ => false,
-    }
-}
-
-type Untimed = (
-    u64,
-    String,
-    bool,
-    u64,
-    bool,
-    String,
-    Result<usize, String>,
-    Vec<u64>,
-);
-
-fn untimed(l: &Ledger) -> Vec<Untimed> {
-    l.turns
-        .iter()
-        .map(|t| {
-            (
-                t.id,
-                t.status.clone(),
-                t.submitted,
-                t.dur_ms,
-                t.carried,
-                t.text.clone(),
-                t.rows.clone(),
-                t.swallowed.clone(),
-            )
-        })
-        .collect()
-}
-
-#[test]
-fn log_and_anchor_paths_agree_modulo_times() {
-    let anchor = read(&mut whole_host(), &opts(None), &mut anchors);
-    let mut host = log_host(true);
-    let log = read_log(&mut host);
-    assert_eq!(
-        host.requests,
-        [
-            "whoami",
-            "@s-work history",
-            "@s-work log class=turn",
-            "@s-work offscreen tail=20000 max=20000 screen=1",
-            "@self inbox --peek --meta",
-            "@self log kinds=mail",
-        ]
-    );
-    assert!(log.aligned && anchor.aligned);
-    assert_eq!(untimed(&log), untimed(&anchor));
-    for (l, a) in log.turns.iter().zip(&anchor.turns) {
-        assert!(
-            l.t.is_some() && near(l.t, a.t),
-            "turn {}: {:?} {:?}",
-            l.id,
-            l.t,
-            a.t
-        );
-    }
-    assert_eq!(log.mail.len(), anchor.mail.len());
-    for (l, a) in log.mail.iter().zip(&anchor.mail) {
-        assert!(near(l.t, a.t), "{l:?} {a:?}");
-        assert_eq!(
-            (l.dir, &l.kind, l.len, &l.trust, l.pending),
-            (a.dir, &a.kind, a.len, &a.trust, a.pending)
-        );
-    }
-    let src = |l: &Ledger, name: &str| {
-        l.sources
-            .iter()
-            .find(|s| s.name == name)
-            .map(|s| (s.ok, s.detail.clone()))
-    };
-    let (ok, detail) = src(&log, "log").expect("a log source");
-    assert!(ok, "{detail}");
-    assert!(
-        detail.starts_with(
-            "@s-work log class=turn: 3 of 3 turn(s) placed by ledger= (1 by its close: the \
-             open was evicted)"
-        ) && detail.contains("the ring evicted 9 record(s)"),
-        "{detail}"
-    );
-    assert!(
-        detail.contains(
-            "; 1 closed turn(s) whose open was evicted name no ledger= (no `turn` exchange \
-             opened them, or an older aterm closed them): joined to nothing"
-        ) && !detail.contains("ledger= is gone")
-            && !detail.contains("no longer holds"),
-        "{detail}"
-    );
-    let what = |l: &Ledger, id: u64| {
-        l.items()
-            .into_iter()
-            .find(|i| i.what.starts_with(&format!("turn {id} ")))
-            .map(|i| i.what)
-    };
-    for id in 1..=3 {
-        let (l, a) = (what(&log, id), what(&anchor, id));
-        assert!(
-            l.as_deref()
-                .is_some_and(|w| w.starts_with(&format!("turn {id} began: ")))
-                && a.as_deref()
-                    .is_some_and(|w| w.starts_with(&format!("turn {id} sent: "))),
-            "{l:?} {a:?}"
-        );
-    }
-    assert!(src(&anchor, "log").is_none(), "the old path reads no log");
-    let (ok, clock) = src(&log, "clock").expect("a clock source");
-    assert!(ok && clock.contains("no clock anchor"), "{clock}");
-    let (s, a) = (log.summary(), anchor.summary());
-    assert_eq!(
-        (s.turns, s.settled, s.timeouts, s.mail_in, s.mail_out),
-        (a.turns, a.settled, a.timeouts, a.mail_in, a.mail_out)
-    );
-}
-
 #[test]
 fn a_close_without_its_ledger_loses_the_join() {
-    let anchor = read(&mut whole_host(), &opts(None), &mut anchors);
-    let log = read_log(&mut log_host(false));
-    assert_eq!(untimed(&log), untimed(&anchor), "the rows still read");
+    let log = read(&mut host_with(false), &opts(None));
+    assert_eq!(
+        log.turns.iter().map(|t| t.id).collect::<Vec<_>>(),
+        [1, 2, 3],
+        "the rows still read"
+    );
     assert_eq!(log.turns[0].t, None, "turn 1 is not joined by time");
-    assert!(anchor.turns[0].t.is_some());
-    assert!(near(log.turns[1].t, anchor.turns[1].t));
+    assert_eq!(log.turns[1].t, Some(EPOCH + SKEW + 100_000));
     let detail = &log
         .sources
         .iter()
@@ -1032,10 +961,12 @@ fn a_close_without_its_ledger_loses_the_join() {
 
 #[test]
 fn a_log_that_cannot_be_read_places_nothing_and_says_so() {
-    let mut host = whole_host()
-        .on("log", err("unknown verb (try: help)"))
-        .on("log", ok(""));
-    let l = read_log(&mut host);
+    let mut host = logless_host();
+    host.replies.insert(
+        "log".to_string(),
+        VecDeque::from(vec![err("unknown verb (try: help)"), ok("")]),
+    );
+    let l = read(&mut host, &opts(None));
     assert!(!l.aligned);
     assert_eq!(l.turns.len(), 3);
     assert!(l.turns.iter().all(|t| t.t.is_none()));
@@ -1060,26 +991,14 @@ fn a_log_that_cannot_be_read_places_nothing_and_says_so() {
     assert_eq!(l.mail[0].t, None);
 }
 
-/// A ledger named with no `--source`: the default.
-fn default_opts(journal: Option<std::path::PathBuf>) -> LedgerOpts {
-    LedgerOpts {
-        worker: format!("@{WORKER}"),
-        journal,
-        ..LedgerOpts::default()
-    }
-}
-
-/// THE DEFAULT IS THE LOG: a ledger named with no source reads the worker's `log
-/// class=turn` and this session's `log kinds=mail`, never a clock anchor nor
-/// `timeline`, and places every turn by its log record; NEGATIVE CONTROL: the
-/// anchor default asks for a clock, and the anchor's own tests name it.
+/// THE LEDGER READS THE LOG: it reads the worker's `log class=turn` and this session's
+/// `log kinds=mail`, never `timeline`, and places every turn by its log record; NEGATIVE
+/// CONTROL: a log that cannot be read places nothing
+/// (`a_log_that_cannot_be_read_places_nothing_and_says_so`).
 #[test]
-fn the_default_source_is_the_log() {
-    assert_eq!(LedgerOpts::default().source, LedgerSource::Log);
-    let mut host = log_host(true);
-    let l = read(&mut host, &default_opts(None), &mut |sid| {
-        panic!("the default asked for @{sid}'s clock anchor")
-    });
+fn the_ledger_reads_the_log_and_no_clock() {
+    let mut host = whole_host();
+    let l = read(&mut host, &opts(None));
     for asked in ["@s-work log class=turn", "@self log kinds=mail"] {
         assert!(
             host.requests.iter().any(|r| r == asked),
@@ -1093,11 +1012,7 @@ fn the_default_source_is_the_log() {
         host.requests
     );
     assert!(l.aligned);
-    assert!(
-        l.turns.iter().all(|t| t.t.is_some() && t.began),
-        "{:#?}",
-        l.turns
-    );
+    assert!(l.turns.iter().all(|t| t.t.is_some()), "{:#?}", l.turns);
     let clock = l.sources.iter().find(|s| s.name == "clock").expect("row");
     assert!(
         clock.ok && !clock.detail.contains("deprecated"),
@@ -1106,17 +1021,13 @@ fn the_default_source_is_the_log() {
     );
 }
 
-/// The default ledger's three renders, byte for byte
+/// The ledger's three renders, byte for byte
 /// (`fixtures/ledger-log-default.{txt,md,html}`): the journal's path reads `<journal>`, and
 /// the page's fixed style and script are left out of the HTML's.
 #[test]
-fn the_default_ledger_renders_its_goldens() {
+fn the_ledger_renders_its_goldens() {
     let (dir, path) = journal_file("golden", &journal_lines());
-    let l = read(
-        &mut log_host(true),
-        &default_opts(Some(path.clone())),
-        &mut |sid| panic!("the default asked for @{sid}'s clock anchor"),
-    );
+    let l = read(&mut whole_host(), &opts(Some(path.clone())));
     let named = path.display().to_string();
     let shown = |format: Format| render(&l, format).replace(&named, "<journal>");
     let html = shown(Format::Html)
@@ -1145,26 +1056,20 @@ fn the_default_ledger_renders_its_goldens() {
     let _ = std::fs::remove_dir(dir);
 }
 
-/// AN UNREAD LOG GUESSES NO TIME: when the worker's `log` cannot be read, the default ledger
-/// places no turn and says, where the latency would be, that the session log could not be
-/// read, and its journal times (wall times) print as they are, with no `~`, in text, md and
-/// html; the deprecated anchor path with no anchor still marks its guesses `~`; NEGATIVE
+/// AN UNREAD LOG GUESSES NO TIME: when the worker's `log` cannot be read, the ledger places no
+/// turn and says, where the latency would be, that the session log could not be read, and its
+/// journal times (wall times) print as they are, with no `~`, in text, md and html; NEGATIVE
 /// CONTROL: a log the ledger read places its turns.
 #[test]
 fn an_unread_log_guesses_no_time() {
     let (dir, path) = journal_file("log-unread", &journal_lines());
-    let l = read(
-        &mut whole_host(),
-        &default_opts(Some(path.clone())),
-        &mut |sid| panic!("the default asked for @{sid}'s clock anchor"),
-    );
-    assert!(!l.aligned && !l.guessed, "{:?}", l.sources);
+    let l = read(&mut logless_host(), &opts(Some(path.clone())));
+    assert!(!l.aligned, "{:?}", l.sources);
     assert!(l.turns.iter().all(|t| t.t.is_none()));
     assert!(l.journal.iter().any(|r| r.line == "TIMEOUT"));
     let text = render(&l, Format::Text);
     assert!(
-        text.contains("- (the session log could not be read)")
-            && !text.contains("the clock could not be placed"),
+        text.contains("- (the session log could not be read)"),
         "{text}"
     );
     for (what, page) in [
@@ -1174,22 +1079,9 @@ fn an_unread_log_guesses_no_time() {
     ] {
         assert!(!page.contains('~'), "the {what} render guesses:\n{page}");
     }
-    let read_log = read(
-        &mut log_host(true),
-        &default_opts(Some(path.clone())),
-        &mut |sid| panic!("the default asked for @{sid}'s clock anchor"),
-    );
-    assert!(read_log.aligned && !read_log.guessed);
+    let read_log = read(&mut whole_host(), &opts(Some(path.clone())));
+    assert!(read_log.aligned);
     assert!(read_log.turns.iter().all(|t| t.t.is_some()));
-    let anchorless = read(&mut whole_host(), &opts(Some(path.clone())), &mut |sid| {
-        Err(format!("no live instance hosts @{sid}"))
-    });
-    assert!(anchorless.guessed && !anchorless.aligned);
-    let text = render(&anchorless, Format::Text);
-    assert!(
-        text.contains("~") && text.contains("- (the clock could not be placed)"),
-        "{text}"
-    );
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir(dir);
 }
@@ -1409,17 +1301,13 @@ fn the_page_colours_each_mark_as_its_legend_row_does() {
 
 /// EVERY MARK HAS ITS OWN LEGEND ROW: the page's legend names each [`MarkKind`] once, after
 /// the reply its `working` bar, each in a swatch the style draws; an item's data says its
-/// swatch; NEGATIVE CONTROL: the golden page (`the_default_ledger_renders_its_goldens`)
+/// swatch; NEGATIVE CONTROL: the golden page (`the_ledger_renders_its_goldens`)
 /// holds the legend's rows byte for byte.
 #[test]
 fn every_mark_has_its_own_legend_row() {
     use super::super::ledger_html::{STYLE, legend, swatch};
     let (dir, path) = journal_file("legend", &journal_lines());
-    let l = read(
-        &mut log_host(true),
-        &default_opts(Some(path.clone())),
-        &mut |sid| panic!("the default asked for @{sid}'s clock anchor"),
-    );
+    let l = read(&mut whole_host(), &opts(Some(path.clone())));
     let html = render(&l, Format::Html);
     let rows = legend();
     assert_eq!(
@@ -1464,9 +1352,8 @@ fn every_mark_has_its_own_legend_row() {
 }
 
 /// A CARRIED TURN THE LOG HOLDS IS PLACED BY IT: a turn carried from an earlier aterm is
-/// placed by its own log record, and the history row does not call it timeless; the
-/// anchor path cannot place it and says so; NEGATIVE CONTROL: a turn the log does not
-/// hold has no time.
+/// placed by its own log record, and the history row does not call it timeless; NEGATIVE
+/// CONTROL: a turn the log does not hold has no time.
 #[test]
 fn a_carried_turn_the_log_holds_is_placed_by_it() {
     let body = "turn 7 submitted=1 status=settled started_ms=5 dur_ms=3 seq=4 hash=0 \
@@ -1481,7 +1368,7 @@ fn a_carried_turn_the_log_holds_is_placed_by_it() {
             .detail
             .clone()
     };
-    let mut host = log_host(true);
+    let mut host = whole_host();
     host.replies
         .insert("history".to_string(), VecDeque::from(vec![ok(body)]));
     host.replies.insert(
@@ -1494,9 +1381,7 @@ fn a_carried_turn_the_log_holds_is_placed_by_it() {
             log_mail_reply(),
         ]),
     );
-    let l = read(&mut host, &default_opts(None), &mut |sid| {
-        panic!("the default asked for @{sid}'s clock anchor")
-    });
+    let l = read(&mut host, &opts(None));
     assert_eq!(l.turns[0].t, Some(EPOCH + 500), "placed by its own record");
     assert_eq!(
         l.turns[1].t, None,
@@ -1506,15 +1391,5 @@ fn a_carried_turn_the_log_holds_is_placed_by_it() {
     assert!(
         detail.contains("1 carried from an earlier aterm") && !detail.contains("no time"),
         "{detail}"
-    );
-    let mut host = whole_host();
-    host.replies
-        .insert("history".to_string(), VecDeque::from(vec![ok(body)]));
-    let a = read(&mut host, &opts(None), &mut anchors);
-    assert_eq!(a.turns[0].t, None, "the anchor cannot place a carried turn");
-    assert!(
-        history_detail(&a).contains("1 carried from an earlier aterm (no time)"),
-        "{}",
-        history_detail(&a)
     );
 }

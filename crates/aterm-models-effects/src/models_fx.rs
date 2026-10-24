@@ -603,14 +603,32 @@ pub fn rain_band_containment_model() -> Model {
             int(0),
         )
     };
-    let diff_last = || {
-        if_(
-            and_(eq(var("mt"), int(1)), eq(cst("Buggy"), int(0))),
-            last_lit(),
-            if_(head_visible(), var("head"), tail()),
+    // One fx layer a grid row (`aterm_effects::matrix_rain::RainLayers`, lane B7 of
+    // `docs/DESIGN-card-engine-2026-10-19.md`), whose keep rule this is: a row lit in
+    // both frames keeps its layer when its cells (the glyphs a window change `mt`
+    // redraws) and the tile set's version (`vb`, a re-bake) are the same, and
+    // identity damage marks every other lit row (a layer new, gone or rebuilt). The
+    // Buggy = 1 marker sees only the rows the head and the tail moved through,
+    // missing the rows a window change redrew.
+    let was_lit = || le(var("r"), sub(var("head"), int(1)));
+    let now_lit = || neq(var("r"), tail());
+    let kept = || {
+        and_(
+            and_(was_lit(), now_lit()),
+            and_(eq(var("mt"), int(0)), eq(var("vb"), int(0))),
         )
     };
-    let marked = || if_(le(var("r"), diff_last()), int(1), int(0));
+    let marked = || {
+        if_(
+            eq(cst("Buggy"), int(1)),
+            if_(
+                or_(eq(var("r"), var("head")), eq(var("r"), tail())),
+                int(1),
+                int(0),
+            ),
+            if_(kept(), int(0), int(1)),
+        )
+    };
     Model {
         name: "RainBandContainment",
         consts: vec![("Buggy", 0), ("Viewport", 6)],
@@ -626,6 +644,10 @@ pub fn rain_band_containment_model() -> Model {
             StateVar { name: "l", init: 2 },
             StateVar {
                 name: "mt",
+                init: 0,
+            },
+            StateVar {
+                name: "vb",
                 init: 0,
             },
             StateVar { name: "r", init: 0 },
@@ -681,6 +703,10 @@ pub fn rain_band_containment_model() -> Model {
                 updates: vec![
                     Update {
                         var: "mt",
+                        expr: in_range(int(0), int(1)),
+                    },
+                    Update {
+                        var: "vb",
                         expr: in_range(int(0), int(1)),
                     },
                     Update {

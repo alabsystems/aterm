@@ -1,14 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! First-party `unicode-width` facade wired via `[patch.crates-io]` for
-//! `codespan-reporting` (`naga`'s diagnostics renderer), backed by
-//! `aterm_grapheme`'s width tables.
-//!
-//! Provides [`UnicodeWidthChar::width`] (`None` for C0/DEL/C1 controls,
-//! `Some(1)` for printable ASCII, `Some(0 | 1 | 2)` otherwise, with East
-//! Asian Ambiguous characters counted narrow). `width_cjk` and
-//! `UnicodeWidthStr` are omitted because no consumer in the graph calls them.
+//! First-party `unicode-width` facade wired via `[patch.crates-io]` for `codespan-reporting`.
 
 #![warn(missing_docs)]
 
@@ -20,8 +13,7 @@ const fn is_control(c: char) -> bool {
 
 /// Displayed width of a `char` in terminal columns.
 pub trait UnicodeWidthChar {
-    /// Columns `self` occupies, East Asian Ambiguous characters counted
-    /// narrow; `None` for a control character.
+    /// Columns `self` occupies (East Asian Ambiguous counted narrow); `None` for a control.
     fn width(self) -> Option<usize>;
 }
 

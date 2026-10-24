@@ -178,6 +178,8 @@ pub(crate) fn lay(run: &mut Run, repo: &Path) -> Result<(), String> {
         .map_err(|e| format!("cannot lay {}: {e}", l.lib.display()))?;
     write_offset(run, 0)?;
     if hardened(&codesign_dv(Path::new(&run.claude_bin))?) {
+        // until `up` starts it, the clone goes with the lab at once
+        let _ = fs::write(run.run.join(crate::lab::CLOCK_UNSTARTED), "");
         crate::sys::put(&l.claude, 0o755, &PutSrc::File(Path::new(&run.claude_bin)))
             .map_err(|e| format!("cannot clone Claude Code into {}: {e}", l.claude.display()))?;
         let signed = aterm_uds::spawnfd::command("/usr/bin/codesign")

@@ -3,9 +3,7 @@
 
 //! Profile-aware URL opener and headless mailbox OAuth flow for `aterm-open-url`.
 
-use std::collections::BTreeMap;
-#[cfg(test)]
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -187,7 +185,7 @@ pub fn extract_query_param(url: &str, key: &str) -> Option<String> {
     let query = query.split('#').next().unwrap_or(query);
     for pair in query.split('&') {
         if let Some((k, v)) = pair.split_once('=')
-            && k == key
+            && percent_decode(k) == key
         {
             return Some(percent_decode(v));
         }
@@ -265,7 +263,101 @@ pub(super) fn decode_html_amp(input: &str) -> String {
         .replace("&#x27;", "'")
 }
 
+pub(super) fn strip_html_comments(input: &str) -> String {
+    if !input.contains("<!--") {
+        return input.to_owned();
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find("<!--") {
+        out.push_str(&rest[..start]);
+        let after_open = &rest[start + 4..];
+        if let Some(end) = after_open.find("-->") {
+            rest = &after_open[end + 3..];
+        } else {
+            rest = "";
+            break;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+pub(super) fn find_tag_close(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if bytes.first() != Some(&b'<') {
+        return s.find('>');
+    }
+    let mut pos = 1usize;
+    while pos < bytes.len()
+        && !bytes[pos].is_ascii_whitespace()
+        && !matches!(bytes[pos], b'>' | b'/')
+    {
+        pos += 1;
+    }
+    while pos < bytes.len() {
+        while pos < bytes.len() && (bytes[pos].is_ascii_whitespace() || bytes[pos] == b'/') {
+            pos += 1;
+        }
+        if pos >= bytes.len() {
+            break;
+        }
+        if bytes[pos] == b'>' {
+            return Some(pos);
+        }
+        let start = pos;
+        while pos < bytes.len()
+            && !bytes[pos].is_ascii_whitespace()
+            && !matches!(bytes[pos], b'=' | b'>' | b'/')
+        {
+            pos += 1;
+        }
+        if start == pos {
+            pos += 1;
+            continue;
+        }
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        if bytes.get(pos) == Some(&b'=') {
+            pos += 1;
+            while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+                pos += 1;
+            }
+            match bytes.get(pos).copied() {
+                Some(q @ (b'"' | b'\'')) => {
+                    let Some(rel_end) = bytes[pos + 1..].iter().position(|&b| b == q) else {
+                        break;
+                    };
+                    pos = pos + 1 + rel_end + 1;
+                }
+                Some(_) => {
+                    while pos < bytes.len()
+                        && !bytes[pos].is_ascii_whitespace()
+                        && bytes[pos] != b'>'
+                    {
+                        pos += 1;
+                    }
+                }
+                None => break,
+            }
+        }
+    }
+    s.find('>')
+}
+
+fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() {
+        return Some(0);
+    }
+    h.windows(n.len()).position(|w| w.eq_ignore_ascii_case(n))
+}
+
 pub(super) fn extract_iframe_srcdoc_fragments(input: &str) -> String {
+    let uncommented = strip_html_comments(input);
+    let input = uncommented.as_str();
     let lower = input.to_ascii_lowercase();
     let mut fragments = Vec::new();
     let mut search_from = 0usize;
@@ -296,7 +388,7 @@ pub(super) fn extract_iframe_srcdoc_fragments(input: &str) -> String {
             .replace("&#62;", ">")
             .replace("&#x3e;", ">")
             .replace("&#x3E;", ">");
-        fragments.push(unescaped);
+        fragments.push(strip_html_comments(&unescaped));
         let consumed = input.len() - value_start.len() + end_idx + quote.len_utf8();
         search_from = consumed;
     }
@@ -760,17 +852,80 @@ pub(super) fn email_matches_target(raw_email: &str, target: &str) -> bool {
 
 fn is_non_auth_link(url: &str) -> bool {
     let lower = url.to_ascii_lowercase();
-    let path = lower.split('?').next().unwrap_or(&lower);
-    lower.contains("unsubscribe")
+    let (without_query, has_query) = lower
+        .split_once('?')
+        .map_or((lower.as_str(), false), |(p, q)| (p, !q.is_empty()));
+    if lower.contains("unsubscribe")
         || lower.contains("email-preferences")
-        || path.ends_with(".png")
-        || path.ends_with(".jpg")
-        || path.ends_with(".jpeg")
-        || path.ends_with(".gif")
-        || path.ends_with(".svg")
-        || path.ends_with(".ico")
-        || path.ends_with(".css")
-        || path.ends_with(".js")
+        || [
+            ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".css", ".js", ".woff", ".woff2",
+            ".ttf", ".eot", ".otf", ".webp", ".avif",
+        ]
+        .iter()
+        .any(|ext| without_query.ends_with(ext))
+    {
+        return true;
+    }
+    let after_scheme = without_query
+        .strip_prefix("https://")
+        .or_else(|| without_query.strip_prefix("http://"))
+        .unwrap_or(without_query);
+    let (host_port, raw_path) = after_scheme.split_once('/').unwrap_or((after_scheme, ""));
+    let host = host_port.split(':').next().unwrap_or(host_port);
+    if matches!(
+        host,
+        "fonts.googleapis.com"
+            | "fonts.gstatic.com"
+            | "www.w3.org"
+            | "w3.org"
+            | "schema.org"
+            | "support.anthropic.com"
+            | "status.anthropic.com"
+            | "docs.anthropic.com"
+    ) {
+        return true;
+    }
+    let trimmed_path = raw_path.trim_matches('/');
+    if !has_query
+        && (trimmed_path.is_empty()
+            || matches!(
+                trimmed_path,
+                "login"
+                    | "signin"
+                    | "sign-in"
+                    | "auth"
+                    | "oauth"
+                    | "welcome"
+                    | "home"
+                    | "app"
+                    | "settings"
+                    | "account"
+                    | "chats"
+                    | "new"
+            ))
+    {
+        return true;
+    }
+    let first_seg = trimmed_path.split('/').next().unwrap_or("");
+    matches!(
+        first_seg,
+        "privacy"
+            | "privacy-policy"
+            | "terms"
+            | "terms-of-service"
+            | "legal"
+            | "support"
+            | "help"
+            | "faq"
+            | "docs"
+            | "status"
+            | "security"
+            | "about"
+            | "careers"
+            | "pricing"
+            | "blog"
+            | "contact"
+    )
 }
 
 fn json_headers_transfer_encoding(obj: &aterm_json::Map) -> (bool, bool) {
@@ -902,6 +1057,7 @@ fn extract_json_email_fields_inner(
                 ) && let Some(u) = v.as_str()
                     && is_supported_auth_url(u)
                     && !is_non_auth_link(u)
+                    && (key != "url" || !is_json_message_self_url(u))
                     && !explicit_urls.iter().any(|existing| existing == u)
                 {
                     explicit_urls.push(u.to_owned());
@@ -1057,6 +1213,26 @@ fn extract_json_email_fields_inner(
     }
 }
 
+fn is_json_message_self_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    let has_auth_kw = [
+        "magic",
+        "verify",
+        "token=",
+        "callback",
+        "authorize",
+        "approve",
+        "confirm",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw));
+    !has_auth_kw
+        && (lower.contains("/api/")
+            || lower.contains("/messages/")
+            || lower.contains("/message/")
+            || lower.contains("/emails/"))
+}
+
 /// Extracts all candidate verification or magic-link URLs from `raw_email` addressed to
 /// `target_email` in priority order.
 #[must_use]
@@ -1076,9 +1252,6 @@ pub fn extract_magic_links_from_email(raw_email: &str, target_email: Option<&str
             is_json_with_body = true;
         }
     }
-    if !explicit_urls.is_empty() {
-        return explicit_urls;
-    }
     let qp_decoded = if is_json_with_body {
         String::new()
     } else if is_quoted_printable_email(raw_email) {
@@ -1091,9 +1264,9 @@ pub fn extract_magic_links_from_email(raw_email: &str, target_email: Option<&str
         extra_text.push_str(&subj);
     }
     let srcdoc_extra = extract_iframe_srcdoc_fragments(&format!("{qp_decoded}\n{extra_text}"));
-    let combined = format!("{srcdoc_extra}\n{extra_text}\n{qp_decoded}");
+    let combined = strip_html_comments(&format!("{srcdoc_extra}\n{extra_text}\n{qp_decoded}"));
     let decoded = decode_html_amp(&combined);
-    let mut urls = Vec::new();
+    let mut urls = explicit_urls;
     for scheme in ["https://", "http://127.0.0.1:", "http://localhost:"] {
         let mut rest = decoded.as_str();
         while let Some(pos) = rest.find(scheme) {
@@ -1115,14 +1288,21 @@ pub fn extract_magic_links_from_email(raw_email: &str, target_email: Option<&str
             rest = &after[end..];
         }
     }
-    let looks_like_auth = |u: &str| {
+    let looks_like_magic_token = |u: &str| {
         let lower = u.to_ascii_lowercase();
         lower.contains("magic")
             || lower.contains("verify")
-            || lower.contains("login")
-            || lower.contains("token=")
-            || lower.contains("auth")
+            || lower.contains("confirm")
             || lower.contains("callback")
+            || lower.contains("token=")
+            || lower.contains("code=")
+            || lower.contains("ticket=")
+            || lower.contains("stytch")
+            || lower.contains("authenticate")
+    };
+    let looks_like_auth = |u: &str| {
+        let lower = u.to_ascii_lowercase();
+        looks_like_magic_token(u) || lower.contains("login") || lower.contains("auth")
     };
     let mut ranked = Vec::with_capacity(urls.len());
     let mut push_unique = |u: &String| {
@@ -1132,8 +1312,17 @@ pub fn extract_magic_links_from_email(raw_email: &str, target_email: Option<&str
     };
     for u in urls
         .iter()
+        .filter(|u| provider_url(u) && looks_like_magic_token(u))
+    {
+        push_unique(u);
+    }
+    for u in urls
+        .iter()
         .filter(|u| provider_url(u) && looks_like_auth(u))
     {
+        push_unique(u);
+    }
+    for u in urls.iter().filter(|u| looks_like_magic_token(u)) {
         push_unique(u);
     }
     for u in urls.iter().filter(|u| looks_like_auth(u)) {
@@ -1262,8 +1451,160 @@ fn is_negative_form_token(s: &str) -> bool {
     let lower = s.trim().to_ascii_lowercase();
     matches!(
         lower.as_str(),
-        "deny" | "cancel" | "reject" | "decline" | "no" | "false" | "logout" | "signout"
+        "deny"
+            | "cancel"
+            | "reject"
+            | "decline"
+            | "no"
+            | "false"
+            | "logout"
+            | "signout"
+            | "sign-out"
+            | "sign out"
+            | "log out"
+            | "abort"
     )
+}
+
+fn has_negative_url_keyword(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    [
+        "logout",
+        "signout",
+        "sign-out",
+        "deny",
+        "cancel",
+        "reject",
+        "decline",
+        "/search",
+        "unsubscribe",
+    ]
+    .iter()
+    .any(|bad| lower.contains(bad))
+}
+
+fn has_positive_approval_keyword(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    [
+        "approve",
+        "authorize",
+        "consent",
+        "allow",
+        "accept",
+        "confirm",
+        "continue",
+        "grant",
+        "yes",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw))
+}
+
+fn strip_inline_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for ch in s.chars() {
+        if ch == '<' {
+            in_tag = true;
+        } else if ch == '>' {
+            in_tag = false;
+        } else if !in_tag {
+            out.push(ch);
+        }
+    }
+    decode_html_amp(out.trim())
+}
+
+fn parse_json_approval_action(
+    doc: &Value,
+    base_url: &str,
+) -> Option<(String, String, Option<String>)> {
+    let candidates = [Some(doc), doc.get("data"), doc.get("result")];
+    for obj in candidates.into_iter().flatten() {
+        let method_override = obj
+            .get("method")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_ascii_uppercase);
+        for key in [
+            "approve_url",
+            "approval_url",
+            "authorize_url",
+            "consent_url",
+        ] {
+            if let Some(target) = obj
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let method = method_override.clone().unwrap_or_else(|| "POST".to_owned());
+                return Some((method, resolve_relative_url(base_url, target), None));
+            }
+        }
+        for key in [
+            "redirect_url",
+            "redirect_uri",
+            "callback_url",
+            "next_url",
+            "location",
+        ] {
+            if let Some(target) = obj
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let method = method_override.unwrap_or_else(|| "GET".to_owned());
+                return Some((method, resolve_relative_url(base_url, target), None));
+            }
+        }
+    }
+    None
+}
+
+fn extract_meta_refresh_url(html: &str, base_url: &str) -> Option<String> {
+    let mut scan = html;
+    while let Some(meta_pos) = scan.to_ascii_lowercase().find("<meta") {
+        let after_meta = &scan[meta_pos..];
+        if after_meta.len() > 5
+            && !after_meta.as_bytes()[5].is_ascii_whitespace()
+            && !matches!(after_meta.as_bytes()[5], b'>' | b'/')
+        {
+            scan = &after_meta[5..];
+            continue;
+        }
+        let Some(end_meta) = after_meta.find('>') else {
+            break;
+        };
+        let meta_tag = &after_meta[..=end_meta];
+        if extract_attr(meta_tag, "http-equiv")
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("refresh"))
+            && let Some(content) = extract_attr(meta_tag, "content")
+        {
+            let content_low = content.to_ascii_lowercase();
+            if let Some(url_idx) = content_low.find("url=") {
+                let raw_target = content[url_idx + 4..]
+                    .trim()
+                    .trim_matches(['"', '\''])
+                    .trim();
+                if !raw_target.is_empty() {
+                    return Some(resolve_relative_url(base_url, raw_target));
+                }
+            }
+        }
+        scan = &after_meta[end_meta + 1..];
+    }
+    None
+}
+
+struct SubmitChoice {
+    score: u8,
+    name: Option<String>,
+    value: String,
+    formaction: Option<String>,
+    formmethod: Option<String>,
 }
 
 /// Parses an OAuth consent page into `(HTTP method, resolved action URL, optional form body)`.
@@ -1273,61 +1614,50 @@ pub fn parse_html_approval_action(
     base_url: &str,
 ) -> Option<(String, String, Option<String>)> {
     if let Ok(doc) = aterm_json::from_str::<Value>(html)
-        && let Some(approve) = doc.get("approve_url").and_then(Value::as_str)
+        && let Some(parsed) = parse_json_approval_action(&doc, base_url)
     {
-        return Some((
-            "POST".to_owned(),
-            resolve_relative_url(base_url, approve),
-            None,
-        ));
+        return Some(parsed);
     }
-    let lower = html.to_ascii_lowercase();
+    let uncommented = strip_html_comments(html);
+    let html = uncommented.as_str();
     let mut best_form: Option<(u8, String, String, Option<String>)> = None;
     let mut search_pos = 0;
-    while let Some(rel_start) = lower[search_pos..].find("<form") {
+    while let Some(rel_start) = find_ascii_ci(&html[search_pos..], "<form") {
         let form_start = search_pos + rel_start;
         let after_name = form_start + 5;
-        if after_name < lower.len()
-            && !lower.as_bytes()[after_name].is_ascii_whitespace()
-            && !matches!(lower.as_bytes()[after_name], b'>' | b'/')
+        if after_name < html.len()
+            && !html.as_bytes()[after_name].is_ascii_whitespace()
+            && !matches!(html.as_bytes()[after_name], b'>' | b'/')
         {
             search_pos = after_name;
             continue;
         }
         let form_slice = &html[form_start..];
-        let form_lower = &lower[form_start..];
-        let form_end = form_lower
-            .find("</form>")
-            .map_or(form_slice.len(), |e| e + 7);
+        let form_end =
+            find_ascii_ci(form_slice, "</form>").map_or(form_slice.len(), |e| e + "</form>".len());
         search_pos = form_start + form_end;
         let form_html = &form_slice[..form_end];
-        let Some(tag_end) = form_html.find('>') else {
+        let Some(tag_end) = find_tag_close(form_html) else {
             continue;
         };
         let open_tag = &form_html[..=tag_end];
-        let action = extract_attr(open_tag, "action").map_or_else(
+        let mut action = extract_attr(open_tag, "action").map_or_else(
             || base_url.to_owned(),
             |a| resolve_relative_url(base_url, &a),
         );
-        let action_low = action.to_ascii_lowercase();
-        if [
-            "logout", "signout", "sign-out", "deny", "cancel", "reject", "decline", "/search",
-        ]
-        .iter()
-        .any(|bad| action_low.contains(bad))
-        {
+        if has_negative_url_keyword(&action) {
             continue;
         }
-        let method = extract_attr(open_tag, "method")
+        let mut method = extract_attr(open_tag, "method")
             .unwrap_or_else(|| "GET".to_owned())
             .to_ascii_uppercase();
         let mut fields = Vec::new();
-        let mut submitted_button = false;
+        let mut saw_submit = false;
+        let mut chosen_submit: Option<SubmitChoice> = None;
         let mut scan = &form_html[tag_end + 1..];
         while !scan.is_empty() {
-            let scan_low = scan.to_ascii_lowercase();
-            let next_in = scan_low.find("<input");
-            let next_btn = scan_low.find("<button");
+            let next_in = find_ascii_ci(scan, "<input");
+            let next_btn = find_ascii_ci(scan, "<button");
             let (ctrl_pos, is_button, tag_len) = match (next_in, next_btn) {
                 (Some(i), Some(b)) if i <= b => (i, false, 6),
                 (Some(_), Some(b)) => (b, true, 7),
@@ -1343,11 +1673,21 @@ pub fn parse_html_approval_action(
                 scan = &after_ctrl[tag_len..];
                 continue;
             }
-            let Some(end_ctrl) = after_ctrl.find('>') else {
+            let Some(end_ctrl) = find_tag_close(after_ctrl) else {
                 break;
             };
             let ctrl_tag = &after_ctrl[..=end_ctrl];
-            scan = &after_ctrl[end_ctrl + 1..];
+            let after_open = &after_ctrl[end_ctrl + 1..];
+            let button_text = if is_button {
+                let end_btn = after_open
+                    .to_ascii_lowercase()
+                    .find("</button>")
+                    .unwrap_or(0);
+                strip_inline_html(&after_open[..end_btn])
+            } else {
+                String::new()
+            };
+            scan = after_open;
             if has_html_attr(ctrl_tag, "disabled") {
                 continue;
             }
@@ -1369,21 +1709,68 @@ pub fn parse_html_approval_action(
                 continue;
             }
             let is_submit = is_button || matches!(ctrl_type.as_str(), "submit" | "image");
+            if is_submit {
+                saw_submit = true;
+                let name = extract_attr(ctrl_tag, "name");
+                let value = extract_attr(ctrl_tag, "value").unwrap_or_default();
+                let formaction = extract_attr(ctrl_tag, "formaction")
+                    .map(|fa| resolve_relative_url(base_url, &fa));
+                let formmethod =
+                    extract_attr(ctrl_tag, "formmethod").map(|fm| fm.to_ascii_uppercase());
+                let is_neg = name.as_deref().is_some_and(is_negative_form_token)
+                    || is_negative_form_token(&value)
+                    || (!button_text.is_empty() && is_negative_form_token(&button_text))
+                    || formaction.as_deref().is_some_and(has_negative_url_keyword);
+                if is_neg {
+                    continue;
+                }
+                let is_pos = name.as_deref().is_some_and(has_positive_approval_keyword)
+                    || has_positive_approval_keyword(&value)
+                    || has_positive_approval_keyword(&button_text)
+                    || formaction
+                        .as_deref()
+                        .is_some_and(has_positive_approval_keyword);
+                let btn_score = if is_pos { 2 } else { 1 };
+                if chosen_submit
+                    .as_ref()
+                    .is_none_or(|prev| btn_score > prev.score)
+                {
+                    chosen_submit = Some(SubmitChoice {
+                        score: btn_score,
+                        name,
+                        value,
+                        formaction,
+                        formmethod,
+                    });
+                }
+                continue;
+            }
             if let Some(name) = extract_attr(ctrl_tag, "name") {
                 let value = extract_attr(ctrl_tag, "value").unwrap_or_default();
-                if is_submit {
-                    if is_negative_form_token(&name)
-                        || is_negative_form_token(&value)
-                        || submitted_button
-                    {
-                        continue;
-                    }
-                    submitted_button = true;
-                }
                 fields.push(format!(
                     "{}={}",
                     percent_encode(&name),
                     percent_encode(&value)
+                ));
+            }
+        }
+        if saw_submit && chosen_submit.is_none() {
+            continue;
+        }
+        let mut submit_score = 1u8;
+        if let Some(sub) = chosen_submit {
+            submit_score = sub.score;
+            if let Some(fa) = sub.formaction {
+                action = fa;
+            }
+            if let Some(fm) = sub.formmethod {
+                method = fm;
+            }
+            if let Some(name) = sub.name {
+                fields.push(format!(
+                    "{}={}",
+                    percent_encode(&name),
+                    percent_encode(&sub.value)
                 ));
             }
         }
@@ -1400,18 +1787,9 @@ pub fn parse_html_approval_action(
             };
             ("GET".to_owned(), full_url, None)
         };
-        let f_low = form_html.to_ascii_lowercase();
-        let score = if [
-            "approve",
-            "authorize",
-            "consent",
-            "allow",
-            "accept",
-            "confirm",
-            "continue",
-        ]
-        .iter()
-        .any(|kw| action_low.contains(kw) || f_low.contains(kw))
+        let score = if submit_score == 2
+            || has_positive_approval_keyword(&action)
+            || has_positive_approval_keyword(form_html)
         {
             2
         } else {
@@ -1428,27 +1806,51 @@ pub fn parse_html_approval_action(
         return Some((m, a, b));
     }
     let mut scan = html;
-    while let Some(a_pos) = scan.to_ascii_lowercase().find("<a") {
+    while let Some(a_pos) = find_ascii_ci(scan, "<a") {
         let after_a = &scan[a_pos..];
-        if after_a.len() > 2 && !after_a.as_bytes()[2].is_ascii_whitespace() {
+        if after_a.len() > 2
+            && !after_a.as_bytes()[2].is_ascii_whitespace()
+            && !matches!(after_a.as_bytes()[2], b'>' | b'/')
+        {
             scan = &after_a[2..];
             continue;
         }
-        let Some(end_a) = after_a.find('>') else {
+        let Some(end_a) = find_tag_close(after_a) else {
             break;
         };
         let a_tag = &after_a[..=end_a];
+        let after_open = &after_a[end_a + 1..];
+        let end_anchor = after_open.to_ascii_lowercase().find("</a>").unwrap_or(0);
+        let anchor_text = strip_inline_html(&after_open[..end_anchor]);
         if let Some(href) = extract_attr(a_tag, "href") {
-            let resolved = resolve_relative_url(base_url, &href);
-            let r_low = resolved.to_ascii_lowercase();
-            if r_low.contains("approve")
-                || r_low.contains("authorize")
-                || r_low.contains("callback")
+            let href_trimmed = href.trim();
+            if !href_trimmed.is_empty()
+                && !href_trimmed.starts_with('#')
+                && !href_trimmed.to_ascii_lowercase().starts_with("javascript:")
+                && !href_trimmed.to_ascii_lowercase().starts_with("mailto:")
             {
-                return Some(("GET".to_owned(), resolved, None));
+                let resolved = resolve_relative_url(base_url, href_trimmed);
+                let r_low = resolved.to_ascii_lowercase();
+                let is_neg = has_negative_url_keyword(&r_low)
+                    || (!anchor_text.is_empty() && is_negative_form_token(&anchor_text));
+                if !is_neg
+                    && (r_low.contains("approve")
+                        || r_low.contains("authorize")
+                        || r_low.contains("callback")
+                        || r_low.contains("consent")
+                        || r_low.contains("allow")
+                        || r_low.contains("accept")
+                        || r_low.contains("confirm")
+                        || has_positive_approval_keyword(&anchor_text))
+                {
+                    return Some(("GET".to_owned(), resolved, None));
+                }
             }
         }
-        scan = &after_a[end_a + 1..];
+        scan = after_open;
+    }
+    if let Some(refresh_url) = extract_meta_refresh_url(html, base_url) {
+        return Some(("GET".to_owned(), refresh_url, None));
     }
     None
 }
@@ -1475,7 +1877,7 @@ pub(super) fn parse_raw_http_response(
         let code_str = parts.next()?;
         let status: u16 = code_str.parse().ok()?;
         if proto.starts_with("HTTP/")
-            && (status == 100
+            && ((100..200).contains(&status)
                 || (status == 200
                     && first_line
                         .to_ascii_lowercase()
@@ -1494,9 +1896,25 @@ pub(super) fn parse_raw_http_response(
             if name.eq_ignore_ascii_case("location") {
                 location = Some(val.to_owned());
             } else if name.eq_ignore_ascii_case("set-cookie") {
-                let pair = val.split(';').next().unwrap_or(val).trim();
+                let mut segments = val.split(';');
+                let pair = segments.next().unwrap_or(val).trim();
+                let expired = segments.any(|attr| {
+                    let Some((ak, av)) = attr.split_once('=') else {
+                        return false;
+                    };
+                    let ak = ak.trim();
+                    let av = av.trim().trim_matches('"');
+                    (ak.eq_ignore_ascii_case("max-age") && (av == "0" || av.starts_with('-')))
+                        || (ak.eq_ignore_ascii_case("expires") && av.contains("1970"))
+                });
                 if let Some((ck, cv)) = pair.split_once('=') {
-                    cookies.insert(ck.trim().to_owned(), cv.trim().to_owned());
+                    let ck = ck.trim();
+                    let cv = cv.trim();
+                    if cv.is_empty() || expired {
+                        cookies.remove(ck);
+                    } else if !ck.is_empty() {
+                        cookies.insert(ck.to_owned(), cv.to_owned());
+                    }
                 }
             }
         }
@@ -1832,13 +2250,15 @@ fn follow_until_page_or_callback(
             return Err("this OAuth destination needs the manual browser");
         }
         let resp = exchange(&method, &current_url, cookies, body.as_deref())?;
-        if matches!(resp.status, 301 | 302 | 303 | 307 | 308) {
+        if matches!(resp.status, 301..=303 | 307 | 308) {
             let Some(loc) = resp.location else {
                 return Err("redirect response omitted Location header");
             };
             current_url = resolve_relative_url(&current_url, &loc);
-            method = "GET".to_owned();
-            body = None;
+            if matches!(resp.status, 301..=303) {
+                method = "GET".to_owned();
+                body = None;
+            }
             continue;
         }
         if (200..300).contains(&resp.status) {
@@ -1914,7 +2334,7 @@ pub(super) fn poll_mailbox_for_magic_link(
 }
 
 fn page_needs_browser_before_email(html: &str) -> bool {
-    let lower = html.to_ascii_lowercase();
+    let lower = strip_html_comments(html).to_ascii_lowercase();
     let has_email_input = lower.contains("type=\"email\"")
         || lower.contains("type='email'")
         || lower.contains("name=\"email\"")
@@ -1933,16 +2353,38 @@ fn page_needs_browser_before_email(html: &str) -> bool {
     lower.contains("<script") && !has_email_sent_notice
 }
 
+#[cfg(all(test, unix))]
 fn poll_http_mailbox_credential(
     mailbox_cfg: &super::headless_oauth::MailboxConfig,
     email: Option<&str>,
     timeout: Duration,
     pending: &mut Option<super::headless_oauth::MailboxCredential>,
 ) -> Result<String, &'static str> {
+    let mut seen_otps = BTreeSet::new();
+    poll_http_mailbox_credential_with_seen_otps(
+        mailbox_cfg,
+        email,
+        timeout,
+        pending,
+        &mut seen_otps,
+    )
+}
+
+fn poll_http_mailbox_credential_with_seen_otps(
+    mailbox_cfg: &super::headless_oauth::MailboxConfig,
+    email: Option<&str>,
+    timeout: Duration,
+    pending: &mut Option<super::headless_oauth::MailboxCredential>,
+    seen_otps: &mut BTreeSet<String>,
+) -> Result<String, &'static str> {
     use super::headless_oauth::MailboxCredential;
 
-    let credential =
-        super::headless_oauth::poll_mailbox_config_for_credential(mailbox_cfg, email, timeout)?;
+    let credential = super::headless_oauth::poll_mailbox_config_for_credential_with_seen_otps(
+        mailbox_cfg,
+        email,
+        timeout,
+        seen_otps,
+    )?;
     *pending = Some(credential.clone());
     match credential {
         MailboxCredential::MagicLink(url) => Ok(url),
@@ -1981,23 +2423,28 @@ pub fn authorize_with_mailbox_config(
         || mailbox_cfg.http_url.is_some();
     if !force_headless && has_non_webmail {
         let mut pending_credential = None;
+        let mut seen_otps = BTreeSet::new();
+        let mut attempt = 0usize;
         let first_res = authorize_using_with_page(
             authorize_url,
             target_email,
             |email, initial_body| {
-                let poll_timeout =
-                    if has_headless_browser && page_needs_browser_before_email(initial_body) {
-                        timeout
-                            .saturating_sub(t0.elapsed())
-                            .min(Duration::from_millis(200))
-                    } else {
-                        timeout.saturating_sub(t0.elapsed())
-                    };
-                poll_http_mailbox_credential(
+                let poll_timeout = if attempt > 0 {
+                    Duration::ZERO
+                } else if has_headless_browser && page_needs_browser_before_email(initial_body) {
+                    timeout
+                        .saturating_sub(t0.elapsed())
+                        .min(Duration::from_millis(200))
+                } else {
+                    timeout.saturating_sub(t0.elapsed())
+                };
+                attempt += 1;
+                poll_http_mailbox_credential_with_seen_otps(
                     mailbox_cfg,
                     email,
                     poll_timeout,
                     &mut pending_credential,
+                    &mut seen_otps,
                 )
             },
             &mut http_exchange,
@@ -2081,10 +2528,11 @@ pub(super) fn authorize_using(
         Option<&str>,
     ) -> Result<HttpResponse, &'static str>,
 ) -> Result<(), &'static str> {
+    let mut magic_link = Some(magic_link);
     authorize_using_with_page(
         authorize_url,
         target_email,
-        |email, _| magic_link(email),
+        |email, _| magic_link.take().ok_or("no more candidate magic links")?(email),
         exchange,
     )
 }
@@ -2092,7 +2540,7 @@ pub(super) fn authorize_using(
 fn authorize_using_with_page(
     authorize_url: &str,
     target_email: Option<&str>,
-    magic_link: impl FnOnce(Option<&str>, &str) -> Result<String, &'static str>,
+    mut magic_link: impl FnMut(Option<&str>, &str) -> Result<String, &'static str>,
     exchange: &mut impl FnMut(
         &str,
         &str,
@@ -2119,44 +2567,72 @@ fn authorize_using_with_page(
         StepOutcome::Page { body, .. } => body,
     };
 
-    let magic_url = magic_link(email.as_deref(), &initial_body)?;
-
-    let mut page = match follow_until_page_or_callback(
-        &flow,
-        exchange,
-        "GET",
-        &magic_url,
-        &mut cookies,
-        None,
-    )? {
-        StepOutcome::CallbackDelivered => return Ok(()),
-        StepOutcome::Page { url, body } => (url, body),
-    };
-
-    for step in 0..4 {
-        let Some((method, action_url, form_body)) = parse_html_approval_action(&page.1, &page.0)
-        else {
-            return Err(if step == 0 {
-                "magic-link response contained no OAuth approval action"
-            } else {
-                "OAuth approval did not redirect to callback listener"
-            });
+    let mut last_err = "magic-link response contained no OAuth approval action";
+    for attempt in 0..3 {
+        let magic_url = match magic_link(email.as_deref(), &initial_body) {
+            Ok(url) => url,
+            Err(err) => return Err(if attempt == 0 { err } else { last_err }),
         };
-        match follow_until_page_or_callback(
+
+        let mut page = match follow_until_page_or_callback(
             &flow,
             exchange,
-            &method,
-            &action_url,
+            "GET",
+            &magic_url,
             &mut cookies,
-            form_body.as_deref(),
-        )? {
-            StepOutcome::CallbackDelivered => return Ok(()),
-            StepOutcome::Page { url, body } => {
-                page = (url, body);
+            None,
+        ) {
+            Ok(StepOutcome::CallbackDelivered) => return Ok(()),
+            Ok(StepOutcome::Page { url, body }) => (url, body),
+            Err(err) => {
+                if err == "the local OAuth callback listener rejected the authorization code" {
+                    return Err(err);
+                }
+                last_err = err;
+                continue;
+            }
+        };
+
+        let mut step_failed = false;
+        for step in 0..4 {
+            let Some((method, action_url, form_body)) =
+                parse_html_approval_action(&page.1, &page.0)
+            else {
+                last_err = if step == 0 {
+                    "magic-link response contained no OAuth approval action"
+                } else {
+                    "OAuth approval did not redirect to callback listener"
+                };
+                step_failed = true;
+                break;
+            };
+            match follow_until_page_or_callback(
+                &flow,
+                exchange,
+                &method,
+                &action_url,
+                &mut cookies,
+                form_body.as_deref(),
+            ) {
+                Ok(StepOutcome::CallbackDelivered) => return Ok(()),
+                Ok(StepOutcome::Page { url, body }) => {
+                    page = (url, body);
+                }
+                Err(err) => {
+                    if err == "the local OAuth callback listener rejected the authorization code" {
+                        return Err(err);
+                    }
+                    last_err = err;
+                    step_failed = true;
+                    break;
+                }
             }
         }
+        if !step_failed {
+            last_err = "OAuth approval did not redirect to callback listener";
+        }
     }
-    Err("OAuth approval did not redirect to callback listener")
+    Err(last_err)
 }
 
 fn discover_store_dir() -> Option<PathBuf> {

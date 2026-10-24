@@ -521,6 +521,9 @@ impl Default for LanesSeen {
 pub struct JobTick {
     /// The host's monotonic clock, ms.
     pub at_ms: u64,
+    /// The host's clock, ms, once it had read [`JobTick::procs`]: each shell's terminal group,
+    /// which says what is in front, is read after the sweep, past `at_ms`.
+    pub read_ms: u64,
     /// aterm's own user (for the own-uid findings).
     pub self_uid: Option<u32>,
     /// The cheap sweep of every process.

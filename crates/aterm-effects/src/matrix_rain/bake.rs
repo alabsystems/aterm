@@ -1,32 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Progressive box-filtering [`RainBaker`] from the 24×48 1-bit [`RomMaster`] into an 8×8 [`SceneAtlas`].
+//! Progressive box-filtering [`RainBaker`] from the 24×48 1-bit [`RomMaster`] into 64 glyph arts.
 
 use std::sync::Arc;
 
-use aterm_render::SceneAtlas;
+use aterm_core::render::{FxArt, FxTexels};
 
 use super::rom::{MASTER_H, MASTER_W, ROM_GLYPHS, RomMaster};
 
-/// Tiles per atlas row and column (8×8 grid of the 64 glyphs).
-pub const RAIN_TILE_GRID: usize = 8;
 /// Maximum tiles baked per engine tick.
 pub const MAX_RAIN_BAKES_PER_TICK: usize = 8;
 
-/// Progressive master-to-cell-metric tile baker publishing [`SceneAtlas`] snapshots.
+/// Progressive master-to-cell-metric tile baker: one interned `cell_w × cell_h`
+/// white-coverage art a glyph (straight RGBA, `255, 255, 255, coverage`), so a
+/// rain cell drawn under the Linear law paints exactly its tint at its
+/// coverage times its alpha.
 #[derive(Default)]
 pub struct RainBaker {
     cell_w: u16,
     cell_h: u16,
-    /// Straight-alpha RGBA8 texels (`(8 * cell_w) * (8 * cell_h)`).
-    rgba: Vec<u8>,
+    /// The baked tiles by glyph: `None` until baked at the current metrics.
+    tiles: Vec<Option<Arc<FxArt>>>,
     /// Per-instance monotonic version bumped on every rebake batch and restart.
     version: u64,
     /// Next tile index to bake (`>= ROM_GLYPHS` when complete).
     next_tile: usize,
-    published: Option<Arc<SceneAtlas>>,
-    dirty: bool,
     /// Flattened `(mx, wx)` horizontal box-filter segments shared across all 64 tiles for `cell_w`.
     col_seg: Vec<(u32, u32)>,
     /// Per-dest-column offsets into `col_seg` (length `cell_w + 1`).
@@ -48,14 +47,10 @@ impl RainBaker {
     /// Restart the bake from tile 0 at the current cell metrics.
     #[inline]
     pub fn restart(&mut self) {
-        let (cw, ch) = (usize::from(self.cell_w), usize::from(self.cell_h));
-        self.rgba.clear();
-        self.rgba
-            .resize(cw * RAIN_TILE_GRID * ch * RAIN_TILE_GRID * 4, 0);
+        self.tiles.clear();
+        self.tiles.resize(ROM_GLYPHS, None);
         self.next_tile = 0;
         self.version = self.version.wrapping_add(1);
-        self.published = None;
-        self.dirty = false;
     }
 
     /// Whether all 64 tiles are baked at the current metric.
@@ -76,7 +71,6 @@ impl RainBaker {
         }
         self.next_tile = end;
         self.version = self.version.wrapping_add(1);
-        self.dirty = true;
         true
     }
 
@@ -87,7 +81,7 @@ impl RainBaker {
         self.cell_w != 0 && self.cell_h != 0 && self.next_tile >= ROM_GLYPHS
     }
 
-    /// Re-bake the tiles selected by `mask` into the completed atlas and advance `version` to match a full rebuild.
+    /// Re-bake the tiles selected by `mask` and advance `version` to match a full rebuild.
     pub fn rebake_tiles(&mut self, rom: &RomMaster, mask: u64) -> bool {
         if !self.can_rebake() || mask == 0 {
             return false;
@@ -102,51 +96,31 @@ impl RainBaker {
         }
         let wholesale = 1 + ROM_GLYPHS.div_ceil(MAX_RAIN_BAKES_PER_TICK) as u64;
         self.version = self.version.wrapping_add(wholesale);
-        self.dirty = true;
         true
     }
 
-    /// Monotonic atlas version folded into the frame fingerprint.
+    /// Monotonic tile-set version folded into the frame fingerprint.
     #[must_use]
     #[inline]
     pub const fn version(&self) -> u64 {
         self.version
     }
 
-    /// Return the published atlas snapshot, rebuilding it lazily after a dirty bake batch.
-    #[inline]
-    pub fn atlas(&mut self) -> Option<Arc<SceneAtlas>> {
-        if self.dirty {
-            self.published = Some(Arc::new(SceneAtlas {
-                width: u32::from(self.cell_w) * RAIN_TILE_GRID as u32,
-                height: u32::from(self.cell_h) * RAIN_TILE_GRID as u32,
-                rgba: self.rgba.clone(),
-                version: self.version,
-            }));
-            self.dirty = false;
-        }
-        self.published.clone()
-    }
-
-    /// Atlas texel origin of `glyph`'s `cell_w × cell_h` tile.
+    /// `glyph`'s baked tile (`glyph` taken modulo the 64 glyphs), `None` until baked.
     #[must_use]
     #[inline]
-    pub const fn tile_origin(&self, glyph: u32) -> (u16, u16) {
-        let g = glyph as usize % ROM_GLYPHS;
-        (
-            ((g % RAIN_TILE_GRID) * self.cell_w as usize) as u16,
-            ((g / RAIN_TILE_GRID) * self.cell_h as usize) as u16,
-        )
+    pub fn tile(&self, glyph: u8) -> Option<&Arc<FxArt>> {
+        self.tiles
+            .get(usize::from(glyph) % ROM_GLYPHS)
+            .and_then(Option::as_ref)
     }
 
-    /// Box-filter `tile`'s 24×48 master into its `(cell_w, cell_h)` atlas slot with integer area weighting.
+    /// Box-filter `tile`'s 24×48 master into a `(cell_w, cell_h)` art with integer area weighting.
     fn bake_tile(&mut self, rom: &RomMaster, tile: usize) {
         let (cw, ch) = (usize::from(self.cell_w), usize::from(self.cell_h));
-        if cw == 0 || ch == 0 {
+        if cw == 0 || ch == 0 || tile >= self.tiles.len() {
             return;
         }
-        let atlas_w = cw * RAIN_TILE_GRID;
-        let (ox, oy) = ((tile % RAIN_TILE_GRID) * cw, (tile / RAIN_TILE_GRID) * ch);
         const DEN: u32 = (MASTER_W * MASTER_H) as u32;
 
         if self.col_off.len() != cw + 1 {
@@ -164,6 +138,7 @@ impl RainBaker {
             }
         }
 
+        let mut rgba = [255u8, 255, 255, 0].repeat(cw * ch);
         let mut src: [(u32, u32); MASTER_H] = [(0, 0); MASTER_H];
         for y in 0..ch {
             let (a, b) = (y * MASTER_H, (y + 1) * MASTER_H);
@@ -179,29 +154,28 @@ impl RainBaker {
                 }
             }
             let src_row = &src[..src_len];
-            let row_base = (oy + y) * atlas_w + ox;
             if src_row.is_empty() {
-                for x in 0..cw {
-                    let idx = (row_base + x) * 4;
-                    self.rgba[idx..idx + 4].copy_from_slice(&[255, 255, 255, 0]);
-                }
                 continue;
             }
             for x in 0..cw {
                 let mut num: u32 = 0;
                 let seg = &self.col_seg[self.col_off[x] as usize..self.col_off[x + 1] as usize];
                 for &(wy, row) in src_row {
+                    let mut row_wx: u32 = 0;
                     for &(mx, wx) in seg {
                         if (row >> mx) & 1 == 1 {
-                            num += wx * wy;
+                            row_wx += wx;
                         }
                     }
+                    num += row_wx * wy;
                 }
                 let alpha = ((num * 255 + DEN / 2) / DEN) as u8;
-                let idx = (row_base + x) * 4;
-                self.rgba[idx..idx + 4].copy_from_slice(&[255, 255, 255, alpha]);
+                let idx = (y * cw + x) * 4;
+                rgba[idx..idx + 4].copy_from_slice(&[255, 255, 255, alpha]);
             }
         }
+        self.tiles[tile] =
+            aterm_render::fx::bitmap(FxTexels::Rgba8Straight, self.cell_w, self.cell_h, rgba);
     }
 }
 
@@ -220,40 +194,45 @@ mod tests {
         b
     }
 
-    fn tile_peak(b: &mut RainBaker, g: u32) -> u8 {
-        let atlas = b.atlas().expect("baked atlas");
-        let (ax, ay) = b.tile_origin(g);
-        let (cw, ch) = (usize::from(b.cell_w), usize::from(b.cell_h));
-        let mut peak = 0u8;
-        for y in 0..ch {
-            for x in 0..cw {
-                let idx = ((usize::from(ay) + y) * atlas.width as usize + usize::from(ax) + x) * 4;
-                peak = peak.max(atlas.rgba[idx + 3]);
-            }
-        }
-        peak
+    fn tile_peak(b: &RainBaker, g: u8) -> u8 {
+        let art = b.tile(g).expect("baked tile");
+        assert_eq!((art.w(), art.h()), (b.cell_w, b.cell_h), "one cell a tile");
+        art.data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|t| t[3])
+            .max()
+            .unwrap_or(0)
     }
 
     /// Verify that all 64 tiles carry ink across small and retina cell metrics.
     #[test]
     fn all_tiles_nonempty_at_live_metrics() {
         for (cw, ch) in [(7u16, 14u16), (10, 20), (20, 40)] {
-            let mut b = baked(cw, ch);
-            for g in 0..ROM_GLYPHS as u32 {
+            let b = baked(cw, ch);
+            for g in 0..ROM_GLYPHS as u8 {
+                assert!(tile_peak(&b, g) >= 64, "tile {g} too faint at {cw}x{ch}");
                 assert!(
-                    tile_peak(&mut b, g) >= 64,
-                    "tile {g} too faint at {cw}x{ch}"
+                    b.tile(g)
+                        .expect("baked")
+                        .data()
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .all(|t| t[..3] == [255, 255, 255]),
+                    "tile {g}: white coverage, so a tint paints exactly"
                 );
             }
         }
     }
 
-    /// Verify that rebuilt bakers replay the same version sequence while publishing distinct `Arc`s.
+    /// Verify that rebuilt bakers replay the same version sequence and bake the same tiles.
     #[test]
-    fn rebuilt_bakers_replay_versions_but_publish_fresh_arcs() {
+    fn rebuilt_bakers_replay_versions_and_tiles() {
         let rom = rasterize_master();
         let mut first = Vec::new();
-        let mut arcs: Vec<Arc<SceneAtlas>> = Vec::new();
+        let mut first_ids = Vec::new();
         for run in 0..2 {
             let mut b = RainBaker::default();
             b.begin_frame(10, 20);
@@ -261,17 +240,15 @@ mod tests {
             while !b.complete() {
                 b.bake_tiles(&rom);
                 seq.push(b.version());
-                let a = b.atlas().expect("baked batch publishes");
-                assert!(
-                    !arcs.iter().any(|prev| Arc::ptr_eq(prev, &a)),
-                    "every publish is a distinct allocation"
-                );
-                arcs.push(a);
             }
+            let ids: Vec<u128> = (0..ROM_GLYPHS as u8)
+                .map(|g| b.tile(g).expect("baked").id())
+                .collect();
             if run == 0 {
-                first = seq;
+                (first, first_ids) = (seq, ids);
             } else {
                 assert_eq!(seq, first, "rebuilt baker replays the version sequence");
+                assert_eq!(ids, first_ids, "…and bakes the same tiles");
             }
         }
     }
@@ -284,6 +261,7 @@ mod tests {
         b.begin_frame(10, 20);
         b.bake_tiles(&rom);
         let (tile, ver) = (b.next_tile, b.version());
+        assert!(b.tile(0).is_some() && b.tile(MAX_RAIN_BAKES_PER_TICK as u8).is_none());
         b.begin_frame(10, 20);
         assert_eq!((b.next_tile, b.version()), (tile, ver));
     }

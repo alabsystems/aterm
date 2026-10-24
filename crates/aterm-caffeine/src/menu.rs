@@ -15,7 +15,7 @@ pub enum Click {
     Menu,
 }
 
-/// Classify a status-item click as [`Click::Menu`] (right click or Control-click) or [`Click::Toggle`].
+/// Classify a status-item click as [`Click::Menu`] (right/Control-click) or [`Click::Toggle`].
 #[inline]
 #[must_use]
 pub const fn classify_click(right_button: bool, control_held: bool) -> Click {

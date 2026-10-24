@@ -31,8 +31,7 @@ impl NotOwn {
 /// What this running cutter is: the commit it is the build of, or why it is none.
 pub type Stamp = Result<String, NotOwn>;
 
-/// The checkout paths whose state decides the cutter binary: a superset of its
-/// first-party build closure (every path dependency lives under `crates` or `vendor`).
+/// The checkout paths whose state decides the cutter binary.
 pub const SOURCE_INPUTS: [&str; 6] = [
     "crates",
     "vendor",
@@ -42,21 +41,17 @@ pub const SOURCE_INPUTS: [&str; 6] = [
     "rust-toolchain.toml",
 ];
 
-/// The cutter's own crate, and its entry point, by which the dep-info names the checkout.
 const OWN_CRATE: &str = "crates/aterm-release";
 const OWN_MAIN: &str = "crates/aterm-release/src/main.rs";
 
-/// Where rustc compiled this crate. Cargo does not fingerprint it, so a binary cargo
-/// reuses from another checkout keeps that checkout's.
 const BUILT_IN: &str = env!("CARGO_MANIFEST_DIR");
 
-/// The remedy when cargo did not link this binary from its checkout as it stands.
 const RELINK: &str = "run it as `targo --unverified ship <verb>` from a clean checkout of the \
                       commit it acts for, a `targo run` that relinks it from that tree first";
 
 static RUNNING: OnceLock<Stamp> = OnceLock::new();
 
-/// Judge this process. `main` calls it first, before any step moves a checkout.
+/// Judge this process.
 pub fn judge_at_start() {
     RUNNING.get_or_init(|| match std::env::current_exe() {
         Ok(exe) => judge(&exe, Path::new(BUILT_IN)),
@@ -68,7 +63,6 @@ pub fn judge_at_start() {
 }
 
 /// This process's verdict, from [`judge_at_start`].
-///
 /// # Errors
 /// This process is no commit's build, or was never judged.
 pub fn running() -> Result<&'static str, &'static NotOwn> {
@@ -78,8 +72,6 @@ pub fn running() -> Result<&'static str, &'static NotOwn> {
         .map(String::as_str)
 }
 
-/// The module's three rules for the executable `exe`, whose crate rustc compiled in
-/// `built_in`.
 fn judge(exe: &Path, built_in: &Path) -> Stamp {
     let linked = fs::metadata(exe)
         .and_then(|meta| meta.modified())
@@ -167,8 +159,6 @@ fn judge(exe: &Path, built_in: &Path) -> Stamp {
     })
 }
 
-/// The same directory, spelled alike or resolving alike; a directory that is gone is
-/// no match.
 fn same_dir(a: &Path, b: &Path) -> bool {
     a == b
         || matches!(
@@ -177,7 +167,6 @@ fn same_dir(a: &Path, b: &Path) -> bool {
         )
 }
 
-/// `targo clean`'s spelling of the profile whose directory holds `exe`.
 fn profile_flag(exe: &Path) -> String {
     match exe
         .parent()
@@ -190,7 +179,6 @@ fn profile_flag(exe: &Path) -> String {
     }
 }
 
-/// `HEAD`'s commit id, when it is a full one.
 fn head(git: &dyn GitRunner) -> Option<String> {
     let out = git
         .git(&["rev-parse", "--verify", "-q", "HEAD^{commit}"])
@@ -200,8 +188,6 @@ fn head(git: &dyn GitRunner) -> Option<String> {
     aterm_codec::hex::is_lower(&commit, 40).then_some(commit)
 }
 
-/// The sources a cargo dep-info file names for `target`: Makefile rules, one per line,
-/// `\ ` escaping a space in a path.
 fn dep_info_sources(text: &str, target: &Path) -> Option<Vec<PathBuf>> {
     let same = |a: &Path| a == target || fs::canonicalize(a).ok() == fs::canonicalize(target).ok();
     text.lines().find_map(|line| {
@@ -212,7 +198,6 @@ fn dep_info_sources(text: &str, target: &Path) -> Option<Vec<PathBuf>> {
     })
 }
 
-/// A dep-info line's words: split at spaces, except a backslash-escaped one.
 fn split_escaped(line: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut word = String::new();
@@ -237,7 +222,6 @@ fn split_escaped(line: &str) -> Vec<String> {
     words
 }
 
-/// The checkout whose [`OWN_MAIN`] is among `sources`.
 fn checkout_of(sources: &[PathBuf]) -> Option<PathBuf> {
     sources
         .iter()
@@ -246,9 +230,6 @@ fn checkout_of(sources: &[PathBuf]) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-/// The sources a person edits: inside the checkout, outside its `.git` and outside the
-/// binary's target root. A build script's `OUT_DIR` output (under the target or build
-/// directory) is rewritten by builds that need not relink this binary.
 fn checkout_sources(sources: Vec<PathBuf>, root: &Path, target_root: &Path) -> Vec<PathBuf> {
     sources
         .into_iter()
@@ -260,7 +241,6 @@ fn checkout_sources(sources: Vec<PathBuf>, root: &Path, target_root: &Path) -> V
         .collect()
 }
 
-/// The first source modified after `linked`, or gone, said as the refusal.
 fn changed_after(sources: &[PathBuf], linked: SystemTime) -> Option<String> {
     sources.iter().find_map(
         |source| match fs::metadata(source).and_then(|meta| meta.modified()) {
@@ -277,7 +257,6 @@ fn changed_after(sources: &[PathBuf], linked: SystemTime) -> Option<String> {
     )
 }
 
-/// Is the repository path `path` one of [`SOURCE_INPUTS`] or beneath one?
 fn is_source_input(path: &str) -> bool {
     SOURCE_INPUTS.iter().any(|input| {
         path.strip_prefix(input)
@@ -291,8 +270,6 @@ mod tests {
     use crate::ledger::testing;
     use std::time::Duration;
 
-    /// A checkout with a cutter source and a doc committed, and a linked "binary"
-    /// beside it whose dep-info names that source.
     struct Built {
         _dir: aterm_tempfile::TempDir,
         work: PathBuf,
@@ -375,8 +352,6 @@ mod tests {
         assert_eq!(judged(&b), Ok(b.head.clone()));
     }
 
-    /// The revert case: a source newer than the link means the binary may hold what the
-    /// source no longer says, so it is no commit's cutter until cargo relinks it.
     #[test]
     fn a_source_changed_after_the_link_refuses() {
         let b = built();
@@ -407,8 +382,6 @@ mod tests {
         assert!(not.fix.contains("git status"), "{not:?}");
     }
 
-    /// Cargo hands a checkout the binary another one linked into a shared target directory
-    /// and rewrites the dep-info to name it: only where rustc compiled the crate tells.
     #[test]
     fn a_binary_compiled_in_another_checkout_refuses_until_it_is_cleaned() {
         let b = built();
@@ -440,8 +413,6 @@ mod tests {
         assert_eq!(not.fix, RELINK);
     }
 
-    /// The verdict is the start's: nothing judges the checkout as it stands later, after a
-    /// release may have moved it, so a process `main` did not judge is no commit's build.
     #[test]
     fn a_verdict_is_never_taken_after_the_start() {
         let not = running().expect_err("never judged at its start");

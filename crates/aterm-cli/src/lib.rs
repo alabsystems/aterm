@@ -45,6 +45,9 @@ mod theme_pack_cmd;
 pub use theme_cmd::main_entry as theme_main_entry;
 pub use theme_cmd::{ThemeHost, ThemeListFormat, ThemeListRequest, list_themes_alias};
 
+mod front_door;
+pub use front_door::{AliasRoute, alias_route, asks_completions, mode_free};
+
 mod windowing;
 
 pub use windowing::{
@@ -1368,7 +1371,7 @@ fn doctor_facts_rows(fix: bool) -> Vec<DoctorRow> {
         let debugger = debugger_facts();
         let instances = match withheld {
             Some(why) => Err(why.to_owned()),
-            None => aterm_ctl::census::window_census(&front_door_verb),
+            None => aterm_ctl::census::window_census(FRONT_DOOR),
         };
         let recovery = recovery_facts();
         let exceptions = exceptions_facts();
@@ -1595,9 +1598,21 @@ fn console_host_fact() -> Option<aterm_pty::ConsoleHostReport> {
     }
 }
 
+/// The `devtools:` row's facts ([`devtools_read_and_hand_over`]): the list and tccd's answers, and the wait beside them ([`wait_beside`]: this user's programs macOS's program check holds now, [`aterm_uds::process::held_programs`], thread lists and start records only, no argument read, so it reads while the check's pool is full too).
 fn devtools_facts(fix: bool, check_full: bool) -> DevtoolsFacts {
     let (facts, did) = devtools_read_and_hand_over(fix, check_full);
     DevtoolsFacts { facts, did }
+}
+
+/// The wait the `devtools:` row counts beside `facts`, the list as this run's hand-over left it: `held()`, this user's programs macOS's program check holds now; none when the hand-over switched aterm on (`before` not granted, `facts` granted). Every program held then started before the grant, which may still wait for them (leftover §5.1), so they say nothing of whether it took.
+fn wait_beside(
+    before: aterm_containment::DevToolGrant,
+    facts: &atpkg::devtools::Facts,
+    held: impl FnOnce() -> Option<aterm_uds::process::HeldNow>,
+) -> Option<aterm_uds::process::HeldNow> {
+    use aterm_containment::DevToolGrant;
+    let switched_on = before == DevToolGrant::NotGranted && facts.grant() == DevToolGrant::Granted;
+    if switched_on { None } else { held() }
 }
 
 fn devtools_read_and_hand_over(
@@ -1631,8 +1646,10 @@ fn devtools_read_and_hand_over(
         local_day: &|at| local_day_words(at, i64::try_from(at).ok().and_then(local_offset_at)),
         say: &|words| eprintln!("{words}"),
     };
-    let (facts, did) =
+    let before = facts.grant();
+    let (mut facts, did) =
         devtools_hand_over_when(fix, facts, over_ssh, check_full, person, &reach, dt::facts);
+    facts.program_check = wait_beside(before, &facts, aterm_uds::process::held_programs);
     (Some(facts), did)
 }
 
@@ -2041,14 +2058,44 @@ fn recovery_row(facts: &RecoveryFacts) -> (Mark, String) {
     (mark, lines.join("\n"))
 }
 
+/// The front door's routes, for the census ([`aterm_ctl::census::FrontDoor`]).
+const FRONT_DOOR: aterm_ctl::census::FrontDoor<'static> = aterm_ctl::census::FrontDoor {
+    alias: &front_door_alias,
+    verb: &front_door_verb,
+};
+
+/// What the front door does under argv[0]'s file name `name` with argv[1] `first`
+/// ([`alias_route`]), for the census: a window alias is a window, any other alias another
+/// program, and its own names (`AliasRoute::FrontDoor`) route by argv[1].
+fn front_door_alias(name: &str, first: &str) -> Option<aterm_ctl::census::Verb> {
+    use aterm_ctl::census::Verb as Census;
+    match alias_route(name, first) {
+        AliasRoute::AliasWindow | AliasRoute::AliasWindowVerb => Some(Census::Window),
+        AliasRoute::Ctl
+        | AliasRoute::Pkg
+        | AliasRoute::Abrew
+        | AliasRoute::Agh
+        | AliasRoute::Fleet
+        | AliasRoute::Drive
+        | AliasRoute::OpenUrl
+        | AliasRoute::Link
+        | AliasRoute::Askpass
+        | AliasRoute::MachinesAskpass
+        | AliasRoute::Amacs => Some(Census::Program),
+        AliasRoute::FrontDoor => None,
+    }
+}
+
+/// What the front door does with `word` as argv[1], for the census: a verb, `hook`, or a word
+/// or flag it answers before it routes a window ([`mode_free`], [`asks_completions`]).
 fn front_door_verb(word: &str) -> Option<aterm_ctl::census::Verb> {
     use aterm_ctl::census::Verb as Census;
     match Verb::from_operand(word) {
         Some(verb) if verb.is_windowing() => Some(Census::Window),
         Some(_) => Some(Census::Program),
-        None => (matches!(word, "help" | "hook")
-            || DIAG_COMMANDS.iter().any(|(name, _)| *name == word))
-        .then_some(Census::Program),
+        None => {
+            (word == "hook" || mode_free(word) || asks_completions(word)).then_some(Census::Program)
+        }
     }
 }
 
@@ -2114,17 +2161,28 @@ fn instances_row(census: &Result<aterm_ctl::census::Census, String>) -> (Mark, S
             named.join(", ")
         ));
     }
-    for p in census.programs.iter().filter(|p| p.adopted) {
+    // A deleted binary is named only from a build directory, its worktree removed: an installed
+    // one is the normal state after a Linux update renames the new binary over the old.
+    for p in census
+        .programs
+        .iter()
+        .filter(|p| p.adopted || (p.build && p.deleted))
+    {
+        let facts: Vec<&str> = [
+            (p.adopted, "its launcher exited and launchd adopted it"),
+            (p.build, "from a build directory"),
+            (p.deleted, "running a deleted binary"),
+        ]
+        .into_iter()
+        .filter_map(|(holds, said)| holds.then_some(said))
+        .collect();
         detail.push_str(&format!(
-            "\npid {} `{}` (up {}): its launcher exited and launchd adopted it",
-            p.pid, p.name, p.age
+            "\npid {} `{}` (up {}): {}",
+            p.pid,
+            p.name,
+            p.age,
+            facts.join("; ")
         ));
-        if p.build {
-            detail.push_str("; from a build directory");
-        }
-        if p.deleted {
-            detail.push_str("; running a deleted binary");
-        }
     }
     let mark = if census.unreached.is_empty() {
         Mark::Ok
@@ -2992,10 +3050,10 @@ mod tests {
         ExceptionsFacts, FdaState, HOOK_AGENTS_ENV, MachineFacts, Mark, PASSTHROUGH_ENV,
         PrivacyFacts, ProbeLabel, REROUTE_DIR_ENV, RecoveryFacts, SelfHardening, ShellCheck, Verb,
         agents_dir_mode, config_conpty_from_text, decide_args, diag_report, doctor_checks,
-        doctor_checks_with_origin, exceptions_report_at, explain_config_report, front_door_verb,
-        help_text, is_tool_candidate, list_fonts_report, list_themes_alias, managed_agents_dir,
-        prepend_path, read_exceptions_log, reroute_dir_from_values, session_limits,
-        session_path_env, show_face_report, version_text,
+        doctor_checks_with_origin, exceptions_report_at, explain_config_report, front_door_alias,
+        front_door_verb, help_text, is_tool_candidate, list_fonts_report, list_themes_alias,
+        managed_agents_dir, prepend_path, read_exceptions_log, reroute_dir_from_values,
+        session_limits, session_path_env, show_face_report, version_text,
     };
     #[cfg(unix)]
     use super::{args_read_withheld, fabric_mark, machine_facts, unix_shell};
@@ -4714,6 +4772,51 @@ mod tests {
             ),
             "{r}"
         );
+        assert!(
+            r.contains(
+                "pid 71102 `aterm link broker` (up 3h 05m): its launcher exited and launchd \
+                 adopted it; from a build directory\n"
+            ),
+            "{r}"
+        );
+
+        let (r, code) = check(with_programs(vec![
+            Program {
+                build: true,
+                deleted: true,
+                ..program(71104, "aterm link broker", false)
+            },
+            Program {
+                build: true,
+                ..program(71105, "aterm link serve", false)
+            },
+            Program {
+                deleted: true,
+                ..program(71106, "aterm", false)
+            },
+        ]));
+        assert_eq!(code, 0, "{r}");
+        assert_eq!(
+            mark_of(&r, "instances:"),
+            "ok",
+            "a deleted binary is a fact\n{r}"
+        );
+        assert!(
+            r.contains(
+                "pid 71104 `aterm link broker` (up 3h 05m): from a build directory; running a \
+                 deleted binary"
+            ),
+            "a build's program whose binary is gone with its worktree is named, adopted or not: \
+             {r}"
+        );
+        assert!(
+            !r.contains("pid 71105"),
+            "a build's program whose launcher lives is counted, not named: {r}"
+        );
+        assert!(
+            !r.contains("pid 71106"),
+            "an installed program whose binary an update replaced is counted, not named: {r}"
+        );
 
         let many: Vec<Program> = (0..8)
             .map(|i| program(72000 + i, &format!("aterm v{i}"), false))
@@ -4732,11 +4835,62 @@ mod tests {
         for word in ["link", "ctl", "doctor", "help", "hook"] {
             assert_eq!(front_door_verb(word), Some(Census::Program), "{word}");
         }
+        for flag in [
+            "-h",
+            "--help",
+            "-V",
+            "--version",
+            "--completions",
+            "--completions=zsh",
+        ] {
+            assert_eq!(
+                front_door_verb(flag),
+                Some(Census::Program),
+                "the front door answers {flag} before it routes a window"
+            );
+        }
         for word in ["new-tab", "new-window", "split-pane"] {
             assert_eq!(front_door_verb(word), Some(Census::Window), "{word}");
         }
-        for word in ["frobnicate", "--headless", ""] {
+        for word in ["frobnicate", "--headless", "--completion", ""] {
             assert_eq!(front_door_verb(word), None, "{word}");
+        }
+        for (name, first) in [
+            ("aterm-ctl", "new-window"),
+            ("atpkg", "new-tab"),
+            ("abrew", "--real"),
+            ("atpkg-abrew", ""),
+            ("agh", ""),
+            ("aterm-fleet", ""),
+            ("aterm-drive", ""),
+            ("aterm-askpass", ""),
+            ("aterm-machines-askpass", "password: "),
+            ("aterm-link", "broker"),
+            ("aterm-open-url", "https://claude.ai/x"),
+            ("amacs", ""),
+        ] {
+            assert_eq!(
+                front_door_alias(name, first),
+                Some(Census::Program),
+                "the front door hands {name} to its own program"
+            );
+        }
+        assert_eq!(front_door_alias("aterm-gui", ""), Some(Census::Window));
+        assert_eq!(
+            front_door_alias("aterm-windowed", "new-tab"),
+            Some(Census::Window)
+        );
+        for (name, first) in [
+            ("aterm", "new-window"),
+            ("aterm-cli", ""),
+            ("a-renamed-copy", ""),
+            ("aterm-gui", aterm_containment::consent::OPEN_PROBE_VERB),
+        ] {
+            assert_eq!(
+                front_door_alias(name, first),
+                None,
+                "{name} {first}: the front door's own route"
+            );
         }
     }
 
@@ -4959,6 +5113,65 @@ mod tests {
         }
     }
 
+    /// Doctor's `devtools:` facts carry this user's programs macOS's program check holds now, read
+    /// from the kernel beside the list (a test binary's list reads `not measured`; the count is
+    /// read all the same).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn doctor_reads_the_live_wait_beside_the_list() {
+        let facts = super::devtools_facts(false, false)
+            .facts
+            .expect("macOS has a Developer Tools list");
+        assert!(facts.program_check.is_some(), "{facts:?}");
+    }
+
+    /// A GRANT THIS RUN MADE IS NOT JUDGED BY PROGRAMS HELD BEFORE IT (leftover §5.1): when the
+    /// hand-over switched aterm on, every program held now started before the grant, which may
+    /// still wait for them, so the `devtools:` row counts no wait and stays ok; any other run
+    /// counts what it reads.
+    #[test]
+    fn the_devtools_row_reads_no_wait_against_a_grant_this_run_made() {
+        use aterm_containment::{DevToolGrant, DevToolListing};
+        use aterm_uds::process::HeldNow;
+        let two = HeldNow {
+            count: 2,
+            oldest_ms: 30_000,
+        };
+        let on = devtools_facts_with(read_list(DevToolListing::On, 2));
+        let off = devtools_facts_with(read_list(DevToolListing::Off, 2));
+        assert_eq!(on.grant(), DevToolGrant::Granted);
+        assert_eq!(off.grant(), DevToolGrant::NotGranted);
+        let beside = |before, facts: &atpkg::devtools::Facts| {
+            super::wait_beside(before, facts, || Some(two))
+        };
+        assert_eq!(
+            beside(DevToolGrant::NotGranted, &on),
+            None,
+            "switched on by this run"
+        );
+        let row = atpkg::devtools::row(&atpkg::devtools::Facts {
+            program_check: beside(DevToolGrant::NotGranted, &on),
+            ..on.clone()
+        })
+        .expect("a row");
+        assert_eq!(row.level, atpkg::doctor::Level::Ok, "{}", row.text);
+        assert_eq!(
+            beside(DevToolGrant::Granted, &on),
+            Some(two),
+            "granted before"
+        );
+        assert_eq!(
+            beside(DevToolGrant::NotGranted, &off),
+            Some(two),
+            "still off"
+        );
+        assert_eq!(
+            beside(DevToolGrant::Unknown, &on),
+            Some(two),
+            "no hand-over ran"
+        );
+    }
+
     #[test]
     fn the_devtools_row_is_a_counted_warning_and_says_what_doctor_did() {
         use aterm_containment::consent::{
@@ -4976,6 +5189,7 @@ mod tests {
                 list: list(listing),
                 log: DevToolProbe::refused(DevToolProbeLabel::NoRecentRequest),
                 other_responsible: None,
+                program_check: None,
             }),
             did: did.map(str::to_string),
         };
@@ -5169,6 +5383,7 @@ mod tests {
             list,
             log: DevToolProbe::refused(DevToolProbeLabel::NoRecentRequest),
             other_responsible: None,
+            program_check: None,
         }
     }
 

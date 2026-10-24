@@ -780,6 +780,7 @@ mod tests {
             version: Some("0.105.0".to_owned()),
             seen_ms: Some(1),
             via: Via::Joined,
+            fleet: None,
         };
         for recorded in [Recorded::New, Recorded::Updated] {
             let note = registration_note(recorded, &member);

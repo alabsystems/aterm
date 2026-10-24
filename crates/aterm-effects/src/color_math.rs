@@ -134,6 +134,25 @@ pub fn floor_contrast_keeping_hue(rgb: u32, ground: u32, min: f32) -> u32 {
         return rgb;
     }
     let darken = (lg + 0.05) * (lg + 0.05) >= 0.05 * 1.05;
+    least_on_hue_path(rgb, darken, meets)
+}
+
+/// Lift `rgb` along its hue (its peak scaled to full, then tinted toward white) to the least
+/// lightness at which `meets` holds, `meets` taken to hold from there to white: `rgb` itself where
+/// it already does, white where nothing short of white does.
+#[must_use]
+pub(crate) fn lift_keeping_hue(rgb: u32, meets: impl Fn(u32) -> bool) -> u32 {
+    let rgb = rgb & 0x00FF_FFFF;
+    if meets(rgb) {
+        return rgb;
+    }
+    least_on_hue_path(rgb, false, meets)
+}
+
+/// The first colour on `rgb`'s hue path at which `meets` holds, by bisection: toward black when
+/// `darken`, else its peak scaled to full and then tinted toward white; the path's end where
+/// `meets` fails even there.
+fn least_on_hue_path(rgb: u32, darken: bool, meets: impl Fn(u32) -> bool) -> u32 {
     let chan = |sh: u32| ((rgb >> sh) & 0xff) as f32;
     let (r, g, b) = (chan(16), chan(8), chan(0));
     let peak = r.max(g).max(b);
@@ -356,6 +375,32 @@ mod tests {
         assert_eq!(
             floor_contrast_keeping_hue(0x0011_1318, 0x0011_1318, f32::NAN),
             0x0011_1318
+        );
+    }
+
+    /// The lift is the page floor's lightening path held to any test: on a near-black ground,
+    /// where the floor lightens, lifting to the floor's own ratio gives the floor's colour, and a
+    /// colour that already passes is kept. NEGATIVE CONTROL: on a mid grey the floor darkens the
+    /// blue while the lift lightens it past the grey, so the two are not one path everywhere.
+    #[test]
+    fn the_lift_is_the_floors_lightening_path() {
+        let night = 0x0011_1318;
+        for rgb in [0x0051_0A00, 0x0000_00FF, 0x004B_0082, 0x0094_00D3] {
+            let floored = floor_contrast_keeping_hue(rgb, night, 4.5);
+            assert_ne!(floored, rgb, "CONTROL: {rgb:06x} starts under the floor");
+            assert_eq!(
+                lift_keeping_hue(rgb, |c| contrast_ratio(c, night) >= 4.5),
+                floored,
+                "{rgb:06x} on {night:06x}"
+            );
+        }
+        assert_eq!(lift_keeping_hue(0x0000_00FF, |_| true), 0x0000_00FF);
+        let grey = 0x0092_9292;
+        let lifted = lift_keeping_hue(0x0000_00FF, |c| contrast_ratio(c, grey) >= 3.0);
+        assert!(
+            lifted != floor_contrast_keeping_hue(0x0000_00FF, grey, 3.0)
+                && relative_luminance(lifted) > relative_luminance(grey),
+            "NEGATIVE CONTROL: on {grey:06x} the lift lightens the blue to {lifted:06x}"
         );
     }
 

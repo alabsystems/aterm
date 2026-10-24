@@ -195,12 +195,15 @@ pub fn jail_left(mark: &str, pids: &[i32]) -> String {
     left
 }
 
-/// Formats `pids` as `pid ppid command` rows.
+/// Formats the jail's members as `pid ppid command` rows, or the one line saying why they were
+/// not read.
 #[must_use]
-pub fn members_table(pids: &[i32]) -> String {
-    if pids.is_empty() {
-        return String::new();
-    }
+pub fn members_table(members: &Result<Vec<i32>, String>) -> String {
+    let pids = match members {
+        Ok(pids) if pids.is_empty() => return String::new(),
+        Ok(pids) => pids,
+        Err(why) => return format!("  not read: {why}\n"),
+    };
     let list: Vec<String> = pids.iter().map(ToString::to_string).collect();
     aterm_uds::spawnfd::command("/bin/ps")
         .args(["-o", "pid=,ppid=,comm=", "-p", &list.join(",")])
@@ -413,11 +416,12 @@ fn checks(run: &Run) -> Result<Checks, Fail> {
     let twin_ok = crate::verbs::twin_link_refused(run);
     let orphan = jail_orphan(run);
     let orphan_ok = orphan > 1 && orphan_seen(run, orphan);
-    let before = crate::sys::jail_pids(&run.mark).unwrap_or_default();
+    let members = crate::sys::jail_pids(&run.mark);
     println!(
         "== the jail's members, by its mark (pid, ppid, command; the orphan control is {orphan}, adopted by launchd)"
     );
-    print!("{}", members_table(&before));
+    print!("{}", members_table(&members));
+    let before = members.unwrap_or_default();
     println!("== the witness's lines for the orphan");
     for l in fs::read_to_string(run.run.join("sockets.log"))
         .unwrap_or_default()
@@ -490,6 +494,17 @@ fn checks(run: &Run) -> Result<Checks, Fail> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A member listing that was not read says why on its one line; an empty jail prints nothing.
+    #[test]
+    fn a_member_table_that_was_not_read_says_why() {
+        let why = "jailpids: the process list could not be read: refused".to_string();
+        assert_eq!(
+            members_table(&Err(why.clone())),
+            format!("  not read: {why}\n")
+        );
+        assert_eq!(members_table(&Ok(Vec::new())), "");
+    }
 
     /// A file of the owner's home that the lab never handed the agent is a
     /// stray: Muse Code 1.4.10's `session-names.db`, opened with HOME pointed

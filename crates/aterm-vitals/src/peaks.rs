@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Rolling 7-day [`DailyMax`] capacities ([`crate::ring::BucketRing::sustained`],
-//! [`Peaks::to_pairs`], [`Peaks::from_pairs`]).
+//! Rolling 7-day [`DailyMax`] and [`Peaks`] capacities.
 
 use crate::ring::BUCKET_S;
 
@@ -16,7 +15,7 @@ pub const TOKENS_LEARN_S: u32 = 600;
 /// The last [`PEAK_DAYS`] days' maxima of one quantity.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DailyMax {
-    /// `(day, maximum)`, oldest first, one row per day; the day is unix days (UTC) ([`PEAK_DAYS`]).
+    /// `(day, maximum)` in UTC Unix days, oldest first ([`PEAK_DAYS`]).
     pub days: Vec<(u32, f64)>,
     /// Seconds of sustained readings noted, ever (saturating).
     pub read_s: u32,

@@ -2179,9 +2179,9 @@ fn the_threshold_crossing_is_a_park_deadline() {
     use crate::metrics::DeadlineOwner;
     use std::time::{Duration, Instant};
     let fold = |app: &App, now: Instant| {
-        let (mut deadline, mut owner) = (None, DeadlineOwner::None);
+        let (mut deadline, mut owner) = (None, crate::deadline_heal::DeadlineFold::default());
         app.fold_consent_lane_deadlines(now, &mut deadline, &mut owner);
-        (deadline, owner)
+        (deadline, owner.owner())
     };
     let _arm = OBSERVER_ARM_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     reset_observer_arm();

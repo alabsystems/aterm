@@ -18,6 +18,7 @@ pub mod controller;
 pub mod engine;
 pub mod envelope;
 pub mod facts;
+pub mod first_exec;
 pub(crate) mod git_credential;
 /// GitHub's REST pagination, shared with the publishers' REST lane.
 pub(crate) use aterm_update_core::github_pages;

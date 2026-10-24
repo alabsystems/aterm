@@ -872,8 +872,26 @@ pub enum FxSpace {
 pub enum FxBlend {
     /// The Unorm byte law.
     Exact,
-    /// FreeSprite's linear-light law over an sRGB view (CPU `blend`), within its declared parity tolerance.
+    /// The companion sprites' linear-light law over an sRGB view (CPU `blend`), within its declared parity tolerance.
     Linear,
+}
+
+impl FxBlend {
+    /// The widest channel delta the law allows between the CPU's bytes and a
+    /// GPU arm's: `Exact` is the same integers on every arm (0); `Linear`
+    /// blends in linear light on the GPU's sRGB view and through the CPU's
+    /// tables (2). A producer declares its own bar, at most its blend's
+    /// (`aterm_render::sprites::SpriteLayers::PARITY`,
+    /// `aterm_effects::matrix_rain::RainLayers::PARITY`,
+    /// `aterm_render::rounded_bar::PARITY`), and its parity tests hold it.
+    #[inline]
+    #[must_use]
+    pub const fn parity(self) -> u8 {
+        match self {
+            Self::Exact => 0,
+            Self::Linear => 2,
+        }
+    }
 }
 
 /// One retained fx layer of a frame.
@@ -891,6 +909,10 @@ pub struct FxLayer {
     pub blend: FxBlend,
     /// Also feed the GPU bloom source (GPU-only; the CPU ignores it).
     pub bloom: bool,
+    /// The knock-out: on a [`FxBlend::Linear`] layer at [`FxSlot::Under`], every glyph
+    /// on one of its sprites is cut back to the page under it, so the letters read
+    /// against the page, not the body under them (`aterm_render::knock_rects`).
+    pub knock: bool,
     /// Where the content's origin lands, in `space`.
     pub offset: (i32, i32),
     /// The layer's clip in `space` (a pane box).
@@ -898,7 +920,7 @@ pub struct FxLayer {
 }
 
 impl FxLayer {
-    /// A layer at offset `(0, 0)`, unclipped, without bloom.
+    /// A layer at offset `(0, 0)`, unclipped, without bloom or knock-out.
     ///
     /// # Panics (debug)
     /// When the content cannot be drawn under `blend`, or a [`FxBlend::Linear`] layer asks for [`FxSlot::Glow`].
@@ -926,6 +948,7 @@ impl FxLayer {
             space,
             blend,
             bloom: false,
+            knock: false,
             offset: (0, 0),
             clip: PxRect::EVERYWHERE,
         }
@@ -951,6 +974,7 @@ impl PartialEq for FxLayer {
             && self.space == other.space
             && self.blend == other.blend
             && self.bloom == other.bloom
+            && self.knock == other.knock
             && self.offset == other.offset
             && self.clip == other.clip
     }
@@ -1420,12 +1444,13 @@ mod tests {
             ..base.clone()
         };
         assert_ne!(base, twin, "equal bytes in a new Arc are a change");
-        let variants: [fn(&mut FxLayer); 7] = [
+        let variants: [fn(&mut FxLayer); 8] = [
             |l| l.id += 1,
             |l| l.slot = FxSlot::Over,
             |l| l.space = FxSpace::Grid,
             |l| l.blend = FxBlend::Linear,
             |l| l.bloom = true,
+            |l| l.knock = true,
             |l| l.offset.1 += 1,
             |l| l.clip = PxRect::new(0, 0, 1, 1),
         ];

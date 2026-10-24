@@ -6,11 +6,11 @@
 use std::sync::Arc;
 
 use aterm_core::render::{
-    FreeSampler, FreeSprite, FreeZ, FxArt, FxBlend, FxContent, FxInk, FxItem, FxLayer, FxRamps,
-    FxRect, FxSlot, FxSpace, FxSprite, FxTexels, PxRect, RenderInput,
+    FxArt, FxBlend, FxContent, FxInk, FxItem, FxLayer, FxRamps, FxRect, FxSlot, FxSpace, FxSprite,
+    FxTexels, PxRect, RenderInput,
 };
 use aterm_core::terminal::Terminal;
-use aterm_render::{Renderer, SceneAtlas, Theme};
+use aterm_render::{Renderer, Theme};
 
 use crate::common::{self, max_channel_delta};
 
@@ -580,7 +580,10 @@ fn linear_fx_layers_hold_the_free_sprite_tolerance() {
             assert_arm(arm, &gpu);
             painted += usize::from(c.pixels != cb.pixels);
             let delta = max_channel_delta(&c.pixels, &g.pixels);
-            assert!(delta <= 2, "{arm}: frame {frame}: Linear delta {delta} > 2");
+            assert!(
+                delta <= i32::from(FxBlend::Linear.parity()),
+                "{arm}: frame {frame}: Linear delta {delta}"
+            );
         }
         assert!(
             painted >= 12,
@@ -648,15 +651,20 @@ fn fx_texel_bytes_survive_the_arm() {
     }
 }
 
+/// The integer nearest map (`docs/DESIGN-card-engine-2026-10-19.md` §4.1)
+/// at odd scales and mirrors, under both laws: an Exact sprite is byte-exact
+/// whatever its texels, and a Linear one is byte-exact wherever its texels
+/// and ink are opaque (its blend has nothing to round), so a delta there is
+/// a texel picked differently. Translucent Linear texels hold the Linear 2.
 #[test]
-fn free_sprites_float_path_misses_where_fx_maps_exactly() {
+fn sprites_map_texels_exactly_at_odd_scales_under_both_laws() {
     let theme = Theme::default();
     let mut t = Terminal::new(ROWS as u16, COLS as u16);
     t.process(b"\x1b[?25l");
-    let (aw, ah) = (61u32, 47u32);
-    let (mut straight, mut premul) = (Vec::new(), Vec::new());
-    for y in 0..ah {
-        for x in 0..aw {
+    let (aw, ah) = (61u16, 47u16);
+    let (mut straight, mut opaque, mut premul) = (Vec::new(), Vec::new(), Vec::new());
+    for y in 0..u32::from(ah) {
+        for x in 0..u32::from(aw) {
             let c = [(x * 4) as u8, (y * 5) as u8, ((x * 7 + y * 3) % 256) as u8];
             let a = if (x + y) % 3 == 0 {
                 255
@@ -664,18 +672,29 @@ fn free_sprites_float_path_misses_where_fx_maps_exactly() {
                 (40 + (x * 13 + y * 29) % 190) as u8
             };
             straight.extend_from_slice(&[c[0], c[1], c[2], a]);
+            opaque.extend_from_slice(&[c[0], c[1], c[2], 255]);
             let pm = |v: u8| ((u32::from(v) * u32::from(a) + 127) / 255) as u8;
             premul.extend_from_slice(&[pm(c[0]), pm(c[1]), pm(c[2]), a]);
         }
     }
-    let atlas = Arc::new(SceneAtlas {
-        width: aw,
-        height: ah,
-        rgba: straight,
-        version: 1,
-    });
-    let art =
-        Arc::new(FxArt::new(aw as u16, ah as u16, FxTexels::Rgba8Premul, premul).expect("sized"));
+    let art = |texels, data| Arc::new(FxArt::new(aw, ah, texels, data).expect("sized"));
+    let arts = [
+        (
+            "exact premul",
+            FxBlend::Exact,
+            art(FxTexels::Rgba8Premul, premul),
+        ),
+        (
+            "linear opaque",
+            FxBlend::Linear,
+            art(FxTexels::Rgba8Straight, opaque),
+        ),
+        (
+            "linear translucent",
+            FxBlend::Linear,
+            art(FxTexels::Rgba8Straight, straight),
+        ),
+    ];
     let scales = [
         (7u16, 5u16),
         (23, 17),
@@ -687,65 +706,57 @@ fn free_sprites_float_path_misses_where_fx_maps_exactly() {
     ];
     for (arm, mut cpu, mut gpu) in arms(theme) {
         let mut win = aterm_gpu::WindowGpu::new();
-        let (mut free_worst, mut fx_worst) = (0, 0);
-        for (i, &(dw, dh)) in scales.iter().enumerate() {
-            let flip = i % 2 == 1;
-            let mut free = t.cell_frame(ROWS, COLS);
-            free.free_atlas = Some(Arc::clone(&atlas));
-            free.free_sprites = vec![FreeSprite {
-                x: 4,
-                y: 6,
-                w: dw,
-                h: dh,
-                ax: 0,
-                ay: 0,
-                aw: aw as u16,
-                ah: ah as u16,
-                tint: 0x00FF_FFFF,
-                alpha: 255,
-                flip_x: flip,
-                z: FreeZ::OverText,
-                sampler: FreeSampler::Nearest,
-            }];
-            let (c, g) = (
-                cpu.render_input(&free),
-                gpu.render_input(&mut win, &free, None),
-            );
-            free_worst = free_worst.max(max_channel_delta(&c.pixels, &g.pixels));
-            let fx = input_with(
-                &mut t,
-                vec![layer(
-                    1,
-                    vec![FxItem::Sprite(FxSprite {
-                        x: 4,
-                        y: 6,
-                        dw,
-                        dh,
-                        flip_x: flip,
-                        art: Arc::clone(&art),
-                        ink: 0,
-                        clip: PxRect::EVERYWHERE,
-                    })],
+        for (name, blend, art) in &arts {
+            let mut worst = 0;
+            for (i, &(dw, dh)) in scales.iter().enumerate() {
+                let flip = i % 2 == 1;
+                let ink = match blend {
+                    FxBlend::Linear => vec![FxInk::over(0x00ff_ffff, 0xff)],
+                    _ => Vec::new(),
+                };
+                let input = input_with(
+                    &mut t,
+                    vec![layer(
+                        1,
+                        vec![FxItem::Sprite(FxSprite {
+                            x: 4,
+                            y: 6,
+                            dw,
+                            dh,
+                            flip_x: flip,
+                            art: Arc::clone(art),
+                            ink: 0,
+                            clip: PxRect::EVERYWHERE,
+                        })],
+                        ink,
+                        FxSlot::Over,
+                        *blend,
+                    )],
                     Vec::new(),
-                    FxSlot::Over,
-                    FxBlend::Exact,
-                )],
-                Vec::new(),
-            );
-            let (c, g) = (cpu.render_input(&fx), gpu.render_input(&mut win, &fx, None));
-            assert_arm(arm, &gpu);
-            fx_worst = fx_worst.max(max_channel_delta(&c.pixels, &g.pixels));
+                );
+                let (c, g) = (
+                    cpu.render_input(&input),
+                    gpu.render_input(&mut win, &input, None),
+                );
+                assert_arm(arm, &gpu);
+                worst = worst.max(max_channel_delta(&c.pixels, &g.pixels));
+            }
+            eprintln!("{arm}: odd scales: {name} delta {worst}");
+            if *name == "linear translucent" {
+                assert!(
+                    worst <= i32::from(FxBlend::Linear.parity()),
+                    "{arm}: {name}: the Linear bar, got {worst}"
+                );
+            } else {
+                assert_eq!(worst, 0, "{arm}: {name}: the integer map is byte-exact");
+            }
         }
-        eprintln!("{arm}: odd scales: FreeSprite delta {free_worst}, fx delta {fx_worst}");
-        assert!(
-            free_worst > 0,
-            "{arm}: the control: FreeSprite's float path differs"
-        );
-        assert!(free_worst <= 2, "{arm}: FreeSprite holds its declared 2");
-        assert_eq!(fx_worst, 0, "{arm}: the fx integer path is byte-exact");
     }
 }
 
+/// An fx layer opens no render pass its slot's stream does not already
+/// open: an Exact layer the passes of the legacy channel it stands beside,
+/// a Linear sprite layer (the companions and the rain) the bare frame's.
 #[test]
 fn fx_layers_open_the_passes_their_slots_already_open() {
     let theme = Theme::default();
@@ -791,28 +802,9 @@ fn fx_layers_open_the_passes_their_slots_already_open() {
         } else {
             FxInk::add(0x0030_2010)
         };
-        layer(1, vec![item], vec![ink, ink], slot, blend)
-    };
-    let atlas = Arc::new(SceneAtlas {
-        width: 1,
-        height: 1,
-        rgba: vec![200, 90, 40, 160],
-        version: 1,
-    });
-    let free = |z| FreeSprite {
-        x: 20,
-        y: 30,
-        w: 90,
-        h: 40,
-        ax: 0,
-        ay: 0,
-        aw: 1,
-        ah: 1,
-        tint: 0x00FF_FFFF,
-        alpha: 255,
-        flip_x: false,
-        z,
-        sampler: FreeSampler::Nearest,
+        let mut l = layer(1, vec![item], vec![ink, ink], slot, blend);
+        l.knock = linear && slot == FxSlot::Under;
+        l
     };
     let passes = |gpu: &mut aterm_gpu::GpuRenderer, input: &RenderInput| {
         let mut win = aterm_gpu::WindowGpu::new();
@@ -832,14 +824,7 @@ fn fx_layers_open_the_passes_their_slots_already_open() {
             match (slot, blend) {
                 (FxSlot::Under, FxBlend::Exact) => legacy.glow_under.push(quad),
                 (_, FxBlend::Exact) => legacy.nova_add.push(quad),
-                (FxSlot::Under, _) => {
-                    legacy.free_atlas = Some(Arc::clone(&atlas));
-                    legacy.free_sprites.push(free(FreeZ::UnderText));
-                }
-                _ => {
-                    legacy.free_atlas = Some(Arc::clone(&atlas));
-                    legacy.free_sprites.push(free(FreeZ::OverText));
-                }
+                _ => {}
             }
             let fx = input_with(&mut t, vec![rect(slot, blend)], Vec::new());
             let (want, got) = (passes(&mut gpu, &legacy), passes(&mut gpu, &fx));
@@ -902,6 +887,10 @@ fn fx_prefetch_makes_arts_resident_without_drawing() {
         let shape = gpu.frame_shape();
         assert_eq!(shape.fx_instances, 0, "{arm}: a prefetch draws nothing");
         assert_eq!(shape.fx_upload_bytes, art_bytes, "{arm}: the arts' texels");
+        assert_eq!(
+            shape.fx_atlas_bytes, art_bytes,
+            "{arm}: all of them atlas texels"
+        );
         assert_eq!(max_channel_delta(&want, &got), 0, "{arm}: no pixel moved");
         let _ = gpu.render_input(&mut aterm_gpu::WindowGpu::new(), &hint, None);
         assert_eq!(
@@ -920,6 +909,7 @@ fn fx_prefetch_makes_arts_resident_without_drawing() {
             u64::from(shape.fx_instances) * 32 + 4 * palette.len() as u64,
             "{arm}: a prefetched art uploads no texel when drawn"
         );
+        assert_eq!(shape.fx_atlas_bytes, 0, "{arm}: no atlas texel");
         assert_eq!(max_channel_delta(&c, &g), 0, "{arm}: and draws byte-exact");
     }
     for (arm, _cpu, mut gpu) in arms(theme) {
@@ -931,6 +921,7 @@ fn fx_prefetch_makes_arts_resident_without_drawing() {
             u64::from(shape.fx_instances) * 32 + 4 * palette.len() as u64 + art_bytes,
             "{arm}: an art first met when drawn uploads with its frame"
         );
+        assert_eq!(shape.fx_atlas_bytes, art_bytes, "{arm}: its texels");
     }
 }
 
@@ -968,6 +959,121 @@ fn fx_residency_refills_after_a_device_rebuild() {
         0,
         "a fresh renderer refills"
     );
+}
+
+/// An opaque `w × h` premultiplied art whose every texel is its own colour
+/// (`seed`, x, y hashed): a region left holding another art's texels shows.
+fn tile_art(seed: u64, w: u16, h: u16) -> Arc<FxArt> {
+    let mut data = Vec::with_capacity(usize::from(w) * usize::from(h) * 4);
+    for y in 0..h {
+        for x in 0..w {
+            let v = (seed ^ (u64::from(x) << 20) ^ (u64::from(y) << 40))
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            data.extend_from_slice(&[(v >> 24) as u8, (v >> 32) as u8, (v >> 40) as u8, 255]);
+        }
+    }
+    Arc::new(FxArt::new(w, h, FxTexels::Rgba8Premul, data).expect("sized"))
+}
+
+/// `arts` drawn at a quarter of their size, side by side (a wide one on a
+/// second row): every fourth texel of each art lands in the frame.
+fn tiles_layer(arts: &[Arc<FxArt>]) -> FxLayer {
+    let mut x = 4;
+    let items = arts
+        .iter()
+        .map(|a| {
+            let (dw, dh) = (a.w() / 4, a.h() / 4);
+            let (ix, iy) = if a.w() > a.h() { (4, 90) } else { (x, 6) };
+            if a.w() <= a.h() {
+                x += i32::from(dw) + 2;
+            }
+            FxItem::Sprite(FxSprite {
+                x: ix,
+                y: iy,
+                dw,
+                dh,
+                flip_x: false,
+                art: Arc::clone(a),
+                ink: 0,
+                clip: PxRect::EVERYWHERE,
+            })
+        })
+        .collect();
+    layer(
+        7,
+        items,
+        vec![FxInk::over(0x00FF_FFFF, 0xff)],
+        FxSlot::Over,
+        FxBlend::Exact,
+    )
+}
+
+/// EVICTION DRAWS WHAT THE CPU DRAWS: frames whose arts outgrow the fx
+/// atlas evict the arts the frame does not draw and reuse their regions;
+/// every frame, a window's frame after another window's frame evicted its
+/// arts, and a frame after a device rebuild that followed evictions, land
+/// the CPU's bytes on every arm. A region left holding the art it held
+/// before shows as another art's texels.
+#[test]
+fn fx_atlas_evictions_draw_every_frame_as_the_cpu() {
+    let theme = Theme::default();
+    let mut t = base_terminal();
+    let group =
+        |g: u64| -> Vec<Arc<FxArt>> { (0..4).map(|i| tile_art(g * 16 + i, 256, 256)).collect() };
+    let (g0, g1, g2, g3) = (group(1), group(2), group(3), group(4));
+    // Two of g1's and one 512-wide art: a whole shelf of the 512 atlas.
+    let wide = vec![
+        Arc::clone(&g1[0]),
+        Arc::clone(&g1[1]),
+        tile_art(99, 512, 256),
+    ];
+    for (arm, mut cpu, mut gpu) in arms(theme) {
+        let mut a = aterm_gpu::WindowGpu::new();
+        let mut b = aterm_gpu::WindowGpu::new();
+        let mut frame = |gpu: &mut aterm_gpu::GpuRenderer,
+                         win: &mut aterm_gpu::WindowGpu,
+                         arts: &[Arc<FxArt>],
+                         what: &str| {
+            let input = input_with(&mut t, vec![tiles_layer(arts)], Vec::new());
+            let want = cpu.render_input(&input).pixels;
+            let got = gpu.render_input(win, &input, None).pixels;
+            assert_arm(arm, gpu);
+            assert_eq!(
+                max_channel_delta(&want, &got),
+                0,
+                "{arm}: {what} draws the CPU's bytes"
+            );
+            gpu.frame_shape()
+        };
+        let first = frame(&mut gpu, &mut a, &g0, "the first group");
+        assert_eq!(first.fx_atlas_bytes, 4 * 256 * 256 * 4, "{arm}: g0 uploads");
+        let next = frame(&mut gpu, &mut a, &g1, "a group that evicts the first");
+        assert_eq!(next.fx_atlas_bytes, 4 * 256 * 256 * 4, "{arm}: g1 uploads");
+        let back = frame(&mut gpu, &mut a, &g0, "the first group again");
+        assert_eq!(
+            back.fx_atlas_bytes,
+            4 * 256 * 256 * 4,
+            "{arm}: g0 was evicted and uploads again"
+        );
+        let _ = frame(&mut gpu, &mut a, &wide, "a wide art beside two of g1");
+        let _ = frame(&mut gpu, &mut a, &g2, "window A's group");
+        let _ = frame(&mut gpu, &mut b, &g3, "window B's group, evicting A's");
+        let again = frame(&mut gpu, &mut a, &g2, "window A's group after B's");
+        assert!(
+            again.fx_atlas_bytes > 0,
+            "{arm}: B's frame evicted A's arts"
+        );
+        let _ = frame(&mut gpu, &mut b, &g3, "window B's group after A's");
+        gpu.drop_fx_arm_residency_for_test();
+        let refilled = frame(
+            &mut gpu,
+            &mut aterm_gpu::WindowGpu::new(),
+            &g3,
+            "a group after a device rebuild",
+        );
+        assert!(refilled.fx_atlas_bytes > 0, "{arm}: the rebuild refilled");
+        let _ = frame(&mut gpu, &mut a, &g0, "an evicted group after the rebuild");
+    }
 }
 
 fn shares_pixels(base: &[u32], solo: &[u32], with: &[u32]) -> bool {
@@ -1099,55 +1205,40 @@ fn fx_slots_draw_between_their_neighbours_on_the_gpu() {
                 );
             }
         }
-        let atlas = Arc::new(SceneAtlas {
-            width: 1,
-            height: 1,
-            rgba: vec![220, 40, 30, 150],
-            version: 1,
-        });
-        let art = Arc::new(
-            FxArt::new(1, 1, FxTexels::Rgba8Straight, vec![30, 60, 230, 170]).expect("sized"),
-        );
+        let tile = |rgba: Vec<u8>| {
+            Arc::new(FxArt::new(1, 1, FxTexels::Rgba8Straight, rgba).expect("sized"))
+        };
+        let (first, art) = (tile(vec![220, 40, 30, 150]), tile(vec![30, 60, 230, 170]));
         let (x, y, w, h) = (cw as i32, ch as i32, (10 * cw) as u16, (4 * ch) as u16);
-        for (name, slot, z) in [
-            ("linear under", FxSlot::Under, FreeZ::UnderText),
-            ("linear over", FxSlot::Over, FreeZ::OverText),
-        ] {
-            let sprite = layer(
-                2,
+        let sprite_layer = |id: u64, slot, art: &Arc<FxArt>, dx: i32, dy: i32| {
+            layer(
+                id,
                 vec![FxItem::Sprite(FxSprite {
-                    x: x + (cw / 2) as i32,
-                    y: y + (ch / 2) as i32,
+                    x: x + dx,
+                    y: y + dy,
                     dw: w,
                     dh: h,
                     flip_x: false,
-                    art: Arc::clone(&art),
+                    art: Arc::clone(art),
                     ink: 0,
                     clip: PxRect::EVERYWHERE,
                 })],
                 vec![FxInk::over(0x00ff_ffff, 0xff)],
                 slot,
                 FxBlend::Linear,
-            );
+            )
+        };
+        for (name, slot) in [
+            ("linear under", FxSlot::Under),
+            ("linear over", FxSlot::Over),
+        ] {
+            let sprite = sprite_layer(2, slot, &art, (cw / 2) as i32, (ch / 2) as i32);
             let alone = input_with(&mut t, vec![sprite], Vec::new());
             let solo = cpu.render_input(&alone).pixels;
+            // Before: a layer of the same slot earlier in the frame's list (the
+            // rain's rows under a companion, an earlier companion over).
             let before = |i: &mut RenderInput| {
-                i.free_atlas = Some(Arc::clone(&atlas));
-                i.free_sprites = vec![FreeSprite {
-                    x,
-                    y,
-                    w,
-                    h,
-                    ax: 0,
-                    ay: 0,
-                    aw: 1,
-                    ah: 1,
-                    tint: 0x00FF_FFFF,
-                    alpha: 255,
-                    flip_x: false,
-                    z,
-                    sampler: FreeSampler::Nearest,
-                }];
+                i.fx_layers.insert(0, sprite_layer(3, slot, &first, 0, 0));
             };
             let after = |i: &mut RenderInput| {
                 if matches!(slot, FxSlot::Under) {
@@ -1186,7 +1277,10 @@ fn fx_slots_draw_between_their_neighbours_on_the_gpu() {
             assert_arm(arm, &gpu);
             assert!(gpu.frame_shape().fx_instances > 0, "{arm} {name}: fx drew");
             let delta = max_channel_delta(&c.pixels, &g.pixels);
-            assert!(delta <= 2, "{arm} {name}: delta {delta} > 2");
+            assert!(
+                delta <= i32::from(FxBlend::Linear.parity()),
+                "{arm} {name}: delta {delta}"
+            );
         }
     }
 }
@@ -1491,4 +1585,70 @@ fn a_frame_whose_fx_fails_closed_counts_no_fx() {
         max_channel_delta(&cpu.render_input(&input).pixels, &drew),
         0
     );
+}
+
+/// THE SCROLLBAR'S ROUNDED BARS ARE BYTE-EXACT ON EVERY ARM (lane B7): the
+/// body rectangle and the two antialiased caps of one Index8 art a
+/// `(width, radius)`, each cap clipped to its own rows, land the CPU's bytes on
+/// the native arm and the wgpu oracle, at every width the chrome draws, from a
+/// dot to a page-tall bar, on and across row bands, and a thumb over its track.
+#[test]
+fn rounded_bars_are_byte_exact_on_the_gpu() {
+    use aterm_render::rounded_bar::{CapArts, RoundedBar, push_items};
+    let theme = Theme::default();
+    let mut t = base_terminal();
+    for (arm, mut cpu, mut gpu) in arms(theme) {
+        let mut win = aterm_gpu::WindowGpu::new();
+        let base = t.cell_frame(ROWS, COLS);
+        let cb = cpu.render_input(&base);
+        let mut arts = CapArts::default();
+        for (rgb, alpha) in [
+            ([200, 200, 200], 92),
+            ([80, 250, 123], 255),
+            ([17, 99, 240], 22),
+        ] {
+            let mut layers = Vec::new();
+            let (mut x, mut y) = (2u32, 1u32);
+            for w in (1..=14).chain([18]) {
+                for h in [1, 2, 3, 5, 6, 7, 9, 13, 16, 17, 29, 61] {
+                    if x + w + 2 > cb.width as u32 - 4 {
+                        (x, y) = (2, y + 64);
+                    }
+                    let bar = RoundedBar {
+                        x,
+                        y,
+                        w,
+                        h,
+                        rgb,
+                        alpha,
+                    };
+                    let (mut items, mut palette) = (Vec::new(), Vec::new());
+                    push_items(bar, &mut arts, &mut items, &mut palette);
+                    layers.push(FxLayer::new(
+                        layers.len() as u64 + 1,
+                        Arc::new(FxContent::new(items, palette)),
+                        FxSlot::Over,
+                        FxSpace::Grid,
+                        FxBlend::Exact,
+                    ));
+                    x += w + 2;
+                }
+            }
+            let input = input_with(&mut t, layers, Vec::new());
+            let (c, g) = (
+                cpu.render_input(&input),
+                gpu.render_input(&mut win, &input, None),
+            );
+            assert_arm(arm, &gpu);
+            assert_ne!(c.pixels, cb.pixels, "{arm}: the bars paint");
+            let delta = max_channel_delta(&c.pixels, &g.pixels);
+            common::assert_byte_exact(
+                "rounded_bars_are_byte_exact_on_the_gpu",
+                &format!("{arm} {rgb:?}@{alpha}"),
+                &gpu,
+                delta,
+                format_args!("{arm} {rgb:?}@{alpha}: the bars are byte-exact (got {delta})"),
+            );
+        }
+    }
 }

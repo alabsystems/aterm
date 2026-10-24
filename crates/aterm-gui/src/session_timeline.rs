@@ -2567,6 +2567,29 @@ impl SessionTimeline {
         true
     }
 
+    /// Edit the task record's fact word ([`crate::task_record::fact_edit`]): the outcome, and
+    /// whether the record moved (its `task-change` recorded).
+    pub(crate) fn note_task_fact(
+        &mut self,
+        word: Option<aterm_agent::supervise::occupancy::FactWord>,
+    ) -> (aterm_agent::supervise::occupancy::NoteOutcome, bool) {
+        let Some(task) = self.task.as_ref() else {
+            return (
+                aterm_agent::supervise::occupancy::NoteOutcome::NoTask,
+                false,
+            );
+        };
+        let (outcome, next) = crate::task_record::fact_edit(task, word);
+        let Some(next) = next else {
+            return (outcome, false);
+        };
+        let at = self.slog.now();
+        self.slog.observe_task(&next, at);
+        self.record("task-change");
+        self.task = Some(next);
+        (outcome, true)
+    }
+
     /// Seed the record a seamless update carried, before the adopted session is registered ([`crate::task_record::seed_carried`]).
     pub(crate) fn seed_task(&mut self, record: crate::task_record::TaskRecord) {
         self.task = Some(record);

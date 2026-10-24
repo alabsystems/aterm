@@ -1093,6 +1093,9 @@ pub fn fold_ledger_row(acc: &mut HarnessStats, v: &Value, ts: i64) {
 fn fold_fact(acc: &mut HarnessStats, rule: &str, outcome: Option<Outcome>, reason: &str) {
     use crate::supervise::facts::FactKind;
     use crate::supervise::occupancy::rules::{RuleId, WOULD_RULE};
+    if crate::supervise::occupancy::door::is_task_row(reason) {
+        return;
+    }
     let (book, kind) = if rule == WOULD_RULE {
         let named = reason
             .split(' ')

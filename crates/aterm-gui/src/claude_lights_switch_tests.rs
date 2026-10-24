@@ -30,15 +30,13 @@ fn claude_pane(cols: u16) -> (App, WindowId, u64, UnixStream, Hosted) {
     (app, wid, session, reader, hosted)
 }
 
+/// Name the program of `session`'s foreground group, `PGID`, which it notes
+/// first: a timeline names a program only for the group it holds in front.
 fn set_program(app: &App, session: u64, program: Option<&str>) {
-    app.pool
-        .get(session)
-        .expect("session")
-        .ctx
-        .timeline
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .set_program(PGID, program.map(Into::into));
+    let ctx = app.pool.get(session).expect("session").ctx.clone();
+    let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+    timeline.note_foreground_group(PGID);
+    timeline.set_program(PGID, program.map(Into::into));
 }
 
 fn policy(app: &mut App, text: &str) {
@@ -1330,5 +1328,127 @@ fn the_facts_words_read_on_a_tab_theme_of_its_own() {
         reads([0x99; 3], ground) < ICON_CONTRAST,
         "CONTROL: the old stub at {:.2}:1",
         reads([0x99; 3], ground)
+    );
+}
+
+/// THE KEYBOARD REACHES THE HARNESS SWITCH (review 13): ctrl+shift+tab
+/// walks a pane's chips and facts and then its top rule's switch, lit as
+/// the pointer lights it, and Return there presses it as a click does: the
+/// harness turns off and nothing is typed. A Gemini pane, whose rule draws
+/// the switch and no chip or fact, reaches it too. NEGATIVE CONTROL: Escape
+/// on the switch lets it go and turns nothing; a shell's pane, no switch,
+/// selects nothing.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_keyboard_walks_to_the_switch_and_return_presses_it() {
+    use super::Target;
+    use super::gesture_tests::{chord, tap};
+    use aterm_window::keyboard::{KeyCode, NamedKey};
+    let selected = |app: &App, wid: WindowId| app.windows[&wid].claude_lights.selected;
+    let walk = |app: &mut App, wid: WindowId, session: u64| {
+        let order = app.windows[&wid].claude_lights.revealable(session);
+        assert_eq!(
+            order.last(),
+            Some(&Target::Switch),
+            "the walk's last stop: {order:?}"
+        );
+        for _ in 0..order.len() {
+            chord(app, wid);
+            frame(app, wid);
+            if selected(&*app, wid) == Some((session, Target::Switch)) {
+                break;
+            }
+        }
+        assert_eq!(
+            selected(&*app, wid),
+            Some((session, Target::Switch)),
+            "{order:?}"
+        );
+        assert!(
+            app.windows[&wid]
+                .claude_lights
+                .switch_shown(session, HarnessSwitch::On)
+                .1,
+            "lit as the pointer lights it"
+        );
+    };
+    let (mut app, wid, session, mut reader, _host) = claude_pane(120);
+    assert_eq!(
+        switch(&app, wid).map(|b| b.face),
+        Some(HarnessSwitch::On),
+        "CONTROL"
+    );
+    let before = autopilot(&app, session);
+    walk(&mut app, wid, session);
+    tap(&mut app, wid, NamedKey::Escape, KeyCode::Escape, "\u{1b}");
+    assert_eq!(
+        selected(&app, wid),
+        None,
+        "NEGATIVE CONTROL: Escape lets it go"
+    );
+    assert_eq!(
+        autopilot(&app, session),
+        before,
+        "NEGATIVE CONTROL: nothing turned"
+    );
+    frame(&mut app, wid);
+    walk(&mut app, wid, session);
+    tap(&mut app, wid, NamedKey::Enter, KeyCode::Enter, "\r");
+    assert_eq!(
+        autopilot(&app, session).1,
+        AutopilotView::Off,
+        "Return is its click"
+    );
+    assert_eq!(selected(&app, wid), None);
+    assert!(pty(&mut reader, 0).is_empty(), "nothing typed");
+
+    let (mut app, wid, session, mut reader) = super::gesture_tests::app();
+    assert!(app.apply_term_resize(wid, 50, 144));
+    let _host = host(&mut app);
+    set_program(&app, session, Some("gemini"));
+    let ctx = app.pool.get(session).expect("session").ctx.clone();
+    crate::session_timeline::claim_supervisor(
+        &ctx,
+        &crate::harness_host::holder(),
+        None,
+        None,
+        crate::metrics::now_us(),
+    )
+    .expect("the claim");
+    let rows: Vec<String> = include_str!("../../aterm-phase/src/fixtures/gemini-0.46.0-idle.txt")
+        .lines()
+        .filter(|l| !l.starts_with("# "))
+        .map(str::to_owned)
+        .collect();
+    crate::claude_footer::probe::feed(&app, session, &rows);
+    frame(&mut app, wid);
+    frame(&mut app, wid);
+    let b = switch(&app, wid).expect("Gemini's rule draws the switch");
+    assert_eq!(
+        (b.program, b.face),
+        (aterm_phase::Program::Gemini, HarnessSwitch::On),
+        "CONTROL"
+    );
+    walk(&mut app, wid, session);
+    tap(&mut app, wid, NamedKey::Enter, KeyCode::Enter, "\r");
+    assert_eq!(
+        autopilot(&app, session).1,
+        AutopilotView::Off,
+        "Gemini: its click"
+    );
+    assert!(pty(&mut reader, 0).is_empty(), "Gemini: nothing typed");
+
+    set_program(&app, session, None);
+    frame(&mut app, wid);
+    assert_eq!(
+        switch(&app, wid),
+        None,
+        "CONTROL: a shell's pane has no switch"
+    );
+    chord(&mut app, wid);
+    assert_eq!(
+        selected(&app, wid),
+        None,
+        "NEGATIVE CONTROL: nothing to select"
     );
 }

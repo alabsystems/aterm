@@ -81,7 +81,8 @@ impl GetError {
     }
 
     pub(super) fn is_not_found(&self) -> bool {
-        self.code == Some(22) && self.status == Some(404)
+        matches!(self.code, Some(22 | 56))
+            && (self.status == Some(404) || self.message.ends_with("returned error: 404"))
     }
 
     pub(super) fn into_message(self) -> String {

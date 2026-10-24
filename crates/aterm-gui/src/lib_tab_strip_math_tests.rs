@@ -110,35 +110,22 @@ fn prepend_shifts_content_and_cursor_down() {
         col: 2,
         color: [1, 2, 3],
     });
-    frame.cat_quads.push(aterm_render::SpriteQuad {
-        row: 1,
-        x: 3,
-        y: 26,
-        w: 8,
-        h: 4,
-        ax: 0,
-        ay: 8,
-        aw: 8,
-        ah: 4,
-        tint: 0x00FF_FFFF,
-        alpha: 255,
-        flip_x: false,
-    });
-    frame.free_sprites.push(aterm_core::render::FreeSprite {
-        x: 3,
-        y: -7, // peeking in from above row 0: the signed case survives
-        w: 8,
-        h: 40,
-        ax: 0,
-        ay: 8,
-        aw: 8,
-        ah: 40,
-        tint: 0x00FF_FFFF,
-        alpha: 255,
-        flip_x: false,
-        z: aterm_core::render::FreeZ::UnderText,
-        sampler: aterm_core::render::FreeSampler::Nearest,
-    });
+    // A companion peeking in from above row 0 (the signed case survives),
+    // shown through its window.
+    let art = aterm_render::fx::bitmap(
+        aterm_core::render::FxTexels::Rgba8Straight,
+        8,
+        40,
+        vec![255; 8 * 40 * 4],
+    )
+    .expect("an art");
+    let peek = aterm_render::sprites::FreeSprite {
+        clip: aterm_core::render::PxRect::new(3, 0, 11, 33),
+        z: aterm_render::sprites::FreeZ::UnderText,
+        ..aterm_render::sprites::FreeSprite::whole(3, -7, std::sync::Arc::clone(&art))
+    };
+    aterm_render::sprites::SpriteLayers::new(1)
+        .publish(std::slice::from_ref(&peek), &mut frame.fx_layers);
     prepend_strip_rows(&mut frame, &[strip_row], 16, 0, &mut Vec::new());
     assert_eq!(frame.rows, before_rows + 1);
     assert_eq!(frame.cells.len(), before_rows + 1);
@@ -156,19 +143,17 @@ fn prepend_shifts_content_and_cursor_down() {
             color: [1, 2, 3]
         }
     );
-    assert_eq!(frame.cat_quads[0].row, 2);
-    assert_eq!(frame.cat_quads[0].y, 26 + 16);
+    let moved = aterm_render::sprites::published(&frame.fx_layers);
+    assert_eq!(moved[0].y, -7 + 16);
+    assert_eq!(moved[0].x, 3, "x is not a strip axis");
     assert_eq!(
-        (frame.cat_quads[0].ax, frame.cat_quads[0].ay),
-        (0, 8),
-        "splice never touches source texels"
+        moved[0].clip,
+        aterm_core::render::PxRect::new(3, 16, 11, 33 + 16),
+        "the peek's window rides the strip with it"
     );
-    assert_eq!(frame.free_sprites[0].y, -7 + 16);
-    assert_eq!(frame.free_sprites[0].x, 3, "x is not a strip axis");
-    assert_eq!(
-        (frame.free_sprites[0].ay, frame.free_sprites[0].h),
-        (8, 40),
-        "splice never touches free source texels/extents"
+    assert!(
+        std::sync::Arc::ptr_eq(&moved[0].art, &art) && moved[0].h == 40,
+        "splice never touches the art or its extent"
     );
     assert_eq!(frame.cells[1][0].ch, 'A');
     assert_eq!(frame.cells[1][1].ch, 'B');

@@ -102,6 +102,19 @@ fn a_turn_end_after_work_is_continued_once_and_a_stop_phrase_escalates() {
     assert_eq!(m.requests[at - 1], "status");
     assert_eq!(count(&m, "turn"), 1, "{:#?}", m.requests);
     assert!(
+        m.requests
+            .iter()
+            .any(|r| r == "mark - act word=continue rule=continue.v1"),
+        "{:#?}",
+        m.requests
+    );
+    assert_eq!(
+        count(&m, "mark - label"),
+        0,
+        "a keep-going is no moment of the harness's own: {:#?}",
+        m.requests
+    );
+    assert!(
         m.attention
             .as_deref()
             .is_some_and(|a| a.starts_with("claude idle: ")),
@@ -1707,10 +1720,16 @@ fn a_question_in_prose_is_answered_by_the_sessions_priority_word() {
         );
         assert_eq!(
             m.requests.iter().filter(|r| *r == "meta").count(),
-            2,
+            3,
             "{word:?}: {:#?}",
             m.requests
         );
+        let badge = m
+            .requests
+            .iter()
+            .position(|r| r.starts_with("meta set attention owner=supervisor "))
+            .expect("the owned badge");
+        assert_eq!(m.requests[badge - 1], "meta");
     }
 }
 
@@ -6971,6 +6990,83 @@ fn an_up_measure_mid_wait_continues_the_outage_within_one_step() {
         "{waiting:#?}"
     );
     assert!(host.asks() > 2, "asked at each step while it waited");
+
+    let agy_busy = aterm_phase::prompt::fixtures::screen(aterm_phase::agy::fixtures::BUSY);
+    let agy_net_outage: Vec<String> =
+        aterm_phase::prompt::fixtures::screen(aterm_phase::agy::fixtures::ERROR_TURN)
+            .into_iter()
+            .map(|r| {
+                if r.starts_with("⚠ failed to construct") {
+                    "⚠ There was a network issue connecting to the server, please try again."
+                        .to_string()
+                } else {
+                    r
+                }
+            })
+            .collect();
+    let agy_done: Vec<String> =
+        aterm_phase::prompt::fixtures::screen(aterm_phase::agy::fixtures::END_OF_TURN)
+            .into_iter()
+            .map(|r| {
+                if r.starts_with("  and ocean floor depth") {
+                    format!("  {STOP}")
+                } else {
+                    r
+                }
+            })
+            .collect();
+    let run_agy = |script: &[Reach], max_s: u64| {
+        let host = ReachHost::scripted(script);
+        let (dir, path) = journal_file(&format!("te-agy-outage-{}-{max_s}", script.len()));
+        let mut m = agy_mock(vec![
+            agy_busy.clone(),
+            agy_net_outage.clone(),
+            agy_busy.clone(),
+            agy_done.clone(),
+        ]);
+        m.turn_releases = Some(1);
+        m.vanish_after = Some(2);
+        m.stall_sleep = Some(Duration::from_millis(5));
+        let opts = SuperviseOpts {
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            journal: Some(path.clone()),
+            ..hosted(max_s)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| s.set_turn_end_timing(far_rungs()));
+        let (records, _) = journal_records(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        let waiting: Vec<String> = records
+            .into_iter()
+            .filter(|r| r.kind == "waiting")
+            .map(|r| r.summary)
+            .collect();
+        (lines, host, m, waiting)
+    };
+    let (lines, host, m, waiting) = run_agy(&[down], 1);
+    assert_eq!(count(&m, "turn"), 0, "{lines:#?}\n{:#?}", m.requests);
+    assert!(
+        !lines.iter().any(|l| l.starts_with("CONTINUED")),
+        "agy must not send messages during a network outage: {lines:#?}"
+    );
+    assert!(
+        waiting.iter().any(|w| w.contains("the API is unreachable")),
+        "{waiting:#?}"
+    );
+    assert!(host.asks() > 2, "{lines:#?}");
+
+    let (lines, _, m, waiting) = run_agy(&[down, down, down, up], 30);
+    let continued: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.starts_with("CONTINUED"))
+        .collect();
+    assert_eq!(continued.len(), 1, "{lines:#?}");
+    assert!(
+        continued[0].starts_with("CONTINUED seq=102 rule=api-back@v1 "),
+        "{lines:#?}"
+    );
+    assert_eq!(count(&m, "turn"), 1, "{:#?}", m.requests);
+    assert_eq!(waiting.len(), 1, "{waiting:#?}");
+    assert!(waiting[0].contains("the API is unreachable"), "{waiting:?}");
 }
 
 #[test]
@@ -26581,16 +26677,28 @@ fn launched_run(
     host: &Arc<LaunchHost>,
     books: Option<&str>,
 ) -> (Vec<String>, Vec<String>) {
+    launched_run_for(tag, m, host, books, 60)
+}
+
+/// [`launched_run`] with the loop's budget at `max_s` seconds, the session
+/// vanishing at the mock's `vanish_after` when the test set one.
+fn launched_run_for(
+    tag: &str,
+    m: &mut Mock,
+    host: &Arc<LaunchHost>,
+    books: Option<&str>,
+    max_s: u64,
+) -> (Vec<String>, Vec<String>) {
     let (dir, ledger) = ledger_at(tag);
     if let Some(books) = books {
         std::fs::write(&ledger, books).expect("the ledger");
     }
     let journal = dir.join("journal.jsonl");
-    m.vanish_after = Some(3);
+    m.vanish_after.get_or_insert(3);
     let opts = SuperviseOpts {
         idle_host: Some(Arc::clone(host) as Arc<dyn IdleHost>),
         journal: Some(journal.clone()),
-        ..hosted(60)
+        ..hosted(max_s)
     };
     let _ = watch_lines_with(m, &opts, |s| {
         s.set_approval_ledger(books.map(|_| ledger.clone()));
@@ -26650,19 +26758,7 @@ fn launches() -> Vec<LaunchCase> {
             gemini_ended(LAB_REPLY),
         ])
     }
-    fn muse() -> Mock {
-        use aterm_phase::muse::fixtures as u;
-        let blank = vec![String::new(); 50];
-        muse_mock(vec![
-            blank.clone(),
-            blank.clone(),
-            blank.clone(),
-            blank,
-            screen(u::BUSY),
-            screen(u::END_OF_TURN),
-        ])
-    }
-    vec![("gemini", gemini, 101, 103), ("muse", muse, 104, 106)]
+    vec![("gemini", gemini, 101, 103)]
 }
 
 #[test]
@@ -26702,6 +26798,129 @@ fn a_launchs_frame_before_any_prompt_is_no_short_turn() {
             "{agent}: {lines:#?}"
         );
     }
+}
+
+fn starts() -> Vec<(&'static str, Mock, Vec<u64>, u64)> {
+    use aterm_phase::prompt::fixtures::screen;
+    let four = |rows: Vec<String>| vec![rows; 4];
+    let blank = || vec![String::new(); 50];
+    let r11 = {
+        use aterm_phase::muse::fixtures as u;
+        let mut screens = four(screen(u::LAUNCH_LINE));
+        screens.push(screen(u::FIRST_REPLY_UNDER_LAUNCH_LINE));
+        muse_mock(screens)
+    };
+    let fl2 = {
+        use aterm_phase::muse::fixtures as u;
+        let mut screens = four(blank());
+        screens.extend([screen(u::BUSY), screen(u::END_OF_TURN)]);
+        muse_mock(screens)
+    };
+    let uaf2 = {
+        use aterm_phase::agy::fixtures::lab as a;
+        let mut screens = vec![blank()];
+        screens.extend(four(screen(a::IDLE)));
+        screens.extend([screen(a::BUSY_THINKING), screen(a::END_OF_TURN)]);
+        agy_mock(screens)
+    };
+    let r2cvu = {
+        use aterm_phase::agy::fixtures::{LAUNCH_LINE, lab as a};
+        let mut screens = four(screen(LAUNCH_LINE));
+        screens.extend([screen(a::BUSY_THINKING), screen(a::END_OF_TURN)]);
+        agy_mock(screens)
+    };
+    vec![
+        ("muse-launch-line", r11, vec![101, 102, 103, 104], 105),
+        ("muse-blank", fl2, vec![101, 102, 103, 104], 106),
+        ("agy-cleared", uaf2, vec![101], 107),
+        ("agy-launch-line", r2cvu, vec![101, 102, 103, 104], 106),
+    ]
+}
+
+#[test]
+fn a_program_still_starting_is_no_point() {
+    for (books, label) in [
+        (Some(""), "launch"),
+        (Some(""), "attach"),
+        (None, "unbooked"),
+    ] {
+        for (agent, mut m, unread, reply) in starts() {
+            let launch = (label != "attach").then_some(LAUNCHED_MS);
+            let host = LaunchHost::saw(launch);
+            let tag = format!("start-{agent}-{label}");
+            let (lines, rows) = launched_run(&tag, &mut m, &host, books);
+            if books.is_some() {
+                assert_eq!(
+                    point_rows(&rows),
+                    [(reply, 1)],
+                    "{tag}: {rows:#?}\n{lines:#?}"
+                );
+            }
+            assert_eq!(
+                back_offs(&lines),
+                ["1 short turn(s) in a row: 2 min back-off"],
+                "{tag}: {lines:#?}"
+            );
+            for seq in unread {
+                assert!(
+                    !lines
+                        .iter()
+                        .any(|l| l.starts_with(&format!("EVENT idle seq={seq} "))),
+                    "{tag}: seq {seq} was read at a point: {lines:#?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_frame_after_a_start_the_loop_saw_is_a_launchs() {
+    use aterm_phase::gemini::fixtures as g;
+    use aterm_phase::prompt::fixtures::screen;
+    let mut screens = vec![vec![String::new(); 50]; 4];
+    screens.extend([
+        screen(g::PRE_BANNER),
+        screen(g::BUSY_THINKING),
+        gemini_ended(LAB_REPLY),
+    ]);
+    let host = LaunchHost::saw(None);
+    let (lines, rows) = launched_run(
+        "start-gemini-attach",
+        &mut gemini_mock(screens),
+        &host,
+        Some(""),
+    );
+    assert!(
+        lines.contains(&"EVENT idle seq=105 -".to_string()),
+        "the frame was read at a point: {lines:#?}"
+    );
+    assert_eq!(point_rows(&rows), [(107, 1)], "{rows:#?}\n{lines:#?}");
+    assert_eq!(
+        back_offs(&lines),
+        ["1 short turn(s) in a row: 2 min back-off"],
+        "{lines:#?}"
+    );
+}
+
+#[test]
+fn a_start_that_stands_still_a_minute_is_read_as_it_stands() {
+    use aterm_phase::muse::fixtures as u;
+    use aterm_phase::prompt::fixtures::screen;
+    let mut m = muse_mock(vec![screen(u::LAUNCH_LINE)]);
+    m.screen_gens.insert(0, (1, 101));
+    m.stall_sleep = Some(Duration::from_secs(20));
+    m.vanish_after = Some(8);
+    let host = LaunchHost::saw(Some(LAUNCHED_MS));
+    let (lines, _) = launched_run_for("start-hang", &mut m, &host, Some(""), 600);
+    let note = "NOTE seq=101 the agent drew nothing of its own on a screen that stood 60 s unmoved";
+    assert!(
+        lines.iter().any(|l| l.starts_with(note)),
+        "the hold ran out: {lines:#?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.starts_with("EVENT idle seq=101 ")),
+        "the launch line read as it stands: {lines:#?}"
+    );
 }
 
 #[test]

@@ -331,6 +331,96 @@ pub fn stdio_on_dead_vnode(_pid: u32) -> Option<bool> {
     None
 }
 
+/// Whether `pid`'s descriptor `fd` is a terminal, by the rule the job probe reads a descriptor
+/// with ([`aterm_sysprobe::jobs::terminal_path`]): a descriptor that is closed or no vnode (a
+/// pipe, a socket; the kernel answers `EBADF` for each) is none. `None` when it does not read:
+/// a revoked vnode (a terminal whose pty closed, or a file on a volume forced off), a process
+/// gone or refused, a short record.
+#[cfg(target_vendor = "apple")]
+#[must_use]
+pub fn fd_is_terminal(pid: u32, fd: i32) -> Option<bool> {
+    use aterm_sysprobe::jobs::darwin;
+    let pid = i32::try_from(pid).ok()?;
+    let mut buf = vec![0u8; darwin::VNODE_PATH_SIZE];
+    let size = i32::try_from(buf.len()).ok()?;
+    clear_errno();
+    // SAFETY: `buf` has `size` writable bytes, the size `PROC_PIDFDVNODEPATHINFO` writes.
+    let got = unsafe {
+        ffi::proc_pidfdinfo(
+            pid,
+            fd,
+            darwin::PROC_PIDFDVNODEPATHINFO,
+            buf.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    let read = if got <= 0 {
+        Err(Failed::last())
+    } else {
+        usize::try_from(got)
+            .ok()
+            .and_then(|got| buf.get(..got))
+            .ok_or(Failed::Other)
+    };
+    vnode_terminal(read)
+}
+
+/// What a `PROC_PIDFDVNODEPATHINFO` read of a descriptor says of a terminal ([`fd_is_terminal`]).
+#[cfg(target_vendor = "apple")]
+fn vnode_terminal(read: Result<&[u8], Failed>) -> Option<bool> {
+    use aterm_sysprobe::jobs::darwin;
+    match read {
+        Ok(record) => darwin::vnode(record).map(|v| v.terminal()),
+        Err(Failed::Closed) => Some(false),
+        Err(Failed::Dead | Failed::Exited | Failed::Refused | Failed::Other) => None,
+    }
+}
+
+/// See the Apple twin: `/proc/<pid>/fd/<fd>`'s link, judged by
+/// [`aterm_sysprobe::jobs::linux::parse_fd_link`]; a terminal the kernel marks ` (deleted)` is
+/// the revoked vnode's twin, and a link that is gone is a closed descriptor only while the
+/// process is not exiting.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[must_use]
+pub fn fd_is_terminal(pid: u32, fd: i32) -> Option<bool> {
+    match std::fs::read_link(format!("/proc/{pid}/fd/{fd}")) {
+        Ok(link) => link_terminal(link.to_str()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => closed_answer(
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .as_deref(),
+        ),
+        Err(_) => None,
+    }
+}
+
+/// What a descriptor's `/proc` link (`None`: no UTF-8) says of a terminal: a terminal's name is
+/// one, unless the kernel marks it ` (deleted)` (a pty whose master closed), which proves nothing.
+#[cfg(any(target_os = "linux", target_os = "android", all(test, unix)))]
+fn link_terminal(link: Option<&str>) -> Option<bool> {
+    use aterm_sysprobe::jobs::linux::{FdLink, parse_fd_link};
+    match link {
+        Some(t) if parse_fd_link(t) == FdLink::Tty => (!t.ends_with(" (deleted)")).then_some(true),
+        _ => Some(false),
+    }
+}
+
+/// A descriptor `/proc` no longer lists, by the process's `stat` line read after it: closed
+/// while the process is not exiting, and unknown once it is (its exit closes every descriptor
+/// before it is a zombie), or when the line does not read.
+#[cfg(any(target_os = "linux", target_os = "android", all(test, unix)))]
+fn closed_answer(stat: Option<&str>) -> Option<bool> {
+    let line = aterm_sysprobe::jobs::linux::parse_stat(stat?)?;
+    (!line.exiting()).then_some(false)
+}
+
+/// See the Apple twin: no reader here.
+#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+#[must_use]
+pub const fn fd_is_terminal(_pid: u32, _fd: i32) -> Option<bool> {
+    None
+}
+
 /// Whether process `pid` holds a descriptor for `rdev`.
 #[cfg(target_vendor = "apple")]
 #[must_use]
@@ -1248,6 +1338,190 @@ mod listing_tests {
             assert!(!root.contains(&me), "this process is not root's");
             assert!(!mine.contains(&1), "pid 1 is not this uid's");
         }
+    }
+
+    /// A pty's terminal end, opened without making it this process's controlling terminal, and
+    /// the master that keeps it open. XNU's lost allocation race (`EREDRIVEOPEN`) is opened
+    /// again, within the one-minute hang detector.
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    fn a_terminal() -> (std::os::fd::OwnedFd, std::fs::File) {
+        use std::os::fd::FromRawFd as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        const EREDRIVEOPEN: i32 = -6;
+        let started = std::time::Instant::now();
+        let raw = loop {
+            // SAFETY: `posix_openpt` returns a fresh descriptor this test owns.
+            let raw = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+            if raw >= 0 {
+                break raw;
+            }
+            let err = std::io::Error::last_os_error();
+            assert_eq!(
+                err.raw_os_error(),
+                Some(EREDRIVEOPEN),
+                "posix_openpt: {err}"
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(60),
+                "posix_openpt lost every race"
+            );
+        };
+        // SAFETY: wraps the fresh descriptor this test owns.
+        let master = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+        // SAFETY: `grantpt` and `unlockpt` read the master this test owns.
+        unsafe {
+            assert_eq!(libc::grantpt(raw), 0, "grantpt");
+            assert_eq!(libc::unlockpt(raw), 0, "unlockpt");
+        }
+        // The name is written into this buffer, never `ptsname`'s process-wide one, which a
+        // test on another thread could overwrite.
+        let mut buf = [0 as libc::c_char; 128];
+        #[cfg(target_vendor = "apple")]
+        // SAFETY: `TIOCPTYGNAME` writes a NUL-terminated name of at most 128 bytes into `buf`,
+        // which has exactly that many.
+        let rc = unsafe { libc::ioctl(raw, libc::TIOCPTYGNAME as libc::c_ulong, buf.as_mut_ptr()) };
+        #[cfg(not(target_vendor = "apple"))]
+        // SAFETY: `ptsname_r` writes a NUL-terminated name of at most `buf.len()` bytes.
+        let rc = unsafe { libc::ptsname_r(raw, buf.as_mut_ptr(), buf.len()) };
+        assert_eq!(
+            rc,
+            0,
+            "the terminal end's name: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: `rc == 0`: `buf` holds a NUL-terminated name.
+        let name = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        let terminal = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY)
+            .open(&name)
+            .unwrap_or_else(|e| panic!("open {name}: {e}"));
+        (master, terminal)
+    }
+
+    /// A child's standard input is a terminal when it is a pty's terminal end, and none when it
+    /// is `/dev/null` or a pipe; a descriptor the child does not hold is none. Each child shows
+    /// it runs by a line before it is read.
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    #[test]
+    fn a_child_s_standard_input_is_a_terminal_only_on_a_pty() {
+        use crate::spawnfd::{Child, Stdio, command};
+        /// The children, each ended and reaped however the test ends.
+        struct Ended(Vec<Child>);
+        impl Drop for Ended {
+            fn drop(&mut self) {
+                for child in &mut self.0 {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+        let (_master, terminal) = a_terminal();
+        let mut children = Ended(Vec::new());
+        for stdin in [Stdio::from(terminal), Stdio::null(), Stdio::piped()] {
+            let child = command("/bin/sh")
+                .args(["-c", "echo ran; exec /bin/sleep 60"])
+                .stdin(stdin)
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("spawn the shell");
+            children.0.push(child);
+            let child = children.0.last_mut().expect("the child just kept");
+            crate::deadline::prints(child, "ran", crate::deadline::ECHO_HANG);
+        }
+        let reads: Vec<Option<bool>> = children
+            .0
+            .iter()
+            .map(|child| super::fd_is_terminal(child.id(), 0))
+            .collect();
+        let unheld = super::fd_is_terminal(children.0[0].id(), 37);
+        drop(children);
+        assert_eq!(
+            reads,
+            [Some(true), Some(false), Some(false)],
+            "a pty, /dev/null, a pipe"
+        );
+        assert_eq!(unheld, Some(false), "a descriptor the child does not hold");
+    }
+
+    /// A descriptor's vnode read answers whether it is a terminal only from a whole record or a
+    /// closed descriptor: a revoked vnode, a process gone or refused, another failure and a short
+    /// record prove nothing.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_vnode_read_answers_for_a_terminal_only_when_it_reads() {
+        use super::Failed;
+        use aterm_sysprobe::jobs::darwin;
+        let record = |path: &[u8]| {
+            let mut b = vec![0u8; darwin::VNODE_PATH_SIZE];
+            let mode = (darwin::S_IFCHR | 0o620).to_ne_bytes();
+            b[darwin::VNODE_MODE_AT..darwin::VNODE_MODE_AT + mode.len()].copy_from_slice(&mode);
+            b[darwin::VNODE_PATH_AT..darwin::VNODE_PATH_AT + path.len()].copy_from_slice(path);
+            b
+        };
+        let (pty, null) = (record(b"/dev/ttys003"), record(b"/dev/null"));
+        assert_eq!(super::vnode_terminal(Ok(&pty)), Some(true), "a pty");
+        assert_eq!(super::vnode_terminal(Ok(&null)), Some(false), "/dev/null");
+        assert_eq!(
+            super::vnode_terminal(Ok(&pty[..darwin::VNODE_PATH_SIZE - 1])),
+            None,
+            "a short record"
+        );
+        assert_eq!(
+            super::vnode_terminal(Err(Failed::Closed)),
+            Some(false),
+            "a closed descriptor, a pipe or a socket"
+        );
+        for failed in [Failed::Dead, Failed::Exited, Failed::Refused, Failed::Other] {
+            assert_eq!(super::vnode_terminal(Err(failed)), None, "{failed:?}");
+        }
+    }
+
+    /// A Linux `fd/<n>` link names a terminal by the job probe's rule; a terminal the kernel marks
+    /// ` (deleted)` (a pty whose master closed) proves nothing, as a revoked vnode on macOS; a
+    /// file is none, deleted or not.
+    #[cfg(unix)]
+    #[test]
+    fn a_descriptor_link_is_a_terminal_by_its_name() {
+        for (link, terminal) in [
+            ("/dev/pts/3", Some(true)),
+            ("/dev/pts/3 (deleted)", None),
+            ("/dev/null", Some(false)),
+            ("pipe:[4711]", Some(false)),
+            ("/tmp/in (deleted)", Some(false)),
+        ] {
+            assert_eq!(super::link_terminal(Some(link)), terminal, "{link}");
+        }
+        assert_eq!(
+            super::link_terminal(None),
+            Some(false),
+            "a link that is no UTF-8 names no terminal"
+        );
+    }
+
+    /// A descriptor `/proc` no longer lists is closed only while its process, read after it, is
+    /// not exiting: an exit closes every descriptor before the process is a zombie.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_descriptor_is_closed_only_while_its_process_is_not_exiting() {
+        let stat = |flags: u32| {
+            format!("4711 (aterm) S 1 4711 4711 0 -1 {flags} 0 0 0 0 1 2 0 0 20 0 1 0 900 0 0")
+        };
+        assert_eq!(
+            super::closed_answer(Some(&stat(0x0040_0000))),
+            Some(false),
+            "a live process closed it"
+        );
+        assert_eq!(
+            super::closed_answer(Some(&stat(0x0040_0004))),
+            None,
+            "an exiting process closes them all"
+        );
+        assert_eq!(super::closed_answer(Some("4711 (cut")), None, "a torn line");
+        assert_eq!(super::closed_answer(None), None, "the process is gone");
     }
 
     /// A uid with no live process lists none: an answer, never an error.

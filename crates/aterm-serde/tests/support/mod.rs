@@ -5,10 +5,8 @@
 // modified by the aterm project in 2026.
 // See ../../LICENSE-MIT and ../../LICENSE-APACHE for the upstream licenses.
 
-//! The `serde_test` token harness: a `Serializer` that checks what it is fed
-//! against a token list and a `Deserializer` that replays one, so a test
-//! states a type's serde shape without a data format. The readable/compact
-//! `Configure` wrapper is left out with the types that needed it.
+//! Format-independent `serde_test` token harness (`Serializer` / `Deserializer` token assertions),
+//! without the upstream `Configure` readable/compact wrapper.
 
 mod assert;
 mod de;

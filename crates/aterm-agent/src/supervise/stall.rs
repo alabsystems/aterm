@@ -287,8 +287,8 @@ impl<C: Ctl> Session<'_, C> {
             format!("{ATTENTION_SKIPPED}{ESCALATED_BEHIND} ({holder}) answers this session")
         } else {
             let attention = self.unset_if_ours(|t| !t.starts_with(ATTENTION_PREFIX))?;
-            if self.attention_ours.is_none() {
-                // The turn-end policy's badge, if that was ours, went too.
+            if self.attention_text().is_none() {
+                // The turn-end badge's desired state was cleared too.
                 self.turn_end_badge = false;
             }
             format!("attention={attention}")

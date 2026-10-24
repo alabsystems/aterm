@@ -731,7 +731,8 @@ pub(crate) fn cmd_await(
                          gone <re> [rows <a> <b>] | block | frame | inbox since=<id>|re=<off> \
                          [kinds=<k|hold,...>] [topic=<t>] | \
                          agent <word>[,<word>...] [since=<rev>] | \
-                         task [@<sel>[:<rev>][,...]] [any|all] [since=<rev>] | \
+                         task [@<sel>[:<rev>[:<fact_rev>]][,...]] [any|all] [since=<rev>] \
+                         [facts=1 [fact_since=<fact_rev>]] | \
                          log <need|open=<lvl>|close=<lvl>|kind=<k>>[,...] [since=<seq> ep=<e>] | \
                          sys <predicate> | \
                          edit ticket=<t>|uri=<file-uri> | consent [kind=debugger] | \
@@ -792,6 +793,8 @@ pub(crate) fn cmd_await(
             local_id: session,
             ctx,
             since: parsed.since,
+            facts: parsed.facts,
+            fact_since: parsed.fact_since,
         };
         return await_task(store, &[target], parsed.combine, timeout_ms);
     }
@@ -961,14 +964,16 @@ fn await_agent(
     }
 }
 
-/// One target of an `await task` ([`await_task`]): the session, and the task rev it waits past — its own `@<sel>:<rev>` or the request's `since=`, else (`None`) its rev when the wait is armed.
+/// One target of an `await task` ([`await_task`]): the session, and the task rev it waits past — its own `@<sel>:<rev>` or the request's `since=`, else (`None`) its rev when the wait is armed — and, with `facts=1` (`facts`), the fact revision it waits past likewise (`@<sel>:<rev>:<fact_rev>` or `fact_since=`, else its `fact_rev` when the wait is armed).
 pub(crate) struct TaskTarget<'a> {
     pub(crate) local_id: u64,
     pub(crate) ctx: &'a SessionCtx,
     pub(crate) since: Option<u64>,
+    pub(crate) facts: bool,
+    pub(crate) fact_since: Option<u64>,
 }
 
-/// `await task`: park until the task records of `targets` have news — a target whose record's rev is past its `since` with a state to read (`done`, `exited`, `stalled`) or the supervisor's attention raised ([`crate::task_record::TaskRecord::has_news`]), or whose session closed — at the first such target (`any`) or once every target is one (`all`).
+/// `await task`: park until the task records of `targets` have news — a target whose record's rev is past its `since` with a state to read (`done`, `exited`, `stalled`) or the supervisor's attention raised ([`crate::task_record::TaskRecord::has_news`]), a `facts=1` target whose fact word was noted past its fact edge (a clear is none), or whose session closed — at the first such target (`any`) or once every target is one (`all`). A fact edit never moves `rev`, so a wait without `facts=1` never wakes on one.
 pub(crate) fn await_task(
     store: &Store,
     targets: &[TaskTarget<'_>],
@@ -984,11 +989,18 @@ pub(crate) fn await_task(
     for target in targets {
         let _ = sub.watch(&target.ctx.watchers);
     }
-    let edges: Vec<u64> = targets
+    let edges: Vec<(u64, Option<u64>)> = targets
         .iter()
         .map(|t| {
-            t.since
-                .unwrap_or_else(|| task_record_of(t.ctx).map_or(0, |task| task.rev))
+            let record = task_record_of(t.ctx);
+            let rev = t
+                .since
+                .unwrap_or_else(|| record.as_ref().map_or(0, |task| task.rev));
+            let fact = t.facts.then(|| {
+                t.fact_since
+                    .unwrap_or_else(|| record.as_ref().map_or(0, |task| task.fact_rev))
+            });
+            (rev, fact)
         })
         .collect();
     let exits: Vec<_> = targets
@@ -1049,7 +1061,7 @@ fn task_wait_row(
 fn latch_task_news<F: Fn(&Store) -> bool>(
     store: &Store,
     targets: &[TaskTarget<'_>],
-    edges: &[u64],
+    edges: &[(u64, Option<u64>)],
     exits: &[F],
     latched: &mut [Option<String>],
 ) {
@@ -1064,9 +1076,13 @@ fn latch_task_news<F: Fn(&Store) -> bool>(
                 .timeline
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
+            let (rev_edge, fact_edge) = *edge;
             timeline
                 .task()
-                .filter(|task| task.rev > *edge && task.has_news())
+                .filter(|task| {
+                    (task.rev > rev_edge && task.has_news())
+                        || fact_edge.is_some_and(|edge| task.fact_rev > edge && task.fact.is_some())
+                })
                 .cloned()
         };
         if closed || news.is_some() {
@@ -5115,6 +5131,8 @@ mod tests {
                     local_id: w.local_id,
                     ctx: &w.ctx,
                     since,
+                    facts: false,
+                    fact_since: None,
                 })
                 .collect();
             await_task(&store, &targets, combine, timeout_ms)
@@ -5189,6 +5207,8 @@ mod tests {
                     local_id: worker.local_id,
                     ctx: &worker.ctx,
                     since: Some(since),
+                    facts: false,
+                    fact_since: None,
                 }],
                 Combine::Any,
                 60_000,
@@ -5226,6 +5246,167 @@ mod tests {
             .unwrap()
             .set_state(workers[2].local_id, SessionState::Exited);
         assert_eq!(task_reply(&one(&workers[2], 1)), ("OK 1", vec!["closed"]));
+    }
+
+    /// THE FACT WORD IS NO NEWS TO A DEFAULT WAIT (the occupancy design's manager door): a
+    /// worker whose supervisor attention stands, waited on past its rev, is not woken by a fact
+    /// edit, which never moves `rev`. NEGATIVE CONTROL: `NoteBumpsNews` (the edit moves `rev`
+    /// too) wakes it at once.
+    #[test]
+    fn a_fact_edit_never_wakes_a_default_await_task() {
+        use crate::occupancy_host::fault::{Fault, with};
+        use crate::session_timeline::{MetaEdit, write_attention_owned};
+        use crate::task_record::{Combine, mark_session_task_fact};
+        use aterm_agent::supervise::occupancy::{FactWord, NoteOutcome, RuleId};
+        let store = crate::session_store::new_store();
+        let workers = three_workers(&store);
+        let w = &workers[0];
+        write_attention_owned(
+            &w.ctx,
+            crate::harness_host::ATTENTION_OWNER,
+            MetaEdit::Set("a login"),
+            aterm_slog::Actor::Harness,
+        )
+        .unwrap();
+        let rev = task_record_of(&w.ctx).expect("a record").rev;
+        let wait = |timeout_ms| {
+            await_task(
+                &store,
+                &[TaskTarget {
+                    local_id: w.local_id,
+                    ctx: &w.ctx,
+                    since: Some(rev),
+                    facts: false,
+                    fact_since: None,
+                }],
+                Combine::Any,
+                timeout_ms,
+            )
+        };
+        assert_eq!(task_reply(&wait(20)).0, "OK 1 status=timeout");
+        let word = |n| FactWord::new(RuleId::HoldRoom, n);
+        let fence = std::time::Duration::ZERO;
+        assert_eq!(
+            mark_session_task_fact(&w.ctx, w.local_id, word(1), fence),
+            NoteOutcome::Noted
+        );
+        let quiet = wait(20);
+        assert_eq!(task_reply(&quiet).0, "OK 1 status=timeout", "{quiet}");
+        assert!(
+            quiet.contains(" fact=hold-room@v1#1 fact_rev=1\n"),
+            "the row shows the word: {quiet}"
+        );
+        assert_eq!(task_record_of(&w.ctx).map(|t| t.rev), Some(rev));
+        with(Fault::NoteBumpsNews, || {
+            mark_session_task_fact(&w.ctx, w.local_id, word(2), fence)
+        });
+        let woken = wait(60_000);
+        assert_eq!(
+            task_reply(&woken).0,
+            "OK 1",
+            "CONTROL: a fact edit that moves the rev wakes it: {woken}"
+        );
+    }
+
+    /// `facts=1`: a waiter parked on a worker's fact word is woken once by its note, a wait
+    /// past the noted `fact_rev` is quiet, and a clear wakes none. The parked waiter names its
+    /// fact edge (`fact_since=0`): a default edge is read after the waiter subscribes, so a note
+    /// landing between the two would be the edge itself, and the answer would hang on the race.
+    #[test]
+    fn facts_1_is_woken_once_by_a_note_and_never_by_a_clear() {
+        use crate::task_record::{Combine, mark_session_task_fact};
+        use aterm_agent::supervise::occupancy::{FactWord, NoteOutcome, RuleId};
+        let store = crate::session_store::new_store();
+        let workers = three_workers(&store);
+        let w = &workers[0];
+        let wait = |fact_since: Option<u64>, timeout_ms| {
+            await_task(
+                &store,
+                &[TaskTarget {
+                    local_id: w.local_id,
+                    ctx: &w.ctx,
+                    since: None,
+                    facts: true,
+                    fact_since,
+                }],
+                Combine::Any,
+                timeout_ms,
+            )
+        };
+        let note = |word: Option<FactWord>| {
+            mark_session_task_fact(&w.ctx, w.local_id, word, std::time::Duration::ZERO)
+        };
+        assert_eq!(task_reply(&wait(None, 20)).0, "OK 1 status=timeout");
+        std::thread::scope(|s| {
+            let waiter = s.spawn(|| wait(Some(0), 60_000));
+            let parked = std::time::Instant::now();
+            while w.ctx.watchers.count() == 0 {
+                assert!(
+                    parked.elapsed() < std::time::Duration::from_secs(60),
+                    "the waiter never parked"
+                );
+                std::thread::yield_now();
+            }
+            assert_eq!(note(FactWord::new(RuleId::HoldRoom, 1)), NoteOutcome::Noted);
+            let reply = waiter.join().expect("the waiter");
+            assert_eq!(task_reply(&reply).0, "OK 1", "{reply}");
+            assert!(
+                reply.ends_with(
+                    " rev=1 state=working agent=- attention=- result_bytes=0 \
+                     fact=hold-room@v1#1 fact_rev=1\n"
+                ),
+                "{reply}"
+            );
+        });
+        assert_eq!(
+            task_reply(&wait(Some(1), 20)).0,
+            "OK 1 status=timeout",
+            "the note was read"
+        );
+        assert_eq!(
+            task_reply(&wait(None, 20)).0,
+            "OK 1 status=timeout",
+            "armed past the note"
+        );
+        assert_eq!(note(FactWord::new(RuleId::HoldRoom, 1)), NoteOutcome::Noted);
+        assert_eq!(
+            task_reply(&wait(Some(1), 20)).0,
+            "OK 1 status=timeout",
+            "the same word again moves nothing"
+        );
+        assert_eq!(note(None), NoteOutcome::Cleared);
+        let cleared = wait(Some(1), 20);
+        assert_eq!(task_reply(&cleared).0, "OK 1 status=timeout", "{cleared}");
+        assert!(cleared.ends_with(" fact=- fact_rev=2\n"), "{cleared}");
+        assert_eq!(
+            task_reply(&wait(Some(0), 20)).0,
+            "OK 1 status=timeout",
+            "past an old note, the cleared word is no news"
+        );
+        assert_eq!(
+            note(FactWord::new(RuleId::WaitNudge, 1)),
+            NoteOutcome::Noted
+        );
+        assert_eq!(
+            task_reply(&wait(Some(2), 60_000)).0,
+            "OK 1",
+            "CONTROL: the next note past the clear wakes it"
+        );
+        let verb = |rest: &str| cmd_await(&w.term, &store, w.local_id, &w.ctx, rest);
+        assert!(
+            verb("task facts=1 fact_since=2 timeout=60000")
+                .ends_with(" fact=wait-nudge@v1#1 fact_rev=3\n"),
+            "the single form reads facts=1"
+        );
+        assert_eq!(
+            task_reply(&verb("task facts=1 timeout=20")).0,
+            "OK 1 status=timeout"
+        );
+        assert_eq!(
+            verb("task fact_since=2"),
+            crate::task_record::AWAIT_TASK_USAGE,
+            "a fact edge names facts=1"
+        );
     }
 
     #[test]
@@ -5266,9 +5447,11 @@ mod tests {
                 local_id: w.local_id,
                 ctx: &w.ctx,
                 since: Some(1),
+                facts: false,
+                fact_since: None,
             })
             .collect();
-        let edges = [1; 3];
+        let edges = [(1, None); 3];
         let exits: Vec<_> = workers
             .iter()
             .map(|w| exit_probe(&store, w.local_id))

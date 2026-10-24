@@ -522,10 +522,10 @@ fn frame(
     let fp = overlay.finish(inputs(), pill, &mut shown, now);
     assert_eq!(
         fp == 0,
-        overlay.pending.is_empty(),
+        overlay.pending_quads().is_empty(),
         "fp is 0 exactly when idle"
     );
-    (overlay.pending.clone(), shown)
+    (overlay.pending_quads(), shown)
 }
 
 fn max_alpha(quads: &[GlowQuad]) -> u8 {
@@ -614,7 +614,7 @@ fn a_resting_gap_thumb_keeps_a_stroke_of_ground_from_the_ring() {
             let mut shown = false;
             overlay.finish(inputs, &mut pill, &mut shown, now);
             let thumb: Vec<GlowQuad> = overlay
-                .pending
+                .pending_quads()
                 .iter()
                 .filter(|q| !(q.alpha == 255 && q.color == ring_color))
                 .copied()
@@ -722,7 +722,7 @@ fn a_split_rests_both_its_thumbs_in_one_idiom() {
             let lane_of = |q: &GlowQuad| u32::from(q.x) >= edge.0;
             let thumb = |at_edge: bool| {
                 let quads: Vec<GlowQuad> = overlay
-                    .pending
+                    .pending_quads()
                     .iter()
                     .filter(|q| !(q.alpha == 255 && q.color == ring))
                     .filter(|q| lane_of(q) == at_edge)
@@ -813,7 +813,7 @@ fn a_hovered_gap_thumb_leaves_the_ring_whole() {
             let mut shown = false;
             overlay.finish(inputs, &mut pill, &mut shown, now);
             let bar: Vec<GlowQuad> = overlay
-                .pending
+                .pending_quads()
                 .iter()
                 .filter(|q| !(q.alpha == 255 && q.color == ring_color))
                 .copied()
@@ -890,7 +890,7 @@ fn reduce_motion_shows_and_hides_without_a_ramp() {
         overlay.note(pane(1, full, true, offset, 200), at);
         let mut shown = false;
         overlay.finish(reduced, &mut pill, &mut shown, at);
-        max_alpha(&overlay.pending)
+        max_alpha(&overlay.pending_quads())
     };
     step(5, t0);
     let t1 = t0 + Duration::from_millis(16);
@@ -985,38 +985,81 @@ fn an_unfocused_pane_shows_a_hollow_cursor_and_the_focused_one_none() {
 }
 
 #[test]
-fn the_splice_never_doubles_its_quads() {
+fn the_splice_never_doubles_its_quads_or_its_bars() {
+    use aterm_core::render::{FxInk, FxItem, FxRect};
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    let mut pending = Vec::new();
-    scrollbar::push_bar(&mut pending, (1000, 30, 3, 60), [200; 3], 90, 23);
-    let foreign = GlowQuad {
+    let quad = |x: u16, color: u32, alpha: u8| GlowQuad {
         row: 0,
-        x: 5,
+        x,
         y: 5,
         w: 1,
         h: 1,
-        color: 0x10_1010,
-        alpha: 0,
-        color2: 0x10_1010,
-        alpha2: 0,
+        color,
+        alpha,
+        color2: color,
+        alpha2: alpha,
     };
+    let (foreign, ring) = (quad(5, 0x10_1010, 0), quad(7, 0x20_2020, 255));
+    let other = FxLayer::new(
+        77,
+        std::sync::Arc::new(FxContent::new(
+            vec![FxItem::Rect(FxRect {
+                x: 0,
+                y: 0,
+                w: 4,
+                h: 4,
+                ink: 0,
+            })],
+            vec![FxInk::over(0x10_1010, 255); 2],
+        )),
+        FxSlot::Over,
+        FxSpace::Grid,
+        FxBlend::Exact,
+    );
+    let thumb = bar_layer_id(1, true);
     {
         let ws = app.windows.get_mut(&wid).expect("window");
         ws.input_scratch.nova_add = vec![foreign];
-        ws.pane_overlay.pending = pending.clone();
+        ws.input_scratch.fx_layers = vec![other.clone()];
+        ws.pane_overlay.pending = vec![ring];
+        scrollbar::push_bar(
+            &mut ws.pane_overlay.bars,
+            thumb,
+            (1000, 30, 3, 60),
+            [200; 3],
+            90,
+        );
+        ws.pane_overlay.lay_bars();
     }
     app.splice_pane_overlay(wid);
+    let first = app.windows[&wid].input_scratch.fx_layers.clone();
     app.splice_pane_overlay(wid);
-    let nova = &app.windows[&wid].input_scratch.nova_add;
-    assert_eq!(nova.len(), 1 + pending.len());
-    assert_eq!(nova[0], foreign, "another producer's quad stays");
+    let input = &app.windows[&wid].input_scratch;
+    assert_eq!(
+        input.nova_add,
+        [foreign, ring],
+        "another producer's quad stays"
+    );
+    assert_eq!(
+        input.fx_layers.iter().map(|l| l.id).collect::<Vec<_>>(),
+        [thumb, 77],
+        "one bar layer, under another producer's Over layer, which stays"
+    );
+    assert_eq!(
+        input.fx_layers, first,
+        "a settled bar splices the same layer"
+    );
     {
         let ws = app.windows.get_mut(&wid).expect("window");
         ws.pane_overlay.pending.clear();
+        ws.pane_overlay.bars.clear();
+        ws.pane_overlay.lay_bars();
     }
     app.splice_pane_overlay(wid);
-    assert_eq!(app.windows[&wid].input_scratch.nova_add, vec![foreign]);
+    let input = &app.windows[&wid].input_scratch;
+    assert_eq!(input.nova_add, vec![foreign]);
+    assert_eq!(input.fx_layers, vec![other]);
 }
 
 fn window_px(app: &App, wid: WindowId, gx: f64, gy: f64) -> (f64, f64) {
@@ -1281,7 +1324,7 @@ fn the_bar_shows_hovers_and_drags_without_regridding_any_pane() {
         app.on_cursor_moved(wid, wx2, wy2);
         compose(&mut app, t0 + Duration::from_millis(16));
         assert!(
-            !app.windows[&wid].pane_overlay.pending.is_empty(),
+            !app.windows[&wid].pane_overlay.pending_quads().is_empty(),
             "the dragged bar draws"
         );
         app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
@@ -1315,4 +1358,367 @@ fn the_scrollbar_off_draws_no_bar() {
     assert!(split.is_some_and(|i| !i.scrollbar && i.hollow));
     let classic = with_split_chrome(SplitChrome::Classic, || app.pane_overlay_inputs(wid, true));
     assert!(classic.is_none(), "Classic splits keep no hollow cursor");
+}
+
+/// Bars of every width the chrome draws (and wider), from a dot to a tall
+/// thumb, at origins on and across row bands, laid side by side in a
+/// `rows × cell_h` frame; then a track under a narrower thumb at its top, its
+/// middle and its bottom, where the thumb's body crosses the track's caps.
+fn bar_scenes(cell_h: u32, rgb: [u8; 3], alpha: u8) -> Vec<RoundedBar> {
+    let mut bars = Vec::new();
+    let (mut x, mut y) = (4u32, 3u32);
+    for w in (1..=14).chain([18, 28]) {
+        for h in [
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 15, 16, 17, 23, 24, 29, 46, 61,
+        ] {
+            if x + w + 4 > 1100 {
+                (x, y) = (4, y + 70 + cell_h / 3);
+            }
+            bars.push(RoundedBar {
+                x,
+                y,
+                w,
+                h,
+                rgb,
+                alpha,
+            });
+            x += w + 3;
+        }
+    }
+    let y = y + 80;
+    for (at, (tw, w)) in [
+        (0u32, (6u32, 3u32)),
+        (40, (6, 4)),
+        (80, (12, 6)),
+        (120, (6, 6)),
+    ] {
+        for (dy, len) in [(0u32, 20u32), (30, 17), (60, 25)] {
+            let (tx, ty) = (40 + 4 * at + dy, y);
+            bars.push(RoundedBar {
+                x: tx,
+                y: ty,
+                w: tw,
+                h: 90,
+                rgb,
+                alpha: scrollbar::ALPHA_TRACK,
+            });
+            bars.push(RoundedBar {
+                x: tx + (tw - w) / 2,
+                y: ty + dy.min(90 - len),
+                w,
+                h: len,
+                rgb,
+                alpha,
+            });
+        }
+    }
+    bars
+}
+
+/// `bars` as the retired path drew them (nova quads) and as their fx layers
+/// (a `PaneOverlay` laying them, as `finish` does), each over the same page.
+fn legacy_and_layered(
+    bars: &[RoundedBar],
+    cell_h: u32,
+    page: &RenderInput,
+) -> (RenderInput, RenderInput) {
+    let mut legacy = page.clone();
+    for b in bars {
+        scrollbar::legacy_bar_quads(
+            &mut legacy.nova_add,
+            (b.x, b.y, b.w, b.h),
+            b.rgb,
+            b.alpha,
+            cell_h,
+        );
+    }
+    let mut overlay = PaneOverlay::default();
+    for (i, b) in bars.iter().enumerate() {
+        overlay.bars.push((bar_layer_id(i as u64, false), *b));
+    }
+    overlay.lay_bars();
+    let mut layered = page.clone();
+    layered.fx_layers.extend(overlay.bar_layers().cloned());
+    (legacy, layered)
+}
+
+const BAR_INKS_UNDER_TEST: [([u8; 3], u8); 5] = [
+    ([200, 200, 200], 1),
+    ([200, 200, 200], scrollbar::ALPHA_REST),
+    ([80, 250, 123], scrollbar::ALPHA_DRAG),
+    ([17, 99, 240], 255),
+    ([255, 255, 255], scrollbar::ALPHA_HOVER),
+];
+
+fn bar_page(cell: (usize, usize)) -> (aterm_core::terminal::Terminal, usize, usize) {
+    let (rows, cols) = (1200 / cell.1 + 2, 1150 / cell.0 + 2);
+    let mut term = aterm_core::terminal::Terminal::new(rows as u16, cols as u16);
+    term.process(b"\x1b[?25l\x1b[3;1Hthe bars cross text: \xe2\x96\x88\xe2\x96\x88 scrollback");
+    (term, rows, cols)
+}
+
+/// THE SCROLLBAR'S FX LAYERS LAND THE RETIRED QUADS' BYTES (design §6, lane
+/// B7): every bar the chrome can draw, alone or a thumb over its track, at
+/// every opacity the chrome uses, draws on the CPU exactly the pixels its
+/// per-row coverage quads drew. Control: a layer whose caps read one coverage
+/// level too high differs.
+#[test]
+fn the_scrollbar_layers_are_the_retired_quads_byte_for_byte_on_the_cpu() {
+    let mut cpu = aterm_render::Renderer::from_bytes(
+        aterm_render::embedded_font(),
+        18.0,
+        aterm_render::Theme::default(),
+    )
+    .expect("the bundled font");
+    cpu.set_runtime_font_discovery(false);
+    let cell = cpu.cell_size();
+    let cell_h = u32::try_from(cell.1).expect("a cell");
+    let (mut term, rows, cols) = bar_page(cell);
+    let page = term.cell_frame(rows, cols);
+    let bare = cpu.render_input(&page).pixels.clone();
+    for (rgb, alpha) in BAR_INKS_UNDER_TEST {
+        let bars = bar_scenes(cell_h, rgb, alpha);
+        let (legacy, layered) = legacy_and_layered(&bars, cell_h, &page);
+        let want = cpu.render_input(&legacy).pixels.clone();
+        assert_ne!(want, bare, "{rgb:?}@{alpha}: the bars paint");
+        assert!(
+            cpu.render_input(&layered).pixels == want,
+            "{rgb:?}@{alpha}: the layers must land the quads' bytes"
+        );
+        let mut mutant = layered.clone();
+        for l in &mut mutant.fx_layers {
+            let mut content = (*l.content).clone();
+            content.edit(|_, palette| {
+                for k in 2..palette.len() - 1 {
+                    palette[k] = palette[k + 1];
+                }
+            });
+            l.content = std::sync::Arc::new(content);
+        }
+        if alpha > 16 {
+            assert!(
+                cpu.render_input(&mutant).pixels != want,
+                "CONTROL {rgb:?}@{alpha}: caps a coverage level off must differ"
+            );
+        }
+    }
+}
+
+/// The same law on the GPU: on Metal the layers land the bytes the retired
+/// quads land there, and the CPU's.
+#[test]
+fn the_scrollbar_layers_are_the_retired_quads_byte_for_byte_on_the_gpu() {
+    let theme = aterm_render::Theme::default();
+    let mut gpu = match aterm_gpu::GpuRenderer::new(18.0, theme) {
+        Ok(gpu) => gpu,
+        Err(error) => {
+            aterm_spec::host::could_not_run(format_args!("no GPU renderer on this host: {error}"))
+        }
+    };
+    let mut cpu = aterm_render::Renderer::from_bytes(aterm_render::embedded_font(), 18.0, theme)
+        .expect("the bundled font");
+    cpu.set_runtime_font_discovery(false);
+    let cell = gpu.cell_size();
+    let cell_h = u32::try_from(cell.1).expect("a cell");
+    let (mut term, rows, cols) = bar_page(cell);
+    let page = term.cell_frame(rows, cols);
+    let mut win = aterm_gpu::WindowGpu::new();
+    for (rgb, alpha) in BAR_INKS_UNDER_TEST {
+        let bars = bar_scenes(cell_h, rgb, alpha);
+        let (legacy, layered) = legacy_and_layered(&bars, cell_h, &page);
+        let want = gpu.render_input(&mut win, &legacy, None).pixels;
+        let got = gpu.render_input(&mut win, &layered, None).pixels;
+        assert!(
+            got == want,
+            "{rgb:?}@{alpha}: Metal: the layers land the quads' bytes"
+        );
+        assert_eq!(cpu.cell_size(), cell, "both backends lay the same cells");
+        let cpu_got = cpu.render_input(&layered).pixels.clone();
+        let cpu_bare = cpu.render_input(&page).pixels.clone();
+        let gpu_bare = gpu.render_input(&mut win, &page, None).pixels;
+        let moved: Vec<usize> = (0..got.len())
+            .filter(|&i| cpu_bare[i] == gpu_bare[i])
+            .filter(|&i| got[i] != gpu_bare[i] || cpu_got[i] != cpu_bare[i])
+            .collect();
+        assert!(!moved.is_empty());
+        assert!(
+            moved.iter().all(|&i| got[i] == cpu_got[i]),
+            "{rgb:?}@{alpha}: where the bars draw on a ground both backends share, Metal \
+             lands the CPU's bytes"
+        );
+    }
+}
+/// A bar crossing a card's left edge, and the card's window-pixel box: it
+/// covers the bar's left half over two of the bar's cell rows.
+fn bar_under_card(
+    cell_h: u32,
+    (pad, top): (usize, usize),
+) -> (RoundedBar, aterm_core::render::PxRect) {
+    let bar = RoundedBar {
+        x: 200,
+        y: 2 * cell_h - 5,
+        w: 10,
+        h: 6 * cell_h,
+        rgb: [80, 250, 123],
+        alpha: scrollbar::ALPHA_DRAG,
+    };
+    let (pad, top, ch) = (pad as i32, top as i32, cell_h as i32);
+    let card = aterm_core::render::PxRect::new(pad + 150, top + 3 * ch, pad + 205, top + 5 * ch);
+    (bar, card)
+}
+
+/// Each pixel of `cut` (the bar's frame with the card's occluder) is the
+/// bare page's under the card and the uncut bar's frame beside it; the
+/// bar draws under the card without the occluder (CONTROL), and beside it
+/// on the card's rows, where the retired scrub dropped every quad of a
+/// card row that met the card.
+fn assert_cut_at_the_card(
+    arm: &str,
+    width: usize,
+    card: aterm_core::render::PxRect,
+    [bare, whole, cut]: [&[u32]; 3],
+) {
+    let under = |i: usize| {
+        let (x, y) = ((i % width) as i32, (i / width) as i32);
+        (card.x0..card.x1).contains(&x) && (card.y0..card.y1).contains(&y)
+    };
+    for i in 0..cut.len() {
+        let want = if under(i) { bare[i] } else { whole[i] };
+        assert!(
+            cut[i] == want,
+            "{arm}: pixel ({}, {}) is {:06x}, not {want:06x}",
+            i % width,
+            i / width,
+            cut[i]
+        );
+    }
+    assert!(
+        (0..cut.len()).any(|i| under(i) && whole[i] != bare[i]),
+        "CONTROL {arm}: without the card the bar draws under it"
+    );
+    let beside = |i: usize| {
+        let (x, y) = ((i % width) as i32, (i / width) as i32);
+        x >= card.x1 && (card.y0..card.y1).contains(&y)
+    };
+    assert!(
+        (0..cut.len()).any(|i| beside(i) && cut[i] != bare[i]),
+        "{arm}: the bar beside the card stays on the card's rows"
+    );
+}
+
+/// A BAR HALF UNDER A CARD IS CUT AT THE CARD'S EDGE (lane B7): a menu
+/// card's occluder cuts the bar's fx layer at the card's box, so the part
+/// beside the card stays.
+#[test]
+fn a_bar_half_under_a_card_is_cut_at_the_cards_edge_on_the_cpu() {
+    let mut cpu = aterm_render::Renderer::from_bytes(
+        aterm_render::embedded_font(),
+        18.0,
+        aterm_render::Theme::default(),
+    )
+    .expect("the bundled font");
+    cpu.set_runtime_font_discovery(false);
+    let cell = cpu.cell_size();
+    let cell_h = u32::try_from(cell.1).expect("a cell");
+    let (mut term, rows, cols) = bar_page(cell);
+    let page = term.cell_frame(rows, cols);
+    let (bar, card) = bar_under_card(cell_h, (cpu.pad(), cpu.grid_top()));
+    let (_, layered) = legacy_and_layered(&[bar], cell_h, &page);
+    let mut covered = layered.clone();
+    covered.fx_occluders.push(card);
+    let bare = cpu.render_input(&page).pixels.clone();
+    let whole = cpu.render_input(&layered).pixels.clone();
+    let f = cpu.render_input(&covered);
+    let width = f.width;
+    let cut = f.pixels.clone();
+    assert_cut_at_the_card("CPU", width, card, [&bare, &whole, &cut]);
+}
+
+/// The same cut on Metal, landing the CPU's bytes wherever the two arms
+/// share the ground.
+#[test]
+fn a_bar_half_under_a_card_is_cut_at_the_cards_edge_on_the_gpu() {
+    let theme = aterm_render::Theme::default();
+    let mut gpu = match aterm_gpu::GpuRenderer::new(18.0, theme) {
+        Ok(gpu) => gpu,
+        Err(error) => {
+            aterm_spec::host::could_not_run(format_args!("no GPU renderer on this host: {error}"))
+        }
+    };
+    let mut cpu = aterm_render::Renderer::from_bytes(aterm_render::embedded_font(), 18.0, theme)
+        .expect("the bundled font");
+    cpu.set_runtime_font_discovery(false);
+    let cell = gpu.cell_size();
+    assert_eq!(cpu.cell_size(), cell, "both backends lay the same cells");
+    let cell_h = u32::try_from(cell.1).expect("a cell");
+    let (mut term, rows, cols) = bar_page(cell);
+    let page = term.cell_frame(rows, cols);
+    let (bar, card) = bar_under_card(cell_h, (cpu.pad(), cpu.grid_top()));
+    let (_, layered) = legacy_and_layered(&[bar], cell_h, &page);
+    let mut covered = layered.clone();
+    covered.fx_occluders.push(card);
+    let mut win = aterm_gpu::WindowGpu::new();
+    let bare = gpu.render_input(&mut win, &page, None).pixels;
+    let whole = gpu.render_input(&mut win, &layered, None).pixels;
+    let f = gpu.render_input(&mut win, &covered, None);
+    assert_cut_at_the_card("Metal", f.width, card, [&bare, &whole, &f.pixels]);
+    let cpu_bare = cpu.render_input(&page).pixels.clone();
+    let cpu_cut = cpu.render_input(&covered).pixels.clone();
+    assert!(
+        (0..f.pixels.len())
+            .filter(|&i| cpu_bare[i] == bare[i])
+            .all(|i| f.pixels[i] == cpu_cut[i]),
+        "where the ground is shared, Metal's cut is the CPU's bytes"
+    );
+}
+
+/// A RESTING BAR COSTS NOTHING: a parked bar's next frames lay the very layer
+/// they laid (same content `Arc`, so no damage and no art build), and a bar
+/// that moves or fades lays a new one. Control: the fade's first frame.
+#[test]
+fn a_resting_bar_keeps_its_layer_and_a_moving_one_lays_a_new_one() {
+    let mut overlay = PaneOverlay::default();
+    let mut pill = crate::scroll_motion::PillFade::default();
+    let full = cell_box(0, 0, 30, 111);
+    let t0 = Instant::now();
+    let layers = |overlay: &PaneOverlay| overlay.bar_layers().cloned().collect::<Vec<_>>();
+    let _ = frame(&mut overlay, &mut pill, &[pane(1, full, true, 20, 200)], t0);
+    let t1 = t0 + Duration::from_millis(5_000);
+    let _ = frame(&mut overlay, &mut pill, &[pane(1, full, true, 20, 200)], t1);
+    let rested = layers(&overlay);
+    assert_eq!(rested.len(), 1, "one thumb");
+    let _ = aterm_render::test_counters::take_art_builds();
+    let _ = frame(
+        &mut overlay,
+        &mut pill,
+        &[pane(1, full, true, 20, 200)],
+        t1 + Duration::from_millis(16),
+    );
+    assert_eq!(
+        layers(&overlay),
+        rested,
+        "the parked thumb's layer, by identity"
+    );
+    assert_eq!(
+        aterm_render::test_counters::take_art_builds(),
+        0,
+        "and no art built for it"
+    );
+    let ((), relaid) = crate::work_counts::allocations_in(|| overlay.lay_bars());
+    assert_eq!(
+        relaid, 0,
+        "laying a parked bar's layer again allocates nothing"
+    );
+    assert_eq!(layers(&overlay), rested);
+    let _ = frame(
+        &mut overlay,
+        &mut pill,
+        &[pane(1, full, true, 40, 200)],
+        t1 + Duration::from_millis(32),
+    );
+    assert_ne!(
+        layers(&overlay),
+        rested,
+        "CONTROL: a moved thumb lays a new layer"
+    );
 }

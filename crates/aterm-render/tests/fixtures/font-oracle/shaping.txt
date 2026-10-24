@@ -2366,6 +2366,27 @@ shape	SFNSMonoItalic	ee9c5d69d84d83d4#0	-	liga=1,calt=1,ss04=1	feat.caps	HelloWo
 shape	SFNSMonoItalic	ee9c5d69d84d83d4#0	-	liga=1,calt=1,ss04=1	feat.case	(A)-[B]{C}	LTR Latn | 1105:0:1266 4:1:1266 1106:2:1266 1119:3:1266 1107:4:1266 34:5:1266 1108:6:1266 1109:7:1266 38:8:1266 1110:9:1266
 shape	SFNSMonoItalic	ee9c5d69d84d83d4#0	-	liga=1,calt=1,ss04=1	feat.cell	g	LTR Latn | 565:0:1266
 shape	SFNSMonoItalic	ee9c5d69d84d83d4#0	-	liga=1,calt=1,ss04=1	feat.digits	0123456789	LTR Zzzz | 1088:0:1266 1091:1:1266 1092:2:1266 1093:3:1266 1094:4:1266 1095:5:1266 1096:6:1266 1097:7:1266 1098:8:1266 1099:9:1266
+shape	SegoeUIEmoji	a7587b123cb34212#0	-	-	emoji.ascii	A	LTR Latn | 36:0:1321
+shape	SegoeUIEmoji	a7587b123cb34212#0	-	-	emoji.couple-tones	\u{1f469}\u{1f3fe}\u{200d}\u{1f91d}\u{200d}\u{1f468}\u{1f3fb}	LTR Zzzz | 2819:0:0 2797:0:2812
+shape	SegoeUIEmoji	a7587b123cb34212#0	-	-	emoji.family	\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}	LTR Zzzz | 1283:0:1405@425,0 1464:0:1161 1271:0:0@-2170,0 1259:0:0@-1161,0
+shape	SegoeUIEmoji	a7587b123cb34212#0	-	-	emoji.flag-england	\u{1f3f4}\u{e0067}\u{e0062}\u{e0065}\u{e006e}\u{e0067}\u{e007f}	LTR Zzzz | 1073:0:2812 3:0:0 3:0:0 3:0:0 3:0:0 3:0:0 3:0:0
+shape	SegoeUIEmoji	a7587b123cb34212#0	-	-	emoji.flag-invalid	\u{1f1e6}\u{1f1e6}	LTR Zzzz | 273:0:960 273:0:960
+shape	SegoeUIEmoji	a7587b123cb34212#0	-	-	emoji.flag-jp	\u{1f1ef}\u{1f1f5}	LTR Zzzz | 282:0:610 288:0:946
+shape	SegoeUIEmoji	a7587b123cb34212#0	-	-	emoji.flag-us	\u{1f1fa}\u{1f1f8}	LTR Zzzz | 293:0:1094 291:0:869
+shape	SegoeUIEmoji	a7587b123cb34212#0	-	-	emoji.grin	\u{1f600}	LTR Zzzz | 2317:0:2812
+shape	SegoeUIEmoji	a7587b123cb34212#0	-	-	emoji.heart-fire	\u{2764}\u{fe0f}\u{200d}\u{1f525}	LTR Zzzz | 4133:0:2812
+shape	SegoeUIEmoji	a7587b123cb34212#0	-	-	emoji.heart-vs16	\u{2764}\u{fe0f}	LTR Zzzz | 4131:0:2812
+shape	SegoeUIEmoji	a7587b123cb34212#0	-	-	emoji.holding-hands	\u{1f9d1}\u{200d}\u{1f91d}\u{200d}\u{1f9d1}	LTR Zzzz | 2782:0:0 2783:0:2812
+shape	SegoeUIEmoji	a7587b123cb34212#0	-	-	emoji.keycap-1	1\u{fe0f}\u{20e3}	LTR Zzzz | 675:0:2812
+shape	SegoeUIEmoji	a7587b123cb34212#0	-	-	emoji.keycap-bare	*\u{20e3}	LTR Zzzz | 673:0:2812
+shape	SegoeUIEmoji	a7587b123cb34212#0	-	-	emoji.keycap-hash	#\u{fe0f}\u{20e3}	LTR Zzzz | 672:0:2812
+shape	SegoeUIEmoji	a7587b123cb34212#0	-	-	emoji.melting	\u{1fae0}	LTR Zzzz | 3865:0:2812
+shape	SegoeUIEmoji	a7587b123cb34212#0	-	-	emoji.rainbow-flag	\u{1f3f3}\u{fe0f}\u{200d}\u{1f308}	LTR Zzzz | 1071:0:2812
+shape	SegoeUIEmoji	a7587b123cb34212#0	-	-	emoji.red-hair-light	\u{1f9d1}\u{1f3fb}\u{200d}\u{1f9b0}	LTR Zzzz | 3358:0:2812
+shape	SegoeUIEmoji	a7587b123cb34212#0	-	-	emoji.smile-vs15	\u{263a}\u{fe0e}	LTR Zzzz | 4006:0:2812 3:0:0
+shape	SegoeUIEmoji	a7587b123cb34212#0	-	-	emoji.technologist	\u{1f469}\u{200d}\u{1f4bb}	LTR Zzzz | 1623:0:2812
+shape	SegoeUIEmoji	a7587b123cb34212#0	-	-	emoji.thumbs-medium	\u{1f44d}\u{1f3fd}	LTR Zzzz | 1216:0:2812
+shape	SegoeUIEmoji	a7587b123cb34212#0	-	-	emoji.wave-dark	\u{1f44b}\u{1f3ff}	LTR Zzzz | 1206:0:2812
 shape	fixture-jetbrains-mono	1e07100fe6b35324#0	-	liga=0,calt=0,zero=1,ss01=1,cv01=2	lig.and	&&	LTR Zzzz | 1152:0:600 1152:1:600
 shape	fixture-jetbrains-mono	1e07100fe6b35324#0	-	liga=0,calt=0,zero=1,ss01=1,cv01=2	lig.arrow	=>	LTR Zzzz | 1316:0:600 1318:1:600
 shape	fixture-jetbrains-mono	1e07100fe6b35324#0	-	liga=0,calt=0,zero=1,ss01=1,cv01=2	lig.eq-run	=====	LTR Zzzz | 1316:0:600 1316:1:600 1316:2:600 1316:3:600 1316:4:600

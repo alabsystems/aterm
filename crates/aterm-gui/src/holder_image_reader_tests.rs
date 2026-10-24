@@ -978,3 +978,33 @@ fn the_reader_feeds_the_jobs_engine_its_bytes_lines_and_block() {
         (block.id, false, Some(2), block.started_ms)
     );
 }
+
+/// A READER ATTACHING SEEDS THE JOBS FEED WITH THE BLOCK ALREADY RUNNING: an engine restored
+/// with its command open holds a block no reader fed, and the block is the feed's once a reader
+/// attaches, before the program writes a byte.
+#[test]
+fn a_reader_attaching_seeds_the_jobs_feed_with_the_block_already_running() {
+    let shell = 8210;
+    set_image(shell, zsh(shell));
+    let mut rig = Rig::attach(9331, shell, SHIPPING);
+    assert!(
+        park_reader(&mut rig.session, Instant::now() + PATIENCE),
+        "parked"
+    );
+    let typed = [&prompt()[..], b"make\r\n", &signed("133;C")].concat();
+    rig.session
+        .term
+        .lock()
+        .expect("terminal lock")
+        .process(&typed);
+    assert!(rig.session.ctx.job_feed.at(Instant::now()).block.is_none());
+    rig.start_reader();
+    let block = rig
+        .session
+        .ctx
+        .job_feed
+        .at(Instant::now())
+        .block
+        .expect("the seeded block");
+    assert_eq!((block.open, block.command.as_str()), (true, "make"));
+}

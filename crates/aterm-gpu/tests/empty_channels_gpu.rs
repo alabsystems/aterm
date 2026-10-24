@@ -4,13 +4,17 @@
 use std::sync::Arc;
 
 use crate::rain_common::RainScene;
-use aterm_core::render::{CharFg, RenderInput};
+use aterm_core::render::{
+    CharFg, FxBlend, FxContent, FxInk, FxItem, FxLayer, FxSlot, FxSpace, FxSprite, PxRect,
+    RenderInput,
+};
 use aterm_core::terminal::Terminal;
+use aterm_render::sprites::published;
 use aterm_render::{
-    FireMode, FirePatch, GlowQuad, HaloMode, RainHalo, Renderer, SceneAtlas, SpriteQuad, Theme,
-    premul_rgb,
+    FireMode, FirePatch, GlowQuad, HaloMode, RainHalo, Renderer, Theme, premul_rgb,
 };
 
+use crate::common::sprites::{cut, put, under};
 use crate::common::{backends, backends_fontdue, max_channel_delta};
 
 struct Ctx {
@@ -33,7 +37,8 @@ struct Channel {
     fontdue: bool,
     /// Also run every leg on the CPU renderer.
     cpu_too: bool,
-    /// An atlas with no draws (`None`: the channel carries no atlas).
+    /// Arts resident or published with no draws (`None`: the channel carries
+    /// no art).
     atlas_only: Option<Setter>,
     /// A payload that paints.
     populate: Setter,
@@ -41,34 +46,35 @@ struct Channel {
     loaded: fn(&RenderInput) -> bool,
     /// The channel's own drain, exercised after a populated render.
     drain: Option<fn(&mut RenderInput)>,
-    /// Every field of the channel is empty (Vecs cleared, atlas Arcs nulled).
+    /// Every field of the channel is empty.
     is_empty: fn(&RenderInput) -> bool,
 }
 
-fn cat_atlas(version: u64) -> SceneAtlas {
-    let (w, h) = (64u32, 64u32);
-    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-    for y in 0..h {
-        for x in 0..w {
-            let a = if y < 32 {
-                255u8
-            } else {
-                (60 + (x * 3) % 180) as u8
-            };
-            rgba.extend_from_slice(&[
-                (x * 37 + y * 11) as u8,
-                (x * 5 + y * 53) as u8,
-                (x * 29 + y * 3) as u8,
-                a,
-            ]);
-        }
-    }
-    SceneAtlas {
-        width: w,
-        height: h,
-        rgba,
-        version,
-    }
+/// A Linear Under knock-out layer over an opaque art whose ink is clear: it
+/// draws nothing, so it knocks nothing out.
+fn clear_knock_layer(c: &Ctx) -> FxLayer {
+    let art = cut(0, 0, 2, 2);
+    let mut l = FxLayer::new(
+        1,
+        Arc::new(FxContent::new(
+            vec![FxItem::Sprite(FxSprite {
+                x: 0,
+                y: 0,
+                dw: (4 * c.cw) as u16,
+                dh: (2 * c.ch) as u16,
+                flip_x: false,
+                art,
+                ink: 0,
+                clip: PxRect::EVERYWHERE,
+            })],
+            vec![FxInk::over(0x00FF_FFFF, 0)],
+        )),
+        FxSlot::Under,
+        FxSpace::Grid,
+        FxBlend::Linear,
+    );
+    l.knock = true;
+    l
 }
 
 fn burn_patches(ch: usize, grid_w: usize, grid_h: usize) -> Vec<FirePatch> {
@@ -125,34 +131,24 @@ fn raining(i: &RenderInput, c: &Ctx) -> RainScene {
 
 const CHANNELS: &[Channel] = &[
     Channel {
-        name: "cat_quads + cat_atlas",
+        name: "companion sprite layers",
         rows: 3,
         cols: 10,
         text: b"\x1b[?25lkitty",
         fontdue: false,
         cpu_too: false,
-        atlas_only: Some(|i, _| i.cat_atlas = Some(Arc::new(cat_atlas(1)))),
+        atlas_only: Some(|i, c| {
+            let layer = clear_knock_layer(c);
+            i.fx_prefetch.push(cut(0, 0, 24, 24));
+            i.fx_layers = vec![layer];
+        }),
         populate: |i, c| {
-            i.cat_atlas = Some(Arc::new(cat_atlas(1)));
             let h = (c.ch as u16).min(32);
-            i.cat_quads = vec![SpriteQuad {
-                row: 1,
-                x: 0,
-                y: c.ch as u16,
-                w: 24,
-                h,
-                ax: 0,
-                ay: 0,
-                aw: 24,
-                ah: h,
-                tint: 0x00FF_FFFF,
-                alpha: 255,
-                flip_x: false,
-            }];
+            put(i, &[under(0, c.ch as i32, cut(0, 0, 24, h))]);
         },
-        loaded: |i| !i.cat_quads.is_empty(),
+        loaded: |i| !published(&i.fx_layers).is_empty(),
         drain: None,
-        is_empty: |i| i.cat_quads.is_empty() && i.cat_atlas.is_none(),
+        is_empty: |i| i.fx_layers.is_empty() && i.fx_prefetch.is_empty(),
     },
     Channel {
         name: "fire_patch",
@@ -259,21 +255,24 @@ const CHANNELS: &[Channel] = &[
         is_empty: |i| i.nova_add.is_empty(),
     },
     Channel {
-        name: "rain_quads + rain_atlas + rain_add",
+        name: "rain layers + rain_add",
         rows: 6,
         cols: 20,
         text: b"\x1b[?25l$ matrix off",
         fontdue: false,
         cpu_too: false,
         atlas_only: Some(|i, c| {
-            let atlas = raining(i, c).atlas();
-            assert!(atlas.is_some(), "the engine must have baked an atlas");
-            i.rain_atlas = atlas;
+            let scene = raining(i, c);
+            let tiles: Vec<_> = (0..64)
+                .filter_map(|g| scene.engine.tile(g).cloned())
+                .collect();
+            assert!(tiles.len() == 64, "the engine must have baked its tiles");
+            i.fx_prefetch = tiles;
         }),
         populate: |i, c| raining(i, c).apply(i),
-        loaded: |i| !i.rain_quads.is_empty() && !i.rain_add.is_empty(),
+        loaded: |i| !i.fx_layers.is_empty() && !i.rain_add.is_empty(),
         drain: None,
-        is_empty: |i| i.rain_quads.is_empty() && i.rain_atlas.is_none() && i.rain_add.is_empty(),
+        is_empty: |i| i.fx_layers.is_empty() && i.fx_prefetch.is_empty() && i.rain_add.is_empty(),
     },
 ];
 
@@ -303,7 +302,7 @@ fn legs(
         set(&mut atlas_only, ctx);
         assert!(
             same(&base, &render(&atlas_only)),
-            "{name} on {backend}: an atlas with no draws must be byte-identical"
+            "{name} on {backend}: resident or published arts with no draws must be byte-identical"
         );
     }
 
@@ -326,10 +325,7 @@ fn legs(
     }
 
     input.clear_overlays();
-    assert!(
-        (c.is_empty)(&input),
-        "{name}: clear_overlays must strip it (Vecs cleared, atlas Arcs nulled)"
-    );
+    assert!((c.is_empty)(&input), "{name}: clear_overlays must strip it");
     assert!(
         same(&base, &render(&input)),
         "{name} on {backend}: clear_overlays must restore the bare frame"

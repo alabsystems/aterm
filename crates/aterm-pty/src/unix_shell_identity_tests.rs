@@ -4,10 +4,9 @@
 use super::*;
 use std::time::{Duration, Instant};
 
-/// A hang detector, never a latency budget.
 const HANG_DETECTOR: Duration = Duration::from_secs(60);
 
-/// A real PTY session running `script` under `/bin/sh`, returned once it has printed `UP`.
+/// Spawn a real PTY session running `script` under `/bin/sh` and wait for `UP`.
 fn parked_session(script: &str) -> SpawnedShell {
     // SAFETY: test process, trusted-launcher contract trivially holds.
     let authority = unsafe { aterm_cap::Authority::root_authority() };
@@ -49,7 +48,6 @@ fn parked_session(script: &str) -> SpawnedShell {
     sh
 }
 
-/// The bystander: a `sleep` in its own session.
 fn setsid_sleep() -> aterm_uds::spawnfd::Child {
     aterm_uds::spawnfd::command("/bin/sleep")
         .arg("30")
@@ -63,7 +61,6 @@ fn end(mut child: aterm_uds::spawnfd::Child) {
     let _ = child.wait();
 }
 
-/// A bystander born after `birth`.
 fn setsid_sleep_born_after(birth: Option<u64>) -> aterm_uds::spawnfd::Child {
     let deadline = Instant::now() + HANG_DETECTOR;
     loop {
@@ -231,7 +228,6 @@ fn an_unreaped_own_child_zombie_still_verifies_and_is_reaped() {
     assert!(!identity.verify(), "once reaped, the pid is no longer ours");
 }
 
-/// Wait (a hang detector) until `pid` is no longer our unreaped child.
 fn still_unreaped_after(pid: i32, patience: Duration) -> bool {
     let deadline = Instant::now() + patience;
     while is_unreaped_child(pid) && Instant::now() < deadline {

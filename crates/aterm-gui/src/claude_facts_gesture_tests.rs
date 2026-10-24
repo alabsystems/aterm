@@ -539,15 +539,21 @@ fn ctrl_shift_tab_walks_the_chips_then_the_facts_that_fit() {
     publish_facts(&app, session);
     draw_claude(&app, session, PLAN);
     frame(&mut app, wid);
-    let walk = [
+    let switch = app.windows[&wid]
+        .claude_lights
+        .shows(session, Target::Switch);
+    let walk: Vec<Target> = [
         Target::Chip(Chip::Autopilot),
         Target::Chip(MODE),
         Target::Fact(Fact::Model),
         Target::Fact(Fact::Effort),
         Target::Fact(Fact::Path),
         Target::Fact(Fact::Branch),
-        Target::Chip(Chip::Autopilot),
-    ];
+    ]
+    .into_iter()
+    .chain(switch.then_some(Target::Switch))
+    .chain([Target::Chip(Chip::Autopilot)])
+    .collect();
     for want in walk {
         chord(&mut app, wid);
         assert_eq!(
@@ -668,9 +674,23 @@ fn facts_are_buttons_named_in_words() {
         .iter()
         .find(|n| n.chip == HarnessChip::Branch)
         .expect("the stub's node");
+    let hit = fact_hit(&app, wid, Fact::Branch);
+    let drawn = crate::claude_footer::read_glass(
+        &app.windows[&wid].input_scratch.cells[hit.frame_row][hit.cols.0..hit.cols.1],
+    );
+    let words: Vec<&str> = drawn
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    assert_eq!(
+        words,
+        ["main", "off"],
+        "CONTROL: the greyed stub: {drawn:?}"
+    );
     assert_eq!(
         (stub.label.as_str(), stub.description.as_deref()),
-        ("Branch: hidden", Some("Activate to show it again."))
+        ("Branch: main off", Some("Activate to show it again.")),
+        "the stub is named in the words the glass draws"
     );
 }
 

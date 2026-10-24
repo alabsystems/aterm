@@ -1,118 +1,95 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-use crate::common;
-use std::sync::Arc;
+//! The word cats, the pet and the kitty cursor as Linear fx sprite layers
+//! (`docs/DESIGN-card-engine-2026-10-19.md` §6, lane B7): the GPU draws
+//! what the CPU draws, byte for byte where every texel and ink is opaque.
 
 use aterm_core::terminal::Terminal;
-use aterm_render::{SceneAtlas, SpriteQuad, Theme};
+use aterm_render::Theme;
+use aterm_render::sprites::{FreeSprite, SpriteLayers};
 
-use crate::common::{backends, max_channel_delta};
-
-fn cat_atlas(version: u64) -> SceneAtlas {
-    let (w, h) = (64u32, 64u32);
-    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-    for y in 0..h {
-        for x in 0..w {
-            let a = if y < 32 {
-                255u8
-            } else {
-                (60 + (x * 3) % 180) as u8
-            };
-            rgba.extend_from_slice(&[
-                (x * 37 + y * 11) as u8,
-                (x * 5 + y * 53) as u8,
-                (x * 29 + y * 3) as u8,
-                a,
-            ]);
-        }
-    }
-    SceneAtlas {
-        width: w,
-        height: h,
-        rgba,
-        version,
-    }
-}
-
-fn quad_1to1(row: u16, dest: [u16; 4], src_xy: [u16; 2], alpha: u8) -> SpriteQuad {
-    let [x, y, w, h] = dest;
-    let [ax, ay] = src_xy;
-    SpriteQuad {
-        row,
-        x,
-        y,
-        w,
-        h,
-        ax,
-        ay,
-        aw: w, // bake == dest: the NEAREST 1:1 contract
-        ah: h,
-        tint: 0x00FF_FFFF,
-        alpha,
-        flip_x: false,
-    }
-}
+use crate::common::sprites::{Publisher, cut, over, put, under};
+use crate::common::{self, backends, max_channel_delta};
 
 #[test]
-fn cat_effect_only_parity_pinned_over_bg_and_text() {
+fn cat_layers_match_the_cpu_over_bg_and_text() {
     let theme = Theme::default();
-    let (mut cpu, mut gpu) = backends(18.0, theme);
-    let mut win = aterm_gpu::WindowGpu::new();
-    let (cw, ch) = cpu.cell_size();
-    let (rows, cols) = (6usize, 16usize);
-    let mut term = Terminal::new(rows as u16, cols as u16);
-    term.process("\x1b[?25l████████".as_bytes()); // procedural: byte-exact base
+    for (arm, mut cpu, mut gpu) in common::arms(18.0, theme) {
+        let mut win = aterm_gpu::WindowGpu::new();
+        let (cw, ch) = cpu.cell_size();
+        let (rows, cols) = (6usize, 16usize);
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        term.process("\x1b[?25l████████\x1b[4;1H████████".as_bytes()); // procedural: byte-exact base
 
-    let base_input = term.cell_frame(rows, cols);
-    let cpu_base = cpu.render_input(&base_input);
-    let gpu_base = gpu.render_input(&mut win, &base_input, None);
-    let base_delta = max_channel_delta(&cpu_base.pixels, &gpu_base.pixels);
-    assert_eq!(
-        base_delta, 0,
-        "procedural-block base must be byte-exact so the cat delta is effect-only"
-    );
+        let base_input = term.cell_frame(rows, cols);
+        let cpu_base = cpu.render_input(&base_input);
+        let gpu_base = gpu.render_input(&mut win, &base_input, None);
+        assert_eq!(
+            max_channel_delta(&cpu_base.pixels, &gpu_base.pixels),
+            0,
+            "procedural-block base must be byte-exact so the sprite delta is effect-only"
+        );
 
-    let hh = (ch as u16).min(32); // stay inside one row band AND the opaque atlas half
-    let mut input = term.cell_frame(rows, cols);
-    input.cat_atlas = Some(Arc::new(cat_atlas(1)));
-    input.cat_quads = vec![
-        quad_1to1(3, [4, (3 * ch) as u16, 40, hh], [2, 0], 255),
-        quad_1to1(0, [2, 0, 48, hh], [8, 0], 255),
-        quad_1to1(
-            4,
-            [8, (4 * ch) as u16, 32, (ch as u16).min(30)],
-            [0, 33],
-            255,
-        ),
-        SpriteQuad {
-            flip_x: true,
-            ..quad_1to1(
-                5,
-                [(cols * cw - 44) as u16, (5 * ch) as u16, 40, hh],
-                [12, 4],
-                140,
-            )
-        },
-    ];
+        let hh = (ch as u16).min(32); // inside one row band and the opaque half of the sheet
+        let opaque = [
+            under(4, (3 * ch) as i32, cut(2, 0, 40, hh)),
+            over(2, 0, cut(8, 0, 48, hh)),
+            FreeSprite {
+                flip_x: true,
+                ..under(60, ch as i32 + 3, cut(5, 1, 33, hh))
+            },
+        ];
+        let mut input = term.cell_frame(rows, cols);
+        put(&mut input, &opaque);
+        let cpu_op = cpu.render_input(&input);
+        let gpu_op = gpu.render_input(&mut win, &input, None);
+        assert_ne!(
+            cpu_op.pixels, cpu_base.pixels,
+            "the sprites must paint (non-vacuous)"
+        );
+        let delta = max_channel_delta(&cpu_op.pixels, &gpu_op.pixels);
+        assert_eq!(
+            delta, 0,
+            "{arm}: opaque texels under an opaque white ink are the texels themselves: \
+         any delta is a texel the GPU's integer mapping picked differently"
+        );
 
-    let cpu_cat = cpu.render_input(&input);
-    let gpu_cat = gpu.render_input(&mut win, &input, None);
-    assert_ne!(
-        cpu_cat.pixels, cpu_base.pixels,
-        "the cat must actually paint (non-vacuous)"
-    );
-    let delta = max_channel_delta(&cpu_cat.pixels, &gpu_cat.pixels);
-    eprintln!("cat effect-only GPU vs CPU max per-channel delta = {delta} (target <= 1)");
-    assert!(
-        delta <= 2,
-        "cat NEAREST-1:1 parity broke its pinned bar: max per-channel delta \
-         {delta} > 2 (target <= 1)"
-    );
+        let mut input = term.cell_frame(rows, cols);
+        let translucent = [
+            under(8, (4 * ch) as i32, cut(0, 33, 32, (ch as u16).min(30))),
+            FreeSprite {
+                flip_x: true,
+                alpha: 140,
+                tint: 0x00C0_FF80,
+                ..over((cols * cw - 44) as i32, (5 * ch) as i32, cut(12, 4, 40, hh))
+            },
+        ];
+        let all: Vec<FreeSprite> = opaque.iter().chain(&translucent).cloned().collect();
+        put(&mut input, &all);
+        let cpu_t = cpu.render_input(&input);
+        let gpu_t = gpu.render_input(&mut win, &input, None);
+        assert_ne!(
+            cpu_t.pixels, cpu_op.pixels,
+            "the translucent sprites must paint"
+        );
+        let delta = max_channel_delta(&cpu_t.pixels, &gpu_t.pixels);
+        eprintln!(
+            "{arm}: cat layers GPU vs CPU max per-channel delta = {delta} (Linear bar <= {})",
+            SpriteLayers::PARITY
+        );
+        assert!(
+            delta <= i32::from(SpriteLayers::PARITY),
+            "{arm}: a translucent Linear sprite broke the companions' declared parity: max per-channel \
+         delta {delta} > {}",
+            SpriteLayers::PARITY
+        );
+        common::assert_arm(arm, &gpu);
+    }
 }
 
 #[test]
-fn cat_under_opaque_sixel_is_hidden_on_both_backends() {
+fn an_under_text_cat_under_an_opaque_sixel_is_hidden_on_both_backends() {
     let theme = Theme::default();
     let (mut cpu, mut gpu) = backends(18.0, theme);
     let mut win = aterm_gpu::WindowGpu::new();
@@ -140,11 +117,11 @@ fn cat_under_opaque_sixel_is_hidden_on_both_backends() {
         "sixel DCS must place an inline image on row 0"
     );
 
+    let hh = (ch as u16).min(32);
+    let art = cut(0, 0, (cw as u16) * 2 - 4, hh);
     let base_input = term.cell_frame(rows, cols);
     let mut input = term.cell_frame(rows, cols);
-    input.cat_atlas = Some(Arc::new(cat_atlas(1)));
-    let hh = (ch as u16).min(32);
-    input.cat_quads = vec![quad_1to1(0, [2, 0, (cw as u16) * 2 - 4, hh], [0, 0], 255)];
+    put(&mut input, &[under(2, 0, art.clone())]);
 
     let cpu_base = cpu.render_input(&base_input);
     let cpu_cat = cpu.render_input(&input);
@@ -163,24 +140,19 @@ fn cat_under_opaque_sixel_is_hidden_on_both_backends() {
     );
     assert_eq!(
         cpu_base.pixels, cpu_cat.pixels,
-        "CPU: an opaque sixel must hide the cat sprite (the pass-1c sprite stamp \
-         is under the inline-image stamp — pass 2b for this image's z >= 0)"
+        "CPU: an opaque sixel must hide an under-text sprite (the Linear Under \
+         layers draw before the inline-image stamp)"
     );
     let gpu_base = gpu.render_input(&mut win, &base_input, None);
     let gpu_cat = gpu.render_input(&mut win, &input, None);
     assert_eq!(
         gpu_base.pixels, gpu_cat.pixels,
-        "GPU: an opaque sixel must hide the cat sprite (cat draws before images)"
+        "GPU: an opaque sixel must hide an under-text sprite (FxLinearUnder \
+         draws before the images)"
     );
 
     let mut moved = term.cell_frame(rows, cols);
-    moved.cat_atlas = Some(Arc::new(cat_atlas(1)));
-    moved.cat_quads = vec![quad_1to1(
-        2,
-        [2, (2 * ch) as u16, (cw as u16) * 2 - 4, hh],
-        [0, 0],
-        255,
-    )];
+    put(&mut moved, &[under(2, (2 * ch) as i32, art)]);
     assert_ne!(
         cpu.render_input(&moved).pixels,
         cpu_base.pixels,
@@ -201,17 +173,12 @@ fn damaged_path_cat_no_ghosting_and_settled_gate_hit() {
     let (rows, cols) = (4usize, 12usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.process(b"\x1b[?25l");
-    let atlas = Arc::new(cat_atlas(3));
+    let art = cut(2, 0, 40, (ch as u16).min(32));
 
-    let mut make = |row: u16| {
+    let mut publisher = Publisher::default();
+    let mut make = |row: usize| {
         let mut input = term.cell_frame(rows, cols);
-        input.cat_atlas = Some(atlas.clone());
-        input.cat_quads = vec![quad_1to1(
-            row,
-            [2, row * ch as u16, 40, (ch as u16).min(32)],
-            [2, 0],
-            255,
-        )];
+        publisher.put(&mut input, &[under(2, (row * ch) as i32, art.clone())]);
         input
     };
     let (in_a, in_b, in_c) = (make(1), make(2), make(2));
@@ -220,16 +187,20 @@ fn damaged_path_cat_no_ghosting_and_settled_gate_hit() {
         (18.0, theme),
         [&in_a, &in_b, &in_c],
         "cat",
-        "cat (equal quads, same atlas version)",
+        "cat (the same layer: same id, same content)",
     );
 }
 
+/// A sprite reaching past an edge of the frame, or cut to nothing by its
+/// clip, lands the same pixels on both backends: the clip and the frame
+/// bound every sprite, and none smears an edge texel.
 #[test]
-fn a_malformed_sprite_quad_is_refused_on_both_backends() {
+fn a_sprite_at_or_past_an_edge_lands_the_same_pixels_on_both_backends() {
+    use aterm_core::render::PxRect;
     let theme = Theme::default();
     let (mut cpu, mut gpu) = backends(18.0, theme);
     let mut win = aterm_gpu::WindowGpu::new();
-    let (_, ch) = cpu.cell_size();
+    let (cw, ch) = cpu.cell_size();
     let (rows, cols) = (6usize, 16usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.process(b"\x1b[?25l");
@@ -243,69 +214,67 @@ fn a_malformed_sprite_quad_is_refused_on_both_backends() {
         "blank base must be byte-exact so the sprite delta is effect-only"
     );
 
-    let cases: [(&str, [u16; 4], u16, bool); 4] = [
-        ("in-bounds control", [2, 0, 40, 20], 3, true),
+    let (gw, gh) = ((cols * cw) as i32, (rows * ch) as i32);
+    let art = cut(2, 0, 40, 20);
+    let cases: [(&str, FreeSprite, bool); 7] = [
         (
-            "source rect overruns the atlas bottom",
-            [2, 40, 40, 34],
-            3,
-            false,
+            "in-bounds control",
+            under(4, 2 * ch as i32, art.clone()),
+            true,
         ),
         (
-            "source rect overruns the atlas right",
-            [40, 0, 40, 20],
-            3,
-            false,
+            "past the right edge",
+            over(gw - 13, 2 * ch as i32, art.clone()),
+            true,
         ),
         (
-            "row tagged past the last grid row",
-            [2, 0, 40, 20],
-            99,
+            "past the left and top edges",
+            over(-17, -9, art.clone()),
+            true,
+        ),
+        (
+            "below the last grid row",
+            under(4, gh + 64, art.clone()),
             false,
+        ),
+        ("left of the frame", over(-400, 0, art.clone()), false),
+        (
+            "clipped to a window",
+            FreeSprite {
+                clip: PxRect::new(10, 2 * ch as i32 + 3, 31, 2 * ch as i32 + 11),
+                ..under(4, 2 * ch as i32, art.clone())
+            },
+            true,
+        ),
+        (
+            "a stretched cut past the bottom edge",
+            FreeSprite {
+                w: 80,
+                h: 60,
+                ..over(30, gh - 25, art.clone())
+            },
+            true,
         ),
     ];
-    for (name, [ax, ay, aw, ah], row, should_paint) in cases {
-        for stream in ["cat", "rain"] {
-            let quad = SpriteQuad {
-                row,
-                x: 4,
-                y: (2 * ch) as u16,
-                w: aw,
-                h: ah,
-                ax,
-                ay,
-                aw,
-                ah,
-                tint: 0x00FF_FFFF,
-                alpha: 255,
-                flip_x: false,
-            };
-            let mut input = term.cell_frame(rows, cols);
-            if stream == "cat" {
-                input.cat_atlas = Some(Arc::new(cat_atlas(1)));
-                input.cat_quads = vec![quad];
-            } else {
-                input.rain_atlas = Some(Arc::new(cat_atlas(1)));
-                input.rain_quads = vec![quad];
-            }
-            let c = cpu.render_input(&input).pixels;
-            let g = gpu.render_input(&mut win, &input, None).pixels;
-            assert_eq!(
-                c == cpu_base,
-                !should_paint,
-                "{stream}: {name} — the CPU is the reference for what this quad may draw"
-            );
-            assert_eq!(
-                g == gpu_base,
-                !should_paint,
-                "{stream}: {name} — the GPU must draw exactly what the CPU draws, \
-                 not the ClampToEdge smear of an out-of-range rect"
-            );
-            assert_eq!(
-                max_channel_delta(&c, &g),
-                0,
-                "{stream}: {name} — CPU and GPU must land the same pixels"
-            );
-        }
+    for (name, sprite, should_paint) in cases {
+        let mut input = term.cell_frame(rows, cols);
+        put(&mut input, std::slice::from_ref(&sprite));
+        let c = cpu.render_input(&input).pixels;
+        let g = gpu.render_input(&mut win, &input, None).pixels;
+        assert_eq!(
+            c == cpu_base,
+            !should_paint,
+            "{name}: the CPU is the reference for what this sprite may draw"
+        );
+        assert_eq!(
+            g == gpu_base,
+            !should_paint,
+            "{name}: the GPU must draw exactly where the CPU draws"
+        );
+        assert_eq!(
+            max_channel_delta(&c, &g),
+            0,
+            "{name}: CPU and GPU must land the same pixels"
+        );
     }
 }

@@ -733,6 +733,9 @@ pub(crate) fn sh_yolo_prelude(
     );
     s.push_str("__atpkg_yolo=0\n__atpkg_posture=0\n");
     s.push_str("__atpkg_have_word=0\n__atpkg_word=\n__atpkg_word_at=0\n__atpkg_word_ok=1\n");
+    if !crate::yolo::word_options(program).optional.is_empty() {
+        s.push_str("__atpkg_maybe=0\n__atpkg_gap=0\n__atpkg_joins=0\n");
+    }
     for i in 0..flags.len() {
         s.push_str("__atpkg_p");
         s.push_str(&i.to_string());
@@ -775,40 +778,82 @@ pub(crate) fn sh_yolo_prelude(
         s.push_str(") __atpkg_posture=1 ;;\n");
     }
     s.push_str("  esac\ndone\n");
-    let (values, switches) = crate::yolo::word_options(program);
+    let crate::yolo::WordOptions {
+        values,
+        optional,
+        switches,
+        own_yolo,
+    } = crate::yolo::word_options(program);
+    let quoted = |words: &[&str]| {
+        words
+            .iter()
+            .map(|f| sh_quote_str(f))
+            .collect::<Vec<_>>()
+            .join("|")
+    };
     let standalone: Vec<&str> = std::iter::once(crate::yolo::WORD)
+        .chain(own_yolo.iter().copied())
         .chain(flags.iter().copied())
         .chain(switches.iter().copied())
+        .collect();
+    let removable: Vec<&str> = std::iter::once(crate::yolo::WORD)
+        .chain(own_yolo.iter().copied())
         .collect();
     s.push_str(
         "__atpkg_at=0\n__atpkg_value=0\n\
          for __atpkg_a in \"$@\"; do\n  \
          __atpkg_at=$((__atpkg_at + 1))\n  \
          if [ \"$__atpkg_a\" = \"--\" ]; then break; fi\n  \
-         if [ \"$__atpkg_value\" = 1 ]; then __atpkg_value=0; continue; fi\n  \
-         case \"$__atpkg_a\" in\n    ",
+         if [ \"$__atpkg_value\" = 1 ]; then __atpkg_value=0; continue; fi\n",
     );
-    s.push_str(
-        &standalone
-            .iter()
-            .map(|f| sh_quote_str(f))
-            .collect::<Vec<_>>()
-            .join("|"),
-    );
+    if !optional.is_empty() {
+        // An optional value takes a bare next token; a `--yolo` (or an own spelling) right
+        // after a bare one, then a bare word, is a removal that would join them (`yolo::Stop`).
+        s.push_str(
+            "  if [ \"$__atpkg_maybe\" = 1 ]; then\n    \
+             __atpkg_maybe=0\n    \
+             case \"$__atpkg_a\" in\n      \
+             -*) ;;\n      \
+             *) continue ;;\n    \
+             esac\n    \
+             case \"$__atpkg_a\" in\n      ",
+        );
+        s.push_str(&quoted(&removable));
+        s.push_str(
+            ") __atpkg_gap=1 ;;\n      \
+             *) __atpkg_gap=0 ;;\n    \
+             esac\n  \
+             elif [ \"$__atpkg_gap\" = 1 ]; then\n    \
+             case \"$__atpkg_a\" in\n      ",
+        );
+        s.push_str(&quoted(&removable));
+        s.push_str(
+            ") ;;\n      \
+             -*) __atpkg_gap=0 ;;\n      \
+             *) __atpkg_joins=1; __atpkg_word_ok=0; break ;;\n    \
+             esac\n  \
+             fi\n",
+        );
+    }
+    s.push_str("  case \"$__atpkg_a\" in\n    ");
+    s.push_str(&quoted(&standalone));
     s.push_str(") ;;\n");
     if !values.is_empty() {
+        s.push_str("    ");
+        s.push_str(&quoted(values));
+        s.push_str(") __atpkg_value=1 ;;\n");
+    }
+    if !optional.is_empty() {
+        s.push_str("    ");
+        s.push_str(&quoted(optional));
+        s.push_str(") __atpkg_maybe=1 ;;\n");
+    }
+    if !values.is_empty() || !optional.is_empty() {
         s.push_str("    ");
         s.push_str(
             &values
                 .iter()
-                .map(|f| sh_quote_str(f))
-                .collect::<Vec<_>>()
-                .join("|"),
-        );
-        s.push_str(") __atpkg_value=1 ;;\n    ");
-        s.push_str(
-            &values
-                .iter()
+                .chain(optional.iter())
                 .map(|f| marker_pattern(f))
                 .collect::<Vec<_>>()
                 .join("|"),
@@ -841,6 +886,9 @@ pub(crate) fn sh_yolo_prelude(
     if !after.is_empty() {
         s.push_str(" && [ \"$__atpkg_word_ok\" = 1 ]");
     }
+    if !optional.is_empty() {
+        s.push_str(" && [ \"$__atpkg_joins\" = 0 ]");
+    }
     s.push_str("; then\n  __atpkg_say=");
     s.push_str(&say(crate::yolo::ECHO_PREFIX));
     s.push_str(
@@ -868,6 +916,23 @@ pub(crate) fn sh_yolo_prelude(
         );
         s.push_str(&fresh("        "));
         s.push_str("      fi\n");
+    }
+    if !own_yolo.is_empty() {
+        // `yolo::decide` drops the program's own spellings of the posture ahead of the first
+        // word, and none past an option the scan does not know.
+        s.push_str(
+            "    elif [ \"$__atpkg_stop\" = 0 ] && [ \"$__atpkg_word_ok\" = 1 ] && \
+             { [ \"$__atpkg_have_word\" = 0 ] || [ \"$__atpkg_at\" -lt \"$__atpkg_word_at\" ]; } && \
+             { ",
+        );
+        s.push_str(
+            &own_yolo
+                .iter()
+                .map(|w| format!("[ \"$1\" = {} ]", sh_quote_str(w)))
+                .collect::<Vec<_>>()
+                .join(" || "),
+        );
+        s.push_str("; }; then\n      shift\n");
     }
     s.push_str(
         "    else\n      \
@@ -2334,6 +2399,81 @@ mod sh_shim_tests {
             run(&agy, &["--no-alab-harness", "--", "--no-harness"]).0,
             "<--dangerously-skip-permissions><--><--no-harness>\n"
         );
+        // grok and kimi: the twin runs exactly what `decide` says, printing the line it prints
+        // (their self-update verbs are the update intercept's, which this twin is laid without).
+        let grok = lay("grok");
+        let kimi = lay("kimi");
+        for (program, twin, args) in [
+            ("grok", &grok, &[][..]),
+            ("grok", &grok, &["-m", "grok-4", "fix it"][..]),
+            ("grok", &grok, &["--resume", "agent", "--json"][..]),
+            ("grok", &grok, &["--yolo", "agent", "-p", "hi"][..]),
+            ("grok", &grok, &["--cwd", "/w", "--yolo"][..]),
+            ("grok", &grok, &["--permission-mode", "plan"][..]),
+            ("grok", &grok, &["agent", "--sandbox=strict"][..]),
+            ("grok", &grok, &["--unknown", "--yolo", "agent"][..]),
+            ("grok", &grok, &["mcp", "list"][..]),
+            ("grok", &grok, &["cursor-worker", "start"][..]),
+            ("grok", &grok, &["--effort", "high", "fix it"][..]),
+            ("grok", &grok, &["-w", "login"][..]),
+            ("grok", &grok, &["-w", "feat", "agent", "-p", "hi"][..]),
+            ("grok", &grok, &["-wfeat", "--resume", "agent"][..]),
+            ("grok", &grok, &["-w", "--yolo"][..]),
+            ("grok", &grok, &["-w", "--yolo", "agent", "-p", "hi"][..]),
+            ("grok", &grok, &["-r", "--yolo", "--yolo", "fix it"][..]),
+            ("grok", &grok, &["-r", "--no-plan", "--yolo", "agent"][..]),
+            (
+                "grok",
+                &grok,
+                &["--yolo", "--dangerously-skip-permissions", "agent"][..],
+            ),
+            ("kimi", &kimi, &[][..]),
+            ("kimi", &kimi, &["--yolo"][..]),
+            ("kimi", &kimi, &["-m", "k2", "--yolo", "--", "--yolo"][..]),
+            ("kimi", &kimi, &["--agent", "coder", "hello"][..]),
+            ("kimi", &kimi, &["-y"][..]),
+            ("kimi", &kimi, &["-phi"][..]),
+            ("kimi", &kimi, &["--session=abc"][..]),
+            ("kimi", &kimi, &["--unknown", "--yolo"][..]),
+            ("kimi", &kimi, &["acp"][..]),
+            ("kimi", &kimi, &["--yolo", "-y"][..]),
+            ("kimi", &kimi, &["--yes", "--yolo", "--auto-approve"][..]),
+            (
+                "kimi",
+                &kimi,
+                &["-y", "-m", "k2", "--yolo", "--add-dir", "/w"][..],
+            ),
+            ("kimi", &kimi, &["--yolo", "upgrade", "-y"][..]),
+            ("kimi", &kimi, &["--yolo", "-y", "--", "-y"][..]),
+            ("kimi", &kimi, &["--yolo", "-S", "-y", "login"][..]),
+            ("kimi", &kimi, &["--yolo", "-S", "abc", "-y"][..]),
+            ("kimi", &kimi, &["--unknown", "--yolo", "-y"][..]),
+        ] {
+            let typed: Vec<String> = args.iter().map(|w| (*w).to_string()).collect();
+            let (ran, said) = match crate::yolo::decide(program, &typed) {
+                crate::yolo::Launch::AsTyped => (typed, String::new()),
+                crate::yolo::Launch::Flag(v) => {
+                    let line = format!("{}\n", crate::yolo::echo_line(program, &v));
+                    (v, line)
+                }
+                crate::yolo::Launch::Default(v) => {
+                    let line = format!("{}\n", crate::yolo::default_echo_line(program, &v));
+                    (v, line)
+                }
+            };
+            let shown: String = ran.iter().map(|a| format!("<{a}>")).collect();
+            assert_eq!(
+                run(twin, args),
+                (format!("{shown}\n"), said),
+                "{program} {args:?}"
+            );
+        }
+        assert_eq!(
+            run(&grok, &["agent", "-p", "hi"]).0,
+            "<agent><--always-approve><-p><hi>\n"
+        );
+        assert_eq!(run(&kimi, &["--yolo"]).0, "<--auto>\n");
+        assert_eq!(run(&kimi, &["-y", "--yolo"]).0, "<--auto>\n");
         std::fs::remove_dir_all(&root).unwrap();
     }
 

@@ -6,11 +6,11 @@
 use crate::explain::WhySubject;
 
 /// The usage line a refused `sys` request answers; a stray word after `why` answers [`WHY_USAGE`].
-pub const USAGE: &str = "ERR usage: sys [overview|tab|aterm|global|jobs|cores|gpu|mem|disk|procs|why] \
+pub const USAGE: &str = "ERR usage: sys [overview|tab|aterm|global|jobs|cores|gpu|mem|disk|net|procs|why] \
                          [scope=pane|tab|window|aterm|global] [instances=all] [top=<1-64>] \
                          [depth=<1-8>] [fresh=<ms>] [since=<ep>.<seq>] [--json]; scope= on \
-                         jobs disk procs (cores gpu mem take it, rows unchanged), depth= on \
-                         disk, instances=all on overview aterm global cores gpu mem and procs \
+                         jobs disk procs (cores gpu mem net take it, rows unchanged), depth= on \
+                         disk, instances=all on overview aterm global cores gpu mem net and procs \
                          scope=aterm\n";
 /// The usage line for a word after `why` that is not its one subject or an option.
 pub const WHY_USAGE: &str =
@@ -44,6 +44,8 @@ pub enum View {
     Mem,
     /// The scope's folders, writers and volume.
     Disk,
+    /// Network interfaces, throughput rates and TCP connection state counts.
+    Net,
     /// Process rows.
     Procs,
     /// Who uses the CPU or memory, and why.
@@ -52,7 +54,7 @@ pub enum View {
 
 impl View {
     /// Every view, in the help's order.
-    pub const ALL: [View; 11] = [
+    pub const ALL: [View; 12] = [
         Self::Overview,
         Self::Tab,
         Self::Aterm,
@@ -62,6 +64,7 @@ impl View {
         Self::Gpu,
         Self::Mem,
         Self::Disk,
+        Self::Net,
         Self::Procs,
         Self::Why,
     ];
@@ -79,6 +82,7 @@ impl View {
             Self::Gpu => "gpu",
             Self::Mem => "mem",
             Self::Disk => "disk",
+            Self::Net => "net",
             Self::Procs => "procs",
             Self::Why => "why",
         }
@@ -94,7 +98,7 @@ impl View {
         match self {
             Self::Overview | Self::Tab | Self::Aterm | Self::Global | Self::Why => None,
             Self::Jobs | Self::Disk | Self::Procs => Some(ScopeArg::Tab),
-            Self::Cores | Self::Gpu | Self::Mem => Some(ScopeArg::Global),
+            Self::Cores | Self::Gpu | Self::Mem | Self::Net => Some(ScopeArg::Global),
         }
     }
 }
@@ -317,7 +321,8 @@ impl SysQuery {
                 | View::Global
                 | View::Cores
                 | View::Gpu
-                | View::Mem => true,
+                | View::Mem
+                | View::Net => true,
                 View::Procs => q.scope == Some(ScopeArg::Aterm),
                 _ => false,
             };
@@ -348,6 +353,7 @@ impl SysQuery {
             | View::Cores
             | View::Gpu
             | View::Mem
+            | View::Net
             | View::Why => true,
             View::Aterm => false,
             View::Jobs | View::Procs => {

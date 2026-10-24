@@ -255,6 +255,7 @@ impl Host {
         let lanes = self.reader.lanes();
         Ok(JobTick {
             at_ms,
+            read_ms: at_ms,
             self_uid,
             sweep,
             procs,

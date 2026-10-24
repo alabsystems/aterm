@@ -67,7 +67,7 @@ impl App {
 
     /// Reset the message center and update flow state between test cases.
     pub(crate) fn clear_messages_for_test(&mut self) {
-        self.messages = aterm_messages::MessageCenter::new(
+        self.messages = crate::messages_host::new_center(
             aterm_messages::MessageLog::empty(),
             std::time::Instant::now(),
         );

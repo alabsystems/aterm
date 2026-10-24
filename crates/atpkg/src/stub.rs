@@ -35,7 +35,8 @@ pub const DEFAULT_SET_STUB_NAMES: &[(&str, &str)] = &[
     ("ty", "ALab's specification checker"),
 ];
 
-/// Coding agents managed by `aterm` as default-set members.
+/// Coding agents managed by `aterm` vendor-direct, one per [`VENDORS`](crate::vendor_direct::VENDORS)
+/// row: the default set's members, and the rows a person installs by name (grok, kimi).
 pub const AGENT_PROGRAMS: &[&str] = &{
     use crate::vendor_direct::VENDORS;
     let mut names = [""; VENDORS.len()];
@@ -1265,13 +1266,23 @@ mod tests {
         }
         let triple = crate::cli::current_triple();
         for name in AGENT_PROGRAMS {
-            let served = crate::vendor_direct::spec(name).is_some_and(|s| s.serves(triple));
+            let row = crate::vendor_direct::spec(name).unwrap();
             assert_eq!(
                 pending_stub_exists(&l, name),
-                served && *name != "agy",
-                "{name}: laid at adoption only where it can arrive"
+                row.serves(triple) && row.default_set && *name != "agy",
+                "{name}: laid at adoption only where it can arrive, and only for the default set"
             );
+            if !row.default_set {
+                assert!(
+                    !l.agent_shim(&tool(name)).exists(),
+                    "{name} is installed by name: no twin either"
+                );
+            }
         }
+        assert!(
+            AGENT_PROGRAMS.contains(&"grok") && AGENT_PROGRAMS.contains(&"kimi"),
+            "PRECONDITION: the opt-in rows are agent programs"
+        );
         std::fs::write(l.bin_dir().join("mine"), "not a stub").unwrap();
         remove_all_stubs(&l);
         for name in compiled_names() {

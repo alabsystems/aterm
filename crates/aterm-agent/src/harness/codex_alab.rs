@@ -118,7 +118,8 @@ pub(crate) enum Fate {
     Refuse,
 }
 
-/// Codex's interactive options (`codex --help`, `codex resume --help`).
+/// Codex's interactive options (`codex --help`, `codex resume --help`), and the hidden
+/// aliases its shared options declare (`--yolo`, `--not-so-yolo`).
 const FLAGS: &[(&str, Arity, Fate)] = &[
     ("-a", Arity::One, Fate::Keep),
     ("--add-dir", Arity::One, Fate::Keep),
@@ -148,6 +149,7 @@ const FLAGS: &[(&str, Arity, Fate)] = &[
     ("--model", Arity::One, Fate::Keep),
     ("--no-alt-screen", Arity::None, Fate::Keep),
     ("--no-daemon", Arity::None, Fate::Keep),
+    ("--not-so-yolo", Arity::None, Fate::Keep),
     ("--oss", Arity::None, Fate::Keep),
     ("-p", Arity::One, Fate::Keep),
     ("--profile", Arity::One, Fate::Keep),
@@ -160,6 +162,7 @@ const FLAGS: &[(&str, Arity, Fate)] = &[
     ("-V", Arity::None, Fate::Refuse),
     ("--version", Arity::None, Fate::Refuse),
     ("--worktree", Arity::None, Fate::Refuse),
+    ("--yolo", Arity::None, Fate::Keep),
 ];
 
 pub(crate) fn flag(name: &str) -> Option<(Arity, Fate)> {
@@ -207,10 +210,11 @@ fn maybe_option(tok: &str) -> bool {
     tok.len() > 1 && tok.starts_with('-')
 }
 
-/// The flags [`rewrite_argv`] carries from `argv` (`argv[0]` first).
+/// The flags [`rewrite_argv`] carries from `argv` (`argv[0]` first), each where `keep`
+/// holds of its name and its tokens (the flag's own, then its values).
 pub(crate) fn kept_flags(
     argv: &[String],
-    keep: impl Fn(&str) -> bool,
+    keep: impl Fn(&str, &[String]) -> bool,
 ) -> Result<Vec<String>, ArgvRefusal> {
     let mut kept: Vec<String> = Vec::new();
     let mut subcommand: Option<&str> = None;
@@ -271,7 +275,7 @@ pub(crate) fn kept_flags(
                 }
             }
         }
-        if fate == Fate::Keep && keep(&name) {
+        if fate == Fate::Keep && keep(&name, &argv[start..i]) {
             kept.extend(argv[start..i].iter().cloned());
         }
     }
@@ -285,7 +289,7 @@ pub(crate) fn kept_flags(
 /// ([`ArgvRefusal::UnknownFlag`]), or a session not resumable in place
 /// ([`ArgvRefusal::NotResumable`]: `exec`, `--remote`, `--worktree`, …).
 pub fn rewrite_argv(argv: &[String], thread: Option<&str>) -> Result<Vec<String>, ArgvRefusal> {
-    Ok(resume_words(kept_flags(argv, |_| true)?, thread))
+    Ok(resume_words(kept_flags(argv, |_, _| true)?, thread))
 }
 
 /// `resume <kept> <thread>`, or the kept flags alone with no thread.

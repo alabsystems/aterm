@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A native publisher's retained model, without calls into AppKit. The shared
-//! consumer validates updates, resolves inherited geometry and joins text runs.
+//! Retained accessibility model without AppKit dependencies.
 
 use std::sync::{Arc, Weak};
 
@@ -11,8 +10,7 @@ use crate::model::NodeId as ModelId;
 use crate::model::{Action, ActionData, ActionRequest, Live, TextSelection, TreeId, TreeUpdate};
 use crate::tree::{ChangeHandler, Node, NodeId, Tree};
 
-/// A native element retains the consumer's exact node lifetime and a weak
-/// publisher identity. Reusing an id, or replacing the publisher, cannot revive it.
+/// Node handle bound to a node's incarnation and publisher identity.
 #[derive(Clone)]
 pub(crate) struct Handle {
     pub(crate) id: NodeId,
@@ -114,8 +112,7 @@ impl Publication {
         self.update_with_changes(update, &mut IgnoreChanges)
     }
 
-    /// Observe the consumer's complete old/new node pairs while retaining the
-    /// shared structure, focus and live-announcement collection.
+    /// Apply `update` and report changes to both the returned [`Changes`] and `observer`.
     pub(crate) fn update_with_changes(
         &mut self,
         update: TreeUpdate,
@@ -176,8 +173,7 @@ impl Publication {
         (node.incarnation() == handle.incarnation).then_some(node)
     }
 
-    /// Only actions advertised by this exact live element are admitted. The
-    /// host independently validates the captured lossless owner/lifecycle context.
+    /// Build an [`ActionRequest`] if `handle` is live, enabled, and supports `action`.
     pub(crate) fn action(
         &self,
         handle: &Handle,

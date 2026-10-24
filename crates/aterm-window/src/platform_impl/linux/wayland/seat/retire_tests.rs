@@ -4,8 +4,7 @@
 // Added by the aterm project in 2026 to its copy of winit 0.30.13
 // (see the repository NOTICE).
 
-//! LW.7's capability-removal race, live (d5f7317b01): a window's pointer and text input are
-//! destroyed on the loop's thread even when another thread holds them as their capability goes.
+//! Tests that a window's pointer and text input are destroyed on the event-loop thread on capability removal.
 
 use std::ffi::CString;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
@@ -23,7 +22,6 @@ use crate::platform_impl::wayland::window::Window;
 use crate::platform_impl::ActiveEventLoop as PlatformActiveEventLoop;
 use crate::window::WindowAttributes;
 
-/// A wait for what must happen: a hang detector, never a latency budget.
 const HANG: Duration = Duration::from_secs(60);
 
 struct Lane {
@@ -47,7 +45,6 @@ fn lane() -> Option<Lane> {
     }
 }
 
-/// Read the loop's state.
 fn with_state<R>(event_loop: &EventLoop<()>, read: impl FnOnce(&WinitState) -> R) -> R {
     #[allow(irrefutable_let_patterns)]
     let PlatformActiveEventLoop::Wayland(target) = &event_loop.window_target().p
@@ -57,7 +54,6 @@ fn with_state<R>(event_loop: &EventLoop<()>, read: impl FnOnce(&WinitState) -> R
     read(&target.state.borrow())
 }
 
-/// Turn the loop until `done` holds, within the hang detector.
 fn pump(event_loop: &mut EventLoop<()>, what: &str, mut done: impl FnMut(&EventLoop<()>) -> bool) {
     let t0 = Instant::now();
     loop {
@@ -94,8 +90,6 @@ struct Outcome {
     reaped_by_the_loop: bool,
 }
 
-/// One arm: a maximized window with the seat's keyboard and pointer on it, a second thread
-/// holding its pointer and text input while the seat's session ends.
 fn arm(lane: &Lane, retire: bool) -> Outcome {
     RETIRE.store(retire, Ordering::SeqCst);
     let mut event_loop =

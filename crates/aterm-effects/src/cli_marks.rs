@@ -47,17 +47,20 @@ pub enum CliMark {
     Gemini,
     /// xAI Grok.
     Grok,
+    /// Moonshot Kimi Code.
+    Kimi,
 }
 
 impl CliMark {
     /// All marks in declaration order.
-    pub const ALL: [CliMark; 6] = [
+    pub const ALL: [CliMark; 7] = [
         CliMark::Claude,
         CliMark::Codex,
         CliMark::Agy,
         CliMark::Muse,
         CliMark::Gemini,
         CliMark::Grok,
+        CliMark::Kimi,
     ];
 
     /// Look up the mark for a canonical lowercase CLI app id.
@@ -217,6 +220,7 @@ pub const fn brand(mark: CliMark) -> &'static Brand {
         CliMark::Muse => &MUSE,
         CliMark::Gemini => &GEMINI,
         CliMark::Grok => &GROK,
+        CliMark::Kimi => &KIMI,
     }
 }
 
@@ -341,12 +345,30 @@ const GROK: Brand = Brand {
     hd: Some(GROK_HD),
 };
 
+/// Kimi Code brand specification (`#38BDF8` sky-cyan).
+const KIMI: Brand = Brand {
+    word: "kimi",
+    alab_word: None,
+    name: Inks::both(&[0x38_BDF8]),
+    icon: Inks::both(&[0x38_BDF8]),
+    chars: b"Kk",
+    texels: &[Texel::Ink(0), Texel::Half(0)],
+    sd: KIMI_SD,
+    hd: Some(KIMI_HD),
+};
+
+const MAX_ICON_INKS: usize = 49;
+
 const _: () = {
     let mut m = 0;
     while m < CliMark::ALL.len() {
         let b = brand(CliMark::ALL[m]);
         assert!(b.texels.len() == b.chars.len());
-        assert!(b.icon.dark.len() == b.icon.paper.len() && !b.icon.dark.is_empty());
+        assert!(
+            b.icon.dark.len() == b.icon.paper.len()
+                && !b.icon.dark.is_empty()
+                && b.icon.dark.len() <= MAX_ICON_INKS
+        );
         let mut k = 0;
         while k < b.texels.len() {
             match b.texels[k] {
@@ -493,7 +515,12 @@ pub fn name_fg(mark: CliMark, letter: usize, ground: u32) -> u32 {
 pub fn icon_palette(mark: CliMark, ground: u32) -> Vec<FxInk> {
     let b = brand(mark);
     let inks = b.icon.on(dark_ground(ground));
-    let floored = |i: u8| floor_contrast_keeping_hue(inks[usize::from(i)], ground, ICON_CONTRAST);
+    let mut cache = [None::<u32>; MAX_ICON_INKS];
+    let mut floored = |i: u8| {
+        let idx = usize::from(i);
+        *cache[idx]
+            .get_or_insert_with(|| floor_contrast_keeping_hue(inks[idx], ground, ICON_CONTRAST))
+    };
     b.texels
         .iter()
         .map(|&t| match t {
@@ -766,6 +793,50 @@ const GROK_HD: &[&str] = &[
     "........gGGGGGGg........",
 ];
 
+/// Kimi Code's `K` glyph mark, SD 12×12.
+const KIMI_SD: &[&str] = &[
+    ".KKK....kKKK",
+    ".KKK...kKKK.",
+    ".KKK..kKKK..",
+    ".KKK.kKKK...",
+    ".KKKKKKk....",
+    ".KKKKKK.....",
+    ".KKKKKKk....",
+    ".KKK.kKKK...",
+    ".KKK..kKKK..",
+    ".KKK...kKKK.",
+    ".KKK....kKKK",
+    "............",
+];
+
+/// Kimi Code's `K` glyph mark, HD 24×24.
+const KIMI_HD: &[&str] = &[
+    "..KKKKKK........kKKKKKK.",
+    "..KKKKKK.......kKKKKKK..",
+    "..KKKKKK......kKKKKKK...",
+    "..KKKKKK.....kKKKKKK....",
+    "..KKKKKK....kKKKKKK.....",
+    "..KKKKKK...kKKKKKK......",
+    "..KKKKKK..kKKKKKK.......",
+    "..KKKKKK.kKKKKKK........",
+    "..KKKKKKKKKKKKK.........",
+    "..KKKKKKKKKKKK..........",
+    "..KKKKKKKKKKKK..........",
+    "..KKKKKKKKKKKKK.........",
+    "..KKKKKK.kKKKKKK........",
+    "..KKKKKK..kKKKKKK.......",
+    "..KKKKKK...kKKKKKK......",
+    "..KKKKKK....kKKKKKK.....",
+    "..KKKKKK.....kKKKKKK....",
+    "..KKKKKK......kKKKKKK...",
+    "..KKKKKK.......kKKKKKK..",
+    "..KKKKKK........kKKKKKK.",
+    "..KKKKKK.........kKKKKKK",
+    "........................",
+    "........................",
+    "........................",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1013,7 +1084,7 @@ mod tests {
     /// Every master is rectangular, holds only its declared chars, preserves its symmetry, and fits centred at integer scale.
     #[test]
     fn every_mark_is_crisp_and_centred() {
-        use CliMark::{Agy, Claude, Codex, Gemini, Grok, Muse};
+        use CliMark::{Agy, Claude, Codex, Gemini, Grok, Kimi, Muse};
         use Master::{Hd, Sd};
         for mark in CliMark::ALL {
             let b = brand(mark);
@@ -1049,36 +1120,42 @@ mod tests {
             ((7, 14), Muse, Sd, 1, (1, 1)),
             ((7, 14), Gemini, Sd, 1, (1, 1)),
             ((7, 14), Grok, Sd, 1, (1, 1)),
+            ((7, 14), Kimi, Sd, 1, (1, 1)),
             ((9, 23), Claude, Sd, 1, (2, 6)),
             ((9, 23), Codex, Sd, 1, (3, 5)),
             ((9, 23), Agy, Sd, 1, (3, 6)),
             ((9, 23), Muse, Sd, 1, (3, 5)),
             ((9, 23), Gemini, Sd, 1, (3, 5)),
             ((9, 23), Grok, Sd, 1, (3, 5)),
+            ((9, 23), Kimi, Sd, 1, (3, 5)),
             ((11, 21), Claude, Sd, 1, (4, 5)),
             ((11, 21), Codex, Sd, 1, (5, 4)),
             ((11, 21), Agy, Sd, 1, (5, 5)),
             ((11, 21), Muse, Sd, 1, (5, 4)),
             ((11, 21), Gemini, Sd, 1, (5, 4)),
             ((11, 21), Grok, Sd, 1, (5, 4)),
+            ((11, 21), Kimi, Sd, 1, (5, 4)),
             ((15, 28), Claude, Hd, 1, (1, 6)),
             ((15, 28), Codex, Hd, 1, (3, 2)),
             ((15, 28), Agy, Sd, 2, (3, 4)),
             ((15, 28), Muse, Hd, 1, (3, 2)),
             ((15, 28), Gemini, Hd, 1, (3, 2)),
             ((15, 28), Grok, Hd, 1, (3, 2)),
+            ((15, 28), Kimi, Hd, 1, (3, 2)),
             ((22, 42), Claude, Sd, 3, (1, 6)),
             ((22, 42), Codex, Sd, 3, (4, 3)),
             ((22, 42), Agy, Sd, 3, (4, 6)),
             ((22, 42), Muse, Sd, 3, (4, 3)),
             ((22, 42), Gemini, Sd, 3, (4, 3)),
             ((22, 42), Grok, Sd, 3, (4, 3)),
+            ((22, 42), Kimi, Sd, 3, (4, 3)),
             ((30, 56), Claude, Hd, 2, (2, 12)),
             ((30, 56), Codex, Hd, 2, (6, 4)),
             ((30, 56), Agy, Sd, 5, (0, 3)),
             ((30, 56), Muse, Hd, 2, (6, 4)),
             ((30, 56), Gemini, Hd, 2, (6, 4)),
             ((30, 56), Grok, Hd, 2, (6, 4)),
+            ((30, 56), Kimi, Hd, 2, (6, 4)),
         ];
         for ((cw, ch), mark, master, scale, (dx, dy)) in table {
             let f = fit(mark, cw, ch).unwrap_or_else(|| panic!("{mark:?} fits {cw}×{ch}"));

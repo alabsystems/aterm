@@ -87,6 +87,12 @@ impl World {
         self.keep = true;
     }
 
+    /// Remove the world when it drops after all: a [`World::keep`] taken
+    /// back once every program copied into it showed it ran.
+    pub const fn release(&mut self) {
+        self.keep = false;
+    }
+
     /// Put its `HOME` at a new `home` (made `0700`, with the world's shell profile).
     /// # Errors
     /// The folder already exists, or it or its profile could not be made.
@@ -1283,6 +1289,29 @@ mod band_tests {
         assert!(!reveal_pending(
             &row(" need=now").replace("title=t", "title=reveal=pending")
         ));
+    }
+}
+
+#[cfg(test)]
+mod world_tests {
+    use super::*;
+
+    /// A world kept stays when it drops, and one whose keep was released
+    /// (`predict-live`, once its shell's copy showed it ran) goes.
+    #[test]
+    fn a_released_world_goes_when_it_drops() {
+        let mut kept = World::new(CONFIG_OFF).expect("fresh private world");
+        let dir = kept.dir.clone();
+        kept.keep();
+        drop(kept);
+        assert!(dir.is_dir(), "kept");
+        std::fs::remove_dir_all(&dir).unwrap();
+        let mut released = World::new(CONFIG_OFF).expect("fresh private world");
+        let dir = released.dir.clone();
+        released.keep();
+        released.release();
+        drop(released);
+        assert!(!dir.exists(), "released");
     }
 }
 

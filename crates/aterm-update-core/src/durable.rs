@@ -1,10 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The crate's flushes, in one place: the boot sentinel's record before its rename, and
-//! its directory after it ([`crate::sentinel`]). Each finishes through aterm-durable:
-//! [`sync_all`] is its DURABLE arm, and [`finish`] picks between it and
-//! [`aterm_durable::ordered`].
+//! File and directory flush helpers backed by [`aterm_durable`].
 
 use aterm_durable::Flush;
 use std::fs::File;

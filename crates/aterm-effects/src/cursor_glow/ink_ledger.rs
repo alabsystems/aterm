@@ -428,11 +428,13 @@ impl InkLedger {
             let (qx1, qy1) = (qx0 + i32::from(q.w), qy0 + i32::from(q.h));
             let w = i32::from(q.w).max(1);
             let denom = (2 * w) as f32;
+            let flat = q.color == q.color2;
             let ends = [16u32, 8, 0].map(|sh| {
                 let a = ((q.color >> sh) & 0xff) as f32;
                 let b = ((q.color2 >> sh) & 0xff) as f32;
                 (a, b - a)
             });
+            let flat_c = [ends[0].0, ends[1].0, ends[2].0];
             let cwi_u = cwi as usize;
             for (k, &cell) in reached.iter().enumerate() {
                 let (cx0, cy0) = self.cell_origin(cell);
@@ -443,16 +445,28 @@ impl InkLedger {
                 }
                 let k_base = k * area + ((y0 - cy0) * cwi) as usize;
                 let y_span = (y1 - y0) as usize;
-                for x in x0..x1 {
-                    let m = (2 * (x - qx0) + 1) as f32;
-                    let t = m / denom;
-                    let c = ends.map(|(a, da)| a + da * t);
-                    let mut at = k_base + (x - cx0) as usize;
-                    for _ in 0..y_span {
-                        for (p, v) in px[at].iter_mut().zip(c) {
-                            *p += v;
+                if flat {
+                    let (rx0, rx1) = ((x0 - cx0) as usize, (x1 - cx0) as usize);
+                    for row in 0..y_span {
+                        let row_base = k_base + row * cwi_u;
+                        for px_cell in &mut px[row_base + rx0..row_base + rx1] {
+                            for (p, v) in px_cell.iter_mut().zip(flat_c) {
+                                *p += v;
+                            }
                         }
-                        at += cwi_u;
+                    }
+                } else {
+                    for x in x0..x1 {
+                        let m = (2 * (x - qx0) + 1) as f32;
+                        let t = m / denom;
+                        let c = ends.map(|(a, da)| a + da * t);
+                        let mut at = k_base + (x - cx0) as usize;
+                        for _ in 0..y_span {
+                            for (p, v) in px[at].iter_mut().zip(c) {
+                                *p += v;
+                            }
+                            at += cwi_u;
+                        }
                     }
                 }
             }

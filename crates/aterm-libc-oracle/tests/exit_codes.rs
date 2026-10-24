@@ -1,19 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The contract `targo --unverified verify libc` reads, on the cases that need
-//! no toolchain: a root with no oracle could not run (exit 3, and a
-//! `COULD NOT RUN: <reason>` line the ladder quotes), a stray flag is usage (2).
-//! What a real run finds is decided by the unit tests and, on every `verify
-//! libc` run, by the planted-defect controls.
+//! The contract `targo --unverified verify libc` reads.
 
 use std::ffi::OsStr;
 use std::time::Instant;
 
 use aterm_spec::wait::MUST_HAPPEN;
 
-/// Run the gate with `args`; its exit code and stdout. The wait is a hang
-/// detector: a wedged gate is killed (`SIGKILL`) and named.
 fn gate(args: &[&OsStr]) -> (Option<i32>, String) {
     let mut command = aterm_uds::spawnfd::command(env!("CARGO_BIN_EXE_aterm-libc-oracle"));
     command.args(args);

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `momentum-glow.lane-fidelity` v1 (design §10.4) calibrated on the corpus, and the early usefulness table (design §10.5).
+//! `momentum-glow.lane-fidelity` v1 corpus calibration and usefulness tests.
 
 use std::fmt::Write as _;
 use std::sync::Mutex;
@@ -39,7 +39,6 @@ fn corpus() -> Corpus {
     Corpus::generate().expect("generator v1's scenarios are admitted")
 }
 
-/// The corpus's lane items (every item but the golden trace), with their ids and splits.
 fn lane_items(c: &Corpus) -> Vec<(&str, CorpusSplit, &Scenario)> {
     c.items()
         .iter()
@@ -53,7 +52,6 @@ fn plan(split: Split, wake: Wake) -> SchedulePlan {
 
 const SHIPPED: Sched = Sched::Prebuilt(MomentumCode::Shipped);
 
-/// `sched` attached at `t0` and run through `s`, its log asserted to hold the run's calls.
 fn hosted_run(t0: Instant, sched: Sched, s: &Scenario) -> (LaneRun, MomentumHost) {
     let mut h = attached_for_lane(t0, sched);
     let r = run(&mut h, s, t0);
@@ -83,7 +81,6 @@ fn assert_same_run(what: &str, a: &LaneRun, b: &LaneRun) {
     assert_eq!(a.fnv(), b.fnv(), "{what}: digest");
 }
 
-/// A glow that draws the shipped engine's frames but answers the scheduler with a rigged wake, and optionally as always active.
 struct Rigged {
     g: MomentumGlow,
     always_active: bool,
@@ -119,7 +116,6 @@ impl Glow for Rigged {
     }
 }
 
-/// Re-runs the engine from rest over a run's calls and hands `each` every tick's instant, the next lane event, the state, the call and its glass encoding.
 fn intervals(r: &LaneRun, mut each: impl FnMut(u64, u64, &MomentumGlow, &MomentumEvent, &[u8])) {
     let s = r.scenario();
     let (origin, inputs, ticks) = (r.origin(), s.events(), r.ticks());
@@ -164,7 +160,6 @@ fn intervals(r: &LaneRun, mut each: impl FnMut(u64, u64, &MomentumGlow, &Momentu
     }
 }
 
-/// The glass encoding of a shipped tick at `s` ns on a copy of `g`, presenting `call`'s presentation.
 fn probe(origin: Instant, g: &MomentumGlow, call: &MomentumEvent, s: u64) -> Vec<u8> {
     let MomentumEvent::Tick { cur, geom, cfg, .. } = *call else {
         panic!("fixture: a tick call");
@@ -184,7 +179,6 @@ fn probe(origin: Instant, g: &MomentumGlow, call: &MomentumEvent, s: u64) -> Vec
     e.as_bytes().to_vec()
 }
 
-/// The contract's artifact is `momentum-glow.lane-fidelity` v1 described by its laws and bounds, and its pinned id differs from `NoStrandedLight`'s.
 #[test]
 fn the_lane_fidelity_artifact_names_its_laws() {
     let id = LaneFidelity::artifact();
@@ -221,10 +215,8 @@ fn the_lane_fidelity_artifact_names_its_laws() {
     );
 }
 
-/// The lane-fidelity contract's artifact digest, pinned.
 const LANE_FIDELITY_ID: &str = "d3fab71f2fcffd4b30d94a49b526527541efadb77a3a603beef09da7ad2c5b33";
 
-/// The shipped code passes lane fidelity on every lane item, bare, unattached and attached, and the attached log replays to the live head and passes `NoStrandedLight`.
 #[test]
 fn shipped_passes_lane_fidelity_on_every_item() {
     let t0 = Instant::now();
@@ -251,7 +243,6 @@ fn shipped_passes_lane_fidelity_on_every_item() {
     assert_eq!(judged, [16, 9], "every lane item of both splits");
 }
 
-/// Sleeping to the cold forecast strands no light, but lane fidelity fails it at `NoStepSlept` on every lane item except `held-105`, whose shipped lane never settles before the glow is cold.
 #[test]
 fn cold_only_fails_no_step_slept() {
     let t0 = Instant::now();
@@ -296,7 +287,6 @@ fn cold_only_fails_no_step_slept() {
     assert!(failed.contains(&"s0"));
 }
 
-/// A 100 ms poll fails `NoStepSlept` on every lane item, while a one-frame poll on `S0` passes lane fidelity and fails `NoStrandedLight`, so a plan must pass both.
 #[test]
 fn a_poll_past_a_frame_fails_no_step_slept() {
     let t0 = Instant::now();
@@ -326,7 +316,6 @@ fn a_poll_past_a_frame_fails_no_step_slept() {
     assert_eq!(law(&judged_log(&h).0), Some(WAKE_NO_LATER_THAN_CLEAR));
 }
 
-/// The shipped plan passes both contracts on every lane item, and runs the shipped lane call for call where the presentation moves only at keys.
 #[test]
 fn the_shipped_plan_lane_equals_shipped_on_every_item() {
     let t0 = Instant::now();
@@ -360,7 +349,6 @@ fn the_shipped_plan_lane_equals_shipped_on_every_item() {
     assert!(equal > 0 && moving > 0, "fixture: both kinds of item");
 }
 
-/// One probe covers an interval: between two lane events a shipped tick never returns to a frame it has left, so a probe that draws `p`'s frame means every instant before it does, on the shipped and cold-only lanes of every lane item.
 #[test]
 fn one_probe_covers_each_interval() {
     const SAMPLES: u64 = 48;
@@ -407,7 +395,6 @@ fn one_probe_covers_each_interval() {
     );
 }
 
-/// No plan changes the glow the judge re-runs: the planned host's state and frames are what the shipped host and a fresh engine reach over the recorded calls, so the judge's oracle never reads the candidate.
 #[test]
 fn no_plan_changes_the_glow_the_judge_reruns() {
     let t0 = Instant::now();
@@ -502,7 +489,6 @@ fn present() -> Presentation {
     Presentation::of(Some((3, 10)), &s0_geom(), &cfg(true))
 }
 
-/// The judge names the first failing law and its tick: `NoStepSlept` for the demonstration fault, `ClearedByEnd` for a run that ends lit, `LaneSettles` for a re-arm, an overrun or a hang.
 #[test]
 fn the_judge_names_the_first_failing_law() {
     let t0 = Instant::now();
@@ -526,7 +512,6 @@ fn the_judge_names_the_first_failing_law() {
         "NoStrandedLight fails the fault too"
     );
 
-    // Ends two and a half frames after a key: the glow is still lit.
     let early = Scenario::new(F, present(), vec![(0, key())], 2 * F + F / 2).expect("admitted");
     let r = run(&mut MomentumGlow::default(), &early, t0);
     assert_eq!(r.fault(), None);
@@ -577,7 +562,6 @@ fn the_judge_names_the_first_failing_law() {
     assert_eq!(cursor(&v), Some(r.ticks().len() - 1));
 }
 
-/// `NoStepSlept` does not judge a presentation change before the next tick: a plan that keeps the old cell on glass until its wake passes, and the lag earns it only a wasted tick.
 #[test]
 fn a_presentation_change_between_ticks_is_not_judged() {
     let t0 = Instant::now();
@@ -587,7 +571,6 @@ fn a_presentation_change_between_ticks_is_not_judged() {
     let base = Scenario::new(F, present(), keys.clone(), end).expect("admitted");
     let (plain, _) = hosted_run(t0, eager, &base);
     assert_eq!(law(&LaneFidelity::new().judge(&plain)), None);
-    // The slow-tail step tick: the longest settle wake to a tick that still draws light.
     let ticks = plain.ticks();
     let (p, w) = ticks
         .windows(2)
@@ -675,7 +658,6 @@ fn a_presentation_change_between_ticks_is_not_judged() {
     );
 }
 
-/// The plans of the usefulness grid, named.
 fn grid_plans() -> Vec<(String, SchedulePlan)> {
     let mut v = vec![("planned(SHIPPED_PLAN)".to_owned(), SHIPPED_PLAN)];
     for g in [0, 8_333, 16_667, 25_000, 33_334, 50_000, 100_000, 250_000] {
@@ -705,7 +687,6 @@ struct Cell {
     reproduced: bool,
 }
 
-/// `sched` (or, for `None`, the bare shipped engine) on `s`.
 fn cell(t0: Instant, sched: Option<Sched>, s: &Scenario) -> Cell {
     let (r, h) = match sched {
         Some(sched) => hosted_run(t0, sched, s),
@@ -726,7 +707,6 @@ fn cell(t0: Instant, sched: Option<Sched>, s: &Scenario) -> Cell {
     }
 }
 
-/// The golden trace replayed open loop through `sched`'s code: its ticks, the frames that differ from the glass, and `NoStrandedLight`'s verdict.
 fn golden(t0: Instant, sched: Sched) -> (u64, u64, Verdict) {
     let trace = MomentumTrace::decode(GOLDEN_TRACE).expect("the golden trace decodes");
     let read = trace.read(t0).expect("the golden trace reads");
@@ -767,7 +747,6 @@ fn golden(t0: Instant, sched: Sched) -> (u64, u64, Verdict) {
     (t, p, v)
 }
 
-/// The early usefulness table prints `T`, `P`, `Z` and both verdicts for each grid plan, and asserts only the calibration the contracts were fixed on.
 #[test]
 fn the_early_usefulness_table() {
     let t0 = Instant::now();

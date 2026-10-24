@@ -1,35 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Walk continuity census: neighboring lit cells along one input step forward by one walk step
-//! (`1/16` over the first sixteen cells, `WALK_LAY_RATE` after), with no dark gaps (`Hole`) and no
-//! recolouring across frames ([`walk_census::Snap::judge`], [`walk_census::recolours`]).
-//!
-//! A flag standing [`STANDING_FRAMES`] frames or more is a defect. Scenarios run on a primary-screen
-//! [`walk_census::Shell`] behind each [`Fold`] alongside captured Claude Code composer takes.
+//! Walk continuity census.
 
 use crate::walk_census::*;
 use aterm_effects::cursor_glow::InsertWidth;
 
-/// What a scenario types after a rest.
 const ON: &str = " and on it goes";
 
-/// A readline shell at 60 columns, keys 83 ms apart, each echoed 2 ms later.
 fn sh() -> Shell {
     Shell::new(60, 83, Echo::After(2))
 }
 
-/// The same shell echoing each key 20 ms (a frame) after it.
 fn sh20() -> Shell {
     Shell::new(60, 83, Echo::After(20))
 }
 
-/// The same shell framed at the GUI's real pacing.
 fn paced() -> Shell {
     Shell::with(60, 83, Echo::After(2), "$ ", true)
 }
 
-/// `text` typed, then the rest out.
 fn typed(mut s: Shell, text: &str) -> Shell {
     s.mark("type");
     s.type_str(text);
@@ -38,7 +28,6 @@ fn typed(mut s: Shell, text: &str) -> Shell {
     s
 }
 
-/// `text` typed, `edit` (labelled `label`), `then` typed, then the rest out.
 fn edited(
     mut s: Shell,
     text: &str,
@@ -57,19 +46,16 @@ fn edited(
     s
 }
 
-/// `text` typed, a rest of `ms`, then `then` typed.
 fn rested(s: Shell, text: &str, ms: u64, then: &str) -> Shell {
     edited(s, text, "rest", |s| s.idle(ms), then)
 }
 
-/// `n` Backspaces.
 fn bs(s: &mut Shell, n: usize) {
     for _ in 0..n {
         s.backspace();
     }
 }
 
-/// A lagging shell: echoes 60 ms behind 40 ms keys, across the fold.
 fn lagged(mut s: Shell) -> Shell {
     s.mark("type");
     s.type_lagged(&prose(90), 40, 60);
@@ -78,7 +64,6 @@ fn lagged(mut s: Shell) -> Shell {
     s
 }
 
-/// Three keys arrive across the margin in one frame, then typing continues.
 fn coalesced_fold(echo: u64) -> Shell {
     let mut s = Shell::new(60, 83, Echo::After(echo)).folding(Fold::Kernel);
     s.mark("type");
@@ -333,7 +318,6 @@ const SCENARIOS: &[(&str, fn() -> Shell)] = &[
     ("kernel-rest-rebirth-wrapped-echo20", || {
         rested(sh20().folding(Fold::Kernel), &prose(80), 2_500, ON)
     }),
-    // Rest right after a run's first key or fold glyph so no later key frame saw the run standing.
     ("one-key-rest-echo20", || {
         rested(sh20(), "t", 2_500, " and on")
     }),
@@ -346,7 +330,6 @@ const SCENARIOS: &[(&str, fn() -> Shell)] = &[
     }),
 ];
 
-/// A captured Claude Code take on a 40×120 grid (7×14 px cells, composer rows 33..=37, two-cell indent).
 const fn claude(name: &'static str, src: &'static str, pause: Option<(usize, u64)>) -> Capture {
     Capture {
         name,
@@ -363,7 +346,6 @@ const fn claude(name: &'static str, src: &'static str, pause: Option<(usize, u64
 
 const WRAP_END: &str = include_str!("fixtures/claude-wrap-2026-09-23-end.ptylog");
 
-/// Captured Claude Code composer takes replayed by the census.
 const CAPTURES: [Capture; 5] = [
     claude("claude-wrap-end-rest-row1", WRAP_END, Some((62, 2_500))),
     claude("claude-wrap-end-rest-row2", WRAP_END, Some((125, 2_500))),
@@ -380,7 +362,6 @@ const CAPTURES: [Capture; 5] = [
     ),
 ];
 
-/// Every scenario and capture lays a lit band with no standing flagged run ([`STANDING_FRAMES`]) and no recolour.
 #[test]
 fn census() {
     enum Run<'a> {

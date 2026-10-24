@@ -13,7 +13,6 @@ fn colors(scheme: &str) -> DemoColors {
     floored(scheme, 1.0)
 }
 
-/// `scheme`'s demo colours under the theme-pair floor `floor`.
 fn floored(scheme: &str, floor: f32) -> DemoColors {
     let scheme = aterm_types::scheme::builtin(scheme).expect("built-in scheme");
     DemoColors::new(
@@ -24,13 +23,11 @@ fn floored(scheme: &str, floor: f32) -> DemoColors {
     )
 }
 
-/// Both sessions paired with the marker of the event that inks slot 14.
 const SESSIONS: [(DemoSession, &[u8]); 2] = [
     (DemoSession::PowerShell, b"help"),
     (DemoSession::Zsh, b"link@"),
 ];
 
-/// Visible non-empty rows after running `tape` on an unwrapped grid.
 fn tape_text(tape: &[DemoEvent]) -> Vec<String> {
     let mut term = Terminal::new(64, 200);
     for event in tape {
@@ -50,7 +47,6 @@ fn tape_text(tape: &[DemoEvent]) -> Vec<String> {
         .collect()
 }
 
-/// Forget this thread's tape, so the next frame is built cold.
 fn cold() {
     TAPE.with_borrow_mut(|slot| *slot = None);
 }
@@ -64,7 +60,6 @@ fn palette_with_slot4(color: Rgb) -> TerminalConfig {
     }
 }
 
-/// Rebasing the baseline recolours parsed palette cells without replaying the tape.
 #[test]
 fn rebase_recolours_parsed_palette_cells() {
     let before = Rgb::new(0x11, 0x22, 0xcc);
@@ -133,7 +128,6 @@ impl Inked {
         inked
     }
 
-    /// What the tape never inks, by name.
     fn missing(&self) -> Vec<String> {
         let mut missing = self
             .slots
@@ -346,7 +340,6 @@ fn no_event_exceeds_256_bytes() {
     assert_eq!(DEMO_LOOP_MS, DemoSession::PLATFORM.loop_ms());
 }
 
-/// The demo plays this platform's shell (PowerShell on Windows, zsh elsewhere).
 #[test]
 fn the_demo_plays_this_platforms_shell() {
     assert_eq!(
@@ -412,7 +405,6 @@ fn the_demo_plays_this_platforms_shell() {
     );
 }
 
-/// The contrast of the drawn cells of the first `word` in `input`.
 fn word_contrast(input: &RenderInput, word: &str) -> f32 {
     let (row, col) = input
         .cells
@@ -428,7 +420,6 @@ fn word_contrast(input: &RenderInput, word: &str) -> f32 {
     crate::native_appearance::contrast_ratio(cell.fg, cell.bg)
 }
 
-/// The demo holds theme-pair badges to the terminal's contrast floor.
 #[test]
 fn the_demo_holds_theme_pairs_to_the_terminals_floor() {
     let settled = u64::from(DEMO_TAPE[DEMO_SETTLED_EVENT].at_ms);
@@ -500,7 +491,6 @@ fn the_memo_hits_and_misses() {
     assert!(!Arc::ptr_eq(&first, &other), "a new theme is a new frame");
 }
 
-/// Demo window bounds (520 × 300 at the origin).
 const DEMO_RECT: crate::native_ui::LogicalRect =
     crate::native_ui::LogicalRect::new(0.0, 0.0, 520.0, 300.0);
 
@@ -515,7 +505,6 @@ fn demo_roles() -> crate::settings::Roles {
     crate::native_appearance::NativeRoles::from_theme(aterm_render::Theme::default())
 }
 
-/// Prims of `scheme`'s resting demo with `chrome` in `frame` (`None` for the platform frame).
 fn demo_prims(
     scheme: &str,
     chrome: aterm_messages::tokens::AuthoredChrome,
@@ -531,7 +520,6 @@ fn demo_prims(
     prims
 }
 
-/// The pixel at logical `(x, y)` of `prims` rasterized at `scale`.
 fn demo_pixels(prims: &[DrawPrim], scale: f32) -> impl Fn(f32, f32) -> [u8; 3] + use<> {
     let (pixels, width, _) =
         crate::tray_raster::rasterize_tray(prims, 520, 300, scale, [0, 0, 0, 255]);
@@ -578,7 +566,6 @@ const AUTHORED: aterm_messages::tokens::AuthoredChrome = aterm_messages::tokens:
     search_match: None,
 };
 
-/// The demo uses this platform's window frame (Windows 11 caption vs. window dots).
 #[test]
 fn the_demo_window_is_this_platforms() {
     assert_eq!(DemoFrame::PLATFORM == DemoFrame::Windows, cfg!(windows));
@@ -606,7 +593,6 @@ fn the_demo_window_is_this_platforms() {
     assert_eq!(format!("{prims:?}"), format!("{framed:?}"));
 }
 
-/// A Windows demo draws Windows 11 caption glyphs, shell tabs, and no window dots.
 #[test]
 fn a_windows_demo_is_a_windows_11_window() {
     let none = aterm_messages::tokens::AuthoredChrome::NONE;
@@ -677,7 +663,6 @@ fn a_windows_demo_is_a_windows_11_window() {
     );
 }
 
-/// The Windows strip fits tabs, `+`, and caption buttons across widths without overlap.
 #[test]
 fn a_windows_demo_strip_fits_every_width() {
     for width in [
@@ -713,7 +698,6 @@ fn a_windows_demo_strip_fits_every_width() {
     }
 }
 
-/// A Windows demo tab whose fill matches the ground opens into the grid across the seam.
 #[test]
 fn a_windows_demo_tab_opens_into_its_grid() {
     let ground = crate::settings::u32_rgb(colors("Dracula").theme.bg);
@@ -760,7 +744,6 @@ fn a_windows_demo_tab_opens_into_its_grid() {
     }
 }
 
-/// The tab strip paints the candidate's chrome tokens in both frames.
 #[test]
 fn the_demo_tab_strip_paints_chrome_tokens() {
     let paint = |chrome, frame: DemoFrame| {
@@ -800,7 +783,6 @@ fn the_demo_tab_strip_paints_chrome_tokens() {
     assert_eq!((tab, seam), (derived.active, derived.seam));
 }
 
-/// Every demo tab paints a whole authored title inside its bounds or none at all.
 #[test]
 fn a_demo_tab_says_a_whole_title_or_none() {
     use crate::native_appearance::{AppearancePreferences, install_preferences};

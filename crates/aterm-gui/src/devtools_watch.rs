@@ -43,6 +43,8 @@ pub(crate) struct DevToolsWatch {
     refreshed: bool,
     /// Whether a hand-over return read is currently in flight.
     prime_on_return: bool,
+    /// A verdict refresh waits for macOS's program check to catch up ([`Self::hold_prime`]).
+    prime_held: bool,
 }
 
 impl DevToolsWatch {
@@ -115,6 +117,16 @@ impl DevToolsWatch {
     /// Takes whether a verdict refresh is owed to macOS.
     pub(crate) fn take_refresh(&mut self) -> bool {
         std::mem::take(&mut self.refresh_owed)
+    }
+
+    /// Holds a verdict refresh asked for while macOS's program check is backed up: its prime would wait in the same line.
+    pub(crate) const fn hold_prime(&mut self) {
+        self.prime_held = true;
+    }
+
+    /// Takes whether a held verdict refresh waits ([`Self::hold_prime`]).
+    pub(crate) fn take_held_prime(&mut self) -> bool {
+        std::mem::take(&mut self.prime_held)
     }
 
     const fn owe_refresh(&mut self) {

@@ -2282,6 +2282,7 @@ impl crate::App {
         let mut clauses_moved: Vec<u64> = Vec::new();
         let mut program_done = Vec::new();
         let mut turns_moved = Vec::new();
+        let mut visited = Vec::new();
         let footer_wake = self.footer_log_wake();
         self.session_status.set_log_wake(&footer_wake);
         for (session, edged_visit) in sessions {
@@ -2291,6 +2292,7 @@ impl crate::App {
             if !edged_visit && !self.session_status.due(id, now) {
                 continue;
             }
+            visited.push(id);
             let (master, pid) = (session.master, session.pid);
             let latest_output_ns = session
                 .latest_output_activity_ns
@@ -2671,6 +2673,9 @@ impl crate::App {
         }
         for id in turns_moved {
             self.reopen_self_claim_landing(id);
+        }
+        for id in visited {
+            self.reconcile_self_claim_task(id);
         }
         for &id in &edged {
             self.prefetch_card_arts_for(id);

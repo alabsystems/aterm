@@ -29,7 +29,7 @@ pub mod kind {
         k >= CLASS && k <= CONSTRUCTOR
     }
 
-    /// Return `true` when `k` is a class member kind (`METHOD`, `STATIC`, `GETTER`, `CONSTRUCTOR`).
+    /// Return `true` when `k` is a class member kind.
     #[must_use]
     pub const fn is_member(k: u8) -> bool {
         matches!(k, METHOD | STATIC | GETTER | CONSTRUCTOR)
@@ -163,7 +163,6 @@ fn ty_part(ty: &str) -> String {
 }
 
 /// Generates the wasm export function and descriptor record for `e`.
-///
 /// # Errors
 /// More than 255 parameters, or a receiver where the kind takes none.
 pub fn export(e: &Export<'_>) -> Result<String, Error> {
@@ -271,7 +270,7 @@ pub fn export(e: &Export<'_>) -> Result<String, Error> {
     ))
 }
 
-/// Generates trait impls, the free export, and the descriptor record for an exported struct `name`.
+/// Generates trait impls.
 pub fn class(name: &str, docs: &str) -> String {
     let symbol = free_symbol(name);
     format!(

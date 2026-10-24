@@ -1603,6 +1603,90 @@ fn a_slice_one_tape_replays_unchanged() {
     assert_eq!(d.door.as_deref(), Some("host.occupancy_said"), "{d:?}");
 }
 
+/// A SLICE-1 TAPE OF A MANAGED WORKER'S LINE BEFORE ITS FIRST FOLD REPLAYS UNCHANGED (2.4's
+/// review): a prompt watch of a tasked worker whose due nudge comes before any fold, recorded as
+/// a build with no read of the record at the write recorded it (`ManagedUnread`), with slice 2's
+/// doors out of its header and off its tape, reproduces: the write reads the record only on a
+/// tape slice 2's doors recorded (`Session::managed_at_write`). This build's own recording reads
+/// it once and reproduces under its own header. NEGATIVE CONTROL: the unread tape under this
+/// build's header diverges, at the read it never recorded.
+#[test]
+fn a_slice_one_tape_of_a_managed_workers_early_line_replays_unchanged() {
+    use crate::supervise::occupancy::fault::{self, Fault};
+    use crate::supervise::tape::codec::Item;
+    use crate::supervise::tape::recover::recover;
+    use crate::supervise::tape::replay::{Options, replay};
+    use crate::supervise::tape::report::Verdict;
+    use crate::supervise::tape::testing::written;
+    use astream_effects::EffectRecord;
+
+    let record = |tag: &str| {
+        let (dir, ledger) = ledger_at(tag);
+        let board = Board::reading(OccupancyReading::default());
+        let mut opts = SuperviseOpts {
+            idle_host: Some(Arc::clone(&board) as Arc<dyn IdleHost>),
+            ledger: Some(ledger.clone()),
+            journal: Some(dir.join("journal.jsonl")),
+            tasks: Some(dir.join("tasks")),
+            ..hosted(35 * 60)
+        };
+        opts.policy.occupancy = Occupancy::Prompt;
+        let mut m = Mock::new(vec![break_screen()]);
+        m.stall_sleep = Some(Duration::from_secs(60));
+        m.task = Some((
+            1,
+            "state=working from=ctl since_ms=0 result_bytes=0".to_string(),
+        ));
+        let run = record_watch(&mut m, &opts, |s| {
+            s.set_approval_ledger(Some(ledger.clone()));
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        let header = run.header.encode();
+        let items = recover(&run.tape.reframed(&header)).items;
+        (header, items, m.task_requests)
+    };
+    let replayed = |header: &str, items: &[Item]| {
+        replay(&written(header, items), &Options::default()).expect("replayed")
+    };
+    let (header, items, reads) = record("door-managed-read-tape");
+    assert_eq!(reads, ["task"], "this build reads the record once");
+    let report = replayed(&header, &items);
+    assert_eq!(report.verdict, Verdict::Reproduced, "{}", report.render());
+
+    let (header, items, reads) =
+        fault::with(Fault::ManagedUnread, || record("door-managed-unread-tape"));
+    assert_eq!(
+        reads,
+        Vec::<String>::new(),
+        "the older build read no record"
+    );
+    let door_of = |i: &Item| match i.record() {
+        Some(EffectRecord::Exchange { door, .. } | EffectRecord::Emit { door, .. }) => {
+            Some(door.clone())
+        }
+        _ => None,
+    };
+    let older_items: Vec<Item> = items
+        .iter()
+        .filter(|i| door_of(i).is_none_or(|d| !SLICE2_DOORS.contains(&d.as_str())))
+        .cloned()
+        .collect();
+    let older = as_recorded(
+        &header,
+        Some(crate::supervise::occupancy::due::K_LOOKS),
+        true,
+    );
+    assert_ne!(older, header, "the header named slice 2's doors");
+    let report = replayed(&older, &older_items);
+    assert_eq!(report.verdict, Verdict::Reproduced, "{}", report.render());
+    let report = replayed(&header, &older_items);
+    assert!(
+        matches!(report.verdict, Verdict::Diverged(_)),
+        "CONTROL: this build's header reads the record: {}",
+        report.render()
+    );
+}
+
 /// A RAISED WORD REPLAYS UNDER THE K ITS TAPE NAMES: a watch whose nudge the autopilot holds,
 /// its K shortened by the setup, tells its host a ready-idle line, and its tape reproduces, every
 /// told word compared byte for byte at `host.occupancy_said`, under the `[setup]

@@ -417,6 +417,12 @@ impl VnodeFd {
     pub const fn char_device(&self) -> bool {
         self.mode & S_IFMT == S_IFCHR
     }
+
+    /// A terminal: a character device whose path names one ([`super::terminal_path`]).
+    #[must_use]
+    pub fn terminal(&self) -> bool {
+        self.char_device() && super::terminal_path(&self.path)
+    }
 }
 
 /// Decode a `vnode_fdinfowithpath`; `None` when `b` is shorter than the struct.

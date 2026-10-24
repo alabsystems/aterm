@@ -1,21 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE FACTS RING'S FILE (`docs/DESIGN-harness-occupancy-2026-10-20.md` §6):
-//! `<state>/occupancy/facts.ring`, as the window's facts board writes it at each minute's look
-//! ([`crate::occupancy_host::append_look`]). The ring's rows and what they count are the agent's pure
-//! part ([`aterm_agent::supervise::occupancy::ring`]); the file is the window's alone, so no
-//! look at the filesystem sits in the supervise loop's tree.
+//! THE FACTS RING'S FILE (`docs/DESIGN-harness-occupancy-2026-10-20.md` §6).
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use aterm_agent::supervise::occupancy::ring::{self, RING_ROWS, RingRow};
 
-/// THE RING'S FILE, as its one writer keeps it: each look's row appended and flushed in order
-/// ([`aterm_durable::ordered`]), and once it holds twice [`RING_ROWS`] the newest
-/// [`RING_ROWS`] written over it whole (staged and renamed), so it never grows past two days of
-/// looks and never loses the last one.
+/// THE RING'S FILE.
 #[derive(Debug)]
 pub(crate) struct RingFile {
     path: PathBuf,
@@ -60,8 +53,7 @@ impl RingFile {
             .unwrap_or_default()
     }
 
-    /// Append `row`, then trim to the newest [`RING_ROWS`] where the file holds twice that.
-    ///
+    /// Append `row`.
     /// # Errors
     /// The directory could not be made, or the append, the flush or the trim failed.
     pub(crate) fn append(&mut self, row: &RingRow) -> std::io::Result<()> {

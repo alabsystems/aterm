@@ -10,7 +10,7 @@ use aterm_core::render::{FxLayer, PxRect};
 use aterm_effects::cat_baker::ResolvedFills;
 use aterm_effects::harness_card::{
     CardFrame, CardFrames, CardPalette, CardScene, EPISODE_MS, FRAME_MS, HarnessCard, LineAt,
-    RIDE_MS, kitty_cols,
+    RIDE_MS, kitty_cols, line_star,
 };
 use aterm_effects::ripple::{FLOW_STEP_MS, GLINT_PERIOD_MS};
 use aterm_time::Instant;
@@ -714,7 +714,7 @@ fn draw_hi(img: &mut [u32], w: usize, fonts: &Fonts, s: &CardScene, g: &Ground, 
             draw_glyph(img, w, fonts, cell, ch, bold, ink, g.bg);
         }
     }
-    let star = inks.first().copied().unwrap_or(g.fg);
+    let (star, blend) = line_star(inks.first().copied().unwrap_or(g.fg), g.bg);
     let mask =
         aterm_render::procedural::deco_coverage(aterm_render::DecoGlyph::Star4, HI_CW, HI_CH);
     let (sx, sy) = (
@@ -728,7 +728,7 @@ fn draw_hi(img: &mut [u32], w: usize, fonts: &Fonts, s: &CardScene, g: &Ground, 
                 continue;
             }
             let px = &mut img[(sy + y) * w + sx + x];
-            *px = if g.dark {
+            *px = if blend == aterm_render::DecoBlend::Add {
                 aterm_render::add_sat(*px, aterm_render::premul_rgb(star, cov as u8))
             } else {
                 let a = (cov * u32::from(STAR_INK_ALPHA) / 255) as u8;

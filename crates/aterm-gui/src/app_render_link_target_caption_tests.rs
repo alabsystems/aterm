@@ -6,10 +6,8 @@ use std::time::Instant;
 use super::{App, ComposedCursorFxClock, WindowId};
 use crate::{reset_visible_leaf_plan_builds, term_lock, visible_leaf_plan_builds};
 
-/// OSC 8 phishing shape.
 const PHISH: &[u8] =
     b"Visit \x1b]8;;https://evil.example/steal\x1b\\google.com\x1b]8;;\x1b\\ for details";
-/// Column of the `g` in `google.com`.
 const LINK_COL: u16 = 6;
 const TARGET: &str = "https://evil.example/steal";
 
@@ -22,8 +20,6 @@ fn frame_rows(app: &App, wid: WindowId) -> Vec<String> {
         .collect()
 }
 
-/// Move the pointer to the centre of window cell `(row, col)` through the real motion path
-/// ([`super::pixel_to_term_cell`]).
 fn hover(app: &mut App, wid: WindowId, row: u16, col: u16) {
     let (cw, ch) = app.win_cell_size(wid);
     let strip_px = f64::from(app.tab_strip_rows) * ch as f64;
@@ -34,7 +30,6 @@ fn hover(app: &mut App, wid: WindowId, row: u16, col: u16) {
     app.on_cursor_moved(wid, x, y);
 }
 
-/// One frame, spliced in production order.
 fn compose(app: &mut App, wid: WindowId) -> Vec<String> {
     assert!(
         app.prepare_terminal_capture_grid_with_cursor_fx(
@@ -50,7 +45,6 @@ fn compose(app: &mut App, wid: WindowId) -> Vec<String> {
     frame_rows(app, wid)
 }
 
-/// Re-extract the grid into `input_scratch` and stop.
 fn extract_only(app: &mut App, wid: WindowId) {
     assert!(
         app.prepare_terminal_capture_grid_with_cursor_fx(
@@ -62,7 +56,6 @@ fn extract_only(app: &mut App, wid: WindowId) {
     );
 }
 
-/// Feed bytes to the window's front terminal without touching the pointer.
 fn feed(app: &App, wid: WindowId, bytes: &[u8]) {
     let term = app
         .front_terminal(wid)
@@ -72,7 +65,6 @@ fn feed(app: &App, wid: WindowId, bytes: &[u8]) {
     term_lock(&term).process(bytes);
 }
 
-/// The rows the find panel owns, as text.
 fn panel_rows(app: &App, wid: WindowId) -> Vec<String> {
     let hit = app.windows[&wid]
         .find_bar_hit
@@ -86,7 +78,6 @@ fn panel_rows(app: &App, wid: WindowId) -> Vec<String> {
         .collect()
 }
 
-/// Open find on `query` through the real entry point and run the real match over live content.
 fn find(app: &mut App, wid: WindowId, query: &str) {
     app.search_enter();
     app.windows
@@ -580,14 +571,12 @@ fn the_caption_reads_its_cached_destination_until_the_frame_moves() {
     );
 }
 
-/// Whether the composed present of window `wid` currently names `TARGET` on its caption row.
 fn captioned(app: &App, wid: WindowId) -> bool {
     frame_rows(app, wid)
         .last()
         .is_some_and(|row| row.contains(TARGET))
 }
 
-/// One frame through the production composed route.
 fn present_compose(app: &mut App, wid: WindowId, now: Instant) -> bool {
     let presented = app
         .redraw_compose(wid, 24, 80, false, false, None, 0, now)
@@ -599,7 +588,6 @@ fn present_compose(app: &mut App, wid: WindowId, now: Instant) -> bool {
     presented
 }
 
-/// Drive the composed route until it takes the RepaintKey early-out.
 fn settle_compose(app: &mut App, wid: WindowId, now: &mut Instant) {
     for _ in 0..40 {
         *now += std::time::Duration::from_millis(16);
@@ -610,11 +598,9 @@ fn settle_compose(app: &mut App, wid: WindowId, now: &mut Instant) {
     panic!("the fixture must reach a settled (skipping) state");
 }
 
-/// Two OSC 8 links on one row ([`OTHER`], [`OTHER_COL`]).
 const TWO_LINKS: &[u8] = b"Visit \x1b]8;;https://evil.example/steal\x1b\\google.com\x1b]8;;\x1b\\ \
     or \x1b]8;;https://other.example/\x1b\\bing.com\x1b]8;;\x1b\\";
 const OTHER: &str = "https://other.example/";
-/// Column of the `b` in `bing.com`.
 const OTHER_COL: u16 = 20;
 
 #[test]
@@ -979,7 +965,6 @@ fn a_keyboard_focus_move_under_a_still_pointer_re_derives_the_cell_before_the_wh
     }
 }
 
-/// The window pixel at the centre of strip column `col` (row 0 of a one-row strip).
 fn strip_px(app: &App, wid: WindowId, col: u16) -> (f64, f64) {
     let (cw, ch) = app.win_cell_size(wid);
     (

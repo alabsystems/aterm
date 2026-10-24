@@ -233,6 +233,23 @@ fn raw(f: &Fields, key: Key) -> &str {
     f.get_str(key).unwrap_or("-")
 }
 
+/// A task mark's ` fact=<word|-> fact_rev=<n>` (`task_record::TaskRecord::push_fact`): nothing
+/// before the fact word's first edit, and `-` for a word that does not read back as a closed
+/// [`aterm_agent::supervise::occupancy::FactWord`] (cleared, or a rule this build does not know).
+fn task_fact(f: &Fields) -> String {
+    let Some(rev) = f.get_u(Key::FactRev).filter(|rev| *rev > 0) else {
+        return String::new();
+    };
+    let word = match (f.get_word(Key::FactRule), f.get_u(Key::FactN)) {
+        (Some(rule), Some(n)) => {
+            aterm_agent::supervise::occupancy::FactWord::parse(&format!("{rule}#{n}"))
+        }
+        _ => None,
+    };
+    let word = word.map_or_else(|| "-".to_string(), |w| w.word());
+    format!(" fact={word} fact_rev={rev}")
+}
+
 /// THE GRAMMAR.
 pub(crate) fn rows_of(r: &Rec) -> Vec<(&'static str, String)> {
     let row = |k: &'static str, p: String| vec![(k, p)];
@@ -335,7 +352,9 @@ fn project_mark(r: &Rec) -> Option<(&'static str, String)> {
                 }
             ),
         ),
-        Kind::Act if r.src == aterm_slog::Src::Mark => (
+        // Only a self-claim's act (`SessionLog::self_claim_act`, the one writer of
+        // `harness_act=`) is a row; the harness's own `mark` act claims are none.
+        Kind::Act if r.src == aterm_slog::Src::Mark && f.get(Key::HarnessAct).is_some() => (
             crate::session_timeline::HARNESS_ACT,
             format!(
                 "act={} holder={}",
@@ -346,7 +365,7 @@ fn project_mark(r: &Rec) -> Option<(&'static str, String)> {
         Kind::Task => (
             "task-change",
             format!(
-                "rev={} state={} attention={}{}{}",
+                "rev={} state={} attention={}{}{}{}",
                 text(f, Key::Rev),
                 text(f, Key::State),
                 text(f, Key::Attention),
@@ -356,7 +375,8 @@ fn project_mark(r: &Rec) -> Option<(&'static str, String)> {
                 match f.get(Key::Code) {
                     Some(Val::I(c)) => format!(" exit={c}"),
                     _ => String::new(),
-                }
+                },
+                task_fact(f)
             ),
         ),
         Kind::Mail if f.get_word(Key::Dir) == Some("in") => (

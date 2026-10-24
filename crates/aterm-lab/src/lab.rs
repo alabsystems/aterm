@@ -6,7 +6,7 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aterm_uds::spawnfd::Stdio;
 
@@ -381,49 +381,167 @@ const BIN_RAN: &str = "bin/ran";
 /// Written in `relay/` once the relay copied there showed it ran.
 const RELAY_RAN: &str = "relay/ran";
 
-/// Whether a directory of copies of the lab's program may be removed
-/// ([`aterm_uds::deadline::FIRST_EXEC_HANG`]).
+/// The ad hoc signed clone of Claude Code a lab up with the clock runs
+/// ([`crate::clock::Layout`]).
+const CLOCK_CLONE: &str = "clock/claude";
+
+/// Written beside [`CLOCK_CLONE`] once it showed it ran: its version line at
+/// `up`.
+const CLOCK_RAN: &str = "clock/ran";
+
+/// Written beside [`CLOCK_CLONE`] before it is laid ([`crate::clock::lay`])
+/// and removed before `up` first starts it: a clone with it was never
+/// started and goes at once. One without it (an older lab's too) counts as
+/// started.
+pub(crate) const CLOCK_UNSTARTED: &str = "clock/unstarted";
+
+/// The holds on a lab's scratch, one directory each: a program the lab
+/// cloned into its scratch, held from before the clone until it showed it
+/// ran ([`hold_scratch`], [`release_scratch`]). The lab may start it until
+/// `down` ends the jail, so `down` stamps each hold left then
+/// ([`stamp_holds`]), and the scratch stays until every stamp is spent
+/// ([`scratch_may_go`]).
+pub(crate) const HELD: &str = "held";
+
+/// Hold the lab's scratch for a program about to be cloned into it and
+/// started (`name` names the clone).
+/// # Errors
+/// The hold could not be made.
+pub(crate) fn hold_scratch(run_dir: &Path, name: &str) -> std::io::Result<()> {
+    fs::create_dir_all(run_dir.join(HELD).join(name))
+}
+
+/// The program `name` [`hold_scratch`] held for showed it ran.
+pub(crate) fn release_scratch(run_dir: &Path, name: &str) {
+    let _ = fs::remove_dir_all(run_dir.join(HELD).join(name));
+}
+
+/// Stamp what `down` (or an `up` that aborted) keeps once its jail is ended,
+/// so nothing can start a program from it any more: each scratch hold
+/// ([`HELD`]), a started [`CLOCK_CLONE`] ([`CLOCK_UNSTARTED`]), the lab
+/// program's copies (`relay/`, `bin/`) and an older lab program's
+/// `twin-src/`, unproven and with no reading stamped yet (none, or a blank
+/// one a cut-short write left: [`aterm_uds::deadline::exec_stamp`]), takes
+/// the awake clock's reading now ([`aterm_uds::deadline::try_stamp_exec`]).
+/// A copy's mtime is when it was laid, and a launch can first exec the relay
+/// long after that. A later `down` leaves a reading as it is, so a hold is
+/// spent once. Whether every stamp was written: one that was not leaves its
+/// directory's age to its mtime, so that `down` keeps them all
+/// ([`sweep_copies`]).
+#[must_use]
+fn stamp_holds(run_dir: &Path) -> bool {
+    let clock = (run_dir.join(CLOCK_CLONE).exists() && !run_dir.join(CLOCK_UNSTARTED).exists())
+        .then(|| run_dir.join("clock"));
+    let copies = ["relay", "bin", "twin-src"]
+        .into_iter()
+        .map(|d| run_dir.join(d))
+        .filter(|d| d.exists());
+    let holds = fs::read_dir(run_dir.join(HELD))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path());
+    let mut stamped = true;
+    for dir in holds.chain(clock).chain(copies) {
+        if !dir.join(aterm_uds::deadline::RAN).exists()
+            && aterm_uds::deadline::exec_stamp(&dir).is_none()
+            && let Err(e) = aterm_uds::deadline::try_stamp_exec(&dir)
+        {
+            eprintln!(
+                "aterm-lab: cannot stamp {} ({e}): this down keeps it unspent, and a later \
+                 down that can stamp it starts its wait",
+                dir.display()
+            );
+            stamped = false;
+        }
+    }
+    stamped
+}
+
+/// Whether the lab's scratch may go at `now`: every hold on it ([`HELD`])
+/// released, or spent ([`copies_may_go`]) when no stamp failed
+/// (`unstamped`, [`stamp_holds`]).
+fn scratch_may_go(run_dir: &Path, unstamped: bool, now: std::time::SystemTime) -> bool {
+    fs::read_dir(run_dir.join(HELD))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .all(|e| !unstamped && copies_may_go(&e.path(), false, now))
+}
+
+/// Whether a directory of copies may be removed: one started from it showed
+/// it ran (`ran`, or its `ran` marker), or no assessment of a copy in it is
+/// still going at `now`: [`aterm_uds::deadline::FIRST_EXEC_HANG`] has passed
+/// since its exec stamp on the awake clock, or since the directory changed
+/// when it has none ([`aterm_uds::deadline::copy_may_go`]).
 fn copies_may_go(dir: &Path, ran: bool, now: std::time::SystemTime) -> bool {
-    let Ok(made) = fs::symlink_metadata(dir).and_then(|m| m.modified()) else {
-        return true;
-    };
-    ran || now
-        .duration_since(made)
-        .is_ok_and(|age| age >= aterm_uds::deadline::FIRST_EXEC_HANG)
+    ran || fs::symlink_metadata(dir).is_err() || aterm_uds::deadline::copy_may_go(dir, now)
 }
 
 /// The words for a directory of copies kept because none was shown to run.
-fn kept_copies(dir: &Path, verb: &str, tag: &str) -> String {
+pub(crate) fn kept_copies(dir: &Path, verb: &str, tag: &str) -> String {
     format!(
-        "KEPT {}: the lab's program copied there was started and never showed it ran, so macOS \
-         may still be assessing its first exec; {LAB} {verb} {tag} removes it once {} minutes \
-         have passed",
+        "KEPT {}: a program copied there was started and never showed it ran, so macOS may \
+         still be assessing its first exec; {LAB} {verb} {tag} removes it once {} minutes have \
+         passed",
         dir.display(),
         aterm_uds::deadline::FIRST_EXEC_HANG.as_secs() / 60
     )
 }
 
-/// Remove the directories of copies of the lab's program in `run_dir` that may go at `now`
-/// ([`copies_may_go`]); the ones kept.
-fn sweep_copies(run_dir: &Path, relay_ran: bool, now: std::time::SystemTime) -> Vec<PathBuf> {
+/// Remove the directories of copies in `run_dir` that may go at `now`
+/// ([`copies_may_go`]): the lab's program's (`relay/`, `bin/`), the clock's
+/// clone of Claude Code (`clock/`), an older lab program's twin probe
+/// (`twin-src/`), and the scratch with its holds ([`scratch_may_go`]); the
+/// ones kept. `unstamped`: a stamp [`stamp_holds`] owed was not written, so
+/// what it stamps stays unless shown to run or gone.
+fn sweep_copies(
+    run_dir: &Path,
+    relay_ran: bool,
+    unstamped: bool,
+    now: std::time::SystemTime,
+) -> Vec<PathBuf> {
+    let at = |d: &str| run_dir.join(d);
+    let clock_ran =
+        !at(CLOCK_CLONE).exists() || at(CLOCK_RAN).exists() || at(CLOCK_UNSTARTED).exists();
+    let stamped_may_go = |d: &str, ran: bool| {
+        let dir = at(d);
+        (ran || !unstamped || fs::symlink_metadata(&dir).is_err()) && copies_may_go(&dir, ran, now)
+    };
     let mut kept = Vec::new();
-    for (d, ran) in [
-        ("relay", relay_ran),
-        ("bin", run_dir.join(BIN_RAN).exists()),
+    for (d, may_go) in [
+        ("relay", stamped_may_go("relay", relay_ran)),
+        ("bin", stamped_may_go("bin", at(BIN_RAN).exists())),
+        ("clock", stamped_may_go("clock", clock_ran)),
+        ("twin-src", stamped_may_go("twin-src", false)),
+        (
+            "scratch",
+            fs::symlink_metadata(at("scratch")).is_err() || scratch_may_go(run_dir, unstamped, now),
+        ),
     ] {
-        let dir = run_dir.join(d);
-        if copies_may_go(&dir, ran, now) {
-            let _ = fs::remove_dir_all(&dir);
-        } else {
-            kept.push(dir);
+        if !may_go {
+            kept.push(at(d));
+            continue;
+        }
+        let _ = fs::remove_dir_all(at(d));
+        if d == "scratch" {
+            let _ = fs::remove_dir_all(at(HELD));
         }
     }
     kept
 }
 
-/// The end of `down`, once its scratch is gone ([`sweep_copies`]).
-fn clear_run_dir(run_dir: &Path, relay_ran: bool, tag: &str, now: std::time::SystemTime) {
-    let kept = sweep_copies(run_dir, relay_ran, now);
+/// The end of `down`, once its logs are kept: the copies that may go, the
+/// scratch among them ([`sweep_copies`]), the run directory's own files, then
+/// the directory.
+fn clear_run_dir(
+    run_dir: &Path,
+    relay_ran: bool,
+    unstamped: bool,
+    tag: &str,
+    now: std::time::SystemTime,
+) {
+    let kept = sweep_copies(run_dir, relay_ran, unstamped, now);
     for dir in &kept {
         eprintln!("aterm-lab: {}", kept_copies(dir, "down", tag));
     }
@@ -480,6 +598,8 @@ fn abort(run: &Run, pids: &[i32], msg: &str) -> Fail {
         let _ = fs::remove_dir_all(&run.sockdir);
     }
     if unproven {
+        // its wait runs from here; one that cannot be stamped is stamped by the next down or up
+        let _ = stamp_holds(&run.run);
         eprintln!("aterm-lab: {}", kept_copies(&run.run, "down", &run.tag));
     } else {
         let _ = fs::remove_dir_all(&run.run);
@@ -506,8 +626,12 @@ fn lifeline_flag() -> Vec<String> {
     vec![aterm_uds::lifeline::FLAG.to_string(), "0".to_string()]
 }
 
-/// How long a jailed child the lab started may take to say it is ready (its `--ready-fd` byte).
+/// How long a jailed child the lab started may go without progress before it says it is ready
+/// (its `--ready-fd` byte, or a window's answer): a hang detector, never a latency budget.
 const READY_HANG: Duration = Duration::from_secs(60);
+
+/// How often a wait for a starting child looks at its progress ([`while_starting`]).
+const READY_LOOK: Duration = Duration::from_secs(1);
 
 /// `sandbox-exec -f <jail> env -i <vars> <program…>` as a std `Command` ([`launch_ready`],
 /// [`launch_window`]).
@@ -545,8 +669,8 @@ fn jailed_command(
 
 /// A WINDOWED instance launched in the jail ([`jailed_command`]).
 /// # Errors
-/// The launch failed, the child ended before its socket answered, it did not answer within `hang`,
-/// or the run was interrupted (`interrupted`).
+/// The launch failed, the child ended before its socket answered, it made no progress for `hang`
+/// before it answered, or the run was interrupted (`interrupted`).
 fn launch_window(
     run: &Run,
     vars: &[(String, String)],
@@ -562,35 +686,65 @@ fn launch_window(
     *pid = procs::keep_forked(child);
     let door = Door::new(run)?;
     let child = *pid;
-    until_answered(
-        || door.ctl(&["version"]).is_ok_and(|r| r.code == 0),
-        || alive(child),
+    while_starting(
+        || {
+            if door.ctl(&["version"]).is_ok_and(|r| r.code == 0) {
+                Ok(true)
+            } else if alive(child) {
+                Ok(false)
+            } else {
+                Err("the window's instance ended before its control socket answered".into())
+            }
+        },
+        || progress_of(child, out),
         hang,
-        || stop::sleep(Duration::from_millis(250)).map_err(|_| "interrupted".to_string()),
+        Instant::now(),
+        || {
+            stop::sleep(Duration::from_millis(250)).map_err(|_| "interrupted".to_string())?;
+            Ok(Instant::now())
+        },
     )
 }
 
-/// A window's readiness ([`launch_window`]).
+/// A starting child's progress: its CPU time used plus the length of its output `out`.
+fn progress_of(pid: i32, out: &Path) -> u64 {
+    crate::sys::cpu_used(pid)
+        .unwrap_or(0)
+        .saturating_add(fs::metadata(out).map_or(0, |m| m.len()))
+}
+
+/// A starting child's readiness, waited for as a hang detector on its `progress`.
 /// # Errors
-/// The child ended before an answer, nothing answered within `hang`, or `pause` failed.
-fn until_answered(
-    mut answers: impl FnMut() -> bool,
-    mut alive: impl FnMut() -> bool,
+/// The child ended before it was ready, it made no progress for `hang`, or `pause` failed.
+fn while_starting(
+    mut look: impl FnMut() -> Result<bool, String>,
+    mut progress: impl FnMut() -> u64,
     hang: Duration,
-    mut pause: impl FnMut() -> Result<(), String>,
+    start: Instant,
+    mut pause: impl FnMut() -> Result<Instant, String>,
 ) -> Result<(), String> {
-    let end = std::time::Instant::now() + hang;
+    let mut still: Option<(u64, Instant)> = None;
+    let mut now = start;
     loop {
-        if answers() {
+        if look()? {
             return Ok(());
         }
-        if !alive() {
-            return Err("the window's instance ended before its control socket answered".into());
+        let moved = progress();
+        let since = match still {
+            Some((seen, since)) if seen == moved => since,
+            _ => {
+                still = Some((moved, now));
+                now
+            }
+        };
+        if now.saturating_duration_since(since) >= hang {
+            return Err(format!(
+                "said nothing and made no progress (no CPU time used, no output written) for {} s: \
+                 the hang detector",
+                hang.as_secs()
+            ));
         }
-        if std::time::Instant::now() >= end {
-            return Err("its control socket did not answer within the hang detector".into());
-        }
-        pause()?;
+        now = pause()?;
     }
 }
 
@@ -605,8 +759,9 @@ pub(crate) fn opts_refused(o: &UpOpts) -> Option<&'static str> {
 /// `sandbox-exec -f <jail> env -i <vars> <program…>` ([`procs::keep_forked`]).
 /// # Errors
 /// The launch failed, or the child closed its ready signal with nothing said (it exited, or it
-/// has nothing to offer), said nothing within `hang` (the hang detector: [`READY_HANG`], or the
-/// first-exec hang for a fresh copy), or the run was interrupted (`interrupted`).
+/// has nothing to offer), made no progress for `hang` before its byte (the hang detector:
+/// [`READY_HANG`], or the first-exec hang for a fresh copy), or the run was interrupted
+/// (`interrupted`).
 pub(crate) fn launch_ready(
     run: &Run,
     vars: &[(String, String)],
@@ -623,36 +778,25 @@ pub(crate) fn launch_ready(
         .spawn()
         .map_err(|e| format!("cannot start {}: {e}", program.join(" ")))?;
     *pid = procs::keep_forked(child);
-    let said = std::sync::Arc::new(std::sync::Mutex::new(None));
-    let slot = std::sync::Arc::clone(&said);
-    std::thread::spawn(move || {
-        let got = ready.wait(hang);
-        *slot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(got);
-        stop::ring();
-    });
-    stop::wait_until(hang + Duration::from_secs(1), || {
-        said.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some()
-    })
-    .map_err(|_| "interrupted".to_string())?;
-    let got = said
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take();
-    match got {
-        Some(aterm_agent::ready::Signal::Ready) => Ok(()),
-        Some(aterm_agent::ready::Signal::Closed) => Err(format!(
-            "{} closed its ready signal with nothing said (it exited, or has nothing to offer)",
-            program.first().map_or("the child", String::as_str)
-        )),
-        Some(aterm_agent::ready::Signal::Failed(e)) => Err(format!("the ready signal: {e}")),
-        Some(aterm_agent::ready::Signal::TimedOut) | None => {
-            Err("said nothing within the hang detector".to_string())
-        }
-    }
+    let child = *pid;
+    let name = program.first().map_or("the child", String::as_str);
+    while_starting(
+        || match ready.wait(READY_LOOK) {
+            aterm_agent::ready::Signal::Ready => Ok(true),
+            aterm_agent::ready::Signal::TimedOut => Ok(false),
+            aterm_agent::ready::Signal::Closed => Err(format!(
+                "{name} closed its ready signal with nothing said (it exited, or has nothing to offer)"
+            )),
+            aterm_agent::ready::Signal::Failed(e) => Err(format!("the ready signal: {e}")),
+        },
+        || progress_of(child, out),
+        hang,
+        Instant::now(),
+        || {
+            stop::check().map_err(|_| "interrupted".to_string())?;
+            Ok(Instant::now())
+        },
+    )
 }
 
 /// `path` opened for appending, twice.
@@ -858,7 +1002,8 @@ pub(crate) fn names_this_lab(run: &Run, pid: i32) -> bool {
     }
 }
 
-/// Whether `up` may make the lab `run` names at `now` ([`sweep_copies`]).
+/// Whether `up` may make the lab `run` names at `now`: what an earlier lab of
+/// the tag left is stamped ([`stamp_holds`]) and swept ([`sweep_copies`]).
 /// # Errors
 /// Why the tag cannot come up now.
 fn room_for(run: &Run, now: std::time::SystemTime) -> Result<(), Fail> {
@@ -869,7 +1014,8 @@ fn room_for(run: &Run, now: std::time::SystemTime) -> Result<(), Fail> {
             run.run.display()
         )));
     }
-    match sweep_copies(&run.run, relay_shown_running(run), now).first() {
+    let unstamped = !stamp_holds(&run.run);
+    match sweep_copies(&run.run, relay_shown_running(run), unstamped, now).first() {
         Some(dir) => Err(Fail::die(format!(
             "lab '{tag}' cannot come up yet: {}",
             kept_copies(dir, "up", tag)
@@ -1175,7 +1321,22 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
             aterm.display()
         )));
     }
+    let clone = Path::new(&run.claude_bin) == run.run.join(CLOCK_CLONE);
+    // the clock's clone counts as started from here on
+    if clone
+        && let Err(e) = fs::remove_file(run.run.join(CLOCK_UNSTARTED))
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        let _ = down(&run.tag, false);
+        return Err(Fail::die(format!(
+            "cannot clear {}: {e}",
+            run.run.join(CLOCK_UNSTARTED).display()
+        )));
+    }
     run.claude_ver = jailed_version(&run, &run.claude_bin, |l| l.split_whitespace().next());
+    if run.claude_ver != "?" && clone {
+        let _ = fs::write(run.run.join(CLOCK_RAN), "");
+    }
     if !run.codex_bin.is_empty() {
         run.codex_ver = codex_version(&run, &run.codex_bin);
     }
@@ -1334,7 +1495,8 @@ pub fn cmd_up(args: &[String]) -> Res {
     Ok(0)
 }
 
-/// Take a lab down: everything in the lab's jail ended.
+/// Take a lab down: everything in the lab's jail ended, the logs kept, and the scratch removed
+/// once no hold keeps it ([`sweep_copies`]).
 /// # Errors
 /// No such lab, or an `env.sh` whose scratch is not its own.
 pub fn down(tag: &str, keep_dumps: bool) -> Result<PathBuf, Fail> {
@@ -1389,6 +1551,7 @@ pub fn down(tag: &str, keep_dumps: bool) -> Result<PathBuf, Fail> {
         let l: Vec<String> = left.iter().map(ToString::to_string).collect();
         eprintln!("aterm-lab: still in the jail after KILL: {}", l.join(" "));
     }
+    let unstamped = !stamp_holds(&r.run);
     if alive(r.sampler_pid) {
         let _ = crate::sys::kill(r.sampler_pid, libc::SIGTERM);
         let end = std::time::Instant::now() + Duration::from_secs(2);
@@ -1500,10 +1663,16 @@ pub fn down(tag: &str, keep_dumps: bool) -> Result<PathBuf, Fail> {
     if r.sockdir.starts_with("/tmp/at.") {
         let _ = fs::remove_dir_all(&r.sockdir);
     }
-    for d in ["scratch", "shim", "gbin", "twin-src", "clock"] {
+    for d in ["shim", "gbin"] {
         let _ = fs::remove_dir_all(r.run.join(d));
     }
-    clear_run_dir(&r.run, relay_ran, tag, std::time::SystemTime::now());
+    clear_run_dir(
+        &r.run,
+        relay_ran,
+        unstamped,
+        tag,
+        std::time::SystemTime::now(),
+    );
     Ok(keep)
 }
 
@@ -2604,34 +2773,62 @@ mod tests {
     }
 
     #[test]
-    fn a_window_is_ready_once_its_socket_answers_and_never_on_a_dead_child_or_a_hang() {
-        let asks = std::cell::Cell::new(0u32);
-        let answered = until_answered(
+    fn a_starting_child_is_waited_for_while_it_makes_progress() {
+        let t0 = Instant::now();
+        let s = |n: u64| t0 + Duration::from_secs(n);
+        let looks = std::cell::Cell::new(0u64);
+        let clock = std::cell::Cell::new(0u64);
+        let tick = || {
+            clock.set(clock.get() + 1);
+            Ok(s(clock.get()))
+        };
+        let answered = while_starting(
             || {
-                asks.set(asks.get() + 1);
-                asks.get() == 3
+                looks.set(looks.get() + 1);
+                Ok(looks.get() == 3)
             },
-            || true,
+            || 0,
             READY_HANG,
-            || Ok(()),
+            t0,
+            tick,
         );
         assert_eq!(answered, Ok(()));
-        assert_eq!(asks.get(), 3);
-        assert_eq!(
-            until_answered(|| true, || false, READY_HANG, || Ok(())),
-            Ok(())
-        );
-        let e = until_answered(|| false, || false, READY_HANG, || Ok(())).expect_err("dead");
-        assert!(
-            e.contains("ended before its control socket answered"),
-            "{e}"
-        );
-        let e = until_answered(|| false, || true, Duration::ZERO, || Ok(())).expect_err("hang");
-        assert!(e.contains("hang detector"), "{e}");
-        let e = until_answered(
-            || false,
-            || true,
+        assert_eq!(looks.get(), 3);
+        let e = while_starting(|| Err("ended".into()), || 0, READY_HANG, t0, || Ok(t0))
+            .expect_err("ended");
+        assert_eq!(e, "ended");
+        // Starved: ready at the 300th second, its CPU time moving every 30 s.
+        clock.set(0);
+        let started = while_starting(
+            || Ok(clock.get() >= 300),
+            || clock.get() / 30,
             READY_HANG,
+            t0,
+            tick,
+        );
+        assert_eq!(started, Ok(()), "a starved start is no hang");
+        // The negative control: the same start whose progress stood still from the 100th
+        // second is a hang at the 160th.
+        clock.set(0);
+        let e = while_starting(
+            || Ok(clock.get() >= 300),
+            || clock.get().min(100),
+            READY_HANG,
+            t0,
+            tick,
+        )
+        .expect_err("hang");
+        assert!(e.contains("made no progress"), "{e}");
+        assert_eq!(
+            clock.get(),
+            160,
+            "the hang is named a minute after the last move"
+        );
+        let e = while_starting(
+            || Ok(false),
+            || 0,
+            READY_HANG,
+            t0,
             || Err("interrupted".to_string()),
         )
         .expect_err("interrupted");
@@ -2696,6 +2893,12 @@ mod tests {
             let failed = abort(&run, &[], "x");
             assert_eq!(failed.msg.as_deref(), Some("x"), "{what}");
             assert_eq!(run.run.join(BIN).is_file(), kept, "{what}");
+            let stamp = aterm_uds::deadline::exec_stamp(&run.run.join("bin"));
+            assert_eq!(
+                stamp.is_some(),
+                kept,
+                "{what}: its wait runs from the abort"
+            );
             let _ = fs::remove_dir_all(root.path().join("runs"));
         }
     }
@@ -2747,14 +2950,239 @@ mod tests {
         ] {
             let (run, made) = torn_down(root.path(), bin_ran, relay);
             let state = run.run.parent().and_then(Path::parent).unwrap();
-            clear_run_dir(&run.run, relay_ran, &run.tag, made);
+            clear_run_dir(&run.run, relay_ran, false, &run.tag, made);
             assert!(!run.run.join("jail.sb").exists(), "{what}");
             assert_eq!(run.run.join("env.sh").is_file(), kept, "{what}");
             let listed = if kept { vec![run.tag.clone()] } else { vec![] };
             assert_eq!(all_runs(state), listed, "{what}");
             if kept {
-                clear_run_dir(&run.run, relay_ran, &run.tag, past_the_hang(made));
+                clear_run_dir(&run.run, relay_ran, false, &run.tag, past_the_hang(made));
             }
+            assert!(!run.run.exists(), "{what}: the later down finished");
+        }
+    }
+
+    /// A DOWN KEEPS A SCRATCH A CLONE IN IT HOLDS: a build the lab cloned
+    /// into its scratch (agy-upgrade's, muse-upgrade's, twin's) that never
+    /// showed it ran keeps the scratch and `env.sh` past any wall time, its
+    /// hold stamped on the awake clock once `down` ended the jail; a later
+    /// `down` keeps that stamp, and goes on a restart since it. NEGATIVE
+    /// CONTROL: a build shown to run released its hold, and the scratch goes.
+    #[test]
+    fn a_down_keeps_a_scratch_a_clone_that_never_showed_it_ran_holds() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        for (what, proven, kept) in [
+            ("never showed it ran", false, true),
+            ("showed it ran", true, false),
+        ] {
+            let (run, made) = torn_down(root.path(), true, false);
+            fs::create_dir_all(&run.w).unwrap();
+            hold_scratch(&run.run, "agy-1").unwrap();
+            if proven {
+                release_scratch(&run.run, "agy-1");
+            }
+            assert!(stamp_holds(&run.run), "{what}");
+            clear_run_dir(&run.run, false, false, &run.tag, past_the_hang(made));
+            assert_eq!(run.w.is_dir(), kept, "{what}");
+            assert_eq!(run.run.join("env.sh").is_file(), kept, "{what}");
+            if kept {
+                let stamp = run.run.join(HELD).join("agy-1/exec");
+                // above any reading the awake clock gives now: a restart since
+                let restart = u64::MAX.to_string();
+                fs::write(&stamp, &restart).unwrap();
+                assert!(stamp_holds(&run.run), "{what}");
+                assert_eq!(fs::read_to_string(&stamp).unwrap(), restart, "{what}");
+                clear_run_dir(&run.run, false, false, &run.tag, made);
+            }
+            assert!(!run.run.exists(), "{what}: the scratch and its holds went");
+        }
+    }
+
+    /// THE CLOCK'S CLONE OF CLAUDE CODE STAYS UNTIL IT SHOWED IT RAN: a
+    /// `clock/` whose clone was started and printed no version line at `up`
+    /// (an older lab's, with no mark at all, too) is kept past any wall time,
+    /// stamped once `down` ended the jail. NEGATIVE CONTROL: with its version
+    /// line recorded, with its mark that it was never started, or with no
+    /// clone, it goes unstamped, at once.
+    #[test]
+    fn the_clocks_clone_stays_until_it_showed_it_ran() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        for (what, clone, mark, kept) in [
+            ("its clone printed nothing", true, None, true),
+            ("it printed its version", true, Some(CLOCK_RAN), false),
+            ("it was never started", true, Some(CLOCK_UNSTARTED), false),
+            ("no clone", false, None, false),
+        ] {
+            let (run, made) = torn_down(root.path(), true, false);
+            fs::create_dir_all(run.run.join("clock")).unwrap();
+            if clone {
+                fs::write(run.run.join(CLOCK_CLONE), "a clone").unwrap();
+            }
+            if let Some(mark) = mark {
+                fs::write(run.run.join(mark), "").unwrap();
+            }
+            assert!(stamp_holds(&run.run), "{what}");
+            let stamp = run.run.join("clock").join(aterm_uds::deadline::EXEC_STAMP);
+            assert_eq!(stamp.is_file(), kept, "{what}");
+            let now = if kept { past_the_hang(made) } else { made };
+            clear_run_dir(&run.run, false, false, &run.tag, now);
+            assert_eq!(run.run.join(CLOCK_CLONE).is_file(), kept, "{what}");
+            assert_eq!(run.run.join("env.sh").is_file(), kept, "{what}");
+            let _ = fs::remove_dir_all(root.path().join("runs"));
+        }
+    }
+
+    /// AN UNPROVEN COPY AGES ON THE AWAKE CLOCK FROM ITS DOWN: the relay a
+    /// launch laid long before its first exec, the lab program's copy an
+    /// interrupted `up` left, and an older lab program's twin probe are
+    /// stamped once `down` ended the jail, so neither the time since they
+    /// were laid nor a sleep frees them; a later `down` keeps that stamp, and
+    /// each goes on a restart since it. NEGATIVE CONTROL: unstamped, its age
+    /// is its mtime's on the wall clock, and it goes.
+    #[test]
+    fn an_unproven_copy_ages_on_the_awake_clock_from_its_down() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        for (what, copy, stamped, kept) in [
+            ("a relay, stamped by its down", "relay/node", true, true),
+            ("a relay, never stamped", "relay/node", false, false),
+            ("the lab's copy, stamped by its down", BIN, true, true),
+            ("the lab's copy, never stamped", BIN, false, false),
+            (
+                "a twin probe, stamped by its down",
+                "twin-src/claude",
+                true,
+                true,
+            ),
+            (
+                "a twin probe, never stamped",
+                "twin-src/claude",
+                false,
+                false,
+            ),
+        ] {
+            let (run, made) = torn_down(root.path(), copy != BIN, copy == "relay/node");
+            let copy = run.run.join(copy);
+            let dir = copy.parent().unwrap().to_path_buf();
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(&copy, "a copy").unwrap();
+            if stamped {
+                assert!(stamp_holds(&run.run), "{what}");
+            }
+            clear_run_dir(&run.run, false, false, &run.tag, past_the_hang(made));
+            assert_eq!(copy.is_file(), kept, "{what}");
+            assert_eq!(run.run.join("env.sh").is_file(), kept, "{what}");
+            if kept {
+                let stamp = dir.join(aterm_uds::deadline::EXEC_STAMP);
+                // above any reading the awake clock gives now: a restart since
+                let restart = u64::MAX.to_string();
+                fs::write(&stamp, &restart).unwrap();
+                assert!(stamp_holds(&run.run), "{what}");
+                assert_eq!(fs::read_to_string(&stamp).unwrap(), restart, "{what}");
+                clear_run_dir(&run.run, false, false, &run.tag, made);
+            }
+            assert!(!run.run.exists(), "{what}: the copy went");
+        }
+    }
+
+    /// A STAMP `DOWN` COULD NOT WRITE KEEPS WHAT IT HOLDS: a scratch hold, a
+    /// started clock clone, an unproven copy of the lab's program (`relay/`,
+    /// `bin/`) or a twin probe whose stamp could not be written
+    /// (a full disk) keeps its directory and `env.sh` past any wall time,
+    /// since its mtime can predate its exec; a later `down` that can stamp it
+    /// starts its wait on the awake clock, and it goes on a restart since.
+    /// NEGATIVE CONTROL: by its mtime alone, each counts as spent.
+    #[test]
+    fn a_down_that_cannot_stamp_a_hold_keeps_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = aterm_tempfile::tempdir().unwrap();
+        for (what, held, kept) in [
+            ("a scratch hold", "held/agy-1", "scratch"),
+            ("the clock's clone", "clock", "clock"),
+            ("a twin probe", "twin-src", "twin-src"),
+            ("the relay", "relay", "relay"),
+            ("the lab's copy", "bin", "bin"),
+        ] {
+            let (run, made) = torn_down(root.path(), held != "bin", false);
+            fs::create_dir_all(&run.w).unwrap();
+            let dir = run.run.join(held);
+            fs::create_dir_all(&dir).unwrap();
+            if held != "held/agy-1" {
+                fs::write(dir.join("claude"), "a clone").unwrap();
+            }
+            let mode = |m| fs::set_permissions(&dir, fs::Permissions::from_mode(m)).unwrap();
+            mode(0o500);
+            let landed = stamp_holds(&run.run);
+            mode(0o700);
+            assert!(!landed, "{what}: the stamp was refused");
+            let past = past_the_hang(made);
+            assert!(copies_may_go(&dir, false, past), "{what}: control");
+            clear_run_dir(&run.run, false, true, &run.tag, past);
+            let kept = run.run.join(kept);
+            assert!(kept.is_dir(), "{what}: kept past any wall time");
+            assert!(run.run.join("env.sh").is_file(), "{what}");
+            assert!(stamp_holds(&run.run), "{what}: a later down stamps it");
+            clear_run_dir(&run.run, false, false, &run.tag, past);
+            assert!(kept.is_dir(), "{what}: its wait runs from that stamp");
+            // above any reading the awake clock gives now: a restart since
+            let restart = u64::MAX.to_string();
+            fs::write(dir.join(aterm_uds::deadline::EXEC_STAMP), restart).unwrap();
+            clear_run_dir(&run.run, false, false, &run.tag, made);
+            assert!(!run.run.exists(), "{what}: the later down finished");
+        }
+    }
+
+    /// A BLANK STAMP IS WRITTEN AGAIN: a scratch hold, a started clock clone,
+    /// an unproven copy of the lab's program or a twin probe whose stamp holds
+    /// no reading (a write cut short by a
+    /// full disk or a kill leaves it blank) takes the awake clock's reading at
+    /// the next `down`, so it stays past any wall time, and goes on a restart
+    /// since; one that `down` cannot write again counts as unstamped. NEGATIVE
+    /// CONTROL: a blank stamp leaves its age to its mtime, and it counts as
+    /// spent.
+    #[test]
+    fn a_down_writes_a_blank_stamp_again() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = aterm_tempfile::tempdir().unwrap();
+        for (what, held, kept) in [
+            ("a scratch hold", "held/agy-1", "scratch"),
+            ("the clock's clone", "clock", "clock"),
+            ("a twin probe", "twin-src", "twin-src"),
+            ("the relay", "relay", "relay"),
+            ("the lab's copy", "bin", "bin"),
+        ] {
+            let (run, made) = torn_down(root.path(), held != "bin", false);
+            fs::create_dir_all(&run.w).unwrap();
+            let dir = run.run.join(held);
+            fs::create_dir_all(&dir).unwrap();
+            if held != "held/agy-1" {
+                fs::write(dir.join("claude"), "a clone").unwrap();
+            }
+            let stamp = dir.join(aterm_uds::deadline::EXEC_STAMP);
+            fs::write(&stamp, "").unwrap();
+            let past = past_the_hang(made);
+            assert!(copies_may_go(&dir, false, past), "{what}: control");
+            let mode = |m| fs::set_permissions(&stamp, fs::Permissions::from_mode(m)).unwrap();
+            mode(0o400);
+            let landed = stamp_holds(&run.run);
+            mode(0o600);
+            assert!(
+                !landed,
+                "{what}: the blank stamp could not be written again"
+            );
+            assert!(stamp_holds(&run.run), "{what}");
+            assert!(
+                aterm_uds::deadline::exec_stamp(&dir).is_some(),
+                "{what}: written again"
+            );
+            clear_run_dir(&run.run, false, false, &run.tag, past);
+            assert!(
+                run.run.join(kept).is_dir(),
+                "{what}: kept past any wall time"
+            );
+            assert!(run.run.join("env.sh").is_file(), "{what}");
+            // above any reading the awake clock gives now: a restart since
+            fs::write(&stamp, u64::MAX.to_string()).unwrap();
+            clear_run_dir(&run.run, false, false, &run.tag, made);
             assert!(!run.run.exists(), "{what}: the later down finished");
         }
     }
@@ -2779,8 +3207,19 @@ mod tests {
             }
             assert!(room_for(&left, made).is_err(), "{what}: the tag waits");
             assert!(left.run.join(unproven).is_file(), "{what}: in place");
-            assert!(room_for(&left, past_the_hang(made)).is_ok(), "{what}");
-            assert!(gone(&left), "{what}: the hang past, the copies went");
+            let dir = left.run.join(unproven).parent().unwrap().to_path_buf();
+            assert!(
+                room_for(&left, past_the_hang(made)).is_err(),
+                "{what}: its wait runs on the awake clock from the up that stamped it"
+            );
+            // above any reading the awake clock gives now: a restart since
+            fs::write(
+                dir.join(aterm_uds::deadline::EXEC_STAMP),
+                u64::MAX.to_string(),
+            )
+            .unwrap();
+            assert!(room_for(&left, made).is_ok(), "{what}");
+            assert!(gone(&left), "{what}: the wait spent, the copies went");
             fs::remove_dir_all(&runs).unwrap();
         }
         let (proven, made) = torn_down(root.path(), true, true);

@@ -169,6 +169,9 @@ struct Mock {
     idle_after: VecDeque<Duration>,
     cursor_col: Option<usize>,
     attention: Option<String>,
+    attention_replies: VecDeque<CtlReply>,
+    supervisor_owner: Option<String>,
+    stop_on_meta: Option<(usize, Arc<AtomicBool>)>,
     foreign_attention: Option<String>,
     cwd: Option<String>,
     pub agent_cwd: Option<String>,
@@ -734,6 +737,9 @@ impl Mock {
             dead_after_turns: None,
             cursor_col: None,
             attention: None,
+            attention_replies: VecDeque::new(),
+            supervisor_owner: None,
+            stop_on_meta: None,
             foreign_attention: None,
             cwd: std::fs::canonicalize(std::env::temp_dir())
                 .ok()
@@ -966,10 +972,11 @@ impl Mock {
         let autopilot = self
             .autopilot
             .map_or_else(String::new, |w| format!(" autopilot={w}"));
+        let supervisor = self.supervisor_owner.as_deref().unwrap_or("-");
         format!(
             "OK title=- user_title=- description=- icon=- role=- attention={attention} \
              cwd={cwd} state=alive attention_owner={owner} attention_owners={owners} \
-             attention_kinds={kinds} supervisor=-{questions} agent_cwd={agent_cwd} \
+             attention_kinds={kinds} supervisor={supervisor}{questions} agent_cwd={agent_cwd} \
              trusted_cwd={trusted_cwd}{autopilot}\n"
         )
     }
@@ -2612,6 +2619,11 @@ impl Mock {
                 .unwrap_or_else(|| err("unknown verb (try: help)"))),
             "meta" if tail.is_empty() => {
                 self.metas += 1;
+                if let Some((at, stop)) = &self.stop_on_meta
+                    && self.metas == *at
+                {
+                    stop.store(true, Ordering::SeqCst);
+                }
                 for &(n, word) in &self.questions_at {
                     if self.metas == n {
                         self.questions = word;
@@ -2678,7 +2690,11 @@ impl Mock {
                 if tail.first() == Some(&"set") && tail.get(1) == Some(&"attention") {
                     self.attentions += 1;
                 }
-                let r = self.replies.pop_front().unwrap_or_else(|| ok("OK\n"));
+                let r = (tail.get(2) == Some(&"owner=supervisor"))
+                    .then(|| self.attention_replies.pop_front())
+                    .flatten()
+                    .or_else(|| self.replies.pop_front())
+                    .unwrap_or_else(|| ok("OK\n"));
                 if r.ok() && tail.get(1) == Some(&"attention") {
                     let keyed = tail.get(2) == Some(&"owner=supervisor");
                     let kinded = keyed && tail.get(3).is_some_and(|t| t.starts_with("kind="));
@@ -2769,6 +2785,18 @@ impl Mock {
         if words.len() >= 3 && words[0] == "meta" && words[2] == "supervisor" {
             self.claims.push(args.join(" "));
             let r = self.claim_replies.pop_front().unwrap_or_else(|| ok("OK\n"));
+            if r.ok() {
+                if words.get(1) == Some(&"set") {
+                    self.supervisor_owner = words.get(3).map(|h| (*h).to_string());
+                } else if words.get(1) == Some(&"unset")
+                    && words
+                        .get(3)
+                        .and_then(|h| h.strip_prefix("holder="))
+                        .is_none_or(|h| self.supervisor_owner.as_deref() == Some(h))
+                {
+                    self.supervisor_owner = None;
+                }
+            }
             self.order.push((args.join(" "), r.ok()));
             return Ok(r);
         }
@@ -3959,7 +3987,7 @@ impl Ctl for MarkFake {
 
 #[test]
 fn a_refused_act_mark_latches_the_rest_off() {
-    let first = "@s-1 mark - act word=approve rule=read-only.classify-v8";
+    let first = "@s-1 mark - act word=approve rule=read-only.classify-v9";
     for (err, latched) in [
         ("ERR unknown verb 'mark' (help lists them)", true),
         ("ERR usage: mark <node|-> <kind> [word=<w>] …", true),
@@ -3976,7 +4004,7 @@ fn a_refused_act_mark_latches_the_rest_off() {
         };
         let mut s = Session::new(&mut fake, Some("@s-1".to_string()));
         s.act_marks
-            .queue("act word=approve rule=read-only.classify-v8".to_string());
+            .queue("act word=approve rule=read-only.classify-v9".to_string());
         s.act_marks.queue("act word=escalate".to_string());
         s.send_act_marks();
         s.act_marks.queue("act word=deny rule=write.v1".to_string());
@@ -4028,7 +4056,7 @@ fn supervise_auto_approves_reads_guarded_and_hands_over_writes() {
             "@s-9 key if-human=7 if-gen=1.101 if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1",
             "@s-9 await seq 101 timeout 20000",
             "@s-9 text --json tail=40",
-            "@s-9 mark - act word=approve rule=read-only.classify-v8",
+            "@s-9 mark - act word=approve rule=read-only.classify-v9",
             "@s-9 await idle 500 timeout 1500",
             "@s-9 text --json tail=40",
             "@s-9 status",
@@ -4179,7 +4207,7 @@ fn the_same_box_is_never_pressed_twice_on_an_unchanged_screen() {
             "key if-human=7 if-gen=1.101 if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1",
             "await seq 101 timeout 20000",
             "text --json tail=40",
-            "mark - act word=approve rule=read-only.classify-v8",
+            "mark - act word=approve rule=read-only.classify-v9",
         ],
         "{:?}",
         m.requests
@@ -4314,6 +4342,13 @@ fn virtual_session(m: &mut Mock, sid: Option<String>) -> Session<'_, Mock> {
     let mut s = session(m, sid);
     s.set_fx(Fx::over(ClockSource::Scripted(clock)));
     s
+}
+
+fn active_metadata_claim(s: &mut Session<'_, Mock>) {
+    s.take_claim(&mut Alone);
+    assert!(matches!(s.claim, claim::Claim::Held { .. }));
+    s.ctl.supervisor_owner = Some(s.setup.holder().to_string());
+    s.note_meta(&s.ctl.meta_line());
 }
 impl Mock {
     fn run_on(&mut self, clock: &Arc<super::super::fx::ScriptedClock>) {
@@ -5100,7 +5135,7 @@ fn nothing_happens_after_the_budget() {
     assert_eq!(m.requests.len(), 9, "nothing read after: {:?}", m.requests);
     assert_eq!(
         m.requests.last().map(String::as_str),
-        Some("mark - act word=approve rule=read-only.classify-v8")
+        Some("mark - act word=approve rule=read-only.classify-v9")
     );
 }
 
@@ -6607,6 +6642,7 @@ fn watch_rides_out_a_lost_connection_to_the_next_event() {
             "offscreen tail=1",
             "meta",
             "status",
+            "meta",
             "meta set attention owner=supervisor claude question: Did the suite pass on your machine? (the worker \
              asked a question; answer_questions is off)",
             "await seq 22 timeout 20000",
@@ -6766,7 +6802,7 @@ fn a_connection_that_never_comes_back_ends_when_the_window_lapses() {
 
 fn never_comes_back(down: CtlReply, words: &str) {
     let mut m = Mock::new(vec![question_screen()]);
-    m.down = Some((5, down));
+    m.down = Some((6, down));
     let (lines, code) = watch_quick(&mut m, Duration::from_millis(60));
     assert_eq!(
         lines,
@@ -6777,18 +6813,21 @@ fn never_comes_back(down: CtlReply, words: &str) {
         ]
     );
     assert_eq!(code, 1);
-    let (last, probes) = m.requests[7..].split_last().expect("requests");
+    let failed = m
+        .requests
+        .iter()
+        .position(|r| r.starts_with("await seq "))
+        .expect("failed wait");
+    let (last, probes) = m.requests[failed + 1..].split_last().expect("requests");
     assert!(!probes.is_empty(), "{:?}", m.requests);
     assert!(
-        probes.iter().all(|r| r == "text --json tail=40"),
+        probes
+            .iter()
+            .all(|r| r == "text --json tail=40" || r == "meta"),
         "only reads, never the failed wait again: {:?}",
         m.requests
     );
-    assert_eq!(
-        last, "meta unset attention owner=supervisor",
-        "{:?}",
-        m.requests
-    );
+    assert_eq!(last, "meta", "{:?}", m.requests);
 }
 
 #[test]
@@ -6826,13 +6865,13 @@ fn an_outage_that_keeps_coming_back_is_one_window() {
 #[test]
 fn a_later_outage_is_a_new_one_with_its_own_window() {
     let mut m = Mock::new(vec![question_screen()]);
-    m.by_index.insert(5, closed());
-    m.by_index.insert(12, timeout());
-    m.delay.insert(12, Duration::from_millis(400));
-    m.by_index.insert(15, closed());
+    m.by_index.insert(6, closed());
+    m.by_index.insert(14, timeout());
+    m.delay.insert(14, Duration::from_millis(400));
+    m.by_index.insert(17, closed());
     m.vanish_after = Some(0);
     let (lines, code) = watch_quick(&mut m, Duration::from_millis(300));
-    assert_eq!(lines.len(), 8, "{lines:?}");
+    assert_eq!(lines.len(), 8, "{lines:?}; requests={:#?}", m.requests);
     assert_eq!(
         lines[0],
         "EVENT question seq=101 ⏺ Did the suite pass on your machine?"
@@ -6864,7 +6903,7 @@ fn a_later_outage_is_a_new_one_with_its_own_window() {
 #[test]
 fn no_such_session_is_final_outside_an_outage_and_not_yet_inside_one() {
     let mut m = Mock::new(vec![question_screen()]);
-    m.by_index.insert(5, err("no such session"));
+    m.by_index.insert(6, err("no such session"));
     let (lines, code) = watch_quick(&mut m, Duration::from_secs(5));
     assert_eq!(
         lines,
@@ -6874,12 +6913,12 @@ fn no_such_session_is_final_outside_an_outage_and_not_yet_inside_one() {
         ]
     );
     assert_eq!(code, 1);
-    assert_eq!(m.requests.len(), 7, "no retry: {:?}", m.requests);
+    assert_eq!(m.requests.len(), 8, "no retry: {:?}", m.requests);
 
     let mut m = Mock::new(vec![question_screen()]);
-    m.by_index.insert(5, closed());
-    m.by_index.insert(6, err("no such session"));
+    m.by_index.insert(6, closed());
     m.by_index.insert(7, err("no such session"));
+    m.by_index.insert(8, err("no such session"));
     m.vanish_after = Some(0);
     let (lines, code) = watch_quick(&mut m, Duration::from_secs(5));
     assert_eq!(lines.len(), 5, "{lines:?}");
@@ -6898,8 +6937,8 @@ fn no_such_session_is_final_outside_an_outage_and_not_yet_inside_one() {
     assert_eq!(code, 1);
 
     let mut m = Mock::new(vec![question_screen()]);
-    m.by_index.insert(5, closed());
-    m.down = Some((6, err("no such session")));
+    m.by_index.insert(6, closed());
+    m.down = Some((7, err("no such session")));
     let (lines, code) = watch_quick(&mut m, Duration::from_millis(60));
     assert_eq!(
         lines,
@@ -6914,7 +6953,7 @@ fn no_such_session_is_final_outside_an_outage_and_not_yet_inside_one() {
     assert_eq!(code, 1);
 
     let mut m = Mock::new(vec![question_screen()]);
-    m.by_index.insert(5, closed());
+    m.by_index.insert(6, closed());
     let (lines, code) = watch_quick(&mut m, Duration::ZERO);
     assert_eq!(
         lines,
@@ -6925,8 +6964,8 @@ fn no_such_session_is_final_outside_an_outage_and_not_yet_inside_one() {
     );
     assert_eq!(code, 1);
     assert_eq!(
-        m.requests[7..],
-        ["meta unset attention owner=supervisor"],
+        m.requests[8..],
+        ["meta", "meta unset attention owner=supervisor"],
         "{:?}",
         m.requests
     );
@@ -6936,8 +6975,8 @@ fn no_such_session_is_final_outside_an_outage_and_not_yet_inside_one() {
 fn a_connection_turned_away_is_ridden_out() {
     let text = "auth";
     let mut m = Mock::new(vec![question_screen()]);
-    m.by_index.insert(4, err(text));
     m.by_index.insert(5, err(text));
+    m.by_index.insert(6, err(text));
     m.vanish_after = Some(0);
     let (lines, code) = watch_quick(&mut m, Duration::from_secs(5));
     assert_eq!(lines.len(), 5, "{text}: {lines:?}");
@@ -6960,7 +6999,7 @@ fn a_connection_turned_away_is_ridden_out() {
 #[test]
 fn a_budget_spent_in_an_outage_is_the_timeout() {
     let mut m = Mock::new(vec![question_screen()]);
-    m.down = Some((5, closed()));
+    m.down = Some((6, closed()));
     let started = Instant::now();
     let (lines, code) = watch_quick_with(&mut m, Duration::from_secs(120), &auto_ms(150));
     assert!(
@@ -6979,8 +7018,8 @@ fn a_budget_spent_in_an_outage_is_the_timeout() {
     assert_eq!(code, EXIT_TIMEOUT);
 
     let mut m = Mock::new(vec![question_screen()]);
-    m.by_index.insert(5, closed());
-    m.delay.insert(5, Duration::from_millis(200));
+    m.by_index.insert(6, closed());
+    m.delay.insert(6, Duration::from_millis(200));
     let (lines, code) = watch_quick_with(&mut m, Duration::from_secs(5), &auto_ms(100));
     assert_eq!(
         lines,
@@ -7003,7 +7042,7 @@ fn a_budget_spent_in_an_outage_is_the_timeout() {
     );
     assert_eq!(
         after[lost..],
-        ["meta unset attention owner=supervisor"],
+        ["meta", "meta unset attention owner=supervisor"],
         "nothing after: {:?}",
         m.requests
     );
@@ -8330,6 +8369,7 @@ fn a_limit_escalates_once_and_extends_the_budget_once() {
             .collect::<Vec<_>>(),
         [
             &"meta".to_string(),
+            &"meta".to_string(),
             &format!("meta set attention owner=supervisor kind=ask {text}"),
         ]
     );
@@ -8371,16 +8411,8 @@ fn a_refused_escalation_is_journaled_and_the_loop_goes_on() {
     credits.extend(composer("  ? for shortcuts"));
     let mut m = Mock::new(vec![busy_screen(), credits]);
     m.vanish_after = Some(2);
-    m.verb_replies.insert(
-        "meta",
-        VecDeque::from([
-            ok(
-                "OK title=- user_title=- description=- icon=- role=- attention=- cwd=- \
-                state=alive\n",
-            ),
-            err("attention too long (max 256 bytes)"),
-        ]),
-    );
+    m.attention_replies
+        .push_back(err("attention too long (max 256 bytes)"));
     let opts = SuperviseOpts {
         journal: Some(path.clone()),
         ..auto(30)
@@ -8412,16 +8444,8 @@ fn a_refusal_naming_a_tighter_cap_is_sent_again_cut_to_it() {
     credits.extend(composer("  ? for shortcuts"));
     let mut m = Mock::new(vec![busy_screen(), credits]);
     m.vanish_after = Some(2);
-    m.verb_replies.insert(
-        "meta",
-        VecDeque::from([
-            ok(
-                "OK title=- user_title=- description=- icon=- role=- attention=- cwd=- \
-                state=alive\n",
-            ),
-            err("attention too long (max 40 bytes)"),
-        ]),
-    );
+    m.attention_replies
+        .push_back(err("attention too long (max 40 bytes)"));
     let opts = SuperviseOpts {
         journal: Some(path.clone()),
         ..auto(30)
@@ -8519,6 +8543,14 @@ fn at_the_reset_one_continuation_goes_with_the_rules_and_the_answer_closes_the_e
         m.requests
     );
     assert_eq!(count(&m, "turn"), 1, "{:#?}", m.requests);
+    let act = at("mark - act word=continue rule=usage-resume.v1");
+    assert_eq!(
+        m.requests[act + 1],
+        "mark - label text=resuming%20after%20limit ttl=30",
+        "the carry-on's act, then the harness's own label for it: {:#?}",
+        m.requests
+    );
+    assert_eq!(count(&m, "mark - label"), 1, "{:#?}", m.requests);
     let (records, _) = journal_records(&journal);
     assert_eq!(
         records
@@ -8596,7 +8628,7 @@ fn a_standing_approval_attention_survives_the_episode_close() {
     assert_eq!(count(&m, "meta set attention"), 1, "never the bare form");
     assert_eq!(
         m.requests.iter().filter(|r| *r == "meta").count(),
-        1,
+        3,
         "{:?}",
         m.requests
     );
@@ -9087,6 +9119,11 @@ mod turn_end;
 mod needs_loop {
     use super::*;
     include!("needs_loop_tests.rs");
+}
+
+mod supervisor_attention {
+    use super::*;
+    include!("supervisor_attention_tests.rs");
 }
 
 mod autopilot_loop {

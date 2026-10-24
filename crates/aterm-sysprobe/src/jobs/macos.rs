@@ -324,9 +324,7 @@ fn fd_info(pid: c_int, fd: i32, flavor: i32, buf: &mut [u8]) -> Option<usize> {
 fn vnode_kind(pid: c_int, fd: i32) -> FdKind {
     let mut buf = vec![0u8; darwin::VNODE_PATH_SIZE];
     match fd_info(pid, fd, darwin::PROC_PIDFDVNODEPATHINFO, &mut buf).and(darwin::vnode(&buf)) {
-        Some(v) if v.char_device() => FdKind::Device {
-            tty: v.path.starts_with(b"/dev/tty") || v.path.starts_with(b"/dev/pty"),
-        },
+        Some(v) if v.char_device() => FdKind::Device { tty: v.terminal() },
         Some(v) => FdKind::File {
             regular: v.regular(),
             size: v.size,

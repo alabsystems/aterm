@@ -589,6 +589,7 @@ fn the_keys_title_and_menu_are_its_own() {
 #[test]
 fn a_readers_press_on_the_key_is_its_click() {
     use crate::a11y_tree::HarnessChip;
+    use aterm_a11y::model::Toggled;
     let (mut app, wid, session, mut reader) = idle();
     frame(&mut app, wid);
     assert!(
@@ -607,8 +608,52 @@ fn a_readers_press_on_the_key_is_its_click() {
         .find(|n| n.chip == HarnessChip::TopEffort)
         .expect("the key's node");
     assert_eq!(node.label, format!("{}: off", key_capitalised()));
+    assert_eq!(
+        node.toggled,
+        Some(Toggled::False),
+        "a two-state key is a switch, its state off (review 13)"
+    );
+    let model = app
+        .claude_chips_a11y(wid)
+        .into_iter()
+        .find(|n| n.chip == HarnessChip::Model)
+        .expect("CONTROL: the model's node");
+    assert_eq!(model.toggled, None, "CONTROL: a fact's button has no state");
     app.press_claude_chip_for_reader(wid, session, HarnessChip::TopEffort);
     assert_eq!(pty(&mut reader, 1), b"/", "the click's probe");
+}
+
+/// THE KEY'S NODE STATES ITS STATE BOTH WAYS (review 13): with Claude's own
+/// tag on the top rule the key is on, its node `<Key>: on` and toggled on.
+/// NEGATIVE CONTROL: the tag gone and the transcript saying off, the ghost's
+/// node is `<Key>: off`, toggled off.
+#[cfg(a11y_tree)]
+#[test]
+fn the_keys_node_is_on_while_claudes_tag_stands() {
+    use crate::a11y_tree::HarnessChip;
+    use aterm_a11y::model::Toggled;
+    let (mut app, wid, session, _reader) = idle();
+    let key = |app: &App| {
+        app.claude_chips_a11y(wid)
+            .into_iter()
+            .find(|n| n.chip == HarnessChip::TopEffort)
+            .map(|n| (n.label, n.toggled))
+    };
+    answered(&app, session, TOP, true);
+    frame(&mut app, wid);
+    assert_eq!(
+        key(&app),
+        Some((format!("{}: on", key_capitalised()), Some(Toggled::True))),
+        "the tag drawn"
+    );
+    answered(&app, session, TOP, false);
+    claude_with(&app, session, "Opus 5.5", "2.1.304", Some(false));
+    frame(&mut app, wid);
+    assert_eq!(
+        key(&app),
+        Some((format!("{}: off", key_capitalised()), Some(Toggled::False))),
+        "NEGATIVE CONTROL: the tag gone, the ghost"
+    );
 }
 
 #[test]

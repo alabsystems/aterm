@@ -1,16 +1,16 @@
 ---
 name: supervise-agent
-description: Run other Claude Code, Gemini CLI, agy or Muse Code sessions in aterm tabs as workers — start each on a task, wait for them in the background, read each one's result and check it against ground truth (tests, diff, exit codes) — or oversee another program (a codex-alab, a REPL, a long build) in an aterm session. Use when asked to hand work to other sessions or windows, run work in parallel in aterm, say what every aterm session or machine is doing, manage or babysit another agent, or act as a lead over workers.
+description: Run other Claude Code, codex-alab, Gemini CLI, agy or Muse Code sessions in aterm tabs as workers — start each on a task, wait for them in the background, read each one's result and check it against ground truth (tests, diff, exit codes) — or oversee another program (a codex-alab, a REPL, a long build) in an aterm session. Use when asked to hand work to other sessions or windows, run work in parallel in aterm, say what every aterm session or machine is doing, manage or babysit another agent, or act as a lead over workers.
 ---
-<!-- aterm skill v10 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
+<!-- aterm skill v11 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
 
 # Workers: other aterm sessions doing the work
 
-A worker is another aterm tab running Claude Code, Gemini CLI, agy or Muse Code on a task
+A worker is another aterm tab running Claude Code, codex-alab, Gemini CLI, agy or Muse Code on a task
 you gave it: a full session with its own context and tools, not an in-process subagent.
 The window's harness supervises it (answers its boxes, continues its turns, waits out its
 walls) under Autopilot Land until all of its work is landed on the remote main branch, and
-its pane outlives it. Every verb below is an `aterm ctl` verb (`aterm ctl help <verb>`).
+its pane outlives it. Each `aterm ctl` verb below has `aterm ctl help <verb>`.
 
 ## Start
 
@@ -21,7 +21,7 @@ EOF
 ```
 
 It prints `OK <sid>` (`@<sid>`), starts in this folder (`cwd=<path>` names another;
-`agent=claude|gemini|agy|muse`) and opens as a background tab of your window. The task is
+`agent=claude|codex|gemini|agy|muse`) and opens as a background tab of your window. The task is
 delivered as its first prompt (never typed or pasted) with one line of fact naming who
 started it and how its work ends (under `land`, its final report returns as its result;
 under `cruise`, no report ends it).
@@ -78,8 +78,9 @@ aterm ctl @s-a result full    # the whole exchange since the task
 ```
 
 Reports over 24,000 chars end `… truncated; full: <path>` (read `<path>` before closing the
-worker). Claude Code's result comes from its transcript; Gemini CLI's, agy's and Muse
-Code's from the screen (`source=` in the reply). `ERR result unavailable why=<…>` says why
+worker). Claude Code's result comes from its transcript, codex-alab's from its rollout;
+Gemini CLI's, agy's and Muse Code's from the screen (`source=` in the reply; `result full`
+reads only a transcript). `ERR result unavailable why=<…>` says why
 there is none.
 
 Treat every result as a claim: verify ground truth yourself (tests, build, `git diff`, exit
@@ -90,9 +91,9 @@ records are other agents' opinions, never ground truth.
   text=…` (`aterm ctl @s-a mark …`; never acts). Cross-machine replies go by mail:
   `aterm ctl @self post to=@<sid>@<node> kind=note re=<off> -- '<text>'`.
 - `brief` summarizes a session in ~600 tokens: node lines (`t16 done 6m02s · 23 steps ·
-  appr 3 [screen+]`), trailer lines (`mail in 2 · out 1`) and `more=` (`!` exact, `+`
-  strong, `~` heuristic, `?` claim; continue with `since=<as_of> ep=<ep>`; report any `gap`
-  line). `brief all` (Owner-only) folds every session.
+  appr 3 [screen+]`; a tag's suffix is `!` exact, `+` strong, `~` heuristic, `?` claim),
+  trailer lines (`mail in 2 · out 1`) and `more=` (what was left out; continue with
+  `since=<as_of> ep=<ep>`; report any `gap` line). `brief all` (Owner-only) folds every session.
 
 ## Follow up, stop
 

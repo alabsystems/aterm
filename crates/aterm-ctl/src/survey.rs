@@ -1159,6 +1159,23 @@ pub(crate) fn render_sid(replies: &[HostReply], sid: &str, own: Option<&str>) ->
     None
 }
 
+/// The replies that carry session `sid`, each cut down to that one session (`--json --sid`).
+pub(crate) fn only_sid(replies: &[HostReply], sid: &str) -> Vec<HostReply> {
+    replies
+        .iter()
+        .filter_map(|reply| {
+            let survey = reply.answer.as_ref().ok()?;
+            let session = survey.sessions.iter().find(|s| s.get("sid") == Some(sid))?;
+            let mut survey = survey.clone();
+            survey.sessions = vec![session.clone()];
+            Some(HostReply {
+                answer: Ok(survey),
+                ..reply.clone()
+            })
+        })
+        .collect()
+}
+
 /// Error message when `--sid` does not match any returned session.
 pub(crate) fn sid_not_found(replies: &[HostReply], sid: &str, fleet: bool) -> String {
     let sid = shown(sid, 32);
@@ -1374,7 +1391,16 @@ pub(crate) fn read_survey(
     notes.extend(facts_note(&replies));
     let answered = !remote || replies.iter().any(|reply| reply.answer.is_ok());
     let mut text = if args.json {
-        render_json(&replies)
+        match args.sid.as_deref() {
+            None => render_json(&replies),
+            Some(sid) => {
+                let only = only_sid(&replies, sid);
+                if only.is_empty() {
+                    return Printed::refused(sid_not_found(&replies, sid, remote), 1);
+                }
+                render_json(&only)
+            }
+        }
     } else if let Some(sid) = args.sid.as_deref() {
         let Some(text) = render_sid(&replies, sid, own) else {
             return Printed::refused(sid_not_found(&replies, sid, remote), 1);

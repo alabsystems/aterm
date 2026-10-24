@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Worker launch (`spawn agent=<claude|gemini|agy|muse>`) across harnesses.
+//! Worker launch (`spawn agent=<claude|codex|gemini|agy|muse>`) across harnesses.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -717,12 +717,12 @@ pub(crate) fn stall_task(ctx: &SessionCtx, local: u64, why: &str) {
     }
 }
 
-/// What a worker's line carries of the agent of its kind its starter runs (`found`).
+/// What a worker's line carries of the agent of its kind its starter runs (`found`), else what it types with none (`WorkerCli::unstarted`).
 pub(crate) fn line_starter(
     cli: &aterm_agent::harness::worker::WorkerCli,
     found: Option<aterm_agent::harness::worker::Starter>,
 ) -> aterm_agent::harness::worker::Starter {
-    found.unwrap_or_else(|| cli.plain())
+    found.unwrap_or_else(|| cli.unstarted())
 }
 
 /// WHETHER THE WORKER'S LINE TRUSTS ITS FOLDER FOR THIS RUN.

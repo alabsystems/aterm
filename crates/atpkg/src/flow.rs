@@ -897,7 +897,7 @@ pub(crate) fn land_artifact(
         .then(|| crate::progress::watch_download(program, &dl, artifact.size));
     if reusable {
         println!(
-            "atpkg: {program}: reusing verified archive {} from the last attempt",
+            "atpkg: {program}: reusing {}, already downloaded and matching its digest",
             artifact.asset
         );
     } else {
@@ -2003,7 +2003,7 @@ fn discard_sibling_partial(dl: &Path) {
     let _ = std::fs::remove_file(dl.with_file_name(part));
 }
 
-fn sweep_foreign_partials(dl: &Path) {
+pub(crate) fn sweep_foreign_partials(dl: &Path) {
     let (Some(dir), Some(name)) = (dl.parent(), dl.file_name()) else {
         return;
     };
@@ -2102,7 +2102,7 @@ fn digest_refusal_note(
     Some(crate::state::held_failed(&memo.why, &how))
 }
 
-const fn disk_gate(required: u64, available: Option<u64>) -> Result<(), FlowError> {
+pub(crate) const fn disk_gate(required: u64, available: Option<u64>) -> Result<(), FlowError> {
     match available {
         Some(avail) if !crate::cost::disk_ok(required, avail, crate::cost::FREE_FLOOR) => {
             Err(FlowError::InsufficientDisk {
@@ -3143,7 +3143,7 @@ fn with_resolve_check<R>(check: InjectedResolveCheck, f: impl FnOnce() -> R) -> 
     out
 }
 
-fn make_staging_dir(dl: &Path) -> std::io::Result<()> {
+pub(crate) fn make_staging_dir(dl: &Path) -> std::io::Result<()> {
     match dl.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => {
             crate::platform::make_dirs_born(parent, 0o700)
@@ -3152,7 +3152,11 @@ fn make_staging_dir(dl: &Path) -> std::io::Result<()> {
     }
 }
 
-fn staged_download_path(layout: &Layout, program: &str, asset: &str) -> Result<PathBuf, FlowError> {
+pub(crate) fn staged_download_path(
+    layout: &Layout,
+    program: &str,
+    asset: &str,
+) -> Result<PathBuf, FlowError> {
     let mut comps = Path::new(asset).components();
     let one_name = matches!(
         (comps.next(), comps.next()),

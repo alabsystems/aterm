@@ -374,7 +374,7 @@ fn gpu_dirty_gate_settled_and_drained_rain() {
     let mut in_b = term.cell_frame(ROWS, COLS);
     scene.apply(&mut in_b);
     assert!(
-        !in_b.rain_quads.is_empty(),
+        !in_b.fx_layers.is_empty(),
         "settled rain is non-empty (non-vacuous)"
     );
     let hits_before = gpu.gate_hits();
@@ -383,7 +383,7 @@ fn gpu_dirty_gate_settled_and_drained_rain() {
     drop(view);
     assert!(
         gpu.gate_hits() > hits_before,
-        "a SETTLED rain frame (equal quads, same atlas version) must take the gate"
+        "a SETTLED rain frame (the same row layers) must take the gate"
     );
     assert!(
         got_b == fresh_render(&in_b, true, None),
@@ -393,14 +393,14 @@ fn gpu_dirty_gate_settled_and_drained_rain() {
     scene.engine.set_visibility(RainVisibility::Hidden);
     let fp_c = scene.tick();
     assert_eq!(fp_c, 0, "a drained field must fingerprint 0");
-    assert!(scene.quads.is_empty() && scene.add.is_empty());
+    assert!(scene.cells.is_empty() && scene.add.is_empty());
     assert!(
         !scene.engine.is_active(),
         "a drained, sleeping field must report inactive (the host timer disarms)"
     );
     let mut in_c = term.cell_frame(ROWS, COLS);
-    scene.apply(&mut in_c); // empty channels, atlas None (the host contract)
-    assert!(in_c.rain_atlas.is_none());
+    scene.apply(&mut in_c); // no cells: no rain layers (the host contract)
+    assert!(in_c.fx_layers.is_empty());
     let misses_before = gpu.gate_misses();
     let view = gpu.render_input_cached(&mut win, &in_c);
     let got_c = view.pixels().to_vec();

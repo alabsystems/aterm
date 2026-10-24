@@ -1460,6 +1460,30 @@ pub fn phys_footprint(pid: i32) -> Option<u64> {
     (rc == 0).then(|| unsafe { info.assume_init() }.ri_phys_footprint)
 }
 
+/// The CPU time `pid` (> 1) has used, user and system together, in the kernel's own units
+/// (`ri_user_time` plus `ri_system_time`): a count that grows while the process runs, read
+/// only for its growth.
+#[must_use]
+pub fn cpu_used(pid: i32) -> Option<u64> {
+    if pid <= 1 {
+        return None;
+    }
+    let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
+    // SAFETY: `info` is a zeroed `rusage_info_v4`, the struct `RUSAGE_INFO_V4` fills.
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            pid,
+            libc::RUSAGE_INFO_V4,
+            info.as_mut_ptr().cast::<libc::rusage_info_t>(),
+        )
+    };
+    (rc == 0).then(|| {
+        // SAFETY: zeroed is a valid `rusage_info_v4` (plain integers), and on success the kernel filled it.
+        let info = unsafe { info.assume_init() };
+        info.ri_user_time.saturating_add(info.ri_system_time)
+    })
+}
+
 struct WholeMap {
     addr: *mut libc::c_void,
     len: usize,
@@ -1736,18 +1760,24 @@ pub fn jail_pids(mark: &str) -> Result<Vec<i32>, String> {
             "jailpids: sandbox_check gives no answer here (run outside any sandbox)".into(),
         );
     }
-    let listed = aterm_uds::holders::uid_pids()
-        .map_err(|e| format!("jailpids: the process list could not be read: {e}"))?;
+    jail_members(aterm_uds::holders::uid_pids(), me, |pid| {
+        sandboxed(pid) == 1 && denied(pid, &m) == 1 && denied(pid, &none) == 0
+    })
+}
+
+/// The pids of `listed` above 1, but `me`, that `in_jail` keeps, sorted, each once. A listing
+/// that failed is an error, never an empty jail.
+fn jail_members(
+    listed: io::Result<Vec<u32>>,
+    me: i32,
+    in_jail: impl Fn(i32) -> bool,
+) -> Result<Vec<i32>, String> {
+    let listed =
+        listed.map_err(|e| format!("jailpids: the process list could not be read: {e}"))?;
     let mut out: Vec<i32> = listed
         .into_iter()
         .filter_map(|pid| i32::try_from(pid).ok())
-        .filter(|&pid| {
-            pid > 1
-                && pid != me
-                && sandboxed(pid) == 1
-                && denied(pid, &m) == 1
-                && denied(pid, &none) == 0
-        })
+        .filter(|&pid| pid > 1 && pid != me && in_jail(pid))
         .collect();
     out.sort_unstable();
     out.dedup();
@@ -2467,5 +2497,18 @@ mod tests {
         assert!(user_temp_dir().is_some_and(|t| t.starts_with('/')));
         let none = jail_pids("lab.jail.test.0000000000000000").unwrap();
         assert!(none.is_empty(), "{none:?}");
+    }
+
+    #[test]
+    fn a_listing_that_fails_is_an_error_and_never_an_empty_jail() {
+        assert_eq!(
+            jail_members(Err(io::Error::other("refused")), 7, |_| true),
+            Err("jailpids: the process list could not be read: refused".to_string())
+        );
+        assert_eq!(
+            jail_members(Ok(vec![40, 9, 1, 7, 12, 9]), 7, |pid| pid != 40),
+            Ok(vec![9, 12]),
+            "pid 1, this process and what the jail does not hold are left out"
+        );
     }
 }

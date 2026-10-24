@@ -1,0 +1,3 @@
+# agy 1.4.6 · MEASURED 2026-10-23, the harness tape of the spawned worker (L15) in the forever lab's cover run under the clamp on main 32043c2851 (`r2cvu-agy`, 144x50), its first decision's screen (seq 14) · the shell's echo of the line that launched agy, nothing of agy's under it
+lab$  HOME=/private/tmp/at.lab-501/aterm-ty2b-9671b4d1/runs/r2cvu-agy/scratch/agy-home '/private/tmp/at.lab-501/aterm-ty2b-9671b4d1/runs/r2cvu-a
+gy/scratch/home/Library/Application Support/aterm/pkg/agents/agy' "--prompt-interactive=$(command cat -- "$ATERM_TASK_FILE")"

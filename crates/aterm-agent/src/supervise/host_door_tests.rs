@@ -91,20 +91,10 @@ impl Planted for Inner {
     }
 }
 
-/// A door's name on the tape.
 fn door(name: &str) -> String {
     format!("{}{name}", doors::HOST)
 }
 
-/// A method added to a host's trait is TAPED BY CONSTRUCTION: the taped host
-/// forwards the planted method to the host behind it — its override, not the
-/// default — and tapes it at `host.planted`, its arguments by name; a default
-/// that asks another method asks it of the host behind the door, the tape
-/// holding the one call the loop made; a notification is said and told; and
-/// the act closes the tape's frame after it, as no other call does. The
-/// replay host then answers every call from the tape alone — the host
-/// behind's overrides, which no default gives — and a call asked otherwise
-/// than the recorded one is the replay's divergence.
 #[test]
 fn a_method_the_trait_grows_is_taped_by_construction() {
     let tape = MemoryTape::over(&Fx::over(ClockSource::Scripted(Arc::default())));
@@ -196,11 +186,6 @@ fn a_method_the_trait_grows_is_taped_by_construction() {
     assert_eq!(d.door.as_deref(), Some(door("planted").as_str()), "{d:?}");
 }
 
-/// AN ACT IS MARKED WHERE IT IS DECLARED: the macro lists the marked method's
-/// door, and no other, among the acts (`HOST_ACTS`), its methods in their
-/// order beside them; and the replay's question — is this door an act? — is
-/// read off the window's own trait's list (`doors::is_host_act`), so a method
-/// marked there is classed with no list kept beside the trait.
 #[test]
 fn an_act_is_marked_where_it_is_declared() {
     assert_eq!(planted::HOST_ACTS, ["host.acted"]);

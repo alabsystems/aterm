@@ -2000,6 +2000,26 @@ mod tests {
     }
 
     #[test]
+    fn a_bash_verdict_refuses_a_secret_and_a_proof_gap() {
+        use aterm_agent::supervise::classify::classify_command;
+        for line in ["cat ~/.ssh/id_rsa", "FOO=1 cat README.md"] {
+            assert!(classify_command(line).read_only, "{line}");
+            assert_eq!(
+                detail_of(&bash_box(&[line])).as_deref(),
+                Some("bash:not-read-only"),
+                "{line}"
+            );
+        }
+        for line in ["cat README.md", "grep -m 1 credentials src/"] {
+            assert_eq!(
+                detail_of(&bash_box(&[line])).as_deref(),
+                Some("bash:read-only"),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
     fn a_node_run_codex_is_named_by_no_screen() {
         use aterm_phase::Program;
         use aterm_phase::prompt::fixtures::{composer, rows, screen};

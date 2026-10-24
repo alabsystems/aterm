@@ -1,15 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The recorded-answer differential: `transcript/script.rs` run against this
-//! crate must print, line for line, what it printed against the crates.io
-//! `smallvec` 1.15.1 it replaces (`transcript/smallvec-1.15.1.txt`, recorded
-//! with the features aterm's graph enables; the script's header says how).
-//!
-//! Each line pins one step's result, contents, length, `spilled()`, capacity
-//! consistency, slice-equal `Hash` and element drop order. The script covers
-//! the constructors and conversions once each, then a seeded operation fuzz
-//! at inline sizes 3, 1 and 0.
+//! Differential transcript test against `smallvec` 1.15.1.
 
 #[path = "transcript/script.rs"]
 mod script;

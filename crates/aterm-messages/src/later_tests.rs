@@ -3,6 +3,8 @@
 
 //! Tests for `notice later` digest entries, dismissal retention, conditional settlement, caps, and browser actions.
 
+use std::sync::Arc;
+
 use crate::center::MessageCenter;
 use crate::exceptions::{Entry, Family};
 use crate::log::{LogLine, MessageLog, Retired};
@@ -32,9 +34,17 @@ fn wall(day_ms: u64) -> WallStamp {
 
 fn fresh(now: Instant) -> (MessageCenter, WireGate) {
     (
-        MessageCenter::new(MessageLog::empty(), now),
+        center(
+            MessageLog::empty(),
+            now,
+            Arc::new(crate::ConfirmationSource::new(Some(1))),
+        ),
         WireGate::default(),
     )
+}
+
+fn center(log: MessageLog, now: Instant, source: Arc<crate::ConfirmationSource>) -> MessageCenter {
+    MessageCenter::with_confirmations(log, now, source)
 }
 
 fn notice(c: &mut MessageCenter, g: &mut WireGate, line: &str, at: u64, now: Instant) -> Applied {
@@ -530,17 +540,17 @@ fn unrelated_digest_changes_do_not_invalidate_an_observed_entry() {
     assert!(c.digest_entry(other_id).is_some());
 }
 
-/// Each successor adopts the open entry past every confirmation an earlier process issued, so
-/// an observation made before a relaunch never settles it, however many relaunches follow; one
-/// made on the successor does.
+/// Sharing a host source keeps replay/adoption fresh even at the same wall time or
+/// after a wall-clock rollback. Independent hosts instead rely on independent random seeds.
 #[test]
 fn an_observation_from_before_a_relaunch_never_settles_the_adopted_entry() {
     let now = Instant::now();
-    let (mut c, mut g) = fresh(now);
-    let (id, _) = later_reply(&notice(&mut c, &mut g, SETUP, 0, now));
+    let source = Arc::new(crate::ConfirmationSource::new(Some(1)));
+    let mut c = center(MessageLog::empty(), now, Arc::clone(&source));
+    let mut g = WireGate::default();
+    let (id, _) = later_reply(&notice(&mut c, &mut g, SETUP, DAY_MS, now));
     let mut file: Vec<LogLine> = Vec::new();
-    for generation in 1..=2 {
-        let at = generation * DAY_MS;
+    for at in [DAY_MS, 0] {
         let stale = observed_confirmation(&c, id);
         let (again, how) = later_reply(&notice(&mut c, &mut g, SETUP, at, now));
         assert_eq!(again, id);
@@ -553,40 +563,118 @@ fn an_observation_from_before_a_relaunch_never_settles_the_adopted_entry() {
         );
         let mut log = MessageLog::empty();
         log.replay_all(file.iter().cloned());
-        c = MessageCenter::new(log, now);
+        c = center(log, now, Arc::clone(&source));
         assert_eq!(c.adopt_digest(wall(at), now), 1);
         g = WireGate::default();
-
         let gone = notice(&mut c, &mut g, &settle_line(id, stale), at, now);
-        assert_eq!(gone.reply, "OK settled=- how=gone", "relaunch {generation}");
-        assert!(
-            c.digest_entry(id).is_some(),
-            "the entry repeated since the observation stays open"
-        );
+        assert_eq!(gone.reply, "OK settled=- how=gone");
+        assert!(c.digest_entry(id).is_some());
     }
     let observed = observed_confirmation(&c, id);
-    let settled = notice(&mut c, &mut g, &settle_line(id, observed), 2 * DAY_MS, now);
+    let settled = notice(&mut c, &mut g, &settle_line(id, observed), 0, now);
     assert_eq!(settled.reply, format!("OK settled={id} how=resolved-ok"));
 }
 
-/// A process whose posting never reached the log mints the same id again after the relaunch; an
-/// observation of the lost entry does not settle the new one.
+/// A lost post can reuse its id. Sharing a host source, or starting a different
+/// independently seeded incarnation, supplies a different observation without clock help.
 #[test]
 fn an_observation_never_settles_a_later_process_entry_under_the_same_id() {
     let now = Instant::now();
-    let (mut parent, mut g) = fresh(now);
-    let (id, _) = later_reply(&notice(&mut parent, &mut g, SETUP, 0, now));
-    let lost = observed_confirmation(&parent, id);
+    for shared in [true, false] {
+        let source = Arc::new(crate::ConfirmationSource::new(Some(10)));
+        let mut parent = center(MessageLog::empty(), now, Arc::clone(&source));
+        let mut g = WireGate::default();
+        let (id, _) = later_reply(&notice(&mut parent, &mut g, SETUP, 0, now));
+        let lost = observed_confirmation(&parent, id);
+        let source = if shared {
+            source
+        } else {
+            Arc::new(crate::ConfirmationSource::new(Some(20)))
+        };
+        let mut successor = center(MessageLog::empty(), now, source);
+        let mut g = WireGate::default();
+        let (again, _) = later_reply(&notice(&mut successor, &mut g, SETUP, 0, now));
+        assert_eq!(
+            again, id,
+            "the unrecorded id is reused at the same wall time"
+        );
+        let gone = notice(&mut successor, &mut g, &settle_line(id, lost), 0, now);
+        assert_eq!(gone.reply, "OK settled=- how=gone");
+        let current = observed_confirmation(&successor, id);
+        let done = notice(&mut successor, &mut g, &settle_line(id, current), 0, now);
+        assert_eq!(done.reply, format!("OK settled={id} how=resolved-ok"));
+    }
+}
 
-    let (mut successor, mut g) = fresh(now);
-    let (again, _) = later_reply(&notice(&mut successor, &mut g, SETUP, DAY_MS, now));
-    assert_eq!(
-        again, id,
-        "the successor reuses the id the log never recorded"
+#[test]
+fn clones_and_other_entries_cannot_reissue_a_consumed_confirmation() {
+    let now = Instant::now();
+    let source = Arc::new(crate::ConfirmationSource::from_entropy(|bytes| {
+        bytes.copy_from_slice(&10_u64.to_le_bytes());
+        true
+    }));
+    let mut c = center(MessageLog::empty(), now, source);
+    let mut g = WireGate::default();
+    let (id, _) = later_reply(&notice(&mut c, &mut g, SETUP, 0, now));
+    let mut cloned = c.clone();
+    let mut clone_gate = WireGate::default();
+    let other = SETUP.replace("0123abcd", "5678abcd");
+    let (other_id, _) = later_reply(&notice(&mut cloned, &mut clone_gate, &other, 0, now));
+    let other_revision = observed_confirmation(&cloned, other_id);
+    notice(&mut c, &mut g, SETUP, 0, now);
+    let current = observed_confirmation(&c, id);
+    assert_ne!(
+        current, other_revision,
+        "per-entry increments would reuse this token"
     );
-    let gone = notice(&mut successor, &mut g, &settle_line(id, lost), DAY_MS, now);
-    assert_eq!(gone.reply, "OK settled=- how=gone");
-    assert!(successor.digest_entry(id).is_some());
+    notice(&mut cloned, &mut clone_gate, SETUP, 0, now);
+    let stale = notice(
+        &mut cloned,
+        &mut clone_gate,
+        &settle_line(id, current),
+        0,
+        now,
+    );
+    assert_eq!(stale.reply, "OK settled=- how=gone");
+    assert!(cloned.digest_entry(id).is_some());
+}
+
+#[test]
+fn unavailable_confirmation_entropy_preserves_notices_and_refuses_settlement() {
+    let now = Instant::now();
+    for seed in [None, Some(0), Some(u64::MAX)] {
+        let mut c = center(
+            MessageLog::empty(),
+            now,
+            Arc::new(crate::ConfirmationSource::new(seed)),
+        );
+        let mut g = WireGate::default();
+        let (id, _) = later_reply(&notice(&mut c, &mut g, SETUP, 0, now));
+        let observed = observed_confirmation(&c, id);
+        assert_eq!(observed, u64::MAX);
+        notice(&mut c, &mut g, SETUP, DAY_MS, now);
+        let gone = notice(&mut c, &mut g, &settle_line(id, observed), DAY_MS, now);
+        assert_eq!(gone.reply, "OK settled=- how=gone");
+        assert!(c.digest_entry(id).is_some());
+    }
+    let source = crate::ConfirmationSource::from_entropy(|bytes| {
+        bytes.fill(7);
+        false
+    });
+    assert_eq!(
+        source.take(),
+        u64::MAX,
+        "failed partial entropy is discarded"
+    );
+    let mut unseeded = MessageCenter::new(MessageLog::empty(), now);
+    let (id, _) = later_reply(&notice(
+        &mut unseeded,
+        &mut WireGate::default(),
+        SETUP,
+        0,
+        now,
+    ));
+    assert_eq!(observed_confirmation(&unseeded, id), u64::MAX);
 }
 
 #[test]
@@ -874,7 +962,11 @@ fn a_press_after_a_restart_still_answers_a_later_entry() {
         .collect();
     let mut log = MessageLog::empty();
     log.replay_all(lines.iter().filter_map(|l| LogLine::decode(l).ok()));
-    let mut next = MessageCenter::new(log, now);
+    let mut next = center(
+        log,
+        now,
+        Arc::new(crate::ConfirmationSource::new(Some(100))),
+    );
     assert_eq!(next.adopt_digest(wall(DAY_MS), now), 2);
     let observed = observed_confirmation(&next, id);
     assert_ne!(observed, u64::MAX);

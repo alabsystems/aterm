@@ -8,13 +8,10 @@ use std::io::Read;
 use aterm_codec::inflate::stream::{DeflateReader, GzipReader, ZlibReader};
 use aterm_codec::inflate::{inflate, zlib_decompress_prefix};
 
-/// Fixed-Huffman literals.
 const HELLO: &[u8] = &[
     0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0xd7, 0x51, 0x28, 0xcf, 0x2f, 0xca, 0x49, 0x01, 0x00,
 ];
-/// Fixed-Huffman back-references.
 const BACKREFS: &[u8] = &[0x4b, 0x4c, 0x4a, 0xa4, 0x2a, 0x04, 0x00];
-/// A dynamic-Huffman block (~1.6 KB of skewed text at level 9).
 const DYNAMIC: &[u8] = &[
     0xed, 0xce, 0x41, 0x12, 0x02, 0x21, 0x0c, 0x44, 0xd1, 0xab, 0xf4, 0x09, 0xbc, 0x13, 0x42, 0x18,
     0xa2, 0x40, 0x30, 0x01, 0x71, 0xe6, 0xf4, 0x52, 0xde, 0xc2, 0x2a, 0x56, 0xbd, 0xf8, 0x8b, 0x7e,
@@ -26,7 +23,6 @@ const DYNAMIC: &[u8] = &[
     0xd8, 0x8c, 0xcd, 0xf8, 0x73, 0xc6, 0x17,
 ];
 
-/// A source that hands out at most `n` bytes per `read`.
 struct Drip<'a> {
     data: &'a [u8],
     at: usize,
@@ -53,7 +49,6 @@ impl Read for Drip<'_> {
     }
 }
 
-/// Read `r` to the end, taking at most `chunk` bytes per call.
 fn read_all_chunked(mut r: impl Read, chunk: usize) -> std::io::Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut buf = vec![0u8; chunk.max(1)];
@@ -66,7 +61,6 @@ fn read_all_chunked(mut r: impl Read, chunk: usize) -> std::io::Result<Vec<u8>> 
     }
 }
 
-/// A deterministic pseudo-random source.
 struct Rng(u64);
 
 impl Rng {
@@ -79,7 +73,6 @@ impl Rng {
     }
 }
 
-/// `raw` as a raw DEFLATE stream of STORED blocks (at most 65,535 bytes each).
 fn stored(raw: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut chunks: Vec<&[u8]> = raw.chunks(65_535).collect();
@@ -97,7 +90,6 @@ fn stored(raw: &[u8]) -> Vec<u8> {
     out
 }
 
-/// One gzip member around a raw DEFLATE `body` whose output is `payload`.
 fn gzip_member(header: &[u8], body: &[u8], payload: &[u8]) -> Vec<u8> {
     let mut out = header.to_vec();
     out.extend_from_slice(body);
@@ -116,8 +108,6 @@ fn crc32_of(data: &[u8]) -> u32 {
     aterm_codec::crc32::Crc32::of(data)
 }
 
-/// Every vector as `(name, raw deflate, decoded payload)`. Stored payloads
-/// straddle the 32 KiB window and the 64 KiB block limit.
 fn vectors() -> Vec<(String, Vec<u8>, Vec<u8>)> {
     let mut out = Vec::new();
     for (name, body) in [
@@ -137,8 +127,6 @@ fn vectors() -> Vec<(String, Vec<u8>, Vec<u8>)> {
     out
 }
 
-/// THE RESUMPTION PROPERTY: every read and refill granularity produces the
-/// bytes the one-shot decoder produces, raw and gzip-framed.
 #[test]
 fn every_read_and_refill_granularity_matches_the_one_shot() {
     for (name, body, payload) in vectors() {
@@ -165,8 +153,6 @@ fn every_read_and_refill_granularity_matches_the_one_shot() {
     }
 }
 
-/// A concatenation of gzip members is itself a gzip file — what the `tar-gz`
-/// lane depends on, since real producers emit it.
 #[test]
 fn concatenated_members_are_one_stream() {
     let members: Vec<(Vec<u8>, Vec<u8>)> = vectors()
@@ -188,8 +174,6 @@ fn concatenated_members_are_one_stream() {
     }
 }
 
-/// A short or corrupted download is refused before a byte reaches the
-/// extractor, and nothing panics. An EMPTY input is a truncated file.
 #[test]
 fn truncated_and_corrupted_gzip_is_refused() {
     let payload = inflate(DYNAMIC, 1 << 20).expect("one-shot");
@@ -212,7 +196,6 @@ fn truncated_and_corrupted_gzip_is_refused() {
     }
 }
 
-/// Malformed raw deflate must never panic.
 #[test]
 fn corrupted_raw_deflate_never_panics() {
     let mut rng = Rng(0x0BAD_C0DE_1234_5678);
@@ -229,8 +212,6 @@ fn corrupted_raw_deflate_never_panics() {
     }
 }
 
-/// Optional gzip header fields: FNAME, FCOMMENT, FEXTRA and FHCRC in every
-/// combination, plus the reserved flag bit, which must be refused.
 #[test]
 fn optional_header_fields_are_skipped_and_reserved_bits_refused() {
     let payload = b"header field coverage".to_vec();
@@ -265,7 +246,6 @@ fn optional_header_fields_are_skipped_and_reserved_bits_refused() {
     }
 }
 
-/// A wrong FHCRC is refused — the one header field that is a checksum.
 #[test]
 fn a_wrong_header_checksum_is_refused() {
     let payload = b"fhcrc".to_vec();
@@ -276,8 +256,6 @@ fn a_wrong_header_checksum_is_refused() {
     assert!(read_all_chunked(GzipReader::new(&stream[..]), 64).is_err());
 }
 
-/// The trailer is load-bearing: a member whose CRC or length is wrong is
-/// refused even though its deflate stream decodes perfectly.
 #[test]
 fn a_wrong_trailer_is_refused() {
     let payload = b"trailer".to_vec();
@@ -297,7 +275,6 @@ fn a_wrong_trailer_is_refused() {
     }
 }
 
-/// `raw` DEFLATE `body` framed as zlib: header, body, big-endian Adler-32.
 fn zlib(body: &[u8], payload: &[u8]) -> Vec<u8> {
     let (mut a, mut b) = (1u32, 0u32);
     for &byte in payload {
@@ -310,9 +287,6 @@ fn zlib(body: &[u8], payload: &[u8]) -> Vec<u8> {
     out
 }
 
-/// zlib framing streams exactly as the one-shot PREFIX form decodes: every
-/// granularity yields the payload, bytes after the Adler-32 are never part of
-/// the stream, and a spoiled header, body end or checksum is refused.
 #[test]
 fn zlib_streams_like_the_one_shot_prefix_form() {
     for (name, body, payload) in vectors() {

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The library lane (design §10.3): it reproduces the perf harness's M3 story through `S0`, keeps the host's rules, and names a busy re-arm, an overrun and a hang.
+//! Tests for the momentum library lane (`S0` reproduction, host rules, and fault detection).
 
 use std::time::Duration;
 
@@ -18,13 +18,10 @@ use super::{MomentumCode, MomentumEvent, MomentumHost, Sched};
 use crate::cursor_glow::Geom;
 use crate::cursor_momentum::{AdmitRefusal, MomentumGlow, MomentumGlowConfig, MomentumGlowFrame};
 
-/// The M3 story's digest (FNV-1a over every frame, quad, wake and reset), as `verify perf aos` reports it.
 const M3_STORY_DIGEST: u64 = 0xbf64_2e76_44df_7e95;
 
-/// The stranded trace's digest: the story program with the demonstration fault running the lane, as `verify perf aos --stranded` reports it.
 const M3_STRANDED_DIGEST: u64 = 0x54bf_a4e7_d959_dc64;
 
-/// The story's shape: 3,265 calls (192 keys, 1 reset, 2,776 ticks, 296 queries).
 fn assert_m3_shape(what: &str, r: &LaneRun) {
     let c = r.counts();
     assert_eq!(r.fault(), None, "{what}: the story runs to its end");
@@ -39,7 +36,6 @@ fn assert_m3_shape(what: &str, r: &LaneRun) {
     assert_eq!(r.fnv(), M3_STORY_DIGEST, "{what}: the story digest");
 }
 
-/// Two runs are the same run: the same calls in order, ticks, counts and digest.
 fn assert_same_run(what: &str, a: &LaneRun, b: &LaneRun) {
     assert_eq!(a.calls(), b.calls(), "{what}: calls");
     assert_eq!(a.ticks(), b.ticks(), "{what}: ticks");
@@ -47,7 +43,6 @@ fn assert_same_run(what: &str, a: &LaneRun, b: &LaneRun) {
     assert_eq!(a.fnv(), b.fnv(), "{what}: digest");
 }
 
-/// The library lane runs the frozen `S0`, the story program's own timeline, to the M3 story through the bare engine, an unattached host and an attached host that logs exactly its calls.
 #[test]
 fn the_library_lane_reproduces_the_m3_story() {
     let t0 = Instant::now();
@@ -84,7 +79,6 @@ fn the_library_lane_reproduces_the_m3_story() {
         "the attached host logged the lane's calls, once each"
     );
 
-    // And on another origin: only offsets reach the engine.
     let later = t0 + Duration::from_secs(9);
     assert_same_run(
         "another origin",
@@ -102,7 +96,6 @@ fn the_library_lane_reproduces_the_m3_story() {
     );
 }
 
-/// The story program under the demonstration fault is the stranded trace `verify perf aos` reports: its lane parks while the glow is hot, so its bursts start where that lane parked, not where `S0`'s do.
 #[test]
 fn the_story_program_under_the_demo_fault_is_the_stranded_trace() {
     let t0 = Instant::now();
@@ -136,7 +129,6 @@ fn scenario(events: Vec<(u64, Exo)>, end: u64) -> Scenario {
     Scenario::new(F, present(10), events, end).expect("fixture: an admitted scenario")
 }
 
-/// The lane keeps the host's rules: inputs before a due tick, cadence while active, the named wake while settling, a park until the next key, and nothing after the end.
 #[test]
 fn the_lane_keeps_the_host_rules() {
     let t0 = Instant::now();
@@ -145,10 +137,8 @@ fn the_lane_keeps_the_host_rules() {
         (k0, key()),
         (k0, Exo::Present(present(11))),
         (F + 1, Exo::Present(present(12))),
-        // A key exactly on a due boundary (the hot glow's cadence tick at 2F) comes first.
         (2 * F, key()),
         (2 * F, Exo::Present(present(13))),
-        // Long after the cool-down: the lane is parked and this key wakes it.
         (20_000_000_000, key()),
     ];
     let sc = scenario(events, 20_000_000_000 + 2 * F);
@@ -222,11 +212,9 @@ fn the_lane_keeps_the_host_rules() {
     );
 }
 
-/// A frame counts in `P` exactly when it differs from the one on glass, the previous tick's or the inert frame before the first.
 #[test]
 fn p_counts_frames_that_differ_from_the_glass() {
     let t0 = Instant::now();
-    // A disabled glow draws the inert frame on every tick: nothing is ever presented.
     let mut off = cfg(true);
     off.enabled = false;
     let dark = Presentation::of(Some((3, 10)), &s0_geom(), &off);
@@ -252,7 +240,6 @@ fn p_counts_frames_that_differ_from_the_glass() {
     }
 }
 
-/// A reset of a glow at rest (before the first key, or after a reset with no key since) is no call on any path, bare, unattached or attached, while a reset after a key is one call.
 #[test]
 fn a_reset_of_a_glow_at_rest_is_no_call() {
     let t0 = Instant::now();
@@ -291,10 +278,8 @@ fn a_reset_of_a_glow_at_rest_is_no_call() {
     );
 }
 
-/// The lane stops at a busy re-arm, names a hang when a glow never stops asking for frames, and stops a one-nanosecond creep at its event bound.
 #[test]
 fn the_lane_stops_and_names_a_rearm_a_hang_and_its_event_bound() {
-    /// The engine, with the scheduler answer replaced.
     struct Rigged {
         g: MomentumGlow,
         active: bool,
@@ -374,7 +359,6 @@ fn the_lane_stops_and_names_a_rearm_a_hang_and_its_event_bound() {
     assert!(r.calls().len() + 2 > LANE_MAX_EVENTS, "it ran to its bound");
 }
 
-/// A scenario is admitted whole or refused naming what breaks: the frame interval, the start, the horizon, an input out of order or past the end, or an input admission refuses.
 #[test]
 fn a_scenario_is_admitted_or_refused_by_name() {
     let p = present(10);
@@ -446,7 +430,6 @@ fn a_scenario_is_admitted_or_refused_by_name() {
     assert_eq!(S0_FRAME_INTERVAL_NS, F);
 }
 
-/// The encoding opens with the format byte and changes with every part of the scenario: the frame interval, the end, the start, and each input's time, kind and presentation.
 #[test]
 fn a_scenario_encoding_names_every_part() {
     let base = s0();

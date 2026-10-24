@@ -855,7 +855,17 @@ fn fronting_a_native_tab_strips_the_terminal_frames_decoration_and_its_pet() {
                 && ws.fx.companion_mut().brain().needs_frames(),
             "fixture: a pet walking after a moved caret is on glass and owes frames"
         );
-        ws.input_scratch.free_sprites = vec![aterm_core::render::FreeSprite::default(); 2];
+        let art = aterm_render::fx::bitmap(
+            aterm_core::render::FxTexels::Rgba8Straight,
+            2,
+            2,
+            vec![255; 16],
+        )
+        .expect("an art");
+        let body = aterm_render::sprites::FreeSprite::whole(0, 0, art);
+        let tiles = aterm_effects::matrix_rain::RainBaker::default();
+        ws.fx
+            .publish_for_test(&[body.clone(), body], (&[], &tiles), &mut ws.input_scratch);
         ws.input_scratch.nova_add = vec![aterm_core::render::GlowQuad::default()];
         ws.input_scratch.cursor_glow_add = vec![aterm_core::render::GlowQuad::default()];
     }
@@ -865,10 +875,10 @@ fn fronting_a_native_tab_strips_the_terminal_frames_decoration_and_its_pet() {
 
     let ws = &app.windows[&wid];
     assert!(
-        ws.input_scratch.free_sprites.is_empty() && ws.input_scratch.free_atlas.is_none(),
-        "a native frame carries no free sprite the terminal left behind \
+        aterm_render::sprites::published(&ws.input_scratch.fx_layers).is_empty(),
+        "a native frame carries no companion sprite the terminal left behind \
          ({} survived)",
-        ws.input_scratch.free_sprites.len()
+        aterm_render::sprites::published(&ws.input_scratch.fx_layers).len()
     );
     assert!(
         ws.input_scratch.nova_add.is_empty() && ws.input_scratch.cursor_glow_add.is_empty(),

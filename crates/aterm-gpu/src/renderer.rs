@@ -1996,10 +1996,6 @@ pub(crate) enum DrawPipe {
     DecoOver,
     DecoAdd,
     KnockOver,
-    RainUnder,
-    CatOver,
-    FreeUnder,
-    FreeOver,
     Fx,
     FxLinear,
     FxStore,
@@ -2023,11 +2019,7 @@ impl DrawPipe {
             Self::DecoOver => Pipeline::DecoOver,
             Self::DecoAdd => Pipeline::DecoAdd,
             Self::KnockOver => Pipeline::KnockOver,
-            Self::Wallpaper
-            | Self::RainUnder
-            | Self::CatOver
-            | Self::FreeUnder
-            | Self::FreeOver => Pipeline::SpriteOver,
+            Self::Wallpaper => Pipeline::SpriteOver,
             Self::Fx => Pipeline::Fx,
             Self::FxLinear => Pipeline::FxLinear,
             Self::FxStore => Pipeline::FxStore,
@@ -2042,9 +2034,6 @@ pub(crate) enum DrawAtlas {
     Color,
     Image,
     Deco,
-    Rain,
-    Cat,
-    Free,
     Wallpaper,
     Fx,
 }
@@ -2060,11 +2049,8 @@ pub(crate) enum StreamId {
     Bg,
     ImageBelowBg,
     ImageBgCover,
-    RainUnder,
-    CatOver,
-    FreeUnder,
-    GlyphKnock,
     FxLinearUnder,
+    GlyphKnock,
     Trail,
     GlowUnder,
     FxUnder,
@@ -2087,7 +2073,6 @@ pub(crate) enum StreamId {
     RainAddOver,
     WdecoOver,
     WdecoAdd,
-    FreeOver,
     FxLinearOver,
     CursorBlock,
     CursorGlyph,
@@ -2105,11 +2090,8 @@ impl StreamId {
         Self::Bg,
         Self::ImageBelowBg,
         Self::ImageBgCover,
-        Self::RainUnder,
-        Self::CatOver,
-        Self::FreeUnder,
-        Self::GlyphKnock,
         Self::FxLinearUnder,
+        Self::GlyphKnock,
         Self::Trail,
         Self::GlowUnder,
         Self::FxUnder,
@@ -2132,7 +2114,6 @@ impl StreamId {
         Self::RainAddOver,
         Self::WdecoOver,
         Self::WdecoAdd,
-        Self::FreeOver,
         Self::FxLinearOver,
         Self::CursorBlock,
         Self::CursorGlyph,
@@ -2157,9 +2138,6 @@ impl StreamId {
             Self::Bg => "bg",
             Self::ImageBelowBg => "image_below_bg",
             Self::ImageBgCover => "image_bg_cover",
-            Self::RainUnder => "rain_under",
-            Self::CatOver => "cat_over",
-            Self::FreeUnder => "free_under",
             Self::FxLinearUnder => "fx_linear_under",
             Self::Trail => "trail",
             Self::GlowUnder => "glow_under",
@@ -2184,7 +2162,6 @@ impl StreamId {
             Self::RainAddOver => "rain_add_over",
             Self::WdecoOver => "wdeco_over",
             Self::WdecoAdd => "wdeco_add",
-            Self::FreeOver => "free_over",
             Self::FxLinearOver => "fx_linear_over",
             Self::CursorBlock => "cursor_block",
             Self::CursorGlyph => "cursor_glyph",
@@ -2212,8 +2189,14 @@ pub struct FrameShape {
     /// The renderer's framebuffer-fetch verdict as of the frame ([`GpuRenderer::fetch_probe`]): `None` until a frame that drew Unorm-law light settled it.
     pub fetch_probe: Option<FetchProbe>,
     pub fx_instances: u32,
+    /// The fx bytes the frame uploaded: its instances, its palette and [`Self::fx_atlas_bytes`].
     pub fx_upload_bytes: u64,
+    /// The texel bytes of the fx atlas regions the frame wrote: 0 once every art it draws is resident.
+    pub fx_atlas_bytes: u64,
     pub fx_refused: u64,
+    /// Metal: the frames in flight the frame's fx atlas sync waited for before rewriting a region they may read (a region reused after eviction, or written once more), and the nanoseconds it parked for them; 0 on the other arms, whose queues order the writes.
+    pub fx_reader_waits: u64,
+    pub fx_reader_wait_ns: u64,
 }
 
 /// The pass-economy ablation.
@@ -2343,7 +2326,10 @@ impl Default for FrameShape {
             fetch_probe: None,
             fx_instances: 0,
             fx_upload_bytes: 0,
+            fx_atlas_bytes: 0,
             fx_refused: 0,
+            fx_reader_waits: 0,
+            fx_reader_wait_ns: 0,
         }
     }
 }
@@ -2413,9 +2399,6 @@ impl DrawItem {
 pub(crate) struct FramePlanCtx {
     pub(crate) has_image_plane: bool,
     pub(crate) has_deco: bool,
-    pub(crate) has_rain: bool,
-    pub(crate) has_cat: bool,
-    pub(crate) has_free: bool,
     pub(crate) has_wallpaper: bool,
     pub(crate) cursor_opaque: bool,
     pub(crate) ablation: UnormAblation,
@@ -2488,38 +2471,23 @@ pub(crate) fn build_frame_plan(
         );
     }
     push(G_BASE_BG, StreamId::ImageBgCover, DrawPipe::Bg, None);
-    push(
-        G_BASE_BG,
-        StreamId::RainUnder,
-        DrawPipe::RainUnder,
-        ctx.has_rain.then_some(DrawAtlas::Rain),
-    );
-    push(
-        G_BASE_BG,
-        StreamId::CatOver,
-        DrawPipe::CatOver,
-        ctx.has_cat.then_some(DrawAtlas::Cat),
-    );
-    push(
-        G_BASE_BG,
-        StreamId::FreeUnder,
-        DrawPipe::FreeUnder,
-        ctx.has_free.then_some(DrawAtlas::Free),
-    );
-    // The knock-out (`aterm_render::KNOCK_DILATE_OFFSETS`): the letters on a
-    // body drawn under the text cut it to the page, before any trail draws,
-    // recolouring the body and keeping the page's alpha (glass stays glass).
-    push(
-        G_BASE_BG,
-        StreamId::GlyphKnock,
-        DrawPipe::KnockOver,
-        Some(DrawAtlas::Mono),
-    );
+    // The Linear layers under the text: the rain's rows, then the companions
+    // on it (lane B7 of `docs/DESIGN-card-engine-2026-10-19.md`).
     push(
         G_BASE_BG,
         StreamId::FxLinearUnder,
         DrawPipe::FxLinear,
         Some(DrawAtlas::Fx),
+    );
+    // The knock-out (`aterm_render::KNOCK_DILATE_OFFSETS`): the letters on a
+    // body drawn under the text (a knock layer, `FxLayer::knock`) cut it to the
+    // page, before any trail draws, recolouring the body and keeping the
+    // page's alpha (glass stays glass).
+    push(
+        G_BASE_BG,
+        StreamId::GlyphKnock,
+        DrawPipe::KnockOver,
+        Some(DrawAtlas::Mono),
     );
     push(G_BASE_BG, StreamId::Trail, DrawPipe::Bg, None);
     if under_store {
@@ -2611,14 +2579,6 @@ pub(crate) fn build_frame_plan(
         );
     }
 
-    if ctx.has_free {
-        push(
-            G_FREE_OVER,
-            StreamId::FreeOver,
-            DrawPipe::FreeOver,
-            Some(DrawAtlas::Free),
-        );
-    }
     push(
         G_FREE_OVER,
         StreamId::FxLinearOver,
@@ -2672,9 +2632,6 @@ pub(crate) struct WgpuFrameRes<'a> {
     pub(crate) atlas_color: &'a wgpu::BindGroup,
     pub(crate) atlas_deco: Option<&'a wgpu::BindGroup>,
     pub(crate) atlas_image: Option<&'a wgpu::BindGroup>,
-    pub(crate) atlas_rain: Option<&'a wgpu::BindGroup>,
-    pub(crate) atlas_cat: Option<&'a wgpu::BindGroup>,
-    pub(crate) atlas_free: Option<&'a wgpu::BindGroup>,
     pub(crate) atlas_wallpaper: Option<&'a wgpu::BindGroup>,
     pub(crate) atlas_fx: Option<&'a wgpu::BindGroup>,
     pub(crate) streams: [Option<wgpu::BufferSlice<'a>>; STREAM_COUNT],
@@ -2758,11 +2715,7 @@ impl FrameRes<'_> {
                     DrawPipe::DecoOver => r.effects.get(EffectPipeline::DecoOver),
                     DrawPipe::DecoAdd => r.effects.get(EffectPipeline::DecoAdd),
                     DrawPipe::KnockOver => r.effects.get(EffectPipeline::KnockOver),
-                    DrawPipe::Wallpaper
-                    | DrawPipe::RainUnder
-                    | DrawPipe::CatOver
-                    | DrawPipe::FreeUnder
-                    | DrawPipe::FreeOver => r.effects.get(EffectPipeline::SpriteOver),
+                    DrawPipe::Wallpaper => r.effects.get(EffectPipeline::SpriteOver),
                     DrawPipe::Fx => r.effects.get(EffectPipeline::Fx),
                     DrawPipe::FxLinear => r.effects.get(EffectPipeline::FxLinear),
                     DrawPipe::FxStore => r.effects.get(EffectPipeline::FxStore),
@@ -2790,9 +2743,6 @@ impl FrameRes<'_> {
                     DrawAtlas::Color => Some(r.atlas_color),
                     DrawAtlas::Deco => r.atlas_deco,
                     DrawAtlas::Image => r.atlas_image,
-                    DrawAtlas::Rain => r.atlas_rain,
-                    DrawAtlas::Cat => r.atlas_cat,
-                    DrawAtlas::Free => r.atlas_free,
                     DrawAtlas::Wallpaper => r.atlas_wallpaper,
                     DrawAtlas::Fx => r.atlas_fx,
                 };
@@ -3119,6 +3069,10 @@ struct MetalArmLive {
     encode_band_shifts: std::cell::Cell<u64>,
     fx_tex: [Option<fx_gpu::FxArmTex>; 2],
     fx_hazard: FxHazard,
+    /// The last fx sync's reader settle ([`Self::sync_fx`]): the frames in
+    /// flight it waited for before rewriting a region they may read, and the
+    /// nanoseconds it parked.
+    fx_reader_wait: (u64, u64),
     #[cfg(any(test, debug_assertions))]
     fx_shared_palette: Option<(crate::device_layer::LayerTexture, u32)>,
 }
@@ -3253,6 +3207,7 @@ impl MetalArmLive {
             encode_band_shifts: std::cell::Cell::new(0),
             fx_tex: [None, None],
             fx_hazard: FxHazard::default(),
+            fx_reader_wait: (0, 0),
             #[cfg(any(test, debug_assertions))]
             fx_shared_palette: None,
         })
@@ -3362,16 +3317,19 @@ impl MetalArmLive {
         (consumed, parked_ns)
     }
 
+    /// Wait for every frame in flight before an fx atlas region rewrite:
+    /// how many it waited for and the nanoseconds it parked.
     fn settle_for_fx(
         frame_slots: &mut [ArmFrameSlot],
         awaited_frames: &mut u64,
         frame_slot_wait_ns: &mut u64,
         fx_hazard: &mut FxHazard,
-    ) {
+    ) -> (u64, u64) {
         let (consumed, ns) = Self::await_atlas_readers(frame_slots);
         *awaited_frames += consumed;
         *frame_slot_wait_ns = frame_slot_wait_ns.saturating_add(ns);
         fx_hazard.settled(ns);
+        (consumed, ns)
     }
 
     #[inline]
@@ -3609,6 +3567,7 @@ impl MetalArmLive {
 
     fn sync_fx(&mut self, atlas: &fx_gpu::FxAtlas, drawing: bool) -> Result<u64, String> {
         let mut bytes = 0;
+        self.fx_reader_wait = (0, 0);
         for kind in [fx_gpu::FxAtlasKind::R8, fx_gpu::FxAtlasKind::Rgba] {
             let side = atlas.side(kind);
             if !fx_gpu::fx_tex_due(&self.fx_tex[kind as usize], side, drawing) {
@@ -3621,6 +3580,7 @@ impl MetalArmLive {
                 awaited_frames,
                 frame_slot_wait_ns,
                 fx_hazard,
+                fx_reader_wait,
                 ..
             } = self;
             let synced = fx_gpu::sync_fx_tex(
@@ -3628,7 +3588,16 @@ impl MetalArmLive {
                 &mut fx_tex[kind as usize],
                 side,
                 |_| true,
-                || Self::settle_for_fx(frame_slots, awaited_frames, frame_slot_wait_ns, fx_hazard),
+                || {
+                    let (frames, ns) = Self::settle_for_fx(
+                        frame_slots,
+                        awaited_frames,
+                        frame_slot_wait_ns,
+                        fx_hazard,
+                    );
+                    fx_reader_wait.0 += frames;
+                    fx_reader_wait.1 = fx_reader_wait.1.saturating_add(ns);
+                },
             )
             .map_err(|e| format!("fx {kind:?} atlas: {e}"))?;
             bytes += synced.bytes;
@@ -3655,7 +3624,7 @@ impl MetalArmLive {
             )?;
             self.fx_shared_palette = Some((tex, h));
         } else {
-            Self::settle_for_fx(
+            let _ = Self::settle_for_fx(
                 &mut self.frame_slots,
                 &mut self.awaited_frames,
                 &mut self.frame_slot_wait_ns,
@@ -4735,11 +4704,6 @@ const _: () = assert!(DECO_GLYPHS.len() == aterm_render::UNDERCURL_SPRITE);
 const _: () = assert!(DECO_GLYPHS.len() + 1 == aterm_render::DECO_ATLAS_SPRITES);
 
 #[inline]
-fn uv_tie_bias(dest_px: u16, atlas_px: f32) -> f32 {
-    0.25 / (f32::from(dest_px.max(1)) * atlas_px)
-}
-
-#[inline]
 const fn deco_sprite_index(g: aterm_render::DecoGlyph) -> usize {
     match g {
         aterm_render::DecoGlyph::Star4 => 0,
@@ -4860,10 +4824,7 @@ struct ResidentAtlas {
 /// Per-window GPU state.
 #[derive(Default)]
 pub struct WindowGpu {
-    cat_atlas: Option<Arc<SpriteTex>>,
-    free_atlas: Option<Arc<SpriteTex>>,
     wallpaper_tex: Option<Arc<SpriteTex>>,
-    rain_atlas: Option<Arc<SpriteTex>>,
     last_present_work_ns: u64,
     last_present_encode_ns: u64,
     last_acquire_wait_ns: u64,
@@ -5779,10 +5740,6 @@ struct Instances {
     rain_add_over: Vec<RainGlowInstance>,
     wdeco_over: Vec<GlyphInstance>,
     wdeco_add: Vec<GlyphInstance>,
-    rain_under: Vec<GlyphInstance>,
-    cat_over: Vec<GlyphInstance>,
-    free_under: Vec<GlyphInstance>,
-    free_over: Vec<GlyphInstance>,
     wallpaper: Vec<GlyphInstance>,
     cursor_block: Vec<BgInstance>,
     cursor_glyph: Vec<GlyphInstance>,
@@ -5807,9 +5764,6 @@ impl Instances {
             StreamId::Bg => stream!(bg),
             StreamId::ImageBelowBg => stream!(image_below_bg),
             StreamId::ImageBgCover => stream!(image_bg_cover),
-            StreamId::RainUnder => stream!(rain_under),
-            StreamId::CatOver => stream!(cat_over),
-            StreamId::FreeUnder => stream!(free_under),
             StreamId::GlyphKnock => stream!(glyph_knock),
             StreamId::FxLinearUnder => self.fx_stream(fx_gpu::FxStream::LinearUnder),
             StreamId::Trail => stream!(trail),
@@ -5834,7 +5788,6 @@ impl Instances {
             StreamId::RainAddOver => stream!(rain_add_over),
             StreamId::WdecoOver => stream!(wdeco_over),
             StreamId::WdecoAdd => stream!(wdeco_add),
-            StreamId::FreeOver => stream!(free_over),
             StreamId::FxLinearOver => self.fx_stream(fx_gpu::FxStream::LinearOver),
             StreamId::CursorBlock => stream!(cursor_block),
             StreamId::CursorGlyph => stream!(cursor_glyph),
@@ -5881,10 +5834,6 @@ impl Instances {
         self.rain_add_over.clear();
         self.wdeco_over.clear();
         self.wdeco_add.clear();
-        self.rain_under.clear();
-        self.cat_over.clear();
-        self.free_under.clear();
-        self.free_over.clear();
         self.wallpaper.clear();
         self.cursor_block.clear();
         self.cursor_glyph.clear();
@@ -5918,11 +5867,8 @@ impl VertexBuffers {
             "aterm-gpu bg instances",
             "aterm-gpu below-cell-background image instances",
             "aterm-gpu image background-cover instances",
-            "aterm-gpu rain under instances",
-            "aterm-gpu cat over instances",
-            "aterm-gpu free under-text instances",
-            "aterm-gpu glyph knock-out instances",
             "aterm-gpu fx linear under instances",
+            "aterm-gpu glyph knock-out instances",
             "aterm-gpu cursor trail instances",
             "aterm-gpu emberforge glow-under instances",
             "aterm-gpu fx under instances",
@@ -5945,7 +5891,6 @@ impl VertexBuffers {
             "aterm-gpu rain add over instances",
             "aterm-gpu sparkle-word paw instances",
             "aterm-gpu sparkle-word sparkle instances",
-            "aterm-gpu free over-text instances",
             "aterm-gpu fx linear over instances",
             "aterm-gpu cursor block fill",
             "aterm-gpu cursor cut-out glyph",
@@ -6707,11 +6652,7 @@ fn frame_effect_pipelines(
         !inst.glyph_halo.is_empty() || !inst.curl.is_empty() || !inst.wdeco_over.is_empty();
     want[EffectPipeline::DecoAdd as usize] = !inst.wdeco_add.is_empty();
     want[EffectPipeline::KnockOver as usize] = !inst.glyph_knock.is_empty();
-    want[EffectPipeline::SpriteOver as usize] = !inst.wallpaper.is_empty()
-        || !inst.rain_under.is_empty()
-        || !inst.cat_over.is_empty()
-        || !inst.free_under.is_empty()
-        || !inst.free_over.is_empty();
+    want[EffectPipeline::SpriteOver as usize] = !inst.wallpaper.is_empty();
     let (fx, linear, store) = fx_effect_demand(inst, fx_gpu::under_draws_opaque(input));
     want[EffectPipeline::Fx as usize] = fx;
     want[EffectPipeline::FxLinear as usize] = linear;
@@ -15535,38 +15476,11 @@ impl GpuRenderer {
     }
 
     #[inline]
-    fn ensure_cat_atlas(&mut self, win: &mut WindowGpu, input: &RenderInput) {
-        self.ensure_sprite_texture(
-            &mut win.cat_atlas,
-            input.cat_atlas.as_ref(),
-            "aterm-gpu cat atlas",
-        );
-    }
-
-    #[inline]
-    fn ensure_free_atlas(&mut self, win: &mut WindowGpu, input: &RenderInput) {
-        self.ensure_sprite_texture(
-            &mut win.free_atlas,
-            input.free_atlas.as_ref(),
-            "aterm-gpu free atlas",
-        );
-    }
-
-    #[inline]
     fn ensure_wallpaper_tex(&mut self, win: &mut WindowGpu, input: &RenderInput) {
         self.ensure_sprite_texture(
             &mut win.wallpaper_tex,
             input.wallpaper.as_ref(),
             "aterm-gpu wallpaper",
-        );
-    }
-
-    #[inline]
-    fn ensure_rain_atlas(&mut self, win: &mut WindowGpu, input: &RenderInput) {
-        self.ensure_sprite_texture(
-            &mut win.rain_atlas,
-            input.rain_atlas.as_ref(),
-            "aterm-gpu rain atlas",
         );
     }
 
@@ -15611,7 +15525,9 @@ impl GpuRenderer {
                 0
             }
             + self.fx.atlas_bytes;
+        shape.fx_atlas_bytes = self.fx.atlas_bytes;
         shape.fx_refused = self.fx.refused;
+        (shape.fx_reader_waits, shape.fx_reader_wait_ns) = self.fx.reader_wait;
         self.frame_shape = shape;
         self.last_bg_instances = self.inst.bg.len();
         self.last_instances = self.inst.bg.len()
@@ -15703,9 +15619,6 @@ impl GpuRenderer {
         };
 
         self.ensure_deco_atlas(cw, ch);
-        self.ensure_cat_atlas(win, input);
-        self.ensure_free_atlas(win, input);
-        self.ensure_rain_atlas(win, input);
         self.ensure_wallpaper_tex(win, input);
 
         let row_active = |r: usize| -> bool {
@@ -15949,17 +15862,20 @@ impl GpuRenderer {
 
         let backdrop_margins_active = self.backdrop_margins_active();
         let backdrop_margin_alpha_byte = (self.backdrop_margin_alpha() * 255.0).round() as u8;
+        // The knock-out's bodies (`aterm_render::knock_rects`): the slices the
+        // knock layers draw, cut as the CPU composite cuts them.
+        let mut knocks = std::mem::take(&mut self.fx.knocks);
+        if self.cpu.knock_out_on() {
+            let f = self.fx_frame_for(input);
+            self.fx
+                .knock_rects(&f, &input.fx_layers, &input.fx_occluders, &mut knocks);
+        } else {
+            knocks.clear();
+        }
         let bg_inst = &mut self.inst.bg;
         let glyph_inst = &mut self.inst.glyph;
         let glyph_halo_inst = &mut self.inst.glyph_halo;
         let glyph_knock_inst = &mut self.inst.glyph_knock;
-        // The knock-out's bodies (`aterm_render::knock_rects`), as the CPU
-        // composite cuts them: only when the free atlas draws them.
-        let knocks: Vec<[i32; 4]> = if win.free_atlas.is_some() && self.cpu.knock_out_on() {
-            aterm_render::knock_rects(&input.free_sprites, pad as i32, grid_top as i32).collect()
-        } else {
-            Vec::new()
-        };
         let fire_present = !input.fire_patch.is_empty();
         let halo_rgb = {
             let rgb = aterm_render::HALO_IN_FIRE_RGB;
@@ -16622,6 +16538,7 @@ impl GpuRenderer {
         }
         self.row_plans = row_plans;
         self.key_scratch = key_scratch;
+        self.fx.knocks = knocks;
         for (r, cells) in rendered.iter().enumerate().take(vis_rows) {
             let Some(win) = glyph_win[r] else {
                 continue;
@@ -17061,6 +16978,7 @@ impl GpuRenderer {
         }
 
         self.fx.atlas_bytes = 0;
+        self.fx.reader_wait = (0, 0);
         self.fx.refused = 0;
         if fx_ok && !(input.fx_layers.is_empty() && input.fx_prefetch.is_empty()) {
             let cap = self.fx_atlas_cap();
@@ -17258,140 +17176,6 @@ impl GpuRenderer {
             }
         }
 
-        #[allow(
-            clippy::too_many_arguments,
-            reason = "the sprite fields SpriteQuad and FreeSprite share, one per argument"
-        )]
-        fn sprite_instance(
-            x: f32,
-            y: f32,
-            w: u16,
-            h: u16,
-            ax: u16,
-            ay: u16,
-            aw: u16,
-            ah: u16,
-            tint: u32,
-            alpha: u8,
-            flip_x: bool,
-            (atlas_w, atlas_h): (u32, u32),
-        ) -> Option<GlyphInstance> {
-            if w == 0 || h == 0 || aw == 0 || ah == 0 {
-                return None;
-            }
-            if (ax as u32 + aw as u32) > atlas_w || (ay as u32 + ah as u32) > atlas_h {
-                return None;
-            }
-            let (saw, sah) = (atlas_w as f32, atlas_h as f32);
-            let (bx, by) = (uv_tie_bias(w, saw), uv_tie_bias(h, sah));
-            let (mut u0, mut du) = (ax as f32 / saw + bx, aw as f32 / saw);
-            if flip_x {
-                u0 = (ax as f32 + aw as f32) / saw - bx;
-                du = -(aw as f32) / saw;
-            }
-            Some(GlyphInstance {
-                rect: [x, y, w as f32, h as f32],
-                uv: [u0, ay as f32 / sah + by, du, ah as f32 / sah],
-                color: [
-                    ((tint >> 16) & 0xff) as u8,
-                    ((tint >> 8) & 0xff) as u8,
-                    (tint & 0xff) as u8,
-                    alpha,
-                ],
-                bg: [0, 0, 0, 0],
-            })
-        }
-        fn build_sprites(
-            dst: &mut Vec<GlyphInstance>,
-            quads: &[aterm_core::render::SpriteQuad],
-            rows: usize,
-            atlas: (u32, u32),
-            padf: f32,
-            grid_topf: f32,
-            keep: impl Fn(u16) -> bool,
-        ) {
-            for q in quads {
-                // Skip a quad past the grid's last row, as every other
-                // row-tagged stream does and the CPU twins do structurally
-                // (`build_rain_row_csr` drops `row >= input.rows`; the cat
-                // stamp fires only for `r` in `0..rows`). `keep` cannot stand
-                // in for this: under `RepaintScope::Full` it passes everything.
-                if !keep(q.row) || q.row as usize >= rows {
-                    continue;
-                }
-                if let Some(inst) = sprite_instance(
-                    padf + q.x as f32,
-                    grid_topf + q.y as f32,
-                    q.w,
-                    q.h,
-                    q.ax,
-                    q.ay,
-                    q.aw,
-                    q.ah,
-                    q.tint,
-                    q.alpha,
-                    q.flip_x,
-                    atlas,
-                ) {
-                    dst.push(inst);
-                }
-            }
-        }
-        let padf = pad as f32;
-        let grid_topf = grid_top as f32;
-        if let Some((raw, rah)) = win.rain_atlas.as_ref().map(|s| (s.w, s.h)) {
-            build_sprites(
-                &mut self.inst.rain_under,
-                &input.rain_quads,
-                rows,
-                (raw, rah),
-                padf,
-                grid_topf,
-                |r| row_active(usize::from(r)),
-            );
-        }
-        if let Some((caw, cah)) = win.cat_atlas.as_ref().map(|s| (s.w, s.h)) {
-            build_sprites(
-                &mut self.inst.cat_over,
-                &input.cat_quads,
-                rows,
-                (caw, cah),
-                padf,
-                grid_topf,
-                |_| true,
-            );
-        }
-        if let Some(atlas) = win.free_atlas.as_ref().map(|s| (s.w, s.h)) {
-            for s in &input.free_sprites {
-                debug_assert!(
-                    matches!(s.sampler, aterm_core::render::FreeSampler::Nearest),
-                    "FreeSampler::Linear is deferred — v1 free sprites are NEAREST-only"
-                );
-                if !matches!(s.sampler, aterm_core::render::FreeSampler::Nearest) {
-                    continue;
-                }
-                let Some(inst) = sprite_instance(
-                    padf + s.x as f32,
-                    grid_topf + s.y as f32,
-                    s.w,
-                    s.h,
-                    s.ax,
-                    s.ay,
-                    s.aw,
-                    s.ah,
-                    s.tint,
-                    s.alpha,
-                    s.flip_x,
-                    atlas,
-                ) else {
-                    continue;
-                };
-                match s.z {
-                    aterm_core::render::FreeZ::UnderText => self.inst.free_under.push(inst),
-                    aterm_core::render::FreeZ::OverText => self.inst.free_over.push(inst),
-                }
-            }
-        }
         #[cfg(wgpu_arm)]
         ensure_effect_pipelines(
             &mut self.effects,
@@ -17475,6 +17259,7 @@ impl GpuRenderer {
                     let fx_drawing = self.inst.fx_instances() > 0;
                     let fx_staged = live.sync_fx(&self.fx.atlas, fx_drawing).and_then(|bytes| {
                         self.fx.atlas_bytes = bytes;
+                        self.fx.reader_wait = live.fx_reader_wait;
                         if !fx_drawing {
                             return Ok(None);
                         }
@@ -17533,9 +17318,6 @@ impl GpuRenderer {
                     FramePlanCtx {
                         has_image_plane: armed_image_plane,
                         has_deco: self.deco_atlas.is_some(),
-                        has_rain: win.rain_atlas.is_some(),
-                        has_cat: win.cat_atlas.is_some(),
-                        has_free: win.free_atlas.is_some(),
                         has_wallpaper: win.wallpaper_tex.is_some(),
                         cursor_opaque,
                         ablation: self.ablation,
@@ -17727,18 +17509,8 @@ impl GpuRenderer {
                                         &mut live.atlases[a as usize],
                                     )
                                 }
-                                DrawAtlas::Rain
-                                | DrawAtlas::Cat
-                                | DrawAtlas::Free
-                                | DrawAtlas::Wallpaper => {
-                                    let sprite = match a {
-                                        DrawAtlas::Rain => &win.rain_atlas,
-                                        DrawAtlas::Cat => &win.cat_atlas,
-                                        DrawAtlas::Free => &win.free_atlas,
-                                        _ => &win.wallpaper_tex,
-                                    }
-                                    .as_ref()
-                                    .unwrap_or_else(|| {
+                                DrawAtlas::Wallpaper => {
+                                    let sprite = win.wallpaper_tex.as_ref().unwrap_or_else(|| {
                                         panic!("plan samples {a:?} but its SpriteTex is absent")
                                     });
                                     match sprite.metal_atlas(
@@ -18026,12 +17798,6 @@ impl GpuRenderer {
             );
 
             #[cfg(wgpu_arm)]
-            let cat_bind = win.cat_atlas.as_ref().map(|s| &s.bind);
-            #[cfg(wgpu_arm)]
-            let free_bind = win.free_atlas.as_ref().map(|s| &s.bind);
-            #[cfg(wgpu_arm)]
-            let rain_bind = win.rain_atlas.as_ref().map(|s| &s.bind);
-            #[cfg(wgpu_arm)]
             let wallpaper_bind = win.wallpaper_tex.as_ref().map(|s| &s.bind);
 
             let off = win.offscreen.as_ref().expect("offscreen set above");
@@ -18045,9 +17811,6 @@ impl GpuRenderer {
                 FramePlanCtx {
                     has_image_plane: win.image_plane.is_some(),
                     has_deco: deco_bind.is_some(),
-                    has_rain: rain_bind.is_some(),
-                    has_cat: cat_bind.is_some(),
-                    has_free: free_bind.is_some(),
                     has_wallpaper: wallpaper_bind.is_some(),
                     cursor_opaque,
                     ablation: self.ablation,
@@ -18067,9 +17830,6 @@ impl GpuRenderer {
                 atlas_color: color_bind,
                 atlas_deco: deco_bind,
                 atlas_image: win.image_plane.as_ref().map(|p| &p.bind),
-                atlas_rain: rain_bind,
-                atlas_cat: cat_bind,
-                atlas_free: free_bind,
                 atlas_wallpaper: wallpaper_bind,
                 atlas_fx: self
                     .fx_wgpu
@@ -18565,17 +18325,13 @@ impl GpuRenderer {
                         &res.atlas.data[..(res.atlas.width * res.atlas.height * 4) as usize],
                     )
                 }
-                DrawAtlas::Rain | DrawAtlas::Cat | DrawAtlas::Free | DrawAtlas::Wallpaper => {
-                    let src = match a {
-                        DrawAtlas::Rain => &win.rain_atlas,
-                        DrawAtlas::Cat => &win.cat_atlas,
-                        DrawAtlas::Free => &win.free_atlas,
-                        _ => &win.wallpaper_tex,
-                    }
-                    .as_ref()
-                    .unwrap_or_else(|| panic!("plan samples {a:?} but its SpriteTex is absent"))
-                    .src
-                    .as_ref();
+                DrawAtlas::Wallpaper => {
+                    let src = win
+                        .wallpaper_tex
+                        .as_ref()
+                        .unwrap_or_else(|| panic!("plan samples {a:?} but its SpriteTex is absent"))
+                        .src
+                        .as_ref();
                     (
                         TexelFormat::Rgba8Unorm,
                         src.width,
@@ -19636,9 +19392,6 @@ mod tests {
         let ctx = |ablation| FramePlanCtx {
             has_image_plane: true,
             has_deco: true,
-            has_rain: true,
-            has_cat: true,
-            has_free: true,
             has_wallpaper: true,
             cursor_opaque: true,
             ablation,
@@ -19715,9 +19468,6 @@ mod tests {
         let ctx = FramePlanCtx {
             has_image_plane: true,
             has_deco: true,
-            has_rain: true,
-            has_cat: true,
-            has_free: true,
             has_wallpaper: true,
             cursor_opaque: false,
             ablation: UnormAblation::Off,
@@ -19786,9 +19536,6 @@ mod tests {
         let ctx = |under_opaque| FramePlanCtx {
             has_image_plane: false,
             has_deco: false,
-            has_rain: false,
-            has_cat: false,
-            has_free: false,
             has_wallpaper: false,
             cursor_opaque: true,
             ablation: UnormAblation::Off,
@@ -22063,6 +21810,7 @@ mod atlas_upload_sync_tests {
             ("fx_gen", 1),
             ("fx_regions", 1),
             ("fx_uploaded", 1),
+            ("fx_rewrite", 0),
             ("region_race", 0),
             ("pal_conflict", 0),
             ("busy0", busy(0)),
@@ -22108,14 +21856,18 @@ mod atlas_upload_sync_tests {
         tex: &crate::metal::resources::SealedTexture,
         slots: &[usize],
     ) {
+        readers_in_as(live, tex, PixelFormat::R8Unorm, slots);
+    }
+
+    fn readers_in_as(
+        live: &mut MetalArmLive,
+        tex: &crate::metal::resources::SealedTexture,
+        format: PixelFormat,
+        slots: &[usize],
+    ) {
         let dest = live
             .mint
-            .texture_2d(
-                PixelFormat::R8Unorm,
-                tex.width(),
-                tex.height(),
-                TEXTURE_USAGE_SHADER_READ,
-            )
+            .texture_2d(format, tex.width(), tex.height(), TEXTURE_USAGE_SHADER_READ)
             .expect("reader destination");
         for &index in slots {
             let mut cb = live.session.begin().expect("reader command buffer");
@@ -22140,6 +21892,95 @@ mod atlas_upload_sync_tests {
             )
             .expect("sized"),
         )
+    }
+
+    /// An LRU rewrite: a tile evicted from a full atlas gives its region to
+    /// the next tile, written in place into the texture two frames in flight
+    /// sample, so the write first settles both; the texture is kept, only the
+    /// new tile's texels upload, and the region reads back as the new tile.
+    #[test]
+    fn an_fx_region_rewrite_settles_every_frame_reader() {
+        let _pool = AutoreleasePool::new();
+        let mut live = live_or_skip();
+        let mut fx = super::fx_gpu::FxGpu::default();
+        let tile = |rgb: [u8; 3]| {
+            let texel = [rgb[0], rgb[1], rgb[2], 0xff];
+            std::sync::Arc::new(
+                aterm_core::render::FxArt::new(
+                    512,
+                    512,
+                    aterm_core::render::FxTexels::Rgba8Straight,
+                    texel.repeat(512 * 512),
+                )
+                .expect("sized"),
+            )
+        };
+        let cap = super::fx_gpu::FX_ATLAS_MIN;
+        fx.admit(&[], &[tile([0x11, 0x22, 0x33])], cap);
+        live.sync_fx(&fx.atlas, false).expect("first mint");
+        let rgba = super::fx_gpu::FxAtlasKind::Rgba as usize;
+        let tex_id = live.fx_tex[rgba].as_ref().unwrap().tex.metal().obj().id();
+        let tex = live.fx_tex[rgba]
+            .as_ref()
+            .unwrap()
+            .tex
+            .metal()
+            .clone_handle();
+        readers_in_as(&mut live, &tex, PixelFormat::Rgba8Unorm, &[0, 2]);
+        assert_eq!(reader_count(&live), 2);
+        fx.admit(&[], &[tile([0x44, 0x55, 0x66])], cap);
+        let side = fx.atlas.side(super::fx_gpu::FxAtlasKind::Rgba);
+        assert_eq!(
+            (side.generation(), side.evictions(), side.len()),
+            (1, 1, 1),
+            "the new tile evicts the old one into the same generation"
+        );
+        let mut before = fx_state(&live, 1, 1, 0);
+        before.insert("fx_rewrite", 1);
+        let bytes = live.sync_fx(&fx.atlas, false).expect("rewrite");
+        assert_eq!(bytes, 512 * 512 * 4, "only the new tile's texels upload");
+        assert_eq!(reader_count(&live), 0, "the rewrite settled both readers");
+        assert_eq!(live.fx_hazard.settles, 1);
+        assert_eq!(
+            live.fx_reader_wait.0, 2,
+            "the frame shape's reader waits count both readers"
+        );
+        let kept = live.fx_tex[rgba].as_ref().unwrap();
+        assert_eq!(
+            kept.tex.metal().obj().id(),
+            tex_id,
+            "a rewrite keeps the texture"
+        );
+        let frame = crate::device_layer::metal_try_read_back(
+            &live.session,
+            &live.mint,
+            kept.tex.metal(),
+            512,
+            512,
+        )
+        .expect("rewritten atlas readback");
+        assert!(
+            frame.pixels.iter().all(|&p| p == 0x0044_5566),
+            "the new tile"
+        );
+        let after = fx_state(&live, 1, 1, 1);
+        let model = aterm_models_render::metal_atlas_residency_model();
+        assert_eq!(
+            aterm_spec::interp::admits(&model, &before, &after),
+            Some("SyncAndPresent")
+        );
+        assert_eq!(
+            aterm_spec::interp::admits(&model, &before, &left_in_flight(after.clone())),
+            None,
+            "negative control: a rewrite under readers in flight is refused"
+        );
+        let mut raced = after;
+        raced.insert("region_race", 1);
+        assert_eq!(
+            aterm_spec::interp::admits(&model, &before, &raced),
+            None,
+            "negative control: the region race is refused"
+        );
     }
 
     #[test]

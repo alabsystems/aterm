@@ -153,7 +153,7 @@ fn the_menus_rows_follow_the_posture_the_offer_and_the_timer() {
         let rows = super::rows(&f);
         assert_eq!(
             rows[1],
-            MenuRow::Note("harness off in Settings".into()),
+            MenuRow::note("harness off in Settings"),
             "{view:?}"
         );
         for row in &rows {
@@ -193,10 +193,10 @@ fn under_an_agents_own_switch_the_menu_names_that_switch() {
         let mut f = facts(view);
         f.land_at = offer(18, 0, None);
         let rows = rows(&f);
-        assert_eq!(rows[1], MenuRow::Note(why.into()), "{agent:?}");
+        assert_eq!(rows[1], MenuRow::note(why), "{agent:?}");
         assert_eq!(
             rows.iter()
-                .filter(|r| matches!(r, MenuRow::Note(_)))
+                .filter(|r| matches!(r, MenuRow::Note { .. }))
                 .count(),
             1,
             "{agent:?}"
@@ -217,7 +217,7 @@ fn under_an_agents_own_switch_the_menu_names_that_switch() {
     for view in [AutopilotView::MasterOff, AutopilotView::Unhosted] {
         assert_eq!(
             rows(&facts(view))[1],
-            MenuRow::Note("harness off in Settings".into()),
+            MenuRow::note("harness off in Settings"),
             "{view:?}"
         );
     }
@@ -2025,7 +2025,7 @@ fn a_readers_cancel_identity_tracks_its_exact_timer_when_the_face_stays() {
         let mut land = f.clone();
         land.view = AutopilotView::Land;
         let mut changed_rows = rows(&land);
-        changed_rows.push(MenuRow::Note("a row the card did not have".to_string()));
+        changed_rows.push(MenuRow::note("a row the card did not have"));
         assert!(ordinary.refresh_rows(changed_rows, land.spoken, land.armed_at_ms));
         assert_eq!(ordinary.rect, None);
         assert_ne!(ordinary.a11y_epoch(), heard, "ordinary row-change control");
@@ -2366,7 +2366,7 @@ fn the_open_menus_card_is_the_pets_overlay_not_its_ground() {
 
 #[test]
 fn the_open_menu_hides_the_caret_and_cuts_the_pet_under_it_on_both_routes() {
-    use aterm_core::render::FreeSprite;
+    use aterm_render::sprites::{FreeSprite, FreeZ, SpriteLayers, is_sprite_layer, published};
     for mixed in [false, true] {
         let (mut app, wid, mut session, host) = claude_app();
         let _host = MenuTestHost(host);
@@ -2390,19 +2390,22 @@ fn the_open_menu_hides_the_caret_and_cuts_the_pet_under_it_on_both_routes() {
             right + 3 < app.windows[&wid].input_scratch.cols,
             "mixed={mixed}: room beside the card"
         );
+        let body = aterm_render::fx::bitmap(
+            aterm_core::render::FxTexels::Rgba8Straight,
+            u16::try_from(4 * cw).unwrap(),
+            u16::try_from(ch).unwrap(),
+            vec![255; 4 * cw * ch * 4],
+        )
+        .expect("a body");
         let pet = FreeSprite {
-            x: px(right - 2, cw),
-            y: px(rect.row + 2, ch),
-            w: u16::try_from(4 * cw).unwrap(),
-            h: u16::try_from(ch).unwrap(),
-            aw: u16::try_from(4 * cw).unwrap(),
-            ah: u16::try_from(ch).unwrap(),
-            ..FreeSprite::default()
+            z: FreeZ::UnderText,
+            ..FreeSprite::whole(px(right - 2, cw), px(rect.row + 2, ch), body)
         };
         let publish = |app: &mut App, caret: (usize, usize), seq: &mut u64| {
             let s = &mut app.windows.get_mut(&wid).unwrap().input_scratch;
             (s.cursor_row, s.cursor_col, s.cursor_visible) = (caret.0, caret.1, true);
-            s.free_sprites = vec![pet];
+            s.fx_layers.retain(|l| !is_sprite_layer(l));
+            SpriteLayers::new(0x6D65_6E75).publish(std::slice::from_ref(&pet), &mut s.fx_layers);
             *seq = s.snapshot_seq;
         };
         let mut seq = 0;
@@ -2418,17 +2421,33 @@ fn the_open_menu_hides_the_caret_and_cuts_the_pet_under_it_on_both_routes() {
             s.snapshot_seq, seq,
             "mixed={mixed}: the card is a host write"
         );
+        let drawn = published(&s.fx_layers);
         assert_eq!(
-            s.free_sprites
+            drawn
                 .iter()
-                .map(|q| (q.x, q.w, q.ax))
+                .map(|q| (q.x, q.y, q.w, q.h))
                 .collect::<Vec<_>>(),
-            [(
-                px(right, cw),
-                u16::try_from(2 * cw).unwrap(),
-                u16::try_from(2 * cw).unwrap()
-            )],
-            "mixed={mixed}: the pet beside the card stays, the part on it goes"
+            [(pet.x, pet.y, pet.w, pet.h)],
+            "mixed={mixed}: the pet's layer stands whole"
+        );
+        let occ = s
+            .fx_occluders
+            .iter()
+            .find(|o| o.x1 - o.x0 == px(rect.w, cw) && o.y1 - o.y0 == px(rect.h, ch))
+            .expect("the card occludes every fx layer");
+        let (pad, top) = (occ.x0 - px(rect.col, cw), occ.y0 - px(rect.row, ch));
+        let (x0, x1) = (pad + pet.x, pad + pet.x + i32::from(pet.w));
+        let (y0, y1) = (top + pet.y, top + pet.y + i32::from(pet.h));
+        assert!(
+            occ.x0 <= x0 && occ.x1 == pad + px(right, cw) && occ.x1 < x1,
+            "mixed={mixed}: the card cuts the part of the pet on it ({x0}..{}) and leaves \
+             the part beside it ({}..{x1})",
+            occ.x1,
+            occ.x1
+        );
+        assert!(
+            occ.y0 <= y0 && y1 <= occ.y1,
+            "mixed={mixed}: over all of the pet's rows"
         );
         frame_with(&mut app, wid, |app| {
             publish(app, (rect.row + 2, right + 1), &mut seq);

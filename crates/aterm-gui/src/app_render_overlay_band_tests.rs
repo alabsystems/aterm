@@ -171,33 +171,60 @@ fn chrome_palette_surfaces_pick_their_theme() {
     assert_eq!(banner[0][0].bg, band.bar_bg);
 }
 
-/// Every destination pixel a list of 1:1 free sprites paints.
-fn free_texels(
-    sprites: &[aterm_core::render::FreeSprite],
-) -> std::collections::BTreeMap<(i64, i64), (i64, i64)> {
-    let mut out = std::collections::BTreeMap::new();
-    for s in sprites {
-        for dy in 0..i64::from(s.h) {
-            for dx in 0..i64::from(s.w) {
-                let ax = if s.flip_x {
-                    i64::from(s.ax) + i64::from(s.aw) - 1 - dx
-                } else {
-                    i64::from(s.ax) + dx
-                };
-                let at = (i64::from(s.x) + dx, i64::from(s.y) + dy);
-                assert!(
-                    out.insert(at, (ax, i64::from(s.ay) + dy)).is_none(),
-                    "no two parts paint one pixel: {at:?}"
-                );
+/// Every frame pixel `input`'s fx layers may paint: their slices against a
+/// `w × h` frame whose grid starts at `(pad, 0)` in `rows` bands of
+/// `cell_h`, past every occluder (`aterm_render::slice_layers`, what both
+/// renderers draw from).
+fn fx_pixels(
+    input: &aterm_render::RenderInput,
+    (w, h): (usize, usize),
+    pad: usize,
+    (cell_h, rows): (usize, usize),
+) -> std::collections::BTreeSet<(usize, usize)> {
+    struct Px<'o>(&'o mut std::collections::BTreeSet<(usize, usize)>);
+    impl<'a> aterm_render::FxSliceSink<'a> for Px<'_> {
+        fn item(
+            &mut self,
+            _: &'a aterm_core::render::FxLayer,
+            _: &'a aterm_core::render::FxItem,
+            _: (i64, i64),
+        ) -> bool {
+            true
+        }
+
+        fn slice(&mut self, s: aterm_render::FxSlice, _: usize) {
+            for y in s.y0..s.y1 {
+                for x in s.x0..s.x1 {
+                    self.0.insert((x, y));
+                }
             }
         }
     }
+    let frame = aterm_render::FxFrame {
+        w,
+        h,
+        pad,
+        grid_top: 0,
+        cell_h,
+        rows,
+    };
+    let mut out = std::collections::BTreeSet::new();
+    aterm_render::slice_layers(
+        &frame,
+        &input.fx_layers,
+        &input.fx_occluders,
+        |_| true,
+        |_| true,
+        &mut aterm_render::FxSlicer::default(),
+        &mut Px(&mut out),
+    );
     out
 }
 
 #[test]
 fn a_menu_card_takes_its_cells_back_from_the_caret_and_every_overlay() {
-    use aterm_core::render::{FreeSprite, GlowQuad, SpriteQuad, TrailCell};
+    use aterm_core::render::{GlowQuad, TrailCell};
+    use aterm_render::sprites::{FreeSprite, FreeZ, SpriteLayers, published};
     let card = crate::tab_menu::MenuRect {
         row: 2,
         col: 4,
@@ -247,48 +274,35 @@ fn a_menu_card_takes_its_cells_back_from_the_caret_and_every_overlay() {
         ..GlowQuad::default()
     };
     input.cursor_glow_add = vec![glow(55), glow(40), glow(105)];
+    let art = |w: u16, h: u16| {
+        let data = vec![255; usize::from(w) * usize::from(h) * 4];
+        aterm_render::fx::bitmap(aterm_core::render::FxTexels::Rgba8Straight, w, h, data)
+            .expect("an art")
+    };
     let pet = FreeSprite {
-        x: 80,
-        y: 50,
-        w: 40,
-        h: 20,
-        ax: 200,
-        ay: 10,
-        aw: 40,
-        ah: 20,
-        ..FreeSprite::default()
+        z: FreeZ::UnderText,
+        ..FreeSprite::whole(80, 50, art(40, 20))
     };
     let flipped = FreeSprite {
         x: 20,
         y: 80,
         flip_x: true,
-        ..pet
+        ..pet.clone()
     };
-    let inside = FreeSprite {
-        x: 50,
-        y: 50,
+    let inside = FreeSprite::whole(50, 50, art(10, 10));
+    let away = FreeSprite {
+        x: 130,
+        ..pet.clone()
+    };
+    let scaled = FreeSprite {
         w: 10,
-        h: 10,
-        aw: 10,
-        ah: 10,
-        ..pet
+        ..FreeSprite::whole(50, 50, art(20, 10))
     };
-    let away = FreeSprite { x: 130, ..pet };
-    let scaled = FreeSprite { aw: 20, ..inside };
-    input.free_sprites = vec![pet, flipped, inside, away, scaled];
-    input.cat_quads = vec![SpriteQuad {
-        row: 2,
-        x: 30,
-        y: 40,
-        w: 20,
-        h: 20,
-        ax: 0,
-        ay: 0,
-        aw: 20,
-        ah: 20,
-        ..SpriteQuad::default()
-    }];
-    let before = free_texels(&input.free_sprites[..4]);
+    let cat = FreeSprite::whole(30, 40, art(20, 20));
+    let sprites = [pet, flipped, inside, away, scaled, cat];
+    SpriteLayers::new(1).publish(&sprites, &mut input.fx_layers);
+    let frame = ((16 * 10 + 2 * 5, 8 * 20), 5, (20, 8));
+    let before = fx_pixels(&input, frame.0, frame.1, frame.2);
 
     super::scrub_overlay_card(&mut input, card, cell, (pad, 0));
 
@@ -306,26 +320,22 @@ fn a_menu_card_takes_its_cells_back_from_the_caret_and_every_overlay() {
         [40, 105],
         "the light on the card goes; the light off it, pad honoured, stays"
     );
-    let on_card = |(x, y): (i64, i64)| (40..100).contains(&x) && (40..100).contains(&y);
-    let expected: std::collections::BTreeMap<_, _> =
-        before.into_iter().filter(|(at, _)| !on_card(*at)).collect();
-    let after = free_texels(&input.free_sprites);
     assert_eq!(
-        after, expected,
-        "every pixel off the card paints the texel it painted, and none on it"
+        published(&input.fx_layers),
+        sprites,
+        "every companion layer stands whole: the card occludes, it cuts nothing"
     );
+    let on_card = |&(x, y): &(usize, usize)| (45..105).contains(&x) && (40..100).contains(&y);
+    let expected: std::collections::BTreeSet<_> =
+        before.iter().copied().filter(|at| !on_card(at)).collect();
     assert!(
-        input.free_sprites.contains(&away),
-        "a sprite off the card is untouched"
+        before.iter().any(on_card) && expected.len() < before.len(),
+        "the sprites reach under the card (non-vacuous)"
     );
     assert_eq!(
-        input
-            .cat_quads
-            .iter()
-            .map(|q| (q.x, q.w, q.ax, q.aw, q.row))
-            .collect::<Vec<_>>(),
-        [(30, 10, 0, 10, 2)],
-        "a row-tagged sprite keeps its part off the card, in its own band"
+        fx_pixels(&input, frame.0, frame.1, frame.2),
+        expected,
+        "every pixel off the card stays drawable, and none on it"
     );
 }
 

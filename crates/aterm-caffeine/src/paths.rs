@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Where the mug keeps its files. Every path derives from three roots ([`Paths`]), so a test
-//! hands in scratch ones and nothing here reads the environment but [`Paths::from_env`].
+//! File paths for `aterm caffeine`, derived from the three root directories in [`Paths`].
 
 use std::path::PathBuf;
 
@@ -41,22 +40,19 @@ impl Paths {
         self.state_dir.join("caffeine.lock")
     }
 
-    /// The pid of the bridge that keeps the Mac awake while an update restart's new mug
-    /// starts (`aterm caffeine bridge`); it holds while this file names it.
+    /// PID file for `aterm caffeine bridge` across an update restart.
     #[must_use]
     pub fn bridge_file(&self) -> PathBuf {
         self.state_dir.join("caffeine.bridge")
     }
 
-    /// Where the mug keeps the bundle copies it runs from ([`crate::code`]). `.noindex` keeps
-    /// Spotlight from listing a copy as a second aterm.
+    /// Cloned bundle directory (`.noindex` excludes copies from Spotlight).
     #[must_use]
     pub fn code_dir(&self) -> PathBuf {
         self.state_dir.join("caffeine-code.noindex")
     }
 
-    /// The job definition `aterm caffeine` bootstraps for this login only when Enable at
-    /// Startup is off (launchd loads nothing from here at login).
+    /// Session-only launchd plist when Enable at Startup is off.
     #[must_use]
     pub fn session_plist(&self, label: &str) -> PathBuf {
         self.state_dir
@@ -70,8 +66,7 @@ impl Paths {
         self.home.join("Library").join("LaunchAgents")
     }
 
-    /// The job definition launchd loads at every login: present exactly when Enable at
-    /// Startup is on.
+    /// Login-time launchd plist when Enable at Startup is on.
     #[must_use]
     pub fn startup_plist(&self, label: &str) -> PathBuf {
         self.launch_agents().join(format!("{label}.plist"))

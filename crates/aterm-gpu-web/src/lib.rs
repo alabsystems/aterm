@@ -2321,33 +2321,44 @@ mod tests {
         t.spill.update(&t.cpu, &t.frame_scratch);
     }
 
-    /// Snapshot equality across two engine instances.
+    /// Snapshot equality across two engine instances: each publishes its own
+    /// fx layer contents (identity is per instance), so the layers compare by
+    /// value (their arts by content id) and the rest by `RenderInput`'s own
+    /// equality.
     fn same_snapshot_across_instances(a: &RenderInput, b: &RenderInput) -> bool {
-        fn atlas_value_eq(
-            x: &Option<std::sync::Arc<aterm_render::SceneAtlas>>,
-            y: &Option<std::sync::Arc<aterm_render::SceneAtlas>>,
-        ) -> bool {
-            match (x, y) {
-                (None, None) => true,
-                (Some(x), Some(y)) => {
-                    x.width == y.width
-                        && x.height == y.height
-                        && x.version == y.version
-                        && x.rgba == y.rgba
-                }
-                _ => false,
-            }
+        use aterm_core::render::{FxContent, FxItem, FxLayer};
+        fn content_value_eq(x: &FxContent, y: &FxContent) -> bool {
+            x.palette() == y.palette()
+                && x.items().len() == y.items().len()
+                && x.items().iter().zip(y.items()).all(|pair| match pair {
+                    (FxItem::Rect(p), FxItem::Rect(q)) => p == q,
+                    (FxItem::Ramps(p), FxItem::Ramps(q)) => p == q,
+                    (FxItem::Sprite(p), FxItem::Sprite(q)) => {
+                        (p.x, p.y, p.dw, p.dh, p.flip_x, p.ink, p.clip)
+                            == (q.x, q.y, q.dw, q.dh, q.flip_x, q.ink, q.clip)
+                            && p.art.id() == q.art.id()
+                    }
+                    _ => false,
+                })
         }
-        if !atlas_value_eq(&a.cat_atlas, &b.cat_atlas)
-            || !atlas_value_eq(&a.free_atlas, &b.free_atlas)
-            || !atlas_value_eq(&a.rain_atlas, &b.rain_atlas)
+        fn layer_value_eq(x: &FxLayer, y: &FxLayer) -> bool {
+            (
+                x.id, x.slot, x.space, x.blend, x.bloom, x.knock, x.offset, x.clip,
+            ) == (
+                y.id, y.slot, y.space, y.blend, y.bloom, y.knock, y.offset, y.clip,
+            ) && content_value_eq(&x.content, &y.content)
+        }
+        if a.fx_layers.len() != b.fx_layers.len()
+            || !a
+                .fx_layers
+                .iter()
+                .zip(&b.fx_layers)
+                .all(|(x, y)| layer_value_eq(x, y))
         {
             return false;
         }
         let mut aligned = b.clone();
-        aligned.cat_atlas.clone_from(&a.cat_atlas);
-        aligned.free_atlas.clone_from(&a.free_atlas);
-        aligned.rain_atlas.clone_from(&a.rain_atlas);
+        aligned.fx_layers.clone_from(&a.fx_layers);
         *a == aligned
     }
 

@@ -415,6 +415,7 @@ impl Take {
     pub(crate) fn prepare(repo_root: &Path, commit: &str) -> Result<Self, String> {
         let hold = snapshot::CacheRoot::for_repo(repo_root)?.hold()?;
         let cache = hold.cache();
+        refuse_held_stage(&cache.stage())?;
         let targo = crate::gates::trust_stage2_bin()
             .map_err(|e| e.to_string())?
             .join("targo");
@@ -490,6 +491,27 @@ impl Take {
                     self.target_root.display()
                 ),
             })
+    }
+}
+
+/// The stage's shipped binary's directory: its first exec is stamped there ([`run_with_take`]).
+fn ship_stage(stage: &Path) -> PathBuf {
+    stage.join("universal").join("ship")
+}
+
+/// Refuse to clear `stage` while the shipped binary an earlier build started there never
+/// showed it ran: macOS may still be assessing its first exec ([`crate::gates::first_exec_hold`]).
+fn refuse_held_stage(stage: &Path) -> Result<(), String> {
+    let ship = ship_stage(stage);
+    match crate::gates::first_exec_hold(&ship) {
+        None => Ok(()),
+        Some(left) => Err(format!(
+            "{} holds the binary an earlier build started that never showed it ran, so macOS \
+             may still be assessing its first exec; it stays — build again in {} s (or after a \
+             restart)",
+            ship.display(),
+            left.as_secs()
+        )),
     }
 }
 
@@ -702,7 +724,7 @@ fn run_with_take(plan: &BuildPlan, take: &Take, symbol_out: &Path) -> Result<Bui
 
     let (dsym, dsym_zip) = extract_dsym(&fat, symbol_out, &plan.short_version, &plan.repo_root)?;
 
-    let ship_dir = universal.join("ship");
+    let ship_dir = ship_stage(&take.stage);
     snapshot::private_dir(&ship_dir, "release ship stage")?;
     let shipped = ship_dir.join("aterm");
     std::fs::copy(&fat, &shipped).map_err(|e| format!("copy {}: {e}", fat.display()))?;
@@ -718,11 +740,17 @@ fn run_with_take(plan: &BuildPlan, take: &Take, symbol_out: &Path) -> Result<Bui
         println!("    updater pin: every final shipped architecture structurally verified");
     }
 
-    let diagnose = match command(&shipped)
+    // The copy's first exec, stamped before it: only an exit of its own shows it ran, and a
+    // stage without that stays ([`refuse_held_stage`]).
+    aterm_uds::deadline::stamp_exec(&ship_dir);
+    let probed = command(&shipped)
         .arg("--diagnose")
         .current_dir(&plan.repo_root)
-        .output()
-    {
+        .output();
+    if probed.as_ref().is_ok_and(|out| out.status.code().is_some()) {
+        let _ = std::fs::write(ship_dir.join(aterm_uds::deadline::RAN), "");
+    }
+    let diagnose = match probed {
         Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
         _ => {
             return Err(
@@ -2180,6 +2208,27 @@ mod tests {
         let (status, peak) = super::wait_with_peak(child).unwrap();
         assert_eq!(status.code(), Some(23));
         assert!(peak.is_some_and(|bytes| bytes > 0), "{peak:?}");
+    }
+
+    /// A stage whose shipped binary was started and never showed it ran is refused, not
+    /// cleared, until its hold is spent (a restart here); one it ran from, or one nothing
+    /// was started from, may go.
+    #[test]
+    fn a_stage_whose_shipped_binary_never_showed_it_ran_is_held() {
+        use aterm_uds::deadline::{EXEC_STAMP, RAN, stamp_exec};
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let stage = dir.path().join("stage");
+        let ship = super::ship_stage(&stage);
+        std::fs::create_dir_all(&ship).unwrap();
+        super::refuse_held_stage(&stage).expect("nothing was started from it");
+        stamp_exec(&ship);
+        let refused = super::refuse_held_stage(&stage).unwrap_err();
+        assert!(refused.contains("never showed it ran"), "{refused}");
+        std::fs::write(ship.join(RAN), "").unwrap();
+        super::refuse_held_stage(&stage).expect("it ran");
+        std::fs::remove_file(ship.join(RAN)).unwrap();
+        std::fs::write(ship.join(EXEC_STAMP), u64::MAX.to_string()).unwrap();
+        super::refuse_held_stage(&stage).expect("a restart spent the hold");
     }
 
     use std::ffi::OsString;

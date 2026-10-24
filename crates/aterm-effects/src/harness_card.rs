@@ -5,12 +5,15 @@
 
 use std::sync::Arc;
 
-use aterm_render::{InkCell, premul_rgb};
+use aterm_render::{DecoBlend, InkCell, add_sat, premul_rgb};
 use aterm_time::Instant;
 use std::ops::Range;
 use std::time::Duration;
 
-use crate::color_math::{floor_contrast_keeping_hue, relative_luminance};
+use crate::cli_marks::ICON_CONTRAST;
+use crate::color_math::{
+    contrast_ratio, floor_contrast_keeping_hue, lift_keeping_hue, relative_luminance,
+};
 use crate::cursor_glow::InkRole;
 use crate::effect_util::{
     STAR_ARM_FINE, STAR_ARM_HERO, STAR_ARM_INK, STAR_ARM_STD, STAR_CORE_ADD, STAR_GLINT_COV,
@@ -861,6 +864,15 @@ impl CardPalette {
         }
     }
 
+    /// The light a dark scene's glint rests at, before its flare mixes it toward white.
+    #[inline]
+    const fn glint_rest(self) -> u32 {
+        match self {
+            Self::Off => MOONBOW[1],
+            Self::Cruise | Self::Land => twinkle_rgb(true),
+        }
+    }
+
     #[inline]
     fn star_ink(self, k: usize) -> u32 {
         print_line(self.stripe(k, false))
@@ -989,7 +1001,8 @@ pub struct CardScene {
     pub kitty_rows: u8,
     /// Active Autopilot color palette.
     pub palette: CardPalette,
-    /// Theme polarity (`true` for additive dark ground, `false` for source-over light ground).
+    /// Theme polarity (`true` for additive dark ground, a mark whose light cannot read on it
+    /// lifted or printed ([`dark_mark`]); `false` for source-over light ground).
     pub dark: bool,
     /// Pane background color (`0x00RRGGBB`).
     pub ground: u32,
@@ -2425,6 +2438,65 @@ pub fn dark_ground(bg: u32) -> bool {
     relative_luminance(bg) < 0.5
 }
 
+/// Minimum WCAG contrast of a dark scene's mark on the ground it is laid on — a field star, a
+/// glint, a ride sparkle, a burst star, the line's leading `✦`: the non-text floor
+/// ([`ICON_CONTRAST`]), a mark being seen, not read as state.
+pub const MARK_CONTRAST: f32 = ICON_CONTRAST;
+
+/// How a dark scene lays a mark on its ground ([`dark_mark`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DarkMark {
+    /// Light (`0x00RRGGBB`) added to the ground, which only brightens it.
+    Light(u32),
+    /// Ink (`0x00RRGGBB`) laid over the ground, source-over, as a light scene prints its marks.
+    Print(u32),
+}
+
+/// How a dark scene lays a mark of light `rgb` on `ground` (both `0x00RRGGBB`): the light itself,
+/// added, where at a settled star's strength ([`STAR_PRINT_FULL`]) it reads [`MARK_CONTRAST`] on
+/// the ground; where it does not but white reads better on the ground than black — every
+/// near-black and dim ground — the light lifted along its hue to the least lightness that reads,
+/// added (the burst's blue reads 1.87:1 on Aterm Night, `#4e4eff` 3:1); and otherwise, on a ground
+/// past that polarity though still under [`dark_ground`]'s cut, where added light misses the floor
+/// or cannot reach it at all (white reads 2.10:1 at most on an imported `#ff8cd9`), or on a dim
+/// ground where even white light misses it (`#eb0000`), the light floored along its hue to
+/// [`MARK_CONTRAST`] and printed.
+#[must_use]
+pub fn dark_mark(rgb: u32, ground: u32) -> DarkMark {
+    let (rgb, ground) = (rgb & 0x00FF_FFFF, ground & 0x00FF_FFFF);
+    let reads = |c: u32| {
+        let lit = add_sat(ground, premul_rgb(c, STAR_PRINT_FULL as u8));
+        contrast_ratio(lit, ground) >= MARK_CONTRAST
+    };
+    if reads(rgb) {
+        return DarkMark::Light(rgb);
+    }
+    if contrast_ratio(WHITE, ground) > contrast_ratio(0, ground) {
+        let lifted = lift_keeping_hue(rgb, reads);
+        if reads(lifted) {
+            return DarkMark::Light(lifted);
+        }
+    }
+    DarkMark::Print(floor_contrast_keeping_hue(rgb, ground, MARK_CONTRAST))
+}
+
+/// The tint and blend of the `✦` leading a card line whose first letter wears `rgb` on `ground`
+/// (both `0x00RRGGBB`): on a dark ground the card's mark ([`dark_mark`]) — the letter's light
+/// added where it reads, or lifted along its hue to read where white is the better polarity, its
+/// ink laid over the ground where added light cannot read (a mid ground, on which the letter is
+/// floored dark: Silver Aerogel's `#929292` read the added `✦` at 1.6:1) — and on paper the
+/// letter's ink laid over.
+#[must_use]
+pub fn line_star(rgb: u32, ground: u32) -> (u32, DecoBlend) {
+    if !dark_ground(ground & 0x00FF_FFFF) {
+        return (rgb, DecoBlend::Over);
+    }
+    match dark_mark(rgb, ground) {
+        DarkMark::Light(rgb) => (rgb, DecoBlend::Add),
+        DarkMark::Print(rgb) => (rgb, DecoBlend::Over),
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct TrailLay {
     tx0: i64,
@@ -2836,10 +2908,7 @@ impl<'a> Emit<'a> {
             .seat
             .and_then(|seat| ride_span(&self.geo, self.scene, &seat));
         let t_sec = self.clock.t_ms.map(|t| t as f32 / 1000.0);
-        let rest_rgb = match self.scene.palette {
-            CardPalette::Off => MOONBOW[1],
-            CardPalette::Cruise | CardPalette::Land => twinkle_rgb(true),
-        };
+        let rest_rgb = self.scene.palette.glint_rest();
         for (i, s) in glints.spots().iter().enumerate() {
             let up = match (self.clock.ride_ms, riding) {
                 (Some(t), Some((from, dist))) => {
@@ -2872,6 +2941,7 @@ impl<'a> Emit<'a> {
                 cov: GLINT_COV * env,
                 gold: w >= GLINT_FLARE_DOTS,
                 color: self.mark_ink(i, mix_rgb(rest_rgb, WHITE, w)),
+                light: self.scene.dark,
             });
         }
     }
@@ -2927,6 +2997,7 @@ impl<'a> Emit<'a> {
                 cov: STAR_COV * env,
                 gold,
                 color: self.mark_ink(i, light_rgb),
+                light: dark,
             });
         }
     }
@@ -2997,6 +3068,7 @@ impl<'a> Emit<'a> {
                 cov: SHED_COV * (1.0 - tau).powf(1.5),
                 gold: false,
                 color: self.mark_ink(k, self.scene.palette.mark(k)),
+                light: dark,
             });
         }
     }
@@ -3013,15 +3085,28 @@ impl<'a> Emit<'a> {
                 cov: ring.cov,
                 gold: true,
                 color: self.mark_ink(k, self.scene.palette.mark(k)),
+                light: self.scene.dark,
             });
         }
     }
 
+    /// Every star of the frame, a dark scene's each laid on its ground ([`StarCall::laid_on`]),
+    /// the glints by their rest light ([`Self::laid_glints`]).
     fn each_star(&self, lay: &mut impl FnMut(StarCall)) {
-        self.burst_stars(lay);
-        self.glints(lay);
+        let ground = self.scene.ground;
+        self.burst_stars(&mut |s: StarCall| lay(s.laid_on(ground)));
+        self.laid_glints(lay);
+        let lay = &mut |s: StarCall| lay(s.laid_on(ground));
         self.field(lay);
         self.shed(lay);
+    }
+
+    /// The glints, each laid with the polarity its rest light takes on the ground
+    /// ([`StarCall::laid_as`]), so a flare toward white never flips one between ink and light.
+    fn laid_glints(&self, lay: &mut impl FnMut(StarCall)) {
+        let ground = self.scene.ground;
+        let rest = dark_mark(self.scene.palette.glint_rest(), ground);
+        self.glints(&mut |s: StarCall| lay(s.laid_as(rest, ground)));
     }
 
     fn burst_ring(&self) -> Option<BurstRing> {
@@ -3065,7 +3150,7 @@ impl<'a> Emit<'a> {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct StarCall {
     clip: Rect,
     centre: (i64, i64),
@@ -3073,6 +3158,44 @@ struct StarCall {
     cov: f32,
     gold: bool,
     color: u32,
+    /// Added to the ground as light (a dark scene's), or else printed over it as ink.
+    light: bool,
+}
+
+impl StarCall {
+    /// The star laid on `ground`: a dark scene's light as [`dark_mark`] lays it — kept where it
+    /// reads, lifted along its hue where white is the polarity that reads best and the lift
+    /// reads, else floored and printed — and a printed star as it is.
+    #[inline]
+    fn laid_on(self, ground: u32) -> Self {
+        if !self.light {
+            return self;
+        }
+        match dark_mark(self.color, ground) {
+            DarkMark::Light(color) => Self { color, ..self },
+            DarkMark::Print(color) => Self {
+                color,
+                light: false,
+                ..self
+            },
+        }
+    }
+
+    /// A glint laid on `ground` by `rest`, its rest light's [`dark_mark`] there: where that
+    /// prints, the rest's floored ink printed through the whole flare, as a light scene's glint
+    /// keeps its ink and flares in shape alone; else its flared light as [`Self::laid_on`] lays
+    /// it, which stays light (white reads wherever the rest light, or its lift, does).
+    #[inline]
+    fn laid_as(self, rest: DarkMark, ground: u32) -> Self {
+        match rest {
+            DarkMark::Print(color) if self.light => Self {
+                color,
+                light: false,
+                ..self
+            },
+            DarkMark::Light(_) | DarkMark::Print(_) => self.laid_on(ground),
+        }
+    }
 }
 
 fn rim_strips(frame: &[&str], p: i64, rim: i64, mut strip: impl FnMut(Rect)) {
@@ -3201,6 +3324,15 @@ mod tests {
 
     const NIGHT: u32 = 0x0012_1721;
     const DAY: u32 = 0x00F8_FAFD;
+    /// Silver Aerogel's ground, a mid grey [`dark_ground`] calls dark.
+    pub(super) const AEROGEL: u32 = 0x0092_9292;
+    /// Unikitty's ground, a mid pink [`dark_ground`] calls dark, on which no added light reads.
+    pub(super) const UNIKITTY: u32 = 0x00FF_8CD9;
+    /// A raspberry mid ground on which the glints' rest gold misses the floor added though white
+    /// light reads, so a glint laid frame by frame on its flare would flip from ink to light.
+    const RASPBERRY: u32 = 0x00FF_375F;
+    /// A dim scarlet on which white reads better than black yet no added light reads the floor.
+    const SCARLET: u32 = 0x00EB_0000;
 
     fn contrast(a: u32, b: u32) -> f32 {
         let (la, lb) = (relative_luminance(a), relative_luminance(b));
@@ -3403,8 +3535,9 @@ mod tests {
     fn lay_calls(cx: &Emit<'_>, out: &mut Vec<GlowQuad>) -> impl FnMut(StarCall) {
         let sink = Sink { geo: cx.geo };
         let trail = cx.trail_ink();
-        let dark = cx.scene.dark;
+        let ground = cx.scene.ground;
         move |st: StarCall| {
+            let st = st.laid_on(ground);
             lay_star(
                 out,
                 &sink,
@@ -3415,7 +3548,7 @@ mod tests {
                 st.gold,
                 st.color,
                 trail.covers(),
-                dark,
+                st.light,
             );
         }
     }
@@ -3438,7 +3571,7 @@ mod tests {
         cx.field(&mut lay_calls(&cx, &mut out.stars));
         cx.shed(&mut lay_calls(&cx, &mut out.sparkles));
         cx.burst_stars(&mut lay_calls(&cx, &mut out.burst));
-        cx.glints(&mut lay_calls(&cx, &mut out.glints));
+        cx.laid_glints(&mut lay_calls(&cx, &mut out.glints));
         out
     }
 
@@ -5227,6 +5360,399 @@ mod tests {
         assert!(
             lifted < 1.5,
             "CONTROL: the lifted letter alone, {lifted:.2}:1"
+        );
+    }
+
+    /// The ground of every built-in and pack theme that [`dark_ground`] calls dark, by name.
+    fn dark_theme_grounds() -> Vec<(String, u32)> {
+        use aterm_types::scheme::{builtin, builtin_names, parse_theme_str};
+        let rgb =
+            |c: aterm_types::Rgb| (u32::from(c.r) << 16) | (u32::from(c.g) << 8) | u32::from(c.b);
+        builtin_names()
+            .into_iter()
+            .filter_map(|n| Some((n.to_owned(), rgb(builtin(n)?.background))))
+            .chain(aterm_theme_pack::themes().iter().map(|t| {
+                let parsed = parse_theme_str(t.text).expect("a pack theme parses");
+                (t.id.to_owned(), rgb(parsed.scheme.background))
+            }))
+            .filter(|&(_, g)| dark_ground(g))
+            .collect()
+    }
+
+    /// The grounds [`dark_ground`] calls dark on which black reads at least as well as white: a
+    /// grey every few steps from that polarity to the cut, a hue every 30° at mid value, the mid
+    /// grounds imported themes bring (Silver Aerogel `#929292`, Unikitty `#ff8cd9`), and
+    /// [`RASPBERRY`], on which a glint's flare reaches a light that reads.
+    fn mid_grounds() -> Vec<u32> {
+        let mut grounds: Vec<u32> = (0..=255u32).step_by(3).map(|v| v * 0x0001_0101).collect();
+        grounds
+            .extend((0..12u8).map(|k| crate::color_math::hsv2rgb(f32::from(k) * 30.0, 0.6, 0.8)));
+        grounds.extend([AEROGEL, UNIKITTY, RASPBERRY]);
+        grounds.retain(|&g| dark_ground(g) && contrast(0, g) >= contrast(WHITE, g));
+        grounds
+    }
+
+    /// The instants a card's stars run through: the settled frame, the ride with its sparkles and
+    /// burst every 50 ms, the seated intro's twinkle every 100 ms, and the flow's glints every
+    /// step for two periods.
+    fn star_clocks() -> Vec<Clock> {
+        let mut v = vec![Clock::SETTLED];
+        v.extend((0..=RIDE_MS + BURST_MS).step_by(50).map(Clock::riding));
+        v.extend((0..EPISODE_MS).step_by(100).map(Clock::seated));
+        v.extend(
+            (0..2 * GLINT_PERIOD_MS)
+                .step_by(FLOW_STEP_MS as usize)
+                .map(Clock::flowing),
+        );
+        v
+    }
+
+    /// The stars `s` lays at `clock`: as the frame lays them ([`Emit::each_star`]) when `laid`,
+    /// else as its four kinds give them, a dark scene's light unchecked against its ground.
+    fn star_calls(s: &CardScene, clock: Clock, laid: bool) -> Vec<StarCall> {
+        let geo = Geo::new(s).expect("a scene");
+        let cx = Emit::new(s, geo, clock, 7);
+        let mut calls = Vec::new();
+        let mut lay = |c: StarCall| calls.push(c);
+        if laid {
+            cx.each_star(&mut lay);
+        } else {
+            cx.burst_stars(&mut lay);
+            cx.glints(&mut lay);
+            cx.field(&mut lay);
+            cx.shed(&mut lay);
+        }
+        calls
+    }
+
+    /// The dark law scenes, all three palettes and both kitties, on `ground`.
+    fn dark_scenes_on(ground: u32) -> Vec<CardScene> {
+        scenes()
+            .into_iter()
+            .filter(|s| s.dark)
+            .map(|s| CardScene { ground, ..s })
+            .collect()
+    }
+
+    /// The contrast a dark scene's star reads on `ground` at a settled star's strength: its light
+    /// added at [`STAR_PRINT_FULL`], or its printed ink.
+    fn star_reads(c: &StarCall, ground: u32) -> f32 {
+        if c.light {
+            contrast(
+                add_sat(ground, premul_rgb(c.color, STAR_PRINT_FULL as u8)),
+                ground,
+            )
+        } else {
+            contrast(c.color, ground)
+        }
+    }
+
+    /// `l` lightened from `r` along its hue: no channel of `l` under `r`'s, and `r`'s channel
+    /// order kept (a channel above another in `r` is not below it in `l`).
+    fn lightened_from(l: u32, r: u32) -> bool {
+        let ch = |c: u32| [(c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff];
+        let (l, r) = (ch(l), ch(r));
+        (0..3).all(|i| l[i] >= r[i] && (0..3).all(|j| r[i] <= r[j] || l[i] >= l[j]))
+    }
+
+    /// EVERY DARK BUILT-IN AND PACK THEME KEEPS THE STARS THAT READ AND LIFTS THE REST: on the
+    /// ground of every built-in and pack theme [`dark_ground`] calls dark, each star the frame
+    /// lays — burst, glints, field and ride sparkles, every palette and both kitties, through the
+    /// ride, the seated twinkle and the flow's glints — is the star its kind gives, its light
+    /// added unchecked, wherever that light reads [`MARK_CONTRAST`] at a settled star's strength;
+    /// each other star, only the Cruise palette's deep hues (its blue, indigo and violet on every
+    /// such ground, its red on Solarized Dark), is that star in its light lifted along its hue to
+    /// read the floor, still added. NEGATIVE CONTROL: some stars start under the floor (the
+    /// burst's blue at 1.74-1.92:1), so the comparison reaches the lift; and on Silver Aerogel's
+    /// `#929292` the laid stars are not the unchecked ones, so it sees a floor.
+    #[test]
+    fn every_dark_builtin_and_pack_theme_keeps_its_stars_or_lifts_them() {
+        let grounds = dark_theme_grounds();
+        assert!(grounds.len() >= 30, "{} dark themes", grounds.len());
+        let clocks = star_clocks();
+        let shape = |c: &StarCall| (c.clip, c.centre, c.arm, c.cov, c.gold);
+        let (mut stars, mut lifted, mut wrong) = (0usize, 0usize, Vec::new());
+        for (name, g) in &grounds {
+            for s in dark_scenes_on(*g) {
+                for &clock in &clocks {
+                    let (laid, raw) = (star_calls(&s, clock, true), star_calls(&s, clock, false));
+                    assert_eq!(laid.len(), raw.len(), "{name} at {clock:?}");
+                    for (l, r) in laid.iter().zip(&raw) {
+                        let right = if star_reads(r, *g) >= MARK_CONTRAST {
+                            l == r
+                        } else {
+                            lifted += 1;
+                            s.palette == CardPalette::Cruise
+                                && l.light
+                                && shape(l) == shape(r)
+                                && lightened_from(l.color, r.color)
+                                && star_reads(l, *g) >= MARK_CONTRAST
+                        };
+                        if !right {
+                            wrong.push(format!(
+                                "{name} {g:06x} {:?} at {clock:?}: {:06x} laid {:06x}",
+                                s.palette, r.color, l.color
+                            ));
+                        }
+                    }
+                    stars += laid.len();
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} stars laid wrong: {wrong:#?}",
+            wrong.len()
+        );
+        assert!(stars > 100_000, "CONTROL: {stars} stars compared");
+        assert!(
+            lifted > 0,
+            "NEGATIVE CONTROL: {lifted} stars start under the floor"
+        );
+        let floored = dark_scenes_on(AEROGEL)
+            .iter()
+            .flat_map(|s| clocks.iter().map(move |&c| (s, c)))
+            .filter(|&(s, c)| star_calls(s, c, true) != star_calls(s, c, false))
+            .count();
+        assert!(
+            floored > 0,
+            "NEGATIVE CONTROL: Silver Aerogel's stars are floored"
+        );
+    }
+
+    /// THE STARS READ ON EVERY MID GROUND: on every ground [`dark_ground`] calls dark past the
+    /// polarity at which black reads better than white — greys up to the cut, mid hues, Silver
+    /// Aerogel `#929292`, Unikitty `#ff8cd9`, [`RASPBERRY`] — each star the frame lays reads
+    /// [`MARK_CONTRAST`] on it at a settled star's strength, every palette and kitty through the
+    /// episode and the flow, and some print; a printed field star still twinkles, its coverage
+    /// running under and up to the strength at which it prints its whole ink, which the settled
+    /// star prints at.
+    /// NEGATIVE CONTROL: the stars' light added unchecked on Silver Aerogel's ground misses the
+    /// floor (the burst's blue at 1.15:1), so the grounds reach the case the floor answers.
+    #[test]
+    fn the_stars_read_on_every_mid_ground() {
+        let grounds = mid_grounds();
+        assert!(grounds.len() >= 20, "{grounds:06x?}");
+        let clocks = star_clocks();
+        let (mut lows, mut printed) = (Vec::new(), 0usize);
+        for &g in &grounds {
+            for s in dark_scenes_on(g) {
+                for &clock in &clocks {
+                    for c in star_calls(&s, clock, true) {
+                        let k = star_reads(&c, g);
+                        if k < MARK_CONTRAST {
+                            lows.push(format!(
+                                "{:?} on {g:06x} at {clock:?}: {:06x} at {k:.2}:1",
+                                s.palette, c.color
+                            ));
+                        }
+                        printed += usize::from(!c.light);
+                    }
+                }
+            }
+        }
+        assert!(
+            lows.is_empty(),
+            "{} stars under the floor: {lows:#?}",
+            lows.len()
+        );
+        assert!(printed > 0, "CONTROL: {printed} stars printed");
+        for s in dark_scenes_on(UNIKITTY) {
+            let geo = Geo::new(&s).expect("a scene");
+            let field = |clock: Clock| {
+                let mut calls = Vec::new();
+                Emit::new(&s, geo, clock, 7).field(&mut |c: StarCall| {
+                    calls.push(c.laid_on(UNIKITTY));
+                });
+                calls
+            };
+            let twinkle: Vec<StarCall> = (0..EPISODE_MS)
+                .step_by(50)
+                .flat_map(|t| field(Clock::seated(t)))
+                .collect();
+            assert!(
+                !twinkle.is_empty() && twinkle.iter().all(|c| !c.light),
+                "{:?}: the field prints",
+                s.palette
+            );
+            let (lo, hi) = twinkle.iter().fold((f32::MAX, 0.0f32), |(lo, hi), c| {
+                (lo.min(c.cov), hi.max(c.cov))
+            });
+            assert!(
+                lo < STAR_PRINT_FULL && hi >= STAR_PRINT_FULL,
+                "{:?}: the printed field twinkles, coverage {lo}..{hi}",
+                s.palette
+            );
+            assert!(
+                field(Clock::SETTLED)
+                    .iter()
+                    .all(|c| c.cov >= STAR_PRINT_FULL),
+                "{:?}: the settled field prints its whole ink",
+                s.palette
+            );
+        }
+        let unchecked = dark_scenes_on(AEROGEL)
+            .iter()
+            .flat_map(|s| clocks.iter().flat_map(|&c| star_calls(s, c, false)))
+            .map(|c| star_reads(&c, AEROGEL))
+            .fold(f32::MAX, f32::min);
+        assert!(
+            unchecked < MARK_CONTRAST,
+            "NEGATIVE CONTROL: the unchecked light on Silver Aerogel, {unchecked:.2}:1"
+        );
+    }
+
+    /// THE LINE'S `✦` IS THE CARD'S MARK ON EVERY GROUND ([`line_star`]): every resting letter
+    /// ink a line can lead with, every palette, laid as the `✦` — on the ground of every built-in
+    /// and pack theme [`dark_ground`] calls dark, its light added unchanged, so those themes' `✦`
+    /// is the one it was; on every mid ground ([`MARK_CONTRAST`]'s, as the stars'), reading the
+    /// floor, added or laid over; on paper laid over unchanged. NEGATIVE CONTROL: added on Silver
+    /// Aerogel, as it was, every letter misses the floor.
+    #[test]
+    fn the_lines_star_is_the_cards_mark_on_every_ground() {
+        let letters = |g: u32| {
+            [CardPalette::Cruise, CardPalette::Land, CardPalette::Off]
+                .into_iter()
+                .flat_map(move |p| (0..=255u8).map(move |k| p.letter_on(f32::from(k) / 255.0, g)))
+        };
+        let reads = |(c, blend): (u32, DecoBlend), g: u32| match blend {
+            DecoBlend::Add => contrast(add_sat(g, c), g),
+            DecoBlend::Over => contrast(c, g),
+        };
+        let (mut seen, mut changed, mut lows) = (0usize, Vec::new(), Vec::new());
+        for (name, g) in dark_theme_grounds() {
+            for c in letters(g) {
+                let laid = line_star(c, g);
+                if laid != (c, DecoBlend::Add) {
+                    changed.push(format!("{name} {g:06x}: {c:06x} laid {laid:?}"));
+                }
+                seen += 1;
+            }
+        }
+        for g in mid_grounds() {
+            for c in letters(g) {
+                let k = reads(line_star(c, g), g);
+                if k < MARK_CONTRAST {
+                    lows.push(format!("{g:06x}: {c:06x} at {k:.2}:1"));
+                }
+            }
+        }
+        assert!(
+            changed.is_empty(),
+            "{} changed: {changed:#?}",
+            changed.len()
+        );
+        assert!(seen >= 30 * 3 * 256, "CONTROL: {seen} dark-theme letters");
+        assert!(lows.is_empty(), "{} under the floor: {lows:#?}", lows.len());
+        assert!(
+            letters(DAY).all(|c| line_star(c, DAY) == (c, DecoBlend::Over)),
+            "on paper, laid over unchanged"
+        );
+        let added = letters(AEROGEL)
+            .map(|c| reads((c, DecoBlend::Add), AEROGEL))
+            .fold(0.0f32, f32::max);
+        assert!(
+            added < MARK_CONTRAST,
+            "NEGATIVE CONTROL: added on Silver Aerogel, at best {added:.2}:1"
+        );
+    }
+
+    /// THE STARS PRINT WHERE NO LIGHT READS: on [`SCARLET`], a dim ground on which white reads
+    /// better than black, each star the frame lays, every palette and kitty through the episode
+    /// and the flow, is printed and reads [`MARK_CONTRAST`]. NEGATIVE CONTROL: white light added
+    /// there at a settled star's strength misses the floor, so no lift reaches it and the
+    /// polarity alone would have kept every star light and under the floor.
+    #[test]
+    fn the_stars_print_where_no_light_reads() {
+        let white = add_sat(SCARLET, premul_rgb(WHITE, STAR_PRINT_FULL as u8));
+        assert!(
+            contrast(WHITE, SCARLET) > contrast(0, SCARLET)
+                && contrast(white, SCARLET) < MARK_CONTRAST,
+            "NEGATIVE CONTROL: white light on scarlet reads {:.2}:1",
+            contrast(white, SCARLET)
+        );
+        let clocks = star_clocks();
+        let (mut stars, mut wrong) = (0usize, Vec::new());
+        for s in dark_scenes_on(SCARLET) {
+            for &clock in &clocks {
+                for c in star_calls(&s, clock, true) {
+                    let k = star_reads(&c, SCARLET);
+                    if c.light || k < MARK_CONTRAST {
+                        wrong.push(format!(
+                            "{:?} at {clock:?}: {:06x} light {} at {k:.2}:1",
+                            s.palette, c.color, c.light
+                        ));
+                    }
+                    stars += 1;
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} stars laid wrong: {wrong:#?}",
+            wrong.len()
+        );
+        assert!(stars > 1_000, "CONTROL: {stars} stars");
+    }
+
+    /// A GLINT KEEPS ONE POLARITY THROUGH ITS FLARE: on every mid ground, every palette and kitty
+    /// through the episode and the flow, the glints the frame lays ([`Emit::laid_glints`]) are
+    /// all added light where their rest light is ([`dark_mark`]), and else all print the rest's
+    /// floored ink, both seen. NEGATIVE CONTROL: on [`RASPBERRY`] the glints laid frame by frame
+    /// on their flared light ([`StarCall::laid_on`]) take both polarities, so the grounds reach
+    /// the flip.
+    #[test]
+    fn a_glint_keeps_one_polarity_through_its_flare() {
+        let clocks = star_clocks();
+        let glints = |s: &CardScene, clock: Clock, laid: bool| {
+            let cx = Emit::new(s, Geo::new(s).expect("a scene"), clock, 7);
+            let mut calls = Vec::new();
+            if laid {
+                cx.laid_glints(&mut |c: StarCall| calls.push(c));
+            } else {
+                cx.glints(&mut |c: StarCall| calls.push(c.laid_on(s.ground)));
+            }
+            calls
+        };
+        let (mut seen, mut printed, mut wrong) = (0usize, 0usize, Vec::new());
+        for g in mid_grounds() {
+            for s in dark_scenes_on(g) {
+                let rest = dark_mark(s.palette.glint_rest(), g);
+                for &clock in &clocks {
+                    for c in glints(&s, clock, true) {
+                        let right = match rest {
+                            DarkMark::Light(_) => c.light,
+                            DarkMark::Print(ink) => !c.light && c.color == ink,
+                        };
+                        if !right {
+                            wrong.push(format!("{:?} {g:06x} {clock:?}: {c:?}", s.palette));
+                        }
+                        seen += 1;
+                        printed += usize::from(!c.light);
+                    }
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} glints laid wrong: {wrong:#?}",
+            wrong.len()
+        );
+        assert!(
+            printed > 0 && printed < seen,
+            "CONTROL: {printed} of {seen} glints printed"
+        );
+        let mut polarities = [false; 2];
+        for s in dark_scenes_on(RASPBERRY) {
+            for &clock in &clocks {
+                for c in glints(&s, clock, false) {
+                    polarities[usize::from(c.light)] = true;
+                }
+            }
+        }
+        assert_eq!(
+            polarities, [true; 2],
+            "NEGATIVE CONTROL: on raspberry, glints laid frame by frame, printed and light"
         );
     }
 

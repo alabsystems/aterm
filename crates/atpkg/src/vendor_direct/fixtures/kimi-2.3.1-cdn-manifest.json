@@ -1,0 +1,12 @@
+{
+  "version": "2.3.1",
+  "tag": "@moonshot-ai/kimi-code@2.3.1",
+  "platforms": {
+    "darwin-arm64": { "filename": "kimi-code-darwin-arm64", "checksum": "f06ba6a3bb7ed2fc1f82590f7c22570736d9ee7344059fa92404ca75dc2d5b45", "zstd": { "file": "kimi-code-darwin-arm64.zst", "sha256": "14feed51d746960ae60c2317167c3dac77c254a77afcac3d9bf562d619126307" } },
+    "darwin-x64": { "filename": "kimi-code-darwin-x64", "checksum": "c88f0d8ffa7d7a330199e63e0b9a4b8857e900c3b8f58fd5e90411d3e3ad1a87", "zstd": { "file": "kimi-code-darwin-x64.zst", "sha256": "e5fa48052a98be9491732dfe373c017a90a57775419a012acda9082c4eaab29e" } },
+    "linux-arm64": { "filename": "kimi-code-linux-arm64", "checksum": "9572c66402643ea16e97db239d739096a31454e74daa5ec12af04519e9916d68", "zstd": { "file": "kimi-code-linux-arm64.zst", "sha256": "62df59ec91578933107896bfa4d53133bca762718672cdd51a100d314d0fd3e9" } },
+    "linux-x64": { "filename": "kimi-code-linux-x64", "checksum": "781ec1c24e5e79a01aaaa31ad859e8818ae11ffe792e93645cdc0c068a264ba0", "zstd": { "file": "kimi-code-linux-x64.zst", "sha256": "074e99db147a8e9df2bdc0ccf3ed64402231adaa647edf45433c2666e63d8feb" } },
+    "win32-arm64": { "filename": "kimi-code-win32-arm64.exe", "checksum": "f15999373de18e1c84d5a5e96ddc0eb6ffdddaa3b056968c378117046b88fe26", "zstd": { "file": "kimi-code-win32-arm64.zst", "sha256": "5e492d07323b80557660ff6c1a7ee33363053991c5255d2f7c6c64eb15561804" } },
+    "win32-x64": { "filename": "kimi-code-win32-x64.exe", "checksum": "93878ac2bd12a8cf21b4e148e7f7705a7a6252c1398fd34eb50f8998ba0bf795", "zstd": { "file": "kimi-code-win32-x64.zst", "sha256": "31cc46575bd45cddffd67e140f1d85fbc8f71fd4bb7fc507e62e0dd3a2bad975" } }
+  }
+}

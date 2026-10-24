@@ -12,7 +12,6 @@ use std::time::{Duration, Instant};
 
 use crate::launch_isolation;
 
-/// A wait for something that must happen: a hang detector, not a latency budget.
 const HANG: Duration = Duration::from_secs(60);
 
 /// The terminal settings of the pty `fd` is either end of.
@@ -99,8 +98,7 @@ struct Session {
     tty: Terminal,
     /// The terminal's settings before amacs ran.
     before: libc::termios,
-    // Held open so the master never sees a hangup and can read termios after child exit.
-    /// The slave end, held to the end so the master never reads a hangup.
+    /// Held open so the master never sees a hangup and can read termios after child exit.
     _slave: OwnedFd,
     /// Where the first frame's output ends.
     at: usize,
@@ -170,10 +168,7 @@ impl Session {
         self.root.path().join("notes.txt")
     }
 
-    // Drain the PTY while waiting so XNU's `ttywait` does not block session-leader exit.
-    /// Wait up to [`HANG`] for amacs to exit, reading the terminal meanwhile: a session
-    /// leader's exit waits until its terminal's output is read (XNU's `ttywait`), as a
-    /// terminal emulator always reads it.
+    /// Drains the PTY while waiting up to [`HANG`] so XNU's `ttywait` does not block exit.
     fn reap(&mut self) -> Option<std::process::ExitStatus> {
         let start = Instant::now();
         loop {
@@ -189,7 +184,6 @@ impl Session {
         }
     }
 
-    /// Wait for amacs to exit, and what it wrote in all.
     fn exit(&mut self, label: &str) -> (std::process::ExitStatus, String) {
         let status = self.reap();
         let shown = String::from_utf8_lossy(&self.tty.out).into_owned();
@@ -197,7 +191,6 @@ impl Session {
         (status, shown)
     }
 
-    /// The terminal's settings are what they were before amacs ran.
     fn assert_put_back(&self, label: &str) {
         assert_eq!(
             settings(&termios(self.tty.master.as_raw_fd())),
@@ -208,8 +201,6 @@ impl Session {
 }
 
 impl Drop for Session {
-    /// A test that failed while amacs runs kills it, and reads the terminal until it is
-    /// gone (or the hang detector gives up on it).
     fn drop(&mut self) {
         if matches!(self.child.try_wait(), Ok(None)) {
             let _ = self.child.kill();
@@ -218,10 +209,7 @@ impl Drop for Session {
     }
 }
 
-/// `amacs NEWFILE` in a real terminal, typing `hello`, `C-x C-s` and `C-x C-c`: the file
-/// holds `hello`, amacs exits 0, and the terminal's settings are what they were. Run as an
-/// ssh login would (no aterm window), and as tmux inside an aterm window would (`TMUX` set
-/// beside the window's session id), which also edits in the terminal and dials no window.
+/// `amacs` edits and saves a file under a real PTY and restores termios on exit.
 #[test]
 fn amacs_edits_a_file_under_a_real_pty() {
     let aterm = launch_isolation::aterm_executable();
@@ -263,8 +251,7 @@ fn amacs_edits_a_file_under_a_real_pty() {
     }
 }
 
-/// SIGTERM while amacs edits an unsaved change: the terminal is put back (its settings, the
-/// main screen), amacs ends as SIGTERM ends a program, and the file was never written.
+/// `SIGTERM` restores termios and the main screen without saving unsaved changes.
 #[test]
 fn sigterm_puts_the_terminal_back() {
     use std::os::unix::process::ExitStatusExt as _;
@@ -291,9 +278,7 @@ fn sigterm_puts_the_terminal_back() {
     assert!(!session.file().exists(), "{label}: nothing was saved");
 }
 
-/// A panic while amacs edits an unsaved change (the seam's key): the terminal is put back
-/// (its settings, the main screen) before the panic's message is printed, amacs exits as a
-/// panic does (101), and the file was never written.
+/// A panic restores termios and the main screen before printing its message.
 #[test]
 fn a_panic_puts_the_terminal_back() {
     let aterm = launch_isolation::aterm_executable();

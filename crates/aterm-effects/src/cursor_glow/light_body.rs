@@ -97,48 +97,47 @@ pub(crate) fn ink_over_floor_from(ink: u32, theme_bg: u32, a_max: u8, floor: f32
         return ink;
     }
     let table = crate::color_math::relative_luminance_table();
-    let lum_at = |w: f32| {
-        crate::color_math::relative_luminance_with(
-            table,
-            over_at(theme_bg, toward_white(ink, w), a_max),
-        )
-    };
-    if lum_at(0.0) >= floor {
+    let lum_of =
+        |c: u32| crate::color_math::relative_luminance_with(table, over_at(theme_bg, c, a_max));
+    if lum_of(ink) >= floor {
         return ink;
     }
-    let bisect = |pass: &dyn Fn(f32) -> bool, want_low: bool| {
+    let bisect = |pass: &dyn Fn(u32) -> bool, want_low: bool| {
         let (mut lo, mut hi) = (0.0f32, 1.0f32);
+        let (mut lo_rgb, mut hi_rgb) = (ink, 0x00FF_FFFF);
         for _ in 0..FRESH_INK_GLYPH_BISECT {
             let mid = 0.5 * (lo + hi);
-            if pass(mid) == want_low {
+            let mid_rgb = toward_white(ink, mid);
+            if pass(mid_rgb) == want_low {
                 hi = mid;
+                hi_rgb = mid_rgb;
             } else {
                 lo = mid;
+                lo_rgb = mid_rgb;
+            }
+            if lo_rgb == hi_rgb {
+                break;
             }
         }
-        if want_low { hi } else { lo }
+        if want_low { (hi, hi_rgb) } else { (lo, lo_rgb) }
     };
-    let w_bar = if lum_at(1.0) >= floor {
-        bisect(&|w| lum_at(w) >= floor, true)
+    let (w_bar, bar_rgb) = if lum_of(0x00FF_FFFF) >= floor {
+        bisect(&|c| lum_of(c) >= floor, true)
     } else {
-        1.0
+        (1.0, 0x00FF_FFFF)
     };
     let linear = &table.linear;
-    let seen_at = |w: f32| {
-        crate::rainbow_kitty::ribbon::seen_with(
-            linear,
-            over_at(theme_bg, toward_white(ink, w), a_max),
-            theme_bg,
-        )
+    let seen_of = |c: u32| {
+        crate::rainbow_kitty::ribbon::seen_with(linear, over_at(theme_bg, c, a_max), theme_bg)
     };
-    let w_seen = if !seen_at(0.0) {
-        0.0
-    } else if seen_at(w_bar) {
-        w_bar
+    if !seen_of(ink) {
+        ink
+    } else if seen_of(bar_rgb) {
+        bar_rgb
     } else {
-        bisect(&seen_at, false)
-    };
-    toward_white(ink, w_bar.min(w_seen))
+        let (w_seen, seen_rgb) = bisect(&seen_of, false);
+        if w_bar <= w_seen { bar_rgb } else { seen_rgb }
+    }
 }
 
 /// The quad budget one light mark may spend past the stream's length: an ellipse is one slab per eighth of a cell across and one quad per pixel row down, about a thousand quads for the widest crown at a Retina cell.

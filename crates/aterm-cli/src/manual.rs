@@ -12,7 +12,8 @@ fn overview() -> String {
     format!(
         "aterm is a terminal an AI agent can read and drive, and the front door to the ALab\n\
          toolchain: the Trust compiler and its verifiers, plus the claude, codex, codex-old, agy\n\
-         and muse CLIs, installed and kept current by one signed package manager.\n\
+         and muse CLIs (grok and kimi on request), installed and kept current by one signed\n\
+         package manager.\n\
          {OVERVIEW_SELF_UPDATE}"
     )
 }
@@ -742,7 +743,8 @@ THE FOOTER
 WHAT IT IS
   Installs and keeps current the ALab verification toolchain (`trust`, `clean`, `ty`,
   `ay`, `ny`, `nn`, `trust-ir`, `trust-cg`, `trust-vc`, `trust-mc`) and the managed
-  agent CLIs (`claude`, `codex`, `codex-old`, `agy`, `muse`). Every ALab package is
+  agent CLIs (`claude`, `codex`, `codex-old`, `agy`, `muse`; `grok` and `kimi` once
+  installed by name). Every ALab package is
   verified against the paper master public key compiled into aterm, which signs the
   machine-key roster, which signs the freshness-stamped index and manifests. Agent
   CLIs come from their vendors' release channels, verified against vendor anchors.
@@ -802,6 +804,8 @@ HOW IT WORKS & GOTCHAS
   * A managed agent launches with its vendor's approvals and sandbox off: the twin adds
     the vendor's own flag (`--dangerously-skip-permissions` for claude), unless the
     command line already names a permission mode; `--yolo` is an alias for that flag.
+    kimi's flag is `--auto` (Never Ask), so aterm's `--yolo` takes over Kimi's own
+    `-y`/`--yolo` (Ask When Needed) and drops `-y`, `--yes` and `--auto-approve` beside it.
     The agent's own updater (`claude update`) runs `aterm pkg update <program>`.
   * A toolchain build stages at once and goes live once no running build holds the old
     one (`aterm pkg lease`). A `trust` build whose `rustc` and `trustc` differ runs from
@@ -852,7 +856,7 @@ THE TABLE
   `cargo --unverified …` run `targo` after one stderr line; `cargo metadata`,
   `locate-project` and `version` run `targo` with no line.
 
-THE AGENT PROGRAMS (claude, codex, codex-old, agy, muse)
+THE AGENT PROGRAMS (claude, codex, codex-old, agy, muse, grok, kimi)
   `<prefix>/reroute` also holds exec-time stubs for the installed agent twins. Inside
   aterm (`ATERM_AGENTS_DIR`, `ATERM_CHILD` or `ATERM_SESSION_ID` set) they run
   `<prefix>/agents/<name>`; outside aterm they pass through to the next copy on PATH.
@@ -1755,6 +1759,7 @@ READ — `aterm ctl @self sys [<view>] [--json] [since=<cursor>]`
   aterm ctl @self sys cores         use per core, grouped by cluster
   aterm ctl @self sys mem           memory, compressor, swap, pressure, who holds it
   aterm ctl @self sys disk          this tab's folders' volumes, and who writes
+  aterm ctl @self sys net           network interfaces, rates, and TCP socket states
   aterm ctl @self sys procs         this tab's processes, busiest first
   aterm ctl @self sys jobs          this tab's commands and agent calls: whether
                                     each still makes progress (fine, quiet, busy,
@@ -2107,10 +2112,10 @@ CLOSING A TAB
 const WORKERS_PAGE: &str = r#"workers — coding agents in other tabs on tasks you give them, and the survey
 
 WHAT IT IS
-  A WORKER is another aterm tab running a coding agent (`claude`, `gemini`, `agy` or
-  `muse`) on a task, with its own context, tools and login. The window harness carries
-  it under Autopilot Land (`autopilot=land`, the default, or `autopilot=cruise`) until
-  all of its work is on the remote main branch.
+  A WORKER is another aterm tab running a coding agent (`claude`, `codex`, `gemini`,
+  `agy` or `muse`) on a task, with its own context, tools and login. The window harness
+  carries it (codex-alab carries itself) under Autopilot Land (`autopilot=land`, the
+  default, or `autopilot=cruise`) until all of its work is on the remote main branch.
 
 KEY USAGE (`aterm ctl help <verb>` has every flag)
   aterm ctl @self spawn agent=claude - <<'EOF'
@@ -2126,7 +2131,7 @@ KEY USAGE (`aterm ctl help <verb>` has every flag)
                              later waits, from each worker's last `rev=`
   aterm ctl @<sid> result [full]
                              the worker's final report (up to 24,000 chars; `full`: the
-                             whole task exchange)
+                             whole task exchange, from a transcript)
   aterm ctl @<sid> task      the task record (`state=`, `rev=`, `from=`, `result_bytes=`)
   aterm ctl @<sid> turn typed=1 settle=submitted '<one line>'
                              a follow-up prompt; it returns `task_rev=<n>` once submitted,
@@ -2138,7 +2143,9 @@ AGENTS
   Each agent starts interactive with the task as its first prompt, and trusts the
   spawned `cwd=` for that worker alone: `agent=claude` (Claude Code; `result` reads its
   transcript), `agent=gemini` (Gemini CLI), `agent=agy` (Antigravity CLI), `agent=muse`
-  (Muse Code). `agent=codex` is refused.
+  (Muse Code). `agent=codex` is codex-alab, which carries itself: it trusts its folder by
+  its own rule (`harness policy`'s approve level and trust roots), and `result` reads its
+  rollout.
 
 ON ANOTHER MAC (`aterm fleet allow drive --from <this Mac>` on `<h>`)
   aterm ctl --host <h> spawn agent=<word> [model=<m>] [cwd=<abs-path>] - < task
@@ -2150,7 +2157,7 @@ ON ANOTHER MAC (`aterm fleet allow drive --from <this Mac>` on `<h>`)
   aterm ctl --host <h> @<w> close
 
 THE SURVEY & CHANNELS
-  aterm ctl survey [--json] [--budget <chars>] [--sid <s>]
+  aterm ctl survey [--budget <chars> | [--json] [--sid <s>]]
                              every session on this machine: program, state, task, model,
                              context, active tool and excerpts (treated as untrusted data)
   aterm ctl survey --brief [--budget <chars>]
@@ -2315,7 +2322,8 @@ SLOW FIRST RUNS (macOS's first-run check, not a wall)
   A newly built binary that pauses for seconds before it starts is being scanned by
   `syspolicyd` / XProtect, one binary at a time.
   1. Check `aterm doctor --read-only`'s `devtools:` row (or `devtools` in `aterm ctl
-     privacy`).
+     privacy`, whose `program_check=` counts this user's programs waiting at the check
+     now).
   2. If it is not allowed, ask your operator to turn aterm on in System Settings ▸
      Privacy & Security ▸ Developer Tools (`aterm doctor` opens the pane).
   3. A tab adopted across an in-place update (`attribution=adopted`) still gets scans;
@@ -3727,12 +3735,12 @@ fn agent_page(sid: Option<&str>) -> String {
          Watch THIS instance's sessions on one fd with `subscribe @a,@b events` (one\n  \
          unresolvable selector fails it all; `aterm ctl survey` reads every instance).\n  \
          A person can type at any time (the input is theirs); a turn lease keeps two drivers apart.\n  \
-         Cheaper reads: `text tail=<n>` / `rows=<a>-<b>` read a slice (header `first=<row>`, the\n  \
-         cure for a bottom-pinned TUI); `text trim` / `turn trim=1` drop the trailing blank rows\n  \
-         (`OK <n> trimmed=<k>`). Place work: `spawn window=<id>` opens a tab behind that window's\n  \
-         active one, never raising it (ids from `windows`); `@<sid> spawn`, in <sid>'s window.\n  \
+         Cheaper reads: `text tail=<n>` / `rows=<a>-<b>` read a slice (the cure for a\n  \
+         bottom-pinned TUI); `text trim` / `turn trim=1` drop the trailing blank rows.\n  \
+         Place work: `spawn window=<id>` opens a tab behind that window's active one, never\n  \
+         raising it (ids from `windows`); `@<sid> spawn`, in <sid>'s window.\n  \
          WORKERS: `@self spawn agent=claude -` starts Claude Code behind your tab on the task on\n  \
-         stdin (agent=gemini|agy|muse for those), under Autopilot Land; `await task @<sid>,…\n  \
+         stdin (agent=codex|gemini|agy|muse for those), under Autopilot Land; `await task @<sid>,…\n  \
          since=0` in the background wakes you when one is done (its work landed) or needs a\n  \
          person, and a later wait names the rev its row printed (`@<sid>:<rev>`). Its report is\n  \
          `@<sid> result`; a follow-up is `@<sid> turn typed=1 settle=submitted '<line>'`, then\n  \

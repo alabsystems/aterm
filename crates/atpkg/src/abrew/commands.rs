@@ -30,7 +30,10 @@ pub(super) fn package_definitively_unknown(
         }
     }
     if cask {
-        if prefix.installed_one(Kind::Cask, name).is_some() {
+        if prefix
+            .installed_one(Kind::Cask, super::api::canonical_cask_token(name))
+            .is_some()
+        {
             return false;
         }
         match api.cask(name) {
@@ -271,7 +274,8 @@ pub(super) fn cmd_search(api: &Api, rest: &[String]) -> ExitCode {
         },
         None => {
             let lowered = joined.to_ascii_lowercase();
-            (SearchQuery::text(&joined), lowered)
+            let canonical = super::api::canonical_cask_token(&joined);
+            (SearchQuery::text(canonical), lowered)
         }
     };
     let mut shown = 0usize;
@@ -1467,7 +1471,7 @@ pub(super) fn cmd_cat(prefix: &Prefix, rest: &[String]) -> ExitCode {
         return usage("cat needs a formula name");
     };
     if has_flag(rest, "--cask", "") {
-        let short = Formula::short_name(&name);
+        let short = super::api::canonical_cask_token(Formula::short_name(&name));
         let parts: Vec<&str> = name.split('/').collect();
         if parts.len() == 3
             && let (Some(u), Some(r)) = (parts.first(), parts.get(1))
@@ -1537,8 +1541,8 @@ pub(super) fn cmd_prefix_query(prefix: &Prefix, api: &Api, cmd: &str, name: &str
     let short = Formula::short_name(name);
     if cmd == "--caskroom" {
         return match api.cask(short) {
-            Ok(_) => {
-                println!("{}", prefix.caskroom().join(short).display());
+            Ok(c) => {
+                println!("{}", prefix.caskroom().join(&c.token).display());
                 ExitCode::SUCCESS
             }
             Err(_) if api.formula(short).is_ok() => failed(&format!(
@@ -2104,10 +2108,11 @@ pub(super) fn cmd_uninstall(
     let mut completed = false;
     for name in &names {
         let short = Formula::short_name(name);
+        let cask_short = super::api::canonical_cask_token(short);
         if !has_flag(rest, "--cask", "")
             && !has_flag(rest, "--formula", "")
             && prefix.installed_one(Kind::Formula, short).is_some()
-            && prefix.installed_one(Kind::Cask, short).is_some()
+            && prefix.installed_one(Kind::Cask, cask_short).is_some()
         {
             eprintln!(
                 "abrew: {short} is installed as both a formula and a cask; say --formula or --cask"
@@ -2118,15 +2123,15 @@ pub(super) fn cmd_uninstall(
         let r = if has_flag(rest, "--cask", "")
             || (!has_flag(rest, "--formula", "")
                 && prefix.installed_one(Kind::Formula, short).is_none()
-                && prefix.installed_one(Kind::Cask, short).is_some())
+                && prefix.installed_one(Kind::Cask, cask_short).is_some())
         {
             if force
                 && has_flag(rest, "--cask", "")
-                && prefix.installed_one(Kind::Cask, short).is_none()
+                && prefix.installed_one(Kind::Cask, cask_short).is_none()
             {
                 Ok(())
             } else {
-                cask::uninstall(prefix, short, dry)
+                cask::uninstall(prefix, cask_short, dry)
             }
         } else {
             let pinned_refusal = !force && prefix.pinned_version(short).is_some();
@@ -2208,17 +2213,18 @@ pub(super) fn cmd_reinstall(
     let mut failures = 0;
     for name in &names {
         let short = Formula::short_name(name);
+        let cask_short = super::api::canonical_cask_token(short);
         let as_cask = if want_cask {
             true
         } else if want_formula || prefix.installed_one(Kind::Formula, short).is_some() {
             false
-        } else if prefix.installed_one(Kind::Cask, short).is_some() {
+        } else if prefix.installed_one(Kind::Cask, cask_short).is_some() {
             true
         } else {
-            api.formula(name).is_err() && api.cask(short).is_ok()
+            api.formula(name).is_err() && api.cask(cask_short).is_ok()
         };
         let r: Result<(), install::InstallError> = if as_cask {
-            match api.cask(short) {
+            match api.cask(cask_short) {
                 Ok(c) => cask::install_with_deps(api, prefix, &c, opts.dry_run, true, false, true)
                     .map(|_| ()),
                 Err(error) => Err(error.into()),
@@ -2229,7 +2235,9 @@ pub(super) fn cmd_reinstall(
         completed |= super::native_attempt_may_have_progress(&r);
         match r {
             Ok(()) => {
-                if let Err(error) = auto_cleanup_old_versions(prefix, api, opts.dry_run, &[short]) {
+                let target = if as_cask { cask_short } else { short };
+                if let Err(error) = auto_cleanup_old_versions(prefix, api, opts.dry_run, &[target])
+                {
                     eprintln!("abrew: {error}");
                     failures += 1;
                 }
@@ -2359,7 +2367,11 @@ pub(super) fn cmd_outdated(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitC
         match outdated_rows(prefix, api, casks, has_flag(rest, "--greedy", "")) {
             Ok(mut rows) => {
                 if !scope.is_empty() {
-                    rows.retain(|(name, _, _)| scope.contains(name));
+                    rows.retain(|(name, _, _)| {
+                        scope.iter().any(|s| {
+                            s == name || (casks && super::api::canonical_cask_token(s) == name)
+                        })
+                    });
                 }
                 collected[slot] = rows;
             }
@@ -2426,8 +2438,9 @@ pub(super) fn cmd_upgrade(
         let (cask_names, formula_names): (Vec<String>, Vec<String>) =
             names.into_iter().partition(|name| {
                 let short = Formula::short_name(name);
+                let cask_short = super::api::canonical_cask_token(short);
                 prefix.installed_one(Kind::Formula, short).is_none()
-                    && prefix.installed_one(Kind::Cask, short).is_some()
+                    && prefix.installed_one(Kind::Cask, cask_short).is_some()
             });
         if !formula_names.is_empty() {
             let code = upgrade_formula_names(prefix, api, args, &formula_names, &opts);
@@ -2581,12 +2594,13 @@ fn cmd_upgrade_casks(
         let mut rows = Vec::new();
         for name in &names {
             let short = Formula::short_name(name);
-            let Some(inst) = prefix.installed_one(Kind::Cask, short) else {
+            let cask_short = super::api::canonical_cask_token(short);
+            let Some(inst) = prefix.installed_one(Kind::Cask, cask_short) else {
                 eprintln!("abrew: cask {short} is not installed (upgrade does not install)");
                 failures += 1;
                 continue;
             };
-            rows.push((short.to_string(), inst.version, String::new()));
+            rows.push((cask_short.to_string(), inst.version, String::new()));
         }
         rows
     } else {
@@ -3135,7 +3149,10 @@ pub(super) fn cmd_cleanup(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCo
             return failed(&format!("abrew: no formula or cask named \"{short}\""));
         }
     }
-    let scope: Vec<&str> = named.iter().map(String::as_str).collect();
+    let scope: Vec<&str> = named
+        .iter()
+        .map(|s| super::api::canonical_cask_token(Formula::short_name(s)))
+        .collect();
     let mut freed = match cleanup_old_versions(prefix, api, dry, &scope) {
         Ok((_, bytes)) => bytes,
         Err(error) => return failed(&error),
@@ -3640,16 +3657,22 @@ pub(super) fn cmd_list(prefix: &Prefix, rest: &[String]) -> ExitCode {
         let mut rows = Vec::new();
         for name in &named {
             let short = Formula::short_name(name);
+            let cask_short = super::api::canonical_cask_token(short);
             let kind = if has_flag(rest, "--cask", "")
                 || (!has_flag(rest, "--formula", "")
                     && prefix.installed_one(Kind::Formula, short).is_none()
-                    && prefix.installed_one(Kind::Cask, short).is_some())
+                    && prefix.installed_one(Kind::Cask, cask_short).is_some())
             {
                 Kind::Cask
             } else {
                 Kind::Formula
             };
-            match prefix.installed_one(kind, short) {
+            let lookup = if kind == Kind::Cask {
+                cask_short
+            } else {
+                short
+            };
+            match prefix.installed_one(kind, lookup) {
                 Some(inst) => rows.push(inst),
                 None => return failed(&format!("abrew: {short} is not installed")),
             }
@@ -3665,29 +3688,35 @@ pub(super) fn cmd_list(prefix: &Prefix, rest: &[String]) -> ExitCode {
         let mut seen: Vec<(Kind, String)> = Vec::new();
         for name in &named {
             let short = Formula::short_name(name).to_string();
+            let cask_short = super::api::canonical_cask_token(&short).to_string();
             let kind = if has_flag(rest, "--cask", "")
                 || (!has_flag(rest, "--formula", "")
                     && prefix.installed_one(Kind::Formula, &short).is_none()
-                    && prefix.installed_one(Kind::Cask, &short).is_some())
+                    && prefix.installed_one(Kind::Cask, &cask_short).is_some())
             {
                 Kind::Cask
             } else {
                 Kind::Formula
             };
-            let Some(inst) = prefix.installed_one(kind, &short) else {
+            let lookup = if kind == Kind::Cask {
+                &cask_short
+            } else {
+                &short
+            };
+            let Some(inst) = prefix.installed_one(kind, lookup) else {
                 return failed(&format!("abrew: {short} is not installed"));
             };
-            if seen.contains(&(kind, short.clone())) {
+            if seen.contains(&(kind, lookup.clone())) {
                 continue;
             }
-            seen.push((kind, short.clone()));
+            seen.push((kind, lookup.clone()));
             match kind {
                 Kind::Formula => {
                     for v in &inst.versions {
                         roots.push(prefix.keg(&short, v));
                     }
                 }
-                Kind::Cask => roots.push(prefix.caskroom().join(&short)),
+                Kind::Cask => roots.push(prefix.caskroom().join(&cask_short)),
             }
         }
         for root in &roots {
@@ -5302,10 +5331,6 @@ mod tests {
             "a Java class file"
         );
 
-        // The rows are the install name then each loaded dylib, once per
-        // file however many slices carry them, read without otool, a 32-bit
-        // file's as a 64-bit one's; a universal static archive has none; an
-        // unreadable or malformed file is a problem, never an empty list.
         use crate::macho::fixtures::{
             ID_DYLIB, LOAD_DYLIB, archive, dylib_command, dylib_command32, fat, thin, thin32,
         };
@@ -5423,14 +5448,20 @@ mod tests {
         assert_eq!(unpin_outcome(false, false, true), UnpinOutcome::FailUnknown);
 
         let url = "https://formulae.brew.sh/api/formula/pkg404.json";
-        let missing =
-            fetch::parse_get_response(url, Some(22), b"\n404".to_vec(), b"HTTP request failed")
-                .unwrap_err();
-        assert!(missing.is_not_found());
-        assert_eq!(
-            unpin_outcome(false, false, missing.is_not_found()),
-            UnpinOutcome::FailUnknown
-        );
+        for code in [Some(22), Some(56)] {
+            let missing = fetch::parse_get_response(
+                url,
+                code,
+                b"\n404".to_vec(),
+                b"curl: (56) The requested URL returned error: 404",
+            )
+            .unwrap_err();
+            assert!(missing.is_not_found(), "code={code:?}");
+            assert_eq!(
+                unpin_outcome(false, false, missing.is_not_found()),
+                UnpinOutcome::FailUnknown
+            );
+        }
         for (code, response) in [
             (Some(6), b"\n000".as_slice()),
             (Some(28), b"\n404".as_slice()),
@@ -6092,5 +6123,50 @@ mod tests {
                 name.as_bytes()
             );
         }
+    }
+
+    #[test]
+    fn caffiene_alias_works_for_list_outdated_and_uninstall() {
+        let dir = crate::testdir::dir("abrew-caffiene-lifecycle-");
+        let p = Prefix::at(&dir.join("prefix"));
+        p.ensure().unwrap();
+        let cask_dir = p.cask_dir("caffeine", "1.1.3");
+        std::fs::create_dir_all(&cask_dir).unwrap();
+        std::fs::write(cask_dir.join("Caffeine.app"), b"stub").unwrap();
+        p.write_receipt(
+            &cask_dir,
+            &[
+                ("installed_by", "abrew"),
+                ("token", "caffeine"),
+                ("version", "1.1.3"),
+                ("installed_on_request", "true"),
+            ],
+        )
+        .unwrap();
+        p.rebuild_state().unwrap();
+
+        assert_eq!(cmd_list(&p, &[String::from("caffiene")]), ExitCode::SUCCESS);
+        assert_eq!(
+            cmd_list(&p, &[String::from("--versions"), String::from("caffiene")]),
+            ExitCode::SUCCESS
+        );
+        let api = Api::read_only(p.clone());
+        assert!(!package_definitively_unknown(
+            &p, &api, "caffiene", false, true
+        ));
+        assert_eq!(
+            cmd_cleanup(&p, &api, &[String::from("caffiene")]),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            cmd_uninstall(
+                &p,
+                &api,
+                &[String::from("uninstall"), String::from("caffiene")],
+                &[String::from("caffiene")]
+            ),
+            ExitCode::SUCCESS
+        );
+        assert!(p.installed_one(Kind::Cask, "caffeine").is_none());
     }
 }

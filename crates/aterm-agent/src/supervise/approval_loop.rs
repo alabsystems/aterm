@@ -1344,6 +1344,10 @@ impl<C: Ctl> Session<'_, C> {
         if let Some(mark) = crate::harness::acts::log_mark(rule_id, outcome, command) {
             self.act_marks.queue(mark);
         }
+        if let Some(words) = crate::harness::acts::loop_label(rule_id, outcome) {
+            self.act_marks
+                .queue(crate::harness::acts::label_mark(words));
+        }
     }
 
     fn stepper_check(
@@ -3364,7 +3368,7 @@ mod act_tests {
         ),
         ("decline@v1", Outcome::Declined, "rm -rf /"),
         (RULE_LOGIN, Outcome::Typed, "/login"),
-        ("read-only@classify-v7", Outcome::Skipped, "ls"),
+        ("read-only@classify-v9", Outcome::Skipped, "ls"),
         ("-", Outcome::Escalated, ""),
         ("wall-wait@v1", Outcome::Waiting, ""),
     ];

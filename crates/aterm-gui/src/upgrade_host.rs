@@ -139,27 +139,13 @@ pub(crate) fn live_word_writer(sock: Option<String>) -> WordWriter {
 /// [`WordWriter`] over `home`, `state`, and control socket `sock`.
 pub(crate) fn word_writer_at(home: PathBuf, state: PathBuf, sock: Option<String>) -> WordWriter {
     WordWriter::new(move |ask: &WordAsk| {
+        // The word only records the request and wakes the host's lane
+        // (`upgrade_drive::ask_for`), dialling no socket; the relaunch line that
+        // lane types arms the tap itself (`harness_host::usage_tap_armed`).
         let opts = upgrade_drive::Opts {
-            home: home.clone(),
-            state: state.clone(),
-            sock: sock.clone(),
             only_sid: Some(ask.tab.clone()),
-            dry_run: false,
-            human_grace_s: 0,
-            hand_back: true,
-            background: false,
             aterm_state: None,
-            ask: crate::harness_host::upgrade_ask(),
-            several_logins: crate::harness_host::several_logins(),
-            usage_credits: crate::harness_host::usage_credits(),
-            // The word only records the request and wakes the host's lane
-            // (`upgrade_drive::ask_for`); the relaunch line that lane types
-            // arms the tap itself (`harness_host::usage_tap_armed`).
-            usage_tap: None,
-            instances: upgrade_drive::Instances::Machine,
-            agents_off: Vec::new(),
-            land: false,
-            timings: aterm_agent::harness::Timings::for_build(),
+            ..crate::harness_host::window_drive_opts(home.clone(), state.clone(), sock.clone())
         };
         upgrade_drive::ask_for(&opts, &ask.tab, ask.ask(), &ask.to, &ask.session)
     })

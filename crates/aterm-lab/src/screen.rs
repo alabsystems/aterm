@@ -87,6 +87,21 @@ pub fn composer_of(rows: &[String]) -> Option<String> {
     Some(t.trim_end().to_string())
 }
 
+/// The status row of a vi-family editor holding the screen `ctl text` gave: the last row that
+/// is neither blank nor vi's `~` (the filler under a short buffer), on a screen with at least
+/// three `~` rows. `None`: no such editor's screen.
+#[must_use]
+pub fn editor_row(screen: &str) -> Option<String> {
+    let rows: Vec<&str> = screen.split('\n').map(str::trim_end).collect();
+    if rows.iter().filter(|r| **r == "~").count() < 3 {
+        return None;
+    }
+    rows.iter()
+        .rev()
+        .find(|r| !r.trim().is_empty() && **r != "~")
+        .map(|r| (*r).to_string())
+}
+
 /// The first row of the composer on a screen `ctl text` gave.
 #[must_use]
 pub fn composer_row(agent: &str, screen: &str) -> Option<String> {

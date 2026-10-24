@@ -732,6 +732,64 @@ fn root_runs_no_program_another_account_can_change() {
     assert_eq!(recs[modes].rc, 0, "{}", recs[modes].err);
 }
 
+/// Under root, the folder the app is installed in is refused when it carries
+/// an ACL, as a folder on a program's way is (entry_without_acl): through a
+/// link, the folder it leads to. A run as the account installs where it can.
+#[cfg(target_os = "macos")]
+#[test]
+fn under_root_an_install_folder_with_an_acl_is_refused() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    lib.step(format!(
+        "{FOREIGN_FIND}\n{FAKE_ROOT}\nFOREIGN_LIST=\"$TMPDIR/foreign\"; : >\"$FOREIGN_LIST\"\n\
+         D=\"$TMPDIR/d\"; mkdir \"$D\" && chmod 755 \"$D\" && ln -s d \"$TMPDIR/dest-link\"\n\
+         judged() {{\n\
+         \tchmod -N \"$D\" && {{ [ -z \"$1\" ] || chmod +a \"$1\" \"$D\"; }} || return\n\
+         \tlocal p\n\
+         \tfor p in \"$D\" \"$TMPDIR/dest-link\"; do\n\
+         \t\tif root_dest_acl_open \"$p\"; then echo refused; else echo installs; fi\n\
+         \tdone\n\
+         }}"
+    ));
+    let rows = [
+        ("no ACL", "", "installs"),
+        (
+            "an account may add folders",
+            "user:nobody allow add_subdirectory",
+            "refused",
+        ),
+        ("everyone may read", "group:everyone allow list", "refused"),
+        (
+            "a deny entry alone",
+            "group:everyone deny delete",
+            "refused",
+        ),
+    ];
+    let calls: Vec<usize> = rows
+        .iter()
+        .map(|(_, ace, _)| lib.call(format!("judged '{ace}'"), &[]))
+        .collect();
+    let as_account = lib.call(
+        "( unset -f id; \
+         chmod +a 'group:everyone allow add_subdirectory' \"$D\" && ! root_dest_acl_open \"$D\" )",
+        &[],
+    );
+    let recs = lib.run(&scratch);
+    for ((label, _, want), i) in rows.iter().zip(calls) {
+        assert_eq!(recs[i].rc, 0, "{label}: {}", recs[i].err);
+        assert_eq!(
+            recs[i].out.lines().collect::<Vec<_>>(),
+            [*want, *want],
+            "{label}: the folder, and a link to it"
+        );
+    }
+    assert_eq!(
+        recs[as_account].rc, 0,
+        "a run as the account installs where it can: {}",
+        recs[as_account].err
+    );
+}
+
 #[test]
 fn a_home_still_to_be_made_is_judged_by_the_folder_it_lands_in() {
     let scratch = Scratch::new();
@@ -941,17 +999,21 @@ fn a_root_runs_bundle_gives_its_folders_group_write_alone() {
          : >\"$1/Contents/Info.plist\" && : >\"$1/Contents/Resources/r\" && \
          chmod 664 \"$1/Contents/Resources/r\"; }; \
          mkdir -p \"$TMPDIR/admin\" \"$TMPDIR/own\" && chmod 775 \"$TMPDIR/admin\" && chmod 755 \"$TMPDIR/own\" && \
-         mk \"$TMPDIR/admin/aterm.app.installing.x\" && mk \"$TMPDIR/own/aterm.app.installing.x\"",
+         mk \"$TMPDIR/admin/aterm.app.installing.x\" && mk \"$TMPDIR/own/aterm.app.installing.x\" && \
+         mk \"$TMPDIR/own/aterm.app.installing.y\" && (umask 002; ln -s own \"$TMPDIR/own-link\")",
     );
-    let modes = |dest: &str| {
+    let modes = |dest: &str, stage: &str| {
         format!(
-            "own_bundle_as_root \"$TMPDIR/{dest}/aterm.app.installing.x\" \"$TMPDIR/{dest}\" && \
-             (cd \"$TMPDIR/{dest}/aterm.app.installing.x\" && find . -exec ls -nd {{}} + | \
+            "own_bundle_as_root \"$TMPDIR/{dest}/aterm.app.installing.{stage}\" \"$TMPDIR/{dest}\" && \
+             (cd \"$TMPDIR/{dest}/aterm.app.installing.{stage}\" && find . -exec ls -nd {{}} + | \
              awk '{{print $NF, substr($1, 1, 10)}}' | sort)"
         )
     };
-    let admin = lib.call(modes("admin"), &[]);
-    let own = lib.call(modes("own"), &[]);
+    let admin = lib.call(modes("admin", "x"), &[]);
+    let own = lib.call(modes("own", "x"), &[]);
+    // A link to that folder, which a umask of 002 (and Linux, always) makes
+    // look group-writable: the folder decides.
+    let linked = lib.call(modes("own-link", "y"), &[]);
     // The bundle takes this account's group: a scratch dir under /private/tmp
     // (root:wheel) would give it gid 0, which bundle_is_only lets write.
     let only = lib.call(
@@ -985,11 +1047,10 @@ fn a_root_runs_bundle_gives_its_folders_group_write_alone() {
         tree("drwxrwxr-x"),
         "a folder its group can write: the bundle's folders, never its files"
     );
-    assert_eq!(recs[own].rc, 0, "{}", recs[own].err);
-    assert_eq!(
-        recs[own].out.lines().collect::<Vec<_>>(),
-        tree("drwxr-xr-x")
-    );
+    for i in [own, linked] {
+        assert_eq!(recs[i].rc, 0, "{}", recs[i].err);
+        assert_eq!(recs[i].out.lines().collect::<Vec<_>>(), tree("drwxr-xr-x"));
+    }
     let plist = tmp.join("own/aterm.app.installing.x/Contents/Info.plist");
     let group = std::fs::metadata(&plist).expect("Info.plist").gid();
     assert_eq!(
@@ -1305,6 +1366,206 @@ fn under_root_git_over_the_checkout_is_roots_and_reads_no_config_of_homes() {
 }
 
 #[test]
+fn root_build_authority_includes_acls_and_the_folders_program_names_pass_through() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    lib.step(format!("{FOREIGN_FIND}\n{FAKE_ROOT}\n{ROOT_LAYOUT}"));
+    // Only listings are injected: the private tree and the production preflight,
+    // executable lookup and PATH filtering remain real. BSD's @ can hide +;
+    // Linux needs a successful ACL query, not mode-only ls's missing +.
+    lib.step(
+        r#"eval "$(declare -f ls_entry | sed '1s/ls_entry/base_ls_entry/')"
+uname() { if [ "$1" = -s ]; then echo "$PLATFORM"; else command uname "$@"; fi; }
+ls_entry() {
+	local p="${!#}" arg flags="" within=0 listing
+	local -a args=()
+	for arg; do
+		case "$arg" in
+		--*) args+=("$arg") ;;
+		-*) flags+="$arg"; args+=("${arg//e/}") ;;
+		*) args+=("$arg") ;;
+		esac
+	done
+	[[ "$p" != "${ACL_AT:-}" && "$p" != "${ACL_UNREADABLE:-}" ]] || within=1
+	if [[ "$flags" != *d* ]]; then
+		case "${ACL_AT:-}" in "$p"/*) within=1 ;; esac
+		case "${ACL_UNREADABLE:-}" in "$p"/*) within=1 ;; esac
+	fi
+	if [[ "$flags" == *l* && "$within" == 1 && -n "${ACL_UNREADABLE:-}" ]]; then return 1; fi
+	listing="$(base_ls_entry "${args[@]}")" || return
+	if [[ "$within" == 1 && -n "${ACL_AT:-}" ]]; then
+		if [[ "$PLATFORM" == Darwin ]]; then
+			printf '%s\n' "$listing"
+			[[ "$flags" != *e* ]] || echo ' 0: user:other allow write,append,add_file,writesecurity'
+		else
+			printf '%s\n' "$listing" | awk '/^[-bcdlps]/ && !marked { $1 = $1 "+"; marked = 1 } { print }'
+		fi
+	else
+		printf '%s\n' "$listing"
+	fi
+}
+linux_acl_query() {
+	local p="${!#}" within=0
+	[[ "$p" == / ]] || p="${p%/}"
+	[[ -z "${ACL_QUERY_UNAVAILABLE:-}" ]] || return 1
+	[[ "$p" != "${ACL_AT:-}" && "$p" != "${ACL_UNREADABLE:-}" ]] || within=1
+	case "${ACL_AT:-}" in "$p"/*) within=1 ;; esac
+	case "${ACL_UNREADABLE:-}" in "$p"/*) within=1 ;; esac
+	[[ "$within" != 1 || -z "${ACL_UNREADABLE:-}" ]] || return 1
+	printf '%s\n' user::rwx group::r-x other::r-x
+	[[ -z "${ACL_DEFAULT:-}" ]] || echo 'default:user::rwx'
+	[[ "$within" != 1 || -z "${ACL_AT:-}" ]] || echo 'user:424242:rwx'
+}"#,
+    );
+    let rows = [
+        ("plain", "", true),
+        ("source-acl", "ACL_AT=\"$W/co/src/main.rs\"", false),
+        ("ancestor-acl", "ACL_AT=\"$W\"", false),
+        ("config-acl", "ACL_AT=\"$W/.cargo/config.toml\"", false),
+        (
+            "cargo-acl",
+            ": >\"$W/home/.cargo/config.toml\"; ACL_AT=\"$W/home/.cargo/config.toml\"",
+            false,
+        ),
+        ("tool-acl", "ACL_AT=\"$W/store/trust/1/bin/targo\"", false),
+        (
+            "unreadable-tree-acl",
+            "ACL_UNREADABLE=\"$W/co/src/main.rs\"",
+            false,
+        ),
+        (
+            "unreadable-tool-acl",
+            "ACL_UNREADABLE=\"$W/store/trust/1/bin/targo\"",
+            false,
+        ),
+    ];
+    let mut checks = Vec::new();
+    for platform in ["Darwin", "Linux"] {
+        for (label, setup, builds) in rows {
+            let call = lib.call(
+                format!(
+                    "( mk {platform}-{label}; PLATFORM={platform}; unset ACL_AT ACL_UNREADABLE; \
+                     {setup}\n source_build_preflight )"
+                ),
+                &[],
+            );
+            checks.push((format!("{platform} {label}"), call, builds));
+        }
+    }
+    // These controls do not race: the folder's authority alone is enough to
+    // refuse it before another account can populate or replace a program.
+    let path = lib.call(
+        format!(
+            r#"( mk path; PLATFORM=Darwin; unset ACL_AT ACL_UNREADABLE
+mkdir -p "$W/unsafe" "$W/safe" "$W/alias-bin"
+chgrp "$(command id -g)" "$W/unsafe"
+chmod 775 "$W/unsafe"
+printf '#!/bin/sh\n' >"$W/unsafe/cc"
+chmod 755 "$W/unsafe/cc"
+ln -s "$W/unsafe/cc" "$W/alias-bin/cc"
+! root_bin_dir "$W/unsafe" && ! root_bin_dir "$W/alias-bin" &&
+! may_run "$W/unsafe/cc" && ! may_run "$W/alias-bin/cc" &&
+root_bin_dir "$W/safe" &&
+PATH="$W/unsafe:$W/alias-bin:$W/safe:{}" root_build_path )"#,
+            system_path()
+        ),
+        &[],
+    );
+    let unavailable = lib.call(
+        "( mk unknown-acl; PLATFORM=Linux; unset ACL_AT ACL_UNREADABLE; \
+         ACL_QUERY_UNAVAILABLE=1; ! source_build_preflight )",
+        &[],
+    );
+    let default_acl = lib.call(
+        "( mk default-acl; PLATFORM=Linux; unset ACL_AT ACL_UNREADABLE; \
+         ACL_DEFAULT=1; ! source_build_preflight )",
+        &[],
+    );
+    let identity = lib.call(
+        r#"( . "$1"
+id() { : >"$TMPDIR/id-ran"; echo 424242; }
+[[ "$(installer_uid)" == "$EUID" && ! -e "$TMPDIR/id-ran" ]] )"#,
+        &[],
+    );
+    let metadata = lib.call(
+        r#"( mk metadata; PLATFORM=Darwin; unset ACL_AT ACL_UNREADABLE
+installer_uid() { echo 0; }
+unset -f id uname
+mkdir -p "$W/inherited-bin"
+for tool in id awk; do
+printf '#!/bin/sh\necho touched >>"$TMPDIR/metadata-ran"\necho 424242\n' >"$W/inherited-bin/$tool"
+chmod 755 "$W/inherited-bin/$tool"
+done
+cd "$W"
+original="inherited-bin:$PATH"
+PATH="$original"
+root_metadata_path && [[ "$ROOT_LOOKUP_PATH" == "$original" ]] &&
+found="$(lookup_program id)" && [[ "$found" == "$W/inherited-bin/id" ]] &&
+may_run "$found" && cd "$W/co" && [[ "$found" -ef "$W/inherited-bin/id" ]] &&
+id -u >/dev/null && awk 'BEGIN { exit 0 }' && [[ ! -e "$TMPDIR/metadata-ran" ]] )"#,
+        &[],
+    );
+    let functions = lib.call(
+        format!(
+            r#"( mk functions; mkdir -p "$W/empty"; ln -s empty "$W/link"
+uname() {{ : >"$TMPDIR/function-ran"; }}
+find() {{ : >"$TMPDIR/function-ran"; }}
+awk() {{ : >"$TMPDIR/function-ran"; }}
+readlink() {{ : >"$TMPDIR/function-ran"; }}
+discard_inherited_functions
+PATH="{}"
+[[ "$(builtin type -t uname)" == file && "$(builtin type -t find)" == file &&
+   "$(builtin type -t awk)" == file && "$(builtin type -t readlink)" == file &&
+   "$(builtin type -t discard_inherited_functions)" == function ]] &&
+uname -s >/dev/null && find "$W/empty" -type f && awk 'BEGIN {{ exit 0 }}' &&
+[[ "$(readlink "$W/link")" == empty && ! -e "$TMPDIR/function-ran" ]] )"#,
+            system_path()
+        ),
+        &[],
+    );
+    let relative_home = lib.call(
+        r#"( mk relative-home; PLATFORM=Darwin; unset ACL_AT ACL_UNREADABLE
+printf '#!/bin/sh\nexit 99\n' >"$W/home/.cargo/bin/rustup"
+cp "$W/home/.cargo/bin/rustup" "$W/home/.cargo/bin/cargo"
+chmod 755 "$W/home/.cargo/bin/"*
+cd "$W"
+CARGO_HOME=../home/.cargo
+find_cargo_and_rustup "$ROOT" && [[ "$CARGO_LANE" == rustup &&
+    "$CARGO_HOME" == "$ROOT/../home/.cargo" &&
+    "$RUSTUP_BIN" == "$CARGO_HOME/bin/rustup" && "$CARGO_BIN" == "$CARGO_HOME/bin/cargo" ]] &&
+cd "$ROOT" && [[ -f "$CARGO_BIN" && -f "$RUSTUP_BIN" ]] )"#,
+        &[],
+    );
+    let recs = lib.run(&scratch);
+    for (label, call, builds) in checks {
+        assert_eq!(
+            recs[call].rc,
+            i32::from(!builds),
+            "{label}: {}{}",
+            recs[call].out,
+            recs[call].err
+        );
+    }
+    assert_eq!(recs[path].rc, 0, "{}", recs[path].err);
+    for (name, call) in [
+        ("unknown ACL capability", unavailable),
+        ("default ACL authority", default_acl),
+        ("readonly process identity", identity),
+        ("trusted metadata PATH with original lookup", metadata),
+        ("inherited command functions", functions),
+        ("relative cargo-home discovery and execution", relative_home),
+    ] {
+        assert_eq!(recs[call].rc, 0, "{name}: {}", recs[call].err);
+    }
+    assert_ne!(gid(&scratch.join("tmp/path/unsafe")), 0);
+    assert_eq!(
+        recs[path].out,
+        format!("{}:{}", s(&scratch.join("tmp/path/safe")), system_path()),
+        "PATH keeps the sealed folder, excluding both writable ancestry and its file alias"
+    );
+}
+
+#[test]
 fn a_source_build_asks_only_the_folders_new_downloads_land_in() {
     let scratch = Scratch::new();
     let tmp = scratch.join("tmp");
@@ -1437,8 +1698,9 @@ fn under_root_an_aterm_root_does_not_ask_is_the_one_the_refusal_names() {
 /// Under root, the copy goes into a folder made inside the staging folder once
 /// that one is root's, 0700, empty and (on macOS) stripped of the ACL an
 /// inheritable entry on DEST gave it. A staging folder an account entered
-/// (an entry named with a newline), opened (mode 0777) or took (another
-/// uid's) fails the staging, and nothing is left in DEST.
+/// (an entry named with a newline), opened (mode 0777), took (another uid's)
+/// or replaced with a link fails the staging, and nothing is left in DEST;
+/// the strip leaves the folder a link leads to as it was.
 #[test]
 fn a_root_run_copies_the_app_where_only_root_can_reach_it() {
     let scratch = Scratch::new();
@@ -1463,11 +1725,15 @@ fn a_root_run_copies_the_app_where_only_root_can_reach_it() {
          \td=\"$(command mktemp \"$@\")\" || return\n\
          \t[ -z \"${ENTERED:-}\" ] || mkdir \"$d\"/$'\\n'\n\
          \t[ -z \"${OPENED:-}\" ] || command chmod 777 \"$d\"\n\
+         \t[ -z \"${LINKED:-}\" ] || { command rmdir \"$d\" && ln -s \"$LINKED\" \"$d\"; } || return\n\
          \tprintf '%s\\n' \"$d\"\n\
          }\n\
          mkdir -p \"$TMPDIR/ok\" \"$TMPDIR/copy-fails\" \"$TMPDIR/chown-fails\" \"$TMPDIR/entered\" \\\n\
-         \t\"$TMPDIR/opened\" \"$TMPDIR/taken\"\n\
-         [ \"$(uname -s)\" != Darwin ] || /bin/chmod +a \"user:nobody allow list,search,add_file,add_subdirectory,file_inherit,directory_inherit\" \"$TMPDIR/ok\"",
+         \t\"$TMPDIR/opened\" \"$TMPDIR/taken\" \"$TMPDIR/linked\" \"$TMPDIR/theirs\"\n\
+         [ \"$(uname -s)\" != Darwin ] || {\n\
+         \t/bin/chmod +a \"user:nobody allow list,search,add_file,add_subdirectory,file_inherit,directory_inherit\" \"$TMPDIR/ok\" &&\n\
+         \t\t/bin/chmod +a \"user:nobody allow list\" \"$TMPDIR/theirs\"\n\
+         }",
     );
     let staged = lib.call(
         "DEST=\"$TMPDIR/ok\"; stage_bundle /nonexistent/aterm.app \"$DEST\" && swap_staged_bundle \"$DEST\" && \
@@ -1486,6 +1752,12 @@ fn a_root_run_copies_the_app_where_only_root_can_reach_it() {
     let entered = lib.call(failed("entered", "ENTERED=1"), &[]);
     let opened = lib.call(failed("opened", "OPENED=1"), &[]);
     let taken = lib.call(failed("taken", "STAGE_UID=424242"), &[]);
+    let linked = lib.call(failed("linked", "LINKED=\"$TMPDIR/theirs\""), &[]);
+    let theirs = lib.call(
+        "[ -d \"$TMPDIR/theirs\" ] && if [ \"$(uname -s)\" = Darwin ]; then \
+         /bin/ls -led \"$TMPDIR/theirs\" | { grep -c '^ [0-9]*: ' || true; }; else echo 0; fi",
+        &[],
+    );
     let recs = lib.run(&scratch);
     assert_eq!(recs[staged].rc, 0, "{}", recs[staged].err);
     assert_eq!(
@@ -1523,10 +1795,16 @@ fn a_root_run_copies_the_app_where_only_root_can_reach_it() {
          goes in with no ACL its inheritable entry would give them, and the copy is root's before \
          it leaves it"
     );
-    for i in [copy_fails, chown_fails, entered, opened, taken] {
+    for i in [copy_fails, chown_fails, entered, opened, taken, linked] {
         assert_eq!(recs[i].rc, 0, "a failed staging says so: {}", recs[i].err);
         assert_eq!(recs[i].out, "", "drop_stage leaves nothing behind");
     }
+    assert_eq!(recs[theirs].rc, 0, "{}", recs[theirs].err);
+    assert_eq!(
+        recs[theirs].out.trim_end(),
+        if cfg!(target_os = "macos") { "1" } else { "0" },
+        "the strip never reaches through a link put in the staging folder's place"
+    );
 }
 
 #[test]
@@ -1645,12 +1923,14 @@ fn a_root_runs_bundle_keeps_no_acl_and_one_with_an_acl_is_reinstalled() {
          ! bundle_is_only \"$ME\" \"$B\"; rc=$?; chmod -N \"$B/Contents/MacOS\"; exit $rc )",
         &[],
     );
-    // What a destination's inheritable ACE gives every entry ditto makes in it.
+    // What a destination's inheritable ACE gives every entry ditto makes in
+    // it, and a link with an ACL of its own, as an archive can carry one.
     let inherited = lib.call(
         format!(
             "mkdir -p \"$TMPDIR/dest\" && \
              chmod +a 'group:everyone allow write,append,add_file,file_inherit,directory_inherit' \"$TMPDIR/dest\" && \
-             ditto \"$B\" \"$TMPDIR/dest/aterm.app\" && {aces}"
+             ditto \"$B\" \"$TMPDIR/dest/aterm.app\" && ln -s MacOS/aterm \"$TMPDIR/dest/aterm.app/Contents/link\" && \
+             chmod -h +a 'group:everyone allow write' \"$TMPDIR/dest/aterm.app/Contents/link\" && {aces}"
         ),
         &[],
     );
@@ -1676,6 +1956,6 @@ fn a_root_runs_bundle_keeps_no_acl_and_one_with_an_acl_is_reinstalled() {
     assert_eq!(
         recs[stripped].out.trim(),
         "0",
-        "own_bundle_as_root strips every ACL"
+        "own_bundle_as_root strips every ACL, a link's own among them"
     );
 }

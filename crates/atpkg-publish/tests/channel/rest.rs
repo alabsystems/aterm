@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-// Author: Andrew Yates
 
 //! Integration tests for [`RestHost`] against `agh-fake` over `/usr/bin/curl`.
 
@@ -29,8 +28,7 @@ fn slug() -> Slug {
     Slug::new("fixture-dev", "packs")
 }
 
-/// One curl the host started, as a process listing and its environment would show it, and
-/// what it was given on stdin.
+/// Recorded `curl` invocation and stdin payload.
 #[derive(Clone, Debug)]
 struct Spawned {
     program: String,
@@ -39,9 +37,7 @@ struct Spawned {
     stdin: Option<Vec<u8>>,
 }
 
-/// A [`Spawn`] that records each child and starts it as [`Direct`] does. With `plant` (the
-/// negative control), it puts that text where a guard must find it, in the child's
-/// environment or as a last argument, records the child, and starts nothing.
+/// [`Spawn`] wrapper that records child invocations or plants a secret for negative controls.
 #[derive(Default)]
 struct Recorder {
     spawned: Mutex<Vec<Spawned>>,
@@ -119,8 +115,7 @@ fn hermetic_git() -> [(&'static str, &'static OsStr); 3] {
     ]
 }
 
-/// agh-fake with `fixture-dev-bot` (push on [`SLUG`]), its token in a private file, and the
-/// host's pieces.
+/// `agh-fake` test rig with `fixture-dev-bot` credentials and scratch storage.
 struct Rig {
     fake: FakeGithub,
     secret: String,
@@ -154,8 +149,7 @@ impl Rig {
         }
     }
 
-    /// The host speaking as the token file, its git at `git_base` and hermetic (no system or
-    /// global config of this machine's).
+    /// Authenticated [`RestHost`] pointed at `git_base` with hermetic git config.
     fn host_at(&self, git_base: &str) -> RestHost {
         RestHost::at(
             Some(self.token_file.clone()),
@@ -165,12 +159,10 @@ impl Rig {
         .with_git_env(&hermetic_git())
     }
 
-    /// The host speaking as the token file.
     fn host(&self) -> RestHost {
         self.host_at(&self.origins.web)
     }
 
-    /// A file named `name` holding `bytes`, in this rig's scratch.
     fn file(&self, name: &str, bytes: &[u8]) -> PathBuf {
         let dir = self.dir.path().join("files");
         std::fs::create_dir_all(&dir).expect("the files directory");
@@ -194,7 +186,6 @@ impl Rig {
         (spec, assets)
     }
 
-    /// The requests the fake has seen at the uploads origin.
     fn uploads_seen(&self) -> usize {
         self.fake
             .seen()
@@ -418,8 +409,7 @@ struct Seen {
     authorizations: Mutex<Vec<Option<String>>>,
 }
 
-/// Loopback HTTP server answering 401 Basic challenge when unauthenticated and 403 when
-/// authenticated.
+/// Loopback HTTP server returning 401 when unauthenticated and 403 when authenticated.
 fn git_server(seen: Arc<Seen>, stop: Arc<AtomicBool>) -> (u16, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
     listener.set_nonblocking(true).expect("nonblocking");

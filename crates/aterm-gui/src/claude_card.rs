@@ -21,6 +21,7 @@ use aterm_core::render::{
 use aterm_core::terminal::RenderCell;
 use aterm_effects::harness_card::{
     CardArts, CardFrames, CardPalette, CardScene, FRAME_MS, HarnessCard, LineAt, kitty_cols,
+    line_star,
 };
 use aterm_phase::{CardPlace, NoticePlace};
 
@@ -1288,7 +1289,7 @@ fn make_line_texts_for(agent: Option<&str>, view: AutopilotView, end: LineEnd) -
     let facts = VersionFacts::this_build();
     let mut texts = Vec::with_capacity(7);
     let tag = agent.map_or_else(String::new, |a| {
-        match aterm_phase::program_of(a).and_then(aterm_phase::Program::harness_version) {
+        match aterm_phase::harness_version_str_of(a) {
             Some(v) => format!(" \u{b7} {a} v{v}"),
             None => format!(" \u{b7} {a}"),
         }
@@ -1834,7 +1835,6 @@ fn ink_words(
     ink.clear();
     #[cfg(test)]
     crate::work_counts::card_line_inked();
-    let dark = dark_ground(ground);
     let wand = read
         .place
         .wand()
@@ -1847,19 +1847,18 @@ fn ink_words(
         wand,
     };
     card.line_ink_into(inked.now, &at, pack(ground.bg), animate, ink);
-    let star_rgb = ink.first().map_or(pack(ground.fg), |c| pack(c.color));
+    let (color, blend) = line_star(
+        ink.first().map_or(pack(ground.fg), |c| pack(c.color)),
+        pack(ground.bg),
+    );
     WordDecoration {
         row: u16_of(frame_row),
         col: u16_of(star_col),
         dx: 0,
         dy: 0,
         glyph: DecoGlyph::Star4,
-        blend: if dark {
-            DecoBlend::Add
-        } else {
-            DecoBlend::Over
-        },
-        color: star_rgb,
+        blend,
+        color,
         alpha: u8::MAX,
     }
 }

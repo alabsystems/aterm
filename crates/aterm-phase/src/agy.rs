@@ -11,8 +11,21 @@ use crate::text::blank;
 use crate::turn::{CardPlace, LaunchCard};
 use crate::wall::{ApiCause, Placement, Wall, WallKind};
 
+/// Major component of the Antigravity CLI (`agy`) harness version, starting at `0.1`.
+pub const HARNESS_VERSION_MAJOR: u16 = 0;
+
+/// Minor component of the Antigravity CLI (`agy`) harness version, starting at `0.1`.
+pub const HARNESS_VERSION_MINOR: u16 = 1;
+
 /// Version of the Antigravity CLI (`agy`) harness, tracked independently per harness starting at `"0.1"`.
 pub const HARNESS_VERSION: &str = "0.1";
+
+/// Structured incremental numeric version of the Antigravity CLI (`agy`) harness.
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(
+    HARNESS_VERSION_MAJOR,
+    HARNESS_VERSION_MINOR,
+    HARNESS_VERSION,
+);
 
 const SPINNER: std::ops::RangeInclusive<char> = '\u{2801}'..='\u{28FF}';
 
@@ -142,6 +155,40 @@ fn panel_under(
     Some((first, close - 1, footer))
 }
 
+/// Active-items panel under composer bottom rule `bottom`: `(first, close)` where
+/// `rows[first..close]` are the panel's `  ● …` rows and `rows[close]` is the
+/// panel's closing rule (`rows.get(close + 1)` is the footer row when present).
+#[must_use]
+pub fn panel_bounds_under(rows: &[String], bottom: usize) -> Option<(usize, usize)> {
+    let width = plain_rule_width(rows.get(bottom)?)?;
+    let last = rows.iter().rposition(|r| !blank(r))?;
+    if last <= bottom + 1 {
+        return None;
+    }
+    let (first, end, _) = panel_under(rows, bottom, width, last)?;
+    Some((first, end + 1))
+}
+
+/// Unwrap `agy`'s `Agent(<type>: <role>)` or `Agent(<name>)` token into its
+/// display name (`<role>` for `self: <role>`, `<type>: <role>` or `<name>`
+/// otherwise).
+#[must_use]
+pub fn unwrap_agent_token(token: &str) -> Option<&str> {
+    let inside = token
+        .strip_prefix(const { anchor_text("agy.panel.agent") })?
+        .strip_suffix(')')?;
+    let inside = crate::text::trim(inside);
+    if inside.is_empty() {
+        return None;
+    }
+    let name = inside
+        .strip_prefix("self:")
+        .map(crate::text::trim_start)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(inside);
+    Some(name)
+}
+
 fn frame(rows: &[String]) -> Option<Frame> {
     (1..rows.len())
         .rev()
@@ -210,9 +257,41 @@ fn panel_work(row: &str) -> Option<&'static str> {
     let (_, state) = item
         .strip_prefix(const { anchor_text("agy.panel.agent") })?
         .rsplit_once(')')?;
-    crate::text::trim_start(state)
-        .starts_with(const { anchor_text("agy.panel.working") })
-        .then_some(SUBAGENT_WORKING)
+    is_subagent_working_state(crate::text::trim_start(state)).then_some(SUBAGENT_WORKING)
+}
+
+const SUBAGENT_WORKING_STATES: &[&str] = &[
+    anchor_text("agy.panel.working"),
+    "Reading file",
+    "Reading page",
+    "Running command",
+    "Sending message",
+    "Finding files",
+    "Sending input",
+    "Searching web",
+    "Searching",
+    "Editing files",
+    "Editing file",
+    "Creating file",
+    "Deleting file",
+    "Listing files",
+    "Using browser",
+    "Checking task",
+    "Killing task",
+    "Scheduling timer",
+    "Generating image",
+    "Spawning",
+    "Messaging",
+    "Thinking",
+];
+
+fn is_subagent_working_state(state: &str) -> bool {
+    let head = state
+        .split_once(" · ")
+        .map_or(state, |(activity, _)| crate::text::trim_end(activity));
+    SUBAGENT_WORKING_STATES
+        .iter()
+        .any(|&known| head == known || state.starts_with(known))
 }
 
 fn footer_work(row: &str) -> Option<&'static str> {
@@ -459,6 +538,13 @@ pub fn message_drawn(rows: &[String]) -> bool {
     last_user(rows, top).is_some()
 }
 
+/// AGY HAS DRAWN ON `rows` ([`crate::ScreenReader::program_drawn`]): its composer's frame, a box,
+/// its onboarding, its survey or its sign-in screen, or its launch card.
+#[must_use]
+pub fn program_drawn(rows: &[String]) -> bool {
+    frame(rows).is_some() || is_agy_screen(rows) || launch_card_scan(rows).0.is_some()
+}
+
 fn is_reply_row(row: &str) -> bool {
     leading_spaces(row) >= 2 && !crate::text::trim_start(row).starts_with(['⎿', '└']) && !blank(row)
 }
@@ -662,10 +748,18 @@ const API_KEY_INVALID: &str = "api_key_invalid";
 const QUOTA_EXCEEDED: &str = "exceeded your current quota";
 const OVERLOADED: &str = "overloaded";
 
-const OWN_WALLS: [(&str, WallKind); 3] = [
+const OWN_WALLS: [(&str, WallKind); 4] = [
     (anchor_text("agy.wall.overloaded"), WallKind::Overloaded),
     (anchor_text("agy.wall.quota"), WallKind::UsageSession),
     (anchor_text("agy.wall.credits"), WallKind::Spend),
+    (
+        anchor_text("agy.wall.network"),
+        WallKind::ApiError {
+            code: None,
+            retryable: true,
+            cause: ApiCause::Unreachable,
+        },
+    ),
 ];
 
 fn squeezed(message: &str) -> String {
@@ -700,8 +794,16 @@ fn failure_kind(message: &str) -> Option<WallKind> {
     {
         return Some(kind);
     }
-    let code = api_status(message)?;
     let lower = message.to_lowercase();
+    let Some(code) = api_status(message) else {
+        return (crate::wall::is_unreachable(message) || lower.contains("fetch failed")).then_some(
+            WallKind::ApiError {
+                code: None,
+                retryable: true,
+                cause: ApiCause::Unreachable,
+            },
+        );
+    };
     Some(match code {
         401 => WallKind::Auth,
         400 if lower.contains(API_KEY_INVALID) => WallKind::Auth,
@@ -1555,6 +1657,62 @@ pub fn launch_card_read(rows: &[String]) -> Option<crate::LaunchCardRead> {
     })
 }
 
+fn parse_agy_usage_row(row: &str) -> Option<(&str, u32, Option<String>)> {
+    let (group, rest) = row.split_once("Weekly Limit Remaining")?;
+    let group = crate::text::trim(group);
+    let (pct, after) = crate::text::trim(rest).split_once('%')?;
+    let left: u32 = pct.split_whitespace().next_back()?.parse().ok()?;
+    if left > 100 {
+        return None;
+    }
+    let reset = crate::text::trim(after);
+    Some((group, left, (!reset.is_empty()).then(|| reset.to_owned())))
+}
+
+/// Extracts the [`crate::muse::UsageCardWeekly`] quota summary from an `agy` `/usage` or `/quota` table on `rows`.
+#[must_use]
+pub fn usage_card_weekly(rows: &[String]) -> Option<crate::muse::UsageCardWeekly> {
+    let f = frame(rows)?;
+    let third_party = launch_card(rows).is_some_and(|c| {
+        let lower = c.model.to_ascii_lowercase();
+        lower.contains("claude") || lower.contains("gpt")
+    });
+    let matches_group = |group: &str| {
+        let lower = group.to_ascii_lowercase();
+        if third_party {
+            lower.contains("claude") || lower.contains("gpt")
+        } else {
+            lower.contains("gemini")
+        }
+    };
+    let parsed_rows = rows[..f.top]
+        .iter()
+        .enumerate()
+        .rev()
+        .filter_map(|(idx, r)| {
+            let (group, left, reset) = parse_agy_usage_row(r)?;
+            let effective_group = if group.is_empty() {
+                rows[..idx]
+                    .iter()
+                    .rev()
+                    .map(|prev| crate::text::trim(prev.as_str()))
+                    .find(|prev| !prev.is_empty() && !prev.contains("Weekly Limit Remaining"))
+                    .unwrap_or("")
+            } else {
+                group
+            };
+            Some((effective_group, left, reset))
+        });
+    let (_, left, reset) = parsed_rows
+        .clone()
+        .find(|(g, _, _)| matches_group(g))
+        .or_else(|| parsed_rows.into_iter().next())?;
+    Some(crate::muse::UsageCardWeekly {
+        text: format!("weekly {left}% left"),
+        reset,
+    })
+}
+
 /// agy's screens, measured, for this crate's tests and a dependent crate's `#[cfg(test)]` code; not part of the documented API.
 #[doc(hidden)]
 pub mod fixtures {
@@ -1611,6 +1769,9 @@ pub mod fixtures {
     pub const EXITED: &str = include_str!("fixtures/agy-1.4.0-exited-resume.txt");
     /// Signed out: the login-method menu drawn instead of a composer.
     pub const SIGNED_OUT: &str = include_str!("fixtures/agy-1.4.0-wall-signed-out.txt");
+    /// A spawned worker's tab before agy 1.4.6 draws: the shell's echo of the line that
+    /// launched it, nothing under it (`aterm-lab forever`, `r2cvu-agy`'s worker, seq 14).
+    pub const LAUNCH_LINE: &str = include_str!("fixtures/agy-1.4.6-launch-line.txt");
 
     /// The same agy driven by `aterm-lab` (`lab agy-captures`) at 144×50, under a scratch HOME whose settings name the Gemini API provider, a fake key and a local stub of the Gemini API, its Google hosts black-holed — each file's line 1 says what the stub answered.
     pub mod lab {

@@ -1,28 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! aterm-core's integration suite: the files listed below as modules of one test binary.
-//! None of them sets the environment, installs a hook or an allocator, re-executes itself
-//! or keeps a process global, and each `ty` check gets a scratch directory of its own.
+//! Integration test suite for `aterm-core`.
 //!
-//! Each file keeps its path (so citations of `aterm-core/tests/<file>.rs` still
-//! resolve) and becomes a module here, instead of linking and exec'ing its own
-//! binary per test run. None of them sets the environment, installs a hook or
-//! an allocator, re-executes itself or keeps a process global. Every `ty` check
-//! goes through `aterm_spec::verify`'s drivers, which give each call a scratch
-//! directory of its own.
-//!
-//! The crate sets `autotests = false`, so a new `tests/*.rs` file compiles ONLY
-//! once it is listed here or as its own `[[test]]` in
-//! Cargo.toml (with the hazard that requires it).
-//!
-//! The deterministic-LCG fuzzers (`fuzz_process_never_panics`, `fuzz_alt_screen`) are
-//! modules here too: they set nothing process-wide, so a binary of their own bought no
-//! isolation, only a second link (`fuzz_process_never_panics`'s fresh-terminal properties
-//! print their own replay line).
-//!
-//! Run one file's tests with
-//! `targo --unverified test -p aterm-core --test core_suite -- <file>::`.
+//! Run a single module with `targo --unverified test -p aterm-core --test core_suite -- <file>::`.
 
 mod alt_archive_claude_like;
 mod chunked_process_equivalence;

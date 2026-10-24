@@ -25,7 +25,7 @@ pub enum Scripted {
     Fail(WireError),
 }
 
-/// A request as the transport saw it. The credential is reduced to its profile and fingerprint.
+/// A request as the transport saw it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SeenRequest {
     /// The method.

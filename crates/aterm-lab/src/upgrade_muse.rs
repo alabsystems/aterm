@@ -98,11 +98,19 @@ struct Store {
     source: PathBuf,
     /// The record text the source build's `.vendor` holds (or one written).
     record: String,
+    /// The lab's run directory, where its holds on the scratch sit.
+    run: PathBuf,
 }
 
 impl Store {
     fn store(&self) -> PathBuf {
         self.prefix.join("store/muse")
+    }
+
+    /// Build `id` showed it ran (its composer drawn, its session's lock
+    /// naming a Muse started from it): its hold on the scratch goes.
+    fn ran(&self, id: u64) {
+        crate::lab::release_scratch(&self.run, &format!("muse-{id}"));
     }
 
     fn twin(&self) -> PathBuf {
@@ -116,10 +124,12 @@ impl Store {
 
     /// LAND build `version` as atpkg lands one (the module's order): its
     /// tree, its record and `.ready`, `current` swapped, the twin rewritten,
-    /// and the activation notice published.
+    /// and the activation notice published; the scratch held for it first.
     fn land(&self, version: &str) -> Result<PathBuf, String> {
         let id = revision_build_id(version).ok_or("no build id")?;
         let bin = self.bin(id);
+        crate::lab::hold_scratch(&self.run, &format!("muse-{id}"))
+            .map_err(|e| format!("its hold on the scratch: {e}"))?;
         crate::sys::put(&bin, 0o755, &crate::sys::PutSrc::File(&self.source))
             .map_err(|e| format!("the build's tree: {e}"))?;
         let store = self.store();
@@ -448,6 +458,7 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
         prefix: run.w.join("home/Library/Application Support/aterm/pkg"),
         source: source.clone(),
         record: source_record,
+        run: run.run.clone(),
     };
     let v1 = run.muse_ver.clone();
     let (Some(v2), Some(v3), Some(v4), Some(v5)) = (
@@ -503,6 +514,7 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
     if !door.seen("^❯", 60)? {
         return Err(could_not("Muse Code never drew its composer"));
     }
+    store.ran(b1);
     crate::verbs::turn(&door, &format!("remember the word {WORD}"))?;
     if !door.seen(r"\(reply 1\)", 60)? {
         return Err(could_not("the stub's first answer never showed"));
@@ -550,6 +562,9 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
         return Ok(false);
     };
     show_rows(&m1.rows);
+    if m1.lock_names {
+        store.ran(b2);
+    }
     stop::sleep(Duration::from_secs(5))?;
     let silent = main_turns(&run) == turns_before;
     println!(
@@ -613,6 +628,9 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
         )
     );
     let moved2 = moved_onto(&run, &store.store(), b3, &session, m1.pid, 180, t2)?;
+    if moved2.as_ref().is_some_and(|m| m.lock_names) {
+        store.ran(b3);
+    }
     let after_end = match (&moved2, ended_at) {
         (Some(m), Some(end)) => {
             row_at(&m.rows, "terminated").is_some_and(|t| t * 1000 >= end - 999)
@@ -668,6 +686,9 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
         }
     }
     let moved3 = moved_onto(&run, &store.store(), b4, &session, m2.pid, 180, t3)?;
+    if moved3.as_ref().is_some_and(|m| m.lock_names) {
+        store.ran(b4);
+    }
     let after_turn = match (&moved3, turn_end) {
         (Some(m), Some(end)) => {
             row_at(&m.rows, "terminated").is_some_and(|t| t * 1000 >= end - 999)
@@ -734,6 +755,9 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
         }
     }
     let moved4 = moved_onto(&run, &store.store(), b5, &session, m3.pid, 180, t4)?;
+    if moved4.as_ref().is_some_and(|m| m.lock_names) {
+        store.ran(b5);
+    }
     show_held(&run, t4);
     let between = turns_at_restart.map(|n| n.saturating_sub(turns_at_landing));
     println!(
@@ -910,5 +934,40 @@ mod tests {
         );
         assert_eq!(r.matches("version = ").count(), 1, "{r}");
         assert!(r.contains("version = \"1.4.11-R6427.1\"") && r.contains("vendor = \"Meta\""));
+    }
+
+    /// A LANDED BUILD HOLDS THE SCRATCH UNTIL IT SHOWED IT RAN: each landing
+    /// holds it before its clone is laid, and a build shown to run releases
+    /// its own hold only. NEGATIVE CONTROL: the other build's hold stays.
+    #[test]
+    fn a_landed_build_holds_the_scratch_until_it_showed_it_ran() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let source = root.join("muse");
+        std::fs::write(&source, "a build").unwrap();
+        let store = Store {
+            prefix: root.join("pkg"),
+            source,
+            record: String::new(),
+            run: root.join("run"),
+        };
+        let versions = ["1.4.10-R6427.1", "1.4.11-R6427.1"];
+        let ids = versions.map(|v| revision_build_id(v).unwrap());
+        let held = |id: u64| {
+            root.join("run")
+                .join(crate::lab::HELD)
+                .join(format!("muse-{id}"))
+        };
+        for v in versions {
+            assert_eq!(
+                store.land(v).unwrap(),
+                store.bin(revision_build_id(v).unwrap()),
+                "{v}"
+            );
+        }
+        assert!(held(ids[0]).is_dir() && held(ids[1]).is_dir());
+        store.ran(ids[0]);
+        assert!(!held(ids[0]).exists(), "shown to run");
+        assert!(held(ids[1]).is_dir(), "the other build still holds it");
     }
 }

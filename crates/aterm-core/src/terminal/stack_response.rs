@@ -1,13 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-// Author: Andrew Yates
 
 //! Inline (stack-allocated) builder for small terminal query replies.
-//!
-//! [`StackResponse`] formats DA/DSR/CPR/DECRQSS-sized replies into a fixed `[u8; N]` with
-//! `core::fmt::Write`: the bytes `format!` would make, without a heap allocation. Surplus
-//! past `N` is dropped; callers size `N` with headroom, and a debug assertion catches
-//! truncation.
 
 use core::fmt::{self, Write};
 
@@ -62,7 +56,6 @@ impl<const N: usize> Write for StackResponse<N> {
             "StackResponse<{N}> overflow: response exceeded inline capacity",
         );
         if end > N {
-            // Truncate rather than panic in the parser hot path.
             let avail = N - self.len;
             self.buf[self.len..N].copy_from_slice(&bytes[..avail]);
             self.len = N;

@@ -247,8 +247,8 @@ fn path_of_open(file: &std::fs::File) -> Option<PathBuf> {
     }
     let mut buf = vec![0u16; 32_768];
     let len = u32::try_from(buf.len()).ok()?;
-    // SAFETY: the handle is the open file's own for the length of the call, and the call
-    // writes at most `len` UTF-16 units into `buf` (flags 0: the DOS name, normalized).
+    // SAFETY: the handle is the open file's own for the length of the call, and the call writes at
+    // most `len` UTF-16 units into `buf` (flags 0: the DOS name, normalized).
     let got = unsafe { GetFinalPathNameByHandleW(file.as_raw_handle(), buf.as_mut_ptr(), len, 0) };
     let got = usize::try_from(got)
         .ok()
@@ -381,11 +381,9 @@ fn tracked_links(git: &Git<'_>) -> Result<Vec<String>, Refused> {
 }
 
 /// Collects the change in `cwd`.
-///
 /// # Errors
-///
-/// Why nothing can be sent: not a repository, a refusal the repository asks for, a filter
-/// driver, no change, or a change over [`CHANGE_MAX`].
+/// Why nothing can be sent: not a repository, a refusal the repository asks for, a filter driver,
+/// no change, or a change over [`CHANGE_MAX`].
 pub fn collect(
     runner: &dyn Runner,
     var: &dyn Fn(&str) -> Option<String>,

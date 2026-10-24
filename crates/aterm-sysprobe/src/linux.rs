@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use crate::jobs::RunState;
 use crate::jobs::linux::parse_stat;
 use crate::machine::{
-    Capacity, Commit, LinkCounters, LinkKind, LinkReading, MAX_LINKS, Throttle, ThrottleLevel,
-    kind_by_name, layout_by_rank, level_names,
+    Capacity, Commit, LinkCounters, LinkKind, LinkReading, MAX_LINKS, TcpCounts, Throttle,
+    ThrottleLevel, kind_by_name, layout_by_rank, level_names,
 };
 use crate::procs::{MAX_PROCESSES, ProcessReading, Sweep, parse_statm_resident};
 use crate::{
@@ -428,6 +428,29 @@ fn sys_link(dir: &mut PathBuf, row: NetDev) -> LinkReading {
         rx: row.rx,
         tx: row.tx,
     }
+}
+
+/// Maximum bytes read from `/proc/net/tcp` or `/proc/net/tcp6`.
+const NET_TCP_CAP: usize = 512 * 1024;
+
+/// TCP connection state counts under `root` ([`crate::tcp_counts_into`] on Linux, with root `/`).
+#[must_use]
+pub fn tcp_counts_under_into(root: &Path, scratch: &mut Vec<u8>) -> Option<TcpCounts> {
+    if scratch.len() < NET_TCP_CAP {
+        scratch.resize(NET_TCP_CAP, 0);
+    }
+    let buf = &mut scratch[..NET_TCP_CAP];
+    let mut counts = TcpCounts::default();
+    let mut any = false;
+    for (rel, v6) in [("proc/net/tcp", false), ("proc/net/tcp6", true)] {
+        if let Ok((n, _)) = crate::read_into(&root.join(rel), buf) {
+            any = true;
+            for row in crate::jobs::linux::parse_net_tcp(crate::utf8_prefix(&buf[..n]), v6) {
+                counts.record(row.state);
+            }
+        }
+    }
+    any.then_some(counts)
 }
 
 /// The kernel's count of every thread on the machine, kernel threads included.

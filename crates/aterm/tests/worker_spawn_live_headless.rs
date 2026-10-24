@@ -14,7 +14,7 @@ use crate::{child_output, headless_boot, launch_isolation};
 
 use headless_boot::{Instance, boot_session, client_command, ctl, ctl_ok, field};
 
-/// The stand-in `claude` (and `gemini`, `agy`, `muse`: the same script under
+/// The stand-in `claude` (and `codex`, `gemini`, `agy`, `muse`: the same script under
 /// each name): `--version` answers at once (the helper runs every fake once
 /// that way, `headless_boot::standin`); any other call writes the
 /// trusted-folders file its environment names (Gemini CLI's
@@ -51,7 +51,7 @@ fn boot(tag: &str, shell: &str, harness: Option<&str>, rc: Option<(&str, &str)>)
                     .expect("write the config");
             }
             let bin = tmp.join("bin");
-            for word in ["claude", "gemini", "agy", "muse"] {
+            for word in ["claude", "codex", "gemini", "agy", "muse"] {
                 headless_boot::standin(&bin.join(word), STANDIN);
             }
             std::fs::create_dir_all(tmp.join("work")).expect("the worker's folder");
@@ -328,6 +328,11 @@ fn an_agy_worker_runs_its_task_as_its_prompt_interactive_argv() {
 }
 
 #[test]
+fn a_codex_worker_runs_its_task_after_the_end_of_options() {
+    run_agent_worker("c", "/bin/bash", Some("gpt-x"), "codex");
+}
+
+#[test]
 fn a_muse_worker_runs_its_task_after_the_end_of_options() {
     run_agent_worker("m", headless_boot::need_zsh(), Some("m-1"), "muse");
 }
@@ -361,7 +366,7 @@ fn a_worker_is_refused_unsupervised_and_spawns_nothing() {
         b"a task",
     );
     assert!(
-        !ok && stderr.contains("ERR agent codex: not yet"),
+        !ok && stderr.contains("ERR unsupervised: [harness] enabled = false"),
         "{stderr}"
     );
     let (ok, _, stderr) = spawn_as(&inst, &manager, &work, &["spawn", "agent=claude", "-"], b"");

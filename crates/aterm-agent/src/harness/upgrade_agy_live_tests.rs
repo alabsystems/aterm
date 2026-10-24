@@ -535,3 +535,17 @@ fn a_launch_that_set_its_own_environment_is_named() {
         assert_eq!(inline_env(line), None, "{line}");
     }
 }
+
+#[test]
+fn tool_output_quoting_subagent_or_task_markers_does_not_hold_restart() {
+    let read_file_output = row(
+        "GENERIC",
+        "DONE",
+        AT,
+        &format!(
+            "Created At: 2026-10-18T11:49:52-07:00\nCompleted At: 2026-10-18T11:49:52-07:00\nShowing lines 1-50 of 500\n45: const SUBAGENTS_CREATED: &str = \"Created the following subagents:\";\n46: // file:///h/.gemini/antigravity-cli/brain/{CONV}/.system_generated/logs/transcript.jsonl\n47: const TASK_STARTED: &str = \"background task with task id: {CONV}/task-99\";"
+        ),
+    );
+    let quoted = log(&[turn(AT), read_file_output]);
+    assert_eq!(open_work(&quoted, read_from()), Ok(()));
+}

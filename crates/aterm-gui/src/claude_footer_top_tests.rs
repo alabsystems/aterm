@@ -1206,6 +1206,11 @@ const SHOWS: &[Shown] = &[
         "none",
         &[(120, "full"), (33, "full"), (26, "full")],
     ),
+    (
+        (CliMark::Kimi, Build::Vendor),
+        "none",
+        &[(120, "full"), (33, "full"), (26, "full")],
+    ),
 ];
 
 fn paint_of(state: &str) -> Option<SwitchPaint> {
@@ -2267,4 +2272,136 @@ fn the_themed_switch_reads_on_every_ground() {
         lifted < 1.5,
         "CONTROL: the lifted letter alone on Silver Aerogel, {lifted:.2}:1"
     );
+}
+
+/// `n` held Claude Code panes in one window (1, 2, or 9 in a three by three
+/// grid), each drawn at rest and settled, with each one's session and the
+/// rows of its screen's two composer rules, the top's and the bottom's.
+fn held_panes(n: usize) -> (App, WindowId, Hosted, Vec<(u64, usize, usize)>) {
+    use crate::pane::SplitDir;
+    const PGID: i32 = 4242;
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    assert!(app.apply_term_resize(wid, 99, 330));
+    let a = app.focused_session_id(wid).expect("the front session");
+    let mut sessions = vec![a];
+    if n >= 2 {
+        sessions.push(app.split_active_stub_tab_dir(wid, SplitDir::Vertical));
+    }
+    if n == 9 {
+        let b = sessions[1];
+        assert!(app.focus_session_window(b));
+        let c = app.split_active_stub_tab_dir(wid, SplitDir::Vertical);
+        sessions.push(c);
+        for column in [a, b, c] {
+            assert!(app.focus_session_window(column));
+            let mid = app.split_active_stub_tab_dir(wid, SplitDir::Horizontal);
+            assert!(app.focus_session_window(mid));
+            let low = app.split_active_stub_tab_dir(wid, SplitDir::Horizontal);
+            sessions.extend([mid, low]);
+        }
+    }
+    assert_eq!(sessions.len(), n);
+    let host = hosted(&mut app);
+    let mut tops = Vec::with_capacity(n);
+    for &session in &sessions {
+        let (_, _, rows, cols) = app.visible_session_rect(wid, session).expect("shown");
+        let (rows, cols) = (usize::from(rows), usize::from(cols));
+        let entry = app.pool.get(session).expect("session");
+        {
+            let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+            timeline.note_foreground_group(PGID);
+            timeline.set_program(PGID, Some("claude".into()));
+            timeline.set_agent_reader_for_test(true);
+            assert!(timeline.set_claude_footer(PGID, None, Some(facts())));
+        }
+        crate::session_timeline::claim_supervisor(
+            &entry.ctx,
+            &crate::harness_host::holder(),
+            None,
+            None,
+            crate::metrics::now_us(),
+        )
+        .expect("the claim");
+        let rule = "\u{2500}".repeat(cols);
+        let mut screen: Vec<String> = (0..rows - 6)
+            .map(|i| format!("\u{23FA} Message {i}: what Claude said."))
+            .collect();
+        screen.extend([
+            DONE.to_owned(),
+            String::new(),
+            rule.clone(),
+            "\u{276F} ".to_owned(),
+            rule,
+            BYPASS.to_owned(),
+        ]);
+        feed(&app, session, &screen);
+        tops.push((session, rows - 4, rows - 2));
+    }
+    for _ in 0..3 {
+        refill(&mut app, wid);
+        let _ = pass(&mut app, wid);
+    }
+    (app, wid, host, tops)
+}
+
+/// The top lines read and the composer rules masked by one footer pass.
+fn rule_reads(app: &mut App, wid: WindowId) -> (usize, usize) {
+    let (plan, route) = app.active_visible_frame_layout(wid).expect("a layout");
+    let _ = (
+        crate::work_counts::take_footer_top_reads(),
+        crate::work_counts::take_footer_rule_masks(),
+    );
+    let _ = pass_on(app, wid, &plan, route);
+    (
+        crate::work_counts::take_footer_top_reads(),
+        crate::work_counts::take_footer_rule_masks(),
+    )
+}
+
+/// A SPLIT WINDOW'S UNCHANGED RULES ARE KEPT, AS ONE PANE'S ARE (review
+/// 13): a split window's composed frame carries no row revisions, and a
+/// refill of its unchanged screens read every pane's top line again, nine
+/// reads a refill for nine panes where one pane's reads none. The cells a
+/// rule was read from vouch for its row now: a refill of two or nine held
+/// panes at rest reads no top line and masks no rule. CONTROL: one pane's
+/// refill reads none. NEGATIVE CONTROL: one pane's top rule repainted in
+/// another colour is read again, and its bottom rule's mask, each alone.
+#[test]
+fn a_split_windows_unchanged_rules_are_kept_as_one_panes_are() {
+    for n in [1, 2, 9] {
+        let (mut app, wid, _host, rules) = held_panes(n);
+        for i in 0..4 {
+            refill(&mut app, wid);
+            assert_eq!(rule_reads(&mut app, wid), (0, 0), "{n} panes, refill {i}");
+        }
+        if n != 9 {
+            continue;
+        }
+        let (session, top, bottom) = rules[4];
+        let (_, _, _, cols) = app.visible_session_rect(wid, session).expect("shown");
+        let repaint = |app: &App, row: usize| {
+            bytes(
+                app,
+                session,
+                format!(
+                    "\x1b7\x1b[{};1H\x1b[38;2;200;90;90m{}\x1b[0m\x1b8",
+                    row + 1,
+                    "\u{2500}".repeat(usize::from(cols))
+                )
+                .as_bytes(),
+            );
+        };
+        for (row, read, what) in [(top, (1, 0), "top"), (bottom, (0, 1), "bottom")] {
+            repaint(&app, row);
+            refill(&mut app, wid);
+            assert_eq!(
+                rule_reads(&mut app, wid),
+                read,
+                "NEGATIVE CONTROL: the {what} rule repainted is read again, alone"
+            );
+            refill(&mut app, wid);
+            assert_eq!(rule_reads(&mut app, wid), (0, 0), "{what}: kept again");
+        }
+    }
 }

@@ -885,9 +885,10 @@ fn toml_quote(s: &str) -> String {
 }
 
 fn email_machines_and_slot(email: &str) -> (Vec<String>, Option<u32>) {
-    let Some((local, _)) = email.split_once('@') else {
+    let Some((raw_local, _)) = email.split_once('@') else {
         return (Vec::new(), None);
     };
+    let local = raw_local.split('+').next().unwrap_or(raw_local);
     let tokens: Vec<&str> = local.split(['.', '-', '_']).collect();
     let mut machines = Vec::new();
     let mut slot = None;

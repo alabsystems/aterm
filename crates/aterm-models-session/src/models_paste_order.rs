@@ -1,16 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Two-session ordered-input admission. GUI paste and key submissions have a single event-loop
-//! producer; each sink's worker completes its own jobs.
+//! Two-session ordered-input admission and fast-echo wake models.
 
 use aterm_spec::derive::*;
 
-/// Ordered input owns both payload bytes and jobs until completion or failed submission. Paste
-/// leaves a byte/job allowance for ordinary input; so does a report the UI thread encoded and
-/// queued, which aterm-gui's `paste_order::Budget::claim` takes through the same `paste` arm,
-/// so `AdmitPaste` is its action too. Zero-byte jobs exercise the job bound alone. `Buggy=1`
-/// ignores admission bounds.
+/// Two-session ordered-input byte and job admission model.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn ordered_input_admission_model() -> Model {
@@ -66,12 +61,7 @@ pub fn ordered_input_admission_model() -> Model {
     }
 }
 
-/// A read answers from the selected sink's outstanding jobs, whatever the other sink holds.
-/// `Buggy=1` is a process-wide active flag: a paste in either session orders a key in both.
-///
-/// `Begin` is the enqueue claim, before channel send; `Complete` is the worker retirement after
-/// its PTY write (or the send-failure rollback). Counts 0..2 cover a paste plus a following key
-/// and a partial drain in either session.
+/// Per-session ordered-input active-state isolation model.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn paste_order_sink_isolation_model() -> Model {
@@ -123,18 +113,13 @@ pub fn paste_order_sink_isolation_model() -> Model {
     }
 }
 
-/// A queued press renews fast echo presentation only from a full, non-empty direct-kernel
-/// receipt. A spill receipt does not wake, even after its backlog drains: the worker retires its
-/// FIFO job at once rather than wait on a whole-sink condition unrelated writers can extend.
-/// `Buggy=1` treats spill admission as direct delivery. Tier-1 drives real sink receipts
-/// through the GUI worker's wake decision.
+/// Fast-echo wake model for direct-kernel vs spill write receipts.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn queued_key_kernel_delivery_model() -> Model {
     aterm_spec::ty_model! {
         QueuedKeyKernelDelivery {
             const Buggy = 0;
-            // 0 unwritten, 1 accepted, 2 wake posted, 3 failed/no wake.
             var phase = 0;
             var accepted_full = 0;
             var direct_receipt = 0;

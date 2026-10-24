@@ -18,12 +18,15 @@ const HEADERS: &str = "#include <stddef.h>\n\
                        #include <stdint.h>\n\
                        #include <sys/types.h>\n\
                        #include <sys/socket.h>\n\
+                       #include <sys/socketvar.h>\n\
                        #include <sys/sockio.h>\n\
                        #include <sys/sysctl.h>\n\
                        #include <net/if.h>\n\
                        #include <net/if_var.h>\n\
                        #include <net/if_dl.h>\n\
-                       #include <net/route.h>\n";
+                       #include <net/route.h>\n\
+                       #include <netinet/in_pcb.h>\n\
+                       #include <netinet/tcp_var.h>\n";
 
 /// The probe, with the row named `off` (if any) asserted one higher.
 fn probe(off: Option<&str>) -> String {

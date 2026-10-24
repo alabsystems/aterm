@@ -3,12 +3,16 @@
 
 //! THE LANDING'S ENDS, the window's side (`docs/DESIGN-harness-autopilot-2026-10-15.md` §9.4): what a move of a session's task face does past the glass the frame reads.
 
+use std::sync::Arc;
+
 use aterm_agent::harness::acts::TaskFace;
+use aterm_agent::harness::result;
 use aterm_messages::{Message, Severity, tags};
 
 use crate::App;
 use crate::autopilot::AutopilotView;
 use crate::harness_glass::EndFace;
+use crate::task_record::{TaskMark, TaskRecord, TaskState};
 
 /// CODEX-ALAB'S LANDING (Autopilot Land): the act a proven self-claim's holder records with `meta set harness_act landed@v1` once all of its work is on the remote main branch — never typed, and the one act that makes the session's face `landed` ([`self_claim_act_face`]).
 pub(crate) const SELF_CLAIM_LANDED: &str = aterm_agent::harness::acts::RULE_LANDED;
@@ -117,6 +121,7 @@ impl App {
         let unseen_before_end = self.end_unseen(session);
         let was = was.or(floor);
         self.harness_task_moved(session, was, face);
+        self.reconcile_self_claim_task(session);
         let end_restamped = cleared || (self.end_unseen(session) && !unseen_before_end);
         if moved && !end_restamped {
             if self.driven_by_aterm(session) != hover_was {
@@ -129,6 +134,34 @@ impl App {
             self.harness_screen
                 .ab
                 .task_opened(session, crate::turn_ledger::now_ms());
+        }
+    }
+
+    /// A PROVEN SELF-CLAIM'S FACE ON ITS WORKER'S TASK RECORD (codex-alab under Autopilot Land), read as a level, not an edge, so a mark an update's fence refused is made at a later pass while the face still shows it (a landing a seamless update carried, at the new build's; one whose glass end the update did not carry is not): a landed face beside a record open to it since before the landing ([`open_before`]) marks it `done why=landed` with the report the claim's rollout holds ([`land_self_claim_task`], one thread per session at a time), and an open face beside a record a landing marked done before that turn ([`landed_before`]) reopens it `working why=turn` ([`reopen_self_claim_task`]). Called at each move of the face and at each status sweep's visit.
+    pub(crate) fn reconcile_self_claim_task(&self, session: u64) {
+        if !self.beside_proven_self_claim(session) {
+            return;
+        }
+        let Some(entry) = self.pool.get(session) else {
+            return;
+        };
+        let (face, landed_at, record) = {
+            let timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+            (
+                timeline.task_face(),
+                timeline.task_face_at(TaskFace::Landed),
+                timeline.task().cloned(),
+            )
+        };
+        match (face, landed_at) {
+            (_, Some(at_ms)) if open_before(record.as_ref(), at_ms) => {
+                let entered = record.map_or(0, |r| r.entered);
+                land_self_claim_task(&entry.ctx, session, Landing { entered, at_ms });
+            }
+            (Some((TaskFace::Open, at_ms)), _) if landed_before(record.as_ref(), at_ms) => {
+                reopen_self_claim_task(&entry.ctx, session);
+            }
+            _ => {}
         }
     }
 
@@ -224,6 +257,177 @@ impl App {
         if let Some(record) = task_record(&sid, &place, &line_place, face) {
             self.record_message(record);
         }
+    }
+}
+
+/// Whether `record` is a worker's task still open to a landing: `working`, or stalled by a deadline (`startup`, `held`), as aterm's own loop reads one at its done edge.
+fn open_to_landing(record: Option<&TaskRecord>) -> bool {
+    record.is_some_and(|r| {
+        r.state == TaskState::Working
+            || (r.state == TaskState::Stalled && matches!(r.why, Some("startup" | "held")))
+    })
+}
+
+/// Whether `record` is open to the landing the face moved to at `at_ms` (unix ms): open to a landing ([`open_to_landing`]) since before it, so a task reopened after the landing (a `turn` into it, a manager's `task mark working`) waits for a landing of its own.
+fn open_before(record: Option<&TaskRecord>, at_ms: i64) -> bool {
+    open_to_landing(record) && record.is_some_and(|r| since_by(r, at_ms))
+}
+
+/// Whether `record` is a task a landing marked done ([`crate::task_record::WHY_LANDED`]) before the turn the face moved to open for at `at_ms` (unix ms), so a done mark made after that turn began (a manager's `task mark done why=landed`) stands.
+fn landed_before(record: Option<&TaskRecord>, at_ms: i64) -> bool {
+    record.is_some_and(|r| {
+        r.state == TaskState::Done
+            && r.why == Some(crate::task_record::WHY_LANDED)
+            && since_by(r, at_ms)
+    })
+}
+
+/// Whether `record` entered its state at or before `at_ms` (unix ms).
+fn since_by(record: &TaskRecord, at_ms: i64) -> bool {
+    i64::try_from(record.since_unix_ms).is_ok_and(|since| since <= at_ms)
+}
+
+/// The landing a [`land_self_claim_task`] thread marks: the open state its record `entered` at (an attention change moves the record's `rev`, never this), and the wall time (unix ms) the face moved to landed (`SessionTimeline::task_face_at`: the face shown, or the one a seamless update carried and holds until it is told again), which a later landing restamps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Landing {
+    entered: u64,
+    at_ms: i64,
+}
+
+/// The landing each session's [`land_self_claim_task`] thread is marking now, by sid.
+static LANDING: std::sync::Mutex<std::collections::BTreeMap<String, Landing>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Tests: whether a [`land_self_claim_task`] thread is marking a landing of session `sid` now.
+#[cfg(test)]
+pub(crate) fn landing_in_flight(sid: &str) -> bool {
+    LANDING
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains_key(sid)
+}
+
+/// A session's entry in [`LANDING`], taken out again when its thread ends however it ends.
+struct LandingSlot(String);
+
+impl Drop for LandingSlot {
+    fn drop(&mut self) {
+        LANDING
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.0);
+    }
+}
+
+/// A PROVEN SELF-CLAIM'S LANDING, ON THE TASK RECORD of session `local` ([`App::reconcile_self_claim_task`]): unless a thread already marks one for the session, the report the claim's rollout holds is snapshotted under `<state>/tasks/` (`result::snapshot_rollout`, once its newest turn has ended or [`result::SETTLE_WITHIN`] ran out) on a thread of its own, and the record marked `done why=landed` with it, if, read together under the mark's lock, the record is still open in the state it `entered`, since before the landing, and the face still shows this `landing`.
+fn land_self_claim_task(ctx: &Arc<crate::SessionCtx>, local: u64, landing: Landing) {
+    let sid = ctx.self_id.as_str().to_string();
+    {
+        let mut marking = LANDING.lock().unwrap_or_else(|p| p.into_inner());
+        if marking.contains_key(&sid) {
+            return;
+        }
+        marking.insert(sid.clone(), landing);
+    }
+    let slot = LandingSlot(sid);
+    let Some(tasks) = crate::task_record::tasks_dir() else {
+        return;
+    };
+    let target = crate::self_claim::rollout_target(ctx);
+    let ctx = Arc::clone(ctx);
+    let spawned = std::thread::Builder::new()
+        .name("aterm-codex-result".into())
+        .spawn(move || {
+            let _slot = slot;
+            crate::qos::set_self(crate::qos::Role::Background);
+            let stem = result::result_stem(Some(ctx.self_id.as_str()), landing.entered);
+            let rollout = target.as_ref().and_then(|t| {
+                let path = aterm_agent::harness::codex_tap::rollout_path(&t.home, &t.thread)?;
+                let tail = settled_rollout(&path)?;
+                Some((path, tail))
+            });
+            let thread = target.as_ref().map_or("-", |t| t.thread.as_str());
+            let snap = result::snapshot_rollout(
+                &tasks,
+                &stem,
+                rollout.as_ref().map(|(path, tail)| (path.as_path(), tail.as_str())),
+                thread,
+                result::DoneBy::Turn,
+            );
+            if snap.is_ok() {
+                result::prune_results(&tasks, &stem);
+            }
+            let mut mark = TaskMark::new(TaskState::Done);
+            mark.why = Some(crate::task_record::WHY_LANDED);
+            match &snap {
+                Ok(s) => {
+                    mark.result_bytes = s.bytes;
+                    mark.result_path = Some(s.path.clone());
+                }
+                Err(e) => aterm_log::warn!("task: codex-alab's landing kept no result: {e}"),
+            }
+            let this_landing = |timeline: &crate::session_timeline::SessionTimeline| {
+                let record = timeline.task();
+                open_before(record, landing.at_ms)
+                    && record.is_some_and(|r| r.entered == landing.entered)
+                    && timeline.task_face_at(TaskFace::Landed) == Some(landing.at_ms)
+            };
+            match crate::task_record::mark_session_task_seen(
+                &ctx,
+                local,
+                &mark,
+                ctx.fabric.fence_wait(),
+                this_landing,
+            ) {
+                Ok(Some(_)) => {}
+                Ok(None) => aterm_log::info!(
+                    "task: codex-alab's landing at {} was not marked: its record or face moved on",
+                    landing.at_ms
+                ),
+                Err(_) => aterm_log::warn!(
+                    "task: codex-alab's landing was not marked done: an update is committing (a later pass marks it)"
+                ),
+            }
+        });
+    if let Err(e) = spawned {
+        aterm_log::warn!("task: codex-alab's landing was not marked done: {e}");
+    }
+}
+
+/// The tail of the Codex rollout at `path` once its newest turn has ended (`result::codex_turn_ended`), read again every [`result::SETTLE_EVERY`] for at most [`result::SETTLE_WITHIN`]: the turn a landing follows may still be on its way to the file.
+fn settled_rollout(path: &std::path::Path) -> Option<String> {
+    let until = std::time::Instant::now() + result::SETTLE_WITHIN;
+    loop {
+        let tail =
+            aterm_agent::harness::codex_rollout::tail_of(path, result::TRANSCRIPT_READ_BYTES)?;
+        if result::codex_turn_ended(&tail) || std::time::Instant::now() >= until {
+            return Some(tail);
+        }
+        std::thread::sleep(result::SETTLE_EVERY);
+    }
+}
+
+/// A TURN BEGUN AFTER A PROVEN SELF-CLAIM'S LANDING, ON THE TASK RECORD of session `local`: a record a landing marked done is `working why=turn` again, as aterm's own loop reopens one, if, under the mark's lock, the face still shows the turn. On the window's thread, so it never waits on an update's fence: a refused reopen is made at a later pass.
+fn reopen_self_claim_task(ctx: &crate::SessionCtx, local: u64) {
+    let turn_begun =
+        |timeline: &crate::session_timeline::SessionTimeline| match timeline.task_face() {
+            Some((TaskFace::Open, at_ms)) => landed_before(timeline.task(), at_ms),
+            _ => false,
+        };
+    let mut mark = TaskMark::new(TaskState::Working);
+    mark.why = Some("turn");
+    if crate::task_record::mark_session_task_seen(
+        ctx,
+        local,
+        &mark,
+        std::time::Duration::ZERO,
+        turn_begun,
+    )
+    .is_err()
+    {
+        aterm_log::info!(
+            "task: codex-alab's next turn did not reopen its task yet: an update is committing"
+        );
     }
 }
 

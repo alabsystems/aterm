@@ -30,8 +30,7 @@ impl ScrollRegion {
     }
 }
 
-/// DECSLRM horizontal margins (left and right, inclusive, 0-indexed). They bound
-/// cursor movement and line operations only while DECLRMM (mode 69) is set.
+/// DECSLRM horizontal margins (left and right, inclusive, 0-indexed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HorizontalMargins {
     /// Left column margin (inclusive, 0-indexed).

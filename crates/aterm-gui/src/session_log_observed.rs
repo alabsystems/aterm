@@ -1034,6 +1034,22 @@ impl SessionLog {
                 .map(Val::Word),
         );
         let f = with(f, Key::Code, task.exit.map(|c| Val::I(i64::from(c))));
+        let edited = task.fact_rev > 0;
+        let f = with(f, Key::FactRev, edited.then_some(Val::U(task.fact_rev)));
+        let f = with(
+            f,
+            Key::FactRule,
+            task.fact
+                .and_then(|w| {
+                    aterm_slog::vocab::lookup(aterm_slog::vocab::FACT_RULE_WORDS, w.rule.name())
+                })
+                .map(Val::Word),
+        );
+        let f = with(
+            f,
+            Key::FactN,
+            task.fact.map(|w| Val::U(u64::from(w.ordinal.get()))),
+        );
         self.put(Kind::Task, Src::Aterm, Conf::Exact, Node::SESSION, f, at);
     }
 
@@ -1065,8 +1081,16 @@ impl SessionLog {
         );
     }
 
-    /// `mark - act word=relaunch rule=<row>`.
-    pub(crate) fn observe_relaunch_act(&mut self, rule: &str, started: bool, at: Stamp) {
+    /// `mark - act word=relaunch rule=<row>`; once a new agent came up (`started`), the lift of
+    /// the failure the relaunch caused ([`SessionLog::harness_saw_failure`]), then the harness's
+    /// own `label` ([`Self::harness_label`]).
+    pub(crate) fn observe_relaunch_act(
+        &mut self,
+        rule: &str,
+        started: bool,
+        label: Option<&str>,
+        at: Stamp,
+    ) {
         let Ok(f) = Fields::new()
             .word(Key::Word, aterm_agent::harness::acts::RELAUNCH_WORD)
             .and_then(|f| f.id(Key::Rule, rule))
@@ -1085,7 +1109,36 @@ impl SessionLog {
             .is_ok();
         if acted && started {
             self.harness_saw_failure(at);
+            if let Some(words) = label {
+                self.harness_label(words, at);
+            }
         }
+    }
+
+    /// THE HARNESS'S OWN LABEL: `mark - label text=<words> ttl=<s> by=harness src=aterm
+    /// conf=strong`, written only while no need is open. A need's row comes before any label
+    /// (§7.3), so a label written under one would show only once the need closed, out of its
+    /// moment; the words are the harness's closed templates
+    /// ([`aterm_agent::harness::acts::relaunch_label`]).
+    pub(crate) fn harness_label(&mut self, words: &str, at: Stamp) -> bool {
+        if self.log.state().top_need().is_some() {
+            return false;
+        }
+        let Ok(f) = Fields::new()
+            .text(Key::Text, words)
+            .and_then(|f| f.u(Key::Ttl, aterm_agent::harness::acts::HARNESS_LABEL_TTL_S))
+        else {
+            return false;
+        };
+        self.log
+            .mark(
+                Mark::new(Kind::Label, Src::Aterm, Conf::Strong)
+                    .at(Node::SESSION)
+                    .by(aterm_slog::Actor::Harness)
+                    .fields(f),
+                at,
+            )
+            .is_ok()
     }
 
     /// `mark - state state=<spawning|alive|exited>`.

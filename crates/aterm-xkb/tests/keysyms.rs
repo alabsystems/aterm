@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! aterm-xkb's keysyms against xkeysym 0.2.1's, recorded in
-//! tests/recorded/xkeysym-0.2.1-keysyms.tsv: the same names, the same values.
-//! (The Linux lane also holds every one to libxkbcommon's own
-//! `xkb_keysym_from_name`: tests/live_xkb.rs.)
-//!
-//! Negative controls: every recording has a constant and every constant a
-//! recording; a value one away misses.
+//! aterm-xkb's keysyms against xkeysym 0.2.1's.
 
 use std::collections::BTreeMap;
 

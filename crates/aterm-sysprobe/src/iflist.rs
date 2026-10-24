@@ -4,7 +4,7 @@
 //! The routing socket's interface list (`sysctl {CTL_NET, PF_ROUTE, 0, 0, NET_RT_IFLIST2, 0}`), decoded from bytes: Darwin's 64-bit interface counters, which [`crate::net_links`] reads on macOS.
 
 use crate::machine::{
-    LinkCounters, LinkKind, LinkReading, MAX_LINKS, kind_by_name, never_the_machines,
+    LinkCounters, LinkKind, LinkReading, MAX_LINKS, TcpCounts, kind_by_name, never_the_machines,
 };
 
 /// `CTL_NET` (`sys/sysctl.h`).
@@ -114,6 +114,17 @@ pub const DL_NLEN_AT: usize = 5;
 /// `offsetof(struct sockaddr_dl, sdl_data)`: the name, then the address.
 pub const DL_DATA_AT: usize = 8;
 
+/// `sizeof(struct xinpgen)` (`netinet/in_pcb.h`).
+pub const XINPGEN_SIZE: usize = 24;
+/// `sizeof(struct xsocket64)` (`sys/socketvar.h`).
+pub const XSOCKET64_SIZE: usize = 108;
+/// `sizeof(struct xtcpcb64)` (`netinet/tcp_var.h`).
+pub const XTCPCB64_SIZE: usize = 472;
+/// `offsetof(struct xtcpcb64, xt_inpcb.xi_socket.xso_len)`.
+pub const XTCPCB64_XSO_LEN_AT: usize = 148;
+/// `offsetof(struct xtcpcb64, t_state)`.
+pub const XTCPCB64_STATE_AT: usize = 292;
+
 /// Every layout row and constant above, as the C expression the SDK must agree with: `tests/iflist_sdk.rs` asserts each on `arm64` and `x86_64`.
 #[cfg(target_os = "macos")]
 pub const SDK_ROWS: &[(&str, i64)] = &[
@@ -220,6 +231,17 @@ pub const SDK_ROWS: &[(&str, i64)] = &[
     ),
     ("offsetof(struct sockaddr_dl, sdl_nlen)", DL_NLEN_AT as i64),
     ("offsetof(struct sockaddr_dl, sdl_data)", DL_DATA_AT as i64),
+    ("sizeof(struct xinpgen)", XINPGEN_SIZE as i64),
+    ("sizeof(struct xsocket64)", XSOCKET64_SIZE as i64),
+    ("sizeof(struct xtcpcb64)", XTCPCB64_SIZE as i64),
+    (
+        "offsetof(struct xtcpcb64, xt_inpcb.xi_socket.xso_len)",
+        XTCPCB64_XSO_LEN_AT as i64,
+    ),
+    (
+        "offsetof(struct xtcpcb64, t_state)",
+        XTCPCB64_STATE_AT as i64,
+    ),
 ];
 
 /// `offsetof(struct if_msghdr2, ifm_data)`, where the counters start.
@@ -363,6 +385,51 @@ pub fn links_of(buf: &[u8]) -> Vec<LinkReading> {
         out.push(link_of(&h, name.unwrap_or_default()));
     }
     out
+}
+
+/// Decode Darwin's `net.inet.tcp.pcblist64` buffer into [`TcpCounts`].
+#[must_use]
+pub fn tcp_counts_of_pcblist64(buf: &[u8]) -> Option<TcpCounts> {
+    if buf.len() < XINPGEN_SIZE * 2 {
+        return None;
+    }
+    let head_len = u32::from_ne_bytes(buf.get(0..4)?.try_into().ok()?) as usize;
+    if head_len < XINPGEN_SIZE || !head_len.is_multiple_of(4) || head_len > buf.len() {
+        return None;
+    }
+    let mut counts = TcpCounts::default();
+    let mut at = head_len;
+    let mut saw_trailer = false;
+    while at < buf.len() {
+        let len = u32::from_ne_bytes(buf.get(at..at + 4)?.try_into().ok()?) as usize;
+        if len < XINPGEN_SIZE || !len.is_multiple_of(4) || at.checked_add(len)? > buf.len() {
+            return None;
+        }
+        let rec = &buf[at..at + len];
+        at += len;
+        if len == head_len && at == buf.len() {
+            saw_trailer = true;
+            break;
+        }
+        if len < XTCPCB64_STATE_AT + 4 {
+            return None;
+        }
+        let xso_len = u32::from_ne_bytes(
+            rec.get(XTCPCB64_XSO_LEN_AT..XTCPCB64_XSO_LEN_AT + 4)?
+                .try_into()
+                .ok()?,
+        ) as usize;
+        if xso_len != 0 && xso_len != XSOCKET64_SIZE {
+            return None;
+        }
+        let raw_state = i32::from_ne_bytes(
+            rec.get(XTCPCB64_STATE_AT..XTCPCB64_STATE_AT + 4)?
+                .try_into()
+                .ok()?,
+        );
+        counts.record(crate::jobs::TcpState::from_darwin(raw_state));
+    }
+    saw_trailer.then_some(counts)
 }
 
 #[cfg(test)]
@@ -745,5 +812,56 @@ mod tests {
             Some(40)
         );
         assert_eq!(capped.asks, [Some(1024)], "never past the cap");
+    }
+
+    #[test]
+    fn pcblist64_decodes_states_and_rejects_torn_records() {
+        let xinpgen = || {
+            let mut b = vec![0u8; XINPGEN_SIZE];
+            put(&mut b, 0, &(XINPGEN_SIZE as u32).to_ne_bytes());
+            b
+        };
+        let pcb = |state: i32, xso_len: u32| {
+            let mut b = vec![0u8; XTCPCB64_SIZE];
+            put(&mut b, 0, &(XTCPCB64_SIZE as u32).to_ne_bytes());
+            put(&mut b, XTCPCB64_XSO_LEN_AT, &xso_len.to_ne_bytes());
+            put(&mut b, XTCPCB64_STATE_AT, &state.to_ne_bytes());
+            b
+        };
+        let mut buf = xinpgen();
+        for (state, xso) in [
+            (4, XSOCKET64_SIZE as u32),
+            (4, XSOCKET64_SIZE as u32),
+            (1, XSOCKET64_SIZE as u32),
+            (2, XSOCKET64_SIZE as u32),
+            (5, XSOCKET64_SIZE as u32),
+            (10, 0),
+        ] {
+            buf.extend_from_slice(&pcb(state, xso));
+        }
+        buf.extend_from_slice(&xinpgen());
+        let counts = tcp_counts_of_pcblist64(&buf).expect("valid pcblist64");
+        assert_eq!(
+            counts,
+            TcpCounts {
+                established: 2,
+                listen: 1,
+                syn_sent: 1,
+                close_wait: 1,
+                time_wait: 1,
+                ..TcpCounts::default()
+            }
+        );
+        assert_eq!(counts.total(), 6);
+
+        // Missing trailer is rejected.
+        let without_trailer = &buf[..buf.len() - XINPGEN_SIZE];
+        assert_eq!(tcp_counts_of_pcblist64(without_trailer), None);
+
+        // Bad xso_len is rejected.
+        let mut bad_xso = xinpgen();
+        bad_xso.extend_from_slice(&pcb(4, 99));
+        bad_xso.extend_from_slice(&xinpgen());
+        assert_eq!(tcp_counts_of_pcblist64(&bad_xso), None);
     }
 }

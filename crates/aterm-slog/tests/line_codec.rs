@@ -5,9 +5,9 @@
 
 use aterm_slog::vocab::{
     ACT_WORDS, ASK_WORDS, BOX_WORDS, CAUSE_WORDS, CHANGE_WORDS, CLASS_WORDS, CLS_WORDS, DIR_WORDS,
-    END_WORDS, HEALED_BY_WORDS, HELD_WORDS, MAIL_KIND_WORDS, NEED_WORDS, NET_WORDS, ORIGIN_WORDS,
-    OUT_WORDS, PHASE_WORDS, POOL_WORDS, SEV_WORDS, SOURCE_WORDS, STATE_WORDS, VERB_WORDS,
-    WALL_WORDS, WHY_WORDS, WORD_WORDS,
+    END_WORDS, FACT_RULE_WORDS, HEALED_BY_WORDS, HELD_WORDS, MAIL_KIND_WORDS, NEED_WORDS,
+    NET_WORDS, ORIGIN_WORDS, OUT_WORDS, PHASE_WORDS, POOL_WORDS, SEV_WORDS, SOURCE_WORDS,
+    STATE_WORDS, VERB_WORDS, WALL_WORDS, WHY_WORDS, WORD_WORDS,
 };
 use aterm_slog::{
     Actor, Cap, Conf, DecodeError, EncodeError, FIELDS, Fields, Key, Kind, Lvl, MAX_RECORD_BYTES,
@@ -114,6 +114,7 @@ fn every_vocabulary_word_is_one_wire_token_named_once() {
         SOURCE_WORDS,
         SEV_WORDS,
         HELD_WORDS,
+        FACT_RULE_WORDS,
     ] {
         for (i, w) in list.iter().enumerate() {
             assert!(
@@ -1358,9 +1359,9 @@ fn phase_6_row_mark_is_appended_local_and_its_text_never_leaves_ram() {
     let at = |key: Key| FIELDS.iter().position(|(k, _, _)| *k == key);
     assert_eq!(at(Key::RowText), at(Key::RowKind).map(|i| i + 1));
     assert_eq!(
-        FIELDS.len(),
-        at(Key::RowText).map_or(0, |i| i + 1),
-        "the last key"
+        at(Key::FactRev),
+        at(Key::RowText).map(|i| i + 1),
+        "the fact word's keys follow"
     );
     assert_eq!(
         (Key::RowKind.word(), Key::RowKind.tier(), Key::RowKind.cap()),
@@ -1421,4 +1422,61 @@ fn phase_6_row_mark_is_appended_local_and_its_text_never_leaves_ram() {
             .contains("QZP6ROW1"),
         "CONTROL: the host tier holds a host key's text"
     );
+}
+
+#[test]
+fn occupancy_fact_keys_are_appended_wire_and_an_older_reader_skips_them() {
+    let at = |key: Key| FIELDS.iter().position(|(k, _, _)| *k == key);
+    let first = at(Key::RowText).map(|i| i + 1).expect("phase 6's last key");
+    for (i, (key, word, cap)) in [
+        (Key::FactRev, "fact_rev", Cap::U),
+        (Key::FactRule, "fact_rule", Cap::Word(FACT_RULE_WORDS)),
+        (Key::FactN, "fact_n", Cap::U),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(at(key), Some(first + i), "{key:?} in its place");
+        assert_eq!(
+            (key.word(), key.tier(), key.cap()),
+            (word, Tier::Wire, cap),
+            "{key:?}"
+        );
+    }
+    assert_eq!(
+        FIELDS.len(),
+        at(Key::FactN).map_or(0, |i| i + 1),
+        "the last key"
+    );
+    assert_eq!(FACT_RULE_WORDS, ["wait-nudge@v1", "hold-room@v1"]);
+    assert!(
+        Fields::new().word(Key::FactRule, "hold-room").is_err(),
+        "a rule is named with its version"
+    );
+    let r = rec(
+        Op::Mark,
+        Node::SESSION,
+        Kind::Task,
+        Fields::new()
+            .u(Key::Rev, 3)
+            .and_then(|f| f.u(Key::FactRev, 2))
+            .and_then(|f| f.word(Key::FactRule, "hold-room@v1"))
+            .and_then(|f| f.u(Key::FactN, 1))
+            .expect("a task mark's fact fields"),
+    );
+    let wire = encode(&r, Tier::Wire).expect("fits");
+    assert!(
+        wire.contains(" fact_rev=2 fact_rule=hold-room@v1 fact_n=1 "),
+        "{wire}"
+    );
+    assert_eq!(decode(&wire), Ok(r.clone()), "{wire}");
+    let older = wire
+        .replace(" fact_rev=", " zz_fact_rev=")
+        .replace(" fact_rule=", " zz_fact_rule=")
+        .replace(" fact_n=", " zz_fact_n=");
+    let read = decode(&older).expect("an older reader still reads it");
+    assert_eq!(read.f.get(Key::Rev), Some(&Val::U(3)), "{older}");
+    for key in [Key::FactRev, Key::FactRule, Key::FactN] {
+        assert_eq!(read.f.get(key), None, "{key:?} skipped: {older}");
+    }
 }

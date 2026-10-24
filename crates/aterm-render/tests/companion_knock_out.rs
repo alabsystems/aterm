@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 //
 // The knock-out: letters on a companion's body read against the page. A body drawn under the
-// text (`FreeZ::UnderText`: the pet, its departures, the idle cat) is cut out under each glyph
+// text (a knock-out sprite layer, `FreeZ::UnderText`: the pet, its departures, the idle cat) is cut out under each glyph
 // that lies on it, the glyph's coverage dilated by one pixel and stamped in the cell's page
 // colour before the trails draw, so the ink reads against the page with a hairline of page
 // around it whatever the coat. Judged per ink pixel against the ground next to it (the
@@ -13,9 +13,7 @@
 // Beside the body nothing changes: a frame with the body away from the letters is byte-equal
 // with and without the knock-out, and the body itself keeps every pixel no glyph touches.
 
-use std::sync::Arc;
-
-use aterm_core::render::{FreeSampler, FreeSprite, FreeZ, RenderInput, SceneAtlas};
+use aterm_core::render::RenderInput;
 use aterm_core::terminal::Terminal;
 use aterm_render::{Renderer, Theme, WindowCpu};
 
@@ -47,32 +45,11 @@ fn contrast(a: u32, b: u32) -> f64 {
     (hi + 0.05) / (lo + 0.05)
 }
 
-fn coat(rgb: u32, w: u32, h: u32, version: u64) -> SceneAtlas {
-    let px = [(rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8, 255];
-    SceneAtlas {
-        width: w,
-        height: h,
-        rgba: (0..w * h).flat_map(|_| px).collect(),
-        version,
-    }
-}
+/// A body's box: `(x, y, w, h)` in grid pixels.
+type Body = (i32, i32, u16, u16);
 
-fn body(x: i32, y: i32, w: u16, h: u16) -> FreeSprite {
-    FreeSprite {
-        x,
-        y,
-        w,
-        h,
-        ax: 0,
-        ay: 0,
-        aw: w,
-        ah: h,
-        tint: 0x00FF_FFFF,
-        alpha: 255,
-        flip_x: false,
-        z: FreeZ::UnderText,
-        sampler: FreeSampler::Nearest,
-    }
+fn body(x: i32, y: i32, w: u16, h: u16) -> Body {
+    (x, y, w, h)
 }
 
 fn page(ink: &str, paper: &str) -> Terminal {
@@ -141,16 +118,27 @@ fn judge(clean: &[u32], frame: &[u32], width: usize, paper: u32, bx: [usize; 4])
     out
 }
 
-fn with_body(term: &mut Terminal, fur: u32, sprite: FreeSprite) -> RenderInput {
+/// The page with a body of one straight colour `rgba` (a knock-out sprite
+/// layer) over `(x, y, w, h)`.
+fn with_coat(term: &mut Terminal, rgba: [u8; 4], (x, y, w, h): Body) -> RenderInput {
     let mut input = term.cell_frame(ROWS, COLS);
-    input.free_atlas = Some(Arc::new(coat(
-        fur,
-        u32::from(sprite.w),
-        u32::from(sprite.h),
-        1,
-    )));
-    input.free_sprites = vec![sprite];
+    crate::sprites::put(
+        &mut input,
+        &[crate::sprites::under(
+            x,
+            y,
+            crate::sprites::solid(rgba, w, h),
+        )],
+    );
     input
+}
+
+fn with_body(term: &mut Terminal, fur: u32, sprite: Body) -> RenderInput {
+    with_coat(
+        term,
+        [(fur >> 16) as u8, (fur >> 8) as u8, fur as u8, 255],
+        sprite,
+    )
 }
 
 #[test]
@@ -304,13 +292,7 @@ fn on_a_translucent_window_the_knock_out_keeps_the_glass() {
     );
     let (bx0, by0, bw, bh) = (4 * cw, ch / 2, 5 * cw, 2 * ch);
     let sprite = body(bx0 as i32, by0 as i32, bw as u16, bh as u16);
-    let mut air = with_body(&mut term, 0, sprite);
-    air.free_atlas = Some(Arc::new(SceneAtlas {
-        width: bw as u32,
-        height: bh as u32,
-        rgba: vec![0; bw * bh * 4],
-        version: 1,
-    }));
+    let air = with_coat(&mut term, [0; 4], sprite);
     let on = rend.render_input(&air).pixels.clone();
     rend.set_knock_out(false);
     let off = rend.render_input(&air).pixels.clone();

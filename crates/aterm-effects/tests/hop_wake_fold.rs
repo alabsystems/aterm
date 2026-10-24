@@ -2,13 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! A typed key takes the hop wake it lands in, from either side.
-//!
-//! The key typed at a word hop's landing joins a cohort (`join_cohort`): past the line's old end
-//! it meets the wake, inside the typed cohort's bounds (which never shrink when the witness
-//! retires cells under them) the typed cohort. Either way `Ribbon::fold_wakes_into_band` folds
-//! every wake at the key's cell into the band, so no wake cell expires on the hop's 0.55 s under
-//! a typing hand. A band already leaving is not taken back by a key in a wake beside it, and no
-//! column gets two owners of one cohort. Driven at the host seam through a real [`Terminal`].
 
 use crate::common::{
     LIT_COV, caret_sample, coverage, holes_of, note_blink, observe_caret_row, observe_ribbon_rows,
@@ -84,7 +77,6 @@ impl Host {
         }
     }
 
-    /// A navigation key, as `app_input.rs` stamps an arrow.
     fn nav(&mut self, bytes: &[u8]) {
         self.now += Duration::from_millis(90);
         self.glow.note_motion(self.now);
@@ -92,12 +84,10 @@ impl Host {
         self.frame();
     }
 
-    /// The plan's coverage per column of `row`, as the glass shows it.
     fn plan_cov(&self, row: u16) -> Vec<u8> {
         coverage(&self.glow, self.g, row)
     }
 
-    /// The lengths of the interior dark runs of the row's planned band.
     fn plan_holes(&self, row: u16) -> Vec<usize> {
         holes_of(&self.plan_cov(row))
             .into_iter()
@@ -115,7 +105,6 @@ impl Host {
             .count()
     }
 
-    /// Program output with no key behind it, one frame on.
     fn program(&mut self, bytes: &[u8]) {
         self.now += Duration::from_millis(16);
         self.term.process(bytes);
@@ -123,9 +112,6 @@ impl Host {
     }
 }
 
-/// A glyph inserted mid-line (the witness retires the shifted suffix; the cohort's bounds still
-/// span the old line), a word hop across the dark stretch, a key at the landing, then typing on:
-/// the wake at the landing folds into the band instead of expiring under the typing hand.
 #[test]
 fn a_word_hop_landing_inside_the_band_s_stale_bounds_folds_its_wake() {
     let mut h = Host::at_row(5);
@@ -133,7 +119,6 @@ fn a_word_hop_landing_inside_the_band_s_stale_bounds_folds_its_wake() {
     h.idle(200);
     h.nav(b"\x1b[7D");
     h.nav(b"\x1b[6D");
-    // An insert echo: the tail shifts right, `X` lands at the caret.
     h.key(b"\x1b[@X");
     h.idle(150);
     h.nav(b"\x1b[4C");
@@ -167,8 +152,6 @@ fn a_word_hop_landing_inside_the_band_s_stale_bounds_folds_its_wake() {
     );
 }
 
-/// `hello` rested into its retract, three Right arrows off its end (a hop wake), a key inside the
-/// wake: folding would put the key's hold on the fading band and snap its spent cells back.
 #[test]
 fn a_key_in_a_hop_wake_does_not_revive_a_retracting_band() {
     let mut h = Host::at_row(5);
@@ -198,8 +181,6 @@ fn a_key_in_a_hop_wake_does_not_revive_a_retracting_band() {
     );
 }
 
-/// One owner per column per cohort: a hop lays wake cells over the hand's still-resident spent
-/// cells, and the key in the wake folds both into the band, so `place`'s law holds.
 #[test]
 fn the_wake_fold_keeps_one_owner_per_column_per_cohort() {
     let mut h = Host::at_row(5);

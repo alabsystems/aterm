@@ -143,14 +143,14 @@ impl Api {
     }
 
     fn cask_doc(&self, token: &str) -> Result<Value, String> {
-        let short = Formula::short_name(token);
+        let short = canonical_cask_token(Formula::short_name(token));
         self.doc_checked(
             &format!("cask/{short}.json"),
             &format!("cask-{short}.json"),
             3600,
             true,
         )
-        .map_err(|e| not_found_error(e, "cask", short))
+        .map_err(|e| not_found_error(e, "cask", Formula::short_name(token)))
     }
 
     pub fn formula(&self, name: &str) -> Result<Formula, String> {
@@ -341,13 +341,23 @@ pub(super) fn formula_record(v: &Value, name: &str, machine: &Machine) -> Result
     Ok(f)
 }
 
+/// Canonicalize known cask token aliases and common transpositions (`caffiene` → `caffeine`).
+#[must_use]
+pub(super) fn canonical_cask_token(token: &str) -> &str {
+    match token {
+        "caffiene" => "caffeine",
+        other => other,
+    }
+}
+
 /// One cask record, bound to the requested token.
 pub(super) fn cask_record(v: &Value, token: &str) -> Result<Cask, String> {
-    let short = Formula::short_name(token);
+    let raw_short = Formula::short_name(token);
+    let short = canonical_cask_token(raw_short);
     let c = Cask::from_api(v)?;
-    if c.token != short {
+    if c.token != short && c.token != raw_short {
         return Err(format!(
-            "abrew: cask metadata for {short} names {}",
+            "abrew: cask metadata for {raw_short} names {}",
             c.token
         ));
     }
@@ -594,6 +604,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(api.formula("demo").unwrap().name, "real");
+        write_metadata(
+            &api.cache_path("cask-caffeine.json"),
+            br#"{"token":"caffeine","name":["Caffeine"],"version":"1.1.4","url":"https://example.com/Caffeine.dmg","sha256":"1ad34c3299a0c866873c4feb432c3e11186375adb6f43c5f481ae9d46d06d723","artifacts":[{"app":["Caffeine.app"]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(api.cask("caffiene").unwrap().token, "caffeine");
     }
 
     #[test]

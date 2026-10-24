@@ -355,6 +355,10 @@ pub struct Opts {
     pub home: PathBuf,
     pub state: PathBuf,
     pub sock: Option<String>,
+    /// The window harness's own token, presented on [`Self::sock`] alone ([`harness_client`]):
+    /// a window's sweep passes it, so what the drive types reads `by=harness`; the CLI's is
+    /// `None`, the token beside the socket.
+    pub token: Option<HarnessToken>,
     pub only_sid: Option<String>,
     pub dry_run: bool,
     pub human_grace_s: u32,
@@ -672,6 +676,7 @@ pub(super) fn table() -> Vec<ProcRow> {
         aterm_sysprobe::kproc::records()
             .unwrap_or_default()
             .into_iter()
+            .filter(|r| !r.zombie)
             .map(|r| (r.pid, r.ppid, Comm::named_when_asked(r)))
             .collect()
     }
@@ -721,7 +726,12 @@ pub(super) fn descendants_in(table: &[ProcRow], root: u32) -> Option<Vec<(u32, S
     let mut frontier = vec![root];
     while let Some(parent) = frontier.pop() {
         for (pid, ppid, name) in table {
-            if *ppid == parent && *pid != root && !found.iter().any(|(p, _)| p == pid) {
+            if *ppid == parent
+                && *pid != root
+                && name != aterm_sysprobe::kproc::DEFUNCT
+                && !name.ends_with(" <defunct>")
+                && !found.iter().any(|(p, _)| p == pid)
+            {
                 found.push((*pid, name.to_string()));
                 frontier.push(*pid);
             }
@@ -1634,8 +1644,59 @@ pub(super) fn connect(opts: &Opts, sid: &str) -> Result<Client, String> {
 }
 
 pub(super) fn connect_at(opts: &Opts, sock: &str) -> Result<Client, String> {
-    let c = RelayClient::connect_local_beside(sock).map_err(|e| format!("{sock}: {e}"))?;
+    let token = opts
+        .token
+        .as_ref()
+        .filter(|_| opts.sock.as_deref() == Some(sock));
+    let c = harness_client(sock, token).map_err(|e| format!("{sock}: {e}"))?;
     Ok(if opts.dry_run { c.reads_only() } else { c })
+}
+
+/// The window harness's in-memory control token, which reads `by=harness` on the window's own
+/// socket. Its `Debug` never prints it, so no `Opts` dump logs it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HarnessToken(String);
+
+impl HarnessToken {
+    /// The token `token`, trimmed.
+    #[must_use]
+    pub fn new(token: &str) -> Self {
+        Self(token.trim().to_string())
+    }
+}
+
+impl std::fmt::Debug for HarnessToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HarnessToken(redacted)")
+    }
+}
+
+/// A connection to `sock` that presents `token`, probed with `version`. A token the server
+/// refuses (`ERR auth`, or the connection it closed on the refusal) is replaced once by the token
+/// beside the socket, every client's: a seamless successor that rebound the socket knows only
+/// its own. `None` presents the token beside the socket, unprobed.
+/// # Errors
+/// The socket could not be reached, the token beside it read, or the probe's reply read.
+pub fn harness_client(sock: &str, token: Option<&HarnessToken>) -> std::io::Result<Client> {
+    let Some(token) = token else {
+        return RelayClient::connect_local_beside(sock);
+    };
+    let mut c = RelayClient::connect_local(sock, &token.0)?;
+    match c.request_counted("version") {
+        Ok((head, _)) if head == "ERR auth" => RelayClient::connect_local_beside(sock),
+        Ok(_) => Ok(c),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::UnexpectedEof
+            ) =>
+        {
+            RelayClient::connect_local_beside(sock)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 pub(super) fn roster_connection(sock: &str) -> Option<Client> {

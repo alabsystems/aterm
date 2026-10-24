@@ -2153,7 +2153,31 @@ pub fn spawn_background_check_with_source(
     notify: Option<HealthNotify>,
     on_staged: Option<StagedNotify>,
 ) {
-    if !automatic() {
+    spawn_background_check_in(
+        automatic(),
+        &UNCHECKED_SWEEP,
+        current_build,
+        source_provider,
+        notify,
+        on_staged,
+    );
+}
+
+/// [`spawn_background_check_with_source`] with automatic checks `automatic`: off, `sweep`
+/// stands in for the scheduled checks' sweep of `staged/`.
+#[cfg(target_os = "macos")]
+fn spawn_background_check_in(
+    automatic: bool,
+    sweep: &UncheckedSweep,
+    current_build: u64,
+    source_provider: SourceProvider,
+    notify: Option<HealthNotify>,
+    on_staged: Option<StagedNotify>,
+) {
+    if !automatic {
+        // No scheduled check sweeps here, and a bundle an earlier stage or another process's
+        // asked check left must still go.
+        sweep.start_resident();
         // Said once per process, where the updater's lines go: the one record of why this
         // machine is not checking by itself. A typed or clicked check still runs.
         if enabled() {
@@ -2191,6 +2215,119 @@ pub fn spawn_background_check_with_source(
     let _ = CHECKER_ARGS.set(std::sync::Arc::clone(&args));
     if let Err(error) = spawn_checker_thread(generation, args) {
         warn(&format!("could not start the update checker: {error}"));
+    }
+}
+
+/// This process's sweep of the installed copy's `staged/` while automatic checks are off.
+#[cfg(target_os = "macos")]
+static UNCHECKED_SWEEP: std::sync::LazyLock<UncheckedSweep> = std::sync::LazyLock::new(|| {
+    UncheckedSweep::new(
+        || bundle::resolve().and_then(|_| paths::Staging::resolve()),
+        std::thread::sleep,
+    )
+});
+
+/// The sweep of `staged/` where no scheduled check comes: what earlier stages left goes as
+/// each exec stamp is spent ([`install::sweep_left_incoming_until_none_held`]), as every
+/// check's sweep would take it, on one thread at a time, which a start while it runs sends
+/// round once more. The launch's thread stays for the life of the process; an asked check's
+/// ends once nothing is held.
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+struct UncheckedSweep {
+    state: std::sync::Arc<std::sync::Mutex<UncheckedSweepState>>,
+    staging: std::sync::Arc<dyn Fn() -> Option<paths::Staging> + Send + Sync>,
+    sleep: std::sync::Arc<dyn Fn(std::time::Duration) + Send + Sync>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct UncheckedSweepState {
+    running: bool,
+    again: bool,
+    /// Once nothing is held the thread lists `staged/` again every FIRST_EXEC_HANG.
+    resident: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl UncheckedSweep {
+    fn new(
+        staging: impl Fn() -> Option<paths::Staging> + Send + Sync + 'static,
+        sleep: impl Fn(std::time::Duration) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            state: std::sync::Arc::default(),
+            staging: std::sync::Arc::new(staging),
+            sleep: std::sync::Arc::new(sleep),
+        }
+    }
+
+    /// Starts the sweep off the caller's thread, or has the running one go round again; it
+    /// ends once nothing is held.
+    fn start(&self) {
+        self.start_staying(false);
+    }
+
+    /// [`Self::start`] for the process's life: once nothing is held its thread lists
+    /// `staged/` again every FIRST_EXEC_HANG (a readdir, no network), so a bundle another
+    /// process's asked check left goes once its hold is spent. It ends when there is no
+    /// `staged/` to sweep (not an installed copy).
+    fn start_resident(&self) {
+        self.start_staying(true);
+    }
+
+    fn start_staying(&self, resident: bool) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.resident |= resident;
+        if state.running {
+            state.again = true;
+            return;
+        }
+        let sweep = self.clone();
+        match std::thread::Builder::new()
+            .name("aterm-update-sweep".into())
+            .spawn(move || sweep.run())
+        {
+            Ok(_) => state.running = true,
+            Err(error) => warn(&format!("could not start the update sweep: {error}")),
+        }
+    }
+
+    fn run(&self) {
+        loop {
+            let staging = (self.staging)();
+            if let Some(staging) = &staging {
+                install::sweep_left_incoming_until_none_held(staging, &*self.sleep);
+            }
+            // Under the lock a start reads, so one that came after the last sweep is not lost.
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if std::mem::take(&mut state.again) {
+                continue;
+            }
+            if staging.is_none() || !state.resident {
+                state.running = false;
+                return;
+            }
+            drop(state);
+            (self.sleep)(aterm_uds::deadline::FIRST_EXEC_HANG);
+        }
+    }
+}
+
+/// Runs a check someone asked for. With automatic checks off no scheduled check follows it,
+/// so `sweep` takes what it left once each hold is spent. A CLI check's own thread dies with
+/// its process; a running app's sweep, or the next launch, takes what it left.
+#[cfg(target_os = "macos")]
+fn asked_check(automatic: bool, sweep: &UncheckedSweep, check: impl FnOnce()) {
+    check();
+    if !automatic {
+        sweep.start();
     }
 }
 
@@ -4053,12 +4190,14 @@ pub fn check_now(current_build: u64, source: &Source) -> UpdateStatus {
             .unwrap_or_else(|| UpdateStatus::empty(true, current_build, why));
     }
     if enabled() {
-        check_lane().run_or_join(current_build, source, || {
-            if let Err(error) =
-                github::check_and_stage_for(current_build, source, github::Asked::Person)
-            {
-                warn(&format!("manual update check failed: {error}"));
-            }
+        asked_check(automatic(), &UNCHECKED_SWEEP, || {
+            check_lane().run_or_join(current_build, source, || {
+                if let Err(error) =
+                    github::check_and_stage_for(current_build, source, github::Asked::Person)
+                {
+                    warn(&format!("manual update check failed: {error}"));
+                }
+            });
         });
     }
     status(current_build).unwrap_or_else(|| {

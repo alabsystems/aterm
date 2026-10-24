@@ -8,7 +8,10 @@ use std::time::Duration;
 
 use aterm_core::render::RenderInput;
 use aterm_core::terminal::{ContentScrollDelta, ContentScrollState, Terminal};
-use aterm_render::{GlowQuad, InkCell, RainHalo, SpriteQuad, WordDecoration, theme_is_dark};
+use aterm_render::{GlowQuad, InkCell, RainHalo, WordDecoration, theme_is_dark};
+
+use crate::matrix_rain::{RainCell, RainLayers};
+use aterm_render::sprites::{FreeSprite, SpriteLayers, WORD_SPRITE_SALT};
 
 use crate::companion::{CompanionOwner, ContrastFallback, GlowOwnership, PetFacts};
 use crate::cursor_fx::{CursorFx, CursorFxInput, brighten, compose_caret_style_override};
@@ -191,8 +194,10 @@ pub struct EffectsPipeline {
 
     deco_scratch: Vec<WordDecoration>,
     ink_scratch: Vec<InkCell>,
-    /// Free-overlay channel (peeking cats and gaze dots as `FreeSprite`s).
-    free_scratch: Vec<aterm_core::render::FreeSprite>,
+    /// Free-overlay channel (peeking cats and companions as [`FreeSprite`]s).
+    free_scratch: Vec<FreeSprite>,
+    /// Publishes `free_scratch` into the frame's fx layers.
+    sprite_layers: SpriteLayers,
     nova_scratch: Vec<GlowQuad>,
 
     /// The resident pet's driver (`companion.rs`).
@@ -222,13 +227,15 @@ pub struct EffectsPipeline {
     rain_latches: RainLatches,
     /// Whole milliseconds already fed to rain's accumulator.
     rain_clock_ms: u64,
-    rain_scratch: Vec<SpriteQuad>,
+    rain_scratch: Vec<RainCell>,
+    /// Publishes `rain_scratch` into the frame's fx layers.
+    rain_layers: RainLayers,
     rain_add_scratch: Vec<RainHalo>,
 
     /// Scratch for a composed frame's per-pane word pass before it is translated into the pane.
     pane_deco: Vec<WordDecoration>,
     pane_ink: Vec<InkCell>,
-    pane_free: Vec<aterm_core::render::FreeSprite>,
+    pane_free: Vec<FreeSprite>,
     pane_nova: Vec<GlowQuad>,
     /// Output streak per visible terminal pane of a composed frame, keyed `(session, pane slot)`.
     streak_panes: std::collections::BTreeMap<(u64, usize), OutputStreak>,
@@ -303,6 +310,7 @@ impl EffectsPipeline {
             deco_scratch: Vec::new(),
             ink_scratch: Vec::new(),
             free_scratch: Vec::new(),
+            sprite_layers: SpriteLayers::new(WORD_SPRITE_SALT),
             nova_scratch: Vec::new(),
             companion: CompanionOwner::default(),
             look: crate::companion_look::LookPolicy::default(),
@@ -318,6 +326,7 @@ impl EffectsPipeline {
             rain_latches: RainLatches::default(),
             rain_clock_ms: 0,
             rain_scratch: Vec::new(),
+            rain_layers: RainLayers::default(),
             rain_add_scratch: Vec::new(),
             chrome_pad: 0,
             chrome_head: 0,
@@ -1315,13 +1324,9 @@ impl EffectsPipeline {
             input.cursor_effect_style_override = None;
             input.word_decorations.clear();
             input.ink.clear();
-            input.cat_quads.clear();
-            input.cat_atlas = None;
-            input.free_sprites.clear();
-            input.free_atlas = None;
+            self.sprite_layers.withdraw(&mut input.fx_layers);
             input.nova_add.clear();
-            input.rain_quads.clear();
-            input.rain_atlas = None;
+            self.rain_layers.withdraw(&mut input.fx_layers);
             input.rain_add.clear();
             return 0;
         }
@@ -1541,6 +1546,9 @@ impl EffectsPipeline {
         self.offer_pet_v2(&pet.pet, glow_geom, (0, 0), now);
         let _ = self.cursor.glow.take_companion_impulse();
 
+        // The word pass and the pet refill the sprite channel from empty (it is
+        // published, not handed over, so nothing else empties it).
+        self.free_scratch.clear();
         let mut damage_consumed = false;
         let deco_fp = match self.sparkle.take() {
             None => 0,
@@ -1623,14 +1631,8 @@ impl EffectsPipeline {
         let deco_fp = deco_fp ^ pet_fp ^ pet.fp.rotate_left(53);
         std::mem::swap(&mut input.word_decorations, &mut self.deco_scratch);
         std::mem::swap(&mut input.ink, &mut self.ink_scratch);
-        input.cat_quads.clear();
-        input.cat_atlas = None;
-        std::mem::swap(&mut input.free_sprites, &mut self.free_scratch);
-        input.free_atlas = if input.free_sprites.is_empty() {
-            None
-        } else {
-            self.decos.free_atlas()
-        };
+        self.sprite_layers
+            .publish(&self.free_scratch, &mut input.fx_layers);
         let streak = self.streak.is_some().then(|| {
             let mut cfg = self.streak_cfg;
             cfg.intensity *= cursor_motion.amplitude(MotionEffect::OutputStreak);
@@ -1724,13 +1726,14 @@ impl EffectsPipeline {
             self.rain_add_scratch.clear();
             0
         };
-        std::mem::swap(&mut input.rain_quads, &mut self.rain_scratch);
+        match self.rain.as_deref() {
+            Some(rain) => {
+                self.rain_layers
+                    .publish(&self.rain_scratch, rain.baker(), &mut input.fx_layers);
+            }
+            None => self.rain_layers.withdraw(&mut input.fx_layers),
+        }
         std::mem::swap(&mut input.rain_add, &mut self.rain_add_scratch);
-        input.rain_atlas = if input.rain_quads.is_empty() && input.rain_add.is_empty() {
-            None
-        } else {
-            self.rain.as_mut().and_then(|r| r.rain_atlas())
-        };
 
         trail_fp
             ^ glow_fp.rotate_left(21)
@@ -1908,8 +1911,24 @@ mod tests {
     }
 
     use crate::cursor_trail::TypingCadence;
-    use aterm_core::render::FreeSprite;
+    use aterm_core::render::{FxBlend, FxLayer, FxSlot};
     use aterm_core::terminal::TerminalBuilder;
+    use aterm_render::sprites::FreeSprite;
+
+    /// The frame's published companion sprites, in draw order.
+    fn free_sprites(input: &RenderInput) -> Vec<FreeSprite> {
+        aterm_render::sprites::published(&input.fx_layers)
+    }
+
+    /// The frame's published rain rows.
+    fn rain_rows(input: &RenderInput) -> Vec<FxLayer> {
+        input
+            .fx_layers
+            .iter()
+            .filter(|l| l.blend == FxBlend::Linear && l.slot == FxSlot::Under && !l.knock)
+            .cloned()
+            .collect()
+    }
 
     fn stamp_effective_terminal_background(term: &Terminal, input: &mut RenderInput) {
         let color = if term.modes().reverse_video() {
@@ -2098,7 +2117,7 @@ mod tests {
         assert!(
             pipeline.cursor_pet_alpha() == 0
                 && pipeline.companion_hit_rect().is_none()
-                && input.free_sprites.is_empty(),
+                && free_sprites(&input).is_empty(),
             "history takes the pet off glass on the very first frame"
         );
         assert!(
@@ -2112,7 +2131,10 @@ mod tests {
             pipeline.advance(100.0);
             term.cell_frame_into(&mut input, 5, 16);
             pipeline.apply(&mut term, &mut input, 10, 19);
-            assert!(input.free_sprites.is_empty(), "history never draws the pet");
+            assert!(
+                free_sprites(&input).is_empty(),
+                "history never draws the pet"
+            );
         }
         assert!(
             !pipeline.companion.needs_frames() && !pipeline.companion.brain().is_active(),
@@ -2329,7 +2351,7 @@ mod tests {
 
     fn pet_body_sprite(free: &[FreeSprite], cell_h: u16) -> Option<FreeSprite> {
         let nat = pet_natural_size(cell_h);
-        free.iter().copied().find(|s| (s.aw, s.ah) == nat)
+        free.iter().find(|s| (s.art.w(), s.art.h()) == nat).cloned()
     }
 
     fn run_command_block(
@@ -2481,7 +2503,7 @@ mod tests {
             "fixture: the resident reached the glass"
         );
         assert!(
-            pet_body_sprite(&input.free_sprites, CELL_H).is_some(),
+            pet_body_sprite(&free_sprites(input), CELL_H).is_some(),
             "fixture: its body rides free_sprites"
         );
         assert!(p.companion_hit_rect().is_some(), "fixture: it is clickable");
@@ -2509,8 +2531,7 @@ mod tests {
                 fa, fb,
                 "step {step}: the fold never learns of a pet that is off"
             );
-            assert!(ia.free_sprites.is_empty() && ib.free_sprites.is_empty());
-            assert!(ia.free_atlas.is_none() && ib.free_atlas.is_none());
+            assert!(free_sprites(&ia).is_empty() && free_sprites(&ib).is_empty());
             assert_eq!(off.cursor_pet_alpha(), 0);
             assert_eq!(off.companion_hit_rect(), None);
             assert_eq!(off.press_px(30.0, 40.0), PressOutcome::Pass);
@@ -2525,7 +2546,7 @@ mod tests {
         none.set_cursor_pet(true, 7);
         let (mut term, mut input) = glass(8, 40);
         assert_eq!(none.apply(&mut term, &mut input, 10, 19), 0);
-        assert!(input.free_sprites.is_empty() && input.free_atlas.is_none());
+        assert!(free_sprites(&input).is_empty());
         assert!(!none.is_active() && !none.enabled_any());
         assert_eq!(none.cursor_pet_alpha(), 0);
         assert!(matches!(none.wake(), Wake::Idle));
@@ -2542,7 +2563,7 @@ mod tests {
         let mut on_glass_at = None;
         for frame in 1..=12u32 {
             commit_ascii(&mut p, &mut term, &mut input, b"k", 33.0);
-            if pet_body_sprite(&input.free_sprites, CELL_H).is_some() {
+            if pet_body_sprite(&free_sprites(&input), CELL_H).is_some() {
                 on_glass_at = Some(frame);
                 break;
             }
@@ -2552,20 +2573,19 @@ mod tests {
             f64::from(frame) * 33.0 <= 400.0,
             "…within its 0.30 s fade-in"
         );
-        assert!(input.free_atlas.is_some(), "the atlas rides with the body");
         assert!(p.cursor_pet_alpha() > 0 && p.companion_hit_rect().is_some());
         assert!(
             p.is_active() && p.companion.needs_frames(),
             "a fading-in cat claims the frame lane"
         );
         assert!(matches!(p.wake(), Wake::Frames));
-        let x_before = pet_body_sprite(&input.free_sprites, CELL_H)
+        let x_before = pet_body_sprite(&free_sprites(&input), CELL_H)
             .expect("on glass")
             .x;
 
         type_line(&mut p, &mut term, &mut input, b"itty walks with me", 33.0);
         idle(&mut p, &mut term, &mut input, 45, 33.0);
-        let x_after = pet_body_sprite(&input.free_sprites, CELL_H)
+        let x_after = pet_body_sprite(&free_sprites(&input), CELL_H)
             .expect("still on glass")
             .x;
         assert!(
@@ -2582,10 +2602,10 @@ mod tests {
         assert_eq!(p.next_deadline_ms(), None);
         assert!(matches!(p.wake(), Wake::Idle));
         let body =
-            pet_body_sprite(&input.free_sprites, CELL_H).expect("a sleeping cat is still drawn");
+            pet_body_sprite(&free_sprites(&input), CELL_H).expect("a sleeping cat is still drawn");
         assert_eq!(body.alpha, 255, "opaque, at rest");
         assert_eq!(p.cursor_pet_alpha(), 255);
-        let sprites = input.free_sprites.clone();
+        let sprites = free_sprites(&input).clone();
         assert_ne!(fp, 0, "a drawn resident folds a non-zero key");
         for _ in 0..3 {
             assert_eq!(
@@ -2593,7 +2613,7 @@ mod tests {
                 fp,
                 "no advance ⇒ the same fold"
             );
-            assert_eq!(input.free_sprites, sprites, "byte-stable sprites");
+            assert_eq!(free_sprites(&input), sprites, "byte-stable sprites");
         }
     }
 
@@ -2607,7 +2627,7 @@ mod tests {
             rainbow_kitty_glow(&mut p, other);
             idle(&mut p, &mut term, &mut input, 1, 33.0);
             assert!(
-                pet_body_sprite(&input.free_sprites, CELL_H).is_none(),
+                pet_body_sprite(&free_sprites(&input), CELL_H).is_none(),
                 "{other}: nothing drawn on the very next frame"
             );
             assert_eq!(p.cursor_pet_alpha(), 0);
@@ -2646,7 +2666,7 @@ mod tests {
             0x0050_FA7B,
         );
         idle(&mut p, &mut term, &mut input, 2, 33.0);
-        assert!(input.free_sprites.is_empty() && input.free_atlas.is_none());
+        assert!(free_sprites(&input).is_empty());
         assert!(!p.companion.brain().is_active() && !p.companion.needs_frames());
         assert!(
             !p.is_active() && !p.enabled_any(),
@@ -2673,7 +2693,7 @@ mod tests {
         let mut released = false;
         for _ in 0..40 {
             idle(&mut p, &mut term, &mut input, 1, 100.0);
-            assert!(input.free_sprites.is_empty());
+            assert!(free_sprites(&input).is_empty());
             if !p.companion.needs_frames() {
                 released = true;
                 break;
@@ -2699,7 +2719,7 @@ mod tests {
         p.set_focused(false);
         idle(&mut p, &mut term, &mut input, 1, 33.0);
         assert_eq!(p.cursor_pet_alpha(), 0);
-        assert!(input.free_sprites.is_empty());
+        assert!(free_sprites(&input).is_empty());
         assert!(
             !p.companion.brain().is_active() && !p.companion.needs_frames(),
             "an unfocused surface retires the body at once and owes no frames"
@@ -2742,16 +2762,16 @@ mod tests {
             let (mut saw_pet, mut saw_other_animal, mut stacked) = (false, false, false);
             for _ in 0..90 {
                 idle(&mut p, &mut term, &mut input, 1, 100.0);
-                let body = pet_body_sprite(&input.free_sprites, CELL_H);
+                let body = pet_body_sprite(&free_sprites(&input), CELL_H);
                 saw_pet |= body.is_some();
-                for s in &input.free_sprites {
+                for s in &free_sprites(&input) {
                     // An animal: at least a cell tall (motes are smaller)
                     // and not the pet's own tile.
-                    if s.ah < CELL_H || (s.aw, s.ah) == nat {
+                    if s.art.h() < CELL_H || (s.art.w(), s.art.h()) == nat {
                         continue;
                     }
                     saw_other_animal = true;
-                    if let Some(b) = body {
+                    if let Some(b) = &body {
                         let ox = (s.x + i32::from(s.w)).min(b.x + i32::from(b.w)) - s.x.max(b.x);
                         let oy = (s.y + i32::from(s.h)).min(b.y + i32::from(b.h)) - s.y.max(b.y);
                         stacked |=
@@ -2824,7 +2844,7 @@ mod tests {
             "outside the body the host keeps routing"
         );
         assert_eq!(p.companion.brain().pending_pets(), 0);
-        let sprites = input.free_sprites.clone();
+        let sprites = free_sprites(&input).clone();
         let alpha = p.cursor_pet_alpha();
         assert_eq!(
             p.press_px((x0 + x1) as f32 / 2.0, (y0 + y1) as f32 / 2.0),
@@ -2839,7 +2859,7 @@ mod tests {
         assert!(matches!(p.wake(), Wake::Frames));
         assert_eq!(p.cursor_pet_alpha(), alpha, "nothing moved without a tick");
         assert_eq!(p.companion_hit_rect(), Some(rect));
-        assert_eq!(input.free_sprites, sprites);
+        assert_eq!(free_sprites(&input), sprites);
         let mut consumed_after = None;
         for frame in 1..=180u32 {
             idle(&mut p, &mut term, &mut input, 1, 33.0);
@@ -2874,11 +2894,11 @@ mod tests {
         assert_eq!(p.companion.brain().pending_trick(), None);
         p.revoke_trick(); // idempotent: the listener revokes with nothing pending
 
-        let sprites = input.free_sprites.clone();
+        let sprites = free_sprites(&input).clone();
         p.note_trick(Trick::Roll, true);
         assert_eq!(p.companion.brain().pending_trick(), Some(Trick::Roll));
         assert!(matches!(p.wake(), Wake::Frames));
-        assert_eq!(input.free_sprites, sprites, "a note draws nothing");
+        assert_eq!(free_sprites(&input), sprites, "a note draws nothing");
         let mut rolled = false;
         for _ in 0..120 {
             idle(&mut p, &mut term, &mut input, 1, 33.0);
@@ -2919,11 +2939,11 @@ mod tests {
         let (mut term, mut input) = glass(8, 40);
         materialize_pet(&mut p, &mut term, &mut input);
         idle(&mut p, &mut term, &mut input, 60, 50.0);
-        let emitted = pet_body_sprite(&input.free_sprites, CELL_H).expect("resident on glass");
+        let emitted = pet_body_sprite(&free_sprites(&input), CELL_H).expect("resident on glass");
         p.set_host_rows_px(CELL_H);
         idle(&mut p, &mut term, &mut input, 1, 50.0);
         assert_eq!(
-            pet_body_sprite(&input.free_sprites, CELL_H).map(|s| s.y),
+            pet_body_sprite(&free_sprites(&input), CELL_H).map(|s| s.y),
             Some(emitted.y),
             "the emission does not move: the compose moves it"
         );
@@ -2937,7 +2957,7 @@ mod tests {
             &mut Vec::new(),
             HostRowPixels::Translate,
         );
-        let body = pet_body_sprite(&drawn.free_sprites, CELL_H).expect("the body is drawn");
+        let body = pet_body_sprite(&free_sprites(&drawn), CELL_H).expect("the body is drawn");
         assert_eq!(body.y, emitted.y + i32::from(CELL_H), "drawn one row lower");
         let (x0, w) = (body.x as f32, f32::from(body.w));
         let y = body.y as f32 + f32::from(body.h) / 2.0;
@@ -2992,12 +3012,12 @@ mod tests {
             let (mut term, mut input) = glass(12, 60);
             materialize_pet(&mut p, &mut term, &mut input);
             idle(&mut p, &mut term, &mut input, 60, 33.0);
-            let before = pet_body_sprite(&input.free_sprites, CELL_H).expect("drawn");
+            let before = pet_body_sprite(&free_sprites(&input), CELL_H).expect("drawn");
             term.process(b"\x1b[10;40H");
             idle(&mut p, &mut term, &mut input, 1, 33.0);
-            let first = pet_body_sprite(&input.free_sprites, CELL_H).expect("drawn");
+            let first = pet_body_sprite(&free_sprites(&input), CELL_H).expect("drawn");
             idle(&mut p, &mut term, &mut input, 60, 33.0);
-            let later = pet_body_sprite(&input.free_sprites, CELL_H).expect("drawn");
+            let later = pet_body_sprite(&free_sprites(&input), CELL_H).expect("drawn");
             (before, first, later)
         };
         let (before, first, later) = jump(true);
@@ -4413,7 +4433,7 @@ mod tests {
                 term.cell_frame_into(&mut input, 4, 24);
                 p.apply(&mut term, &mut input, 10, 20);
                 frames.push((
-                    input.free_sprites.len(),
+                    free_sprites(&input).len(),
                     input.word_decorations.clone(),
                     input.ink.clone(),
                 ));
@@ -4773,11 +4793,11 @@ mod tests {
             p.advance(100.0);
             term.cell_frame_into(&mut input, 4, 24);
             p.apply(&mut term, &mut input, 10, 20);
-            saw_cat |= !input.free_sprites.is_empty();
+            saw_cat |= !free_sprites(&input).is_empty();
         }
         assert!(saw_cat, "the peek actually played");
         assert!(
-            input.free_sprites.is_empty(),
+            free_sprites(&input).is_empty(),
             "the one-shot is spent (zero sprites at rest)"
         );
 
@@ -4790,14 +4810,14 @@ mod tests {
             p.advance(100.0);
             term.cell_frame_into(&mut input, 4, 24);
             p.apply(&mut term, &mut input, 10, 20);
-            replayed |= !input.free_sprites.is_empty();
+            replayed |= !free_sprites(&input).is_empty();
         }
         assert!(
             replayed,
             "web knob setters are hard_reset(): the one-shot replays (§1.1 table)"
         );
 
-        let sprites_before = input.free_sprites.clone();
+        let sprites_before = free_sprites(&input).clone();
         assert!(
             !sprites_before.is_empty(),
             "mid-peek before the alt round-trip"
@@ -4806,22 +4826,29 @@ mod tests {
         p.advance(100.0);
         term.cell_frame_into(&mut input, 4, 24);
         p.apply(&mut term, &mut input, 10, 20);
-        assert!(input.free_sprites.is_empty(), "suppressed: no decorations");
+        assert!(
+            free_sprites(&input).is_empty(),
+            "suppressed: no decorations"
+        );
         term.process(b"\x1b[?1049l"); // long suspension, then back
         p.advance(5000.0);
         term.cell_frame_into(&mut input, 4, 24);
         p.apply(&mut term, &mut input, 10, 20);
         assert_eq!(
-            input.free_sprites.len(),
+            free_sprites(&input).len(),
             sprites_before.len(),
             "thaw resumes the peek (no mass replay, and it did not silently end)"
         );
-        for (after, before) in input.free_sprites.iter().zip(sprites_before.iter()) {
+        // The art, its box and the window it is seen through (the peek's
+        // reveal), not where the idle breath has it.
+        let peek = |s: &FreeSprite| {
+            let v = s.visible();
+            (s.w, s.h, s.art.id(), v.y0 - s.y, v.x1 - v.x0, v.y1 - v.y0)
+        };
+        for (after, before) in free_sprites(&input).iter().zip(sprites_before.iter()) {
             assert_eq!(
-                (after.w, after.h, after.ax, after.ay, after.aw, after.ah),
-                (
-                    before.w, before.h, before.ax, before.ay, before.aw, before.ah
-                ),
+                peek(after),
+                peek(before),
                 "thaw resumes the peek exactly where it froze (no mass replay)"
             );
             assert!(
@@ -4870,7 +4897,7 @@ mod tests {
             p.advance(50.0);
             synthetic_empty_frame(term, input);
             p.apply(term, input, 10, 20);
-            if !input.rain_quads.is_empty() {
+            if !rain_rows(input).is_empty() {
                 return;
             }
         }
@@ -4991,18 +5018,17 @@ mod tests {
         let mut term = Terminal::new(24, 80);
         let mut input = RenderInput::default();
         rain_until_visible(&mut p, &mut term, &mut input);
-        assert!(input.rain_atlas.is_some(), "the atlas rides with the quads");
-        let quads = input.rain_quads.clone();
+        let quads = rain_rows(&input).clone();
         let adds = input.rain_add.clone();
-        let atlas_version = input.rain_atlas.as_ref().map(|a| a.version);
+        let atlas_version = p.rain.as_ref().map(|r| r.atlas_version());
         let fp1 = p.apply(&mut term, &mut input, 10, 20);
         let fp2 = p.apply(&mut term, &mut input, 10, 20);
         assert_ne!(fp1, 0, "nonempty emission folds a nonzero fp");
         assert_eq!(fp1, fp2, "no advance ⇒ stable fold");
-        assert_eq!(input.rain_quads, quads, "byte-stable quads");
+        assert_eq!(rain_rows(&input), quads, "byte-stable quads");
         assert_eq!(input.rain_add, adds, "byte-stable halos");
         assert_eq!(
-            input.rain_atlas.as_ref().map(|a| a.version),
+            p.rain.as_ref().map(|r| r.atlas_version()),
             atlas_version,
             "no tick ⇒ no rebake"
         );
@@ -5224,9 +5250,8 @@ mod tests {
         assert!(!p.is_active(), "dropping the engine disarms the host loop");
         let fp = p.apply(&mut term, &mut input, 10, 20);
         assert_eq!(fp, 0);
-        assert!(input.rain_quads.is_empty());
+        assert!(rain_rows(&input).is_empty());
         assert!(input.rain_add.is_empty());
-        assert!(input.rain_atlas.is_none());
 
         p.set_matrix_rain_enabled(true);
         rain_until_visible(&mut p, &mut term, &mut input);
@@ -5246,9 +5271,8 @@ mod tests {
         p.advance(16.0);
         term.cell_frame_into(&mut input, 24, 80);
         p.apply(&mut term, &mut input, 10, 20);
-        assert!(input.rain_quads.is_empty());
+        assert!(rain_rows(&input).is_empty());
         assert!(input.rain_add.is_empty());
-        assert!(input.rain_atlas.is_none());
     }
 
     #[test]
@@ -5261,9 +5285,8 @@ mod tests {
 
         term.process(b"tear"); // grid damage after the snapshot: `input` is stale
         p.apply(&mut term, &mut input, 10, 20);
-        assert!(input.rain_quads.is_empty(), "torn frame: no rain quads");
+        assert!(rain_rows(&input).is_empty(), "torn frame: no rain quads");
         assert!(input.rain_add.is_empty(), "torn frame: no rain halos");
-        assert!(input.rain_atlas.is_none(), "torn frame: no atlas rides");
 
         rain_until_visible(&mut p, &mut term, &mut input);
     }

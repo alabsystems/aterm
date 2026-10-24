@@ -554,14 +554,17 @@ pub(crate) enum Fact {
 }
 
 impl Fact {
-    /// Every fact of the bottom rule, in the order the rule sets them.
-    pub(crate) const ALL: [Fact; 6] = [
+    /// Every fact a person acts on, each with its wire name: the bottom rule's
+    /// in the order the rule sets them, then the top rule's key and the account group.
+    pub(crate) const EVERY: [Fact; 8] = [
         Fact::Model,
         Fact::Effort,
         Fact::Path,
         Fact::Branch,
         Fact::Context,
         Fact::Usage,
+        Fact::TopEffort,
+        Fact::Account,
     ];
 
     /// Its wire name (`open fact-menu <name>`, `fact-menu/<name>/…`).
@@ -579,13 +582,10 @@ impl Fact {
         }
     }
 
-    /// The fact a wire name names ([`Self::key`]).
+    /// The fact a wire name names ([`Self::key`]), of [`Self::EVERY`].
     #[must_use]
     pub(crate) fn parse(name: &str) -> Option<Self> {
-        if name == Fact::Account.key() {
-            return Some(Fact::Account);
-        }
-        Self::ALL.into_iter().find(|fact| fact.key() == name)
+        Self::EVERY.into_iter().find(|fact| fact.key() == name)
     }
 
     /// Its name heading its menu (`Folder · tab 1`).
@@ -651,6 +651,9 @@ impl Fact {
 pub(crate) enum Target {
     Chip(Chip),
     Fact(Fact),
+    /// The harness switch on the top rule ([`BorderSwitch`]), the keyboard's
+    /// last stop in a pane whose rule draws one (a Gemini pane's only one).
+    Switch,
 }
 
 impl From<Chip> for Target {
@@ -671,7 +674,7 @@ impl Target {
     pub(crate) const fn chip(self) -> Option<Chip> {
         match self {
             Target::Chip(chip) => Some(chip),
-            Target::Fact(_) => None,
+            Target::Fact(_) | Target::Switch => None,
         }
     }
 
@@ -680,7 +683,7 @@ impl Target {
     pub(crate) const fn fact(self) -> Option<Fact> {
         match self {
             Target::Fact(fact) => Some(fact),
-            Target::Chip(_) => None,
+            Target::Chip(_) | Target::Switch => None,
         }
     }
 }
@@ -1181,7 +1184,8 @@ impl WindowLights {
         out
     }
 
-    /// What the keyboard walks in `session` while a selection lasts, in the row's order.
+    /// What the keyboard walks in `session` while a selection lasts, in the
+    /// row's order: the chips, the facts, then the top rule's harness switch.
     fn revealable(&self, session: u64) -> Vec<Target> {
         let s = self.sessions.get(&session);
         let shown = s.map(|s| s.shown).unwrap_or_default();
@@ -1195,7 +1199,18 @@ impl WindowLights {
             })
             .map(Target::Chip)
             .chain(self.facts_on_glass(session).into_iter().map(Target::Fact))
+            .chain(self.switch_of(session).map(|_| Target::Switch))
             .collect()
+    }
+
+    /// `session`'s harness switch on this frame's glass.
+    fn switch_of(&self, session: u64) -> Option<&BorderSwitch> {
+        self.border_toggles.iter().find(|b| b.session == session)
+    }
+
+    /// Whether the pointer or the keyboard is on `session`'s harness switch.
+    fn switch_lit(&self, session: u64) -> bool {
+        self.switch_hover == Some(session) || self.selected == Some((session, Target::Switch))
     }
 
     /// Whether `target` of `session` is on this frame's glass.
@@ -1209,6 +1224,7 @@ impl WindowLights {
                 .fact_hits
                 .iter()
                 .any(|h| h.session == session && h.fact == fact),
+            Target::Switch => self.switch_of(session).is_some(),
         }
     }
 
@@ -1297,7 +1313,7 @@ impl WindowLights {
         } else {
             face
         };
-        (face, self.switch_hover == Some(session))
+        (face, self.switch_lit(session))
     }
 
     /// Whether this press still belongs to the last harness-switch gesture.
@@ -1318,7 +1334,7 @@ impl WindowLights {
             .is_some_and(|s| s.switch_turning.is_some());
         u64::from(supervised)
             | u64::from(turning) << 1
-            | u64::from(self.switch_hover == Some(session)) << 2
+            | u64::from(self.switch_lit(session)) << 2
             | u64::from(self.mark_hovered(session)) << 3
     }
 
@@ -3505,6 +3521,22 @@ impl App {
         }
     }
 
+    /// A press of `session`'s harness switch showing `face` as a click on it
+    /// makes one, from the pointer, a screen reader or the keyboard: a tab
+    /// name being edited settles first, then the switch turns.
+    fn press_switch_as_clicked(
+        &mut self,
+        wid: WindowId,
+        session: u64,
+        face: crate::autopilot::HarnessSwitch,
+    ) {
+        if self.inline_rename_edit(wid).is_some() {
+            self.clear_strip_press(wid);
+            self.settle_rename_edit(wid);
+        }
+        self.press_harness_switch(wid, session, face);
+    }
+
     /// A left press on a chip acts on it ([`Self::press_claude_chip`]).
     pub(crate) fn press_claude_light(&mut self, wid: WindowId) -> bool {
         let (x, y) = self
@@ -3530,11 +3562,7 @@ impl App {
                 self.press_visible_claude_chip(wid, session, chip)
             }
             GlassAt::Switch(face) => {
-                if self.inline_rename_edit(wid).is_some() {
-                    self.clear_strip_press(wid);
-                    self.settle_rename_edit(wid);
-                }
-                self.press_harness_switch(wid, session, face);
+                self.press_switch_as_clicked(wid, session, face);
                 true
             }
             GlassAt::Fact(..) if secondary => {
@@ -3979,9 +4007,9 @@ impl App {
         let Some(ws) = self.windows.get(&wid) else {
             return false;
         };
-        if ws.claude_lights.selected.is_none()
-            && (!select_chord || ws.claude_lights.footers.is_empty())
-        {
+        let walkable =
+            !ws.claude_lights.footers.is_empty() || !ws.claude_lights.border_toggles.is_empty();
+        if ws.claude_lights.selected.is_none() && !(select_chord && walkable) {
             return false;
         }
         let Some(session) = self.focused_session_id(wid) else {
@@ -4021,7 +4049,7 @@ impl App {
                     )
                     .is_some_and(|block| block.shows(chip))
             }),
-            Target::Fact(_) => lights_.shows(session, target),
+            Target::Fact(_) | Target::Switch => lights_.shows(session, target),
         };
         let step = |from: Option<Target>| -> Option<Target> {
             let n = order.len();
@@ -4035,7 +4063,8 @@ impl App {
             .selected
             .filter(|(id, _)| *id == session)
             .map(|(_, l)| l);
-        if select_chord && room.is_some() {
+        let switched = ws.claude_lights.switch_of(session).is_some();
+        if select_chord && (room.is_some() || switched) {
             if let Some(next) = step(selected) {
                 ws.claude_lights.select(Some((session, next)));
                 redraw(ws);
@@ -4057,6 +4086,23 @@ impl App {
         };
         let chip = match target {
             Target::Chip(chip) => chip,
+            Target::Switch => {
+                let face = ws.claude_lights.switch_of(session).map(|b| b.face);
+                let clicks = matches!(
+                    &ev.logical_key,
+                    Key::Named(NamedKey::Enter | NamedKey::Space)
+                ) && plain;
+                let escape = matches!(&ev.logical_key, Key::Named(NamedKey::Escape));
+                ws.claude_lights.select(None);
+                redraw(ws);
+                return match face {
+                    Some(face) if clicks => {
+                        self.press_switch_as_clicked(wid, session, face);
+                        true
+                    }
+                    _ => escape,
+                };
+            }
             Target::Fact(fact) => {
                 let hit = ws
                     .claude_lights
@@ -4295,7 +4341,7 @@ impl App {
                 chip: HarnessChip::of_fact(hit.fact),
                 label,
                 description: (!description.is_empty()).then_some(description),
-                toggled: None,
+                toggled: self.fact_toggled(hit.session, hit.fact),
                 row,
                 col: hit.cols.0,
                 width: hit.cols.1.saturating_sub(hit.cols.0),
@@ -4358,11 +4404,7 @@ impl App {
                         })
                 });
                 if let Some(face) = shown {
-                    if self.inline_rename_edit(wid).is_some() {
-                        self.clear_strip_press(wid);
-                        self.settle_rename_edit(wid);
-                    }
-                    self.press_harness_switch(wid, session, face);
+                    self.press_switch_as_clicked(wid, session, face);
                 }
                 return;
             }
@@ -6472,10 +6514,14 @@ mod gesture_tests {
             draw_claude_cols(&app, session, ACCEPT_SHORT, usize::from(cols));
             frame(&mut app, wid);
             let facts = app.windows[&wid].claude_lights.facts_on_glass(session);
+            let switch = app.windows[&wid]
+                .claude_lights
+                .shows(session, Target::Switch);
             let walk: Vec<Target> = chips
                 .iter()
                 .map(|chip| Target::Chip(*chip))
                 .chain(facts.into_iter().map(Target::Fact))
+                .chain(switch.then_some(Target::Switch))
                 .chain([Target::Chip(Chip::Autopilot)])
                 .collect();
             for want in walk {

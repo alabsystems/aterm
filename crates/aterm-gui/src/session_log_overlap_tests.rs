@@ -2102,6 +2102,63 @@ fn an_act_the_limiter_refuses_is_no_row() {
     assert_eq!(named, rows, "each recorded act names its own row");
 }
 
+/// A SUPERVISED SESSION'S ACT CLAIMS ARE NO ROWS (forever r11, Finding 5:
+/// the view printed `harness-act act=- holder=-` for each claim, where the
+/// ring 6G-5 deleted had none). The harness that supervises a session writes
+/// each act as a `mark - act word= rule=` claim through the `mark` verb,
+/// between the status sweep's transitions; a self-claimed agent's act goes
+/// through `meta set harness_act`, the one writer of `harness_act=`. So the
+/// view's one `harness-act` row is the self-claim's, every reader reads the
+/// same rows, and every transition is a row.
+#[test]
+fn a_supervised_sessions_act_claims_are_no_rows_of_the_view() {
+    use crate::session_timeline::HARNESS_ACT;
+    let (h, _store) = rig(83);
+    let claims = [
+        "- act word=continue rule=continue.v1",
+        "- act word=dispatch rule=land.v1",
+        "- act word=escalate",
+    ];
+    for claim in claims {
+        status_move(&mut h.ctx.timeline.lock().unwrap(), true);
+        let (reply, _) = crate::session_log::cmd_mark(&h.ctx, Actor::Harness, true, claim);
+        assert!(reply.starts_with("OK seq="), "{claim}: {reply}");
+        status_move(&mut h.ctx.timeline.lock().unwrap(), false);
+    }
+    let mut g = h.ctx.timeline.lock().unwrap();
+    assert!(
+        g.note_harness_act("approve", "codex-alab@1", Actor::Ctl)
+            .is_some(),
+        "CONTROL: the self-claim's act is recorded"
+    );
+    status_move(&mut g, true);
+    let marked = g
+        .slog()
+        .log()
+        .window()
+        .filter(|r| r.k == Kind::Act && r.src == Src::Mark && r.f.get(Key::Holder).is_none())
+        .count();
+    assert_eq!(marked, claims.len(), "CONTROL: each claim is a record");
+    let view = g.view_since(None).rows;
+    assert_eq!(g.view_copy(None, 0).rows(), view);
+    assert_eq!(g.view_newest_first().count(), view.len());
+    let acts: Vec<&str> = view
+        .iter()
+        .filter(|e| e.kind == HARNESS_ACT)
+        .map(|e| &*e.payload)
+        .collect();
+    assert_eq!(
+        acts,
+        ["act=approve holder=codex-alab@1"],
+        "the self-claim's act alone is a harness-act row"
+    );
+    let statuses = view
+        .iter()
+        .filter(|e| e.kind == crate::session_status::STATUS_CHANGE)
+        .count();
+    assert_eq!(statuses, 2 * claims.len() + 1, "every transition a row");
+}
+
 /// EVERY READER READS THE VIEW: the wire copy, the seek, the head, the
 /// chrome's newest-first tail and the events digest each read the view's
 /// rows, a burst's `human` row (written outside the timeline's writers)

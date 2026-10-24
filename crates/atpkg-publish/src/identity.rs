@@ -174,8 +174,6 @@ pub fn signer_for(ctx: &Ctx, roster: &aterm_update_core::Roster) -> Result<Signe
     })
 }
 
-/// The machine record, or the refusal that restores it by hand: `join` cannot (it refuses
-/// while the key exists, and would mint a new one).
 fn read_record(ctx: &Ctx, key_pub: &str) -> Result<MachineRecord> {
     let restore = || {
         format!(

@@ -872,7 +872,7 @@ impl CursorRainbow {
             return (None, None);
         }
         let table = crate::color_math::relative_luminance_table();
-        let base = light_on_glass(page, 0);
+        let base = crate::color_math::relative_luminance_with(table, page);
         let mut scratch = std::mem::take(&mut self.rim_scratch);
         scratch.clear();
         scratch.resize(w * h, 0);
@@ -934,14 +934,11 @@ impl CursorRainbow {
             }
             Some(peak)
         };
-        let pile_light = |quads: &[GlowQuad], colour: &dyn Fn(usize) -> u32| -> f32 {
-            let _ = quads;
-            let mut cols = [0u32; HALO_LAYERS as usize];
+        let pile_light = |cols: &[u32; HALO_LAYERS as usize]| -> f32 {
             let mut aurora = 0.0f32;
             for (i, &px_count) in ring_pixels[..rings.len()].iter().enumerate() {
-                let c = colour(i);
-                cols[i] = c;
-                aurora += px_count as f32 * crate::color_math::relative_luminance_with(table, c);
+                aurora +=
+                    px_count as f32 * crate::color_math::relative_luminance_with(table, cols[i]);
             }
             let mut sum = 0.0f32;
             for &(mask, count) in &buckets[..n_buckets] {
@@ -963,8 +960,8 @@ impl CursorRainbow {
             std::array::from_fn(|i| rings.get(i).map_or(0, |r| premul_rgb(RIM_LIGHT_GREY, r.1)));
         let init_cols: [u32; HALO_LAYERS as usize] =
             std::array::from_fn(|i| rings.get(i).map_or(0, |r| r.3));
-        let target = pile_light(quads, &|i| grey_rings[i]);
-        let have = pile_light(quads, &|i| init_cols[i]);
+        let target = pile_light(&grey_rings);
+        let have = pile_light(&init_cols);
         if target <= 0.0 || (have - target).abs() <= target * Self::RIM_LIGHT_SLACK {
             let peak = peak_of(&init_cols);
             self.rim_scratch = scratch;
@@ -988,7 +985,7 @@ impl CursorRainbow {
         for _ in 1..8 {
             let mid = 0.5 * (lo + hi);
             let c = solve(mid);
-            let l = pile_light(quads, &|i| c[i]);
+            let l = pile_light(&c);
             if l < target {
                 lo = mid;
                 lo_solved = Some((c, l));
@@ -996,15 +993,20 @@ impl CursorRainbow {
                 hi = mid;
                 hi_solved = Some((c, l));
             }
+            if let (Some((lc, _)), Some((hc, _))) = (lo_solved, hi_solved)
+                && lc == hc
+            {
+                break;
+            }
         }
         let (a, la) = lo_solved.unwrap_or_else(|| {
             let a = solve(lo);
-            let la = pile_light(quads, &|i| a[i]);
+            let la = pile_light(&a);
             (a, la)
         });
         let (b, lb) = hi_solved.unwrap_or_else(|| {
             let b = solve(hi);
-            let lb = pile_light(quads, &|i| b[i]);
+            let lb = pile_light(&b);
             (b, lb)
         });
         let best = if (la - target).abs() <= (lb - target).abs() {
@@ -1057,11 +1059,17 @@ impl CursorRainbow {
                 }
             }
         }
+        let mut last_px = field;
+        let mut last_lum = field_peak;
         let peak = scratch.iter().copied().fold(field_peak, |peak, px| {
             if px == field {
                 peak
             } else {
-                peak.max(crate::color_math::relative_luminance_with(table, px) * 255.0)
+                if px != last_px {
+                    last_px = px;
+                    last_lum = crate::color_math::relative_luminance_with(table, px) * 255.0;
+                }
+                peak.max(last_lum)
             }
         });
         self.rim_scratch = scratch;
@@ -1177,23 +1185,25 @@ pub(crate) fn lift_to_light_floor(rgb: u32, floor: f32) -> u32 {
         return 0x00FF_FFFF;
     }
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
+    let (mut lo_rgb, mut hi_rgb) = (rgb & 0x00FF_FFFF, 0x00FF_FFFF);
     for _ in 0..20 {
         let mid = 0.5 * (lo + hi);
-        if light(mix_rgb(rgb, 0x00FF_FFFF, mid)) < floor {
+        let mid_rgb = mix_rgb(rgb, 0x00FF_FFFF, mid);
+        if light(mid_rgb) < floor {
             lo = mid;
+            lo_rgb = mid_rgb;
         } else {
             hi = mid;
+            hi_rgb = mid_rgb;
+        }
+        if lo_rgb == hi_rgb {
+            break;
         }
     }
-    mix_rgb(rgb, 0x00FF_FFFF, hi)
+    hi_rgb
 }
 
 /// Relative luminance of one additive quad-pixel over `page`.
-#[inline]
-fn light_on_glass(page: u32, premul: u32) -> f32 {
-    light_on_glass_with(crate::color_math::relative_luminance_table(), page, premul)
-}
-
 #[inline]
 fn light_on_glass_with(
     table: &crate::color_math::RelativeLuminanceTable,

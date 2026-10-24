@@ -156,8 +156,8 @@ pub struct Guards {
     pub taskless: bool,
     /// The task is done and the person's own exchange holds it.
     pub exchange: bool,
-    /// A manager waits on the session: the fact is the manager's to carry, by a note no slice
-    /// writes yet.
+    /// A manager waits on the session: the fact is the manager's to carry, by the fact word on
+    /// the session's task record under `prompt` (the occupancy loop's task door), never a line.
     pub managed: bool,
     /// The memory wall acts.
     pub memory: bool,
@@ -201,6 +201,19 @@ impl Guards {
         self.each_for(line)
             .into_iter()
             .find_map(|(guard, holds)| holds.then_some(guard))
+    }
+
+    /// The first guard but `except` that holds a line of `rule` (a brake first, as
+    /// [`Self::held`] asks), or `None`: whether `except` alone holds it, as the task door asks
+    /// of [`Guard::Managed`] (a line typed but for the manager).
+    #[must_use]
+    pub fn held_except(&self, except: Guard, rule: RuleId) -> Option<Guard> {
+        if let Some(brake) = self.brake.filter(|brake| *brake != except) {
+            return Some(brake);
+        }
+        self.each(rule)
+            .into_iter()
+            .find_map(|(guard, holds)| (holds && guard != except).then_some(guard))
     }
 
     /// Each guard past the brake, in [`Self::held`]'s order, with whether it holds a line of
@@ -598,7 +611,8 @@ pub struct WouldRow {
 /// THE LINES A LOOP BEFORE THIS ONE BOOKED for session `sid` in the ledger text `body`, oldest
 /// first, which [`Books`] seeds from: each `fact-would@v1` row (what `observe` would have typed),
 /// and each `fact-hold@v1` row `typed` that names its rule (what `prompt` typed: the door's
-/// outcome rows). A row this build cannot read is passed over.
+/// outcome rows). A row this build cannot read is passed over, and so is the task door's
+/// (`door=task`, [`super::door::is_task_row`]): a note is no line.
 #[must_use]
 pub fn would_rows_in(body: &str, sid: Option<&str>) -> Vec<WouldRow> {
     let hold = crate::supervise::facts::FactKind::Hold.rule();
@@ -628,6 +642,9 @@ pub fn would_rows_in(body: &str, sid: Option<&str>) -> Vec<WouldRow> {
         ) else {
             continue;
         };
+        if super::door::is_task_row(reason) {
+            continue;
+        }
         let mut rule = None;
         let mut held_ms = None;
         for word in reason.split(' ') {

@@ -1,6 +1,5 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-// Author: Andrew Yates
 
 //! Reflow chunking, cell copying, and `CellExtras` coordinate remapping.
 
@@ -213,8 +212,7 @@ pub(super) fn chunk_cells_to_rows(
     while cell_offset < cells.len() {
         let chunk_end = (cell_offset + usize::from(new_cols)).min(cells.len());
         let actual_end = adjust_chunk_boundary(cells, cell_offset, chunk_end);
-        // SAFETY: Each chunk row is appended to `new_rows` and returned with
-        // the same `new_pages` owner in the enclosing reflow result.
+        // SAFETY: Each chunk row is returned with the same `new_pages` owner.
         let mut row = unsafe { Row::new(new_cols, new_pages) };
         copy_cells_to_row(
             &mut row,

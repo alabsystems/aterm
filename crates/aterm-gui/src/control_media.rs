@@ -943,6 +943,11 @@ mod window_target_refusal_tests {
         );
     }
 
+    /// `OPEN FACT-MENU <NAME>` TAKES EVERY NAME `controls` PRINTS: each
+    /// fact's wire name (`fact=<key>`, [`crate::claude_lights::Fact::key`]),
+    /// the top rule's key's `top-effort` and the account group's `account`
+    /// among them, and the usage names them all. NEGATIVE CONTROL: a bogus
+    /// name, a missing one and a trailing word are refused with that usage.
     #[test]
     fn open_fact_menu_names_its_fact() {
         use crate::claude_lights::Fact;
@@ -951,9 +956,21 @@ mod window_target_refusal_tests {
             ("fact-menu effort", Fact::Effort),
             ("FACT-MENU path", Fact::Path),
             ("fact-menu  branch", Fact::Branch),
+            ("fact-menu context", Fact::Context),
             ("fact-menu usage", Fact::Usage),
+            ("fact-menu top-effort", Fact::TopEffort),
             ("fact-menu account", Fact::Account),
         ] {
+            let said: Vec<String> = words
+                .split_whitespace()
+                .map(str::to_ascii_lowercase)
+                .collect();
+            assert_eq!(
+                said,
+                ["fact-menu", fact.key()],
+                "{words}: the name `controls` prints as `fact={}`",
+                fact.key()
+            );
             assert_eq!(
                 super::fact_menu_operand(words),
                 Some(Ok(Some(fact))),
@@ -965,15 +982,78 @@ mod window_target_refusal_tests {
             let refusal = super::fact_menu_operand(refused)
                 .expect("the fact menu's words")
                 .expect_err(refused);
-            assert!(
-                refusal.starts_with(
-                    "ERR usage: open fact-menu <model | effort | path | branch | context | usage | account>"
-                ),
-                "{refused}: {refusal}"
+            assert_eq!(
+                refusal,
+                "ERR usage: open fact-menu <model | effort | path | branch | context | usage \
+                 | top-effort | account> | open fact-menu close\n",
+                "{refused}"
             );
         }
         assert_eq!(super::fact_menu_operand("autopilot-menu"), None);
         assert_eq!(super::fact_menu_operand("fact-menus"), None);
+    }
+
+    /// EVERY `Fact` IS IN `Fact::EVERY`, SO EACH PARSES AND THE USAGE NAMES
+    /// IT: one list below writes both an exhaustive `match` over `Fact` (a
+    /// new variant does not compile until it is listed) and the facts
+    /// `EVERY` is held to, so a fact left out of `EVERY`, which
+    /// `Fact::parse` walks and `open fact-menu`'s usage prints, fails here.
+    /// Each wire name is its own and parses back to its fact. NEGATIVE
+    /// CONTROL: a fact dropped from `EVERY` fails the walk; a variant
+    /// dropped from the list fails to compile.
+    #[test]
+    fn every_fact_is_in_every_so_each_parses_and_the_usage_names_it() {
+        use crate::claude_lights::Fact;
+        macro_rules! each_fact {
+            ($($variant:ident),+ $(,)?) => {{
+                let ident = |fact: Fact| match fact {
+                    $(Fact::$variant => stringify!($variant)),+
+                };
+                [$((Fact::$variant, ident(Fact::$variant))),+]
+            }};
+        }
+        let variants = each_fact!(
+            TopEffort, Model, Effort, Path, Branch, Context, Usage, Account
+        );
+        let usage = super::fact_menu_operand("fact-menu")
+            .expect("the fact menu's words")
+            .expect_err("a missing name is refused with the usage");
+        let named: Vec<&str> = usage
+            .split_once('<')
+            .and_then(|(_, rest)| rest.split_once('>'))
+            .map(|(names, _)| names.split('|').map(str::trim).collect())
+            .unwrap_or_default();
+        for (fact, ident) in variants {
+            assert!(
+                Fact::EVERY.contains(&fact),
+                "Fact::{ident} is left out of Fact::EVERY: {:?}",
+                Fact::EVERY
+            );
+            assert_eq!(
+                Fact::parse(fact.key()),
+                Some(fact),
+                "Fact::{ident}'s wire name `{}` parses back",
+                fact.key()
+            );
+            assert_eq!(
+                super::fact_menu_operand(&format!("fact-menu {}", fact.key())),
+                Some(Ok(Some(fact))),
+                "Fact::{ident}: `open fact-menu {}`",
+                fact.key()
+            );
+            assert_eq!(
+                named.iter().filter(|&&name| name == fact.key()).count(),
+                1,
+                "Fact::{ident}'s `{}` is in the usage once: {usage}",
+                fact.key()
+            );
+        }
+        assert_eq!(
+            (Fact::EVERY.len(), named.len()),
+            (variants.len(), variants.len()),
+            "EVERY and the usage hold each fact once: {:?}, {usage}",
+            Fact::EVERY
+        );
     }
 
     #[test]
@@ -1910,8 +1990,11 @@ fn fact_menu_operand(trimmed: &str) -> Option<Result<Option<crate::claude_lights
     }
     let operand = words.next().map(str::to_ascii_lowercase);
     let usage = || {
-        "ERR usage: open fact-menu <model | effort | path | branch | context | usage | account> | open fact-menu close\n"
-            .to_string()
+        let names: Vec<&str> = Fact::EVERY.into_iter().map(Fact::key).collect();
+        format!(
+            "ERR usage: open fact-menu <{}> | open fact-menu close\n",
+            names.join(" | ")
+        )
     };
     if words.next().is_some() {
         return Some(Err(usage()));
@@ -2603,7 +2686,7 @@ pub(crate) fn split_quoted_tokens(rest: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
-pub(crate) const SPAWN_USAGE: &str = "ERR usage: spawn [window=<id>] [raise=<t|f>] [cwd=<path>] [split=<v|h>] [theme=<name>] [connected=controlled|controller place=window|tab of=<sid> | agent=<claude|gemini|agy|muse> [model=<m>] [autopilot=<land|cruise>] [from=<sid>] len=<n>]\n";
+pub(crate) const SPAWN_USAGE: &str = "ERR usage: spawn [window=<id>] [raise=<t|f>] [cwd=<path>] [split=<v|h>] [theme=<name>] [connected=controlled|controller place=window|tab of=<sid> | agent=<claude|codex|gemini|agy|muse> [model=<m>] [autopilot=<land|cruise>] [from=<sid>] len=<n>]\n";
 
 /// Parsed `agent=<word>` worker specification for `spawn`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2614,26 +2697,17 @@ pub(crate) enum AgentSpec {
         autopilot: Option<aterm_agent::supervise::Autopilot>,
         from: Option<aterm_session::SessionId>,
     },
-    Reserved(aterm_phase::Program),
 }
 
 fn agent_spec(word: &str) -> Option<AgentSpec> {
     use aterm_phase::Program;
     let program = Program::ALL.into_iter().find(|p| p.name() == word)?;
-    match program {
-        Program::Generic => None,
-        _ if aterm_agent::harness::worker::worker_cli(program).is_some() => {
-            Some(AgentSpec::Worker {
-                agent: program,
-                model: None,
-                autopilot: None,
-                from: None,
-            })
-        }
-        Program::Claude | Program::Codex | Program::Agy | Program::Muse | Program::Gemini => {
-            Some(AgentSpec::Reserved(program))
-        }
-    }
+    aterm_agent::harness::worker::worker_cli(program).map(|_| AgentSpec::Worker {
+        agent: program,
+        model: None,
+        autopilot: None,
+        from: None,
+    })
 }
 
 fn valid_model(model: &str) -> bool {
@@ -2750,7 +2824,6 @@ fn parse_spawn_args(rest: &str) -> Result<SpawnForm, ()> {
             autopilot,
             from,
         }),
-        Some(AgentSpec::Reserved(program)) => Some(AgentSpec::Reserved(program)),
         None if model.is_some() || autopilot.is_some() || from.is_some() || framed => {
             return Err(());
         }
@@ -2854,9 +2927,6 @@ pub(crate) fn cmd_spawn(proxy: &EventLoopProxy<Wake>, rest: &str, session: Optio
         } => {
             let task = match agent {
                 None => None,
-                Some(AgentSpec::Reserved(program)) => {
-                    return format!("ERR agent {}: not yet\n", program.name());
-                }
                 Some(AgentSpec::Worker {
                     agent,
                     model,
@@ -3816,6 +3886,7 @@ mod spawn_parse_tests {
             );
         }
         for program in [
+            aterm_phase::Program::Codex,
             aterm_phase::Program::Agy,
             aterm_phase::Program::Muse,
             aterm_phase::Program::Gemini,
@@ -3834,11 +3905,6 @@ mod spawn_parse_tests {
                 "a worker of {program:?}"
             );
         }
-        assert_eq!(
-            agent_of("agent=codex len=1"),
-            Some(AgentSpec::Reserved(aterm_phase::Program::Codex)),
-            "CONTROL: Codex has no worker row"
-        );
         let too_long = format!("agent=claude model={longest}x len=1");
         for bad in [
             "agent=",
@@ -3863,6 +3929,7 @@ mod spawn_parse_tests {
             "agent=claude connected=controlled place=tab of=s-a",
             "agent=gemini connected=controlled place=tab of=s-a",
             "agent=Gemini len=1",
+            "agent=codex-old len=1",
             "agent=muse model=a/b len=1",
             "agent=gemini model=--yolo len=1",
             "agent=muse model=-x len=1",
@@ -3872,8 +3939,8 @@ mod spawn_parse_tests {
             assert_eq!(parse_spawn_args(bad), Err(()), "{bad}");
         }
         assert!(super::SPAWN_USAGE.contains(
-            "agent=<claude|gemini|agy|muse> [model=<m>] [autopilot=<land|cruise>] [from=<sid>] \
-             len=<n>"
+            "agent=<claude|codex|gemini|agy|muse> [model=<m>] [autopilot=<land|cruise>] \
+             [from=<sid>] len=<n>"
         ));
     }
 
@@ -4494,6 +4561,7 @@ mod worker_start_app_tests {
                 (3, "agent=gemini autopilot=cruise len=8", Autopilot::Cruise),
                 (4, "agent=agy len=8", Autopilot::Land),
                 (5, "agent=muse len=8", Autopilot::Land),
+                (6, "agent=codex autopilot=cruise len=8", Autopilot::Cruise),
             ] {
                 app.push_stub_tab(wid, crate::stub_session(local));
                 let Ok(super::SpawnForm::Plain {
@@ -4549,9 +4617,9 @@ mod worker_start_app_tests {
                     "{args}: the agent its startup is read by"
                 );
             }
-            app.push_stub_tab(wid, crate::stub_session(6));
+            app.push_stub_tab(wid, crate::stub_session(7));
             assert_eq!(
-                ctx_of(&app, 6)
+                ctx_of(&app, 7)
                     .timeline
                     .lock()
                     .unwrap()

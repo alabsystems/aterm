@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Unattended publication lanes ([`alab`], [`linux`], [`resolve`], [`gap`], [`state`], [`hold`],
-//! [`rows`], [`report`], [`install`], [`units`], [`self_check`]).
+//! [`rows`], [`report`], [`install`], [`units`], [`mark_ran`], [`self_check`]).
 
 pub mod alab;
 pub mod gap;
@@ -141,6 +141,7 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
 
 fn run_lane(ctx: &Ctx, kind: LaneKind, flags: &RunFlags) -> Result<()> {
     let exe = std::env::current_exe().map_err(|e| Error::io("find this binary's own path", &e))?;
+    mark_ran(&exe);
     let pinned = self_check(&exe, flags.sha256.as_deref(), flags.dry_run, &ctx.state_dir)?;
     let me = match kind {
         LaneKind::Alab => alab::ME,
@@ -207,6 +208,24 @@ fn run_with_production_deps(
             };
             linux::run(ctx, &opts, &deps, tx).map(|_| ())
         }
+    }
+}
+
+/// Say in the `lane.*` snapshot `exe` runs from that a run from it started
+/// ([`aterm_uds::deadline::RAN`]): macOS's first-exec check of it is over, so `lane install`
+/// may prune it. An `exe` anywhere else (a build of one's own) marks nothing.
+pub fn mark_ran(exe: &Path) {
+    let Some(snapshot) = exe.parent().filter(|d| {
+        d.file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("lane."))
+    }) else {
+        return;
+    };
+    if let Err(e) = std::fs::write(snapshot.join(aterm_uds::deadline::RAN), b"") {
+        eprintln!(
+            "atpkg-publish: cannot mark {} as run from: {e}",
+            snapshot.display()
+        );
     }
 }
 

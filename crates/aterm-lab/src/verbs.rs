@@ -15,7 +15,7 @@ use crate::procs::alive;
 use crate::pyjson::{J, Style};
 use crate::run::{Run, take_tag};
 use crate::stub::{control, query_escape};
-use crate::util::{atomic_write, hms, now_secs, scratch_text};
+use crate::util::{atomic_write, hms, now_ms, now_secs, scratch_text};
 use crate::{Fail, Res};
 
 fn lab(args: &[String]) -> Result<(Run, Vec<String>), Fail> {
@@ -1105,28 +1105,36 @@ pub fn twin(run: &Run, a: &[String]) -> Res {
             return Err(Fail::die(format!("twin: cannot execute {src}")));
         }
         let src = fs::canonicalize(&src).map_err(|e| Fail::die(e.to_string()))?;
-        let probe = run.run.join("twin-src/claude");
-        let _ = fs::remove_dir_all(run.run.join("twin-src"));
-        put(&probe, 0o755, &PutSrc::File(&src))
-            .map_err(|e| Fail::die(format!("twin: cannot clone {}: {e}", src.display())))?;
-        let ver = crate::lab::jailed_version(run, &probe.to_string_lossy(), |l| {
-            l.split_whitespace().next()
-        });
-        let _ = fs::remove_dir_all(run.run.join("twin-src"));
-        if !semver_like(&ver) {
+        // a build directory of its own, its program probed where the instance
+        // will start it: it showed it ran before the twin names it, and no
+        // later twin puts over it
+        let build = format!("lab-{}-{}", std::process::id(), now_ms());
+        let dest = pkg.join(format!("store/claude/{build}/bin/claude"));
+        crate::lab::hold_scratch(&run.run, &build)
+            .map_err(|e| Fail::die(format!("twin: cannot hold the scratch: {e}")))?;
+        if let Err(e) = put(&dest, 0o755, &PutSrc::File(&src)) {
+            crate::lab::release_scratch(&run.run, &build);
             return Err(Fail::die(format!(
-                "twin: {} --version named no version",
-                src.display()
-            )));
-        }
-        let dest = pkg.join(format!("store/claude/lab-{ver}/bin/claude"));
-        put(&dest, 0o755, &PutSrc::File(&src)).map_err(|e| {
-            Fail::die(format!(
                 "twin: cannot copy {} into {}: {e}",
                 src.display(),
                 dest.display()
-            ))
-        })?;
+            )));
+        }
+        // the hold's clock starts at its probe's exec, so a `down` the hang
+        // after a refusal frees it
+        aterm_uds::deadline::stamp_exec(&run.run.join(crate::lab::HELD).join(&build));
+        let ver = crate::lab::jailed_version(run, &dest.to_string_lossy(), |l| {
+            l.split_whitespace().next()
+        });
+        if !semver_like(&ver) {
+            let kept = dest.parent().and_then(Path::parent).unwrap_or(&dest);
+            return Err(Fail::die(format!(
+                "twin: {} --version named no version; {}",
+                src.display(),
+                crate::lab::kept_copies(kept, "down", &run.tag)
+            )));
+        }
+        crate::lab::release_scratch(&run.run, &build);
         (ver, dest)
     };
     let q = dest.to_string_lossy().replace('\'', "'\\''");

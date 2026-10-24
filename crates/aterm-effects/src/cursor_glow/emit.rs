@@ -4526,11 +4526,7 @@ const FLAME_CORE_STOPS: [(f32, u32); 4] = [
 #[inline]
 fn flame_core_ramp(rise: f32) -> u32 {
     let rise = rise.clamp(0.0, 1.0);
-    let i = FLAME_CORE_STOPS
-        .iter()
-        .rposition(|s| s.0 <= rise)
-        .unwrap_or(0)
-        .min(FLAME_CORE_STOPS.len() - 2);
+    let i = usize::from(rise >= FLAME_CORE_STOPS[1].0) + usize::from(rise >= FLAME_CORE_STOPS[2].0);
     let (a, b) = (FLAME_CORE_STOPS[i], FLAME_CORE_STOPS[i + 1]);
     lerp_rgb(a.1, b.1, (rise - a.0) / (b.0 - a.0))
 }
@@ -4625,22 +4621,24 @@ const FLAME_LIGHT_STOPS: [(f32, u32); 4] = [
 ];
 
 #[inline]
-fn flame_light_paint_bounds() -> (u32, u32) {
-    FLAME_LIGHT_STOPS
-        .iter()
-        .fold((0x00FF_FFFF, 0), |(lo, hi), &(_, rgb)| {
-            (chan_min(lo, rgb), chan_max(hi, rgb))
-        })
+const fn flame_light_paint_bounds() -> (u32, u32) {
+    let mut lo = 0x00FF_FFFF;
+    let mut hi = 0;
+    let mut i = 0;
+    while i < FLAME_LIGHT_STOPS.len() {
+        let rgb = FLAME_LIGHT_STOPS[i].1;
+        lo = chan_min(lo, rgb);
+        hi = chan_max(hi, rgb);
+        i += 1;
+    }
+    (lo, hi)
 }
 
 #[inline]
 fn flame_light_ramp(rise: f32) -> u32 {
     let rise = rise.clamp(0.0, 1.0);
-    let i = FLAME_LIGHT_STOPS
-        .iter()
-        .rposition(|s| s.0 <= rise)
-        .unwrap_or(0)
-        .min(FLAME_LIGHT_STOPS.len() - 2);
+    let i =
+        usize::from(rise >= FLAME_LIGHT_STOPS[1].0) + usize::from(rise >= FLAME_LIGHT_STOPS[2].0);
     let (a, b) = (FLAME_LIGHT_STOPS[i], FLAME_LIGHT_STOPS[i + 1]);
     lerp_rgb(a.1, b.1, (rise - a.0) / (b.0 - a.0))
 }

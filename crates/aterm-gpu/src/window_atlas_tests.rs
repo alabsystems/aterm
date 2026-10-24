@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Window-owned artwork cache reuse, replacement, and teardown on both backends.
+//! Window-owned artwork (the wallpaper, an image plane) cache reuse, replacement, and
+//! teardown on both backends.
 
 use super::{GpuRenderer, RenderInput, SceneAtlas, SpriteTex, WindowGpu};
-use aterm_core::render::{FreeSampler, FreeSprite, FreeZ, SpriteQuad};
 use aterm_core::terminal::Terminal;
 use aterm_spec::derive::Model;
 use aterm_spec::interp::State;
@@ -58,45 +58,7 @@ fn artwork_input(gpu: &GpuRenderer, tag: u8) -> RenderInput {
         rgba: pixel.repeat((width * height) as usize),
         version: 1,
     });
-    input.free_atlas = Some(atlas.clone());
-    input.cat_atlas = Some(atlas.clone());
-    input.rain_atlas = Some(atlas.clone());
     input.wallpaper = Some(atlas);
-    input.free_sprites.push(FreeSprite {
-        x: 2,
-        y: 2,
-        w: 8,
-        h: 8,
-        ax: 0,
-        ay: 0,
-        aw: 8,
-        ah: 8,
-        tint: 0x00ff_ffff,
-        alpha: 255,
-        flip_x: false,
-        z: FreeZ::OverText,
-        sampler: FreeSampler::Nearest,
-    });
-    let quad = SpriteQuad {
-        row: 1,
-        x: 16,
-        y: ch as u16,
-        w: 8,
-        h: 8,
-        ax: 0,
-        ay: 0,
-        aw: 8,
-        ah: 8,
-        tint: 0x00ff_ffff,
-        alpha: 255,
-        flip_x: false,
-    };
-    input.cat_quads.push(quad);
-    input.rain_quads.push(SpriteQuad {
-        row: 2,
-        y: (2 * ch) as u16,
-        ..quad
-    });
 
     let mut png = Vec::new();
     {
@@ -130,19 +92,13 @@ fn artwork_input(gpu: &GpuRenderer, tag: u8) -> RenderInput {
     input
 }
 
-fn sprites(win: &WindowGpu) -> [&SpriteTex; 4] {
-    [
-        &win.cat_atlas,
-        &win.free_atlas,
-        &win.rain_atlas,
-        &win.wallpaper_tex,
-    ]
-    .map(|s| s.as_deref().expect("fixture must build every sprite atlas"))
+fn sprites(win: &WindowGpu) -> [&SpriteTex; 1] {
+    [&win.wallpaper_tex].map(|s| s.as_deref().expect("fixture must build every sprite atlas"))
 }
 
 struct Handles {
     #[cfg(wgpu_arm)]
-    wgpu: [wgpu::BindGroup; 5],
+    wgpu: [wgpu::BindGroup; 2],
     #[cfg(target_os = "macos")]
     metal: Vec<crate::metal::resources::SealedTexture>,
 }
@@ -156,9 +112,6 @@ impl Handles {
                 let s = sprites(win);
                 [
                     s[0].bind.clone(),
-                    s[1].bind.clone(),
-                    s[2].bind.clone(),
-                    s[3].bind.clone(),
                     win.image_plane.as_ref().unwrap().bind.clone(),
                 ]
             },
@@ -215,13 +168,7 @@ impl Handles {
 fn observed(model_state: &State, windows: &[WindowGpu; 2]) -> State {
     let mut state = model_state.clone();
     for (name, win) in ["cached_a", "cached_b"].into_iter().zip(windows) {
-        let tags = [
-            &win.cat_atlas,
-            &win.free_atlas,
-            &win.rain_atlas,
-            &win.wallpaper_tex,
-        ]
-        .map(|slot| {
+        let tags = [&win.wallpaper_tex].map(|slot| {
             slot.as_ref()
                 .map_or(0, |s| if s.src.rgba[0] == 40 { 1 } else { 2 })
         });
@@ -244,7 +191,7 @@ fn run_ownership_replay(native: bool) {
     let inputs = [artwork_input(&gpu, 40), artwork_input(&gpu, 220)];
     let weak = inputs
         .each_ref()
-        .map(|input| Arc::downgrade(input.free_atlas.as_ref().unwrap()));
+        .map(|input| Arc::downgrade(input.wallpaper.as_ref().unwrap()));
     let model = ownership_model();
     let mut state = model.init_state();
     let mut pixels: [Option<Vec<u32>>; 2] = [None, None];
@@ -290,7 +237,7 @@ fn run_ownership_replay(native: bool) {
         "the old global-slot eviction must fail conformance"
     );
     let replacement = artwork_input(&gpu, 220);
-    let replacement_weak = Arc::downgrade(replacement.free_atlas.as_ref().unwrap());
+    let replacement_weak = Arc::downgrade(replacement.wallpaper.as_ref().unwrap());
     let prior = state.clone();
     let frame = gpu
         .try_render_input(&mut windows[0], &replacement, None)
@@ -333,7 +280,7 @@ fn run_ownership_replay(native: bool) {
     );
     for _ in 0..3 {
         let input = artwork_input(&gpu, 40);
-        let source = Arc::downgrade(input.free_atlas.as_ref().unwrap());
+        let source = Arc::downgrade(input.wallpaper.as_ref().unwrap());
         let prior = state.clone();
         let frame = gpu.try_render_input(&mut windows[1], &input, None).unwrap();
         assert_eq!(Some(frame.pixels), pixels[0]);
@@ -351,13 +298,7 @@ fn run_ownership_replay(native: bool) {
     #[cfg(target_os = "macos")]
     if native {
         let live = gpu.metal_arm.as_mut().unwrap().live_mut();
-        for atlas in [
-            super::DrawAtlas::Cat,
-            super::DrawAtlas::Free,
-            super::DrawAtlas::Rain,
-            super::DrawAtlas::Wallpaper,
-            super::DrawAtlas::Image,
-        ] {
+        for atlas in [super::DrawAtlas::Wallpaper, super::DrawAtlas::Image] {
             assert!(
                 live.atlases[atlas as usize].is_none(),
                 "window artwork must not be retained in shared renderer slots"
@@ -428,12 +369,7 @@ fn shared_observation(model_state: &State, windows: &[WindowGpu; 2]) -> State {
     let mut state = model_state.clone();
     let mut uploads: Vec<&Arc<SpriteTex>> = Vec::new();
     for (name, win) in ["a", "b"].into_iter().zip(windows) {
-        let slots = [
-            &win.cat_atlas,
-            &win.free_atlas,
-            &win.rain_atlas,
-            &win.wallpaper_tex,
-        ];
+        let slots = [&win.wallpaper_tex];
         let mut tags = Vec::new();
         for slot in slots {
             tags.push(slot.as_ref().map_or(0, |texture| {
@@ -495,40 +431,41 @@ fn run_sharing_replay(native: bool) {
                 let handles = Handles::capture(&windows[owner], native);
                 #[cfg(wgpu_arm)]
                 assert!(
-                    handles.wgpu[..4]
+                    handles.wgpu[..1]
                         .iter()
                         .all(|bind| *bind == handles.wgpu[0])
                 );
                 #[cfg(target_os = "macos")]
                 if native {
                     assert!(
-                        handles.metal[..4]
+                        handles.metal[..1]
                             .iter()
                             .all(|tex| tex.obj().id() == handles.metal[0].obj().id())
                     );
                 }
                 match first_upload.as_ref() {
                     None => {
-                        first_upload =
-                            Some(Arc::downgrade(windows[owner].free_atlas.as_ref().unwrap()));
+                        first_upload = Some(Arc::downgrade(
+                            windows[owner].wallpaper_tex.as_ref().unwrap(),
+                        ));
                         first_handles = Some(handles);
                     }
                     Some(upload) if source == 0 && upload.upgrade().is_some() => {
                         let first = first_handles.as_ref().unwrap();
                         #[cfg(wgpu_arm)]
-                        assert_eq!(first.wgpu[..4], handles.wgpu[..4]);
+                        assert_eq!(first.wgpu[..1], handles.wgpu[..1]);
                         #[cfg(target_os = "macos")]
                         assert_eq!(
                             first
                                 .metal
                                 .iter()
-                                .take(4)
+                                .take(1)
                                 .map(|t| t.obj().id())
                                 .collect::<Vec<_>>(),
                             handles
                                 .metal
                                 .iter()
-                                .take(4)
+                                .take(1)
                                 .map(|t| t.obj().id())
                                 .collect::<Vec<_>>(),
                         );
@@ -573,11 +510,11 @@ fn run_sharing_replay(native: bool) {
     );
 
     let mut owners = Vec::new();
-    let keep = inputs[0].free_atlas.as_ref().unwrap().clone();
+    let keep = inputs[0].wallpaper.as_ref().unwrap().clone();
     for _ in 0..super::SPRITE_TEXTURE_LOOKUP_LIMIT + 3 {
         let mut win = WindowGpu::new();
         let input = RenderInput {
-            free_atlas: Some(Arc::new(SceneAtlas {
+            wallpaper: Some(Arc::new(SceneAtlas {
                 width: 1,
                 height: 1,
                 rgba: vec![40, 80, 215, 255],
@@ -585,18 +522,21 @@ fn run_sharing_replay(native: bool) {
             })),
             ..RenderInput::default()
         };
-        gpu.ensure_free_atlas(&mut win, &input);
+        gpu.ensure_wallpaper_tex(&mut win, &input);
         owners.push(win);
         assert!(gpu.sprite_textures.recent.len() <= super::SPRITE_TEXTURE_LOOKUP_LIMIT);
     }
-    let first = owners[0].free_atlas.as_ref().unwrap().clone();
+    let first = owners[0].wallpaper_tex.as_ref().unwrap().clone();
     let first_source = Arc::downgrade(&first.src);
     let same = RenderInput {
-        free_atlas: Some(first.src.clone()),
+        wallpaper: Some(first.src.clone()),
         ..RenderInput::default()
     };
-    gpu.ensure_free_atlas(&mut owners[0], &same);
-    assert!(Arc::ptr_eq(owners[0].free_atlas.as_ref().unwrap(), &first));
+    gpu.ensure_wallpaper_tex(&mut owners[0], &same);
+    assert!(Arc::ptr_eq(
+        owners[0].wallpaper_tex.as_ref().unwrap(),
+        &first
+    ));
     drop(same);
     drop(first);
     drop(owners);

@@ -1,45 +1,43 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-// Author: Andrew Yates
 
-//! [`HasNativeWindow`]: a window's X11 or Wayland handles, handed from crate to crate.
+//! Window X11 or Wayland handles ([`HasNativeWindow`]).
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::Arc;
 
-/// A window's handles on its window system, borrowed from the window that owns them.
+/// Borrowed X11 or Wayland window handles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeWindow {
-    /// An X11 window, on the Xlib connection that made it.
+    /// X11 window on an Xlib connection.
     Xlib {
-        /// The connection's `Display *`.
+        /// Connection `Display *`.
         display: NonNull<c_void>,
-        /// The number of the screen the window was made on.
+        /// Screen number.
         screen: i32,
-        /// The window's XID.
+        /// Window XID.
         window: u32,
-        /// The window's visual id; 0 when it is not known.
+        /// Visual ID, or 0 when unknown.
         visual: u32,
     },
-    /// A Wayland window.
+    /// Wayland window.
     Wayland {
-        /// The connection's `wl_display *`.
+        /// Connection `wl_display *`.
         display: NonNull<c_void>,
-        /// The window's `wl_surface *`.
+        /// Window `wl_surface *`.
         surface: NonNull<c_void>,
     },
 }
 
-/// A value that owns or borrows an X11 or Wayland window: a window, or a reference or shared
-/// pointer to one.
+/// A value that owns or borrows an X11 or Wayland window.
 /// # Safety
 /// [`native_window`](Self::native_window) answers `None` or handles that stay live for as long as
 /// `self` does: the display connection stays open, and the X11 window or `wl_surface` is not
 /// destroyed. A caller that keeps a handle past `self` keeps `self` alive with it.
 pub unsafe trait HasNativeWindow {
-    /// The window's handles, or `None` when there are none to hand out.
+    /// The window's handles, or `None` when unavailable.
     fn native_window(&self) -> Option<NativeWindow>;
 }
 

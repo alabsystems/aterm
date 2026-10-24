@@ -432,6 +432,21 @@ pub fn provision_plan(web2: Option<String>) -> Vec<Step> {
             &["sudo", "dpkg", "--add-architecture", "amd64"],
             None,
         ),
+        // A VM stopped mid-install (the Mac restarted under it) leaves dpkg interrupted, and
+        // apt refuses every install until its unpacked packages are configured; with nothing
+        // pending this does nothing.
+        step(
+            "dpkg configure",
+            &[
+                "sudo",
+                "env",
+                "DEBIAN_FRONTEND=noninteractive",
+                "dpkg",
+                "--configure",
+                "-a",
+            ],
+            None,
+        ),
         step("apt-get update", &["sudo", "apt-get", "update", "-q"], None),
         Step {
             label: "apt-get install",
@@ -1419,7 +1434,10 @@ mod tests {
         assert_eq!(fingerprint(&plan), fingerprint(&provision_plan(None)));
         assert_eq!(fingerprint(&plan).len(), 16);
         let mut changed = plan.clone();
-        changed[4].argv.push("extra-package".into());
+        let install = plan.iter().position(|s| s.label == "apt-get install");
+        changed[install.expect("an install step")]
+            .argv
+            .push("extra-package".into());
         assert_ne!(fingerprint(&plan), fingerprint(&changed));
         let mut sources = plan.clone();
         sources[0].stdin = Some(SOURCES_AMD64.into());

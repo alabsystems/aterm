@@ -491,6 +491,25 @@ pub fn find_executable(sys: &dyn System, dir: &Path) -> Result<(PathBuf, bool), 
     }
 }
 
+/// The name of each upgrade's work folder under `stage/` starts with this (`upgrade-<run>`).
+const UPGRADE_WORK: &str = "upgrade-";
+
+/// Remove each upgrade's work folder under `stage/` that holds nothing back: nothing was
+/// started from it, its program showed it ran, or its hold is spent
+/// ([`crate::first_exec::hold_left`]). One still held stays for a later sweep.
+pub(super) fn sweep_upgrades(sys: &dyn System, layout: &Layout) {
+    let stage = layout.stage();
+    for name in sys.list_dir(&stage).unwrap_or_default() {
+        let work = stage.join(&name);
+        if name.starts_with(UPGRADE_WORK)
+            && sys.stat(&work).is_ok_and(|s| s.dir && !s.symlink)
+            && crate::first_exec::hold_left(sys, &work).is_none()
+        {
+            let _ = super::remove_tree(sys, &work);
+        }
+    }
+}
+
 /// Installs an `upgrade` archive from the root cache.
 fn upgrade(
     sys: &dyn System,
@@ -498,6 +517,7 @@ fn upgrade(
     e: &Envelope,
     run: &str,
 ) -> Result<ItemReport, String> {
+    sweep_upgrades(sys, layout);
     let u = e
         .upgrade
         .as_ref()
@@ -509,7 +529,7 @@ fn upgrade(
         Ok(got) => return Err(format!("upgrade: the cached archive hashes to {got}")),
         Err(err) => return Err(format!("upgrade: {}: {err}", archive.display())),
     }
-    let work = layout.stage().join(format!("upgrade-{run}"));
+    let work = layout.stage().join(format!("{UPGRADE_WORK}{run}"));
     let _ = super::remove_tree(sys, &work);
     sys.create_dir_all(&work, 0o700)
         .map_err(|err| format!("{}: {err}", work.display()))?;
@@ -562,9 +582,19 @@ fn upgrade(
     let new_exe = expanded.join(&rel);
     chain::check(sys, &new_exe)
         .map_err(|why| format!("upgrade: the new agent's path is not root's alone: {why}"))?;
+    // Its first exec: `work` stays (uninstall too keeps it) until it shows it ran.
+    crate::first_exec::stamp(sys, &work)
+        .map_err(|err| format!("upgrade: {}: {err}", work.display()))?;
     let said = sys
-        .run(&Cmd::new(&new_exe).args(["machines", "agent", "version"]))
+        .run(
+            &Cmd::new(&new_exe)
+                .args(["machines", "agent", "version"])
+                .budget(aterm_uds::deadline::FIRST_EXEC_HANG),
+        )
         .map_err(|err| format!("upgrade: the new agent did not run: {err}"))?;
+    if crate::first_exec::showed_it_ran(&said) {
+        crate::first_exec::mark_ran(sys, &work);
+    }
     let version = said.out().trim().to_owned();
     if !said.success() || (!u.version.is_empty() && version != u.version) {
         return Err(format!(
@@ -1049,6 +1079,125 @@ mod tests {
         assert!(sudoers.contains(&format!("sha256:{digest} ")), "{sudoers}");
         assert!(rule < at(&format!("remove {}", cached_archive(&e))));
         assert!(fake.written(&cached_archive(&e)).is_none());
+    }
+
+    const VERSION: &str = "/A/stage/upgrade-1-5/payload/aterm-machines-dev machines agent version";
+
+    #[test]
+    fn the_new_agent_runs_within_the_first_exec_hang_and_its_answer_proves_its_folder() {
+        let (fake, e) = upgrading(0);
+        let budget = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let seen = std::sync::Arc::clone(&budget);
+        fake.simulate(move |_, cmd| {
+            if cmd.display() == VERSION {
+                *seen.lock().unwrap() = Some(cmd.budget);
+            }
+            None
+        });
+        fake.awake_at(5_000_000);
+        upgrade(&fake, &layout(), &e, "1-5").unwrap();
+        assert_eq!(
+            *budget.lock().unwrap(),
+            Some(aterm_uds::deadline::FIRST_EXEC_HANG)
+        );
+        let calls = fake.calls();
+        let at = |c: &str| {
+            calls
+                .iter()
+                .position(|x| x == c)
+                .unwrap_or_else(|| panic!("{c}: {calls:#?}"))
+        };
+        let stamped = at("write /A/stage/upgrade-1-5/exec 644");
+        let ran = at("write /A/stage/upgrade-1-5/ran 644");
+        assert!(stamped < at(VERSION) && at(VERSION) < ran, "{calls:#?}");
+        assert!(ran < at("rename /A/stage/upgrade-1-5/payload /A/agent"));
+    }
+
+    #[test]
+    fn an_upgrade_first_sweeps_each_earlier_upgrade_folder_that_holds_nothing_back() {
+        let (fake, e) = upgrading(0);
+        fake.awake_at(10_000_000);
+        for (name, stamp, ran) in [
+            ("upgrade-1-1", None, false),
+            ("upgrade-1-2", Some("1000000"), false),
+            ("upgrade-1-3", Some("9900000"), true),
+            ("upgrade-1-4", Some("9900000"), false),
+        ] {
+            let dir = format!("/A/stage/{name}");
+            listed_dir(&fake, &dir);
+            fake.file(&format!("{dir}/aterm"), b"agent");
+            if let Some(stamp) = stamp {
+                fake.file(&format!("{dir}/exec"), stamp.as_bytes());
+            }
+            if ran {
+                fake.file(&format!("{dir}/ran"), b"");
+            }
+        }
+        fake.file("/A/stage/upgrade-link", b"").stat_of(
+            "/A/stage/upgrade-link",
+            Stat {
+                dir: false,
+                symlink: true,
+                ..root_dir()
+            },
+        );
+        fake.file("/A/stage/aterm-open-1.sig", b"sig");
+        upgrade(&fake, &layout(), &e, "1-5").unwrap();
+        for (gone, why) in [
+            ("upgrade-1-1", "nothing was started from it"),
+            ("upgrade-1-2", "its hold is spent"),
+            ("upgrade-1-3", "its program showed it ran"),
+        ] {
+            assert!(
+                fake.written(&format!("/A/stage/{gone}/aterm")).is_none(),
+                "{gone}: {why}"
+            );
+        }
+        assert!(
+            fake.written("/A/stage/upgrade-1-4/aterm").is_some(),
+            "a program started from it 100 seconds ago has not shown it ran"
+        );
+        assert!(fake.written("/A/stage/aterm-open-1.sig").is_some());
+        let calls = fake.calls();
+        assert!(!calls.contains(&"remove /A/stage/upgrade-link".to_owned()));
+        let at = |c: &str| {
+            calls
+                .iter()
+                .position(|x| x == c)
+                .unwrap_or_else(|| panic!("{c}: {calls:#?}"))
+        };
+        assert!(at("remove /A/stage/upgrade-1-2") < at("mkdir /A/stage/upgrade-1-5 700"));
+    }
+
+    #[test]
+    fn a_new_agent_a_signal_ended_leaves_its_folder_held_in_place() {
+        let (fake, e) = upgrading(0);
+        fake.simulate(|_, cmd| {
+            (cmd.display() == VERSION).then(|| Ran {
+                status: None,
+                stdout: Vec::new(),
+                stderr: b"Killed: 9".to_vec(),
+            })
+        });
+        fake.awake_at(5_000_000);
+        let err = upgrade(&fake, &layout(), &e, "1-5").unwrap_err();
+        assert!(err.contains("killed by a signal"), "{err}");
+        let calls = fake.calls();
+        let run = calls.iter().position(|c| c == VERSION).unwrap();
+        assert!(
+            !calls[run..]
+                .iter()
+                .any(|c| c.starts_with("rename") || c.starts_with("remove")),
+            "{calls:#?}"
+        );
+        assert!(
+            fake.written("/A/stage/upgrade-1-5/payload/aterm-machines-dev")
+                .is_some()
+        );
+        assert_eq!(
+            crate::first_exec::hold_left(&fake, Path::new("/A/stage/upgrade-1-5")),
+            Some(aterm_uds::deadline::FIRST_EXEC_HANG)
+        );
     }
 
     #[test]

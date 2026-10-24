@@ -16,32 +16,20 @@ use super::paint::{
 use super::scan::{Cell, RecordingIndex, StatusRow, TakeContext, scan_dir};
 use super::starvation::{DEFAULT_LATE_THRESHOLD_US, Sampler, SchedInputs, classify, paint_verdict};
 
-/// The scheduling sampler's tick.
 const SAMPLER_TICK: Duration = Duration::from_millis(50);
-/// The typist's pause between keys on a recorded take, taken after each key's round trip.
 const VIDEO_KEY_GAP: Duration = Duration::from_millis(120);
-/// The screen rows a scene that never came up quotes in its reason.
 const SCREEN_TAIL_ROWS: &str = "tail=12";
-/// The burst's second capture after each key, and the gap after it.
 const BURST_GAP: Duration = Duration::from_millis(40);
-/// The decay tail's capture gap.
 const TAIL_GAP: Duration = Duration::from_millis(50);
 const TAIL_SHOTS: usize = 8;
-/// A cold burst spans time with nothing typed.
 const COLD_SHOTS: usize = 24;
 const COLD_GAP: Duration = Duration::from_millis(100);
-/// The earned-cat typist runs on its own clock.
 const CAT_SLOT: Duration = Duration::from_millis(250);
-/// The cat's decay tail is bounded in wall time from the last key.
 const CAT_TAIL: Duration = Duration::from_secs(1);
-/// The quiet after staging the companion plane.
 const PLANE_DECAY: Duration = Duration::from_secs(1);
-/// The isolated companion stills at the end of a companion take.
 const COMPANION_STILLS: usize = 3;
-/// The companion plane's caret row and column, zero-based (`ESC [10;10H`).
 const PLANE_CARET: &str = "9";
 
-/// The companion plane.
 const COMPANION_PLANE: &str = r"printf '\033[2J\033[10;10H'; sleep 30";
 
 /// Measure one row.
@@ -113,7 +101,6 @@ struct Take {
     band: super::instance::Band,
 }
 
-/// The config the row runs under: its style line first.
 fn config_head(row: &PaintRow) -> String {
     let mut head = row
         .style
@@ -195,7 +182,6 @@ fn run_take(
     })
 }
 
-/// Split the window.
 fn stage_split(ctl: &Ctl, split: Split) -> Result<(), CouldNotRun> {
     let arg = match split {
         Split::V => "split=v",
@@ -210,7 +196,6 @@ fn stage_split(ctl: &Ctl, split: Split) -> Result<(), CouldNotRun> {
     Ok(())
 }
 
-/// A scene that did not come up, with what the screen and the instance said.
 fn scene_missed(inst: &Instance, CouldNotRun(why): CouldNotRun) -> CouldNotRun {
     let screen = match inst.ctl.call(&["text", SCREEN_TAIL_ROWS]) {
         reply if reply.ok() => reply.stdout,
@@ -223,7 +208,6 @@ fn scene_missed(inst: &Instance, CouldNotRun(why): CouldNotRun) -> CouldNotRun {
     ))
 }
 
-/// Bring the scene up and confirm it is on the screen it claims.
 fn stage_scene(rig: &Rig, inst: &Instance, scene: Scene) -> Result<u64, CouldNotRun> {
     let ctl = &inst.ctl;
     let Some(shape) = scene.tui() else {
@@ -262,7 +246,6 @@ fn stage_scene(rig: &Rig, inst: &Instance, scene: Scene) -> Result<u64, CouldNot
     Ok(waited)
 }
 
-/// Clear to a blank plane with the caret parked at row 10, column 10.
 fn stage_companion_plane(ctl: &Ctl) -> Result<(), CouldNotRun> {
     ctl.ok(&["send", COMPANION_PLANE])?;
     ctl.ok(&["key", "enter"])?;
@@ -278,7 +261,6 @@ fn stage_companion_plane(ctl: &Ctl) -> Result<(), CouldNotRun> {
     Ok(())
 }
 
-/// The rasterized cell, which every geometry floor of the scan is drawn from.
 fn cell_of(ctl: &Ctl) -> Result<Cell, CouldNotRun> {
     let dims = ctl.ok(&["dims"])?;
     let w = uint_field(&dims, "cell_w")
@@ -291,7 +273,6 @@ fn cell_of(ctl: &Ctl) -> Result<Cell, CouldNotRun> {
         .ok_or_else(|| CouldNotRun(format!("ctl dims reported no positive cell ({dims})")))
 }
 
-/// `ctl cursor`: `OK <row> <col> <visible> <style>`.
 fn caret(ctl: &Ctl) -> Result<(String, String, String), CouldNotRun> {
     let line = ctl.ok(&["cursor"])?;
     let parts: Vec<&str> = line.split_whitespace().collect();
@@ -301,7 +282,6 @@ fn caret(ctl: &Ctl) -> Result<(String, String, String), CouldNotRun> {
     }
 }
 
-/// The cold streamer's caret must be visible and walking.
 fn fence_walking_caret(ctl: &Ctl) -> Result<(), CouldNotRun> {
     let first = caret(ctl)?;
     let moved = ctl.await_event("the cold streamer's caret advancing", || {
@@ -318,7 +298,6 @@ fn fence_walking_caret(ctl: &Ctl) -> Result<(), CouldNotRun> {
     Ok(())
 }
 
-/// Unfocus the window through the OS event's own path, and verify it took.
 fn fence_focus_out(ctl: &Ctl) -> Result<(), CouldNotRun> {
     ctl.ok(&["focus", "out"])?;
     let rain = ctl.ok(&["rain", "status"])?;
@@ -330,7 +309,6 @@ fn fence_focus_out(ctl: &Ctl) -> Result<(), CouldNotRun> {
     Ok(())
 }
 
-/// What a capture produced.
 struct Captured {
     frames_dir: PathBuf,
     rows: Option<Vec<StatusRow>>,
@@ -341,7 +319,6 @@ struct Captured {
     typed_shots: Vec<usize>,
 }
 
-/// Sleep until `deadline`.
 fn pace_until(deadline: Instant) {
     let now = Instant::now();
     if deadline > now {
@@ -353,7 +330,6 @@ fn elapsed_ms(reply: &str) -> Option<i64> {
     field(reply, "elapsed_ms").and_then(|v| v.parse().ok())
 }
 
-/// The pinned path.
 fn capture_video(ctl: &Ctl, row: &PaintRow, sampler: &Sampler) -> Result<Captured, CouldNotRun> {
     sampler.open_window();
     let secs = row.record_secs().to_string();
@@ -424,7 +400,6 @@ fn capture_video(ctl: &Ctl, row: &PaintRow, sampler: &Sampler) -> Result<Capture
     })
 }
 
-/// One paired capture.
 struct Burst<'a> {
     ctl: &'a Ctl,
     shots: usize,
@@ -454,7 +429,6 @@ impl Burst<'_> {
     }
 }
 
-/// The unpinned path.
 fn capture_burst(ctl: &Ctl, row: &PaintRow, sampler: &Sampler) -> Result<Captured, CouldNotRun> {
     sampler.open_window();
     let mut burst = Burst {
@@ -529,7 +503,6 @@ fn capture_burst(ctl: &Ctl, row: &PaintRow, sampler: &Sampler) -> Result<Capture
     })
 }
 
-/// The median and worst gap between consecutive typed keys' first frames.
 fn typed_gaps(dir: &Path, typed: &[usize]) -> Option<(u64, u64)> {
     let stamps: Vec<std::time::SystemTime> = typed
         .iter()

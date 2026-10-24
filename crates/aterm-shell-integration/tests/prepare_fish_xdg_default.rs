@@ -1,14 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-// Author: Andrew Yates
 
-//! With XDG_DATA_DIRS unset, `prepare_fish` falls back to the XDG Base Directory default
-//! (`/usr/local/share:/usr/share`) instead of only our injection dir, so fish keeps its
-//! vendor conf.d paths.
-//!
-//! It mutates the process environment, so it lives outside the unit-test binary (whose tests
-//! call `prepare_into` in parallel); `aterm_log::env::scoped_unset`'s lock serialises it with
-//! the other env test in `shell_suite` and restores the variable even on a panic.
+//! Separate test binary because `scoped_unset` mutates the process environment while unit tests
+//! call `prepare_into` in parallel.
 
 use aterm_shell_integration::{ShellType, prepare_into};
 

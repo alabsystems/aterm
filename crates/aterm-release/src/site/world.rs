@@ -13,7 +13,7 @@ use aterm_update_core::github_rest::Spawn;
 use aterm_verify::wasm_glue::WASM_OPT_FLAGS;
 
 use super::engine::{STEM, TARGET};
-use super::{Launch, Ran, World, output};
+use super::{ENGINE_UNPROVEN, Launch, Ran, World, output};
 
 /// Environment variables stripped from the engine cargo build.
 pub const ENGINE_BUILD_UNSET: [&str; 12] = [
@@ -339,10 +339,19 @@ impl World for Real {
         let (cargo, rustc) = (which("cargo")?, which("rustc")?);
         let mut build = module_command(&cargo, &rustc, pin, clone, rustflags, unset)?;
         keep_rust_homes(&mut build);
-        let ran = streamed(launch, &mut build, out, DRAIN_AFTER_EXIT)?;
+        let ran = streamed(launch, &mut build, out, DRAIN_AFTER_EXIT)
+            .map_err(|e| format!("{ENGINE_UNPROVEN}: {e}"))?;
         if ran.code != 0 {
+            // Cargo waits for each build script it starts: only its own exit, with no signal
+            // forwarded to them, shows they ran.
+            let unproven = ran.code < 0 || launch.interrupted().is_some();
             return Err(format!(
-                "the wasm32 build of aterm-wasm on {pin} exited {}",
+                "{}the wasm32 build of aterm-wasm on {pin} exited {}",
+                if unproven {
+                    format!("{ENGINE_UNPROVEN}: ")
+                } else {
+                    String::new()
+                },
                 ran.code
             ));
         }

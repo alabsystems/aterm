@@ -323,7 +323,6 @@ impl<'a, 'f> MapBuilder<'a, 'f> {
                 MAX_BITS.min(32 - v.leading_zeros())
             };
             if info.max_value == 0 || next_bit + bits_needed >= GLOBAL_BIT_SHIFT {
-                // Disabled, or out of bits.
                 continue;
             }
             let mut found = false;

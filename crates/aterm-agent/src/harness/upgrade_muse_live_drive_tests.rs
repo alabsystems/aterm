@@ -492,6 +492,7 @@ impl LiveRig {
             home: base.join("home"),
             state,
             sock: Some(sock),
+            token: None,
             only_sid: Some(TAB.to_string()),
             dry_run: false,
             human_grace_s: 120,

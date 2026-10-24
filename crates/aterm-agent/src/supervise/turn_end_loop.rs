@@ -743,15 +743,18 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// Whether `r` is the initial idle point after an unasked launch with no conversation yet.
+    /// The launch is the host's ([`IdleHost::launch`]), or this loop's own: it read the agent
+    /// before the agent's first frame ([`super::FirstFrame::saw_start`]).
     fn unasked_launch(&self, r: &TurnEndReading, host: Option<&Arc<dyn IdleHost>>) -> bool {
         (self.first_books || self.books_last_ms.is_some())
             && self.turn_end.point_number().is_none()
             && r.holds_no_conversation()
-            && if self.first_books {
-                host.is_some_and(|h| h.launch().is_some())
-            } else {
-                self.launched_since_books(host)
-            }
+            && (self.first_frame.saw_start()
+                || if self.first_books {
+                    host.is_some_and(|h| h.launch().is_some())
+                } else {
+                    self.launched_since_books(host)
+                })
     }
 
     /// Whether the agent process launched after the newest ledger row this loop found.
@@ -892,15 +895,21 @@ impl<C: Ctl> Session<'_, C> {
         if reading.wall.is_some() {
             self.persist_wall(screen.seq);
         }
-        self.reach_seen = reading
+        let net_wall = reading
             .wall
             .as_ref()
-            .filter(|w| answered_by_the_network(w.kind))
-            .map(|_| {
-                opts.idle_host
-                    .as_ref()
-                    .map_or(Reach::Unknown, |h| h.reach())
-            });
+            .map(|w| w.kind)
+            .or_else(|| {
+                (worked.is_none() && opts.policy.retry_api_errors)
+                    .then(|| self.turn_end.standing_retry_wall())
+                    .flatten()
+            })
+            .is_some_and(answered_by_the_network);
+        self.reach_seen = net_wall.then(|| {
+            opts.idle_host
+                .as_ref()
+                .map_or(Reach::Unknown, |h| h.reach())
+        });
         let composer = self.composer_read(&reading, screen);
         let r = TurnEndReading::of_slept(
             &reading,

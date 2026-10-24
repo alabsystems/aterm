@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A schedule plan published over the front window's glow on the host path, in process with every instant pinned (design §10.6), so the lane's one-shot wakes are exact and a windowed host's coarse-slot rounding (design §10.8) goes unmeasured.
+//! In-process host-path tests for publishing a schedule plan over the front window's glow.
 
 use std::time::{Duration, Instant};
 
@@ -18,22 +18,19 @@ use crate::aos_repair_tests::{
 use crate::aos_verb::{Ask, Asked, UNEVALUATED, evaluate, parse};
 use crate::scripted_redraw_fixture::surface;
 
-/// When the fresh keys start on both windows, from the attach: far past either window's first clear (τ·ln 50 is about 4.7 s after the last key).
+/// Offset from attach before typing fresh keys, well past the first burst's settle.
 const FRESH_AFTER: Duration = Duration::from_secs(20);
 
-/// A plan's 12 bytes.
 fn bytes(split: Split, wake: Wake) -> [u8; 12] {
     SchedulePlan::new(split, wake)
         .expect("fixture: an in-range plan")
         .encode()
 }
 
-/// The grid winner's bytes.
 fn winner() -> [u8; 12] {
     bytes(Split::SettleAtStep { gap_us: 0 }, Wake::NextStep)
 }
 
-/// What one window did after its pause.
 struct Story {
     app: App,
     /// The lane from the pause until it parked.
@@ -42,7 +39,7 @@ struct Story {
     fresh: Parked,
 }
 
-/// A window attached under the shipped code at `t0` and paused after 24 keys, then published over with the grid winner (or, as the control, resumed), its lane run to park before and after 12 fresh keys from `t0 + FRESH_AFTER`.
+/// Runs a paused window through either publication or control resume, then 12 fresh keys.
 fn story(light: bool, t0: Instant, publish: bool) -> Story {
     let mut app = momentum_app(light);
     app.redraw_window_at(WID, t0);
@@ -52,7 +49,6 @@ fn story(light: bool, t0: Instant, publish: bool) -> Story {
     assert!(status(&app).hot, "light={light}: the keys lit the glow");
     app.aos_pause_at(last).expect("a running glow pauses");
     if publish {
-        // The host's build, as it attached: the evaluator judges the interpreter it runs.
         let build = status(&app).build.expect("attached");
         let admitted = evaluate(&build, &winner()).expect("the grid winner is admitted");
         assert!(admitted.useful(), "fixture: the winner is useful");
@@ -112,7 +108,7 @@ fn story(light: bool, t0: Instant, publish: bool) -> Story {
     Story { app, first, fresh }
 }
 
-/// The plan published over a paused shipped glow settles the fresh keys in fewer lane wakes than the control's shipped code on both pages, each fresh key reaching the plan once with no reset recorded.
+/// Published plan settles fresh keys in fewer lane wakes than the control's shipped code.
 #[test]
 fn fresh_keys_after_publication_clear_in_fewer_ticks_than_a_control_host() {
     for light in [false, true] {
@@ -151,7 +147,7 @@ fn fresh_keys_after_publication_clear_in_fewer_ticks_than_a_control_host() {
     }
 }
 
-/// The `Wake::Aos` handler's `publish` refuses a bare ask without change and a plan not useful over the shipped code with its pause undone, and answers the winner's line with the plan live.
+/// `publish` refuses bare or non-useful plans without leaving the glow paused.
 #[test]
 fn the_publish_ask_answers_its_line_and_a_refusal_resumes_the_glow() {
     let t0 = Instant::now();
@@ -205,7 +201,6 @@ fn the_publish_ask_answers_its_line_and_a_refusal_resumes_the_glow() {
     assert_eq!((s.code, s.revision, s.paused), ("schedule-plan", 1, false));
 }
 
-/// The value of `key=` in a `k=v` line.
 fn field<'a>(line: &'a str, key: &str) -> &'a str {
     let want = format!("{key}=");
     line.split(' ')
@@ -213,7 +208,6 @@ fn field<'a>(line: &'a str, key: &str) -> &'a str {
         .unwrap_or_else(|| panic!("no {key}= in {line}"))
 }
 
-/// The bytes lowercase hex spells.
 fn unhex(hex: &str) -> Vec<u8> {
     assert!(
         hex.len().is_multiple_of(2),
@@ -228,7 +222,7 @@ fn unhex(hex: &str) -> Vec<u8> {
         .collect()
 }
 
-/// `aos bundle` exports the live plan's bundle, which verifies in the host's build with its publication part and toolchain line, until a later publication replaces it or a repair, re-attach or detach drops it.
+/// `aos bundle` exports the live plan's verifiable bundle until the window's code changes.
 #[test]
 fn the_bundle_ask_exports_the_live_plans_bundle_until_the_windows_code_changes() {
     let t0 = Instant::now();

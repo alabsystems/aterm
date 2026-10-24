@@ -12,7 +12,7 @@ mod scenarios;
 use aterm_vitals::jobs::wire::{exe_word, is_exe_word};
 use aterm_vitals::jobs::{
     Block, Class, Consumer, Demand, Findings, GateWord, HeldEpisode, JobKind, JobsView, MuFrom,
-    Named, NamedWait, ProcState, TierB, Verdict, WaitName, command_class,
+    Named, NamedWait, OWN_MIN, ProcState, TierB, Verdict, WaitName, command_class,
 };
 use scenarios::{TICK_MS, curl, follow_fds, pipe_end, sleeper, spinner, tcp_fd};
 use world::{OutFile, Proc, World, hint};
@@ -868,7 +868,11 @@ fn a_typed_sleep_poll_loop_is_one_polling_job_that_reaches_stuck() {
 #[test]
 fn a_block_learned_after_its_group_in_front_is_that_groups_one_job() {
     let mut w = World::new();
-    w.run_bg(1, sleeper(1300, "claude"));
+    for _ in 0..OWN_MIN {
+        w.jobs
+            .learn(&command_class("python3 train.py", JobKind::Shell), 9_000);
+    }
+    w.run_bg(1, sleeper(1300, "Python"));
     w.tab(1).tpgid = 1300;
     let v = w.tick(TICK_MS);
     assert_eq!(v.row("j1300").map(|r| r.kind), Some(JobKind::Shell));
@@ -877,7 +881,7 @@ fn a_block_learned_after_its_group_in_front_is_that_groups_one_job() {
         id: 14,
         started_ms: at,
         open: true,
-        command: "claude".to_owned(),
+        command: "python3 train.py".to_owned(),
         status: None,
         stopped: false,
     });
@@ -890,6 +894,12 @@ fn a_block_learned_after_its_group_in_front_is_that_groups_one_job() {
             .map(|r| r.id.as_str())
             .collect();
         assert_eq!(live, ["j1300"], "tick {n}: {:?}", v.rows);
+        assert_eq!(
+            v.row("j1300").and_then(|r| r.mu_from),
+            Some(MuFrom::Class),
+            "the block's command names it: {:?}",
+            v.rows
+        );
     }
     w.exit(1300, false);
     w.close_block(1, 2);
@@ -991,36 +1001,441 @@ fn a_stop_and_fg_no_tick_saw_keep_the_one_job_and_its_quiet_clock() {
 /// THE NEXT COMMAND TYPED AHEAD IS ITS OWN BLOCK'S JOB: a tick that read the
 /// tab before `D` gave the group the next command put in front to the block
 /// that was ending. Once the next block is the tab's, that block hands it
-/// over: the ended block's job exits with its status and the next command is
-/// the next block's job, no orphan.
+/// over: the ended block's job exits with its status (or parks, when its
+/// command was stopped) and the next command is the next block's job, no
+/// orphan.
 #[test]
 fn the_next_command_typed_ahead_is_its_own_blocks_job() {
+    for stopped in [false, true] {
+        let mut w = World::new();
+        w.run_fg(1, 7, "make", sleeper(1000, "make"));
+        let _ = run_to(&mut w, 4_000, |_, _| {});
+        if stopped {
+            w.p(1000).state = ProcState::Stopped;
+        } else {
+            w.exit(1000, false);
+        }
+        w.run_bg(1, sleeper(1001, "less"));
+        w.tab(1).tpgid = 1001;
+        let _ = w.tick(TICK_MS);
+        if stopped {
+            w.stop_block(1);
+        } else {
+            w.close_block(1, 0);
+        }
+        w.run_fg(1, 8, "less x", sleeper(1002, "unused"));
+        w.exit(1002, false);
+        w.tab(1).tpgid = 1001;
+        for _ in 0..2 {
+            let v = w.tick(TICK_MS);
+            let ended = v.row("b7").map(|r| (r.kind, r.verdict, r.exit));
+            if stopped {
+                assert!(
+                    ended.is_some_and(|(k, v, _)| k == JobKind::ShellBg && v != Verdict::Exited),
+                    "{:?}",
+                    v.rows
+                );
+            } else {
+                assert_eq!(
+                    ended,
+                    Some((JobKind::Shell, Verdict::Exited, Some(0))),
+                    "{:?}",
+                    v.rows
+                );
+            }
+            let row = v.row("b8").expect("the next command's job");
+            assert_ne!(row.verdict, Verdict::Exited, "{stopped}: {}", row.wire());
+            assert!(row.wire().contains(" exe=less "), "{}", row.wire());
+            assert!(
+                v.rows.iter().all(|r| !r.id.starts_with('o')),
+                "{:?}",
+                v.rows
+            );
+        }
+    }
+}
+
+/// A process the shell started in its own group (a process substitution:
+/// `exec > >(tee log)`, `less <(tail -f log)`), kept by an orphan or a parked
+/// job.
+fn in_the_shells_group(w: &mut World, pid: u32, name: &str) {
+    let shell = w.tab(1).tab.shell_pid;
+    let mut p = Proc::new(pid, shell, name);
+    p.pgid = shell;
+    p.sid = shell;
+    p.tty = true;
+    w.add(p);
+}
+
+/// A SURVIVOR IN THE SHELL'S OWN GROUP NEVER HIDES THE JOB `fg` RESUMES: the
+/// `tee` an earlier block left as an orphan is in every block's unit, and the
+/// block `fg` opens resumes the parked job by the group in front.
+#[test]
+fn a_survivor_in_the_shells_own_group_never_hides_the_job_fg_resumes() {
     let mut w = World::new();
-    w.run_fg(1, 7, "make", sleeper(1000, "make"));
+    in_the_shells_group(&mut w, 1100, "tee");
+    w.run_fg(1, 11, "make", sleeper(1000, "make"));
     let _ = run_to(&mut w, 4_000, |_, _| {});
     w.exit(1000, false);
-    w.run_bg(1, sleeper(1001, "less"));
-    w.tab(1).tpgid = 1001;
-    let _ = w.tick(TICK_MS);
     w.close_block(1, 0);
-    w.run_fg(1, 8, "less x", sleeper(1002, "unused"));
-    w.exit(1002, false);
-    w.tab(1).tpgid = 1001;
+    let _ = w.tick(TICK_MS);
+    w.run_fg(1, 12, "vim notes", sleeper(1200, "vim"));
+    let v = run_to(&mut w, 4_000, |_, _| {});
+    assert!(v.rows.iter().any(|r| r.id.starts_with('o')), "{:?}", v.rows);
+    w.p(1200).state = ProcState::Stopped;
+    w.stop_block(1);
+    let _ = w.tick(TICK_MS);
+    w.run_fg(1, 13, "fg", sleeper(1201, "unused"));
+    w.exit(1201, false);
+    w.tab(1).tpgid = 1200;
+    w.p(1200).state = ProcState::Sleeping;
+    let v = w.tick(TICK_MS);
+    assert!(v.row("b13").is_none(), "{:?}", v.rows);
+    let row = v.row("b12").expect("the resumed job");
+    assert_eq!(row.kind, JobKind::Shell, "{}", row.wire());
+}
+
+/// A debugger's child in a group of its own, in tab 1's terminal.
+fn inferior(w: &mut World, pid: u32, gdb: u32, state: ProcState) {
+    let shell = w.tab(1).tab.shell_pid;
+    let mut p = Proc::new(pid, gdb, "srv");
+    p.sid = shell;
+    p.tty = true;
+    p.state = state;
+    w.add(p);
+}
+
+/// A DEBUGGER'S CHILD IT PUTS IN FRONT IS ITS BLOCK'S: gdb's inferior, first
+/// seen stopped in the background, gets the terminal at `continue`, and the
+/// block's job (gdb) takes it in rather than giving way to it.
+#[test]
+fn a_debuggers_child_it_puts_in_front_is_its_blocks() {
+    let mut w = World::new();
+    w.run_fg(1, 2, "gdb ./srv", sleeper(1200, "gdb"));
+    let _ = run_to(&mut w, 4_000, |_, _| {});
+    inferior(&mut w, 1300, 1200, ProcState::Stopped);
+    let v = w.tick(TICK_MS);
+    assert!(v.row("j1300").is_some(), "{:?}", v.rows);
+    w.p(1300).state = ProcState::Sleeping;
+    w.tab(1).tpgid = 1300;
     for _ in 0..2 {
         let v = w.tick(TICK_MS);
-        assert_eq!(
-            v.row("b7").map(|r| (r.verdict, r.exit)),
-            Some((Verdict::Exited, Some(0)))
-        );
-        let row = v.row("b8").expect("the next command's job");
+        let row = v.row("b2").expect("gdb's job");
         assert_ne!(row.verdict, Verdict::Exited, "{}", row.wire());
-        assert!(row.wire().contains(" exe=less "), "{}", row.wire());
-        assert!(
-            v.rows.iter().all(|r| !r.id.starts_with('o')),
-            "{:?}",
+        assert_eq!(row.members, 3, "{}", row.wire());
+        assert!(v.row("j1300").is_none(), "{:?}", v.rows);
+    }
+}
+
+/// A DEBUGGER'S TRACED STOP IS NO STOP OF ITS JOB: the inferior stopped at a
+/// breakpoint leaves gdb in front as the block's last group, so a Ctrl-Z of
+/// gdb and `fg` no tick saw resume the one job.
+#[test]
+fn a_debuggers_traced_stop_keeps_it_the_group_fg_resumes() {
+    let mut w = World::new();
+    w.run_fg(1, 2, "gdb ./srv", sleeper(1200, "gdb"));
+    let _ = run_to(&mut w, 4_000, |_, _| {});
+    inferior(&mut w, 1300, 1200, ProcState::Sleeping);
+    w.tab(1).tpgid = 1300;
+    let _ = w.tick(TICK_MS);
+    w.p(1300).state = ProcState::Stopped;
+    w.tab(1).tpgid = 1200;
+    let _ = w.tick(TICK_MS);
+    w.stop_block(1);
+    w.run_fg(1, 3, "fg", sleeper(1201, "unused"));
+    w.exit(1201, false);
+    w.tab(1).tpgid = 1200;
+    let v = w.tick(TICK_MS);
+    assert!(v.row("b3").is_none(), "{:?}", v.rows);
+    let row = v.row("b2").expect("the one job");
+    assert_eq!(row.kind, JobKind::Shell, "{}", row.wire());
+}
+
+/// A PARKED JOB'S PROCESS IN THE SHELL'S OWN GROUP NEVER TAKES THE NEXT
+/// BLOCK: `less <(tail -f log)` parked by Ctrl-Z keeps the `tail` the shell
+/// started for it, and the next command is its own block's job.
+#[test]
+fn a_parked_jobs_process_in_the_shells_own_group_never_takes_the_next_block() {
+    let mut w = World::new();
+    in_the_shells_group(&mut w, 1100, "tail");
+    w.run_fg(1, 20, "less <(tail -f app.log)", sleeper(1200, "less"));
+    let _ = run_to(&mut w, 4_000, |_, _| {});
+    w.p(1200).state = ProcState::Stopped;
+    w.stop_block(1);
+    let v = run_to(&mut w, 10_000, |_, _| {});
+    assert_eq!(
+        v.row("b20").map(|r| r.verdict),
+        Some(Verdict::Parked),
+        "{:?}",
+        v.rows
+    );
+    w.run_fg(1, 21, "make", sleeper(1300, "make"));
+    let v = run_to(&mut w, 4_000, |_, _| {});
+    let row = v.row("b21").expect("make's own job");
+    assert!(row.wire().contains(" exe=make "), "{}", row.wire());
+    assert_eq!(
+        v.row("b20").map(|r| r.kind),
+        Some(JobKind::ShellBg),
+        "{:?}",
+        v.rows
+    );
+}
+
+/// A STOPPED MEMBER OUT OF FRONT IS NO HELD STOP: job control took the
+/// terminal from it. A Ctrl-Z'd job stays parked while the next command holds
+/// the terminal, and a member stopped while another of its job's groups runs
+/// in front (gdb's inferior at a breakpoint, the command bash moved on to
+/// past a stopped one of its list) is no stop of that job's, which is judged
+/// by what runs in front. None reads quiet or stuck however long it lasts.
+/// A stage stopped in the group in front (`kill -STOP` of `a` in `a | b`)
+/// holds it.
+#[test]
+fn a_stopped_member_out_of_front_is_no_held_stop() {
+    for setup in [
+        "parked beside make",
+        "gdb at a breakpoint",
+        "bash past a stop",
+        "a stage stopped in front",
+    ] {
+        let mut w = World::new();
+        let id = match setup {
+            "parked beside make" => {
+                w.run_fg(1, 12, "vim notes", sleeper(1200, "vim"));
+                let _ = run_to(&mut w, 4_000, |_, _| {});
+                w.p(1200).state = ProcState::Stopped;
+                w.stop_block(1);
+                let _ = w.tick(TICK_MS);
+                w.run_fg(1, 13, "make", sleeper(1300, "make"));
+                "b12"
+            }
+            "gdb at a breakpoint" => {
+                w.run_fg(1, 2, "gdb ./srv", sleeper(1200, "gdb"));
+                let _ = run_to(&mut w, 4_000, |_, _| {});
+                inferior(&mut w, 1300, 1200, ProcState::Sleeping);
+                w.tab(1).tpgid = 1300;
+                let _ = w.tick(TICK_MS);
+                w.p(1300).state = ProcState::Stopped;
+                w.tab(1).tpgid = 1200;
+                "b2"
+            }
+            "bash past a stop" => {
+                w.run_fg(1, 1, "vim a; vim b", sleeper(1010, "vim"));
+                let _ = run_to(&mut w, 4_000, |_, _| {});
+                w.p(1010).state = ProcState::Stopped;
+                w.run_bg(1, sleeper(1011, "vim"));
+                w.tab(1).tpgid = 1011;
+                "b1"
+            }
+            _ => {
+                w.run_fg(1, 3, "a | b", sleeper(1300, "a"));
+                let mut b = sleeper(1301, "b");
+                b.pgid = 1300;
+                w.run_bg(1, b);
+                let _ = run_to(&mut w, 4_000, |_, _| {});
+                w.p(1300).state = ProcState::Stopped;
+                "b3"
+            }
+        };
+        w.tty_mode(1, false, false);
+        let v = run_to(&mut w, 600_000, |_, _| {});
+        let row = v.row(id).expect("the job");
+        if setup == "parked beside make" {
+            assert_eq!(row.verdict, Verdict::Parked, "{setup}: {}", row.wire());
+        } else if setup == "a stage stopped in front" {
+            assert_eq!(
+                (row.class, row.stop.as_ref().map(|s| s.parked)),
+                (Class::Stopped, Some(false)),
+                "{setup}: {}",
+                row.wire()
+            );
+        } else {
+            assert_ne!(row.class, Class::Stopped, "{setup}: {}", row.wire());
+            assert!(
+                !matches!(row.verdict, Verdict::Quiet | Verdict::Stuck),
+                "{setup}: {}",
+                row.wire()
+            );
+        }
+    }
+}
+
+/// A `fg` TYPED AHEAD AND READ BEFORE THE LAST BLOCK'S `D` RESUMES THE
+/// PARKED JOB: a pass reads the tab while block 13 (`make`, over, swept or
+/// not before it read the processes) is still open and the parked vim
+/// already in front. Block 13's job ends with its row, and its status once
+/// `D` is read, and the resumed job is `fg`'s block's once that block is the
+/// tab's, keeping its id.
+#[test]
+fn a_typed_ahead_fg_read_before_the_last_blocks_d_resumes_the_parked_job() {
+    for swept in [false, true] {
+        let mut w = World::new();
+        w.run_fg(1, 12, "vim notes", sleeper(1200, "vim"));
+        let _ = run_to(&mut w, 4_000, |_, _| {});
+        w.p(1200).state = ProcState::Stopped;
+        w.stop_block(1);
+        let _ = w.tick(TICK_MS);
+        w.run_fg(1, 13, "make", sleeper(1300, "make"));
+        let _ = run_to(&mut w, 4_000, |_, _| {});
+        if swept {
+            w.unread.insert(1300);
+        } else {
+            w.exit(1300, false);
+        }
+        w.p(1200).state = ProcState::Sleeping;
+        w.tab(1).tpgid = 1200;
+        let v = w.tick(TICK_MS);
+        assert_eq!(
+            v.row("b13").map(|r| r.verdict),
+            Some(Verdict::Exited),
+            "{swept}: {:?}",
             v.rows
         );
+        w.exit(1300, false);
+        w.close_block(1, 0);
+        w.run_fg(1, 14, "fg", sleeper(1201, "unused"));
+        w.exit(1201, false);
+        w.tab(1).tpgid = 1200;
+        for _ in 0..2 {
+            let v = w.tick(TICK_MS);
+            assert!(v.row("b14").is_none(), "{swept}: {:?}", v.rows);
+            assert_eq!(
+                v.row("b13").map(|r| (r.verdict, r.exit)),
+                Some((Verdict::Exited, Some(0))),
+                "{swept}: {:?}",
+                v.rows
+            );
+            let row = v.row("b12").expect("the resumed job");
+            assert_eq!(
+                (row.kind, row.verdict == Verdict::Exited),
+                (JobKind::Shell, false),
+                "{swept}: {}",
+                row.wire()
+            );
+        }
     }
+}
+
+/// A COMMAND LIST THAT ENDS IN `fg` GIVES WAY PAST A SURVIVOR ITS RECIPE
+/// LEFT: `make test && fg` started a server with `&` in make's group, which
+/// launchd adopted when make exited, so nothing of the block's own command
+/// lives on in the shell's tree. The parked job takes the block, and the
+/// server is an orphan's.
+#[test]
+fn a_command_list_ending_in_fg_gives_way_past_a_survivor_its_recipe_left() {
+    let mut w = World::new();
+    let shell = w.tab(1).tab.shell_pid;
+    w.run_fg(1, 12, "vim notes", sleeper(1200, "vim"));
+    let _ = run_to(&mut w, 4_000, |_, _| {});
+    w.p(1200).state = ProcState::Stopped;
+    w.stop_block(1);
+    let _ = w.tick(TICK_MS);
+    w.run_fg(1, 13, "make test && fg", sleeper(1300, "make"));
+    let mut server = Proc::new(1301, 1300, "redis-server");
+    server.pgid = 1300;
+    server.sid = shell;
+    server.tty = true;
+    w.add(server);
+    let _ = run_to(&mut w, 4_000, |_, _| {});
+    w.exit(1300, false);
+    w.p(1301).ppid = 1;
+    w.p(1200).state = ProcState::Sleeping;
+    w.tab(1).tpgid = 1200;
+    let v = w.tick(TICK_MS);
+    let row = v.row("b12").expect("the resumed job");
+    assert_eq!(row.kind, JobKind::Shell, "{}", row.wire());
+    let v = w.tick(TICK_MS);
+    let row = v.row("b12").expect("the resumed job");
+    assert_eq!(
+        (row.kind, row.members),
+        (JobKind::Shell, 2),
+        "{}",
+        row.wire()
+    );
+    assert!(
+        v.rows
+            .iter()
+            .any(|r| r.id.starts_with('o') && r.wire().contains(" exe=redis-server ")),
+        "{:?}",
+        v.rows
+    );
+}
+
+/// `fg %1` READ BEFORE A STOP'S `D` NEVER MERGES ITS JOB INTO THE STOPPED
+/// ONE: a pass reads the tab while vim's block is still open, vim stopped
+/// behind it, and the job `fg %1` resumes already in front. Vim's job keeps
+/// its block until `D` parks it, and the resumed job is `fg %1`'s block's,
+/// keeping its id.
+#[test]
+fn fg_of_another_job_read_before_a_stops_d_never_merges_it_into_the_stopped_one() {
+    let mut w = World::new();
+    w.run_fg(1, 11, "curl x", curl(1100));
+    let _ = run_to(&mut w, 4_000, |_, _| {});
+    w.p(1100).state = ProcState::Stopped;
+    w.stop_block(1);
+    let _ = w.tick(TICK_MS);
+    w.run_fg(1, 12, "vim notes", sleeper(1200, "vim"));
+    let _ = run_to(&mut w, 4_000, |_, _| {});
+    w.p(1200).state = ProcState::Stopped;
+    w.p(1100).state = ProcState::Sleeping;
+    w.tab(1).tpgid = 1100;
+    let v = w.tick(TICK_MS);
+    assert!(
+        v.row("b11").is_some_and(|r| r.verdict != Verdict::Exited),
+        "{:?}",
+        v.rows
+    );
+    assert_eq!(v.row("b12").map(|r| r.pgid), Some(1200), "{:?}", v.rows);
+    w.stop_block(1);
+    w.run_fg(1, 13, "fg %1", sleeper(1201, "unused"));
+    w.exit(1201, false);
+    w.tab(1).tpgid = 1100;
+    let v = w.tick(TICK_MS);
+    assert!(v.row("b13").is_none(), "{:?}", v.rows);
+    assert_eq!(
+        v.row("b11").map(|r| (r.kind, r.verdict == Verdict::Exited)),
+        Some((JobKind::Shell, false)),
+        "{:?}",
+        v.rows
+    );
+    assert_eq!(
+        v.row("b12").map(|r| (r.kind, r.verdict)),
+        Some((JobKind::ShellBg, Verdict::Parked)),
+        "{:?}",
+        v.rows
+    );
+}
+
+/// BASH MOVING ON PAST A STOPPED COMMAND KEEPS THE NEXT ONE ITS BLOCK'S:
+/// bash sends one block per line, so after a Ctrl-Z of `vim a` in
+/// `vim a; vim b` the block stays open with `vim b` in front. Seen there at
+/// two passes, `vim b` is the block's last group in front though `vim a` is
+/// stopped behind it, so a Ctrl-Z of `vim b` and `fg` no tick saw resume the
+/// one job.
+#[test]
+fn bash_moving_on_past_a_stopped_command_keeps_the_next_one_its_blocks() {
+    let mut w = World::new();
+    w.run_fg(1, 1, "vim a; vim b", sleeper(1010, "vim"));
+    let _ = run_to(&mut w, 4_000, |_, _| {});
+    w.p(1010).state = ProcState::Stopped;
+    w.run_bg(1, sleeper(1011, "vim"));
+    w.tab(1).tpgid = 1011;
+    let _ = w.tick(TICK_MS);
+    let _ = w.tick(TICK_MS);
+    w.p(1011).state = ProcState::Stopped;
+    w.stop_block(1);
+    w.run_fg(1, 2, "fg", sleeper(1201, "unused"));
+    w.exit(1201, false);
+    w.tab(1).tpgid = 1011;
+    w.p(1011).state = ProcState::Sleeping;
+    let v = w.tick(TICK_MS);
+    assert!(v.row("b2").is_none(), "{:?}", v.rows);
+    let row = v.row("b1").expect("the one job");
+    assert_eq!(
+        (row.kind, row.verdict == Verdict::Exited),
+        (JobKind::Shell, false),
+        "{}",
+        row.wire()
+    );
 }
 
 /// A COMMAND TYPED AHEAD OF ONE NO TICK SAW IN FRONT IS ITS OWN BLOCK'S JOB:
@@ -1101,29 +1516,54 @@ fn ctrl_z_and_bg_no_tick_saw_park_the_one_job() {
     }
 }
 
-/// `fg` NEVER NAMES THE JOB IT RESUMES: a tick may see a parked job's group
-/// in front before the reader fed `fg`'s `C`, even the tick after the one
-/// that saw the stop. Once the `fg` block is learned
-/// the job keeps its own command, so it is never judged by (nor teaches) the
-/// `fg` command's class.
+/// `fg` NEVER NAMES THE JOB IT RESUMES: not a parked block's job (a tick may
+/// see its group in front before the reader fed `fg`'s `C`, even the tick
+/// after the one that saw the stop), nor a `cmd &` job, nor a group a tick saw
+/// in front before any block and then stopped. The job keeps its own command,
+/// so it is never judged by (nor teaches) the `fg` command's class.
 #[test]
 fn fg_never_names_the_job_it_resumes() {
-    let mut w = World::new();
-    w.jobs.learn(&command_class("fg", JobKind::Shell), 8_000);
-    w.run_fg(1, 12, "curl x", curl(1200));
-    let _ = run_to(&mut w, 4_000, |_, _| {});
-    w.p(1200).state = ProcState::Stopped;
-    w.stop_block(1);
-    let _ = w.tick(TICK_MS);
-    w.p(1200).state = ProcState::Sleeping;
-    w.tab(1).tpgid = 1200;
-    let _ = w.tick(TICK_MS);
-    w.run_fg(1, 13, "fg", sleeper(1201, "unused"));
-    w.exit(1201, false);
-    w.tab(1).tpgid = 1200;
-    let v = run_to(&mut w, 60_000, |_, _| {});
-    let row = v.row("b12").expect("the resumed job");
-    assert_eq!(row.mu_from, Some(MuFrom::Prior), "{}", row.wire());
+    for setup in ["parked block", "cmd &", "stopped before a block"] {
+        let mut w = World::new();
+        for _ in 0..OWN_MIN {
+            w.jobs.learn(&command_class("fg", JobKind::Shell), 8_000);
+        }
+        let id = match setup {
+            "parked block" => {
+                w.run_fg(1, 12, "curl x", curl(1200));
+                let _ = run_to(&mut w, 4_000, |_, _| {});
+                w.p(1200).state = ProcState::Stopped;
+                w.stop_block(1);
+                let _ = w.tick(TICK_MS);
+                w.p(1200).state = ProcState::Sleeping;
+                w.tab(1).tpgid = 1200;
+                let _ = w.tick(TICK_MS);
+                "b12"
+            }
+            "cmd &" => {
+                w.run_bg(1, curl(1200));
+                let _ = w.tick(TICK_MS);
+                "j1200"
+            }
+            _ => {
+                w.run_bg(1, curl(1200));
+                w.tab(1).tpgid = 1200;
+                let _ = w.tick(TICK_MS);
+                w.p(1200).state = ProcState::Stopped;
+                let shell = w.tab(1).tab.shell_pid;
+                w.tab(1).tpgid = shell;
+                let _ = w.tick(TICK_MS);
+                w.p(1200).state = ProcState::Sleeping;
+                "j1200"
+            }
+        };
+        w.run_fg(1, 13, "fg", sleeper(1201, "unused"));
+        w.exit(1201, false);
+        w.tab(1).tpgid = 1200;
+        let v = run_to(&mut w, 60_000, |_, _| {});
+        let row = v.row(id).expect("the resumed job");
+        assert_eq!(row.mu_from, Some(MuFrom::Prior), "{setup}: {}", row.wire());
+    }
 }
 
 /// A BLOCK'S OWN `C` NEVER VOIDS ITS JOB'S LINES: the reader may feed `C`
@@ -1170,55 +1610,111 @@ fn a_background_job_fg_resumed_keeps_its_group_through_a_stop_and_fg_no_tick_saw
 
 /// A STOP AND `fg` NO TICK SAW KEEP AN `a && b` BLOCK ONE JOB: the stopped
 /// command is the block's second group, not its first, and is in front
-/// again under the `fg` block.
+/// again under the `fg` block, also when a tick saw the shell take the
+/// terminal back before the reader fed the stop's `D`.
 #[test]
 fn a_stop_and_fg_no_tick_saw_keep_a_later_command_of_a_block_its_jobs() {
-    let mut w = World::new();
-    w.run_fg(1, 51, "make && make test", sleeper(1000, "make"));
-    let _ = run_to(&mut w, 6_000, |_, _| {});
-    w.exit(1000, false);
-    let shell = w.tab(1).tab.shell_pid;
-    w.tab(1).tpgid = shell;
-    let _ = w.tick(TICK_MS);
-    w.run_bg(1, sleeper(1001, "make"));
-    w.tab(1).tpgid = 1001;
-    let _ = w.tick(TICK_MS);
-    w.stop_block(1);
-    w.run_fg(1, 52, "fg", sleeper(1002, "unused"));
-    w.exit(1002, false);
-    w.tab(1).tpgid = 1001;
-    let v = w.tick(TICK_MS);
-    assert!(v.row("b52").is_none(), "{:?}", v.rows);
-    let row = v.row("b51").expect("the one job");
-    assert_ne!(row.verdict, Verdict::Exited, "{}", row.wire());
+    for before_d in [false, true] {
+        let mut w = World::new();
+        w.run_fg(1, 51, "make && make test", sleeper(1000, "make"));
+        let _ = run_to(&mut w, 6_000, |_, _| {});
+        w.exit(1000, false);
+        let shell = w.tab(1).tab.shell_pid;
+        w.tab(1).tpgid = shell;
+        let _ = w.tick(TICK_MS);
+        w.run_bg(1, sleeper(1001, "make"));
+        w.tab(1).tpgid = 1001;
+        let _ = w.tick(TICK_MS);
+        if before_d {
+            w.p(1001).state = ProcState::Stopped;
+            w.tab(1).tpgid = shell;
+            let _ = w.tick(TICK_MS);
+            w.p(1001).state = ProcState::Sleeping;
+        }
+        w.stop_block(1);
+        w.run_fg(1, 52, "fg", sleeper(1002, "unused"));
+        w.exit(1002, false);
+        w.tab(1).tpgid = 1001;
+        let v = w.tick(TICK_MS);
+        assert!(v.row("b52").is_none(), "{before_d}: {:?}", v.rows);
+        let row = v.row("b51").expect("the one job");
+        assert_ne!(row.verdict, Verdict::Exited, "{before_d}: {}", row.wire());
+    }
 }
 
-/// `fg`'S NOTICE AFTER A PASS'S CLOCK IS NONE OF THE JOB'S PROGRESS: the
-/// pass that resumes a parked job can take its clock between `fg`'s `C` and
-/// the shell's notice, so the notice lands in the job's next tick, which
-/// credits it nothing either.
+/// `fg`'S BLOCK READ BEFORE THE SHELL HANDS THE TERMINAL OVER RESUMES THE
+/// PARKED JOB: a tick finds `fg`'s block with the shell alone in front, and
+/// the tick that sees the parked group in front makes it that block's job,
+/// one job that takes the lines it prints.
 #[test]
-fn fgs_notice_after_the_resuming_pass_clock_is_none_of_the_jobs_progress() {
+fn fgs_block_read_before_the_shell_hands_the_terminal_over_resumes_the_parked_job() {
     let mut w = World::new();
     w.run_fg(1, 12, "curl x", curl(1200));
     let _ = run_to(&mut w, 4_000, |_, _| {});
     w.p(1200).state = ProcState::Stopped;
     w.stop_block(1);
     let _ = w.tick(TICK_MS);
-    let c = w.at + 1;
     w.run_fg(1, 13, "fg", sleeper(1201, "unused"));
     w.exit(1201, false);
-    w.tab(1).tab.block.as_mut().expect("fg's block").started_ms = c;
-    w.tab(1).tab.shell_ms = Some(c);
+    let shell = w.tab(1).tab.shell_pid;
+    w.tab(1).tpgid = shell;
+    let _ = w.tick(TICK_MS);
     w.tab(1).tpgid = 1200;
     w.p(1200).state = ProcState::Sleeping;
-    let _ = w.tick(TICK_MS);
-    w.advance(5);
-    w.line(1);
-    w.advance(TICK_MS - 5);
-    let v = w.observe();
+    let v = run_to(&mut w, 10_000, |w, _| w.line(1));
+    assert!(v.row("b13").is_none(), "{:?}", v.rows);
     let row = v.row("b12").expect("the resumed job");
-    assert_ne!(row.class, Class::Running, "{}", row.wire());
+    assert_eq!(
+        (row.kind, row.class),
+        (JobKind::Shell, Class::Running),
+        "{}",
+        row.wire()
+    );
+}
+
+/// `fg`'S NOTICE AFTER A PASS'S CLOCK IS NONE OF THE JOB'S PROGRESS: the
+/// pass that resumes a parked job can take its clock between `fg`'s `C` and
+/// the shell's notice, so the notice lands in the job's next tick, which
+/// credits it nothing either, also when the pass read the group in front
+/// well after its clock (a slow sweep). A line the job prints after the
+/// notice is its own however long that next tick comes after (a slow
+/// cadence).
+#[test]
+fn fgs_notice_after_the_resuming_pass_clock_is_none_of_the_jobs_progress() {
+    for (lag, notice, own_line) in [(0, 5, false), (1_500, 1_200, false), (0, 5, true)] {
+        let mut w = World::new();
+        w.run_fg(1, 12, "curl x", curl(1200));
+        let _ = run_to(&mut w, 4_000, |_, _| {});
+        w.p(1200).state = ProcState::Stopped;
+        w.stop_block(1);
+        let _ = w.tick(TICK_MS);
+        let c = w.at + 1;
+        w.run_fg(1, 13, "fg", sleeper(1201, "unused"));
+        w.exit(1201, false);
+        w.tab(1).tab.block.as_mut().expect("fg's block").started_ms = c;
+        w.tab(1).tab.shell_ms = Some(c);
+        w.tab(1).tpgid = 1200;
+        w.p(1200).state = ProcState::Sleeping;
+        w.read_lag_ms = lag;
+        let _ = w.tick(TICK_MS);
+        w.read_lag_ms = 0;
+        w.advance(notice);
+        w.line(1);
+        if own_line {
+            w.advance(30_000);
+            w.line(1);
+        } else {
+            w.advance(TICK_MS - notice);
+        }
+        let v = w.observe();
+        let row = v.row("b12").expect("the resumed job");
+        assert_eq!(
+            row.class == Class::Running,
+            own_line,
+            "{own_line}: {}",
+            row.wire()
+        );
+    }
 }
 
 #[test]

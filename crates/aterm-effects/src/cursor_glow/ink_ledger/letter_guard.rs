@@ -70,9 +70,19 @@ pub(crate) struct LetterGuard {
     row: Vec<(Stream, u32)>,
     /// Of those, the lights that reach the cell being read.
     cell: Vec<(Stream, u32)>,
-    /// The cell's ring box composited: ground, then each pixel's luminance.
-    ground: Vec<u32>,
+    /// [`Self::cell`] bucketed by the ring box pixel each light covers, each
+    /// bucket in `cell`'s order: pixel `k`'s lights are
+    /// `by_px[px_at[k]..px_at[k + 1]]`. A ribbon's quads are 1 px tall and a
+    /// few wide, so a pixel meets a handful of the cell's hundreds of lights.
+    by_px: Vec<(Stream, u32)>,
+    px_at: Vec<u32>,
+    /// [`Self::index_pixels`]'s fill cursor per pixel.
+    px_fill: Vec<u32>,
+    /// The ring box's ground luminance per pixel, and per pixel row the
+    /// least and greatest of it within [`RING`] columns.
     lum: Vec<f32>,
+    ring_lo: Vec<f32>,
+    ring_hi: Vec<f32>,
     /// An additive cell's whole light per ring-box pixel: under the ink
     /// (ground only) and over it (ground and ink), per channel.
     lift_under: Vec<[u16; 3]>,
@@ -139,26 +149,21 @@ fn over_cap(color: u32, s: f32) -> Option<u8> {
 }
 
 impl LetterGuard {
-    /// Composite `px` (window pixel `(x, y)`) under the cell's lights at share
-    /// `s`: the under-text lights when `ground`, then the over-text quads and
-    /// the halos.
+    /// Composite `px` (window pixel `(x, y)`, ring box pixel `k`) under the
+    /// cell's lights at share `s`: the under-text lights when `ground`, then
+    /// the over-text quads and the halos.
     #[inline]
     fn composite(
         &self,
         mut px: u32,
-        (x, y): (i32, i32),
+        (x, y, k): (i32, i32, usize),
         ground: bool,
         s: f32,
         streams: (&[GlowQuad], &[GlowQuad], &[RainHalo]),
     ) -> u32 {
         let (under, over, halos) = streams;
-        let inside = |x0: u16, y0: u16, w: u16, h: u16| {
-            x >= i32::from(x0)
-                && x < i32::from(x0) + i32::from(w)
-                && y >= i32::from(y0)
-                && y < i32::from(y0) + i32::from(h)
-        };
-        for &(stream, i) in &self.cell {
+        let lights = &self.by_px[self.px_at[k] as usize..self.px_at[k + 1] as usize];
+        for &(stream, i) in lights {
             let i = i as usize;
             match stream {
                 Stream::Under | Stream::Over => {
@@ -170,17 +175,11 @@ impl LetterGuard {
                     } else {
                         &over[i]
                     };
-                    if !inside(q.x, q.y, q.w, q.h) {
-                        continue;
-                    }
                     let (c, a) = quad_at(q, x, s);
                     px = aterm_render::over_premul(px, c, a);
                 }
                 Stream::HaloAdd => {
                     let h = &halos[i];
-                    if !inside(h.x, h.y, h.w, h.h) {
-                        continue;
-                    }
                     let wt = halo_wt(h, x, y);
                     if wt > 0 {
                         let c = if s >= 1.0 {
@@ -193,9 +192,6 @@ impl LetterGuard {
                 }
                 Stream::HaloOver => {
                     let h = &halos[i];
-                    if !inside(h.x, h.y, h.w, h.h) {
-                        continue;
-                    }
                     let wt = halo_wt(h, x, y);
                     if let Some(cap) = over_cap(h.color, s)
                         && wt > 0
@@ -208,8 +204,6 @@ impl LetterGuard {
         px
     }
 
-    /// The worst ratio a solid ink pixel of the cell reads against the
-    /// ground within [`RING`] of it, with the cell's lights at share `s`.
     /// Fill [`Self::lift_under`]/[`Self::lift_over`] with the cell's whole
     /// light, when every light that reaches it adds (no source-over light):
     /// then a share's composite is the ground or ink plus that share of it,
@@ -284,19 +278,92 @@ impl LetterGuard {
         true
     }
 
-    fn worst(
+    /// Fill [`Self::by_px`] for `j`'s ring box: a stable counting sort of
+    /// [`Self::cell`] by the pixels each light covers, so
+    /// [`Self::composite`] visits exactly a pixel's own lights, in the order
+    /// it would meet them in `cell`.
+    fn index_pixels(
+        &mut self,
+        j: Judge,
+        (under, over, halos): (&[GlowQuad], &[GlowQuad], &[RainHalo]),
+    ) {
+        let (w, h) = ((j.x1 - j.x0).max(0), (j.y1 - j.y0).max(0));
+        let cover = |&(stream, i): &(Stream, u32)| {
+            let i = i as usize;
+            let (x, y, qw, qh) = match stream {
+                Stream::Under => (under[i].x, under[i].y, under[i].w, under[i].h),
+                Stream::Over => (over[i].x, over[i].y, over[i].w, over[i].h),
+                Stream::HaloAdd | Stream::HaloOver => {
+                    (halos[i].x, halos[i].y, halos[i].w, halos[i].h)
+                }
+            };
+            let span = |at: u16, len: u16, o: i32, n: i32| {
+                let lo = (i32::from(at) - o).clamp(0, n);
+                let hi = (i32::from(at) + i32::from(len) - o).clamp(0, n);
+                lo as usize..hi as usize
+            };
+            (span(x, qw, j.x0, w), span(y, qh, j.y0, h))
+        };
+        let (w, n) = (w as usize, (w * h) as usize);
+        self.px_at.clear();
+        self.px_at.resize(n + 1, 0);
+        for light in &self.cell {
+            let (xs, ys) = cover(light);
+            for y in ys {
+                for n in &mut self.px_at[y * w + xs.start + 1..y * w + xs.end + 1] {
+                    *n += 1;
+                }
+            }
+        }
+        for k in 0..n {
+            self.px_at[k + 1] += self.px_at[k];
+        }
+        self.by_px.clear();
+        self.by_px
+            .resize(self.px_at[n] as usize, (Stream::Under, 0));
+        let mut next = std::mem::take(&mut self.px_fill);
+        next.clear();
+        next.extend_from_slice(&self.px_at[..n]);
+        for &light in &self.cell {
+            let (xs, ys) = cover(&light);
+            for y in ys {
+                for at in &mut next[y * w + xs.start..y * w + xs.end] {
+                    self.by_px[*at as usize] = light;
+                    *at += 1;
+                }
+            }
+        }
+        self.px_fill = next;
+    }
+
+    /// Whether every solid ink pixel of the cell reads at least `bar`
+    /// against the ground within [`RING`] of it, with the cell's lights at
+    /// share `s`: the ground's rows composite in order, each ink row is read
+    /// once the ring's last ground row is in, and the first pixel under the
+    /// bar settles it.
+    fn holds(
         &mut self,
         j: Judge,
         s: f32,
+        bar: f32,
         streams: (&[GlowQuad], &[GlowQuad], &[RainHalo]),
         additive: bool,
         table: &crate::color_math::RelativeLuminanceTable,
-    ) -> f32 {
+    ) -> bool {
         let (w, h) = ((j.x1 - j.x0) as usize, (j.y1 - j.y0) as usize);
-        let mut ground = std::mem::take(&mut self.ground);
+        let r = RING as usize;
+        if w <= 2 * r || h <= 2 * r {
+            return true;
+        }
         let mut lum = std::mem::take(&mut self.lum);
-        ground.clear();
+        let mut ring_lo = std::mem::take(&mut self.ring_lo);
+        let mut ring_hi = std::mem::take(&mut self.ring_hi);
         lum.clear();
+        ring_lo.clear();
+        ring_hi.clear();
+        lum.resize(w * h, 0.0);
+        ring_lo.resize(w * h, 0.0);
+        ring_hi.resize(w * h, 0.0);
         let lift = |c: u32, a: [u16; 3], b: [u16; 3]| {
             let ch = |sh: u32, k: usize| {
                 let l = (f32::from(a[k]) + f32::from(b[k])) * s;
@@ -304,42 +371,55 @@ impl LetterGuard {
             };
             (ch(16, 0) << 16) | (ch(8, 1) << 8) | ch(0, 2)
         };
-        for y in j.y0..j.y1 {
-            for x in j.x0..j.x1 {
+        let ratio = |a: f32, b: f32| (a.max(b) + 0.05) / (a.min(b) + 0.05);
+        let mut holds = true;
+        'rows: for gy in 0..h {
+            let row = gy * w;
+            for x in 0..w {
                 let g = if additive {
-                    let at = (y - j.y0) as usize * w + (x - j.x0) as usize;
-                    lift(j.ground, self.lift_under[at], self.lift_over[at])
+                    lift(j.ground, self.lift_under[row + x], self.lift_over[row + x])
                 } else {
-                    self.composite(j.ground, (x, y), true, s, streams)
+                    let at = (j.x0 + x as i32, j.y0 + gy as i32, row + x);
+                    self.composite(j.ground, at, true, s, streams)
                 };
-                ground.push(g);
-                lum.push(crate::color_math::relative_luminance_with(table, g));
+                lum[row + x] = crate::color_math::relative_luminance_with(table, g);
             }
-        }
-        let mut worst = f32::INFINITY;
-        let r = RING as usize;
-        for y in r..h.saturating_sub(r) {
-            for x in r..w.saturating_sub(r) {
+            for x in r..w - r {
+                let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+                for &l in &lum[row + x - r..=row + x + r] {
+                    lo = lo.min(l);
+                    hi = hi.max(l);
+                }
+                ring_lo[row + x] = lo;
+                ring_hi[row + x] = hi;
+            }
+            let Some(y) = gy.checked_sub(2 * r) else {
+                continue;
+            };
+            let y = y + r;
+            for x in r..w - r {
                 let ink = if additive {
                     lift(j.ink, [0; 3], self.lift_over[y * w + x])
                 } else {
-                    self.composite(j.ink, (j.x0 + x as i32, j.y0 + y as i32), false, s, streams)
+                    let at = (j.x0 + x as i32, j.y0 + y as i32, y * w + x);
+                    self.composite(j.ink, at, false, s, streams)
                 };
                 let li = crate::color_math::relative_luminance_with(table, ink);
                 let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
                 for yy in y - r..=y + r {
-                    for &l in &lum[yy * w + x - r..=yy * w + x + r] {
-                        lo = lo.min(l);
-                        hi = hi.max(l);
-                    }
+                    lo = lo.min(ring_lo[yy * w + x]);
+                    hi = hi.max(ring_hi[yy * w + x]);
                 }
-                let ratio = |a: f32, b: f32| (a.max(b) + 0.05) / (a.min(b) + 0.05);
-                worst = worst.min(ratio(li, lo)).min(ratio(li, hi));
+                if ratio(li, lo) < bar || ratio(li, hi) < bar {
+                    holds = false;
+                    break 'rows;
+                }
             }
         }
-        self.ground = ground;
         self.lum = lum;
-        worst
+        self.ring_lo = ring_lo;
+        self.ring_hi = ring_hi;
+        holds
     }
 
     /// The largest share of the cell's lights that keeps the letter's `bar`
@@ -352,13 +432,16 @@ impl LetterGuard {
         table: &crate::color_math::RelativeLuminanceTable,
     ) -> f32 {
         let additive = self.prepare(j, streams);
-        if self.worst(j, 1.0, streams, additive, table) >= bar {
+        if !additive {
+            self.index_pixels(j, streams);
+        }
+        if self.holds(j, 1.0, bar, streams, additive, table) {
             return 1.0;
         }
         let (mut lo, mut hi) = (0.0f32, 1.0f32);
         for _ in 0..STEPS {
             let mid = 0.5 * (lo + hi);
-            if self.worst(j, mid, streams, additive, table) >= bar {
+            if self.holds(j, mid, bar, streams, additive, table) {
                 lo = mid;
             } else {
                 hi = mid;

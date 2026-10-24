@@ -6178,14 +6178,11 @@ fn fold_video_deadlines(rec: Option<&VideoRec>, mut deadline: Option<Instant>) -
 
 fn fold_owned_deadline(
     deadline: &mut Option<Instant>,
-    owner: &mut metrics::DeadlineOwner,
+    owner: &mut deadline_heal::DeadlineFold,
     candidate: Instant,
     candidate_owner: metrics::DeadlineOwner,
 ) {
-    if deadline.is_none_or(|current| candidate < current) {
-        *deadline = Some(candidate);
-        *owner = candidate_owner;
-    }
+    owner.fold(deadline, candidate, candidate_owner);
 }
 
 #[allow(
@@ -7354,14 +7351,9 @@ impl WindowState {
         self.input_scratch.cursor_fill_override = None;
         self.input_scratch.word_decorations.clear();
         self.input_scratch.ink.clear();
-        self.input_scratch.cat_quads.clear();
-        self.input_scratch.cat_atlas = None;
-        self.input_scratch.free_sprites.clear();
-        self.input_scratch.free_atlas = None;
         self.input_scratch.nova_add.clear();
-        self.input_scratch.rain_quads.clear();
-        self.input_scratch.rain_atlas = None;
-        self.input_scratch.rain_add.clear();
+        self.fx.withdraw_sprites(&mut self.input_scratch);
+        self.fx.withdraw_rain(&mut self.input_scratch);
 
         self.park_terminal_effect_scheduler();
         self.next_rain_tick = None;
@@ -9996,7 +9988,7 @@ impl App {
         &self,
         now: Instant,
         deadline: &mut Option<Instant>,
-        owner: &mut metrics::DeadlineOwner,
+        owner: &mut deadline_heal::DeadlineFold,
     ) {
         // Setup owns the decision to release the permission lanes. Its timer
         // and progress polling must keep waking while those lanes are held.
@@ -10137,7 +10129,7 @@ impl App {
             .devtools_watch
             .take_return_prime(list_read, row.grant())
         {
-            let _ = self.devtools_helper.refresh_verdict();
+            self.refresh_devtools_verdict();
         }
         if self.apply_devtools_step(step) {
             let _ = self.hand_devtools_to_owner(devtools_helper::Origin::Automatic);
@@ -10150,14 +10142,13 @@ impl App {
             devtools_watch::Step::Clear => {
                 self.except_clear(crate::message_reporters::DEVTOOLS_KEY);
                 if self.devtools_watch.take_refresh() {
-                    let _ = self.devtools_helper.refresh_verdict();
+                    self.refresh_devtools_verdict();
                 }
                 false
             }
             devtools_watch::Step::Raise { hand_over } => {
-                self.except(&crate::message_reporters::devtools_entry(
-                    self.devtools_step(),
-                ));
+                let entry = self.devtools_entry_now();
+                self.except(&entry);
                 hand_over
             }
         }
@@ -10464,7 +10455,7 @@ impl App {
                         self.consent.invalidate_devtools();
                         self.devtools_watch.note_handed_over();
                         if self.devtools_watch.note_switched_on() {
-                            let _ = self.devtools_helper.refresh_verdict();
+                            self.refresh_devtools_verdict();
                         }
                     }
                     if asks.list_terminal {
@@ -11398,7 +11389,8 @@ impl App {
             ) {
                 self.flush_messages_log_within(messages_host::MESSAGES_FLUSH_UI_WAIT);
             }
-            self.except(&message_reporters::devtools_entry(self.devtools_step()));
+            let entry = self.devtools_entry_now();
+            self.except(&entry);
         }
         self.note_devtools_outcome_on(&waiting.settings, out, unlisted);
     }
@@ -13855,7 +13847,7 @@ impl App {
             boot_health_confirmation_backoff: BOOT_HEALTH_RETRY_MIN,
             seamless_position: None,
             level_up: None,
-            messages: aterm_messages::MessageCenter::new(
+            messages: crate::messages_host::new_center(
                 aterm_messages::MessageLog::empty(),
                 Instant::now(),
             ),
@@ -16332,7 +16324,7 @@ impl ApplicationHandler<Wake> for App {
         self.service_due_scroll_motion(now);
         let output_hold_due = self.release_output_holds(Instant::now());
         let mut deadline: Option<Instant> = None;
-        let mut deadline_owner = metrics::DeadlineOwner::None;
+        let mut deadline_owner = deadline_heal::DeadlineFold::default();
         if let Some(candidate) = output_hold_due {
             fold_owned_deadline(
                 &mut deadline,
@@ -17085,9 +17077,11 @@ impl ApplicationHandler<Wake> for App {
             );
         }
         let now = Instant::now();
-        let heal = self.deadline_healer.heal(deadline_owner, deadline, now);
-        metrics::note_deadline(deadline_owner, deadline, now, heal);
-        let deadline = heal.armed;
+        let heal = self
+            .deadline_healer
+            .heal(deadline_owner.owner(), deadline, now);
+        metrics::note_deadline(deadline_owner.owner(), deadline, now, heal);
+        let deadline = deadline_owner.armed(heal, now);
         match deadline {
             Some(d) => el.set_control_flow(ControlFlow::WaitUntil(d)),
             None => el.set_control_flow(ControlFlow::Wait),
@@ -25641,7 +25635,7 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
         level_up: None,
         messages: {
             let now = Instant::now();
-            let mut center = aterm_messages::MessageCenter::new(messages_ring, now);
+            let mut center = crate::messages_host::new_center(messages_ring, now);
             if !headless {
                 let _ = center.adopt_digest(messages_host::wall_stamp_now(), now);
                 let _ = center.settle_digest(messages_host::wall_stamp_now(), now);

@@ -6,13 +6,11 @@
 use super::*;
 use crate::supervise::occupancy::fault::{self, Fault};
 
-/// This session's PTY child.
 const PTY: AgentId = AgentId {
     pid: 100,
     birth_us: 1_000,
 };
 
-/// The hosted agent, the PTY child's child.
 const AGENT: AgentId = AgentId {
     pid: 200,
     birth_us: 2_000,
@@ -26,7 +24,6 @@ const fn link(pid: u32, birth_us: i64, ppid: u32) -> ProcLink {
     }
 }
 
-/// A build script the agent runs, up to launchd.
 fn under_the_agent() -> Vec<ProcLink> {
     vec![
         link(400, 4_000, 300),
@@ -37,8 +34,6 @@ fn under_the_agent() -> Vec<ProcLink> {
     ]
 }
 
-/// A DESCENDANT OF THE TAB IS ADMITTED, for the hosted agent where one is named, else for the PTY
-/// child's own child, else for the PTY child itself (the peer is the tab's program).
 #[test]
 fn a_descendant_of_the_pty_child_is_admitted() {
     let chain = under_the_agent();
@@ -52,8 +47,6 @@ fn a_descendant_of_the_pty_child_is_admitted() {
     );
 }
 
-/// A CHAIN UNDER ANOTHER SESSION'S PTY CHILD IS ANOTHER SESSION'S, and so is one under no tab.
-/// NEGATIVE CONTROL: `AwaitFromAnyone` admits it.
 #[test]
 fn a_chain_under_another_sessions_pty_child_is_refused() {
     let other = vec![link(910, 9_100, 900), link(900, 9_000, 1), link(1, 0, 0)];
@@ -69,18 +62,12 @@ fn a_chain_under_another_sessions_pty_child_is_refused() {
     assert_eq!(admitted, Ok(AGENT));
 }
 
-/// A CONNECTION WITH NO KERNEL PEER (the bridge, a relay) proves nothing.
 #[test]
 fn no_peer_is_refused() {
     assert_eq!(prove(&[], PTY, Some(AGENT)), Err(DeclarerRefusal::NoPeer));
     assert_eq!(prove(&[], PTY, None), Err(DeclarerRefusal::NoPeer));
 }
 
-/// A CHAIN THAT DOES NOT HOLD UP IS NOT IN THE TREE: a parent born after its child (its pid
-/// reused), whether or not the host names its agent, and a stranger whose dead parent's pid the
-/// PTY child took; a link whose parent is not the next, the tab's pid reborn, and a process in
-/// the tab that is not under the agent it hosts (the person's own shell). CONTROL: the chain as
-/// recorded is admitted.
 #[test]
 fn a_child_born_before_its_parent_is_not_in_the_tree() {
     let mut reused = under_the_agent();

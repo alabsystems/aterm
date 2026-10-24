@@ -68,8 +68,7 @@ pub fn output_until_complete_stdout(
 /// Runs `cmd` with `stdin` until `deadline`, requiring complete stdout up to [`OUTPUT_KEEP`].
 ///
 /// # Errors
-/// [`CompleteOutputError`] for the child's refusal, stdout read failure, overflow or
-/// missing EOF. Existing diagnostic capture APIs and their behavior are unchanged.
+/// [`CompleteOutputError`] for a child refusal, stdout read failure, overflow, or missing EOF.
 pub fn output_until_complete_stdout_from(
     cmd: &mut Command,
     stdin: Stdio,
@@ -145,7 +144,6 @@ pub fn output_until_complete_stdout_from(
     })
 }
 
-/// Kill as the diagnostic path does, then use the existing bounded reap loop.
 fn end_bounded(child: &mut Child) {
     #[cfg(unix)]
     super::children::kill_group(child);
@@ -154,14 +152,12 @@ fn end_bounded(child: &mut Child) {
     reap_within(child, None, Instant::now() + Duration::from_secs(60));
 }
 
-/// A result exists only after the actual Read observed EOF (or an explicit read error).
 struct CompleteDrain {
     ended: mpsc::Receiver<Result<Vec<u8>, CompleteOutputError>>,
     pipe: Option<PipeEnd>,
 }
 
 impl CompleteDrain {
-    /// The stdout, once its reader saw EOF; a refusal when `grace` stops it first.
     fn collect(self, grace: &Grace) -> Result<Vec<u8>, CompleteOutputError> {
         let ended = match self
             .ended
@@ -177,7 +173,6 @@ impl CompleteDrain {
     }
 }
 
-/// The same bounded read loop the strict child path uses, over an injected Read in tests.
 fn read_stdout(mut stream: impl Read) -> Result<Vec<u8>, CompleteOutputError> {
     let mut bytes = Vec::new();
     let mut too_large = false;

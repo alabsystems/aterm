@@ -5,9 +5,7 @@
 
 use core::fmt;
 
-/// Nanoseconds in a second.
 const NS: i128 = 1_000_000_000;
-/// Microseconds in a second.
 const US: i128 = 1_000_000;
 
 /// `CLOCK_REALTIME`.
@@ -71,7 +69,6 @@ pub(crate) fn parse_offset(text: &[u8]) -> Option<i64> {
     Some(if negative { -ns } else { ns })
 }
 
-/// `value` clamped into an `i64`.
 fn clamp(value: i128) -> i64 {
     i64::try_from(value).unwrap_or(if value < 0 { i64::MIN } else { i64::MAX })
 }
@@ -131,7 +128,6 @@ impl<const N: usize> Text<N> {
     }
 
     /// Append `bytes`, or nothing when they do not fit.
-    ///
     /// # Errors
     /// They do not fit.
     pub(crate) fn push(&mut self, bytes: &[u8]) -> fmt::Result {
@@ -168,7 +164,6 @@ pub(crate) struct Record<'a> {
 }
 
 /// The record's text.
-///
 /// # Errors
 /// It does not fit in `out`.
 pub(crate) fn render<const N: usize>(r: &Record<'_>, out: &mut Text<N>) -> fmt::Result {

@@ -17,11 +17,8 @@ use aterm_spec::rng::XorShift;
 
 use crate::support::at;
 
-/// The model's appends.
 const MAX_SEQ: i64 = 9;
-/// The overlap's reserve the world carries its count with (the model's).
 const RESERVE: u64 = 1;
-/// The floor of the world's ring.
 const FLOOR: usize = 2;
 
 /// The test grammar: a directory mark one row, a handoff mark and a handoff
@@ -271,10 +268,7 @@ fn slog_rows_conform_to_derived_model() {
     assert!(outside > 0, "no batch took a row outside the floor");
 }
 
-/// The broken state `broken` is no state the honest `action` (and the
-/// batch after it) makes of `prev`, and it is exactly what mutant `mutant`
-/// makes of `from` (T11: each negative control is its mutant's successor,
-/// so the conformance check would catch that mutant's call in the code).
+/// Asserts `broken` is unreachable by `action` from `prev` and is `mutant`'s successor from `from`.
 fn rejected(m: &Model, action: &str, prev: &State, (mutant, from): (&str, &State), broken: &State) {
     assert!(
         !reach(m, action, prev).contains(broken),
@@ -286,7 +280,6 @@ fn rejected(m: &Model, action: &str, prev: &State, (mutant, from): (&str, &State
     );
 }
 
-/// `s` with each `(key, delta)` added.
 fn moved(s: &State, deltas: &[(&'static str, i64)]) -> State {
     let mut out = s.clone();
     for (k, d) in deltas {
@@ -295,8 +288,6 @@ fn moved(s: &State, deltas: &[(&'static str, i64)]) -> State {
     out
 }
 
-/// A world with two rows in the floor and bells after them, the next bell
-/// running a batch: (the world, its state before that bell).
 fn floor_world() -> (World, State) {
     let mut w = World::new();
     w.mark(Kind::Cwd);
@@ -309,16 +300,7 @@ fn floor_world() -> (World, State) {
     (w, prev)
 }
 
-/// NEGATIVE CONTROLS on the update: a carried update whose successor's
-/// counter is not carried (`HandoffRowsRestart`, a real call: its first
-/// row takes id 1, which the predecessor's rows hold), a crash adoption at
-/// its predecessor's epoch (`CrashKeepsEpoch`: the log built at that
-/// epoch, its ids starting over in the same id space, which the world's
-/// projection reads off the two epochs; the epoch is the host's choice,
-/// so this is a check of the projection and the model, and the host's
-/// own choice, `Epochs::crash`, is aterm-gui's
-/// `a_keeper_recovery_names_its_rows_apart_by_epoch`), and a carried
-/// update that dropped a record nobody counted (`CarryShedUncounted`).
+/// Negative controls for `CarryShedUncounted`, `HandoffRowsRestart`, and `CrashKeepsEpoch`.
 #[test]
 fn slog_rows_conformance_rejects_each_broken_update() {
     let m = session_log_rows_model();
@@ -364,9 +346,7 @@ fn slog_rows_conformance_rejects_each_broken_update() {
     rejected(&m, "Crash", &prev, ("CrashKeepsEpoch", &prev), &same_epoch);
 }
 
-/// NEGATIVE CONTROLS on the batch: one that also took a floor row while a
-/// bell could go (`EvictRowUnderFloor`, its step from the state the honest
-/// batch left), and a projection that miscounts a row as a bell.
+/// Negative controls for `EvictRowUnderFloor` and row-versus-other miscounting.
 #[test]
 fn slog_rows_conformance_rejects_a_floor_row_taken_early_and_a_miscount() {
     let m = session_log_rows_model();

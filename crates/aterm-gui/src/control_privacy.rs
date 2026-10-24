@@ -39,21 +39,34 @@ pub(crate) fn cmd_privacy(
         Ok(form) => form,
         Err(usage) => return usage,
     };
-    privacy(form, || {
-        crate::control::control_media::call_main(proxy, |tx| Wake::ReadPrivacy { scope, reply: tx })
-    })
+    privacy(
+        form,
+        || {
+            crate::control::control_media::call_main(proxy, |tx| Wake::ReadPrivacy {
+                scope,
+                reply: tx,
+            })
+        },
+        || {
+            cfg!(target_os = "macos")
+                .then(|| crate::sys_host::SYS.program_check_now())
+                .flatten()
+        },
+    )
 }
 
+/// The report from the main hop's facts and `held`, this user's programs macOS's program check holds now, read here on the control worker since it may pull a reading.
 fn privacy(
     form: PrivacyForm,
     hop: impl FnOnce() -> Result<PrivacyAppFacts, MainHopError>,
+    held: impl FnOnce() -> Option<(u32, u64)>,
 ) -> String {
     let identity = signing_identity();
     let facts = match hop() {
         Ok(facts) => facts,
         Err(e) => return format!("ERR {e}\n"),
     };
-    let snapshot = facts.report(identity);
+    let snapshot = facts.with_program_check(held()).report(identity);
     match form {
         PrivacyForm::Json => cmd_privacy_json(&snapshot),
         PrivacyForm::Lines => {
@@ -440,13 +453,19 @@ mod tests {
     #[test]
     fn a_failed_privacy_hop_is_the_reply() {
         assert_eq!(
-            privacy(PrivacyForm::Lines, || Err(MainHopError::Reason(
-                "event loop gone"
-            ))),
+            privacy(
+                PrivacyForm::Lines,
+                || Err(MainHopError::Reason("event loop gone")),
+                || panic!("no hop, nothing read")
+            ),
             "ERR event loop gone\n"
         );
         let app = crate::App::headless_for_test();
-        let reply = privacy(PrivacyForm::Lines, || Ok(app.privacy_facts(Scope::Owner)));
+        let reply = privacy(
+            PrivacyForm::Lines,
+            || Ok(app.privacy_facts(Scope::Owner)),
+            || Some((2, 35_940_000)),
+        );
         let (head, body) = reply.split_once('\n').expect("a framed reply");
         assert_eq!(head, format!("OK {}", body.lines().count()), "{reply}");
         assert!(
@@ -454,7 +473,16 @@ mod tests {
                 .any(|l| l.starts_with("full_disk_access=unknown probe=refused_disabled ")),
             "{reply}"
         );
-        let json = privacy(PrivacyForm::Json, || Ok(app.privacy_facts(Scope::Owner)));
+        assert!(
+            body.lines().any(|l| l.starts_with("devtools ")
+                && l.ends_with(" program_check=2 program_check_oldest_ms=35940000")),
+            "the worker's count: {reply}"
+        );
+        let json = privacy(
+            PrivacyForm::Json,
+            || Ok(app.privacy_facts(Scope::Owner)),
+            || None,
+        );
         assert!(json.starts_with("OK 1\n{\"schema\":1,"), "{json}");
         assert_eq!(json.lines().count(), 2, "{json}");
     }

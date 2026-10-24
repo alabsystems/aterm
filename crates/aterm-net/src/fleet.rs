@@ -178,6 +178,45 @@ impl fmt::Debug for FleetSecret {
     }
 }
 
+impl FleetSecret {
+    /// Which fleet this secret is.
+    #[must_use]
+    pub fn mark(&self) -> FleetMark {
+        let mut h = aterm_digest::Sha256::new();
+        h.update(b"aterm-fleet/v1 mark");
+        h.update(self.server);
+        let digest = h.finalize();
+        let mut mark = [0; FleetMark::LEN];
+        mark.copy_from_slice(&digest[..FleetMark::LEN]);
+        FleetMark(mark)
+    }
+}
+
+/// Which fleet a secret is: the first 8 bytes of SHA-256 over a label and `Ks`,
+/// telling nothing of the secret or its keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FleetMark([u8; FleetMark::LEN]);
+
+impl FleetMark {
+    /// Mark byte length.
+    pub const LEN: usize = 8;
+
+    /// Encode as 16 lowercase hex digits.
+    #[must_use]
+    pub fn hex(self) -> String {
+        hex::encode_lower(&self.0)
+    }
+
+    /// Parse from 16 lowercase hex digits.
+    #[must_use]
+    pub fn from_hex(word: &str) -> Option<Self> {
+        if !hex::is_lower(word, 2 * Self::LEN) {
+            return None;
+        }
+        crate::hex_decode(word)?.try_into().ok().map(Self)
+    }
+}
+
 /// Error returned when a secret's byte length is outside `FleetSecret::MIN_LEN..=MAX_LEN`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SecretLength(pub usize);
@@ -461,6 +500,34 @@ impl FleetError {
             _ => false,
         }
     }
+
+    /// The same failure again, for each dial that shares one handshake.
+    pub(crate) fn copied(&self) -> Self {
+        match self {
+            Self::ListenerWrongSecret => Self::ListenerWrongSecret,
+            Self::DialerWrongSecret => Self::DialerWrongSecret,
+            Self::DialerHungUp => Self::DialerHungUp,
+            Self::Refused => Self::Refused,
+            Self::AddressBusy => Self::AddressBusy,
+            Self::Reflection => Self::Reflection,
+            Self::UnknownOp(op) => Self::UnknownOp(op.clone()),
+            Self::UnknownScope(scope) => Self::UnknownScope(scope.clone()),
+            Self::NodeProof => Self::NodeProof,
+            Self::Alpn => Self::Alpn,
+            Self::Malformed(why) => Self::Malformed(why),
+            Self::Tls(e) => Self::Tls(copied_io(e)),
+            Self::Timeout(within) => Self::Timeout(*within),
+            Self::Io(e) => Self::Io(copied_io(e)),
+        }
+    }
+}
+
+/// `e` again: its OS error where it carries one, else its kind and text.
+pub(crate) fn copied_io(e: &io::Error) -> io::Error {
+    e.raw_os_error().map_or_else(
+        || io::Error::new(e.kind(), e.to_string()),
+        io::Error::from_raw_os_error,
+    )
 }
 
 impl fmt::Display for FleetError {

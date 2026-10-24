@@ -126,10 +126,32 @@ const SCOPE_CLAIMS: &[ScopeClaim] = &[
                 kind: ReplicaKind::SeparateScope,
                 justification: "The Settings cursor preview's companion engine, one per \
                     raster thread. It only bakes and places the pet and flying-kitty sprites \
-                    (`begin_host_frame`, `pet_cursor`, `kitty_cursor`, `free_atlas`); it never \
+                    (`begin_host_frame`, `pet_cursor`, `kitty_cursor`, then its own `SpriteLayers`); it never \
                     scans rows or ticks, so it reaches neither `super_prepass` nor \
                     `nova_prepass`, the only writers of the `ignitions` reservation vec. It \
                     holds no flash budget and cannot put a luminance transition on the glass.",
+            },
+            Replica {
+                file: "crates/aterm-bench/examples/effects_harness.rs",
+                owner: "GlowHost",
+                decl: "fx: EffectsPipeline,",
+                kind: ReplicaKind::SeparateScope,
+                justification: "The effects perf lane's typing host: a dev-only bench process \
+                    whose one pipeline stands in for one window's, presenting to an offscreen \
+                    frame no retina sees. Each scene builds a fresh host, so at most one \
+                    pipeline is live at a time; its budget is that simulated window's whole.",
+            },
+            Replica {
+                file: "crates/aterm-bench/examples/effects_harness.rs",
+                owner: "pipeline_scene",
+                decl: "EffectsPipeline::new()",
+                kind: ReplicaKind::SeparateScope,
+                justification: "The effects harness's measurement pipeline (`targo \
+                    --unverified verify perf effects`): one per scene run, in a process \
+                    that opens no window. It draws offscreen (`present_virtual`) and on \
+                    the CPU presenter to count what the rain, the cats and the pet cost, \
+                    so no retina ever sees its frames and its flash budget limits only \
+                    the frames it measures.",
             },
         ],
         aggregator: None,

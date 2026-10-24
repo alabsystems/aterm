@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Callbacks the terminal uses to notify the UI layer of events (notifications, clipboard
-//! and window operations).
+//! Terminal callbacks for notifications, clipboard, and window operations.
 
 use crate::{ClipboardOperation, Notification, WindowOperation, WindowResponse};
 
@@ -13,10 +12,8 @@ pub type NotificationCallback = Box<dyn FnMut(&str) + Send>;
 /// Callback for a complete kitty desktop notification (OSC 99).
 pub type AdvancedNotificationCallback = Box<dyn FnMut(Notification) + Send>;
 
-/// Callback for clipboard operations (OSC 52): returns the content for a query (`None` when
-/// access is denied or unavailable); ignored for a set.
+/// Callback for clipboard operations (OSC 52); returns query text or `None` when unavailable.
 pub type ClipboardCallback = Box<dyn FnMut(ClipboardOperation) -> Option<String> + Send>;
 
-/// Callback for window operations (CSI t, XTWINOPS): returns the response to a report
-/// operation; ignored for manipulation operations (iconify, move, ...).
+/// Callback for window operations (CSI t, XTWINOPS); returns a report response when queried.
 pub type WindowCallback = Box<dyn FnMut(WindowOperation) -> Option<WindowResponse> + Send>;

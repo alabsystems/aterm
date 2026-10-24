@@ -267,6 +267,13 @@ impl ProgramStamp {
         update(layout, program, |s| s.refused = None)
     }
 
+    /// Whether the lane refused `version` at stage, whatever its digest: the memo of a
+    /// payload no document names a digest for, which only its bytes could tell apart.
+    #[must_use]
+    pub(crate) fn refused_at(&self, version: Version) -> bool {
+        self.refused.as_ref().is_some_and(|(v, _)| *v == version)
+    }
+
     /// Whether the lane refused `version` with `digest` at stage.
     #[must_use]
     pub(crate) fn is_refused(&self, version: Version, digest: &AuthenticatedDigest) -> bool {

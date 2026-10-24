@@ -11,7 +11,7 @@ use emoji_cluster::ClusterShape;
 use aterm_core::grid::LineSize;
 pub use aterm_core::render::DefaultBgSpan;
 pub use aterm_core::render::{BandIcon, ChromeIcon, ChromeRaster, ChromeRing, InkSplit};
-use aterm_core::render::{EffectStreamDamage, FreeSampler, FreeSprite, FreeZ, LineSizeSpan};
+use aterm_core::render::{EffectStreamDamage, LineSizeSpan};
 use aterm_core::render::{FxBlend, FxInk, FxSlot};
 use aterm_core::terminal::{CursorStyle, RenderCell, UnderlineStyle};
 
@@ -82,12 +82,18 @@ pub mod hdr;
 ))]
 #[cfg_attr(all(test, target_os = "macos"), allow(dead_code))]
 mod hinted;
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub mod legacy_sprite_oracle;
 pub mod ligature_shaping;
 pub mod procedural;
 /// The scanline signed-area coverage rasterizer every outline fill in this crate uses.
 pub mod raster;
+/// A rounded bar (body and antialiased caps) as fx items.
+pub mod rounded_bar;
 pub mod scroll_translate;
 pub mod spill;
+pub mod sprites;
 #[cfg(any(
     all(unix, not(target_os = "macos")),
     all(test, feature = "embedded-font", target_os = "macos")
@@ -105,7 +111,7 @@ pub use fx_damage::RowBands;
 /// The fx engine's one slicer and its bloom source (`fx_raster`), shared with the GPU renderer so the band gate, the clips and the occluders are one statement on every backend.
 pub use fx_raster::{
     FxBudget, FxFrame, FxSlice, FxSliceSink, FxSlicer, SpriteCols, for_each_drawn_sprite,
-    fx_bloom_quads, slice_layers,
+    fx_bloom_quads, knock_rects, slice_layers,
 };
 pub use spill::SpillBand;
 
@@ -473,7 +479,7 @@ pub mod render_api;
 pub use render_api::{
     CharFg, DecoBlend, DecoGlyph, FireHaloCell, FireMode, FirePatch, Frame, GlowBlend, GlowQuad,
     HaloMode, InkCell, RainHalo, Rasterizer, RenderInput, RenderView, SceneAtlas, SelectionClip,
-    SpriteQuad, TrailCell, WordDecoration,
+    TrailCell, WordDecoration,
 };
 
 /// Which glyph source a [`GlyphKey`] rasterizes from.
@@ -1311,7 +1317,7 @@ pub struct Renderer {
     keep_spans_scratch: Vec<(usize, usize)>,
     curl_scratch: Vec<(usize, usize, usize, usize, usize, usize, u32)>,
     ligature_break_scratch: Vec<usize>,
-    /// The frame's under-text bodies' boxes ([`knock_rects`]), resident.
+    /// The frame's knock-layer bodies' boxes ([`knock_rects`]), resident.
     knock_scratch: Vec<[i32; 4]>,
     /// [`Renderer::set_knock_out`]: a test's negative control.
     #[cfg(any(test, debug_assertions))]
@@ -1370,12 +1376,11 @@ pub struct Renderer {
     underline_adjust_thick: i32,
     underline_skip_descenders: bool,
     undercurl_masks: UndercurlMaskCache,
-    rain_row_starts: Vec<u32>,
-    rain_row_idx: Vec<u32>,
-    rain_row_cursor: Vec<u32>,
-    free_xmap_scratch: Vec<u32>,
     fx_scratch: fx_raster::FxScratch,
-    rain_white_cache: Option<(usize, u64, usize, bool)>,
+    /// [`Self::set_legacy_sprites`]: the old sprite path, drawn where the
+    /// old composite drew it, as a differential oracle.
+    #[cfg(any(test, debug_assertions))]
+    legacy_sprites: Option<legacy_sprite_oracle::LegacySprites>,
     alpha_memo: Option<Box<AlphaMemoBank>>,
 }
 
@@ -6309,12 +6314,9 @@ impl Renderer {
             underline_adjust_thick: 0,
             underline_skip_descenders: true,
             undercurl_masks: std::cell::RefCell::new(Vec::new()),
-            rain_row_starts: Vec::new(),
-            rain_row_idx: Vec::new(),
-            rain_row_cursor: Vec::new(),
-            free_xmap_scratch: Vec::new(),
             fx_scratch: fx_raster::FxScratch::default(),
-            rain_white_cache: None,
+            #[cfg(any(test, debug_assertions))]
+            legacy_sprites: None,
             alpha_memo: None,
         };
         r.refresh_variations()
@@ -11407,16 +11409,17 @@ impl Renderer {
         );
         self.draw_rain_add(&mut cache.pixels, w, h, input, Some(&dirty));
         self.draw_decorations(&mut cache.pixels, w, h, input, Some(&dirty));
-        self.stamp_free_sprites(
+        #[cfg(any(test, debug_assertions))]
+        self.stamp_legacy_sprites(
             &mut cache.pixels,
             w,
             h,
-            input,
+            input.rows,
             dirty
                 .iter()
                 .enumerate()
                 .filter_map(|(r, &d)| d.then_some(r)),
-            FreeZ::OverText,
+            false,
         );
         self.draw_fx(
             &mut cache.pixels,
@@ -11566,7 +11569,8 @@ impl Renderer {
         self.draw_fx(&mut pixels, w, h, input, FxSlot::Over, FxBlend::Exact, None);
         self.draw_rain_add(&mut pixels, w, h, input, None);
         self.draw_decorations(&mut pixels, w, h, input, None);
-        self.stamp_free_sprites(&mut pixels, w, h, input, 0..rows, FreeZ::OverText);
+        #[cfg(any(test, debug_assertions))]
+        self.stamp_legacy_sprites(&mut pixels, w, h, input.rows, 0..rows, false);
         self.draw_fx(
             &mut pixels,
             w,
@@ -11858,26 +11862,10 @@ impl Renderer {
             self.fill_chrome_raster(pixels, w, h, input, r);
             self.render_row_images_below_bg(ic, pixels, w, h, input, r, &ctx);
         }
-        let rain_white = self.rain_atlas_is_white(input);
-        if !input.rain_quads.is_empty() || !input.cat_quads.is_empty() {
-            self.build_rain_row_csr(input);
-            for r in rows.clone() {
-                let s = self.rain_row_starts[r] as usize;
-                let e = self.rain_row_starts[r + 1] as usize;
-                self.draw_sprites_for_row(
-                    pixels,
-                    w,
-                    h,
-                    input,
-                    r,
-                    &self.rain_row_idx[s..e],
-                    rain_white,
-                );
-            }
-        }
-        self.stamp_free_sprites(pixels, w, h, input, rows.clone(), FreeZ::UnderText);
-        self.knock_out_under_text(pixels, w, input, rows.clone(), base.is_some(), dirty);
         self.draw_fx(pixels, w, h, input, FxSlot::Under, FxBlend::Linear, dirty);
+        #[cfg(any(test, debug_assertions))]
+        self.stamp_legacy_sprites(pixels, w, h, input.rows, rows.clone(), true);
+        self.knock_out_under_text(pixels, w, h, input, rows.clone(), base.is_some(), dirty);
         self.draw_trail(pixels, w, h, input, dirty);
         self.draw_glow_under(pixels, w, h, input, dirty);
         self.draw_fx(pixels, w, h, input, FxSlot::Under, FxBlend::Exact, dirty);
@@ -11893,8 +11881,8 @@ impl Renderer {
     }
 
     /// THE KNOCK-OUT: letters on a companion's body read against the page.
-    /// A body drawn under the text ([`FreeZ::UnderText`]: the pet, its
-    /// departures, the idle cat) is knocked out under every glyph that lies
+    /// A body on a knock layer ([`aterm_core::render::FxLayer::knock`]: the pet, its departures,
+    /// the idle cat) is knocked out under every glyph that lies
     /// on it: the glyph's coverage, dilated by one pixel
     /// ([`KNOCK_DILATE_OFFSETS`]), is stamped in the colour the background
     /// pass painted under the cell, over the body and before any trail
@@ -11913,10 +11901,12 @@ impl Renderer {
     /// glass; a stamp in the opaque page would draw a solid glyph-shaped
     /// outline round every letter the body's box touched, even under an
     /// all-transparent body.
+    #[allow(clippy::too_many_arguments)]
     fn knock_out_under_text<I>(
         &mut self,
         pixels: &mut [u32],
         w: usize,
+        h: usize,
         input: &RenderInput,
         rows: I,
         wallpaper: bool,
@@ -11930,11 +11920,18 @@ impl Renderer {
         }
         let mut knocks = std::mem::take(&mut self.knock_scratch);
         knocks.clear();
-        knocks.extend(knock_rects(
-            &input.free_sprites,
-            self.pad as i32,
-            self.grid_top() as i32,
-        ));
+        let frame = self.fx_frame(w, h, input.rows);
+        knock_rects(
+            &frame,
+            &input.fx_layers,
+            &input.fx_occluders,
+            self.fx_scratch.slicer(),
+            &mut knocks,
+        );
+        #[cfg(any(test, debug_assertions))]
+        if let Some(l) = &self.legacy_sprites {
+            knocks.extend(l.knock_rects(self.pad as i32, self.grid_top() as i32));
+        }
         if !knocks.is_empty() {
             let sel = self.selection_palette(input);
             for r in rows {
@@ -12111,6 +12108,35 @@ impl Renderer {
         }
     }
 
+    /// Draw the old sprite path ([`legacy_sprite_oracle`]) where the old
+    /// composite drew it: a differential test's oracle.
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    pub fn set_legacy_sprites(&mut self, sprites: Option<legacy_sprite_oracle::LegacySprites>) {
+        self.legacy_sprites = sprites;
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    fn stamp_legacy_sprites(
+        &self,
+        pixels: &mut [u32],
+        w: usize,
+        h: usize,
+        grid_rows: usize,
+        rows: impl Iterator<Item = usize>,
+        under: bool,
+    ) {
+        let Some(l) = &self.legacy_sprites else {
+            return;
+        };
+        for r in rows {
+            let (y_lo, y_hi) = self.row_pixel_band(r, grid_rows, h);
+            for s in l.sprites.iter().filter(|s| s.under == under) {
+                legacy_sprite_oracle::stamp(pixels, w, h, self.pad, self.grid_top(), s, y_lo, y_hi);
+            }
+        }
+    }
+
     /// A test's negative control: draw companions under the text without
     /// the knock-out ([`Self::knock_out_under_text`]).
     #[cfg(any(test, debug_assertions))]
@@ -12133,43 +12159,6 @@ impl Renderer {
         {
             true
         }
-    }
-
-    fn stamp_free_sprites<I>(
-        &mut self,
-        pixels: &mut [u32],
-        w: usize,
-        h: usize,
-        input: &RenderInput,
-        rows: I,
-        z: FreeZ,
-    ) where
-        I: Iterator<Item = usize>,
-    {
-        if input.free_sprites.is_empty() {
-            return;
-        }
-        let Some(atlas) = input.free_atlas.as_deref() else {
-            return;
-        };
-        if !atlas_texels_valid(atlas) {
-            return;
-        }
-        let pad_x = self.pad;
-        let pad_y = self.grid_top();
-        let mut xmap = std::mem::take(&mut self.free_xmap_scratch);
-        for r in rows {
-            let (y_lo, y_hi) = self.row_pixel_band(r, input.rows, h);
-            if y_lo >= y_hi {
-                continue;
-            }
-            for s in &input.free_sprites {
-                if s.z == z {
-                    stamp_free_sprite(pixels, w, h, pad_x, pad_y, atlas, s, y_lo, y_hi, &mut xmap);
-                }
-            }
-        }
-        self.free_xmap_scratch = xmap;
     }
 }
 
@@ -13406,119 +13395,6 @@ impl Renderer {
         }
     }
 
-    fn build_rain_row_csr(&mut self, input: &RenderInput) {
-        let rows = input.rows;
-        self.rain_row_starts.clear();
-        self.rain_row_starts.resize(rows + 1, 0);
-        self.rain_row_idx.clear();
-        if input.rain_quads.is_empty() {
-            return;
-        }
-        for q in &input.rain_quads {
-            let rr = q.row as usize;
-            if rr < rows {
-                self.rain_row_starts[rr + 1] += 1;
-            }
-        }
-        for r in 0..rows {
-            self.rain_row_starts[r + 1] += self.rain_row_starts[r];
-        }
-        let total = self.rain_row_starts[rows] as usize;
-        self.rain_row_idx.resize(total, 0);
-        self.rain_row_cursor.clear();
-        self.rain_row_cursor
-            .extend_from_slice(&self.rain_row_starts[..rows]);
-        for (i, q) in input.rain_quads.iter().enumerate() {
-            let rr = q.row as usize;
-            if rr < rows {
-                let pos = self.rain_row_cursor[rr] as usize;
-                self.rain_row_idx[pos] = i as u32;
-                self.rain_row_cursor[rr] += 1;
-            }
-        }
-    }
-
-    fn rain_atlas_is_white(&mut self, input: &RenderInput) -> bool {
-        let Some(atlas) = input.rain_atlas.as_deref() else {
-            return false;
-        };
-        let key = (
-            atlas.rgba.as_ptr() as usize,
-            atlas.version,
-            atlas.rgba.len(),
-        );
-        if let Some((p, v, l, white)) = self.rain_white_cache
-            && (p, v, l) == key
-        {
-            return white;
-        }
-        let mut white = true;
-        let mut i = 0;
-        while i + 3 < atlas.rgba.len() {
-            if atlas.rgba[i] != 255 || atlas.rgba[i + 1] != 255 || atlas.rgba[i + 2] != 255 {
-                white = false;
-                break;
-            }
-            i += 4;
-        }
-        self.rain_white_cache = Some((key.0, key.1, key.2, white));
-        white
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn draw_sprites_for_row(
-        &self,
-        pixels: &mut [u32],
-        w: usize,
-        h: usize,
-        input: &RenderInput,
-        r: usize,
-        rain_row: &[u32],
-        rain_white: bool,
-    ) {
-        let (pad_x, pad_y) = (self.pad, self.grid_top());
-        if !rain_row.is_empty()
-            && let Some(atlas) = input.rain_atlas.as_deref()
-            && atlas_texels_valid(atlas)
-        {
-            if rain_white {
-                for &qi in rain_row {
-                    stamp_cat_quad::<true>(
-                        pixels,
-                        w,
-                        h,
-                        pad_x,
-                        pad_y,
-                        atlas,
-                        &input.rain_quads[qi as usize],
-                    );
-                }
-            } else {
-                for &qi in rain_row {
-                    stamp_cat_quad::<false>(
-                        pixels,
-                        w,
-                        h,
-                        pad_x,
-                        pad_y,
-                        atlas,
-                        &input.rain_quads[qi as usize],
-                    );
-                }
-            }
-        }
-        if !input.cat_quads.is_empty()
-            && let Some(atlas) = input.cat_atlas.as_deref()
-            && atlas_texels_valid(atlas)
-        {
-            for q in &input.cat_quads {
-                if q.row as usize == r {
-                    stamp_cat_quad::<false>(pixels, w, h, pad_x, pad_y, atlas, q);
-                }
-            }
-        }
-    }
-
     fn draw_decorations(
         &self,
         pixels: &mut [u32],
@@ -14391,30 +14267,6 @@ pub const KNOCK_DILATE_OFFSETS: [(i32, i32); 21] = [
     (2, 1),
 ];
 
-/// The frame-pixel boxes (`[x0, y0, x1, y1)`, right and bottom exclusive)
-/// of the bodies drawn under the text ([`FreeZ::UnderText`]), which the
-/// knock-out cuts the letters out of ([`Renderer::knock_out_under_text`]);
-/// `pad_x`/`pad_y` place the grid-interior sprite in the frame.
-pub fn knock_rects(
-    sprites: &[FreeSprite],
-    pad_x: i32,
-    pad_y: i32,
-) -> impl Iterator<Item = [i32; 4]> + '_ {
-    sprites
-        .iter()
-        .filter(|s| s.z == FreeZ::UnderText && s.alpha > 0 && s.w > 0 && s.h > 0)
-        .map(move |s| {
-            let x0 = pad_x.saturating_add(s.x);
-            let y0 = pad_y.saturating_add(s.y);
-            [
-                x0,
-                y0,
-                x0.saturating_add(i32::from(s.w)),
-                y0.saturating_add(i32::from(s.h)),
-            ]
-        })
-}
-
 #[allow(clippy::too_many_arguments)]
 #[inline]
 fn blit_mono_halo(
@@ -15071,13 +14923,7 @@ fn clone_input_stamped_inner(dst: &mut RenderInput, src: &RenderInput, drop_effe
         ink,
         char_fg,
         fire_halo,
-        cat_quads,
-        cat_atlas,
-        free_sprites,
-        free_atlas,
         nova_add,
-        rain_quads,
-        rain_atlas,
         rain_add,
         fx_layers,
         fx_occluders,
@@ -15203,13 +15049,7 @@ fn clone_input_stamped_inner(dst: &mut RenderInput, src: &RenderInput, drop_effe
     dst.ink.clone_from(ink);
     dst.char_fg.clone_from(char_fg);
     dst.fire_halo.clone_from(fire_halo);
-    dst.cat_quads.clone_from(cat_quads);
-    dst.cat_atlas.clone_from(cat_atlas);
-    dst.free_sprites.clone_from(free_sprites);
-    dst.free_atlas.clone_from(free_atlas);
     dst.nova_add.clone_from(nova_add);
-    dst.rain_quads.clone_from(rain_quads);
-    dst.rain_atlas.clone_from(rain_atlas);
     dst.rain_add.clone_from(rain_add);
     dst.fx_layers.clone_from(fx_layers);
     dst.fx_occluders.clone_from(fx_occluders);
@@ -15397,14 +15237,8 @@ pub struct DirtyRows {
     pub char_fg_changed: bool,
     /// Whether the fire contrast-halo strengths (`fire_halo`) changed.
     pub fire_halo_changed: bool,
-    /// Whether the cat sprites (`cat_quads`) or the cat-atlas version changed.
-    pub cat_changed: bool,
-    /// Whether the free-floating sprites (`free_sprites`) or the free-atlas version changed.
-    pub free_changed: bool,
     /// Whether the supernova light (`nova_add`) changed.
     pub nova_changed: bool,
-    /// Whether the rain sprites (`rain_quads`) or the rain-atlas version changed.
-    pub rain_changed: bool,
     /// Whether the rain head halos (`rain_add`) changed.
     pub rain_add_changed: bool,
     /// Whether the fx layers (`fx_layers`) differ from the prior frame by identity, or the occluders (`fx_occluders`) differ while either frame draws a layer.
@@ -15429,10 +15263,7 @@ impl DirtyRows {
             ink_changed: false,
             char_fg_changed: false,
             fire_halo_changed: false,
-            cat_changed: false,
-            free_changed: false,
             nova_changed: false,
-            rain_changed: false,
             rain_add_changed: false,
             fx_changed: false,
         }
@@ -15454,10 +15285,7 @@ impl DirtyRows {
             && !self.ink_changed
             && !self.char_fg_changed
             && !self.fire_halo_changed
-            && !self.cat_changed
-            && !self.free_changed
             && !self.nova_changed
-            && !self.rain_changed
             && !self.rain_add_changed
             && !self.fx_changed
     }
@@ -15689,10 +15517,7 @@ fn scroll_blittable_content(input: &RenderInput) -> bool {
         && input.word_decorations.iter().all(|d| d.dy == 0)
         && input.char_fg.is_empty()
         && input.fire_halo.is_empty()
-        && input.cat_quads.is_empty()
-        && input.free_sprites.is_empty()
         && input.nova_add.is_empty()
-        && input.rain_quads.is_empty()
         && input.rain_add.is_empty()
         && !input.any_selection()
 }
@@ -15913,7 +15738,6 @@ pub fn compute_dirty_rows(
     bands: RowBands,
     dirty: &mut Vec<bool>,
 ) -> DirtyDecision {
-    let cell_h = bands.cell_h;
     let (rows, cols) = (input.rows, input.cols);
 
     let anchor_eq = prev_input.base_y - i64::from(prev_input.display_offset)
@@ -16169,77 +15993,10 @@ pub fn compute_dirty_rows(
         }
     }
 
-    let cat_changed = prev_input.cat_quads != input.cat_quads
-        || prev_input.cat_atlas.as_ref().map(std::sync::Arc::as_ptr)
-            != input.cat_atlas.as_ref().map(std::sync::Arc::as_ptr);
-    if cat_changed {
-        for q in prev_input.cat_quads.iter().chain(&input.cat_quads) {
-            mark(dirty, q.row as usize);
-        }
-    }
-
-    let free_changed = prev_input.free_sprites != input.free_sprites
-        || prev_input.free_atlas.as_ref().map(std::sync::Arc::as_ptr)
-            != input.free_atlas.as_ref().map(std::sync::Arc::as_ptr);
-    if free_changed {
-        let ch = cell_h.max(1);
-        let last_row = rows.saturating_sub(1) as i32;
-        for s in prev_input.free_sprites.iter().chain(&input.free_sprites) {
-            let y_lo = s.y;
-            let y_hi = s.y + s.h as i32 - 1;
-            let r_lo = y_lo.div_euclid(ch as i32).clamp(0, last_row);
-            let r_hi = y_hi.div_euclid(ch as i32).clamp(0, last_row);
-            for r in r_lo..=r_hi {
-                mark(dirty, r as usize);
-            }
-            if y_lo < 0 {
-                mark(dirty, 0);
-            }
-            if y_hi >= (rows as i32) * (ch as i32) {
-                mark(dirty, last_row as usize);
-            }
-        }
-    }
-
     let nova_changed = prev_input.nova_add != input.nova_add;
     if nova_changed {
         for q in prev_input.nova_add.iter().chain(&input.nova_add) {
             mark(dirty, q.row as usize);
-        }
-    }
-
-    let rain_atlas_bumped = prev_input.rain_atlas.as_ref().map(std::sync::Arc::as_ptr)
-        != input.rain_atlas.as_ref().map(std::sync::Arc::as_ptr);
-    let rain_changed = rain_atlas_bumped || prev_input.rain_quads != input.rain_quads;
-    if rain_atlas_bumped {
-        for q in prev_input.rain_quads.iter().chain(&input.rain_quads) {
-            mark(dirty, q.row as usize);
-        }
-    } else if rain_changed {
-        let (pq, cq) = (&prev_input.rain_quads, &input.rain_quads);
-        debug_assert!(
-            pq.is_sorted_by_key(|q| q.row) && cq.is_sorted_by_key(|q| q.row),
-            "rain_quads must arrive row-sorted (the engine's emission order)"
-        );
-        let (mut i, mut j) = (0usize, 0usize);
-        while i < pq.len() || j < cq.len() {
-            let row = match (pq.get(i), cq.get(j)) {
-                (Some(p), Some(c)) => p.row.min(c.row),
-                (Some(p), None) => p.row,
-                (None, Some(c)) => c.row,
-                (None, None) => unreachable!("loop condition holds a quad"),
-            };
-            let i0 = i;
-            while i < pq.len() && pq[i].row == row {
-                i += 1;
-            }
-            let j0 = j;
-            while j < cq.len() && cq[j].row == row {
-                j += 1;
-            }
-            if pq[i0..i] != cq[j0..j] {
-                mark(dirty, row as usize);
-            }
         }
     }
 
@@ -16256,30 +16013,6 @@ pub fn compute_dirty_rows(
         (&prev_input.fx_layers, &prev_input.fx_occluders),
         (&input.fx_layers, &input.fx_occluders),
     );
-
-    if !(input.free_sprites.is_empty() && input.cat_quads.is_empty() && input.rain_quads.is_empty())
-        && let Some(first) = dirty.iter().position(|&d| d)
-    {
-        let last = dirty.iter().rposition(|&d| d).unwrap_or(first);
-        let ch = cell_h.max(1) as i32;
-        let last_row = rows.saturating_sub(1) as i32;
-        for s in &input.free_sprites {
-            if s.w == 0 || s.h == 0 || s.aw == 0 || s.ah == 0 {
-                continue;
-            }
-            let r_lo = s.y.div_euclid(ch).clamp(0, last_row) as usize;
-            let r_hi = (s.y + s.h as i32 - 1).div_euclid(ch).clamp(0, last_row) as usize;
-            for r in r_lo.max(first)..=r_hi.min(last) {
-                mark(dirty, r);
-            }
-        }
-        for q in input.cat_quads.iter().chain(&input.rain_quads) {
-            let r = q.row as usize;
-            if (first..=last).contains(&r) {
-                mark(dirty, r);
-            }
-        }
-    }
 
     if input.word_decorations.iter().any(|d| d.dy != 0) {
         loop {
@@ -16317,10 +16050,7 @@ pub fn compute_dirty_rows(
         ink_changed,
         char_fg_changed,
         fire_halo_changed,
-        cat_changed,
-        free_changed,
         nova_changed,
-        rain_changed,
         rain_add_changed,
         fx_changed,
     })
@@ -17798,162 +17528,6 @@ fn ensure_wallpaper_px(wc: &mut WindowCpu, input: &RenderInput, w: usize, h: usi
             .map(|t| rgb_to_u32([t[0], t[1], t[2]])),
     );
     wc.wallpaper_px = Some(WallpaperPx { key, px });
-}
-
-fn stamp_cat_quad<const WHITE_RGB: bool>(
-    pixels: &mut [u32],
-    w: usize,
-    h: usize,
-    pad_x: usize,
-    pad_y: usize,
-    atlas: &SceneAtlas,
-    q: &SpriteQuad,
-) {
-    if q.w == 0 || q.h == 0 || q.aw == 0 || q.ah == 0 {
-        return;
-    }
-    if (q.ax as u32 + q.aw as u32) > atlas.width || (q.ay as u32 + q.ah as u32) > atlas.height {
-        return;
-    }
-    let x0 = pad_x + q.x as usize;
-    let y0 = pad_y + q.y as usize;
-    let xend = (x0 + q.w as usize).min(w);
-    let yend = (y0 + q.h as usize).min(h);
-    if x0 >= xend || y0 >= yend {
-        return;
-    }
-    let (aw, ah) = (q.aw as usize, q.ah as usize);
-    let (dw, dh) = (q.w as usize, q.h as usize);
-    let one_to_one = aw == dw && ah == dh;
-    let tr = (q.tint >> 16) & 0xff;
-    let tg = (q.tint >> 8) & 0xff;
-    let tb = q.tint & 0xff;
-    let qa = q.alpha as u32;
-    let mul8 = |c: u32, f: u32| -> u32 { (c * f + 127) / 255 };
-    for py in y0..yend {
-        let dy = py - y0;
-        let sy = if one_to_one {
-            dy
-        } else {
-            (((2 * dy + 1) * ah) / (2 * dh)).min(ah - 1)
-        };
-        let base = py * w;
-        let arow = (q.ay as usize + sy) * atlas.width as usize;
-        for px in x0..xend {
-            let dx = px - x0;
-            let sx0 = if one_to_one {
-                dx
-            } else {
-                (((2 * dx + 1) * aw) / (2 * dw)).min(aw - 1)
-            };
-            let sx = if q.flip_x { aw - 1 - sx0 } else { sx0 };
-            let i = (arow + q.ax as usize + sx) * 4;
-            let ta = atlas.rgba[i + 3] as u32;
-            if ta == 0 {
-                continue;
-            }
-            let a8 = mul8(ta, qa);
-            if a8 == 0 {
-                continue;
-            }
-            let color = if WHITE_RGB {
-                debug_assert!(
-                    atlas.rgba[i] == 255 && atlas.rgba[i + 1] == 255 && atlas.rgba[i + 2] == 255,
-                    "WHITE_RGB stamp fed a non-white atlas texel — parity would break"
-                );
-                q.tint & 0x00FF_FFFF
-            } else {
-                let cr = mul8(atlas.rgba[i] as u32, tr);
-                let cg = mul8(atlas.rgba[i + 1] as u32, tg);
-                let cb = mul8(atlas.rgba[i + 2] as u32, tb);
-                (cr << 16) | (cg << 8) | cb
-            };
-            let idx = base + px;
-            pixels[idx] = blend(pixels[idx], color, a8 as u8);
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn stamp_free_sprite(
-    pixels: &mut [u32],
-    w: usize,
-    h: usize,
-    pad_x: usize,
-    pad_y: usize,
-    atlas: &SceneAtlas,
-    s: &FreeSprite,
-    y_lo: usize,
-    y_hi: usize,
-    xmap: &mut Vec<u32>,
-) {
-    debug_assert!(
-        matches!(s.sampler, FreeSampler::Nearest),
-        "FreeSampler::Linear is deferred — v1 free sprites are NEAREST-only"
-    );
-    if !matches!(s.sampler, FreeSampler::Nearest) {
-        return;
-    }
-    if s.w == 0 || s.h == 0 || s.aw == 0 || s.ah == 0 {
-        return;
-    }
-    if (s.ax as u32 + s.aw as u32) > atlas.width || (s.ay as u32 + s.ah as u32) > atlas.height {
-        return;
-    }
-    let ox = pad_x as i32 + s.x;
-    let oy = pad_y as i32 + s.y;
-    let px0 = ox.max(0) as usize;
-    let py0 = (oy.max(0) as usize).max(y_lo);
-    let xend = ((ox + s.w as i32).max(0) as usize).min(w);
-    let yend = ((oy + s.h as i32).max(0) as usize).min(h).min(y_hi);
-    if px0 >= xend || py0 >= yend {
-        return;
-    }
-    let (aw, ah) = (s.aw as usize, s.ah as usize);
-    let (dw, dh) = (s.w as usize, s.h as usize);
-    let tr = (s.tint >> 16) & 0xff;
-    let tg = (s.tint >> 8) & 0xff;
-    let tb = s.tint & 0xff;
-    let qa = s.alpha as u32;
-    let mul8 = |c: u32, f: u32| -> u32 { (c * f + 127) / 255 };
-    let one_to_one = aw == dw && ah == dh;
-    if !one_to_one {
-        xmap.clear();
-        xmap.extend((px0..xend).map(|px| {
-            let dx = (px as i32 - ox) as usize;
-            let sx0 = (((2 * dx + 1) * aw) / (2 * dw)).min(aw - 1);
-            (if s.flip_x { aw - 1 - sx0 } else { sx0 }) as u32
-        }));
-    }
-    for py in py0..yend {
-        let dy = (py as i32 - oy) as usize;
-        let sy = if one_to_one {
-            dy
-        } else {
-            (((2 * dy + 1) * ah) / (2 * dh)).min(ah - 1)
-        };
-        let base = py * w;
-        let arow = (s.ay as usize + sy) * atlas.width as usize;
-        for px in px0..xend {
-            let sx = if one_to_one {
-                let dx = (px as i32 - ox) as usize;
-                if s.flip_x { aw - 1 - dx } else { dx }
-            } else {
-                xmap[px - px0] as usize
-            };
-            let i = (arow + s.ax as usize + sx) * 4;
-            let a8 = mul8(atlas.rgba[i + 3] as u32, qa);
-            if a8 == 0 {
-                continue;
-            }
-            let cr = mul8(atlas.rgba[i] as u32, tr);
-            let cg = mul8(atlas.rgba[i + 1] as u32, tg);
-            let cb = mul8(atlas.rgba[i + 2] as u32, tb);
-            let color = (cr << 16) | (cg << 8) | cb;
-            let idx = base + px;
-            pixels[idx] = blend(pixels[idx], color, a8 as u8);
-        }
-    }
 }
 
 /// Default inactive (unfocused) selection background when the host gives no `selectionInactiveBackground`.
@@ -27087,6 +26661,7 @@ mod tests {
         }
     }
 
+    /// The drawn glass marks read as one set with the default face's own: the ring family as its `●`, and `⤓` within a row of the face's own `⤓` where it has one (Iosevka, Windows' default), else of its `↓` (SF Mono has no `⤓`). `⤓` is drawn at the capitals' height on the baseline, which hinting snaps with the digits beside it (`⤓18:00`) and not with the arrows: Iosevka Term Semibold at 12 px under Windows' hinting sets its capitals, digits and `⤓`'s top on the same rows, and its `↓` two rows taller (a row over the capitals, a row under the baseline).
     #[test]
     fn the_glass_marks_read_as_one_set_at_1x_and_2x() {
         let ink_box = |w: usize, bytes: &[u8]| {
@@ -27128,6 +26703,7 @@ mod tests {
                 };
                 let dot = own(&mut r, '\u{25cf}');
                 let arrow = own(&mut r, '\u{2193}');
+                let land = own(&mut r, '\u{2913}');
                 let at = format!("{px} px ({cw}x{ch}) {style:?}");
                 let drawn = |r: &mut Renderer, icon| {
                     let key = band_icon_key(icon, style, true, r.px_q);
@@ -27154,9 +26730,10 @@ mod tests {
                         "{at}: the family {w}x{h}, the face's ● {dw}x{dh} in a {cw} px cell"
                     );
                 }
-                if let Some((_, ah)) = arrow {
+                let face_arrow = land.map(|s| ('⤓', s)).or(arrow.map(|s| ('↓', s)));
+                if let Some((name, (_, ah))) = face_arrow {
                     let (_, th) = size(drawn(&mut r, BandIcon::ToBar));
-                    assert!(near(th, ah), "{at}: ⤓ {th} rows, the face's ↓ {ah}");
+                    assert!(near(th, ah), "{at}: ⤓ {th} rows, the face's {name} {ah}");
                 }
                 let m = r.icon_metrics(bold);
                 let control = |m: procedural::IconMetrics| {

@@ -23,13 +23,25 @@ pub enum Anchor {
     /// muse's `muse-stable` channel on `api.meta.ai` paired with the lookaside release manifest's sha256 and size.
     #[serde(rename = "meta-developer-id")]
     MetaDeveloperId,
+    /// kimi's CDN release manifest paired with the GitHub release manifest on `{version, tag, filename, sha256}`.
+    #[serde(rename = "moonshot-two-host")]
+    MoonshotTwoHost,
+    /// grok's stable pointer in xAI's bucket. Nothing on xAI's own hosts carries a digest (npm's registry signs one for xAI's `@xai-official/grok-<plat>` copy of the same bytes, which aterm does not read), so the lane measures the bytes and the darwin team pin vouches for them.
+    #[serde(rename = "xai-developer-id")]
+    XaiDeveloperId,
 }
 
 impl Anchor {
     /// Whether the documents vouch for the payload digest before a byte is fetched.
     #[must_use]
     pub(crate) const fn vouches_before_download(self) -> bool {
-        !matches!(self, Self::MetaDeveloperId)
+        !matches!(self, Self::MetaDeveloperId | Self::XaiDeveloperId)
+    }
+
+    /// Whether any vendor document names the payload's digest: false only for grok, whose digest the lane measures from the bytes it downloads.
+    #[must_use]
+    pub(crate) const fn publishes_digest(self) -> bool {
+        !matches!(self, Self::XaiDeveloperId)
     }
 
     /// The payload digest this anchor vouches for.
@@ -37,9 +49,11 @@ impl Anchor {
     pub(crate) const fn digest_alg(self) -> DigestAlg {
         match self {
             Self::GoogleTwoHost => DigestAlg::Sha512,
-            Self::AnthropicOpenPgp | Self::OpenAiTwoHost | Self::MetaDeveloperId => {
-                DigestAlg::Sha256
-            }
+            Self::AnthropicOpenPgp
+            | Self::OpenAiTwoHost
+            | Self::MetaDeveloperId
+            | Self::MoonshotTwoHost
+            | Self::XaiDeveloperId => DigestAlg::Sha256,
         }
     }
 }
@@ -126,6 +140,8 @@ pub struct VendorSpec {
     pub floor: Version,
     /// The newest legacy ALab index build of the program this code vouches for, or [`NEVER_INDEX_PINNED`].
     pub legacy_ceiling: u64,
+    /// Whether the default set installs it on every machine it serves; a row without it is installed only when a person asks (`aterm pkg install <program>`) and kept current once installed.
+    pub default_set: bool,
 }
 
 impl VendorSpec {
@@ -285,6 +301,7 @@ const OPENAI_CODEX: VendorSpec = VendorSpec {
     revision_versions: false,
     floor: floor(0, 156, 1),
     legacy_ceiling: LEGACY_CEILING,
+    default_set: true,
 };
 
 /// The agent programs, each fetched from its own vendor.
@@ -372,6 +389,7 @@ pub const VENDORS: &[VendorSpec] = &[
         revision_versions: false,
         floor: floor(2, 1, 281),
         legacy_ceiling: LEGACY_CEILING,
+        default_set: true,
     },
     OPENAI_CODEX,
     VendorSpec {
@@ -416,6 +434,7 @@ pub const VENDORS: &[VendorSpec] = &[
         revision_versions: false,
         floor: floor(1, 3, 6),
         legacy_ceiling: NEVER_INDEX_PINNED,
+        default_set: true,
     },
     VendorSpec {
         program: "muse",
@@ -495,6 +514,7 @@ pub const VENDORS: &[VendorSpec] = &[
         revision_versions: true,
         floor: revision_floor(1, 4, 9, 6297, Some(1)),
         legacy_ceiling: NEVER_INDEX_PINNED,
+        default_set: true,
     },
     VendorSpec {
         program: "codex-old",
@@ -507,6 +527,158 @@ pub const VENDORS: &[VendorSpec] = &[
         floor: floor(0, 163, 0),
         legacy_ceiling: NEVER_INDEX_PINNED,
         ..OPENAI_CODEX
+    },
+    VendorSpec {
+        program: "grok",
+        vendor: "xAI",
+        product: "Grok Build",
+        description: "xAI Grok Build — Apache-2.0, ~180 MB, downloaded from \
+                      storage.googleapis.com/grok-build-public-artifacts",
+        head_url: "https://storage.googleapis.com/grok-build-public-artifacts/cli/stable",
+        anchor: Anchor::XaiDeveloperId,
+        apple_team: "5Y6N3AJ54S",
+        exposes: &["grok"],
+        aliases: &[],
+        url_prefixes: &["https://storage.googleapis.com/grok-build-public-artifacts/cli/"],
+        url_query: &[],
+        digest_docs: &[DocPin {
+            prefix: "https://storage.googleapis.com/grok-build-public-artifacts/cli/",
+            redirect_hosts: &[],
+        }],
+        shim_env: &["GROK_DISABLE_AUTOUPDATER=1"],
+        warm: None,
+        self_update_verbs: &["update"],
+        yolo_flags: &["--always-approve"],
+        yolo_markers: &[
+            "--always-approve",
+            "--dangerously-skip-permissions",
+            "--permission-mode",
+            "--permission-mode=",
+            "--sandbox",
+            "--sandbox=",
+            "--allow",
+            "--allow=",
+            "--allowedTools",
+            "--allowedTools=",
+            "--deny",
+            "--deny=",
+            "--disallowedTools",
+            "--disallowedTools=",
+            "--disallowed-tools",
+            "--disallowed-tools=",
+        ],
+        yolo_after: &["agent"],
+        // The 1.0.45 source's `Command` words, and 1.0.67's `worker`, `cursor-worker`,
+        // `clone`, `ssh` and `host-server` (its strings name each), and clap's `help`.
+        yolo_skip: &[
+            "inspect",
+            "doctor",
+            "leader",
+            "login",
+            "logout",
+            "mcp",
+            "plugin",
+            "memory",
+            "models",
+            "sessions",
+            "usage",
+            "setup",
+            "share",
+            "wrap",
+            "export",
+            "trace",
+            "version",
+            "v",
+            "completions",
+            "worktree",
+            "du",
+            "disk-usage",
+            "workspace",
+            "dashboard",
+            "worker",
+            "cursor-worker",
+            "clone",
+            "ssh",
+            "host-server",
+            "help",
+        ],
+        live_upgrade: false,
+        revision_versions: false,
+        floor: floor(1, 0, 67),
+        legacy_ceiling: NEVER_INDEX_PINNED,
+        default_set: false,
+    },
+    VendorSpec {
+        program: "kimi",
+        vendor: "Moonshot AI",
+        product: "Kimi Code",
+        description: "Moonshot AI Kimi Code — MIT, ~190 MB, downloaded from cdn.kimi.com",
+        head_url: "https://cdn.kimi.com/kimi-code/latest",
+        anchor: Anchor::MoonshotTwoHost,
+        apple_team: "2J9472RW75",
+        exposes: &["kimi"],
+        aliases: &[],
+        url_prefixes: &[
+            "https://cdn.kimi.com/kimi-code/",
+            "https://github.com/MoonshotAI/kimi-code/releases/download/",
+        ],
+        url_query: &[],
+        digest_docs: &[
+            DocPin {
+                prefix: "https://cdn.kimi.com/kimi-code/",
+                redirect_hosts: &[],
+            },
+            DocPin {
+                prefix: "https://github.com/MoonshotAI/kimi-code/releases/download/",
+                redirect_hosts: &[
+                    "release-assets.githubusercontent.com",
+                    "objects.githubusercontent.com",
+                ],
+            },
+        ],
+        shim_env: &["KIMI_CODE_NO_AUTO_UPDATE=1"],
+        warm: None,
+        self_update_verbs: &["upgrade", "update"],
+        yolo_flags: &["--auto"],
+        yolo_markers: &[
+            "--auto",
+            "-y",
+            "--yes",
+            "--auto-approve",
+            "--plan",
+            "-p",
+            "--prompt",
+            "--prompt=",
+            "-S",
+            "--session",
+            "--session=",
+            "-r",
+            "--resume",
+            "--resume=",
+            "-c",
+            "--continue",
+            "-C",
+        ],
+        yolo_after: &[],
+        yolo_skip: &[
+            "export",
+            "fork",
+            "provider",
+            "session",
+            "acp",
+            "web",
+            "login",
+            "doctor",
+            "vis",
+            "install-desktop",
+            "app",
+            "migrate",
+        ],
+        live_upgrade: false,
+        revision_versions: false,
+        floor: floor(2, 3, 1),
+        legacy_ceiling: NEVER_INDEX_PINNED,
+        default_set: false,
     },
 ];
 
@@ -613,6 +785,8 @@ mod tests {
             (Anchor::OpenAiTwoHost, "openai-two-host"),
             (Anchor::GoogleTwoHost, "google-two-host"),
             (Anchor::MetaDeveloperId, "meta-developer-id"),
+            (Anchor::MoonshotTwoHost, "moonshot-two-host"),
+            (Anchor::XaiDeveloperId, "xai-developer-id"),
         ] {
             let text = aterm_toml::to_string(&Row { a }).unwrap();
             assert_eq!(text.trim(), format!("a = \"{spelled}\""));
@@ -679,5 +853,83 @@ mod tests {
             assert!(row.digest_doc_admitted(doc, doc), "{doc}");
             assert!(!row.digest_doc_admitted(doc, other), "{doc} from {other}");
         }
+        let kimi = spec("kimi").unwrap();
+        let cdn = "https://cdn.kimi.com/kimi-code/binaries/2.3.1/manifest.json";
+        let github = "https://github.com/MoonshotAI/kimi-code/releases/download/\
+                      @moonshot-ai/kimi-code@2.3.1/manifest.json";
+        for doc in [kimi.head_url, cdn, github] {
+            assert!(kimi.digest_doc_admitted(doc, doc), "{doc}");
+        }
+        assert!(kimi.digest_doc_admitted(github, storage));
+        assert!(kimi.digest_doc_admitted(github, "https://objects.githubusercontent.com/x"));
+        for effective in [
+            storage,
+            "https://objects.githubusercontent.com/x",
+            "https://cdn.kimi.com/kimi-code/binaries/2.3.2/manifest.json",
+            github,
+        ] {
+            assert!(
+                !kimi.digest_doc_admitted(cdn, effective),
+                "{cdn} from {effective}"
+            );
+            assert!(
+                !kimi.digest_doc_admitted(kimi.head_url, effective),
+                "the head from {effective}"
+            );
+        }
+        for effective in [
+            cdn,
+            "https://code.kimi.com/kimi-code/latest",
+            "https://evil.example/x",
+            "https://release-assets.githubusercontent.com.evil.com/x",
+            "http://release-assets.githubusercontent.com/x",
+        ] {
+            assert!(!kimi.digest_doc_admitted(github, effective), "{effective}");
+        }
+        let grok = spec("grok").unwrap();
+        assert!(!grok.anchor.publishes_digest(), "grok's bytes are measured");
+        assert!(grok.digest_doc_admitted(grok.head_url, grok.head_url));
+        for effective in [
+            "https://x.ai/cli/stable",
+            "https://storage.googleapis.com/grok-build-public-artifacts/cli/alpha",
+            "https://storage.googleapis.com/antigravity-public/antigravity-cli/stable",
+        ] {
+            assert!(
+                !grok.digest_doc_admitted(grok.head_url, effective),
+                "grok's pointer from {effective}"
+            );
+        }
+        for row in VENDORS {
+            assert_eq!(
+                row.anchor.publishes_digest(),
+                row.anchor != Anchor::XaiDeveloperId,
+                "{}",
+                row.program
+            );
+            assert!(
+                row.anchor.publishes_digest() || !row.anchor.vouches_before_download(),
+                "{}: a measured digest vouches for nothing before the bytes",
+                row.program
+            );
+        }
+    }
+
+    /// THE DEFAULT SET IS THE OWNER'S ROSTER: every machine a row serves gets claude, codex
+    /// (and OpenAI's own codex-old beside it), agy and muse; grok and kimi are installed only
+    /// when a person asks for them, and kept current once they are.
+    #[test]
+    fn only_the_owners_roster_is_in_the_default_set() {
+        let set: Vec<&str> = VENDORS
+            .iter()
+            .filter(|row| row.default_set)
+            .map(|row| row.program)
+            .collect();
+        assert_eq!(set, ["claude", "codex", "agy", "muse", "codex-old"]);
+        let asked: Vec<&str> = VENDORS
+            .iter()
+            .filter(|row| !row.default_set)
+            .map(|row| row.program)
+            .collect();
+        assert_eq!(asked, ["grok", "kimi"]);
     }
 }

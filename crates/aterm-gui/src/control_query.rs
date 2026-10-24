@@ -2252,15 +2252,9 @@ const fn _styled_frame_covers_every_render_input_field(ri: &aterm_core::render::
         ink: _, // OMITTED: host-owned animated-ink fg overrides (render bling), not engine cell content
         char_fg: _, // OMITTED: host-owned EMBERFORGE charred glyph-ink fg overrides (render bling), not engine cell content
         fire_halo: _, // OMITTED: host-owned EMBERFORGE fire contrast-halo strengths (render bling), not engine cell content
-        cat_quads: _, // OMITTED: host-owned peeking-cat sprite quads (render bling), not engine cell content
-        cat_atlas: _, // OMITTED: host-owned peeking-cat sprite atlas (texture), not engine cell content
         nova_add: _, // OMITTED: host-owned supernova additive-light quads (render bling), not engine cell content
-        free_sprites: _, // OMITTED: host-owned free-overlay sprites (render bling; spliced into styled captures like cat_quads), not engine cell content
-        free_atlas: _, // OMITTED: host-owned free-overlay atlas (texture), not engine cell content
-        rain_quads: _, // OMITTED: host-owned PHOSPHOR rain sprite quads (render bling), not engine cell content
-        rain_atlas: _, // OMITTED: host-owned PHOSPHOR rain glyph atlas (texture), not engine cell content
         rain_add: _, // OMITTED: host-owned PHOSPHOR rain additive halos (render bling), not engine cell content
-        fx_layers: _, // OMITTED: host-owned retained fx layers (the engine's sprite/bitmap primitive), not engine cell content
+        fx_layers: _, // OMITTED: host-owned retained fx layers (the engine's sprite/bitmap primitive: the companions, the rain's rows, the cards), not engine cell content
         fx_occluders: _, // OMITTED: host chrome rects subtracted from the fx layers, not engine cell content
         fx_prefetch: _,  // OMITTED: GPU residency hints for fx arts; draw nothing
         display_offset: _, // OMITTED: viewport scroll position, not visible-cell content

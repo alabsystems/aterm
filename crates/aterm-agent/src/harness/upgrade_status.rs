@@ -4609,6 +4609,7 @@ impl View {
                 home: std::path::PathBuf::new(),
                 state: std::path::PathBuf::new(),
                 sock: Some(sock),
+                token: None,
                 only_sid: None,
                 dry_run: false,
                 human_grace_s: 0,

@@ -503,6 +503,25 @@ fn one_session_reads_in_full() {
 }
 
 #[test]
+fn the_json_form_with_a_sid_is_that_session_alone() {
+    let replies = vec![
+        reply(3, vec![busy_agent(3, 1), shell(2)]),
+        HostReply {
+            label: "pid 77".into(),
+            remote: false,
+            unproven: false,
+            answer: Err("server replied: ERR unknown verb 'survey'".into()),
+        },
+    ];
+    let sid = "s-ffff0000000000000002";
+    let json = render_json(&only_sid(&replies, sid));
+    assert!(json.contains(&format!("\"sid\":\"{sid}\"")), "{json}");
+    assert!(!json.contains("\"program\":\"claude\""), "{json}");
+    assert!(!json.contains("pid 77"), "{json}");
+    assert!(only_sid(&replies, "s-nope").is_empty());
+}
+
+#[test]
 fn the_json_form_is_every_record() {
     let replies = vec![
         reply(3, vec![busy_agent(3, 1), shell(2)]),

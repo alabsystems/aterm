@@ -9,8 +9,7 @@ use super::error::Error;
 use super::token::Token;
 use aterm_serde::ser::{self, Serialize};
 
-/// A `Serializer` that ensures that a value serializes to a given list of
-/// tokens.
+/// A `Serializer` that verifies a value serializes to a given token list.
 #[derive(Debug)]
 pub struct Serializer<'a> {
     tokens: &'a [Token],
@@ -22,7 +21,6 @@ impl<'a> Serializer<'a> {
         Serializer { tokens }
     }
 
-    /// Pulls the next token off of the serializer, ignoring it.
     fn next_token(&mut self) -> Option<Token> {
         if let Some((&first, rest)) = self.tokens.split_first() {
             self.tokens = rest;

@@ -64,8 +64,19 @@ fn resource_accounting_reaps_once_and_keeps_the_childs_status() {
         .recv_timeout(Duration::from_secs(60))
         .expect("child never reached its handshake");
     assert_eq!(child.try_wait_with_rusage().unwrap(), None);
+    assert!(!child.exited().unwrap());
     child.stdin.as_mut().unwrap().write_all(b"x").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !child.exited().unwrap() {
+        assert!(Instant::now() < deadline, "the child never exited");
+        std::thread::yield_now();
+    }
+    let pid = i32::try_from(child.id()).unwrap();
+    // SAFETY: two integers; the pid is this test's own unreaped child.
+    let held = unsafe { libc::kill(pid, 0) } == 0;
+    assert!(held, "a child read as exited was reaped");
     let usage = child.wait_with_rusage().unwrap();
+    assert!(child.exited().unwrap());
     assert_eq!(usage.status.code(), Some(7));
     assert!(usage.maxrss >= ALLOCATED as u64, "{usage:?}");
     assert!(usage.cpu > Duration::ZERO, "{usage:?}");

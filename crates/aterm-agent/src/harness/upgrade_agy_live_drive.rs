@@ -119,17 +119,32 @@ pub(in super::super) fn leads(opts: &Opts, tabs: &[LiveTab]) -> bool {
 
 /// Runs the `agy` upgrade sweep step ([`super::super::lanes`]) for `opts.only_sid`.
 pub(in super::super) fn upgrade_pass(opts: &Opts, live_tabs: Option<&[LiveTab]>) -> Vec<Report> {
-    let Some(tabs) = live_tabs else {
-        return Vec::new();
+    let owned;
+    let tabs = match live_tabs {
+        Some(t) => t,
+        None => {
+            owned = super::super::instance_tabs(opts);
+            &owned
+        }
     };
-    upgrade_visit(
-        opts,
-        tabs,
-        managed_agent_twin(ag::PROGRAM),
-        &super::super::Live,
-    )
-    .into_iter()
-    .collect()
+    let twin = managed_agent_twin(ag::PROGRAM);
+    if opts.only_sid.is_some() {
+        return upgrade_visit(opts, tabs, twin, &super::super::Live)
+            .into_iter()
+            .collect();
+    }
+    tabs.iter()
+        .filter(|t| {
+            leader(tabs, &t.sid, &super::super::Live).is_some()
+                || load(opts, &key(&t.sid))
+                    .is_some_and(|st| st.agent == Agent::Agy && st.in_flight())
+        })
+        .filter_map(|t| {
+            let mut single = opts.clone();
+            single.only_sid = Some(t.sid.clone());
+            upgrade_visit(&single, tabs, twin.clone(), &super::super::Live)
+        })
+        .collect()
 }
 
 /// The directory agy keeps a conversation's own files under

@@ -332,6 +332,18 @@ impl Shared {
         }
     }
 
+    /// `privacy`'s `program_check=` ([`crate::vitals_jobs::program_check_of`]) from the newest jobs view this copy holds, pulled once when none speaks for now (leftover §9); `None` with no view that speaks for now after it. A control worker's call: the pull waits for the probe.
+    pub(crate) fn program_check_now(&self) -> Option<(u32, u64)> {
+        let read = || {
+            let (view, at, reader) = self.jobs_view()?;
+            crate::vitals_jobs::program_check_of(&view, at.elapsed(), reader)
+        };
+        read().or_else(|| {
+            let _ = self.fresh(crate::vitals_jobs::JOBS_FRESH, false);
+            read()
+        })
+    }
+
     /// The newest snapshot's jobs view, when it landed, and whether its reader runs.
     pub(crate) fn jobs_view(&self) -> Option<(Arc<aterm_vitals::jobs::JobsView>, Instant, bool)> {
         let g = self.lock();

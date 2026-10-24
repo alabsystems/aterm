@@ -1165,6 +1165,15 @@ fn the_cards_line_follows_an_armed_timer() {
             "cleared timer, untimed words"
         );
     }
+    for harness in aterm_phase::CliHarness::ALL {
+        let id = harness.id();
+        let ver = harness.version_str();
+        let texts = make_line_texts_for(Some(id), AutopilotView::Cruise, LineEnd::Mode);
+        assert!(
+            texts[0].contains(&format!(" \u{b7} {id} v{ver}")),
+            "{harness:?}: {texts:?}"
+        );
+    }
 }
 
 #[test]
@@ -1883,6 +1892,77 @@ fn a_light_theme_card_is_ink() {
                 .iter()
                 .any(|i| usize::from(i.row) == line_row && usize::from(i.col) == col)),
             "{osc}: the hero word inked"
+        );
+        set_now(None);
+        host.shutdown_and_join();
+    }
+}
+
+/// THE LINE'S `✦` READS ON A MID GROUND ON THE GLASS (`harness_card::line_star`): on Silver
+/// Aerogel's `#929292` and Unikitty's `#ff8cd9`, grounds the harness calls dark on which the
+/// line's letters are floored dark, the `✦` leading the words is laid over the ground in the
+/// first letter's ink through the episode and the flow, reading at least `MARK_CONTRAST` (its
+/// light added, as it was, read 1.59-1.65:1 on Silver Aerogel in the real-Claude lab). NEGATIVE
+/// CONTROL: that ink added to the ground misses the floor.
+#[test]
+fn the_lines_star_reads_on_a_mid_ground() {
+    use aterm_effects::color_math::contrast_ratio;
+    use aterm_effects::harness_card::MARK_CONTRAST;
+    for (name, osc, bg) in [
+        ("Silver Aerogel", "92/92/92", 0x0092_9292u32),
+        ("Unikitty", "ff/8c/d9", 0x00FF_8CD9),
+    ] {
+        let (mut app, wid, session) = glass(120);
+        {
+            let term = app.pool.get(session).unwrap().term.clone();
+            crate::term_lock(&term)
+                .process(format!("\x1b]11;rgb:{osc}\x1b\\\x1b]10;rgb:00/00/00\x1b\\").as_bytes());
+        }
+        let host = supervise(&mut app, session);
+        let t0 = Instant::now();
+        let mut added = 0.0f32;
+        for t in [
+            0,
+            1500,
+            3000,
+            EPISODE_MS + 1,
+            EPISODE_MS + 1 + 5 * FLOW_STEP_MS,
+        ] {
+            set_now(Some(t0 + Duration::from_millis(t)));
+            frame(&mut app, wid);
+            let line_row = strip_rows(&app, wid) + 4;
+            let scratch = &app.windows[&wid].input_scratch;
+            let star = scratch
+                .word_decorations
+                .iter()
+                .find(|d| usize::from(d.row) == line_row)
+                .unwrap_or_else(|| panic!("{name} {t} ms: the star"));
+            let first = scratch
+                .ink
+                .iter()
+                .find(|c| (usize::from(c.row), usize::from(c.col)) == (line_row, 11 + LINE_LEAD))
+                .unwrap_or_else(|| panic!("{name} {t} ms: the first letter's ink"));
+            assert_eq!(
+                (star.glyph, star.blend, star.color, star.alpha),
+                (
+                    DecoGlyph::Star4,
+                    DecoBlend::Over,
+                    pack(first.color),
+                    u8::MAX
+                ),
+                "{name} {t} ms: the first letter's ink, laid over"
+            );
+            let k = contrast_ratio(star.color, bg);
+            assert!(
+                k >= MARK_CONTRAST,
+                "{name} {t} ms: {:06x} at {k:.2}:1",
+                star.color
+            );
+            added = added.max(contrast_ratio(aterm_render::add_sat(bg, star.color), bg));
+        }
+        assert!(
+            added < MARK_CONTRAST,
+            "NEGATIVE CONTROL: {name}: the ink added, at best {added:.2}:1"
         );
         set_now(None);
         host.shutdown_and_join();

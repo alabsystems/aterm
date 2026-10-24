@@ -20,6 +20,7 @@ fn composed_frame(app: &mut App, wid: WindowId) {
         let mut term = term_lock(&terminal);
         term.resize(rows, cols);
         term.cell_frame_into(&mut ws.input_scratch, rows as usize, cols as usize);
+        ws.input_scratch.fx_occluders.clear(); // as the redraw does before it splices
     }
     app.splice_tab_strip_with(wid, 1);
 }
@@ -196,7 +197,7 @@ fn the_card_is_pinned_out_of_the_sub_row_scroll_band() {
 
 #[test]
 fn the_tab_menus_card_hides_the_caret_and_cuts_the_pet_under_it() {
-    use aterm_core::render::FreeSprite;
+    use aterm_render::sprites::{FreeSprite, FreeZ, SpriteLayers, is_sprite_layer, published};
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     app.tab_strip_rows = 1;
@@ -211,19 +212,28 @@ fn the_tab_menus_card_hides_the_caret_and_cuts_the_pet_under_it() {
         right + 3 < app.windows[&wid].input_scratch.cols,
         "room beside it"
     );
+    let body = aterm_render::fx::bitmap(
+        aterm_core::render::FxTexels::Rgba8Straight,
+        u16::try_from(4 * cw).unwrap(),
+        u16::try_from(ch).unwrap(),
+        vec![255; 4 * cw * ch * 4],
+    )
+    .expect("a body");
     let pet = FreeSprite {
-        x: px(right - 2, cw),
-        y: px(rect.row + 2, ch),
-        w: u16::try_from(4 * cw).unwrap(),
-        h: u16::try_from(ch).unwrap(),
-        aw: u16::try_from(4 * cw).unwrap(),
-        ah: u16::try_from(ch).unwrap(),
-        ..FreeSprite::default()
+        z: FreeZ::UnderText,
+        ..FreeSprite::whole(px(right - 2, cw), px(rect.row + 2, ch), body)
     };
     let publish = |app: &mut App| {
         let s = &mut app.windows.get_mut(&wid).unwrap().input_scratch;
         (s.cursor_row, s.cursor_col, s.cursor_visible) = (rect.row + 2, rect.col + 2, true);
-        s.free_sprites = vec![pet];
+        s.fx_layers.retain(|l| !is_sprite_layer(l));
+        SpriteLayers::new(0x7461_626D).publish(std::slice::from_ref(&pet), &mut s.fx_layers);
+    };
+    let card_occluder = |s: &aterm_render::RenderInput| {
+        s.fx_occluders
+            .iter()
+            .find(|o| o.x1 - o.x0 == px(rect.w, cw) && o.y1 - o.y0 == px(rect.h, ch))
+            .copied()
     };
     composed_frame(&mut app, wid);
     publish(&mut app);
@@ -231,22 +241,28 @@ fn the_tab_menus_card_hides_the_caret_and_cuts_the_pet_under_it() {
     let s = &app.windows[&wid].input_scratch;
     assert!(!s.cursor_visible, "the caret under the card is hidden");
     assert_eq!(
-        s.free_sprites
-            .iter()
-            .map(|q| (q.x, q.w, q.ax))
-            .collect::<Vec<_>>(),
-        [(
-            px(right, cw),
-            u16::try_from(2 * cw).unwrap(),
-            u16::try_from(2 * cw).unwrap()
-        )],
-        "the pet beside the card stays, the part on it goes"
+        published(&s.fx_layers),
+        std::slice::from_ref(&pet),
+        "the pet's layer stands whole"
     );
+    let occ = card_occluder(s).expect("the card occludes every fx layer");
+    let (pad, top) = (occ.x0 - px(rect.col, cw), occ.y0 - px(rect.row, ch));
+    let (x0, x1) = (pad + pet.x, pad + pet.x + i32::from(pet.w));
+    let (y0, y1) = (top + pet.y, top + pet.y + i32::from(pet.h));
+    assert!(
+        occ.x0 <= x0 && occ.x1 == pad + px(right, cw) && occ.x1 < x1,
+        "the card cuts the part of the pet on it and leaves the part beside it"
+    );
+    assert!(occ.y0 <= y0 && y1 <= occ.y1, "over all of the pet's rows");
     assert!(app.close_tab_menu(wid));
     composed_frame(&mut app, wid);
     publish(&mut app);
     app.splice_tab_menu(wid);
     let s = &app.windows[&wid].input_scratch;
     assert!(s.cursor_visible, "CONTROL: no card, the caret stands");
-    assert_eq!(s.free_sprites, [pet], "CONTROL: no card, the pet is whole");
+    assert_eq!(published(&s.fx_layers), [pet], "CONTROL: the pet is whole");
+    assert!(
+        card_occluder(s).is_none(),
+        "CONTROL: no card, nothing occludes it"
+    );
 }

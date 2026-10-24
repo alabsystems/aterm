@@ -1,10 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The seed pin at publish time (`channel::seed::publish_refusals`) against a real trust origin
-//! in scratch git: publishing waits until origin main contains this cut's re-pin, which pins
-//! this compiler (and the generated section byte for byte), its ledger names the re-pin's
-//! archive release, and that release exists.
+//! Seed pin tests (`channel::seed::publish_refusals`) against a scratch git origin.
 
 use std::path::{Path, PathBuf};
 
@@ -37,8 +34,6 @@ fn commit(dir: &Path, stage0_text: &str, ledger_text: &str, msg: &str) -> String
     git(dir, &["rev-parse", "HEAD"])
 }
 
-/// An origin whose main carries the re-pin, a consumer clone of it, and a seal whose
-/// SEED-MINT names that re-pin.
 struct Fixture {
     rig: Rig,
     origin: PathBuf,
@@ -229,7 +224,6 @@ fn the_receipt_is_described_honestly() {
                    ddc_seed_lineage=trust\nddc_seed_relation=pin-ancestor\n\
                    stage2_tree_sha256_pinned_seed=feed\nlineage_disjoint_anchor=none\n\
                    repin_commit=3333333333cccc\nrepin_branch=seed/repin-x\nrepin_release_tag=t\n";
-    // A pin-ancestor double compile is never called diverse.
     let line = seed::describe(receipt);
     assert!(line.contains("not diverse"), "{line}");
     let disjoint = seed::describe(&receipt.replace("pin-ancestor", "lineage-disjoint"));

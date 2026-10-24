@@ -419,7 +419,7 @@ fn an_expired_prediction_ghost_leaves_no_cells_behind_in_a_split() {
     );
 }
 
-/// Compares all pane-extraction channels of two [`aterm_core::render::RenderInput`] frames (atlases and wallpaper by presence).
+/// Compares all pane-extraction channels of two [`aterm_core::render::RenderInput`] frames (the companions by value, the rain by its rows, the wallpaper by presence).
 fn extraction_diff(
     a: &aterm_core::render::RenderInput,
     b: &aterm_core::render::RenderInput,
@@ -484,21 +484,28 @@ fn extraction_diff(
         ink,
         char_fg,
         fire_halo,
-        cat_quads,
-        free_sprites,
         nova_add,
-        rain_quads,
         rain_add,
     );
-    for (name, x, y) in [
-        ("cat_atlas", a.cat_atlas.is_some(), b.cat_atlas.is_some()),
-        ("free_atlas", a.free_atlas.is_some(), b.free_atlas.is_some()),
-        ("rain_atlas", a.rain_atlas.is_some(), b.rain_atlas.is_some()),
-        ("wallpaper", a.wallpaper.is_some(), b.wallpaper.is_some()),
-    ] {
-        if x != y {
-            out.push(format!("{name} presence {x} vs {y}"));
-        }
+    use aterm_render::sprites::published;
+    if published(&a.fx_layers) != published(&b.fx_layers) {
+        out.push("companion sprite layers".to_string());
+    }
+    let rain_rows = |i: &aterm_core::render::RenderInput| {
+        let layers = i.fx_layers.iter();
+        layers
+            .filter(|l| aterm_effects::matrix_rain::is_rain_row(l))
+            .count()
+    };
+    if rain_rows(a) != rain_rows(b) {
+        out.push(format!("rain rows {} vs {}", rain_rows(a), rain_rows(b)));
+    }
+    if a.wallpaper.is_some() != b.wallpaper.is_some() {
+        out.push(format!(
+            "wallpaper presence {} vs {}",
+            a.wallpaper.is_some(),
+            b.wallpaper.is_some()
+        ));
     }
     out
 }

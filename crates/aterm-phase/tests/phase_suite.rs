@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The aterm-phase integration files as modules of ONE test binary: each file
-//! stays at its own path and keeps its own `#[test]`s.
-//!
-//! `autotests = false` in `Cargo.toml`: a `tests/*.rs` file that is neither a
-//! `mod` line here nor a `[[test]]` of its own never compiles.
-//!
-//! Run one file's tests with
-//! `targo --unverified test -p aterm-phase --test phase_suite -- <file>::`.
+//! Combined `aterm-phase` integration test binary (`autotests = false` in `Cargo.toml`).
 
 #[path = "common/fixture_files.rs"]
 mod fixture_files;
@@ -17,8 +10,6 @@ mod busy_zone_sweep;
 mod frame_torn_sweep;
 mod live_zone_sweep;
 
-/// `f` of each of `items`, on every core, in `items`' order. The sweeps'
-/// screens are independent and each is read by every reader.
 fn on_every_core<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let next = AtomicUsize::new(0);

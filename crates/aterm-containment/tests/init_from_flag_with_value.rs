@@ -1,10 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-// Author: Andrew Yates
 
 //! Integration test: `init_mode_from_flag` takes the flag's mode over the default.
-//!
-//! This runs in a fresh process (`crate::in_fresh_process`), so the OnceLock is fresh.
 
 use aterm_containment::ContainmentMode;
 
@@ -18,16 +15,13 @@ fn init_from_flag_uses_the_flag_over_default() {
                 aterm_containment::init_mode_from_flag(Some("safety"), ContainmentMode::User)
                     .expect("init_mode_from_flag should succeed");
 
-            // The flag's "safety" overrides the User default.
             assert_eq!(mode, ContainmentMode::Safety);
 
-            // Global mode should now be Safety.
             assert_eq!(
                 aterm_containment::try_current_mode(),
                 Some(ContainmentMode::Safety)
             );
 
-            // Capabilities should match Safety policy.
             let caps = aterm_containment::ContainmentPolicy::capabilities(mode);
             assert_eq!(caps.network, aterm_containment::NetworkCapability::Full);
             assert_eq!(

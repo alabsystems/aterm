@@ -2339,6 +2339,36 @@ fn dispatch_await_task_resolves_its_list_and_refuses_what_it_cannot() {
     );
 }
 
+/// THE LIST FORM'S PER-TARGET FACT EDGE (`@<sel>:<rev>:<fact_rev>`, which the ctl client's
+/// re-arm legs send): an element's own fact edge wins over the request's `fact_since=`, so a word
+/// noted past it answers at once. CONTROL: an element whose edge is the record's `fact_rev` waits
+/// to its short timeout, so the edge decided, not the word standing.
+#[test]
+fn dispatch_await_task_reads_each_targets_own_fact_edge() {
+    use crate::task_record::{TaskMark, TaskState, mark_session_task, mark_session_task_fact};
+    use aterm_agent::supervise::occupancy::{FactWord, NoteOutcome, RuleId};
+    let store = session_store::new_store();
+    let active: ActiveHandle = Arc::default();
+    let a = registered_session(1, -1, b"");
+    store.write().unwrap().register(a.clone());
+    mark_session_task(&a.ctx, 1, &TaskMark::new(TaskState::Working)).expect("unfenced");
+    let word = FactWord::new(RuleId::HoldRoom, 1);
+    assert_eq!(
+        mark_session_task_fact(&a.ctx, 1, word, std::time::Duration::ZERO),
+        NoteOutcome::Noted
+    );
+    let ask = |line: String| {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        dispatch_await_task(&words, &active, &store, Scope::Owner)
+    };
+    let sid = a.sid.as_str();
+    let past = ask(format!("@{sid}:1:0 facts=1 fact_since=1 timeout=60000"));
+    assert!(past.starts_with("OK 1\n"), "{past}");
+    assert!(past.contains(" fact=hold-room@v1#1 fact_rev=1"), "{past}");
+    let at = ask(format!("@{sid}:1:1 facts=1 timeout=20"));
+    assert!(at.starts_with("OK 1 status=timeout\n"), "CONTROL: {at}");
+}
+
 #[test]
 fn wait_requests_are_the_ones_that_park_or_relay() {
     let store = session_store::new_store();
@@ -12147,6 +12177,8 @@ fn a_turn_into_a_worker_names_the_task_rev_its_enter_found() {
             local_id: 0,
             ctx: &h.ctx,
             since: Some(named),
+            facts: false,
+            fact_since: None,
         }];
         super::control_session::await_task(&store, &target, Combine::Any, timeout_ms)
     };
@@ -16770,6 +16802,130 @@ fn the_harness_token_reads_as_harness_and_holds_owner_power() {
     );
 }
 
+/// A connection that presents the window harness's in-memory token writes `by=harness` into the
+/// session log, and one that presents the token beside the socket writes `by=ctl`, over a socket
+/// end to end: the agent's own connector ([`aterm_agent::harness::upgrade_drive::harness_client`],
+/// which the window's drive, its disk resume and the hosted loop dial with), the real handshake
+/// ([`authenticate_connection`]), a lane that enters the principal it proved, and the log's own
+/// `mark` and `log` verbs. The mark is the label the supervise loop writes after a usage wall.
+#[cfg(unix)]
+#[test]
+fn the_harness_tokens_connection_writes_the_log_by_harness_and_the_beside_one_by_ctl() {
+    use aterm_agent::harness::upgrade_drive::{HarnessToken, harness_client};
+    const INSTANCE: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const LABEL: &str = "mark - label text=resuming%20after%20limit ttl=30";
+    struct LogService {
+        active: ActiveHandle,
+        ctx: Arc<SessionCtx>,
+        denials: control_denials::AuthDenials,
+    }
+    impl control_lanes::LaneService for LogService {
+        fn authenticate(
+            &self,
+            stream: &CtlStream,
+            reader: &mut control_lanes::LaneReader<'_>,
+        ) -> Option<(Scope, Principal, Option<String>)> {
+            authenticate_connection(
+                stream,
+                reader,
+                INSTANCE,
+                &self.active,
+                &self.denials,
+                std::time::Instant::now() + AUTH_READ_TIMEOUT,
+            )
+        }
+        fn serve_line(
+            &self,
+            request: Request,
+            scope: Scope,
+            _stream: &CtlStream,
+            _reader: &mut control_lanes::LaneReader<'_>,
+            out: &mut control_lanes::Outbox,
+        ) -> Option<ServeDisposition> {
+            let line = request.line();
+            let reply = match line.strip_prefix("mark ") {
+                Some(rest) => dispatch_mark(&self.ctx, scope, rest),
+                None if line == "log" => control_session::cmd_log(&self.ctx, ""),
+                None => "OK\n".to_string(),
+            };
+            out.extend_from_slice(reply.as_bytes());
+            None
+        }
+        fn is_wait(&self, _request: &Request, _scope: Scope) -> bool {
+            false
+        }
+        fn subscribe(&self, _request: Request, _scope: Scope, _stream: CtlStream) {}
+        fn release(&self, _id: u64) {}
+        fn has_live_claim(&self, _id: u64) -> bool {
+            false
+        }
+    }
+    let h = registered_session(0, -1, b"");
+    let dir = crate::test_scratch::short_dir("the log's socket");
+    let sock = dir.path().join("c.sock");
+    let names = aterm_types::control_socket::token_names_for_sock("c.sock");
+    std::fs::write(dir.path().join(&names[0]), format!("{INSTANCE}\n")).expect("beside");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    let lanes = control_lanes::Lanes::new(control_lanes::LaneLimits {
+        rpc: 1,
+        wait: 0,
+        inline: 0,
+        open: 4,
+        subscriptions: 0,
+    });
+    assert_eq!(lanes.start().rpc, 1, "the request lane starts");
+    lanes.publish(Arc::new(LogService {
+        active: active_for(&h),
+        ctx: Arc::clone(&h.ctx),
+        denials: control_denials::AuthDenials::new(),
+    }));
+    let path = sock.to_string_lossy().into_owned();
+    let harness = HarnessToken::new(control_auth::harness_token().expect("entropy"));
+    let client = std::thread::spawn(move || {
+        let mut said = Vec::new();
+        for token in [Some(&harness), None] {
+            let mut c = harness_client(&path, token).expect("a connection");
+            said.push(c.request_line(LABEL).expect("marked"));
+            drop(c);
+        }
+        let mut c = harness_client(&path, None).expect("a connection");
+        let (_, log) = c.request_counted("log").expect("the log");
+        (said, log)
+    });
+    for _ in 0..3 {
+        let (stream, _) = aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the connector connects",
+            || match listener.accept() {
+                Ok(connection) => Some(connection),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => None,
+                Err(error) => panic!("accept: {error}"),
+            },
+        );
+        stream.set_nonblocking(false).expect("blocking lane stream");
+        assert!(lanes.admit(stream).is_ok(), "admitted");
+    }
+    let (said, log) = client.join().expect("the connector's thread");
+    assert_eq!(
+        said,
+        ["OK seq=1 node=- by=harness", "OK seq=2 node=- by=ctl"],
+        "the harness's token, then the one beside the socket"
+    );
+    let labels = |by: &str| {
+        log.lines()
+            .filter(|l| l.contains(" label text=resuming%20after%20limit ") && l.contains(by))
+            .count()
+    };
+    assert_eq!(
+        (labels(" by=harness "), labels(" by=ctl ")),
+        (1, 1),
+        "{log}"
+    );
+}
+
 #[test]
 fn a_wrong_token_is_still_err_auth() {
     let instance = "0f".repeat(32);
@@ -18213,7 +18369,7 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
         Ok(DriveLine::Act { line, .. }) => assert_eq!(line, "spawn agent=claude raise=false len=5"),
         other => panic!("{other:?}"),
     }
-    for word in ["gemini", "agy", "muse"] {
+    for word in ["codex", "gemini", "agy", "muse"] {
         match gate(&format!("spawn agent={word} model=m-1 cwd={CWD} len=5")) {
             Ok(DriveLine::Act { line, .. }) => assert_eq!(
                 line,
@@ -18254,7 +18410,7 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
         "spawn".to_owned(),
         "spawn agent=claude".to_owned(),
         "spawn len=5".to_owned(),
-        "spawn agent=codex len=5".to_owned(),
+        "spawn agent=codex-old len=5".to_owned(),
         "spawn agent=generic len=5".to_owned(),
         "spawn agent=gemini".to_owned(),
         "spawn agent=agy identity=x len=5".to_owned(),

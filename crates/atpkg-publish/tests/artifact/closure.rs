@@ -1,9 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The trust bundle's frozen closure: every refusal of `closure::prepare`, the seal never
-//! written, no link followed or written through, and a complete closure that survives a
-//! moved root and a repack.
+//! Tests for `closure::prepare` refusals, symlink handling, and relocated repacks.
 
 #![cfg(unix)]
 
@@ -21,7 +19,6 @@ fn triple() -> Triple {
     Triple::parse(SEAL_TRIPLE).expect("a target")
 }
 
-/// A seal, its private closure, and a stage copied from the seal (links kept).
 struct Fx {
     _tmp: aterm_tempfile::TempDir,
     root: PathBuf,
@@ -82,7 +79,6 @@ fn a_complete_closure_survives_a_moved_root_and_a_repack() {
     let moved = f.root.join("elsewhere/toolchain");
     std::fs::create_dir_all(moved.parent().expect("parent")).expect("mkdir");
     std::fs::rename(&f.stage, &moved).expect("move the stage");
-    // Hide the original seal and its sibling registry: nothing may still point there.
     std::fs::rename(&f.source, f.root.join("hidden-seal")).expect("hide");
     std::fs::rename(
         f.private.parent().expect("registry"),
@@ -108,8 +104,6 @@ fn a_complete_closure_survives_a_moved_root_and_a_repack() {
     );
     assert!(no_links(&moved), "no symlink reaches the client");
 
-    // Relocation may rewrite the driver's bytes; its two names stay one inode, and a
-    // repack of the complete tree needs neither the old seal nor its hash.
     std::fs::write(
         moved.join("lib").join(SEAL_DRIVER),
         b"relocated same driver\n",
@@ -164,7 +158,6 @@ fn no_other_private_directory_is_ever_taken_for_the_named_one() {
     assert!(matches!(f.prepare(), Err(Refusal::NotRealDir(_))));
 }
 
-/// `(name, private member, its bytes, the refusal it must cause)`.
 type Case = (&'static str, String, &'static [u8], fn(&Refusal) -> bool);
 
 #[test]

@@ -447,6 +447,21 @@ pub enum LinkKind {
     Other,
 }
 
+impl LinkKind {
+    /// Canonical lowercase word for `sys` output.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Wifi => "wifi",
+            Self::Ethernet => "ethernet",
+            Self::Cellular => "cellular",
+            Self::Vpn => "vpn",
+            Self::Bridge => "bridge",
+            Self::Other => "other",
+        }
+    }
+}
+
 /// An account among the tabs', as the host numbers them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct AccountIx(pub u8);
@@ -458,14 +473,135 @@ pub struct LinkSample {
     pub name: String,
     /// What it is.
     pub kind: LinkKind,
+    /// True when the interface is up and running (`IFF_UP` and `IFF_RUNNING`).
+    pub up: bool,
+    /// True when the interface is loopback (`IFF_LOOPBACK`).
+    pub loopback: bool,
     /// True when traffic on this interface counts toward machine-level totals.
     pub counts: bool,
     /// Bytes received, cumulative.
     pub rx: u64,
     /// Bytes sent, cumulative.
     pub tx: u64,
+    /// Packets received, cumulative.
+    pub rx_packets: u64,
+    /// Packets sent, cumulative.
+    pub tx_packets: u64,
+    /// Receive errors, cumulative.
+    pub rx_errors: u64,
+    /// Send errors, cumulative.
+    pub tx_errors: u64,
+    /// Inbound packets dropped, cumulative.
+    pub rx_drops: u64,
+    /// Outbound packets dropped, cumulative (`None` where the OS does not expose it).
+    pub tx_drops: Option<u64>,
     /// The link rate the driver reports, bits per second.
     pub rate_bps: Option<u64>,
+}
+
+/// Machine-wide TCP socket counts by connection state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TcpCounts {
+    /// `ESTABLISHED` connections.
+    pub established: u32,
+    /// `SYN_SENT` sockets.
+    pub syn_sent: u32,
+    /// `SYN_RECV` sockets.
+    pub syn_recv: u32,
+    /// `FIN_WAIT1` sockets.
+    pub fin_wait1: u32,
+    /// `FIN_WAIT2` sockets.
+    pub fin_wait2: u32,
+    /// `TIME_WAIT` sockets.
+    pub time_wait: u32,
+    /// `CLOSE` sockets.
+    pub close: u32,
+    /// `CLOSE_WAIT` sockets.
+    pub close_wait: u32,
+    /// `LAST_ACK` sockets.
+    pub last_ack: u32,
+    /// `LISTEN` sockets.
+    pub listen: u32,
+    /// `CLOSING` sockets.
+    pub closing: u32,
+}
+
+impl TcpCounts {
+    /// Total TCP sockets across all states.
+    #[must_use]
+    pub const fn total(&self) -> u32 {
+        self.established
+            .saturating_add(self.syn_sent)
+            .saturating_add(self.syn_recv)
+            .saturating_add(self.fin_wait1)
+            .saturating_add(self.fin_wait2)
+            .saturating_add(self.time_wait)
+            .saturating_add(self.close)
+            .saturating_add(self.close_wait)
+            .saturating_add(self.last_ack)
+            .saturating_add(self.listen)
+            .saturating_add(self.closing)
+    }
+
+    /// Sockets in handshake states (`SYN_SENT + SYN_RECV`).
+    #[must_use]
+    pub const fn connecting(&self) -> u32 {
+        self.syn_sent.saturating_add(self.syn_recv)
+    }
+
+    /// Sockets in teardown states (`FIN_WAIT1 + FIN_WAIT2 + TIME_WAIT + CLOSE_WAIT + LAST_ACK + CLOSING`).
+    #[must_use]
+    pub const fn closing_total(&self) -> u32 {
+        self.fin_wait1
+            .saturating_add(self.fin_wait2)
+            .saturating_add(self.time_wait)
+            .saturating_add(self.close_wait)
+            .saturating_add(self.last_ack)
+            .saturating_add(self.closing)
+    }
+}
+
+/// Per-second network throughput, packet, error, and drop rates over the last sample interval.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LinkRates {
+    /// Bytes received per second.
+    pub rx_bps: f64,
+    /// Bytes sent per second.
+    pub tx_bps: f64,
+    /// Packets received per second.
+    pub rx_pps: f64,
+    /// Packets sent per second.
+    pub tx_pps: f64,
+    /// Receive errors per second.
+    pub rx_err_ps: f64,
+    /// Send errors per second.
+    pub tx_err_ps: f64,
+    /// Inbound packet drops per second.
+    pub rx_drop_ps: f64,
+    /// Outbound packet drops per second, where both readings carried `tx_drops`.
+    pub tx_drop_ps: Option<f64>,
+}
+
+/// One network interface as `sys net` and the Network lens show it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LinkView {
+    /// Cumulative counters and attributes from this reading.
+    pub sample: LinkSample,
+    /// Per-second rates over the last sample window (`None` on first reading or after counter reset).
+    pub rates: Option<LinkRates>,
+}
+
+/// Network interfaces, throughput rates, and TCP connection counts.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct NetView {
+    /// Every interface read on this sample, in probe order.
+    pub links: Vec<LinkView>,
+    /// Aggregate rates summed across counted (`counts == true`) interfaces over the last sample window.
+    pub rates: Option<LinkRates>,
+    /// Sample window duration in nanoseconds when `rates` is present.
+    pub window_ns: Option<u64>,
+    /// Machine-wide TCP socket counts by state, where readable.
+    pub tcp: Option<TcpCounts>,
 }
 
 /// The most processes the machine and one user may run.
@@ -577,6 +713,8 @@ pub struct Sample {
     pub swapped_kib: Option<u64>,
     /// Every network link's counters.
     pub links: Option<Vec<LinkSample>>,
+    /// Machine-wide TCP socket counts by state, where readable.
+    pub tcp: Option<TcpCounts>,
     /// The process limits.
     pub proc_limits: ProcLimits,
     /// Total machine processes (or tasks on Linux) and processes owned by this user.
@@ -915,6 +1053,17 @@ impl Resource {
     pub const fn index(self) -> usize {
         self as usize
     }
+
+    /// Whether a scope's figure is in the row's own unit, and so a share of the row's capacity:
+    /// busy cores, memory, tokens per minute and processes. A scope's Disk figure is a write rate
+    /// beside the volume's used bytes, and GPU and Network keep no figure per scope.
+    #[must_use]
+    pub const fn scope_shares_capacity(self) -> bool {
+        match self {
+            Self::Cpu | Self::Memory | Self::Tokens | Self::Processes => true,
+            Self::Gpu | Self::Disk | Self::Network => false,
+        }
+    }
 }
 
 /// Severity state of a resource row, ordered least to most severe.
@@ -994,13 +1143,30 @@ pub enum NoFigure {
     NoAgent,
 }
 
+/// Buckets of a scope's hour a snapshot carries ([`ScopeFig::run`]): the deck's 10 minutes.
+pub const SCOPE_RUN_BUCKETS: usize = 60;
+
 /// One scope's figure in a row: aterm's or a tab's.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ScopeFig {
     /// Trailing mean in the row's native unit, or `None` before the first full reading.
     pub now: Option<f64>,
     /// Why there is no figure at all, where that is known.
     pub missing: Option<NoFigure>,
+    /// The newest [`SCOPE_RUN_BUCKETS`] of the scope's 10 s cells, oldest first, raw; empty where
+    /// the scope never read this row.
+    pub run: Arc<[Cell]>,
+    /// Bucket index of the last cell in `run` (covering Unix seconds `[10 * run_k, 10 * run_k + 10)`).
+    pub run_k: i64,
+}
+
+impl ScopeFig {
+    /// The run's raw columns ([`BucketRing::columns`]). A column older than the run's first cell
+    /// is hollow although the model may hold it: the run carries [`SCOPE_RUN_BUCKETS`] alone.
+    #[must_use]
+    pub fn columns(&self, per_s: u32, ncols: usize, now_unix_ms: i64) -> Vec<Cell> {
+        columns_of(&self.run, self.run_k, per_s, ncols, now_unix_ms)
+    }
 }
 
 /// One series of a row: its "now", capacity and hour of cells.
@@ -1066,16 +1232,11 @@ impl ResourceView {
     /// Resample the 1-hour ring into `ncols` heat columns at `per_s` seconds per column.
     #[must_use]
     pub fn heat_columns(&self, per_s: u32, ncols: usize, now_unix_ms: i64) -> Vec<HeatCell> {
-        let ceiling = self.basis.heat_ceiling();
         let cells = |s: &Series| {
-            columns_of(&s.ring, self.ring_k, per_s, ncols, now_unix_ms)
-                .into_iter()
-                .map(|c| HeatCell {
-                    heat: heat_of(c.mean, s.capacity).map(|h| h.min(ceiling)),
-                    max: heat_of(c.max, s.capacity).map(|h| h.min(ceiling)),
-                    over: c.over,
-                })
-                .collect::<Vec<_>>()
+            self.heat_of_columns(
+                columns_of(&s.ring, self.ring_k, per_s, ncols, now_unix_ms),
+                s.capacity,
+            )
         };
         let mut out = cells(&self.first());
         if let Some(second) = self.second.as_ref() {
@@ -1086,6 +1247,17 @@ impl ResourceView {
             }
         }
         out
+    }
+
+    fn heat_of_columns(&self, cols: Vec<Cell>, capacity: Option<f64>) -> Vec<HeatCell> {
+        let ceiling = self.basis.heat_ceiling();
+        cols.into_iter()
+            .map(|c| HeatCell {
+                heat: heat_of(c.mean, capacity).map(|h| h.min(ceiling)),
+                max: heat_of(c.max, capacity).map(|h| h.min(ceiling)),
+                over: c.over,
+            })
+            .collect()
     }
 
     /// The first series, as [`Series`].
@@ -1264,6 +1436,8 @@ pub struct Snapshot {
     pub mem: Option<MemView>,
     /// The focused tab's volume, where readable.
     pub volume: Option<VolumeSample>,
+    /// Network interfaces, rates, and TCP connection counts, where readable.
+    pub net: Option<NetView>,
     /// The machine.
     pub global: ScopeView,
     /// This instance and its tabs; `None` until two sweeps exist.
@@ -1335,9 +1509,30 @@ impl Snapshot {
     pub fn resource(&self, res: Resource, tab: Option<u64>) -> ResourceView {
         let mut v = self.resources[res.index()].clone();
         if let Some(fig) = tab.and_then(|key| v.tabs.iter().find(|(k, _)| *k == key)) {
-            v.tab = fig.1;
+            v.tab = fig.1.clone();
         }
         v
+    }
+
+    /// Resample `fig`, a scope's figure in row `res`, into heat columns against the row's
+    /// binding capacity, the basis of the scope's share of the row; `None` where a scope's figure
+    /// is no share of the row's capacity ([`Resource::scope_shares_capacity`]).
+    #[must_use]
+    pub fn scope_heat_columns(
+        &self,
+        res: Resource,
+        fig: &ScopeFig,
+        per_s: u32,
+        ncols: usize,
+        now_unix_ms: i64,
+    ) -> Option<Vec<HeatCell>> {
+        let view = &self.resources[res.index()];
+        res.scope_shares_capacity().then(|| {
+            view.heat_of_columns(
+                fig.columns(per_s, ncols, now_unix_ms),
+                view.binding().capacity,
+            )
+        })
     }
 
     /// Take the stuck engine's view, and with it the Processes row's state.
@@ -1570,10 +1765,10 @@ struct Rows {
     yours: BucketRing,
     /// Last known fixed capacity per row.
     caps: [Option<f64>; 7],
-    /// aterm's figures' recent readings, by row.
-    aterm: [Recent; 7],
+    /// aterm's figures' hour, by row.
+    aterm: ScopeRings,
     /// Each tab's, by key.
-    tabs: HashMap<u64, [Recent; 7]>,
+    tabs: HashMap<u64, ScopeRings>,
     /// aterm's input tokens per minute.
     tokens_in: Recent,
     peaks: Peaks,
@@ -1584,7 +1779,7 @@ struct Rows {
     written: HashMap<u32, u64>,
     links_at: Option<Stamp>,
     /// Each link's counters at the last reading, by name.
-    links: HashMap<String, (u64, u64)>,
+    links: HashMap<String, LinkSample>,
     /// Name of the currently selected reference network link.
     link_pick: Option<String>,
     /// Another counted link leading it, and for how many readings in a row.
@@ -1597,6 +1792,26 @@ struct Rows {
     /// The GPU's reset count at the first reading, and when it first rose.
     gpu_recoveries: Option<u64>,
     gpu_rose_at: Option<i64>,
+}
+
+/// One scope's hour rings in [`Resource::ALL`] order; a row's ring exists once the scope read it.
+#[derive(Debug, Default)]
+struct ScopeRings([Option<BucketRing>; 7]);
+
+impl ScopeRings {
+    fn push(&mut self, now: i64, vals: [Option<f64>; 7]) {
+        for (ring, v) in self.0.iter_mut().zip(vals) {
+            if let Some(v) = v {
+                let _ = ring
+                    .get_or_insert_with(BucketRing::default)
+                    .push(now, Some(v), false);
+            }
+        }
+    }
+
+    fn ring(&self, res: Resource) -> Option<&BucketRing> {
+        self.0[res.index()].as_ref()
+    }
 }
 
 /// The model's running state. One per host instance.
@@ -1762,7 +1977,7 @@ impl Vitals {
             .filter(|_| cores_dt.is_some())
             .map(|c| f64::from(c.busy.raw));
         let figs = pass.figs.as_ref().filter(|_| !s.machine_only);
-        let (resources, facts) = self.rows.absorb(s, stamp, busy, figs, sweep_dt);
+        let (resources, facts, net) = self.rows.absorb(s, stamp, busy, figs, sweep_dt);
         let split = match (cpu.as_ref(), pass.split_parts) {
             (Some(c), Some((aterm, others, unread))) => {
                 let rest = c.busy.raw - aterm - others;
@@ -1785,6 +2000,7 @@ impl Vitals {
             gpu,
             mem,
             volume: s.volume.clone(),
+            net,
             global,
             aterm: pass.aterm,
             tabs: pass.tabs,
@@ -2180,7 +2396,7 @@ impl Rows {
         busy: Option<f64>,
         figs: Option<&SweepFigs>,
         sweep_dt: Option<f64>,
-    ) -> ([ResourceView; 7], RowFacts) {
+    ) -> ([ResourceView; 7], RowFacts, Option<NetView>) {
         use Resource::{Cpu, Disk, Gpu, Memory, Network, Processes, Tokens};
         let now = s.at_unix_ms;
         let mut facts = RowFacts {
@@ -2254,7 +2470,7 @@ impl Rows {
             facts.filling = history::filling(v.available, &facts.disk_rates, ttf);
         }
 
-        let (rx, tx) = self.absorb_links(s.links.as_deref(), stamp, &mut facts);
+        let (rx, tx, net) = self.absorb_links(s.links.as_deref(), s.tcp, stamp, &mut facts);
         let closed_rx = self.rings[Network.index()].push(now, rx, false);
         let closed_tx = self.net_tx.push(now, tx, false);
         note_peak(
@@ -2304,10 +2520,10 @@ impl Rows {
                 v[Processes.index()] = Some(f64::from(acc.procs));
                 v
             };
-            push_figs(&mut self.aterm, now, vals(&f.aterm, tokens.out));
+            self.aterm.push(now, vals(&f.aterm, tokens.out));
             for (root, acc) in s.tabs.iter().zip(&f.tabs) {
-                let recents = self.tabs.entry(root.key).or_default();
-                push_figs(recents, now, vals(acc, tokens.tabs.get(&root.key).copied()));
+                let rings = self.tabs.entry(root.key).or_default();
+                rings.push(now, vals(acc, tokens.tabs.get(&root.key).copied()));
             }
             facts.writers = f.writers.clone();
             facts.busiest = f.busiest.clone();
@@ -2320,9 +2536,14 @@ impl Rows {
                 _ => None,
             }
         };
-        let fig = |recent: Option<&Recent>, res: Resource, agent: bool| ScopeFig {
-            now: figs.and(recent).and_then(|r| r.mean(now, window_of(res))),
-            missing: missing(res, agent),
+        let fig = |rings: Option<&ScopeRings>, res: Resource, agent: bool| {
+            let ring = rings.and_then(|r| r.ring(res));
+            ScopeFig {
+                now: figs.and(ring).and_then(|r| r.now_mean(now, window_of(res))),
+                missing: missing(res, agent),
+                run: ring.map_or_else(|| Arc::from([]), |r| r.tail_cells(SCOPE_RUN_BUCKETS).into()),
+                run_k: ring.and_then(BucketRing::open_k).unwrap_or(0),
+            }
         };
 
         let disk_state = disk_state(s.disk.as_ref(), facts.filling.as_ref());
@@ -2364,56 +2585,96 @@ impl Rows {
                 Disk => disk_state,
                 _ => None,
             };
-            view.aterm = fig(Some(&self.aterm[i]), res, tokens.agents > 0);
+            view.aterm = fig(Some(&self.aterm), res, tokens.agents > 0);
             view.tab = fig(None, res, false);
             view.tabs = s
                 .tabs
                 .iter()
                 .map(|t| {
                     let agent = tokens.with_agent.contains(&t.key);
-                    (t.key, fig(self.tabs.get(&t.key).map(|r| &r[i]), res, agent))
+                    (t.key, fig(self.tabs.get(&t.key), res, agent))
                 })
                 .collect();
             view
         });
-        (resources, facts)
+        (resources, facts, net)
     }
 
     fn absorb_links(
         &mut self,
         links: Option<&[LinkSample]>,
+        tcp: Option<TcpCounts>,
         stamp: Stamp,
         facts: &mut RowFacts,
-    ) -> (Option<f64>, Option<f64>) {
+    ) -> (Option<f64>, Option<f64>, Option<NetView>) {
         let Some(links) = links else {
-            return (None, None);
+            let net = tcp.map(|tcp| NetView {
+                tcp: Some(tcp),
+                ..NetView::default()
+            });
+            return (None, None, net);
         };
         let dt = stamp.rate_dt(self.links_at.replace(stamp));
         let (mut rx, mut tx) = (0u64, 0u64);
+        let (mut rx_pkts, mut tx_pkts) = (0u64, 0u64);
+        let (mut rx_err, mut tx_err) = (0u64, 0u64);
+        let (mut rx_drop, mut tx_drop) = (0u64, 0u64);
+        let mut any_tx_drop = false;
         let mut measured = false;
         let mut moved_by: Vec<(&LinkSample, u64)> = Vec::new();
-        for l in links.iter().filter(|l| l.counts) {
-            let delta = match (dt, self.links.get(&l.name)) {
-                (Some(_), Some(&(brx, btx))) => l.rx.checked_sub(brx).zip(l.tx.checked_sub(btx)),
-                _ => None,
-            };
-            let moved = delta.map_or(0, |(d_rx, d_tx)| {
-                rx = rx.saturating_add(d_rx);
-                tx = tx.saturating_add(d_tx);
-                measured = true;
-                d_rx.saturating_add(d_tx)
+        let mut link_views: Vec<LinkView> = Vec::with_capacity(links.len());
+        for l in links {
+            let prev = self.links.get(&l.name);
+            let rates = dt.and_then(|d| prev.and_then(|b| link_rates(b, l, d)));
+            if l.counts {
+                let moved = if rates.is_some()
+                    && let Some(b) = prev
+                {
+                    let d_rx = l.rx - b.rx;
+                    let d_tx = l.tx - b.tx;
+                    rx = rx.saturating_add(d_rx);
+                    tx = tx.saturating_add(d_tx);
+                    rx_pkts = rx_pkts.saturating_add(l.rx_packets - b.rx_packets);
+                    tx_pkts = tx_pkts.saturating_add(l.tx_packets - b.tx_packets);
+                    rx_err = rx_err.saturating_add(l.rx_errors - b.rx_errors);
+                    tx_err = tx_err.saturating_add(l.tx_errors - b.tx_errors);
+                    rx_drop = rx_drop.saturating_add(l.rx_drops - b.rx_drops);
+                    if let (Some(bt), Some(nt)) = (b.tx_drops, l.tx_drops) {
+                        tx_drop = tx_drop.saturating_add(nt - bt);
+                        any_tx_drop = true;
+                    }
+                    measured = true;
+                    d_rx.saturating_add(d_tx)
+                } else {
+                    0
+                };
+                moved_by.push((l, moved));
+            }
+            link_views.push(LinkView {
+                sample: l.clone(),
+                rates,
             });
-            moved_by.push((l, moved));
         }
         facts.link = self.pick_link(&moved_by, dt).cloned();
-        self.links = links
-            .iter()
-            .map(|l| (l.name.clone(), (l.rx, l.tx)))
-            .collect();
-        match dt.filter(|_| measured) {
-            Some(dt) => (Some(rx as f64 / dt), Some(tx as f64 / dt)),
-            None => (None, None),
-        }
+        self.links = links.iter().map(|l| (l.name.clone(), l.clone())).collect();
+        let rates = dt.filter(|_| measured).map(|d| LinkRates {
+            rx_bps: rx as f64 / d,
+            tx_bps: tx as f64 / d,
+            rx_pps: rx_pkts as f64 / d,
+            tx_pps: tx_pkts as f64 / d,
+            rx_err_ps: rx_err as f64 / d,
+            tx_err_ps: tx_err as f64 / d,
+            rx_drop_ps: rx_drop as f64 / d,
+            tx_drop_ps: any_tx_drop.then(|| tx_drop as f64 / d),
+        });
+        let window_ns = dt.filter(|_| measured).map(|d| (d * 1e9).round() as u64);
+        let net = (!link_views.is_empty() || tcp.is_some()).then_some(NetView {
+            links: link_views,
+            rates,
+            window_ns,
+            tcp,
+        });
+        (rates.map(|r| r.rx_bps), rates.map(|r| r.tx_bps), net)
     }
 
     fn pick_link<'a>(
@@ -2515,20 +2776,39 @@ fn window_of(res: Resource) -> i64 {
     }
 }
 
+fn link_rates(before: &LinkSample, now: &LinkSample, dt: f64) -> Option<LinkRates> {
+    if dt <= 0.0 {
+        return None;
+    }
+    let d_rx = now.rx.checked_sub(before.rx)?;
+    let d_tx = now.tx.checked_sub(before.tx)?;
+    let d_rx_pkts = now.rx_packets.checked_sub(before.rx_packets)?;
+    let d_tx_pkts = now.tx_packets.checked_sub(before.tx_packets)?;
+    let d_rx_err = now.rx_errors.checked_sub(before.rx_errors)?;
+    let d_tx_err = now.tx_errors.checked_sub(before.tx_errors)?;
+    let d_rx_drop = now.rx_drops.checked_sub(before.rx_drops)?;
+    let tx_drop_ps = match (before.tx_drops, now.tx_drops) {
+        (Some(b), Some(n)) => Some(n.checked_sub(b)? as f64 / dt),
+        _ => None,
+    };
+    Some(LinkRates {
+        rx_bps: d_rx as f64 / dt,
+        tx_bps: d_tx as f64 / dt,
+        rx_pps: d_rx_pkts as f64 / dt,
+        tx_pps: d_tx_pkts as f64 / dt,
+        rx_err_ps: d_rx_err as f64 / dt,
+        tx_err_ps: d_tx_err as f64 / dt,
+        rx_drop_ps: d_rx_drop as f64 / dt,
+        tx_drop_ps,
+    })
+}
+
 fn series(ring: &BucketRing, now: i64, window_ms: i64, capacity: Option<f64>) -> Series {
     Series {
         now: ring.now_mean(now, window_ms),
         capacity,
         ring: ring.cells().into(),
         binds: false,
-    }
-}
-
-fn push_figs(recents: &mut [Recent; 7], now: i64, vals: [Option<f64>; 7]) {
-    for (r, v) in recents.iter_mut().zip(vals) {
-        if let Some(v) = v {
-            r.push(now, v);
-        }
     }
 }
 
@@ -3440,10 +3720,12 @@ mod tests {
             links: Some(vec![LinkSample {
                 name: "en0".into(),
                 kind: LinkKind::Wifi,
+                up: true,
                 counts: true,
                 rx: 1_000 * mono_ms,
                 tx: 250 * mono_ms,
                 rate_bps: Some(100_000_000),
+                ..LinkSample::default()
             }]),
             proc_limits: ProcLimits {
                 system: Some(16_000),
@@ -3804,6 +4086,250 @@ mod tests {
         }
     }
 
+    use crate::ring::RING_BUCKETS;
+
+    const MIB: f64 = (1u64 << 20) as f64;
+
+    fn scope_ring(v: &Vitals, key: Option<u64>, res: Resource) -> Option<&BucketRing> {
+        match key {
+            Some(key) => v.rows.tabs.get(&key)?.ring(res),
+            None => v.rows.aterm.ring(res),
+        }
+    }
+
+    fn means(cells: &[Cell]) -> Vec<Option<f64>> {
+        cells.iter().map(|c| c.mean).collect()
+    }
+
+    fn whole(t_s: u64) -> Sample {
+        at(t_s * 1000, 10_000)
+    }
+
+    #[test]
+    fn each_scope_keeps_the_hour_and_a_snapshot_carries_its_last_ten_minutes() {
+        let mut v = Vitals::new();
+        let mut s = Snapshot::default();
+        for i in 0..=420 {
+            s = v.absorb(&whole(10 * i));
+        }
+        for (res, tab, aterm) in [
+            (Cpu, 0.5, 0.6),
+            (Memory, 305.0 * MIB, 505.0 * MIB),
+            (Processes, 2.0, 3.0),
+            (Disk, 2e6, 2e6),
+        ] {
+            let r = s.resource(res, Some(7));
+            for (key, fig, want) in [(Some(7), &r.tab, tab), (None, &r.aterm, aterm)] {
+                assert_eq!(
+                    scope_ring(&v, key, res).map(BucketRing::len),
+                    Some(RING_BUCKETS),
+                    "{res:?} {key:?}: the model keeps the hour"
+                );
+                assert_eq!(fig.run.len(), SCOPE_RUN_BUCKETS, "{res:?} {key:?}");
+                assert_eq!(fig.run_k, r.ring_k, "{res:?} {key:?}: ends with the Mac's");
+                assert!(
+                    fig.run.iter().all(|c| close(c.mean, want)),
+                    "{res:?} {key:?}: {:?}",
+                    means(&fig.run)
+                );
+                assert!(close(fig.now, want), "{res:?} {key:?}: {:?}", fig.now);
+            }
+        }
+    }
+
+    #[test]
+    fn a_scope_run_never_exceeds_its_container() {
+        let mut v = Vitals::new();
+        let mut s = Snapshot::default();
+        let (mut cargo_ms, mut helper_ms, mut child_ms) = (0, 0, 0);
+        for i in 0..90u64 {
+            cargo_ms += (i * 7 % 5) * 800;
+            helper_ms += (i * 3 % 4) * 500;
+            child_ms += i % 2 * 1_500;
+            let mut r = at(i * 2_000, 2_000);
+            let procs = r.procs.as_mut().expect("swept");
+            if let Some(cargo) = procs.iter_mut().find(|p| p.pid == 201) {
+                cargo.cpu_ns = Some(cargo_ms * 1_000_000);
+                cargo.footprint = Some((100 + i * 13 % 9 * 50) << 20);
+            }
+            if i % 3 != 0 {
+                procs.push(ProcSample {
+                    disk_written: Some(i * 4_000_000),
+                    uid: Some(501),
+                    ..proc(202, 201, child_ms, 40 + i % 5 * 20, "rustc")
+                });
+            }
+            if i % 4 != 1 {
+                procs.push(ProcSample {
+                    disk_written: Some(i * 1_000_000),
+                    uid: Some(501),
+                    ..proc(101, 100, helper_ms, 70 + i % 7 * 10, "helper")
+                });
+            }
+            s = v.absorb(&r);
+        }
+        for res in [Cpu, Memory, Processes, Disk] {
+            let r = s.resource(res, Some(7));
+            let tab = r.tab.columns(10, 60, s.at_unix_ms);
+            let aterm = r.aterm.columns(10, 60, s.at_unix_ms);
+            let both: Vec<(f64, f64)> = tab
+                .iter()
+                .zip(&aterm)
+                .filter_map(|(t, a)| t.mean.zip(a.mean))
+                .collect();
+            assert!(both.len() >= 15, "{res:?}: {both:?}");
+            let mut seen: Vec<f64> = both.iter().map(|&(t, _)| t).collect();
+            seen.dedup();
+            assert!(seen.len() > 1, "{res:?}: the load varies: {both:?}");
+            for (t, a) in both {
+                assert!(
+                    t <= a + 1e-6 * a.abs().max(1.0),
+                    "{res:?}: tab {t} > all tabs {a}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hidden_time_is_hollow_in_scope_runs_never_zero() {
+        let mut v = Vitals::new();
+        let hidden = |t_s: u64| Sample {
+            procs: None,
+            machine_only: true,
+            ..whole(t_s)
+        };
+        let mut s = Snapshot::default();
+        for i in 0..60 {
+            let t_s = 10 * i;
+            s = v.absorb(&if (30..48).contains(&i) {
+                hidden(t_s)
+            } else {
+                whole(t_s)
+            });
+            if i == 40 {
+                let r = s.resource(Memory, Some(7));
+                assert_eq!(r.tab.now, None, "no figure while hidden");
+                assert_eq!(r.tab.run.len(), 29, "the run is carried while hidden");
+            }
+        }
+        let now = s.at_unix_ms;
+        assert!(
+            s.resources[Memory.index()]
+                .columns(10, 60, now)
+                .iter()
+                .all(|c| c.mean.is_some()),
+            "the Mac reads throughout"
+        );
+        for res in [Cpu, Memory, Disk, Processes] {
+            let r = s.resource(res, Some(7));
+            let back = if matches!(res, Cpu | Disk) { 49 } else { 48 };
+            let hidden_span: Vec<usize> = std::iter::once(0).chain(30..back).collect();
+            for fig in [&r.tab, &r.aterm] {
+                let cols = fig.columns(10, 60, now);
+                let hollow: Vec<usize> = (0..cols.len())
+                    .filter(|&j| cols[j].mean.is_none())
+                    .collect();
+                assert_eq!(
+                    hollow, hidden_span,
+                    "{res:?}: a scope reads from its second sweep, unread is hollow, and a \
+                     rate's first sweep back is a baseline"
+                );
+                assert!(
+                    cols.iter().all(|c| c.mean != Some(0.0)),
+                    "{res:?}: {cols:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_closed_tab_takes_its_run_with_it() {
+        let mut v = Vitals::new();
+        for i in 0..6 {
+            let _ = v.absorb(&whole(10 * i));
+        }
+        assert!(v.rows.tabs.contains_key(&7));
+        let mut gone = whole(60);
+        gone.tabs.clear();
+        let s = v.absorb(&gone);
+        assert!(!v.rows.tabs.contains_key(&7));
+        assert!(s.resources.iter().all(|r| r.tabs.is_empty()));
+        assert!(s.resource(Memory, Some(7)).tab.run.is_empty());
+        let s = v.absorb(&whole(70));
+        let back = s.resource(Memory, Some(7));
+        assert_eq!(
+            means(&back.tab.run),
+            [Some(305.0 * MIB)],
+            "a returning key starts hollow"
+        );
+        assert_eq!(back.aterm.run.len(), 7, "aterm's run goes on");
+    }
+
+    #[test]
+    fn gpu_and_network_scope_runs_stay_empty() {
+        let mut v = Vitals::new();
+        let mut s = Snapshot::default();
+        for i in 0..6 {
+            s = v.absorb(&whole(10 * i));
+        }
+        for res in [Gpu, Network] {
+            let r = s.resource(res, Some(7));
+            for fig in [&r.aterm, &r.tab] {
+                assert_eq!(fig.missing, Some(NoFigure::NotPerApp), "{res:?}");
+                assert!(fig.run.is_empty() && fig.now.is_none(), "{res:?}");
+            }
+            assert!(scope_ring(&v, None, res).is_none(), "{res:?}");
+            assert!(scope_ring(&v, Some(7), res).is_none(), "{res:?}");
+        }
+        assert_eq!(s.resource(Memory, Some(7)).tab.run.len(), 5);
+    }
+
+    #[test]
+    fn a_scope_run_and_its_share_agree() {
+        let mut v = Vitals::new();
+        let mut s = Snapshot::default();
+        for i in 0..12 {
+            let mut r = whole(10 * i);
+            r.proc_limits.per_user = Some(1_000);
+            s = v.absorb(&r);
+        }
+        assert_eq!(
+            s.resources[Processes.index()].binding().capacity,
+            Some(1_000.0),
+            "the per-user limit binds, not the first series' system limit"
+        );
+        for res in [Disk, Gpu, Network] {
+            let r = s.resource(res, Some(7));
+            assert_eq!(
+                s.scope_heat_columns(res, &r.tab, 10, 60, s.at_unix_ms),
+                None,
+                "{res:?}: a scope's figure is no share of this row"
+            );
+        }
+        assert!(
+            s.resource(Disk, Some(7))
+                .tab
+                .run
+                .iter()
+                .any(|c| c.mean > Some(0.0)),
+            "the writes run itself is carried raw"
+        );
+        for res in [Cpu, Memory, Processes] {
+            let r = s.resource(res, Some(7));
+            let cap = r.binding().capacity.expect("a capacity");
+            for fig in [&r.aterm, &r.tab] {
+                let cols = s
+                    .scope_heat_columns(res, fig, 10, 60, s.at_unix_ms)
+                    .expect("a share of the row");
+                assert_eq!(cols.len(), 60);
+                let share = fig.now.expect("read") / cap;
+                let last = cols.last().and_then(|c| c.heat).map(f64::from);
+                assert!(close(last, share), "{res:?}: {last:?} vs {share}");
+                assert!(cols[..48].iter().all(|c| c.heat.is_none()), "{res:?}");
+            }
+        }
+    }
+
     #[test]
     fn token_rate_hygiene() {
         let mut v = Vitals::new();
@@ -4114,10 +4640,12 @@ mod tests {
         let link = |name: &str, kind, total: u64, rate_bps| LinkSample {
             name: name.into(),
             kind,
+            up: true,
             counts: true,
             rx: total,
             tx: 0,
             rate_bps: Some(rate_bps),
+            ..LinkSample::default()
         };
         let wifi = |total| link("en0", LinkKind::Wifi, total, 54_000_000);
         let wired = |total| link("en7", LinkKind::Ethernet, total, 1_000_000_000);

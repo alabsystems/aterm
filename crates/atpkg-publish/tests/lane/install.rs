@@ -8,11 +8,11 @@ use std::sync::{Arc, Mutex};
 
 use atpkg_publish::error::Result;
 use atpkg_publish::lane::install::{
-    self, Built, InstallFlags, Lint, Machine, ServiceManager, SnapshotBuilder,
+    self, Built, InstallFlags, Lint, Machine, Retirement, ServiceManager, SnapshotBuilder,
 };
 use atpkg_publish::lane::report::Transcript;
 use atpkg_publish::lane::units::{self, UnitSpec};
-use atpkg_publish::lane::{LaneKind, self_check};
+use atpkg_publish::lane::{self, LaneKind, self_check};
 use atpkg_publish::testkit::NOW;
 use atpkg_publish::triple::Os;
 
@@ -41,18 +41,66 @@ impl SnapshotBuilder for FakeBuild {
     }
 }
 
-#[derive(Clone, Default)]
-struct Recorder(Arc<Mutex<Vec<String>>>);
+/// Records the calls, and checks at each arm that the snapshot the units name was stamped before
+/// the arm could start it.
+#[derive(Clone)]
+struct Recorder {
+    calls: Arc<Mutex<Vec<String>>>,
+    unstamped: Arc<Mutex<Vec<String>>>,
+    state_dir: PathBuf,
+}
 
 impl Recorder {
+    fn new(state_dir: &Path) -> Self {
+        Self {
+            calls: Arc::default(),
+            unstamped: Arc::default(),
+            state_dir: state_dir.to_path_buf(),
+        }
+    }
+
     fn calls(&self) -> Vec<String> {
-        self.0.lock().expect("calls").clone()
+        self.calls.lock().expect("calls").clone()
+    }
+
+    fn unstamped(&self) -> Vec<String> {
+        self.unstamped.lock().expect("unstamped").clone()
+    }
+
+    /// Why the snapshot `paths` name was not stamped by the time of its arm, if it was not.
+    fn armed_unstamped(&self, paths: &[PathBuf]) -> Option<String> {
+        let texts: Vec<String> = paths
+            .iter()
+            .map(|p| std::fs::read_to_string(p).expect("armed unit"))
+            .collect();
+        let named: Vec<PathBuf> = std::fs::read_dir(&self.state_dir)
+            .expect("state")
+            .map(|e| e.expect("entry").path())
+            .filter(|p| {
+                let name = p.file_name().expect("name").to_string_lossy();
+                let binary = format!("/{name}/{}", install::BINARY);
+                name.starts_with("lane.") && texts.iter().any(|t| t.contains(&binary))
+            })
+            .collect();
+        let [snapshot] = named.as_slice() else {
+            return Some(format!("the units name {named:?}, not one snapshot"));
+        };
+        let stamp = std::fs::read_to_string(snapshot.join(aterm_uds::deadline::EXEC_STAMP));
+        let awake = aterm_uds::process::awake_ms();
+        match (&stamp, awake) {
+            (Ok(text), Some(now)) if text.trim().parse::<u64>().is_ok_and(|at| at <= now) => None,
+            (Ok(_), None) => None,
+            _ => Some(format!(
+                "{} armed with stamp {stamp:?} at awake {awake:?}",
+                snapshot.display()
+            )),
+        }
     }
 }
 
 impl ServiceManager for Recorder {
     fn lint(&self, kind: LaneKind, paths: &[PathBuf]) -> Result<Lint> {
-        self.0
+        self.calls
             .lock()
             .expect("calls")
             .push(format!("lint {}", kind.as_str()));
@@ -62,8 +110,11 @@ impl ServiceManager for Recorder {
         }
     }
 
-    fn arm(&self, kind: LaneKind, paths: &[PathBuf]) -> Result<()> {
-        self.0.lock().expect("calls").push(format!(
+    fn arm(&self, kind: LaneKind, paths: &[PathBuf]) -> Result<Retirement> {
+        if let Some(why) = self.armed_unstamped(paths) {
+            self.unstamped.lock().expect("unstamped").push(why);
+        }
+        self.calls.lock().expect("calls").push(format!(
             "arm {} {}",
             kind.as_str(),
             paths
@@ -72,11 +123,11 @@ impl ServiceManager for Recorder {
                 .collect::<Vec<_>>()
                 .join(" ")
         ));
-        Ok(())
+        Ok(Retirement::Confirmed)
     }
 
     fn disarm(&self, kind: LaneKind) -> Result<()> {
-        self.0
+        self.calls
             .lock()
             .expect("calls")
             .push(format!("disarm {}", kind.as_str()));
@@ -100,7 +151,7 @@ fn machine(label: &str, os: Os) -> Box_ {
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-q", "-m", "inputs"]);
     fx.ctx.repo_root = repo;
-    let rec = Recorder::default();
+    let rec = Recorder::new(&fx.ctx.state_dir);
     let machine = Machine {
         os,
         agents_dir: fx.path("home/Library/LaunchAgents"),
@@ -118,10 +169,46 @@ fn install(
     flags: InstallFlags,
 ) -> (Result<install::Installed>, Transcript) {
     let tx = Transcript::memory("lane install");
-    (
-        install::install_with(&b.fx.ctx, kind, flags, &b.machine, &tx),
-        tx,
+    let r = install::install_with(&b.fx.ctx, kind, flags, &b.machine, &tx);
+    let unstamped = b.rec.unstamped();
+    assert!(
+        unstamped.is_empty(),
+        "an armed unit could start its snapshot before the stamp that holds it: {unstamped:?}"
+    );
+    (r, tx)
+}
+
+/// A stamp spent at any uptime: it reads as a reading from before a restart.
+fn spend(dir: &Path) {
+    std::fs::write(
+        dir.join(aterm_uds::deadline::EXEC_STAMP),
+        u64::MAX.to_string(),
     )
+    .expect("spent stamp");
+    assert_eq!(
+        aterm_uds::deadline::copy_wait_left(dir, std::time::SystemTime::now()),
+        None,
+        "{} is spent",
+        dir.display()
+    );
+}
+
+fn held(dir: &Path) -> bool {
+    aterm_uds::deadline::copy_wait_left(dir, std::time::SystemTime::now()).is_some()
+}
+
+/// The `lane.*` snapshot holding a binary, other than those in `known`.
+fn other_snapshot(state_dir: &Path, known: &[&Path]) -> PathBuf {
+    std::fs::read_dir(state_dir)
+        .expect("state")
+        .map(|e| e.expect("entry").path())
+        .find(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("lane."))
+                && p.join(install::BINARY).is_file()
+                && !known.contains(&p.as_path())
+        })
+        .expect("the other snapshot")
 }
 
 #[test]
@@ -481,9 +568,14 @@ fn a_reinstall_keeps_the_previous_snapshot_and_prunes_the_rest() {
     for day in 0..3 {
         b.fx.ctx.now_unix = NOW + day * 86_400;
         let (r, _) = install(&b, LaneKind::Linux, flags);
-        snapshots.push(r.expect("installed"));
+        let done = r.expect("installed");
+        lane::mark_ran(&done.binary);
+        snapshots.push(done);
     }
-    assert!(!snapshots[0].snapshot.exists(), "the oldest is pruned");
+    assert!(
+        !snapshots[0].snapshot.exists(),
+        "the oldest, which a run started from, is pruned"
+    );
     assert!(
         snapshots[1].snapshot.exists(),
         "the previous is kept for a rollback"
@@ -503,6 +595,214 @@ fn a_reinstall_keeps_the_previous_snapshot_and_prunes_the_rest() {
     );
     let rendered = std::fs::read_to_string(&snapshots[2].rendered[0]).expect("rendered");
     assert!(rendered.contains(&snapshots[2].sha256));
+}
+
+#[test]
+fn a_snapshot_no_run_has_shown_it_started_from_is_kept_until_one_has() {
+    let mut b = machine("install-unproven", Os::Darwin);
+    let mut snapshots = Vec::new();
+    let mut said = String::new();
+    for day in 0..3 {
+        b.fx.ctx.now_unix = NOW + day * 86_400;
+        let (r, tx) = install(&b, LaneKind::Alab, InstallFlags::default());
+        snapshots.push(r.expect("installed"));
+        said = tx.text();
+    }
+    let first = &snapshots[0];
+    assert!(
+        first.binary.is_file(),
+        "booted out before a run from it showed it started: kept"
+    );
+    let name = first.snapshot.file_name().expect("name").to_string_lossy();
+    assert!(
+        said.contains("kept ") && said.contains(&*name),
+        "the kept snapshot is named: {said}"
+    );
+    lane::mark_ran(&first.binary);
+    b.fx.ctx.now_unix = NOW + 3 * 86_400;
+    let (r, _) = install(&b, LaneKind::Alab, InstallFlags::default());
+    r.expect("installed");
+    assert!(
+        !first.snapshot.exists(),
+        "pruned once a run started from it"
+    );
+    assert!(
+        snapshots[1].binary.is_file(),
+        "its successor, unproven, is still kept"
+    );
+    let own = b.fx.path("target/release/atpkg-publish");
+    std::fs::create_dir_all(own.parent().expect("parent")).expect("mkdir");
+    lane::mark_ran(&own);
+    assert!(
+        !b.fx
+            .path("target/release")
+            .join(aterm_uds::deadline::RAN)
+            .exists(),
+        "a build outside a snapshot is never marked"
+    );
+}
+
+#[test]
+fn a_snapshot_the_replaced_unit_could_start_is_held_from_its_bootout() {
+    let mut b = machine("install-outgoing", Os::Darwin);
+    let mut snapshots = Vec::new();
+    let mut said = String::new();
+    for day in 0..3 {
+        b.fx.ctx.now_unix = NOW + day * 86_400;
+        let (r, tx) = install(&b, LaneKind::Alab, InstallFlags::default());
+        let done = r.expect("installed");
+        if day == 0 {
+            // Launchd started it again at a later login, a first exec again if the first never
+            // finished, long after its own stamp.
+            spend(&done.snapshot);
+        }
+        snapshots.push(done);
+        said = tx.text();
+    }
+    let first = &snapshots[0];
+    let name = first.snapshot.file_name().expect("name").to_string_lossy();
+    assert!(
+        first.binary.is_file() && said.contains(&format!("{name} (")) && said.contains("min left"),
+        "the second install booted out the unit that could start it: held from then: {said}"
+    );
+
+    b.machine.services = Box::new(FailedArm);
+    b.fx.ctx.now_unix = NOW + 3 * 86_400;
+    let (r, _) = install(&b, LaneKind::Alab, InstallFlags::default());
+    r.expect_err("arming failed");
+    let known: Vec<&Path> = snapshots.iter().map(|s| s.snapshot.as_path()).collect();
+    let stranded = other_snapshot(&b.fx.ctx.state_dir, &known);
+    spend(&stranded);
+    b.machine.services = Box::new(b.rec.clone());
+    b.fx.ctx.now_unix = NOW + 4 * 86_400;
+    let (r, tx) = install(&b, LaneKind::Alab, InstallFlags::default());
+    let last = r.expect("installed");
+    assert_eq!(
+        last.previous.as_deref(),
+        Some(snapshots[2].snapshot.as_path()),
+        "the link never pointed at the failed arm's snapshot"
+    );
+    assert!(
+        stranded.join(install::BINARY).is_file(),
+        "the failed arm left a unit naming it, which a login may have started: held from this \
+         bootout: {}",
+        tx.text()
+    );
+}
+
+#[test]
+fn a_snapshot_a_login_started_is_held_from_the_disarm_that_stopped_it() {
+    let mut b = machine("install-disarm-hold", Os::Darwin);
+    let (r, _) = install(&b, LaneKind::Alab, InstallFlags::default());
+    let live = r.expect("installed");
+    lane::mark_ran(&live.binary);
+    b.machine.services = Box::new(FailedArm);
+    b.fx.ctx.now_unix = NOW + 86_400;
+    let (r, _) = install(&b, LaneKind::Alab, InstallFlags::default());
+    r.expect_err("bootstrap failed");
+    let loaded = other_snapshot(&b.fx.ctx.state_dir, &[&live.snapshot]);
+    // The plist the failed bootstrap left names it, so a later login started it, long after its
+    // stamp.
+    spend(&loaded);
+    b.machine.services = Box::new(b.rec.clone());
+    install::disarm(&b.fx.ctx, LaneKind::Alab, &b.machine).expect("disarmed");
+    assert!(
+        held(&loaded),
+        "the disarm's bootout may have stopped that first exec: held from it"
+    );
+    b.fx.ctx.now_unix = NOW + 2 * 86_400;
+    let (r, tx) = install(&b, LaneKind::Alab, InstallFlags::default());
+    r.expect("installed");
+    assert!(
+        loaded.join(install::BINARY).is_file(),
+        "no unit file names it any more, and it is still held: {}",
+        tx.text()
+    );
+}
+
+#[test]
+fn a_snapshot_no_job_can_start_any_more_is_held_from_one_bootout_then_reclaimed() {
+    let mut b = machine("install-retired", Os::Linux);
+    let (r, _) = install(&b, LaneKind::Linux, InstallFlags::default());
+    let first = r.expect("installed");
+    b.fx.ctx.now_unix = NOW + 3_600;
+    let (r, _) = install(
+        &b,
+        LaneKind::Linux,
+        InstallFlags {
+            no_arm: true,
+            ..InstallFlags::default()
+        },
+    );
+    let render = r.expect("rendered");
+    b.fx.ctx.now_unix = NOW + 86_400;
+    let (r, _) = install(&b, LaneKind::Linux, InstallFlags::default());
+    let live = r.expect("installed");
+    for s in [&first, &render] {
+        assert!(
+            held(&s.snapshot) && s.snapshot.join(install::RETIRED).is_file(),
+            "held from the bootout that replaced the first unit, and from no later one"
+        );
+        spend(&s.snapshot);
+    }
+    let retired = std::fs::read(first.snapshot.join(install::RETIRED)).expect("retired marker");
+    let first_bytes = std::fs::read(&first.binary).expect("first binary");
+    let render_bytes = std::fs::read(&render.binary).expect("rendered binary");
+    spend(&live.snapshot);
+    b.machine.services = Box::new(Unconfirmed(b.rec.clone()));
+    b.fx.ctx.now_unix = NOW + 2 * 86_400;
+    let (r, _) = install(&b, LaneKind::Linux, InstallFlags::default());
+    let uncertain = r.expect("the current job is armed independently of legacy retirement");
+    assert_eq!(
+        std::fs::read(&first.binary).expect("first kept"),
+        first_bytes
+    );
+    assert_eq!(
+        std::fs::read(&render.binary).expect("render kept"),
+        render_bytes
+    );
+    assert_eq!(
+        std::fs::read(first.snapshot.join(install::RETIRED)).expect("retired marker kept"),
+        retired
+    );
+    assert!(
+        !live.snapshot.join(install::RETIRED).exists(),
+        "unknown retirement cannot publish a new permanent retirement marker"
+    );
+    assert_eq!(
+        std::fs::read_link(b.fx.ctx.state_dir.join("lane")).expect("live link kept"),
+        live.snapshot
+    );
+    assert!(
+        uncertain.binary.is_file(),
+        "the newly armed snapshot is also kept"
+    );
+    b.machine.services = Box::new(b.rec.clone());
+    b.fx.ctx.now_unix = NOW + 3 * 86_400;
+    let (r, tx) = install(&b, LaneKind::Linux, InstallFlags::default());
+    r.expect("installed");
+    assert!(
+        !first.snapshot.exists() && !render.snapshot.exists(),
+        "no job could start them once their hold ran out: reclaimed: {}",
+        tx.text()
+    );
+}
+
+struct Unconfirmed(Recorder);
+
+impl ServiceManager for Unconfirmed {
+    fn lint(&self, kind: LaneKind, paths: &[PathBuf]) -> Result<Lint> {
+        self.0.lint(kind, paths)
+    }
+
+    fn arm(&self, kind: LaneKind, paths: &[PathBuf]) -> Result<Retirement> {
+        self.0.arm(kind, paths)?;
+        Ok(Retirement::Unknown("fixture legacy stop is unknown".into()))
+    }
+
+    fn disarm(&self, kind: LaneKind) -> Result<()> {
+        self.0.disarm(kind)
+    }
 }
 
 #[test]
@@ -558,24 +858,24 @@ fn reinstalling_with_the_same_clock_stamp_preserves_the_armed_snapshot_bytes() {
     );
 }
 
-#[test]
-fn a_legacy_shell_alias_survives_unarmed_and_failed_installs_until_the_manager_switches() {
-    struct FailedArm;
+struct FailedArm;
 
-    impl ServiceManager for FailedArm {
-        fn lint(&self, _kind: LaneKind, _paths: &[PathBuf]) -> Result<Lint> {
-            Ok(Lint::Passed)
-        }
-
-        fn arm(&self, _kind: LaneKind, _paths: &[PathBuf]) -> Result<()> {
-            Err(atpkg_publish::error::Error::refused("fixture arm failure"))
-        }
-
-        fn disarm(&self, _kind: LaneKind) -> Result<()> {
-            Ok(())
-        }
+impl ServiceManager for FailedArm {
+    fn lint(&self, _kind: LaneKind, _paths: &[PathBuf]) -> Result<Lint> {
+        Ok(Lint::Passed)
     }
 
+    fn arm(&self, _kind: LaneKind, _paths: &[PathBuf]) -> Result<Retirement> {
+        Err(atpkg_publish::error::Error::refused("fixture arm failure"))
+    }
+
+    fn disarm(&self, _kind: LaneKind) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_legacy_shell_alias_survives_unarmed_and_failed_installs_until_the_manager_switches() {
     let mut b = machine("install-legacy-alias", Os::Linux);
     let alias = b.fx.ctx.state_dir.join("lane");
     let script = alias.join("tools/linux-auto-atpkg.sh");
@@ -594,6 +894,26 @@ fn a_legacy_shell_alias_survives_unarmed_and_failed_installs_until_the_manager_s
         std::fs::read(&script).expect("old shell unit's path"),
         b"legacy shell snapshot"
     );
+    let (r, _) = install(&b, LaneKind::Linux, InstallFlags::default());
+    let e = r.expect_err("a shell lane that may still be in a first exec stays where it is");
+    assert!(e.to_string().contains("re-run this installer in"), "{e}");
+    assert!(
+        script.is_file() && std::fs::symlink_metadata(&alias).is_ok_and(|m| m.is_dir()),
+        "nothing moved aside"
+    );
+    assert!(
+        !b.rec.calls().iter().any(|c| c.starts_with("arm")),
+        "nothing armed"
+    );
+    std::fs::File::open(&alias)
+        .and_then(|dir| {
+            dir.set_modified(
+                std::time::SystemTime::now()
+                    - aterm_uds::deadline::FIRST_EXEC_HANG
+                    - std::time::Duration::from_secs(60),
+            )
+        })
+        .expect("age the shell lane past its first exec");
     b.machine.services = Box::new(FailedArm);
     let (r, _) = install(&b, LaneKind::Linux, InstallFlags::default());
     r.expect_err("arming failed");
@@ -614,20 +934,58 @@ fn a_legacy_shell_alias_survives_unarmed_and_failed_installs_until_the_manager_s
     assert!(failed_binary.is_file());
     b.machine.services = Box::new(b.rec.clone());
     let (r, _) = install(&b, LaneKind::Linux, InstallFlags::default());
-    let armed = r.expect("manager switched");
+    let e = r.expect_err("the failed arm's bootout may have stopped the shell lane mid first exec");
+    assert!(e.to_string().contains("re-run this installer in"), "{e}");
+    assert!(
+        script.is_file() && !b.rec.calls().iter().any(|c| c.starts_with("arm")),
+        "nothing moved aside or armed"
+    );
+    spend(&alias);
+    let (r, tx) = install(&b, LaneKind::Linux, InstallFlags::default());
+    let first = r.expect("manager switched");
+    assert!(
+        script.is_file() && std::fs::symlink_metadata(&alias).is_ok_and(|m| m.is_dir()),
+        "this arm's bootout may have stopped the shell lane mid first exec: it keeps its path: {}",
+        tx.text()
+    );
+    assert!(
+        held(&alias) && tx.text().contains("stays where it is"),
+        "{}",
+        tx.text()
+    );
+    assert_eq!(first.previous.as_deref(), Some(alias.as_path()));
+    lane::mark_ran(&first.binary);
+    let (r, _) = install(&b, LaneKind::Linux, InstallFlags::default());
+    let e = r.expect_err("held from that bootout");
+    assert!(e.to_string().contains("re-run this installer in"), "{e}");
+    spend(&alias);
+    let (r, tx) = install(&b, LaneKind::Linux, InstallFlags::default());
+    let armed = r.expect("the shell lane moves aside once its hold is over");
     assert_eq!(
-        std::fs::read_link(alias).expect("new alias"),
+        std::fs::read_link(&alias).expect("new alias"),
         armed.snapshot
     );
     assert_eq!(
-        std::fs::read(
-            armed
-                .previous
-                .expect("legacy rollback")
-                .join("tools/linux-auto-atpkg.sh")
-        )
-        .expect("legacy kept"),
-        b"legacy shell snapshot"
+        armed.previous.as_deref(),
+        Some(first.snapshot.as_path()),
+        "the rollback is the snapshot the replaced unit ran"
+    );
+    assert!(
+        first.binary.is_file(),
+        "kept for a rollback though a run started from it"
+    );
+    let legacy: Vec<PathBuf> = std::fs::read_dir(&b.fx.ctx.state_dir)
+        .expect("state")
+        .map(|e| e.expect("entry").path())
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("lane.legacy."))
+        })
+        .collect();
+    assert!(
+        legacy.is_empty(),
+        "no job can start the shell lane and its hold is over: reclaimed: {legacy:?}: {}",
+        tx.text()
     );
 }
 

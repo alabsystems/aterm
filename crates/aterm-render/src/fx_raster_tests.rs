@@ -6,8 +6,8 @@
 use std::sync::Arc;
 
 use aterm_core::render::{
-    FreeSampler, FreeSprite, FreeZ, FxArt, FxBlend, FxContent, FxInk, FxItem, FxLayer, FxRamps,
-    FxRect, FxSlot, FxSpace, FxSprite, FxTexels, PxRect, SceneAtlas,
+    FxArt, FxBlend, FxContent, FxInk, FxItem, FxLayer, FxRamps, FxRect, FxSlot, FxSpace, FxSprite,
+    FxTexels, PxRect,
 };
 
 use super::*;
@@ -731,29 +731,20 @@ fn fx_linear_is_the_free_sprite_law() {
                 &[tint],
             );
         }
-        let atlas = SceneAtlas {
-            width: u32::from(art.w()),
-            height: u32::from(art.h()),
-            rgba: art.data().to_vec(),
-            version: 1,
-        };
-        let free = FreeSprite {
+        let old = crate::legacy_sprite_oracle::LegacySprite {
             x,
             y,
             w: sp.dw,
             h: sp.dh,
-            ax: 0,
-            ay: 0,
-            aw: art.w(),
-            ah: art.h(),
+            src: [0, 0, art.w(), art.h()],
+            art: art.clone(),
             tint: tint.color,
             alpha: tint.alpha,
             flip_x: sp.flip_x,
-            z: FreeZ::UnderText,
-            sampler: FreeSampler::Nearest,
+            under: true,
         };
         let mut want = base;
-        crate::stamp_free_sprite(&mut want, w, h, 0, 0, &atlas, &free, 0, h, &mut Vec::new());
+        crate::legacy_sprite_oracle::stamp(&mut want, w, h, 0, 0, &old, 0, h);
         assert!(got == want, "case {case}: scale {s}");
     }
 }
@@ -1498,6 +1489,7 @@ fn fx_mixed_content_draws_nothing() {
             space: FxSpace::Window,
             blend,
             bloom: false,
+            knock: false,
             offset: (0, 0),
             clip: PxRect::EVERYWHERE,
         };

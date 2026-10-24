@@ -1083,6 +1083,298 @@ fn muse_provider_arg(argv: &[String]) -> Option<String> {
     provider.filter(|provider| !provider.is_empty())
 }
 
+type AgyUsageCacheKey = (PathBuf, String, bool);
+type AgyUsageCacheMap = std::collections::HashMap<AgyUsageCacheKey, (i64, Option<WeeklyFigure>)>;
+
+static AGY_USAGE_CACHE: std::sync::Mutex<Option<AgyUsageCacheMap>> = std::sync::Mutex::new(None);
+
+const AGY_USAGE_RETRY_S: i64 = 60;
+
+/// Extracts the signed-in OAuth email from `agy`'s CLI log (`applyAuthResult: email=...`).
+#[must_use]
+pub fn parse_agy_auth_log(bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+    for line in text.lines().rev() {
+        let Some((_, rest)) = line.split_once("applyAuthResult: ") else {
+            continue;
+        };
+        let (email, after) = rest.strip_prefix("email=")?.split_once(", authMethod=")?;
+        let method = after.split(',').next().unwrap_or_default().trim();
+        let email = email.trim();
+        return (method == "consumer"
+            && email.contains('@')
+            && !email.chars().any(char::is_whitespace))
+        .then(|| email.to_owned());
+    }
+    None
+}
+
+/// Parses `agy -p /usage --output-format json` output into a [`WeeklyFigure`].
+#[must_use]
+pub fn parse_agy_usage_json(bytes: &[u8], third_party: bool, now: i64) -> Option<WeeklyFigure> {
+    let root: aterm_json::Value = aterm_json::from_slice(bytes).ok()?;
+    if root.get("status").and_then(aterm_json::Value::as_str) != Some("SUCCESS") {
+        return None;
+    }
+    let groups = root
+        .get("command")?
+        .get("data")?
+        .get("groups")?
+        .as_array()?;
+    let want_id = if third_party {
+        "3p-weekly"
+    } else {
+        "gemini-weekly"
+    };
+    let bucket = groups
+        .iter()
+        .flat_map(|g| g.get("buckets").and_then(aterm_json::Value::as_array))
+        .flatten()
+        .find(|b| b.get("id").and_then(aterm_json::Value::as_str) == Some(want_id))
+        .or_else(|| {
+            groups
+                .iter()
+                .flat_map(|g| g.get("buckets").and_then(aterm_json::Value::as_array))
+                .flatten()
+                .find(|b| b.get("window").and_then(aterm_json::Value::as_str) == Some("weekly"))
+        })?;
+    let rem = bucket
+        .get("remaining_fraction")
+        .and_then(aterm_json::Value::as_f64)?
+        .clamp(0.0, 1.0);
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "clamped to 0.0..=1.0"
+    )]
+    let left_pct = ((rem * 100.0).round() as u32).min(100);
+    let used_x10 = 100u32.saturating_sub(left_pct).saturating_mul(10);
+    let reset_str = bucket
+        .get("reset_time")
+        .and_then(aterm_json::Value::as_str)?;
+    let resets_at = i64::try_from(super::upgrade_models::parse_utc(reset_str)?).ok()?;
+    Some(WeeklyFigure {
+        used_x10,
+        resets_at,
+        at: now,
+    })
+}
+
+fn agy_log_email(argv: &[String], config: &Path) -> Option<String> {
+    let mut log_arg = None;
+    let mut i = 0;
+    while let Some(arg) = argv.get(i) {
+        if arg == "--" {
+            break;
+        }
+        if arg == "--log-file" {
+            log_arg = argv.get(i + 1).cloned();
+            i += 2;
+            continue;
+        }
+        if let Some(v) = arg.strip_prefix("--log-file=") {
+            log_arg = Some(v.to_owned());
+        }
+        i += 1;
+    }
+    let read_log = |path: &Path| -> Option<String> {
+        const WINDOW: u64 = 128 * 1024;
+        let mut f = std::fs::File::open(path).ok()?;
+        let len = f.metadata().ok().map_or(0, |m| m.len());
+        if len > WINDOW {
+            use std::io::{Seek, SeekFrom};
+            let mut tail = Vec::new();
+            let offset = i64::try_from(WINDOW).unwrap_or(131_072);
+            if f.seek(SeekFrom::End(-offset)).is_ok()
+                && (&mut f).take(WINDOW).read_to_end(&mut tail).is_ok()
+                && let Some(email) = parse_agy_auth_log(&tail)
+            {
+                return Some(email);
+            }
+            let _ = f.seek(SeekFrom::Start(0));
+        }
+        let mut head = Vec::new();
+        f.take(WINDOW).read_to_end(&mut head).ok()?;
+        parse_agy_auth_log(&head)
+    };
+    if let Some(path) = log_arg.as_deref().map(Path::new)
+        && let Some(email) = read_log(path)
+    {
+        return Some(email);
+    }
+    if let Some(email) = read_log(&config.join("cli.log")) {
+        return Some(email);
+    }
+    let mut logs: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(config.join("log"))
+        .ok()?
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            let name = p.file_name()?.to_str()?;
+            if !name.starts_with("cli-")
+                || !Path::new(name)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("log"))
+            {
+                return None;
+            }
+            Some((e.metadata().ok()?.modified().ok()?, p))
+        })
+        .collect();
+    logs.sort_by_key(|a| std::cmp::Reverse(a.0));
+    logs.into_iter().take(3).find_map(|(_, p)| read_log(&p))
+}
+
+fn agy_exe_for(argv: &[String], user_home: &Path) -> Option<PathBuf> {
+    if let Some(first) = argv.first().map(Path::new)
+        && first.is_absolute()
+        && first.is_file()
+    {
+        return Some(first.to_path_buf());
+    }
+    if std::env::var_os("HOME").is_some_and(|h| Path::new(&h) == user_home)
+        && let Some(layout) = atpkg::store::resolve_configured()
+    {
+        let managed = layout.agents_dir().join("agy");
+        if managed.is_file() {
+            return Some(managed);
+        }
+    }
+    None
+}
+
+fn fetch_agy_usage(
+    exe: &Path,
+    config: &Path,
+    home: &Path,
+    third_party: bool,
+    now: i64,
+) -> Option<WeeklyFigure> {
+    let mut child = aterm_uds::spawnfd::command(exe)
+        .arg("--config-dir")
+        .arg(config)
+        .arg("--log-file")
+        .arg("/dev/null")
+        .arg("-p")
+        .arg("/usage")
+        .arg("--output-format")
+        .arg("json")
+        .env("HOME", home)
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .stdout(aterm_uds::spawnfd::Stdio::piped())
+        .stderr(aterm_uds::spawnfd::Stdio::null())
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.take(64 * 1024).read_to_end(&mut buf);
+        buf
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let ok = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.success(),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break false;
+            }
+        }
+    };
+    let bytes = reader.join().ok()?;
+    ok.then(|| parse_agy_usage_json(&bytes, third_party, now))
+        .flatten()
+}
+
+/// The account and weekly quota an `agy` process is signed in as ([`SubscriptionDisplay`]).
+#[must_use]
+pub fn agy_subscription_for(
+    argv: &[String],
+    env: &[String],
+    user_home: &Path,
+    prev: &SubscriptionDisplay,
+    model: Option<&str>,
+    now: i64,
+) -> Option<SubscriptionDisplay> {
+    let var = |key: &str| {
+        env.iter()
+            .find_map(|entry| entry.strip_prefix(key)?.strip_prefix('='))
+            .filter(|value| !value.is_empty())
+    };
+    if var("GEMINI_API_KEY").is_some() || var("GOOGLE_API_KEY").is_some() {
+        return None;
+    }
+    let home_dir = var("HOME").map_or_else(|| user_home.to_path_buf(), PathBuf::from);
+    let config = match var("AGY_CLI_CONFIG_DIR").map(PathBuf::from) {
+        Some(dir) if dir.is_absolute() => dir,
+        _ => super::upgrade_agy::config_dir(argv, var("HOME"), user_home)?,
+    };
+    let settings: Option<aterm_json::Value> = std::fs::read(config.join("settings.json"))
+        .ok()
+        .and_then(|b| aterm_json::from_slice(&b).ok());
+    if settings
+        .as_ref()
+        .and_then(|s| s.get("auth_method").and_then(aterm_json::Value::as_str))
+        .is_some_and(|m| m != "oauth" && m != "google" && m != "consumer")
+    {
+        return None;
+    }
+    let email = agy_log_email(argv, &config).or_else(|| prev.email.clone())?;
+    let active_model = model.map(str::to_owned).or_else(|| {
+        settings
+            .as_ref()
+            .and_then(|s| s.get("model").and_then(aterm_json::Value::as_str))
+            .map(str::to_owned)
+    });
+    let third_party = active_model.as_deref().is_some_and(|m| {
+        let lower = m.to_ascii_lowercase();
+        lower.contains("claude") || lower.contains("gpt")
+    });
+    let key = (config.clone(), email.clone(), third_party);
+    let cached = AGY_USAGE_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .and_then(|map| map.get(&key).copied());
+    let figure = match cached {
+        Some((_, Some(fig))) if fig.current(now) => Some(fig),
+        Some((at, None)) if now.saturating_sub(at) < AGY_USAGE_RETRY_S => prev.weekly_figure,
+        _ => {
+            if let Some(exe) = agy_exe_for(argv, user_home) {
+                let fetched = fetch_agy_usage(&exe, &config, &home_dir, third_party, now);
+                let mut guard = AGY_USAGE_CACHE
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard
+                    .get_or_insert_with(std::collections::HashMap::new)
+                    .insert(key, (now, fetched));
+                fetched.or(prev.weekly_figure)
+            } else {
+                prev.weekly_figure
+            }
+        }
+    };
+    let same_email = prev.email.as_deref() == Some(email.as_str());
+    let figure = figure.filter(|f| f.words(now).is_some());
+    let weekly = figure.and_then(|f| f.words(now)).or_else(|| {
+        (same_email && prev.weekly_figure.is_none())
+            .then(|| prev.weekly.clone())
+            .flatten()
+    });
+    Some(SubscriptionDisplay {
+        email: Some(email),
+        plan: same_email.then(|| prev.plan.clone()).flatten(),
+        weekly,
+        weekly_figure: figure,
+        weekly_reset: same_email.then(|| prev.weekly_reset.clone()).flatten(),
+        ..SubscriptionDisplay::default()
+    })
+}
+
 /// One read of a process's selected profile ([`selected_profile`]).
 struct Selected {
     /// What the profile says of its account.

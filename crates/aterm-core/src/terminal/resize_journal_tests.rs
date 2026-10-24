@@ -42,7 +42,6 @@ fn flap(t: &mut Terminal, resizes: &[u16]) -> Vec<ResizeReport> {
     reports
 }
 
-/// Verify that a quiet alternate-screen flap with a full tail restores the demoted top row.
 #[test]
 fn a_quiet_alt_flap_with_a_full_tail_is_an_identity() {
     let mut t = claude_shaped_alt(8);
@@ -92,7 +91,6 @@ fn a_quiet_alt_flap_with_a_full_tail_is_an_identity() {
     assert_eq!((t.cursor().row, t.cursor().col), (51, 4));
 }
 
-/// Verify that output between shrink and grow drops the undo until an `ED 2` repaint heals the shift.
 #[test]
 fn alt_flap_with_output_between_the_halves_keeps_the_shift() {
     let mut t = claude_shaped_alt(8);
@@ -140,7 +138,6 @@ fn alt_flap_with_output_between_the_halves_keeps_the_shift() {
     assert!(!grow.healed_by(clears, 0));
 }
 
-/// Verify that a quiet flap preserves DECSC, DECSTBM, and combining marks on demoted rows.
 #[test]
 fn a_quiet_alt_flap_keeps_decsc_the_scroll_region_and_extras() {
     let mut t = claude_shaped_alt(8);
@@ -159,7 +156,6 @@ fn a_quiet_alt_flap_keeps_decsc_the_scroll_region_and_extras() {
     assert_eq!((t.cursor().row, t.cursor().col), (5, 2));
 }
 
-/// Verify that an undone flap restores the selection unless moved or interrupted by output.
 #[test]
 fn an_undone_flap_puts_the_selection_back() {
     use crate::selection::{SelectionSide, SelectionType};
@@ -200,7 +196,6 @@ fn an_undone_flap_puts_the_selection_back() {
     assert_ne!(t.text_selection(), &before);
 }
 
-/// Verify that an alternate-screen switch between shrink and grow drops the resize undo.
 #[test]
 fn an_alt_screen_switch_between_the_halves_drops_the_undo() {
     let mut t = Terminal::new(8, 20);
@@ -225,7 +220,6 @@ fn an_alt_screen_switch_between_the_halves_drops_the_undo() {
     assert_eq!(screen(&t)[0], "L1");
 }
 
-/// Verify that each `Terminal` has a fixed lifetime token and checkpoint restore mints a new one at ordinal 0.
 #[test]
 fn every_engine_has_its_own_lifetime_token() {
     let mut a = Terminal::new(8, 20);
@@ -245,7 +239,6 @@ fn every_engine_has_its_own_lifetime_token() {
     assert_eq!(restored.resize_ordinal(), 0);
 }
 
-/// Verify that an alternate-screen shrink with a blank tail below the cursor only trims.
 #[test]
 fn alt_shrink_with_a_blank_tail_only_trims() {
     let mut t = Terminal::new(8, 20);
@@ -268,7 +261,6 @@ fn alt_shrink_with_a_blank_tail_only_trims() {
     assert_eq!(t.cursor().row, 5);
 }
 
-/// Verify that a primary-screen row flap demotes into history and reveals back losslessly.
 #[test]
 fn primary_rows_only_flap_is_lossless() {
     let mut t = Terminal::new(8, 20);
@@ -290,7 +282,6 @@ fn primary_rows_only_flap_is_lossless() {
     assert_eq!(t.cursor().row, 5);
 }
 
-/// Verify that the resize journal records adjacent resizes, tracks ring overflow, and flags rewraps.
 #[test]
 fn journal_keeps_both_halves_of_a_flap() {
     let mut t = Terminal::new(8, 20);
@@ -361,7 +352,6 @@ fn journal_keeps_both_halves_of_a_flap() {
     assert_eq!((r[0].to, r[0].reflowed), ((8, 30), true));
 }
 
-/// Verify that `full_clear_count` increments only on `ED 2` and home `ED 0`.
 #[test]
 fn full_clear_count_counts_ed2_and_home_ed0_not_ed3_el_or_mid_screen_ed0() {
     let mut t = Terminal::new(8, 20);
@@ -395,7 +385,6 @@ fn full_clear_count_counts_ed2_and_home_ed0_not_ed3_el_or_mid_screen_ed0() {
     );
 }
 
-/// Verify that `screen_replaced_count` tracks effective alternate-screen switches and full resets.
 #[test]
 fn screen_replaced_counts_alt_screen_switches_and_resets() {
     let mut t = Terminal::new(8, 20);
@@ -553,7 +542,6 @@ fn a_primary_screen_resize_owes_nothing() {
     assert_eq!(t.render_debt(), RenderDebt::default());
 }
 
-/// Verify that a primary-screen row flap over a blank tail appends back a blank rather than revealing history.
 #[test]
 fn a_primary_row_flap_over_a_blank_tail_leaves_every_row_where_it_was() {
     let mut t = Terminal::new(8, 20);
@@ -580,7 +568,6 @@ fn a_primary_row_flap_over_a_blank_tail_leaves_every_row_where_it_was() {
     );
 }
 
-/// Verify that primary-screen flaps that grow first demote revealed history rows before trimming the blank tail.
 #[test]
 fn a_primary_row_flap_that_grows_first_leaves_every_row_where_it_was() {
     for heights in [&[9u16, 8][..], &[7, 9, 8], &[5, 10, 8], &[7, 8, 9, 8]] {
@@ -616,7 +603,6 @@ fn offloaded_resize(t: &mut Terminal, rows: u16, cols: u16) {
     }
 }
 
-/// Verify that primary-screen flaps that also change width preserve row positions across sync and offloaded paths.
 #[test]
 fn a_primary_flap_that_changes_the_width_too_leaves_every_row_where_it_was() {
     let paths: [&[(u16, u16)]; 4] = [
@@ -670,7 +656,6 @@ fn a_primary_flap_that_changes_the_width_too_leaves_every_row_where_it_was() {
     }
 }
 
-/// Verify that redrawing from the top after a grow claims the top rows so shrinking back trims below.
 #[test]
 fn a_redraw_from_the_top_after_a_grow_keeps_its_rows_through_the_shrink_back() {
     let build = || {
@@ -716,7 +701,6 @@ fn a_conpty_resize_owes_nothing() {
     assert_eq!(t.render_debt(), RenderDebt::of_rows(-1, 0));
 }
 
-/// Verify that narrowing an alternate screen across drawn cells records `cut` debt until a full clear.
 #[test]
 fn a_column_flap_that_cuts_drawn_cells_owes_them_until_a_full_clear() {
     let ruled = || {

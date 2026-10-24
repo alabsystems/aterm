@@ -11,7 +11,7 @@ pub const MANAGED_PREFIX: &str = "managed ";
 pub const SYSTEM_PREFIX: &str = "system: ";
 /// The tail every system-satisfied row carries before the optional retirement note.
 pub const SYSTEM_TAIL: &str = " — not managed by aterm";
-/// The whole row of an agent program ([`crate::stub::AGENT_PROGRAMS`]) the pass has not installed yet: it is default-set, so it is coming.
+/// The whole row of a wanted agent program ([`crate::stub::AGENT_PROGRAMS`]) the pass has not installed yet: it is default-set, so it is coming.
 pub const AGENT_INSTALLING: &str = "agent program — installing";
 /// The head of a member the pinned build does not serve on this target.
 pub const UNAVAILABLE_PREFIX: &str = "unavailable on ";

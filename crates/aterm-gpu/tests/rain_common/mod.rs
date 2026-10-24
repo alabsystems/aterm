@@ -3,10 +3,10 @@
 
 //! Shared phosphor rain fixture for GPU rendering tests.
 
-use std::sync::Arc;
-
-use aterm_effects::matrix_rain::{EffectGeom, MatrixRain, RainConfig, RainTickInput};
-use aterm_render::{RainHalo, RenderInput, SceneAtlas, SpriteQuad};
+use aterm_effects::matrix_rain::{
+    EffectGeom, MatrixRain, RainCell, RainConfig, RainLayers, RainTickInput,
+};
+use aterm_render::{RainHalo, RenderInput};
 
 /// Deterministic replay seed.
 pub const RAIN_SEED: u64 = 0xA7E2_11D3;
@@ -20,9 +20,12 @@ pub struct RainScene {
     pub engine: MatrixRain,
     geom: EffectGeom,
     /// Current emission, row-sorted.
-    pub quads: Vec<SpriteQuad>,
+    pub cells: Vec<RainCell>,
     /// Current bright-head halos (premultiplied additive light).
     pub add: Vec<RainHalo>,
+    /// The rain's layer publisher: it lives across frames, as the host's does,
+    /// so a row whose cells held is a layer that held.
+    layers: RainLayers,
 }
 
 impl RainScene {
@@ -54,8 +57,9 @@ impl RainScene {
                 rows: rows as u16,
                 cols: cols as u16,
             },
-            quads: Vec::new(),
+            cells: Vec::new(),
             add: Vec::new(),
+            layers: RainLayers::default(),
         }
     }
 
@@ -81,29 +85,29 @@ impl RainScene {
         let fp = self.engine.emit(
             self.geom,
             &Self::tick_input(),
-            &mut self.quads,
+            &mut self.cells,
             &mut self.add,
         );
-        self.quads.sort_by_key(|q| q.row);
+        self.cells.sort_by_key(|q| q.row);
         fp
     }
 
-    /// Tick until a frame with tinted glyph quads, a head halo, and a baked atlas.
+    /// Tick until a frame with tinted cells, a head halo, and baked tiles.
     pub fn drive_until_raining(&mut self) -> u64 {
         for i in 0..DRIVE_CAP {
             let fp = self.tick();
             if i % 100 == 0 {
                 eprintln!(
-                    "drive tick {i}: quads={} add={} tint0={:#x}",
-                    self.quads.len(),
+                    "drive tick {i}: cells={} add={} tint0={:#x}",
+                    self.cells.len(),
                     self.add.len(),
-                    self.quads.first().map_or(0, |q| q.tint)
+                    self.cells.first().map_or(0, |q| q.tint)
                 );
             }
             if i >= 8
-                && !self.quads.is_empty()
                 && !self.add.is_empty()
-                && self.quads.iter().any(|q| q.tint != 0x00FF_FFFF)
+                && self.cells.iter().any(|q| q.tint != 0x00FF_FFFF)
+                && self.baker_complete()
             {
                 return fp;
             }
@@ -111,19 +115,31 @@ impl RainScene {
         panic!("MatrixRain produced no tinted + haloed frame within {DRIVE_CAP} ticks");
     }
 
-    /// The versioned rain atlas (`Some` once the first bake batch landed).
-    pub fn atlas(&mut self) -> Option<Arc<SceneAtlas>> {
-        self.engine.rain_atlas()
+    /// Whether every glyph tile is baked (a cell whose tile is not draws
+    /// nothing).
+    pub fn baker_complete(&self) -> bool {
+        self.engine.baker().complete()
     }
 
-    /// Load the current emission into `input`'s rain channels.
+    /// The cells of the current emission whose tile is baked: the ones that
+    /// draw.
+    pub fn drawn(&self) -> impl Iterator<Item = &RainCell> {
+        self.cells
+            .iter()
+            .filter(|c| self.engine.tile(c.glyph).is_some() && c.alpha > 0)
+    }
+
+    /// Load the current emission into `input`: its cells as the rain's fx
+    /// layers, its halos into `rain_add`.
     pub fn apply(&mut self, input: &mut RenderInput) {
-        input.rain_quads.clone_from(&self.quads);
+        self.apply_cells(input);
         input.rain_add.clone_from(&self.add);
-        input.rain_atlas = if self.quads.is_empty() {
-            None
-        } else {
-            self.engine.rain_atlas()
-        };
+    }
+
+    /// Load only the current emission's cells into `input`, as the rain's fx
+    /// layers.
+    pub fn apply_cells(&mut self, input: &mut RenderInput) {
+        self.layers
+            .publish(&self.cells, self.engine.baker(), &mut input.fx_layers);
     }
 }

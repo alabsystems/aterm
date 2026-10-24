@@ -26,6 +26,9 @@ fn manifest(build: u64, commit: &str) -> Manifest {
     }
 }
 
+/// An ad-hoc-signed `staged/aterm.app.incoming` sealed as [`BUILD`] / [`COMMIT`],
+/// whose executable writes its pid to `ran` each time it starts, and `stamped` to
+/// [`stamped_marker`] when it finds its exec stamp, and exits `exit`.
 fn incoming(staging: &Staging, ran: &Path, exit: i32) -> PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
     ensure_private_dir(&staging.staged_dir()).unwrap();
@@ -35,8 +38,12 @@ fn incoming(staging: &Staging, ran: &Path, exit: i32) -> PathBuf {
     std::fs::write(
         &exe,
         format!(
-            "#!/bin/sh\nprintf %s $$ > '{}'\nexit {exit}\n",
-            ran.display()
+            "#!/bin/sh\nprintf %s $$ > '{}'\n[ -f '{}' ] && printf stamped > '{}'\nexit {exit}\n",
+            ran.display(),
+            incoming_exec_home(&app)
+                .join(aterm_uds::deadline::EXEC_STAMP)
+                .display(),
+            stamped_marker(ran).display()
         ),
     )
     .unwrap();
@@ -54,6 +61,11 @@ fn incoming(staging: &Staging, ran: &Path, exit: i32) -> PathBuf {
     .unwrap();
     aterm_uds::deadline::sign_ad_hoc(&app);
     app
+}
+
+/// Where [`incoming`]'s executable says it found its exec stamp when it started.
+fn stamped_marker(ran: &Path) -> PathBuf {
+    ran.with_extension("stamped")
 }
 
 fn stage(staging: &Staging, incoming: &Path, manifest: &Manifest) -> Result<(), String> {
@@ -90,6 +102,10 @@ fn the_stage_starts_the_candidate_only_after_its_whole_gate_passes() {
         );
         assert!(!staging.ready.exists(), "{why}: a marker was published");
         assert!(!app.exists(), "{why}: the refused bundle was left behind");
+        assert!(
+            !incoming_exec_home(&app).exists(),
+            "{why}: stamped unstarted"
+        );
     }
 
     let staging = Staging::scratch("stage-probe-pass");
@@ -97,9 +113,54 @@ fn the_stage_starts_the_candidate_only_after_its_whole_gate_passes() {
     let app = incoming(&staging, &ran, 0);
     stage(&staging, &app, &manifest(BUILD, COMMIT)).expect("a passing bundle publishes");
     assert!(ran.exists(), "the stage started the candidate");
+    assert!(
+        stamped_marker(&ran).exists(),
+        "the candidate's exec was stamped before the probe started it"
+    );
+    assert!(
+        !incoming_exec_home(&app).exists(),
+        "its exit of its own ends the stamp"
+    );
     let ready = Ready::read(&staging.ready).expect("the marker is published");
     assert_eq!(ready.build_number, BUILD);
     assert!(staging.staged_app.join("Contents/MacOS/aterm").is_file());
+}
+
+/// NO STAMP, NO PROBE. When the exec stamp cannot be written in its new directory (here an
+/// access list the directory inherits denies adding a file to it), the stage refuses before
+/// the probe: the candidate never ran, nothing is published, and neither the bundle nor a
+/// stampless directory that would age it on the wall clock is left.
+#[test]
+fn a_stage_whose_exec_stamp_cannot_be_written_starts_nothing() {
+    aterm_uds::deadline::require_trust_service();
+    let chmod = |args: &[&std::ffi::OsStr]| {
+        let ran = aterm_uds::spawnfd::command("/bin/chmod")
+            .args(args)
+            .status()
+            .expect("run chmod");
+        assert!(ran.success(), "chmod {args:?}");
+    };
+    let staging = Staging::scratch("stage-probe-unstamped");
+    let ran = staging.root.join("ran");
+    let app = incoming(&staging, &ran, 0);
+    let staged = staging.staged_dir();
+    chmod(&[
+        "+a".as_ref(),
+        "everyone deny add_file,directory_inherit,only_inherit".as_ref(),
+        staged.as_os_str(),
+    ]);
+    let refused = stage(&staging, &app, &manifest(BUILD, COMMIT));
+    chmod(&["-N".as_ref(), staged.as_os_str()]);
+    let error = refused.expect_err("a stage whose stamp cannot be written refuses");
+    assert!(
+        error.contains("could not stamp the staged bundle") && crate::is_passing_refusal(&error),
+        "{error}"
+    );
+    assert!(!ran.exists(), "the candidate ran without its stamp");
+    assert!(!staging.ready.exists());
+    assert!(!app.exists());
+    assert!(!incoming_exec_home(&app).exists());
+    assert!(!staging.staged_app.exists());
 }
 
 #[test]
@@ -143,6 +204,7 @@ fn a_candidate_that_cannot_start_is_refused_before_any_marker() {
     assert!(ran.exists(), "it was started");
     assert!(!staging.ready.exists());
     assert!(!app.exists());
+    assert!(!incoming_exec_home(&app).exists());
     assert!(!staging.staged_app.exists());
 }
 
@@ -164,6 +226,10 @@ fn a_stage_probe_that_runs_to_no_answer_publishes_for_the_apply_to_judge() {
         Some(BUILD)
     );
     assert!(staging.staged_app.join("Contents/MacOS/aterm").is_file());
+    assert!(
+        !incoming_exec_home(&app).exists(),
+        "a spawn refused started nothing to hold"
+    );
 
     let staging = Staging::scratch("stage-probe-timed-out");
     let ran = staging.root.join("ran");
@@ -176,6 +242,12 @@ fn a_stage_probe_that_runs_to_no_answer_publishes_for_the_apply_to_judge() {
     assert!(
         app.join("Contents/MacOS/aterm").is_file(),
         "incoming stays at its path while syspolicyd may still be assessing it"
+    );
+    let home = incoming_exec_home(&app);
+    assert!(
+        home.join(aterm_uds::deadline::EXEC_STAMP).is_file()
+            && !aterm_uds::deadline::copy_may_go(&home, std::time::SystemTime::now()),
+        "held by the stamp written before its probe, which a later check's sweep ages"
     );
     assert!(!staging.staged_app.exists());
 
@@ -192,5 +264,6 @@ fn a_stage_probe_that_runs_to_no_answer_publishes_for_the_apply_to_judge() {
     assert!(!crate::is_passing_refusal(&error), "{error}");
     assert!(!staging.ready.exists());
     assert!(!app.exists());
+    assert!(!incoming_exec_home(&app).exists());
     assert!(!staging.staged_app.exists());
 }

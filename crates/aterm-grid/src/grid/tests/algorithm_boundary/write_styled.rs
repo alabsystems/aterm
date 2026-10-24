@@ -6,11 +6,6 @@
 
 use super::*;
 
-/// The styled ASCII run leaves the grid exactly as the same bytes written one
-/// at a time through `write_char_wrap_styled` do — every cell's glyph,
-/// colours and flags, every row's wrap flag, the cursor and the deferred wrap
-/// — and reports the bytes written and the last one (an empty run keeps the
-/// caller's).
 #[test]
 fn write_ascii_run_styled_matches_per_char_writes() {
     let styles = [

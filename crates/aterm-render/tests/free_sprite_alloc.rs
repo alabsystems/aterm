@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Allocation gate for the CPU free-sprite compositor.
+//! Allocation gate for the companions' sprite layers on the CPU compositor.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use aterm_core::render::{FreeSampler, FreeSprite, FreeZ, SceneAtlas};
+use aterm_core::render::{FxArt, FxTexels};
 use aterm_core::terminal::Terminal;
+use aterm_render::sprites::{FreeSprite, FreeZ, SpriteLayers};
 use aterm_render::{Renderer, Theme, WindowCpu, embedded_font};
 
 struct CountingAlloc;
@@ -61,9 +62,8 @@ fn counted<R>(f: impl FnOnce() -> R) -> (R, u64) {
     (result, ALLOCS.load(Ordering::Relaxed))
 }
 
-fn atlas() -> Arc<SceneAtlas> {
-    let (width, height) = (64u32, 64u32);
-    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+fn art(width: u16, height: u16) -> Arc<FxArt> {
+    let mut rgba = Vec::with_capacity(usize::from(width) * usize::from(height) * 4);
     for y in 0..height {
         for x in 0..width {
             rgba.extend_from_slice(&[
@@ -74,29 +74,20 @@ fn atlas() -> Arc<SceneAtlas> {
             ]);
         }
     }
-    Arc::new(SceneAtlas {
-        width,
-        height,
-        rgba,
-        version: 1,
-    })
+    Arc::new(FxArt::new(width, height, FxTexels::Rgba8Straight, rgba).expect("a sized art"))
 }
 
-fn sprite(x: i32, w: u16, h: u16, aw: u16, ah: u16, flip_x: bool) -> FreeSprite {
+/// `art` stretched to `w × h` at `(x, 3)`: one held art a pose, as the bakers
+/// hold theirs (an art builds its row runs once, on its first draw).
+fn sprite(x: i32, w: u16, h: u16, art: &Arc<FxArt>, flip_x: bool) -> FreeSprite {
     FreeSprite {
-        x,
-        y: 3,
         w,
         h,
-        ax: 0,
-        ay: 0,
-        aw,
-        ah,
         tint: 0x00E8_F5FF,
         alpha: 217,
         flip_x,
         z: FreeZ::UnderText,
-        sampler: FreeSampler::Nearest,
+        ..FreeSprite::whole(x, 3, Arc::clone(art))
     }
 }
 
@@ -109,25 +100,24 @@ fn active_free_sprites_do_not_allocate_per_frame() {
     let (rows, cols) = (4usize, 16usize);
     let mut terminal = Terminal::new(rows as u16, cols as u16);
     terminal.process(b"\x1b[?25l");
-    let atlas = atlas();
-
+    let mut layers = SpriteLayers::new(1);
     let mut make = |free: FreeSprite| {
         let mut input = terminal.cell_frame(rows, cols);
-        input.free_atlas = Some(Arc::clone(&atlas));
-        input.free_sprites = vec![free];
+        layers.publish(&[free], &mut input.fx_layers);
         input
     };
 
-    let dormant = make(sprite(2, 0, cell_h as u16, 8, 8, false));
-    let one_to_one = make(sprite(
-        2,
-        22,
-        (cell_h + 5) as u16,
-        22,
-        (cell_h + 5) as u16,
-        true,
-    ));
+    let (pose, small, wide) = (art(22, (cell_h + 5) as u16), art(8, 8), art(13, 9));
+    let dormant = make(sprite(2, 0, cell_h as u16, &small, false));
+    // A sprite shown once, at rest since: the window's fx scratch has grown to
+    // one layer on both the full and the damaged path (a first frame with any
+    // layer sizes it), and keeps it.
+    let warm = make(sprite(5, 22, (cell_h + 5) as u16, &pose, false));
+    let one_to_one = make(sprite(2, 22, (cell_h + 5) as u16, &pose, true));
     let mut window = WindowCpu::new();
+    for input in [&dormant, &warm, &dormant, &warm] {
+        let _ = renderer.render_input_cached(&mut window, input);
+    }
     let dormant_pixels = renderer
         .render_input_cached(&mut window, &dormant)
         .pixels()
@@ -146,11 +136,11 @@ fn active_free_sprites_do_not_allocate_per_frame() {
     );
     assert_eq!(
         first_active_allocs, 0,
-        "a first active 1:1 pet/mote/note stamp must not allocate an x-map"
+        "a 1:1 pet/mote/note waking from rest must not allocate"
     );
 
-    let scaled_a = make(sprite(-7, 39, (2 * cell_h + 3) as u16, 13, 9, false));
-    let scaled_b = make(sprite(9, 37, (2 * cell_h + 1) as u16, 13, 9, true));
+    let scaled_a = make(sprite(-7, 39, (2 * cell_h + 3) as u16, &wide, false));
+    let scaled_b = make(sprite(9, 37, (2 * cell_h + 1) as u16, &wide, true));
     let _ = renderer.render_input_cached(&mut window, &scaled_a);
     let _ = renderer.render_input_cached(&mut window, &scaled_b);
 
@@ -167,6 +157,6 @@ fn active_free_sprites_do_not_allocate_per_frame() {
     black_box(checksum);
     assert_eq!(
         steady_allocs, 0,
-        "warm scaled/flip/clipped free-sprite motion must allocate zero times"
+        "warm scaled/flip/clipped sprite-layer motion must allocate zero times"
     );
 }

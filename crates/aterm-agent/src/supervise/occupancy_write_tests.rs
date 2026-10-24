@@ -10,7 +10,8 @@ use crate::supervise::config::Autopilot;
 use crate::supervise::occupancy::fault::{self, Fault};
 use crate::supervise::occupancy::templates;
 use crate::supervise::occupancy::{
-    OccupancyReading, OccupancySaid, PaceGrant, PaceRefusal, RuleId, SaidReadyIdle, SlotsSeen,
+    FactWord, NoteOutcome, OccupancyReading, OccupancySaid, PaceGrant, PaceRefusal, RuleId,
+    SaidReadyIdle, SlotsSeen,
 };
 use crate::supervise::policy::turn_end::{HostTurn, RULE_LAND};
 
@@ -39,6 +40,9 @@ struct DoorHost {
     calls: Mutex<Vec<String>>,
     /// What the door told the host ([`IdleHost::occupancy_said`]), in order.
     said: Mutex<Vec<OccupancySaid>>,
+    /// The task record's answer to the task door ([`IdleHost::task_fact`]); `None`, a record's:
+    /// `noted` for a word, `cleared` for none.
+    note: Mutex<Option<NoteOutcome>>,
 }
 
 impl DoorHost {
@@ -109,6 +113,18 @@ impl IdleHost for DoorHost {
     fn occupancy_said(&self, said: &OccupancySaid) {
         self.said.lock().expect("said").push(said.clone());
     }
+    fn task_fact(&self, word: Option<FactWord>) -> NoteOutcome {
+        self.called(format!(
+            "task_fact {}",
+            word.map_or_else(|| "-".to_string(), FactWord::word)
+        ));
+        let answer = *self.note.lock().expect("note");
+        answer.unwrap_or(if word.is_some() {
+            NoteOutcome::Noted
+        } else {
+            NoteOutcome::Cleared
+        })
+    }
 }
 
 struct Logged<'m> {
@@ -166,10 +182,25 @@ impl Ctl for Logged<'_> {
 const INTENT: &str = "fact-intent@v1";
 const HOLD: &str = "fact-hold@v1";
 
+/// The typed door's fact rows in the ledger at `path`: its intents, its would-be lines and its
+/// outcomes, and never the task door's ([`task_rows`]).
 fn fact_rows(path: &Path) -> Vec<(String, String, String, String)> {
-    std::fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
+    door_rows(&std::fs::read_to_string(path).unwrap_or_default())
+        .into_iter()
+        .filter(|(_, _, _, reason)| !crate::supervise::occupancy::door::is_task_row(reason))
+        .collect()
+}
+
+/// The task door's rows (`door=task`) in ledger text `body`, oldest first.
+fn task_rows(body: &str) -> Vec<(String, String, String, String)> {
+    door_rows(body)
+        .into_iter()
+        .filter(|(_, _, _, reason)| crate::supervise::occupancy::door::is_task_row(reason))
+        .collect()
+}
+
+fn door_rows(body: &str) -> Vec<(String, String, String, String)> {
+    body.lines()
         .filter_map(|line| aterm_json::from_str::<aterm_json::Value>(line).ok())
         .map(|v| {
             let text = |k: &str| {
@@ -185,10 +216,10 @@ fn fact_rows(path: &Path) -> Vec<(String, String, String, String)> {
                 text("reason"),
             )
         })
-        .filter(|(rule, decision, _, _)| {
+        .filter(|(rule, decision, _, reason)| {
             rule == INTENT
                 || rule == crate::supervise::occupancy::rules::WOULD_RULE
-                || (rule == HOLD && decision != "waiting")
+                || (rule == HOLD && (decision != "waiting" || reason.starts_with("rule=")))
         })
         .collect()
 }
@@ -392,9 +423,9 @@ fn observe_types_nothing(make: &dyn Fn(Occupancy) -> Ran) {
             ran.rows
         );
         assert!(
-            !ran.calls
-                .iter()
-                .any(|c| c.starts_with("occupancy_pace") || c == "break_taken"),
+            !ran.calls.iter().any(|c| {
+                c.starts_with("occupancy_pace") || c == "break_taken" || c.starts_with("task_fact")
+            }),
             "{mode}: {:?}",
             ran.calls
         );
@@ -2193,6 +2224,509 @@ fn of_two_lines_raised_the_word_names_the_one_due_longest() {
         both.at_ms,
         T0 + 120 * MIN,
         "the room line due from two hours"
+    );
+}
+
+fn live_turn() -> Vec<String> {
+    let mut r = rows(&["⏺ Working.", "", "✻ Synthesizing… (18s)", ""]);
+    r.extend(composer("  esc to interrupt"));
+    r
+}
+
+/// A managed worker's breaks every ten minutes to 130, its nudge put past the run (the setup's
+/// wait a day) and the board's room standing: the room line is due from 120 minutes on. At
+/// `close_at` a live turn not the harness's is drawn, and closes the hold.
+fn managed_room(
+    tag: &str,
+    occupancy: Occupancy,
+    autopilot: Autopilot,
+    close_at: Option<usize>,
+) -> Ran {
+    let at_s: Vec<i64> = (0..=13).map(|m| m * 10 * 60).collect();
+    let host = Arc::new(DoorHost::default());
+    *host.board.lock().expect("board") = room_at(T0);
+    let drawn = |i| {
+        if close_at == Some(i) {
+            live_turn()
+        } else {
+            waiting_break()
+        }
+    };
+    let mut script = Script {
+        drawn: &drawn,
+        host,
+        ..Script::new(tag, occupancy, &at_s)
+    };
+    script.policy.autopilot = autopilot;
+    let cfg = script.policy.clone();
+    script.run(&mut |s, i| {
+        s.turn_end.set_managed(true);
+        s.setup.occupancy_nudge_after = Duration::from_secs(24 * 3600);
+        if close_at == Some(i) {
+            s.hold_live(90, Some(&cfg), &mut Heard::default());
+        }
+    })
+}
+
+fn task_facts(ran: &Ran) -> Vec<String> {
+    ran.calls
+        .iter()
+        .filter(|c| c.starts_with("task_fact "))
+        .cloned()
+        .collect()
+}
+
+fn task_kinds(ran: &Ran) -> Vec<(String, String)> {
+    task_rows(&ran.ledger)
+        .into_iter()
+        .map(|(rule, decision, _, _)| (rule, decision))
+        .collect()
+}
+
+fn row(rule: &str, decision: &str) -> (String, String) {
+    (rule.to_string(), decision.to_string())
+}
+
+/// THE MANAGER DOOR (the slice-2 plan's D1, W3): under `prompt` a managed Cruise worker's due
+/// room line, held by the managed guard alone, is noted once on its task record — its intent
+/// row, one `task_fact` with the episode's word, its `noted` row — and never typed, however many
+/// breaks stand past due. NEGATIVE CONTROLS: `NoteAndType` (the managed guard dropped from the
+/// break's guards) sends the line as well as noting it, and `NoteEachBreak` notes the episode at
+/// every break past due.
+#[test]
+fn a_managed_cruise_workers_due_room_line_is_noted_once_and_never_typed() {
+    let ran = managed_room(
+        "write-task-room",
+        Occupancy::Prompt,
+        Autopilot::Cruise,
+        None,
+    );
+    assert_eq!(task_facts(&ran), [format!("task_fact {ROOM}#1")]);
+    assert!(ran.writes().is_empty(), "{:?}", ran.writes());
+    assert!(
+        !ran.calls.iter().any(|c| c.starts_with("occupancy_pace")),
+        "a note draws no pace: {:?}",
+        ran.calls
+    );
+    assert_eq!(room_said(&ran), ["held:managed"], "{:#?}", ran.noted);
+    assert!(ran.rows.is_empty(), "no line's rows: {:?}", ran.rows);
+    assert_eq!(
+        task_kinds(&ran),
+        [row(INTENT, "waiting"), row(HOLD, "waiting")]
+    );
+    let rows = task_rows(&ran.ledger);
+    assert_eq!(rows[0].2, "", "the intent names no word");
+    assert_eq!(
+        rows[1].2,
+        format!("{ROOM}#1"),
+        "the outcome row names the word"
+    );
+    assert!(rows[0].3.ends_with(" door=task"), "{rows:?}");
+    assert!(rows[1].3.ends_with(" door=task noted"), "{rows:?}");
+    let episode = |reason: &str| {
+        reason
+            .split(' ')
+            .find(|w| w.starts_with("episode="))
+            .map(str::to_string)
+    };
+    assert!(episode(&rows[0].3).is_some());
+    assert_eq!(episode(&rows[0].3), episode(&rows[1].3));
+    assert!(
+        ran.noted.iter().any(|l| l.starts_with("OCCUPANCY ")
+            && l.contains(&format!(" rule={ROOM} "))
+            && l.ends_with(" door=task noted")),
+        "{:#?}",
+        ran.noted
+    );
+    observe_types_nothing(&|occupancy| {
+        managed_room("write-task-room-obs", occupancy, Autopilot::Cruise, None)
+    });
+
+    let typed = fault::with(Fault::NoteAndType, || {
+        managed_room(
+            "write-task-and-type",
+            Occupancy::Prompt,
+            Autopilot::Cruise,
+            None,
+        )
+    });
+    assert_eq!(task_facts(&typed), [format!("task_fact {ROOM}#1")]);
+    assert!(
+        typed.writes().iter().any(|w| w.starts_with("send ")),
+        "CONTROL: a note that keeps no guard types the line too: {:?}",
+        typed.writes()
+    );
+    let each = fault::with(Fault::NoteEachBreak, || {
+        managed_room(
+            "write-task-each",
+            Occupancy::Prompt,
+            Autopilot::Cruise,
+            None,
+        )
+    });
+    assert_eq!(
+        task_facts(&each),
+        [format!("task_fact {ROOM}#1"), format!("task_fact {ROOM}#1")],
+        "CONTROL: noted again at the next break past due"
+    );
+}
+
+/// The hold's close clears the word the door noted (`task_fact(None)`) and books its row; a
+/// clear the host fenced is owed and made at the next step, and under no grant none is asked.
+#[test]
+fn the_holds_close_clears_the_word_the_door_noted() {
+    let ran = managed_room(
+        "write-task-close",
+        Occupancy::Prompt,
+        Autopilot::Cruise,
+        Some(13),
+    );
+    assert_eq!(
+        task_facts(&ran),
+        [format!("task_fact {ROOM}#1"), "task_fact -".to_string()]
+    );
+    assert_eq!(
+        task_kinds(&ran),
+        [
+            row(INTENT, "waiting"),
+            row(HOLD, "waiting"),
+            row(HOLD, "waiting")
+        ]
+    );
+    let rows = task_rows(&ran.ledger);
+    assert_eq!(
+        (rows[2].2.as_str(), rows[2].3.as_str()),
+        (
+            "hold-room@v1#1",
+            "rule=hold-room@v1 fact=hold-room@v1#1 door=task cleared"
+        )
+    );
+    assert!(ran.writes().is_empty(), "{:?}", ran.writes());
+    let unnoted = managed_room(
+        "write-task-close-observe",
+        Occupancy::Observe,
+        Autopilot::Cruise,
+        Some(13),
+    );
+    assert_eq!(task_facts(&unnoted), Vec::<String>::new());
+    assert_eq!(
+        task_kinds(&unnoted),
+        [row(
+            crate::supervise::occupancy::rules::WOULD_RULE,
+            "waiting"
+        )],
+        "observe books the would-be note, and no clear"
+    );
+}
+
+/// Under Land a managed worker's due nudge is held by the autopilot's guard too, so the task
+/// door notes nothing: no line would have gone but for the manager. NEGATIVE CONTROL:
+/// `NoteOnManagedAlone` (the managed guard's verdict alone asked) notes it.
+#[test]
+fn a_land_workers_managed_nudge_is_never_noted() {
+    let run = |tag: &str| {
+        let mut script = Script::new(tag, Occupancy::Prompt, &[0, 31 * 60, 32 * 60]);
+        script.policy.autopilot = Autopilot::Land;
+        script.run(&mut |s, _| s.turn_end.set_managed(true))
+    };
+    let ran = run("write-task-land");
+    assert_eq!(wrote(&ran.noted), [said(NUDGE, "held:managed")]);
+    assert_eq!(task_facts(&ran), Vec::<String>::new());
+    assert_eq!(task_rows(&ran.ledger), Vec::new());
+    assert!(ran.writes().is_empty());
+    let alone = fault::with(Fault::NoteOnManagedAlone, || run("write-task-land-alone"));
+    assert_eq!(
+        task_facts(&alone),
+        [format!("task_fact {NUDGE}#1")],
+        "CONTROL: the managed guard's verdict alone notes the Land worker's line"
+    );
+}
+
+/// T-obs2 for the task door: under `observe` a managed Cruise worker's due nudge books one
+/// would-be note (`fact-would@v1 … door=task`) however many breaks stand past due, and asks the
+/// host nothing; under `off`, nothing at all. NEGATIVE CONTROL: `NoteUnderObserve` asks it.
+#[test]
+fn under_observe_the_task_door_books_a_would_row_and_asks_nothing() {
+    let run = |tag: &str, occupancy| {
+        Script::new(tag, occupancy, &[0, 31 * 60, 32 * 60])
+            .run(&mut |s, _| s.turn_end.set_managed(true))
+    };
+    let would = crate::supervise::occupancy::rules::WOULD_RULE;
+    let ran = run("write-task-observe", Occupancy::Observe);
+    assert_eq!(task_facts(&ran), Vec::<String>::new());
+    assert!(ran.writes().is_empty());
+    let rows = task_rows(&ran.ledger);
+    assert_eq!(
+        rows.iter()
+            .map(|(r, d, c, _)| (r.as_str(), d.as_str(), c.as_str()))
+            .collect::<Vec<_>>(),
+        [(would, "waiting", "")]
+    );
+    assert!(rows[0].3.starts_with(&format!("rule={NUDGE} ")), "{rows:?}");
+    assert!(rows[0].3.ends_with(" door=task"), "{rows:?}");
+    assert!(
+        ran.rows.is_empty(),
+        "the typed door's would-be rows hold none: {:?}",
+        ran.rows
+    );
+    assert_eq!(
+        crate::supervise::occupancy::rules::would_rows_in(&ran.ledger, Some("@s-1")),
+        Vec::new(),
+        "a successor's books count no note"
+    );
+    let off = run("write-task-off", Occupancy::Off);
+    assert_eq!(task_rows(&off.ledger), Vec::new());
+    assert_eq!(task_facts(&off), Vec::<String>::new());
+    let asked = fault::with(Fault::NoteUnderObserve, || {
+        run("write-task-observe-asked", Occupancy::Observe)
+    });
+    assert_eq!(
+        task_facts(&asked),
+        [format!("task_fact {NUDGE}#1")],
+        "CONTROL: a door that asks under observe is seen"
+    );
+}
+
+/// The host's answer that took no word is booked `skipped why=<word>`: `no-task` and `closed`
+/// once an episode, `fenced` tried again at the next break.
+#[test]
+fn a_word_the_host_took_not_is_skipped_and_a_fenced_one_tried_again() {
+    for (outcome, calls) in [
+        (NoteOutcome::NoTask, 1),
+        (NoteOutcome::Closed, 1),
+        (NoteOutcome::Fenced, 2),
+    ] {
+        let tag = format!("write-task-{}", outcome.word());
+        let host = Arc::new(DoorHost::default());
+        *host.note.lock().expect("note") = Some(outcome);
+        let ran = Script {
+            host,
+            ..Script::new(&tag, Occupancy::Prompt, &[0, 31 * 60, 32 * 60])
+        }
+        .run(&mut |s, _| s.turn_end.set_managed(true));
+        assert_eq!(task_facts(&ran).len(), calls, "{tag}: {:?}", ran.calls);
+        let skipped: Vec<String> = task_rows(&ran.ledger)
+            .into_iter()
+            .filter(|(rule, decision, _, _)| rule == HOLD && decision == "skipped")
+            .map(|(_, _, _, reason)| reason)
+            .collect();
+        assert_eq!(skipped.len(), calls, "{tag}");
+        assert!(
+            skipped
+                .iter()
+                .all(|r| r.ends_with(&format!(" door=task why={}", outcome.word()))),
+            "{tag}: {skipped:?}"
+        );
+        assert!(ran.writes().is_empty(), "{tag}");
+        assert_eq!(
+            crate::supervise::occupancy::door::seed_rows_in(&ran.ledger, Some("@s-1")),
+            Vec::new(),
+            "{tag}: a successor's facts take no note's intent or skip for a line's"
+        );
+    }
+}
+
+/// A word the record carries at the loop's first read of it (`task_seed`), with no hold open,
+/// stands for no episode: under `prompt` it is cleared at once, its row booked; under `observe`
+/// and `off` nothing is asked. With a hold open, the clear waits for that hold's close.
+#[test]
+fn a_standing_word_with_no_hold_open_is_cleared_at_the_seed_under_prompt_alone() {
+    let word = FactWord::new(RuleId::HoldRoom, 1);
+    let run = |tag: &str, occupancy, at: usize| {
+        Script::new(tag, occupancy, &[0, 10 * 60]).run(&mut |s, i| {
+            if i == at {
+                s.door_task_seed(word, &policy(occupancy));
+            }
+        })
+    };
+    let ran = run("write-task-seed", Occupancy::Prompt, 0);
+    assert_eq!(task_facts(&ran), ["task_fact -"]);
+    assert_eq!(
+        task_rows(&ran.ledger),
+        [(
+            HOLD.to_string(),
+            "waiting".to_string(),
+            "hold-room@v1#1".to_string(),
+            "rule=hold-room@v1 fact=hold-room@v1#1 door=task cleared".to_string()
+        )]
+    );
+    for occupancy in [Occupancy::Observe, Occupancy::Off] {
+        let quiet = run("write-task-seed-quiet", occupancy, 0);
+        assert_eq!(task_facts(&quiet), Vec::<String>::new(), "{occupancy:?}");
+        assert_eq!(task_rows(&quiet.ledger), Vec::new(), "{occupancy:?}");
+    }
+    let open = run("write-task-seed-open", Occupancy::Prompt, 1);
+    assert_eq!(
+        task_facts(&open),
+        Vec::<String>::new(),
+        "the open hold's close clears it"
+    );
+}
+
+/// A standing word seeded with a hold open is taken up as the hold's (`DoorWatch::task_word`):
+/// that hold's close clears it under `prompt`, its row booked, and asks nothing under `observe`.
+/// CONTROL: the same close with no word seeded asks no clear, so the seeded word alone made it.
+#[test]
+fn a_word_seeded_under_an_open_hold_is_cleared_at_that_holds_close() {
+    let word = FactWord::new(RuleId::HoldRoom, 1);
+    let run = |tag: &str, occupancy, seeded: bool| {
+        let cfg = policy(occupancy);
+        let drawn = |i| if i == 2 { live_turn() } else { break_screen() };
+        Script {
+            drawn: &drawn,
+            ..Script::new(tag, occupancy, &[0, 10 * 60, 20 * 60])
+        }
+        .run(&mut |s, i| {
+            if i == 1 && seeded {
+                s.door_task_seed(word, &cfg);
+            }
+            if i == 2 {
+                s.hold_live(90, Some(&cfg), &mut Heard::default());
+            }
+        })
+    };
+    let ran = run("write-task-seed-close", Occupancy::Prompt, true);
+    assert_eq!(task_facts(&ran), ["task_fact -"], "{:?}", ran.calls);
+    assert_eq!(
+        task_rows(&ran.ledger),
+        [(
+            HOLD.to_string(),
+            "waiting".to_string(),
+            "hold-room@v1#1".to_string(),
+            "rule=hold-room@v1 fact=hold-room@v1#1 door=task cleared".to_string()
+        )]
+    );
+    let observed = run("write-task-seed-close-observe", Occupancy::Observe, true);
+    assert_eq!(task_facts(&observed), Vec::<String>::new());
+    assert_eq!(task_rows(&observed.ledger), Vec::new());
+    let unseeded = run("write-task-seed-close-none", Occupancy::Prompt, false);
+    assert_eq!(
+        task_facts(&unseeded),
+        Vec::<String>::new(),
+        "CONTROL: a close with no word seeded asks no clear"
+    );
+}
+
+/// A TAPE SLICE 2'S DOORS DID NOT RECORD HAS NO TASK DOOR (the slice-2 plan's F2 and D7): on a
+/// replay whose header names a slice-1 build's doors, a line the managed guard alone holds is no
+/// task door's (`door_task_due`), and a word the record carries at the seed is not cleared
+/// (`door_task_seed`), so such a tape's loop asks `host.task_fact` nothing it never recorded.
+/// NEGATIVE CONTROL: the same loop under a header with slice 2's doors in takes the line and asks
+/// the clear (answered `fenced`, so it books no row).
+#[test]
+fn a_tape_without_slice_twos_doors_has_no_task_door() {
+    use crate::supervise::occupancy::rules::{Guards, HoldSeen, Verdict};
+    use crate::supervise::tape::header::VERBATIM;
+    use crate::supervise::tape::replay::ReplayCore;
+    use crate::supervise::tape::testing::TAPE_ID;
+    const SLICE2: [&str; 5] = [
+        "host.wakes",
+        "host.wake_claim",
+        "host.wake_release",
+        "host.wake_told",
+        "host.task_fact",
+    ];
+    let cfg = policy(Occupancy::Prompt);
+    let held = [(RuleId::HoldRoom, Verdict::Held(Guard::Managed))];
+    let guards = Guards {
+        managed: true,
+        ..Guards::clear(Autopilot::Cruise)
+    };
+    let hold = HoldSeen {
+        since_ms: 0,
+        declared: false,
+    };
+    let run = |slice2: bool| {
+        let host = Arc::new(DoorHost::default());
+        *host.note.lock().expect("note") = Some(NoteOutcome::Fenced);
+        let mut m = Mock::new(Vec::new());
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        s.stall_host = Some(Arc::clone(&host) as Arc<dyn IdleHost>);
+        let start = s.fx.mono();
+        s.hold_seed_from("", start, T0, false, &cfg, &Heard::default());
+        let doors: Vec<String> = crate::supervise::run::host_door::HOST_DOORS
+            .iter()
+            .filter(|door| slice2 || !SLICE2.contains(door))
+            .map(ToString::to_string)
+            .collect();
+        let core = ReplayCore::start(Vec::new(), VERBATIM, VERBATIM, TAPE_ID, None);
+        core.recorded_doors(doors);
+        s.set_fx(Fx::replay(core));
+        assert_eq!(s.fx.slice2_recorded(), slice2);
+        let due = s.door_task_due(&held, &guards, hold).is_some();
+        s.door_task_seed(FactWord::new(RuleId::HoldRoom, 1), &cfg);
+        (due, host.calls())
+    };
+    assert_eq!(run(false), (false, Vec::new()));
+    assert_eq!(
+        run(true),
+        (true, vec!["task_fact -".to_string()]),
+        "CONTROL: slice 2's doors in, the door takes the line and asks the clear"
+    );
+}
+
+/// A MANAGED WORKER'S LINE BEFORE THE LOOP'S FIRST FOLD (its first turn, or a loop that carried
+/// an open hold; 2.4's safety review): the record no fold has read yet is read once, at the write
+/// past the owner's grant (`Session::managed_at_write`), and the managed guard holds the due
+/// nudge there; the next break notes it on the record, and nothing is typed. A read the server
+/// turned away holds the line, and the next write reads again. Under `observe` and `off` the
+/// record is not read. NEGATIVE CONTROLS: `ManagedUnread` (no read at the write) types the nudge
+/// into the managed worker, and a session with no task record is typed it after the same one
+/// read.
+#[test]
+fn a_managed_workers_line_before_its_first_fold_is_held_by_the_record_read_at_the_write() {
+    let working = Some((
+        1,
+        "state=working from=ctl since_ms=0 result_bytes=0".to_string(),
+    ));
+    let run_lost = |tag: &str, occupancy, task: &Option<(u64, String)>, lost: usize| {
+        let set = |m: &mut Mock| {
+            m.task.clone_from(task);
+            m.task_lost = lost;
+        };
+        Script {
+            set: &set,
+            ..Script::new(tag, occupancy, &[0, 31 * 60, 32 * 60])
+        }
+        .run(&mut |s, _| s.tasks_tracked = true)
+    };
+    let run =
+        |tag: &str, occupancy, task: &Option<(u64, String)>| run_lost(tag, occupancy, task, 0);
+    let reads = |ran: &Ran| ran.requests().iter().filter(|r| *r == "task").count();
+    let ran = run("write-managed-unread", Occupancy::Prompt, &working);
+    assert!(ran.writes().is_empty(), "{:?}", ran.writes());
+    assert_eq!(reads(&ran), 1, "{:?}", ran.requests());
+    assert_eq!(task_facts(&ran), [format!("task_fact {NUDGE}#1")]);
+    assert!(ran.rows.is_empty(), "no line's rows: {:?}", ran.rows);
+    observe_types_nothing(&|occupancy| {
+        let ran = run("write-managed-unread-observe", occupancy, &working);
+        assert_eq!(reads(&ran), 0, "{occupancy:?}: {:?}", ran.requests());
+        ran
+    });
+    let typed = fault::with(Fault::ManagedUnread, || {
+        run("write-managed-unread-typed", Occupancy::Prompt, &working)
+    });
+    assert_eq!(reads(&typed), 0);
+    assert!(
+        typed.writes().iter().any(|w| w.starts_with("send ")),
+        "CONTROL: a write that reads no record types into the managed worker: {:?}",
+        typed.writes()
+    );
+    let lost = run_lost("write-managed-lost", Occupancy::Prompt, &working, 1);
+    assert!(lost.writes().is_empty(), "{:?}", lost.writes());
+    assert_eq!(
+        reads(&lost),
+        2,
+        "read again at the next write: {:?}",
+        lost.requests()
+    );
+    assert_eq!(task_facts(&lost), Vec::<String>::new());
+    let unmanaged = run("write-managed-none", Occupancy::Prompt, &None);
+    assert_eq!(reads(&unmanaged), 1);
+    assert!(
+        unmanaged.writes().iter().any(|w| w.starts_with("send ")),
+        "CONTROL: a session with no task record is typed its line: {:?}",
+        unmanaged.writes()
     );
 }
 

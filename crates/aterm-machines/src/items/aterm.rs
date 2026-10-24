@@ -10,7 +10,7 @@ use super::apps::{
 };
 use super::{Ctx, Item};
 use crate::model::{Effect, Outcome, Probe, Read, User};
-use crate::port::{Cmd, Ran, System};
+use crate::port::{Cmd, Ran, RunFailed, System};
 use aterm_converge::StoodAside;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -28,6 +28,10 @@ pub const APP: &str = "/Applications/aterm.app";
 
 /// The one executable, which `~/.local/bin/aterm` links to.
 pub const EXE: &str = "/Applications/aterm.app/Contents/MacOS/aterm";
+
+/// Where [`App`] records whether the aterm.app it installed showed it ran
+/// ([`crate::first_exec`]): nothing replaces that bundle while its hold lasts.
+pub const FIRST_RUN: &str = "/Library/Management/aterm/state/aterm.app-first-run";
 
 /// `staff`, the group install.sh's own installs leave aterm.app in.
 pub const STAFF_GID: u32 = 20;
@@ -254,7 +258,47 @@ impl App {
             Read::Absent => return Err("the release zip's bundle has no identifier".into()),
             Read::Unusable(why) => return Err(why),
         }
-        swap_into(sys, &staged, Path::new(APP), stage)
+        swap_into(sys, &staged, Path::new(APP), stage)?;
+        self.first_run(sys)
+    }
+
+    /// Run the aterm just installed once, as its owner: its first exec, which
+    /// [`FIRST_RUN`] holds the bundle in place for until it showed it ran. The record is
+    /// readable by all, so a plan run without root reads the hold too.
+    fn first_run(&self, sys: &dyn System) -> Result<(), String> {
+        let record = Path::new(FIRST_RUN);
+        sys.create_dir_all(record, 0o755)
+            .and_then(|()| crate::first_exec::stamp(sys, record))
+            .map_err(|e| format!("{APP} is in place, but {}: {e}", record.display()))?;
+        let ran = sys.run(
+            &Cmd::new(EXE)
+                .arg("--version")
+                .as_user(&self.owner)
+                .budget(aterm_uds::deadline::FIRST_EXEC_HANG),
+        );
+        let why = match ran {
+            Ok(ran) if crate::first_exec::showed_it_ran(&ran) => {
+                crate::first_exec::mark_ran(sys, record);
+                return Ok(());
+            }
+            Ok(ran) => ran.describe(),
+            Err(e @ RunFailed::TimedOut(_)) => format!(
+                "{e}; a first exec this long suggests macOS's check of it is stuck, which a \
+                 restart clears"
+            ),
+            Err(e) => e.to_string(),
+        };
+        let then = match crate::first_exec::hold_left(sys, record) {
+            Some(left) => format!(
+                "nothing replaces it for {} more minute(s) of awake time, or until a restart",
+                crate::first_exec::minutes(left)
+            ),
+            None => "its hold is spent, so the next apply may replace it".to_owned(),
+        };
+        self.notes.push(format!(
+            "aterm.app's first run did not show it ran ({why}); {then}"
+        ));
+        Ok(())
     }
 }
 
@@ -300,6 +344,17 @@ impl Item for App {
         if ctx.cached(sha).is_none() {
             return Probe::Blocked {
                 why: not_cached(sha),
+            };
+        }
+        if from != "absent"
+            && let Some(left) = crate::first_exec::hold_left(sys, Path::new(FIRST_RUN))
+        {
+            return Probe::Deferred {
+                why: format!(
+                    "the aterm.app installed last has not shown it ran, and macOS may still be \
+                     checking it; it is replaced in {} minute(s), or after a restart",
+                    crate::first_exec::minutes(left)
+                ),
             };
         }
         if from != "absent" && !ctx.disrupt {
@@ -526,10 +581,12 @@ impl Item for Toolset {
                 };
             }
         }
+        // It may be the first exec of an aterm.app no [`FIRST_RUN`] record covers, so it is
+        // killed no sooner than macOS's check of that exec can last.
         let ran = match sys.run(
             &self
                 .pkg(&["doctor", "--json"])
-                .budget(Duration::from_secs(300)),
+                .budget(aterm_uds::deadline::FIRST_EXEC_HANG),
         ) {
             Ok(ran) => ran,
             Err(e) => {
@@ -890,6 +947,17 @@ mod tests {
             &plistbuddy(&staged, "CFBundleIdentifier"),
             ok("com.aterm.aterm\n"),
         );
+        let first_run = format!("admin$ {EXE} --version");
+        let budget = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let seen = std::sync::Arc::clone(&budget);
+        let key = first_run.clone();
+        sys.simulate(move |_, cmd| {
+            (cmd.display() == key).then(|| {
+                *seen.lock().unwrap() = Some(cmd.budget);
+                ok("aterm 0.104.0\n")
+            })
+        });
+        sys.awake_at(5_000_000);
         let items = expand(&t, &ctx).unwrap();
         assert!(
             matches!(items[0].probe(&sys, &ctx), Probe::Change { from, .. } if from == "absent")
@@ -904,7 +972,99 @@ mod tests {
         };
         assert!(at("/usr/sbin/chown -R 501:20") < at("/usr/bin/codesign"));
         assert!(at("/usr/bin/codesign") < at(&format!("rename {staged} {APP}")));
+        let stamp = at(&format!("write {FIRST_RUN}/exec 644"));
+        assert!(
+            at(&format!("mkdir {FIRST_RUN} 755")) < stamp,
+            "a plan without root reads it"
+        );
+        assert!(at(&format!("rename {staged} {APP}")) < stamp && stamp < at(&first_run));
+        assert!(at(&first_run) < at(&format!("write {FIRST_RUN}/ran 644")));
+        assert_eq!(
+            *budget.lock().unwrap(),
+            Some(aterm_uds::deadline::FIRST_EXEC_HANG)
+        );
         assert_eq!(items[0].detail(&sys, &ctx), None, "Gatekeeper accepted it");
+    }
+
+    #[test]
+    fn a_first_run_that_did_not_show_it_ran_notes_how_long_its_bundle_is_held() {
+        let note = |took_ms: u64, reply: Option<Ran>| {
+            let sys = Fake::root();
+            sys.awake_at(5_000_000);
+            let key = format!("admin$ {EXE} --version");
+            sys.simulate(move |sys, cmd| {
+                if cmd.display() != key {
+                    return None;
+                }
+                sys.awake_at(5_000_000 + took_ms);
+                reply.clone()
+            });
+            let app = App {
+                version: None,
+                archive: None,
+                owner: admin(),
+                notes: Notes::default(),
+            };
+            app.first_run(&sys).unwrap();
+            assert!(sys.written(&format!("{FIRST_RUN}/ran")).is_none());
+            app.notes.joined().unwrap()
+        };
+        let killed = Ran {
+            status: None,
+            stdout: Vec::new(),
+            stderr: b"Killed: 9".to_vec(),
+        };
+        let held = note(0, Some(killed.clone()));
+        assert!(
+            held.contains(
+                "nothing replaces it for 10 more minute(s) of awake time, or until a restart"
+            ),
+            "{held}"
+        );
+        let spent = note(600_000, Some(killed));
+        assert!(
+            spent.contains("its hold is spent, so the next apply may replace it"),
+            "{spent}"
+        );
+        let unstarted = note(60_000, None);
+        assert!(
+            unstarted.contains("could not start") && unstarted.contains("for 9 more minute(s)"),
+            "{unstarted}"
+        );
+    }
+
+    #[test]
+    fn an_aterm_app_that_has_not_shown_it_ran_is_not_replaced_even_now() {
+        let probe = |record: &[(&str, &[u8])], awake: u64| {
+            let sys = Fake::root();
+            installed(&sys, "0.103.0", 501);
+            for (name, bytes) in record {
+                sys.file(&format!("{FIRST_RUN}/{name}"), bytes);
+            }
+            sys.awake_at(awake);
+            let ctx = ctx_with(&sys, &[(ZIP_SHA, b"zip")], true);
+            expand(&table(), &ctx).unwrap()[0].probe(&sys, &ctx)
+        };
+        let started: &[(&str, &[u8])] = &[("exec", b"5000000")];
+        assert!(
+            matches!(
+                probe(started, 5_100_000),
+                Probe::Deferred { why } if why.contains("in 9 minute(s)")
+            ),
+            "{:?}",
+            probe(started, 5_100_000)
+        );
+        let changes = |p: Probe| matches!(p, Probe::Change { from, .. } if from == "aterm 0.103.0");
+        assert!(changes(probe(&[], 5_100_000)), "no record");
+        assert!(
+            changes(probe(&[("exec", b"5000000"), ("ran", b"")], 5_100_000)),
+            "it showed it ran"
+        );
+        assert!(changes(probe(started, 5_600_000)), "its hang has passed");
+        assert!(
+            changes(probe(started, 4_000_000)),
+            "the Mac restarted since"
+        );
     }
 
     #[test]

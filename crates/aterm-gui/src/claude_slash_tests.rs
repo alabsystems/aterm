@@ -171,7 +171,7 @@ fn menu_notes(app: &App) -> Vec<String> {
             m.rows
                 .iter()
                 .filter_map(|row| match row {
-                    MenuRow::Note(t) => Some(t.clone()),
+                    MenuRow::Note { text, .. } => Some(text.clone()),
                     _ => None,
                 })
                 .collect()

@@ -258,6 +258,8 @@ pub struct FxBudget {
     /// that a ruling reads (the walk filters on them, and a content is
     /// immutable).
     ruled: Vec<(Arc<FxContent>, FxSlot, FxBlend)>,
+    /// How many times it has ruled afresh.
+    epoch: u64,
 }
 
 impl FxBudget {
@@ -280,6 +282,7 @@ impl FxBudget {
                 .iter()
                 .map(|l| (Arc::clone(&l.content), l.slot, l.blend)),
         );
+        self.epoch = self.epoch.wrapping_add(1);
         #[cfg(any(test, debug_assertions))]
         crate::test_counters::count_budget_ruling();
         self.refused.clear();
@@ -329,6 +332,15 @@ impl FxBudget {
     pub const fn refused_items(&self) -> u64 {
         self.refused_items
     }
+
+    /// How many times it has ruled afresh: a reader that acts on a new
+    /// ruling (the GPU's atlas admission) remembers the epoch it acted on,
+    /// so it sees a ruling another reader of the same budget made first.
+    #[inline]
+    #[must_use]
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
 }
 
 /// An art's texel count.
@@ -357,6 +369,14 @@ impl FxSlicer {
 pub(crate) struct FxScratch {
     slicer: FxSlicer,
     cols: SpriteCols,
+}
+
+impl FxScratch {
+    /// The slicer, for a reader that slices without drawing ([`knock_rects`]).
+    #[inline]
+    pub(crate) const fn slicer(&mut self) -> &mut FxSlicer {
+        &mut self.slicer
+    }
 }
 
 /// A sprite's column table ([`sprite_cols`]), built when a slice of the sprite is first drawn and kept while the sprites drawn after it have the same art width and destination width.
@@ -440,6 +460,48 @@ pub fn slice_layers<'a>(
             }
         }
     }
+}
+
+/// The knock-out's boxes: every slice (`[x0, y0, x1, y1)`, frame pixels,
+/// right and bottom exclusive) of a sprite on a knock layer
+/// ([`FxLayer::knock`], a Linear layer at [`FxSlot::Under`]) whose ink is
+/// not clear, after the layer's clips and the occluders, into `out`
+/// (cleared first). The CPU knock-out (`Renderer::knock_out_under_text`)
+/// and the GPU's glyph-knock stream both read these, so a body cut by a
+/// pane edge or a card knocks out no letter beyond what it draws.
+pub fn knock_rects(
+    f: &FxFrame,
+    layers: &[FxLayer],
+    occluders: &[PxRect],
+    slicer: &mut FxSlicer,
+    out: &mut Vec<[i32; 4]>,
+) {
+    /// Collects the slices of every sprite whose ink is not clear.
+    struct Knocks<'o>(&'o mut Vec<[i32; 4]>);
+    impl<'a> FxSliceSink<'a> for Knocks<'_> {
+        fn item(&mut self, layer: &'a FxLayer, item: &'a FxItem, _: (i64, i64)) -> bool {
+            matches!(item, FxItem::Sprite(sp)
+                if layer.content.palette().get(sp.ink as usize).is_some_and(|k| k.alpha > 0))
+        }
+
+        fn slice(&mut self, s: FxSlice, _band: usize) {
+            let px = |v: usize| i32::try_from(v).unwrap_or(i32::MAX);
+            self.0.push([px(s.x0), px(s.y0), px(s.x1), px(s.y1)]);
+        }
+    }
+    out.clear();
+    if !layers.iter().any(|l| l.knock) {
+        return;
+    }
+    slice_layers(
+        f,
+        layers,
+        occluders,
+        |l| l.knock && l.slot == FxSlot::Under && l.blend == FxBlend::Linear,
+        |_| true,
+        slicer,
+        &mut Knocks(out),
+    );
 }
 
 /// The CPU sink: stamps each slice into a frame buffer.

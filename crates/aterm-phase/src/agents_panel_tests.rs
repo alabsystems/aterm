@@ -431,3 +431,35 @@ fn the_panel_holds_its_rows_in_order_up_to_its_capacity() {
     assert_eq!((panel.top(), panel.bottom()), (Some(10), Some(25)));
     assert!(panel.rows().iter().all(|r| r.name == row.name));
 }
+
+#[test]
+fn reads_agy_subagent_panel_rows_with_unwrapped_name_and_activity_clock() {
+    let row = parse("  ● Agent(self: Cursor Trail Rendering Engineer)  Reading file · 4m36s");
+    assert_eq!(row.kind, RowKind::Agent);
+    assert_eq!(row.bullet, Some((span(2, 3), Bullet::Filled)));
+    assert_eq!(
+        row.name,
+        span(4, 4 + "Cursor Trail Rendering Engineer".len() as u16)
+    );
+    assert_eq!(row.name_hash, text_hash("Cursor Trail Rendering Engineer"));
+    assert_eq!(row.activity, Some(span(50, 62)));
+    assert_eq!(row.activity_hash, text_hash("Reading file"));
+    assert_eq!(row.elapsed, Some((span(65, 70), clock(276_000, 1000))));
+
+    let research = parse("  ● Agent(research: Docs Reader)  Searching web · 1m5s");
+    assert_eq!(research.kind, RowKind::Agent);
+    assert_eq!(
+        research.name,
+        span(4, 4 + "research: Docs Reader".len() as u16)
+    );
+    assert_eq!(research.name_hash, text_hash("research: Docs Reader"));
+    assert_eq!(research.activity_hash, text_hash("Searching web"));
+    assert_eq!(research.elapsed.map(|e| e.1), Some(clock(65_000, 1000)));
+
+    let bare = parse("  ● Agent(self: Probe)  Working");
+    assert_eq!(bare.kind, RowKind::Agent);
+    assert_eq!(bare.name, span(4, 9));
+    assert_eq!(bare.name_hash, text_hash("Probe"));
+    assert_eq!(bare.activity_hash, text_hash("Working"));
+    assert_eq!(bare.elapsed, None);
+}

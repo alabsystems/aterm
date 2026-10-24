@@ -613,7 +613,6 @@ fn fill_over(cx: &Emit<'_>, arts: &CardArts, items: &mut Vec<FxItem>, palette: &
     kitty(cx, arts, items, palette);
     rim(cx, arts, items, palette);
     let trail = cx.trail_ink();
-    let dark = cx.scene.dark;
     let clip = cx.geo.clip;
     cx.each_star(&mut |s| {
         if s.cov < 1.0 || s.arm < 1 {
@@ -627,7 +626,7 @@ fn fill_over(cx: &Emit<'_>, arts: &CardArts, items: &mut Vec<FxItem>, palette: &
             );
             return;
         };
-        star(items, palette, art, clip, s, trail.covers(), dark);
+        star(items, palette, art, clip, s, trail.covers());
     });
     debug_assert!(
         items.len() <= CARD_OVER_ITEMS_MAX,
@@ -725,13 +724,13 @@ fn star(
     geo_clip: Rect,
     s: StarCall,
     on_trail: &[Rect],
-    dark: bool,
 ) {
     let StarCall {
         clip,
         centre: (sx, sy),
         cov,
         color,
+        light: added,
         ..
     } = s;
     let p = &art.pieces;
@@ -754,10 +753,10 @@ fn star(
     for (id, c) in covs.iter_mut().enumerate() {
         *c = match id {
             0 => cov.floor(),
-            1 if dark => (cov * STAR_CORE_ADD).floor(),
+            1 if added => (cov * STAR_CORE_ADD).floor(),
             1 => cov.floor(),
             id if id == STAR_PAINTS - 1 => {
-                if dark {
+                if added {
                     (cov * STAR_GLINT_COV).floor()
                 } else {
                     cov.floor()
@@ -765,7 +764,7 @@ fn star(
             }
             id => {
                 let tip = (cov * art.tapers[id - 2]).floor();
-                ended |= dark && premul_rgb(color, tip as u8) == 0;
+                ended |= added && premul_rgb(color, tip as u8) == 0;
                 if ended { 0.0 } else { tip }
             }
         };
@@ -782,7 +781,7 @@ fn star(
             clip: px_rect(clip),
         })
     };
-    if dark {
+    if added {
         let base = palette.len() as u32;
         let tones: [u32; STAR_PAINTS] = std::array::from_fn(|id| light(color, covs[id]).color);
         palette.extend(p.classes().iter().map(|members| {
@@ -856,12 +855,11 @@ pub(super) fn one_star(
     s: StarCall,
     geo_clip: Rect,
     on_trail: &[Rect],
-    dark: bool,
 ) -> (Vec<FxItem>, Vec<FxInk>) {
     let (mut items, mut palette) = (Vec::new(), Vec::new());
     let arm = i32::try_from(s.arm).expect("a test arm");
     if let Some(art) = StarArt::of(arm, s.gold) {
-        star(&mut items, &mut palette, &art, geo_clip, s, on_trail, dark);
+        star(&mut items, &mut palette, &art, geo_clip, s, on_trail);
     }
     (items, palette)
 }

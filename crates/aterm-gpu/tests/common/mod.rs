@@ -5,6 +5,8 @@
 
 #![allow(dead_code)] // each test binary uses its own subset of the kit
 
+pub mod sprites;
+
 use aterm_render::{Frame, Renderer, Theme};
 
 pub fn rr(p: u32) -> i32 {
@@ -107,6 +109,42 @@ pub fn disarm_for_oracle(g: &mut aterm_gpu::GpuRenderer) {
     g.disarm_gl_for_oracle();
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let _ = g;
+}
+
+/// The arms a parity test runs on, each a fresh [`backends`] pair at
+/// `px`/`theme`: the native arm (Metal on macOS, GL on Linux) and, in the
+/// oracle build on macOS or Linux, the wgpu oracle.
+pub fn arms(px: f32, theme: Theme) -> Vec<(&'static str, Renderer, aterm_gpu::GpuRenderer)> {
+    let (cpu, gpu) = backends(px, theme);
+    #[allow(unused_mut, reason = "the oracle build adds an arm")]
+    let mut out = vec![("native", cpu, gpu)];
+    #[cfg(all(wgpu_arm, any(target_os = "macos", target_os = "linux")))]
+    {
+        let (cpu, mut gpu) = backends(px, theme);
+        disarm_for_oracle(&mut gpu);
+        out.push(("wgpu-oracle", cpu, gpu));
+    }
+    out
+}
+
+/// That `gpu`'s last frame drew on the arm `arm` names (the oracle is
+/// neither Metal nor GL).
+#[track_caller]
+pub fn assert_arm(arm: &str, gpu: &aterm_gpu::GpuRenderer) {
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        gpu.metal_render_armed(),
+        arm == "native",
+        "{arm}: the frame's arm"
+    );
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        gpu.last_frame_on_gl(),
+        arm == "native",
+        "{arm}: the frame's arm"
+    );
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let _ = (arm, gpu);
 }
 
 /// End the calling test as could-not-run unless this host ships a colour-emoji face.

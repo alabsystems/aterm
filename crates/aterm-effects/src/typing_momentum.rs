@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Canonical typing-momentum leaky integrator in `[0, 1]` shared by [`crate::cursor_glow::CursorGlow`] and [`crate::kitty_cursor::CursorCat`].
-//! Accrues `RATE * min(gap, CREDIT_CAP_S)` on non-delete printable advances, drains on deletes/kills, and decays exponentially with time constant [`TYPING_MOMENTUM_TAU`].
+//! Canonical typing-momentum leaky integrator in `[0, 1]` shared by
+//! [`crate::cursor_glow::CursorGlow`] and [`crate::kitty_cursor::CursorCat`].
+//! Accrues `RATE * min(gap, CREDIT_CAP_S)` on non-delete printable advances, drains on
+//! deletes/kills, and decays exponentially with time constant [`TYPING_MOMENTUM_TAU`].
 
 use aterm_time::Instant;
 
@@ -44,7 +46,7 @@ impl TypingMomentum {
         }
     }
 
-    /// Evaluate the metric at `now`, decaying over [`TYPING_MOMENTUM_TAU`] and snapping below [`SNAP_ZERO`] to `0.0`.
+    /// Evaluate at `now`, decaying over [`TYPING_MOMENTUM_TAU`] and snapping below [`SNAP_ZERO`].
     #[inline]
     #[must_use]
     pub fn value(&self, now: Instant) -> f32 {
@@ -63,7 +65,7 @@ impl TypingMomentum {
         if v < SNAP_ZERO { 0.0 } else { v }
     }
 
-    /// Record one non-delete printable typing advance at `now`, crediting `RATE * min(gap, CREDIT_CAP_S)`.
+    /// Record one printable advance at `now`, crediting `RATE * min(gap, CREDIT_CAP_S)`.
     #[inline]
     pub fn advance(&mut self, now: Instant) {
         let gap = self.at.map_or(TYPING_MOMENTUM_CREDIT_CAP_S, |at| {
@@ -74,14 +76,14 @@ impl TypingMomentum {
         self.at = Some(now);
     }
 
-    /// Record one backspace at `now`, draining [`TYPING_MOMENTUM_DELETE_DRAIN`] and re-stamping `at`.
+    /// Record one backspace at `now`, draining [`TYPING_MOMENTUM_DELETE_DRAIN`].
     #[inline]
     pub fn delete(&mut self, now: Instant) {
         self.value = (self.value(now) - TYPING_MOMENTUM_DELETE_DRAIN).max(0.0);
         self.at = Some(now);
     }
 
-    /// Record one kill chord at `now`, draining [`TYPING_MOMENTUM_KILL_DRAIN`] and re-stamping `at`.
+    /// Record one kill chord at `now`, draining [`TYPING_MOMENTUM_KILL_DRAIN`].
     #[inline]
     pub fn kill(&mut self, now: Instant) {
         self.value = (self.value(now) - TYPING_MOMENTUM_KILL_DRAIN).max(0.0);
@@ -102,7 +104,7 @@ impl TypingMomentum {
         self.at = None;
     }
 
-    /// Analytic instant when the decaying metric crosses `threshold` (`> 0`), or `None` when unstamped.
+    /// Analytic instant when the metric crosses `threshold` (`> 0`), or `None` when unstamped.
     #[must_use]
     #[inline]
     pub fn low_crossing(&self, threshold: f32) -> Option<Instant> {
@@ -114,7 +116,7 @@ impl TypingMomentum {
         Some(at + std::time::Duration::from_secs_f32(elapsed.max(0.0)))
     }
 
-    /// Deadline at which [`Self::value`] reads at or below `threshold` (`0.0..=1.0`), accounting for [`SNAP_ZERO`].
+    /// Deadline when [`Self::value`] reads `<= threshold` (`0.0..=1.0`), including [`SNAP_ZERO`].
     #[must_use]
     #[inline]
     pub fn reading_low_crossing(&self, threshold: f32) -> Option<Instant> {
@@ -133,7 +135,6 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    /// Verify that a 5 ms key-repeat flood and a 30 ms sprint accrue at the same rate-capped ceiling.
     #[test]
     fn accrual_is_rate_capped_so_key_repeat_cannot_outrun_typing() {
         let t0 = Instant::now();
@@ -162,7 +163,6 @@ mod tests {
         );
     }
 
-    /// Verify that a key after a long pause earns at most one capped credit.
     #[test]
     fn credit_cannot_be_banked_across_a_pause() {
         let t0 = Instant::now();
@@ -179,7 +179,6 @@ mod tests {
         );
     }
 
-    /// Verify that `low_crossing` predicts the analytic exponential decay instant.
     #[test]
     fn low_crossing_predicts_the_analytic_decay_instant() {
         let t0 = Instant::now();
@@ -239,7 +238,6 @@ mod tests {
         assert_eq!(TypingMomentum::default().reading_low_crossing(0.0), None);
     }
 
-    /// Verify that repeated deletes drain an earned run to zero and re-stamp the clock.
     #[test]
     fn delete_flood_walks_an_earned_run_to_zero() {
         let t0 = Instant::now();

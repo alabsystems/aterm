@@ -272,8 +272,33 @@ pub(crate) fn hit(lane: Lane, thumb: (u32, u32), x: f64, y: f64, m: Metrics) -> 
     lane.edge.then_some(Hit::Track { above: y < y0 })
 }
 
-/// Append a rounded bar `(x, y, w, h)` in frame pixels (grid-interior, the chrome rows included) as source-over [`GlowQuad`]s of `rgb` at `alpha`: the body one quad per cell-row band (each quad lies in one band, as the stream requires), the two semicircular caps per pixel row at their antialiased coverage.
+/// Append a rounded bar `(x, y, w, h)` in frame pixels (grid-interior, the chrome rows included) of `rgb` at `alpha` to `out`, under the fx layer id `id`: its body and its antialiased caps draw as one fx layer of [`aterm_render::rounded_bar`] items ([`crate::pane_chrome`] splices it). A bar of no area or opacity draws nothing.
 pub(crate) fn push_bar(
+    out: &mut Vec<(u64, aterm_render::rounded_bar::RoundedBar)>,
+    id: u64,
+    (x, y, w, h): (u32, u32, u32, u32),
+    rgb: [u8; 3],
+    alpha: u8,
+) {
+    if w == 0 || h == 0 || alpha == 0 {
+        return;
+    }
+    out.push((
+        id,
+        aterm_render::rounded_bar::RoundedBar {
+            x,
+            y,
+            w,
+            h,
+            rgb,
+            alpha,
+        },
+    ));
+}
+
+/// The retired path of [`push_bar`], kept as the differential oracle its fx layer is held to byte for byte: a rounded bar `(x, y, w, h)` in frame pixels as source-over [`GlowQuad`]s of `rgb` at `alpha`, the body one quad per cell-row band, the two semicircular caps per pixel row at their antialiased coverage.
+#[cfg(test)]
+pub(crate) fn legacy_bar_quads(
     out: &mut Vec<GlowQuad>,
     (x, y, w, h): (u32, u32, u32, u32),
     rgb: [u8; 3],
@@ -760,7 +785,7 @@ mod tests {
     #[test]
     fn a_bar_is_rounded_source_over_and_banded() {
         let mut out = Vec::new();
-        push_bar(&mut out, (100, 40, 6, 60), [200, 200, 200], 160, 23);
+        legacy_bar_quads(&mut out, (100, 40, 6, 60), [200, 200, 200], 160, 23);
         assert!(!out.is_empty());
         let mut cover = std::collections::BTreeMap::new();
         for q in &out {

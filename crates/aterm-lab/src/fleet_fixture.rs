@@ -6,11 +6,6 @@
 use std::io::Write as _;
 use std::time::{Duration, Instant};
 
-/// What each fixture session was asked and said, picked by `<n>`: each near
-/// the 400-byte excerpt record, as a lab's Claude Code sessions' are — an
-/// instruction of a paragraph, a report ending with its result — so a fleet
-/// read of thirty machines is far over its budget, as the end use's is, and
-/// the client's cut is what the simulation judges (`fleet_judge::judge_text`).
 const WORDS: &[(&str, &str, &str)] = &[
     (
         "Fix the flaky reconnect test in crates/net: run it fifty times with the seed printed, \
@@ -204,7 +199,6 @@ pub fn claude(args: &[String]) -> i32 {
     paint_until_gone(|tick, cols, rows| screen(mode, tick, cols, rows, &cwd, &prompt, &said))
 }
 
-/// `claude follow <file>`: one run that paints the screen of the mode word `<file>` holds (`busy`, `question`, `prompt` or `idle`; [`followed_mode`]), read again every tick, so a driver walks it through a turn, its box and its end (`seamless`).
 fn follow(file: &std::path::Path) -> i32 {
     let (prompt, said, tool) = words(0);
     let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
@@ -223,7 +217,6 @@ pub fn followed_mode(file: &std::path::Path) -> Mode {
         .unwrap_or(Mode::Idle)
 }
 
-/// Seed only a fresh lab home. A pre-existing profile is never overwritten.
 fn write_subscription(home: &std::path::Path, now: i64) -> std::io::Result<()> {
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -283,8 +276,6 @@ pub fn build_loop(args: &[String]) -> i32 {
     0
 }
 
-/// Whether the terminal's input ended within `wait` (polled; nothing read
-/// that was typed is kept).
 fn stdin_closed(wait: Duration) -> bool {
     let mut fds = [crate::sys::pollfd(0)];
     let ms = i32::try_from(wait.as_millis()).unwrap_or(i32::MAX);
@@ -298,8 +289,6 @@ fn stdin_closed(wait: Duration) -> bool {
     }
 }
 
-/// Paint `draw(tick, cols, rows)` on the alternate screen every quarter
-/// second until the terminal goes; the exit status.
 fn paint_until_gone(draw: impl Fn(u64, usize, usize) -> Vec<String>) -> i32 {
     let mut out = std::io::stdout().lock();
     if out.write_all(b"\x1b[?1049h\x1b[2J").is_err() {
@@ -331,12 +320,10 @@ fn paint_until_gone(draw: impl Fn(u64, usize, usize) -> Vec<String>) -> i32 {
     0
 }
 
-/// `text` cut to `cols` characters.
 fn clip(text: &str, cols: usize) -> String {
     text.chars().take(cols).collect()
 }
 
-/// One frame of `mode` on a `cols` x `rows` screen, `tick` quarter-seconds in.
 fn screen(
     mode: Mode,
     tick: u64,
@@ -450,8 +437,6 @@ fn screen(
     rows_out.into_iter().map(|row| clip(&row, cols)).collect()
 }
 
-/// This process's environment, as a Claude Code session in this tab has it,
-/// to `$HOME/`[`ENV_DIR`]`/<pid>`: NUL-separated `KEY=value`, mode 0600.
 fn write_env() -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -474,11 +459,6 @@ fn write_env() -> std::io::Result<()> {
         .write_all(&body)
 }
 
-/// Claude Code's own record of this process and its conversation, as the
-/// footer's tail read finds them (`aterm_agent::harness::footer`): the
-/// registry entry `<claude dir>/sessions/<pid>.json` and the transcript
-/// `<claude dir>/projects/<slug of cwd>/<session id>.jsonl` — a user prompt,
-/// the answer's words and, unless at rest, a tool call no result answered.
 fn write_session(
     cwd: &std::path::Path,
     mode: Mode,
@@ -550,8 +530,6 @@ fn write_session(
 mod tests {
     use super::*;
 
-    /// Every mode's frame fills the screen exactly, and the busy one's
-    /// mode row says `esc to interrupt` (what the agent reader keys busy on).
     #[test]
     fn every_frame_fills_its_screen_and_busy_says_esc_to_interrupt() {
         let cwd = std::path::Path::new("/tmp/af/m00/home");
@@ -579,8 +557,6 @@ mod tests {
         assert!(!idle[29].contains("esc to interrupt"), "{idle:?}");
     }
 
-    /// `claude follow <file>` paints the mode its file names, read again on
-    /// every tick, and at rest when the file names none.
     #[test]
     fn a_followed_mode_is_its_files_word_and_idle_without_one() {
         let scratch = aterm_tempfile::tempdir().expect("exclusive mode file");

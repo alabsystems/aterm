@@ -1,6 +1,5 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-// Author: Andrew Yates
 
 //! Taskbar progress and desktop notification types.
 
@@ -13,35 +12,34 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum TaskbarProgress {
-    /// Progress is hidden (state 0).
+    /// Hidden (state 0).
     Hidden,
-    /// Normal progress display (state 1). Value is 0-100.
+    /// Normal progress (state 1, 0..=100).
     Normal(u8),
-    /// Error state (state 2). Value is 0-100.
+    /// Error state (state 2, 0..=100).
     Error(u8),
     /// Indeterminate progress (state 3).
     Indeterminate,
-    /// Paused state (state 4). Value is 0-100.
+    /// Paused state (state 4, 0..=100).
     Paused(u8),
 }
 
-/// Notification urgency level (OSC 99 `u` parameter): 0 low, 1 normal (the default), 2
-/// critical.
+/// Notification urgency level (OSC 99 `u` parameter).
 #[non_exhaustive]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NotificationUrgency {
-    /// Low urgency (u=0). Notification may be suppressed if user is busy.
+    /// Low urgency (`u=0`).
     Low,
-    /// Normal urgency (u=1). Standard notification behavior.
+    /// Normal urgency (`u=1`).
     #[default]
     Normal,
-    /// Critical urgency (u=2). Notification should persist until acknowledged.
+    /// Critical urgency (`u=2`).
     Critical,
 }
 
 impl NotificationUrgency {
-    /// Parse urgency from OSC 99 'u' parameter value.
+    /// Parse urgency from the OSC 99 `u` parameter.
     #[inline]
     #[must_use]
     pub fn from_param(value: &str) -> Self {
@@ -53,8 +51,7 @@ impl NotificationUrgency {
     }
 }
 
-/// Desktop notification (OSC 99, kitty protocol), aggregated from the OSC 99 sequences that
-/// share a notification ID.
+/// Desktop notification (OSC 99, kitty protocol), aggregated by notification ID.
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Notification {
@@ -69,7 +66,7 @@ pub struct Notification {
 }
 
 impl Notification {
-    /// Check if this notification has any content to display.
+    /// Whether this notification has a title or body.
     #[inline]
     #[must_use]
     pub const fn has_content(&self) -> bool {

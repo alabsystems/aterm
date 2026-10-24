@@ -51,7 +51,6 @@ impl Frame {
     }
 
     /// Decode a PNG through the workspace's one decoder (`aterm-png`).
-    ///
     /// # Errors
     /// [`FrameError::NotPng`] for anything that is not a decodable 8-bit PNG.
     pub fn decode_png(bytes: &[u8]) -> Result<Self, FrameError> {
@@ -65,7 +64,6 @@ impl Frame {
     }
 
     /// Read and decode the PNG at `path`.
-    ///
     /// # Errors
     /// The file cannot be read, or is not a PNG.
     pub fn load(path: &Path) -> Result<Self, FrameError> {
@@ -73,7 +71,6 @@ impl Frame {
     }
 
     /// Set the pixel at `(x, y)`.
-    ///
     /// # Panics
     /// When `(x, y)` is outside the frame.
     pub fn paint(&mut self, x: usize, y: usize, rgb: Rgb) {

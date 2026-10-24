@@ -825,7 +825,7 @@ pub const VERBS: &[VerbSpec] = &[
          denied: …` and closes the connection. Under `[fleet] allow = \"drive\"`, a node named by \
          `aterm fleet allow drive --from` and proved by its key also runs, as Owner, `@<sid> \
          status|text|screen|result|turn|key|send` on a hosted session, `hold <sid> on|off`, \
-         `spawn agent=<claude|gemini|agy|muse>` with its task, `await task`, and `@<sid> close` \
+         `spawn agent=<claude|codex|gemini|agy|muse>` with its task, `await task`, and `@<sid> close` \
          on a worker it spawned (`aterm help fleet`).",
     )
     .input(Input::NONE)
@@ -912,8 +912,9 @@ pub const VERBS: &[VerbSpec] = &[
          self_hardened=<yes|no|unknown> right= probe= probe_age_ms= pending=off pending_right=- \
          pending_age_ms=- last=- watch_ms=-`; `devtools state=<allowed|denied|unlisted|unknown> \
          subject= requests= not_allowed= answer_age_ms= window_s=600 probe= probe_age_ms= \
-         grant=<granted|not_granted|unknown> list=<on|off|absent|unknown> list_probe=`; `observer \
-         fda= responsible= log= taskport=`; `access_card \
+         grant=<granted|not_granted|unknown> list=<on|off|absent|unknown> list_probe= \
+         program_check=<n|-> program_check_oldest_ms=<ms|->`; `observer fda= responsible= log= \
+         taskport=`; `access_card \
          state=<quiet|asked|opened|granted|declined> asked_at= opened_at= verified_at= renew_at= \
          needs=`; `remediate fda= files= debugger= devtools=`; then a `note <pct>` when `anchor=` \
          is `displaced` or `deleted`, and the closing `note <pct>`. `--json` is `OK 1` and one \
@@ -930,7 +931,10 @@ pub const VERBS: &[VerbSpec] = &[
          marks a copy Settings ▸ Security can move to Trash. `devtools`: `state=` is tccd's \
          newest answer within `window_s=`, `list=` the system `TCC.db` switch, and `grant=` the \
          two joined (the newer wins, the switch when a time is missing; `list=absent` is \
-         `not_granted`). Only a person changes these, at the places `remediate` names: \
+         `not_granted`); `program_check=` counts this user's programs waiting at macOS's program \
+         check now by the latest jobs reading (one is pulled when none is fresh), a lower bound, \
+         and `program_check_oldest_ms=` the longest held (`-` with none held, off macOS, or with \
+         no reading). Only a person changes these, at the places `remediate` names: \
          `settings:<pane>` is a System Settings pane, `aterm-settings:<page>` a page of aterm's \
          Settings (the debugger's is Settings ▸ Security); `devtools hand-over` opens the \
          Developer Tools pane and `await consent [kind=debugger]` waits for a change.",
@@ -1393,8 +1397,9 @@ pub const VERBS: &[VerbSpec] = &[
          resolves that open digest entry only while its key and confirmation (`id` and `rev` from \
          its `messages need=later live` row) still match (`OK settled=<id|-> \
          how=<resolved-ok|gone>`); an entry repeated, changed, replaced or filed since that \
-         observation is left alone, and a relaunch or update gives every open entry a new `rev`. \
-         `rev` is independent of UI revisions; an exhausted `rev` never settles (`how=gone`). \
+         observation is left alone. Hosts share clock-independent confirmations seeded from random \
+         entropy at startup; cross-process freshness is probabilistic. Missing entropy or an \
+         exhausted `rev` disables settlement (`how=gone`); `rev` is independent of UI revisions. \
          Settling never forgets a dismissal. `notice dismiss <id|review>` dismisses a row or \
          files the open exceptions; `notice act <id> <label|index|details>` presses a button (`OK \
          acted=<label> performed=<1|0>`). Titles <= 6 words / 48 chars; keys `1..=40` of \
@@ -1592,7 +1597,7 @@ pub const VERBS: &[VerbSpec] = &[
          <col>`, `action=`, or `reason=no-strip|not-laid-out|no-ui-face|strip-full`). One \
          `autopilot sid=<sid> window=<id> program=<claude|agy|muse|gemini|codex> \
          face=<cruise|cruise-until|land|landed|theirs|off|master-off|agent-off|unhosted|-> \
-         drawn=\"<cells>\"|drawn=- why=<not-drawn|no-room|no-host|no-footer> \
+         drawn=\"<cells>\"|drawn=- why=<not-drawn|no-room|no-host|no-footer|switch-only> \
          spoken=\"<label>\"|spoken=- description=\"<words>\"|description=-` line per supervised \
          pane in any window. Then `statusitem title=<❯|❯•|❯N> needs=<n> stuck=<n> exceptions=<n> \
          done=<n> fleet=<off|unread|reading|failed|as_of:<unix ms>>` and, on macOS, the `❯` menu's \
@@ -1876,7 +1881,7 @@ pub const VERBS: &[VerbSpec] = &[
          with `since=<as_of> ep=<ep>` (an update writes `mark - handoff carried=<n> shed=<m> \
          epoch=<ep>` or `gap why=handoff epoch=<ep>`; an eviction or reset writes `gap \
          why=<evicted|reset> lost=<k> resync_to=<seq>`). A closed session stays readable as \
-         `log @<sid>` (its last 512, journaled unless `[session_log] journal = false`, mirrored \
+         `@<sid> log` (its last 512, journaled unless `[session_log] journal = false`, mirrored \
          under `[fabric] log = \"auto\"|\"turns\"`). `log n` (Owner-only) reads the instance \
          node log (`open n start \
          prev_end=<clean|handoff|killed|signal|panic|running|unknown|none|->`, `mark n link \
@@ -2002,7 +2007,7 @@ pub const VERBS: &[VerbSpec] = &[
         "sys [<view>] [--json] [since=<c>]: cores, GPU, memory, disk of the machine, aterm and \
          this tab",
         "— views: `overview` (default) | `tab` | `aterm` | `global` | `jobs` | `cores` | `gpu` | \
-         `mem` | `disk` | `procs` | `why`; options: `scope=pane|tab|window|aterm|global` \
+         `mem` | `disk` | `net` | `procs` | `why`; options: `scope=pane|tab|window|aterm|global` \
          (on resource/job views), `top=<n>` (default 8, max 64), `fresh=<ms>` (0 forces a live \
          sample; stale replies add `state=stale age_ms=`), `depth=` (on `disk`), `instances=all` \
          (folded by `aterm ctl`). Header: \
@@ -2398,9 +2403,9 @@ pub const VERBS: &[VerbSpec] = &[
             "; ",
             open_aliases!(),
             "), replying `OK opened <target>` or `OK closed <target>`. `open fact-menu \
-             <model|effort|path|branch|context|usage|close>` opens or closes that composer-rule \
-             menu. While any session is held, opening `menu`, `tab-menu`, `overview`, \
-             `autopilot-menu` or `fact-menu` is `ERR halted` (see `hold`)."
+             <model|effort|path|branch|context|usage|top-effort|account|close>` opens or closes \
+             that composer-rule menu. While any session is held, opening `menu`, `tab-menu`, \
+             `overview`, `autopilot-menu` or `fact-menu` is `ERR halted` (see `hold`)."
         ),
     )
     .input(Input::NONE),
@@ -2631,19 +2636,21 @@ pub const VERBS: &[VerbSpec] = &[
          connected=controlled|controller place=window|tab of=<sid> [cwd=<path>]` mints a `both` \
          connection with `of=<sid>` (`controller` sets `ATERM_OBSERVE_SESSION_ID`; `place=window` \
          is `ERR headless` without a GUI). Worker form (Owner-only): `spawn … \
-         agent=<claude|gemini|agy|muse> [model=<m>] [autopilot=<land|cruise>] [from=<sid>] \
+         agent=<claude|codex|gemini|agy|muse> [model=<m>] [autopilot=<land|cruise>] [from=<sid>] \
          len=<n>` replies `GO <n>`, reads `<n>` task bytes (`1..=65536`, no NUL; `ERR spawn \
          agent=<word>: the task is <n> bytes (max 65536)` beyond; `aterm ctl spawn agent=<word> \
          [model=<m>] [cwd=<p>] -` reads stdin), writes `<state>/tasks/` (`ATERM_TASK_FILE`), and \
          at the login shell's (`zsh`/`bash`/`fish`) first prompt launches the interactive agent \
          (`--prompt-interactive=` for `gemini`/`agy`, `GEMINI_CLI_TRUSTED_FOLDERS_PATH=` for \
-         `gemini`, `--trust-workspace` for `muse`). Sets `task` to `working` (`from=<sid|ctl>`) \
+         `gemini`, `--trust-workspace` for `muse`; `codex` is codex-alab, which carries the \
+         session itself, `supervisor_proven=1`, and whose landing marks `task` `done \
+         why=landed` with its rollout's report). Sets `task` to `working` (`from=<sid|ctl>`) \
          and `autopilot` to `land` (or `autopilot=cruise`; `meta set autopilot land` switches \
          later); marks `stalled why=shell` if no shell prompt within 20 s, `stalled why=startup` \
-         if no agent composer within 120 s of `since_ms=`, or `stalled why=held` if stuck 120 s \
-         at an unhandled screen. Refuses with `ERR unsupervised: <switch>` when the window \
-         harness cannot supervise (`[harness] enabled = false`, `headless = false`, or `autopilot \
-         = \"off\"`), and `ERR agent codex: not yet` for `agent=codex`.",
+         if no agent composer (for `codex`, no proven claim) within 120 s of `since_ms=`, or \
+         `stalled why=held` if stuck 120 s at an unhandled screen. Refuses with `ERR \
+         unsupervised: <switch>` when the window harness cannot supervise (`[harness] enabled = \
+         false`, `headless = false`, or `autopilot = \"off\"`).",
     )
     .input(Input::NONE),
     v(
@@ -2668,15 +2675,19 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Session,
         "task [mark <state> …]: a worker's task record: OK task rev= state= from= since_ms=",
-        "— `result_bytes= [why=] [exit=] [result_path=] agent= attention=` (or `OK task -` when \
-         the session has no task). `state=`: `working`, `done` (under Land, work landed on remote \
+        "— `result_bytes= [why=] [exit=] [result_path=] [fact= fact_rev=] agent= attention=` (or \
+         `OK task -` when the session has no task). `state=`: `working`, `done` (under Land, work landed on remote \
          `main` and defended with `Nothing left:`), `exited` (`exit=<code>`), or `stalled` \
          (`why=startup|shell|held`; it resumes `working why=moved` or `working why=turn`). `why=` \
          is `landed|marker|done-check|exit|shell|startup|held|turn|moved`. `rev=` increments on \
-         record changes and on `meta set attention owner=supervisor|needs` changes (`status` and \
-         `sessions` carry `task_state=<state|-> task_rev=<n>`, `subscribe … events` emits `EVENT \
-         <local> task rev=<n> state=<s> attention=<0|1> [why=<w>] [exit=<n>]`, and `turn` verdicts \
-         carry `task_rev=`). `task mark <working|done|exited|stalled> [from=<s-…|ctl>] \
+         record changes and on `meta set attention owner=supervisor|needs|codex-alab` changes \
+         (`status` and `sessions` carry `task_state=<state|-> task_rev=<n>`, `subscribe … events` \
+         emits `EVENT <local> task rev=<n> state=<s> attention=<0|1> [why=<w>] [exit=<n>]`, and \
+         `turn` verdicts carry `task_rev=`). `fact=<rule>@v<n>#<ordinal>|-` is the occupancy door's \
+         word for a managed worker's line the harness held for its manager (written under the \
+         owner's `[harness] occupancy = \"prompt\"` alone), shown once first edited on the reply, \
+         `await task` rows and the event (`fact= fact_rev=` at their end); `fact_rev=` moves on its \
+         own, never `rev=`, and no verb takes `fact=` as input. `task mark <working|done|exited|stalled> [from=<s-…|ctl>] \
          [why=<word>] [exit=<n>] [result_bytes=<n>] [result_path=<pct>]` (Owner-only; `ERR denied` \
          for edges; `ERR busy update-committing` if a seamless handoff blocks > 10 s) updates the \
          record and replies with `changed=<0|1>`.",
@@ -2689,11 +2700,13 @@ pub const VERBS: &[VerbSpec] = &[
         Session,
         "result [full]: a worker's result, the report it ended its task with",
         "— replies `OK <n> source=transcript session=<id> uuid=<row> bytes=<n>` (or `OK <n> \
-         source=screen program=<agent> bytes=<n>` for Gemini CLI, agy and Muse Code) followed by \
-         `<n>` lines (up to 24000 chars, ending with `… truncated; full: <path>` when truncated; \
-         `result full` adds `full=1` and returns the full transcript exchange since the task \
-         prompt). Snapshotted when `task` is marked `done` (and retried on `no-reply`/`no-marker`, \
-         updating `result_bytes=`). Errors: `ERR no task`, `ERR result unavailable \
+         source=screen program=<agent> bytes=<n>` for Gemini CLI, agy and Muse Code, `OK <n> \
+         source=rollout thread=<id> turn=<id> bytes=<n>` for codex-alab) followed by `<n>` lines \
+         (up to 24000 chars, ending with `… truncated; full: <path>` when truncated; `result \
+         full` adds `full=1` and returns the full transcript exchange since the task prompt, \
+         `why=no-transcript` for a screen or rollout result). Snapshotted when `task` is marked \
+         `done` (a transcript's retried on `no-reply`/`no-marker`, updating `result_bytes=`). \
+         Errors: `ERR no task`, `ERR result unavailable \
          why=<working|stalled|exited|no-transcript|no-reply|no-marker|empty|no-check|no-report|no-snapshot|unreadable|no-prompt|no-words>`.",
     ),
     v(
@@ -2743,10 +2756,12 @@ pub const VERBS: &[VerbSpec] = &[
          agent <word>[,<word>…] [since=<rev>]`: `status agent=` is one of \
          `busy|prompt|question|idle|survey|unknown|-|wall|wall:<kind>` at a `rev` past \
          `since=`, such as a `settle=submitted` turn's `agent_rev=` (`OK agent <word> \
-         rev=<n>`). `await task [@<sel>[:<rev>][,...]] [any|all] [since=<rev>]`: a `task` `rev` \
-         past `since=` (`OK <n>`, or `OK <n> status=timeout`, then `@<sid> rev=<n> \
+         rev=<n>`). `await task [@<sel>[:<rev>[:<fact_rev>]][,...]] [any|all] [since=<rev>] [facts=1 \
+         [fact_since=<fact_rev>]]`: a `task` `rev` past `since=`, and with `facts=1` a fact word \
+         noted past `fact_since=` (by default the `fact_rev` at the wait; a clear wakes nothing) \
+         (`OK <n>`, or `OK <n> status=timeout`, then `@<sid> rev=<n> \
          state=<working|done|exited|stalled|-|closed> agent=<word> attention=<pct|-> \
-         result_bytes=<n>` rows). `await consent [kind=debugger] [timeout=<ms>]`: this session's \
+         result_bytes=<n> [fact=<word|-> fact_rev=<n>]` rows). `await consent [kind=debugger] [timeout=<ms>]`: this session's \
          consent (`privacy`'s `full_disk_access=` and its `session` row's `fs_consent=` and \
          `attribution=`; with `kind=debugger`, `debugger mode=`) differs from the first completed \
          reading (`OK consent fs_consent= fda= attribution= elapsed_ms=`, or `OK consent \
@@ -3119,9 +3134,10 @@ pub const VERBS: &[VerbSpec] = &[
          local default; `needs=ask` selects the ask excerpt and `by=harness` turns are skipped in \
          `prompt=`): `user_title= title= cwd= branch= prompt= said= cmd= rows=` (<= 400 B per \
          excerpt, credentials/fleet codes redacted, fleet replies capped at 256 KiB; `rows=-` on \
-         an unfinished DEC 2026 frame, never waited for). `aterm ctl survey [--json] [--budget \
-         <chars>] [--sid <s>] [--fleet | --host <h>] [--timeout <s>]` and `survey --brief \
-         [--budget <chars>]` (`log n` + `brief all`) format multi-instance and fleet digests.",
+         an unfinished DEC 2026 frame, never waited for). `aterm ctl survey [--fleet] [--budget \
+         <chars>]`, `survey [--json] [--sid <s>] [--fleet | --host <h>]` (`--timeout <s>` with \
+         `--fleet` or `--host`) and `survey --brief [--budget <chars>]` (`log n` + `brief all`) \
+         format multi-instance and fleet digests.",
     )
     .for_fleet(),
     va(
@@ -3672,6 +3688,11 @@ mod tests {
         assert_eq!(framing_of("topic", "@s-a topic drop build"), Status);
         assert_eq!(framing_of("await", "await task @s-a,@s-b all"), Lines);
         assert_eq!(framing_of("await", "@s-a await task since=3"), Lines);
+        assert_eq!(
+            framing_of("await", "await task @s-a:3:1,@s-b any facts=1 fact_since=2"),
+            Lines
+        );
+        assert_eq!(framing_of("await", "@s-a await task facts=1"), Lines);
         assert_eq!(framing_of("await", "await agent idle"), Status);
         assert_eq!(framing_of("await", "await inbox since=1"), Status);
         assert_eq!(
@@ -3687,6 +3708,7 @@ mod tests {
             Status
         );
         assert_eq!(framing_of("task", "@s-a task mark done"), Status);
+        assert_eq!(framing_of("task", "@s-a task"), Status);
         for (request, framing) in [
             ("doc", Lines),
             ("doc ls", Lines),

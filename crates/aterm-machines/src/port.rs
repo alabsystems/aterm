@@ -616,6 +616,12 @@ pub trait System: Sync {
         None
     }
 
+    /// The awake clock in milliseconds ([`aterm_uds::process::awake_ms`]), which
+    /// [`crate::first_exec`] stamps and ages a started program's folder by.
+    fn awake_ms(&self) -> Option<u64> {
+        aterm_uds::process::awake_ms()
+    }
+
     /// Open the converge journal for the account this system acts as.
     fn journal(&self) -> Result<Box<dyn aterm_converge::Journal + '_>, String> {
         Err("this system keeps no converge journal".into())
@@ -1538,6 +1544,8 @@ mod fake {
         files: Mutex<BTreeMap<PathBuf, (Vec<u8>, u32)>>,
         stats: Mutex<BTreeMap<PathBuf, Stat>>,
         stat_errors: Mutex<BTreeMap<PathBuf, io::ErrorKind>>,
+        stat_errors_once: Mutex<BTreeMap<PathBuf, io::ErrorKind>>,
+        list_errors_once: Mutex<BTreeMap<PathBuf, io::ErrorKind>>,
         directory_flush_errors: Mutex<BTreeMap<PathBuf, io::ErrorKind>>,
         links: Mutex<BTreeMap<PathBuf, PathBuf>>,
         alive: Mutex<Vec<u32>>,
@@ -1568,6 +1576,9 @@ mod fake {
         pub full_disk_access: Option<bool>,
         /// What [`System::running_app`] answers: `None` unless a test names a bundle.
         pub running_app: Option<PathBuf>,
+        /// What [`System::awake_ms`] answers ([`Fake::awake_at`]): `None`, no awake clock,
+        /// unless a test sets it.
+        awake: Mutex<Option<u64>>,
     }
 
     #[derive(Clone)]
@@ -1943,6 +1954,24 @@ mod fake {
             self
         }
 
+        /// Fail the next `stat` of `path`, then return its seeded answer again.
+        pub fn stat_fails_once(&self, path: &str, kind: io::ErrorKind) -> &Self {
+            self.stat_errors_once
+                .lock()
+                .unwrap()
+                .insert(PathBuf::from(path), kind);
+            self
+        }
+
+        /// Fail the next listing of `path`, then list its seeded entries again.
+        pub fn list_fails_once(&self, path: &str, kind: io::ErrorKind) -> &Self {
+            self.list_errors_once
+                .lock()
+                .unwrap()
+                .insert(PathBuf::from(path), kind);
+            self
+        }
+
         /// Refuse a directory flush without opening a host path; `None` permits it again.
         pub fn durable_dir_fails(&self, path: &Path, kind: Option<io::ErrorKind>) -> &Self {
             let mut errors = self.directory_flush_errors.lock().unwrap();
@@ -2009,6 +2038,12 @@ mod fake {
         /// Record that `pid` started at `unix` seconds ([`System::process_started`]).
         pub fn born(&self, pid: u32, unix: u64) -> &Self {
             self.born.lock().unwrap().insert(pid, unix);
+            self
+        }
+
+        /// Set the awake clock [`System::awake_ms`] reads to `ms`.
+        pub fn awake_at(&self, ms: u64) -> &Self {
+            *self.awake.lock().unwrap() = Some(ms);
             self
         }
 
@@ -2232,6 +2267,10 @@ mod fake {
             self.running_app.clone()
         }
 
+        fn awake_ms(&self) -> Option<u64> {
+            *self.awake.lock().unwrap()
+        }
+
         fn run_tty(&self, cmd: &Cmd) -> Result<Option<i32>, RunFailed> {
             let key = format!("tty {}", cmd.display());
             self.calls.lock().unwrap().push(key.clone());
@@ -2412,6 +2451,9 @@ mod fake {
         }
 
         fn stat(&self, path: &Path) -> io::Result<Stat> {
+            if let Some(kind) = self.stat_errors_once.lock().unwrap().remove(path) {
+                return Err(io::Error::from(kind));
+            }
             if let Some(kind) = self.stat_errors.lock().unwrap().get(path) {
                 return Err(io::Error::from(*kind));
             }
@@ -2444,6 +2486,9 @@ mod fake {
         }
 
         fn list_dir(&self, path: &Path) -> io::Result<Vec<String>> {
+            if let Some(kind) = self.list_errors_once.lock().unwrap().remove(path) {
+                return Err(io::Error::from(kind));
+            }
             let files = self.files.lock().unwrap();
             let mut names: Vec<String> = files
                 .keys()

@@ -65,6 +65,8 @@ struct FakeKernel {
     exes: HashMap<i32, PathBuf>,
     markers: HashMap<i32, Option<Markers>>,
     held: HashMap<i32, Option<bool>>,
+    /// [`Kernel::held_now`]'s answer.
+    held_now: Option<HeldNow>,
     ttys: HashMap<u32, Option<bool>>,
     /// The uid listing fails.
     unlisted: bool,
@@ -212,6 +214,9 @@ impl Kernel for FakeKernel {
     }
     fn held(&self, pid: i32) -> Option<bool> {
         self.held.get(&pid).copied().unwrap_or(Some(false))
+    }
+    fn held_now(&self) -> Option<HeldNow> {
+        self.held_now
     }
     fn launchd_version(&self) -> Option<i32> {
         Some(1026)
@@ -1774,4 +1779,62 @@ fn a_stage_survivor_running_from_the_roots_is_ended_at_its_stage_end() {
     assert_eq!(report.named, [word], "{report:?}");
     assert!(report.ended.is_empty() && !report.closed(), "{report:?}");
     gone(pid, birth);
+}
+
+/// THE RUN-START LINE COUNTS WHAT MACOS'S PROGRAM CHECK HOLDS: this user's programs the one
+/// shared reader counts held ([`Kernel::held_now`], doctor's too), the oldest by its fork age,
+/// with the responsible app's listing read only then. Nothing held, or no listing of this user's
+/// processes, is no line and no listing read; the line reads no process itself.
+#[test]
+fn the_run_start_line_counts_held_programs_and_reads_the_listing_only_then() {
+    fn listing<'a>(
+        asked: &'a std::cell::Cell<u32>,
+        app: Option<&'static str>,
+        word: &'static str,
+    ) -> impl FnOnce() -> (Option<String>, &'static str) + 'a {
+        move || {
+            asked.set(asked.get() + 1);
+            (app.map(str::to_owned), word)
+        }
+    }
+    let asked = std::cell::Cell::new(0);
+    let listed = |app, word| listing(&asked, app, word);
+    let mut k = FakeKernel::default();
+    with_me(&mut k, 1);
+    for none in [None, Some(HeldNow::default())] {
+        k.held_now = none;
+        assert_eq!(program_check_line(&k, listed(None, "no")), None, "{none:?}");
+    }
+    assert_eq!(asked.get(), 0, "nothing held: no listing read");
+
+    k.held_now = Some(HeldNow {
+        count: 2,
+        oldest_ms: 35_940_500,
+    });
+    assert_eq!(
+        program_check_line(&k, listed(None, "no")).as_deref(),
+        Some(
+            "macOS's program check: 2 programs waiting, the oldest started 9 h 59 m ago (aterm \
+             listed: no)"
+        )
+    );
+    assert_eq!(asked.get(), 1);
+    assert_eq!(
+        program_check_line(&k, listed(Some("Terminal"), "unknown")).as_deref(),
+        Some(
+            "macOS's program check: 2 programs waiting, the oldest started 9 h 59 m ago \
+             (Terminal listed: unknown)"
+        ),
+        "the responsible app takes aterm's place"
+    );
+    k.held_now = Some(HeldNow {
+        count: 1,
+        oldest_ms: 20_000,
+    });
+    assert_eq!(
+        program_check_line(&k, listed(None, "yes")).as_deref(),
+        Some(
+            "macOS's program check: 1 program waiting, the oldest started 20 s ago (aterm listed: yes)"
+        )
+    );
 }

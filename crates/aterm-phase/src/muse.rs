@@ -10,8 +10,21 @@ use crate::text::blank;
 use crate::turn::{CardPlace, LaunchCard};
 use crate::wall::{ApiCause, Placement, Wall, WallKind};
 
+/// Major component of the Muse Code (`muse`) harness version, starting at `0.1`.
+pub const HARNESS_VERSION_MAJOR: u16 = 0;
+
+/// Minor component of the Muse Code (`muse`) harness version, starting at `0.1`.
+pub const HARNESS_VERSION_MINOR: u16 = 1;
+
 /// Version of the Muse Code (`muse`) harness.
 pub const HARNESS_VERSION: &str = "0.1";
+
+/// Structured incremental numeric version of the Muse Code (`muse`) harness.
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(
+    HARNESS_VERSION_MAJOR,
+    HARNESS_VERSION_MINOR,
+    HARNESS_VERSION,
+);
 
 #[derive(Debug, Clone, Copy)]
 struct Frame {
@@ -625,6 +638,14 @@ pub fn message_drawn(rows: &[String]) -> bool {
     scope(rows, top).1.is_some()
 }
 
+/// MUSE CODE HAS DRAWN ON `rows` ([`crate::ScreenReader::program_drawn`]): a composer's frame
+/// (its side chat's too), a box, its sign-in screen, or its launch card. The shell's own lines
+/// before it draws (the prompt and the command line that launched it) are none of these.
+#[must_use]
+pub fn program_drawn(rows: &[String]) -> bool {
+    any_frame(rows).is_some() || is_muse_screen(rows) || launch_card_scan(rows).0.is_some()
+}
+
 fn rests_on(rows: &[String]) -> Option<Rest> {
     match open_frame(rows).map(|f| turn(rows, f.top)) {
         Some(Turn::Carded(rest)) => Some(rest),
@@ -957,11 +978,17 @@ fn wall_of(message: &str) -> Option<(WallKind, Option<String>)> {
         .and_then(|r| r.get(..4))
         .and_then(|c| c.strip_suffix(':'))
         .and_then(|c| c.parse::<u16>().ok());
+    let unreachable = code.is_none()
+        && (crate::wall::is_unreachable(rest) || rest.to_lowercase().contains("fetch failed"));
     Some((
         WallKind::ApiError {
             code,
             retryable: code.is_none_or(|c| matches!(c, 408 | 409 | 429) || c >= 500),
-            cause: ApiCause::Server,
+            cause: if unreachable {
+                ApiCause::Unreachable
+            } else {
+                ApiCause::Server
+            },
         },
         None,
     ))
@@ -2118,6 +2145,12 @@ pub fn launch_card_read(rows: &[String]) -> Option<crate::LaunchCardRead> {
 
 #[doc(hidden)]
 pub mod fixtures {
+    /// A spawned worker's tab before Muse Code 1.4.12 draws: the shell's echo of the line
+    /// that launched it, nothing under it (`aterm-lab forever` r11, `r11cv-muse`, seq 33).
+    pub const LAUNCH_LINE: &str = include_str!("fixtures/muse-1.4.12-launch-line.txt");
+    /// The same tab at Muse Code's first reply, the launch line still above it (seq 1751).
+    pub const FIRST_REPLY_UNDER_LAUNCH_LINE: &str =
+        include_str!("fixtures/muse-1.4.12-first-reply-under-launch-line.txt");
     pub const BOX_TRUST: &str = include_str!("fixtures/muse-1.4.9-R6297.1-box-trust.txt");
     pub const IDLE: &str = include_str!("fixtures/muse-1.4.9-R6297.1-idle.txt");
     pub const IDLE_NARROW: &str =

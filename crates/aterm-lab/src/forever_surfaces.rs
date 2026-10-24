@@ -686,6 +686,16 @@ fn no_footer(c: &Chip) -> bool {
     c.face == "-" && c.drawn.is_none() && c.why.as_deref() == Some("no-footer")
 }
 
+/// Whether harness `program` leaves `c`'s footer bare: agy on an off face with a switch (`claude_footer::bare_while_off`).
+fn bare_under_switch(program: &str, c: &Chip) -> bool {
+    program == "agy" && matches!(c.face.as_str(), "off" | "agent-off" | "master-off")
+}
+
+/// Whether `c` is `chrome`'s `drawn=- why=switch-only` line.
+fn switch_only(c: &Chip) -> bool {
+    c.drawn.is_none() && c.why.as_deref() == Some("switch-only")
+}
+
 /// The entries of `list` standing in `[from, until)`: the last one at or
 /// before `from` (what stood when it opened), then each one inside.
 fn standing(list: &[(i64, String)], from: i64, until: i64) -> Vec<&(i64, String)> {
@@ -2049,18 +2059,34 @@ pub fn judge_end(desk: &Desk, tabs: &[(Chain, &Window)], program: &str) -> Verdi
     let fires = metric(m, "deadline_fires_by_owner");
     let wakes = metric(m, "wakes_by_variant");
     let output = wakes_of(&wakes, "Output");
+    let heal_arms = count_of(&arms, WAKE_HEAL);
+    let heal_fires = count_of(&fires, WAKE_HEAL);
+    let heals = metric(m, "wake_heals");
+    let watched = output > 0 && (heal_arms > 0 || heal_fires > 0);
     let allowed: &[&str] = if output == 0 {
         &[PRESENCE]
     } else {
-        &[PRESENCE, SWEEP]
+        &[PRESENCE, SWEEP, WAKE_HEAL]
     };
     let mut bad = Vec::new();
+    if watched {
+        if heals != "0" {
+            bad.push(format!(
+                "the output-wake watch's recheck (armed {heal_arms}, fired {heal_fires}) beside wake_heals={heals}: a program's wake lost at rest, or unread"
+            ));
+        }
+        if heal_arms.max(heal_fires) > output {
+            bad.push(format!(
+                "the output-wake watch armed {heal_arms} and fired {heal_fires} time(s) for {output} Output wake(s): more than once a write"
+            ));
+        }
+    }
     if n_render != "0" {
         bad.push(format!("n_render={n_render}"));
     }
     let fired: Vec<&str> = owners(&fires)
         .into_iter()
-        .filter(|o| output == 0 || *o != SWEEP)
+        .filter(|o| output == 0 || (*o != SWEEP && *o != WAKE_HEAL))
         .collect();
     if !fired.is_empty() {
         bad.push(format!("deadline_fires_by_owner={fires}"));
@@ -2068,9 +2094,14 @@ pub fn judge_end(desk: &Desk, tabs: &[(Chain, &Window)], program: &str) -> Verdi
     let sweep_fires = count_of(&fires, SWEEP);
     if output == 0 && timer != "0" {
         bad.push(format!("timer_wakes={timer}"));
-    } else if output > 0 && timer.parse::<u64>().ok() != Some(sweep_fires) {
+    } else if output > 0 && timer.parse::<u64>().ok() != Some(sweep_fires + heal_fires) {
         bad.push(format!(
-            "timer_wakes={timer}, not the status sweep's {sweep_fires} fire(s)"
+            "timer_wakes={timer}, not the status sweep's {sweep_fires} fire(s){}",
+            if heal_fires > 0 {
+                format!(" and the output-wake watch's {heal_fires}")
+            } else {
+                String::new()
+            }
         ));
     }
     if sweep_fires > SWEEP_FIRES_PER_WRITE * output && output > 0 {
@@ -2118,6 +2149,7 @@ pub fn judge_end(desk: &Desk, tabs: &[(Chain, &Window)], program: &str) -> Verdi
         }
     );
     let mut sweep = Vec::new();
+    let mut bare = Vec::new();
     let mut swept = 0;
     for (chain, w) in tabs {
         let Some((_, l)) = &w.front else {
@@ -2132,13 +2164,22 @@ pub fn judge_end(desk: &Desk, tabs: &[(Chain, &Window)], program: &str) -> Verdi
             continue;
         }
         let c = chip(l);
-        let ok = if footless(program) {
-            no_footer(&c)
+        let (ok, want) = if footless(program) {
+            (no_footer(&c), "")
+        } else if bare_under_switch(program, &c) {
+            let ok = switch_only(&c);
+            if ok {
+                bare.push(chain.name());
+            }
+            (
+                ok,
+                " (wanted drawn=- why=switch-only: agy's footer is bare under its off switch)",
+            )
         } else {
-            drawn_is_face(&c)
+            (drawn_is_face(&c), "")
         };
         if !ok {
-            sweep.push(format!("{}: {}", chain.name(), one_line(l, 120)));
+            sweep.push(format!("{}: {}{want}", chain.name(), one_line(l, 120)));
         }
     }
     let said = format!(
@@ -2150,10 +2191,26 @@ pub fn judge_end(desk: &Desk, tabs: &[(Chain, &Window)], program: &str) -> Verdi
             format!(", NOT as their faces: {}", sweep.join("; "))
         }
     );
+    let said = if bare.is_empty() {
+        said
+    } else {
+        format!(
+            "{said} ({}: drawn=- why=switch-only, the footer bare under the off switch by design)",
+            bare.join(", ")
+        )
+    };
     let said = if output > 0 {
         format!(
             "{said}; the programs' own writes: {output} Output wake(s), answered by the status sweep alone ({sweep_fires} fire(s), {:.2} a write, at most {SWEEP_FIRES_PER_WRITE})",
             ratio(sweep_fires, output)
+        )
+    } else {
+        said
+    };
+    let said = if watched {
+        format!(
+            "{said}; the output-wake watch's recheck armed {heal_arms} time(s) and fired {heal_fires} time(s), wake_heals={heals} output_wake_late={}: allowed at rest while it arms and fires at most once a write and heals nothing (a write's wake met in flight at a loop pass; a fire is that wake still unhandled when the recheck came due, the main thread held up, late, not lost)",
+            metric(m, "output_wake_late")
         )
     } else {
         said
@@ -2187,6 +2244,9 @@ const PRESENCE: &str = "presence";
 
 /// The deadline owner of the status sweep, which answers a program's output.
 const SWEEP: &str = "session_status";
+
+/// The deadline owner of the output-wake watch's recheck, which may arm and fire at most once a write at rest, healing nothing.
+const WAKE_HEAL: &str = "wake_heal";
 
 /// How many times the status sweep may fire for each `Output` wake at idle.
 const SWEEP_FIRES_PER_WRITE: u64 = 3;
@@ -2416,6 +2476,47 @@ pub fn unix_ms_of(stamp: &str) -> Option<i64> {
     Some(secs * 1000)
 }
 
+/// `keys` of a `metrics` reply `line`, each as `key=value` (`-` where absent).
+fn keep(line: &str, keys: &[&str]) -> String {
+    keys.iter()
+        .map(|k| format!("{k}={}", metric(line, k)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// What END keeps of the idle window's `metrics` reply ([`Idle::metrics`]).
+#[must_use]
+pub fn idle_metrics(reply: &str) -> String {
+    keep(
+        reply,
+        &[
+            "timer_wakes",
+            "event_wakes",
+            "deadline_owner",
+            "deadline_arms_by_owner",
+            "deadline_fires_by_owner",
+            "wakes_by_variant",
+            "wake_heals",
+            "output_wake_late",
+        ],
+    )
+}
+
+/// What END keeps of the idle window's `metrics percentiles` reply ([`Idle::percentiles`]).
+#[must_use]
+pub fn idle_percentiles(reply: &str) -> String {
+    keep(
+        reply,
+        &[
+            "n_render",
+            "render_p50_ms",
+            "render_p95_ms",
+            "render_p99_ms",
+            "n_input",
+        ],
+    )
+}
+
 /// The end's idle window: once every tab's journal stood still [`IDLE_QUIET_BEFORE_MS`] and no tab's next act falls within it and [`IDLE_CLEAR_AFTER_MS`] after, `metrics reset`, [`IDLE_MS`] with no read, then `metrics` and `metrics percentiles`.
 fn idle_window(
     run: &crate::run::Run,
@@ -2480,12 +2581,6 @@ fn idle_window(
             && door
                 .out(&["inspect", "app/v1", "view", &desk.page_view, "text"])
                 .contains("harness/status");
-        let keep = |line: &str, keys: &[&str]| {
-            keys.iter()
-                .map(|k| format!("{k}={}", metric(line, k)))
-                .collect::<Vec<_>>()
-                .join(" ")
-        };
         let mut moved = Vec::new();
         let mut relogged = Vec::new();
         for tab in tabs.iter_mut() {
@@ -2497,27 +2592,8 @@ fn idle_window(
         let idle = Idle {
             from,
             ms,
-            metrics: keep(
-                &metrics,
-                &[
-                    "timer_wakes",
-                    "event_wakes",
-                    "deadline_owner",
-                    "deadline_arms_by_owner",
-                    "deadline_fires_by_owner",
-                    "wakes_by_variant",
-                ],
-            ),
-            percentiles: keep(
-                &percentiles,
-                &[
-                    "n_render",
-                    "render_p50_ms",
-                    "render_p95_ms",
-                    "render_p99_ms",
-                    "n_input",
-                ],
-            ),
+            metrics: idle_metrics(&metrics),
+            percentiles: idle_percentiles(&percentiles),
             moved,
             relogged,
             ends,

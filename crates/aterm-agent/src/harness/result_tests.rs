@@ -573,6 +573,71 @@ fn a_landing_prunes_the_previous_result_pair() {
     assert_eq!(prune_results(&tasks, "s-ab12-3"), 0);
 }
 
+#[test]
+fn a_delayed_landing_keeps_results_from_newer_revisions() {
+    let tasks = ScratchDir::new("result", "prune-order");
+    for revision in ["2", "9", "10", "010", "11", "100", "18446744073709551616"] {
+        for extension in ["md", "src"] {
+            std::fs::write(
+                tasks.join(format!("s-ab12-{revision}.result.{extension}")),
+                format!("result {revision}, {extension}"),
+            )
+            .expect("a landing's result pair");
+        }
+    }
+    let removed = prune_results(&tasks, "s-ab12-10");
+    for revision in ["11", "100", "10", "010", "18446744073709551616"] {
+        for extension in ["md", "src"] {
+            assert_eq!(
+                std::fs::read_to_string(
+                    tasks.join(format!("s-ab12-{revision}.result.{extension}"))
+                )
+                .ok(),
+                Some(format!("result {revision}, {extension}")),
+                "an older capture must preserve revision {revision}'s {extension}"
+            );
+        }
+    }
+    for revision in ["2", "9"] {
+        for extension in ["md", "src"] {
+            assert!(
+                !tasks
+                    .join(format!("s-ab12-{revision}.result.{extension}"))
+                    .exists(),
+                "revision {revision} precedes 10 numerically"
+            );
+        }
+    }
+    assert_eq!(removed, 4, "only the two earlier result pairs");
+}
+
+#[test]
+fn an_unordered_landing_never_prunes_result_files() {
+    let tasks = ScratchDir::new("result", "prune-unordered");
+    for extension in ["md", "src"] {
+        std::fs::write(
+            tasks.join(format!("s-ab12-2.result.{extension}")),
+            "a result whose ordering is known",
+        )
+        .expect("a landing's result pair");
+    }
+    let observed: Vec<usize> = ["unknown", "", "+10", "18446744073709551616"]
+        .iter()
+        .map(|revision| prune_results(&tasks, &format!("s-ab12-{revision}")))
+        .collect();
+    assert_eq!(
+        observed,
+        vec![0; 4],
+        "an invalid or overflowing captured revision proves no earlier result"
+    );
+    for extension in ["md", "src"] {
+        assert_eq!(
+            std::fs::read_to_string(tasks.join(format!("s-ab12-2.result.{extension}"))).ok(),
+            Some("a result whose ordering is known".to_string())
+        );
+    }
+}
+
 fn dead_pid() -> u32 {
     #[cfg(windows)]
     let mut command = {
@@ -1778,5 +1843,473 @@ fn a_turn_that_wrote_no_end_row_stops_at_the_next_turns_start() {
         )
         .map(|r| r.uuid),
         Ok("a-report".to_string())
+    );
+}
+
+const THREAD: &str = "01a15a2c-3732-7b22-9cf1-19657e6444e7";
+
+fn cx(kind: &str, payload: &str) -> String {
+    format!(r#"{{"timestamp":"2026-10-23T10:00:00.000Z","type":"{kind}","payload":{payload}}}"#)
+}
+
+fn cx_started(turn: &str, trigger: &str) -> String {
+    cx(
+        "event_msg",
+        &format!(
+            r#"{{"type":"task_started","turn_id":"{turn}","root_turn_id":"{turn}","turn_attribution":{{"turn_id":"{turn}","turn_trigger":"{trigger}"}}}}"#
+        ),
+    )
+}
+
+fn cx_user(t: &str) -> String {
+    cx(
+        "response_item",
+        &format!(
+            r#"{{"type":"message","role":"user","content":[{{"type":"input_text","text":{}}}]}}"#,
+            js(t)
+        ),
+    )
+}
+
+fn cx_said(t: &str, phase: &str) -> String {
+    cx(
+        "response_item",
+        &format!(
+            r#"{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":{}}}],"phase":"{phase}"}}"#,
+            js(t)
+        ),
+    )
+}
+
+fn cx_complete(turn: &str, last: &str) -> String {
+    cx(
+        "event_msg",
+        &format!(
+            r#"{{"type":"task_complete","turn_id":"{turn}","last_agent_message":{}}}"#,
+            js(last)
+        ),
+    )
+}
+
+fn cx_reasoning() -> String {
+    cx(
+        "response_item",
+        r#"{"type":"reasoning","summary":[],"encrypted_content":"gAAAAB-message-"}"#,
+    )
+}
+
+/// A codex-alab worker's conversation: its task (after the context Codex opens a
+/// conversation with), the report, Land's first act, then `act` and its `reply`.
+fn codex_landing(act: &str, reply: &str) -> Vec<String> {
+    vec![
+        cx_started("t-1", "user"),
+        cx_user("<environment_context>\n  <cwd>/w</cwd>\n</environment_context>"),
+        cx_user("# AGENTS.md instructions for /w\n\n<INSTRUCTIONS>\nrules\n</INSTRUCTIONS>"),
+        cx_user("Fix the parser."),
+        cx_said("Reading the parser first.", "commentary"),
+        cx_reasoning(),
+        cx_user("Also run the suite."),
+        cx_said("The parser is fixed; 12 tests pass.", "final_answer"),
+        cx_complete("t-1", "The parser is fixed; 12 tests pass."),
+        cx_started("t-2", "alab_autopilot"),
+        cx_user(LAND),
+        cx_said("Committed it and pushed; merging next.", "final_answer"),
+        cx_complete("t-2", "Committed it and pushed; merging next."),
+        cx_started("t-3", "alab_autopilot"),
+        cx_user(act),
+        cx_said(reply, "final_answer"),
+        cx_complete("t-3", reply),
+    ]
+}
+
+/// A CODEX ROLLOUT IS READ AS A TRANSCRIPT IS: a landing's result is the report before
+/// the land acts, then the defense; a turn opens at its `task_started`, its prompt the
+/// first words typed into it past the context Codex adds itself (each guard's own test:
+/// [`a_codex_turns_prompt_is_its_first_words_past_codexs_own`]); a turn whose last words
+/// are commentary has no reply yet; and a person's own turn after the landing is its
+/// final answer alone.
+#[test]
+fn a_codex_rollout_is_read_as_a_transcript_is() {
+    let defense = "Nothing left: merged to origin/main at 4f2a9c1, worktree removed.";
+    for act in [LAND, LAND_NUDGE, LAND_ANSWER] {
+        let rows = codex_landing(act, defense);
+        for by in [DoneBy::Turn, DoneBy::Check] {
+            let got = codex_report(&jsonl(&rows), THREAD, by).expect("the landing's result");
+            assert_eq!(
+                (got.text.as_str(), got.session.as_str(), got.uuid.as_str()),
+                (
+                    format!("The parser is fixed; 12 tests pass.\n\n{defense}").as_str(),
+                    THREAD,
+                    "t-3"
+                ),
+                "{act:.40}"
+            );
+        }
+    }
+    let mut rows = codex_landing(LAND_NUDGE, defense);
+    rows.extend([
+        cx_started("t-4", "user"),
+        cx_user("status?"),
+        cx_said("All merged.", "final_answer"),
+        cx_complete("t-4", "All merged."),
+    ]);
+    assert_eq!(
+        codex_report(&jsonl(&rows), THREAD, DoneBy::Turn).map(|r| (r.text, r.uuid)),
+        Ok(("All merged.".to_string(), "t-4".to_string())),
+        "the control: a person's turn is no check"
+    );
+    let mut rows = codex_landing(LAND_NUDGE, defense);
+    rows.truncate(rows.len() - 2);
+    rows.push(cx_said("Merging now.", "commentary"));
+    assert_eq!(
+        codex_report(&jsonl(&rows), THREAD, DoneBy::Turn),
+        Err("no-reply")
+    );
+    let task = jsonl(&codex_landing(LAND, defense)[..9]);
+    assert_eq!(
+        codex_report(&task, THREAD, DoneBy::Turn).map(|r| r.text),
+        Ok("The parser is fixed; 12 tests pass.".to_string()),
+        "the task's own turn, before any land act"
+    );
+    assert_eq!(codex_report("", THREAD, DoneBy::Turn), Err("no-reply"));
+}
+
+/// A CODEX TURN'S PROMPT IS ITS FIRST WORDS PAST WHAT CODEX ADDS ITSELF, each guard where
+/// dropping it changes the result: a person's message steered into the land turn opens no
+/// turn of its own; an `<environment_context>` update or a directory-less `AGENTS.md`
+/// fragment opening the land turn is no prompt; and a person's prompt with an image
+/// attached is theirs (Codex's `<image …>` labels are no context), so its turn is its own.
+#[test]
+fn a_codex_turns_prompt_is_its_first_words_past_codexs_own() {
+    let defense = "Nothing left: merged to origin/main at 4f2a9c1.";
+    let landed = format!("The parser is fixed; 12 tests pass.\n\n{defense}");
+    let land_turn_at = 14;
+    for (label, extra, at) in [
+        ("a steered message", cx_user("hurry"), land_turn_at + 1),
+        (
+            "an environment update",
+            cx_user("<environment_context>\n  <cwd>/w</cwd>\n</environment_context>"),
+            land_turn_at,
+        ),
+        (
+            "a directory-less AGENTS.md",
+            cx_user("# AGENTS.md instructions\n\n<INSTRUCTIONS>\nrules\n</INSTRUCTIONS>"),
+            land_turn_at,
+        ),
+    ] {
+        let mut rows = codex_landing(LAND_NUDGE, defense);
+        assert_eq!(
+            rows[land_turn_at],
+            cx_user(LAND_NUDGE),
+            "the land act's row"
+        );
+        rows.insert(at, extra);
+        assert_eq!(
+            codex_report(&jsonl(&rows), THREAD, DoneBy::Turn).map(|r| r.text),
+            Ok(landed.clone()),
+            "{label}"
+        );
+    }
+    let mut rows = codex_landing(LAND_NUDGE, defense);
+    rows.extend([
+        cx_started("t-4", "user"),
+        cx(
+            "response_item",
+            r#"{"type":"message","role":"user","content":[{"type":"input_text","text":"<image name=[Image #1] path=/w/s.png>"},{"type":"input_image","image_url":"data:image/png;base64,AA"},{"type":"input_text","text":"</image>"},{"type":"input_text","text":"still failing, see this"}]}"#,
+        ),
+        cx_said("Fixed what the screenshot shows.", "final_answer"),
+        cx_complete("t-4", "Fixed what the screenshot shows."),
+    ]);
+    assert_eq!(
+        codex_report(&jsonl(&rows), THREAD, DoneBy::Turn).map(|r| (r.text, r.uuid)),
+        Ok((
+            "Fixed what the screenshot shows.".to_string(),
+            "t-4".to_string()
+        )),
+        "a prompt with an image attached"
+    );
+}
+
+/// A CODEX TURN HAS ENDED once a matching `task_complete` or `turn_aborted` follows
+/// its newest `task_started`; a tail with no start has nothing to wait for.
+#[test]
+fn a_codex_turn_ends_at_its_completion_or_abort() {
+    let rows = codex_landing(LAND, "Nothing left: merged.");
+    assert!(codex_turn_ended(&jsonl(&rows)));
+    let running = &rows[..rows.len() - 1];
+    assert!(!codex_turn_ended(&jsonl(&rows[..rows.len() - 3])));
+    assert!(
+        !codex_turn_ended(&jsonl(running)),
+        "the control: no completion yet"
+    );
+    let mut aborted = rows[..rows.len() - 1].to_vec();
+    aborted.push(cx(
+        "event_msg",
+        r#"{"type":"turn_aborted","turn_id":"t-3"}"#,
+    ));
+    assert!(codex_turn_ended(&jsonl(&aborted)));
+    assert!(codex_turn_ended(""));
+}
+
+#[test]
+fn a_codex_completion_can_name_a_started_event_in_its_report() {
+    let rows = [
+        cx_started("t-1", "user"),
+        cx_user("Name the start event."),
+        cx_said("task_started", "final_answer"),
+        cx_complete("t-1", "task_started"),
+    ];
+    assert!(
+        codex_turn_ended(&jsonl(&rows)),
+        "the completion's report does not reopen the turn"
+    );
+}
+
+#[test]
+fn codex_message_words_cannot_end_a_running_turn() {
+    let mut observed = Vec::new();
+    for word in ["task_complete", "turn_aborted"] {
+        for message in [
+            cx_user(word),
+            cx_said(word, "commentary"),
+            cx(
+                "event_msg",
+                &format!(r#"{{"type":"agent_message","message":{}}}"#, js(word)),
+            ),
+        ] {
+            let rows = [cx_started("t-2", "user"), message];
+            observed.push(codex_turn_ended(&jsonl(&rows)));
+        }
+    }
+    assert_eq!(
+        observed,
+        vec![false; 6],
+        "user and assistant words leave the actual started turn running"
+    );
+}
+
+#[test]
+fn a_late_codex_terminal_does_not_end_the_active_turn() {
+    let mut observed = Vec::new();
+    for late in [
+        cx_complete("older", "The earlier turn finished."),
+        cx("event_msg", r#"{"type":"turn_aborted","turn_id":"older"}"#),
+        cx(
+            "event_msg",
+            r#"{"type":"task_complete","turn_id":"older","root_turn_id":"current"}"#,
+        ),
+        cx(
+            "event_msg",
+            r#"{"type":"turn_aborted","turn_id":"older","root_turn_id":"current"}"#,
+        ),
+    ] {
+        let rows = [
+            cx_started("older", "user"),
+            cx_complete("older", "The earlier turn finished."),
+            cx_started("current", "user"),
+            cx_user("Keep working on the current task."),
+            late,
+        ];
+        observed.push(codex_turn_ended(&jsonl(&rows)));
+    }
+    assert_eq!(
+        observed,
+        vec![false; 4],
+        "a previous turn's delayed terminal cannot close the current turn"
+    );
+}
+
+#[test]
+fn a_codex_turn_ends_at_its_own_terminal_despite_later_older_terminals() {
+    for terminal in [
+        cx_complete("current", "The current task finished."),
+        cx(
+            "event_msg",
+            r#"{"type":"turn_aborted","turn_id":"current"}"#,
+        ),
+    ] {
+        let mut rows = vec![
+            cx_started("older", "user"),
+            cx_started("current", "user"),
+            cx_complete("older", "The earlier turn finished."),
+            terminal,
+        ];
+        assert!(codex_turn_ended(&jsonl(&rows)), "its matching terminal");
+        rows.extend([
+            cx_complete("older", "The earlier turn finished."),
+            cx("event_msg", r#"{"type":"turn_aborted","turn_id":"older"}"#),
+        ]);
+        assert!(
+            codex_turn_ended(&jsonl(&rows)),
+            "older terminals cannot reopen a completed current turn"
+        );
+        rows.push(cx_started("resumed", "alab_autopilot"));
+        assert!(
+            !codex_turn_ended(&jsonl(&rows)),
+            "a subsequent turn still opens normally"
+        );
+    }
+}
+
+#[test]
+fn codex_turn_end_preserves_legacy_events_without_turn_ids() {
+    let legacy_start = cx("event_msg", r#"{"type":"task_started"}"#);
+    let legacy_abort = cx("event_msg", r#"{"type":"turn_aborted"}"#);
+    for (start, terminal) in [
+        (cx_started("current", "user"), legacy_abort.clone()),
+        (
+            cx_started("current", "user"),
+            cx("event_msg", r#"{"type":"turn_aborted","turn_id":null}"#),
+        ),
+        (legacy_start.clone(), legacy_abort.clone()),
+        (legacy_start.clone(), cx_complete("current", "Finished.")),
+    ] {
+        assert!(!codex_turn_ended(&start), "an unmatched start is active");
+        assert!(
+            codex_turn_ended(&jsonl(&[start, terminal])),
+            "an absent turn id retains the legacy terminal boundary"
+        );
+    }
+    assert!(codex_turn_ended(&legacy_abort), "a tail without a start");
+    assert!(
+        !codex_turn_ended(&jsonl(&[legacy_abort, legacy_start])),
+        "an older terminal cannot close a later legacy start"
+    );
+}
+
+#[test]
+fn a_codex_xml_task_keeps_its_report_separate_from_an_earlier_landing() {
+    let tasks = ScratchDir::new("result", "codex-xml-task");
+    let defense = "Nothing left: the lexer is committed and pushed.";
+    let report = "The lexer is fixed; 9 tests pass.";
+    let mut rows = codex_landing(LAND_NUDGE, "Nothing left: the parser landed.");
+    rows.extend([
+        cx_started("t-4", "user"),
+        cx_user("<task>Fix the lexer.</task>"),
+        cx_said(report, "final_answer"),
+        cx_complete("t-4", report),
+        cx_started("t-5", "alab_autopilot"),
+        cx_user(LAND),
+        cx_said(defense, "final_answer"),
+        cx_complete("t-5", defense),
+    ]);
+    let text = jsonl(&rows);
+    let file = Path::new("/c/sessions/rollout-xml-task.jsonl");
+    let snap = snapshot_rollout(&tasks, "s-c1-4", Some((file, &text)), THREAD, DoneBy::Turn)
+        .expect("written");
+    assert_eq!(
+        std::fs::read_to_string(&snap.path).expect("the captured result"),
+        format!("{report}\n\n{defense}"),
+        "a new task's landing captures its own report"
+    );
+}
+
+#[test]
+fn an_aborted_codex_task_does_not_reuse_an_earlier_report() {
+    let tasks = ScratchDir::new("result", "codex-aborted-task");
+    let defense = "Nothing left: the aborted task has no work to land.";
+    let mut rows = codex_landing(LAND_NUDGE, "Nothing left: the parser landed.");
+    rows.extend([
+        cx_started("t-4", "user"),
+        cx_user("<task>Fix the lexer.</task>"),
+        cx("event_msg", r#"{"type":"turn_aborted","turn_id":"t-4"}"#),
+        cx_started("t-5", "alab_autopilot"),
+        cx_user(LAND),
+        cx_said(defense, "final_answer"),
+        cx_complete("t-5", defense),
+    ]);
+    let text = jsonl(&rows);
+    let file = Path::new("/c/sessions/rollout-aborted-task.jsonl");
+    let snap = snapshot_rollout(&tasks, "s-c1-5", Some((file, &text)), THREAD, DoneBy::Turn)
+        .expect("written");
+    assert_eq!(
+        std::fs::read_to_string(&snap.path).expect("the captured result"),
+        defense,
+        "an empty task remains distinct from the earlier report"
+    );
+}
+
+/// A CODEX LANDING'S SNAPSHOT NAMES ITS ROLLOUT: `result` answers its text under
+/// `source=rollout`, `result full` reads no transcript of it, a missed result is never
+/// read again as a Claude Code transcript, and no rollout at all is said.
+#[test]
+fn a_codex_snapshot_names_its_rollout_and_answers_it() {
+    let tasks = ScratchDir::new("result", "codex");
+    let defense = "Nothing left: merged.";
+    let text = jsonl(&codex_landing(LAND, defense));
+    let file = Path::new("/c/sessions/rollout-x.jsonl");
+    let snap = snapshot_rollout(&tasks, "s-c1-2", Some((file, &text)), THREAD, DoneBy::Turn)
+        .expect("written");
+    let want = format!("The parser is fixed; 12 tests pass.\n\n{defense}");
+    assert_eq!(
+        (snap.by, snap.bytes, snap.unavailable),
+        (DoneBy::Check, want.len() as u64, None)
+    );
+    assert_eq!(
+        source_of(&snap.path),
+        Some(Source::Rollout {
+            thread: THREAD.to_string(),
+            turn: "t-3".to_string(),
+            rollout: Some(file.to_path_buf()),
+        })
+    );
+    let shown = answer(&snap.path, false);
+    assert!(
+        shown.starts_with(&format!(
+            "OK 3 source=rollout thread={THREAD} turn=t-3 bytes={}\n",
+            want.len()
+        )),
+        "{shown}"
+    );
+    assert!(shown.ends_with(&format!("{defense}\n")), "{shown}");
+    assert_eq!(
+        answer(&snap.path, true),
+        "ERR result unavailable why=no-transcript\n"
+    );
+    assert!(reread(&snap.path).is_none());
+    let mut missed = codex_landing(LAND, defense);
+    missed.truncate(missed.len() - 2);
+    missed.push(cx_said("Merging now.", "commentary"));
+    let snap = snapshot_rollout(
+        &tasks,
+        "s-c1-4",
+        Some((file, &jsonl(&missed))),
+        THREAD,
+        DoneBy::Turn,
+    )
+    .expect("written");
+    assert_eq!(
+        (snap.by, snap.unavailable),
+        (DoneBy::Check, Some("no-reply")),
+        "a missed landing names the check's rule"
+    );
+    assert!(
+        reread(&snap.path).is_none(),
+        "never read again as a transcript"
+    );
+    assert_eq!(
+        answer(&snap.path, false),
+        "ERR result unavailable why=no-reply\n"
+    );
+    let none = snapshot_rollout(&tasks, "s-c1-3", None, THREAD, DoneBy::Turn).expect("written");
+    assert_eq!((none.bytes, none.unavailable), (0, Some("no-transcript")));
+    assert_eq!(
+        answer(&none.path, false),
+        "ERR result unavailable why=no-transcript\n"
+    );
+    let line = Source::Rollout {
+        thread: THREAD.to_string(),
+        turn: "t 3".to_string(),
+        rollout: None,
+    }
+    .line();
+    assert_eq!(line, format!("source=rollout thread={THREAD} turn=t%203"));
+    assert_eq!(
+        Source::parse(&line),
+        Some(Source::Rollout {
+            thread: THREAD.to_string(),
+            turn: "t 3".to_string(),
+            rollout: None,
+        })
     );
 }

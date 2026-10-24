@@ -220,6 +220,12 @@ pub struct FactsState {
     /// Each kind a seed holds told (with the last time it was told), until its condition has
     /// been seen clear once.
     seeded: Vec<(FactKind, i64)>,
+    /// Each episode the occupancy loop's task door booked (`door=task`), with when: a fact word
+    /// noted on a managed session's task record, a host's answer that took none, or under
+    /// `observe` the note that would have been. A mark apart from [`Self::told`]: a note tells
+    /// the session's manager, never the session, so a line the managed guard no longer holds is
+    /// still the session's to be told.
+    noted: BTreeMap<EpisodeKey, i64>,
 }
 
 impl FactsState {
@@ -229,6 +235,8 @@ impl FactsState {
     /// are not this reading's to judge, and keep what they hold.
     pub fn observe_closed(&mut self, kind: FactKind, open: &[EpisodeKey]) {
         self.told
+            .retain(|key, _| key.kind != kind || open.contains(key));
+        self.noted
             .retain(|key, _| key.kind != kind || open.contains(key));
         self.seeded
             .retain(|(seeded, _)| *seeded != kind || open.iter().any(|key| key.kind == kind));
@@ -267,6 +275,19 @@ impl FactsState {
     /// `key` was told at `at_ms`: where its act was taken, never where it was decided.
     pub fn told(&mut self, key: EpisodeKey, at_ms: i64) {
         self.told.insert(key, at_ms);
+    }
+
+    /// The task door booked `key` at `at_ms` ([`Self::noted`]).
+    pub fn note(&mut self, key: EpisodeKey, at_ms: i64) {
+        self.noted.insert(key, at_ms);
+    }
+
+    /// Whether the task door booked `key` ([`Self::note`]): forgotten with the episode
+    /// ([`Self::observe_closed`]). A successor seeds none: the host's edit of a word standing
+    /// already moves nothing.
+    #[must_use]
+    pub fn is_noted(&self, key: EpisodeKey) -> bool {
+        self.noted.contains_key(&key)
     }
 
     /// Whether `key` has been told: the episode itself, or any episode of a kind a seed holds.

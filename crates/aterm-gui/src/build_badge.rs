@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The top-right build/version badge: a faint [`DrawPrim`] pill showing `v{version} · {build}`.
-//! Off by default (`show_build_badge`, Settings "Show floating version pill"). It is paint-only,
-//! so it lives in its own `badge_card` slot behind the modal cards: an open overlay hides it, and
-//! a native route composes it into its own tray (`App::compose_native_route_card`).
+//! Top-right paint-only build/version pill (`v{version} · {build}`).
 
 #[cfg(test)]
 use aterm_render::Theme;
@@ -14,8 +11,7 @@ use crate::tray_raster::row_baseline;
 use crate::type_scale::TypeStep;
 use crate::widget::{DrawPrim, TextFace, TextWeight, TrayInput, rgba, text_prim};
 
-/// The badge caption, e.g. `v0.59 · 1783203308`: the shared display version and
-/// `build_info::build_number()`. Full provenance (compiler, commit, signature) is in About.
+/// Returns the `v{version} · {build}` caption.
 pub(crate) fn badge_text() -> String {
     format!(
         "v{} \u{00b7} {}",
@@ -24,9 +20,7 @@ pub(crate) fn badge_text() -> String {
     )
 }
 
-/// A fingerprint of everything the badge paints, folded into the frame's `RepaintKey`
-/// (`badge_fp`) so toggling the setting, or a version/build change on a live swap, forces
-/// exactly one present. `0` means disabled, so an enabled badge is never `0`.
+/// Non-zero repaint fingerprint when enabled, or `0` when disabled.
 pub(crate) fn fingerprint(enabled: bool) -> u64 {
     if !enabled {
         return 0;
@@ -38,9 +32,7 @@ pub(crate) fn fingerprint(enabled: bool) -> u64 {
     h.finish() | 1
 }
 
-/// Build the badge tray: a small rounded pill pinned to the top-right with the
-/// `v{version} · {build}` caption. `card` is the pill's own bounds, so the shared rasterizer
-/// paints only that region.
+/// Builds the top-right badge tray and its bounding card.
 pub(crate) fn badge_tray(
     g: &SettingsGeom,
     theme: impl Into<crate::chrome_band::ChromePalette>,
@@ -63,8 +55,6 @@ pub(crate) fn badge_tray(
     let y = margin_t;
     let radius = (pill_h * 0.5).min(11.0);
 
-    // Faint pill: a mostly-transparent fill and hairline, legible over whatever terminal
-    // content is beneath it.
     let prims: Vec<DrawPrim> = vec![
         DrawPrim::Panel {
             x,

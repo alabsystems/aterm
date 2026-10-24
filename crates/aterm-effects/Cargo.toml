@@ -22,8 +22,9 @@ aterm-types = { workspace = true }
 # The one char-width authority, shared with the terminal's write path and the
 # native capture seam.
 aterm-grapheme = { workspace = true }
-# The render-boundary overlay types (GlowQuad/WordDecoration/InkCell/SpriteQuad/
-# SceneAtlas) + the comet-beam rasterizer the aurora shares with the renderer.
+# The render-boundary overlay types (GlowQuad/WordDecoration/InkCell), the
+# companions' sprite layers (`sprites`) + the comet-beam rasterizer the aurora
+# shares with the renderer.
 aterm-render = { path = "../aterm-render", default-features = false }
 # Multilingual whole-word matching for the sparkle-words rescan.
 aterm-lexicon = { workspace = true }
@@ -68,6 +69,8 @@ aterm-models-effects = { workspace = true }
 aterm-models-misc = { workspace = true }
 aterm-models-render = { workspace = true }
 aterm-png = { workspace = true }
+# The pack themes' grounds the harness card's floor tests hold every dark theme's stars on.
+aterm-theme-pack = { workspace = true }
 
 [lints]
 workspace = true

@@ -1092,6 +1092,49 @@ fn a_page_offset_is_seconds_east_of_utc() {
     }
 }
 
+/// One fx item as data: what it covers in its content's space, its ink,
+/// whether it mirrors, and (for a sprite) its art's id.
+type FxItemShape = (aterm_core::render::PxRect, u32, bool, u128);
+
+/// An fx layer as data, moved down `d` px: its name, how it draws, where, and
+/// what (each item by its art's id), so two hosts' layers compare by value.
+#[derive(Debug, PartialEq)]
+struct FxShape {
+    id: u64,
+    how: (
+        aterm_core::render::FxSlot,
+        aterm_core::render::FxSpace,
+        aterm_core::render::FxBlend,
+        bool,
+        bool,
+    ),
+    offset: (i32, i32),
+    clip: aterm_core::render::PxRect,
+    items: Vec<FxItemShape>,
+    palette: Vec<aterm_core::render::FxInk>,
+}
+
+fn fx_shape(l: &aterm_core::render::FxLayer, d: i32) -> FxShape {
+    use aterm_core::render::FxItem;
+    FxShape {
+        id: l.id,
+        how: (l.slot, l.space, l.blend, l.bloom, l.knock),
+        offset: (l.offset.0, l.offset.1 + d),
+        clip: l.clip.translate(0, d),
+        items: l
+            .content
+            .items()
+            .iter()
+            .map(|item| match item {
+                FxItem::Rect(r) => (item.bounds(), r.ink, false, 0),
+                FxItem::Ramps(r) => (item.bounds(), r.ink, false, 0),
+                FxItem::Sprite(s) => (item.bounds(), s.ink, s.flip_x, s.art.id()),
+            })
+            .collect(),
+        palette: l.content.palette().to_vec(),
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "one assertion per RenderInput stream"
@@ -1201,19 +1244,6 @@ fn assert_translated(
         assert_eq!(z, *y, "ink");
     }
     note("ink", !a.ink.is_empty());
-    for (what, xs, ys) in [
-        ("cat", &a.cat_quads, &b.cat_quads),
-        ("rain", &a.rain_quads, &b.rain_quads),
-    ] {
-        assert_eq!(xs.len(), ys.len(), "{what}");
-        for (x, y) in xs.iter().zip(ys) {
-            let mut z = *x;
-            z.row = x.row + rows;
-            z.y = x.y + dy;
-            assert_eq!(z, *y, "{what}");
-        }
-        note(what, !xs.is_empty());
-    }
     assert_eq!(a.nova_add.len(), b.nova_add.len(), "nova");
     for (x, y) in a.nova_add.iter().zip(&b.nova_add) {
         let want = GlowQuad {
@@ -1235,13 +1265,28 @@ fn assert_translated(
         assert_eq!(*y, want, "rain_add");
     }
     note("rain_add", !a.rain_add.is_empty());
-    assert_eq!(a.free_sprites.len(), b.free_sprites.len(), "pet");
-    for (x, y) in a.free_sprites.iter().zip(&b.free_sprites) {
-        let mut z = *x;
-        z.y = x.y + i32::from(dy);
-        assert_eq!(z, *y, "pet");
+    assert_eq!(a.fx_layers.len(), b.fx_layers.len(), "fx layers");
+    for (x, y) in a.fx_layers.iter().zip(&b.fx_layers) {
+        let d = y.offset.1 - x.offset.1;
+        if x.space == aterm_core::render::FxSpace::Grid {
+            assert_eq!(d, i32::from(dy), "a grid layer moves with the grid");
+        }
+        assert_eq!(
+            fx_shape(x, d),
+            fx_shape(y, 0),
+            "an fx layer is the bandless one, moved"
+        );
     }
-    note("pet", !a.free_sprites.is_empty());
+    let sprites = aterm_render::sprites::published(&a.fx_layers);
+    let pet = pet_art_size(ch);
+    note("cat", sprites.iter().any(|s| (s.art.w(), s.art.h()) != pet));
+    note(
+        "rain",
+        a.fx_layers
+            .iter()
+            .any(aterm_effects::matrix_rain::is_rain_row),
+    );
+    note("pet", sprites.iter().any(|s| (s.art.w(), s.art.h()) == pet));
     assert_eq!(a.fx_clip, b.fx_clip, "the web sets no effect clip");
     lit
 }

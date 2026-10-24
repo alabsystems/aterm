@@ -1067,6 +1067,14 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
             eprintln!("verify: {line}");
         });
     }
+    #[cfg(target_os = "macos")]
+    if let Some(line) = runs::program_check_line(&runs::LiveKernel, || {
+        let me = i32::try_from(std::process::id()).unwrap_or(0);
+        let (app, listed) = atpkg::devtools::listed_for_responsible(me);
+        (app, listed.word())
+    }) {
+        eprintln!("verify: {line}");
+    }
 
     let path_env = tools.path_with_stage2_first(&env.path);
     let (scope, cone) = if !parsed.narrows() || parsed.all {

@@ -1,20 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Full-colour RGBA tile baker and LRU atlas cache for cat and pet quads.
+//! Full-colour RGBA tile baker and LRU cache of the cat and pet arts.
 
 use std::sync::Arc;
 
-use aterm_render::SceneAtlas;
+use aterm_core::render::{FxArt, FxTexels};
 use aterm_scene::vector::{FIXED_ONE, PathSeg};
 use aterm_scene::{PathTransform, Tile, fill_path_fixed, mix_rgb};
 
 use crate::cat_glyphs_gen::{CatGlyphId, GLYPHS, GlyphRole, Layer, Recolor};
 use crate::color_math::{hsv2rgb, relative_luminance, rgb2hsv};
 
-/// Structural slot ceiling (§5.5): the LRU never exceeds 32 tiles.
+/// Structural entry ceiling (§5.5): the LRU never holds more than 32 tiles.
 pub const MAX_SLOTS: usize = 32;
-/// Structural memory ceiling for the whole atlas: 2 MiB at any cell size.
+/// Structural memory ceiling for the whole cache: 2 MiB at any cell size.
 pub const MAX_ATLAS_BYTES: usize = 2 << 20;
 /// Bake-rate cap (§5.5): at most 2 tiles baked per presented frame.
 pub const MAX_BAKES_PER_FRAME: u32 = 2;
@@ -22,17 +22,18 @@ pub const MAX_BAKES_PER_FRAME: u32 = 2;
 /// Extra texel width baked onto every tile for the catch-light dot.
 pub const PATCH_STRIP: u16 = 4;
 
-/// A resolved cache hit: where the tile lives in the baker's atlas.
-#[derive(Clone, Copy, Debug)]
+/// A resolved cache hit: the tile's art at its design size (straight RGBA,
+/// drawn by a [`FreeSprite`](aterm_render::sprites::FreeSprite)).
+#[derive(Clone, Debug)]
 pub struct CatTile {
-    /// Tile origin X in atlas texels (the design box spans `ax..ax+key.w`).
-    pub ax: u16,
-    /// Tile origin Y in atlas texels (the design box spans `ay..ay+h`).
-    pub ay: u16,
+    /// The baked art: `key.w × key.h` for a generated cat, the host's size
+    /// for a host tile.
+    pub art: Arc<FxArt>,
 }
 
 struct Slot {
     key: SlotKey,
+    art: Arc<FxArt>,
     last_used: u64,
 }
 
@@ -44,30 +45,21 @@ enum SlotKey {
     Host(u64),
 }
 
-/// Host-side LRU bake cache + the published `Arc<SceneAtlas>` (§5.5).
+/// Host-side LRU bake cache of interned [`FxArt`]s (§5.5): what to keep baked,
+/// never where it lives on a GPU (`aterm-gpu`'s fx atlas keeps its own
+/// residency, uploading an art's region only when it is first drawn).
 #[derive(Default)]
 pub struct CatBaker {
     cell_w: u16,
     cell_h: u16,
-    /// Slot (and atlas) width: `4·ch` — the §5.2 `W ≤ 4·ch` cap made structural.
+    /// The widest tile a slot holds: `4·ch`, the §5.2 `W ≤ 4·ch` cap made
+    /// structural.
     slot_w: u16,
-    /// `min(32, ⌊2 MiB / slot_bytes⌋)` occupied-or-free slots, single column.
+    /// `min(32, ⌊2 MiB / slot_bytes⌋)` occupied-or-free slots.
     slots: Vec<Option<Slot>>,
-    /// Master straight-alpha RGBA8 texels (`slot_w × slots.len()·ch`), resident.
-    rgba: Vec<u8>,
     /// Monotonic; bumped on every bake and every wholesale clear (a rebake must
-    /// repaint and re-upload).
+    /// repaint).
     version: u64,
-    /// The last published snapshot; rebuilt only when `dirty`, so the steady
-    /// state allocates nothing.
-    published: Option<Arc<SceneAtlas>>,
-    /// The snapshot published before [`CatBaker::published`], kept so the next
-    /// dirty publish can recycle its buffer instead of cloning the atlas.
-    spare: Option<Arc<SceneAtlas>>,
-    dirty: bool,
-    /// Per-slot write stamp (parallel to `slots`): the `version` this slot's
-    /// band in `rgba` was last baked at.
-    slot_version: Vec<u64>,
     /// Reusable destination tile and open-eye reflection mask across cache-miss bakes.
     scratch: Option<Tile>,
     eye_mask_scratch: Option<Tile>,
@@ -109,13 +101,6 @@ impl CatBaker {
             let slots = Self::slot_count(cell_h);
             self.slots.clear();
             self.slots.resize_with(slots, || None);
-            self.slot_version.clear();
-            self.slot_version.resize(slots, 0);
-            self.rgba.clear();
-            self.rgba.resize(
-                usize::from(self.slot_w) * slots * 2 * usize::from(cell_h) * 4,
-                0,
-            );
         }
     }
 
@@ -124,21 +109,16 @@ impl CatBaker {
     pub fn clear(&mut self) {
         self.scratch = None;
         self.eye_mask_scratch = None;
-        if self.slots.iter().all(Option::is_none) && self.published.is_none() {
+        if self.slots.iter().all(Option::is_none) {
             return;
         }
         for s in &mut self.slots {
             *s = None;
         }
-        self.slot_version.fill(0);
-        self.rgba.fill(0);
         self.version = self.version.wrapping_add(1);
-        self.published = None;
-        self.spare = None;
-        self.dirty = false;
     }
 
-    /// Monotonic atlas version (folded into the frame fingerprint — a rebake must repaint).
+    /// Monotonic cache version (folded into the frame fingerprint — a rebake must repaint).
     #[inline]
     #[must_use]
     pub const fn version(&self) -> u64 {
@@ -152,55 +132,21 @@ impl CatBaker {
         self.clock
     }
 
-    /// The published atlas snapshot, rebuilt lazily after any bake.
-    pub fn atlas(&mut self) -> Option<Arc<SceneAtlas>> {
-        if self.dirty {
-            let width = u32::from(self.slot_w);
-            let height = (self.slots.len() * 2 * usize::from(self.cell_h)) as u32;
-            let band = 2 * usize::from(self.cell_h) * usize::from(self.slot_w) * 4;
-            let spare = self.spare.take();
-            let recycled = spare.and_then(|mut arc| {
-                let synced = arc.version;
-                let buf = Arc::get_mut(&mut arc)?;
-                if buf.rgba.len() != self.rgba.len()
-                    || buf.width != width
-                    || buf.height != height
-                    || band == 0
-                {
-                    return None;
-                }
-                for (i, stamp) in self.slot_version.iter().enumerate() {
-                    if *stamp <= synced {
-                        continue;
-                    }
-                    let lo = i * band;
-                    let hi = lo + band;
-                    if let (Some(dst), Some(src)) =
-                        (buf.rgba.get_mut(lo..hi), self.rgba.get(lo..hi))
-                    {
-                        dst.copy_from_slice(src);
-                    }
-                }
-                buf.version = self.version;
-                Some(arc)
-            });
-            let published = match recycled {
-                Some(arc) => arc,
-                None => Arc::new(SceneAtlas {
-                    width,
-                    height,
-                    rgba: self.rgba.clone(),
-                    version: self.version,
-                }),
-            };
-            self.spare = self.published.take();
-            self.published = Some(published);
-            self.dirty = false;
-        }
-        self.published.clone()
+    /// How many tiles are baked.
+    #[inline]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.slots.iter().flatten().count()
     }
 
-    /// Look up a [`BakeKeyV4`] glyph tile, baking on a miss when the per-frame budget allows, and blit it at its slot origin (atlas row `i·2·ch`).
+    /// Whether no tile is baked.
+    #[inline]
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Look up a [`BakeKeyV4`] glyph tile, baking on a miss when the per-frame budget allows.
     pub fn get_v4(&mut self, key: &BakeKeyV4) -> Option<CatTile> {
         // The whole baked tile is `key.w + PATCH_STRIP` wide and must fit the slot.
         if self.cell_h == 0
@@ -223,10 +169,10 @@ impl CatBaker {
         let mut eye_mask_scratch = self.eye_mask_scratch.take();
         let tile = key.bake_scratch(&mut scratch, &mut eye_mask_scratch);
         let tw = tile.width() as usize;
-        let out = self.install(i, slot_key, tile.pixels(), tw, usize::from(key.h));
+        let out = self.install(i, slot_key, tile.pixels(), tw, key.w, key.h);
         self.scratch = scratch;
         self.eye_mask_scratch = eye_mask_scratch;
-        Some(out)
+        out
     }
 
     /// Look up a resident `BakeKeyV4` tile and stamp it used this frame without spending bake budget on a miss.
@@ -246,19 +192,14 @@ impl CatBaker {
     }
 
     /// The cache hit: find `key`'s slot and stamp it used this frame (the LRU
-    /// touch), returning its atlas placement.
+    /// touch), returning its art.
     #[inline]
     fn touch(&mut self, key: SlotKey) -> Option<CatTile> {
-        let slot_h = 2 * usize::from(self.cell_h);
-        let (i, slot) = self
-            .slots
-            .iter_mut()
-            .enumerate()
-            .find_map(|(i, s)| s.as_mut().filter(|s| s.key == key).map(|s| (i, s)))?;
-        slot.last_used = self.clock;
+        let clock = self.clock;
+        let slot = self.slots.iter_mut().flatten().find(|s| s.key == key)?;
+        slot.last_used = clock;
         Some(CatTile {
-            ax: 0,
-            ay: (i * slot_h) as u16,
+            art: Arc::clone(&slot.art),
         })
     }
 
@@ -280,38 +221,33 @@ impl CatBaker {
         })
     }
 
-    fn install(&mut self, i: usize, key: SlotKey, src: &[u8], tw: usize, rows: usize) -> CatTile {
-        let slot_h = 2 * usize::from(self.cell_h);
-        let atlas_w = usize::from(self.slot_w);
-        let y0 = i * slot_h;
-        let copy_rows = rows.min(slot_h);
-        for row in 0..copy_rows {
-            let d = (y0 + row) * atlas_w * 4;
-            let s = row * tw * 4;
-            self.rgba[d..d + tw * 4].copy_from_slice(&src[s..s + tw * 4]);
-            self.rgba[d + tw * 4..d + atlas_w * 4].fill(0);
+    /// Intern the `w × h` top-left of the `tw`-wide straight RGBA `src` as
+    /// slot `i`'s art.
+    fn install(
+        &mut self,
+        i: usize,
+        key: SlotKey,
+        src: &[u8],
+        tw: usize,
+        w: u16,
+        h: u16,
+    ) -> Option<CatTile> {
+        let (wu, hu) = (usize::from(w), usize::from(h));
+        let mut data = Vec::with_capacity(wu * hu * 4);
+        for row in src.chunks_exact(tw * 4).take(hu) {
+            data.extend_from_slice(&row[..wu * 4]);
         }
-        if copy_rows < slot_h {
-            let tail_start = (y0 + copy_rows) * atlas_w * 4;
-            let tail_end = (y0 + slot_h) * atlas_w * 4;
-            self.rgba[tail_start..tail_end].fill(0);
-        }
+        let art = aterm_render::fx::bitmap(FxTexels::Rgba8Straight, w, h, data)?;
         self.slots[i] = Some(Slot {
             key,
+            art: Arc::clone(&art),
             last_used: self.clock,
         });
         self.version = self.version.wrapping_add(1);
-        if let Some(stamp) = self.slot_version.get_mut(i) {
-            *stamp = self.version;
-        }
-        self.dirty = true;
-        CatTile {
-            ax: 0,
-            ay: y0 as u16,
-        }
+        Some(CatTile { art })
     }
 
-    /// Bake a host-authored straight-alpha RGBA tile into the shared atlas, keyed by a stable `host_id` so later calls are cache hits.
+    /// Bake a host-authored straight-alpha RGBA tile into the cache, keyed by a stable `host_id` so later calls are cache hits.
     pub fn host_tile(&mut self, host_id: u64, w: u16, h: u16, rgba: &[u8]) -> Option<CatTile> {
         if self.cell_h == 0 || w == 0 || h == 0 {
             return None;
@@ -328,7 +264,7 @@ impl CatBaker {
             return Some(tile);
         }
         let i = self.bake_slot()?;
-        Some(self.install(i, slot_key, rgba, usize::from(w), usize::from(h)))
+        self.install(i, slot_key, rgba, usize::from(w), w, h)
     }
 
     /// Peek [`CatBaker::host_tile`]'s cache without supplying texels.
@@ -342,32 +278,11 @@ impl CatBaker {
         self.touch(SlotKey::Host(host_id))
     }
 
-    /// Whether this frame still has cold-bake budget left for an initialised atlas.
+    /// Whether this frame still has cold-bake budget left for an initialised cache.
     #[inline]
     #[must_use]
     pub const fn can_bake(&self) -> bool {
         self.cell_h > 0 && self.bakes_left > 0
-    }
-
-    /// Touch a held [`CatBaker::host_tile`] slot at `(ax, ay)` (`last_used = clock`) and confirm it still holds the expected host-authored tile.
-    #[inline]
-    pub fn touch_held_host_slot(&mut self, host_id: u64, ax: u16, ay: u16) -> bool {
-        if self.cell_h == 0 || ax != 0 {
-            return false;
-        }
-        let slot_h = 2 * usize::from(self.cell_h);
-        if !usize::from(ay).is_multiple_of(slot_h) {
-            return false;
-        }
-        let i = usize::from(ay) / slot_h;
-        let Some(Some(slot)) = self.slots.get_mut(i) else {
-            return false;
-        };
-        if slot.key != SlotKey::Host(host_id) {
-            return false;
-        }
-        slot.last_used = self.clock;
-        true
     }
 }
 
@@ -1401,7 +1316,7 @@ mod tests {
             let tile = baker
                 .get_v4(&vk(coat))
                 .expect("a resident key is an exact hit and never needs a bake");
-            served.push(tile.ay);
+            served.push(tile.art.id());
         }
         let stranger = baker.get_v4(&vk(200));
 
@@ -1410,9 +1325,10 @@ mod tests {
             "every slot was served this frame, so the bake must be REFUSED \
              (callers hold a last-good tile and retry); got {stranger:?}"
         );
-        if let Some(t) = stranger {
-            assert!(
-                !served.contains(&t.ay),
+        for coat in 0..slots as u8 {
+            assert_eq!(
+                baker.peek_v4(&vk(coat)).map(|t| t.art.id()),
+                Some(served[usize::from(coat)]),
                 "the stranger re-baked over a slot already drawn this frame"
             );
         }
@@ -1454,8 +1370,7 @@ mod tests {
         let v1 = b.version();
         b.clear();
         assert_eq!(b.version(), v1 + 1);
-        assert!(b.atlas().is_none(), "cleared baker publishes no atlas");
-        assert_eq!(b.slots.iter().flatten().count(), 0);
+        assert!(b.is_empty(), "a cleared baker holds no tile");
     }
 
     #[test]
@@ -1478,12 +1393,11 @@ mod tests {
         let mut b = CatBaker::default();
         b.begin_frame(10, 20);
         assert!(b.get_v4(&vk(0)).is_some());
-        assert!(b.atlas().is_some());
+        assert!(!b.is_empty());
         let v = b.version();
         b.begin_frame(12, 24);
         assert!(b.version() > v, "metric change bumps the version");
-        assert_eq!(b.slots.iter().flatten().count(), 0, "metric change clears");
-        assert!(b.atlas().is_none());
+        assert!(b.is_empty(), "metric change clears");
     }
 
     #[test]
@@ -1496,109 +1410,42 @@ mod tests {
     }
 
     #[test]
-    fn atlas_publishes_on_change_only() {
+    fn a_hit_hands_back_the_held_art_and_only_a_bake_bumps_the_version() {
         let mut b = CatBaker::default();
         b.begin_frame(10, 20);
-        assert!(b.atlas().is_none(), "no bake → no atlas");
-        b.get_v4(&vk(0)).expect("bake");
-        let a1 = b.atlas().expect("atlas after bake");
-        let a2 = b.atlas().expect("atlas");
-        assert!(Arc::ptr_eq(&a1, &a2), "no rebake → same snapshot Arc");
-        assert_eq!(a1.version, b.version());
+        let a1 = b.get_v4(&vk(0)).expect("bake").art;
+        let v1 = b.version();
+        let a2 = b.get_v4(&vk(0)).expect("hit").art;
+        assert!(Arc::ptr_eq(&a1, &a2), "a hit hands back the baked art");
+        assert_eq!(b.version(), v1, "a hit bakes nothing");
         b.begin_frame(10, 20);
-        b.get_v4(&vk(1)).expect("bake 2");
-        let a3 = b.atlas().expect("atlas");
-        assert!(a3.version > a1.version, "bake bumps the published version");
+        let a3 = b.get_v4(&vk(1)).expect("bake 2").art;
+        assert!(b.version() > v1, "a bake bumps the version");
+        assert_ne!(a3.id(), a1.id(), "another key bakes another art");
     }
 
     #[test]
-    fn recycled_publish_is_byte_equal_to_full_clone() {
-        let mut fast = CatBaker::default();
-        let mut mirror = CatBaker::default();
-        let mut retained: Vec<Arc<SceneAtlas>> = Vec::new();
-        let mut published = 0usize;
-        for f in 0..96u64 {
-            let (cw, ch) = if f == 61 { (12u16, 24u16) } else { (10, 20) };
-            fast.begin_frame(cw, ch);
-            mirror.begin_frame(cw, ch);
-            if f % 3 != 2 {
-                let key = vk((f % 37) as u8);
-                assert_eq!(fast.get_v4(&key).is_some(), mirror.get_v4(&key).is_some());
-            }
-            if f % 2 == 0 {
-                let px = vec![((f * 7) % 251) as u8; 40 * 24 * 4];
-                let a = fast.host_tile(f % 13, 40, 24, &px);
-                let b = mirror.host_tile(f % 13, 40, 24, &px);
-                assert_eq!(a.is_some(), b.is_some());
-            }
-            match (fast.atlas(), mirror.atlas()) {
-                (Some(a), Some(b)) => {
-                    published += 1;
-                    assert_eq!(
-                        (a.width, a.height, a.version),
-                        (b.width, b.height, b.version),
-                        "frame {f}: published header must be identical"
-                    );
-                    assert!(
-                        a.rgba == b.rgba,
-                        "frame {f}: the recycled publish must be BYTE-EQUAL to a full clone"
-                    );
-                    retained.push(b);
-                }
-                (a, b) => assert!(a.is_none() && b.is_none(), "frame {f}: publish parity"),
-            }
+    fn a_host_tile_is_the_hosts_texels_at_its_size() {
+        let mut b = CatBaker::default();
+        b.begin_frame(10, 20);
+        let px: Vec<u8> = (0..6 * 5 * 4).map(|i| (i * 7 % 251) as u8).collect();
+        let art = b.host_tile(0x51, 6, 5, &px).expect("fits").art;
+        assert_eq!(
+            (art.w(), art.h(), art.texels()),
+            (6, 5, FxTexels::Rgba8Straight)
+        );
+        assert_eq!(art.data(), &px[..], "the art is the host's bytes");
+        let held = Arc::clone(&art);
+        for coat in 0..40u8 {
+            b.begin_frame(10, 20);
+            let _ = b.get_v4(&vk(coat));
         }
-        assert!(
-            published > 40,
-            "the loop must actually publish ({published})"
-        );
-    }
-
-    #[test]
-    fn dirty_publish_recycles_and_never_mutates_a_held_snapshot() {
-        let mut b = CatBaker::default();
-        b.begin_frame(10, 20);
-        b.get_v4(&vk(0)).expect("bake 1");
-        let a1 = b.atlas().expect("publish 1");
-        let p1 = Arc::as_ptr(&a1);
-        drop(a1);
-        b.begin_frame(10, 20);
-        b.get_v4(&vk(1)).expect("bake 2");
-        let held = b.atlas().expect("publish 2");
-        let p2 = Arc::as_ptr(&held);
-        let held_bytes = held.rgba.clone();
-        assert_ne!(p1, p2, "consecutive publishes are distinct snapshots");
-
-        b.begin_frame(10, 20);
-        b.get_v4(&vk(2)).expect("bake 3");
-        let a3 = b.atlas().expect("publish 3");
+        assert!(b.host_peek(0x51).is_none(), "fixture: the tile was evicted");
         assert_eq!(
-            Arc::as_ptr(&a3),
-            p1,
-            "the third publish must reuse the first buffer instead of cloning \
-             the whole atlas"
+            held.data(),
+            &px[..],
+            "an evicted art a holder keeps is never rewritten"
         );
-        assert_eq!(
-            a3.version,
-            b.version(),
-            "a recycled publish carries the live version"
-        );
-        drop(a3);
-
-        b.begin_frame(10, 20);
-        b.get_v4(&vk(3)).expect("bake 4");
-        let a4 = b.atlas().expect("publish 4");
-        assert_ne!(Arc::as_ptr(&a4), p2, "a held snapshot must never be reused");
-        assert_ne!(
-            Arc::as_ptr(&a4),
-            p1,
-            "the live snapshot must never be reused"
-        );
-        assert_eq!(
-            held.rgba, held_bytes,
-            "a held snapshot must never be mutated"
-        );
-        assert_eq!(held.version, 2, "…nor re-stamped");
     }
 
     fn fills(coat: u8, iris: u8, dark: bool) -> ResolvedFills {
@@ -2238,13 +2085,18 @@ mod tests {
             );
             let direct = key.bake();
             let tw = direct.width() as usize;
-            let atlas_w = usize::from(baker.slot_w);
+            let aw = usize::from(key.w);
+            assert_eq!(
+                (placed.art.w(), placed.art.h()),
+                (key.w, key.h),
+                "the art is the design box"
+            );
             for row in 0..usize::from(key.h) {
-                let d = (usize::from(placed.ay) + row) * atlas_w * 4;
+                let d = row * aw * 4;
                 let s = row * tw * 4;
                 assert_eq!(
-                    &baker.rgba[d..d + tw * 4],
-                    &direct.pixels()[s..s + tw * 4],
+                    &placed.art.data()[d..d + aw * 4],
+                    &direct.pixels()[s..s + aw * 4],
                     "reused scratch bake must match fresh key.bake() texels (coat={coat}, eyes={eyes:?}, w={w}, row={row})"
                 );
             }

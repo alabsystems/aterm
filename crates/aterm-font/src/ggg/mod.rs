@@ -7,9 +7,6 @@
 
 //! Common data types used by GDEF/GPOS/GSUB tables.
 
-// A heavily modified port of https://github.com/harfbuzz/rustybuzz implementation
-// originally written by https://github.com/laurmaedje
-
 use crate::GlyphId;
 use crate::parser::{FromData, FromSlice, LazyArray16, Stream};
 

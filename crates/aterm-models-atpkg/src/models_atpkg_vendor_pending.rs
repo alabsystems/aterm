@@ -5,26 +5,15 @@
 
 use aterm_spec::derive::*;
 
-/// Each of the two vendor-head slots moves from idle to in flight to ready, then to an offered
-/// head or a scheduled retry. A ready result may be harvested while the other vendor is still
-/// in flight (the slow head must not hold the fast head's update). At most two checks are
-/// active, and a slot's completion is consumed exactly once. Tier 1 drives the real pending
-/// watch through both completion orders and a failed-head retry.
-///
-/// `Buggy = 1` permits one fault: an extra worker, a duplicate completion or harvest, a dropped
-/// ready result, or a failed head discarded without retry, each with a counterexample. The
-/// one-fault bound keeps the interpreter's per-invariant non-vacuity sweep finite when it
-/// disables the other invariants.
+/// Model of the two vendor-head slots moving from idle to in-flight, ready, and offered or retried.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn atpkg_vendor_pending_check_model() -> Model {
     aterm_spec::ty_model! {
         AtpkgVendorPendingCheck {
             const Buggy = 0;
-            // 0 idle, 1 in flight, 2 ready, 3 offered, 4 retry scheduled.
             var first = 0;
             var second = 0;
-            // 0 no answer, 1 newer head, 2 unreachable/retryable failure.
             var first_answer = 0;
             var second_answer = 0;
             var active = 0;

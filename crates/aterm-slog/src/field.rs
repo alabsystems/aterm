@@ -5,9 +5,9 @@
 
 use crate::vocab::{
     ACT_WORDS, ASK_WORDS, BOX_WORDS, CAUSE_WORDS, CHANGE_WORDS, CLASS_WORDS, CLS_WORDS, DIR_WORDS,
-    DUR_WORDS, END_WORDS, HEALED_BY_WORDS, HELD_WORDS, MAIL_KIND_WORDS, NEED_WORDS, NET_WORDS,
-    ORIGIN_WORDS, OUT_WORDS, PHASE_WORDS, POOL_WORDS, SEV_WORDS, SOURCE_WORDS, STATE_WORDS,
-    ShortId, VERB_WORDS, WALL_WORDS, WHY_WORDS, WORD_WORDS, lookup,
+    DUR_WORDS, END_WORDS, FACT_RULE_WORDS, HEALED_BY_WORDS, HELD_WORDS, MAIL_KIND_WORDS,
+    NEED_WORDS, NET_WORDS, ORIGIN_WORDS, OUT_WORDS, PHASE_WORDS, POOL_WORDS, SEV_WORDS,
+    SOURCE_WORDS, STATE_WORDS, ShortId, VERB_WORDS, WALL_WORDS, WHY_WORDS, WORD_WORDS, lookup,
 };
 
 /// Where a value may be stored.
@@ -214,6 +214,9 @@ keys! {
     Held "held" Wire Cap::Word(HELD_WORDS),
     RowKind "row" Wire Cap::Tok(Charset::Lower, 32),
     RowText "row_text" Content Cap::Text(360),
+    FactRev "fact_rev" Wire Cap::U,
+    FactRule "fact_rule" Wire Cap::Word(FACT_RULE_WORDS),
+    FactN "fact_n" Wire Cap::U,
 }
 
 impl Key {

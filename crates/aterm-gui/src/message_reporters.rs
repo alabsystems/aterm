@@ -4164,8 +4164,32 @@ pub(crate) fn workstation_setup_failure_entry() -> Entry {
     .more("System State shows what each step waits for; its Apply runs the checked steps again now")
 }
 
-/// Builds the exceptions digest entry when aterm lacks macOS Developer Tools permission.
-pub(crate) fn devtools_entry(step: atpkg::devtools::Step) -> Entry {
+/// The devtools Entry's live line ([`crate::App::held_line`]): how many programs aterm started macOS's program check holds while a backed-up episode stands, and the longest held, ms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HeldLine {
+    /// The held programs aterm started.
+    pub(crate) count: u32,
+    /// The longest any of them has been held, ms.
+    pub(crate) oldest_ms: u64,
+}
+
+impl HeldLine {
+    /// "now: 2 programs aterm started wait for macOS's program check, the oldest 9 h 59 m".
+    pub(crate) fn words(self) -> String {
+        let age = aterm_uds::process::held_age(self.oldest_ms);
+        if self.count == 1 {
+            format!("now: 1 program aterm started waits for macOS's program check, for {age}")
+        } else {
+            format!(
+                "now: {} programs aterm started wait for macOS's program check, the oldest {age}",
+                self.count
+            )
+        }
+    }
+}
+
+/// Builds the exceptions digest entry when aterm lacks macOS Developer Tools permission. Its first detail line, the one every step keeps within `MORE_LINES`, is `live`'s words while macOS's program check holds programs aterm started (leftover §5.1), else why the list matters.
+pub(crate) fn devtools_entry(step: atpkg::devtools::Step, live: Option<HeldLine>) -> Entry {
     use atpkg::devtools::Step;
     let skips = aterm_containment::SpikeEvidence::MEASURED.devtool_skips_first_run_check;
     let (title, why) = match step {
@@ -4196,18 +4220,77 @@ pub(crate) fn devtools_entry(step: atpkg::devtools::Step) -> Entry {
     })
     .severity(Severity::Warn)
     .resurface(Resurface::CHOICE)
-    .more(atpkg::devtools::why(skips));
+    .more(live.map_or_else(|| atpkg::devtools::why(skips).to_owned(), HeldLine::words));
     let entry = match step {
-        Step::Add => entry.more(format!("{path} ({})", atpkg::devtools::PLUS_ROUTE)),
-        Step::SwitchOn => entry.more(path),
+        Step::Add => entry
+            .more(format!("{path} ({})", atpkg::devtools::PLUS_ROUTE))
+            .more(DEVTOOLS_ONCE_ON),
+        Step::SwitchOn => entry.more(path).more(DEVTOOLS_ONCE_ON),
         Step::ListedOn => entry.more(atpkg::devtools::HELPER_LISTED_ON).more(path),
     };
-    entry
-        .more(
-            "Once it is on, aterm has macOS check it again: when aterm reads the switch on, or \
-             when you come back to aterm from the page. Programs started before that may still wait.",
+    entry.log_line("devtools not-granted")
+}
+
+/// What switching aterm on does, for a step that switches it on (a row already on has nothing to switch).
+const DEVTOOLS_ONCE_ON: &str = "Once it is on, aterm has macOS check it again: when aterm reads \
+                                the switch on, or when you come back to aterm from the page. \
+                                Programs started before that may still wait.";
+
+/// The key every record of macOS's program check's backed-up episodes takes (leftover §6.5's `program-check.` stem).
+pub(crate) const PROGRAM_CHECK_EPISODE_KEY: &str = "program-check.episode";
+
+/// A backed-up episode of macOS's program check opening or draining, as the view that saw it says ([`crate::vitals_host::held_edge`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HeldEdge {
+    /// It opened at this reading.
+    Opened(aterm_vitals::jobs::HeldEpisode),
+    /// It closed: its second reading in a row found nothing held.
+    Drained(aterm_vitals::jobs::HeldEpisode),
+}
+
+/// Builds the record of a backed-up episode of macOS's program check opening or draining (leftover §6.5): a fact for later, never an Entry or a Now (§6.7). The opening says when aterm started none of the held programs (`aterm`, how many aterm started, is 0): aterm's grant does not reach them (§5.1). The drain's length is the longer of the episode's own span and its longest wait: an episode opens a reading after its first program was seen held, so a short one can span no time while a program waited.
+pub(crate) fn program_check_episode(edge: HeldEdge, aterm: u32) -> Message {
+    let programs = |n: u32| if n == 1 { "program" } else { "programs" };
+    let age = aterm_uds::process::held_age;
+    match edge {
+        HeldEdge::Opened(episode) => {
+            let opened = Message::new(
+                tags::SYSTEM,
+                Severity::Info,
+                format!(
+                    "macOS's program check is holding {} {}",
+                    episode.peak,
+                    programs(episode.peak)
+                ),
+            )
+            .line(format!(
+                "the oldest for {}; only this user's programs are counted",
+                age(episode.oldest_ms)
+            ));
+            match (aterm, episode.peak) {
+                (0, 1) => {
+                    opened.line("it started outside aterm, so aterm's grant does not reach it")
+                }
+                (0, _) => {
+                    opened.line("they started outside aterm, so aterm's grant does not reach them")
+                }
+                _ => opened,
+            }
+        }
+        HeldEdge::Drained(episode) => Message::new(
+            tags::SYSTEM,
+            Severity::Info,
+            "macOS's program check caught up",
         )
-        .log_line("devtools not-granted")
+        .line(format!(
+            "drained after {}, at most {} {} held at once",
+            age(episode.for_ms.max(episode.oldest_ms)),
+            episode.peak,
+            programs(episode.peak)
+        )),
+    }
+    .record()
+    .key(PROGRAM_CHECK_EPISODE_KEY)
 }
 
 /// Builds the exceptions digest entry when the live upgrade host cannot lock its state directory.

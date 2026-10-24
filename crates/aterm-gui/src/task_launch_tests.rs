@@ -26,10 +26,10 @@ fn a_task_frame_is_at_most_64_kib() {
             "{bad:?}"
         );
     }
-    for word in ["claude", "gemini", "agy", "muse"] {
+    for word in ["claude", "codex", "gemini", "agy", "muse"] {
         assert_eq!(worker_word(Some(word)), word);
     }
-    for none in [Some("codex"), Some("bash"), Some(""), None] {
+    for none in [Some("codex-old"), Some("bash"), Some(""), None] {
         assert_eq!(worker_word(none), "claude", "CONTROL: {none:?}");
     }
 }
@@ -164,7 +164,12 @@ fn a_line_that_draws_as_a_blank_row_is_dropped_from_an_agy_task() {
         text(Program::Agy),
         "First paragraph.\n\u{a0}keep me\nSecond paragraph.\n"
     );
-    for agent in [Program::Claude, Program::Gemini, Program::Muse] {
+    for agent in [
+        Program::Claude,
+        Program::Codex,
+        Program::Gemini,
+        Program::Muse,
+    ] {
         assert_eq!(
             text(agent),
             task,
@@ -207,7 +212,12 @@ fn an_agy_workers_first_prompt_holds_no_blank_line() {
         format!("{folded}{}\n", fact_line("s-ab12", Autopilot::Land, "agy"))
     );
     assert_eq!(text(task.as_bytes(), None, Program::Agy), folded);
-    for agent in [Program::Claude, Program::Gemini, Program::Muse] {
+    for agent in [
+        Program::Claude,
+        Program::Codex,
+        Program::Gemini,
+        Program::Muse,
+    ] {
         let fact = fact_line("s-ab12", Autopilot::Land, agent.name());
         assert_eq!(
             text(task.as_bytes(), Some("s-ab12"), agent),
@@ -417,6 +427,11 @@ fn a_worker_carries_its_starters_configuration_or_uses_the_plain_command() {
             "{}",
             cli.word
         );
+        if cli.agent == aterm_phase::Program::Codex {
+            // codex-alab's line with no starter is atpkg's managed twin where
+            // this machine has one: `WorkerCli::unstarted_by`'s own test.
+            continue;
+        }
         assert_eq!(
             line_starter(cli, None),
             Starter {
@@ -511,6 +526,7 @@ fn a_starter_not_named_yet_is_read_from_its_terminal() {
     let unread = || -> Option<i32> { panic!("the front group is not read") };
     for agent in [
         Program::Claude,
+        Program::Codex,
         Program::Gemini,
         Program::Agy,
         Program::Muse,

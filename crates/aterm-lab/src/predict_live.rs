@@ -1015,7 +1015,7 @@ fn run_one(
         cfg.rtt,
         if cfg.on { "on" } else { "off" }
     );
-    let world = match World::new(instance::CONFIG_OFF) {
+    let mut world = match World::new(instance::CONFIG_OFF) {
         Ok(w) => w,
         Err(e) => return Ok(Err(e)),
     };
@@ -1045,6 +1045,8 @@ fn run_one(
         Ok(p) => p,
         Err(e) => return Ok(Err(format!("cannot lay out the world: {e}"))),
     };
+    // the instance starts the shell's copy: it stays until its take shows it ran
+    world.keep();
     let mut env = world.env();
     env.push((crate::link::ENV_RTT.into(), cfg.rtt.to_string()));
     env.push((
@@ -1112,6 +1114,7 @@ fn run_one(
             "the link relay kept no take: is the shell behind it?".into()
         ));
     }
+    world.release();
     if !headless {
         match crate::meta_keys::await_idle()? {
             Ok(()) => {}

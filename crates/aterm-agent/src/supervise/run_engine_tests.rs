@@ -298,7 +298,7 @@ fn err_halted_parks_until_the_hold_lifts_and_the_loop_goes_on() {
     assert!(rows[0].contains("\"decision\":\"deferred\""), "{rows:?}");
     assert!(rows[1].contains("\"decision\":\"approved\""), "{rows:?}");
     assert!(
-        rows[1].contains("\"rule_id\":\"read-only@classify-v8\""),
+        rows[1].contains("\"rule_id\":\"read-only@classify-v9\""),
         "{rows:?}"
     );
     let _ = std::fs::remove_dir_all(&jdir);
@@ -342,10 +342,11 @@ fn a_stale_attention_is_reconciled_at_the_start() {
     let (lines, _) = watch_lines(&mut m, &opts);
     assert_eq!(lines[0], "EVENT idle seq=102 ⏺ Done.", "{lines:?}");
     assert_eq!(
-        m.requests[..3],
+        m.requests[..4],
         [
             "meta",
             "text --json tail=40",
+            "meta",
             "meta unset attention owner=supervisor"
         ],
         "{:?}",
@@ -457,7 +458,7 @@ fn the_rm_breaker_is_approved_under_a_scratch_root_and_escalated_otherwise() {
     let rows = ledger_rows(&ledger);
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert!(
-        rows[0].contains("\"rule_id\":\"rm-breaker@v7\""),
+        rows[0].contains("\"rule_id\":\"rm-breaker@v8\""),
         "{rows:?}"
     );
     assert!(rows[0].contains("\"decision\":\"approved\""), "{rows:?}");
@@ -508,7 +509,7 @@ fn the_rm_breaker_is_approved_under_a_scratch_root_and_escalated_otherwise() {
 }
 
 /// THE RM BREAKER'S TOO-MANY BOX OVER A PROVEN READ IS PRESSED AND LEDGERED UNDER
-/// `breaker-read-only@v8`, in a bypass session, under the safe rules alone: Claude Code 2.1.307
+/// `breaker-read-only@v9`, in a bypass session, under the safe rules alone: Claude Code 2.1.307
 /// draws that box over any command with more than 64 command substitutions, rm or none
 /// (MEASURED). The box is the MEASURED one with its command made thirteen barred lines of `echo`
 /// and five `$(true)`; the press is guarded by its first command row, and the one ledger row is
@@ -542,7 +543,7 @@ fn the_too_many_breaker_over_a_proven_read_is_ledgered_under_its_rule() {
     let rows = ledger_rows(&ledger);
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert!(
-        rows[0].contains("\"rule_id\":\"breaker-read-only@v8\""),
+        rows[0].contains("\"rule_id\":\"breaker-read-only@v9\""),
         "{rows:?}"
     );
     assert!(rows[0].contains("\"decision\":\"approved\""), "{rows:?}");
@@ -603,7 +604,7 @@ fn breaker_run(
     (lines, m, rows, host.asks())
 }
 
-/// A TOO-MANY BOX READS NO TRANSCRIPT AND WAITS FOR NONE (`breaker-read-only@v8`): breaker-4's
+/// A TOO-MANY BOX READS NO TRANSCRIPT AND WAITS FOR NONE (`breaker-read-only@v9`): breaker-4's
 /// lane read the agent's transcript for every too-many box the screen did not prove, retried
 /// it while it named no call and waited a 1 s settle, and the call it found could only add a
 /// reading, so it decided nothing. Now the measured box (one line of `echo` and 65 `$(true)`,
@@ -652,7 +653,7 @@ fn a_too_many_box_reads_no_transcript_and_waits_for_none() {
     assert_eq!(m.presses().len(), 1, "{:?}", m.requests);
     assert!(out[0].starts_with("APPROVED seq=102 "), "{out:?}");
     assert!(
-        rows[0].contains("\"rule_id\":\"breaker-read-only@v8\""),
+        rows[0].contains("\"rule_id\":\"breaker-read-only@v9\""),
         "{rows:?}"
     );
     assert_eq!(asks, 0, "a proven box asks the transcript nothing");

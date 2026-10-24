@@ -1,22 +1,18 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Named selector aliases (§3.4).
-//!
-//! Human-readable names usable in a rule's `sequence`; the selector parser
-//! translates them to concrete selector syntax.
+//! Named selector aliases usable in `Rule::sequence`.
 
-/// One row of the alias table.
+/// Named selector alias entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AliasEntry {
-    /// The alias token that appears in a `Rule::sequence` string.
+    /// Alias token usable in `Rule::sequence`.
     pub alias: &'static str,
-    /// What the alias stands for. The compiled form lives in the selector
-    /// parser.
+    /// Human-readable description of the selector expansion.
     pub expansion: &'static str,
 }
 
-/// The full alias table from design §3.4.
+/// Built-in selector alias table.
 pub const ALIAS_TABLE: &[AliasEntry] = &[
     AliasEntry {
         alias: "OSC 52 set",
@@ -48,7 +44,7 @@ pub const ALIAS_TABLE: &[AliasEntry] = &[
     },
 ];
 
-/// Look up an alias by name. Case-sensitive (TOML authors must match exactly).
+/// Look up an alias by exact case-sensitive name.
 #[must_use]
 #[inline]
 pub fn lookup(alias: &str) -> Option<&'static AliasEntry> {

@@ -86,37 +86,6 @@ pub fn sleep(d: Duration) -> Result<(), Stopped> {
     }
 }
 
-/// Ring the bell: every waiter ([`sleep`], [`wait_until`]) looks again now.
-pub fn ring() {
-    let (lock, cv) = bell();
-    let _g = lock.lock().unwrap_or_else(|p| p.into_inner());
-    cv.notify_all();
-}
-
-/// Wait until `done` holds or `limit` has passed ([`ring`]).
-///
-/// # Errors
-/// The run was interrupted.
-pub fn wait_until(limit: Duration, done: impl Fn() -> bool) -> Result<bool, Stopped> {
-    let end = Instant::now() + limit;
-    let (lock, cv) = bell();
-    let mut g = lock.lock().unwrap_or_else(|p| p.into_inner());
-    loop {
-        check()?;
-        if done() {
-            return Ok(true);
-        }
-        let now = Instant::now();
-        if now >= end {
-            return Ok(false);
-        }
-        g = cv
-            .wait_timeout(g, end - now)
-            .unwrap_or_else(|p| p.into_inner())
-            .0;
-    }
-}
-
 /// Wait until the wall clock reads `t` (seconds since the epoch).
 ///
 /// # Errors

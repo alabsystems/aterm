@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance: what [`Log::read`] tells a reader, against the derived `SessionLogCursor`
-//! model (`aterm_models_session::session_log_cursor_model`, checked at Tier-0 in
-//! `aterm-models/tests/derived_ring_ty.rs`).
+//! Tier-1 conformance: [`Log::read`] against `aterm_models_session::session_log_cursor_model`.
 
 use aterm_models_session::session_log_cursor_model;
 use aterm_slog::{
@@ -15,7 +13,6 @@ use aterm_spec::rng::XorShift;
 
 use crate::support::at;
 
-/// The model's seqs.
 const SLOTS: u64 = 4;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -31,8 +28,7 @@ struct World {
     run: Option<Node>,
     reader: Reader,
     clock: u64,
-    /// While a carry stands: the snapshot the update took (the outgoing
-    /// log's readers fenced at it).
+    /// Active carry snapshot fencing outgoing readers.
     carry: Option<aterm_slog::CarrySnapshot>,
     /// Whether the update was committed (the successor's log).
     committed: bool,
@@ -50,8 +46,7 @@ impl World {
         }
     }
 
-    /// Seq `i`'s standing: 0 not yet assigned, 1 live, 2 evicted, 3 never
-    /// held, 4 written by the outgoing process after its carry.
+    /// Seq `i` state: 0 unassigned, 1 live, 2 evicted, 3 hole, 4 post-carry overlap.
     fn standing(&self, i: u64) -> i64 {
         if i > self.log.last_seq() {
             0
@@ -91,13 +86,11 @@ fn project_reader(w: &World, r: Reader) -> State {
     s
 }
 
-/// The model reaches `next` from `prev` by `action` and then any of the
-/// evictions in `evicted` (one model step each, in any order).
+/// Assert `next` is reachable from `prev` via `action` followed by `evicted` steps.
 fn admitted(m: &Model, action: &str, evicted: &[u64], prev: &State, next: &State) {
     admitted_chain(m, &[action], evicted, prev, next);
 }
 
-/// [`admitted`] for a chain of model actions, then the evictions.
 fn admitted_chain(m: &Model, actions: &[&str], evicted: &[u64], prev: &State, next: &State) {
     let mut frontier = vec![prev.clone()];
     for action in actions {
@@ -133,8 +126,6 @@ fn admitted_chain(m: &Model, actions: &[&str], evicted: &[u64], prev: &State, ne
     }
 }
 
-/// One real append (`what`), returning the model action and the seqs its
-/// batch evicted.
 fn append(w: &mut World, what: &str) -> (&'static str, Vec<u64>) {
     w.clock += 5;
     let stamp = at(w.clock);
@@ -180,11 +171,8 @@ fn append(w: &mut World, what: &str) -> (&'static str, Vec<u64>) {
     (action, evicted)
 }
 
-/// The update's real steps: `export` takes the carry and fences the
-/// readers, `overlap` is a record the outgoing process writes after it,
-/// `commit` hands over to the successor that continues the carry (its
-/// `mark - handoff` the model's `Append` after `Commit`), `stand` lifts the
-/// fence. Returns the model actions and the seqs the step left evicted.
+/// Run an update step (`export`, `overlap`, `stand`, or `commit`), returning model actions and
+/// evictions.
 fn update(w: &mut World, what: &str) -> (Vec<&'static str>, Vec<u64>) {
     w.clock += 5;
     let stamp = at(w.clock);
@@ -242,7 +230,6 @@ fn update(w: &mut World, what: &str) -> (Vec<&'static str>, Vec<u64>) {
     (actions, evicted)
 }
 
-/// One real read: to the head (`to = None`) or cut at the live record `to`.
 fn read(w: &mut World, to: Option<u64>) -> &'static str {
     let c = w.reader.cur;
     let max = match to {
@@ -357,8 +344,7 @@ fn slog_cursor_conforms_to_derived_model() {
     }
 }
 
-/// NEGATIVE CONTROLS: a reader that counts a hole as a loss, and one never
-/// told of a record evicted from the middle of the window, are rejected.
+/// Negative controls: counting a hole as loss or dropping a mid-window eviction is rejected.
 #[test]
 fn slog_cursor_conformance_rejects_what_a_read_never_says() {
     let m = session_log_cursor_model();

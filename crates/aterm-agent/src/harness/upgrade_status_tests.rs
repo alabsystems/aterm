@@ -13,6 +13,7 @@ fn opts(dir: &std::path::Path) -> Opts {
         home: dir.join("home"),
         state: dir.join("state"),
         sock: Some(dir.join("no.sock").to_string_lossy().into_owned()),
+        token: None,
         only_sid: None,
         dry_run: false,
         human_grace_s: 120,

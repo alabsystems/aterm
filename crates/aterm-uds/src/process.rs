@@ -463,10 +463,10 @@ mod kin;
 #[cfg(any(unix, windows))]
 pub use kin::held_among;
 pub use kin::{
-    GroupMembers, HeldNow, Lineage, MARKER_VARS, MAX_GROUP_PIDS, Markers, VERIFY_RUN_VAR,
-    at_program_check, boot_id, group_listing_can_be_whole, group_members, held_programs,
-    launchd_idversion, launched_before, pid_namespace, read_identity, read_lineage,
-    read_process_markers, thread_ran,
+    GroupMembers, HeldNow, Lineage, MARKER_VARS, MAX_GROUP_PIDS, Markers, TRUST_CHECK_VAR,
+    VERIFY_RUN_VAR, at_program_check, boot_id, group_listing_can_be_whole, group_members, held_age,
+    held_programs, launchd_idversion, launched_before, pid_namespace, process_serial,
+    read_identity, read_lineage, read_process_markers, thread_ran,
 };
 
 #[cfg(target_vendor = "apple")]

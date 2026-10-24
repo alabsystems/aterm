@@ -13,7 +13,7 @@ use aterm_render::{FxFrame, GlowQuad};
 
 use super::layers::{kitty_art, one_star, rim_art, rim_cover};
 use super::oracle::{Sink, kitty_quads, lay_star, quads, rim_quads};
-use super::tests::{aired, clipped, scene, scenes, widest};
+use super::tests::{AEROGEL, UNIKITTY, aired, clipped, scene, scenes, widest};
 use super::*;
 use crate::cursor_glow::Geom;
 use crate::effect_util::{push_twinkle_star, star_pieces};
@@ -189,6 +189,7 @@ struct Seen {
     rim_cut: usize,
     peeled: usize,
     folded: usize,
+    printed: usize,
     row0_air: usize,
     heights: BTreeSet<u16>,
     most_items: usize,
@@ -257,7 +258,14 @@ fn assert_same_pixels(
     let m = marks(frames, &frame, s, clock, seed);
     seen.rim_cut += usize::from(m.rims.len() > 1);
     if s.dark {
-        seen.folded += m.stars.len();
+        let palette = frame.over.palette();
+        for sp in &m.stars {
+            if palette.get(sp.ink as usize).is_some_and(|i| i.alpha > 0) {
+                seen.printed += 1;
+            } else {
+                seen.folded += 1;
+            }
+        }
     } else {
         seen.peeled += m.stars.len();
         let palette = frame.over.palette();
@@ -429,6 +437,12 @@ fn the_card_layers_equal_the_legacy_quads() {
         .into_iter()
         .chain(scenes().into_iter().map(aired))
         .chain([clipped()])
+        .chain(
+            scenes()
+                .into_iter()
+                .filter(|s| s.dark)
+                .flat_map(|s| [AEROGEL, UNIKITTY].map(|ground| CardScene { ground, ..s })),
+        )
         .collect();
     for (i, s) in law_scenes.iter().enumerate() {
         for seed in [7u64, 42] {
@@ -474,6 +488,7 @@ fn the_card_layers_equal_the_legacy_quads() {
             && seen.rim_cut > 0
             && seen.peeled > 0
             && seen.folded > 0
+            && seen.printed > 0
             && seen.row0_air > 0,
         "CONTROL: the frames exercise every path: {seen:?}"
     );
@@ -949,6 +964,7 @@ fn the_star_is_the_family_star() {
                     cov,
                     gold,
                     color: 0x00FF_C878,
+                    light: true,
                 };
                 let mut family = Vec::new();
                 assert!(push_twinkle_star(
@@ -962,7 +978,7 @@ fn the_star_is_the_family_star() {
                     call.color,
                     4096
                 ));
-                let (items, palette) = one_star(call, whole, &[], true);
+                let (items, palette) = one_star(call, whole, &[]);
                 assert_eq!(items.len(), 1, "{what}: one folded sprite");
                 let a = patch.paint_quads(&[], &family, true);
                 let b = patch.paint_content(FxContent::new(items, palette), (0, 0), pane, 18, true);
@@ -983,6 +999,7 @@ fn the_star_is_the_family_star() {
                 ];
                 let light = StarCall {
                     color: 0x00B0_3060,
+                    light: false,
                     ..call
                 };
                 let mut want = Vec::new();
@@ -1002,7 +1019,7 @@ fn the_star_is_the_family_star() {
                     &edge,
                     false,
                 );
-                let (items, palette) = one_star(light, whole, &edge, false);
+                let (items, palette) = one_star(light, whole, &edge);
                 let peeled = items.len();
                 let a = patch.paint_quads(&[], &want, false);
                 let b = patch.paint_content(

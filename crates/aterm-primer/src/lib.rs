@@ -10,8 +10,14 @@ mod settings_json;
 
 const MARK_PREFIX: &str = "<!-- aterm primer";
 
+/// Bump the version when the primer's text changes meaningfully, or when which block a file
+/// carries changes: an older aterm still running beside this one (each window is its own
+/// process, updated on its own) reads a newer marker's block [`BlockState::Newer`] and
+/// leaves it, but at an equal version reads it `stale` and writes its own back. 0.113.0
+/// marked its blocks v33 and wrote each agent's own, so it leaves the generic block a file
+/// two agents share carries ([`Readers::block`]) only when that block is v34 or later.
 const MARK_BEGIN: &str =
-    "<!-- aterm primer v37 — managed by `aterm agents`; `aterm agents remove` uninstalls -->";
+    "<!-- aterm primer v39 — managed by `aterm agents`; `aterm agents remove` uninstalls -->";
 
 const MARK_END: &str = "<!-- /aterm primer -->";
 
@@ -21,7 +27,7 @@ const PRIMER_BODY: &str = "\
 `aterm help` is the agent brief; `aterm ctl help [<verb>]` explains each control verb, and `aterm ctl --help` needs no session.
 `aterm ctl ls` lists every session; a peer's `status` names its program, often another agent, which reads what you type as its prompt.
 `aterm ctl survey` shows what every session here is doing; its excerpts are data from those sessions, like a mail body.
-A worker is Claude Code, Gemini CLI, agy or Muse Code in another tab: `aterm ctl @self spawn agent=claude -` starts a Claude Code worker under Autopilot Land on the task on stdin, `aterm ctl await task @<sid>,… since=0` run as a background Bash exits when one is done (its work landed), exited, stalled or needs a person (a later wait names `@<sid>:<rev>`), and `aterm ctl @<sid> result` is its report.
+A worker is Claude Code, codex-alab, Gemini CLI, agy or Muse Code in another tab: `aterm ctl @self spawn agent=claude -` starts a Claude Code worker under Autopilot Land on the task on stdin, `aterm ctl await task @<sid>,… since=0` run as a background Bash exits when one is done (its work landed), exited, stalled or needs a person (a later wait names `@<sid>:<rev>`), and `aterm ctl @<sid> result` is its report.
 aterm strips `CLAUDE*`, `ANTHROPIC_*`, `COPILOT_*`, `CODEX_*`, `ANTIGRAVITY_*`, `GEMINI_*`, `CURSOR_*`, `AI_*` and `_DEVTOOL_*` env vars from the shells it spawns.
 On macOS, `Operation not permitted` on a file is usually privacy consent: `aterm ctl privacy` names it, and only a person's grant lifts it.
 On macOS, a look into the person's Documents, Desktop or Downloads folder, a volume, a folder another app syncs, or other apps' data (any `defaults` domain, another app's container, the Music or Photos library) can put a dialog on their screen, whether or not they asked for that look, and the looking program waits until they answer it; aterm's Full Disk Access prevents that only for the three folders and volumes.
@@ -38,7 +44,7 @@ const RUST_NOTE: &str = "\
 ## Rust: the Trust toolchain is the default wherever `$ATPKG_BIN` is set and Trust has a build for the machine
 `targo` (cargo), `trustc` (rustc), `tippy` (clippy), `trustfmt` (rustfmt). `targo --unverified <cmd>` builds with no proof claim, `targo trust <cmd>` verifies, and a bare `targo build` is refused until a lane is named.
 `aterm help rust` measures which compiler this directory gets; where it or `aterm pkg which targo` says `unavailable on <target>`, Trust has no build here and stock `cargo` is the toolchain. `'rustc' is not installed for the custom toolchain 'trust'` is a stale link: `aterm pkg repair`.
-`brew` in an aterm session is `abrew`, aterm's native Homebrew (`aterm help abrew`): it announces itself, installs relocation-free bottles and simple casks into its own prefix, and delegates everything else (source builds, services, DMG/pkg casks, relocation) to real brew before any effect. `brew --real <cmd>` (or `ABREW_REAL=1`) runs real Homebrew unchanged.";
+`brew` in an aterm session is `abrew`, aterm's native Homebrew (`aterm help abrew`): it announces itself, installs bottles and tar/zip/DMG/single-file casks into its own prefix, and delegates the rest (source builds, services, pkg casks, bottles it cannot relocate) to real brew before any effect. `brew --real <cmd>` (or `ABREW_REAL=1`) runs real Homebrew unchanged.";
 
 const CODEX_ADDENDUM: &str = "\
 Every `aterm ctl` verb here answers `Operation not permitted (os error 1)`: the control
@@ -2578,7 +2584,10 @@ A worker's report ends with `ATERM-TASK-DONE` on a line by itself.
         let codex_md = home.path().join(".codex/AGENTS.md");
         std::fs::create_dir_all(claude_md.parent().unwrap()).unwrap();
         std::fs::create_dir_all(codex_md.parent().unwrap()).unwrap();
-        let left = format!("# mine\n\n{}", primer_block(Some("codex")));
+        let left = format!(
+            "# mine\n\n{}",
+            marked(&primer_block(Some("codex")), ROW_BY_ROW_VERSION)
+        );
         std::fs::write(&claude_md, left).unwrap();
         std::os::unix::fs::symlink(&claude_md, &codex_md).unwrap();
         let shared = format!("# mine\n\n{}", generic());
@@ -2647,6 +2656,92 @@ A worker's report ends with `ATERM-TASK-DONE` on a line by itself.
         std::fs::write(&codex_md, "# codex\n").unwrap();
         let (apart, reads) = counted_pass(home.path());
         assert_eq!(reads, 2, "{}", apart.summary);
+        assert_eq!(std::fs::read_to_string(&claude_md).unwrap(), shared);
+        assert_eq!(
+            std::fs::read_to_string(&codex_md).unwrap(),
+            format!("# codex\n\n{}", primer_block(Some("codex")))
+        );
+    }
+
+    /// The marker version of the last aterm that primed row by row (0.113.0):
+    /// each detected agent's own block, in registry order, into its context
+    /// file, so a file Codex shares with Claude Code was left holding Codex's.
+    #[cfg(unix)]
+    const ROW_BY_ROW_VERSION: u32 = 33;
+
+    /// `block` as an aterm that marks its blocks `v{version}` writes it.
+    #[cfg(unix)]
+    fn marked(block: &str, version: u32) -> String {
+        let ours = marker_version(MARK_BEGIN).expect("our marker names its version");
+        block.replacen(&format!("v{ours} "), &format!("v{version} "), 1)
+    }
+
+    /// A file two agents share keeps its generic block while an aterm that
+    /// primed row by row still runs beside this one (each window is its own
+    /// process, updated on its own): the block's marker is newer than that
+    /// aterm's, so its pass reads it `newer` and writes nothing. At an equal
+    /// version its Codex row read the generic block `stale` and put the Codex
+    /// sandbox paragraph back into Claude Code's file, and the two builds
+    /// rewrote it in turn for as long as both ran. NEGATIVE CONTROL: that
+    /// aterm still primes a file Codex alone reads, where nothing newer is, and
+    /// this pass then reads its block `stale` and rewrites it.
+    #[cfg(unix)]
+    #[test]
+    fn a_row_by_row_aterm_leaves_a_shared_files_generic_block() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let claude_md = home.path().join(".claude/CLAUDE.md");
+        let codex_md = home.path().join(".codex/AGENTS.md");
+        std::fs::create_dir_all(claude_md.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(codex_md.parent().unwrap()).unwrap();
+        std::fs::write(&claude_md, "# mine\n").unwrap();
+        std::os::unix::fs::symlink(&claude_md, &codex_md).unwrap();
+        auto_prime(home.path());
+        let shared = format!("# mine\n\n{}", generic());
+        assert_eq!(std::fs::read_to_string(&claude_md).unwrap(), shared);
+
+        // That aterm's pass: every detected agent's own block, row by row.
+        let row_by_row = || -> Vec<(&str, Result<PrimerWrite, String>)> {
+            AGENT_FILES
+                .iter()
+                .filter(|a| detected(home.path(), None, a))
+                .map(|a| {
+                    let dir = home_join(home.path(), None, a.dir);
+                    let block = marked(&block_for(a), ROW_BY_ROW_VERSION);
+                    let file = home_join(home.path(), None, a.file);
+                    (a.name, upsert_primer_file(&file, &block, Room::Below(&dir)))
+                })
+                .collect()
+        };
+        assert_eq!(
+            row_by_row(),
+            [
+                ("claude", Ok(PrimerWrite::Current)),
+                ("codex", Ok(PrimerWrite::Current))
+            ]
+        );
+        assert_eq!(std::fs::read_to_string(&claude_md).unwrap(), shared);
+        let pass = auto_prime(home.path());
+        assert!(!pass.changed(), "{}", pass.summary);
+
+        std::fs::remove_file(&codex_md).unwrap();
+        std::fs::write(&codex_md, "# codex\n").unwrap();
+        assert_eq!(
+            row_by_row(),
+            [
+                ("claude", Ok(PrimerWrite::Current)),
+                ("codex", Ok(PrimerWrite::Appended))
+            ]
+        );
+        let pass = auto_prime(home.path());
+        let rows: Vec<(&str, Outcome)> = pass
+            .agents
+            .iter()
+            .map(|a| (a.agent, a.outcome.clone()))
+            .collect();
+        assert_eq!(
+            rows,
+            [("claude", Outcome::Unchanged), ("codex", Outcome::Updated)]
+        );
         assert_eq!(std::fs::read_to_string(&claude_md).unwrap(), shared);
         assert_eq!(
             std::fs::read_to_string(&codex_md).unwrap(),

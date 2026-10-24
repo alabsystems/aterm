@@ -71,6 +71,42 @@ pub(super) fn wait(pid: u32, block: bool) -> io::Result<Option<Rusage>> {
     }
 }
 
+/// Whether `pid`, the caller's own child, has exited, left unreaped (`waitid` with `WNOWAIT`).
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+pub(super) fn exited(pid: u32) -> io::Result<bool> {
+    loop {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        // SAFETY: `info` is one writable `siginfo_t` that `waitid` does not retain; the pid is
+        // the caller's own child, which `WNOWAIT` leaves unreaped.
+        let got = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if got == 0 {
+            // SAFETY: zeroed plain data, which `waitid` filled or, with no exit to report under
+            // `WNOHANG`, left with `si_pid` 0.
+            return Ok(unsafe { info.assume_init().si_pid() } != 0);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+/// See the Apple and Linux twin.
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+pub(super) fn exited(_pid: u32) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "an unreaped exit is read on Darwin and Linux only",
+    ))
+}
+
 #[cfg(not(all(
     target_pointer_width = "64",
     any(target_vendor = "apple", target_os = "linux")

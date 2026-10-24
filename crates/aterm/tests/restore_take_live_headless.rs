@@ -12,9 +12,7 @@ use std::time::Duration;
 use crate::live_ctl::Ctl;
 use crate::{headless_boot, launch_isolation};
 
-/// A wait for something that must happen is a hang detector (AGENTS.md).
 const HANG: Duration = aterm_spec::wait::MUST_HAPPEN;
-/// How often a wait asks again.
 const GAP: Duration = Duration::from_millis(25);
 
 /// Seam giving a headless instance a window's desk (`aterm-gui`'s `desk::HEADLESS_RESTORE_SEAM`).
@@ -105,13 +103,11 @@ impl Proc {
         self.child.id()
     }
 
-    /// SIGKILL it and reap it: the end that runs no handler at all.
     fn kill(mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
 
-    /// Quit the instance via `invoke Quit`.
     fn quit(mut self) {
         let _ = Ctl::connect(&self.sock).line("invoke Quit");
         let ended = aterm_spec::wait::within(HANG, GAP, || self.child.try_wait().ok().flatten());
@@ -195,7 +191,6 @@ fn session_titles(proc: &Proc) -> Vec<String> {
     titles
 }
 
-/// Seed `world` with a quit layout.
 fn seed(world: &World) {
     let q = boot(world, "q", false);
     {
@@ -215,15 +210,12 @@ fn seed(world: &World) {
     assert!(world.quit_layout().exists(), "the quit wrote its layout");
 }
 
-/// The seeded tabs' titles.
 const TITLES: [&str; 2] = ["qone", "qtwo"];
 
-/// Whether `titles` holds both seeded tabs.
 fn holds_the_seeded_tabs(titles: &[String]) -> bool {
     TITLES.iter().all(|title| titles.iter().any(|t| t == title))
 }
 
-/// Whether `titles` holds either seeded tab.
 fn holds_a_seeded_tab(titles: &[String]) -> bool {
     TITLES.iter().any(|title| titles.iter().any(|t| t == title))
 }
@@ -240,8 +232,7 @@ fn restored_titles(world: &World, proc: &Proc) -> Vec<String> {
     session_titles(proc)
 }
 
-/// A is SIGKILLed with its build held, L boots meanwhile and leaves A's take alone, and B
-/// brings back both layouts' tabs.
+/// If A is killed mid-build while L runs and quits, B restores both layouts' tabs.
 #[test]
 fn a_launch_killed_inside_its_event_loop_build_leaves_the_quit_layout_to_the_next() {
     let world = World::new("kill");
@@ -294,8 +285,7 @@ fn a_launch_killed_inside_its_event_loop_build_leaves_the_quit_layout_to_the_nex
     assert!(!world.quit_layout().exists(), "B took L's layout too");
 }
 
-/// THE BRAKE: A, then B (which took A's layout again), die inside their builds, and C sets
-/// the twice-lost layout aside.
+/// After two consecutive launches die mid-build, the third sets the layout aside.
 #[test]
 fn a_layout_taken_again_and_lost_again_is_not_taken_a_third_time() {
     let world = World::new("brake");

@@ -4,10 +4,7 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/activation.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-//! Modified by the aterm project in 2026; see the repository NOTICE. (Only the launchee's
-//! half survives: naming the launch on the window and ending its sequence. Requesting a token
-//! for a launch of our own is cut. The messages are aterm-x11's `ClientMessage`s, where
-//! upstream used x11rb's.)
+//! Launchee X11 startup notification (`_NET_STARTUP_ID` and `_NET_STARTUP_INFO` remove).
 
 use aterm_x11::proto::event::ClientMessage;
 use aterm_x11::proto::xproto;
@@ -60,16 +57,13 @@ impl XConnection {
     }
 }
 
-/// The X server time of the user action behind `startup_id`: the decimal stamp after its last
-/// `_TIME`, which a launcher appends (libstartup-notification's
-/// `<launcher>/<launchee>/<pid>-<seq>-<host>_TIME<time>`) and GTK reads the same way.
+/// Extracts the X server timestamp after the last `_TIME` in `startup_id`.
 pub(crate) fn startup_time(startup_id: &str) -> Option<u32> {
     let (_, after) = startup_id.rsplit_once("_TIME")?;
     let digits = after.find(|c: char| !c.is_ascii_digit()).unwrap_or(after.len());
     after[..digits].parse().ok()
 }
 
-/// The `remove` message for `startup_id`, NUL-terminated as the spec frames it.
 fn remove_message(startup_id: &str) -> Vec<u8> {
     let mut message = b"remove: ID=".to_vec();
     quote_value(startup_id, &mut message);
@@ -77,8 +71,6 @@ fn remove_message(startup_id: &str) -> Vec<u8> {
     message
 }
 
-/// Quote a value as the specification reads one: in double quotes, with `"` and `\`
-/// escaped by a backslash.
 fn quote_value(value: &str, target: &mut Vec<u8>) {
     target.push(b'"');
     for &byte in value.as_bytes() {
@@ -94,8 +86,6 @@ fn quote_value(value: &str, target: &mut Vec<u8>) {
 mod tests {
     use super::*;
 
-    /// The message a launcher's monitor parses: the key, the quoted id with its
-    /// quotes and backslashes escaped, and the terminating NUL.
     #[test]
     fn the_remove_message_quotes_the_id_and_ends_in_nul() {
         assert_eq!(remove_message(""), b"remove: ID=\"\"\0");
@@ -106,9 +96,6 @@ mod tests {
         assert_eq!(remove_message("a\"b\\c d"), b"remove: ID=\"a\\\"b\\\\c d\"\0");
     }
 
-    /// The stamp a raise is made for: the digits after the id's last `_TIME`, as GNOME
-    /// Shell's activation token for a notification click carries them. An id with no stamp,
-    /// an empty one, or one past 32 bits has none, and the raise asks with `CURRENT_TIME`.
     #[test]
     fn a_startup_id_s_time_is_the_stamp_after_its_last_time() {
         assert_eq!(startup_time("gnome-shell/aterm/4242-0-host_TIME5678"), Some(5678));

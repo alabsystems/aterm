@@ -128,6 +128,20 @@ pub mod fault {
         AwaitFromAnyone,
         /// [`wake_atoms::admit`](super::wake_atoms::admit) probes the path before it judges it.
         CanonicalizeAtRead,
+        /// The task door notes a managed session's line and the door types it too: the managed
+        /// guard is dropped from the break's guards.
+        NoteAndType,
+        /// The task door notes its episode again at every break.
+        NoteEachBreak,
+        /// The task door notes under `observe` as well, with no grant.
+        NoteUnderObserve,
+        /// The task door notes a line the managed guard holds whatever else holds it (the
+        /// autopilot's, under Land).
+        NoteOnManagedAlone,
+        /// A line's write before the loop's first fold reads no task record
+        /// (`Session::managed_at_write`): the managed guard judges a worker no one has read as
+        /// unmanaged.
+        ManagedUnread,
     }
 
     thread_local! {
@@ -191,6 +205,11 @@ pub(crate) mod fault {
         ReleaseAfterTyped,
         AwaitFromAnyone,
         CanonicalizeAtRead,
+        NoteAndType,
+        NoteEachBreak,
+        NoteUnderObserve,
+        NoteOnManagedAlone,
+        ManagedUnread,
     }
 
     /// The shipped build: never armed.

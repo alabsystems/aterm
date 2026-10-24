@@ -1352,7 +1352,7 @@ fn recover_orphaned_prepared_candidate(
         return Ok(());
     }
     let fixed = rollback_path(installed);
-    UnprovenCandidate::check(staging, &fixed, unix_now_secs())?;
+    UnprovenCandidate::check(staging, &fixed, ProbeClock::now())?;
     let recoverable = verified_bundle_identity(&fixed).is_ok_and(|(build, commit)| {
         same_volume(&fixed, installed)
             && build > current_build
@@ -1545,7 +1545,7 @@ fn prepare_fixed_swap_candidate(
 ) -> Result<PreparedSwapCandidate, String> {
     let staged = &staging.staged_app;
     let fixed = rollback_path(installed);
-    UnprovenCandidate::check(staging, &fixed, unix_now_secs())?;
+    UnprovenCandidate::check(staging, &fixed, ProbeClock::now())?;
     clear_kept_predecessor(staging);
     remove_path_no_follow(&fixed)
         .map_err(|error| format!("remove stale fixed rollback: {error}"))?;
@@ -2144,6 +2144,91 @@ fn sweep_stale_extracts(staging: &Staging) {
 fn sweep_stale_scratch(staging: &Staging) {
     sweep_stale_mounts(staging);
     sweep_stale_extracts(staging);
+    sweep_left_incoming(staging, std::time::SystemTime::now());
+}
+
+/// [`sweep_left_incoming`] when the stage lock is free, which every check runs: one that
+/// stages nothing (up to date, covered, held) still reclaims what an earlier stage left,
+/// and one that finds the lock held leaves them to a later sweep. Returns when a later
+/// sweep has work: the longest hold this one kept, or FIRST_EXEC_HANG while a stage holds
+/// the lock; `None` when nothing is left to wait for.
+pub(crate) fn sweep_left_incoming_unless_staging(staging: &Staging) -> Option<std::time::Duration> {
+    match FileLock::acquire_within(&staging.stage_lock, std::time::Duration::ZERO) {
+        Ok(_stage_lock) => sweep_left_incoming(staging, std::time::SystemTime::now()),
+        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+            Some(aterm_uds::deadline::FIRST_EXEC_HANG)
+        }
+        Err(_) => None,
+    }
+}
+
+/// [`sweep_left_incoming_unless_staging`] now and again after each wait it returns, until
+/// nothing is left to wait for: the sweep of a copy no scheduled check sweeps for.
+pub(crate) fn sweep_left_incoming_until_none_held(
+    staging: &Staging,
+    sleep: &dyn Fn(std::time::Duration),
+) {
+    while let Some(wait) = sweep_left_incoming_unless_staging(staging) {
+        sleep(wait);
+    }
+}
+
+/// Reclaims the bundles earlier stages left in `staged/` (`.aterm-incoming-<nonce>.app`), each
+/// once the exec stamp beside it ([`incoming_exec_home`]) lets it go
+/// ([`aterm_uds::deadline::copy_may_go`]). One with no stamp (a stage that never started it, or
+/// an earlier build's, which stamped nothing) is stamped now and goes on a later sweep, so
+/// whatever started it has had FIRST_EXEC_HANG since; a stamp whose bundle is gone goes too.
+/// Runs under the stage lock, so no stage is in flight. Returns the longest hold it kept.
+fn sweep_left_incoming(
+    staging: &Staging,
+    now: std::time::SystemTime,
+) -> Option<std::time::Duration> {
+    let Ok(entries) = std::fs::read_dir(staging.staged_dir()) else {
+        return None;
+    };
+    let mut longest = None;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(rest) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix(".aterm-incoming-"))
+        else {
+            continue;
+        };
+        let path = entry.path();
+        if let Some(nonce) = rest.strip_suffix(".app.exec") {
+            let bundle = path.with_file_name(format!(".aterm-incoming-{nonce}.app"));
+            if aterm_codec::hex::is_hex(nonce, 32)
+                && std::fs::symlink_metadata(&bundle)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            {
+                let _ = std::fs::remove_dir_all(&path);
+            }
+            continue;
+        }
+        let Some(nonce) = rest.strip_suffix(".app") else {
+            continue;
+        };
+        if !aterm_codec::hex::is_hex(nonce, 32)
+            || !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir())
+        {
+            continue;
+        }
+        let home = incoming_exec_home(&path);
+        let held = if std::fs::symlink_metadata(&home).is_err() {
+            stamp_incoming_exec(&path)
+                .is_ok()
+                .then_some(aterm_uds::deadline::FIRST_EXEC_HANG)
+        } else {
+            let left = aterm_uds::deadline::copy_wait_left(&home, now);
+            if left.is_none() && std::fs::remove_dir_all(&path).is_ok() {
+                let _ = std::fs::remove_dir_all(&home);
+            }
+            left
+        };
+        longest = longest.max(held);
+    }
+    longest
 }
 
 fn canonical_release_commit(commit: Option<&str>) -> Option<String> {
@@ -2254,31 +2339,153 @@ fn probe_left_unproven(error: &str) -> bool {
         || (!stage_failure_is_a_verdict(error) && !error.starts_with("spawn "))
 }
 
+/// This build's [`UnprovenCandidate`] record. Each record format has a file of its own, so an
+/// earlier build never reads, and so never drops, a later build's record.
 fn unproven_candidate_path(staging: &Staging) -> PathBuf {
+    staging.root.join("fixed.unproven.v2")
+}
+
+/// The `v1` record earlier builds write, after their probe was killed: honoured here, never
+/// written.
+fn legacy_unproven_candidate_path(staging: &Staging) -> PathBuf {
     staging.root.join("fixed.unproven")
 }
 
+/// A clock reading for [`UnprovenCandidate`]: the awake clock
+/// ([`aterm_uds::process::awake_ms`]), which a sleep does not advance, and the wall clock for
+/// when that cannot be read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProbeClock {
+    awake_ms: Option<u64>,
+    wall_secs: u64,
+}
+
+impl ProbeClock {
+    fn now() -> Self {
+        Self {
+            awake_ms: aterm_uds::process::awake_ms(),
+            wall_secs: unix_now_secs(),
+        }
+    }
+
+    /// Milliseconds from `self` to `now` on the awake clock, `None` when it reads below
+    /// `self` (a restart since); without it, on the wall clock, which a backward step cannot
+    /// age.
+    fn since(self, now: Self) -> Option<u64> {
+        match (self.awake_ms, now.awake_ms) {
+            (Some(at), Some(awake)) => awake.checked_sub(at),
+            _ => Some(
+                now.wall_secs
+                    .saturating_sub(self.wall_secs)
+                    .saturating_mul(1000),
+            ),
+        }
+    }
+}
+
+/// `fixed.unproven.v2`: the candidate a start probe is about to start, written before the
+/// probe starts it and cleared when the probe saw an exit of its own or never started the
+/// candidate, so an apply killed mid-probe still holds the candidate where it ran for
+/// [`aterm_uds::deadline::FIRST_EXEC_HANG`] of awake time, or until a restart, after which the
+/// record is dropped. Every install sharing this Updates root shares the one record, and every
+/// one's swap defers while it holds; so it does while an earlier build's `fixed.unproven`
+/// holds (on the wall clock), and while a record this build cannot parse is younger than
+/// FIRST_EXEC_HANG by its file's mtime.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct UnprovenCandidate {
     bundle: PathBuf,
-    killed_at: u64,
+    started: ProbeClock,
+}
+
+/// What a record file holds.
+enum RecordAt {
+    /// Nothing, or something that is not a regular file.
+    Absent,
+    Parsed(UnprovenCandidate),
+    /// A record this build cannot parse, as of its file's mtime.
+    Unparsed(ProbeClock),
 }
 
 impl UnprovenCandidate {
-    fn check(staging: &Staging, fixed: &Path, now: u64) -> Result<(), String> {
-        let Some(left) = Self::holds(staging, fixed, now) else {
-            return Ok(());
-        };
-        Err(verify::mark_passing(format!(
-            "the candidate at {} was started by a start probe killed before it exited, and \
-             macOS may still be assessing its first exec; it stays where it is for {left} s \
-             more",
-            fixed.display()
-        )))
+    /// Defers while a record holds a candidate, this install's at `fixed` or another's, and
+    /// while a record cannot be read.
+    fn check(staging: &Staging, fixed: &Path, now: ProbeClock) -> Result<(), String> {
+        for path in [
+            unproven_candidate_path(staging),
+            legacy_unproven_candidate_path(staging),
+        ] {
+            let (bundle, left) = match Self::holds_at(&path, now) {
+                Ok(None) => continue,
+                Ok(Some(held)) => held,
+                Err(error) => {
+                    let message = format!(
+                        "could not read the unproven-candidate record at {}: {error}; the \
+                         candidate it may hold stays where it is",
+                        path.display()
+                    );
+                    return Err(if verify::io_error_is_passing(&error) {
+                        verify::mark_passing(message)
+                    } else {
+                        message
+                    });
+                }
+            };
+            let Some(bundle) = bundle else {
+                return Err(verify::mark_passing(format!(
+                    "the unproven-candidate record at {} is in a format this build cannot \
+                     read; the candidate it may hold stays where it is for {left} s more",
+                    path.display()
+                )));
+            };
+            let whose = if bundle == fixed {
+                "the candidate"
+            } else {
+                "another install's candidate"
+            };
+            return Err(verify::mark_passing(format!(
+                "{whose} at {} was started by a start probe that saw no exit of its own, and \
+                 macOS may still be assessing its first exec; it stays where it is for {left} s \
+                 more",
+                bundle.display()
+            )));
+        }
+        Ok(())
     }
 
-    fn read(staging: &Staging) -> Option<Self> {
-        Self::parse(&crate::read_ledger_text(&unproven_candidate_path(staging))?)
+    /// This build's record, `None` unless it parses.
+    #[cfg(test)]
+    fn read(staging: &Staging) -> std::io::Result<Option<Self>> {
+        Ok(match Self::read_at(&unproven_candidate_path(staging))? {
+            RecordAt::Parsed(record) => Some(record),
+            RecordAt::Absent | RecordAt::Unparsed(_) => None,
+        })
+    }
+
+    fn read_at(path: &Path) -> std::io::Result<RecordAt> {
+        if let Some(record) = crate::read_ledger_text_checked(path)?
+            .as_deref()
+            .and_then(Self::parse)
+        {
+            return Ok(RecordAt::Parsed(record));
+        }
+        let meta = match std::fs::metadata(path) {
+            Ok(meta) if meta.is_file() => meta,
+            Ok(_) => return Ok(RecordAt::Absent),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(RecordAt::Absent);
+            }
+            Err(error) => return Err(error),
+        };
+        let written = meta
+            .modified()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        Ok(RecordAt::Unparsed(ProbeClock {
+            awake_ms: None,
+            wall_secs: written
+                .as_secs()
+                .saturating_add(u64::from(written.subsec_nanos() > 0)),
+        }))
     }
 
     fn parse(text: &str) -> Option<Self> {
@@ -2286,24 +2493,37 @@ impl UnprovenCandidate {
 
         let mut lines = text.lines();
         let mut fields = lines.next()?.split_whitespace();
-        if fields.next()? != "v1" {
-            return None;
-        }
-        let killed_at = fields.next()?.parse().ok()?;
+        let version = fields.next()?;
+        let wall_secs = fields.next()?.parse().ok()?;
+        // A v1 record, written after its probe was killed, carries the wall clock alone.
+        let awake_ms = match (version, fields.next()) {
+            ("v1", None) | ("v2", Some("-")) => None,
+            ("v2", Some(ms)) => Some(ms.parse().ok()?),
+            _ => return None,
+        };
         let bytes = aterm_codec::hex::decode_vec(lines.next()?.as_bytes())?;
         if fields.next().is_some() || lines.next().is_some() || bytes.contains(&0) {
             return None;
         }
         let bundle = PathBuf::from(std::ffi::OsString::from_vec(bytes));
-        bundle.is_absolute().then_some(Self { bundle, killed_at })
+        bundle.is_absolute().then_some(Self {
+            bundle,
+            started: ProbeClock {
+                awake_ms,
+                wall_secs,
+            },
+        })
     }
 
     fn encode(&self) -> String {
         use std::os::unix::ffi::OsStrExt;
 
         format!(
-            "v1 {}\n{}\n",
-            self.killed_at,
+            "v2 {} {}\n{}\n",
+            self.started.wall_secs,
+            self.started
+                .awake_ms
+                .map_or_else(|| "-".to_string(), |ms| ms.to_string()),
             aterm_codec::hex::encode_lower(self.bundle.as_os_str().as_bytes())
         )
     }
@@ -2312,37 +2532,43 @@ impl UnprovenCandidate {
         write_private_file(&unproven_candidate_path(staging), self.encode().as_bytes())
     }
 
-    fn holds(staging: &Staging, fixed: &Path, now: u64) -> Option<u64> {
-        let hang = aterm_uds::deadline::FIRST_EXEC_HANG.as_secs();
-        let Some(record) = Self::read(staging) else {
-            let _ = std::fs::remove_file(unproven_candidate_path(staging));
-            return None;
+    fn clear(staging: &Staging) {
+        let _ = std::fs::remove_file(unproven_candidate_path(staging));
+    }
+
+    /// The candidate the record at `path` holds and the seconds it stays, whichever install's
+    /// path it names (`None` for a record this build cannot parse, which may name any), or
+    /// `None`, dropping a record whose hold is spent; one that cannot be read is kept and its
+    /// error returned.
+    fn holds_at(path: &Path, now: ProbeClock) -> std::io::Result<Option<(Option<PathBuf>, u64)>> {
+        let hang = aterm_uds::deadline::FIRST_EXEC_HANG
+            .as_secs()
+            .saturating_mul(1000);
+        let (bundle, started) = match Self::read_at(path)? {
+            RecordAt::Absent => return Ok(None),
+            RecordAt::Parsed(record) => (Some(record.bundle), record.started),
+            RecordAt::Unparsed(written) => (None, written),
         };
-        let since = now.saturating_sub(record.killed_at);
-        if since >= hang {
-            let _ = std::fs::remove_file(unproven_candidate_path(staging));
-            return None;
-        }
-        (record.bundle == fixed).then(|| hang - since)
+        let left = started
+            .since(now)
+            .and_then(|since| hang.checked_sub(since))
+            .filter(|left| *left > 0);
+        let Some(left) = left else {
+            let _ = std::fs::remove_file(path);
+            return Ok(None);
+        };
+        Ok(Some((bundle, left.div_ceil(1000))))
     }
 }
 
-fn keep_unproven_candidate(prepared: &PreparedSwapCandidate, staging: &Staging, now: u64) {
-    let kept = UnprovenCandidate {
-        bundle: prepared.fixed.clone(),
-        killed_at: now,
-    };
-    if let Err(error) = kept.record(staging) {
-        crate::warn(&format!(
-            "could not record the unproven candidate at {}: {error}",
-            prepared.fixed.display()
-        ));
-    }
+/// Leave a candidate whose start probe saw no exit of its own where it ran, held by the
+/// [`UnprovenCandidate`] record written before the probe.
+fn keep_unproven_candidate(prepared: &PreparedSwapCandidate, staging: &Staging) {
     if prepared.moved_from_stage {
         staging.retire_published();
     }
     crate::warn(&format!(
-        "the start probe of {} was killed before it exited; it stays there while macOS may \
+        "the start probe of {} saw no exit of its own; it stays there while macOS may \
          still be assessing its first exec",
         prepared.fixed.display()
     ));
@@ -2700,6 +2926,26 @@ impl Drop for StageIncoming {
         // Remove only an empty reservation; a retained candidate keeps its path across assessment.
         let _ = std::fs::remove_dir(&self.path);
     }
+}
+
+/// Where `incoming`'s exec is stamped ([`aterm_uds::deadline::stamp_exec`]): a directory
+/// beside the bundle, since a file in a bundle's root breaks its seal.
+fn incoming_exec_home(incoming: &Path) -> PathBuf {
+    let mut home = incoming.as_os_str().to_os_string();
+    home.push(".exec");
+    PathBuf::from(home)
+}
+
+/// Stamps `incoming`'s exec in a new [`incoming_exec_home`]; without the awake clock the
+/// stamp is blank and the directory's mtime dates it. When the stamp cannot be written the
+/// home goes too, since a home with no stamp would age on the wall clock.
+fn stamp_incoming_exec(incoming: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    let home = incoming_exec_home(incoming);
+    std::fs::DirBuilder::new().mode(0o700).create(&home)?;
+    aterm_uds::deadline::try_stamp_exec(&home).inspect_err(|_| {
+        let _ = std::fs::remove_dir_all(&home);
+    })
 }
 
 /// Mount `dmg`, copy out `aterm.app`, verify its signature and identity, and atomically publish `staged/aterm.app` and `ready.toml`.
@@ -3192,7 +3438,25 @@ fn verify_and_publish_incoming(
         roster_read_at,
     );
     let probed = match stage_withdrawn(staging, &ready) {
-        Ok(()) => verify::probe_staged_bundle_starts(incoming, bundle_build),
+        Ok(()) => {
+            // The stamp goes down before the probe starts the bundle, so one the probe leaves
+            // unproven stays where it ran until a later sweep finds the stamp spent
+            // ([`sweep_left_incoming`]); with no stamp, no probe.
+            if let Err(error) = stamp_incoming_exec(incoming) {
+                return refuse(verify::mark_passing(format!(
+                    "could not stamp the staged bundle at {} before its start probe: {error}",
+                    incoming.display()
+                )));
+            }
+            let probed = verify::probe_staged_bundle_starts(incoming, bundle_build);
+            if !probed
+                .as_ref()
+                .is_err_and(|error| probe_left_unproven(error))
+            {
+                let _ = std::fs::remove_dir_all(incoming_exec_home(incoming));
+            }
+            probed
+        }
         Err(_) => Ok(()),
     };
     if let Err(error) = probed {
@@ -3678,12 +3942,36 @@ fn swap_admitted_stage(
     )?;
     let previous_receipt = previous_receipt_for_sealed_old(staging, old_build, &old_commit);
 
-    if let Err(error) = (seams.probe)(&prepared.fixed, ready.build_number) {
-        // A candidate whose start probe saw no exit of its own (killed at its ceiling, or ended
-        // by a signal) stays at its path while macOS finishes assessing it
-        // ([`keep_unproven_candidate`]); any other failure is backed out.
+    // The record goes down before the probe starts the candidate, so an apply killed
+    // mid-probe leaves it holding the candidate where it ran; with no record, no probe.
+    // `prepare_fixed_swap_candidate` deferred on any live record, and the apply lock keeps
+    // every other writer out, so this replaces none and the clear below drops only this one.
+    let started = UnprovenCandidate {
+        bundle: prepared.fixed.clone(),
+        started: ProbeClock::now(),
+    };
+    if let Err(error) = started.record(staging) {
+        recover_prepared_candidate(&prepared, staging);
+        return Err(ApplyOutcome::Deferred(verify::mark_passing(format!(
+            "could not record the candidate at {} before its start probe: {error}",
+            prepared.fixed.display()
+        ))));
+    }
+    let probed = (seams.probe)(&prepared.fixed, ready.build_number);
+    if !probed
+        .as_ref()
+        .is_err_and(|error| probe_left_unproven(error))
+    {
+        UnprovenCandidate::clear(staging);
+    }
+    if let Err(error) = probed {
+        // A probe that started the candidate and saw no exit of its own (killed at the
+        // probe's ceiling or by any other signal) leaves macOS assessing its first
+        // exec, which the kill does not end: the candidate stays exactly where it ran
+        // and its record stays ([`keep_unproven_candidate`]). Any other failure either
+        // ran it to an exit or never started it, and is backed out as before.
         if probe_left_unproven(&error) {
-            keep_unproven_candidate(&prepared, staging, unix_now_secs());
+            keep_unproven_candidate(&prepared, staging);
         } else {
             recover_prepared_candidate(&prepared, staging);
         }

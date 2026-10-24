@@ -4,9 +4,8 @@
 use std::sync::Arc;
 
 use aterm_core::render::{
-    FirePatch, FreeSampler, FreeSprite, FreeZ, FxArt, FxBlend, FxContent, FxInk, FxItem, FxLayer,
-    FxRamps, FxRect, FxSlot, FxSpace, FxSprite, FxTexels, GlowQuad, PxRect, RainHalo, RenderInput,
-    SceneAtlas,
+    FirePatch, FxArt, FxBlend, FxContent, FxInk, FxItem, FxLayer, FxRamps, FxRect, FxSlot, FxSpace,
+    FxSprite, FxTexels, GlowQuad, PxRect, RainHalo, RenderInput,
 };
 use aterm_core::terminal::Terminal;
 use aterm_render::{
@@ -419,71 +418,6 @@ fn each_slot_sits_where_the_gpu_draws_it() {
             assert!(both == stored, "{name}: hidden under the fx store");
         }
     }
-
-    let art = Arc::new(
-        FxArt::new(
-            2,
-            2,
-            FxTexels::Rgba8Straight,
-            [[200u8, 40, 10, 255]; 4].concat(),
-        )
-        .expect("sized"),
-    );
-    let atlas = Arc::new(SceneAtlas {
-        width: 2,
-        height: 2,
-        rgba: [[10u8, 220, 90, 255]; 4].concat(),
-        version: 1,
-    });
-    for (slot, z) in [
-        (FxSlot::Under, FreeZ::UnderText),
-        (FxSlot::Over, FreeZ::OverText),
-    ] {
-        let free = FreeSprite {
-            x: cw as i32,
-            y: ch as i32,
-            w: 8 * cw as u16,
-            h: 2 * ch as u16,
-            ax: 0,
-            ay: 0,
-            aw: 2,
-            ah: 2,
-            tint: 0x00FF_FFFF,
-            alpha: 255,
-            flip_x: false,
-            z,
-            sampler: FreeSampler::Nearest,
-        };
-        let fx = layer(
-            5,
-            vec![FxItem::Sprite(FxSprite {
-                x: cw as i32,
-                y: ch as i32,
-                dw: 8 * cw as u16,
-                dh: 2 * ch as u16,
-                flip_x: false,
-                art: art.clone(),
-                ink: 0,
-                clip: PxRect::EVERYWHERE,
-            })],
-            vec![FxInk::over(0x00FF_FFFF, 255)],
-            slot,
-            FxSpace::Grid,
-            FxBlend::Linear,
-        );
-        let add_free = |i: &mut RenderInput| {
-            i.free_sprites = vec![free];
-            i.free_atlas = Some(atlas.clone());
-        };
-        let alone = frame_of(&mut rend, &mut t, &[], add_free);
-        let fx_only = frame_of(&mut rend, &mut t, std::slice::from_ref(&fx), |_| {});
-        let both = frame_of(&mut rend, &mut t, std::slice::from_ref(&fx), add_free);
-        assert!(alone != fx_only, "{z:?}: the free sprite and the fx differ");
-        assert!(
-            both == fx_only,
-            "{z:?}: Linear fx draws right after the free sprites"
-        );
-    }
 }
 
 #[test]
@@ -557,80 +491,6 @@ fn grid_space_is_window_space_at_the_grid_origin() {
         g != render(&mut rend, &mut t, &unshifted),
         "CONTROL: unshifted differs"
     );
-}
-
-#[test]
-fn a_linear_fx_sprite_is_the_free_sprite_stamp() {
-    let mut rend = renderer();
-    rend.set_knock_out(false);
-    let (cw, ch) = rend.cell_size();
-    let (rows, cols) = (4u16, 14u16);
-    let mut t = term(rows, cols);
-    let art = straight_art(7, 9);
-    let atlas = Arc::new(SceneAtlas {
-        width: 7,
-        height: 9,
-        rgba: art.data().to_vec(),
-        version: 1,
-    });
-    let (tint, alpha) = (0x00e0_c0ff, 200);
-    for scale in [1u16, 3] {
-        for (slot, z, other) in [
-            (FxSlot::Under, FreeZ::UnderText, FxSlot::Over),
-            (FxSlot::Over, FreeZ::OverText, FxSlot::Under),
-        ] {
-            let (x, y) = (cw as i32 + 1, ch as i32 / 2);
-            let free = FreeSprite {
-                x,
-                y,
-                w: 7 * scale,
-                h: 9 * scale,
-                ax: 0,
-                ay: 0,
-                aw: 7,
-                ah: 9,
-                tint,
-                alpha,
-                flip_x: scale == 3,
-                z,
-                sampler: FreeSampler::Nearest,
-            };
-            let fx = |slot| {
-                layer(
-                    3,
-                    vec![FxItem::Sprite(FxSprite {
-                        x,
-                        y,
-                        dw: 7 * scale,
-                        dh: 9 * scale,
-                        flip_x: scale == 3,
-                        art: art.clone(),
-                        ink: 0,
-                        clip: PxRect::EVERYWHERE,
-                    })],
-                    vec![FxInk::over(tint, alpha)],
-                    slot,
-                    FxSpace::Grid,
-                    FxBlend::Linear,
-                )
-            };
-            let mut want = t.cell_frame(usize::from(rows), usize::from(cols));
-            want.free_sprites = vec![free];
-            want.free_atlas = Some(atlas.clone());
-            let want = rend.render_input(&want).pixels;
-            let got = rend
-                .render_input(&with_layers(&mut t, rows, cols, &[fx(slot)]))
-                .pixels;
-            assert!(got == want, "scale {scale}, {z:?}");
-            let swapped = rend
-                .render_input(&with_layers(&mut t, rows, cols, &[fx(other)]))
-                .pixels;
-            assert!(
-                swapped != want,
-                "CONTROL: scale {scale}, {z:?} at the other z"
-            );
-        }
-    }
 }
 
 struct Rng(u64);

@@ -358,9 +358,15 @@ fn codex_home_of(codex_home: Option<&str>, home: Option<&str>) -> Option<PathBuf
 /// atpkg's managed Codex twin, where one is configured and the build it execs
 /// is ALab's ([`codex_alab::alab_bytes`]).
 fn managed_alab_twin() -> Option<PathBuf> {
-    let twin = atpkg::store::resolve_configured()?
-        .agents_dir()
-        .join("codex");
+    alab_twin(
+        atpkg::store::resolve_configured()?
+            .agents_dir()
+            .join("codex"),
+    )
+}
+
+/// The atpkg twin `twin`, where the build it execs is ALab's ([`codex_alab::alab_bytes`]).
+pub(crate) fn alab_twin(twin: PathBuf) -> Option<PathBuf> {
     let exe = super::upgrade_catalog::twin_binary(&std::fs::read_to_string(&twin).ok()?)?;
     codex_alab::alab_bytes(&exe).then_some(twin)
 }

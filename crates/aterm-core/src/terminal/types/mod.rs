@@ -1,9 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-// Author: Andrew Yates
 
-//! Terminal type definitions. Public types live in `aterm-types`, and `CurrentStyle` /
-//! `SavedCursorState` in `aterm-grid`; this module re-exports them.
+//! Terminal type definitions.
 
 pub use crate::grid::{CurrentStyle, SavedCursorState};
 
@@ -13,8 +11,7 @@ pub use aterm_types::mouse::MouseMode;
 pub use aterm_types::osc::Iterm2ShellIntegrationVersion;
 pub use aterm_types::{ClipboardOperation, ClipboardSelection, CursorStyle, TerminalSize};
 
-/// Bitmask of the SGR attribute groups a selective XTPUSHSGR (`CSI # { Ps…`) saved;
-/// [`Self::from_params`] maps the xterm Ps values.
+/// Bitmask of the SGR attribute groups a selective XTPUSHSGR (`CSI # { Ps…`) saved.
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct SgrPushMask(u16);
 
@@ -115,8 +112,7 @@ impl SgrPushMask {
     }
 }
 
-/// SGR attribute stack entry for XTPUSHSGR/XTPOPSGR (`CSI # {` / `CSI # }`); a selective
-/// push (`CSI # { 1 ; 30`) saves and restores only the attributes in `mask`.
+/// SGR attribute stack entry for XTPUSHSGR/XTPOPSGR (`CSI # {` / `CSI # }`).
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct SgrStackEntry {
     /// Current style attributes (fg, bg, flags, protected).

@@ -83,11 +83,19 @@ struct Store {
     source: PathBuf,
     /// The record text the source build's `.vendor` holds (or one written).
     record: String,
+    /// The lab's run directory, where its holds on the scratch sit.
+    run: PathBuf,
 }
 
 impl Store {
     fn store(&self) -> PathBuf {
         self.prefix.join("store/agy")
+    }
+
+    /// Build `id` showed it ran (its composer drawn, its conversation's lock
+    /// held by an agy started from it): its hold on the scratch goes.
+    fn ran(&self, id: u64) {
+        crate::lab::release_scratch(&self.run, &format!("agy-{id}"));
     }
 
     fn twin(&self) -> PathBuf {
@@ -97,6 +105,8 @@ impl Store {
     fn land(&self, version: &str) -> Result<PathBuf, String> {
         let id = plain_build_id(version).ok_or("no build id")?;
         let bin = self.store().join(id.to_string()).join("bin/agy");
+        crate::lab::hold_scratch(&self.run, &format!("agy-{id}"))
+            .map_err(|e| format!("its hold on the scratch: {e}"))?;
         crate::sys::put(&bin, 0o755, &crate::sys::PutSrc::File(&self.source))
             .map_err(|e| format!("the build's tree: {e}"))?;
         let store = self.store();
@@ -294,6 +304,7 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
         prefix: run.w.join("home/Library/Application Support/aterm/pkg"),
         source: source.clone(),
         record: source_record,
+        run: run.run.clone(),
     };
     let v1 = run.agy_ver.clone();
     let versions: Vec<String> = (0..7).filter_map(|k| bumped(&v1, k)).collect();
@@ -338,6 +349,7 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
     if !door.seen("Antigravity CLI", 60)? || !door.seen("^>", 60)? {
         return Err(could_not("agy never drew its composer"));
     }
+    store.ran(ids[0]);
     door.await_idle(1500, 30)?;
     if !crate::verbs::turn(&door, &format!("remember the word {WORD}"))? {
         return Err(could_not("the first turn was not sent"));
@@ -396,6 +408,9 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
         return Ok(false);
     };
     show_moved(&m1, ids[1], "");
+    if m1.holds_lock {
+        store.ran(ids[1]);
+    }
     stop::sleep(Duration::from_secs(5))?;
     let silent = main_turns(&run) == turns_before;
     let probed = row_at(&m1.rows, "build-probe:starts").is_some();
@@ -459,6 +474,9 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
         )
     );
     let m2 = moved_onto(&run, &store.store(), ids[2], &conversation, pid, 180, t2)?;
+    if m2.as_ref().is_some_and(|m| m.holds_lock) {
+        store.ran(ids[2]);
+    }
     show_held(&run, t2);
     if let Some(m) = &m2 {
         show_moved(m, ids[2], "");
@@ -508,6 +526,9 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
         )
     );
     let m3 = moved_onto(&run, &store.store(), ids[3], &conversation, pid, 180, t3)?;
+    if m3.as_ref().is_some_and(|m| m.holds_lock) {
+        store.ran(ids[3]);
+    }
     show_held(&run, t3);
     if let Some(m) = &m3 {
         show_moved(m, ids[3], "");
@@ -552,6 +573,9 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
         )
     );
     let m4 = moved_onto(&run, &store.store(), ids[4], &conversation, pid, 180, t4)?;
+    if m4.as_ref().is_some_and(|m| m.holds_lock) {
+        store.ran(ids[4]);
+    }
     show_held(&run, t4);
     if let Some(m) = &m4 {
         show_moved(m, ids[4], "");
@@ -589,6 +613,9 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
         )
     );
     let m5 = moved_onto(&run, &store.store(), ids[5], &conversation, pid, 180, t5)?;
+    if m5.as_ref().is_some_and(|m| m.holds_lock) {
+        store.ran(ids[5]);
+    }
     show_held(&run, t5);
     if let Some(m) = &m5 {
         show_moved(m, ids[5], " after the turn");
@@ -642,6 +669,9 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
         }
     }
     let m6 = moved_onto(&run, &store.store(), ids[6], &conversation, pid, 180, t6)?;
+    if m6.as_ref().is_some_and(|m| m.holds_lock) {
+        store.ran(ids[6]);
+    }
     show_held(&run, t6);
     let between = turns_at_restart.map(|n| n.saturating_sub(turns_at_landing));
     println!(
@@ -735,5 +765,35 @@ mod tests {
         assert_eq!(bumped("1.4.0", 0).as_deref(), Some("1.4.0"));
         assert_eq!(bumped("1.4.0", 6).as_deref(), Some("1.4.6"));
         assert_eq!(bumped("1.4.10-R6427.1", 1), None);
+    }
+
+    /// A LANDED BUILD HOLDS THE SCRATCH UNTIL IT SHOWED IT RAN: each landing
+    /// holds it before its clone is laid, and a build shown to run releases
+    /// its own hold only. NEGATIVE CONTROL: the other build's hold stays.
+    #[test]
+    fn a_landed_build_holds_the_scratch_until_it_showed_it_ran() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let source = root.join("agy");
+        std::fs::write(&source, "a build").unwrap();
+        let store = Store {
+            prefix: root.join("pkg"),
+            source,
+            record: String::new(),
+            run: root.join("run"),
+        };
+        let ids = ["1.4.0", "1.4.1"].map(|v| plain_build_id(v).unwrap());
+        let held = |id: u64| {
+            root.join("run")
+                .join(crate::lab::HELD)
+                .join(format!("agy-{id}"))
+        };
+        for v in ["1.4.0", "1.4.1"] {
+            assert!(store.land(v).unwrap().is_file(), "{v}");
+        }
+        assert!(held(ids[0]).is_dir() && held(ids[1]).is_dir());
+        store.ran(ids[0]);
+        assert!(!held(ids[0]).exists(), "shown to run");
+        assert!(held(ids[1]).is_dir(), "the other build still holds it");
     }
 }

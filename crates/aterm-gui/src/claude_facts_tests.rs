@@ -173,7 +173,19 @@ fn a_reader_hears_each_fact_in_words() {
     );
     assert_eq!(
         spoken(Fact::Branch, mask(&[FactKind::Branch])),
-        ("Branch: hidden".into(), "Activate to show it again.".into())
+        (
+            "Branch: main off".into(),
+            "Activate to show it again.".into()
+        ),
+        "a stub is named as it is drawn: `\u{2387} main off`"
+    );
+    assert_eq!(
+        spoken(Fact::Model, mask(&[FactKind::Model])).0,
+        "Model: Opus 5.5 off"
+    );
+    assert_eq!(
+        spoken(Fact::Effort, mask(&[FactKind::Effort])).0,
+        "Effort: xhigh off"
     );
     assert_eq!(tokens_spoken(940), "940");
     assert_eq!(tokens_spoken(1_200), "1.2 thousand");
@@ -183,6 +195,8 @@ fn a_reader_hears_each_fact_in_words() {
     assert_eq!(runtime_spoken(42), "42 seconds");
     assert_eq!(runtime_spoken(7 * 3600 + 52 * 60), "7 hours 52 minutes");
     assert_eq!(runtime_spoken(3600 + 60), "1 hour 1 minute");
+    assert_eq!(runtime_spoken(60), "1 minute", "no `0 seconds`");
+    assert_eq!(runtime_spoken(2 * 3600), "2 hours", "no `0 minutes`");
 }
 
 /// AN ACCOUNT WITH NO WEEKLY FIGURE says why in its title, in the footer's own words

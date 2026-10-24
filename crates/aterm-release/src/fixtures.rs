@@ -33,6 +33,10 @@ pub const STAGED_ANSWERS: &str = "shipped-state.txt";
 /// Environment variable naming where the generator writes [`STAGED_ANSWERS`].
 pub const ANSWERS_OUT: &str = "ATERM_SHIPPED_STATE_OUT";
 
+/// Written in the generator's target before it runs and removed once the release judged
+/// what it built there: found by a later stage, it means no release did.
+pub const UNJUDGED: &str = "unjudged";
+
 /// Release identity pins stamped into generated fixtures.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pins {
@@ -187,7 +191,30 @@ pub fn stage(
     let dir = at.join(pins.tag());
     fs::create_dir_all(&dir).map_err(|e| io("cannot create", &dir, e))?;
     let target = tree.join(HANDOFF_FIXTURE_GUARD_TARGET);
+    let unjudged = target.join(UNJUDGED);
+    if fs::symlink_metadata(&unjudged).is_ok() {
+        // The release that ran the generator here ended before it judged the target, so a
+        // program built there may never have shown it ran. The run claim keeps a rerun out
+        // while that release's child lives, so its run is over by now: the hold runs from
+        // here.
+        aterm_uds::deadline::stamp_exec(&target);
+        fs::remove_file(&unjudged).map_err(|e| io("cannot remove", &unjudged, e))?;
+    }
+    if let Some(left) = crate::gates::first_exec_hold(&target) {
+        return Err(Error::new(format!(
+            "handoff fixtures: {} holds programs an earlier run started that never showed \
+             they ran, so macOS may still be assessing a first exec; it stays — run again in \
+             {} s (or after a restart)",
+            target.display(),
+            left.as_secs()
+        )));
+    }
     crate::gates::clear_path(&target).map_err(|e| io("cannot clear", &target, e))?;
+    // Stamped and marked unjudged before anything runs from it: a release killed before it
+    // judges the target leaves the mark, and the next stage holds the target from then.
+    fs::create_dir_all(&target).map_err(|e| io("cannot create", &target, e))?;
+    aterm_uds::deadline::stamp_exec(&target);
+    fs::write(&unjudged, b"").map_err(|e| io("cannot write", &unjudged, e))?;
     println!(
         "==> handoff fixtures: {} build {} ({}) written by its own producer (targo \
          --unverified test -p aterm-gui --lib -- {})",
@@ -205,7 +232,40 @@ pub fn stage(
         .env("ATERM_RENDEZVOUS_FIXTURE_OUT", &dir)
         .env(ANSWERS_OUT, at.join(STAGED_ANSWERS));
     let outcome = run(&mut command);
-    if let Err(error) = crate::gates::clear_path(&target) {
+    // Cargo waits for each build script and test binary it starts, so only its own exit, with
+    // no signal forwarded to them, shows every program built in `target` ran. One that did
+    // not is stamped again: its hold runs from now, after every exec. A `run` that failed
+    // and left nothing in `target` but its stamp built nothing there to hold.
+    let proven = crate::interrupt::caught().is_none()
+        && outcome
+            .as_ref()
+            .is_ok_and(|out| out.status.code().is_some());
+    let built_nothing = outcome.is_err()
+        && fs::read_dir(&target).is_ok_and(|mut entries| {
+            entries.all(|entry| {
+                entry.is_ok_and(|entry| {
+                    entry.file_name() == aterm_uds::deadline::EXEC_STAMP
+                        || entry.file_name() == UNJUDGED
+                })
+            })
+        });
+    if !proven && !built_nothing {
+        aterm_uds::deadline::stamp_exec(&target);
+        if let Err(error) = fs::remove_file(&unjudged) {
+            println!(
+                "==> handoff fixtures: could not remove {} ({error}); the next run holds the \
+                 target from when it finds it",
+                unjudged.display()
+            );
+        }
+        println!(
+            "==> handoff fixtures: kept {}: the generator did not exit on its own, so a \
+             program built there may never have shown it ran and macOS may still be assessing \
+             its first exec; a run {} min from now removes it",
+            target.display(),
+            aterm_uds::deadline::FIRST_EXEC_HANG.as_secs() / 60
+        );
+    } else if let Err(error) = crate::gates::clear_path(&target) {
         println!(
             "==> handoff fixtures: could not remove {} ({error}); remove it by hand",
             target.display()

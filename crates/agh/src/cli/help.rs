@@ -2,20 +2,17 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! Help, generated from the verb table and the exit table (design §15).
+//! Help text rendered from the verb and exit tables.
 
 use super::jq::{DIVERGENCES, FORMATS, FUNCTIONS, REFUSED_JQ, SHARED_RULES};
 use super::verbs::{FlagSpec, GLOBAL_FLAGS, REFUSED, Takes, VERBS, Verb};
 use crate::error::{Error, Result, exit_rows};
 
-/// The longest line an authored text may print.
 const MAX_LINE: usize = 100;
 
-/// The purpose line.
 const PURPOSE: &str =
     "agh: aterm's GitHub client, for reads that route each request to the right identity";
 
-/// The routing page (design §6.4), the one authored text.
 const ROUTING: &[&str] = &[
     "A read walks the owner's read chain in agh.toml, in order: a present profile is used, an",
     "  absent one falls through, an unusable one stops the chain, and anonymous sends nothing.",
@@ -28,13 +25,11 @@ const ROUTING: &[&str] = &[
     "agh whoami --for REPO --op read|writer-read|write shows the decision.",
 ];
 
-/// The `release wait` page's extra line.
 const BACKGROUND_WAIT: &str = concat!(
     "in Claude Code, run a wait over two minutes as a background Bash ",
     "and read its exit when it ends"
 );
 
-/// A flag as its page spells it: `-s, --name VALUE`, with `...` after a Repeat.
 fn flag_spec(flag: &FlagSpec) -> String {
     let mut text = String::new();
     if let Some(short) = flag.short {
@@ -51,7 +46,6 @@ fn flag_spec(flag: &FlagSpec) -> String {
     text
 }
 
-/// Flag lines, two spaces in, their help aligned.
 fn flag_lines(flags: &[FlagSpec]) -> String {
     let specs: Vec<String> = flags.iter().map(flag_spec).collect();
     let width = specs.iter().map(|s| s.chars().count()).max().unwrap_or(0);
@@ -89,12 +83,10 @@ pub fn brief() -> String {
     text
 }
 
-/// The global flags, one line each.
 fn global_page() -> String {
     format!("GLOBAL FLAGS\n{}", flag_lines(GLOBAL_FLAGS))
 }
 
-/// One row per exit: the exit, the slug and the meaning, then the next step.
 fn exit_page() -> String {
     let mut text = String::from("EXIT CODES\n");
     let rows = exit_rows();
@@ -109,7 +101,6 @@ fn exit_page() -> String {
     text
 }
 
-/// The routing page.
 fn routing_page() -> String {
     let mut text = String::from("ROUTING\n");
     for line in ROUTING {
@@ -120,7 +111,6 @@ fn routing_page() -> String {
     text
 }
 
-/// Words joined into lines of at most `width` characters, each starting with `indent`.
 fn wrap(words: &[String], indent: &str, width: usize) -> String {
     let mut text = String::new();
     let mut line = String::from(indent);
@@ -142,8 +132,6 @@ fn wrap(words: &[String], indent: &str, width: usize) -> String {
     text
 }
 
-/// The jq page: the functions, the formats, the refused constructs with their rewrites, and
-/// the divergences from jq 1.7.1.
 fn jq_page() -> String {
     let mut text = String::from(
         "JQ\n  --jq runs agh's jq subset, jq 1.7.1's dialect, as jq -r -c -S would print it.\n",

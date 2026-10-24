@@ -3,12 +3,11 @@
 
 //! GPU companion knock-out parity and contrast tests.
 
-use std::sync::Arc;
-
-use aterm_core::render::{FreeSampler, FreeSprite, FreeZ, RenderInput, SceneAtlas};
+use aterm_core::render::RenderInput;
 use aterm_core::terminal::Terminal;
 use aterm_render::Theme;
 
+use crate::common::sprites::{put, solid, under};
 use crate::common::{backends, max_channel_delta};
 
 const ROWS: usize = 4;
@@ -101,27 +100,8 @@ fn both_backends_knock_the_body_out_under_its_letters() {
 
     let (bx0, by0, bw, bh) = (4 * cw, ch / 2, 5 * cw, 2 * ch);
     let mut input: RenderInput = term.cell_frame(ROWS, COLS);
-    input.free_atlas = Some(Arc::new(SceneAtlas {
-        width: bw as u32,
-        height: bh as u32,
-        rgba: (0..bw * bh).flat_map(|_| [0xAA, 0x95, 0x68, 255]).collect(),
-        version: 1,
-    }));
-    input.free_sprites = vec![FreeSprite {
-        x: bx0 as i32,
-        y: by0 as i32,
-        w: bw as u16,
-        h: bh as u16,
-        ax: 0,
-        ay: 0,
-        aw: bw as u16,
-        ah: bh as u16,
-        tint: 0x00FF_FFFF,
-        alpha: 255,
-        flip_x: false,
-        z: FreeZ::UnderText,
-        sampler: FreeSampler::Nearest,
-    }];
+    let body = solid([0xAA, 0x95, 0x68, 255], bw as u16, bh as u16);
+    put(&mut input, &[under(bx0 as i32, by0 as i32, body)]);
     let bx = [bx0, by0, bx0 + bw, by0 + bh];
 
     let cpu_on = cpu.render_input(&input).pixels.clone();
@@ -165,30 +145,10 @@ fn on_a_translucent_window_both_backends_keep_the_glass() {
     term.process(b"\x1b]10;#d0d0d0\x07\x1b]11;#111318\x07\x1b[?25l\r\nthe kitty flies");
     let (cw, ch) = cpu.cell_size();
     let (bx0, by0, bw, bh) = (4 * cw, ch / 2, 5 * cw, 2 * ch);
-    let sprite = FreeSprite {
-        x: bx0 as i32,
-        y: by0 as i32,
-        w: bw as u16,
-        h: bh as u16,
-        ax: 0,
-        ay: 0,
-        aw: bw as u16,
-        ah: bh as u16,
-        tint: 0x00FF_FFFF,
-        alpha: 255,
-        flip_x: false,
-        z: FreeZ::UnderText,
-        sampler: FreeSampler::Nearest,
-    };
     let mut with = |texel: [u8; 4]| -> RenderInput {
         let mut input: RenderInput = term.cell_frame(ROWS, COLS);
-        input.free_atlas = Some(Arc::new(SceneAtlas {
-            width: bw as u32,
-            height: bh as u32,
-            rgba: (0..bw * bh).flat_map(|_| texel).collect(),
-            version: 1,
-        }));
-        input.free_sprites = vec![sprite];
+        let body = solid(texel, bw as u16, bh as u16);
+        put(&mut input, &[under(bx0 as i32, by0 as i32, body)]);
         input
     };
     let air = with([0, 0, 0, 0]);

@@ -716,6 +716,12 @@ fn task_row(
 ) -> Option<PanelRow> {
     let name_end = crate::text::find(&row[body..end], "  ").map_or(end, |k| body + k);
     let mut name_text = &row[body..name_end];
+    if bullet == Bullet::Filled
+        && out.depth == 0
+        && let Some(unwrapped) = crate::agy::unwrap_agent_token(name_text)
+    {
+        return agy_agent_row(row, body, name_end, end, unwrapped, cols, out);
+    }
     let mut descendants = 0u16;
     if let Some(open) = name_text.rfind(" (+")
         && let Some(n) = name_text[open + 3..].strip_suffix(')')
@@ -861,6 +867,89 @@ fn task_row(
         task.activity_hash = text_hash(&row[tail..end]);
     }
     Some(task)
+}
+
+/// An `agy` subagent row (`  ● Agent(…)  <activity> [· <elapsed>]`).
+///
+/// `name` spans the unwrapped agent name columns at `body` so the glass splice
+/// (which unwraps `Agent(self: Role)` in place at `body`) and `claude_panel`
+/// agree on the exact columns of the agent's name.
+fn agy_agent_row(
+    row: &str,
+    body: usize,
+    name_end: usize,
+    end: usize,
+    unwrapped: &str,
+    cols: Cols<'_>,
+    out: PanelRow,
+) -> Option<PanelRow> {
+    let start_col = cols.at(body);
+    let name_cols: usize = unwrapped.chars().map(cols.width).sum();
+    let mut task = PanelRow {
+        kind: RowKind::Agent,
+        name: Span {
+            start: start_col,
+            end: start_col.saturating_add(u16::try_from(name_cols).unwrap_or(u16::MAX)),
+        },
+        name_hash: text_hash(unwrapped),
+        ..out
+    };
+    let tail =
+        name_end + (row[name_end..end].len() - crate::text::trim_start(&row[name_end..end]).len());
+    if tail >= end {
+        return Some(task);
+    }
+    let rest = &row[tail..end];
+    let mut activity_end = end;
+    if let Some(k) = rest.rfind(SEP) {
+        let elapsed_start = tail + k + SEP.len();
+        if let Some(elapsed) = agy_elapsed(&row[elapsed_start..end]) {
+            task.elapsed = Some((cols.span(elapsed_start, end), elapsed));
+            activity_end = tail + k;
+        }
+    } else if let Some(elapsed) = agy_elapsed(rest) {
+        task.elapsed = Some((cols.span(tail, end), elapsed));
+        activity_end = tail;
+    }
+    let activity_text = crate::text::trim_end(&row[tail..activity_end]);
+    if !activity_text.is_empty() {
+        task.activity = Some(cols.span(tail, tail + activity_text.len()));
+        task.activity_hash = text_hash(activity_text);
+    }
+    Some(task)
+}
+
+/// Elapsed duration on an `agy` subagent row (`4m36s`, `4m5s`, `1h2m3s`, `1s`).
+fn agy_elapsed(text: &str) -> Option<Elapsed> {
+    if let Some(e) = duration(text)
+        .or_else(|| bar_elapsed(text))
+        .or_else(|| word_elapsed(text))
+    {
+        return Some(e);
+    }
+    let mut rest = text;
+    let mut total_s: u64 = 0;
+    let mut last_rank = 0u8;
+    while !rest.is_empty() {
+        let (val, after) = number(rest)?;
+        let unit = *after.as_bytes().first()?;
+        let (rank, mul, ok) = match unit {
+            b'h' => (1, 3600, (1..24).contains(&val)),
+            b'm' => (2, 60, val < 60 && (last_rank > 0 || val > 0)),
+            b's' => (3, 1, val < 60),
+            _ => return None,
+        };
+        if !ok || rank <= last_rank {
+            return None;
+        }
+        total_s = total_s.saturating_add(val * mul);
+        last_rank = rank;
+        rest = &after[1..];
+    }
+    (last_rank == 3).then_some(Elapsed::Clock {
+        ms: total_s * 1000,
+        res_ms: 1000,
+    })
 }
 
 /// An agent's status in its order: `elapsed`, then `↓ N tokens`, then `N

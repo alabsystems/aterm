@@ -59,7 +59,7 @@ fn shown(rows: &[MenuRow]) -> Vec<String> {
                 ..
             } => format!("{glyph} {label} [{}] {enabled}", act.key()),
             MenuRow::Header(t) => format!("header {t}"),
-            MenuRow::Note(t) => format!("note {t}"),
+            MenuRow::Note { text, .. } => format!("note {text}"),
             MenuRow::Rule => "rule".into(),
             other => format!("{other:?}"),
         })
@@ -248,7 +248,7 @@ fn texts(rows: &[MenuRow]) -> Vec<String> {
     rows.iter()
         .map(|row| match row {
             MenuRow::Plot(cells) => cells.iter().map(|c| c.ch).collect(),
-            MenuRow::Note(t) => format!("note {t}"),
+            MenuRow::Note { text, .. } => format!("note {text}"),
             other => format!("{other:?}"),
         })
         .collect()
@@ -352,7 +352,8 @@ fn busy_columns_take_the_shaded_ground() {
 
 /// THE ACCOUNT MENU GIVES THE FULL WHY of a weekly figure the footer has not got, under the
 /// footer's own short word, in lines the card's widest content holds; a meter, where there is
-/// one, says it instead.
+/// one, says it instead. A reader hears the word as the chip speaks it and the why whole, once,
+/// never cut at each line the card wraps it to.
 #[test]
 fn the_account_menu_says_why_the_week_is_missing() {
     use aterm_agent::harness::profile::WeeklyGap;
@@ -386,6 +387,21 @@ fn the_account_menu_says_why_the_week_is_missing() {
             .map(|line| format!("note {line}"))
             .collect();
         assert_eq!(menu[at + 1..at + 1 + why.len()], why[..], "{gap:?}");
+        let built = rows(Fact::Account, &facts);
+        let heard: Vec<&str> = built[at..=at + why.len()]
+            .iter()
+            .map(|row| match row {
+                MenuRow::Note { spoken, .. } => spoken.as_str(),
+                other => panic!("{gap:?}: a note, not {other:?}"),
+            })
+            .collect();
+        let whole = weekly_gap_why(gap).join(" ");
+        let mut said = vec![gap.spoken(), whole.as_str()];
+        said.resize(heard.len(), "");
+        assert_eq!(
+            heard, said,
+            "{gap:?}: the word in the chip's words, then the why whole, once"
+        );
         for line in weekly_gap_why(gap) {
             assert!(
                 crate::tab_menu::display_cells(line) <= crate::autopilot_menu::MAX_CONTENT,

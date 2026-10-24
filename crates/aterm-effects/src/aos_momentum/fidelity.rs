@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `momentum-glow.lane-fidelity` v1: judges a closed-loop lane run ([`LaneRun`]) against a fresh shipped engine re-run over its recorded calls, never the candidate's state (design §10.4).
+//! `momentum-glow.lane-fidelity` v1: judges a closed-loop lane run ([`LaneRun`]) against a fresh shipped engine re-run over its recorded calls, never the candidate's state.
 
 use std::time::Duration;
 
@@ -17,7 +17,7 @@ use crate::cursor_momentum::{MomentumGlow, MomentumGlowFrame};
 /// The contract artifact's name.
 pub const LANE_FIDELITY_NAME: &str = "momentum-glow.lane-fidelity";
 
-/// The law: no tick leaves its frame on glass across a step the shipped engine would draw (blind to the interval after a presentation change, design §10.4).
+/// The law: no tick leaves its frame on glass across a step the shipped engine would draw (blind to the interval after a presentation change).
 pub const NO_STEP_SLEPT: &str = "NoStepSlept";
 /// The law: the glass is inert at the scenario's end.
 pub const CLEARED_BY_END: &str = "ClearedByEnd";
@@ -123,12 +123,10 @@ impl LaneFidelity {
                 format!("{} calls, more than {LANE_MAX_EVENTS}", run.calls().len()),
             );
         }
-        // The first-party engine, re-run from rest over the recorded calls.
         let mut g = MomentumGlow::default();
         let (mut out, mut under) = (Vec::new(), Vec::new());
         let (mut probe_out, mut probe_under) = (Vec::new(), Vec::new());
         let (mut drawn, mut probed) = (Enc::new(), Enc::new());
-        // The tick ordinal next to judge, and the first scenario input after the tick judged.
         let mut n = 0usize;
         let mut next_input = 0usize;
         let mut last_inert = true;
@@ -228,7 +226,7 @@ impl LaneFidelity {
             .unwrap_or(p);
             // An interval ending within a frame and δ of `p` is not judged: a probe clamped to `p + f` sees the step a shipped wake one margin later was armed for.
             let floor = p.saturating_add(f);
-            // The drawn step only decays between lane events, so one probe δ before the next event sees any step slept through (design §10.4).
+            // The drawn step only decays between lane events, so one probe δ before the next event sees any step slept through.
             if next.saturating_sub(delta) > floor {
                 let s = next.saturating_sub(delta);
                 let mut copy = g;

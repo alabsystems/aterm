@@ -20,10 +20,12 @@ use crate::pane::{
 };
 use crate::word_decorations::{CompanionOnGlass, DecoConfig, EffectGeom, SelView};
 use aterm_core::grid::LineSize;
-use aterm_core::render::{FreeSprite, RenderInput};
+use aterm_core::render::RenderInput;
+
 use aterm_core::terminal::RenderCell;
 use aterm_lexicon::Lexicon;
 use aterm_render::GlowQuad;
+use aterm_render::sprites::FreeSprite;
 use aterm_time::Instant;
 
 /// What one content-scroll snapshot did to the cursor family's coordinates ([`EffectsPipeline::sync_scroll`]).
@@ -941,14 +943,8 @@ impl EffectsPipeline {
     pub fn publish_words(&mut self, input: &mut RenderInput) {
         input.word_decorations.clone_from(&self.deco_scratch);
         input.ink.clone_from(&self.ink_scratch);
-        input.cat_quads.clear();
-        input.cat_atlas = None;
-        input.free_sprites.clone_from(&self.free_scratch);
-        input.free_atlas = if self.free_scratch.is_empty() {
-            None
-        } else {
-            self.decos.free_atlas()
-        };
+        self.sprite_layers
+            .publish(&self.free_scratch, &mut input.fx_layers);
         input.nova_add.clone_from(&self.nova_scratch);
     }
 
@@ -1077,16 +1073,53 @@ impl EffectsPipeline {
         self.rain_scratch.is_empty() && self.rain_add_scratch.is_empty()
     }
 
-    /// Install the rain channels into a frame; the atlas rides only with quads, so a rain-free frame is byte-identical to no rain.
+    /// Install the rain channels into a frame: the cells as fx layers under every other Linear
+    /// layer ([`crate::matrix_rain::RainLayers`]), so a rain-free frame is byte-identical to no
+    /// rain.
     #[inline]
     pub fn publish_rain(&mut self, input: &mut RenderInput) {
-        input.rain_quads.clone_from(&self.rain_scratch);
+        match self.rain.as_deref() {
+            Some(rain) => {
+                self.rain_layers
+                    .publish(&self.rain_scratch, rain.baker(), &mut input.fx_layers);
+            }
+            None => self.rain_layers.withdraw(&mut input.fx_layers),
+        }
         input.rain_add.clone_from(&self.rain_add_scratch);
-        input.rain_atlas = if self.rain_scratch.is_empty() {
-            None
-        } else {
-            self.rain.as_mut().and_then(|e| e.rain_atlas())
-        };
+    }
+
+    /// Take the rain out of a frame: its layers and its halos (a host that
+    /// will not draw the rain this frame).
+    #[inline]
+    pub fn withdraw_rain(&mut self, input: &mut RenderInput) {
+        self.rain_layers.withdraw(&mut input.fx_layers);
+        input.rain_add.clear();
+    }
+
+    /// Publish `sprites` as the window's companion layers and `cells`, drawn from
+    /// `tiles`, as its rain rows, through the window's own publishers: a test's way
+    /// to stand a frame's effect layers up without running the effects.
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    pub fn publish_for_test(
+        &mut self,
+        sprites: &[FreeSprite],
+        (cells, tiles): (
+            &[crate::matrix_rain::RainCell],
+            &crate::matrix_rain::RainBaker,
+        ),
+        input: &mut RenderInput,
+    ) {
+        self.sprite_layers.publish(sprites, &mut input.fx_layers);
+        self.rain_layers.publish(cells, tiles, &mut input.fx_layers);
+    }
+
+    /// Take the companions' sprite layers out of a frame (the word cats, the
+    /// pet, the kitty cursor, the flying head and its notes, the dog, the
+    /// nuke): a host that clears the window's effect channels.
+    #[inline]
+    pub fn withdraw_sprites(&mut self, input: &mut RenderInput) {
+        self.sprite_layers.withdraw(&mut input.fx_layers);
     }
 
     /// The single grid's output-streak engine, when one is built.

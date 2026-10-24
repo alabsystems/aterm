@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The acceptance policy v1 (design §10.4–§10.6): its pin, its baseline, corpus drift, its bases, grid and budgets, and the slack `NoStepSlept` leaves unjudged.
+//! The acceptance policy v1: its pin, baseline, corpus drift, bases, grid, budgets, and the
+//! slack `NoStepSlept` leaves unjudged.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -40,7 +41,6 @@ fn facts(c: &Corpus) -> Vec<ItemFacts<'_>> {
     c.items().iter().map(ItemFacts::of).collect()
 }
 
-/// The pinned rows, as the baseline check reads a measurement.
 fn pinned_rows() -> Vec<Measured> {
     ITEMS_V1
         .iter()
@@ -52,7 +52,8 @@ fn pinned_rows() -> Vec<Measured> {
         .collect()
 }
 
-/// A baseline row as [`ITEMS_V1`] spells it: `T`, `P` and `Z` grouped by thousands, the lane digest by 16 bits, and the chain's hex.
+/// A baseline row as [`ITEMS_V1`] spells it: `T`, `P`, and `Z` grouped by thousands, the lane
+/// digest by 16 bits, and the chain's hex.
 fn pin_spelling(b: &Baseline) -> String {
     let n = |v: u64| {
         let d = v.to_string();
@@ -87,19 +88,15 @@ fn pin_spelling(b: &Baseline) -> String {
     )
 }
 
-/// The remedy for a whole change of the baseline when the measured rows are not the policy's items.
 const ROWS: &str =
     "the measured rows are not the policy's items: a new policy version (design §10.4)";
-/// The remedy when the shipped code is not admitted on some lane row and the rows are the policy's items.
 const FAULT: &str = "the shipped code is not admitted on a lane row, which no pin can take: fix what broke its admission (design §10.4)";
-/// The remedy when the golden trace is the only row not admitted and the rows are the policy's items.
 const GOLDEN: &str = "the shipped code is not admitted on the golden trace, and no v1 re-pin can take that: a change meant to move its recorded head needs a new trace and a new policy version; otherwise fix what broke its admission (design §10.4)";
-/// The remedy when some row moved `T`, `P` or `Z` and no earlier class moved.
 const VERSION: &str = "the fixed baseline moved: a new policy version (design §10.4)";
-/// The remedy when every moved row moved only its lane digest or chain.
 const REPIN: &str = "only lane digests or chains moved: a v1 re-pin may take the measured values (ITEMS_V1's doc; for s0's lane digest also M3_STORY_DIGEST in lane_tests.rs and the_baseline_is_pinned's copy), then the digest the_policy_is_pinned prints";
 
-/// The remedy that comes first for the whole change from `pins` to `measured`, judged in `check_baseline`'s order of classes (the rows, admission on a lane, admission on the golden trace, `T`, `P` or `Z`, then the lane digest or chain), or none when nothing moved.
+/// The remedy that comes first for the change from `pins` to `measured` in `check_baseline`'s
+/// order of classes, or `None` when nothing moved.
 fn verdict(measured: &[Measured], pins: &[Measured]) -> Option<&'static str> {
     let pairs = || measured.iter().zip(pins);
     let fixed = |b: &Baseline, q: &Baseline| {
@@ -125,7 +122,6 @@ fn verdict(measured: &[Measured], pins: &[Measured]) -> Option<&'static str> {
     }
 }
 
-/// The report's wording of the remedy a [`PolicyRefusal::BaselineDrift`] at `field` carries.
 const fn remedy(field: BaselineField) -> &'static str {
     match field {
         BaselineField::Row => ROWS,
@@ -136,7 +132,8 @@ const fn remedy(field: BaselineField) -> &'static str {
     }
 }
 
-/// `the_baseline_is_pinned`'s report: a line per row that differs from its pin, is extra or is missing, with its values as [`ITEMS_V1`] spells them and, for a differing row, what moved, then the remedy that comes first for the whole change.
+/// `the_baseline_is_pinned`'s report: a line per differing, extra, or missing row, followed by
+/// the first applicable remedy.
 fn moved_rows(measured: &[Measured], pins: &[Measured]) -> Vec<String> {
     let moved = |m: &Measured, p: &Measured| {
         let (b, q) = (&m.baseline, &p.baseline);
@@ -202,7 +199,6 @@ fn law(v: &Verdict) -> Option<&'static str> {
     }
 }
 
-/// The policy is `momentum-glow.m4-acceptance` v1, built the same every time, pinned on the golden trace's target and refused as mutated on any other.
 #[test]
 fn the_policy_is_pinned() {
     let t0 = Instant::now();
@@ -236,7 +232,6 @@ fn the_policy_is_pinned() {
     }
 }
 
-/// Every descriptor field, altered alone, moves the digest its own way, and the pin check refuses each as `PolicyMutated`.
 #[test]
 fn a_mutated_policy_is_refused_field_by_field() {
     let v1 = AcceptancePolicy::v1();
@@ -262,10 +257,8 @@ fn a_mutated_policy_is_refused_field_by_field() {
     assert_eq!(seen.len(), Field::ALL.len() + 1);
 }
 
-/// A change to one measured row.
 type Move = fn(&mut Measured);
 
-/// The shipped baseline measured now, on two origins, is every pinned row, and a row moved in any one field is drift naming the item and the field.
 #[test]
 fn the_baseline_is_pinned() {
     let t0 = Instant::now();
@@ -391,7 +384,6 @@ fn the_baseline_is_pinned() {
     );
 }
 
-/// A drift's message offers a v1 re-pin only for a lane digest or chain, sends a lost admission to what broke it, or on the golden trace to a new trace when the change was meant, calls every other baseline move a new policy version, and sends a moved corpus to a fix or a new version.
 #[test]
 fn a_drift_says_whether_a_re_pin_may_take_it() {
     use BaselineField::{Admitted, Chain, LaneDigest, Presented, Row, Ticks, Wasted};
@@ -446,7 +438,6 @@ fn a_drift_says_whether_a_re_pin_may_take_it() {
     );
 }
 
-/// The drift report spells rows as [`ITEMS_V1`] does and names a row past the shorter side, and over single and mixed moves its remedy for the whole change is the one `check_baseline`'s refusal carries.
 #[test]
 fn the_baseline_report_names_each_moved_row_and_its_rule() {
     let pins = pinned_rows();
@@ -746,7 +737,6 @@ fn the_baseline_report_names_each_moved_row_and_its_rule() {
     );
 }
 
-/// The golden trace with a byte flipped or cut short is corpus drift naming the golden item, and the baseline measured on it is drift too.
 #[test]
 fn a_damaged_golden_trace_is_corpus_drift() {
     let t0 = Instant::now();
@@ -788,7 +778,6 @@ fn a_damaged_golden_trace_is_corpus_drift() {
     }
 }
 
-/// A lane item's changed scenario, id, kind or split is corpus drift naming that item.
 #[test]
 fn a_changed_scenario_is_corpus_drift() {
     let c = corpus();
@@ -845,7 +834,6 @@ fn a_changed_scenario_is_corpus_drift() {
     assert_eq!(v1.check_corpus(&f), corpus_drift(id), "another split");
 }
 
-/// Every item counts: the corpus is the 26 pinned items in order, and a corpus or baseline with one item removed or one too many is refused naming that item.
 #[test]
 fn every_item_counts() {
     let c = corpus();
@@ -908,7 +896,6 @@ fn every_item_counts() {
     assert_eq!(c.digest(), CORPUS_V1_DIGEST, "the corpus digest is the pin");
 }
 
-/// The bases are exactly the shipped code (an optimization) and the demonstration fault (a repair), named by artifact, and no plan is a base.
 #[test]
 fn shipped_and_the_demo_code_are_the_only_bases() {
     let v1 = AcceptancePolicy::v1();
@@ -946,7 +933,6 @@ fn shipped_and_the_demo_code_are_the_only_bases() {
     assert_ne!(Replace::Optimization.rule(), Replace::Repair.rule());
 }
 
-/// The grid is v1's 54 distinct plans, split-major, and the budgets and grade cap are v1's.
 #[test]
 fn the_grid_and_the_budgets_are_v1() {
     let v1 = AcceptancePolicy::v1();
@@ -980,7 +966,8 @@ fn the_grid_and_the_budgets_are_v1() {
     assert_eq!(GRADE_CAP, EvidenceGrade::Tested);
 }
 
-/// `plan` attached for a whole lane run of `s`: lane fidelity's verdict, `NoStrandedLight`'s verdict on the replayed log, the replay and its inputs.
+/// `plan` attached for a whole lane run of `s`: lane fidelity's verdict, `NoStrandedLight`'s
+/// verdict on the replayed log, the replay, and its inputs.
 fn judged(
     t0: Instant,
     plan: SchedulePlan,
@@ -1007,7 +994,8 @@ fn judged(
     (fidelity, verdict, replayed, log.inputs().to_vec())
 }
 
-/// Whether `v` fails `WakeNoLaterThanClear` at a settle wake after `max(cold_at + margin, at + frame_interval)`.
+/// Whether `v` fails `WakeNoLaterThanClear` at a settle wake after
+/// `max(cold_at + margin, at + frame_interval)`.
 fn wakes_past_the_clear(v: &Verdict, run: &Run<MomentumSchema>, inputs: &[MomentumEvent]) -> bool {
     let Verdict::Fail { cursor, law, .. } = v else {
         return false;
@@ -1036,7 +1024,6 @@ fn wakes_past_the_clear(v: &Verdict, run: &Run<MomentumSchema>, inputs: &[Moment
     }
 }
 
-/// `NoStepSlept` never probes a wake in `(p + f, p + f + δ]`, but a poll there, the only grammar-v1 wake that picks one at will, fails `NoStrandedLight` at `WakeNoLaterThanClear`, so the slack gives no admitted plan a lag beyond the floor.
 #[test]
 fn a_poll_just_past_a_frame_is_refused() {
     let t0 = Instant::now();
@@ -1109,7 +1096,6 @@ fn a_poll_just_past_a_frame_is_refused() {
     }
 }
 
-/// The baseline type's fields are the pinned ones, and an unmeasured row is no pin.
 #[test]
 fn an_unmeasured_row_is_no_pin() {
     let zero = Baseline {

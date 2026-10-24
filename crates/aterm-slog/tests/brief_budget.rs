@@ -935,6 +935,37 @@ fn a_relaunched_sessions_acts_are_one_count_line_shed_first() {
     assert!(counted > 0, "the count line shows when it fits");
 }
 
+/// A relaunch's carry-on turn briefs by the actor the host hands the tracker, beside the
+/// relaunch's acts: `by=harness` for a turn typed over the harness's own token, which the
+/// window's drive presents (aterm-gui's `control_tests` drive that socket path end to end), and
+/// `by=ctl`, the manager's word, for one typed over the token beside the socket.
+#[test]
+fn a_relaunchs_carry_on_turn_briefs_as_the_harness() {
+    let carried = |by: Actor| {
+        let (mut log, _) = relaunched(true);
+        let run = log.state().run().expect("the relaunched run").node;
+        let mut tr = TurnTracker::new(run);
+        let ms = 40_000;
+        tr.ctl_turn(&mut log, by, 9, at(ms));
+        tr.observe(&mut log, Verdict::Busy, None, at(ms + 10));
+        let t = log.state().turn().expect("the carry-on turn").node;
+        let b = log.brief("s-1", 100_000, WALL0 + ms + 100);
+        assert!(b.text.contains("\nacts 2 "), "{}", b.text);
+        b.text
+            .lines()
+            .find(|l| l.starts_with(&format!("{t} ")))
+            .unwrap_or_else(|| panic!("no line for {t}:\n{}", b.text))
+            .to_string()
+    };
+    let line = carried(Actor::Harness);
+    assert!(line.contains(" by=harness ledger=9"), "{line}");
+    let line = carried(Actor::Ctl);
+    assert!(
+        line.contains(" by=ctl ledger=9"),
+        "NEGATIVE CONTROL: the beside token's turn: {line}"
+    );
+}
+
 fn tx_step(log: &mut Log, run: Node, tx: bool, ms: u64, close: bool) -> Node {
     let open = if tx {
         let turn = log.state().turn().expect("an open turn").node;

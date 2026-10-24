@@ -2024,6 +2024,7 @@ fn the_devtools_row_is_a_warning_never_a_fault() {
             },
             log: DevToolProbe::refused(DevToolProbeLabel::NoRecentRequest),
             other_responsible: None,
+            program_check: None,
         }),
         ..Probes::default()
     };

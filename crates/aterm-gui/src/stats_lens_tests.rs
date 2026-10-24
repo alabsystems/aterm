@@ -176,7 +176,7 @@ pub(crate) fn lens_scene(sc: Scene) -> Snapshot {
         let sum = |keep: &dyn Fn(ProcScope) -> bool| -> ScopeFig {
             ScopeFig {
                 now: Some(s.top.iter().filter(|t| keep(t.scope)).filter_map(of).sum()),
-                missing: None,
+                ..ScopeFig::default()
             }
         };
         let aterm = sum(&|p| p != ProcScope::Other);

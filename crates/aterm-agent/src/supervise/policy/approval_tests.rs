@@ -450,9 +450,10 @@ fn under_zsh_only_a_plain_line_is_a_proven_read() {
     assert!(classify_command_with(line, &Vec::<String>::new()).read_only);
     let d = on_screen(&bash_box(&[line], Some("Look")), &with(&zsh, Approve::Safe));
     assert!(
-        reason(&d).starts_with("not a plain line under zsh"),
+        reason(&d).starts_with("runs export (space reading)"),
         "{d:?}"
     );
+    assert!(plain_zsh_line(line).is_err(), "not plain under zsh");
     for line in [
         "git log --oneline -5 --format='%h %s' 2>/dev/null | head -3",
         "grep -rn \"TODO\" src && wc -l ~/notes.txt",
@@ -3244,13 +3245,232 @@ fn the_no_rule_note_stays_with_a_person_over_what_it_may_stand_for() {
     }
 }
 
+/// Claude Code 2.1.309's Bash boxes over classifier audit 3's folder probes (MEASURED in the real-Claude lab).
+const FOLDER_BOXES: &[(&str, &str, &str)] = &[
+    (
+        "wc",
+        "wc -l /etc/hosts",
+        include_str!("fixtures/claude-2.1.309-box-bash-folder-wc.txt"),
+    ),
+    (
+        "awk",
+        "awk 'NR<3' /etc/hosts",
+        include_str!("fixtures/claude-2.1.309-box-bash-folder-awk.txt"),
+    ),
+    (
+        "assignment",
+        "FOO=1 cat /etc/hosts",
+        include_str!("fixtures/claude-2.1.309-box-bash-folder-assignment.txt"),
+    ),
+    (
+        "env-assignment",
+        "env FOO=1 cat /etc/hosts",
+        include_str!("fixtures/claude-2.1.309-box-bash-folder-env-assignment.txt"),
+    ),
+    (
+        "env",
+        "env cat /etc/hosts",
+        include_str!("fixtures/claude-2.1.309-box-bash-folder-env.txt"),
+    ),
+    (
+        "for-loop",
+        "for f in a; do cat /etc/hosts; done",
+        include_str!("fixtures/claude-2.1.309-box-bash-folder-for-loop.txt"),
+    ),
+    (
+        "sort-glob",
+        "sort /etc/host*",
+        include_str!("fixtures/claude-2.1.309-box-bash-folder-sort-glob.txt"),
+    ),
+    (
+        "assignment-inside",
+        "FOO=1 cat README.md",
+        include_str!("fixtures/claude-2.1.309-box-bash-note-assignment-inside.txt"),
+    ),
+];
+
+/// The screen of [`FOLDER_BOXES`]' `name`, its command checked.
+fn folder_box(name: &str) -> Vec<String> {
+    let (_, command, text) = FOLDER_BOXES
+        .iter()
+        .find(|(n, _, _)| *n == name)
+        .unwrap_or_else(|| panic!("the capture {name}"));
+    let rows = phase_fixtures::screen(text);
+    let p = aterm_phase::prompt::parse_prompt_v2(&rows).expect(name);
+    assert_eq!(p.command, *command, "{name}");
+    rows
+}
+
+/// The measured note-free folder box with its command row made `command`.
+fn folder_box_with(command: &str) -> Vec<String> {
+    let rows: Vec<String> = folder_box("assignment")
+        .into_iter()
+        .map(|r| {
+            if r == " FOO=1 cat /etc/hosts" {
+                format!(" {command}")
+            } else {
+                r
+            }
+        })
+        .collect();
+    let p = aterm_phase::prompt::parse_prompt_v2(&rows).expect(command);
+    assert_eq!(p.command, command);
+    assert!(p.notes.is_empty(), "{command}: {:?}", p.notes);
+    rows
+}
+
+#[test]
+fn a_note_free_folder_box_is_held_to_the_proof_gaps_as_the_no_rule_note_is() {
+    let note = "(the box's vendor note: This command requires approval)";
+    for (name, why) in [
+        ("assignment", "assigns a variable (space reading): FOO=1"),
+        (
+            "env-assignment",
+            "assigns a variable (space reading): FOO=1",
+        ),
+        ("env", "runs env (space reading)"),
+        ("for-loop", "assigns a for loop's variable (space reading)"),
+        (
+            "sort-glob",
+            "an unquoted glob `*` (space reading) beside sort",
+        ),
+    ] {
+        let rows = folder_box(name);
+        let p = aterm_phase::prompt::parse_prompt_v2(&rows).expect(name);
+        assert!(
+            p.notes.is_empty(),
+            "{name}: drawn with no note: {:?}",
+            p.notes
+        );
+        assert!(
+            p.options
+                .iter()
+                .any(|o| o.label.contains(anchor("box.read_grant"))),
+            "{name}: a folder grant"
+        );
+        let r = reason(&on_screen(&rows, &git_host(ctx()))).to_string();
+        assert!(r.starts_with(why) && !r.contains(note), "{name}: {r}");
+    }
+    let inside = folder_box("assignment-inside");
+    let p = aterm_phase::prompt::parse_prompt_v2(&inside).expect("inside");
+    assert_eq!(p.notes, [anchor("box.note_no_rule")], "the no-rule note");
+    let r = reason(&on_screen(&inside, &git_host(ctx()))).to_string();
+    assert!(r.starts_with("assigns a variable (space reading): FOO=1") && r.ends_with(note));
+    for (command, why) in [
+        (
+            "FOO=1 awk 'NR<3' /etc/hosts",
+            "assigns a variable (space reading): FOO=1",
+        ),
+        (
+            "time FOO=1 cat /etc/hosts",
+            "assigns a variable (space reading): FOO=1",
+        ),
+        (
+            "export FOO=1; cat /etc/hosts",
+            "runs export (space reading)",
+        ),
+        (
+            "find /etc -name hosts | xargs cat",
+            "runs xargs (space reading)",
+        ),
+        (
+            "cat /etc/host* | awk 'NR<3'",
+            "an unquoted glob `*` (space reading) beside awk",
+        ),
+        (
+            "cat /etc/hosts; FOO=1 awk 'NR<3' README.md",
+            "assigns a variable (space reading): FOO=1",
+        ),
+        ("env cat /etc/hosts", "runs env (space reading)"),
+        (
+            "for f in a; do cat /etc/hosts; done",
+            "assigns a for loop's variable (space reading)",
+        ),
+    ] {
+        let r = reason(&on_screen(&folder_box_with(command), &git_host(ctx()))).to_string();
+        assert!(
+            r.starts_with(why) && !r.contains(note),
+            "folder, {command}: {r}"
+        );
+        let r = reason(&on_screen(&no_rule_box(command), &git_host(ctx()))).to_string();
+        assert!(
+            r.starts_with(why) && r.ends_with(note),
+            "no-rule, {command}: {r}"
+        );
+    }
+    for name in ["wc", "awk"] {
+        let d = on_screen(&folder_box(name), &git_host(ctx()));
+        assert_eq!(pressed(&d), (RULE_READ_ONLY, Choice::Digit(1)), "{name}");
+    }
+    for command in [
+        "cat /etc/host*",
+        "awk 'NR<3' '/etc/host*'",
+        "awk -v n=3 'NR<n' /etc/hosts",
+        "grep 'a=b' /etc/hosts",
+        "wc -l /etc/hosts; head -3 /etc/hosts",
+    ] {
+        let d = on_screen(&folder_box_with(command), &git_host(ctx()));
+        assert_eq!(pressed(&d), (RULE_READ_ONLY, Choice::Digit(1)), "{command}");
+        let d = on_screen(&no_rule_box(command), &git_host(ctx()));
+        assert_eq!(
+            pressed(&d),
+            (RULE_NO_RULE_READ_ONLY, Choice::Digit(1)),
+            "{command}"
+        );
+    }
+}
+
+#[test]
+fn a_too_many_box_is_held_to_the_proof_gaps() {
+    let label = "the rm circuit breaker (not ruled out: too many command substitutions to \
+                 analyze; the command need not name rm)";
+    for (line, why) in [
+        ("FOO=1 awk 'NR<3' README.md", "assigns a variable"),
+        ("env awk 'NR<3' README.md", "runs env"),
+        ("awk 'NR<3' *.md", "an unquoted glob `*`"),
+    ] {
+        let lines = sixty_five(&[(12, line)]);
+        for base in [ctx(), bypass()] {
+            let r = reason(&on_screen(&too_many_box(&lines, base.bypass_mode), &base)).to_string();
+            assert!(r.starts_with(&format!("{label}: ")), "{line}: {r}");
+            assert!(r.contains(why), "{line}: {r}");
+        }
+    }
+    let lines = sixty_five(&[(12, "awk 'NR<3' README.md")]);
+    for base in [ctx(), bypass()] {
+        let d = on_screen(&too_many_box(&lines, base.bypass_mode), &base);
+        assert_eq!(approved(&d), Some(RULE_BREAKER_READ_ONLY), "{d:?}");
+    }
+}
+
+#[test]
+fn the_advisory_word_refuses_a_secret_and_a_proof_gap() {
+    let word = |line: &str| readings_read_only(&[line.to_string()], &[]);
+    for (line, why) in [
+        ("cat ~/.ssh/id_rsa", "a read of a secret"),
+        ("awk 'NR<3' .env", "a read of a secret"),
+        ("FOO=1 awk 'NR<3' README.md", "assigns a variable"),
+        ("env cat README.md", "runs env"),
+    ] {
+        let r = word(line).expect_err(line);
+        assert!(r.contains(why), "{line}: {r}");
+    }
+    for line in [
+        "cat README.md",
+        "grep -rn credentials src/",
+        "grep -m 1 id_rsa docs/",
+    ] {
+        assert_eq!(word(line), Ok(()), "{line}");
+    }
+}
+
 #[test]
 fn every_other_vendor_note_on_a_bash_box_stays_with_a_person() {
     for (name, note, proven) in [
         (
             "n11-variable",
             "A variable in this command can't be checked before it runs",
-            true,
+            false,
         ),
         (
             "n14-quoted-text",
@@ -3314,6 +3534,13 @@ fn every_other_vendor_note_on_a_bash_box_stays_with_a_person() {
         let d = on_screen(&bare, &git_host(ctx()));
         assert_eq!(approved(&d), Some(RULE_READ_ONLY), "{name}: {d:?}");
     }
+    let note = "A variable in this command can't be checked before it runs";
+    let bare: Vec<String> = note_box("n11-variable")
+        .into_iter()
+        .filter(|r| r.trim() != note)
+        .collect();
+    let r = reason(&on_screen(&bare, &git_host(ctx()))).to_string();
+    assert!(r.starts_with("assigns a for loop's variable"), "{r}");
 }
 
 #[test]
@@ -3499,7 +3726,6 @@ fn a_bash_read_of_a_secret_is_not_read_only() {
         "jq . ~/.docker/config.json",
         "jq -n 'import \"/Users/_owner/.config/gh/hosts\" as $h; $h'",
         "awk 'BEGIN { while ((getline l < \"/Users/_owner/.ssh/id_rsa\") > 0) print l }'",
-        "find ~/.ssh -type f | xargs cat",
         "cat $(find ~/.ssh -type f)",
         "cat $(ls ~/.ssh/id_*)",
         "find ~/.ssh -print0 | sort --files0-from=-",
@@ -3514,6 +3740,16 @@ fn a_bash_read_of_a_secret_is_not_read_only() {
             "{cmd}: expected a secret refusal, got {r}"
         );
     }
+    let xargs = "find ~/.ssh -type f | xargs cat";
+    let r = reason(&on_screen(
+        &bash_box(&[xargs], Some("Read it")),
+        &git_host(ctx()),
+    ))
+    .to_string();
+    assert!(r.starts_with("runs xargs (space reading)"), "{r}");
+    let home = Some(Path::new("/Users/_owner"));
+    let r = secrets_free(&[xargs.to_string()], &default_secrets(home), home).expect_err("a secret");
+    assert!(r.contains("a read of a secret"), "{r}");
     for cmd in [
         "git config -f/Users/_owner/.aws/credentials --list",
         "git config -f.aws/credentials --list",
@@ -3587,6 +3823,50 @@ fn a_non_secret_read_beside_it_stays_read_only() {
         &git_host(ctx()),
     );
     assert_eq!(approved(&d), Some(RULE_READ_ONLY), "{d:?}");
+}
+
+#[test]
+fn a_grep_or_rg_value_option_is_no_pattern_to_the_secret_check() {
+    for cmd in [
+        "grep -m 1 credentials src/",
+        "grep -m1 credentials src/",
+        "grep --max-count=1 credentials src/",
+        "grep --max-count 1 credentials src/",
+        "grep -A 2 -B 1 id_rsa docs/",
+        "grep -C 3 credentials src/",
+        "grep -d skip credentials src/",
+        "grep -D skip credentials src/",
+        "grep --after-context 2 credentials src/",
+        "grep --binary-files text credentials src/",
+        "grep --label stdin credentials src/",
+        "grep --context=3 credentials src/",
+        "rg -m 1 credentials src/",
+        "rg -M 200 credentials src/",
+        "rg -t rust credentials",
+        "rg -j 4 credentials src",
+        "rg -d 2 credentials src",
+        "rg --max-depth 2 credentials src",
+        "rg -r X credentials src",
+        "rg -E utf8 credentials src",
+        "rg --type-add 'web:*.html' credentials src",
+    ] {
+        let d = on_screen(&bash_box(&[cmd], Some("Search")), &git_host(ctx()));
+        assert_eq!(approved(&d), Some(RULE_READ_ONLY), "{cmd}: {d:?}");
+    }
+    for cmd in [
+        "grep -m 1 key ~/.ssh/config",
+        "grep -A 2 token .env",
+        "grep --binary token ~/.ssh/id_rsa",
+        "grep --context 3 credentials src/",
+        "rg -M 200 token .env",
+        "rg -m1 x ~/.aws/credentials",
+        "rg --max-columns 80 token ~/.ssh",
+        "rg --ignore token ~/.ssh/id_rsa",
+        "jq -R --slurp . a.json ~/.ssh/id_rsa",
+    ] {
+        let d = on_screen(&bash_box(&[cmd], Some("Search")), &git_host(ctx()));
+        assert!(reason(&d).contains("a read of a secret"), "{cmd}: {d:?}");
+    }
 }
 
 #[test]

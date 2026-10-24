@@ -227,21 +227,33 @@ pub struct CatFrame {
     pub sing: f32,
 }
 
+const MARKED_GLYPHS: [bool; crate::cat_glyphs_gen::GLYPHS.len()] = {
+    let mut out = [false; crate::cat_glyphs_gen::GLYPHS.len()];
+    let mut g = 0;
+    while g < out.len() {
+        let layers = crate::cat_glyphs_gen::GLYPHS[g].layers;
+        let mut i = 0;
+        while i < layers.len() {
+            if matches!(
+                layers[i].role,
+                crate::cat_glyphs_gen::GlyphRole::Pattern
+                    | crate::cat_glyphs_gen::GlyphRole::CoatShade
+            ) {
+                out[g] = true;
+                break;
+            }
+            i += 1;
+        }
+        g += 1;
+    }
+    out
+};
+
 /// Whether `variant`'s art carries markings (pattern or coat-shade layers) a
 /// face swap would drop.
+#[inline]
 const fn marked(variant: CatGlyphId) -> bool {
-    let layers = crate::cat_glyphs_gen::GLYPHS[variant as usize].layers;
-    let mut i = 0;
-    while i < layers.len() {
-        if matches!(
-            layers[i].role,
-            crate::cat_glyphs_gen::GlyphRole::Pattern | crate::cat_glyphs_gen::GlyphRole::CoatShade
-        ) {
-            return true;
-        }
-        i += 1;
-    }
-    false
+    MARKED_GLYPHS[variant as usize]
 }
 
 impl CatFrame {

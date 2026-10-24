@@ -1,12 +1,10 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-// Author: Andrew Yates
 
 use super::{Cell, PackedColor};
 
 impl Cell {
-    /// Get foreground color when it is encoded inline in the cell; `None` for
-    /// RGB cells (`CellExtra` overflow).
+    /// Get foreground color when it is encoded inline in the cell.
     #[must_use]
     #[inline]
     pub const fn fg_color(&self) -> Option<PackedColor> {
@@ -20,8 +18,7 @@ impl Cell {
         }
     }
 
-    /// Get background color when it is encoded inline in the cell; `None` for
-    /// RGB cells (`CellExtra` overflow).
+    /// Get background color when it is encoded inline in the cell.
     #[must_use]
     #[inline]
     pub const fn bg_color(&self) -> Option<PackedColor> {

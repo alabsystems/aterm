@@ -3,7 +3,6 @@
 
 //! TOML 1.0.0 conformance tests ([`VALID`]).
 
-/// These must be accepted.
 const VALID: &[&str] = &[
     "key = 1\nbare_key = 2\nbare-key = 3\n1234 = 4\n",
     "\"127.0.0.1\" = 1\n\"character encoding\" = 2\n\"ʎǝʞ\" = 3\n'key2' = 4\n'quoted \"value\"' = 5\n",
@@ -74,7 +73,6 @@ const VALID: &[&str] = &[
     "\u{feff}# just a comment\n",
 ];
 
-/// These must be refused.
 const INVALID: &[(&str, &str)] = &[
     (
         "name = \"Tom\"\nname = \"Pradyun\"\n",
@@ -230,8 +228,6 @@ fn everything_the_spec_forbids_is_refused() {
     );
 }
 
-/// Rejections must locate themselves, or the config editor has nothing to
-/// underline.
 #[test]
 fn parse_errors_carry_a_span_inside_the_source() {
     for (source, rule) in INVALID {
@@ -251,8 +247,6 @@ fn parse_errors_carry_a_span_inside_the_source() {
     }
 }
 
-/// A super-table may be declared after the header that implied it, the one redefinition
-/// the spec allows.
 #[test]
 fn an_implicit_super_table_may_be_declared_later() {
     let source = "[a.b]\nx = 1\n\n[a]\ny = 2\n";
@@ -280,8 +274,6 @@ fn an_implicit_super_table_may_be_declared_later() {
     );
 }
 
-/// The multi-line quote-run rule: up to two of the delimiter may sit against
-/// the closing one.
 #[test]
 fn multiline_strings_handle_delimiter_runs() {
     for (source, expected) in [
@@ -306,9 +298,6 @@ fn multiline_strings_handle_delimiter_runs() {
     );
 }
 
-/// TOML does not say what an implementation should do with a finite literal
-/// that overflows binary64. This crate refuses both signs, so `timeout =
-/// -1e400` cannot slip into a config as negative infinity.
 #[test]
 fn overflowing_float_literals_are_refused_in_both_signs() {
     for source in [
@@ -330,8 +319,6 @@ fn overflowing_float_literals_are_refused_in_both_signs() {
     );
 }
 
-/// The rendered diagnostic carries the source line, and the span underlines
-/// the offending value.
 #[test]
 fn a_schema_error_renders_the_offending_line() {
     #[derive(Debug, serde::Deserialize)]
@@ -358,10 +345,6 @@ fn a_schema_error_renders_the_offending_line() {
     }
 }
 
-/// End of input is on the last authored line, with an empty span:
-/// `native_config_language::parser_diagnostic_range` turns that into a visible caret on the
-/// last authored byte, where a span over the whole construct would underline its opening
-/// bracket.
 #[test]
 fn end_of_input_errors_point_at_the_last_authored_line() {
     for (source, position) in [
@@ -387,8 +370,6 @@ fn end_of_input_errors_point_at_the_last_authored_line() {
     }
 }
 
-/// Spans underline the offending token (`int = 010` is `6..9`, the literal); every span is
-/// in range and on character boundaries.
 #[test]
 fn token_spans_underline_the_token() {
     for (source, why) in INVALID {

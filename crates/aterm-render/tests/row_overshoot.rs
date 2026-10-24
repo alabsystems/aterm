@@ -14,9 +14,7 @@ use aterm_render::{DamageOutcome, Renderer, Theme, WindowCpu};
 
 const ROWS: usize = 8;
 const COLS: usize = 22;
-/// The row the "one" class carries its accented capitals on, and the row the typing streams edit.
 const HOT: usize = 3;
-/// Frames per case after the warm frame.
 const FRAMES: usize = 6;
 
 fn renderer_px(px: f32) -> Renderer {
@@ -28,10 +26,8 @@ fn renderer_px(px: f32) -> Renderer {
         .expect("no font: build with aterm-render's default embedded-font feature")
 }
 
-/// Accented capitals.
 const ACCENTS: &str = "\u{c9}\u{c1}\u{d1}\u{c5}\u{ca}\u{cd}";
 
-/// Row `r`'s text for a glyph class ([`HOT`]).
 fn line(class: &str, r: usize) -> String {
     let accented = match class {
         "accent" => true,
@@ -46,7 +42,6 @@ fn line(class: &str, r: usize) -> String {
     }
 }
 
-/// A terminal showing `class`'s screen, the cursor parked at `(row, col)` and shown or hidden.
 fn screen(class: &str, cursor: Option<(usize, usize)>) -> Terminal {
     let mut t = Terminal::new(ROWS as u16, COLS as u16);
     for r in 0..ROWS {
@@ -68,7 +63,6 @@ struct Geo {
     top: usize,
 }
 
-/// A full-width `glow_under` quad over row `r` (window-absolute pixels).
 fn under(g: Geo, r: usize, color: u32) -> GlowQuad {
     GlowQuad {
         row: r as u16,
@@ -83,7 +77,6 @@ fn under(g: Geo, r: usize, color: u32) -> GlowQuad {
     }
 }
 
-/// A steady flame filling row `r`'s band ([`Renderer::row_may_ink_above`]).
 fn flames(g: Geo, r: usize, i: &mut RenderInput) {
     i.fire_patch = vec![FirePatch {
         row: r as u16,
@@ -110,7 +103,6 @@ fn flames(g: Geo, r: usize, i: &mut RenderInput) {
         .collect();
 }
 
-/// An fx layer over row [`HOT`]'s band in `slot`, with a fresh content `Arc` each call.
 fn hot_layer(g: Geo, slot: FxSlot) -> FxLayer {
     let rect = FxItem::Rect(FxRect {
         x: 2,
@@ -143,7 +135,6 @@ const STREAMS: [&str; 11] = [
     "type_below",
 ];
 
-/// The warm frame and [`FRAMES`] frames of `stream` over `class`'s screen.
 fn frames(class: &str, stream: &str, g: Geo) -> Vec<RenderInput> {
     let snap = |t: &mut Terminal| t.cell_frame(ROWS, COLS);
     match stream {
@@ -328,7 +319,6 @@ fn ascii_typing_repaints_only_its_row() {
     }
 }
 
-/// Whether `glyphs` on row 1 ink into row 0's band at `px` in this host's face.
 fn inks_above(px: f32, glyphs: &str) -> bool {
     let mut r = renderer_px(px);
     let (_, ch) = r.cell_size();
@@ -343,7 +333,6 @@ fn inks_above(px: f32, glyphs: &str) -> bool {
     lit.pixels[band0.clone()] != bare.pixels[band0]
 }
 
-/// The first px of the sweep at which `glyphs` ink above their cell in this host's face.
 fn an_overshooting_px(glyphs: &str) -> f32 {
     (11..=20)
         .map(|px| px as f32)
@@ -356,10 +345,8 @@ fn accented_capitals_ink_above_their_cell_at_some_px() {
     an_overshooting_px(ACCENTS);
 }
 
-/// The prompt glyphs a shell draws its prompt with.
 const PROMPTS: [&str; 4] = ["$ ", "\u{276f} ", "\u{3bb} ", "\u{2192} "];
 
-/// The rows [`HOT`]'s typing marked.
 fn rows_typing_marks(r: &mut Renderer, prompt: &str, keys: &[&str]) -> Vec<Vec<usize>> {
     let mut t = Terminal::new(ROWS as u16, COLS as u16);
     for row in 0..ROWS {

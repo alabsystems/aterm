@@ -463,6 +463,10 @@ pub fn test_run(up: &Up, cargo: impl Fn(&[&str]) -> Vec<String>, args: &[&str]) 
 /// The packages whose Linux tests the proof runs.
 pub const TESTED: [&str; 3] = ["aterm-uds", "aterm-pty", "libc"];
 
+/// The package whose library tests the proof runs on their own row: the renderer's glyph and
+/// icon tests measure the face the guest resolves as its system face.
+pub const RENDER: &str = "aterm-render";
+
 /// The static bootstrap verifier's package and executable (install.sh's Linux verifier).
 pub const VERIFIER: &str = "aterm-bootstrap-verify";
 
@@ -2017,6 +2021,17 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
                 &out.text,
                 arch,
             ));
+            if let Err(s) = crate::stop::check() {
+                stopped = Some(s);
+                break 'arches;
+            }
+            println!("\n=== {tag}: {RENDER} library tests ===");
+            let mut render = vec!["--no-fail-fast", "-p", RENDER, "--lib", "--", "--nocapture"];
+            if arch == Arch::X86_64 {
+                render.push(ROSETTA_ONE_AT_A_TIME);
+            }
+            let out = test_run(&up, workspace, &render);
+            rows.push(test_verdict(&format!("{tag} tests: render lib"), &out));
             if let Err(s) = crate::stop::check() {
                 stopped = Some(s);
                 break 'arches;

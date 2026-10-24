@@ -38,6 +38,7 @@ pub(crate) enum Host {
     ErrorStack,
     PerformanceNow,
     DateNow,
+    RandomFill,
     /// Releases a JS object table slot (`object_drop`).
     ObjectDrop,
     /// WebGL2 import by index in [`super::webgl::IMPORTS`].
@@ -54,6 +55,7 @@ impl Host {
             Host::ErrorStack => ("aterm_host", "error_stack", &[I32], &[]),
             Host::PerformanceNow => ("aterm_host", "performance_now", &[], &[F64]),
             Host::DateNow => ("aterm_host", "date_now", &[], &[F64]),
+            Host::RandomFill => ("aterm_host", "random_fill", &[I32, I32], &[I32]),
             Host::ObjectDrop => ("aterm_host", "object_drop", &[I32], &[]),
             Host::Gl(i) => {
                 let g = &super::webgl::IMPORTS[i];
@@ -62,13 +64,13 @@ impl Host {
         }
     }
 
-    /// Every import the glue provides.
     fn all() -> impl Iterator<Item = Host> {
         [
             Host::ConsoleError,
             Host::ErrorStack,
             Host::PerformanceNow,
             Host::DateNow,
+            Host::RandomFill,
             Host::ObjectDrop,
         ]
         .into_iter()
@@ -400,7 +402,6 @@ pub(crate) const RESERVED: &[&str] = &[
     "yield",
 ];
 
-/// The top-level names the glue itself declares (`templates.rs`, `js.rs`).
 const GLUE_NAMES: &[&str] = &[
     "wasm",
     "wasmModule",
@@ -482,7 +483,6 @@ const GLUE_NAMES: &[&str] = &[
     "SyncInitInput",
 ];
 
-/// Validates that `name` is an ASCII JS identifier.
 fn identifier(name: &str) -> Result<(), String> {
     let mut bytes = name.bytes();
     let start = |b: u8| b.is_ascii_alphabetic() || b == b'_' || b == b'$';
@@ -492,7 +492,6 @@ fn identifier(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Rejects class or function names that collide with JS reserved words or glue declarations.
 fn top_level_name(name: &str) -> Result<(), String> {
     let glue = GLUE_NAMES.contains(&name)
         || name.starts_with("__wbg_")
@@ -510,7 +509,6 @@ fn top_level_name(name: &str) -> Result<(), String> {
     }
 }
 
-/// A record as a [`Func`], with its types checked for its kind.
 fn func(r: &Record, classes: &BTreeMap<String, Class>) -> Result<Func, String> {
     let at = || {
         if r.class.is_empty() {

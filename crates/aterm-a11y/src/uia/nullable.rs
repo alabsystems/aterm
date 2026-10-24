@@ -2,12 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Nullable interface results over the existing generated COM vtables.
-//!
-//! The generated traits represent interface results as non-null Rust values.
-//! Their `Err(Error::empty())` convention returns S_OK without writing the output.
-//! These typed wrappers initialize nullable slots, then delegate to the
-//! original thunk with its original object offset and HRESULT. All other methods,
-//! QueryInterface and reference counting remain the generated implementation.
 
 use super::*;
 use std::ffi::c_void;

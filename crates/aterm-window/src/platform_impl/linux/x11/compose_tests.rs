@@ -17,11 +17,8 @@ use crate::keyboard::{KeyCode, PhysicalKey};
 use crate::platform_impl::{ActiveEventLoop as PlatformActiveEventLoop, EventLoop};
 use crate::window::WindowAttributes;
 
-/// XI2's `XINotifyNormal` focus mode (XI2.h).
 const NORMAL: i32 = 0;
 
-/// The Left arrow's X keycode: evdev's `KEY_LEFT` (105) plus X's offset of 8, which the
-/// physical key is read from whatever the server's keymap.
 const LEFT: u32 = 113;
 
 /// What the application was told, of what these tests look at.
@@ -33,7 +30,6 @@ enum Told {
     Left,
 }
 
-/// The recorder's reading of one event.
 fn told(event: Event<()>) -> Option<Told> {
     let Event::WindowEvent { event, .. } = event else { return None };
     match event {
@@ -49,7 +45,6 @@ fn told(event: Event<()>) -> Option<Told> {
     }
 }
 
-/// A test's loop, its window and what the window was told.
 struct Bed {
     event_loop: EventLoop<()>,
     window: Window,
@@ -85,7 +80,6 @@ impl Bed {
         self.window.id().0 as ffi::Window
     }
 
-    /// What the window was told since the last look.
     fn take(&self) -> Vec<Told> {
         std::mem::take(&mut *self.seen.borrow_mut())
     }
@@ -96,7 +90,6 @@ impl Bed {
         x11.event_processor.process_ime(|_, event| seen.borrow_mut().extend(told(event)));
     }
 
-    /// The window's focus moves in (`true`) or out, as XI2 reports it with no grab.
     fn focus(&mut self, gained: bool) {
         // SAFETY: a plain C struct; every pointer in it stays null and the handlers read none.
         let mut event: XIFocusInEvent = unsafe { std::mem::zeroed() };
@@ -112,7 +105,6 @@ impl Bed {
         }
     }
 
-    /// The input method's preedit starts, as its preedit-start callback reports it.
     fn open_composition(&mut self) {
         let window = self.xwindow();
         let sender = self.ime(|ime| ime.event_sender_for_test());
@@ -123,7 +115,6 @@ impl Bed {
         assert_eq!(composing, Some(window as u32), "and is open");
     }
 
-    /// The Left arrow is pressed in the focused window.
     fn press_left(&mut self) {
         let window = self.xwindow();
         let (display, root) = {

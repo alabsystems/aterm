@@ -35,6 +35,30 @@ fn retired_token_flags_are_unknown_arguments() {
     assert_eq!(tree(&home.home), Vec::<String>::new());
 }
 
+/// `sh install.sh` on macOS runs it in bash 3.2's POSIX mode, which takes
+/// no process substitution: there the script parses and answers as bash
+/// does.
+#[test]
+fn the_script_runs_as_sh_runs_it() {
+    let scratch = Scratch::new();
+    let home = scratch.home("posix");
+    let control = gate(&home, &[]);
+    let args = [
+        "--dry-run",
+        "--no-app",
+        "--no-cli",
+        "--no-toolchain",
+        "--no-path",
+    ];
+    let posix = installer(&install_sh(), &home, &[("POSIXLY_CORRECT", "1")], &args);
+    assert_eq!(
+        (posix.code(), posix.stderr.as_str()),
+        (control.code(), control.stderr.as_str()),
+        "{}",
+        posix.all()
+    );
+}
+
 #[test]
 fn the_version_flag_pins_a_three_component_release() {
     let scratch = Scratch::new();

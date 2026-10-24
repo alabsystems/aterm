@@ -49,7 +49,6 @@ fn a_leaf_ran_a_program_when_its_job_its_root_or_a_child_says_so() {
     assert_eq!(leaf_program(100, 100, &RootAnswer::Unasked, None), None);
 }
 
-/// Open a close-on-exec PTY pair (`aterm_pty::open_pty_pair`) so the child cannot inherit the master FD.
 fn open_pty_pair() -> (i32, i32) {
     aterm_pty::open_pty_pair().expect("open_pty_pair")
 }
@@ -72,8 +71,7 @@ fn spawn_leader(argv: &[&str], home: &std::path::Path) -> (i32, i32) {
         .stdin(slave.try_clone().expect("dup slave"))
         .stdout(slave.try_clone().expect("dup slave"))
         .stderr(slave);
-    // SAFETY: `setsid` and `ioctl` are async-signal-safe; the closure runs
-    // in the forked child after its stdio is the slave.
+    // SAFETY: `setsid` and `ioctl` are async-signal-safe; the closure runs in the forked child after its stdio is the slave.
     unsafe {
         cmd.pre_exec(|| {
             if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
@@ -100,8 +98,7 @@ fn read_until(master: i32, want: &str) -> String {
         // SAFETY: one live `pollfd` this frame owns, for a bounded wait.
         if unsafe { libc::poll(&raw mut ready, 1, 50) } > 0 {
             let mut buf = [0u8; 4096];
-            // SAFETY: `master` is this test's open pty master; the buffer is
-            // live and its length is the one passed.
+            // SAFETY: `master` is this test's open pty master; the buffer is live and its length is the one passed.
             let n = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
             if let Ok(n) = usize::try_from(n) {
                 seen.extend_from_slice(&buf[..n]);
@@ -176,8 +173,7 @@ fn name_group(app: &App, id: u64, pgid: i32, program: &str) {
 
 fn kill_all(pids: &[i32], masters: &[i32]) {
     for pid in pids {
-        // SAFETY: each pid is a process this test started (or its job),
-        // still unreaped by anyone but this test's sessions.
+        // SAFETY: each pid is a process this test started (or its job), still unreaped by anyone but this test's sessions.
         unsafe { libc::kill(*pid, libc::SIGKILL) };
     }
     for master in masters {
@@ -186,7 +182,6 @@ fn kill_all(pids: &[i32], masters: &[i32]) {
     }
 }
 
-/// Verify crash-journal program capture across idle, foreground, background, direct-exec, and coview tabs.
 #[test]
 fn the_journal_names_the_tabs_whose_programs_a_death_would_take() {
     let home = aterm_tempfile::tempdir().expect("scratch home");
@@ -297,7 +292,6 @@ fn the_journal_names_the_tabs_whose_programs_a_death_would_take() {
     kill_all(&pids, &[idle.0, fg.0, bg.0, exe.0, exec.0]);
 }
 
-/// Verify that a pane held by a non-hosted foreground program does not request or count a missing remote folder on restore.
 #[test]
 fn a_held_panes_folder_that_is_not_here_is_not_asked_for_or_counted() {
     let home = aterm_tempfile::tempdir().expect("scratch home");
@@ -437,7 +431,6 @@ fn a_held_panes_folder_that_is_not_here_is_not_asked_for_or_counted() {
     kill_all(&[group, idle.1, held.1], &[idle.0, held.0]);
 }
 
-/// Verify that a foreground process-group change marks the crash journal dirty.
 #[test]
 fn a_foreground_change_owes_the_journal_a_capture() {
     let mut app = App::headless_for_test();

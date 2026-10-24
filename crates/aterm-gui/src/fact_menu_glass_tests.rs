@@ -513,3 +513,99 @@ fn a_cards_marks_are_drawn_while_it_is_open_and_gone_once_it_closes() {
         );
     }
 }
+
+/// The name a screen reader hears for the card open on `wid`.
+#[cfg(a11y_tree)]
+fn card_name(app: &App, wid: WindowId) -> String {
+    let tree = app.grid_a11y_tree(wid, None).expect("the grid's tree");
+    tree.nodes
+        .iter()
+        .find(|(_, n)| n.role() == aterm_a11y::model::Role::Menu)
+        .and_then(|(_, n)| n.label().map(str::to_owned))
+        .expect("the card is published, named")
+}
+
+/// A FACT'S CARD IS NAMED IN THE WORDS IT STATES (review 13): a card's
+/// lines, the model's `◆  Opus 5.5` and the traffic's `6m33s working ·
+/// ↑20M in · ↓82k out` and `peak …` under a graph a reader cannot see,
+/// reach the card's name in words: every line, in order, its marks and
+/// arrows left out, a `·` a comma, the counts and times said as a reader
+/// says them, and the graph named by what it spans. CONTROL: the glass
+/// draws the marks the name leaves out.
+#[cfg(a11y_tree)]
+#[test]
+fn a_fact_card_is_named_in_its_words_never_its_glyphs() {
+    let marks = ['\u{25c6}', '\u{2191}', '\u{2193}', '\u{b7}', '\u{2581}'];
+    let (mut app, wid, session, _reader) = usage_glass();
+    press_fact(&mut app, wid, session, Fact::Model, MouseButton::Right);
+    menu_frame(&mut app, wid);
+    assert_eq!(owner(&app), Some(MenuOwner::Fact(Fact::Model)));
+    let model = card_name(&app, wid);
+    assert!(model.ends_with(", Opus 5.5"), "{model}");
+    let drawn: Vec<String> = app
+        .autopilot_menu
+        .as_ref()
+        .expect("open")
+        .rows
+        .iter()
+        .filter_map(|row| match row {
+            MenuRow::Note { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        drawn,
+        ["\u{25c6}  Opus 5.5"],
+        "CONTROL: the glass draws the mark"
+    );
+    app.close_autopilot_menu();
+    menu_frame(&mut app, wid);
+    press_fact(&mut app, wid, session, Fact::Usage, MouseButton::Left);
+    menu_frame(&mut app, wid);
+    assert_eq!(owner(&app), Some(MenuOwner::Fact(Fact::Usage)));
+    let usage = card_name(&app, wid);
+    let worked = usage
+        .find(", 6 minutes 33 seconds working, 20 million in, 82 thousand out, graph from ")
+        .unwrap_or_else(|| panic!("both lines, in order: {usage}"));
+    assert!(usage[worked..].contains(" to now, peak "), "{usage}");
+    assert!(usage.contains(" out per "), "{usage}");
+    assert!(!usage.contains(char::is_control), "{usage}");
+    for name in [&model, &usage] {
+        assert!(!name.contains(marks), "{name}");
+    }
+    let lines = app.fact_menu_controls();
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("\u{2191}20M in \u{b7} \u{2193}82k out")),
+        "CONTROL: the glass draws the arrows and the dot: {lines:?}"
+    );
+}
+
+/// A LINE'S SPOKEN WORDS (review 13): a mark or a meter's glyphs left out,
+/// a `·` or `—` between two parts a comma, the words between kept as they
+/// stand. CONTROL: a line of words alone is said as it reads.
+#[test]
+fn a_lines_spoken_words_leave_its_glyphs_out() {
+    use crate::autopilot_menu::spoken_words;
+    for (line, said) in [
+        (
+            "\u{2386}  sol@example.test \u{b7} max 20x",
+            "sol@example.test, max 20x",
+        ),
+        (
+            "\u{25f7}  \u{25b0}\u{25b0}\u{25b1} 64% weekly",
+            "64% weekly",
+        ),
+        (
+            "No rotation accounts configured \u{2014} run aterm init",
+            "No rotation accounts configured, run aterm init",
+        ),
+        ("\u{2191}20M in \u{b7} \u{2193}82k out", "20M in, 82k out"),
+        ("+3 unread not graphed", "+3 unread not graphed"),
+        ("\u{2387}  main", "main"),
+        ("\u{2302}", ""),
+    ] {
+        assert_eq!(spoken_words(line), said, "{line:?}");
+    }
+}

@@ -1,17 +1,11 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-// Author: Andrew Yates
 
-//! The three containment levels: User=2, Safety=1, Containment=0; a higher level is more
-//! capability.
+//! The three containment levels.
 
 use std::fmt;
 
-/// The 3 containment modes, ordered by capability ([`Self::level`]); the crate-root table says
-/// what each enforces.
-///
-/// Set only by the launcher (`--containment` / `--sandbox` / `--no-sandbox`); aterm cannot
-/// upgrade its own mode, and it is immutable after initialization.
+/// The 3 containment modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 #[non_exhaustive]
@@ -32,9 +26,7 @@ impl ContainmentMode {
         self as u8
     }
 
-    /// The variant's canonical name, identical to its `Display` rendering, so
-    /// `Display` and the audit trail write one static string without
-    /// `format_args!`.
+    /// The variant's canonical name.
     #[inline]
     #[must_use]
     pub(crate) const fn name(self) -> &'static str {
@@ -80,8 +72,6 @@ impl Ord for ContainmentMode {
 #[derive(Debug, Clone)]
 pub struct ParseModeError(pub(crate) String);
 
-// Hand-written `Display`/`Error`: no runtime-argument `format_args!`, which the Trust strict
-// gate fails closed on.
 impl fmt::Display for ParseModeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("invalid containment mode: ")?;
@@ -114,10 +104,8 @@ mod tests {
         assert!(ContainmentMode::Safety > ContainmentMode::Containment);
     }
 
-    /// Only an exact mode name (any case) parses: no number, padding, prefix or NUL.
     #[test]
     fn test_parse_rejects_bypass_attempts() {
-        // The level encoding is not a name.
         assert!("0".parse::<ContainmentMode>().is_err());
         assert!("1".parse::<ContainmentMode>().is_err());
         assert!("2".parse::<ContainmentMode>().is_err());

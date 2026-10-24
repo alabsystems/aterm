@@ -31,19 +31,17 @@ fn divider_grid_is_uniform_seam() {
         col: 0,
         color: [9, 9, 9],
     });
-    let atlas = std::sync::Arc::new(aterm_render::SceneAtlas {
-        width: 1,
-        height: 1,
-        rgba: vec![255, 255, 255, 255],
-        version: 1,
-    });
-    dst.cat_quads.push(aterm_render::SpriteQuad::default());
-    dst.cat_atlas = Some(std::sync::Arc::clone(&atlas));
-    dst.free_sprites
-        .push(aterm_core::render::FreeSprite::default());
-    dst.free_atlas = Some(std::sync::Arc::clone(&atlas));
-    dst.rain_quads.push(aterm_render::SpriteQuad::default());
-    dst.rain_atlas = Some(atlas);
+    let art = aterm_render::fx::bitmap(
+        aterm_core::render::FxTexels::Rgba8Straight,
+        1,
+        1,
+        vec![255, 255, 255, 255],
+    )
+    .expect("an art");
+    aterm_render::sprites::SpriteLayers::new(1).publish(
+        &[aterm_render::sprites::FreeSprite::whole(0, 0, art)],
+        &mut dst.fx_layers,
+    );
     dst.scroll_frac_px = 3;
     dst.grid_top_row = 1;
     dst.grid_bot_row = 3;
@@ -75,25 +73,8 @@ fn divider_grid_is_uniform_seam() {
     fill_divider_grid(&mut dst, 3, 5, theme, None);
     assert!(dst.ink.is_empty(), "fill_divider_grid paints cells only");
     assert!(
-        dst.cat_quads.is_empty(),
-        "compose path carries no stale cats"
-    );
-    assert!(dst.cat_atlas.is_none(), "compose path drops the cat atlas");
-    assert!(
-        dst.free_sprites.is_empty(),
-        "compose path carries no stale free sprites"
-    );
-    assert!(
-        dst.free_atlas.is_none(),
-        "compose path drops the free-sprite atlas"
-    );
-    assert!(
-        dst.rain_quads.is_empty(),
-        "compose path carries no stale rain sprites"
-    );
-    assert!(
-        dst.rain_atlas.is_none(),
-        "compose path drops the rain atlas"
+        dst.fx_layers.is_empty(),
+        "compose path carries no stale fx layer (the companions, the rain)"
     );
     assert_eq!(
         (

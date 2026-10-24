@@ -3,14 +3,15 @@
 
 //! Pane placement and coordinate translators for a composed (split) frame.
 
-/// Translate one pane's rain emission into window-content coords and clip it to the pane's
-/// grid-interior box.
+/// Translate one pane's rain emission into window-content coords: a cell outside the pane's
+/// grid-interior box is dropped (cells are cell-aligned, so none is ever trimmed) and a halo is
+/// clipped to it.
 #[allow(
     clippy::too_many_arguments,
     reason = "the pane placement (row/col offset + rows/cols) and cell metrics are one flat geometry tuple; a wrapper struct would relocate the list, not simplify it"
 )]
 pub fn translate_rain_into_pane(
-    quads: &mut Vec<aterm_render::SpriteQuad>,
+    quads: &mut Vec<crate::matrix_rain::RainCell>,
     add: &mut Vec<aterm_render::RainHalo>,
     row_off: u16,
     col_off: u16,
@@ -51,7 +52,10 @@ pub fn translate_rain_into_pane(
             ) else {
                 return false;
             };
-            (q.x, q.y, q.w, q.h) = (x, y, w, h);
+            if (w, h) != (q.w, q.h) {
+                return false;
+            }
+            (q.x, q.y) = (x, y);
             q.row = q.row.saturating_add(row_off);
             true
         });
@@ -164,9 +168,12 @@ pub fn translate_ink_into_pane(ink: &mut Vec<aterm_render::InkCell>, place: Pane
     });
 }
 
-/// Move one pane's free-overlay sprites into the composed window grid and crop them to [`PanePlace`].
+/// Move one pane's companion sprites into the composed window grid and clip them to [`PanePlace`].
 #[inline]
-pub fn translate_free_into_pane(free: &mut Vec<aterm_core::render::FreeSprite>, place: PanePlace) {
+pub fn translate_free_into_pane(
+    free: &mut Vec<aterm_render::sprites::FreeSprite>,
+    place: PanePlace,
+) {
     if free.is_empty() {
         return;
     }
@@ -175,63 +182,23 @@ pub fn translate_free_into_pane(free: &mut Vec<aterm_core::render::FreeSprite>, 
     free.retain_mut(|s| {
         s.x = s.x.saturating_add(dx);
         s.y = s.y.saturating_add(dy);
+        s.clip = s.clip.translate(dx, dy);
         crop_free_sprite(s, px_box)
     });
 }
 
-/// Crop one free sprite and its atlas source rect to the pixel box `(x0, y0, x1, y1)`.
+/// Clip one companion sprite to the pixel box `(x0, y0, x1, y1)`: whether any
+/// of it is left to draw. The art and its destination stay whole, so the
+/// surviving pixels sample exactly the texels they sampled uncut.
 #[inline]
-pub const fn crop_free_sprite(
-    s: &mut aterm_core::render::FreeSprite,
-    px_box: (i32, i32, i32, i32),
+pub fn crop_free_sprite(
+    s: &mut aterm_render::sprites::FreeSprite,
+    (x0, y0, x1, y1): (i32, i32, i32, i32),
 ) -> bool {
-    let (bx0, by0, bx1, by1) = px_box;
-    let (x0, y0) = (s.x, s.y);
-    let x1 = x0.saturating_add(s.w as i32);
-    let y1 = y0.saturating_add(s.h as i32);
-    let cx0 = if x0 > bx0 { x0 } else { bx0 };
-    let cy0 = if y0 > by0 { y0 } else { by0 };
-    let cx1 = if x1 < bx1 { x1 } else { bx1 };
-    let cy1 = if y1 < by1 { y1 } else { by1 };
-    if cx1 <= cx0 || cy1 <= cy0 {
-        return false;
-    }
-    s.x = cx0;
-    s.y = cy0;
-    if cx0 == x0 && cy0 == y0 && cx1 == x1 && cy1 == y1 {
-        return true; // wholly inside: a pure shift, no atlas math
-    }
-    const fn scale(span: i32, dest: u16, atlas: u16) -> u16 {
-        if dest == 0 {
-            return 0;
-        }
-        let n = span as i64 * atlas as i64 + dest as i64 / 2;
-        let q = n / dest as i64;
-        if q < 0 {
-            0
-        } else if q > u16::MAX as i64 {
-            u16::MAX
-        } else {
-            q as u16
-        }
-    }
-    let (aw0, ah0) = (s.aw, s.ah);
-    let (w0, h0) = (s.w, s.h);
-    let left_trim = cx0 - x0;
-    let right_trim = x1 - cx1;
-    s.ax = s.ax.saturating_add(scale(
-        if s.flip_x { right_trim } else { left_trim },
-        w0,
-        aw0,
-    ));
-    s.ay = s.ay.saturating_add(scale(cy0 - y0, h0, ah0));
-    s.w = (cx1 - cx0) as u16;
-    s.h = (cy1 - cy0) as u16;
-    let aw_scaled = scale(cx1 - cx0, w0, aw0);
-    s.aw = if aw_scaled < 1 { 1 } else { aw_scaled };
-    let ah_scaled = scale(cy1 - cy0, h0, ah0);
-    s.ah = if ah_scaled < 1 { 1 } else { ah_scaled };
-    true
+    s.clip = s
+        .clip
+        .intersect(aterm_core::render::PxRect::new(x0, y0, x1, y1));
+    !s.visible().is_empty()
 }
 
 /// Move one pane's supernova additive light into the composed window grid and clip to the pane box.
@@ -266,35 +233,19 @@ pub fn translate_nova_into_pane(nova: &mut Vec<aterm_render::GlowQuad>, place: P
 
 #[cfg(test)]
 mod pane_free_crop_tests {
-    use aterm_core::render::{FreeSampler, FreeSprite, FreeZ};
+    use aterm_core::render::{FxTexels, PxRect};
 
     use super::{PanePlace, translate_free_into_pane};
+    use aterm_render::sprites::FreeSprite;
 
-    fn sprite(x: i32, w: u16, ax: u16, aw: u16, flip_x: bool) -> FreeSprite {
+    fn sprite(x: i32, w: u16, flip_x: bool) -> FreeSprite {
+        let art = aterm_render::fx::bitmap(FxTexels::Rgba8Straight, 8, 4, vec![9; 8 * 4 * 4])
+            .expect("art");
         FreeSprite {
-            x,
-            y: 0,
             w,
-            h: 4,
-            ax,
-            ay: 0,
-            aw,
-            ah: 4,
-            tint: 0x00FF_FFFF,
-            alpha: 255,
             flip_x,
-            z: FreeZ::OverText,
-            sampler: FreeSampler::Nearest,
+            ..FreeSprite::whole(x, 0, art)
         }
-    }
-
-    fn sampled(s: &FreeSprite) -> Vec<u16> {
-        (0..s.w)
-            .map(|i| {
-                let sx = if s.flip_x { s.aw - 1 - i } else { i };
-                s.ax + sx
-            })
-            .collect()
     }
 
     fn place(cols: u16) -> PanePlace {
@@ -311,17 +262,29 @@ mod pane_free_crop_tests {
     }
 
     #[test]
-    fn cropping_preserves_which_texels_the_surviving_pixels_sample() {
+    fn a_pane_clips_a_sprite_and_keeps_its_art_and_box_whole() {
         for flip in [false, true] {
-            let full = sprite(-2, 8, 100, 8, flip);
-            let want: Vec<u16> = sampled(&full).into_iter().skip(2).collect();
-            let mut v = vec![full];
+            let full = sprite(-2, 8, flip);
+            let mut v = vec![full.clone()];
             translate_free_into_pane(&mut v, place(6));
-            let got = sampled(&v[0]);
+            let s = &v[0];
             assert_eq!(
-                got, want,
-                "flip_x={flip}: a left crop must keep the same texels"
+                (s.x, s.y, s.w, s.h),
+                (2, 1, 8, 4),
+                "flip_x={flip}: shifted, not shrunk"
+            );
+            assert_eq!(s.art.id(), full.art.id());
+            assert_eq!(
+                s.visible(),
+                PxRect::new(4, 1, 10, 5),
+                "flip_x={flip}: cut at the pane's interior edges, so the surviving pixels sample the texels they sampled uncut"
             );
         }
+        let mut gone = vec![sprite(-20, 8, false)];
+        translate_free_into_pane(&mut gone, place(6));
+        assert!(
+            gone.is_empty(),
+            "a sprite wholly outside its pane is dropped"
+        );
     }
 }

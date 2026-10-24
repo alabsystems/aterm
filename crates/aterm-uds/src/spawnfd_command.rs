@@ -464,6 +464,17 @@ impl Child {
         Ok(usage)
     }
 
+    /// Whether the child has exited, without reaping it: until a wait does, its pid, and the
+    /// group and session it leads, stay its own.
+    /// # Errors
+    /// `waitid`'s, other than `EINTR` (retried); `Unsupported` off Darwin and Linux.
+    pub fn exited(&mut self) -> io::Result<bool> {
+        if self.usage.is_some() || self.handle.status.is_some() {
+            return Ok(true);
+        }
+        rusage::exited(self.id())
+    }
+
     /// The child's pid.
     #[must_use]
     pub fn id(&self) -> u32 {

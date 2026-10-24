@@ -6,7 +6,6 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use aterm_core::render::FreeZ;
 use aterm_core::terminal::Terminal;
 use aterm_effects::companion::{
     CompanionFrame, CompanionOwner, ContrastFallback, GlowOwnership, PetFacts, PetGlass,
@@ -21,6 +20,7 @@ use aterm_effects::pet_world::{PetPane, PetWorldFacts};
 use aterm_effects::word_decorations::{DecoConfig, WordDecorations};
 use aterm_lexicon::Lexicon;
 use aterm_models_effects::pet_surface_seam_model;
+use aterm_render::sprites::{FreeSprite, FreeZ};
 use aterm_spec::derive::Model;
 
 const FRAME: Duration = Duration::from_millis(16);
@@ -86,18 +86,18 @@ struct Shot {
     /// The focused pane's cell `(0, 0)` in window pixels.
     pane_at: (i32, i32),
     /// Every pet-sized body drawn this frame, either channel, in window
-    /// pixels: the ghosts and the live body, with the atlas tile each wears.
+    /// pixels: the ghosts and the live body, with the baked tile each wears.
     pets: [Option<Drawn>; 8],
 }
 
-/// One pet-sized sprite as drawn: its window rect `(x0, y0, x1, y1)`, the atlas
+/// One pet-sized sprite as drawn: its window rect `(x0, y0, x1, y1)`, the baked
 /// tile it wears (the bake of its pose, look and palette), its opacity, and whether
 /// it is the frame's live body (the last sprite the live lane pushed, at
 /// `body_win`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Drawn {
     rect: (i32, i32, i32, i32),
-    tile: (u16, u16),
+    tile: u128,
     alpha: u8,
     body: bool,
 }
@@ -247,7 +247,7 @@ impl Host {
             self.now,
         );
         let pane = self.pane.unwrap_or((0, 0));
-        let win = |s: &aterm_core::render::FreeSprite, at: (i32, i32)| {
+        let win = |s: &FreeSprite, at: (i32, i32)| {
             (
                 s.x + at.0,
                 s.y + at.1,
@@ -266,7 +266,7 @@ impl Host {
             .body_px
             .map(|(x0, x1, y0, y1)| (x0 + pane.0, y0 + pane.1, x1 + pane.0, y1 + pane.1));
         let mut pets = [None; 8];
-        let pet_sized = |s: &&aterm_core::render::FreeSprite| s.ah > self.cell.1;
+        let pet_sized = |s: &&FreeSprite| s.art.h() > self.cell.1;
         let last = free.len().checked_sub(1);
         let drawn = free
             .iter()
@@ -285,7 +285,7 @@ impl Host {
         for (slot, (rect, s, body)) in pets.iter_mut().zip(drawn) {
             *slot = Some(Drawn {
                 rect,
-                tile: (s.ax, s.ay),
+                tile: s.art.id(),
                 alpha: s.alpha,
                 body,
             });
@@ -2136,7 +2136,7 @@ fn light_screen(rows: u16, cols: u16, caret_row: u16, alt: bool) -> Vec<u8> {
     b
 }
 
-type Repaint = ((i32, i32, i32, i32), (u16, u16), (u16, u16));
+type Repaint = ((i32, i32, i32, i32), u128, u128);
 
 fn repainted(before: &Shot, after: &Shot) -> Vec<Repaint> {
     after
@@ -2305,7 +2305,7 @@ fn a_ghost_wears_the_palette_its_body_was_drawn_in() {
             after
         };
         let now = h.owner.brain().appearance_colors();
-        let ghost_tiles: Vec<Vec<(u16, u16)>> = after
+        let ghost_tiles: Vec<Vec<u128>> = after
             .iter()
             .take(3)
             .map(|s| {
@@ -2317,7 +2317,7 @@ fn a_ghost_wears_the_palette_its_body_was_drawn_in() {
                     .collect()
             })
             .collect();
-        let body_tiles: Vec<(u16, u16)> = before
+        let body_tiles: Vec<u128> = before
             .pets
             .iter()
             .flatten()
@@ -2354,7 +2354,7 @@ fn a_ghost_wears_the_palette_its_body_was_drawn_in() {
                 .flatten()
                 .find(|d| d.body)
                 .expect("the arriver drawn");
-            let seen: Vec<(u16, u16)> = before
+            let seen: Vec<u128> = before
                 .pets
                 .iter()
                 .flatten()

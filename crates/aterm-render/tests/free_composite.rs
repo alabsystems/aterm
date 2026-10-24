@@ -1,120 +1,61 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! CPU free-floating overlay layer compositing tests.
+//! The companions' sprite layers composited on the CPU: a multi-row sprite is
+//! the old per-row stamp byte for byte, a moved one leaves no ghost, a settled
+//! translucent one is never stamped twice, and each sits at its z.
 
 use std::sync::Arc;
 
 use aterm_core::render::{
-    DecoBlend, DecoGlyph, FreeSampler, FreeSprite, FreeZ, GlowQuad, SceneAtlas, SpriteQuad,
-    WordDecoration,
+    DecoBlend, DecoGlyph, FxArt, FxBlend, FxContent, FxInk, FxItem, FxLayer, FxSlot, FxSpace,
+    FxSprite, GlowQuad, PxRect, WordDecoration,
 };
 use aterm_core::terminal::Terminal;
+use aterm_render::legacy_sprite_oracle::{LegacySprite, LegacySprites};
+use aterm_render::sprites::{FreeSprite, FreeZ, SpriteLayers};
 use aterm_render::{Renderer, Theme, WindowCpu, premul_rgb, rgb_to_u32};
+
+use crate::sprites::{SALT, art_of, solid, under};
 
 fn renderer() -> Renderer {
     Renderer::from_system(18.0, Theme::default())
         .expect("no font: build with aterm-render's default embedded-font feature")
 }
 
-fn free_atlas(version: u64) -> SceneAtlas {
-    let (w, h) = (64u32, 128u32);
-    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-    for y in 0..h {
-        for x in 0..w {
-            let a = if y < 16 {
-                255u8
-            } else {
-                (60 + (x * 3 + y) % 180) as u8
-            };
-            rgba.extend_from_slice(&[
-                (x * 37 + y * 11) as u8,
-                (x * 5 + y * 53) as u8,
-                (x * 29 + y * 3) as u8,
-                a,
-            ]);
-        }
-    }
-    SceneAtlas {
-        width: w,
-        height: h,
-        rgba,
-        version,
-    }
-}
-
-fn free_1to1(x: i32, y: i32, w: u16, h: u16, src_xy: [u16; 2]) -> FreeSprite {
-    let [ax, ay] = src_xy;
-    FreeSprite {
-        x,
-        y,
-        w,
-        h,
-        ax,
-        ay,
-        aw: w,
-        ah: h,
-        tint: 0x00FF_FFFF,
-        alpha: 255,
-        flip_x: false,
-        z: FreeZ::UnderText,
-        sampler: FreeSampler::Nearest,
-    }
-}
-
-fn legacy_slices(x: i32, y: i32, w: u16, h: u16, src_xy: [u16; 2], ch: usize) -> Vec<SpriteQuad> {
-    let [ax, ay] = src_xy;
-    let (y0, y1) = (y as usize, y as usize + h as usize);
-    let mut slices = Vec::new();
-    for r in y0 / ch..=(y1 - 1) / ch {
-        let band_y0 = y0.max(r * ch);
-        let band_y1 = y1.min((r + 1) * ch);
-        slices.push(SpriteQuad {
-            row: r as u16,
-            x: x as u16,
-            y: band_y0 as u16,
-            w,
-            h: (band_y1 - band_y0) as u16,
-            ax,
-            ay: ay + (band_y0 - y0) as u16,
-            aw: w,
-            ah: (band_y1 - band_y0) as u16,
-            tint: 0x00FF_FFFF,
-            alpha: 255,
-            flip_x: false,
-        });
-    }
-    slices
+/// A `w × h` cut of a 64×128 pattern at `src`: opaque in its first 16 rows,
+/// translucent below.
+fn free_art(w: u16, h: u16, [sx, sy]: [u16; 2]) -> Arc<FxArt> {
+    art_of(w, h, |x, y| {
+        let (x, y) = (u32::from(x + sx), u32::from(y + sy));
+        let a = if y < 16 {
+            255u8
+        } else {
+            (60 + (x * 3 + y) % 180) as u8
+        };
+        [
+            (x * 37 + y * 11) as u8,
+            (x * 5 + y * 53) as u8,
+            (x * 29 + y * 3) as u8,
+            a,
+        ]
+    })
 }
 
 #[test]
-fn free_multirow_rect_matches_legacy_perrow_slices_on_both_paths() {
+fn a_multirow_sprite_is_the_old_stamp_and_its_move_repaints_exactly() {
     let mut rend = renderer();
     let (_, ch) = rend.cell_size();
     let (rows, cols) = (6usize, 12usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.process(b"\x1b[?25l");
-    let atlas = Arc::new(free_atlas(1));
-
-    let (x, w) = (4i32, 40u16);
     let h = (2 * ch + ch / 2) as u16;
+    let art = free_art(40, h, [2, 3]);
     let (y_a, y_b) = ((ch + ch / 2) as i32, (2 * ch + ch / 2) as i32);
-    let src = [2u16, 3u16];
-
-    let make_free = |term: &mut Terminal, y: i32| {
+    let mut pubr = SpriteLayers::new(SALT);
+    let mut make = |term: &mut Terminal, y: i32| {
         let mut input = term.cell_frame(rows, cols);
-        input.free_atlas = Some(atlas.clone());
-        input.free_sprites = vec![free_1to1(x, y, w, h, src)];
-        input
-    };
-    let make_legacy = |term: &mut Terminal, y: i32| {
-        let mut input = term.cell_frame(rows, cols);
-        input.cat_atlas = Some(atlas.clone());
-        input.cat_quads = legacy_slices(x, y, w, h, src, ch);
-        assert!(
-            input.cat_quads.len() >= 3,
-            "the rect must span >= 3 bands (multi-row premise)"
-        );
+        pubr.publish(&[under(4, y, art.clone())], &mut input.fx_layers);
         input
     };
 
@@ -122,42 +63,29 @@ fn free_multirow_rect_matches_legacy_perrow_slices_on_both_paths() {
         .render_input(&term.cell_frame(rows, cols))
         .pixels
         .clone();
-    let free_full = rend.render_input(&make_free(&mut term, y_a)).pixels.clone();
-    let legacy_full = rend
-        .render_input(&make_legacy(&mut term, y_a))
+    let full = rend.render_input(&make(&mut term, y_a)).pixels.clone();
+    assert_ne!(full, base, "the multi-row sprite paints");
+    rend.set_legacy_sprites(Some(LegacySprites {
+        sprites: vec![LegacySprite::of(&under(4, y_a, art.clone())).expect("whole")],
+    }));
+    let old = rend
+        .render_input(&term.cell_frame(rows, cols))
         .pixels
         .clone();
-    assert_ne!(
-        free_full, base,
-        "the multi-row free rect must actually paint"
-    );
+    rend.set_legacy_sprites(None);
     assert_eq!(
-        free_full, legacy_full,
-        "FULL path: one multi-row free rect must equal its legacy per-row \
-         slices byte-for-byte on the CPU (NEAREST 1:1 has no seam)"
+        full, old,
+        "one multi-row layer is the old stamp byte for byte"
     );
 
-    let mut wc_free = WindowCpu::new();
-    let mut wc_legacy = WindowCpu::new();
-    let _ = rend.render_input_cached(&mut wc_free, &make_free(&mut term, y_a));
-    let free_dmg = rend
-        .render_input_cached(&mut wc_free, &make_free(&mut term, y_b))
-        .pixels()
-        .to_vec();
-    let _ = rend.render_input_cached(&mut wc_legacy, &make_legacy(&mut term, y_a));
-    let legacy_dmg = rend
-        .render_input_cached(&mut wc_legacy, &make_legacy(&mut term, y_b))
-        .pixels()
-        .to_vec();
+    let mut wc = WindowCpu::new();
+    let _ = rend.render_input_cached(&mut wc, &make(&mut term, y_a));
+    let moved = make(&mut term, y_b);
+    let dmg = rend.render_input_cached(&mut wc, &moved).pixels().to_vec();
     assert_eq!(
-        free_dmg, legacy_dmg,
-        "DAMAGED path: the moved multi-row free rect must equal its moved \
-         legacy slices byte-for-byte on the CPU"
-    );
-    let free_fresh = rend.render_input(&make_free(&mut term, y_b)).pixels.clone();
-    assert_eq!(
-        free_dmg, free_fresh,
-        "the damaged-path free rect must equal a fresh full render"
+        dmg,
+        rend.render_input(&moved).pixels,
+        "the damaged move equals a full render"
     );
 }
 
@@ -169,23 +97,22 @@ fn free_no_ghosting_cached_equals_fresh_including_off_grid_pad_spill() {
     let (rows, cols) = (6usize, 12usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.process(b"\x1b[?25l");
-    let atlas = Arc::new(free_atlas(2));
-
-    let make = |term: &mut Terminal, x: i32, y: i32| {
+    let art = free_art(40, (ch + 8) as u16, [2, 0]);
+    let mut pubr = SpriteLayers::new(SALT);
+    let mut make = |term: &mut Terminal, at: Option<(i32, i32)>| {
         let mut input = term.cell_frame(rows, cols);
-        input.free_atlas = Some(atlas.clone());
-        input.free_sprites = vec![free_1to1(x, y, 40, (ch + 8) as u16, [2, 0])];
+        let sprites: Vec<FreeSprite> = at
+            .map(|(x, y)| under(x, y, art.clone()))
+            .into_iter()
+            .collect();
+        pubr.publish(&sprites, &mut input.fx_layers);
         input
     };
     let frames = [
-        make(&mut term, 2, -8),
-        make(&mut term, -5, (ch + 2) as i32),
-        make(&mut term, 2, (rows * ch - 4) as i32),
-        {
-            let mut input = term.cell_frame(rows, cols);
-            input.free_atlas = Some(atlas.clone());
-            input
-        },
+        make(&mut term, Some((2, -8))),
+        make(&mut term, Some((-5, (ch + 2) as i32))),
+        make(&mut term, Some((2, (rows * ch - 4) as i32))),
+        make(&mut term, None),
     ];
 
     let mut wc = WindowCpu::new();
@@ -217,15 +144,18 @@ fn settled_translucent_sprite_survives_text_edits_without_double_stamp() {
     term.process(b"\x1b[?25lhello free overlay");
     term.process(b"\x1b[3;1Hmiddle row");
 
-    let atlas = Arc::new(free_atlas(5));
     let sprite = FreeSprite {
         alpha: 140,
-        ..free_1to1(6, (ch + ch / 2) as i32, 48, (2 * ch) as u16, [1, 2])
+        ..under(
+            6,
+            (ch + ch / 2) as i32,
+            free_art(48, (2 * ch) as u16, [1, 2]),
+        )
     };
-    let make = |t: &mut Terminal| {
+    let mut pubr = SpriteLayers::new(SALT);
+    let mut make = |t: &mut Terminal| {
         let mut input = t.cell_frame(rows, cols);
-        input.free_atlas = Some(atlas.clone());
-        input.free_sprites = vec![sprite];
+        pubr.publish(std::slice::from_ref(&sprite), &mut input.fx_layers);
         input
     };
 
@@ -253,44 +183,53 @@ fn settled_translucent_sprite_survives_text_edits_without_double_stamp() {
     );
 }
 
+/// The rain's kind of layer: Linear, Under, no knock-out, `art` stretched to
+/// `w × h` at `(x, y)`.
+fn rain_like(x: i32, y: i32, w: u16, h: u16, art: Arc<FxArt>) -> FxLayer {
+    FxLayer::new(
+        2,
+        Arc::new(FxContent::new(
+            vec![FxItem::Sprite(FxSprite {
+                x,
+                y,
+                dw: w,
+                dh: h,
+                flip_x: false,
+                art,
+                ink: 0,
+                clip: PxRect::EVERYWHERE,
+            })],
+            vec![FxInk::over(0x00FF_FFFF, 255)],
+        )),
+        FxSlot::Under,
+        FxSpace::Grid,
+        FxBlend::Linear,
+    )
+}
+
 #[test]
-fn free_z_under_text_over_legacy_and_over_text() {
+fn free_z_under_text_over_the_rain_and_over_text() {
     let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let (rows, cols) = (3usize, 8usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.process("\x1b[?25l█".as_bytes());
-
-    let solid = |c: [u8; 4], version: u64| SceneAtlas {
-        width: 8,
-        height: 8,
-        rgba: (0..8 * 8).flat_map(|_| c).collect(),
-        version,
-    };
     let red = 0x00C8_2020u32;
+    let body = FreeSprite {
+        w: (2 * cw) as u16,
+        h: (2 * ch) as u16,
+        ..under(0, 0, solid([0xC8, 0x20, 0x20, 255], 8, 8))
+    };
 
     let mut input = term.cell_frame(rows, cols);
-    input.free_atlas = Some(Arc::new(solid([0xC8, 0x20, 0x20, 255], 1)));
-    input.free_sprites = vec![FreeSprite {
-        aw: 8,
-        ah: 8,
-        ..free_1to1(0, 0, (2 * cw) as u16, (2 * ch) as u16, [0, 0])
-    }];
-    input.cat_atlas = Some(Arc::new(solid([0x20, 0x20, 0xC8, 255], 2)));
-    input.cat_quads = vec![SpriteQuad {
-        row: 0,
-        x: cw as u16,
-        y: 0,
-        w: cw as u16,
-        h: ch as u16,
-        ax: 0,
-        ay: 0,
-        aw: 8,
-        ah: 8,
-        tint: 0x00FF_FFFF,
-        alpha: 255,
-        flip_x: false,
-    }];
+    input.fx_layers.push(rain_like(
+        cw as i32,
+        0,
+        cw as u16,
+        ch as u16,
+        solid([0x20, 0x20, 0xC8, 255], 8, 8),
+    ));
+    SpriteLayers::new(SALT).publish(std::slice::from_ref(&body), &mut input.fx_layers);
 
     let f = rend.render_input(&input);
     let fg = rgb_to_u32(input.cells[0][0].fg);
@@ -331,8 +270,8 @@ fn free_z_under_text_over_legacy_and_over_text() {
         band(0, 1)
             .iter()
             .all(|&(x, y, p)| if reach(x, y) { p == page } else { p == red }),
-        "B1-then-B2: the free under-sprite must draw OVER the legacy cat quad, and the \
-         knock-out lays the page round the block's ink"
+        "the companion draws OVER the rain under it, and the knock-out lays the page \
+         round the block's ink"
     );
     assert!(
         band(1, 0)
@@ -342,10 +281,7 @@ fn free_z_under_text_over_legacy_and_over_text() {
         "the sprite's second band must not be clobbered by that row's bg"
     );
 
-    let mut input_over = input.clone();
-    input_over.cat_quads.clear();
-    input_over.cat_atlas = None;
-    input_over.free_sprites[0].z = FreeZ::OverText;
+    let mut input_over = term.cell_frame(rows, cols);
     input_over.word_decorations.push(WordDecoration {
         row: 0,
         col: 1,
@@ -378,10 +314,14 @@ fn free_z_under_text_over_legacy_and_over_text() {
         color2: premul_rgb(0x00FF_C040, 200),
         alpha2: 0,
     });
-    let mut input_bare = input_over.clone();
-    input_bare.free_sprites.clear();
-    input_bare.free_atlas = None;
-    let bare = rend.render_input(&input_bare);
+    let bare = rend.render_input(&input_over);
+    SpriteLayers::new(SALT).publish(
+        &[FreeSprite {
+            z: FreeZ::OverText,
+            ..body
+        }],
+        &mut input_over.fx_layers,
+    );
     let f = rend.render_input(&input_over);
     assert_ne!(
         bare.pixels, f.pixels,

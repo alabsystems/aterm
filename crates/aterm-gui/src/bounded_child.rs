@@ -12,10 +12,7 @@ use aterm_uds::spawnfd::Stdio;
 pub(crate) const OUTPUT_CAP: u64 = 8 << 20;
 /// Timeout for bounded document reads.
 pub(crate) const READ_CAP: Duration = Duration::from_secs(30);
-/// How often [`run_bounded`] looks whether its child has exited.
 const POLL: Duration = Duration::from_millis(20);
-/// Cleanup may wait this long for the killed direct child, then leaves the
-/// existing spawnfd handle/reaper to finish; it does not certify exit.
 const REAP_RESERVE: Duration = Duration::from_secs(60);
 
 /// What a bounded child said.
@@ -29,11 +26,8 @@ pub(crate) struct Ran {
     pub(crate) stderr: String,
 }
 
-/// One reader's work, passed to the fallible thread constructor.
 type ReaderWork = Box<dyn FnOnce() + Send + 'static>;
 
-/// A reader started BEFORE the child. Dropping its input without a pipe
-/// cancels it, so a second reader that cannot start leaves no child running.
 struct Reader<R> {
     input: SyncSender<Option<R>>,
     output: Receiver<Vec<u8>>,
@@ -48,9 +42,6 @@ impl<R> Reader<R> {
     }
 }
 
-/// Start the reader while no child exists. The worker waits for its pipe,
-/// then keeps the same capped prefix as before. A reader still blocked on a
-/// descendant's pipe is not joined or certified ended by the caller's cap.
 fn reader<R: Read + Send + 'static>(
     which: &str,
     start: &mut impl FnMut(&str, ReaderWork) -> io::Result<()>,
@@ -71,8 +62,6 @@ fn reader<R: Read + Send + 'static>(
     Ok(Reader { input, output })
 }
 
-/// Collect one reader under the same absolute deadline as the child and the
-/// other stream. No deadline deliberately preserves the uncut command path.
 fn collect(output: Receiver<Vec<u8>>, by: Option<Instant>, which: &str) -> Result<String, String> {
     let bytes = match by {
         Some(by) => output
@@ -85,8 +74,6 @@ fn collect(output: Receiver<Vec<u8>>, by: Option<Instant>, which: &str) -> Resul
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// Kill the owned direct child, then wait only through the cleanup reserve.
-/// A retained descendant or an unsettled kernel wait is not claimed dead.
 fn end(child: &mut aterm_uds::spawnfd::Child) {
     let _ = child.kill();
     let mut exit = aterm_uds::deadline::ExitWait::new(child);
@@ -105,10 +92,6 @@ fn end(child: &mut aterm_uds::spawnfd::Child) {
     }
 }
 
-/// Keep the direct child owned through setup errors and unwinds too. An
-/// uncut command (bus install) gets no kill request: even on an exceptional
-/// exit from its caller it is waited for. A bounded command requests the existing
-/// kill/reap cleanup. Neither path claims every descendant or reader ended.
 struct RunningChild {
     child: aterm_uds::spawnfd::Child,
     bounded: bool,
@@ -141,8 +124,6 @@ pub(crate) fn run_bounded(
     })
 }
 
-/// The shipping flow with only its reader-thread constructor supplied. Both
-/// readers must start before even trying the command, including an uncut one.
 fn run_with_readers(
     program: &Path,
     args: &[String],
@@ -209,10 +190,6 @@ pub(crate) fn fence(text: &str) -> String {
 mod tests {
     use super::*;
 
-    /// A bounded child that answers is read whole, its exit code with it; one
-    /// that never exits is SIGKILLed at the cap and answers `Err`. The hang
-    /// detector is a minute; the cap is what ends the wait. NEGATIVE CONTROL:
-    /// the answering child is not killed.
     #[test]
     fn a_bounded_child_is_read_or_killed_at_its_cap() {
         let scratch = aterm_tempfile::TempDir::new().expect("owned reader setup scratch");

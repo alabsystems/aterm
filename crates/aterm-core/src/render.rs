@@ -460,86 +460,6 @@ const fn hash_fire_patch(patch: &FirePatch, hasher: &mut EffectStreamFingerprint
     hasher.write_pair(third, fourth);
 }
 
-/// One textured sprite quad for an animated overlay.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct SpriteQuad {
-    /// The viewport row band this quad lives in (its sole row, for the dirty gate).
-    pub row: u16,
-    /// Grid-interior pixel X of the dest rect (pad-relative).
-    pub x: u16,
-    /// Grid-interior pixel Y of the dest rect (pad-relative; within the `row` band).
-    pub y: u16,
-    /// Dest width in pixels.
-    pub w: u16,
-    /// Dest height in pixels (kept within the single `row` cell band).
-    pub h: u16,
-    /// Source rect X in the sprite atlas, in texels.
-    pub ax: u16,
-    /// Source rect Y in the sprite atlas, in texels.
-    pub ay: u16,
-    /// Source rect width in the sprite atlas, in texels.
-    pub aw: u16,
-    /// Source rect height in the sprite atlas, in texels.
-    pub ah: u16,
-    /// Multiply tint `0x00RRGGBB` applied to the sampled texel (`0x00FF_FFFF` = none).
-    pub tint: u32,
-    /// Extra opacity `0..=255` multiplied onto the sampled alpha (`255` = as-authored).
-    pub alpha: u8,
-    /// Mirror the sampled sprite horizontally (one baked pose facing either way).
-    pub flip_x: bool,
-}
-
-/// One free-floating decorative sprite: a pixel rectangle anywhere, even off-grid, with no row tag.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct FreeSprite {
-    /// Grid-interior pixel X of the dest rect (pad-relative; may be negative for an off-grid peek).
-    pub x: i32,
-    /// Grid-interior pixel Y of the dest rect (pad-relative; may be negative or past the bottom edge).
-    pub y: i32,
-    /// Dest width in pixels (zero is a no-op, rejected in the stamp).
-    pub w: u16,
-    /// Dest height in pixels (zero is a no-op, rejected in the stamp).
-    pub h: u16,
-    /// Source rect X in the free atlas, in texels.
-    pub ax: u16,
-    /// Source rect Y in the free atlas, in texels.
-    pub ay: u16,
-    /// Source rect width in the free atlas, in texels.
-    pub aw: u16,
-    /// Source rect height in the free atlas, in texels.
-    pub ah: u16,
-    /// Multiply tint `0x00RRGGBB` applied to the sampled texel (`0x00FF_FFFF` = none).
-    pub tint: u32,
-    /// Extra opacity `0..=255` multiplied onto the sampled alpha (`255` = as-authored).
-    pub alpha: u8,
-    /// Mirror the sampled sprite horizontally, exactly like [`SpriteQuad::flip_x`].
-    pub flip_x: bool,
-    /// Painter's-order slot: under or over the terminal text.
-    pub z: FreeZ,
-    /// Sampling regime.
-    pub sampler: FreeSampler,
-}
-
-/// Where a [`FreeSprite`] sits relative to the terminal text (painter's order, not a depth test); part of the damage compare.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum FreeZ {
-    /// Drawn after the cell backgrounds / under-text sprites, before glyphs.
-    #[default]
-    UnderText,
-    /// Drawn after glyphs and word decorations, before the cursor.
-    OverText,
-}
-
-/// How a [`FreeSprite`] samples its atlas.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum FreeSampler {
-    /// Nearest 1:1 (cats).
-    #[default]
-    Nearest,
-    /// Bilinear (deferred — scaled sprite art).
-    Linear,
-}
-
 /// An RGBA8 sprite atlas (straight alpha, row-major, `width*height*4`), shared by `Arc`.
 #[derive(Debug)]
 pub struct SceneAtlas {
@@ -1142,20 +1062,8 @@ pub struct RenderInput {
     pub char_fg: Vec<CharFg>,
     /// Per-cell contrast-halo strengths (fire legibility): the engulfment weight of the dark ring under a glyph's ink.
     pub fire_halo: Vec<FireHaloCell>,
-    /// Peeking-cat sprites drawn under the glyphs and inline images on both backends.
-    pub cat_quads: Vec<SpriteQuad>,
-    /// RGBA8 atlas for [`cat_quads`](RenderInput::cat_quads) (the host's `CatBaker`).
-    pub cat_atlas: Option<std::sync::Arc<SceneAtlas>>,
-    /// Free-floating decorative sprites ([`FreeSprite`]): pixel rects with no row tag.
-    pub free_sprites: Vec<FreeSprite>,
-    /// RGBA8 atlas for [`free_sprites`](RenderInput::free_sprites), versioned like [`cat_atlas`](RenderInput::cat_atlas).
-    pub free_atlas: Option<std::sync::Arc<SceneAtlas>>,
     /// Supernova additive light (crown, shockwave ring, rays), like [`cursor_glow_add`](RenderInput::cursor_glow_add) but grid-interior.
     pub nova_add: Vec<GlowQuad>,
-    /// Matrix-rain glyph sprites drawn under text, before [`cat_quads`](RenderInput::cat_quads) (cats walk on rain).
-    pub rain_quads: Vec<SpriteQuad>,
-    /// RGBA8 white-coverage atlas for [`rain_quads`](RenderInput::rain_quads) (the `RainBaker`'s).
-    pub rain_atlas: Option<std::sync::Arc<SceneAtlas>>,
     /// Rain bright-head additive halos, like [`nova_add`](RenderInput::nova_add): grid-interior pixels, one row band per quad.
     pub rain_add: Vec<RainHalo>,
     /// Retained fx layers ([`FxLayer`]).
@@ -1438,16 +1346,7 @@ impl PartialEq for RenderInput {
             && self.ink == other.ink
             && self.char_fg == other.char_fg
             && self.fire_halo == other.fire_halo
-            && self.cat_quads == other.cat_quads
-            && self.cat_atlas.as_ref().map(std::sync::Arc::as_ptr)
-                == other.cat_atlas.as_ref().map(std::sync::Arc::as_ptr)
-            && self.free_sprites == other.free_sprites
-            && self.free_atlas.as_ref().map(std::sync::Arc::as_ptr)
-                == other.free_atlas.as_ref().map(std::sync::Arc::as_ptr)
             && self.nova_add == other.nova_add
-            && self.rain_quads == other.rain_quads
-            && self.rain_atlas.as_ref().map(std::sync::Arc::as_ptr)
-                == other.rain_atlas.as_ref().map(std::sync::Arc::as_ptr)
             && self.rain_add == other.rain_add
             && self.fx_layers == other.fx_layers
             && self.fx_occluders == other.fx_occluders
@@ -1615,13 +1514,7 @@ impl RenderInput {
         self.ink.clone_from(&source.ink);
         self.char_fg.clone_from(&source.char_fg);
         self.fire_halo.clone_from(&source.fire_halo);
-        self.cat_quads.clone_from(&source.cat_quads);
-        self.cat_atlas.clone_from(&source.cat_atlas);
-        self.free_sprites.clone_from(&source.free_sprites);
-        self.free_atlas.clone_from(&source.free_atlas);
         self.nova_add.clone_from(&source.nova_add);
-        self.rain_quads.clone_from(&source.rain_quads);
-        self.rain_atlas.clone_from(&source.rain_atlas);
         self.rain_add.clone_from(&source.rain_add);
         self.fx_layers.clone_from(&source.fx_layers);
         self.fx_occluders.clone_from(&source.fx_occluders);
@@ -1719,13 +1612,7 @@ impl RenderInput {
             ink: Vec::new(),
             char_fg: Vec::new(),
             fire_halo: Vec::new(),
-            cat_quads: Vec::new(),
-            cat_atlas: None,
-            free_sprites: Vec::new(),
-            free_atlas: None,
             nova_add: Vec::new(),
-            rain_quads: Vec::new(),
-            rain_atlas: None,
             rain_add: Vec::new(),
             fx_layers: Vec::new(),
             fx_occluders: Vec::new(),
@@ -1967,19 +1854,7 @@ impl RenderInput {
         for c in &mut self.ink {
             c.row = c.row.saturating_add(strip as u16);
         }
-        for q in &mut self.cat_quads {
-            q.row = q.row.saturating_add(strip as u16);
-            q.y = q.y.saturating_add(dy);
-        }
-        let dy_free = i32::from(dy);
-        for s in &mut self.free_sprites {
-            s.y = s.y.saturating_add(dy_free);
-        }
         for q in &mut self.nova_add {
-            q.row = q.row.saturating_add(strip as u16);
-            q.y = q.y.saturating_add(dy);
-        }
-        for q in &mut self.rain_quads {
             q.row = q.row.saturating_add(strip as u16);
             q.y = q.y.saturating_add(dy);
         }
@@ -2167,13 +2042,7 @@ impl RenderInput {
         self.ink.clear();
         self.char_fg.clear();
         self.fire_halo.clear();
-        self.cat_quads.clear();
-        self.cat_atlas = None;
-        self.free_sprites.clear();
-        self.free_atlas = None;
         self.nova_add.clear();
-        self.rain_quads.clear();
-        self.rain_atlas = None;
         self.rain_add.clear();
         self.fx_layers.clear();
         self.fx_occluders.clear();
@@ -3973,34 +3842,17 @@ mod selection_clip_tests {
 mod rain_channel_tests {
     use super::{
         CharFg, FireHaloCell, FireMode, FirePatch, GlowQuad, HaloMode, RainHalo, RenderInput,
-        SceneAtlas, SpriteQuad,
+        SceneAtlas,
     };
     use std::sync::Arc;
 
-    fn rain_atlas(version: u64, fill: u8) -> Arc<SceneAtlas> {
+    fn wallpaper(version: u64, fill: u8) -> Arc<SceneAtlas> {
         Arc::new(SceneAtlas {
             width: 2,
             height: 2,
             rgba: vec![fill; 2 * 2 * 4],
             version,
         })
-    }
-
-    fn rain_quad(row: u16) -> SpriteQuad {
-        SpriteQuad {
-            row,
-            x: 4,
-            y: row * 16,
-            w: 8,
-            h: 16,
-            ax: 0,
-            ay: 0,
-            aw: 8,
-            ah: 16,
-            tint: 0x0000_FF44,
-            alpha: 96,
-            flip_x: true,
-        }
     }
 
     fn rain_halo(row: u16) -> RainHalo {
@@ -4070,8 +3922,7 @@ mod rain_channel_tests {
 
     fn populated() -> RenderInput {
         let mut input = RenderInput::empty();
-        input.rain_quads = vec![rain_quad(1), rain_quad(2)];
-        input.rain_atlas = Some(rain_atlas(7, 0xFF));
+        input.wallpaper = Some(wallpaper(7, 0xFF));
         input.rain_add = vec![rain_halo(1)];
         input.glow_halo = vec![rain_halo(2)];
         input.glow_under = vec![under_quad(1), under_quad(2)];
@@ -4151,21 +4002,21 @@ mod rain_channel_tests {
         let base = populated();
 
         let mut version_bumped = base.clone();
-        version_bumped.rain_atlas = Some(rain_atlas(8, 0xFF));
+        version_bumped.wallpaper = Some(wallpaper(8, 0xFF));
         assert_ne!(base, version_bumped, "a fresh atlas publish must be seen");
 
         let mut same_version_rebake = base.clone();
-        same_version_rebake.rain_atlas = Some(rain_atlas(7, 0x00));
+        same_version_rebake.wallpaper = Some(wallpaper(7, 0x00));
         assert_ne!(
             base, same_version_rebake,
             "a same-version DIFFERENT-Arc publish (rebuilt engine) compares UNEQUAL"
         );
 
         let mut same_arc = base.clone();
-        same_arc.rain_atlas.clone_from(&base.rain_atlas);
+        same_arc.wallpaper.clone_from(&base.wallpaper);
         assert_eq!(
             base, same_arc,
-            "re-presenting the same published Arc stays EQUAL (resting rain is free)"
+            "re-presenting the same published Arc stays EQUAL (a resting wallpaper is free)"
         );
     }
 

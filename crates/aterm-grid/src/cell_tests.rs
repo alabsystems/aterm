@@ -21,8 +21,6 @@ fn cell_set_methods() {
     assert!(cell.flags().contains(CellFlags::STRIKETHROUGH));
 }
 
-/// `fg_color`/`bg_color` return inline (default or indexed) colours only: an
-/// RGB colour lives in the extras overflow, so it reads `None`.
 #[test]
 fn color_accessors_report_inline_colours_only() {
     let inline = Cell::with_style(
@@ -45,8 +43,6 @@ fn color_accessors_report_inline_colours_only() {
     assert_eq!((rgb.fg_color(), rgb.bg_color()), (None, None));
 }
 
-/// The packing is lossless over every `char` (past the BMP as U+FFFD, never
-/// complex), visual flag set, (fg, bg) index pair and overflow index.
 #[test]
 fn cell_packing_is_lossless_over_every_input() {
     for c in (0..=0x10_FFFF).filter_map(char::from_u32) {
@@ -98,16 +94,6 @@ fn cell_packing_is_lossless_over_every_input() {
     }
 }
 
-/// HAS_EXTRAS (PackedColors bit 16) IS ORTHOGONAL TO EVERYTHING ELSE A CELL
-/// HOLDS, which the render path's `has_extras() || is_complex()` probe relies
-/// on:
-/// - the flag operations touch bit 16 and nothing else, and every colour
-///   setter leaves it alone, for every fg/bg index, the fg/bg mode byte at its
-///   edge values (the operations are per-bit, so 0x00/0x01/0x7F/0x80/0xFE/0xFF
-///   drive every bit both ways) and the unused bits 17..=23 clear and set;
-/// - HAS_EXTRAS and COMPLEX set and clear independently for every overflow
-///   index, and `set_has_extras` round-trips a cell's colours;
-/// - `Cell::EMPTY` — what erases write — has it clear.
 #[test]
 fn has_extras_is_independent_of_complex_and_colours() {
     const HAS: u32 = 1 << 16;

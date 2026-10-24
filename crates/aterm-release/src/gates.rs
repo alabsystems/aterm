@@ -2293,6 +2293,15 @@ pub(crate) fn aterm_gui_lib_test(
     command
 }
 
+/// How much longer `dir` stays where it is: a program was started from it
+/// ([`aterm_uds::deadline::stamp_exec`]) and never showed it ran, so macOS may still be
+/// assessing its first exec, until [`aterm_uds::deadline::FIRST_EXEC_HANG`] of awake time
+/// has passed or the Mac restarted. A directory with no stamp holds nothing.
+pub(crate) fn first_exec_hold(dir: &Path) -> Option<std::time::Duration> {
+    fs::symlink_metadata(dir.join(aterm_uds::deadline::EXEC_STAMP)).ok()?;
+    aterm_uds::deadline::copy_wait_left(dir, std::time::SystemTime::now())
+}
+
 /// Remove `path` (a directory, a file or a link), and nothing when it is absent.
 pub(crate) fn clear_path(path: &Path) -> std::io::Result<()> {
     match fs::symlink_metadata(path) {

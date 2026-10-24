@@ -45,6 +45,8 @@ pub const SELF_UPDATE_SWITCHES: &[(&str, Option<&str>)] = &[
     ("DISABLE_AUTOUPDATER", None),
     ("DISABLE_UPDATES", None),
     ("AGY_CLI_DISABLE_AUTO_UPDATE", Some("true")),
+    ("GROK_DISABLE_AUTOUPDATER", Some("1")),
+    ("KIMI_CODE_NO_AUTO_UPDATE", Some("1")),
 ];
 
 /// Whether `name=value` turns its tool's own updater off ([`SELF_UPDATE_SWITCHES`]).
@@ -396,5 +398,46 @@ mod tests {
         remove_sidecar(&build_dir);
         assert!(!path.exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Each vendor row's declared env turns its own updater off, by the value aterm writes
+    /// (grok's 1.0.45 source, whose variable name the 1.0.67 binary carries, and kimi
+    /// 2.3.1's source each read `1` as off and `0` as on), so `which` and the
+    /// doctor's drift line say so; `0`, or a variable no CLI reads, is just an environment.
+    /// Other spellings each CLI also reads as off (`true`, `yes`, `on`) are never written by
+    /// aterm, so the record names only `1`.
+    #[test]
+    fn every_rows_declared_env_turns_its_own_updater_off() {
+        for row in crate::vendor_direct::VENDORS {
+            let env = row.shim_env();
+            if env.is_empty() {
+                continue;
+            }
+            let line = env.fix_line(row.program).unwrap();
+            assert!(
+                line.starts_with(&format!("{}'s own updater is off here (", row.product)),
+                "{}: {line}",
+                row.program
+            );
+        }
+        let kimi = ShimEnv::admit(&raw(&["KIMI_CODE_NO_AUTO_UPDATE=1"])).unwrap();
+        assert_eq!(
+            kimi.fix_line("kimi").unwrap(),
+            "Kimi Code's own updater is off here (KIMI_CODE_NO_AUTO_UPDATE=1)"
+        );
+        for (name, on) in [
+            ("GROK_DISABLE_AUTOUPDATER", "0"),
+            ("KIMI_CODE_NO_AUTO_UPDATE", "0"),
+            ("GROK_AUTOUPDATER", "1"),
+            ("KIMI_AUTO_UPDATE", "1"),
+        ] {
+            assert!(!turns_updater_off(name, on), "{name}={on}");
+            let env = ShimEnv::admit(&raw(&[&format!("{name}={on}")])).unwrap();
+            assert_eq!(
+                env.fix_line("grok").unwrap(),
+                format!("runs with {name}={on}")
+            );
+        }
+        assert!(turns_updater_off("GROK_DISABLE_AUTOUPDATER", "1"));
     }
 }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Publication of an admitted plan through the wrapper with injected instants (design §10.6, and the publication part of §10.7).
+//! Publication of an admitted plan through the wrapper with injected instants.
 
 use aterm_aos::contract::Verdict;
 use aterm_aos::effects::NoEffects;
@@ -26,19 +26,16 @@ use super::test_fixtures::{
 };
 use super::{HOT_HAS_WAKE, MomentumCode, MomentumEvent, MomentumHost, PrebuiltMomentum, Sched};
 
-/// The grid winner, `{SettleAtStep{0}, NextStep}`, admitted on demand, since each publication consumes its own result.
 fn winner() -> Admitted {
     evaluator()
         .admit_one(&gap0().encode())
         .expect("the grid winner is admitted")
 }
 
-/// `{Shipped, Cadence}`: admitted, not useful.
 fn cadence() -> SchedulePlan {
     plan(Split::Shipped, Wake::Cadence)
 }
 
-/// A host running `sched` at `t0`, typed into with 12 keys and paused hot at the last, with the pause instant and the head it captured.
 fn typed_and_paused(t0: Instant, sched: Sched) -> (MomentumHost, Instant, Head) {
     let mut host = match sched {
         Sched::Prebuilt(code) => attached(t0, code),
@@ -53,7 +50,6 @@ fn typed_and_paused(t0: Instant, sched: Sched) -> (MomentumHost, Instant, Head) 
     (host, last, head)
 }
 
-/// [`typed_and_paused`] under the shipped code, with two keys queued during the pause.
 fn queued_two(t0: Instant) -> (MomentumHost, Instant, Head) {
     let (mut host, last, head) = typed_and_paused(t0, Sched::Prebuilt(MomentumCode::Shipped));
     host.on_key(last + ms(30), TAU);
@@ -66,7 +62,6 @@ fn queued_two(t0: Instant) -> (MomentumHost, Instant, Head) {
     (host, last + ms(60), head)
 }
 
-/// Asserts a refusal left the host paused at `head` with `queued` keys, `sched` live, and the boundary's counters at `replays` and `publications`.
 fn untouched(
     host: &MomentumHost,
     head: &Head,
@@ -88,7 +83,6 @@ fn untouched(
     );
 }
 
-/// The grid winner publishes over a paused shipped glow once, delivering the queued keys to the new pair and clearing the glow on the lane, and a second result is refused.
 #[test]
 fn an_admitted_plan_publishes_once() {
     let t0 = Instant::now();
@@ -159,7 +153,6 @@ fn an_admitted_plan_publishes_once() {
     assert_eq!(counted.publications, 1);
 }
 
-/// A winner whose live head moved between `prepare` and `commit`, by an input, a restore or a rival commit, is refused as `StaleHead` and nothing more is published.
 #[test]
 fn a_stale_winner_is_refused() {
     type Between = fn(&mut MomentumHost, Instant);
@@ -250,7 +243,6 @@ fn a_stale_winner_is_refused() {
     }
 }
 
-/// Over a live plan the policy names as no base, the useful winner and the cadence plan are refused as `BaseNotInPolicy` (the base is checked before usefulness) and a result of another policy as `PolicyMismatch` (the policy before the base), before anything is replayed.
 #[test]
 fn publishing_over_an_unnamed_base_is_refused() {
     let t0 = Instant::now();
@@ -285,7 +277,6 @@ fn publishing_over_an_unnamed_base_is_refused() {
     }
 }
 
-/// Every refusal before the boundary is named, in order, and changes nothing: unattached, running, another policy, another build.
 #[test]
 fn each_refusal_before_the_boundary_is_named_and_changes_nothing() {
     let t0 = Instant::now();
@@ -332,7 +323,6 @@ fn each_refusal_before_the_boundary_is_named_and_changes_nothing() {
     untouched(&host, &head, 2, shipped, (0, 0), "another build");
 }
 
-/// `{Shipped, Cadence}`, admitted but not useful, is refused as `NotUseful` over the shipped code but repairs the stranded demonstration fault with a bundle that verifies.
 #[test]
 fn a_not_useful_plan_repairs_the_demo_fault_but_cannot_replace_shipped() {
     let t0 = Instant::now();
@@ -482,7 +472,6 @@ fn an_interrupted_plan_commit_leaves_one_complete_pair() {
     );
 }
 
-/// The publication part is the commit's witness, its candidate state is the one the commit installed (nothing was queued), and every other part is the evaluator's result unchanged.
 #[test]
 fn a_published_plan_records_its_witness_and_revision() {
     let t0 = Instant::now();
@@ -553,7 +542,6 @@ fn a_published_plan_records_its_witness_and_revision() {
     assert_eq!(rest, computed, "only the publication part is filled");
 }
 
-/// The published bundle verifies, is named by its bytes' digest and round-trips its publication part, and every forged publication part is refused.
 #[test]
 fn a_published_bundle_verifies_and_a_forged_publication_is_refused() {
     let t0 = Instant::now();

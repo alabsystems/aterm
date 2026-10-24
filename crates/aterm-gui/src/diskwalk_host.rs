@@ -385,6 +385,9 @@ pub(crate) enum ToWalker {
     /// End the thread (tests: the process's walker lives as long as it).
     #[cfg(test)]
     Stop,
+    /// Answer with the walker thread's own disk policy, read on that thread (a test's read of what [`walker_main`] set).
+    #[cfg(test)]
+    ReadDiskPolicy(Sender<Option<bool>>),
 }
 
 /// The walker's whole answer, sent after each change.
@@ -1203,6 +1206,10 @@ impl Engine {
             }
             #[cfg(test)]
             ToWalker::Stop => return false,
+            #[cfg(test)]
+            ToWalker::ReadDiskPolicy(reply) => {
+                let _ = reply.send(aterm_diskwalk::thread_disk_throttled());
+            }
         }
         true
     }

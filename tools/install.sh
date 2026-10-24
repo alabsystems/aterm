@@ -122,6 +122,59 @@
 #   curl -fsSL https://raw.githubusercontent.com/alabsystems/aterm/HEAD/tools/install.sh | bash
 set -euo pipefail
 
+# Ordinary exported command functions must not override root's fixed OS tools.
+# This begins after Bash startup; it does not establish custody of the shell
+# interpreter, BASH_ENV, or a replacement of the builtin dispatcher itself.
+# The list comes in as a here-string: `sh install.sh` runs bash in POSIX
+# mode, where bash 3.2 (macOS's sh) does not parse a process substitution.
+discard_inherited_functions() {
+	builtin local inherited
+	while builtin read -r inherited; do
+		# This definition already replaced any imported one and remains callable
+		# by the private controlled-subshell fixture after a root library load.
+		[[ -z "$inherited" || "$inherited" == discard_inherited_functions ]] ||
+			builtin unset -f -- "$inherited"
+	done <<<"$(builtin compgen -A function)"
+}
+if [[ "$EUID" == 0 ]]; then
+	discard_inherited_functions
+fi
+
+# Bash sets EUID from the process and makes it readonly. The private library
+# fixtures replace this seam; production never asks an inherited PATH's id.
+installer_uid() { printf '%s\n' "$EUID"; }
+
+# Root's bootstrap utilities come from fixed OS folders. Keep the caller's
+# PATH for reading candidate locations, never for running metadata programs.
+# A host without these standard utilities can install as its account instead.
+root_metadata_path() {
+	unset ROOT_LOOKUP_PATH
+	[[ "$(installer_uid)" == 0 ]] || return 0
+	ROOT_LOOKUP_PATH="$PATH"
+	PATH=/usr/bin:/bin:/usr/sbin:/sbin
+	local tool
+	for tool in id uname ls find awk sed head dirname readlink env; do
+		if ! builtin type -P -- "$tool" >/dev/null 2>&1; then
+			echo "install.sh: root needs trusted system metadata tools ($tool is unavailable); run install.sh as your account, without sudo" >&2
+			return 1
+		fi
+	done
+}
+
+# Looking up a candidate executes nothing. Root still judges its absolute
+# path with may_run before asking it; nonroot keeps ordinary shell lookup.
+lookup_program() { # <name>
+	if [[ "$(installer_uid)" == 0 ]]; then
+		local p
+		p="$(PATH="${ROOT_LOOKUP_PATH-$PATH}" builtin type -P -- "$1")" || return 1
+		# Validation and execution can be separated by cd into the checkout.
+		[[ "$p" == /* ]] || p="$PWD/$p"
+		printf '%s\n' "$p"
+	else
+		command -v -- "$1"
+	fi
+}
+
 # Is this file really on disk (vs piped/`bash -s`, where BASH_SOURCE is unusable —
 # and on bash >= 5 points at the bash binary itself, so -r alone is not enough)?
 self_on_disk() {
@@ -1009,7 +1062,7 @@ console_owner_uid() {
 # a --dry-run's toolset line can never disagree with what the install does.
 elect_install_lane() { # <toolchain01> <version> <dmg> <dmg_sha> <zip> <zip_sha>
 	elect_container "$@" || return 1
-	toolset_deferral "$(console_owner_uid)" "$(id -u)" "${SUDO_UID:-}"
+	toolset_deferral "$(console_owner_uid)" "$(installer_uid)" "${SUDO_UID:-}"
 }
 
 # --- a root run over an account's home ---------------------------------------
@@ -1197,7 +1250,7 @@ run_as_home_account() { # <arg>...
 			;;
 		esac
 	done
-	exec_as_account "$HOME_ACCOUNT" "$keep" /usr/bin/env "HOME=$HOME" "PATH=$PATH" /bin/bash "$script" "$@"
+	exec_as_account "$HOME_ACCOUNT" "$keep" /usr/bin/env "HOME=$HOME" "PATH=${ROOT_LOOKUP_PATH-$PATH}" /bin/bash "$script" "$@"
 	exit $?
 }
 
@@ -1224,7 +1277,7 @@ foreign_home_folders() {
 	local p f cfg="${XDG_CONFIG_HOME:-$HOME/.config}" data="${XDG_DATA_HOME:-$HOME/.local/share}"
 	local -a trees
 	FOREIGN_FOLDERS=()
-	[[ "$(id -u)" != 0 && -O "$HOME" ]] || return 0
+	[[ "$(installer_uid)" != 0 && -O "$HOME" ]] || return 0
 	local -a desktop=()
 	if [[ "$(uname -s)" == Darwin ]]; then
 		trees=("$HOME/Library/Application Support/aterm" "$HOME/Library/Logs/aterm")
@@ -1273,7 +1326,7 @@ home_folder_top() { # <path>
 # with a newline, which would read as two paths (a test replaces it).
 foreign_inside() { # <dir>
 	find "$1" -mindepth 1 -maxdepth 4 \( -name "*"$'\n'"*" -prune \) -o \
-		\( ! -type l ! -user "$(id -u)" -prune -print \) 2>/dev/null || true
+		\( ! -type l ! -user "$(installer_uid)" -prune -print \) 2>/dev/null || true
 }
 
 # Add <path> to FOREIGN_FOLDERS unless one there holds it, and drop each one
@@ -1349,7 +1402,7 @@ unwritable_remedy() { # <dir> <setting>
 # root the question is another one (root_build_preflight).
 source_build_preflight() {
 	local d p me stale="" f
-	me="$(id -u)"
+	me="$(installer_uid)"
 	if [[ "$me" == 0 ]]; then
 		root_build_preflight
 		return
@@ -1682,7 +1735,7 @@ find_managed_targo() { # <root>
 		MANAGED_DECLINE="rust-toolchain.toml pins '${pin:-nothing}', not 'trust', so the aterm-managed Trust store is not this checkout's toolchain"
 		return 1
 	fi
-	if aterm="$(command -v aterm 2>/dev/null)" && [[ -n "$aterm" ]] && ! may_run "$aterm"; then
+	if aterm="$(lookup_program aterm 2>/dev/null)" && [[ -n "$aterm" ]] && ! may_run "$aterm"; then
 		# Root does not ask it; the PATH walk below only reads files. Kept for
 		# the refusal when nothing else is in reach (find_cargo_and_rustup).
 		MANAGED_ROOT_REFUSED="$aterm"
@@ -1705,7 +1758,7 @@ find_managed_targo() { # <root>
 	if [[ -z "$cand" ]]; then
 		# Routes 2 and 3: PATH, dir by dir, the first targo (or alias) that
 		# proves to be the store's; else the first seen, for the decline.
-		IFS=: read -ra dirs <<<"${PATH:-}"
+		IFS=: read -ra dirs <<<"${ROOT_LOOKUP_PATH-${PATH:-}}"
 		for d in ${dirs[@]+"${dirs[@]}"}; do
 			[[ -n "$d" ]] || continue
 			for name in targo alab-targo; do
@@ -1739,7 +1792,7 @@ find_managed_targo() { # <root>
 # source (trust_link_remedy).
 gate_trust_remedy() {
 	local a
-	a="$(command -v aterm 2>/dev/null)" || a=""
+	a="$(lookup_program aterm 2>/dev/null)" || a=""
 	if [[ "$(uname -s)" != Darwin ]]; then
 		printf '%s\n' "install rustup (https://rustup.rs), then $(trust_link_remedy)"
 	elif { [[ -n "$a" ]] && may_run "$a"; } ||
@@ -1780,6 +1833,16 @@ trust_link_remedy() { # [name]
 # that aterm, never `aterm pkg install trust`, which would run it as root.
 find_cargo_and_rustup() { # [root]
 	local root="${1:-}" home="${CARGO_HOME:-$HOME/.cargo}" beside="" seen managed=1 declined=""
+	if [[ "$(installer_uid)" == 0 ]]; then
+		if [[ "$home" != /* ]]; then
+			local here="$PWD"
+			[[ -z "$root" ]] || here="$(cd -P -- "$root" && pwd)" || return 1
+			home="$here/$home"
+		fi
+		# Preflight already interprets a relative cargo home at the checkout.
+		# Discovery, probes and the later build must read that same directory.
+		[[ -z "${CARGO_HOME:-}" ]] || export CARGO_HOME="$home"
+	fi
 	CARGO_BIN=""
 	RUSTUP_BIN=""
 	CARGO_LANE=""
@@ -1803,7 +1866,7 @@ find_cargo_and_rustup() { # [root]
 	# rustup first: its proxies sit beside it.
 	if [[ -x "$home/bin/rustup" ]]; then
 		RUSTUP_BIN="$home/bin/rustup"
-	elif ! RUSTUP_BIN="$(command -v rustup 2>/dev/null)" || [[ -z "$RUSTUP_BIN" ]]; then
+	elif ! RUSTUP_BIN="$(lookup_program rustup 2>/dev/null)" || [[ -z "$RUSTUP_BIN" ]]; then
 		RUSTUP_BIN=""
 	fi
 	if [[ -n "$RUSTUP_BIN" ]]; then
@@ -1813,7 +1876,7 @@ find_cargo_and_rustup() { # [root]
 		CARGO_BIN="$beside"
 	elif [[ -x "$home/bin/cargo" ]]; then
 		CARGO_BIN="$home/bin/cargo"
-	elif ! CARGO_BIN="$(command -v cargo 2>/dev/null)" || [[ -z "$CARGO_BIN" ]]; then
+	elif ! CARGO_BIN="$(lookup_program cargo 2>/dev/null)" || [[ -z "$CARGO_BIN" ]]; then
 		CARGO_BIN=""
 		if [[ -n "$MANAGED_ROOT_REFUSED" ]] && { [[ -z "$RUSTUP_BIN" ]] || ! may_run "$RUSTUP_BIN"; }; then
 			# Under root, with nothing root may run in reach: the toolchain is
@@ -2024,7 +2087,7 @@ CARGO_UNVERIFIED_LANE="target.'cfg(trust_verify)'.rustflags=[\"-Ztrust-verify=of
 cargo_build_pinned() { # <root>
 	local rest=":$PATH"
 	local -a genv=()
-	if [[ "$(id -u)" == 0 ]]; then
+	if [[ "$(installer_uid)" == 0 ]]; then
 		rest="$(root_build_path)"
 		rest="${rest:+:$rest}"
 		genv=("${ROOT_GIT_ENV[@]}")
@@ -2065,7 +2128,7 @@ ROOT_GIT_ENV=(GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1)
 # no such folders; as the account, PATH's.
 checkout_git() { # <arg>...
 	local d
-	if [[ "$(id -u)" != 0 ]]; then
+	if [[ "$(installer_uid)" != 0 ]]; then
 		git "$@"
 		return
 	fi
@@ -2989,6 +3052,20 @@ app_dest_verdict() { # <app-dir>
 	echo "foreign no readable CFBundleIdentifier and no binary that answers as aterm — if it is a damaged aterm install, move it aside (mv '$app' '$app.broken') and re-run"
 }
 
+# Whether a root run must not install into folder <dest>: it carries an ACL
+# (entry_without_acl), which may let an account other than root change what
+# is in it. The swap leaves <dest>/aterm.app free for a moment, and an
+# account that may add an entry there could make a folder of its own at that
+# name, which `mv` would then move the app into, and one that may remove
+# entries could take the app away. Its owner and the groups that can write it
+# are another matter: they could replace the app in any case, and
+# /Applications is admin's to write on purpose (own_bundle_as_root). A <dest>
+# that is a link is judged by the folder it leads to, which the staging and
+# the swap write.
+root_dest_acl_open() { # <dest>
+	[[ "$(installer_uid)" == 0 ]] && ! entry_without_acl "$1/"
+}
+
 # Whether <bundle> and everything in it is root's, with no file in it that a
 # group other than root's can write (root_entry), and nothing every account
 # can write or that carries an ACL.
@@ -3006,7 +3083,7 @@ bundle_is_only() { # <uid> <bundle>
 	[[ -d "$2" && -z "$(find "$2" \( ! -user "$1" -o \( ! -type l -perm -002 \) -o \
 		\( -type f -perm -020 ! -group 0 \) \) -print 2>/dev/null | head -n 1)" ]] || return 1
 	# `ls -le` prints each entry's ACL as ` <n>: <entry>` lines below it.
-	[[ "$(uname -s)" != Darwin ]] ||
+	[[ "$(uname -s)" == Linux ]] ||
 		ls_entry -leRA -- "$2" 2>/dev/null | awk '/^ [0-9]+: / { n = 1 } END { exit n }'
 }
 
@@ -3017,13 +3094,14 @@ bundle_is_only() { # <uid> <bundle>
 # folders take <dest>'s group and, when that group can write <dest>, its write
 # (/Applications: admin, as an admin's updater renames and removes the bundle);
 # its files stay root's alone to write, so no group changes what root runs. No
-# entry keeps an ACL: one <dest> passes down to what ditto makes in it (an
-# inheritable ACE) would grant what the modes do not.
+# entry keeps an ACL, a link's own among them, which `chmod -R` does not reach:
+# one the archive carries would grant what the modes do not. A <dest> that is
+# a link gives the group and write of the folder it leads to.
 own_bundle_as_root() { # <stage> <dest>
 	local mode links uid gid rest
-	read -r mode links uid gid rest <<<"$(ls_entry -nd -- "$2")"
+	read -r mode links uid gid rest <<<"$(ls_entry -nd -- "$2/")"
 	chown -R "0:${gid:-0}" "$1" && chmod -R go-w "$1" || return 1
-	[[ "$(uname -s)" != Darwin ]] || chmod -R -N "$1" || return 1
+	[[ "$(uname -s)" == Linux ]] || { chmod -R -N "$1" && find "$1" -type l -exec chmod -h -N {} +; } || return 1
 	[[ "${mode:5:1}" != w ]] || find "$1" -type d -exec chmod g+w {} +
 }
 
@@ -3035,25 +3113,26 @@ own_bundle_as_root() { # <stage> <dest>
 # copy is that account's, and it could change the app before root makes it
 # root's: the copy is made inside STAGE_DIR, a folder mktemp makes in <dest>,
 # and made root's there. An inheritable ACL entry on <dest> (SIP keeps one
-# off /Applications, not off another folder) passes down to STAGE_DIR, and
-# until it is stripped an account it names may enter, replace, chmod or take
-# the folder, or hold a descriptor that later looks up names in it without
-# the search right. So STAGE_DIR loses its ACL and must then be
-# staging_folder_sealed's, and the copy goes into a second folder mktemp
-# makes in it: made after the strip, that one inherits nothing, and no
-# descriptor on STAGE_DIR can search it. Status 1 when any of it fails;
-# drop_stage removes what this made.
+# off /Applications, not off another folder; root_dest_acl_open refuses a
+# <dest> with one, so this is for one added since) passes down to STAGE_DIR,
+# and until it is stripped an account it names may enter, replace, chmod or
+# take the folder, or hold a descriptor that later looks up names in it
+# without the search right. So STAGE_DIR loses its ACL (with -h, never
+# through a link put in its place) and must then be staging_folder_sealed's,
+# and the copy goes into a second folder mktemp makes in it: made after the
+# strip, that one inherits nothing, and no descriptor on STAGE_DIR can search
+# it. Status 1 when any of it fails; drop_stage removes what this made.
 stage_bundle() { # <app> <dest>
 	local d
 	STAGE=""
 	STAGE_DIR=""
-	if [[ "$(id -u)" != 0 ]]; then
+	if [[ "$(installer_uid)" != 0 ]]; then
 		STAGE="$2/aterm.app.installing.$(random_suffix)"
 		ditto "$1" "$STAGE"
 		return
 	fi
 	STAGE_DIR="$(mktemp -d "$2/aterm.app.installing.XXXXXX")" || return 1
-	[[ "$(uname -s)" != Darwin ]] || chmod -N "$STAGE_DIR" || return 1
+	[[ "$(uname -s)" == Linux ]] || chmod -h -N "$STAGE_DIR" || return 1
 	staging_folder_sealed "$STAGE_DIR" || return 1
 	d="$(mktemp -d "$STAGE_DIR/copy.XXXXXX")" || return 1
 	STAGE="$d/aterm.app"
@@ -3070,7 +3149,7 @@ staging_folder_sealed() { # <dir>
 	read -r mode links uid rest <<<"$(ls_entry -nld -- "$1" 2>/dev/null)"
 	[[ "${mode:0:10}" == drwx------ && "$uid" == 0 ]] || return 1
 	[[ -z "$(find "$1" -mindepth 1 -maxdepth 1 -print 2>/dev/null | head -n 1)" ]] || return 1
-	[[ "$(uname -s)" != Darwin ]] ||
+	[[ "$(uname -s)" == Linux ]] ||
 		ls_entry -lde -- "$1" 2>/dev/null | awk '/^ [0-9]+: / { n = 1 } END { exit n }'
 }
 
@@ -3143,7 +3222,7 @@ install_app_cleanup() {
 retire_caffeine_startup() { # <exe>
 	local exe="$1" plist label s=0 found=()
 	[[ "$(uname -s)" == Darwin ]] || return 0
-	[[ "$(id -u)" != 0 || "$(home_owner_uid)" == 0 ]] || return 0
+	[[ "$(installer_uid)" != 0 || "$(home_owner_uid)" == 0 ]] || return 0
 	for plist in "$HOME"/Library/LaunchAgents/com.aterm.aterm.caffeine*.plist; do
 		[[ -f "$plist" && ! -L "$plist" ]] || continue
 		label="${plist##*/}"
@@ -3163,7 +3242,7 @@ retire_caffeine_startup() { # <exe>
 		rm -f "$plist" || continue
 		label="${plist##*/}"
 		# Not loaded is as good as unloaded.
-		bounded "$VERIFY_WAIT_SECS" launchctl bootout "gui/$(id -u)/${label%.plist}" >/dev/null 2>&1 || true
+		bounded "$VERIFY_WAIT_SECS" launchctl bootout "gui/$(installer_uid)/${label%.plist}" >/dev/null 2>&1 || true
 		echo "install.sh: turned off aterm Caffeine's Enable at Startup ($plist): this aterm has no Caffeine, so its login job would fail every 10 s — an aterm with the Caffeine menu turns it back on"
 	done
 }
@@ -3219,16 +3298,16 @@ bin_aterm_verdict() { # <path> <store-dir>
 # Whether this run may run <program>: a run as anyone but root may run any;
 # root only one no other account can change, so the file and every folder on
 # its way from /, as written and through each link it passes, are root's, and
-# none of those folders lets every account write in it unless it is sticky.
+# none has an ACL or lets another account write in it, sticky folders included.
 # Over a HOME another account owns (a CI container's, a folder outside its
 # owner's own home), root would otherwise run, as root, what that account left
 # there (~/.local/bin/aterm, ~/Applications/aterm.app).
 may_run() { # <program>
-	[[ "$(id -u)" == 0 ]] || return 0
+	[[ "$(installer_uid)" == 0 ]] || return 0
 	local p="$1" t hops=0
 	[[ "$p" == /* ]] || p="$PWD/$p"
 	while :; do
-		root_folders "${p%/*}" || return 1
+		[[ -z "$(folder_failing sealed_entry "${p%/*}")" ]] || return 1
 		[[ -L "$p" ]] || break
 		hops=$((hops + 1))
 		[[ "$hops" -le 40 ]] || return 1
@@ -3236,7 +3315,7 @@ may_run() { # <program>
 		[[ "$t" == /* ]] || t="${p%/*}/$t"
 		p="$t"
 	done
-	[[ -f "$p" ]] && root_entry "$p"
+	[[ -f "$p" ]] && sealed_entry "$p"
 }
 
 # Whether <dir> and each folder above it are root_entry ones, as written and as
@@ -3275,7 +3354,57 @@ folder_failing() { # <test> <dir>
 sealed_entry() { # <path>
 	local mode links uid gid rest
 	read -r mode links uid gid rest <<<"$(ls_entry -nd -- "$1" 2>/dev/null)"
-	[[ "$uid" == 0 && ( "${mode:0:1}" == l || ( "${mode:8:1}" != w && ( "${mode:5:1}" != w || "$gid" == 0 ) ) ) ]]
+	[[ "$uid" == 0 && ( "${mode:0:1}" == l || ( "${mode:8:1}" != w && ( "${mode:5:1}" != w || "$gid" == 0 ) ) ) ]] &&
+		entry_without_acl "$1"
+}
+
+# Read BSD ACL metadata successfully, then refuse every extended ACL: its
+# write, delete or security rights need not appear in the mode bits. ls lists
+# the ACEs even when an extended attribute hides the mode's `+`. No output
+# is no proof.
+acl_listing_clear() { # <ls-arg>...
+	local listing
+	listing="$(ls_entry "$@" 2>/dev/null)" || return 1
+	[[ -n "$listing" ]] || return 1
+	printf '%s\n' "$listing" | awk '
+		/^[[:blank:]]+[0-9]+:/ { bad = 1 }
+		/^[-bcdlps]/ && length($1) >= 10 && substr($1, 11) ~ /[+?]/ { bad = 1 }
+		END { exit bad }'
+}
+
+entry_without_acl() { # <path>
+	if [[ "$(uname -s)" == Darwin ]]; then
+		acl_listing_clear -ndle -- "$1"
+	else
+		linux_acl_clear -cpn -- "$1"
+	fi
+}
+
+# A mode-only ls may have been built without ACL support. A successful
+# getfacl query supplies the actual access and default ACLs; if no fixed OS
+# query tool exists, root has no authority proof. POSIXLY_CORRECT otherwise
+# hides default ACLs, so it is removed for this one read.
+linux_acl_query() { # <getfacl-arg>...
+	local tool
+	for tool in /usr/bin/getfacl /bin/getfacl; do
+		[[ -x "$tool" ]] || continue
+		env -u POSIXLY_CORRECT "$tool" "$@"
+		return
+	done
+	return 1
+}
+
+linux_acl_clear() { # <getfacl-arg>...
+	local listing
+	listing="$(linux_acl_query "$@" 2>/dev/null)" || return 1
+	[[ -n "$listing" ]] || return 1
+	printf '%s\n' "$listing" | awk '
+		/^user::[r-][w-][x-]$/ { users++; next }
+		/^group::[r-][w-][x-]$/ { groups++; next }
+		/^other::[r-][w-][x-]$/ { others++; next }
+		/^# flags: [s-][s-][t-]$/ || /^[[:space:]]*$/ { next }
+		{ bad = 1 }
+		END { exit (bad || !users || users != groups || users != others) }'
 }
 
 # The first entry at or below folder <dir> (a physical path) that another
@@ -3293,6 +3422,13 @@ root_tree_offender() { # <dir>
 		printf '%s\n' "$f"
 		return 0
 	fi
+	# The mode walk does not see an ACL's authority. Read the complete tree,
+	# including dot entries, and name its root if the metadata is not ACL-free.
+	if [[ "$(uname -s)" == Darwin ]]; then
+		acl_listing_clear -lneRA -- "$1"
+	else
+		linux_acl_clear -RcpnP -- "$1"
+	fi || { printf '%s\n' "$1"; return 0; }
 	while IFS= read -r l; do
 		[[ -n "$l" ]] || continue
 		if [[ -d "$l" ]]; then
@@ -3331,21 +3467,35 @@ root_tree_failing() { # <path>
 }
 
 # Whether root may take programs from folder <dir> by name, as a build takes
-# cc, ar, ld or git from PATH: root_folders allows it, and nothing directly in
-# it that is a file, through its link when it is one, is another uid's or one
-# every account or a group but root's can write.
+# cc, ar, ld or git from PATH: sealed ancestry prevents replacing an entry
+# after this walk, files have root's modes and no ACL, and file aliases pass
+# the same ancestry check through their targets.
 root_bin_dir() { # <dir>
-	[[ "$1" == /* ]] && root_folders "$1" &&
-		[[ -z "$(find -L "$1/" -mindepth 1 -maxdepth 1 \( -name "*"$'\n'"*" -prune \) -o \
-			\( -type f \( ! -user 0 -o -perm -002 -o \( -perm -020 ! -group 0 \) \) -print \) 2>/dev/null |
-			head -n 1)" ]]
+	local found links link
+	[[ "$1" == /* && -z "$(folder_failing sealed_entry "$1")" ]] || return 1
+	found="$(find -L "$1/" -mindepth 1 -maxdepth 1 \( -name "*"$'\n'"*" -print -prune \) -o \
+		\( -type f \( ! -user 0 -o -perm -002 -o \( -perm -020 ! -group 0 \) \) -print \) 2>/dev/null)" || return 1
+	[[ -z "$found" ]] || return 1
+	if [[ "$(uname -s)" == Darwin ]]; then
+		acl_listing_clear -lneAL -- "$1"
+	else
+		# A trailing slash resolves an admitted /bin-style directory alias;
+		# -P still avoids following links found inside the directory.
+		linux_acl_clear -RcpnP -- "$1/"
+	fi || return 1
+	# A file alias also depends on every folder its target passes through.
+	links="$(find "$1/" -mindepth 1 -maxdepth 1 -type l -print 2>/dev/null)" || return 1
+	while IFS= read -r link; do
+		[[ -n "$link" && -f "$link" ]] || continue
+		may_run "$link" || return 1
+	done <<<"$links"
 }
 
 # PATH's folders that root_bin_dir allows, in PATH's order: the PATH a root
 # source build runs on after the folders its lane puts first.
 root_build_path() {
 	local d out="" dirs
-	IFS=: read -ra dirs <<<"${PATH:-}"
+	IFS=: read -ra dirs <<<"${ROOT_LOOKUP_PATH-${PATH:-}}"
 	for d in ${dirs[@]+"${dirs[@]}"}; do
 		root_bin_dir "$d" && out+="${out:+:}$d"
 	done
@@ -3657,6 +3807,8 @@ if [[ "${ATERM_INSTALL_LIBRARY_ONLY:-0}" == 1 ]]; then
 	return 0 2>/dev/null || exit 0
 fi
 
+root_metadata_path || exit 1
+
 # --- uninstall: the installed aterm's own sweep ------------------------------
 
 # --uninstall: the installed aterm sweeps what this script placed (`aterm pkg
@@ -3930,11 +4082,11 @@ done
 # invoker's.
 HOME_OWNER="$(home_owner_uid)"
 HOME_NAMED=0
-if [[ "$(id -u)" == 0 && -n "$HOME_OWNER" && "$HOME_OWNER" != 0 && "$HOME_OWNER" != "${SUDO_UID:-}" ]] &&
+if [[ "$(installer_uid)" == 0 && -n "$HOME_OWNER" && "$HOME_OWNER" != 0 && "$HOME_OWNER" != "${SUDO_UID:-}" ]] &&
 	home_owner_named; then
 	HOME_NAMED=1
 fi
-home_account "$(id -u)" "${SUDO_UID:-}" "$HOME_OWNER" "$HOME_NAMED"
+home_account "$(installer_uid)" "${SUDO_UID:-}" "$HOME_OWNER" "$HOME_NAMED"
 if [[ -n "$HOME_ACCOUNT" || "$HOME_REFUSED" -eq 1 ]]; then
 	run_as_home_account ${ARGV[@]+"${ARGV[@]}"}
 fi
@@ -4093,6 +4245,8 @@ if [[ "$DO_APP" -eq 1 ]]; then
 			fi
 			if ! ensure_dirs_writable "$DEST"; then
 				APP_SKIP="cannot create/write $DEST (set ATERM_INSTALL_DIR to a writable dir)"
+			elif root_dest_acl_open "$DEST"; then
+				APP_SKIP="$DEST carries an ACL, which may let an account other than root change what is in it, so a root run does not install aterm.app there (that account could put a folder of its own in the app's place as it is swapped in) — ls -led '$DEST/' lists the entries; remove them (sudo chmod -N '$DEST'), or set ATERM_INSTALL_DIR to a folder without one"
 			elif APP_DEST_VERDICT="$(app_dest_verdict "$DEST/aterm.app")" &&
 				[[ "$APP_DEST_VERDICT" == foreign* ]]; then
 				# Ownership, the uninstaller's own test: a bundle that is not
@@ -4125,7 +4279,7 @@ if [[ "$DO_APP" -eq 1 ]]; then
 				fi
 				SKIP_STATUS=0
 				installed_bundle_verified "$DEST/aterm.app" "$SKIP_TEAM" || SKIP_STATUS=$?
-				if [[ "$SKIP_STATUS" -eq 0 && "$(id -u)" == 0 ]] && ! bundle_is_roots "$DEST/aterm.app"; then
+				if [[ "$SKIP_STATUS" -eq 0 && "$(installer_uid)" == 0 ]] && ! bundle_is_roots "$DEST/aterm.app"; then
 					# A root run's bundle is root's (own_bundle_as_root): one in
 					# which an earlier root run left the builder's uid, files its
 					# folder's group can write, an entry every account can write
@@ -4799,7 +4953,7 @@ setup_completions_and_man() {
 
 cli_path_hint() {
 	local rc_name f
-	case ":$PATH:" in
+	case ":${ROOT_LOOKUP_PATH-$PATH}:" in
 	*":$BIN_DIR:"*) ;;
 	*)
 		case "${SHELL##*/}" in

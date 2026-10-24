@@ -52,11 +52,11 @@ pub use procs::{
 pub use caps::{Cap, CapSource, Caps, Why};
 pub use machine::{
     Capacity, Cluster, Commit, CoreTicks, CpuLayout, GpuReading, LinkCounters, LinkKind,
-    LinkReading, MAX_LINKS, MachineWords, MemoryDetail, Probe, ProcessLimits, Throttle,
+    LinkReading, MAX_LINKS, MachineWords, MemoryDetail, Probe, ProcessLimits, TcpCounts, Throttle,
     ThrottleLevel, VmCounters, VolumeReading, WorkqueueLimits, capacity, caps,
     counts_toward_machine, cpu_layout, gpu, layout_by_rank, level_names, load_average,
-    machine_words, memory_detail, net_links, net_links_into, pid_counts, process_limits, volume,
-    withdrawn_cores, workqueue_limits,
+    machine_words, memory_detail, net_links, net_links_into, pid_counts, process_limits,
+    tcp_counts, tcp_counts_into, volume, withdrawn_cores, workqueue_limits,
 };
 
 /// A path buffer (`PROC_PIDPATHINFO_MAXSIZE`).

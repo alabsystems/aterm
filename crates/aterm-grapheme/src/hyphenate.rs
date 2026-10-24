@@ -7,8 +7,7 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-/// TeX's American English patterns and exceptions, as hyph-utf8 publishes
-/// them (its notice kept in the file).
+/// TeX's American English patterns and exceptions, as hyph-utf8 publishes them.
 const PATTERNS: &str = include_str!("../data/hyph-en-us.tex");
 
 /// The fewest letters before a hyphen (TeX's `\lefthyphenmin` for English).
@@ -16,8 +15,6 @@ const LEFT_MIN: usize = 2;
 /// The fewest letters after a hyphen (TeX's `\righthyphenmin` for English).
 const RIGHT_MIN: usize = 3;
 
-/// The patterns, parsed once: each pattern's letters to the values between
-/// them, and each exception's letters to its hyphen positions.
 struct Patterns {
     values: HashMap<String, Vec<u8>>,
     /// The most letters a pattern has (the dots that anchor one included).
@@ -82,13 +79,8 @@ fn patterns() -> &'static Patterns {
     })
 }
 
-/// WHERE `letters` — one run of ASCII letters, any case — MAY TAKE A
-/// HYPHEN: the byte offsets (each a count of letters before it) of its
-/// syllable breaks, in order, at least [`LEFT_MIN`] letters from its start
-/// and [`RIGHT_MIN`] from its end. Liang's algorithm: every pattern found in
-/// the word, dot-anchored at its ends, sets the values between its letters,
-/// the greatest value at a place winning, and an odd value is a break; a
-/// word on the exception list takes its listed breaks instead.
+/// Byte offsets of syllable breaks in `letters` (one run of ASCII letters, any case), at least
+/// [`LEFT_MIN`] letters from its start and [`RIGHT_MIN`] from its end.
 fn letter_run_points(letters: &str) -> Vec<usize> {
     let count = letters.len();
     if count < LEFT_MIN + RIGHT_MIN || !letters.bytes().all(|b| b.is_ascii_alphabetic()) {
@@ -158,7 +150,6 @@ pub(crate) fn syllable_points(text: &str) -> Vec<usize> {
 mod tests {
     use super::*;
 
-    /// `word` with a hyphen at each of its syllable breaks.
     fn hyphenated(word: &str) -> String {
         let mut out = String::new();
         let mut from = 0;
@@ -171,9 +162,6 @@ mod tests {
         out
     }
 
-    /// THE PATTERNS FIND A TYPESETTER'S BREAKS, two letters from a word's
-    /// start and three from its end, in any case, the exception list
-    /// winning; and a word too short for both minimums takes none.
     #[test]
     fn words_break_at_their_syllables() {
         for (word, broken) in [
@@ -195,9 +183,6 @@ mod tests {
         }
     }
 
-    /// AN IDENTIFIER TAKES NO HYPHEN: a path, a host, a version, a hash, a
-    /// file's name, a flag and a name written in mixed case keep every
-    /// character their own.
     #[test]
     fn identifiers_take_no_hyphen() {
         for identifier in [

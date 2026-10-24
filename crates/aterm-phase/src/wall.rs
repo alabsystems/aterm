@@ -542,9 +542,17 @@ const UNREACHABLE_WORDS: &[&str] = &[
     "connection dropped",
     "connection lost",
     "connection closed",
+    "connection reset",
     "timed out",
     "no response from api",
     "asleep",
+    "network issue",
+    "no such host",
+    "network is unreachable",
+    "no route to host",
+    "failed to lookup address",
+    "dns error",
+    "error sending request",
     "enotfound",
     "eai_again",
     "econnrefused",
@@ -561,6 +569,13 @@ const UNREACHABLE_WORDS: &[&str] = &[
     "err_socket_closed",
     "connectionclosed",
 ];
+
+/// Whether `text` names a network reachability failure ([`UNREACHABLE_WORDS`]).
+#[must_use]
+pub(crate) fn is_unreachable(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    UNREACHABLE_WORDS.iter().any(|w| lower.contains(w))
+}
 
 /// The wall the worker's last turn ended on, if any: Claude Code's critical-memory banner first ([`memory_wall`]), then [`classify_wall`] over the rows [`crate::phase::limit_notice`] reads, every kind.
 #[must_use]

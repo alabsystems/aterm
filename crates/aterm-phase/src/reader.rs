@@ -118,17 +118,37 @@ impl Program {
         }
     }
 
+    /// Canonical [`crate::CliHarness`] entry for this program, or `None` for [`Program::Generic`].
+    #[inline]
+    #[must_use]
+    pub const fn cli_harness(self) -> Option<crate::CliHarness> {
+        match self {
+            Program::Claude => Some(crate::CliHarness::ClaudeCode),
+            Program::Codex => Some(crate::CliHarness::CodexAlab),
+            Program::Agy => Some(crate::CliHarness::Agy),
+            Program::Muse => Some(crate::CliHarness::Muse),
+            Program::Gemini => Some(crate::CliHarness::Gemini),
+            Program::Generic => None,
+        }
+    }
+
+    /// Structured incremental numeric [`crate::HarnessVersion`] of this program's harness.
+    #[inline]
+    #[must_use]
+    pub const fn harness_version_num(self) -> Option<crate::HarnessVersion> {
+        match self.cli_harness() {
+            Some(h) => Some(h.version()),
+            None => None,
+        }
+    }
+
     /// Incremental version of this program's aterm/alab harness, starting at `"0.1"` per harness.
     #[inline]
     #[must_use]
     pub const fn harness_version(self) -> Option<&'static str> {
-        match self {
-            Program::Claude => Some(crate::phase::HARNESS_VERSION),
-            Program::Codex => Some(crate::codex::HARNESS_VERSION),
-            Program::Agy => Some(crate::agy::HARNESS_VERSION),
-            Program::Muse => Some(crate::muse::HARNESS_VERSION),
-            Program::Gemini => Some(crate::gemini::HARNESS_VERSION),
-            Program::Generic => None,
+        match self.cli_harness() {
+            Some(h) => Some(h.version_str()),
+            None => None,
         }
     }
 
@@ -187,6 +207,10 @@ pub struct Reading {
 /// Per-program screen grammar.
 pub trait ScreenReader: Sync {
     fn program(&self) -> Program;
+    /// Structured incremental numeric version of this program's harness, or `None` for [`Program::Generic`].
+    fn harness_version_num(&self) -> Option<crate::HarnessVersion> {
+        self.program().harness_version_num()
+    }
     /// Incremental version of this program's harness (`"0.1"`), or `None` for [`Program::Generic`].
     fn harness_version(&self) -> Option<&'static str> {
         self.program().harness_version()
@@ -278,6 +302,15 @@ pub trait ScreenReader: Sync {
     /// Whether any user message is drawn in the transcript on `rows`.
     fn message_drawn(&self, rows: &[String]) -> bool {
         rows.iter().any(|r| !r.trim().is_empty())
+    }
+    /// WHETHER THE PROGRAM HAS DRAWN ON `rows`: something of its own stands
+    /// there (its composer's frame, a box or dialog of its own, its launch
+    /// card). `false` is a screen it has not drawn on: blank, or holding only
+    /// the shell's own lines (its prompt and the command line that launched
+    /// the program), which a supervisor reads as the program still starting,
+    /// never as idle. A program no reader knows is credited with any screen.
+    fn program_drawn(&self, _rows: &[String]) -> bool {
+        true
     }
     fn interrupted(&self, _rows: &[String]) -> bool {
         false
@@ -494,6 +527,13 @@ impl ScreenReader for ClaudeReader {
     fn message_drawn(&self, rows: &[String]) -> bool {
         crate::turn::message_drawn(rows)
     }
+    /// Its composer's frame, a box or its sign-in dialog, or its launch card.
+    fn program_drawn(&self, rows: &[String]) -> bool {
+        has_composer_frame(rows)
+            || parse_prompt_v2(rows).is_some()
+            || names_login(rows)
+            || crate::turn::launch_card_scan(rows).0.is_some()
+    }
     /// Inside its frame only: a `❯` row with no frame around it is a user's message, and
     /// a box replaces the frame.
     fn composer(&self, rows: &[String]) -> Option<(usize, Vec<String>)> {
@@ -644,6 +684,9 @@ impl ScreenReader for AgyReader {
     fn message_drawn(&self, rows: &[String]) -> bool {
         agy::message_drawn(rows)
     }
+    fn program_drawn(&self, rows: &[String]) -> bool {
+        agy::program_drawn(rows)
+    }
     fn composer(&self, rows: &[String]) -> Option<(usize, Vec<String>)> {
         agy::composer_draft(rows)
     }
@@ -728,6 +771,9 @@ impl ScreenReader for MuseReader {
     }
     fn message_drawn(&self, rows: &[String]) -> bool {
         muse::message_drawn(rows)
+    }
+    fn program_drawn(&self, rows: &[String]) -> bool {
+        muse::program_drawn(rows)
     }
     fn composer(&self, rows: &[String]) -> Option<(usize, Vec<String>)> {
         muse::composer_draft(rows)
@@ -820,6 +866,9 @@ impl ScreenReader for GeminiReader {
     }
     fn message_drawn(&self, rows: &[String]) -> bool {
         gemini::message_drawn(rows)
+    }
+    fn program_drawn(&self, rows: &[String]) -> bool {
+        gemini::program_drawn(rows)
     }
     /// Its placeholder read as an empty draft ([`gemini::composer_draft`]).
     fn composer(&self, rows: &[String]) -> Option<(usize, Vec<String>)> {
@@ -1019,6 +1068,18 @@ pub fn may_host_agent(program: &str) -> bool {
         .any(|runtime| word.eq_ignore_ascii_case(runtime))
 }
 
+/// WHETHER `rows` COULD BE THE SHELL'S ALONE, before a program drew: every row blank, or the
+/// non-blank rows one unbroken run with nothing under it (a prompt and the line it echoed).
+#[must_use]
+pub fn shell_alone(rows: &[String]) -> bool {
+    let drawn = |row: &String| !row.trim().is_empty();
+    let Some(first) = rows.iter().position(drawn) else {
+        return true;
+    };
+    let last = rows.iter().rposition(drawn).unwrap_or(first);
+    rows[first..=last].iter().all(drawn)
+}
+
 /// Borrowed basename of `program`'s first word with any leading login-shell `-` stripped.
 fn program_word(program: &str) -> &str {
     let head = program.split_whitespace().next().unwrap_or(program);
@@ -1085,6 +1146,128 @@ mod tests {
         assert!(drawn(Program::Generic, &screen(END_OF_TURN_ANY)));
         assert!(!drawn(Program::Generic, &vec![String::new(); 50]));
         assert!(!drawn(Program::Generic, &[]));
+    }
+
+    /// A LAUNCH'S SCREEN BEFORE THE PROGRAM DRAWS IS NONE OF ITS OWN
+    /// ([`ScreenReader::program_drawn`]): blank (the lab's launcher clears the
+    /// screen first), or the shell's echo of the line that launched it (r11's
+    /// `r11cv-muse`, where Muse Code's first point was read off that line),
+    /// while each program's own frames, boxes and launch card are. A program
+    /// no reader knows is credited with any screen.
+    #[test]
+    fn a_launch_screen_before_the_program_draws_is_none_of_its_own() {
+        use crate::muse::fixtures::{FIRST_REPLY_UNDER_LAUNCH_LINE, LAUNCH_LINE};
+        let drawn = |p: Program, rows: &[String]| p.reader().program_drawn(rows);
+        let blank = vec![String::new(); 50];
+        let launch = screen(LAUNCH_LINE);
+        let agy_launch = screen(crate::agy::fixtures::LAUNCH_LINE);
+        let mut card = launch.clone();
+        card.extend(["", "  Muse Code 1.4.12"].map(str::to_string));
+        for p in [
+            Program::Claude,
+            Program::Agy,
+            Program::Muse,
+            Program::Gemini,
+        ] {
+            assert!(!drawn(p, &blank), "{p:?}: a blank screen");
+            assert!(!drawn(p, &launch), "{p:?}: Muse Code's launch line");
+            assert!(!drawn(p, &agy_launch), "{p:?}: agy's launch line");
+            assert!(!drawn(p, &[]), "{p:?}: no rows");
+        }
+        for p in [Program::Codex, Program::Generic] {
+            assert!(drawn(p, &blank) && drawn(p, &launch), "{p:?}");
+        }
+        {
+            use crate::muse::fixtures::{
+                BOX_SHELL, BOX_TRUST, BUSY, END_OF_TURN, IDLE, SIGNED_OUT,
+            };
+            for (what, rows) in [
+                ("idle", screen(IDLE)),
+                ("busy", screen(BUSY)),
+                ("its reply", screen(END_OF_TURN)),
+                ("a box", screen(BOX_SHELL)),
+                ("its trust box", screen(BOX_TRUST)),
+                ("signed out", screen(SIGNED_OUT)),
+                ("its launch card", card.clone()),
+                (
+                    "its reply under the launch line",
+                    screen(FIRST_REPLY_UNDER_LAUNCH_LINE),
+                ),
+            ] {
+                assert!(drawn(Program::Muse, &rows), "muse: {what}: {rows:#?}");
+            }
+        }
+        {
+            use crate::agy::fixtures::{BUSY, END_OF_TURN, IDLE, IDLE_FRESH_NOTICE, lab};
+            for rows in [IDLE, BUSY, END_OF_TURN, IDLE_FRESH_NOTICE, lab::BOX_SHELL].map(screen) {
+                assert!(drawn(Program::Agy, &rows), "agy: {rows:#?}");
+            }
+            let queried = screen(IDLE_FRESH_NOTICE)[..2].to_vec();
+            assert!(
+                !drawn(Program::Agy, &queried),
+                "the launch line and the shell's echo of agy's queries: {queried:#?}"
+            );
+        }
+        {
+            use crate::gemini::fixtures::{BOX_SHELL, END_OF_TURN, IDLE, PRE_BANNER, TRUST};
+            for rows in [PRE_BANNER, IDLE, END_OF_TURN, BOX_SHELL, TRUST].map(screen) {
+                assert!(drawn(Program::Gemini, &rows), "gemini: {rows:#?}");
+            }
+        }
+        {
+            use crate::prompt::fixtures::{first_turn_under_a_table, launch_under_a_table};
+            let launch = launch_under_a_table("❯ Try \"refactor <filepath>\"", "  ? for shortcuts");
+            for rows in [
+                launch,
+                first_turn_under_a_table(&["❯ then add tests"]),
+                screen(TRUST),
+                screen(BOX_BASH_TOUCH),
+                screen(LOGIN_HANDOFF),
+            ] {
+                assert!(drawn(Program::Claude, &rows), "claude: {rows:#?}");
+            }
+        }
+    }
+
+    /// THE SHELL ALONE LEAVES ONE UNBROKEN RUN ([`shell_alone`]): a blank
+    /// screen, no rows, and the launch lines measured on Muse Code's and agy's
+    /// tabs could be the shell's; Claude Code's usage panel, Muse Code's reply
+    /// under its launch line, and a screen whose one blank row splits a
+    /// prompt from a later row are some program's.
+    #[test]
+    fn the_shell_alone_leaves_one_unbroken_run() {
+        use crate::muse::fixtures::{FIRST_REPLY_UNDER_LAUNCH_LINE, LAUNCH_LINE};
+        for (what, rows) in [
+            ("blank", vec![String::new(); 50]),
+            ("no rows", vec![]),
+            ("muse's launch line", screen(LAUNCH_LINE)),
+            (
+                "agy's launch line",
+                screen(crate::agy::fixtures::LAUNCH_LINE),
+            ),
+            (
+                "a prompt alone, under blank rows",
+                rows(&["", "", "lab$ ", "", ""]),
+            ),
+        ] {
+            assert!(shell_alone(&rows), "{what}: {rows:#?}");
+        }
+        for (what, rows) in [
+            (
+                "claude's usage panel",
+                screen(crate::prompt::fixtures::USAGE_REFRESHING),
+            ),
+            (
+                "muse's reply under its launch line",
+                screen(FIRST_REPLY_UNDER_LAUNCH_LINE),
+            ),
+            (
+                "one blank row inside",
+                rows(&["lab$ agy", "", "  agy 1.4.6"]),
+            ),
+        ] {
+            assert!(!shell_alone(&rows), "{what}: {rows:#?}");
+        }
     }
 
     fn shell_asking() -> Vec<String> {
@@ -2219,6 +2402,8 @@ mod tests {
         assert_eq!(crate::phase::HARNESS_VERSION, "0.1");
         assert_eq!(crate::codex::HARNESS_VERSION, "0.1");
         assert_eq!(crate::agy::HARNESS_VERSION, "0.1");
+        assert_eq!(crate::grok::HARNESS_VERSION, "0.1");
+        assert_eq!(crate::kimi::HARNESS_VERSION, "0.1");
         assert_eq!(crate::muse::HARNESS_VERSION, "0.1");
         assert_eq!(crate::gemini::HARNESS_VERSION, "0.1");
         for prog in Program::ALL {
@@ -2228,14 +2413,31 @@ mod tests {
                 "{prog:?}"
             );
             assert_eq!(
+                prog.harness_version_num()
+                    .map(crate::HarnessVersion::as_str),
+                prog.harness_version(),
+                "{prog:?}"
+            );
+            assert_eq!(
                 prog.reader().harness_version(),
                 prog.harness_version(),
                 "{prog:?}"
             );
+            assert_eq!(
+                prog.reader().harness_version_num(),
+                prog.harness_version_num(),
+                "{prog:?}"
+            );
             if prog.harness_table() {
                 assert_eq!(prog.harness_version(), Some("0.1"), "{prog:?}");
+                assert_eq!(
+                    prog.harness_version_num(),
+                    Some(crate::HarnessVersion::INITIAL),
+                    "{prog:?}"
+                );
             }
         }
         assert_eq!(Program::Generic.harness_version(), None);
+        assert_eq!(Program::Generic.harness_version_num(), None);
     }
 }

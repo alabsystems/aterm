@@ -4,9 +4,8 @@
 use std::sync::Arc;
 
 use aterm_core::render::{
-    CharFg, FreeSampler, FreeSprite, FreeZ, FxArt, FxBlend, FxContent, FxInk, FxItem, FxLayer,
-    FxRect, FxSlot, FxSpace, FxTexels, GlowQuad, InkCell, PxRect, RainHalo, RenderInput,
-    SceneAtlas, SpriteQuad,
+    CharFg, FxArt, FxBlend, FxContent, FxInk, FxItem, FxLayer, FxRect, FxSlot, FxSpace, FxSprite,
+    FxTexels, GlowQuad, InkCell, PxRect, RainHalo, RenderInput,
 };
 use aterm_core::terminal::Terminal;
 use aterm_render::{Renderer, Theme, premul_rgb};
@@ -27,43 +26,6 @@ struct Channel {
     must_paint: bool,
     /// Every field of the channel is empty (Vecs cleared, atlas Arcs nulled).
     is_empty: fn(&RenderInput) -> bool,
-}
-
-fn patterned_atlas(w: u32, h: u32, version: u64) -> SceneAtlas {
-    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-    for y in 0..h {
-        for x in 0..w {
-            rgba.extend_from_slice(&[
-                (x * 37 + y * 11) as u8,
-                (x * 5 + y * 53) as u8,
-                (x * 29 + y * 3) as u8,
-                255,
-            ]);
-        }
-    }
-    SceneAtlas {
-        width: w,
-        height: h,
-        rgba,
-        version,
-    }
-}
-
-fn quad(row: u16, dest: [u16; 4], src: [u16; 4]) -> SpriteQuad {
-    SpriteQuad {
-        row,
-        x: dest[0],
-        y: dest[1],
-        w: dest[2],
-        h: dest[3],
-        ax: src[0],
-        ay: src[1],
-        aw: src[2],
-        ah: src[3],
-        tint: 0x00FF_FFFF,
-        alpha: 255,
-        flip_x: false,
-    }
 }
 
 fn halo(row: u16, x: u16, y: u16, w: u16, h: u16, color: u32) -> RainHalo {
@@ -97,50 +59,6 @@ fn glow(row: u16, x: u16, y: u16, w: u16, h: u16, color: u32) -> GlowQuad {
 }
 
 const CHANNELS: &[Channel] = &[
-    Channel {
-        name: "cat_quads + cat_atlas",
-        text: b"\x1b[?25lkitty cat",
-        empties: &[("an atlas with no quads draws nothing", |i, _, _| {
-            i.cat_atlas = Some(Arc::new(patterned_atlas(16, 16, 1)));
-        })],
-        populate: Some(|i, _, ch| {
-            i.cat_atlas = Some(Arc::new(patterned_atlas(16, 16, 1)));
-            i.cat_quads = vec![quad(
-                1,
-                [0, ch as u16, 16, 16.min(ch as u16)],
-                [0, 0, 16, 16.min(ch as u16)],
-            )];
-        }),
-        must_paint: true,
-        is_empty: |i| i.cat_quads.is_empty() && i.cat_atlas.is_none(),
-    },
-    Channel {
-        name: "free_sprites + free_atlas",
-        text: b"\x1b[?25lfree layer",
-        empties: &[("an atlas with no sprites draws nothing", |i, _, _| {
-            i.free_atlas = Some(Arc::new(patterned_atlas(16, 16, 1)));
-        })],
-        populate: Some(|i, _, _| {
-            i.free_atlas = Some(Arc::new(patterned_atlas(16, 16, 1)));
-            i.free_sprites = vec![FreeSprite {
-                x: 2,
-                y: 5,
-                w: 16,
-                h: 16,
-                ax: 0,
-                ay: 0,
-                aw: 16,
-                ah: 16,
-                tint: 0x00FF_FFFF,
-                alpha: 255,
-                flip_x: false,
-                z: FreeZ::UnderText,
-                sampler: FreeSampler::Nearest,
-            }];
-        }),
-        must_paint: false,
-        is_empty: |i| i.free_sprites.is_empty() && i.free_atlas.is_none(),
-    },
     Channel {
         name: "glow_halo",
         text: b"\x1b[?25lember forge",
@@ -245,26 +163,14 @@ const CHANNELS: &[Channel] = &[
         is_empty: |i| i.nova_add.is_empty(),
     },
     Channel {
-        name: "rain_quads + rain_atlas + rain_add",
+        name: "rain_add",
         text: b"\x1b[?25lrainy planet",
-        empties: &[
-            ("every rain channel explicitly empty", |i, _, _| {
-                i.rain_quads = Vec::new();
-                i.rain_atlas = None;
-                i.rain_add = Vec::new();
-            }),
-            ("an atlas with no quads draws nothing", |i, _, _| {
-                i.rain_atlas = Some(Arc::new(patterned_atlas(16, 16, 1)));
-            }),
-        ],
+        empties: &[("explicitly empty", |i, _, _| i.rain_add = Vec::new())],
         populate: Some(|i, cw, ch| {
-            i.rain_atlas = Some(Arc::new(patterned_atlas(32, 32, 1)));
-            let h = ch.min(32) as u16;
-            i.rain_quads = vec![quad(1, [0, h, cw as u16, h], [0, 0, cw as u16, h])];
             i.rain_add = vec![halo(1, 0, ch as u16, cw as u16, 2, 0x0020_4020)];
         }),
         must_paint: true,
-        is_empty: |i| i.rain_quads.is_empty() && i.rain_atlas.is_none() && i.rain_add.is_empty(),
+        is_empty: |i| i.rain_add.is_empty(),
     },
     Channel {
         name: "fx_layers + fx_occluders + fx_prefetch",
@@ -293,6 +199,34 @@ const CHANNELS: &[Channel] = &[
                     FxBlend::Exact,
                 )];
             }),
+            (
+                "a knock-out sprite layer with a clear ink draws and knocks nothing",
+                |i, cw, ch| {
+                    let art =
+                        FxArt::new(2, 2, FxTexels::Rgba8Straight, vec![255; 16]).expect("sized");
+                    let mut l = FxLayer::new(
+                        1,
+                        Arc::new(FxContent::new(
+                            vec![FxItem::Sprite(FxSprite {
+                                x: 0,
+                                y: 0,
+                                dw: (4 * cw) as u16,
+                                dh: (2 * ch) as u16,
+                                flip_x: false,
+                                art: Arc::new(art),
+                                ink: 0,
+                                clip: PxRect::EVERYWHERE,
+                            })],
+                            vec![FxInk::over(0x00FF_FFFF, 0)],
+                        )),
+                        FxSlot::Under,
+                        FxSpace::Grid,
+                        FxBlend::Linear,
+                    );
+                    l.knock = true;
+                    i.fx_layers = vec![l];
+                },
+            ),
         ],
         populate: Some(|i, cw, ch| {
             let content = FxContent::new(

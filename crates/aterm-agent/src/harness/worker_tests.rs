@@ -25,8 +25,8 @@ fn proc_args(argv: &[&str], env: &[&str]) -> ProcArgs {
 /// NUL-separated, named as the CLI — gets the trust flag (Muse Code's, where
 /// the folder is the trusted one), `--model <m>`, Gemini CLI's
 /// `--session-id <id>`, then the task file's text with its trailing
-/// newlines trimmed: Claude Code's and Muse Code's after `--`, Gemini CLI's
-/// and agy's as the attached value of `--prompt-interactive=`.
+/// newlines trimmed: Claude Code's, codex-alab's and Muse Code's after `--`,
+/// Gemini CLI's and agy's as the attached value of `--prompt-interactive=`.
 #[cfg(unix)]
 #[test]
 fn every_workers_first_line_hands_the_task_over_as_one_argument() {
@@ -51,11 +51,16 @@ fn every_workers_first_line_hands_the_task_over_as_one_argument() {
     let session = "0b5c6c33-1f7e-4a59-9d2a-6f1e2d3c4b5a";
     let trust_file = tmp.path().join("trust.json");
     let trust_file = trust_file.to_str().expect("a UTF-8 scratch path");
-    let cases: [(Program, Vec<&str>, &str); 4] = [
+    let cases: [(Program, Vec<&str>, &str); 5] = [
         (
             Program::Claude,
             vec!["--model", "m-1.5", "--", trimmed],
             "CLAUDE_CONFIG_DIR",
+        ),
+        (
+            Program::Codex,
+            vec!["--model", "m-1.5", "--", trimmed],
+            "CODEX_HOME",
         ),
         (
             Program::Gemini,
@@ -177,7 +182,8 @@ fn every_workers_first_line_hands_the_task_over_as_one_argument() {
             ),
             Program::Agy => super::super::upgrade_agy::rewrite_argv(&process(&["agy"]), None),
             Program::Muse => super::super::upgrade_muse::rewrite_argv(&process(&["muse"]), None),
-            Program::Codex | Program::Generic => unreachable!(),
+            Program::Codex => super::super::codex_alab::rewrite_argv(&process(&["codex"]), None),
+            Program::Generic => unreachable!(),
         }
         .unwrap_or_else(|e| panic!("{agent:?}: the lane refused the worker's argv: {e:?}"));
         assert!(
@@ -610,4 +616,207 @@ fn a_starters_program_rides_only_where_it_runs_the_same_cli() {
         )
         .is_none()
     );
+}
+
+/// A CODEX STARTER IS codex-alab, its package's ALab bytes ([`super::super::codex_alab::alab_bytes`]):
+/// its worker types atpkg's managed twin where that twin execs ALab bytes too, else the
+/// starter's own image; it carries the starter's `CODEX_HOME` (an empty one is unset, a
+/// relative one refused; with none, another `HOME`'s `.codex`) and the flags that move its
+/// config or say how it reaches its provider, never its model, folders or approval posture
+/// (by flag, hidden alias or `-c`); a vendor Codex image of the same name, which never
+/// carries itself, is no starter (the line is then the managed twin's, else the word's);
+/// a starter no relaunch could resume (`exec`, `--remote`) lends no flags, and one whose
+/// argv holds a flag no table knows starts no worker.
+#[test]
+fn a_codex_starter_is_codex_alab_and_carries_its_config() {
+    let d = crate::supervise::ScratchDir::new("codex", "worker-starter");
+    let user = Path::new("/Users//u");
+    let package = |name: &str, alab: bool| -> PathBuf {
+        let root = d.join(name);
+        std::fs::create_dir_all(root.join("bin")).expect("bin");
+        std::fs::write(root.join("bin/codex"), "").expect("exe");
+        std::fs::write(
+            root.join(super::super::codex_alab::PACKAGE_JSON),
+            r#"{"layoutVersion": 1, "version": "0.165.0", "entrypoint": "bin/codex"}"#,
+        )
+        .expect("manifest");
+        if alab {
+            std::fs::write(root.join(super::super::codex_alab::ALAB_BUILD_JSON), "{}")
+                .expect("marker");
+        }
+        std::fs::canonicalize(root.join("bin/codex")).expect("the image")
+    };
+    let alab = package("alab", true);
+    let vendor = package("vendor", false);
+    let twin_of = |name: &str, exe: &Path| -> PathBuf {
+        let twin = d.join(name);
+        std::fs::write(
+            &twin,
+            format!("#!/bin/sh\nexec '{}' \"$@\"\n", exe.display()),
+        )
+        .expect("twin");
+        twin
+    };
+    let alab_twin = twin_of("twin-alab", &alab);
+    let vendor_twin = twin_of("twin-vendor", &vendor);
+    let cli = row(Program::Codex);
+    let argv = [
+        alab.to_str().expect("UTF-8"),
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--yolo",
+        "-m",
+        "gpt-x",
+        "-c",
+        "model_reasoning_effort=high",
+        "-c",
+        "approval_policy=\"never\"",
+        "--config=sandbox_mode=danger-full-access",
+        "-cmodel=gpt-y",
+        "--config",
+        "sandbox_workspace_write.network_access=true",
+        "-c",
+        "default_permissions=\":danger-full-access\"",
+        "-c",
+        "permissions.dev.filesystem=\"write\"",
+        "--profile",
+        "work",
+        "-C",
+        "/elsewhere",
+        "--add-dir",
+        "/x",
+        "-s",
+        "workspace-write",
+        "--oss",
+        "--",
+        "-c",
+        "the task",
+    ];
+    let env = ["CODEX_HOME=/cx", "HOME=/Users//other"];
+    let s = starter_of(cli, Some(&alab), &proc_args(&argv, &env), user, || None)
+        .expect("a codex-alab starter");
+    assert_eq!(s.exe, alab, "no twin: its own image");
+    assert_eq!(
+        s.env,
+        [("CODEX_HOME".to_string(), "/cx".to_string())],
+        "its home, and no other variable"
+    );
+    assert_eq!(
+        s.args.clone().expect("its flags read"),
+        [
+            "-c",
+            "model_reasoning_effort=high",
+            "--profile",
+            "work",
+            "--oss"
+        ]
+    );
+    let typed = line(cli, Dialect::Zsh, &s, &Fresh::default()).expect("a line");
+    for gone in [
+        "dangerously",
+        "yolo",
+        "gpt-x",
+        "gpt-y",
+        "approval_policy",
+        "sandbox_mode",
+        "network_access",
+        "permissions",
+        "/elsewhere",
+        "/x'",
+        "workspace-write",
+    ] {
+        assert!(!typed.contains(gone), "{gone}: {typed}");
+    }
+    let s = starter_of(cli, Some(&alab), &proc_args(&argv, &env), user, || {
+        Some(alab_twin.clone())
+    })
+    .expect("a codex-alab starter");
+    assert_eq!(s.exe, alab_twin, "a twin that execs ALab bytes");
+    let s = starter_of(cli, Some(&alab), &proc_args(&argv, &env), user, || {
+        Some(vendor_twin.clone())
+    })
+    .expect("a codex-alab starter");
+    assert_eq!(s.exe, alab, "a twin that execs a vendor Codex is not typed");
+    assert!(
+        starter_of(cli, Some(&vendor), &proc_args(&argv, &env), user, || {
+            Some(alab_twin.clone())
+        })
+        .is_none(),
+        "a vendor Codex starts no worker"
+    );
+    let unset = starter_of(
+        cli,
+        Some(&alab),
+        &proc_args(&argv, &["CODEX_HOME="]),
+        user,
+        || None,
+    )
+    .expect("a starter");
+    assert!(unset.env.is_empty(), "{:?}", unset.env);
+    let homes = |env: &[&str]| {
+        starter_of(cli, Some(&alab), &proc_args(&argv, env), user, || None)
+            .expect("a starter")
+            .env
+    };
+    assert_eq!(
+        homes(&["HOME=/Users//other"]),
+        [("CODEX_HOME".to_string(), "/Users//other/.codex".to_string())],
+        "another home's .codex"
+    );
+    assert!(
+        homes(&["CODEX_HOME=", "HOME=/Users//u"]).is_empty(),
+        "the user's own home"
+    );
+    assert!(
+        homes(&["HOME=rel"]).is_empty(),
+        "a relative HOME names no home"
+    );
+    assert_eq!(cli.unstarted_by(|| Some(alab_twin.clone())).exe, alab_twin);
+    for twin in [Some(vendor_twin.clone()), None] {
+        let s = cli.unstarted_by(|| twin.clone());
+        assert_eq!(
+            (s.exe, s.env, s.args),
+            (PathBuf::from("codex"), Vec::new(), Ok(Vec::new()))
+        );
+    }
+    assert_eq!(
+        row(Program::Claude)
+            .unstarted_by(|| Some(alab_twin.clone()))
+            .exe,
+        Path::new("claude"),
+        "only codex-alab's line names a twin"
+    );
+    let rel = Starter {
+        exe: PathBuf::from("codex"),
+        env: vec![("CODEX_HOME".to_string(), "rel/home".to_string())],
+        args: Ok(Vec::new()),
+    };
+    let err = line(cli, Dialect::Bash, &rel, &Fresh::default()).expect_err("relative refused");
+    assert!(err.contains("CODEX_HOME"), "{err}");
+    for (unresumable, flag) in [
+        (
+            vec![alab.to_str().expect("UTF-8"), "-c", "x=1", "exec", "x"],
+            "exec",
+        ),
+        (
+            vec![alab.to_str().expect("UTF-8"), "--remote", "ws://h"],
+            "--remote",
+        ),
+    ] {
+        let s = starter_of(
+            cli,
+            Some(&alab),
+            &proc_args(&unresumable, &[]),
+            user,
+            || None,
+        )
+        .expect("a starter");
+        assert_eq!(s.args, Ok(Vec::new()), "{flag}: it lends no flags");
+        let typed = line(cli, Dialect::Zsh, &s, &Fresh::default()).expect("a fresh codex-alab");
+        assert!(!typed.contains(flag), "{typed}");
+    }
+    let unknown = [alab.to_str().expect("UTF-8"), "--frobnicate"];
+    let s =
+        starter_of(cli, Some(&alab), &proc_args(&unknown, &[]), user, || None).expect("a starter");
+    let err = line(cli, Dialect::Zsh, &s, &Fresh::default()).expect_err("an unread argv");
+    assert!(err.contains("--frobnicate"), "{err}");
 }

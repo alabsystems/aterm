@@ -860,6 +860,35 @@ fn the_walker_thread_sizes_a_demanded_tab_and_reads_nested_roots_from_one_walk()
     );
 }
 
+/// THE WALKER THREAD RUNS UNDER THE DISK POLICY ITS CLASS NAMES: spawned
+/// with [`aterm_diskwalk::DiskIo::Throttled`] (the product's, as
+/// [`WALKER_CLASS`] names it) its own disk policy, read on that thread,
+/// is `IOPOL_THROTTLE`; spawned with `Inherited` it is not. Each runs at
+/// the test class's CPU role, so the answer waits on no background class,
+/// and the wait for it is a one-minute hang detector. A `walker_main` that
+/// dropped its `DiskIo` for either constant fails one of the two.
+#[test]
+fn the_walker_thread_runs_under_the_disk_policy_its_class_names() {
+    use aterm_diskwalk::DiskIo;
+    assert_eq!(WALKER_CLASS.disk, DiskIo::Throttled, "the product's reads");
+    for (disk, throttled) in [(DiskIo::Throttled, true), (DiskIo::Inherited, false)] {
+        let shared: &'static Shared = Box::leak(Box::new(Shared::new()));
+        let class = WalkerClass {
+            role: TEST_WALKER_CLASS.role,
+            disk,
+        };
+        let _from_walker = spawn_walker(shared, None, class).expect("the walker starts");
+        let (reply, answer) = std::sync::mpsc::channel();
+        shared.send(ToWalker::ReadDiskPolicy(reply));
+        let read = answer
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the walker thread answers");
+        shared.send(ToWalker::Stop);
+        let expected = cfg!(target_vendor = "apple").then_some(throttled);
+        assert_eq!(read, expected, "{disk:?}");
+    }
+}
+
 /// Newly demanded roots walk immediately, later roots promote on their second consecutive sighting, and unnamed roots retire after a minute.
 #[test]
 fn a_root_is_walked_at_its_second_sighting_and_retired_a_minute_after_its_last() {

@@ -490,6 +490,9 @@ downloads.claude.ai for Claude Code, releases.openai.com for Codex CLI,
 antigravity-cli-auto-updater-974169037036.us-central1.run.app and
 storage.googleapis.com/antigravity-public for Antigravity CLI, and api.meta.ai
 and lookaside.facebook.com for Muse Code, which aterm installs on macOS only).
+Grok Build (storage.googleapis.com/grok-build-public-artifacts, macOS only) and
+Kimi Code (cdn.kimi.com and github.com/MoonshotAI/kimi-code) are fetched only
+once you install them by name.
 aterm never mirrors or bundles an agent CLI. Only the window and
 interactive sessions run them; explicit network commands always do their work.
 When the pass lands a new Claude Code or Codex CLI you have used before, aterm

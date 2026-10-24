@@ -164,7 +164,6 @@ impl Log {
         Ok(log)
     }
 
-    /// Counts seqs in `(lo, hi]` accounted for by this log that have no record.
     fn count_missing(&mut self, lo: u64, hi: u64) {
         let missing = self.held_between(lo, hi);
         if missing > 0 {
@@ -173,7 +172,6 @@ impl Log {
         }
     }
 
-    /// Replays one journaled record into the rebuilt log.
     fn replay(&mut self, rec: Rec) {
         for n in [Some(rec.node), rec.par].into_iter().flatten() {
             if let Some(i) = level_slot(n.lvl) {
@@ -240,7 +238,6 @@ impl Log {
         self.push(rec, 0);
     }
 
-    /// Removes `n` from the open set at close record `seq` and records its parent and close index.
     fn forget_open(&mut self, n: Node, seq: u64) {
         let Some(i) = self.open.iter().position(|e| e.node == n) else {
             return;

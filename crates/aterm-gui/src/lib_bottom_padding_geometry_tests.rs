@@ -5,7 +5,6 @@ use super::{
     asymmetric_pad_cells, clamp_visible_pad_top, crop_visible_frame, gpu_visible_crop_top,
     project_visible_pad_crop, try_shift_window_absolute_effects_y, visible_frame_height,
 };
-use aterm_core::render::FreeSprite;
 use aterm_render::{FirePatch, Frame, GlowQuad, RainHalo, RenderInput};
 
 #[test]
@@ -255,10 +254,18 @@ fn gpu_effect_shift_covers_only_absolute_streams_and_restores_exactly() {
         cy: 32,
         ..RainHalo::default()
     }];
-    input.free_sprites = vec![FreeSprite {
-        y: 34,
-        ..FreeSprite::default()
-    }];
+    // A companion: a Grid-space layer, which the window-absolute shift leaves alone.
+    let art = aterm_render::fx::bitmap(
+        aterm_core::render::FxTexels::Rgba8Straight,
+        2,
+        2,
+        vec![255; 16],
+    )
+    .expect("an art");
+    aterm_render::sprites::SpriteLayers::new(1).publish(
+        &[aterm_render::sprites::FreeSprite::whole(0, 34, art)],
+        &mut input.fx_layers,
+    );
     let original = input.clone();
 
     assert!(try_shift_window_absolute_effects_y(&mut input, 7));
@@ -271,7 +278,7 @@ fn gpu_effect_shift_covers_only_absolute_streams_and_restores_exactly() {
     );
     assert_eq!(input.nova_add[0].y, 30);
     assert_eq!((input.rain_add[0].y, input.rain_add[0].cy), (31, 32));
-    assert_eq!(input.free_sprites[0].y, 34);
+    assert_eq!(aterm_render::sprites::published(&input.fx_layers)[0].y, 34);
 
     assert!(try_shift_window_absolute_effects_y(&mut input, -7));
     assert_eq!(input, original, "+crop/-crop must restore every byte");

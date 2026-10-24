@@ -1594,3 +1594,111 @@ fn a_muse_login_store_names_its_account_alone() {
         Some("xdg@example.com".to_owned())
     );
 }
+
+#[test]
+fn agy_subscription_reads_auth_log_and_usage_json() {
+    let log_bytes = br"I1022 09:30:56.342240 375 main.go:1084] Starting CLI v1.4.5
+I1022 09:30:56.364166 375 server_oauth.go:224] applyAuthResult: email=interviewstreetuser@gmail.com, authMethod=consumer, quotaProject=
+";
+    assert_eq!(
+        parse_agy_auth_log(log_bytes).as_deref(),
+        Some("interviewstreetuser@gmail.com")
+    );
+    let usage_json = br#"{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{"name":"Gemini Models","buckets":[{"id":"gemini-weekly","name":"Weekly Limit Remaining","window":"weekly","remaining_fraction":0.782786,"reset_time":"2026-10-29T16:31:22Z"}]},{"name":"Claude and GPT models","buckets":[{"id":"3p-weekly","name":"Weekly Limit Remaining","window":"weekly","remaining_fraction":1.0,"reset_time":"2026-10-31T00:51:20Z"}]}]}}}"#;
+    let now = 1_792_796_000;
+    let gemini_fig = parse_agy_usage_json(usage_json, false, now).expect("gemini weekly");
+    assert_eq!(gemini_fig.words(now).as_deref(), Some("weekly 78% left"));
+    let third_party_fig = parse_agy_usage_json(usage_json, true, now).expect("3p weekly");
+    assert_eq!(
+        third_party_fig.words(now).as_deref(),
+        Some("weekly 100% left")
+    );
+
+    let tmp = tmp_dir("agy-auth");
+    let home = tmp.path().join("home");
+    let cfg = home.join(".gemini/antigravity-cli");
+    std::fs::create_dir_all(&cfg).expect("cfg");
+    std::fs::write(cfg.join("cli.log"), log_bytes).expect("cli.log");
+    let argv = vec!["agy".to_owned()];
+    let env = vec![format!("HOME={}", home.display())];
+    let sub = agy_subscription_for(
+        &argv,
+        &env,
+        &home,
+        &SubscriptionDisplay::default(),
+        Some("Gemini 3.1 Pro"),
+        now,
+    )
+    .expect("agy subscription");
+    assert_eq!(sub.email.as_deref(), Some("interviewstreetuser@gmail.com"));
+
+    let mut keyed = env.clone();
+    keyed.push("GEMINI_API_KEY=secret".to_owned());
+    assert_eq!(
+        agy_subscription_for(
+            &argv,
+            &keyed,
+            &home,
+            &SubscriptionDisplay::default(),
+            None,
+            now,
+        ),
+        None
+    );
+
+    // An expired WeeklyFigure on `prev` must not leave stale `prev.weekly` text when no live
+    // figure replaces it, whereas an on-screen `/usage` reading (`weekly_figure: None`) stays
+    // until its reset time passes.
+    let expired_prev = SubscriptionDisplay {
+        email: Some("interviewstreetuser@gmail.com".to_owned()),
+        weekly: Some("weekly 78% left".to_owned()),
+        weekly_figure: Some(gemini_fig),
+        ..SubscriptionDisplay::default()
+    };
+    let after_expiry = agy_subscription_for(
+        &argv,
+        &env,
+        &home,
+        &expired_prev,
+        Some("Gemini 3.1 Pro"),
+        now + USAGE_SHOWN_S + 10,
+    )
+    .expect("subscription after figure expiry");
+    assert_eq!(after_expiry.weekly, None);
+    assert_eq!(after_expiry.weekly_figure, None);
+
+    let screen_prev = SubscriptionDisplay {
+        email: Some("interviewstreetuser@gmail.com".to_owned()),
+        weekly: Some("weekly 78% left".to_owned()),
+        weekly_figure: None,
+        ..SubscriptionDisplay::default()
+    };
+    let kept_screen = agy_subscription_for(
+        &argv,
+        &env,
+        &home,
+        &screen_prev,
+        Some("Gemini 3.1 Pro"),
+        now + USAGE_SHOWN_S + 10,
+    )
+    .expect("subscription with screen weekly");
+    assert_eq!(kept_screen.weekly.as_deref(), Some("weekly 78% left"));
+
+    // A mid-session `/login` appended past 128 KB in `cli.log` overrides the startup email in the head.
+    let mut big_log = log_bytes.to_vec();
+    big_log.extend(std::iter::repeat_n(b'x', 200 * 1024));
+    big_log.extend_from_slice(
+        b"\nI1023 18:00:00.000000 375 server_oauth.go:224] applyAuthResult: email=switched@example.com, authMethod=consumer\n",
+    );
+    std::fs::write(cfg.join("cli.log"), &big_log).expect("big cli.log");
+    let switched = agy_subscription_for(
+        &argv,
+        &env,
+        &home,
+        &SubscriptionDisplay::default(),
+        Some("Gemini 3.1 Pro"),
+        now,
+    )
+    .expect("switched agy subscription");
+    assert_eq!(switched.email.as_deref(), Some("switched@example.com"));
+}

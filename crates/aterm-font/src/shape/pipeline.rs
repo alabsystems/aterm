@@ -140,9 +140,6 @@ fn ensure_native_direction(buffer: &mut Buffer) {
     }
 }
 
-/// A backward run's characters whose `Bidi_Mirroring_Glyph` the font lacks
-/// get the `rtlm` mask; the others were mirrored, if at all, by the bidi
-/// step that produced the run.
 fn rotate_chars(plan: &ShapePlan, face: &ShapeFace, buffer: &mut Buffer, target: Direction) {
     if !target.is_backward() || plan.rtlm_mask == 0 {
         return;
@@ -156,9 +153,6 @@ fn rotate_chars(plan: &ShapePlan, face: &ShapeFace, buffer: &mut Buffer, target:
     }
 }
 
-/// Maps each character to its nominal glyph (0 when the font lacks it),
-/// cluster by cluster: a base followed by marks that include a variation
-/// selector maps through `cmap` format 14 first.
 fn map_characters(face: &ShapeFace, buffer: &mut Buffer) {
     if buffer.len == 0 {
         return;
@@ -253,9 +247,6 @@ fn setup_masks(plan: &ShapePlan, face: &ShapeFace, buffer: &mut Buffer) {
     }
 }
 
-/// Automatic fractions: digits before a U+2044 FRACTION SLASH get `numr`
-/// (`dnom` when the run is backward), digits after get `dnom`, and all of
-/// them and the slash `frac`.
 fn setup_masks_fraction(plan: &ShapePlan, buffer: &mut Buffer) {
     if buffer.scratch_flags & SCRATCH_HAS_NON_ASCII == 0 || !plan.has_frac {
         return;
@@ -301,9 +292,7 @@ fn setup_masks_fraction(plan: &ShapePlan, buffer: &mut Buffer) {
     }
 }
 
-/// Glyph classes for a face without `GDEF`: a nonspacing mark is a mark,
-/// unless it is default ignorable (Uniscribe treats the Mongolian variation
-/// selectors and CGJ as bases); everything else is a base.
+// Uniscribe treats default-ignorable nonspacing marks (Mongolian VS, CGJ) as bases.
 fn synthesize_glyph_classes(buffer: &mut Buffer) {
     for info in &mut buffer.info[..buffer.len] {
         let class = if info.gc != GeneralCategory::NonspacingMark || is_default_ignorable_info(info)
@@ -348,8 +337,6 @@ fn position(plan: &ShapePlan, face: &ShapeFace, buffer: &mut Buffer) {
     }
 }
 
-/// Default ignorables the font did not substitute become the space glyph
-/// (zero advance, already), or are deleted when the font has no space.
 fn hide_default_ignorables(face: &ShapeFace, buffer: &mut Buffer) {
     if buffer.scratch_flags & SCRATCH_HAS_DEFAULT_IGNORABLES == 0 {
         return;

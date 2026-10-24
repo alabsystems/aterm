@@ -451,7 +451,8 @@ pub(crate) struct GridChip {
     pub(crate) label: String,
     /// The newest act, in words, where the harness has taken one.
     pub(crate) description: Option<String>,
-    /// Switch toggle state for [`HarnessChip::Switch`], or `None` for a button.
+    /// Toggle state for a two-state chip ([`HarnessChip::Switch`], the top
+    /// rule's key [`HarnessChip::TopEffort`]), or `None` for a button.
     pub(crate) toggled: Option<aterm_a11y::model::Toggled>,
     /// Grid row index.
     pub(crate) row: usize,

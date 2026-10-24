@@ -3853,6 +3853,310 @@ fn the_zip_lane_reclaims_a_dmg_era_mountpoint() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// A bundle a stage's start probe left unproven stays at its path while its exec stamp
+/// holds, and a later stage's sweep reclaims it once the stamp is spent or a restart came
+/// between; a sleep does not spend it. One with no stamp is stamped by the first sweep that
+/// finds it and goes on a later one; a stamp whose bundle is gone goes, and the published stage
+/// is never touched.
+#[test]
+fn a_bundle_a_stage_probe_left_unproven_goes_once_its_exec_stamp_is_spent() {
+    let (s, root) = temp_staging();
+    make_app(&s.staged_app, "PUBLISHED");
+    let awake = aterm_uds::process::awake_ms().expect("the awake clock");
+    let stamp =
+        |incoming: &Path| incoming_exec_home(incoming).join(aterm_uds::deadline::EXEC_STAMP);
+    let left = |id: &str| {
+        let path = StageIncoming::create(&s).unwrap().path.clone();
+        make_app(&path, id);
+        path
+    };
+    let held = left("HELD");
+    stamp_incoming_exec(&held).unwrap();
+    let restarted = left("RESTARTED");
+    stamp_incoming_exec(&restarted).unwrap();
+    std::fs::write(stamp(&restarted), (awake + 3_600_000).to_string()).unwrap();
+    // Without the awake clock the stamp is blank, and its directory's mtime dates it.
+    let spent = left("SPENT");
+    stamp_incoming_exec(&spent).unwrap();
+    std::fs::write(stamp(&spent), "").unwrap();
+    let unstamped = left("UNSTAMPED");
+    let gone = left("GONE");
+    stamp_incoming_exec(&gone).unwrap();
+    std::fs::remove_dir_all(&gone).unwrap();
+
+    sweep_stale_scratch(&s);
+    assert!(
+        !restarted.exists(),
+        "a stamp from before a restart lets its bundle go"
+    );
+    assert!(!incoming_exec_home(&restarted).exists());
+    assert!(
+        !incoming_exec_home(&gone).exists(),
+        "a stamp whose bundle is gone goes"
+    );
+    assert_eq!(read_id(&held), "HELD", "a live stamp holds its bundle");
+    assert_eq!(read_id(&spent), "SPENT");
+    assert_eq!(
+        read_id(&unstamped),
+        "UNSTAMPED",
+        "no stamp: stamped, not removed"
+    );
+    assert!(stamp(&unstamped).is_file());
+
+    let later = std::time::SystemTime::now()
+        + aterm_uds::deadline::FIRST_EXEC_HANG
+        + std::time::Duration::from_secs(60);
+    sweep_left_incoming(&s, later);
+    assert!(!spent.exists(), "FIRST_EXEC_HANG past its stamp, it goes");
+    assert!(!incoming_exec_home(&spent).exists());
+    assert_eq!(
+        read_id(&held),
+        "HELD",
+        "the wall clock ran on, the awake clock did not"
+    );
+    assert_eq!(
+        read_id(&unstamped),
+        "UNSTAMPED",
+        "its hold runs from the sweep that stamped it"
+    );
+
+    std::fs::write(stamp(&unstamped), "").unwrap();
+    sweep_left_incoming(&s, later);
+    assert!(
+        !unstamped.exists(),
+        "its hold spent, a later sweep takes it"
+    );
+    assert!(!incoming_exec_home(&unstamped).exists());
+    assert_eq!(read_id(&held), "HELD");
+    assert_eq!(read_id(&s.staged_app), "PUBLISHED");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// With automatic checks off no check comes to sweep, so the launch starts a sweep that takes
+/// a bundle a stage's probe left once its stamp is spent, then waits out each hold it kept
+/// (a live stamp, and the one it put on an unstamped bundle) and takes those too. It stays:
+/// every FIRST_EXEC_HANG it lists `staged/` again, so a bundle another process's asked check
+/// left goes once its hold is spent; it ends only when there is no `staged/` to sweep.
+#[test]
+fn with_automatic_checks_off_the_launch_sweep_takes_each_left_bundle_once_its_hold_is_spent() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc::{RecvTimeoutError::Disconnected, channel};
+    let (s, _root) = temp_staging();
+    make_app(&s.staged_app, "PUBLISHED");
+    let hang = std::time::Duration::from_secs(60);
+    let restarted =
+        (aterm_uds::process::awake_ms().expect("the awake clock") + 3_600_000).to_string();
+    let stamp =
+        |incoming: &Path| incoming_exec_home(incoming).join(aterm_uds::deadline::EXEC_STAMP);
+    let left = |id: &str| {
+        let path = StageIncoming::create(&s).unwrap().path.clone();
+        make_app(&path, id);
+        path
+    };
+    let spent = left("SPENT");
+    stamp_incoming_exec(&spent).unwrap();
+    std::fs::write(stamp(&spent), &restarted).unwrap();
+    let held = left("HELD");
+    stamp_incoming_exec(&held).unwrap();
+    let unstamped = left("UNSTAMPED");
+
+    // A sweep that says each wait, then waits until the test lets it go on; it has no
+    // `staged/` once the test says so, or once the test is gone.
+    let no_staging = std::sync::Arc::new(AtomicBool::new(false));
+    let (waited, waits) = channel();
+    let (go, gate) = channel::<()>();
+    let sweep = {
+        let staging = Staging::clone(&s);
+        let (listed, ended) = (
+            std::sync::Arc::clone(&no_staging),
+            std::sync::Arc::clone(&no_staging),
+        );
+        let gate = std::sync::Mutex::new(gate);
+        crate::UncheckedSweep::new(
+            move || (!listed.load(Ordering::SeqCst)).then(|| staging.clone()),
+            move |wait| {
+                if waited.send(wait).is_err() || gate.lock().unwrap().recv_timeout(hang).is_err() {
+                    ended.store(true, Ordering::SeqCst);
+                }
+            },
+        )
+    };
+    crate::spawn_background_check_in(false, &sweep, 1, std::sync::Arc::new(|| None), None, None);
+    // The sweep's thread now holds the only `sleep`, so its channel closes when it ends.
+    drop(sweep);
+
+    assert_eq!(
+        waits.recv_timeout(hang),
+        Ok(aterm_uds::deadline::FIRST_EXEC_HANG),
+        "it waits out the longest hold it kept"
+    );
+    assert!(!spent.exists(), "the first sweep takes the spent bundle");
+    assert!(!incoming_exec_home(&spent).exists());
+    assert_eq!(read_id(&held), "HELD", "it keeps the live one");
+    assert_eq!(read_id(&unstamped), "UNSTAMPED");
+    assert!(stamp(&unstamped).is_file(), "it stamps the unstamped one");
+    // The holds run out while it waits.
+    for kept in [&held, &unstamped] {
+        std::fs::write(stamp(kept), &restarted).unwrap();
+    }
+    go.send(()).unwrap();
+
+    assert_eq!(
+        waits.recv_timeout(hang),
+        Ok(aterm_uds::deadline::FIRST_EXEC_HANG),
+        "with nothing held it stays, to list staged/ again"
+    );
+    for gone in [&held, &unstamped] {
+        assert!(!gone.exists(), "{} outlived its hold", gone.display());
+        assert!(!incoming_exec_home(gone).exists());
+    }
+    // Meanwhile another process's asked check leaves its bundle under a live stamp.
+    let other = left("OTHER");
+    stamp_incoming_exec(&other).unwrap();
+    go.send(()).unwrap();
+
+    let wait = waits
+        .recv_timeout(hang)
+        .expect("it lists staged/ again and waits out the new hold");
+    assert!(wait <= aterm_uds::deadline::FIRST_EXEC_HANG);
+    assert_eq!(read_id(&other), "OTHER", "a live stamp holds its bundle");
+    std::fs::write(stamp(&other), &restarted).unwrap();
+    go.send(()).unwrap();
+
+    assert_eq!(
+        waits.recv_timeout(hang),
+        Ok(aterm_uds::deadline::FIRST_EXEC_HANG)
+    );
+    assert!(!other.exists(), "{} outlived its hold", other.display());
+    assert!(!incoming_exec_home(&other).exists());
+    no_staging.store(true, Ordering::SeqCst);
+    go.send(()).unwrap();
+    assert_eq!(
+        waits.recv_timeout(hang),
+        Err(Disconnected),
+        "with no staged/ to sweep, it ends"
+    );
+    assert_eq!(read_id(&s.staged_app), "PUBLISHED");
+}
+
+/// With automatic checks off no scheduled check follows an asked one, so the asked check
+/// starts the sweep, which takes the bundle its probe left once the stamp is spent; another
+/// asked check while that sweep runs sends it round once more. With them on, it starts
+/// nothing: the next scheduled check sweeps.
+#[test]
+fn with_automatic_checks_off_an_asked_check_sweeps_what_it_left_once_its_stamp_is_spent() {
+    use std::sync::mpsc::{Receiver, RecvTimeoutError::Disconnected, channel};
+    let (s, _root) = temp_staging();
+    make_app(&s.staged_app, "PUBLISHED");
+    let hang = std::time::Duration::from_secs(60);
+    let restarted =
+        (aterm_uds::process::awake_ms().expect("the awake clock") + 3_600_000).to_string();
+    let stamp =
+        |incoming: &Path| incoming_exec_home(incoming).join(aterm_uds::deadline::EXEC_STAMP);
+    // What a stage whose start probe stayed unproven leaves: its bundle, under a live stamp.
+    let stage_left = |id: &str| {
+        let path = StageIncoming::create(&s).unwrap().path.clone();
+        make_app(&path, id);
+        stamp_incoming_exec(&path).unwrap();
+        path
+    };
+    let rounds = std::sync::Arc::new(AtomicU32::new(0));
+    // A sweep that says each wait, then waits until the test lets it go on.
+    let recorded = |go: Receiver<()>| {
+        let (waited, waits) = channel();
+        let go = std::sync::Mutex::new(go);
+        let (staging, rounds) = (Staging::clone(&s), std::sync::Arc::clone(&rounds));
+        let sweep = crate::UncheckedSweep::new(
+            move || {
+                rounds.fetch_add(1, Ordering::SeqCst);
+                Some(staging.clone())
+            },
+            move |wait| {
+                waited.send(wait).unwrap();
+                let _ = go.lock().unwrap().recv_timeout(hang);
+            },
+        );
+        (sweep, waits)
+    };
+
+    let (go, gate) = channel();
+    let (sweep, waits) = recorded(gate);
+    let mut first = None;
+    crate::asked_check(false, &sweep, || first = Some(stage_left("FIRST")));
+    let first = first.unwrap();
+    let wait = waits
+        .recv_timeout(hang)
+        .expect("the asked check's sweep waits out the hold");
+    assert!(wait <= aterm_uds::deadline::FIRST_EXEC_HANG);
+    assert_eq!(read_id(&first), "FIRST", "a live stamp holds its bundle");
+    let mut second = None;
+    crate::asked_check(false, &sweep, || second = Some(stage_left("SECOND")));
+    let second = second.unwrap();
+    // The sweep's thread now holds the only `sleep`, so its channel closes when it ends.
+    drop(sweep);
+    for left in [&first, &second] {
+        std::fs::write(stamp(left), &restarted).unwrap();
+    }
+    go.send(()).unwrap();
+    assert_eq!(
+        waits.recv_timeout(hang),
+        Err(Disconnected),
+        "both holds spent, the sweep ends"
+    );
+    for gone in [&first, &second] {
+        assert!(!gone.exists(), "{} outlived its hold", gone.display());
+        assert!(!incoming_exec_home(gone).exists());
+    }
+    assert_eq!(
+        rounds.load(Ordering::SeqCst),
+        2,
+        "the second check sent the running sweep round again"
+    );
+
+    let (_go, gate) = channel();
+    let (sweep, waits) = recorded(gate);
+    let mut left = None;
+    crate::asked_check(true, &sweep, || left = Some(stage_left("SCHEDULED")));
+    drop(sweep);
+    assert_eq!(
+        waits.recv_timeout(hang),
+        Err(Disconnected),
+        "with automatic checks on, an asked check starts no sweep"
+    );
+    assert_eq!(read_id(&left.unwrap()), "SCHEDULED");
+    assert_eq!(read_id(&s.staged_app), "PUBLISHED");
+}
+
+/// A sweep that finds a stage holding the lock touches nothing, not even a spent bundle, and
+/// asks to come back once that stage's own bundle could be spent; once the lock is free it
+/// takes the spent bundle and asks for nothing.
+#[test]
+fn a_sweep_that_finds_the_stage_lock_held_leaves_everything_and_comes_back_later() {
+    let (s, _root) = temp_staging();
+    let spent = StageIncoming::create(&s).unwrap().path.clone();
+    make_app(&spent, "SPENT");
+    stamp_incoming_exec(&spent).unwrap();
+    // Stamped before a restart, so any sweep that holds the lock takes it.
+    let restarted =
+        (aterm_uds::process::awake_ms().expect("the awake clock") + 3_600_000).to_string();
+    std::fs::write(
+        incoming_exec_home(&spent).join(aterm_uds::deadline::EXEC_STAMP),
+        restarted,
+    )
+    .unwrap();
+    let stage = FileLock::acquire_within(&s.stage_lock, std::time::Duration::ZERO).unwrap();
+    assert_eq!(
+        sweep_left_incoming_unless_staging(&s),
+        Some(aterm_uds::deadline::FIRST_EXEC_HANG)
+    );
+    assert_eq!(read_id(&spent), "SPENT", "a stage in flight owns staged/");
+    assert!(incoming_exec_home(&spent).exists());
+    drop(stage);
+    assert_eq!(sweep_left_incoming_unless_staging(&s), None);
+    assert!(!spent.exists());
+    assert!(!incoming_exec_home(&spent).exists());
+}
+
 /// A window's settled trial keeps its predecessor at the fixed path while that window runs.
 #[test]
 fn a_kept_predecessor_is_released_only_after_its_window_and_outside_a_trial() {
@@ -4683,7 +4987,9 @@ fn only_a_probe_that_lost_a_started_candidate_leaves_it_unproven() {
     }
 }
 
-/// A start probe killed before its candidate exited leaves it where it ran.
+/// A start probe killed before its candidate exited leaves it where it ran: every probe finds
+/// the candidate recorded before it starts it, so an apply killed mid-probe leaves the record
+/// holding it; with no record there is no probe.
 #[test]
 fn a_start_probe_killed_before_its_candidate_exited_leaves_it_where_it_ran() {
     let (running, build, commit, other_commit) = (
@@ -4724,6 +5030,16 @@ fn a_start_probe_killed_before_its_candidate_exited_leaves_it_where_it_ran() {
             }
         };
         let read_both = |[a, b]: [&Path; 2]| [read(a), read(b)];
+        let recorded_first = |path: &Path, build: u64| {
+            assert_eq!(
+                UnprovenCandidate::read(s)
+                    .unwrap()
+                    .map(|record| record.bundle),
+                Some(path.to_path_buf()),
+                "the candidate is recorded before its probe starts it"
+            );
+            probe(path, build)
+        };
         let admitted =
             admit_stage_under_apply_lock(s, installed, running, Some(other_commit), None)?;
         swap_admitted_stage(
@@ -4735,7 +5051,7 @@ fn a_start_probe_killed_before_its_candidate_exited_leaves_it_where_it_ran() {
             &SwapSeams {
                 one: &read,
                 both: &read_both,
-                probe,
+                probe: &recorded_first,
             },
         )
         .map(drop)
@@ -4757,7 +5073,9 @@ fn a_start_probe_killed_before_its_candidate_exited_leaves_it_where_it_ran() {
         "the moved stage's marker is retired"
     );
     assert_eq!(read_id(&installed), "OLD");
-    let record = UnprovenCandidate::read(&s).expect("the unproven candidate is recorded");
+    let record = UnprovenCandidate::read(&s)
+        .unwrap()
+        .expect("the unproven candidate is recorded");
     assert_eq!(record.bundle, fixed);
     stage(&s, "NEW2");
     match swap(&s, &installed, &starts) {
@@ -4770,9 +5088,16 @@ fn a_start_probe_killed_before_its_candidate_exited_leaves_it_where_it_ran() {
     assert_eq!(read_id(&fixed), "NEW");
     assert_eq!(read_id(&s.staged_app), "NEW2");
     assert_eq!(read_id(&installed), "OLD");
+    let hang = aterm_uds::deadline::FIRST_EXEC_HANG;
     UnprovenCandidate {
         bundle: fixed.clone(),
-        killed_at: record.killed_at - aterm_uds::deadline::FIRST_EXEC_HANG.as_secs(),
+        started: ProbeClock {
+            awake_ms: record
+                .started
+                .awake_ms
+                .and_then(|ms| ms.checked_sub(hang.as_secs() * 1000)),
+            wall_secs: record.started.wall_secs - hang.as_secs(),
+        },
     }
     .record(&s)
     .unwrap();
@@ -4780,9 +5105,108 @@ fn a_start_probe_killed_before_its_candidate_exited_leaves_it_where_it_ran() {
     assert_eq!(read_id(&installed), "NEW2");
     assert_eq!(read_id(&fixed), "OLD", "the rollback source");
     assert!(
-        UnprovenCandidate::read(&s).is_none(),
-        "the record is dropped"
+        UnprovenCandidate::read(&s).unwrap().is_none(),
+        "the spent record is dropped, and the new one goes on the probe's own exit"
     );
+    let _ = std::fs::remove_dir_all(root);
+
+    let signalled = |_: &Path, _: u64| -> Result<(), String> {
+        Err(format!(
+            "{} (signal: 9 (SIGKILL))",
+            crate::verify::START_PROBE_SIGNALLED
+        ))
+    };
+    let (s, root, installed) = desk("NEW");
+    let fixed = rollback_path(&installed);
+    assert!(matches!(
+        swap(&s, &installed, &signalled),
+        Err(ApplyOutcome::Deferred(_))
+    ));
+    assert_eq!(read_id(&fixed), "NEW", "a signal's end: left where it ran");
+    assert_eq!(
+        UnprovenCandidate::read(&s)
+            .unwrap()
+            .map(|record| record.bundle),
+        Some(fixed),
+        "and held there"
+    );
+    assert_eq!(
+        crate::manifest::FailedMark::read(&s.failed()).map(|mark| mark.build_number),
+        Some(build),
+        "a verdict on the build"
+    );
+    let _ = std::fs::remove_dir_all(root);
+
+    let (s, root, installed) = desk("NEW");
+    std::fs::create_dir(unproven_candidate_path(&s)).unwrap();
+    let unrecorded = |_: &Path, _: u64| -> Result<(), String> { panic!("probed unrecorded") };
+    match swap(&s, &installed, &unrecorded) {
+        Err(ApplyOutcome::Deferred(why)) => assert!(
+            crate::is_passing_refusal(&why) && why.contains("before its start probe"),
+            "{why}"
+        ),
+        other => panic!("probed a candidate it could not record: {other:?}"),
+    }
+    assert_eq!(
+        read_id(&s.staged_app),
+        "NEW",
+        "never started: back to its stage"
+    );
+    assert!(s.ready.exists());
+    assert!(!rollback_path(&installed).exists());
+    assert_eq!(read_id(&installed), "OLD");
+    let _ = std::fs::remove_dir_all(root);
+
+    // Every install sharing the Updates root shares the one record: another install's live
+    // hold defers this one's swap before anything moves, and is left exactly as it was.
+    let unprobed =
+        |_: &Path, _: u64| -> Result<(), String> { panic!("probed past a held candidate") };
+    let (s, root, installed) = desk("NEW");
+    let theirs = root.join("Volumes/Ext/A/aterm.app.rollback");
+    make_app(&theirs, "A");
+    let held = UnprovenCandidate {
+        bundle: theirs.clone(),
+        started: ProbeClock::now(),
+    };
+    held.record(&s).unwrap();
+    match swap(&s, &installed, &unprobed) {
+        Err(ApplyOutcome::Deferred(why)) => assert!(
+            crate::is_passing_refusal(&why)
+                && why.contains("another install's candidate")
+                && why.contains(&theirs.display().to_string()),
+            "{why}"
+        ),
+        other => panic!("swapped past another install's held candidate: {other:?}"),
+    }
+    assert_eq!(
+        UnprovenCandidate::read(&s).unwrap(),
+        Some(held),
+        "its record stays"
+    );
+    assert_eq!(read_id(&theirs), "A", "and so does its copy");
+    assert_eq!(read_id(&s.staged_app), "NEW");
+    assert!(s.ready.exists());
+    assert!(!rollback_path(&installed).exists());
+    assert_eq!(read_id(&installed), "OLD");
+    let _ = std::fs::remove_dir_all(root);
+
+    // A record that cannot be read is kept, and the refusal names it to the person.
+    let (s, root, installed) = desk("NEW");
+    let unreadable = unproven_candidate_path(&s);
+    std::os::unix::fs::symlink(&unreadable, &unreadable).unwrap();
+    match swap(&s, &installed, &unprobed) {
+        Err(ApplyOutcome::Deferred(why)) => assert!(
+            !crate::is_passing_refusal(&why) && why.contains(&unreadable.display().to_string()),
+            "{why}"
+        ),
+        other => panic!("swapped past an unreadable record: {other:?}"),
+    }
+    assert!(
+        std::fs::symlink_metadata(&unreadable).is_ok(),
+        "the unreadable record is kept"
+    );
+    assert_eq!(read_id(&s.staged_app), "NEW");
+    assert!(!rollback_path(&installed).exists());
     let _ = std::fs::remove_dir_all(root);
 
     let verdict = |_: &Path, _: u64| -> Result<(), String> {
@@ -4814,7 +5238,7 @@ fn a_start_probe_killed_before_its_candidate_exited_leaves_it_where_it_ran() {
         assert!(s.ready.exists(), "{what}: its marker stays");
         assert!(!rollback_path(&installed).exists(), "{what}");
         assert!(
-            UnprovenCandidate::read(&s).is_none(),
+            UnprovenCandidate::read(&s).unwrap().is_none(),
             "{what}: nothing recorded"
         );
         let _ = std::fs::remove_dir_all(root);
@@ -4822,7 +5246,8 @@ fn a_start_probe_killed_before_its_candidate_exited_leaves_it_where_it_ran() {
 }
 
 /// Across volumes the candidate is a copy at the fixed path beside an intact stage: an
-/// unproven one stays there with the stage and its marker, recorded.
+/// unproven one stays there with the stage and its marker, held by its record for
+/// FIRST_EXEC_HANG of awake time (a sleep does not age it) or until a restart.
 #[test]
 fn an_unproven_copied_candidate_stays_beside_its_stage() {
     let (s, root) = temp_staging();
@@ -4832,21 +5257,24 @@ fn an_unproven_copied_candidate_stays_beside_its_stage() {
     make_app(&installed, "OLD");
     let fixed = rollback_path(&installed);
     make_app(&fixed, "COPY");
-    keep_unproven_candidate(&copied_candidate(&fixed), &s, 1_800_000_000);
+    let at = |awake_ms: Option<u64>, wall_secs: u64| ProbeClock {
+        awake_ms,
+        wall_secs,
+    };
+    let record = UnprovenCandidate {
+        bundle: fixed.clone(),
+        started: at(Some(5_000_000), 1_800_000_000),
+    };
+    record.record(&s).unwrap();
+    keep_unproven_candidate(&copied_candidate(&fixed), &s);
     assert_eq!(read_id(&fixed), "COPY");
     assert_eq!(read_id(&s.staged_app), "NEW");
     assert!(s.ready.exists());
-    assert_eq!(
-        UnprovenCandidate::read(&s),
-        Some(UnprovenCandidate {
-            bundle: fixed.clone(),
-            killed_at: 1_800_000_000
-        })
-    );
+    assert_eq!(UnprovenCandidate::read(&s).unwrap(), Some(record.clone()));
     std::fs::remove_dir_all(&s.staged_app).unwrap();
     UnprovenCandidate {
         bundle: fixed.clone(),
-        killed_at: u64::MAX,
+        started: ProbeClock::now(),
     }
     .record(&s)
     .unwrap();
@@ -4861,45 +5289,173 @@ fn an_unproven_copied_candidate_stays_beside_its_stage() {
         "the held copy stays at its fixed path"
     );
     make_app(&s.staged_app, "NEW");
-    UnprovenCandidate {
-        bundle: fixed.clone(),
-        killed_at: 1_800_000_000,
-    }
-    .record(&s)
-    .unwrap();
+    record.record(&s).unwrap();
 
     let hang = aterm_uds::deadline::FIRST_EXEC_HANG.as_secs();
-    for earlier in [1_800_000_000 - hang, 0] {
+    let awake = |secs: u64| Some(5_000_000 + secs * 1000);
+    let path = unproven_candidate_path(&s);
+    let left = |now: ProbeClock| {
+        UnprovenCandidate::holds_at(&path, now)
+            .unwrap()
+            .map(|(bundle, left)| {
+                assert_eq!(bundle.as_ref(), Some(&fixed));
+                left
+            })
+    };
+    assert_eq!(left(at(awake(60), 1_800_000_060)), Some(hang - 60));
+    assert_eq!(
+        left(at(awake(60), 1_800_000_000 + hang + 3_600)),
+        Some(hang - 60),
+        "a sleep runs the wall clock past the hold, not the awake clock"
+    );
+    for wall in [1_800_000_000 - hang, 0] {
         assert_eq!(
-            UnprovenCandidate::holds(&s, &fixed, earlier),
+            left(at(None, wall)),
             Some(hang),
-            "a backward or unavailable clock cannot age the candidate"
+            "without the awake clock, a backward or unavailable wall clock cannot age it"
         );
-        assert!(UnprovenCandidate::read(&s).is_some());
     }
+    assert_eq!(left(at(None, 1_800_000_060)), Some(hang - 60));
+    let legacy = UnprovenCandidate {
+        bundle: fixed.clone(),
+        started: at(None, 1_800_000_000),
+    };
     assert_eq!(
-        UnprovenCandidate::holds(&s, &fixed, 1_800_000_000 + 60),
-        Some(hang - 60)
+        UnprovenCandidate::parse(
+            &legacy
+                .encode()
+                .replacen("v2 1800000000 -", "v1 1800000000", 1)
+        ),
+        Some(legacy),
+        "an earlier build's record, written at the kill, ages on the wall clock"
     );
-    assert_eq!(
-        UnprovenCandidate::holds(&s, &root.join("elsewhere"), 1_800_000_060),
-        None,
-        "it holds only the path it names"
-    );
+    let refusal =
+        UnprovenCandidate::check(&s, &root.join("elsewhere"), at(awake(60), 0)).unwrap_err();
     assert!(
-        UnprovenCandidate::read(&s).is_some(),
-        "kept for its own path"
+        crate::is_passing_refusal(&refusal)
+            && refusal.contains("another install's candidate")
+            && refusal.contains(&fixed.display().to_string()),
+        "it holds its path against every install sharing the record: {refusal}"
     );
     assert_eq!(
-        UnprovenCandidate::holds(&s, &fixed, 1_800_000_000 + hang),
-        None
+        UnprovenCandidate::read(&s).unwrap(),
+        Some(record.clone()),
+        "and stays as it was"
     );
-    assert!(
-        UnprovenCandidate::read(&s).is_none(),
-        "run its course: dropped"
-    );
+    for (now, why) in [
+        (
+            at(Some(4_999_999), 1_800_000_060),
+            "a restart ended the assessment",
+        ),
+        (at(awake(hang), 1_800_000_000 + hang), "run its course"),
+    ] {
+        record.record(&s).unwrap();
+        assert_eq!(left(now), None, "{why}");
+        assert!(
+            UnprovenCandidate::read(&s).unwrap().is_none(),
+            "{why}: dropped"
+        );
+    }
     recover_prepared_candidate(&copied_candidate(&fixed), &s);
     assert!(!fixed.exists(), "backed out, the copy goes");
     assert_eq!(read_id(&s.staged_app), "NEW");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// No build drops a record in a format it cannot read. This build's record has a file of its
+/// own, so an earlier build's pass over `fixed.unproven` (which drops what does not parse as
+/// `v1`) leaves it holding. An earlier build's live `v1` record holds every install's swap on
+/// the wall clock, whichever install's candidate it names, and stays until it is spent. A
+/// record this build cannot parse, in either file, holds every swap for FIRST_EXEC_HANG by its
+/// file's mtime and goes only then.
+#[test]
+fn no_build_drops_a_record_in_a_format_it_cannot_read() {
+    let (s, root) = temp_staging();
+    let fixed = rollback_path(&root.join("Applications/aterm.app"));
+    let theirs = root.join("Volumes/Ext/B/aterm.app.rollback");
+    let legacy = legacy_unproven_candidate_path(&s);
+    let hang = aterm_uds::deadline::FIRST_EXEC_HANG.as_secs();
+    let earlier_build_pass = || {
+        if std::fs::read_to_string(&legacy).is_ok_and(|text| !text.starts_with("v1 ")) {
+            std::fs::remove_file(&legacy).unwrap();
+        }
+    };
+    let deferred = |now: ProbeClock, says: &str, names: &Path| {
+        let refusal = UnprovenCandidate::check(&s, &fixed, now).unwrap_err();
+        assert!(
+            crate::is_passing_refusal(&refusal)
+                && refusal.contains(says)
+                && refusal.contains(&names.display().to_string()),
+            "{refusal}"
+        );
+    };
+
+    let now = ProbeClock::now();
+    UnprovenCandidate {
+        bundle: fixed.clone(),
+        started: now,
+    }
+    .record(&s)
+    .unwrap();
+    earlier_build_pass();
+    assert_eq!(
+        UnprovenCandidate::read(&s)
+            .unwrap()
+            .map(|record| record.bundle),
+        Some(fixed.clone()),
+        "an earlier build's pass leaves this build's record"
+    );
+    deferred(now, "the candidate at", &fixed);
+    UnprovenCandidate::clear(&s);
+
+    std::fs::write(
+        &legacy,
+        format!(
+            "v1 {}\n{}\n",
+            now.wall_secs,
+            aterm_codec::hex::encode_lower(theirs.as_os_str().as_encoded_bytes())
+        ),
+    )
+    .unwrap();
+    let asleep = ProbeClock {
+        awake_ms: now.awake_ms,
+        wall_secs: now.wall_secs + hang / 2,
+    };
+    deferred(asleep, "another install's candidate", &theirs);
+    assert!(legacy.exists(), "an earlier build's live record stays");
+    let spent = ProbeClock {
+        awake_ms: now.awake_ms,
+        wall_secs: now.wall_secs + hang,
+    };
+    assert_eq!(
+        UnprovenCandidate::check(&s, &fixed, spent),
+        Ok(()),
+        "it ages on the wall clock, as the build that wrote it did"
+    );
+    assert!(!legacy.exists(), "spent: dropped");
+
+    for unknown in [unproven_candidate_path(&s), legacy.clone()] {
+        std::fs::write(&unknown, "v3 a format to come\n").unwrap();
+        let now = ProbeClock::now();
+        for within in [
+            now,
+            ProbeClock {
+                awake_ms: None,
+                wall_secs: now.wall_secs + hang / 2,
+            },
+        ] {
+            deferred(within, "a format this build cannot read", &unknown);
+            assert!(unknown.exists(), "kept while its file is young");
+        }
+        let spent = ProbeClock {
+            awake_ms: now.awake_ms,
+            wall_secs: now.wall_secs + hang + 1,
+        };
+        assert_eq!(UnprovenCandidate::check(&s, &fixed, spent), Ok(()));
+        assert!(
+            !unknown.exists(),
+            "dropped once its file is FIRST_EXEC_HANG old"
+        );
+    }
     let _ = std::fs::remove_dir_all(root);
 }

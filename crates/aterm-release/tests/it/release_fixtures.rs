@@ -254,6 +254,142 @@ fn a_generator_that_refuses_or_leaves_a_required_desk_out_stages_nothing() {
     assert!(fixtures::staged(&root, &pins(7)).is_none());
 }
 
+/// A generator a signal ended never showed that what it built ran: its target stays,
+/// stamped, and the next stage refuses and leaves it until the hold is spent (a restart
+/// here), then clears it and runs.
+#[test]
+fn a_generator_a_signal_ended_keeps_its_target_until_the_hold_is_spent() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let o = Origin::new();
+    let root = o.stage_root();
+    let target = o.work.join(crate::gates::HANDOFF_FIXTURE_GUARD_TARGET);
+    let built = target.join("debug/deps/aterm_gui-0");
+    let mut killed = |_: &mut Command| -> std::io::Result<Output> {
+        fs::create_dir_all(built.parent().unwrap()).unwrap();
+        fs::write(&built, b"held").unwrap();
+        Ok(Output {
+            status: std::process::ExitStatus::from_raw(9),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        })
+    };
+    fixtures::stage(Path::new("targo"), &o.work, &root, &pins(7), &mut killed).unwrap_err();
+    assert!(built.is_file(), "what the killed run built stays");
+
+    let runs = Cell::new(0);
+    let mut run = generator(&["history"], &runs);
+    let refused =
+        fixtures::stage(Path::new("targo"), &o.work, &root, &pins(7), &mut run).unwrap_err();
+    assert!(
+        refused.to_string().contains("never showed they ran"),
+        "{refused}"
+    );
+    assert_eq!(runs.get(), 0, "nothing runs while the hold stands");
+    assert!(built.is_file());
+
+    fs::write(
+        target.join(aterm_uds::deadline::EXEC_STAMP),
+        u64::MAX.to_string(),
+    )
+    .unwrap();
+    fixtures::stage(Path::new("targo"), &o.work, &root, &pins(7), &mut run).unwrap();
+    assert_eq!(runs.get(), 1);
+    assert!(
+        !target.exists(),
+        "a run that exited on its own takes its target"
+    );
+}
+
+/// A release killed while the generator ran never judged its target. Once the stamp written
+/// before the run is spent, the next stage still keeps the target: it holds it from when it
+/// finds it, refuses, and clears it only once that hold is spent.
+#[test]
+fn a_target_a_killed_release_never_judged_is_held_from_when_it_is_found() {
+    use aterm_uds::deadline::{EXEC_STAMP, FIRST_EXEC_HANG};
+    let o = Origin::new();
+    let root = o.stage_root();
+    let target = o.work.join(crate::gates::HANDOFF_FIXTURE_GUARD_TARGET);
+    let built = target.join("debug/deps/aterm_gui-0");
+    let killed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut run = |_: &mut Command| -> std::io::Result<Output> {
+            fs::create_dir_all(built.parent().unwrap()).unwrap();
+            fs::write(&built, b"held").unwrap();
+            panic!("the release is killed while the generator runs");
+        };
+        fixtures::stage(Path::new("targo"), &o.work, &root, &pins(7), &mut run)
+    }));
+    assert!(killed.is_err(), "the release never got back from the run");
+    let hang = u64::try_from(FIRST_EXEC_HANG.as_millis()).unwrap();
+    let spent = aterm_uds::process::awake_ms()
+        .and_then(|awake| awake.checked_sub(hang + 1000))
+        .unwrap_or(u64::MAX);
+    fs::write(target.join(EXEC_STAMP), spent.to_string()).unwrap();
+
+    let runs = Cell::new(0);
+    let mut run = generator(&["history"], &runs);
+    for stage in ["found", "held"] {
+        let refused =
+            fixtures::stage(Path::new("targo"), &o.work, &root, &pins(7), &mut run).unwrap_err();
+        assert!(
+            refused.to_string().contains("never showed they ran"),
+            "{stage}: {refused}"
+        );
+        assert_eq!(runs.get(), 0, "{stage}: nothing runs while the hold stands");
+        assert!(
+            built.is_file(),
+            "{stage}: what the killed release built stays"
+        );
+    }
+
+    fs::write(target.join(EXEC_STAMP), u64::MAX.to_string()).unwrap();
+    fixtures::stage(Path::new("targo"), &o.work, &root, &pins(7), &mut run).unwrap();
+    assert_eq!(runs.get(), 1, "a restart spent the hold");
+    assert!(
+        !target.exists(),
+        "a run that exited on its own takes its target"
+    );
+}
+
+/// A `run` that failed and left nothing in the target but its stamp built nothing there:
+/// the target goes and the next stage runs at once. One that failed after building there
+/// keeps it.
+#[test]
+fn a_run_that_failed_before_building_leaves_no_hold() {
+    let o = Origin::new();
+    let root = o.stage_root();
+    let target = o.work.join(crate::gates::HANDOFF_FIXTURE_GUARD_TARGET);
+    let mut not_started = |_: &mut Command| -> std::io::Result<Output> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "not started: the release was interrupted",
+        ))
+    };
+    fixtures::stage(
+        Path::new("targo"),
+        &o.work,
+        &root,
+        &pins(7),
+        &mut not_started,
+    )
+    .unwrap_err();
+    assert!(!target.exists(), "a target nothing was built in goes");
+
+    let runs = Cell::new(0);
+    let mut run = generator(&["history"], &runs);
+    fixtures::stage(Path::new("targo"), &o.work, &root, &pins(7), &mut run).unwrap();
+    assert_eq!(runs.get(), 1, "nothing holds the next stage");
+
+    let built = target.join("debug/deps/aterm_gui-0");
+    let mut lost = |_: &mut Command| -> std::io::Result<Output> {
+        fs::create_dir_all(built.parent().unwrap()).unwrap();
+        fs::write(&built, b"held").unwrap();
+        Err(std::io::Error::other("its output could not be read"))
+    };
+    fixtures::stage(Path::new("targo"), &o.work, &root, &pins(8), &mut lost).unwrap_err();
+    assert!(built.is_file(), "what a failed run built stays");
+    assert!(target.join(aterm_uds::deadline::EXEC_STAMP).is_file());
+}
+
 #[test]
 fn a_landing_commits_the_staging_and_its_rows_on_main_once() {
     let o = Origin::new();

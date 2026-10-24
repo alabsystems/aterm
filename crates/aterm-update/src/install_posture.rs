@@ -1,13 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Portable presentation values for macOS bundle posture: no path or bundle probes and no
-//! replacement authority. Probing stays in `bundle`; any host's messages can render these.
+//! Portable presentation values for macOS bundle posture.
 
-/// Where a running copy is installed from, kept as a reason. `bundle::resolve_from`
-/// answers only "may I replace this?", and its "no" is the same for a dev build and for a
-/// download left in `~/Downloads`, though only the latter is the user's to fix.
-/// `bundle::posture_from` classifies from the path alone.
+/// Where a running copy is installed from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallPosture {
     /// Replaceable in place: self-update works and the shell shims go beside it.

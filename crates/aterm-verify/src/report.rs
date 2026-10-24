@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! What a run prints: one line per check as it finishes, each failure followed
-//! by its findings and the command that reruns just it, then one verdict line.
+//! Per-check output, finding summaries, and final verdict formatting.
 
 use std::fmt::Write as _;
 use std::time::Duration;
@@ -39,9 +38,7 @@ pub const fn word(o: Outcome) -> &'static str {
     }
 }
 
-/// Fold a check's stage reports into its result. The worst row decides: a
-/// finding, then a could-not-run, then a skip (the check did not fully run),
-/// else ok. `scope` is the selection it ran over, `""` for a whole-tree check.
+/// Folds a check's stage reports into its [`CheckResult`] (worst outcome wins).
 #[must_use]
 pub fn judge(
     check: Check,
@@ -73,8 +70,6 @@ pub fn judge(
                 1 => "1 test failed".to_string(),
                 n => format!("{n} tests failed"),
             };
-            // What could not run beside the failures follows them under its own
-            // word, counted in none of them: a host with no fish is no failure.
             let unrun = Outcome::Fail(Severity::CouldNotRun);
             findings.extend(
                 rows.iter()
@@ -132,9 +127,7 @@ pub fn duration(secs: f64) -> String {
     }
 }
 
-/// A check's lines: `ok    lint    40s  -p aterm-grid`, and under a failure
-/// its findings, each with its message and rerun, then the check's own rerun.
-/// `width` pads the check names into one column.
+/// Formats a check result line and any findings/rerun commands.
 #[must_use]
 pub fn render(r: &CheckResult, width: usize) -> String {
     let mut s = format!(
@@ -174,8 +167,7 @@ pub fn render(r: &CheckResult, width: usize) -> String {
     s
 }
 
-/// The verdict line and the exit code, from every check's result. Under
-/// `release` a skip is exit 3: publication needs every check to have run.
+/// Formats the summary verdict line and returns the exit code.
 #[must_use]
 pub fn verdict(results: &[CheckResult], release: bool, seconds: f64) -> (String, i32) {
     let named = |o: Outcome| -> Vec<&str> {

@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The wake doors' words: each reads back as the door or answer that wrote it, and a word no door
-//! or answer writes reads as none.
+//! Tests for wake door words, claim answers, and book head ordering.
 
 use super::*;
 
-/// Every claim answer, each refusal among them.
 fn every_claim() -> Vec<WakeClaim> {
     [
         WakeClaim::Granted,
@@ -23,9 +21,6 @@ fn every_claim() -> Vec<WakeClaim> {
     .collect()
 }
 
-/// Each door and each claim answer reads back from its word, and the words are distinct; only a
-/// grant lets the door tell. NEGATIVE CONTROL: a word none writes (a refusal the host has no word
-/// for, a door none is, an empty word) reads as none.
 #[test]
 fn each_word_reads_back_as_what_wrote_it() {
     for door in WakeDoor::ALL {
@@ -44,7 +39,6 @@ fn each_word_reads_back_as_what_wrote_it() {
     }
 }
 
-/// The default host's book is empty.
 #[test]
 fn the_default_book_is_empty() {
     let seen = WakesSeen::default();
@@ -52,8 +46,6 @@ fn the_default_book_is_empty() {
     assert!(seen.head_due().is_none());
 }
 
-/// Every closed word of the book reads back as what wrote it, and the words are distinct within
-/// their kind. NEGATIVE CONTROL: a word none writes reads as none.
 #[test]
 fn the_books_words_read_back() {
     fn back<T: Copy + PartialEq + std::fmt::Debug>(
@@ -91,9 +83,6 @@ fn wake(ord: u16, prio: Prio, state: WakeState, await_only: bool) -> WakeSeen {
     }
 }
 
-/// THE HEAD OF THE BOOK: of the wakes ready (or answered), a critical one first, then the lowest
-/// ordinal; a time-only wake is never a door's; the counts read the live wakes and those met.
-/// NEGATIVE CONTROL: a book with nothing ready has no head.
 #[test]
 fn the_head_is_critical_first_then_the_lowest_ordinal() {
     let ready = WakeState::Ready;
@@ -133,8 +122,6 @@ fn the_head_is_critical_first_then_the_lowest_ordinal() {
     assert!(none.head_due().is_none());
 }
 
-/// A wake's episode is the built-in rules' form over its declaration and ordinal: two wakes of
-/// one book, or one ordinal declared twice, are two episodes.
 #[test]
 fn a_wakes_episode_is_its_declaration_and_ordinal() {
     let one = wake(1, Prio::Normal, WakeState::Ready, false);

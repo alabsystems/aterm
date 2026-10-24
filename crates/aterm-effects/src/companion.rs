@@ -3,8 +3,8 @@
 
 //! The pet driver, [`CompanionOwner`](crate::companion::CompanionOwner): owns a resident pet brain per surface, senses for it, picks its coat, decides custody (pet vs flying head vs idle) and draws it.
 
-use aterm_core::render::FreeSprite;
 use aterm_core::terminal::RenderCell;
+use aterm_render::sprites::FreeSprite;
 use aterm_time::Instant;
 
 use crate::cat_baker::CatColorKey;

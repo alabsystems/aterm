@@ -2354,7 +2354,7 @@ fn image_req_for_test(
 }
 
 #[cfg(test)]
-fn captured_resident_body_for_test(app: &App, wid: WindowId) -> &aterm_core::render::FreeSprite {
+fn captured_resident_body_for_test(app: &App, wid: WindowId) -> aterm_render::sprites::FreeSprite {
     let ws = &app.windows[&wid];
     let (cw, ch) = app.win_cell_size(wid);
     let (ox, oy, _, _, _) =
@@ -2364,7 +2364,8 @@ fn captured_resident_body_for_test(app: &App, wid: WindowId) -> &aterm_core::ren
         .companion()
         .hit_rect()
         .expect("capture publishes the resident body");
-    let mut matching = ws.input_scratch.free_sprites.iter().filter(|sprite| {
+    let sprites = aterm_render::sprites::published(&ws.input_scratch.fx_layers);
+    let mut matching = sprites.into_iter().filter(|sprite| {
         let x = sprite.x + i32::from(ox);
         let y = sprite.y + i32::from(oy);
         (x, x + i32::from(sprite.w), y, y + i32::from(sprite.h)) == published
@@ -2376,10 +2377,9 @@ fn captured_resident_body_for_test(app: &App, wid: WindowId) -> &aterm_core::ren
         matching.next().is_none(),
         "one resident owns the published rectangle"
     );
-    assert!(ws.input_scratch.free_atlas.is_some());
-    assert!(body.alpha > 0 && body.w > 0 && body.h > 0);
+    assert!(body.alpha > 0 && body.w > 0 && body.h > 0 && !body.art.is_empty());
     assert!(
-        usize::from(body.aw) >= 5 * cw && usize::from(body.ah) >= ch,
+        usize::from(body.art.w()) >= 5 * cw && usize::from(body.art.h()) >= ch,
         "the emitted sprite addresses full-body art, not a head or attachment"
     );
     body
@@ -3294,9 +3294,7 @@ impl App {
         let capture_owns_cursor_fx = capture_ticks_cursor_fx(has_os_window, recording_this_window);
         if !capture_owns_cursor_fx {
             if let Some(ws) = self.windows.get_mut(&wid) {
-                ws.input_scratch.rain_quads.clear();
-                ws.input_scratch.rain_atlas = None;
-                ws.input_scratch.rain_add.clear();
+                ws.fx.withdraw_rain(&mut ws.input_scratch);
                 ws.fx.publish_words(&mut ws.input_scratch);
             }
             return;
@@ -3308,15 +3306,10 @@ impl App {
             self.recompute_matrix_rain();
         }
         if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.input_scratch.rain_quads.clear();
-            ws.input_scratch.rain_atlas = None;
-            ws.input_scratch.rain_add.clear();
+            ws.fx.withdraw_rain(&mut ws.input_scratch);
             ws.input_scratch.word_decorations.clear();
             ws.input_scratch.ink.clear();
-            ws.input_scratch.cat_quads.clear();
-            ws.input_scratch.cat_atlas = None;
-            ws.input_scratch.free_sprites.clear();
-            ws.input_scratch.free_atlas = None;
+            ws.fx.withdraw_sprites(&mut ws.input_scratch);
             ws.input_scratch.nova_add.clear();
         }
         self.install_window_config_assets(wid);
@@ -8094,18 +8087,17 @@ mod split_capture_tests {
             }
             app.capture_words(wid, Instant::now());
             let ws = app.windows.get(&wid).expect("window");
+            let sprites = aterm_render::sprites::published(&ws.input_scratch.fx_layers);
             assert!(
-                !ws.input_scratch.free_sprites.is_empty(),
+                !sprites.is_empty(),
                 "the first capture emits the configured pet body"
             );
             (
                 ws.fx.companion().brain().species(),
-                std::sync::Arc::clone(
-                    ws.input_scratch
-                        .free_atlas
-                        .as_ref()
-                        .expect("the first capture publishes the pet atlas"),
-                ),
+                sprites
+                    .iter()
+                    .map(|s| s.art.data().to_vec())
+                    .collect::<Vec<_>>(),
             )
         };
 
@@ -8119,8 +8111,8 @@ mod split_capture_tests {
             );
             assert_eq!(dog.0, PetSpecies::Dog, "split={split}");
             assert!(
-                dog.1.rgba != cat.1.rgba,
-                "split={split}: the first captured atlas must contain the configured dog skin"
+                dog.1 != cat.1,
+                "split={split}: the first captured arts must be the configured dog skin"
             );
         }
     }
@@ -8228,15 +8220,16 @@ mod split_capture_tests {
         app.capture_words(wid, t0);
         app.capture_words(wid, t0 + Duration::from_millis(600));
         let ws = app.windows.get(&wid).expect("window");
+        let sprites = aterm_render::sprites::published(&ws.input_scratch.fx_layers);
         assert!(
-            !ws.input_scratch.free_sprites.is_empty(),
+            !sprites.is_empty(),
             "a split capture carries the cats the glass draws (deco={} ink={})",
             ws.input_scratch.word_decorations.len(),
             ws.input_scratch.ink.len()
         );
         assert!(
-            ws.input_scratch.free_atlas.is_some(),
-            "and the atlas those sprites address"
+            sprites.iter().all(|s| !s.art.is_empty()),
+            "and the arts those sprites draw"
         );
     }
 }
@@ -9485,27 +9478,22 @@ mod terminal_split_capture_tests {
                 color2: 0x0001_0101,
                 alpha2: 0,
             }];
-            window.input_scratch.free_atlas = Some(std::sync::Arc::new(aterm_render::SceneAtlas {
-                width: 2,
-                height: 2,
-                rgba: kitty_color.repeat(4),
-                version: 0xC47,
-            }));
-            window.input_scratch.free_sprites = vec![aterm_core::render::FreeSprite {
-                x: 30,
-                y: i32::try_from(6 * cell_h).expect("fixture kitty y"),
-                w: 2,
-                h: 2,
-                ax: 0,
-                ay: 0,
-                aw: 2,
-                ah: 2,
-                tint: 0x00FF_FFFF,
-                alpha: 255,
-                flip_x: false,
-                z: aterm_core::render::FreeZ::OverText,
-                sampler: aterm_core::render::FreeSampler::Nearest,
-            }];
+            let kitty = aterm_render::fx::bitmap(
+                aterm_core::render::FxTexels::Rgba8Straight,
+                2,
+                2,
+                kitty_color.repeat(4),
+            )
+            .expect("a 2x2 kitty art");
+            aterm_render::sprites::SpriteLayers::new(aterm_render::sprites::WORD_SPRITE_SALT)
+                .publish(
+                    &[aterm_render::sprites::FreeSprite::whole(
+                        30,
+                        i32::try_from(6 * cell_h).expect("fixture kitty y"),
+                        kitty,
+                    )],
+                    &mut window.input_scratch.fx_layers,
+                );
         }
         app.bind_window_renderer_state(wid);
         app.present_input_scratch_for_test(wid, false, None)
@@ -9528,8 +9516,9 @@ mod terminal_split_capture_tests {
             let scratch = &mut window.input_scratch;
             scratch.cursor_trail.clear();
             scratch.cursor_glow_add.clear();
-            scratch.free_sprites.clear();
-            scratch.free_atlas = None;
+            scratch
+                .fx_layers
+                .retain(|l| aterm_render::sprites::FreeSprite::of_layer(l).is_none());
         }
         let retained = app
             .recording_presented_frame_capture(wid, true, false)
@@ -9541,7 +9530,10 @@ mod terminal_split_capture_tests {
             retained.input.cursor_glow_add[0].y, 1,
             "resident semantic capture undoes the nonzero pad transport shift"
         );
-        assert_eq!(retained.input.free_sprites.len(), 1);
+        assert_eq!(
+            aterm_render::sprites::published(&retained.input.fx_layers).len(),
+            1
+        );
         drop(retained);
 
         app.windows.get_mut(&wid).unwrap().blink_phase = false;
@@ -10234,13 +10226,9 @@ mod terminal_split_capture_tests {
             "the production composed-image route advances the default resident pet"
         );
         assert_eq!(
-            ws.input_scratch.free_sprites.len(),
+            aterm_render::sprites::published(&ws.input_scratch.fx_layers).len(),
             1,
             "the split capture carries exactly one resident companion, never zero or a pet+kitty pair"
-        );
-        assert!(
-            ws.input_scratch.free_atlas.is_some(),
-            "the retained split companion carries its atlas"
         );
         assert_eq!(
             text.lines().count(),
@@ -10258,7 +10246,6 @@ mod terminal_split_capture_tests {
 mod capture_overlay_reset_tests {
     use super::App;
     use crate::WindowId;
-    use std::sync::Arc;
     use std::time::Instant;
 
     #[test]
@@ -10269,14 +10256,27 @@ mod capture_overlay_reset_tests {
         app.prepare_terminal_capture_grid(wid).unwrap();
         app.sparkle_dirty = false;
         app.sparkle = None;
-        let atlas = Arc::new(aterm_render::SceneAtlas {
-            width: 1,
-            height: 1,
-            rgba: vec![255, 255, 255, 255],
-            version: 1,
-        });
         {
-            let input = &mut app.windows.get_mut(&wid).unwrap().input_scratch;
+            let ws = app.windows.get_mut(&wid).unwrap();
+            let art = aterm_render::fx::bitmap(
+                aterm_core::render::FxTexels::Rgba8Straight,
+                1,
+                1,
+                vec![255; 4],
+            )
+            .expect("a 1x1 art");
+            let tiles = aterm_effects::matrix_rain::RainBaker::default();
+            ws.fx.publish_for_test(
+                &[aterm_render::sprites::FreeSprite::whole(0, 0, art)],
+                (&[], &tiles),
+                &mut ws.input_scratch,
+            );
+            assert_eq!(
+                aterm_render::sprites::published(&ws.input_scratch.fx_layers).len(),
+                1,
+                "fixture: a prior capture left a companion layer"
+            );
+            let input = &mut ws.input_scratch;
             input.word_decorations.push(aterm_render::WordDecoration {
                 row: 0,
                 col: 0,
@@ -10292,12 +10292,6 @@ mod capture_overlay_reset_tests {
                 col: 0,
                 color: [1, 2, 3],
             });
-            input.cat_quads.push(aterm_render::SpriteQuad::default());
-            input.cat_atlas = Some(Arc::clone(&atlas));
-            input
-                .free_sprites
-                .push(aterm_core::render::FreeSprite::default());
-            input.free_atlas = Some(atlas);
             input.nova_add.push(aterm_render::GlowQuad::default());
         }
 
@@ -10306,8 +10300,7 @@ mod capture_overlay_reset_tests {
         let input = &app.windows[&wid].input_scratch;
         assert!(input.word_decorations.is_empty());
         assert!(input.ink.is_empty());
-        assert!(input.cat_quads.is_empty() && input.cat_atlas.is_none());
-        assert!(input.free_sprites.is_empty() && input.free_atlas.is_none());
+        assert!(aterm_render::sprites::published(&input.fx_layers).is_empty());
         assert!(input.nova_add.is_empty());
     }
 
@@ -12949,11 +12942,13 @@ mod encode_worker_tests {
         {
             let ws = &app.windows[&wid];
             assert!(
-                !ws.input_scratch.free_sprites.is_empty(),
+                !aterm_render::sprites::published(&ws.input_scratch.fx_layers).is_empty(),
                 "first headless capture after output includes the peeking cat"
             );
             assert!(
-                ws.input_scratch.free_atlas.is_some(),
+                aterm_render::sprites::published(&ws.input_scratch.fx_layers)
+                    .iter()
+                    .all(|s| !s.art.is_empty()),
                 "a visible cat must publish its atlas"
             );
         }
@@ -12978,11 +12973,9 @@ mod encode_worker_tests {
 
         app.capture_words(wid, first_capture + Duration::from_secs(30));
         assert!(
-            app.windows[&wid]
-                .input_scratch
-                .free_sprites
+            aterm_render::sprites::published(&app.windows[&wid].input_scratch.fx_layers)
                 .iter()
-                .all(|sprite| sprite.z != aterm_core::render::FreeZ::OverText),
+                .all(|sprite| sprite.z != aterm_render::sprites::FreeZ::OverText),
             "an ambient discovery presents no over-text cursor hello"
         );
         assert_eq!(
@@ -12993,11 +12986,9 @@ mod encode_worker_tests {
 
         app.capture_words(wid, first_capture + Duration::from_secs(40));
         assert!(
-            app.windows[&wid]
-                .input_scratch
-                .free_sprites
+            aterm_render::sprites::published(&app.windows[&wid].input_scratch.fx_layers)
                 .iter()
-                .all(|sprite| sprite.z != aterm_core::render::FreeZ::UnderText),
+                .all(|sprite| sprite.z != aterm_render::sprites::FreeZ::UnderText),
             "the preview is created only by a damaged rescan"
         );
         assert_eq!(app.kitty_log.log().sightings, 1);
@@ -13029,9 +13020,7 @@ mod encode_worker_tests {
             "PRECONDITION: the fixture has real cell metrics"
         );
         let cat_at_col = |app: &App, col: u16| {
-            app.windows[&wid]
-                .input_scratch
-                .free_sprites
+            aterm_render::sprites::published(&app.windows[&wid].input_scratch.fx_layers)
                 .iter()
                 .any(|s| (s.x - i32::from(col) * cell_w).abs() <= cell_w)
         };
@@ -13160,7 +13149,7 @@ mod encode_worker_tests {
 
         let ws = &app.windows[&wid];
         assert!(
-            !ws.input_scratch.free_sprites.is_empty(),
+            !aterm_render::sprites::published(&ws.input_scratch.fx_layers).is_empty(),
             "the splice rescans the post-snapshot word from fresh cells"
         );
         assert_eq!(
@@ -13300,12 +13289,10 @@ mod encode_worker_tests {
             "episodes resume where they paused (freeze/thaw, not reset)"
         );
         assert!(
-            app.windows[&wid]
-                .input_scratch
-                .free_sprites
+            aterm_render::sprites::published(&app.windows[&wid].input_scratch.fx_layers)
                 .iter()
-                .any(|sprite| sprite.z == aterm_core::render::FreeZ::UnderText
-                    && !std::ptr::eq(sprite, captured_resident_body_for_test(&app, wid))),
+                .any(|sprite| sprite.z == aterm_render::sprites::FreeZ::UnderText
+                    && *sprite != captured_resident_body_for_test(&app, wid)),
             "the resumed ambient episode emits its own cat; the resident cannot buy this pass"
         );
     }
@@ -13356,8 +13343,7 @@ mod encode_worker_tests {
         );
         assert!(
             ws.fx.free_sprites().is_empty()
-                && ws.input_scratch.free_sprites.is_empty()
-                && ws.input_scratch.free_atlas.is_none(),
+                && aterm_render::sprites::published(&ws.input_scratch.fx_layers).is_empty(),
             "the retired capture publishes no companion projection"
         );
         assert_eq!(
@@ -13846,7 +13832,8 @@ mod headless_cursor_fx_tests {
                     selected
                 );
                 let (cw, ch) = app.win_cell_size(wid);
-                let sprites = &app.windows[&wid].input_scratch.free_sprites;
+                let sprites =
+                    &aterm_render::sprites::published(&app.windows[&wid].input_scratch.fx_layers);
                 if selected {
                     assert_eq!(sprites.len(), 1, "one full reading pet, split={split}");
                     assert!(usize::from(sprites[0].w) >= 5 * cw);
@@ -13884,14 +13871,12 @@ mod headless_cursor_fx_tests {
             let (cw, ch) = app.win_cell_size(wid);
             let full_body = |app: &App| {
                 let ws = &app.windows[&wid];
-                let bodies: Vec<_> = ws
-                    .input_scratch
-                    .free_sprites
-                    .iter()
+                let bodies: Vec<_> = aterm_render::sprites::published(&ws.input_scratch.fx_layers)
+                    .into_iter()
                     .filter(|s| usize::from(s.w) >= 5 * cw && usize::from(s.h) >= ch)
                     .collect();
                 assert_eq!(bodies.len(), 1, "one resident, split={split}");
-                let body = bodies[0];
+                let body = &bodies[0];
                 assert_eq!(body.alpha, 255, "split={split}");
                 let (ox, oy, _, _, _) =
                     app.effects_origin_win(wid, usize::from(ws.rows), usize::from(ws.cols), ch);
@@ -13986,7 +13971,10 @@ mod headless_cursor_fx_tests {
                     app.windows.get_mut(&wid).unwrap().focused = false;
                 }
                 app.capture_words(wid, now + Duration::from_millis(16));
-                assert!(app.windows[&wid].input_scratch.free_sprites.is_empty());
+                assert!(
+                    aterm_render::sprites::published(&app.windows[&wid].input_scratch.fx_layers)
+                        .is_empty()
+                );
                 assert_eq!(app.windows[&wid].fx.companion().hit_rect(), None);
             }
         }
@@ -14049,10 +14037,8 @@ mod headless_cursor_fx_tests {
             );
             let (cw, ch) = app.win_cell_size(wid);
             let ws = &app.windows[&wid];
-            let bodies: Vec<_> = ws
-                .input_scratch
-                .free_sprites
-                .iter()
+            let bodies: Vec<_> = aterm_render::sprites::published(&ws.input_scratch.fx_layers)
+                .into_iter()
                 .filter(|sprite| usize::from(sprite.w) >= 5 * cw && usize::from(sprite.h) >= ch)
                 .collect();
             assert_eq!(
@@ -14062,7 +14048,7 @@ mod headless_cursor_fx_tests {
             );
             assert_eq!(bodies[0].alpha, 255);
             assert_eq!(
-                ws.input_scratch.free_sprites.len(),
+                aterm_render::sprites::published(&ws.input_scratch.fx_layers).len(),
                 1,
                 "no head or animated attachment under load"
             );
@@ -14133,12 +14119,16 @@ mod headless_cursor_fx_tests {
             "reduced motion keeps the full resident visible and caret-fed during the song"
         );
         assert_eq!(
-            ws.input_scratch.free_sprites.len(),
+            aterm_render::sprites::published(&ws.input_scratch.fx_layers).len(),
             1,
             "the production still contains one full resident, never a replacement or second head"
         );
-        assert!(ws.input_scratch.free_atlas.is_some());
-        let body = &ws.input_scratch.free_sprites[0];
+        assert!(
+            aterm_render::sprites::published(&ws.input_scratch.fx_layers)
+                .iter()
+                .all(|s| !s.art.is_empty())
+        );
+        let body = &aterm_render::sprites::published(&ws.input_scratch.fx_layers)[0];
         assert!(
             usize::from(body.w) >= 5 * cell_w && usize::from(body.h) >= cell_h,
             "capture must show the full animal, not a replacement head"
@@ -14191,11 +14181,15 @@ mod headless_cursor_fx_tests {
         assert!(ws.fx.companions().cursor_cat.is_active());
         assert!(!ws.fx.companion().brain().is_active());
         assert_eq!(
-            ws.input_scratch.free_sprites.len(),
+            aterm_render::sprites::published(&ws.input_scratch.fx_layers).len(),
             1,
             "the config-free capture carries exactly the one earned classic kitty"
         );
-        assert!(ws.input_scratch.free_atlas.is_some());
+        assert!(
+            aterm_render::sprites::published(&ws.input_scratch.fx_layers)
+                .iter()
+                .all(|s| !s.art.is_empty())
+        );
         assert!(
             ws.input_scratch.word_decorations.is_empty()
                 && ws.input_scratch.ink.is_empty()
@@ -14241,7 +14235,7 @@ mod headless_cursor_fx_tests {
         assert!(!ws.fx.companion().brain().is_active());
         assert!(!ws.fx.companions().music_notes.is_active());
         assert!(
-            ws.input_scratch.free_sprites.is_empty() && ws.input_scratch.free_atlas.is_none(),
+            aterm_render::sprites::published(&ws.input_scratch.fx_layers).is_empty(),
             "Serious Mode capture must publish no companion pixels"
         );
     }
@@ -14269,11 +14263,15 @@ mod headless_cursor_fx_tests {
         app.capture_words(wid, Instant::now());
         let ws = app.windows.get(&wid).expect("headless window 0");
         assert_eq!(
-            ws.input_scratch.free_sprites.len(),
+            aterm_render::sprites::published(&ws.input_scratch.fx_layers).len(),
             1,
             "the word-only alt-screen switch cannot blank the resident cursor pet"
         );
-        assert!(ws.input_scratch.free_atlas.is_some());
+        assert!(
+            aterm_render::sprites::published(&ws.input_scratch.fx_layers)
+                .iter()
+                .all(|s| !s.art.is_empty())
+        );
         assert!(
             ws.input_scratch.word_decorations.is_empty()
                 && ws.input_scratch.ink.is_empty()

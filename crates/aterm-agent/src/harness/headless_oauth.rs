@@ -172,6 +172,28 @@ impl MailboxConfig {
             .or_else(|| self.totp_secrets.get("*").cloned())
     }
 
+    /// Look up the mailbox login username for `target_email` (preferring an explicit `user`,
+    /// otherwise stripping any RFC 5233 `+tag` subaddress from `target_email`).
+    #[must_use]
+    pub fn webmail_user_for(&self, target_email: Option<&str>) -> Option<String> {
+        if let Some(u) = self
+            .user
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Some(u.to_owned());
+        }
+        let em = target_email.map(str::trim).filter(|s| !s.is_empty())?;
+        if let Some((local, domain)) = em.split_once('@') {
+            let base_local = local.split('+').next().unwrap_or(local);
+            if !base_local.is_empty() {
+                return Some(format!("{base_local}@{domain}"));
+            }
+        }
+        Some(em.to_owned())
+    }
+
     /// Map any per-account credentials keyed by `label` onto `email`.
     pub fn alias_label_to_email(&mut self, label: Option<&str>, email: Option<&str>) {
         let (Some(lbl), Some(em)) = (
@@ -844,7 +866,8 @@ fn is_machine_account_label(key: &str) -> bool {
 /// address.
 #[must_use]
 pub fn derive_account_label_from_email(email: &str) -> Option<String> {
-    let (local, _) = email.trim().split_once('@')?;
+    let (raw_local, _) = email.trim().split_once('@')?;
+    let local = raw_local.split('+').next().unwrap_or(raw_local);
     let tokens: Vec<String> = local
         .split(['.', '-', '_'])
         .map(str::to_ascii_lowercase)
@@ -890,37 +913,36 @@ pub fn derive_account_label_from_email(email: &str) -> Option<String> {
 
 fn candidate_lookup_keys(target_email: Option<&str>) -> Vec<String> {
     let mut keys = Vec::new();
+    let mut push_unique = |k: String| {
+        if !k.is_empty() && !keys.contains(&k) {
+            keys.push(k);
+        }
+    };
     let Some(raw) = target_email.map(str::trim).filter(|s| !s.is_empty()) else {
         return keys;
     };
     let lower = raw.to_ascii_lowercase();
-    keys.push(lower.clone());
-    let sanitized = sanitize_profile_key(&lower);
-    if !keys.contains(&sanitized) {
-        keys.push(sanitized);
-    }
-    if let Some((local, _)) = lower.split_once('@') {
-        let local_str = local.to_owned();
-        if !keys.contains(&local_str) {
-            keys.push(local_str);
+    push_unique(lower.clone());
+    push_unique(sanitize_profile_key(&lower));
+    if let Some((raw_local, domain)) = lower.split_once('@') {
+        let base_local = raw_local.split('+').next().unwrap_or(raw_local);
+        if base_local != raw_local && !base_local.is_empty() {
+            let base_email = format!("{base_local}@{domain}");
+            push_unique(base_email.clone());
+            push_unique(sanitize_profile_key(&base_email));
         }
-        let dashed = local.replace(['.', '_'], "-");
-        if !keys.contains(&dashed) {
-            keys.push(dashed);
-        }
-        let underscored = local.replace(['.', '-'], "_");
-        if !keys.contains(&underscored) {
-            keys.push(underscored);
+        for loc in [raw_local, base_local] {
+            push_unique(loc.to_owned());
+            push_unique(loc.replace(['.', '_'], "-"));
+            push_unique(loc.replace(['.', '-'], "_"));
         }
         if let Some(lbl) = derive_account_label_from_email(&lower) {
-            if !keys.contains(&lbl) {
-                keys.push(lbl.clone());
-            }
-            let lbl_underscored = lbl.replace('-', "_");
-            if !keys.contains(&lbl_underscored) {
-                keys.push(lbl_underscored);
-            }
+            push_unique(lbl.clone());
+            push_unique(lbl.replace('-', "_"));
         }
+    } else {
+        push_unique(lower.replace(['.', '_'], "-"));
+        push_unique(lower.replace(['.', '-'], "_"));
     }
     keys
 }
@@ -930,6 +952,10 @@ fn is_webmail_ui_url(url: &str) -> bool {
     lower.contains("mail.proton.me")
         || lower.contains("app.fastmail.com")
         || lower.contains("mail.zoho.com")
+        || lower.contains("outlook.live.com/mail")
+        || lower.contains("purelymail.com/webmail")
+        || lower.contains("webmail.migadu.com")
+        || lower.contains("app.tuta.com")
 }
 
 fn parse_single_line_mailbox_secret(text: &str) -> Option<MailboxConfig> {
@@ -1771,21 +1797,21 @@ fn strip_tag_block(input: &str, tag: &str) -> String {
 }
 
 fn strip_html_tags(input: &str) -> String {
-    let cleaned = strip_tag_block(&strip_tag_block(input, "style"), "script");
+    let uncommented = super::open_url::strip_html_comments(input);
+    let cleaned = strip_tag_block(&strip_tag_block(&uncommented, "style"), "script");
     let mut out = String::with_capacity(cleaned.len());
-    let mut in_tag = false;
-    let mut tag_buf = String::new();
-    for ch in cleaned.chars() {
-        if ch == '<' {
-            in_tag = true;
-            tag_buf.clear();
+    let mut rest = cleaned.as_str();
+    while let Some(lt) = rest.find('<') {
+        out.push_str(&rest[..lt]);
+        let from_lt = &rest[lt..];
+        if let Some(gt) = super::open_url::find_tag_close(from_lt) {
             out.push(' ');
-        } else if ch == '>' {
-            in_tag = false;
-            let t = tag_buf
+            let tag_inner = &from_lt[1..gt];
+            let t = tag_inner
                 .split_whitespace()
                 .next()
                 .unwrap_or("")
+                .trim_end_matches('/')
                 .to_ascii_lowercase();
             if matches!(
                 t.as_str(),
@@ -1799,7 +1825,6 @@ fn strip_html_tags(input: &str) -> String {
                     | "li"
                     | "/li"
                     | "br"
-                    | "br/"
                     | "h1"
                     | "/h1"
                     | "h2"
@@ -1811,14 +1836,13 @@ fn strip_html_tags(input: &str) -> String {
             } else {
                 out.push(' ');
             }
-        } else if in_tag {
-            if tag_buf.len() < 16 {
-                tag_buf.push(ch);
-            }
+            rest = &from_lt[gt + 1..];
         } else {
-            out.push(ch);
+            out.push('<');
+            rest = &from_lt[1..];
         }
     }
+    out.push_str(rest);
     out
 }
 
@@ -1893,7 +1917,7 @@ pub fn extract_otps_from_email(raw_email: &str, target_email: Option<&str>) -> V
     let srcdoc_extra =
         super::open_url::extract_iframe_srcdoc_fragments(&format!("{qp_decoded}\n{extra_text}"));
     let combined = format!("{srcdoc_extra}\n{extra_text}\n{qp_decoded}\n{subject_extra}");
-    let plain = strip_html_tags(&decode_html_amp(&combined));
+    let plain = decode_html_amp(&strip_html_tags(&combined));
     let mut fallbacks = Vec::new();
     let mut context_lines_left = 0usize;
     let mut single_digit_run = String::new();
@@ -2259,21 +2283,55 @@ fn imap_read_until_tag(
             return None;
         }
         let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed.len() >= ok_prefix.len()
-            && trimmed[..ok_prefix.len()].eq_ignore_ascii_case(&ok_prefix)
+        if trimmed
+            .get(..ok_prefix.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&ok_prefix))
         {
             return Some((true, lines));
         }
-        if (trimmed.len() >= no_prefix.len()
-            && trimmed[..no_prefix.len()].eq_ignore_ascii_case(&no_prefix))
-            || (trimmed.len() >= bad_prefix.len()
-                && trimmed[..bad_prefix.len()].eq_ignore_ascii_case(&bad_prefix))
+        if trimmed
+            .get(..no_prefix.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&no_prefix))
+            || trimmed
+                .get(..bad_prefix.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&bad_prefix))
         {
             return Some((false, lines));
         }
         lines.push(line);
     }
     None
+}
+
+fn imap_search_sequences<'a>(lines: impl IntoIterator<Item = &'a str>) -> Vec<u32> {
+    let mut seqs = Vec::new();
+    for line in lines {
+        let mut words = line.split_ascii_whitespace();
+        if words.next() != Some("*")
+            || !words
+                .next()
+                .is_some_and(|word| word.eq_ignore_ascii_case("SEARCH"))
+        {
+            continue;
+        }
+        seqs.extend(words.filter_map(|word| word.parse::<u32>().ok()));
+    }
+    seqs
+}
+
+#[test]
+fn imap_search_responses_ignore_utf8_and_require_the_search_word() {
+    assert_eq!(
+        imap_search_sequences([
+            "* 12345é",
+            "* SEARCHING 99",
+            "* SeArCh 1 2 invalid 3",
+            "* SEARCH",
+            "* search 4",
+            "a3 OK SEARCH completed",
+        ]),
+        [1, 2, 3, 4]
+    );
 }
 
 #[expect(
@@ -2328,20 +2386,7 @@ fn fetch_imap_tcp_credential(
         return None;
     }
 
-    let mut seqs: Vec<u32> = Vec::new();
-    for line in &search_lines {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed
-            .strip_prefix("* SEARCH")
-            .or_else(|| trimmed.strip_prefix("* search"))
-        {
-            for tok in rest.split_whitespace() {
-                if let Ok(seq) = tok.parse::<u32>() {
-                    seqs.push(seq);
-                }
-            }
-        }
-    }
+    let seqs = imap_search_sequences(search_lines.iter().map(String::as_str));
 
     for (idx, seq) in seqs.into_iter().rev().take(10).enumerate() {
         let tag = format!("f{idx}");
@@ -2355,26 +2400,50 @@ fn fetch_imap_tcp_credential(
         if !ok || msg_lines.is_empty() {
             continue;
         }
-        let start = usize::from(
-            msg_lines
-                .first()
-                .is_some_and(|l| l.trim_start().starts_with("* ")),
+        let fetch_idx = msg_lines.iter().position(|l| {
+            let t = l.trim_start();
+            t.starts_with("* ") && t.to_ascii_uppercase().contains("FETCH")
+        });
+        let literal_len = fetch_idx.and_then(|fi| {
+            let hdr = msg_lines[fi].trim_end();
+            let inner = hdr.strip_suffix('}')?.rsplit_once('{')?.1;
+            inner
+                .strip_suffix('+')
+                .unwrap_or(inner)
+                .parse::<usize>()
+                .ok()
+        });
+        let start = fetch_idx.map_or_else(
+            || {
+                usize::from(
+                    msg_lines
+                        .first()
+                        .is_some_and(|l| l.trim_start().starts_with("* ")),
+                )
+            },
+            |fi| fi + 1,
         );
-        let end = if msg_lines.last().is_some_and(|l| l.trim() == ")") && msg_lines.len() > start {
-            msg_lines.len() - 1
-        } else {
-            msg_lines.len()
+        let mut end = msg_lines.len();
+        while end > start && msg_lines[end - 1].trim_start().starts_with("* ") {
+            end -= 1;
+        }
+        if end > start && msg_lines[end - 1].trim_start().starts_with(')') {
+            end -= 1;
+        }
+        let joined: String = msg_lines[start..end].concat();
+        let raw_msg = match literal_len {
+            Some(n) if n <= joined.len() && joined.is_char_boundary(n) => &joined[..n],
+            _ => joined.as_str(),
         };
-        let raw_msg: String = msg_lines[start..end].concat();
         if raw_msg.trim().is_empty() {
             continue;
         }
-        let digest = fnv1a_hex(&raw_msg);
+        let digest = fnv1a_hex(raw_msg);
         if seen.contains(&digest) {
             continue;
         }
         if let Some((cred, exhausted)) =
-            extract_unseen_credential_from_email(&raw_msg, target_email, seen, seen_otps)
+            extract_unseen_credential_from_email(raw_msg, target_email, seen, seen_otps)
         {
             let store_cmd = if exhausted {
                 format!("s{idx} STORE {seq} +FLAGS (\\Seen)\r\na9 LOGOUT\r\n")
@@ -2383,6 +2452,7 @@ fn fetch_imap_tcp_credential(
             };
             let _ = writer.write_all(store_cmd.as_bytes());
             let _ = writer.flush();
+            let _ = imap_read_until_tag(&mut reader, "a9");
             record_consumed_credential(
                 seen_file,
                 seen,
@@ -2398,6 +2468,7 @@ fn fetch_imap_tcp_credential(
 
     let _ = writer.write_all(b"a9 LOGOUT\r\n");
     let _ = writer.flush();
+    let _ = imap_read_until_tag(&mut reader, "a9");
     None
 }
 
@@ -2434,20 +2505,7 @@ fn fetch_imaps_curl_credential(
         return None;
     }
     let search_stdout = String::from_utf8_lossy(&out.stdout);
-    let mut seqs: Vec<u32> = Vec::new();
-    for line in search_stdout.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed
-            .strip_prefix("* SEARCH")
-            .or_else(|| trimmed.strip_prefix("* search"))
-        {
-            for tok in rest.split_whitespace() {
-                if let Ok(seq) = tok.parse::<u32>() {
-                    seqs.push(seq);
-                }
-            }
-        }
-    }
+    let seqs = imap_search_sequences(search_stdout.lines());
     for seq in seqs.into_iter().rev().take(8) {
         let msg_url = format!(
             "imaps://{}:{}/{};MAILINDEX={seq}",
@@ -2503,11 +2561,11 @@ fn fetch_imap_credential(
 ) -> Option<MailboxCredential> {
     let imap_url = cfg.effective_imap_url(target_email)?;
     let parsed = parse_imap_url(&imap_url)?;
+    let fallback_user = cfg.webmail_user_for(target_email);
     let user = parsed
         .user
         .as_deref()
-        .or(cfg.user.as_deref())
-        .or(target_email)
+        .or(fallback_user.as_deref())
         .unwrap_or("user");
     let cfg_pw = cfg.password_for(target_email);
     let password = parsed
@@ -2641,7 +2699,8 @@ fn fetch_http_url_body(
     target_email: Option<&str>,
 ) -> Option<String> {
     let cfg_pw = cfg.password_for(target_email);
-    let basic_auth = cfg.user.as_deref().or(target_email).zip(cfg_pw.as_deref());
+    let cfg_user = cfg.webmail_user_for(target_email);
+    let basic_auth = cfg_user.as_deref().zip(cfg_pw.as_deref());
     if is_loopback_http_url(url) {
         fetch_loopback_http_body(url, cfg.bearer_token.as_deref(), basic_auth)
     } else if url.starts_with("https://") || url.starts_with("http://") {
@@ -3059,7 +3118,7 @@ pub fn poll_mailbox_config_for_credential(
     poll_mailbox_config_for_credential_with_seen_otps(cfg, target_email, timeout, &mut seen_otps)
 }
 
-fn poll_mailbox_config_for_credential_with_seen_otps(
+pub(super) fn poll_mailbox_config_for_credential_with_seen_otps(
     cfg: &MailboxConfig,
     target_email: Option<&str>,
     timeout: Duration,
@@ -3367,7 +3426,15 @@ pub fn oauth_step_js(
   const switchBtn = buttons.find(btn => !btn.disabled &&
     /use another account|different account|switch account|sign in with another|not you|sign out|log out/i.test(btnText(btn)));
   const emailsIn = (text) => String(text).toLowerCase().match(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{{2,}}/g) || [];
-  const hasTargetEmail = (text) => emailsIn(text).includes(targetEmail);
+  const canonEmail = (em) => {{
+    const s = String(em || "").trim().toLowerCase();
+    const at = s.indexOf("@");
+    if (at <= 0) return s;
+    const local = s.slice(0, at).split("+")[0];
+    return local + s.slice(at);
+  }};
+  const targetCanon = canonEmail(targetEmail);
+  const hasTargetEmail = (text) => Boolean(targetCanon) && emailsIn(text).some(e => canonEmail(e) === targetCanon);
   const pageEmails = emailsIn(bodyText)
     .filter(e => !e.endsWith("@anthropic.com"));
   const hasForeignAccount = Boolean(targetEmail) && !hasTargetEmail(bodyText) && (
@@ -3886,6 +3953,7 @@ pub fn poll_webmail_via_cdp(
     let webmail_url = cfg
         .effective_webmail_url(target_email)
         .ok_or("headless browser requires sign-in, but no webmail URL is configured")?;
+    let login_user = cfg.webmail_user_for(target_email);
     let password = cfg.password_for(target_email);
     let mailbox_password = cfg.mailbox_password_for(target_email);
     let totp_secret = cfg.totp_secret_for(target_email);
@@ -3952,7 +4020,7 @@ pub fn poll_webmail_via_cdp(
                 .and_then(|s| generate_totp_at(s, now_secs));
             let expr = webmail_step_js(
                 (
-                    target_email,
+                    login_user.as_deref(),
                     password.as_deref(),
                     mailbox_password.as_deref(),
                     totp_code.as_deref(),
@@ -4466,6 +4534,7 @@ pub(super) fn authorize_with_headless_browser_config_and_credential(
             let mut cdp = CdpClient::new(cmd_write, out_read);
             let mut seen_otps = BTreeSet::new();
 
+            let t0 = Instant::now();
             drive_cdp_oauth_with_webmail(
                 &mut cdp,
                 authorize_url,
@@ -4481,7 +4550,7 @@ pub(super) fn authorize_with_headless_browser_config_and_credential(
                         cdp_inner,
                         mb,
                         em,
-                        timeout,
+                        timeout.saturating_sub(t0.elapsed()),
                         Duration::from_millis(200),
                         &mut seen_otps,
                     )

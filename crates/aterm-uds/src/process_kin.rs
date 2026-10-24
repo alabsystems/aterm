@@ -341,10 +341,18 @@ pub fn group_members(_pgid: u32) -> Option<GroupMembers> {
 }
 
 /// Environment marker variables read by [`read_process_markers`].
-pub const MARKER_VARS: [&str; 3] = ["ATERM_PARENT_SESSION_ID", "ATERM_CHILD", VERIFY_RUN_VAR];
+pub const MARKER_VARS: [&str; 4] = [
+    "ATERM_PARENT_SESSION_ID",
+    "ATERM_CHILD",
+    VERIFY_RUN_VAR,
+    TRUST_CHECK_VAR,
+];
 
 /// `ATERM_VERIFY_RUN`.
 pub const VERIFY_RUN_VAR: &str = "ATERM_VERIFY_RUN";
+
+/// `ATERM_TRUST_CHECK`: the mark every process of one trust-lane check carries.
+pub const TRUST_CHECK_VAR: &str = "ATERM_TRUST_CHECK";
 
 /// Exec-environment marker variables ([`MARKER_VARS`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -357,6 +365,8 @@ pub struct Markers {
     pub child: Option<String>,
     /// `ATERM_VERIFY_RUN`.
     pub verify_run: Option<String>,
+    /// `ATERM_TRUST_CHECK`.
+    pub trust_check: Option<String>,
 }
 
 /// `pid`'s [`Markers`], read between two identity reads that must agree ([`bracketed`]): from
@@ -399,9 +409,9 @@ pub fn read_process_markers(pid: i32) -> Option<Markers> {
     target_os = "android",
     all(test, unix)
 ))]
-fn bracketed<T>(
+fn bracketed<I: PartialEq, T>(
     pid: i32,
-    mut identity: impl FnMut(i32) -> Option<super::Identity>,
+    mut identity: impl FnMut(i32) -> Option<I>,
     read: impl FnOnce() -> Option<T>,
 ) -> Option<T> {
     let before = identity(pid)?;
@@ -434,7 +444,7 @@ fn markers_from_environ(bytes: &[u8]) -> Option<Markers> {
     ))
 }
 
-/// The three markers of an environment's `NAME=value` words, as `getenv` reads them: the first
+/// The markers of an environment's `NAME=value` words, as `getenv` reads them: the first
 /// word naming each wins, a word with no `=` is skipped, and no word at all is withheld.
 #[cfg(any(
     target_os = "macos",
@@ -463,10 +473,35 @@ fn markers_from_words<'a>(words: impl Iterator<Item = &'a [u8]>) -> Markers {
         match slot {
             0 => markers.parent_session = value,
             1 => markers.child = value,
-            _ => markers.verify_run = value,
+            2 => markers.verify_run = value,
+            _ => markers.trust_check = value,
         }
     }
     markers
+}
+
+/// A number `pid`'s process holds that no other process given `pid` in this boot holds: its
+/// unique id on macOS (`p_uniqueid`, never reused within a boot), its start in clock ticks on
+/// Linux (`/proc/<pid>/stat`). Neither reads a clock's zone or a locale. `None` when unread: no
+/// such process, a zombie on macOS, or no reader here.
+#[must_use]
+pub fn process_serial(pid: i32) -> Option<u64> {
+    if pid <= 0 {
+        return None;
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        uniq_identifier(pid).map(|info| info.p_uniqueid)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        super::procfs::stat_start(&stat, pid).map(|(_, ticks)| ticks)
+    }
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+    {
+        None
+    }
 }
 
 /// This boot's id, which a record kept for one boot names  ([`astream_sys::boot_session`]).
@@ -569,6 +604,17 @@ pub struct HeldNow {
     pub oldest_ms: u64,
 }
 
+/// How long a program has waited at macOS's program check, in the words every surface that counts the wait shares: `20 s` under a minute, `5 m` under an hour, `9 h 59 m` past one (its minutes two digits: `10 h 05 m`).
+#[must_use]
+pub fn held_age(ms: u64) -> String {
+    let s = ms / 1000;
+    match s {
+        0..60 => format!("{s} s"),
+        60..3600 => format!("{} m", s / 60),
+        _ => format!("{} h {:02} m", s / 3600, s % 3600 / 60),
+    }
+}
+
 /// [`held_programs`]' count over `pids`, each read by `read`: a row `read` cannot read is skipped, and only one [`aterm_sysprobe::jobs::judge_start`] calls held is counted.
 #[cfg(any(unix, windows))]
 #[must_use]
@@ -621,14 +667,15 @@ mod tests {
     }
 
     #[test]
-    fn only_the_three_markers_are_read_and_an_empty_environment_is_withheld() {
-        let words: [&[u8]; 6] = [
+    fn only_the_marker_vars_are_read_and_an_empty_environment_is_withheld() {
+        let words: [&[u8]; 7] = [
             b"/bin/aterm",
             b"ATERM_VERIFY_RUN=argv-not-env",
             b"HOME=/h",
             b"ATERM_VERIFY_RUN=71-1792163800331520",
             b"ATERM_PARENT_SESSION_ID=s7",
             b"ATERM_CHILD=1",
+            b"ATERM_TRUST_CHECK=0f1e",
         ];
         let read = markers_from_procargs2(&frame(2, &words)).expect("a buffer");
         assert_eq!(
@@ -638,7 +685,17 @@ mod tests {
                 parent_session: Some("s7".into()),
                 child: Some("1".into()),
                 verify_run: Some("71-1792163800331520".into()),
+                trust_check: Some("0f1e".into()),
             }
+        );
+        let environ: Vec<u8> = words[1..].join(&0u8);
+        assert_eq!(
+            markers_from_environ(&environ).expect("within the bound"),
+            Markers {
+                verify_run: Some("argv-not-env".into()),
+                ..read.clone()
+            },
+            "an environ file reads as the same words"
         );
         let shifted = markers_from_procargs2(&frame(1, &words[..2])).expect("a buffer");
         assert_eq!(shifted.verify_run.as_deref(), Some("argv-not-env"));
@@ -708,9 +765,10 @@ mod tests {
         let _ = std::io::Read::read(&mut std::io::stdin(), &mut [0u8; 1]);
     }
 
-    /// A child's three markers are read off the kernel's copy of its exec environment
+    /// A child's four markers are read off the kernel's copy of its exec environment
     /// (`KERN_PROCARGS2` on macOS, `/proc/<pid>/environ` on Linux) between two identity reads,
-    /// and nothing once it has exited, unreaped or reaped, or for pid 1. The child is this test
+    /// and nothing once it has exited, unreaped or reaped, or for pid 1. Its serial is its own:
+    /// read again it is the same, this process's differs, and once it is reaped none reads. The child is this test
     /// binary, run in place: macOS withholds a platform binary's environment (`/bin/sleep`'s).
     /// NEGATIVE CONTROLS: hand the macOS parser an empty buffer in place of the child's
     /// arguments, and its markers do not read; read Linux's `environ` without the identity
@@ -731,6 +789,7 @@ mod tests {
             ])
             .env(MARKED_CHILD_ENV, "1")
             .env(VERIFY_RUN_VAR, &run)
+            .env(TRUST_CHECK_VAR, "5eed")
             .env("ATERM_CHILD", "1")
             .env("ATERM_PARENT_SESSION_ID", "s-markers")
             .stdin(crate::spawnfd::Stdio::piped())
@@ -741,6 +800,7 @@ mod tests {
         crate::deadline::prints(&mut child, MARKED_CHILD_RUNS, HANG);
         let pid = i32::try_from(child.id()).expect("pid");
         let read = read_process_markers(pid);
+        let (serial, again) = (process_serial(pid), process_serial(pid));
         drop(child.stdin.take());
         let deadline = std::time::Instant::now() + HANG;
         while process_presence(pid) != ProcessPresence::Exited {
@@ -753,7 +813,11 @@ mod tests {
         let unreaped = read_process_markers(pid);
         let _ = child.wait();
         if !cfg!(any(target_os = "macos", target_os = "linux")) {
-            assert_eq!(read, None, "no marker reader here");
+            assert_eq!(
+                (read, serial),
+                (None, None),
+                "no marker or serial reader here"
+            );
             return;
         }
         assert_eq!(
@@ -763,9 +827,13 @@ mod tests {
                 parent_session: Some("s-markers".into()),
                 child: Some("1".into()),
                 verify_run: Some(run),
+                trust_check: Some("5eed".into()),
             }),
             "the child's markers"
         );
+        assert!(serial.is_some() && serial == again, "{serial:?} {again:?}");
+        assert_ne!(serial, process_serial(me));
+        assert_eq!(process_serial(pid), None, "a reaped child's serial");
         assert_eq!(unreaped, None, "an exited child its parent has not reaped");
         assert_eq!(read_process_markers(pid), None, "a reaped child");
         assert_eq!(read_process_markers(1), None, "launchd's or init's");
@@ -858,6 +926,22 @@ mod tests {
         assert_eq!(held_among(&[3, 4, 5], read), HeldNow::default());
     }
 
+    /// A held program's age reads in seconds, then minutes, then hours with two-digit minutes.
+    #[test]
+    fn a_held_age_reads_in_seconds_minutes_then_hours() {
+        for (ms, words) in [
+            (20_999, "20 s"),
+            (59_999, "59 s"),
+            (60_000, "1 m"),
+            (3_599_999, "59 m"),
+            (3_600_000, "1 h 00 m"),
+            (36_300_000, "10 h 05 m"),
+            (35_940_000, "9 h 59 m"),
+        ] {
+            assert_eq!(held_age(ms), words, "{ms}");
+        }
+    }
+
     #[test]
     fn a_launcher_version_is_older_across_the_wrap() {
         assert!(launched_before(10, 11));
@@ -880,6 +964,7 @@ mod tests {
                 parent_session: Some("s7".into()),
                 child: Some("1".into()),
                 verify_run: Some("71-1".into()),
+                trust_check: None,
             })
         );
         let empty = markers_from_environ(b"").expect("an empty file reads");

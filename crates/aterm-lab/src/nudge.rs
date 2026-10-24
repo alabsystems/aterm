@@ -17,15 +17,10 @@ use crate::stop;
 use crate::util::{now, scratch_text};
 use crate::{Fail, Res};
 
-/// Any output between the halves of a flap ends the engine's undo (which would hand the rows back).
 const MODE_SET: &[u8] = b"\x1b[?1004h";
-/// Rows that may differ between two readings of one screen (a spinner frame, a transient hint).
 const SLACK: usize = 1;
-/// Seconds between two flaps of a lab whose nudge acts: 3 tries per session-hour, a 60 s cooldown.
 const SPACING: f64 = 62.0;
-/// Seconds a trial waits after the flap before reading the end state.
 const OBSERVE: f64 = 8.0;
-/// The most a trial waits for a nudge that is still running.
 const OBSERVE_CAP: f64 = 30.0;
 
 /// The trial could not mean anything; the message says why.
@@ -170,7 +165,6 @@ impl Lab<'_> {
             .collect()
     }
 
-    /// Two readings 0.7 s apart that agree (nothing animates).
     fn stable_screen(&self) -> R<Vec<String>> {
         let mut prev: Option<Vec<String>> = None;
         for _ in 0..20 {
@@ -207,7 +201,6 @@ impl Lab<'_> {
         Ok(false)
     }
 
-    /// `status render=`, re-read while it answers `-` (aterm never waits for the terminal lock).
     fn status_render(&self) -> R<String> {
         let mut word = "-".to_string();
         for _ in 0..6 {
@@ -242,7 +235,6 @@ pub fn configured_nudge(toml: &str) -> Option<String> {
     })
 }
 
-/// The lab's PTY relay, found in the instance's process tree by its path.
 struct Relay {
     instance: i32,
     exe: String,
@@ -258,7 +250,6 @@ impl Relay {
         }
     }
 
-    /// Find the relay process under the instance by command line (`procs::descendants`).
     fn pid(&self) -> R<i32> {
         let found: Vec<i32> = crate::procs::descendants(self.instance)
             .into_iter()
@@ -298,7 +289,6 @@ impl Relay {
         self.lines().len()
     }
 
-    /// SIGUSR1, then until the relay's own log says it holds.
     fn hold(&self) -> R<()> {
         let n = self.mark();
         self.signal(libc::SIGUSR1)?;
@@ -318,7 +308,6 @@ impl Relay {
         Err(could_not("the relay did not confirm the hold"))
     }
 
-    /// Output of the program in the tab: the bytes go into the tab's tty, from the slave side.
     fn write_tty(&self, data: &[u8]) -> R<()> {
         let pid = self.pid()?;
         let tty = crate::procs::tty_of(pid);
@@ -338,7 +327,6 @@ impl Relay {
             .map_err(|e| could_not(format!("/dev/{tty}: {e}")))
     }
 
-    /// The sizes the relay passed on to Claude Code after line `since` of its log.
     fn told(&self, since: usize) -> Vec<String> {
         self.lines()
             .get(since..)
@@ -464,7 +452,6 @@ impl Trial {
 #[derive(Debug)]
 struct NoFrame(String);
 
-/// HOLD; shrink one row; output reaches the tab; grow back; RELEASE.
 fn flap(
     lab: &Lab<'_>,
     relay: &Relay,
@@ -501,7 +488,6 @@ fn flap(
     inner
 }
 
-/// Force one displacement and read everything; the judgement is [`judge`]'s.
 struct How<'a> {
     rows: i64,
     cols: i64,
@@ -607,7 +593,6 @@ fn trial(ctx: &mut Ctx, lab: &Lab<'_>, relay: &Relay, k: u32, how: &How<'_>) -> 
     Ok(m)
 }
 
-/// PASS, FAIL or INCONCLUSIVE for one trial against the mode expected.
 fn judge(expect: &str, m: &mut Trial) -> (String, Vec<String>) {
     let rows_h = usize::try_from(m.rows).unwrap_or(0);
     m.shot_rows = std::iter::once(differing(&m.shot, &m.before).len())
@@ -919,7 +904,6 @@ struct Opts {
     no_hold: bool,
 }
 
-/// Run the trials on the lab `tag`; the exit status.
 fn drive(tag: &str, o: &Opts) -> Result<i32, stop::Stopped> {
     let mut ctx = Ctx::new(
         "nudge-trial",

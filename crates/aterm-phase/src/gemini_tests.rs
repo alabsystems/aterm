@@ -917,6 +917,21 @@ fn an_api_error_row_is_the_turns_wall() {
         WallKind::Auth,
         "a code the wrap cut"
     );
+    for msg in [
+        "[API Error: fetch failed]",
+        "[API Error: request failed: getaddrinfo ENOTFOUND generativelanguage.googleapis.com]",
+        "[API Error: Unable to connect to the server]",
+    ] {
+        assert_eq!(
+            error_kind(msg),
+            WallKind::ApiError {
+                code: None,
+                retryable: true,
+                cause: ApiCause::Unreachable,
+            },
+            "{msg}"
+        );
+    }
 }
 
 #[test]

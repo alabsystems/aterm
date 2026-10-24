@@ -121,6 +121,7 @@ fn opts() -> Opts {
         home: none.join("home"),
         state: none.join("state"),
         sock: None,
+        token: None,
         only_sid: None,
         dry_run: false,
         human_grace_s: GRACE,

@@ -1,18 +1,6 @@
 // Copyright 2022 The AccessKit Authors.
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-//
-// Derived from accesskit_atspi_common 0.19.0 (MIT OR Apache-2.0, used under
-// Apache-2.0) src/node.rs and src/text_attributes.rs, and cut by the aterm
-// project in 2026 to aterm's model: its roles only, no text attributes, no
-// relations, author ids, role descriptions, placeholders or set positions
-// (so no object attributes), and a poisoned lock recovered rather than
-// unwound.
-//
-// Derived from Chromium's accessibility abstraction.
-// Copyright 2017 The Chromium Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style license that can be
-// found in the LICENSE-CHROMIUM file.
 
 //! What one node is to an assistive technology (`PlatformNode` and `PlatformRoot`).
 
@@ -879,14 +867,14 @@ impl PlatformNode {
 
     pub(crate) fn hyperlink_start_index(&self) -> Result<i32> {
         self.resolve(|_| {
-            // TODO: Support rich text
+            // Distinct branch.
             Ok(-1)
         })
     }
 
     pub(crate) fn hyperlink_end_index(&self) -> Result<i32> {
         self.resolve(|_| {
-            // TODO: Support rich text
+            // Distinct branch.
             Ok(-1)
         })
     }

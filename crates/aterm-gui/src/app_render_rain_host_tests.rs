@@ -8,17 +8,14 @@ use crate::matrix_rain::{EffectGeom, MatrixRain, RainConfig, RainSignal, RainTic
 use aterm_core::grid::damage::{Damage, DamageTracker};
 use aterm_effects::pane::translate_rain_into_pane;
 
-fn q(row: u16, x: u16, y: u16, w: u16, h: u16) -> aterm_render::SpriteQuad {
-    aterm_render::SpriteQuad {
+fn q(row: u16, x: u16, y: u16, w: u16, h: u16) -> crate::matrix_rain::RainCell {
+    crate::matrix_rain::RainCell {
         row,
         x,
         y,
         w,
         h,
-        ax: 0,
-        ay: 0,
-        aw: 8,
-        ah: 16,
+        glyph: 7,
         tint: 0x00FF_FFFF,
         alpha: 255,
         flip_x: false,
@@ -318,14 +315,13 @@ fn hidden_band_ignores_full_damage() {
 fn strip_splice_shifts_every_grid_relative_channel() {
     struct Want {
         strip: usize,
-        /// The viewport-row-2 rain quad and halo, and the halo's centre.
+        /// The viewport-row-2 rain cell and halo, and the halo's centre.
         rain_row: u16,
         rain_y: u16,
         halo_cy: u16,
         /// The viewport-row-2 fire-halo and `char_fg` cells.
         grid_row: u16,
-        /// The viewport-row-1 cat/rain sprites and the free sprite's y.
-        sprite_row: u16,
+        /// The viewport-row-1 companion's y.
         sprite_y: u16,
         /// Terminal row zero, where the selection sits, after the splice.
         selected_row: usize,
@@ -338,7 +334,6 @@ fn strip_splice_shifts_every_grid_relative_channel() {
             rain_y: 48,
             halo_cy: 56,
             grid_row: 3,
-            sprite_row: 2,
             sprite_y: 32,
             selected_row: 1,
         },
@@ -348,7 +343,6 @@ fn strip_splice_shifts_every_grid_relative_channel() {
             rain_y: 64,
             halo_cy: 72,
             grid_row: 4,
-            sprite_row: 3,
             sprite_y: 48,
             selected_row: 2,
         },
@@ -379,20 +373,35 @@ fn strip_splice_shifts_every_grid_relative_channel() {
             fg: aterm_core::render::COLOR_UNSET,
             inactive: true,
         }];
-        input.rain_quads.push(aterm_render::SpriteQuad {
-            row: 2,
-            x: 8,
-            y: 32,
-            w: 8,
-            h: 16,
-            ax: 0,
-            ay: 0,
-            aw: 8,
-            ah: 16,
-            tint: 0x0028_D75F,
-            alpha: 96,
-            flip_x: false,
-        });
+        // A rain row: one Linear Under layer whose cell sits at viewport row 2.
+        let tile = aterm_render::fx::bitmap(
+            aterm_core::render::FxTexels::Rgba8Straight,
+            8,
+            16,
+            vec![255; 8 * 16 * 4],
+        )
+        .expect("a tile");
+        input.fx_layers.push(aterm_core::render::FxLayer::new(
+            1,
+            std::sync::Arc::new(aterm_core::render::FxContent::new(
+                vec![aterm_core::render::FxItem::Sprite(
+                    aterm_core::render::FxSprite {
+                        x: 8,
+                        y: 32,
+                        dw: 8,
+                        dh: 16,
+                        flip_x: false,
+                        art: std::sync::Arc::clone(&tile),
+                        ink: 0,
+                        clip: aterm_core::render::PxRect::EVERYWHERE,
+                    },
+                )],
+                vec![aterm_core::render::FxInk::over(0x0028_D75F, 96)],
+            )),
+            aterm_core::render::FxSlot::Under,
+            aterm_core::render::FxSpace::Grid,
+            aterm_core::render::FxBlend::Linear,
+        ));
         input.rain_add.push(aterm_render::RainHalo {
             row: 2,
             x: 8,
@@ -416,20 +425,11 @@ fn strip_splice_shifts_every_grid_relative_channel() {
             col: 5,
             fg: 0x0010_0804,
         });
-        input.cat_quads.push(aterm_render::SpriteQuad {
-            row: 1,
-            y: 16,
-            ..Default::default()
-        });
-        input.rain_quads.push(aterm_render::SpriteQuad {
-            row: 1,
-            y: 16,
-            ..Default::default()
-        });
-        input.free_sprites.push(aterm_core::render::FreeSprite {
-            y: 16,
-            ..Default::default()
-        });
+        // A companion at viewport row 1.
+        aterm_render::sprites::SpriteLayers::new(aterm_render::sprites::WORD_SPRITE_SALT).publish(
+            &[aterm_render::sprites::FreeSprite::whole(0, 16, tile)],
+            &mut input.fx_layers,
+        );
 
         prepend_strip_rows(
             &mut input,
@@ -440,13 +440,14 @@ fn strip_splice_shifts_every_grid_relative_channel() {
         );
 
         let at = format!("{strip}-row strip");
+        let rain = &input.fx_layers[0];
+        let [aterm_core::render::FxItem::Sprite(cell)] = rain.content.items() else {
+            panic!("{at}: the rain row keeps its one cell");
+        };
         assert_eq!(
-            input.rain_quads[0].row, want.rain_row,
-            "{at}: row shifted by the strip"
-        );
-        assert_eq!(
-            input.rain_quads[0].y, want.rain_y,
-            "{at}: pixel y shifted by strip*cell_h"
+            rain.offset.1 + cell.y,
+            i32::from(want.rain_y),
+            "{at}: the rain row's pixel y shifted by strip*cell_h"
         );
         assert_eq!(input.rain_add[0].row, want.rain_row, "{at}");
         assert_eq!(input.rain_add[0].y, want.rain_y, "{at}");
@@ -502,20 +503,10 @@ fn strip_splice_shifts_every_grid_relative_channel() {
                 && input.selection_contains_cell(want.selected_row, 0, false, false),
             "{at}: the renderer predicate agrees with both halves after the splice"
         );
-        for quad in input.cat_quads.iter().chain(&input.rain_quads[1..]) {
-            assert_eq!(
-                quad.row, want.sprite_row,
-                "{at}: sprite damage tag follows the grid"
-            );
-            assert_eq!(
-                quad.y, want.sprite_y,
-                "{at}: sprite destination follows strip*cell_h"
-            );
-        }
         assert_eq!(
-            input.free_sprites[0].y,
+            aterm_render::sprites::published(&input.fx_layers)[0].y,
             i32::from(want.sprite_y),
-            "{at}: rowless sprite destination follows strip*cell_h"
+            "{at}: the companion's destination follows strip*cell_h"
         );
     }
 }

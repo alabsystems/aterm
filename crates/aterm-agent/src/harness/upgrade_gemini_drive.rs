@@ -19,6 +19,7 @@ use super::{
     running_block, said, save, screen, shell_dialect_of, squash, state_dir, table, turn_takes_gen,
     turn_verdict, type_relaunch_line_with, under_hand, upgrade, wait_now, wait_until,
 };
+use crate::harness::laps;
 use crate::supervise::run::composer_guard_at;
 
 /// The process facts the Gemini CLI lane rests on.
@@ -262,25 +263,35 @@ fn witness_of(
     let (Some(chats), false, true) = (chats, root.is_empty(), start_ms > 0) else {
         return Err(NoWitness::NoChats);
     };
-    let together = match k.project_geminis(root) {
+    let others = k.project_geminis(root);
+    laps::lap("gemini.procs");
+    let together = match &others {
         Some(others) => others.iter().any(|(other, _, start)| {
             *other != pid && (*start == 0 || start.abs_diff(start_ms) <= ug::START_WINDOW_MS)
         }),
         None => true,
     };
     let read = files_since(chats, start_ms).ok_or(NoWitness::NoChats)?;
+    laps::lap("gemini.files");
     let resumed = |session: &str| {
         session_files(chats, session)
             .is_some_and(|files| ug::resumes_account_for_switches(&as_files(&files), session))
     };
-    ug::witness(
-        &as_files(&read),
+    let (files, hash, named) = (
+        as_files(&read),
+        ug::project_hash(root),
+        ug::argv_session(argv),
+    );
+    let rule = ug::witness(
+        &files,
         start_ms,
-        &ug::project_hash(root),
-        ug::argv_session(argv).as_deref(),
+        &hash,
+        named.as_deref(),
         together,
         &resumed,
-    )
+    );
+    laps::lap("gemini.rule");
+    rule
 }
 
 fn bundle_version(script: Option<&String>) -> Option<String> {
@@ -373,14 +384,29 @@ pub(super) fn snapshot(
     let env = ug::relaunch_env(|name| args.env_var(name), &opts.home);
     let cwd = k.cwd(pid).unwrap_or_default();
     let started_ms = k.start_ms(pid).unwrap_or(0);
+    laps::lap("gemini.process");
     let chats = project_dir(&home, &cwd).map(|p| ug::chats_dir(&p));
+    laps::lap("gemini.project");
+    let child = k.child_of(pid).unwrap_or(0);
+    laps::lap("gemini.child");
     let witnessed = witness_of(chats.as_deref(), &cwd, started_ms, &args.argv, pid, k);
+    let version = bundle_version(args.argv.get(1));
+    laps::lap("gemini.version");
+    let block = (shell != NO_SHELL)
+        .then(|| connect(opts, tab).ok())
+        .flatten()
+        .and_then(|mut c| running_block(&mut c, tab));
+    laps::lap("gemini.block");
+    let dialect = (shell != NO_SHELL)
+        .then(|| shell_dialect(shell, k))
+        .flatten();
+    laps::lap("gemini.dialect");
     Ok(super::super::relaunch::Snapshot {
         tab: tab.to_string(),
         pid,
         start,
         shell,
-        version: bundle_version(args.argv.get(1)),
+        version,
         program: exe,
         argv: args.argv.clone(),
         session: witnessed.as_ref().ok().cloned(),
@@ -390,16 +416,11 @@ pub(super) fn snapshot(
             chats,
             env,
             started_ms,
-            child: k.child_of(pid).unwrap_or(0),
+            child,
             unwitnessed: witnessed.err(),
-            block: (shell != NO_SHELL)
-                .then(|| connect(opts, tab).ok())
-                .flatten()
-                .and_then(|mut c| running_block(&mut c, tab)),
+            block,
         }),
-        dialect: (shell != NO_SHELL)
-            .then(|| shell_dialect(shell, k))
-            .flatten(),
+        dialect,
         login: None,
         home: None,
         claude_dir: None,

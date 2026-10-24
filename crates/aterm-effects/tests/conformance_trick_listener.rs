@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 of `TrickListenerPurity` (`aterm_models_effects::trick_listener_purity_model`).
+//! Conformance tests for `TrickListenerPurity`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -58,8 +58,7 @@ struct Seen {
     pure: i64,
     poisoned: i64,
     count: i64,
-    /// The editor's line is not empty. Not compared on a poisoned line: what
-    /// the listener did not see is the point of poison.
+    /// Non-empty editor line, ignored when poisoned.
     real: i64,
 }
 
@@ -72,8 +71,7 @@ fn matches(s: &State, seen: &Seen) -> bool {
         && (seen.poisoned == 1 || s["real"] == seen.real)
 }
 
-/// The model states one press can lead to from `frontier` that show `seen`,
-/// and the actions that got there.
+/// Successor states from `frontier` matching `seen`, and the actions taken.
 fn advance(model: &Model, frontier: &[State], seen: &Seen) -> (Vec<State>, BTreeSet<&'static str>) {
     let mut next: Vec<State> = Vec::new();
     let mut by = BTreeSet::new();
@@ -128,17 +126,14 @@ fn trailing_token(line: &str) -> &str {
     &line[start..]
 }
 
-/// A token that begins or ends with a pet name without being one: the shape
-/// of a glued run, read off the text alone.
+/// Whether `token` strictly starts or ends with a pet name.
 fn holds_a_name(token: &str) -> bool {
     NAMES
         .iter()
         .any(|name| token.len() > name.len() && (token.starts_with(name) || token.ends_with(name)))
 }
 
-/// A real listener, two sessions' editor lines, and the clock. Keys: `⏎`
-/// Enter, `⌫` Backspace, `⌃` Ctrl+U, `ʷ` Ctrl+W, `⎋` Esc, `ᶻ` Ctrl+Z, `①` /
-/// `②` a switch to that session; anything else is typed.
+/// Real listener, two session editor lines, and simulated clock.
 struct Rig {
     l: TrickListener,
     lex: TrickLexicon,
@@ -162,7 +157,6 @@ impl Rig {
         }
     }
 
-    /// One press: what it showed.
     fn press(&mut self, key: char) -> Seen {
         self.now += Duration::from_millis(100);
         let poisoned = self.l.is_poisoned();
@@ -180,7 +174,6 @@ impl Rig {
             }
             '⎋' => (8, said(self.l.note_break().event)),
             'ᶻ' => {
-                // A reset only of a line known to be empty; any other is lost.
                 let ev = if !poisoned && self.l.line_chars() == 0 {
                     7
                 } else {
@@ -293,10 +286,7 @@ fn the_real_listener_refines_the_purity_model() {
     assert_eq!(anchored, actions, "the anchors name the model's actions");
 }
 
-/// Replays `keys` on the real listener, then answers the last press as
-/// `forged` instead of what the listener said: the model must refuse it from
-/// every state the presses before it left. Answers those states and the
-/// forged press.
+/// Replays `keys` and asserts the model refuses `forged` on the final press.
 fn refused(model: &Model, keys: &str, forged: impl Fn(Seen) -> Seen) -> (Vec<State>, Seen) {
     let mut rig = Rig::new();
     let mut frontier = vec![model.init_state()];
@@ -344,9 +334,7 @@ fn a_fire_on_a_prefix_on_prose_or_on_a_glued_name_is_refused() {
     caught("猫咪 猫咪坐下. ", |seen| Seen { said: 2, ..seen });
 }
 
-/// The host's old mapping: Ctrl+Z on a zero count reset the line even when
-/// Esc had poisoned it and the shell still held `sot`. No step of the model
-/// admits the fresh, empty-counted line beside the editor's text.
+/// Refuses a job chord that resets a poisoned line while editor text remains.
 #[test]
 fn a_job_chord_that_resets_a_poisoned_line_is_refused() {
     let model = trick_listener_purity_model();

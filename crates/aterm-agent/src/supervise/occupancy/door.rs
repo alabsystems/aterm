@@ -343,7 +343,60 @@ pub fn outcome_reason(
     }
 }
 
-/// Extracts the fact rows for `sid` from ledger `body`, oldest first, for [`FactsState::seed`](crate::supervise::facts::FactsState::seed): an intent of the kind its `kind=` word names (the hold where none), and each kind's `typed` or `skipped` row.
+/// THE TASK DOOR'S MARK (`door=task`): every row the occupancy loop books for a managed
+/// session's fact word carries it (its intent, its outcome, its clear, and under `observe` its
+/// would-be note), and no reader of the typed door's rows ([`seed_rows_in`], [`break_lines_in`],
+/// `rules::would_rows_in`, the Harness page's counts) takes such a row for a line.
+pub const TASK_DOOR: &str = "door=task";
+
+/// Whether a row's `reason` is the task door's ([`TASK_DOOR`]).
+#[must_use]
+pub fn is_task_row(reason: &str) -> bool {
+    reason.split(' ').any(|w| w == TASK_DOOR)
+}
+
+/// The task door's intent row's reason (`fact-intent@v1`, `waiting`), and under `observe` its
+/// would-be note's (`fact-would@v1`): the episode's words and [`TASK_DOOR`].
+#[must_use]
+pub fn task_intent_reason(rule: RuleId, episode: u64, held_ms: i64, declared: bool) -> String {
+    format!(
+        "{} {TASK_DOOR}",
+        episode_words(rule, episode, held_ms, declared)
+    )
+}
+
+/// The task door's outcome row's reason (`fact-hold@v1`): the intent's words, then `noted` for a
+/// word the host took (a `waiting` row), `cleared` for a clear (`waiting`, the hold closed), or
+/// `why=<word>` for one it did not (`skipped`: `no-task`, `closed` or `fenced`).
+#[must_use]
+pub fn task_outcome_reason(
+    rule: RuleId,
+    episode: u64,
+    held_ms: i64,
+    declared: bool,
+    outcome: super::NoteOutcome,
+) -> String {
+    let words = task_intent_reason(rule, episode, held_ms, declared);
+    match outcome {
+        super::NoteOutcome::Noted | super::NoteOutcome::Cleared => {
+            format!("{words} {}", outcome.word())
+        }
+        refused => format!("{words} why={}", refused.word()),
+    }
+}
+
+/// The task door's clear row's reason (`fact-hold@v1`): `rule=<name> fact=<word>`, [`TASK_DOOR`],
+/// then `cleared` (a `waiting` row) or `why=<word>` (`skipped`).
+#[must_use]
+pub fn task_clear_reason(word: super::FactWord, outcome: super::NoteOutcome) -> String {
+    let words = format!("rule={} fact={} {TASK_DOOR}", word.rule.name(), word.word());
+    match outcome {
+        super::NoteOutcome::Cleared => format!("{words} cleared"),
+        refused => format!("{words} why={}", refused.word()),
+    }
+}
+
+/// Extracts the fact rows for `sid` from ledger `body`, oldest first, for [`FactsState::seed`](crate::supervise::facts::FactsState::seed): an intent of the kind its `kind=` word names (the hold where none), and each kind's `typed` or `skipped` row; the task door's rows ([`is_task_row`]) none.
 #[must_use]
 pub fn seed_rows_in(body: &str, sid: Option<&str>) -> Vec<(EpisodeKey, i64, SeedOutcome)> {
     let want = sid.map(|s| s.trim_start_matches('@').to_string());
@@ -367,6 +420,9 @@ pub fn seed_rows_in(body: &str, sid: Option<&str>) -> Vec<(EpisodeKey, i64, Seed
         ) else {
             continue;
         };
+        if is_task_row(reason) {
+            continue;
+        }
         let word = |key: &str| reason.split(' ').find_map(|w| w.strip_prefix(key));
         let (kind, outcome) = match (text("rule_id"), text("decision")) {
             (Some(INTENT_RULE), Some("waiting")) => match word("kind=") {

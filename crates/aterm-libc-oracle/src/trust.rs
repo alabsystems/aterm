@@ -64,10 +64,9 @@ fn ask(trustc: &Path, args: &[&str]) -> Result<String, CouldNotRun> {
 const REPAIR: &str = "`aterm pkg doctor`, then `aterm pkg repair`";
 
 /// Find the pinned toolchain for the checkout at `root` and ask it its host.
-///
 /// # Errors
-/// When no pinned toolchain with `targo`, `trustc` and `trustdoc` is found, or it
-/// cannot report a host or link a host build.
+/// When no pinned toolchain with `targo`, `trustc` and `trustdoc` is found, or it cannot report a
+/// host or link a host build.
 pub fn discover(root: &Path) -> Result<Trust, CouldNotRun> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -142,7 +141,6 @@ impl Stock {
 }
 
 /// Locates the rustup toolchain `name` (`stable` or `<name>-<host>`).
-///
 /// # Errors
 /// When rustup holds no such toolchain.
 pub fn stock(name: &str, host: &str) -> Result<Stock, CouldNotRun> {

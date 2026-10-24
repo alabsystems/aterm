@@ -27,6 +27,69 @@ fn settings_view(app: &App, wid: WindowId) -> Option<&crate::native_settings::Se
 }
 
 #[test]
+fn native_centers_share_one_confirmation_incarnation() {
+    let now = Instant::now();
+    let mut first = crate::messages_host::new_center(aterm_messages::MessageLog::empty(), now);
+    let mut next = crate::messages_host::new_center(aterm_messages::MessageLog::empty(), now);
+    let req = "later incarnation Owner action -- only you have access -- Resolve this in settings";
+    let stamp = WallStamp { unix_ms: 0 };
+    let post = |center: &mut aterm_messages::MessageCenter| {
+        wire::apply(
+            center,
+            &mut wire::WireGate::default(),
+            wire::NoticeRequest::parse(req).unwrap(),
+            stamp,
+            now,
+        )
+    };
+    post(&mut first);
+    post(&mut next);
+    let read = |center: &aterm_messages::MessageCenter| {
+        wire::message_rows(
+            center,
+            &wire::parse_read_args("live need=later").unwrap(),
+            0,
+            &str::to_string,
+        )
+        .into_iter()
+        .next()
+        .unwrap()
+    };
+    let parent = read(&first);
+    let successor = read(&next);
+    let revision = |row: &str| {
+        row.split_whitespace()
+            .find_map(|word| word.strip_prefix("rev="))
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+    };
+    let old = revision(&parent);
+    if old == u64::MAX {
+        assert_eq!(
+            revision(&successor),
+            u64::MAX,
+            "unavailable entropy stays disabled"
+        );
+    } else {
+        assert_ne!(
+            revision(&successor),
+            old,
+            "opening another center must not reseed or reset"
+        );
+    }
+    let applied = wire::apply(
+        &mut next,
+        &mut wire::WireGate::default(),
+        wire::NoticeRequest::parse(&format!("settle incarnation 1 {old}")).unwrap(),
+        stamp,
+        now,
+    );
+    assert_eq!(applied.reply, "OK settled=- how=gone");
+    assert!(!next.digest().is_empty());
+}
+
+#[test]
 fn the_deadline_is_none_when_idle_and_the_holds_freeze_under_a_handoff() {
     let mut app = App::headless_for_test();
     assert_eq!(app.messages_deadline(), None, "an idle band never wakes");
@@ -122,7 +185,7 @@ fn finished_workstation_setup_clears_existing_and_queued_exceptions() {
     let mut app = App::headless_for_test();
     let account = crate::message_reporters::workstation_accounts_entry();
     let settings = crate::message_reporters::workstation_setup_failure_entry();
-    let other = crate::message_reporters::devtools_entry(atpkg::devtools::Step::Add);
+    let other = crate::message_reporters::devtools_entry(atpkg::devtools::Step::Add, None);
     app.except(&account);
     app.except(&settings);
     app.except(&other);
@@ -1251,6 +1314,7 @@ fn the_developer_tools_line_opens_security_and_never_answers_the_file_access_car
     let wid = WindowId(0);
     app.except(&crate::message_reporters::devtools_entry(
         atpkg::devtools::Step::Add,
+        None,
     ));
     let id = app.messages.digest().entries[0].id;
     assert_eq!(
@@ -1352,6 +1416,7 @@ fn a_digest_press_whose_page_does_not_open_brings_its_line_back() {
         );
         app.except(&crate::message_reporters::devtools_entry(
             atpkg::devtools::Step::Add,
+            None,
         ));
         let id = app.messages.digest().entries[0].id;
         let _ = app.perform_message_act(wid, id.raw(), 0);

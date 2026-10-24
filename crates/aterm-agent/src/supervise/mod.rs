@@ -33,7 +33,7 @@ pub use config::{Autopilot, LandAt, Occupancy, SupervisorConfig};
 pub use facts::{Fact, FactsReading};
 pub use journal::{Journal, read_journal};
 pub use ledger::{
-    ClockAnchor, Format as LedgerFormat, LedgerHost, LedgerOpts, LedgerSource, gather, parse_since,
+    ANCHOR_REMOVED, Format as LedgerFormat, LedgerHost, LedgerOpts, gather, parse_since,
     render as render_ledger,
 };
 pub use phase::{

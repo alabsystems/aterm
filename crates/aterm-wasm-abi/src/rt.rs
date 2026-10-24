@@ -81,15 +81,13 @@ macro_rules! export_runtime {
                 new_size: usize,
                 align: usize,
             ) -> usize {
-                // SAFETY: the glue reallocates only what `aterm_alloc` gave it,
-                // with the size it asked for.
+                // SAFETY: the glue reallocates only `aterm_alloc` buffers at the requested size.
                 unsafe { $crate::__rt::realloc(ptr, old_size, new_size, align) }
             }
 
             #[unsafe(no_mangle)]
             unsafe extern "C" fn aterm_free(ptr: usize, size: usize, align: usize) {
-                // SAFETY: the glue frees each buffer the module returned once,
-                // with the layout its type's lowering names.
+                // SAFETY: the glue frees each returned buffer once with its lowered layout.
                 unsafe { $crate::__rt::free_buffer(ptr, size, align) }
             }
 

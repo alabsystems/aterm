@@ -123,11 +123,11 @@ pub(super) fn lay_toned(
     });
 }
 
-/// One four-point star of [`star_pieces`], clipped to `clip`.
+/// One four-point star of [`star_pieces`], clipped to `clip`: added light when `added`, else printed.
 #[allow(
     clippy::too_many_arguments,
     reason = "output + sink + clip + centre + arm + coverage + glint + colour + the \
-              trail's ink + theme: the push_twinkle_star call with its clip, tones and theme"
+              trail's ink + paint: the push_twinkle_star call with its clip, tones and paint"
 )]
 pub(super) fn lay_star(
     out: &mut Vec<GlowQuad>,
@@ -139,13 +139,13 @@ pub(super) fn lay_star(
     gold: bool,
     color: u32,
     on_trail: &[Rect],
-    dark: bool,
+    added: bool,
 ) {
     if cov < 1.0 || arm < 1 {
         return;
     }
     let tone = |rgb: u32, c: f32| {
-        if dark {
+        if added {
             light(rgb, c)
         } else {
             ink(rgb, c * 255.0 / STAR_PRINT_FULL)
@@ -158,17 +158,17 @@ pub(super) fn lay_star(
     for piece in star_pieces(arm32, gold).iter() {
         let p = match piece.part {
             StarPart::Body => full,
-            StarPart::Core if dark => paint((cov * STAR_CORE_ADD).floor()),
+            StarPart::Core if added => paint((cov * STAR_CORE_ADD).floor()),
             StarPart::Core => full,
             StarPart::Tip { taper, .. } => {
                 let tip_cov = (cov * taper).floor();
-                ended |= dark && premul_rgb(color, tip_cov as u8) == 0;
+                ended |= added && premul_rgb(color, tip_cov as u8) == 0;
                 if ended {
                     continue;
                 }
                 paint(tip_cov)
             }
-            StarPart::Glint if dark => paint((cov * STAR_GLINT_COV).floor()),
+            StarPart::Glint if added => paint((cov * STAR_GLINT_COV).floor()),
             StarPart::Glint => full,
         };
         let r = Rect {
@@ -271,7 +271,6 @@ pub(super) fn quads(cx: &Emit<'_>, under: &mut Vec<GlowQuad>, over: &mut Vec<Glo
     kitty_quads(cx, &sink, over);
     rim_quads(cx, &sink, over);
     let trail = cx.trail_ink();
-    let dark = cx.scene.dark;
     cx.each_star(&mut |s| {
         lay_star(
             over,
@@ -283,7 +282,7 @@ pub(super) fn quads(cx: &Emit<'_>, under: &mut Vec<GlowQuad>, over: &mut Vec<Glo
             s.gold,
             s.color,
             trail.covers(),
-            dark,
+            s.light,
         );
     });
 }

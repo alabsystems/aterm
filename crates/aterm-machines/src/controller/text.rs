@@ -1,16 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Text from a host or the LAN, made safe to print on the owner's terminal.
-//!
-//! A report row's values, a program's output under `run`, an advertised Bonjour name: each is
-//! whatever a lab Mac (or anyone on it) chose, so an escape sequence in it could set the
-//! owner's clipboard (OSC 52), retitle the window or forge a link. Every such string goes
-//! through [`shown`] at the point it is printed.
+//! Text from a host or the LAN, made safe to print on the owner's terminal ([`shown`]).
 
-/// `text` safe to print to a terminal: each control character (an escape sequence's ESC, a
-/// carriage return, a line feed) and each bidirectional override is shown as its `\u{…}`
-/// escape rather than sent.
+/// `text` safe to print to a terminal.
 #[must_use]
 pub fn shown(text: &str) -> String {
     let inert = |c: char| {

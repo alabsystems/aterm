@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The export policy in publish/, read the way the publication engine reads it: what
-//! `manifest.txt` selects from this tree, and the public-clone command `config.sh`
-//! hands the engine's gate.
+//! Tests `publish/manifest.txt` path selection and `publish/config.sh` public-clone check.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -31,8 +29,6 @@ fn git(args: &[&str]) -> String {
     String::from_utf8_lossy(&o.stdout).into_owned()
 }
 
-/// manifest.txt as git pathspecs, as the engine selects with them: a comment runs from
-/// `#`, `!x` excludes x, and publish/, docs/ and .github/ are denied whatever the rows say.
 fn specs(manifest: &str) -> Vec<String> {
     let denied = |p: &str| {
         ["publish", "docs", ".github"]
@@ -61,11 +57,6 @@ fn specs(manifest: &str) -> Vec<String> {
     specs
 }
 
-/// WHAT THE EXPORT SELECTS: no gitlink (the engine dies on one before the transforms
-/// run), never publish/, not a test whose fixture is withheld — and none of the art
-/// whose rights were never established, each excluded path tracked (so no exclusion is
-/// vacuous), while the roster the product is generated from and the man page the
-/// crates embed ship.
 #[test]
 fn the_export_selects_no_gitlink_and_none_of_the_withheld_files() {
     let manifest = std::fs::read_to_string(repo().join("publish/manifest.txt")).unwrap();
@@ -92,8 +83,6 @@ fn the_export_selects_no_gitlink_and_none_of_the_withheld_files() {
     ] {
         assert!(!exported.contains(withheld), "{withheld} is exported");
     }
-    // Outside crates/ and assets/, yet aterm-gui embeds it (`include_bytes!`), so a
-    // public clone without it does not compile.
     assert!(
         exported.contains("man/aterm.1"),
         "man/aterm.1 is not exported"
@@ -156,12 +145,6 @@ fn the_export_selects_no_gitlink_and_none_of_the_withheld_files() {
     }
 }
 
-/// THE PUBLIC-CLONE COMMAND is one line the engine can read (`^CHECK_CMD_DEFAULT="([^"]*)"`,
-/// never sourced), and its version clause — one `sh -c` step of the plain `&&` chain the
-/// known-red baseline needs, run whole with an owned version command — admits a successful
-/// public `MAJOR.MINOR.0` and refuses a failed command even when its output has that shape.
-/// The engine's own patch-slot rule reads
-/// Cargo.toml; this is the binary's answer.
 #[test]
 fn the_public_clone_command_reads_as_one_line_and_admits_only_a_public_version() {
     let config = std::fs::read_to_string(repo().join("publish/config.sh")).unwrap();
@@ -181,8 +164,6 @@ fn the_public_clone_command_reads_as_one_line_and_admits_only_a_public_version()
         .split(" && ")
         .find(|c| c.contains("aterm --version"))
         .expect("a version clause");
-    // One `sh -c '…'` step: the known-red baseline needs a plain `&&` chain, which
-    // may pipe only inside single quotes.
     let clause = clause
         .strip_prefix("sh -c '")
         .and_then(|c| c.strip_suffix('\''))

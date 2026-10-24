@@ -36,10 +36,8 @@ fn feed(app: &App, bytes: &[u8], at: Instant) {
 }
 
 fn head(app: &App) -> Option<(i32, i32)> {
-    app.windows[&WID]
-        .input_scratch
-        .free_sprites
-        .iter()
+    aterm_render::sprites::published(&app.windows[&WID].input_scratch.fx_layers)
+        .into_iter()
         .max_by_key(|s| s.h)
         .map(|s| (s.x, s.y))
 }
@@ -225,8 +223,8 @@ fn a_capture_draws_the_flying_head_where_the_glass_has_it() {
             .get_mut(&WID)
             .expect("window")
             .input_scratch
-            .free_sprites
-            .clear();
+            .fx_layers
+            .retain(|l| !aterm_render::sprites::is_sprite_layer(l));
         app.capture_words(WID, t);
         head(app)
     };

@@ -238,6 +238,23 @@ function() {
             return Date.now();
         }";
 
+/// `aterm_host.random_fill(ptr, len)`: unavailable entropy is a refused fill.
+pub(crate) const RANDOM_FILL_SHIM: &str = "\
+function(ptr, len) {
+            try {
+                ptr = ptr >>> 0;
+                len = len >>> 0;
+                const memory = wasm.memory.buffer;
+                if (len > 65536 || ptr + len > memory.byteLength) return 0;
+                const crypto = globalThis.crypto;
+                if (!crypto || typeof crypto.getRandomValues !== 'function') return 0;
+                crypto.getRandomValues(new Uint8Array(memory, ptr, len));
+                return 1;
+            } catch (_) {
+                return 0;
+            }
+        }";
+
 /// A class's handle plumbing; `{C}` the class, `{FREE}` its free export.
 pub(crate) const CLASS_HEAD: &str = "    static __wrap(ptr) {
         ptr = ptr >>> 0;

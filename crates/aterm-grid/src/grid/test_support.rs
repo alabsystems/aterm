@@ -1,5 +1,4 @@
 // Copyright 2026 Andrew Yates
-// Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
 //! Grid fixtures shared by the grid's unit-test modules.
@@ -17,8 +16,7 @@ pub(crate) fn feed_numbered_lines(grid: &mut Grid, start: usize, n: usize) {
     }
 }
 
-/// Every history row oldest→newest, read without draining (the `line` /
-/// `search` path), trailing blanks trimmed.
+/// Every history row oldest→newest.
 pub(crate) fn history_trimmed(grid: &Grid) -> Vec<String> {
     (0..grid.scrollback_lines())
         .map(|i| {

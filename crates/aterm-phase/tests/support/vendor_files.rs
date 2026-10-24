@@ -5,9 +5,7 @@
 
 use crate::vendor_drift::version_in;
 
-/// Where the store keeps managed programs under `home`: MIRRORS
-/// `atpkg::platform::default_prefix` (this crate has no dependencies, and a
-/// moved prefix makes a canary say `COULD NOT RUN`, never pass).
+// Mirrors `atpkg::platform::default_prefix` (`aterm-phase` has no `atpkg` dependency).
 fn canary_prefix(home: &std::path::Path) -> std::path::PathBuf {
     if cfg!(target_os = "macos") {
         home.join("Library")
@@ -19,8 +17,7 @@ fn canary_prefix(home: &std::path::Path) -> std::path::PathBuf {
     }
 }
 
-/// The path the drift canaries read a program's build at, from the first line `aterm pkg which
-/// <program>` prints.
+/// Resolves a managed binary path from `aterm pkg which <program>` output.
 pub(crate) fn canary_path(
     which_line: &str,
     home: Option<&std::path::Path>,
@@ -47,8 +44,6 @@ pub(crate) fn canary_path(
     current.exists().then_some(current)
 }
 
-/// Whether `path` lies in a store's tree for `program` (`…/store/<program>/…`),
-/// the layout [`canary_path`]'s fallback reads.
 fn in_store(path: &str, program: &str) -> bool {
     let parts: Vec<&std::ffi::OsStr> = std::path::Path::new(path)
         .components()
@@ -57,9 +52,7 @@ fn in_store(path: &str, program: &str) -> bool {
     parts.windows(2).any(|w| w[0] == "store" && w[1] == program)
 }
 
-/// The version atpkg's record beside the build names (`<build>.vendor`'s `version = "…"`: the build
-/// of the binary's directory, reached through a `current` link, else of the file a link from
-/// outside the store names), or `None` where there is no record ([`version_in`]).
+/// Reads the build version from the sibling `<build>.vendor` record ([`version_in`]).
 pub(crate) fn build_version(path: &str) -> Option<String> {
     use std::path::{Path, PathBuf};
     let path = Path::new(path);
@@ -83,9 +76,7 @@ pub(crate) fn build_version(path: &str) -> Option<String> {
     version_in(version.trim().trim_matches('"'))
 }
 
-/// Gemini CLI's npm bundle, found from `bin` (a `gemini` on PATH, a Homebrew link or the script
-/// itself): the directory the script resolves into, every `.js` file in it (joined, NUL between),
-/// and the version its package's `package.json` (one up) names.
+/// Loads Gemini CLI's npm `.js` bundle and version from `bin`.
 pub(crate) fn gemini_bundle(bin: &std::path::Path) -> Option<(String, Vec<u8>, Option<String>)> {
     let script = std::fs::canonicalize(bin).ok()?;
     let dir = script.parent()?;

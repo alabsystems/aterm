@@ -24,9 +24,10 @@ pub(crate) const LEG_MAX: Duration = Duration::from_secs(600);
 /// What a leg's socket may take beyond the wait it asked for: the reply's own write.
 pub(crate) const LEG_SLACK: Duration = Duration::from_secs(30);
 
-const USAGE: &str = "ERR usage: aterm ctl await task [@<sel>[:<rev>][,...]] [any|all] \
-                     [since=<rev>] [timeout=<ms>] | aterm ctl @<sel> await task [any|all] \
-                     [since=<rev>] [timeout=<ms>]";
+const USAGE: &str = "ERR usage: aterm ctl await task [@<sel>[:<rev>[:<fact_rev>]][,...]] \
+                     [any|all] [since=<rev>] [facts=1 [fact_since=<fact_rev>]] [timeout=<ms>] | \
+                     aterm ctl @<sel> await task [any|all] [since=<rev>] [facts=1 \
+                     [fact_since=<fact_rev>]] [timeout=<ms>]";
 
 /// Whether `parts` (the request, `@self` expanded) is `[@<sel>] await task …`.
 pub(crate) fn is_await_task(parts: &[String]) -> bool {
@@ -54,11 +55,13 @@ impl Combine {
     }
 }
 
-/// One target as the caller wrote it: the selector body, and its own since.
+/// One target as the caller wrote it: the selector body, its own since, and its own fact edge
+/// (`@<sel>:<rev>:<fact_rev>`, read under `facts=1` alone).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Target {
     selector: String,
     since: Option<u64>,
+    fact_since: Option<u64>,
 }
 
 /// The request, parsed client-side (the server's grammar: the same words).
@@ -67,6 +70,10 @@ struct Request {
     targets: Vec<Target>,
     combine: Combine,
     since: Option<u64>,
+    /// `facts=1`: a new fact word on a worker's task record answers too (the occupancy design's
+    /// manager door).
+    facts: bool,
+    fact_since: Option<u64>,
     timeout: Option<Duration>,
 }
 
@@ -84,6 +91,8 @@ fn parse(parts: &[String]) -> io::Result<Request> {
         targets: Vec::new(),
         combine: Combine::Any,
         since: None,
+        facts: false,
+        fact_since: None,
         timeout: None,
     };
     let (mut listed, mut combined) = (false, false);
@@ -112,6 +121,16 @@ fn parse(parts: &[String]) -> io::Result<Request> {
                 return Err(usage());
             }
             request.since = Some(rev.parse().map_err(|_| usage())?);
+        } else if word == "facts=1" {
+            if request.facts {
+                return Err(usage());
+            }
+            request.facts = true;
+        } else if let Some(rev) = word.strip_prefix("fact_since=") {
+            if request.fact_since.is_some() {
+                return Err(usage());
+            }
+            request.fact_since = Some(rev.parse().map_err(|_| usage())?);
         } else {
             let value = match word.strip_prefix("timeout=") {
                 Some(value) => value,
@@ -127,10 +146,16 @@ fn parse(parts: &[String]) -> io::Result<Request> {
     if let Some(sel) = leading {
         request.targets.push(target(sel)?);
     }
+    let fact_edge =
+        request.fact_since.is_some() || request.targets.iter().any(|t| t.fact_since.is_some());
+    if fact_edge && !request.facts {
+        return Err(usage());
+    }
     if request.targets.is_empty() {
         request.targets.push(Target {
             selector: ".".to_string(),
             since: None,
+            fact_since: None,
         });
     }
     let mut seen: Vec<String> = Vec::new();
@@ -142,12 +167,19 @@ fn parse(parts: &[String]) -> io::Result<Request> {
     Ok(request)
 }
 
-/// One list element, `@<sel>` or `@<sel>:<rev>` ([`aterm_types::control_verbs::EMPTY_SELECTOR`]).
+/// One list element, `@<sel>`, `@<sel>:<rev>` or `@<sel>:<rev>:<fact_rev>`
+/// ([`aterm_types::control_verbs::EMPTY_SELECTOR`]).
 fn target(element: &str) -> io::Result<Target> {
     let body = element.strip_prefix('@').ok_or_else(usage)?;
-    let (selector, since) = match body.split_once(':') {
-        Some((selector, rev)) => (selector, Some(rev.parse().map_err(|_| usage())?)),
-        None => (body, None),
+    let (selector, since, fact_since) = match body.split_once(':') {
+        Some((selector, revs)) => {
+            let (rev, fact) = match revs.split_once(':') {
+                Some((rev, fact)) => (rev, Some(fact.parse().map_err(|_| usage())?)),
+                None => (revs, None),
+            };
+            (selector, Some(rev.parse().map_err(|_| usage())?), fact)
+        }
+        None => (body, None, None),
     };
     if !aterm_types::control_verbs::selector_body_names_something(selector) {
         return Err(io::Error::new(
@@ -158,6 +190,7 @@ fn target(element: &str) -> io::Result<Target> {
     Ok(Target {
         selector: selector.to_string(),
         since,
+        fact_since,
     })
 }
 
@@ -342,6 +375,14 @@ fn row_rev(row: &str) -> Option<u64> {
     row_field(row, "rev").and_then(|rev| rev.parse().ok())
 }
 
+/// A row's `fact_rev=`: 0 where it has none, as a record whose fact word was never edited
+/// answers (and an older server's every row).
+fn row_fact_rev(row: &str) -> u64 {
+    row_field(row, "fact_rev")
+        .and_then(|rev| rev.parse().ok())
+        .unwrap_or(0)
+}
+
 fn row_sid(row: &str) -> Option<&str> {
     row.split_whitespace()
         .next()
@@ -382,20 +423,34 @@ fn gone_target(e: &io::Error, targets: &[Target], live: &[usize]) -> Option<usiz
         .find(|&i| targets[i].selector == selector)
 }
 
+/// One leg's request: each target with its edges, and under `facts=1` the request's own
+/// `fact_since=` for the targets whose element cannot carry one before the baseline named their
+/// `rev` (every such target's edge is the request's, [`run_await_task`]).
 fn leg_request<'a>(
     targets: impl Iterator<Item = &'a Target>,
     combine: Combine,
+    facts: bool,
     wait: Duration,
 ) -> String {
+    let mut loose = None;
     let list = targets
-        .map(|t| match t.since {
-            Some(rev) => format!("@{}:{rev}", t.selector),
-            None => format!("@{}", t.selector),
+        .map(|t| match (t.since, t.fact_since) {
+            (Some(rev), Some(fact)) => format!("@{}:{rev}:{fact}", t.selector),
+            (Some(rev), None) => format!("@{}:{rev}", t.selector),
+            (None, fact) => {
+                loose = loose.or(fact);
+                format!("@{}", t.selector)
+            }
         })
         .collect::<Vec<_>>()
         .join(",");
+    let facts = match (facts, loose) {
+        (true, Some(fact)) => format!(" facts=1 fact_since={fact}"),
+        (true, None) => " facts=1".to_string(),
+        (false, _) => String::new(),
+    };
     format!(
-        "await task {list} {} timeout={}\n",
+        "await task {list} {}{facts} timeout={}\n",
         combine.word(),
         wait.as_millis()
     )
@@ -425,7 +480,7 @@ fn malformed(what: &str) -> io::Error {
 fn run_group(
     index: usize,
     mut group: Group,
-    combine: Combine,
+    (combine, facts): (Combine, bool),
     until: Option<Instant>,
     follow: redial::Redial,
     legs: &Legs,
@@ -450,7 +505,12 @@ fn run_group(
                     .min(legs.max)
             })
         };
-        let request = leg_request(live.iter().map(|&i| &group.targets[i]), combine, wait);
+        let request = leg_request(
+            live.iter().map(|&i| &group.targets[i]),
+            combine,
+            facts,
+            wait,
+        );
         let (answered, latest) = match (legs.send)(&group.sock, &request, wait) {
             Leg::Answered(latest) => (true, latest),
             Leg::TimedOut(latest) => (false, latest),
@@ -539,6 +599,9 @@ fn run_group(
                 let target = &mut group.targets[i];
                 target.selector = sid.to_string();
                 target.since = target.since.or_else(|| row_rev(&row));
+                if facts {
+                    target.fact_since = target.fact_since.or(Some(row_fact_rev(&row)));
+                }
             }
             gone[i] = row_closed(&row);
             rows[i] = Some(row);
@@ -563,6 +626,7 @@ enum Waited {
 fn wait_task_groups(
     groups: Vec<Group>,
     combine: Combine,
+    facts: bool,
     until: Option<Instant>,
     follow: &redial::Redial,
     legs: &Legs,
@@ -574,7 +638,7 @@ fn wait_task_groups(
         std::thread::Builder::new()
             .name("aterm-ctl-await-task".into())
             .spawn(move || {
-                let end = run_group(index, group, combine, until, follow, &legs, &tx);
+                let end = run_group(index, group, (combine, facts), until, follow, &legs, &tx);
                 let _ = tx.send(Report::End(index, end));
             })?;
     }
@@ -634,6 +698,7 @@ pub(crate) fn run_await_task(
         .map(|t| Target {
             selector: t.selector.clone(),
             since: t.since.or(request.since),
+            fact_since: t.fact_since.or(request.fact_since),
         })
         .collect();
     let groups = group(targets, pinned, default, dir.as_deref())?;
@@ -645,6 +710,7 @@ pub(crate) fn run_await_task(
     print_waited(wait_task_groups(
         groups,
         request.combine,
+        request.facts,
         until,
         follow,
         &legs,
@@ -689,6 +755,7 @@ pub(crate) fn run_driven(
         .map(|t| Target {
             selector: t.selector.clone(),
             since: t.since.or(request.since),
+            fact_since: t.fact_since.or(request.fact_since),
         })
         .collect();
     let host = host.to_owned();
@@ -706,6 +773,7 @@ pub(crate) fn run_driven(
     print_waited(wait_task_groups(
         groups,
         request.combine,
+        request.facts,
         until,
         &redial::Redial::none(),
         &legs,
@@ -752,15 +820,19 @@ mod tests {
                 targets: vec![
                     Target {
                         selector: "s-a1".into(),
-                        since: None
+                        since: None,
+                        fact_since: None,
                     },
                     Target {
                         selector: "2".into(),
-                        since: Some(5)
+                        since: Some(5),
+                        fact_since: None,
                     },
                 ],
                 combine: Combine::All,
                 since: Some(3),
+                facts: false,
+                fact_since: None,
                 timeout: Some(Duration::from_millis(1500)),
             },
             "a target named twice is waited on once"
@@ -770,7 +842,8 @@ mod tests {
             single.targets,
             vec![Target {
                 selector: "s-b2".into(),
-                since: None
+                since: None,
+                fact_since: None,
             }]
         );
         assert_eq!(
@@ -782,10 +855,33 @@ mod tests {
             bare.targets,
             vec![Target {
                 selector: ".".into(),
-                since: None
+                since: None,
+                fact_since: None,
             }]
         );
         assert_eq!(bare.combine, Combine::Any);
+        assert!(!bare.facts);
+        let facts = parse(&parts("await task @s-a:4:2,@s-b facts=1 fact_since=7")).unwrap();
+        assert_eq!(
+            (facts.facts, facts.fact_since),
+            (true, Some(7)),
+            "the manager door's opt-in"
+        );
+        assert_eq!(
+            facts.targets,
+            vec![
+                Target {
+                    selector: "s-a".into(),
+                    since: Some(4),
+                    fact_since: Some(2),
+                },
+                Target {
+                    selector: "s-b".into(),
+                    since: None,
+                    fact_since: None,
+                },
+            ]
+        );
         for bad in [
             "@s-a await task @s-b",
             "await task @s-a @s-b",
@@ -796,6 +892,14 @@ mod tests {
             "await task timeout=soon",
             "await task timeout",
             "await task later",
+            "await task facts=1 facts=1",
+            "await task facts=2",
+            "await task facts=1 fact_since=1 fact_since=2",
+            "await task facts=1 fact_since=x",
+            "await task fact_since=1",
+            "await task @s-a:4:2",
+            "await task @s-a:4:x facts=1",
+            "await task @s-a::2 facts=1",
         ] {
             assert!(parse(&parts(bad)).is_err(), "{bad:?}");
         }
@@ -834,16 +938,42 @@ mod tests {
             Target {
                 selector: "s-a".into(),
                 since: Some(3),
+                fact_since: None,
             },
             Target {
                 selector: "1".into(),
                 since: None,
+                fact_since: None,
             },
         ];
         assert_eq!(
-            leg_request(targets.iter(), Combine::All, Duration::from_secs(600)),
+            leg_request(
+                targets.iter(),
+                Combine::All,
+                false,
+                Duration::from_secs(600)
+            ),
             "await task @s-a:3,@1 all timeout=600000\n"
         );
+        let mut facts = targets.clone();
+        assert_eq!(
+            leg_request(facts.iter(), Combine::Any, true, Duration::ZERO),
+            "await task @s-a:3,@1 any facts=1 timeout=0\n"
+        );
+        facts[0].fact_since = Some(2);
+        facts[1].fact_since = Some(5);
+        assert_eq!(
+            leg_request(facts.iter(), Combine::Any, true, Duration::ZERO),
+            "await task @s-a:3:2,@1 any facts=1 fact_since=5 timeout=0\n",
+            "a target with no rev yet takes the request's fact edge"
+        );
+        facts[1].since = Some(9);
+        assert_eq!(
+            leg_request(facts.iter(), Combine::Any, true, Duration::ZERO),
+            "await task @s-a:3:2,@1:9:5 any facts=1 timeout=0\n"
+        );
+        assert_eq!(row_fact_rev("@s-a rev=7 fact=- fact_rev=3"), 3);
+        assert_eq!(row_fact_rev("@s-a rev=7 state=done"), 0, "never edited");
         let row = "@s-a rev=7 state=done agent=- attention=- result_bytes=1";
         assert_eq!(row_rev(row), Some(7));
         assert_eq!(row_rev("garbage"), None);
@@ -968,6 +1098,7 @@ mod tests {
                 .map(|s| Target {
                     selector: (*s).to_string(),
                     since: None,
+                    fact_since: None,
                 })
                 .collect(),
         }]
@@ -979,11 +1110,78 @@ mod tests {
         until: Option<Instant>,
         legs: &Legs,
     ) -> (Vec<String>, bool) {
-        match wait_task_groups(groups, combine, until, &redial::Redial::none(), legs) {
+        match wait_task_groups(groups, combine, false, until, &redial::Redial::none(), legs) {
             Ok(Waited::Rows { rows, answered }) => (rows, answered),
             Ok(Waited::Code(code)) => panic!("an exit code: {code:?}"),
             Err(e) => panic!("{e}"),
         }
+    }
+
+    /// `facts=1` rides every leg, and the re-arm carries each target's fact edge as its baseline
+    /// row read it (`fact_rev=`, 0 for a record whose word was never edited), so a word noted
+    /// between legs answers the next one. NEGATIVE CONTROL: without `facts=1` no leg asks for it
+    /// and no element carries a fact edge.
+    #[test]
+    fn under_facts_1_the_rearm_carries_each_targets_fact_edge() {
+        let x = "/x.sock";
+        let legs = scripted(vec![
+            (
+                x,
+                "await task @s-a,@s-b any facts=1 timeout=0\n",
+                timed_out(&[
+                    "@s-a rev=2 state=working agent=- attention=- result_bytes=0",
+                    "@s-b rev=1 state=working agent=- attention=- result_bytes=0 fact=- fact_rev=4",
+                ]),
+            ),
+            (
+                x,
+                "await task @s-a:2:0,@s-b:1:4 any facts=1 timeout=600\n",
+                answered(&[
+                    "@s-a rev=2 state=working agent=- attention=- result_bytes=0 \
+                     fact=hold-room@v1#1 fact_rev=1",
+                    "@s-b rev=1 state=working agent=- attention=- result_bytes=0 fact=- fact_rev=4",
+                ]),
+            ),
+        ]);
+        let groups = one_group(x, &["s-a", "s-b"]);
+        let Ok(Waited::Rows {
+            rows,
+            answered: woke,
+        }) = wait_task_groups(
+            groups,
+            Combine::Any,
+            true,
+            None,
+            &redial::Redial::none(),
+            &legs,
+        )
+        else {
+            panic!("the scripted legs answer");
+        };
+        assert!(woke);
+        assert!(
+            rows[0].ends_with(" fact=hold-room@v1#1 fact_rev=1"),
+            "{rows:?}"
+        );
+        let legs = scripted(vec![
+            (
+                x,
+                "await task @s-b any timeout=0\n",
+                timed_out(&[
+                    "@s-b rev=1 state=working agent=- attention=- result_bytes=0 fact=- fact_rev=4",
+                ]),
+            ),
+            (
+                x,
+                "await task @s-b:1 any timeout=600\n",
+                answered(&[
+                    "@s-b rev=2 state=done agent=- attention=- result_bytes=3 fact=- fact_rev=4",
+                ]),
+            ),
+        ]);
+        let (rows, woke) = waited(one_group(x, &["s-b"]), Combine::Any, None, &legs);
+        assert!(woke);
+        assert_eq!(rows.len(), 1);
     }
 
     #[test]
@@ -1066,6 +1264,7 @@ mod tests {
         let refusal = wait_task_groups(
             one_group(x, &["s-d"]),
             Combine::All,
+            false,
             None,
             &redial::Redial::none(),
             &legs,
@@ -1100,6 +1299,7 @@ mod tests {
         let refusal = wait_task_groups(
             one_group(x, &["s-a"]),
             Combine::Any,
+            false,
             None,
             &redial::Redial::none(),
             &legs,
@@ -1117,6 +1317,7 @@ mod tests {
         let gave_up = wait_task_groups(
             one_group(x, &["s-a"]),
             Combine::Any,
+            false,
             None,
             &redial::Redial::none(),
             &legs,
@@ -1246,10 +1447,12 @@ mod tests {
             Target {
                 selector: "s-abc".into(),
                 since: None,
+                fact_since: None,
             },
             Target {
                 selector: "3".into(),
                 since: None,
+                fact_since: None,
             },
         ];
         let pinned = group(targets.clone(), true, "/tmp/pinned.sock", Some(&dir)).unwrap();
@@ -1264,6 +1467,7 @@ mod tests {
             vec![Target {
                 selector: ".".into(),
                 since: None,
+                fact_since: None,
             }],
             false,
             "/tmp/default.sock",

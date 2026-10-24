@@ -2,25 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Proposers, which supply Aos M4 candidates as bytes and hold no authority over how they are judged (design §10.2).
-//!
-//! A proposer is shown [`TrainFeedback`] rows, whose private fields only the evaluator builds, carrying training-split facts alone (the plan digest, admitted, the first
-//! failing law, the training sum of `T`). There is no held-out field to read:
-//!
-//! ```compile_fail,E0599
-//! use aterm_effects::aos_momentum::search::TrainFeedback;
-//! fn peek(f: &TrainFeedback) -> Option<u64> {
-//!     f.held_out_ticks()
-//! }
-//! ```
-//!
-//! and a row's fields are not public:
-//!
-//! ```compile_fail,E0616
-//! use aterm_effects::aos_momentum::search::TrainFeedback;
-//! fn peek(f: &TrainFeedback) -> Option<u64> {
-//!     f.ticks
-//! }
-//! ```
 
 use aterm_aos::Digest;
 
@@ -36,17 +17,17 @@ pub const GRID_PROPOSER: &str = "grid";
 /// [`FileProposer`]'s name.
 pub const FILE_PROPOSER: &str = "file";
 
-/// The proposer name the on-demand re-evaluation (`m4::Evaluator::admit_one`) records, where no proposer ran.
+/// Proposer name recorded by on-demand re-evaluation (`m4::Evaluator::admit_one`).
 pub const ON_DEMAND: &str = "on-demand";
 
-/// The identity of a candidate's bytes, `Digest::of(PLAN_DOMAIN, [bytes])`, which for bytes that decode is the plan's own [`SchedulePlan::digest`], since a plan's encoding is canonical.
+/// Canonical candidate digest `Digest::of(PLAN_DOMAIN, [bytes])` ([`SchedulePlan::digest`]).
 #[inline]
 #[must_use]
 pub fn candidate_id(bytes: &[u8]) -> Digest {
     Digest::of(PLAN_DOMAIN, &[bytes])
 }
 
-/// Who proposed, as declared data the evaluator records and grants nothing: a name, a version and the digest of its configuration.
+/// Declared proposer identity recorded in the bundle (`name`, `version`, config digest).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ProposerId {
     /// Its name.
@@ -80,11 +61,11 @@ pub trait Proposer {
     /// Its identity, as the bundle records it.
     fn id(&self) -> ProposerId;
 
-    /// The candidates of round `round` (from 0), given the evaluator's feedback on every candidate it judged in earlier rounds, in judging order.
+    /// Candidates for `round` (from 0), given feedback from earlier rounds in judging order.
     fn propose(&mut self, round: u8, feedback: &[TrainFeedback]) -> Vec<Vec<u8>>;
 }
 
-/// What the evaluator tells a proposer about one candidate it judged: training-split facts only, in private fields only the evaluator builds.
+/// Training-split feedback for one judged candidate, built only by the evaluator.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrainFeedback {
     plan: Digest,
@@ -150,9 +131,9 @@ impl TrainFeedback {
 /// How a result was reached.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Mode {
-    /// A proposer's rounds with selection on the training split, then the held-out split read once, for the training winner.
+    /// Proposer rounds with training-split selection and a single held-out evaluation.
     Search,
-    /// The on-demand re-evaluation of one candidate (`m4::Evaluator::admit_one`), not the one-look search.
+    /// On-demand re-evaluation of one candidate (`m4::Evaluator::admit_one`).
     OnDemand,
 }
 
@@ -211,7 +192,7 @@ impl SearchStats {
     };
 }
 
-/// The policy's grid, [`GRID_V1`]'s 54 plans in order, proposed in round 0 and nothing after, whatever the feedback.
+/// Proposes [`GRID_V1`]'s 54 plans in order in round 0 and nothing in later rounds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GridProposer;
 
@@ -223,7 +204,7 @@ impl GridProposer {
         GridProposer
     }
 
-    /// The grid's plans' bytes, in [`GRID_V1`]'s order (every grid plan decodes, so there are 54).
+    /// Encoded plan bytes in [`GRID_V1`] order (54 plans).
     #[must_use]
     pub fn plans() -> Vec<Vec<u8>> {
         GRID_V1
@@ -249,8 +230,7 @@ impl Proposer for GridProposer {
     }
 }
 
-/// Candidates from a text, all in round 0: each line, cut at `#` and trimmed, is skipped when empty, is the bytes it spells when it is an even number of hex digits, and is otherwise its own bytes.
-/// Printable text never holds a plan's format byte, 1, so the evaluator refuses such a line at decode or at the byte budget.
+/// Round-0 proposer reading hex-encoded or raw candidate lines (with `#` comments stripped).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileProposer {
     candidates: Vec<Vec<u8>>,
@@ -268,7 +248,6 @@ const fn hex_value(c: u8) -> Option<u8> {
     }
 }
 
-/// The bytes an even number of hex digits spells, or `None`.
 fn hex_bytes(s: &str) -> Option<Vec<u8>> {
     let (pairs, rest) = s.as_bytes().as_chunks::<2>();
     if !rest.is_empty() {

@@ -7,7 +7,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
-use aterm_uds::deadline::RunError;
+use aterm_uds::deadline::{FIRST_EXEC_HANG, RAN, RunError, stamp_exec};
 use aterm_uds::spawnfd::Command;
 
 use crate::dev_identity::{self, CODESIGN, Run, WAIT};
@@ -28,6 +28,14 @@ const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Fram
                           LaunchServices.framework/Support/lsregister";
 
 const APPLICATIONS: &str = "/Applications";
+
+/// Beside the install, never inside it (that would break its seal): the stamp of its first
+/// exec, kept until that exec showed it ran ([`first_run`]).
+const EXEC_MARKS: &str = ".aterm-dev-app.exec.noindex";
+
+/// Beside the install and outside [`EXEC_MARKS`] (which a proven first run removes): the lock
+/// one [`install`] into a directory holds while it runs.
+const INSTALL_LOCK: &str = ".aterm-dev-app.lock";
 
 pub const USAGE: &str = "
   targo --unverified ship dev-app [--sign-id IDENTITY] [--out DIRECTORY]
@@ -356,6 +364,25 @@ fn first_line(run: &dyn Run, program: &Path, args: &[&str]) -> Option<String> {
     text.lines().next().map(str::to_string)
 }
 
+/// The first line a fresh install's `exe --version` prints: its first exec, stamped in
+/// `marks` before it starts and held to [`FIRST_EXEC_HANG`]. Only an exit of its own shows
+/// it ran and takes `marks` away; a probe killed or interrupted leaves them holding the
+/// install in place ([`install`]).
+fn first_run(run: &dyn Run, exe: &Path, marks: &Path) -> Option<String> {
+    let _ = std::fs::create_dir_all(marks);
+    let _ = std::fs::remove_file(marks.join(RAN));
+    stamp_exec(marks);
+    let mut cmd = aterm_uds::spawnfd::command(exe);
+    cmd.arg("--version");
+    let out = run.run(&mut cmd, FIRST_EXEC_HANG).ok()?;
+    if out.status.code().is_some() {
+        let _ = std::fs::write(marks.join(RAN), "");
+        let _ = std::fs::remove_dir_all(marks);
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines().next().map(str::to_string)
+}
+
 /// `ship dev-app [...]`: build, assemble, sign and (unless `--no-install`) install.
 /// # Errors
 /// The first step that could not be done, said with its remedy; nothing is installed after a failed
@@ -610,6 +637,11 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Install `app` into `dir` as [`DEV_APP_NAME`], replacing a previous dev install: a
+/// verified copy is moved into place, so a failed copy leaves the old one. A previous
+/// install whose first run never showed it ran stays until its hold is spent. One install
+/// into `dir` at a time: from its hold check to its own first run's stamp, no other install
+/// there removes an install or a stamp it has not seen.
 fn install(
     app: &Path,
     dir: &Path,
@@ -618,7 +650,22 @@ fn install(
     run: &dyn Run,
 ) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let _installing = crate::trust_lane::RunLock::take(
+        &dir.join(INSTALL_LOCK),
+        "another ship dev-app is installing here; install again once it ends",
+    )?;
     let installed = dir.join(DEV_APP_NAME);
+    let marks = dir.join(EXEC_MARKS);
+    if installed.exists()
+        && let Some(left) = crate::gates::first_exec_hold(&marks)
+    {
+        return Err(format!(
+            "{} was started and never showed it ran, so macOS may still be assessing its \
+             first exec; it stays as it is — install again in {} s (or after a restart)",
+            installed.display(),
+            left.as_secs()
+        ));
+    }
     let staging = dir.join(format!(".aterm-dev-app.{}.noindex", std::process::id()));
     if staging.exists() {
         std::fs::remove_dir_all(&staging)
@@ -654,8 +701,7 @@ fn install(
         cmd.arg("-f").arg(&installed);
         let _ = run.run(&mut cmd, WAIT);
     }
-    let version =
-        first_line(run, &exe, &["--version"]).unwrap_or_else(|| "aterm (version unknown)".into());
+    let version = first_run(run, &exe, &marks).unwrap_or_else(|| "aterm (version unknown)".into());
     println!(
         "ship dev-app: installed {version} -> {}",
         installed.display()
@@ -762,6 +808,16 @@ mod tests {
 
     fn log(fake: &Fake) -> Vec<String> {
         fake.0.borrow().log.iter().map(|c| c.join(" ")).collect()
+    }
+
+    /// The names in `dir`, sorted.
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
     }
 
     #[test]
@@ -1188,8 +1244,8 @@ mod tests {
             Some(PathBuf::from("aterm"))
         );
         assert_eq!(
-            std::fs::read_dir(&dest).unwrap().count(),
-            1,
+            entries(&dest),
+            [INSTALL_LOCK, DEV_APP_NAME],
             "no staging left"
         );
         let calls = log(&fake);
@@ -1215,10 +1271,87 @@ mod tests {
             "the previous install stands"
         );
         assert_eq!(
-            std::fs::read_dir(&dest).unwrap().count(),
-            1,
+            entries(&dest),
+            [INSTALL_LOCK, DEV_APP_NAME],
             "no staging left"
         );
+    }
+
+    /// An install whose first `--version` never exited was started and never showed it
+    /// ran: the next install leaves it exactly where it is until the hold is spent (a
+    /// restart here), and then replaces it.
+    #[test]
+    fn an_install_that_never_showed_it_ran_stays_until_its_hold_is_spent() {
+        let (_dir, root) = scratch();
+        let app = bundle_at(&root.join("dist"));
+        let dest = root.join("Applications");
+        let exe = dest.join(DEV_APP_NAME).join("Contents/MacOS/aterm");
+        let marks = dest.join(EXEC_MARKS);
+        let fake = Fake::new(World {
+            hang_on: Some("aterm --version".into()),
+            ..World::default()
+        });
+        install(&app, &dest, false, None, &fake).expect("installed, its version unknown");
+        assert!(marks.join(aterm_uds::deadline::EXEC_STAMP).is_file());
+        assert!(!marks.join(RAN).exists());
+
+        std::fs::write(app.join("Contents/MacOS/aterm"), b"exe 2").unwrap();
+        let refused = install(&app, &dest, false, None, &fake).unwrap_err();
+        assert!(refused.contains("never showed it ran"), "{refused}");
+        assert_eq!(
+            std::fs::read(&exe).unwrap(),
+            b"exe",
+            "the unproven install stays"
+        );
+
+        std::fs::write(
+            marks.join(aterm_uds::deadline::EXEC_STAMP),
+            u64::MAX.to_string(),
+        )
+        .unwrap();
+        fake.0.borrow_mut().hang_on = None;
+        fake.0
+            .borrow_mut()
+            .versions
+            .insert(exe.clone(), "aterm 0.104.0 (dev)".into());
+        install(&app, &dest, false, None, &fake).expect("the hold is spent");
+        assert_eq!(std::fs::read(&exe).unwrap(), b"exe 2");
+        assert!(!marks.exists(), "an exit of its own takes the marks away");
+    }
+
+    /// An install into a directory another install holds refuses before it looks or
+    /// removes anything there, and runs once that one ends.
+    #[test]
+    fn an_install_into_a_directory_another_install_holds_refuses_and_touches_nothing() {
+        let (_dir, root) = scratch();
+        let app = bundle_at(&root.join("dist"));
+        let dest = root.join("Applications");
+        let exe = dest.join(DEV_APP_NAME).join("Contents/MacOS/aterm");
+        let fake = Fake::new(World::default());
+        fake.0
+            .borrow_mut()
+            .versions
+            .insert(exe.clone(), "aterm 0.104.0 (dev)".into());
+        install(&app, &dest, false, None, &fake).expect("install");
+
+        let other = crate::trust_lane::RunLock::take(&dest.join(INSTALL_LOCK), "a test holds it")
+            .expect("free once an install returned");
+        std::fs::write(app.join("Contents/MacOS/aterm"), b"exe 2").unwrap();
+        let refused = install(&app, &dest, false, None, &fake).unwrap_err();
+        assert!(
+            refused.contains("another ship dev-app is installing here"),
+            "{refused}"
+        );
+        assert_eq!(std::fs::read(&exe).unwrap(), b"exe", "the install stands");
+        assert_eq!(
+            entries(&dest),
+            [INSTALL_LOCK, DEV_APP_NAME],
+            "nothing staged"
+        );
+
+        drop(other);
+        install(&app, &dest, false, None, &fake).expect("the other install ended");
+        assert_eq!(std::fs::read(&exe).unwrap(), b"exe 2");
     }
 
     #[test]

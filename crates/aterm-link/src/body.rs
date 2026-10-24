@@ -26,23 +26,23 @@ pub struct Body {
     pub v: u32,
     /// The publisher's wall clock in ms.
     pub t: u64,
-    /// The session a NODE published on behalf of.
+    /// The session a node published on behalf of.
     pub from: Option<String>,
     /// The offset this record answers.
     pub re: Option<u64>,
     /// An advisory deadline in ms.
     pub dl: Option<u64>,
-    /// The receipt's verdict (R8) ([`VERDICTS`]).
+    /// The receipt's verdict ([`VERDICTS`]).
     pub verdict: Option<String>,
-    /// The target session's public launch nonce (§7).
+    /// The target session's public launch nonce.
     pub epoch: Option<String>,
-    /// The `<seq>:<fp16>` freshness fence §6.6 defined for `term/in`.
+    /// The `<seq>:<fp16>` freshness fence for `term/in`.
     pub gen: Option<String>,
     /// The relay chain.
     pub via: Option<String>,
-    /// A BROADCAST's kind, carried IN THE BODY ([`KINDS`]).
+    /// A broadcast's kind ([`KINDS`]).
     pub kind: Option<String>,
-    /// The message text, already pct-DECODED.
+    /// The percent-decoded message text.
     pub text: String,
     /// Tokens this build does not know.
     pub unknown: BTreeMap<String, String>,

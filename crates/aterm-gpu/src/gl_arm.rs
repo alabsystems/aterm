@@ -113,8 +113,9 @@ impl GlArmLive {
     }
 
     /// Bring both fx atlases up to date with `atlas` (re-minted on a new
-    /// generation or another context, else the log's tail appended in place)
-    /// when the frame draws fx or prefetches.
+    /// generation or another context, else the resident arts written since
+    /// the last sync uploaded into their regions) when the frame draws fx or
+    /// prefetches.
     fn sync_fx(&mut self, atlas: &fx_gpu::FxAtlas, drawing: bool) -> Result<u64, String> {
         let mut bytes = 0;
         for kind in [fx_gpu::FxAtlasKind::R8, fx_gpu::FxAtlasKind::Rgba] {
@@ -398,9 +399,6 @@ pub(crate) fn encode_tail(
         FramePlanCtx {
             has_image_plane: image_plane,
             has_deco: t.deco.is_some(),
-            has_rain: win.rain_atlas.is_some(),
-            has_cat: win.cat_atlas.is_some(),
-            has_free: win.free_atlas.is_some(),
             has_wallpaper: win.wallpaper_tex.is_some(),
             cursor_opaque: t.cursor_opaque,
             ablation: t.ablation,
@@ -480,15 +478,11 @@ pub(crate) fn encode_tail(
                     &d.data[..],
                 )
             }
-            DrawAtlas::Rain | DrawAtlas::Cat | DrawAtlas::Free | DrawAtlas::Wallpaper => {
-                let sprite = match a {
-                    DrawAtlas::Rain => &win.rain_atlas,
-                    DrawAtlas::Cat => &win.cat_atlas,
-                    DrawAtlas::Free => &win.free_atlas,
-                    _ => &win.wallpaper_tex,
-                }
-                .as_ref()
-                .unwrap_or_else(|| panic!("plan samples {a:?} but its SpriteTex is absent"));
+            DrawAtlas::Wallpaper => {
+                let sprite = win
+                    .wallpaper_tex
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("plan samples {a:?} but its SpriteTex is absent"));
                 sprites[a as usize] = Some(sprite.gl_atlas(&live.dev)?);
                 continue;
             }

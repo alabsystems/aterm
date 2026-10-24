@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use rustls::ClientConnection;
 
 use crate::fleet::{
-    Dialed, DriveGrant, FleetError, FleetOp, FleetScope, FleetSecret, KEY_FILE, NodeIdentity,
-    NodeKey, NodeProof, REPLY_MAX, Served, client_handshake_as,
+    Dialed, DriveGrant, FleetError, FleetMark, FleetOp, FleetScope, FleetSecret, KEY_FILE,
+    NodeIdentity, NodeKey, NodeProof, REPLY_MAX, Served, client_handshake_as,
 };
 use crate::slots::{Claim, HandshakeWatchdog};
 use crate::tls::TlsTransport;
@@ -33,6 +33,9 @@ pub const PEERS_FILE: &str = "fleet-peers";
 
 /// A member's copy of its issuer's book, in the state directory: a file of its own, so an older aterm reading [`PEERS_FILE`] never meets a copy, and no edit of the book (`peers add`, `rm`, a join) ever writes one.
 pub const ISSUER_BOOK_FILE: &str = "fleet-issuer-book";
+
+/// The old fleet's entries a join of another fleet set aside once it wrote the new key ([`set_aside_peers`]), kept until the join finishes ([`settle_peers`]): a file of their own, so an older aterm, which reads no [`Peer::fleet`], never reads them as the new fleet's or drops them.
+pub const PEERS_LEFT_FILE: &str = "fleet-peers-left";
 
 const PEERS_LOCK: &str = ".fleet-peers.lock";
 
@@ -633,14 +636,16 @@ pub struct Peer {
     pub seen_ms: Option<u64>,
     /// How it came into the book.
     pub via: Via,
+    /// The fleet whose key this machine held when its join recorded the entry, read only while that key is held ([`read_peers`]); `None` reads as the fleet held, as before marks came.
+    pub fleet: Option<FleetMark>,
 }
 
 impl Peer {
-    /// The peer as one line of the book: `key_from=` only where there is one.
+    /// The peer as one line of the book: `key_from=` and `fleet=` only where there is one.
     #[must_use]
     pub fn line(&self) -> String {
         format!(
-            "peer node={} key={}{} host={} addr={} port={} version={} seen_ms={} via={}",
+            "peer node={} key={}{} host={} addr={} port={} version={} seen_ms={} via={}{}",
             self.node.as_deref().unwrap_or("-"),
             self.key.map_or_else(|| "-".to_owned(), |key| key.hex()),
             self.key_from
@@ -654,6 +659,8 @@ impl Peer {
             self.seen_ms
                 .map_or_else(|| "-".to_owned(), |ms| ms.to_string()),
             self.via.word(),
+            self.fleet
+                .map_or_else(String::new, |mark| format!(" fleet={}", mark.hex())),
         )
     }
 
@@ -704,6 +711,10 @@ impl Peer {
         if !matches!(via, Via::Manual | Via::IssuerBook) && node.is_none() {
             return None;
         }
+        let fleet = match get("fleet") {
+            Some(mark) => Some(FleetMark::from_hex(mark)?),
+            None => None,
+        };
         Some(Self {
             node,
             key,
@@ -714,6 +725,7 @@ impl Peer {
             version,
             seen_ms,
             via,
+            fleet,
         })
     }
 
@@ -800,11 +812,49 @@ impl fmt::Display for PeersError {
 
 impl std::error::Error for PeersError {}
 
-/// The book of peers in the state directory `dir`: empty when there is none.
+/// The book of peers in the state directory `dir` as the fleet whose key `dir` holds reads it: empty when there is none, and an entry marked with another fleet ([`Peer::fleet`]), or any marked one when no key is held, left out.
 pub fn read_peers(dir: &Path) -> Result<Vec<Peer>, PeersError> {
+    Ok(read_book(dir)?.0)
+}
+
+/// Whether the book in `dir` holds entries of another fleet than the key held ([`Peer::fleet`]) or set aside ([`PEERS_LEFT_FILE`]): a join of that key's fleet unfinished, which a join again finishes.
+#[must_use]
+pub fn holds_another_fleet(dir: &Path) -> bool {
+    std::fs::symlink_metadata(dir.join(PEERS_LEFT_FILE)).is_ok()
+        || read_book(dir).is_ok_and(|(_, others)| !others.is_empty())
+}
+
+fn read_left(dir: &Path) -> Vec<Peer> {
+    read_private(dir, PEERS_LEFT_FILE, PEERS_FILE_MAX).map_or_else(
+        |_| Vec::new(),
+        |bytes| {
+            String::from_utf8_lossy(&bytes)
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .filter_map(Peer::parse)
+                .collect()
+        },
+    )
+}
+
+/// The book in `dir`: its entries of the fleet whose key `dir` holds ([`read_peers`]), then those of another fleet.
+fn read_book(dir: &Path) -> Result<(Vec<Peer>, Vec<Peer>), PeersError> {
+    read_book_as(dir, held_mark(dir))
+}
+
+/// The mark of the fleet whose key `dir` holds, when it holds one it can read.
+fn held_mark(dir: &Path) -> Option<FleetMark> {
+    crate::fleet::read_key_file(dir)
+        .ok()
+        .map(|secret| secret.mark())
+}
+
+/// [`read_book`], as the fleet `held` marks.
+fn read_book_as(dir: &Path, held: Option<FleetMark>) -> Result<(Vec<Peer>, Vec<Peer>), PeersError> {
     let bytes = match read_private(dir, PEERS_FILE, PEERS_FILE_MAX) {
         Ok(bytes) => bytes,
-        Err(PrivateFileError::Missing) => return Ok(Vec::new()),
+        Err(PrivateFileError::Missing) => return Ok((Vec::new(), Vec::new())),
         Err(e) => return Err(PeersError::File(e)),
     };
     let text = String::from_utf8_lossy(&bytes);
@@ -819,7 +869,9 @@ pub fn read_peers(dir: &Path) -> Result<Vec<Peer>, PeersError> {
             book.push(peer);
         }
     }
-    Ok(book)
+    Ok(book
+        .into_iter()
+        .partition(|peer| peer.fleet.is_none_or(|mark| Some(mark) == held)))
 }
 
 const ISSUER_BOOK_HEAD: &str = "issuer node=";
@@ -889,16 +941,66 @@ fn book_text(book: &[Peer]) -> String {
     text
 }
 
-/// Edit the book in `dir` under its lock: read it, run `edit`, and write it back whole when `edit` changed it.
+/// Edit the book in `dir` under its lock: read it ([`read_peers`]), run `edit`, and write it back whole when `edit` changed it, its entries of another fleet kept (set aside while a key is held: [`set_aside_peers`]).
 pub fn update_peers<R>(
     dir: &Path,
     edit: impl FnOnce(&mut Vec<Peer>) -> Result<R, String>,
 ) -> Result<R, String> {
+    edit_book(dir, true, edit)
+}
+
+/// [`update_peers`], every entry of another fleet dropped and those set aside removed: how a join that holds its fleet's key finishes the book.
+pub fn settle_peers<R>(
+    dir: &Path,
+    edit: impl FnOnce(&mut Vec<Peer>) -> Result<R, String>,
+) -> Result<R, String> {
+    edit_book(dir, false, edit)
+}
+
+/// Move the book's entries of another fleet out of [`PEERS_FILE`] into [`PEERS_LEFT_FILE`] once a join wrote its new key, so an older aterm reads the book of no fleet until the join finishes.
+pub fn set_aside_peers(dir: &Path) -> Result<(), String> {
+    edit_book(dir, true, |_| Ok(()))
+}
+
+/// [`update_peers`] (`keep_others`) or [`settle_peers`].
+fn edit_book<R>(
+    dir: &Path,
+    keep_others: bool,
+    edit: impl FnOnce(&mut Vec<Peer>) -> Result<R, String>,
+) -> Result<R, String> {
     let _lock = BookLock::take(dir, LOCK_WAIT).map_err(|e| format!("{PEERS_FILE}'s lock: {e}"))?;
-    let mut book = read_peers(dir).map_err(|e| e.to_string())?;
+    let held = held_mark(dir);
+    let (mut book, mut others) = read_book_as(dir, held).map_err(|e| e.to_string())?;
     let before = book.clone();
     let out = edit(&mut book)?;
-    if book != before {
+    // Removed before the book is written, so a failure leaves the book as it was.
+    if !keep_others {
+        remove_private(dir, PEERS_LEFT_FILE).map_err(|e| format!("{PEERS_LEFT_FILE}: {e}"))?;
+    }
+    // Set aside only while a key is held, and before they leave the book: a kill between leaves them in both, each read as no fleet's.
+    let aside = keep_others && held.is_some() && !others.is_empty();
+    if aside {
+        let mut left = read_left(dir);
+        for peer in &others {
+            if !left.contains(peer) {
+                left.push(peer.clone());
+            }
+        }
+        let mut text = String::from(
+            "# What a join of another fleet set aside of the fleet this machine held, until it \
+             finishes: written by aterm, never read as the book.\n",
+        );
+        for peer in &left {
+            text.push_str(&peer.line());
+            text.push('\n');
+        }
+        write_private(dir, PEERS_LEFT_FILE, text.as_bytes())
+            .map_err(|e| format!("{PEERS_LEFT_FILE}: {e}"))?;
+    }
+    if book != before || aside || (!keep_others && !others.is_empty()) {
+        if keep_others && !aside {
+            book.append(&mut others);
+        }
         write_private(dir, PEERS_FILE, book_text(&book).as_bytes())
             .map_err(|e| format!("{PEERS_FILE}: {e}"))?;
     }
@@ -1606,6 +1708,7 @@ pub fn serve_join<S: Read + Write>(
                     version: Some(reg.version),
                     seen_ms: Some(now_ms),
                     via: Via::Joined,
+                    fleet: None,
                 };
                 let recorded_as = peer.clone();
                 update_peers(state_dir, |book| {
@@ -1825,23 +1928,40 @@ pub fn fetch_book(
     (secret, me): (&FleetSecret, Option<&NodeIdentity>),
     deadline: (Instant, Duration),
 ) -> Result<Book, BookUnread> {
-    fetch_book_in(issuer, (secret, me), deadline, None)
+    fetch_book_in(issuer, (secret, me), deadline, (None, None))
 }
 
-fn fetch_book_in(
+/// [`fetch_book`] as a read's dial ([`HeldAddrs`]): it opens the exchange at an address where none is open (`first`, the one its read opened at the issuer's recorded address) and waits on none.
+fn fetch_book_in<'a>(
     issuer: &Target,
     (secret, me): (&FleetSecret, Option<&NodeIdentity>),
     (deadline, within): (Instant, Duration),
-    held: Option<&std::sync::Arc<HeldAddrs>>,
+    (held, mut first): (Option<&'a HeldAddrs>, Option<(SocketAddr, Opened<'a>)>),
 ) -> Result<Book, BookUnread> {
-    let mut reached = dial_avoiding(
-        &issuer.host,
-        issuer.addr,
-        issuer.port,
-        (secret, me),
-        FleetOp::Book,
+    // Open until the book's stream is gone, which is dropped first.
+    let mut holding = None;
+    let mut reached = walk(
+        (&issuer.host, issuer.addr, issuer.port),
         (deadline, within),
-        (&[], resolve, held),
+        (&[], resolve),
+        |to| {
+            let mine = match first.take() {
+                Some((at, opened)) if at == to => Some(opened),
+                _ => held.and_then(|held| held.enter(to).ok()),
+            };
+            let reached = reach(to, (secret, me), FleetOp::Book, (deadline, within));
+            if let Some(mut mine) = mine {
+                match &reached {
+                    AtAddr::Reached(_) => holding = Some(mine),
+                    AtAddr::Passed(why @ Unreached::Connect(..)) => mine.close(Exchanged::Failed {
+                        passed: true,
+                        why: why.copied(),
+                    }),
+                    AtAddr::Passed(_) | AtAddr::Ended(_) => mine.close(Exchanged::Unasked),
+                }
+            }
+            reached
+        },
     )
     .map_err(|unreached| match unreached {
         Unreached::Handshake(at, FleetError::UnknownOp(_)) => BookUnread::Older(at),
@@ -1935,6 +2055,8 @@ fn copy_of(entry: &Peer, issuer_at: IpAddr) -> Peer {
     let mut copy = Peer {
         via: Via::IssuerBook,
         key_from: None,
+        // Marks are what this machine's own joins recorded, never a copy's.
+        fleet: None,
         ..entry.clone()
     };
     if issuer_at.is_loopback() {
@@ -2015,57 +2137,241 @@ pub struct Reached {
     pub addr: SocketAddr,
     /// The node it proved it holds the key of, when it proved one: which node that makes it is the book's to say ([`Keyring::proven`]).
     pub peer: Option<NodeProof>,
-    _hold: Option<AddrHold>,
 }
 
+/// ONE EXCHANGE AT AN ADDRESS in one read ([`read_whole`], [`survey_all`]): a listener serves one address [`crate::fleet::per_source`] proved connections at once, sized for one per reader, so the read's first dial to an address makes the one connection there and every other dial reaching it while it is open reads that exchange as its own, judging the node proved there by its own target and keys.
 #[derive(Default)]
 struct HeldAddrs {
-    held: std::sync::Mutex<Vec<SocketAddr>>,
-    freed: std::sync::Condvar,
+    open: std::sync::Mutex<Vec<(SocketAddr, std::sync::Arc<Exchange>)>>,
+}
+
+/// One exchange of a read at an address ([`HeldAddrs`]): how far it has come, and its readers' wake.
+#[derive(Default)]
+struct Exchange {
+    now: std::sync::Mutex<Exchanged>,
+    changed: std::sync::Condvar,
+}
+
+/// How far an [`Exchange`] has come.
+#[derive(Default)]
+enum Exchanged {
+    /// Its dial is connecting there, or proving.
+    #[default]
+    Dialing,
+    /// Failed before any proof: passed over (`passed`, the next address tried) or the dial's end.
+    Failed { passed: bool, why: Unreached },
+    /// Reached and proved: the level it serves, and the node it proved.
+    Proved(FleetScope, Option<NodeProof>),
+    /// Its request's answer, beside what it proved.
+    Answered(FleetScope, Option<NodeProof>, Result<Vec<String>, Asked>),
+    /// Its dial took the node proved there for another than its target's, and asked nothing.
+    Unasked,
+}
+
+/// What one address of a read's dial came to ([`HeldAddrs::ask`]): what it proved, the dial's judgement of that node ([`answered_as`]) and the request's answer.
+struct Answer {
+    scope: FleetScope,
+    addr: SocketAddr,
+    peer: Option<NodeProof>,
+    answered: Option<(String, bool)>,
+    lines: Result<Vec<String>, Asked>,
+}
+
+/// What a dial that reads another's [`Exchange`] has seen of it.
+enum Seen {
+    /// It failed there before any proof, for this reason ([`Exchanged::Failed`]).
+    Failed(bool, Unreached),
+    /// It proved this level and node there.
+    Proved(FleetScope, Option<NodeProof>),
+    /// It is closed, nothing asked: this dial makes its own.
+    Gone,
 }
 
 impl HeldAddrs {
-    fn take(self: &std::sync::Arc<Self>, at: SocketAddr, by: Instant) -> Option<AddrHold> {
-        let mut held = self
-            .held
+    /// This dial's own exchange at `to`, else the one another dial of the read has open there.
+    fn enter(&self, to: SocketAddr) -> Result<Opened<'_>, std::sync::Arc<Exchange>> {
+        let mut open = self
+            .open
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while held.contains(&at) {
+        if let Some((_, theirs)) = open.iter().find(|(at, _)| *at == to) {
+            return Err(std::sync::Arc::clone(theirs));
+        }
+        let mine = std::sync::Arc::new(Exchange::default());
+        open.push((to, std::sync::Arc::clone(&mine)));
+        Ok(Opened {
+            of: self,
+            exchange: mine,
+            closed: false,
+        })
+    }
+
+    /// `to`'s answer for one dial of the read by `deadline`: this dial's own exchange there (`dial`, `judge`, then `ask`) when none is open, else the open one read as its own, its node judged by this dial's `judge`.
+    fn ask(
+        &self,
+        to: SocketAddr,
+        (deadline, within): (Instant, Duration),
+        dial: impl Fn() -> AtAddr<Reached>,
+        judge: impl Fn(Option<&NodeProof>) -> Result<Option<(String, bool)>, Unreached>,
+        ask: impl Fn(&mut TlsTransport<ClientConnection>) -> Result<Vec<String>, Asked>,
+    ) -> AtAddr<Answer> {
+        loop {
+            let theirs = match self.enter(to) {
+                Ok(opened) => return opened.ask(to, dial(), &judge, &ask),
+                Err(theirs) => theirs,
+            };
+            let seen = theirs.read(deadline, |now| match now {
+                Exchanged::Dialing => None,
+                Exchanged::Failed { passed, why } => Some(Seen::Failed(*passed, why.copied())),
+                Exchanged::Proved(scope, peer) | Exchanged::Answered(scope, peer, _) => {
+                    Some(Seen::Proved(*scope, peer.clone()))
+                }
+                Exchanged::Unasked => Some(Seen::Gone),
+            });
+            let (scope, peer) = match seen {
+                None => return AtAddr::Ended(Unreached::Deadline(Stage::Connect, within)),
+                Some(Seen::Gone) => continue,
+                // Its deadline came there, and this dial's has not.
+                Some(Seen::Failed(_, Unreached::Deadline(..))) if Instant::now() < deadline => {
+                    continue;
+                }
+                Some(Seen::Failed(true, why)) => return AtAddr::Passed(why),
+                Some(Seen::Failed(false, why)) => return AtAddr::Ended(why),
+                Some(Seen::Proved(scope, peer)) => (scope, peer),
+            };
+            let answered = match judge(peer.as_ref()) {
+                Ok(answered) => answered,
+                Err(why) => return AtAddr::Ended(why),
+            };
+            let lines = theirs.read(deadline, |now| match now {
+                Exchanged::Answered(_, _, lines) => Some(Some(lines.clone())),
+                Exchanged::Unasked => Some(None),
+                _ => None,
+            });
+            let lines = match lines {
+                None => Err(Asked::Deadline),
+                // It asked nothing, or its deadline cut the answer short and this dial's has not.
+                Some(None) => continue,
+                Some(Some(Err(Asked::Deadline))) if Instant::now() < deadline => continue,
+                Some(Some(lines)) => lines,
+            };
+            return AtAddr::Reached(Answer {
+                scope,
+                addr: to,
+                peer,
+                answered,
+                lines,
+            });
+        }
+    }
+}
+
+impl Exchange {
+    /// What `seen` makes of this exchange once it says something, or `None` when `by` comes first.
+    fn read<T>(&self, by: Instant, seen: impl Fn(&Exchanged) -> Option<T>) -> Option<T> {
+        let mut now = self
+            .now
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if let Some(seen) = seen(&now) {
+                return Some(seen);
+            }
             let left = by.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return None;
             }
-            held = self
-                .freed
-                .wait_timeout(held, left)
+            now = self
+                .changed
+                .wait_timeout(now, left)
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .0;
         }
-        held.push(at);
-        Some(AddrHold {
-            of: std::sync::Arc::clone(self),
-            at,
-        })
+    }
+
+    /// Tell every dial that reads it how far it has come.
+    fn tell(&self, now: Exchanged) {
+        *self
+            .now
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = now;
+        self.changed.notify_all();
     }
 }
 
-struct AddrHold {
-    of: std::sync::Arc<HeldAddrs>,
-    at: SocketAddr,
+/// A dial's own exchange at an address ([`HeldAddrs`]): closed once its stream is gone, as [`Exchanged::Unasked`] when it drops unclosed.
+struct Opened<'a> {
+    of: &'a HeldAddrs,
+    exchange: std::sync::Arc<Exchange>,
+    closed: bool,
 }
 
-impl Drop for AddrHold {
-    fn drop(&mut self) {
-        let mut held = self
-            .of
-            .held
+impl Opened<'_> {
+    /// The exchange at `to`: `reached`, its node judged by `judge`, and only then `ask`.
+    fn ask(
+        mut self,
+        to: SocketAddr,
+        reached: AtAddr<Reached>,
+        judge: impl Fn(Option<&NodeProof>) -> Result<Option<(String, bool)>, Unreached>,
+        ask: impl Fn(&mut TlsTransport<ClientConnection>) -> Result<Vec<String>, Asked>,
+    ) -> AtAddr<Answer> {
+        let mut reached = match reached {
+            AtAddr::Reached(reached) => reached,
+            AtAddr::Passed(why) => {
+                self.close(Exchanged::Failed {
+                    passed: true,
+                    why: why.copied(),
+                });
+                return AtAddr::Passed(why);
+            }
+            AtAddr::Ended(why) => {
+                self.close(Exchanged::Failed {
+                    passed: false,
+                    why: why.copied(),
+                });
+                return AtAddr::Ended(why);
+            }
+        };
+        let (scope, peer) = (reached.scope, reached.peer.clone());
+        self.exchange.tell(Exchanged::Proved(scope, peer.clone()));
+        let answered = match judge(peer.as_ref()) {
+            Ok(answered) => answered,
+            Err(why) => {
+                drop(reached);
+                self.close(Exchanged::Unasked);
+                return AtAddr::Ended(why);
+            }
+        };
+        let lines = ask(&mut reached.transport);
+        // The stream is gone before another dial of the read may open one.
+        drop(reached);
+        self.close(Exchanged::Answered(scope, peer.clone(), lines.clone()));
+        AtAddr::Reached(Answer {
+            scope,
+            addr: to,
+            peer,
+            answered,
+            lines,
+        })
+    }
+
+    /// Out of the read's open exchanges, then `now` told to its readers.
+    fn close(&mut self, now: Exchanged) {
+        self.closed = true;
+        self.of
+            .open
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(at) = held.iter().position(|held| *held == self.at) {
-            held.swap_remove(at);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(_, open)| !std::sync::Arc::ptr_eq(open, &self.exchange));
+        self.exchange.tell(now);
+    }
+}
+
+impl Drop for Opened<'_> {
+    fn drop(&mut self) {
+        if !self.closed {
+            self.close(Exchanged::Unasked);
         }
-        drop(held);
-        self.of.freed.notify_all();
     }
 }
 
@@ -2145,6 +2451,47 @@ pub enum Stage {
 }
 
 impl Unreached {
+    /// The same failure again, for each dial of a read that meets the one exchange at an address ([`HeldAddrs`]).
+    fn copied(&self) -> Self {
+        match self {
+            Self::Resolve(host) => Self::Resolve(host.clone()),
+            Self::Connect(at, e) => Self::Connect(*at, crate::fleet::copied_io(e)),
+            Self::Handshake(at, e) => Self::Handshake(*at, e.copied()),
+            Self::Deadline(stage, within) => Self::Deadline(*stage, *within),
+            Self::Lookup(host, within) => Self::Lookup(host.clone(), *within),
+            Self::Reply(at, why) => Self::Reply(*at, why.clone()),
+            Self::NotFleet(at) => Self::NotFleet(*at),
+            Self::OtherNode { at, said, want } => Self::OtherNode {
+                at: *at,
+                said: said.clone(),
+                want: want.clone(),
+            },
+            Self::Impostor { at, node, issuer } => Self::Impostor {
+                at: *at,
+                node: node.clone(),
+                issuer: *issuer,
+            },
+            Self::Misnamed {
+                at,
+                proved,
+                claimed,
+            } => Self::Misnamed {
+                at: *at,
+                proved: proved.clone(),
+                claimed: claimed.clone(),
+            },
+            Self::Unproved { at, node } => Self::Unproved {
+                at: *at,
+                node: node.clone(),
+            },
+            Self::Unbound { at, node } => Self::Unbound {
+                at: *at,
+                node: node.clone(),
+            },
+            Self::Local(why) => Self::Local(why.clone()),
+        }
+    }
+
     /// Whether it came before the peer proved itself — no name, no address, no connection, no handshake — so a second dial of that peer in the same deadline would fail the same way.
     #[must_use]
     pub const fn before_proof(&self) -> bool {
@@ -2395,7 +2742,7 @@ pub fn dial(
         (secret, me),
         op,
         (Instant::now() + within, within),
-        (&[], resolve, None),
+        (&[], resolve),
     )
 }
 
@@ -2408,60 +2755,54 @@ fn dial_avoiding(
     (secret, me): (&FleetSecret, Option<&NodeIdentity>),
     op: FleetOp,
     (deadline, within): (Instant, Duration),
-    (avoid, resolver, held): (&[SocketAddr], Resolver, Option<&std::sync::Arc<HeldAddrs>>),
+    (avoid, resolver): (&[SocketAddr], Resolver),
 ) -> Result<Reached, Unreached> {
+    walk(
+        (host, addr, port),
+        (deadline, within),
+        (avoid, resolver),
+        |to| reach(to, (secret, me), op, (deadline, within)),
+    )
+}
+
+/// What one address of a dial came to ([`walk`]).
+enum AtAddr<R> {
+    /// It answered: what the dial asks of an address.
+    Reached(R),
+    /// It was passed over, for this reason: the next address is tried.
+    Passed(Unreached),
+    /// The dial ends here, for this reason.
+    Ended(Unreached),
+}
+
+/// The addresses of a dial to `host` (at `addr` first) on `port` by `deadline`, never one in `avoid`: `attempt` of each in turn until one is reached or ends the dial, the first failure the reason when none answers.
+fn walk<R>(
+    (host, addr, port): (&str, Option<IpAddr>, u16),
+    (deadline, within): (Instant, Duration),
+    (avoid, resolver): (&[SocketAddr], Resolver),
+    mut attempt: impl FnMut(SocketAddr) -> AtAddr<R>,
+) -> Result<R, Unreached> {
     let mut tried: Vec<SocketAddr> = avoid.to_vec();
     let mut first = None;
-    let attempt = |to: SocketAddr, first: &mut Option<Unreached>| {
+    let mut at = |to: SocketAddr, first: &mut Option<Unreached>| {
         if !crate::fleet::is_fleet_source(to.ip()) {
             first.get_or_insert(Unreached::NotFleet(to));
             return None;
         }
-        let hold = match held.map(|held| held.take(to, deadline)) {
-            Some(None) => return Some(Err(Unreached::Deadline(Stage::Connect, within))),
-            Some(hold) => hold,
-            None => None,
-        };
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Some(Err(Unreached::Deadline(Stage::Connect, within)));
-        }
-        match TcpStream::connect_timeout(&to, left.min(CONNECT_WITHIN)) {
-            Ok(tcp) => {
-                let left = deadline.saturating_duration_since(Instant::now());
-                match client_handshake_as(tcp, secret, me, op, left) {
-                    Ok(Dialed {
-                        transport,
-                        scope,
-                        peer,
-                    }) => Some(Ok(Reached {
-                        transport,
-                        scope,
-                        addr: to,
-                        peer,
-                        _hold: hold,
-                    })),
-                    Err(FleetError::Timeout(_)) => {
-                        Some(Err(Unreached::Deadline(Stage::Handshake, within)))
-                    }
-                    Err(e @ FleetError::UnknownOp(_)) => Some(Err(Unreached::Handshake(to, e))),
-                    Err(e) => {
-                        first.get_or_insert(Unreached::Handshake(to, e));
-                        None
-                    }
-                }
-            }
-            Err(e) => {
-                first.get_or_insert(Unreached::Connect(to, e));
+        match attempt(to) {
+            AtAddr::Reached(reached) => Some(Ok(reached)),
+            AtAddr::Passed(why) => {
+                first.get_or_insert(why);
                 None
             }
+            AtAddr::Ended(why) => Some(Err(why)),
         }
     };
     if let Some(ip) = addr {
         let to = SocketAddr::new(ip, port);
         if !tried.contains(&to) {
             tried.push(to);
-            if let Some(done) = attempt(to, &mut first) {
+            if let Some(done) = at(to, &mut first) {
                 return done;
             }
         }
@@ -2483,11 +2824,47 @@ fn dial_avoiding(
             continue;
         }
         tried.push(to);
-        if let Some(done) = attempt(to, &mut first) {
+        if let Some(done) = at(to, &mut first) {
             return done;
         }
     }
     Err(first.unwrap_or_else(|| Unreached::Resolve(host.to_owned())))
+}
+
+/// One address of a dial: a connect to `to`, then the proof of `op` there, by `deadline`.
+fn reach(
+    to: SocketAddr,
+    (secret, me): (&FleetSecret, Option<&NodeIdentity>),
+    op: FleetOp,
+    (deadline, within): (Instant, Duration),
+) -> AtAddr<Reached> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return AtAddr::Ended(Unreached::Deadline(Stage::Connect, within));
+    }
+    match TcpStream::connect_timeout(&to, left.min(CONNECT_WITHIN)) {
+        Ok(tcp) => {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match client_handshake_as(tcp, secret, me, op, left) {
+                Ok(Dialed {
+                    transport,
+                    scope,
+                    peer,
+                }) => AtAddr::Reached(Reached {
+                    transport,
+                    scope,
+                    addr: to,
+                    peer,
+                }),
+                Err(FleetError::Timeout(_)) => {
+                    AtAddr::Ended(Unreached::Deadline(Stage::Handshake, within))
+                }
+                Err(e @ FleetError::UnknownOp(_)) => AtAddr::Ended(Unreached::Handshake(to, e)),
+                Err(e) => AtAddr::Passed(Unreached::Handshake(to, e)),
+            }
+        }
+        Err(e) => AtAddr::Passed(Unreached::Connect(to, e)),
+    }
 }
 
 enum Lookup {
@@ -2683,7 +3060,7 @@ impl Surveyed {
     }
 }
 
-/// THE FLEET READ (`aterm ctl survey --fleet`, design §3): every target asked `survey` at once — at most [`AT_ONCE`] at a time — each under ONE wall-clock deadline `within` that covers the name lookup, the connects, TLS, both proofs, the request and the whole reply ([`dial`], then the exchange); a reply past [`REPLY_MAX`] bytes is refused.
+/// THE FLEET READ (`aterm ctl survey --fleet`, design §3): every target asked `survey` at once — at most [`AT_ONCE`] at a time — each under ONE wall-clock deadline `within` that covers the name lookup, the connects, TLS, both proofs, the request and the whole reply ([`dial`], then the exchange); a reply past [`REPLY_MAX`] bytes is refused. Targets that reach one address read the one exchange there ([`HeldAddrs`]).
 #[must_use]
 pub fn survey_all(
     targets: &[Target],
@@ -2741,7 +3118,7 @@ pub enum BookRead {
     Unread(String),
 }
 
-/// THE MEMBER'S WHOLE READ (`aterm ctl survey --fleet`, `aterm fleet peers`): `request` (`survey`, or `survey facts` for a check) of every one of `peers` — this machine's book, the peers aterm.toml names beside it, then its copy of its issuer's book ([`with_copies`]) — and of every member its issuer's book adds, the first [`AT_ONCE`] dials under the ONE deadline `within` from now.
+/// THE MEMBER'S WHOLE READ (`aterm ctl survey --fleet`, `aterm fleet peers`): `request` (`survey`, or `survey facts` for a check) of every one of `peers` — this machine's book, the peers aterm.toml names beside it, then its copy of its issuer's book ([`with_copies`]) — and of every member its issuer's book adds, the first [`AT_ONCE`] dials under the ONE deadline `within` from now. The book's exchange at the issuer's recorded address opens before any other dial ([`fetch_book_in`]), and a refusal the copy's keys made of a node the book's keys judge otherwise is read again under the book's.
 #[must_use]
 pub fn read_whole(
     peers: &[Peer],
@@ -2769,14 +3146,13 @@ pub fn read_whole(
     let given = peers.len();
     let addrs = std::sync::Arc::new(HeldAddrs::default());
     let held = &addrs;
-    let queue = std::sync::Mutex::new(Queue {
-        peers: peers.to_vec(),
-        next: 0,
-        skip: vec![issuer_at],
-        live: 1,
-        started: 1,
-        keys: std::sync::Arc::new(keys.clone()),
-    });
+    let issuer = target_of(&peers[issuer_at]);
+    // The book's exchange at the issuer's recorded address, open before any other dial begins.
+    let first = issuer
+        .addr
+        .map(|ip| SocketAddr::new(ip, issuer.port))
+        .and_then(|to| Some((to, held.enter(to).ok()?)));
+    let queue = std::sync::Mutex::new(Queue::seated(peers.to_vec(), issuer_at, keys.clone()));
     let lock = || {
         queue
             .lock()
@@ -2787,27 +3163,22 @@ pub fn read_whole(
         loop {
             let next = {
                 let mut queued = lock();
-                let next = queued.take();
+                let next = queued.take(deadline);
                 if next.is_none() {
                     queued.live = queued.live.saturating_sub(1);
                 }
                 next.map(|next| (next, std::sync::Arc::clone(&queued.keys)))
             };
-            let Some(((at, target, waited), keys)) = next else {
+            let Some(((at, target, by, read), keys)) = next else {
                 return done;
             };
-            let by = if waited {
-                (Instant::now() + within, within)
-            } else {
-                deadline
-            };
-            done.push((
-                at,
-                read_one_by(&target, &keys, (secret, me), by, request, held),
-            ));
+            let answer = read_one_by(&target, &keys, (secret, me), by, request, held);
+            if let Some(node) = refused_for(&answer) {
+                lock().refused(at, node, &keys, by);
+            }
+            done.push((at, read, answer));
         }
     };
-    let issuer = target_of(&peers[issuer_at]);
     let (reads, book, dropped) = std::thread::scope(|scope| {
         let helper = move || {
             let spawned = std::thread::Builder::new()
@@ -2840,7 +3211,12 @@ pub fn read_whole(
                 };
                 let mut helpers = Vec::new();
                 let mut dropped = Vec::new();
-                let fetched = fetch_book_in(&issuer, (secret, me), deadline, Some(held));
+                let fetched = fetch_book_in(
+                    &issuer,
+                    (secret, me),
+                    deadline,
+                    (Some(held.as_ref()), first),
+                );
                 if let Ok(book) = &fetched {
                     (dropped, helpers) = take(book);
                 }
@@ -2883,8 +3259,12 @@ pub fn read_whole(
                                         node: issuer.node.clone(),
                                         key: issuer.key,
                                     };
-                                    fetched =
-                                        fetch_book_in(&there, (secret, me), deadline, Some(held));
+                                    fetched = fetch_book_in(
+                                        &there,
+                                        (secret, me),
+                                        deadline,
+                                        (Some(held.as_ref()), None),
+                                    );
                                     if let Ok(book) = &fetched {
                                         let (gone, started) = take(book);
                                         dropped = gone;
@@ -2903,7 +3283,7 @@ pub fn read_whole(
                 let more = lock().hands();
                 helpers.extend((0..more).filter_map(|_| helper()));
                 let mut done = work();
-                done.push((issuer_at, issuer_read));
+                done.push((issuer_at, 0, issuer_read));
                 for helper in helpers {
                     match helper.join() {
                         Ok(theirs) => done.extend(theirs),
@@ -2929,7 +3309,7 @@ pub fn read_whole(
             },
             Err(e) => {
                 let why = format!("could not start the issuer's read: {e}");
-                done.push((issuer_at, Err(Unreached::Local(why.clone()))));
+                done.push((issuer_at, 0, Err(Unreached::Local(why.clone()))));
                 (BookRead::Unread(why), Vec::new())
             }
         };
@@ -2938,14 +3318,22 @@ pub fn read_whole(
     let queued = queue
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut slots: Vec<Option<Result<Surveyed, Unreached>>> = std::iter::repeat_with(|| None)
-        .take(queued.peers.len())
-        .collect();
-    for (at, read) in reads {
-        if let Some(slot) = slots.get_mut(at) {
-            *slot = Some(read);
+    // Each place's latest read: one read again holds what it found.
+    let mut latest: Vec<Option<(usize, Result<Surveyed, Unreached>)>> =
+        std::iter::repeat_with(|| None)
+            .take(queued.peers.len())
+            .collect();
+    for (at, read, answer) in reads {
+        if let Some(slot) = latest.get_mut(at)
+            && slot.as_ref().is_none_or(|(had, _)| *had < read)
+        {
+            *slot = Some((read, answer));
         }
     }
+    let mut slots: Vec<Option<Result<Surveyed, Unreached>>> = latest
+        .into_iter()
+        .map(|slot| slot.map(|(_, answer)| answer))
+        .collect();
     for (peer, slot) in queued.peers.iter().zip(&mut slots) {
         *slot = slot.take().map(|read| {
             read.and_then(|surveyed| judged_again(&target_of(peer), &queued.keys, me, surveyed))
@@ -3063,33 +3451,119 @@ struct Queue {
     live: usize,
     started: usize,
     keys: std::sync::Arc<Keyring>,
+    refused: Vec<Refused>,
+    again: Vec<(usize, (Instant, Duration))>,
+    reads: usize,
+}
+
+/// A read its keys refused ([`refused_for`]), read again once the read's keys judge that node otherwise.
+struct Refused {
+    at: usize,
+    node: String,
+    keys: std::sync::Arc<Keyring>,
+    by: (Instant, Duration),
 }
 
 impl Queue {
-    fn take(&mut self) -> Option<(usize, Target, bool)> {
-        while self.next < self.peers.len() {
-            let at = self.next;
-            self.next += 1;
-            if !self.skip.contains(&at) {
-                self.started += 1;
-                return Some((at, target_of(&self.peers[at]), self.started > AT_ONCE));
-            }
+    /// `peers` to read by `keys`, the issuer's seat at `issuer_at` reading from the start.
+    fn seated(peers: Vec<Peer>, issuer_at: usize, keys: Keyring) -> Self {
+        Self {
+            peers,
+            next: 0,
+            skip: vec![issuer_at],
+            live: 1,
+            started: 1,
+            keys: std::sync::Arc::new(keys),
+            refused: Vec::new(),
+            again: Vec::new(),
+            reads: 0,
         }
-        None
+    }
+
+    /// The next peer to read, its deadline and the read's number: a place to read again first, by its first read's deadline; then the next queued, by `deadline`, or past the first [`AT_ONCE`] dials by one of its own from now.
+    fn take(
+        &mut self,
+        deadline: (Instant, Duration),
+    ) -> Option<(usize, Target, (Instant, Duration), usize)> {
+        let (at, by) = match self.again.pop() {
+            Some(again) => again,
+            None => loop {
+                let at = self.next;
+                if at >= self.peers.len() {
+                    return None;
+                }
+                self.next += 1;
+                if !self.skip.contains(&at) {
+                    self.started += 1;
+                    let by = if self.started > AT_ONCE {
+                        (Instant::now() + deadline.1, deadline.1)
+                    } else {
+                        deadline
+                    };
+                    break (at, by);
+                }
+            },
+        };
+        self.reads += 1;
+        Some((at, target_of(&self.peers[at]), by, self.reads))
     }
 
     fn hands(&mut self) -> usize {
-        let left = (self.next..self.peers.len())
-            .filter(|at| !self.skip.contains(at))
-            .count();
+        let left = self.again.len()
+            + (self.next..self.peers.len())
+                .filter(|at| !self.skip.contains(at))
+                .count();
         let more = left.min(AT_ONCE.saturating_sub(self.live));
         self.live += more;
         more
+    }
+
+    /// A read of `at` that `keys` refused for `node`: read again at once when the read's keys judge that node otherwise, else kept for a book's keys ([`queue_book`]).
+    fn refused(
+        &mut self,
+        at: usize,
+        node: &str,
+        keys: &std::sync::Arc<Keyring>,
+        by: (Instant, Duration),
+    ) {
+        if self.skip.contains(&at) {
+            return;
+        }
+        if keys.bound(node) != self.keys.bound(node) {
+            self.again_by(at, by);
+        } else {
+            self.refused.push(Refused {
+                at,
+                node: node.to_owned(),
+                keys: std::sync::Arc::clone(keys),
+                by,
+            });
+        }
+    }
+
+    /// The place `at` read again by `by`, while that leaves it time.
+    fn again_by(&mut self, at: usize, by: (Instant, Duration)) {
+        if Instant::now() < by.0 {
+            self.again.push((at, by));
+        }
+    }
+}
+
+/// The node a read's keys refused it for ([`Unreached::Impostor`], [`Unreached::Unproved`]), which a book's keys may judge otherwise.
+fn refused_for(answer: &Result<Surveyed, Unreached>) -> Option<&str> {
+    match answer {
+        Err(Unreached::Impostor { node, .. } | Unreached::Unproved { node, .. }) => Some(node),
+        _ => None,
     }
 }
 
 fn queue_book(queued: &mut Queue, given: usize, book: &Book, own: Option<&str>) -> Vec<usize> {
     queued.keys = std::sync::Arc::new(queued.keys.with_book(book, own));
+    // Each refusal these keys judge otherwise is read again under them.
+    let (again, still): (Vec<Refused>, Vec<Refused>) = std::mem::take(&mut queued.refused)
+        .into_iter()
+        .partition(|refused| refused.keys.bound(&refused.node) != queued.keys.bound(&refused.node));
+    queued.refused = still;
     let mut merged = queued.peers[..given].to_vec();
     merge_book(&mut merged, book, own);
     let fresh: Vec<Peer> = merged
@@ -3105,6 +3579,11 @@ fn queue_book(queued: &mut Queue, given: usize, book: &Book, own: Option<&str>) 
         })
         .collect();
     queued.skip.extend(&dropped);
+    for refused in again {
+        if !queued.skip.contains(&refused.at) {
+            queued.again_by(refused.at, refused.by);
+        }
+    }
     for copy in fresh {
         let known = queued
             .peers
@@ -3159,7 +3638,7 @@ fn read_one_by(
         (secret, me),
         deadline,
         request,
-        (&[], Some(held)),
+        (&[], held),
     ) {
         Ok(first) => {
             let (Some(want), Some(got)) = (target.node.as_deref(), first.node.as_deref()) else {
@@ -3190,7 +3669,7 @@ fn read_one_by(
         (secret, me),
         deadline,
         request,
-        (&[at], Some(held)),
+        (&[at], held),
     ) {
         Ok(again)
             if again
@@ -3272,7 +3751,7 @@ fn drive_at(
         (secret, Some(me)),
         FleetOp::Drive,
         (deadline, within),
-        (avoid, resolve, None),
+        (avoid, resolve),
     )?;
     let at = reached.addr;
     let node = match answered_as(target, keys, at, reached.peer.as_ref())? {
@@ -3311,37 +3790,43 @@ fn ask_at(
     (secret, me): (&FleetSecret, Option<&NodeIdentity>),
     (deadline, within): (Instant, Duration),
     request: &str,
-    (avoid, held): (&[SocketAddr], Option<&std::sync::Arc<HeldAddrs>>),
+    (avoid, held): (&[SocketAddr], &HeldAddrs),
 ) -> Result<Surveyed, Unreached> {
-    let mut reached = dial_avoiding(
-        &target.host,
+    let Answer {
+        scope,
         addr,
-        target.port,
-        (secret, me),
-        FleetOp::Survey,
-        (deadline, within),
-        (avoid, resolve, held),
-    )?;
-    let addr = reached.addr;
-    let answered = answered_as(target, keys, addr, reached.peer.as_ref())?;
-    let (_, lines) = ask_lines(&mut reached.transport, Some(request), deadline, reply_head)
-        .map_err(|why| match why {
-            Asked::Deadline => Unreached::Deadline(Stage::Answer, within),
-            Asked::Failed(why) => Unreached::Reply(addr, why),
-            Asked::Local(why) => Unreached::Local(why),
-        })?;
-    let (node, proven) = reply_node(
+        peer,
         answered,
-        (&lines, addr),
-        keys,
-        proves_me(me, reached.peer.as_ref()),
+        lines,
+    } = walk(
+        (&target.host, addr, target.port),
+        (deadline, within),
+        (avoid, resolve),
+        |to| {
+            held.ask(
+                to,
+                (deadline, within),
+                || reach(to, (secret, me), FleetOp::Survey, (deadline, within)),
+                |peer| answered_as(target, keys, to, peer),
+                |transport| {
+                    ask_lines(transport, Some(request), deadline, reply_head)
+                        .map(|(_, lines)| lines)
+                },
+            )
+        },
     )?;
+    let lines = lines.map_err(|why| match why {
+        Asked::Deadline => Unreached::Deadline(Stage::Answer, within),
+        Asked::Failed(why) => Unreached::Reply(addr, why),
+        Asked::Local(why) => Unreached::Local(why),
+    })?;
+    let (node, proven) = reply_node(answered, (&lines, addr), keys, proves_me(me, peer.as_ref()))?;
     Ok(Surveyed {
-        scope: reached.scope,
+        scope,
         addr,
         node,
         proven,
-        key: reached.peer.map(|proof| proof.key),
+        key: peer.map(|proof| proof.key),
         lines,
     })
 }
@@ -3455,6 +3940,7 @@ fn header_nodes(lines: &[String]) -> impl Iterator<Item = String> + '_ {
         .filter(|value| !value.is_empty() && value != "-")
 }
 
+#[derive(Clone)]
 enum Asked {
     Deadline,
     Failed(String),

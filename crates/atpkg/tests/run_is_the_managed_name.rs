@@ -13,7 +13,6 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
-/// The managed build: a legacy index build, as the machine the audit measured had.
 const BUILD: u64 = 2_026_092_201;
 
 struct Fixture {
@@ -46,8 +45,6 @@ impl Fixture {
         self.layout.build_dir("claude", BUILD)
     }
 
-    /// The store `claude`, its `bin/claude` shim laid by the activation code exporting
-    /// `env` (empty ⇒ PLAIN), and the build marked ready.
     fn install_claude(&self, env: &[&str]) {
         let dir = self.build_dir();
         std::fs::create_dir_all(dir.join("bin")).unwrap();
@@ -76,8 +73,6 @@ impl Fixture {
         atpkg::store::mark_build_ready(&dir).unwrap();
     }
 
-    /// What the build DECLARES: its `store/claude/<build>.shim-env` sidecar, one
-    /// `NAME=VALUE` per line — the file the install lanes write from the signed policy.
     fn declare(&self, entry: &str) {
         let mut name = self
             .build_dir()
@@ -94,8 +89,6 @@ impl Fixture {
             .shim(&atpkg::store::ToolName::new("claude").unwrap())
     }
 
-    /// `program args…` confined to this fixture, the variable under test absent from the
-    /// caller's environment.
     fn run(&self, program: &std::path::Path, args: &[&str]) -> Output {
         Command::new(program)
             .args(args)
@@ -114,7 +107,6 @@ impl Fixture {
             .expect("run")
     }
 
-    /// `atpkg run claude -- args…`, the argv `aterm claude args…` synthesizes.
     fn atpkg_run(&self, args: &[&str]) -> Output {
         let mut argv = vec!["run", "claude", "--"];
         argv.extend_from_slice(args);
@@ -131,7 +123,6 @@ fn describe(out: &Output) -> String {
     )
 }
 
-/// The fake's one line, or a panic naming everything the run printed.
 fn fake_line(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout)
         .lines()
@@ -140,9 +131,6 @@ fn fake_line(out: &Output) -> String {
         .to_string()
 }
 
-/// A DRIFTED machine: an older `repair` laid `bin/claude` plain over a build
-/// that declares `DISABLE_AUTOUPDATER=1` — the shim itself runs without it (the control)
-/// — and `atpkg run claude` still exports what the build declares.
 #[test]
 fn run_exports_what_the_build_declares_over_a_shim_laid_plain() {
     let fx = Fixture::new("drifted");
@@ -178,10 +166,6 @@ fn run_exports_what_the_build_declares_over_a_shim_laid_plain() {
     }
 }
 
-/// THE TWIN'S SELF-UPDATE BLOCK: `aterm claude install stable` is answered by the
-/// package manager — declined, exit 2, the exact line the twin's hand-over prints, the
-/// vendor's installer never run — and only on the FIRST token: `claude -p update` is a
-/// prompt and reaches the tool, with its environment.
 #[test]
 fn run_answers_a_self_update_verb_the_way_the_twin_does() {
     let fx = Fixture::new("selfupdate");
@@ -215,11 +199,6 @@ fn run_answers_a_self_update_verb_the_way_the_twin_does() {
     assert_eq!(fake_line(&out), "fake: [1] -p update", "{}", describe(&out));
 }
 
-/// HELP ON A SELF-UPDATE VERB is the one ending of the plan that runs the tool, and it
-/// runs it as every other `aterm claude` is run: the one note, then the vendor's own
-/// `--help` from the store binary WITH the build's environment, never through
-/// `bin/claude` — which on a drifted machine (the shim laid plain, the control) runs it
-/// with Claude Code's own updater on.
 #[test]
 fn run_answers_self_update_help_with_the_builds_environment() {
     let fx = Fixture::new("selfupdate-help");

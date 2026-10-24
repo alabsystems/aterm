@@ -107,6 +107,7 @@ impl JobsPass {
     pub(crate) fn tick(
         &mut self,
         at_ms: u64,
+        read_ms: impl FnOnce() -> u64,
         sweep: Option<&[ProcessReading]>,
         tabs: &[TabRoot],
         ttys: &[(u64, TtyMode)],
@@ -142,6 +143,7 @@ impl JobsPass {
             .iter()
             .map(|p| job_proc(p, stand_in))
             .collect();
+        let read_ms = read_ms();
         let mounts = OnceCell::new();
         let ours = OnceCell::new();
         let held = held_list(
@@ -165,6 +167,7 @@ impl JobsPass {
         let lanes = self.reader.lanes();
         let tick = JobTick {
             at_ms,
+            read_ms,
             self_uid,
             sweep,
             procs,
@@ -232,9 +235,28 @@ pub(crate) fn held_list(
 /// How old the board's view may be and still speak for the canary ([`JobsBoard::evidence`]).
 pub(crate) const JOBS_FRESH: Duration = Duration::from_secs(60);
 
-/// WHETHER A JOBS VIEW `age` OLD SPEAKS FOR NOW: one at most [`JOBS_FRESH`] old does; so does a PARKED one (its demand idle: every live job waits only for the person, or none is live) of any age while its reader runs (`reader`), because a parked engine is read again only on an edge (output that moves a screen, a parked screen's redraw at most once a floor, a session's fork, `exec` or exit the kernel watch hears, the disk watch's look; design §6.1), so no reading since says nothing changed that drew or that the kernel told of.
+/// WHETHER A JOBS VIEW `age` OLD SPEAKS FOR NOW: one at most [`JOBS_FRESH`] old does; so does a PARKED one (its demand idle: every live job waits only for the person, or none is live; and no program waits at macOS's program check, [`holds_a_wait`]) of any age while its reader runs (`reader`), because a parked engine is read again only on an edge (output that moves a screen, a parked screen's redraw at most once a floor, a session's fork, `exec` or exit the kernel watch hears, the disk watch's look; design §6.1), so no reading since says nothing changed that drew or that the kernel told of. A held program's start raises no such edge, and a view that holds a wait is read again on a timer instead, so past [`JOBS_FRESH`] its reader has stopped delivering.
 pub(crate) fn speaks_for_now(view: &JobsView, age: Duration, reader: bool) -> bool {
-    age <= JOBS_FRESH || (reader && view.demand == Demand::Idle)
+    age <= JOBS_FRESH || (reader && view.demand == Demand::Idle && !holds_a_wait(view))
+}
+
+/// Whether `view` names a program of this user that macOS's program check holds, or stands in a backed-up episode that has not had its closing reading (leftover §5.1): it is read again after 30 s at the latest, whatever its demand (`vitals_host::job_demand_after`).
+pub(crate) fn holds_a_wait(view: &JobsView) -> bool {
+    !view.findings.program_check.is_empty() || view.findings.program_check_episode.is_some()
+}
+
+/// `privacy`'s `program_check=` from `view`, `age` old: how many of this user's programs macOS's program check holds, a lower bound (`Findings::program_check`, aterm's and others'), and the longest held to now, ms (its first sighting's age plus the view's); `None` when the view does not speak for now ([`speaks_for_now`], its reader running `reader`).
+pub(crate) fn program_check_of(view: &JobsView, age: Duration, reader: bool) -> Option<(u32, u64)> {
+    if !speaks_for_now(view, age, reader) {
+        return None;
+    }
+    let held = &view.findings.program_check;
+    let oldest = held.iter().map(|n| n.for_ms).max().unwrap_or(0);
+    let age_ms = u64::try_from(age.as_millis()).unwrap_or(u64::MAX);
+    Some((
+        u32::try_from(held.len()).unwrap_or(u32::MAX),
+        oldest.saturating_add(age_ms),
+    ))
 }
 
 /// The view last posted, its tabs' session ids, and when it was first posted.
@@ -1331,6 +1353,7 @@ pub(crate) mod tests {
         let first = pass
             .tick(
                 10_000,
+                || 10_000,
                 Some(&sweep.procs),
                 &tabs,
                 &[],
@@ -1343,6 +1366,7 @@ pub(crate) mod tests {
         let again = pass
             .tick(
                 10_500,
+                || 10_500,
                 Some(&sweep.procs),
                 &tabs,
                 &[],
@@ -1357,7 +1381,7 @@ pub(crate) mod tests {
             "inside the cadence nothing is re-read"
         );
         assert!(
-            pass.tick(10_600, None, &tabs, &[], &[], me, false, true)
+            pass.tick(10_600, || 10_600, None, &tabs, &[], &[], me, false, true)
                 .is_some(),
             "a reading without a sweep keeps the last view"
         );
@@ -1384,6 +1408,7 @@ pub(crate) mod tests {
         let first = pass
             .tick(
                 10_000,
+                || 10_000,
                 Some(&sweep.procs),
                 &tabs,
                 &[],
@@ -1396,6 +1421,7 @@ pub(crate) mod tests {
         let paced = pass
             .tick(
                 11_900,
+                || 11_900,
                 Some(&sweep.procs),
                 &tabs,
                 &[],
@@ -1407,7 +1433,17 @@ pub(crate) mod tests {
             .expect("the last view");
         assert!(Arc::ptr_eq(&first, &paced), "paced: the engine waits");
         let edge = pass
-            .tick(11_900, Some(&sweep.procs), &tabs, &[], &[], me, false, true)
+            .tick(
+                11_900,
+                || 11_900,
+                Some(&sweep.procs),
+                &tabs,
+                &[],
+                &[],
+                me,
+                false,
+                true,
+            )
             .expect("a new view");
         assert!(!Arc::ptr_eq(&first, &edge), "an edge's reading looks");
     }
@@ -1531,7 +1567,17 @@ pub(crate) mod tests {
             stand_in: || Some(21),
         };
         let view = pass
-            .tick(10_000, Some(&sweep), &[], &[], &[], 10, false, true)
+            .tick(
+                10_000,
+                || 10_000,
+                Some(&sweep),
+                &[],
+                &[],
+                &[],
+                10,
+                false,
+                true,
+            )
             .expect("a view");
         let held: Vec<(u32, &str, Option<u64>)> = view
             .findings
@@ -1588,10 +1634,13 @@ pub(crate) mod tests {
         assert!(job_proc(&held, Some(30)).program_check, "the kernel's own");
     }
 
-    /// A view speaks for now for a minute; a PARKED one (demand idle) for as
-    /// long as its reader runs.
+    /// A view speaks for now for a minute; a PARKED one (demand idle, nothing waiting at
+    /// macOS's program check) for as long as its reader runs. One that names a held program or
+    /// stands in a backed-up episode is read again every 30 s whatever its demand, and a held
+    /// program's start raises no edge, so past the minute it does not speak.
     #[test]
     fn a_parked_view_speaks_for_now_while_its_reader_runs() {
+        use aterm_vitals::jobs::{Findings, HeldEpisode, Named};
         let parked = JobsView::default();
         assert_eq!(parked.demand, Demand::Idle);
         let watched = JobsView {
@@ -1603,6 +1652,70 @@ pub(crate) mod tests {
         assert!(speaks_for_now(&parked, late, true), "parked, read on edges");
         assert!(!speaks_for_now(&watched, late, true), "due long ago");
         assert!(!speaks_for_now(&parked, late, false), "no reader");
+        let held = JobsView {
+            findings: Findings {
+                program_check: vec![Named {
+                    pid: 25311,
+                    name: "gh".into(),
+                    tab: None,
+                    for_ms: 35_940_000,
+                }],
+                ..Findings::default()
+            },
+            ..JobsView::default()
+        };
+        let episode = JobsView {
+            findings: Findings {
+                program_check_episode: Some(HeldEpisode::default()),
+                ..Findings::default()
+            },
+            ..JobsView::default()
+        };
+        for view in [&held, &episode] {
+            assert_eq!(view.demand, Demand::Idle);
+            assert!(speaks_for_now(view, JOBS_FRESH, true), "{view:?}");
+            assert!(
+                !speaks_for_now(view, late, true),
+                "a held wait is read on a timer, not on edges: {view:?}"
+            );
+        }
+    }
+
+    /// PRIVACY'S COUNT: every held program of this user, aterm's and others', and the longest
+    /// held to now, its first sighting's age plus the view's; nothing from a view that does not
+    /// speak for now.
+    #[test]
+    fn privacys_count_is_every_held_program_and_the_longest_wait_to_now() {
+        use aterm_vitals::jobs::{Findings, Named};
+        let named = |pid, for_ms| Named {
+            pid,
+            name: "gh".into(),
+            tab: None,
+            for_ms,
+        };
+        let view = JobsView {
+            findings: Findings {
+                program_check: vec![named(25311, 35_940_000), named(25312, 20_000)],
+                program_check_aterm: (1, 20_000),
+                ..Findings::default()
+            },
+            ..JobsView::default()
+        };
+        assert_eq!(
+            program_check_of(&view, Duration::from_millis(1_500), false),
+            Some((2, 35_941_500)),
+            "both held, the oldest plus the view's age"
+        );
+        assert_eq!(
+            program_check_of(&JobsView::default(), Duration::ZERO, false),
+            Some((0, 0)),
+            "none held"
+        );
+        assert_eq!(
+            program_check_of(&view, JOBS_FRESH + Duration::from_secs(1), true),
+            None,
+            "a view that does not speak for now"
+        );
     }
 
     /// THE RE-PROOF READS THE ENGINE'S OWN BIRTH: this process, read by the jobs reader as the

@@ -828,6 +828,118 @@ pub struct Install<'a> {
     pub fleet_key: String,
 }
 
+/// The commands the root script reads this Mac's clocks with: the boot's id, the boot and
+/// the last wake (0 before any) in `sysctl`'s `{ sec = <unix>, usec = <n> } <date>` form,
+/// and the wall clock's Unix seconds.
+#[derive(Debug, Clone, Copy)]
+struct Clocks<'a> {
+    session: &'a str,
+    boot: &'a str,
+    wake: &'a str,
+    now: &'a str,
+}
+
+/// This Mac's [`Clocks`].
+const MAC_CLOCKS: Clocks<'static> = Clocks {
+    session: "/usr/sbin/sysctl -n kern.bootsessionuuid",
+    boot: "/usr/sbin/sysctl -n kern.boottime",
+    wake: "/usr/sbin/sysctl -n kern.waketime",
+    now: "/bin/date +%s",
+};
+
+/// Shell that sets `ok` to 1 when `$word` is a boot id (`kern.bootsessionuuid`'s form),
+/// and empties it when it is not.
+pub(crate) fn boot_id_check(word: &str) -> String {
+    let pattern = [8, 4, 4, 4, 12]
+        .map(|n| "[0123456789ABCDEFabcdef]".repeat(n))
+        .join("-");
+    format!("ok=; case {word} in {pattern}) ok=1;; esac\n")
+}
+
+/// Shell that empties `ok` unless each of `words` is a count of seconds.
+fn seconds_check(words: &str) -> String {
+    format!("for n in {words}; do case $n in ''|*[!0-9]*|?????????????*) ok=;; esac; done\n")
+}
+
+/// Shell that sets `sess` to this boot's id, `boot` and `woke` to the Unix seconds of the
+/// boot and of the last wake, and `up` to the wall clock less `boot`: the seconds since
+/// boot, asleep or awake, which no step of the wall clock moves, since XNU moves the boot
+/// time with each step. The boot time is read again after the wall clock, so a step between
+/// the two reads shows as a boot time that moved. A reading of another form, or a boot time
+/// that moved, ends the script.
+fn clock_reading(c: &Clocks<'_>) -> String {
+    let Clocks {
+        session,
+        boot,
+        wake,
+        now,
+    } = c;
+    format!(
+        "sess=$({session})\n\
+         boot=$({boot}); boot=${{boot#*sec = }}; boot=${{boot%%,*}}\n\
+         woke=$({wake}); woke=${{woke#*sec = }}; woke=${{woke%%,*}}\n\
+         now=$({now})\n\
+         again=$({boot}); again=${{again#*sec = }}; again=${{again%%,*}}\n\
+         {}{}\
+         [ \"$again\" = \"$boot\" ] || ok=\n\
+         if [ -z \"$ok\" ]; then echo \"aterm machines: this Mac's boot id and clocks read \
+         '$sess' '$boot' '$woke' '$now' '$again'; nothing was installed\" >&2; exit 1; fi\n\
+         up=$((now - boot))\n",
+        boot_id_check("$sess"),
+        seconds_check("\"$boot\" \"$woke\" \"$now\""),
+    )
+}
+
+/// Shell that writes [`clock_reading`]'s readings to `staging`'s `exec` stamp.
+fn stamp_line(staging: &str) -> String {
+    format!("echo \"$sess $up $boot $woke\" > {staging}/exec\n")
+}
+
+/// The root script's refusal to clear `staging` while the agent an earlier enrollment
+/// started from it has not shown it ran. [`root_script`] stamps `exec` there with the boot's
+/// id and [`clock_reading`]'s readings just before the agent's first exec, and the agent
+/// writes `ran` first thing ([`crate::agent::install::main`]). A restart since releases it.
+/// Otherwise it holds for [`aterm_uds::deadline::FIRST_EXEC_HANG`] of `up` from the later of
+/// the stamp and the last wake, so time asleep is not counted. A stamp it cannot read, and
+/// a wake it cannot place on `up` (the wall clock stepped since the stamp too), hold for
+/// the whole of it from the moment this finds them: it stamps `exec` again then.
+#[must_use]
+pub fn stage_guard(staging: &str) -> String {
+    guard_reading(staging, &MAC_CLOCKS)
+}
+
+/// [`stage_guard`], reading the clocks with `c`.
+fn guard_reading(staging: &str, c: &Clocks<'_>) -> String {
+    let hang = aterm_uds::deadline::FIRST_EXEC_HANG.as_secs();
+    let reading = clock_reading(c);
+    let stamp = stamp_line(staging);
+    let checks =
+        boot_id_check("$was_sess") + &seconds_check("\"$was_up\" \"$was_boot\" \"$was_woke\"");
+    format!(
+        "if [ -e {staging}/exec ] && [ ! -e {staging}/ran ]; then\n\
+         {reading}\
+         was_sess= was_up= was_boot= was_woke= rest=\n\
+         read -r was_sess was_up was_boot was_woke rest < {staging}/exec || :\n\
+         {checks}\
+         left=\n\
+         if [ -n \"$ok\" ] && [ -z \"$rest\" ]; then\n\
+         if [ \"$was_sess\" != \"$sess\" ]; then left=0\n\
+         elif [ \"$was_woke\" = \"$woke\" ]; then\n\
+         [ \"$up\" -lt \"$was_up\" ] || left=$(( {hang} - up + was_up ))\n\
+         elif [ \"$was_boot\" = \"$boot\" ]; then\n\
+         from=$((woke - boot)); [ \"$from\" -ge \"$was_up\" ] || from=$was_up\n\
+         [ \"$up\" -lt \"$from\" ] || left=$(( {hang} - up + from ))\n\
+         fi\n\
+         fi\n\
+         if [ -z \"$left\" ]; then left={hang}; {stamp}fi\n\
+         if [ \"$left\" -gt 0 ]; then echo \"aterm machines: the helper an earlier enrollment \
+         started from {staging} has not shown it ran, and macOS may still be checking it; \
+         enroll again in $(( (left + 59) / 60 )) minute(s), or after a restart\" >&2; exit 1; \
+         fi\n\
+         fi\n"
+    )
+}
+
 /// Generate the root `/bin/sh` installation script executed under `sudo`.
 #[must_use]
 pub fn root_script(i: &Install<'_>) -> String {
@@ -840,8 +952,11 @@ pub fn root_script(i: &Install<'_>) -> String {
     s.push_str(&format!(
         "/bin/mkdir -p -m 0755 /Library/Management {root}\n\
          /usr/sbin/chown root:wheel /Library/Management {root}\n\
-         /bin/chmod 0755 /Library/Management {root}\n\
-         /bin/rm -rf {staging}\n\
+         /bin/chmod 0755 /Library/Management {root}\n"
+    ));
+    s.push_str(&stage_guard(&staging));
+    s.push_str(&format!(
+        "/bin/rm -rf {staging}\n\
          /bin/mkdir -m 0700 {staging}\n\
          /bin/cp {} {staging}/payload.zip\n\
          /bin/cp {} {staging}/allowed_signers\n",
@@ -874,8 +989,10 @@ pub fn root_script(i: &Install<'_>) -> String {
         ));
     }
     s.push_str(&format!(
-        "{} machines agent install --admin {} --fleet-key {} --allowed-signers \
+        "{}{}{} machines agent install --admin {} --fleet-key {} --allowed-signers \
          {staging}/allowed_signers --payload-sha {} --stage {staging}/payload\n",
+        clock_reading(&MAC_CLOCKS),
+        stamp_line(&staging),
         q(&exe),
         q(&i.admin),
         q(&i.fleet_key),
@@ -2543,6 +2660,19 @@ mod tests {
             copy < hash && hash < expand && expand < sign && sign < run,
             "{s}"
         );
+        let guard = at("if [ -e /Library/Management/aterm/.staging/exec ]");
+        let clear = at("/bin/rm -rf /Library/Management/aterm/.staging\n");
+        let stamp_line =
+            "echo \"$sess $up $boot $woke\" > /Library/Management/aterm/.staging/exec\n";
+        let stamp = s.rfind(stamp_line).unwrap();
+        let read = s[..stamp].rfind("sess=$(/usr/sbin/sysctl -n kern.bootsessionuuid)\n");
+        assert!(read.is_some_and(|read| sign < read), "{s}");
+        assert!(guard < at(stamp_line) && at(stamp_line) < clear, "{s}");
+        assert!(guard < clear && clear < copy, "{s}");
+        assert!(
+            sign < stamp && s[stamp..].lines().nth(1) == s[run..].lines().next(),
+            "{s}"
+        );
         assert!(
             !s.lines()
                 .any(|l| l.starts_with("/var/folders") || l.starts_with("'/var")),
@@ -2557,6 +2687,292 @@ mod tests {
         assert!(dev.contains(
             "\n/Library/Management/aterm/.staging/payload/aterm-machines-dev machines agent install"
         ));
+    }
+
+    /// A boot id in `kern.bootsessionuuid`'s form.
+    const BOOT_ID: &str = "55C317A3-F793-4F0D-BE04-262D2C6ED332";
+
+    /// The guard of `stage`, its clocks reading `boot`, `woke` and `now` (Unix seconds) and
+    /// the boot id `session`, run before the stage's removal; the stage is gone when it passed.
+    fn guarded(stage: &Path, session: &str, boot: u64, woke: u64, now: u64) -> Ran {
+        let at = stage.to_str().unwrap();
+        assert!(!at.contains(|c: char| c.is_whitespace() || "'\"$`\\".contains(c)));
+        let sysctl =
+            |sec: u64| format!("echo '{{ sec = {sec}, usec = 0 }} Thu Oct 22 09:00:00 2026'");
+        let (session, boot, wake, now) = (
+            format!("echo {session}"),
+            sysctl(boot),
+            sysctl(woke),
+            format!("echo {now}"),
+        );
+        let guard = guard_reading(
+            at,
+            &Clocks {
+                session: &session,
+                boot: &boot,
+                wake: &wake,
+                now: &now,
+            },
+        );
+        sh(&format!("set -e\n{guard}/bin/rm -rf {at}\n"))
+    }
+
+    /// `script`, run by `/bin/sh`.
+    fn sh(script: &str) -> Ran {
+        crate::port::Live::new()
+            .run(&Cmd::new("/bin/sh").arg("-c").arg(script))
+            .unwrap()
+    }
+
+    /// A stage with a staged agent, its `exec` stamp `stamp` when it is `Some`.
+    fn staged(stage: &Path, stamp: Option<&str>, ran: bool) {
+        std::fs::create_dir_all(stage.join("payload")).unwrap();
+        std::fs::write(stage.join("payload/aterm"), b"agent").unwrap();
+        if let Some(stamp) = stamp {
+            std::fs::write(stage.join("exec"), stamp).unwrap();
+        }
+        if ran {
+            std::fs::write(stage.join("ran"), b"").unwrap();
+        }
+    }
+
+    /// The minutes a refusal asks for, `None` when the guard passed.
+    fn held_for(stage: &Path, ran: &Ran) -> Option<String> {
+        if ran.success() {
+            assert!(!stage.exists(), "a pass clears the stage");
+            return None;
+        }
+        assert_eq!(ran.status, Some(1), "{}", ran.err());
+        assert!(stage.join("payload/aterm").is_file(), "the stage stays");
+        let err = ran.err();
+        assert!(err.contains("has not shown it ran"), "{err}");
+        let minutes = err
+            .split(" again in ")
+            .nth(1)
+            .and_then(|t| t.split(' ').next());
+        Some(minutes.unwrap_or_else(|| panic!("{err}")).to_owned())
+    }
+
+    #[test]
+    fn the_stage_stays_while_the_helper_an_earlier_enrollment_started_has_not_shown_it_ran() {
+        const BOOT: u64 = 1_792_000_000;
+        const UP: u64 = 5_000;
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let stage = tmp.path().join("stage");
+        let stamp = format!("{BOOT_ID} {UP} {BOOT} 0\n");
+        let at = |up: u64| guarded(&stage, BOOT_ID, BOOT, 0, BOOT + up);
+
+        staged(&stage, Some(&stamp), false);
+        assert_eq!(held_for(&stage, &at(UP)).as_deref(), Some("10"));
+        assert_eq!(held_for(&stage, &at(UP + 9 * 60)).as_deref(), Some("1"));
+        assert_eq!(
+            held_for(&stage, &at(UP + 10 * 60)),
+            None,
+            "its hang has passed"
+        );
+
+        staged(&stage, Some(&stamp), true);
+        assert_eq!(held_for(&stage, &at(UP)), None, "the helper showed it ran");
+        staged(&stage, None, false);
+        assert_eq!(
+            held_for(&stage, &at(UP)),
+            None,
+            "no helper was started from it"
+        );
+
+        staged(&stage, Some(&stamp), false);
+        let other = "0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0";
+        let restarted = guarded(&stage, other, BOOT + 9_000, 0, BOOT + 9_030);
+        assert_eq!(
+            held_for(&stage, &restarted),
+            None,
+            "a restart since the stamp"
+        );
+
+        staged(&stage, Some(&stamp), false);
+        let clocks = guarded(&stage, "", BOOT, 0, BOOT + UP);
+        assert_eq!(clocks.status, Some(1));
+        assert!(
+            clocks.err().contains("boot id and clocks read"),
+            "{}",
+            clocks.err()
+        );
+        assert!(stage.join("payload/aterm").is_file());
+
+        // The root script's own stamp and guard, on this Mac's clocks.
+        #[cfg(target_os = "macos")]
+        {
+            let at = stage.to_str().unwrap();
+            std::fs::remove_file(stage.join("exec")).unwrap();
+            let stamped = sh(&format!(
+                "set -e\n{}{}",
+                clock_reading(&MAC_CLOCKS),
+                stamp_line(at)
+            ));
+            assert!(stamped.success(), "{}", stamped.err());
+            let held = sh(&format!("set -e\n{}/bin/rm -rf {at}\n", stage_guard(at)));
+            assert!(
+                held_for(&stage, &held).is_some(),
+                "a stamp just written holds"
+            );
+        }
+    }
+
+    #[test]
+    fn the_stage_guard_counts_awake_time_that_no_step_of_the_wall_clock_moves() {
+        const BOOT: u64 = 1_792_000_000;
+        const UP: u64 = 5_000;
+        const STEP: u64 = 20 * 60;
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let stage = tmp.path().join("stage");
+        let stamp = format!("{BOOT_ID} {UP} {BOOT} 0\n");
+
+        // Two minutes after the stamp the wall clock steps 20 minutes forward, and XNU moves
+        // the boot time with it.
+        staged(&stage, Some(&stamp), false);
+        let stepped = guarded(&stage, BOOT_ID, BOOT + STEP, 0, BOOT + STEP + UP + 120);
+        assert_eq!(
+            held_for(&stage, &stepped).as_deref(),
+            Some("8"),
+            "the negative control"
+        );
+        let stepped = guarded(&stage, BOOT_ID, BOOT + STEP, 0, BOOT + STEP + UP + 600);
+        assert_eq!(held_for(&stage, &stepped), None);
+
+        // An hour asleep a minute after the stamp, then a minute awake: only awake time counts.
+        staged(&stage, Some(&stamp), false);
+        let woke = BOOT + UP + 60 + 3_600;
+        let after = |awake: u64| guarded(&stage, BOOT_ID, BOOT, woke, woke + awake);
+        assert_eq!(held_for(&stage, &after(60)).as_deref(), Some("9"));
+        assert_eq!(held_for(&stage, &after(600)), None);
+    }
+
+    #[test]
+    fn the_agent_ages_the_root_scripts_stamp_as_the_stage_guard_does() {
+        const BOOT: u64 = 1_792_000_000;
+        const UP: u64 = 5_000;
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let stage = tmp.path().join("stage");
+        let stamp = format!("{BOOT_ID} {UP} {BOOT} 0\n");
+        let other = "0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0";
+        let (stepped, woke) = (BOOT + 1_200, BOOT + UP + 3_660);
+        for (session, boot, woke, now) in [
+            (BOOT_ID, BOOT, 0, BOOT + UP),
+            (BOOT_ID, BOOT, 0, BOOT + UP + 9 * 60),
+            (BOOT_ID, BOOT, 0, BOOT + UP + 10 * 60),
+            (BOOT_ID, BOOT, 0, BOOT + UP - 60),
+            (other, BOOT + 9_000, 0, BOOT + 9_030),
+            (BOOT_ID, stepped, 0, stepped + UP + 120),
+            (BOOT_ID, BOOT, woke, woke + 60),
+            (BOOT_ID, stepped, woke, woke + 3_600),
+        ] {
+            staged(&stage, Some(&stamp), false);
+            let shell = held_for(&stage, &guarded(&stage, session, boot, woke, now));
+            let clocks = crate::first_exec::BootClocks {
+                session: session.to_owned(),
+                boot,
+                woke,
+                up: now - boot,
+            };
+            let agent = crate::first_exec::root_stamp_left(&stamp, Some(&clocks))
+                .expect("the root script's stamp");
+            assert_eq!(
+                agent.map(|left| crate::first_exec::minutes(left).to_string()),
+                shell,
+                "{clocks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wall_clock_step_between_the_boot_and_wall_clock_reads_stops_the_script() {
+        const BOOT: u64 = 1_792_000_000;
+        const UP: u64 = 5_000;
+        const STEP: u64 = 20 * 60;
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let stage = tmp.path().join("stage");
+        let at = stage.to_str().unwrap();
+        let first = tmp.path().join("boot-read");
+        let first = first.to_str().unwrap();
+        let sysctl =
+            |sec: u64| format!("echo '{{ sec = {sec}, usec = 0 }} Thu Oct 22 09:00:00 2026'");
+        // The first read of the boot time comes before a 20-minute forward step; the wall
+        // clock and the second read come after it.
+        let boot = format!(
+            "if [ -e {first} ]; then {}; else : > {first}; {}; fi",
+            sysctl(BOOT + STEP),
+            sysctl(BOOT)
+        );
+        let (session, wake, now) = (
+            format!("echo {BOOT_ID}"),
+            sysctl(0),
+            format!("echo {}", BOOT + STEP + UP + 120),
+        );
+        let clocks = Clocks {
+            session: &session,
+            boot: &boot,
+            wake: &wake,
+            now: &now,
+        };
+
+        staged(&stage, Some(&format!("{BOOT_ID} {UP} {BOOT} 0\n")), false);
+        let guard = guard_reading(at, &clocks);
+        let ran = sh(&format!("set -e\n{guard}/bin/rm -rf {at}\n"));
+        assert_eq!(ran.status, Some(1), "the negative control: {}", ran.err());
+        assert!(
+            ran.err().contains("boot id and clocks read"),
+            "{}",
+            ran.err()
+        );
+        assert!(stage.join("payload/aterm").is_file(), "the stage stays");
+
+        // At the stamp, the script stops before the staged agent's exec.
+        std::fs::remove_file(first).unwrap();
+        std::fs::remove_file(stage.join("exec")).unwrap();
+        let ran = sh(&format!(
+            "set -e\n{}{}: > {at}/started\n",
+            clock_reading(&clocks),
+            stamp_line(at)
+        ));
+        assert_eq!(ran.status, Some(1), "{}", ran.err());
+        assert!(!stage.join("exec").exists() && !stage.join("started").exists());
+    }
+
+    #[test]
+    fn a_stamp_the_stage_guard_cannot_place_holds_the_whole_hang_from_when_it_finds_it() {
+        const BOOT: u64 = 1_792_000_000;
+        const UP: u64 = 5_000;
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let stage = tmp.path().join("stage");
+        let found = BOOT + UP + 7_200;
+        for stamp in [
+            String::new(),
+            "5000000\n".to_owned(),
+            format!("{BOOT_ID} {UP} {BOOT} 0 more\n"),
+            format!("not-a-boot {UP} {BOOT} 0\n"),
+            format!("------------------------------------ {UP} {BOOT} 0\n"),
+        ] {
+            staged(&stage, Some(&stamp), false);
+            let first = guarded(&stage, BOOT_ID, BOOT, 0, found);
+            assert_eq!(held_for(&stage, &first).as_deref(), Some("10"), "{stamp:?}");
+            assert_eq!(
+                std::fs::read_to_string(stage.join("exec")).unwrap(),
+                format!("{BOOT_ID} {} {BOOT} 0\n", UP + 7_200),
+                "{stamp:?} is stamped again"
+            );
+            let later = guarded(&stage, BOOT_ID, BOOT, 0, found + 9 * 60);
+            assert_eq!(held_for(&stage, &later).as_deref(), Some("1"), "{stamp:?}");
+            let done = guarded(&stage, BOOT_ID, BOOT, 0, found + 10 * 60);
+            assert_eq!(held_for(&stage, &done), None, "{stamp:?}: the hold ends");
+        }
+
+        // A wake since the stamp after the wall clock stepped: the wake is not on `up`.
+        staged(&stage, Some(&format!("{BOOT_ID} {UP} {BOOT} 0\n")), false);
+        let (boot, woke) = (BOOT + 1_200, BOOT + UP + 7_200);
+        let first = guarded(&stage, BOOT_ID, boot, woke, woke + 3_600);
+        assert_eq!(held_for(&stage, &first).as_deref(), Some("10"));
+        let later = guarded(&stage, BOOT_ID, boot, woke, woke + 3_600 + 10 * 60);
+        assert_eq!(held_for(&stage, &later), None);
     }
 
     #[test]

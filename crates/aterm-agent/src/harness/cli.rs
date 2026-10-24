@@ -91,6 +91,7 @@ USAGE:
                                                  hurry, defer, or skip one tab's upgrade
     aterm harness upgrade models [set <id>,<id>,...]
                                                  show or set the upgrade model priority list
+    aterm harness versions [--json]              incremental numeric version of each CLI harness
     aterm harness tap                            Claude Code statusLine usage tap (`[harness] usage_tap`)
 
 `hook` and `statusline` do nothing and exit 0, so settings that still name them stay harmless.
@@ -221,6 +222,11 @@ usage limit a reading written since the limit was first read times the continuat
 than six minutes, the later wins and a `tap-reset@v1` ledger row records both. Switched off,
 no new relaunch line carries the tap and no reading times a wait; a session already tapped
 keeps writing readings until it is relaunched.
+";
+
+const HELP_VERSIONS: &str = "\
+`versions` (`version`) prints the incremental numeric harness version (`v0.1`, \u{2026})
+for each CLI harness (`codex-alab`, `claude`, `agy`, `grok`, `kimi`, `muse`, `gemini`).
 ";
 
 const HELP_LEDGER: &str = "\
@@ -707,6 +713,11 @@ pub enum Cmd {
     },
     /// The Claude Code accounts: the report, and the roster's verbs.
     Accounts(AccountsCmd),
+    /// The incremental numeric harness version of each CLI harness.
+    Versions {
+        /// The JSON form.
+        json: bool,
+    },
     /// Print a help page ([`help_page`]) and exit 0.
     Help(HelpPage),
 }
@@ -731,6 +742,8 @@ pub enum HelpPage {
     Upgrade,
     /// `upgrade --status --help`: every field of a status line.
     UpgradeStatus,
+    /// `versions --help`: incremental numeric harness versions.
+    Versions,
     /// `tap --help`: the usage tap.
     Tap,
 }
@@ -853,6 +866,7 @@ pub fn help_page(page: HelpPage) -> String {
             ],
         ),
         HelpPage::UpgradeStatus => ("upgrade", true, &[HELP_UPGRADE_STATUS]),
+        HelpPage::Versions => ("versions", false, &[HELP_VERSIONS]),
         HelpPage::Tap => ("tap", false, &[HELP_TAP]),
     };
     let mut entries: Vec<String> = Vec::new();
@@ -1004,6 +1018,7 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
             Some("accounts") => HelpPage::Accounts,
             Some("upgrade") if owner.contains(&OwnerAsk::Status) => HelpPage::UpgradeStatus,
             Some("upgrade") => HelpPage::Upgrade,
+            Some("versions" | "version") => HelpPage::Versions,
             Some("tap") => HelpPage::Tap,
             _ => HelpPage::Verbs,
         };
@@ -1032,6 +1047,12 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
                 return Err(format!("usage takes no operand, not {:?}", &rest[1..]));
             }
             Cmd::Usage { json }
+        }
+        "versions" | "version" => {
+            if rest.len() > 1 {
+                return Err(format!("{verb} takes no operand, not {:?}", &rest[1..]));
+            }
+            Cmd::Versions { json }
         }
         "limits" => Cmd::Limits {
             sid: sid_operand(&rest[1..])?,
@@ -3618,6 +3639,7 @@ fn run_upgrade_models(
         home,
         state: env.state.clone(),
         sock: None,
+        token: None,
         only_sid: None,
         dry_run: set.is_none(),
         human_grace_s: 0,
@@ -3691,6 +3713,7 @@ fn upgrade_opts(
         home,
         state: env.state.clone(),
         sock: env.sock.clone(),
+        token: None,
         only_sid: (!sid.is_empty()).then(|| sid.to_string()),
         dry_run: false,
         human_grace_s: policy.human_grace_s,
@@ -6537,7 +6560,38 @@ pub fn run(cmd: &Cmd, env: &Env, out: &mut dyn Write, err: &mut dyn Write) -> Ex
         Cmd::UpgradeOwner { sid, ask, json } => run_upgrade_owner(env, sid, *ask, *json, out, err),
         Cmd::UpgradeModels { set } => run_upgrade_models(env, set.as_deref(), out, err),
         Cmd::Accounts(form) => run_accounts(form, env, &LiveAccounts, out, err),
+        Cmd::Versions { json } => run_versions(*json, out),
     }
+}
+
+fn run_versions(json: bool, out: &mut dyn Write) -> ExitCode {
+    if json {
+        let mut items = Vec::new();
+        for harness in aterm_phase::CliHarness::ALL {
+            let v = harness.version();
+            items.push(format!(
+                r#"{{"id":"{}","slug":"{}","label":"{}","version":"{}","major":{},"minor":{}}}"#,
+                harness.id(),
+                harness.cli(),
+                harness.product(),
+                v.as_str(),
+                v.major(),
+                v.minor()
+            ));
+        }
+        let _ = writeln!(out, "[{}]", items.join(","));
+    } else {
+        for harness in aterm_phase::CliHarness::ALL {
+            let _ = writeln!(
+                out,
+                "{:<12} {:<16} v{}",
+                harness.id(),
+                harness.product(),
+                harness.version()
+            );
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 fn run_tap(out: &mut dyn Write) -> ExitCode {

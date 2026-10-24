@@ -11,6 +11,9 @@ pub mod codex;
 pub mod credits;
 pub mod disk_full;
 pub mod gemini;
+pub mod grok;
+pub mod harness_version;
+pub mod kimi;
 pub mod login;
 pub mod muse;
 pub mod notice;
@@ -35,6 +38,9 @@ mod vendor_files;
 
 pub use anchors::{ANCHORS, anchor, anchor_text};
 pub use autocompact::{Offer, OfferFocus};
+pub use harness_version::{
+    CliHarness, HarnessVersion, cli_harness_of, harness_version_of, harness_version_str_of,
+};
 pub use login::{
     LoginAtWall, LoginMethod, LoginScreen, Picker as LoginPicker, login_at_wall, login_interrupted,
     login_screen,
@@ -58,7 +64,7 @@ pub use question::{
 pub use reader::{
     AgyReader, BLANK_GAP, ClaudeReader, CodexReader, GeminiReader, GenericReader, MuseReader,
     Program, Reading, ScreenReader, identify, live_zone_reaches_above, live_zone_start,
-    may_host_agent, program_of, read, read_at,
+    may_host_agent, program_of, read, read_at, shell_alone,
 };
 pub use reset::{
     ConfirmRead, ResetConfirm, ResetKind, ResetLine, ResetPending, ResetRow, reset_confirm,

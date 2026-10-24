@@ -30,12 +30,29 @@ pub const EXEC_STAMP: &str = "exec";
 
 /// Writes the current awake-clock reading to [`EXEC_STAMP`] inside `home` before exec.
 pub fn stamp_exec(home: &std::path::Path) {
+    if let Err(e) = try_stamp_exec(home) {
+        eprintln!("cannot stamp {} before its exec: {e}", home.display());
+    }
+}
+
+/// [`stamp_exec`] for a caller that must know whether the stamp was written.
+/// # Errors
+/// The stamp could not be written; a write cut short can leave it blank, a
+/// stamp [`exec_stamp`] reads no reading from.
+pub fn try_stamp_exec(home: &std::path::Path) -> std::io::Result<()> {
     let stamp = crate::process::awake_ms()
         .map(|ms| ms.to_string())
         .unwrap_or_default();
-    if let Err(e) = std::fs::write(home.join(EXEC_STAMP), stamp) {
-        eprintln!("cannot stamp {} before its exec: {e}", home.display());
-    }
+    std::fs::write(home.join(EXEC_STAMP), stamp)
+}
+
+/// The awake-clock reading [`EXEC_STAMP`] inside `home` holds: none when it is
+/// missing, unreadable or blank.
+#[must_use]
+pub fn exec_stamp(home: &std::path::Path) -> Option<u64> {
+    std::fs::read_to_string(home.join(EXEC_STAMP))
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
 }
 
 /// Whether the binary copy directory `home` is safe to remove at `now`.
@@ -58,10 +75,7 @@ fn copy_wait_left_at(
     if home.join(RAN).exists() {
         return None;
     }
-    let stamp = std::fs::read_to_string(home.join(EXEC_STAMP))
-        .ok()
-        .and_then(|text| text.trim().parse::<u64>().ok());
-    let age = match (stamp, awake_now) {
+    let age = match (exec_stamp(home), awake_now) {
         (Some(at), Some(awake)) => Some(Duration::from_millis(awake.checked_sub(at)?)),
         _ => std::fs::symlink_metadata(home)
             .and_then(|meta| meta.modified())
@@ -753,7 +767,10 @@ mod tests {
 
     #[test]
     fn a_copy_ages_on_the_awake_clock_from_its_exec() {
-        use super::{EXEC_STAMP, FIRST_EXEC_HANG, RAN, copy_wait_left_at, stamp_exec};
+        use super::{
+            EXEC_STAMP, FIRST_EXEC_HANG, RAN, copy_wait_left_at, exec_stamp, stamp_exec,
+            try_stamp_exec,
+        };
         let copy_may_go_at =
             |home: &std::path::Path, now, awake| copy_wait_left_at(home, now, awake).is_none();
         let hang = u64::try_from(FIRST_EXEC_HANG.as_millis()).expect("ms");
@@ -764,7 +781,9 @@ mod tests {
         let later = now + FIRST_EXEC_HANG + Duration::from_secs(60);
         assert!(!copy_may_go_at(&home, now, Some(5)));
         assert!(copy_may_go_at(&home, later, Some(5)));
+        assert_eq!(exec_stamp(&home), None, "no stamp");
         std::fs::write(home.join(EXEC_STAMP), "1000\n").expect("stamp");
+        assert_eq!(exec_stamp(&home), Some(1000));
         assert!(
             !copy_may_go_at(&home, later, Some(1000 + hang - 1)),
             "slept through"
@@ -779,6 +798,7 @@ mod tests {
         assert!(!copy_may_go_at(&home, now, None));
         assert!(copy_may_go_at(&home, later, None));
         std::fs::write(home.join(EXEC_STAMP), "").expect("blank stamp");
+        assert_eq!(exec_stamp(&home), None, "a blank stamp holds no reading");
         assert!(!copy_may_go_at(&home, now, Some(1000 + hang)));
         assert!(copy_may_go_at(&home, later, Some(1000 + hang)));
         std::fs::write(home.join(RAN), "").expect("ran");
@@ -788,6 +808,11 @@ mod tests {
         stamp_exec(&fresh);
         let text = std::fs::read_to_string(fresh.join(EXEC_STAMP)).expect("stamped");
         assert!(text.is_empty() || text.parse::<u64>().is_ok(), "{text:?}");
+        let gone = dir.path().join("5-6");
+        assert!(try_stamp_exec(&gone).is_err(), "nowhere to write it");
+        stamp_exec(&gone);
+        assert!(!gone.exists(), "a stamp that failed made nothing");
+        assert!(try_stamp_exec(&fresh).is_ok());
         let first = crate::process::awake_ms();
         let second = crate::process::awake_ms();
         assert!(first <= second, "{first:?} then {second:?}");

@@ -1992,7 +1992,7 @@ pub(crate) fn note_fx_composed(glow_quads: usize, under_quads: usize, trail_cell
 
 type FxStream = (&'static str, fn(&aterm_render::RenderInput) -> usize);
 
-static FX_STREAMS: [FxStream; 15] = [
+static FX_STREAMS: [FxStream; 14] = [
     ("trail", |i| i.cursor_trail.len()),
     ("glow_add", |i| i.cursor_glow_add.len()),
     ("glow_halo", |i| i.glow_halo.len()),
@@ -2000,10 +2000,18 @@ static FX_STREAMS: [FxStream; 15] = [
     ("fire_patch", |i| i.fire_patch.len()),
     ("fire_halo", |i| i.fire_halo.len()),
     ("nova_add", |i| i.nova_add.len()),
-    ("rain", |i| i.rain_quads.len()),
+    ("rain_rows", |i| {
+        let rows = i.fx_layers.iter();
+        rows.filter(|l| aterm_effects::matrix_rain::is_rain_row(l))
+            .count()
+    }),
     ("rain_add", |i| i.rain_add.len()),
-    ("cat", |i| i.cat_quads.len()),
-    ("free", |i| i.free_sprites.len()),
+    ("sprites", |i| {
+        let layers = i.fx_layers.iter();
+        layers
+            .filter(|l| aterm_render::sprites::is_sprite_layer(l))
+            .count()
+    }),
     ("wdeco", |i| i.word_decorations.len()),
     ("ink", |i| i.ink.len()),
     ("char_fg", |i| i.char_fg.len()),

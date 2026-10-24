@@ -871,7 +871,8 @@ impl Pace {
     }
 }
 
-/// THE NEGATIVE CONTROLS' FAULT POINTS in the pace ([`conformance`], the pace tests).
+/// THE NEGATIVE CONTROLS' FAULT POINTS in the pace ([`conformance`], the pace tests) and in the
+/// task record's fact word (`task_record::fact_edit`).
 #[cfg(test)]
 pub(crate) mod fault {
     use std::cell::Cell;
@@ -885,6 +886,9 @@ pub(crate) mod fault {
         YoungestFirst,
         /// A holder's re-ask counts its own reservation against it.
         CountOwn,
+        /// The fact word's edit moves the record's `rev` too, so every `await task` past a rev
+        /// with news standing wakes on it.
+        NoteBumpsNews,
     }
 
     thread_local! {
@@ -911,13 +915,14 @@ pub(crate) mod fault {
 }
 
 #[cfg(not(test))]
-mod fault {
+pub(crate) mod fault {
     /// A planted defect: none is armed outside the tests.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) enum Fault {
         RenewOnAsk,
         YoungestFirst,
         CountOwn,
+        NoteBumpsNews,
     }
 
     /// Never armed.

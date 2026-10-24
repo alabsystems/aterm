@@ -1,19 +1,13 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! What a hostile document can make the runtime do, where upstream's suite
-//! leaves it unpinned: a second tag key is an error rather than a silent
-//! override, and a length hint cannot size an allocation past the 1 MiB
-//! preallocation cap (`private::size_hint::cautious`). aterm reads every
-//! document it persists through these paths, from files any process can
-//! write.
+//! Deserializer tests for duplicate tag keys and `private::size_hint::cautious` bounds.
 
 use crate::support::{Deserializer, Token, assert_de_tokens_error};
 use aterm_serde::de::Deserialize;
 use serde_derive::Deserialize;
 use std::collections::HashMap;
 
-/// The cap `size_hint::cautious` keeps preallocation under.
 const MAX_PREALLOC_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, PartialEq, Deserialize)]
@@ -84,8 +78,6 @@ enum Buffered {
 
 #[test]
 fn a_huge_hint_into_the_untagged_buffer_preallocates_at_most_the_cap() {
-    // `untagged` buffers the input as `Content` before any variant reads it;
-    // that buffer is sized by the same cap.
     let v: Buffered = from_tokens(&[
         Token::Seq {
             len: Some(usize::MAX),

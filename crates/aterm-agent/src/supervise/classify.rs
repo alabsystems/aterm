@@ -187,7 +187,8 @@ const HAZARD_VARS: &[&str] = &[
     "PYTHONHOME",
 ];
 
-const HAZARD_VAR_PREFIXES: &[&str] = &["LD_", "DYLD_", "GIT_", "BASH_FUNC_"];
+/// `LESS` covers every variable less reads: a `LESSKEYIN` file's `#env` can set `LESSOPEN` (MEASURED, less 668).
+const HAZARD_VAR_PREFIXES: &[&str] = &["LD_", "DYLD_", "GIT_", "BASH_FUNC_", "LESS"];
 
 const ZSH_TIED: &[(&str, &str)] = &[
     ("cdpath", "CDPATH"),
@@ -2054,9 +2055,14 @@ fn runs_or_writes_by_flag_reading(head: &str, args: &[String], reading: Reading)
         ));
     }
     match head {
+        // `--pre` and `--hostname-bin` (rg 14) run a program.
         "rg" => args
             .iter()
-            .find(|t| *t == "--pre" || t.starts_with("--pre="))
+            .find(|t| {
+                ["--pre", "--hostname-bin"]
+                    .iter()
+                    .any(|f| *t == f || t.starts_with(&format!("{f}=")))
+            })
             .map(|t| flag(t)),
         "sort" => args
             .iter()
@@ -2596,6 +2602,7 @@ enum First {
 struct Grammar {
     short: &'static [(char, Val)],
     long: &'static [(&'static str, &'static [Val])],
+    flags: &'static [&'static str],
     /// jq, rg and git log require whole long-option names. Prefix matching
     /// would turn flags such as --slurp and --ignore into value options.
     abbreviates: bool,
@@ -2604,7 +2611,16 @@ struct Grammar {
 }
 
 const GREP: Grammar = Grammar {
-    short: &[('e', Val::Pattern), ('f', Val::PatternFile)],
+    short: &[
+        ('e', Val::Pattern),
+        ('f', Val::PatternFile),
+        ('A', Val::Text),
+        ('B', Val::Text),
+        ('C', Val::Text),
+        ('D', Val::Text),
+        ('d', Val::Text),
+        ('m', Val::Text),
+    ],
     long: &[
         ("regexp", &[Val::Pattern]),
         ("file", &[Val::PatternFile]),
@@ -2613,7 +2629,16 @@ const GREP: Grammar = Grammar {
         ("exclude-dir", &[Val::Text]),
         ("include-dir", &[Val::Text]),
         ("exclude-from", &[Val::Path]),
+        ("after-context", &[Val::Text]),
+        ("before-context", &[Val::Text]),
+        ("max-count", &[Val::Text]),
+        ("devices", &[Val::Text]),
+        ("directories", &[Val::Text]),
+        ("label", &[Val::Text]),
+        ("binary-files", &[Val::Text]),
+        ("group-separator", &[Val::Text]),
     ],
+    flags: &["binary"],
     abbreviates: true,
     first: First::Pattern,
     operands_read: true,
@@ -2626,6 +2651,15 @@ const RG: Grammar = Grammar {
         ('g', Val::Text),
         ('t', Val::Text),
         ('T', Val::Text),
+        ('A', Val::Text),
+        ('B', Val::Text),
+        ('C', Val::Text),
+        ('d', Val::Text),
+        ('E', Val::Text),
+        ('j', Val::Text),
+        ('M', Val::Text),
+        ('m', Val::Text),
+        ('r', Val::Text),
     ],
     long: &[
         ("regexp", &[Val::Pattern]),
@@ -2634,8 +2668,38 @@ const RG: Grammar = Grammar {
         ("iglob", &[Val::Text]),
         ("type", &[Val::Text]),
         ("type-not", &[Val::Text]),
+        ("type-add", &[Val::Text]),
+        ("type-clear", &[Val::Text]),
         ("ignore-file", &[Val::Path]),
+        ("after-context", &[Val::Text]),
+        ("before-context", &[Val::Text]),
+        ("context", &[Val::Text]),
+        ("max-count", &[Val::Text]),
+        ("max-columns", &[Val::Text]),
+        ("max-depth", &[Val::Text]),
+        ("maxdepth", &[Val::Text]),
+        ("max-filesize", &[Val::Text]),
+        ("threads", &[Val::Text]),
+        ("encoding", &[Val::Text]),
+        ("engine", &[Val::Text]),
+        ("replace", &[Val::Text]),
+        ("color", &[Val::Text]),
+        ("colors", &[Val::Text]),
+        ("context-separator", &[Val::Text]),
+        ("field-context-separator", &[Val::Text]),
+        ("field-match-separator", &[Val::Text]),
+        ("path-separator", &[Val::Text]),
+        ("sort", &[Val::Text]),
+        ("sortr", &[Val::Text]),
+        ("dfa-size-limit", &[Val::Text]),
+        ("regex-size-limit", &[Val::Text]),
+        ("hyperlink-format", &[Val::Text]),
+        ("generate", &[Val::Text]),
+        ("pre-glob", &[Val::Text]),
+        ("pre", &[Val::Path]),
+        ("hostname-bin", &[Val::Path]),
     ],
+    flags: &[],
     abbreviates: false,
     first: First::Pattern,
     operands_read: true,
@@ -2651,6 +2715,7 @@ const JQ: Grammar = Grammar {
         ("rawfile", &[Val::Text, Val::Path]),
         ("indent", &[Val::Text]),
     ],
+    flags: &[],
     abbreviates: false,
     first: First::Filter,
     operands_read: true,
@@ -2673,6 +2738,7 @@ const AWK: Grammar = Grammar {
         ("assign", &[Val::Path]),
         ("field-separator", &[Val::Text]),
     ],
+    flags: &[],
     abbreviates: true,
     first: First::Program,
     operands_read: true,
@@ -2681,6 +2747,7 @@ const AWK: Grammar = Grammar {
 const PGREP: Grammar = Grammar {
     short: &[('F', Val::Path)],
     long: &[("pidfile", &[Val::Path])],
+    flags: &[],
     abbreviates: true,
     first: First::Pattern,
     operands_read: true,
@@ -2692,14 +2759,30 @@ const MEASURE: Grammar = Grammar {
         ("files0-from", &[Val::Path]),
         ("exclude-from", &[Val::Path]),
     ],
+    flags: &[],
     abbreviates: true,
     first: First::Operand,
     operands_read: false,
 };
 
 const GIT_GREP: Grammar = Grammar {
-    short: &[('e', Val::Pattern), ('f', Val::PatternFile)],
-    long: &[],
+    short: &[
+        ('e', Val::Pattern),
+        ('f', Val::PatternFile),
+        ('A', Val::Text),
+        ('B', Val::Text),
+        ('C', Val::Text),
+        ('m', Val::Text),
+    ],
+    long: &[
+        ("after-context", &[Val::Text]),
+        ("before-context", &[Val::Text]),
+        ("context", &[Val::Text]),
+        ("max-count", &[Val::Text]),
+        ("max-depth", &[Val::Text]),
+        ("threads", &[Val::Text]),
+    ],
+    flags: &[],
     abbreviates: true,
     first: First::Pattern,
     operands_read: true,
@@ -2713,6 +2796,7 @@ const GIT_LOG: Grammar = Grammar {
         ("committer", &[Val::Text]),
         ("grep-reflog", &[Val::Text]),
     ],
+    flags: &[],
     abbreviates: false,
     first: First::Operand,
     operands_read: true,
@@ -2724,9 +2808,9 @@ fn option_values<'a>(g: &Grammar, a: &'a str) -> (Vec<Val>, Option<&'a str>) {
             .split_once('=')
             .map_or((body, None), |(n, v)| (n, Some(v)));
         let listed = g.long.iter().find(|(n, _)| *n == name).or_else(|| {
-            g.long
-                .iter()
-                .find(|(n, _)| g.abbreviates && !name.is_empty() && n.starts_with(name))
+            g.long.iter().find(|(n, _)| {
+                g.abbreviates && !name.is_empty() && n.starts_with(name) && !g.flags.contains(&name)
+            })
         });
         return match listed {
             Some((_, kinds)) => (kinds.to_vec(), glued),

@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! CPU/GPU byte-parity tests for `harness_card` fx layers: delta 0, or one
-//! LSB where `common::assert_byte_exact` names the GPU. No GPU: COULD NOT RUN.
+//! CPU/GPU byte-parity tests for `harness_card` fx layers.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -19,22 +18,17 @@ use crate::common::{self, max_channel_delta};
 const ROWS: usize = 12;
 const COLS: usize = 80;
 
-/// The card's box.
 const BOX_ROWS: u16 = 4;
 const BOX_COLS: u16 = 51;
 const TRAIL: (u16, u16) = (22, 30);
 const KITTY_COL: u16 = 30;
 
-/// The card's name in the frame's layers.
 const CARD: u64 = 7;
 
-/// A wait for something that must happen (an episode's end) is a hang detector, never a budget.
 const FRAMES_MAX: usize = 400;
 
-/// Flow steps compared after the intro: the card flows on while it may animate.
 const FLOW_STEPS: usize = 3;
 
-/// A hidden-cursor terminal whose every cell is the ground `bg` (`None` uses the theme's).
 fn ground_term(bg: Option<&str>) -> Terminal {
     let mut t = Terminal::new(ROWS as u16, COLS as u16);
     t.process(b"\x1b[?25l");
@@ -48,7 +42,6 @@ fn ground_term(bg: Option<&str>) -> Terminal {
     t
 }
 
-/// The card's scene with its banner on grid row `top`.
 fn scene(cpu: &Renderer, top: u16, dark: bool, ground: u32) -> CardScene {
     let (cw, ch) = cpu.cell_size();
     let px = |v: usize| i32::try_from(v).expect("a pixel");
@@ -80,7 +73,6 @@ fn scene(cpu: &Renderer, top: u16, dark: bool, ground: u32) -> CardScene {
     }
 }
 
-/// `frame`'s two layers as the app lays them for `scene`.
 fn layers(frame: &CardFrame, scene: &CardScene, cpu: &Renderer) -> Vec<FxLayer> {
     let (x0, y0, x1, y1) = scene.clip;
     let grid = (
@@ -121,7 +113,6 @@ fn exact(
     );
 }
 
-/// The RGB comparator must see complete frames, rather than a shared prefix.
 fn same_extent(c: &aterm_render::Frame, g: &aterm_render::Frame) {
     assert_eq!((c.width, c.height), (g.width, g.height));
     assert_eq!(c.pixels.len(), g.pixels.len());
@@ -132,9 +123,6 @@ fn same_extent(c: &aterm_render::Frame, g: &aterm_render::Frame) {
     assert_eq!(c.pixels.len(), pixels);
 }
 
-/// The renderers under test: the renderer's own arm (Metal on macOS, GL on
-/// Linux) and, in the oracle build on macOS or Linux, the wgpu oracle, each
-/// beside its own CPU twin.
 fn arms(px: f32, theme: Theme) -> Vec<(&'static str, Renderer, aterm_gpu::GpuRenderer)> {
     let (cpu, gpu) = common::backends(px, theme);
     #[allow(unused_mut, reason = "the oracle build adds an arm")]
@@ -148,8 +136,6 @@ fn arms(px: f32, theme: Theme) -> Vec<(&'static str, Renderer, aterm_gpu::GpuRen
     out
 }
 
-/// After a frame: that it drew on the arm `arm` names (the oracle is
-/// neither Metal nor GL).
 fn assert_arm(arm: &str, gpu: &aterm_gpu::GpuRenderer, what: &str) {
     #[cfg(target_os = "macos")]
     assert_eq!(
@@ -167,9 +153,6 @@ fn assert_arm(arm: &str, gpu: &aterm_gpu::GpuRenderer, what: &str) {
     let _ = (arm, gpu, what);
 }
 
-/// THE CARD'S LAYERS ARE BYTE-EXACT ON THE GPU (design §4.9): its intro, its
-/// flow, settled, replayed, scrolled and under a menu's occluder, on both
-/// themes at two cell sizes, on every arm this build carries.
 #[test]
 fn the_cards_layers_are_byte_exact_on_the_gpu() {
     for px in [18.0, 30.0] {
@@ -182,7 +165,6 @@ fn the_cards_layers_are_byte_exact_on_the_gpu() {
     }
 }
 
-/// [`the_cards_layers_are_byte_exact_on_the_gpu`] on one arm.
 fn card_on_arm(
     arm: &str,
     px: f32,

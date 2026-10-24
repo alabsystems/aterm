@@ -241,34 +241,52 @@ fn find_bar_owns_its_entire_effect_band_without_sparkle_or_sprite_bleed() {
         row: 0,
         ..Default::default()
     });
-    input.cat_quads.push(aterm_render::SpriteQuad {
-        row: 0,
-        ..Default::default()
-    });
-    input.rain_quads.push(aterm_render::SpriteQuad {
-        row: 0,
-        ..Default::default()
-    });
     input.rain_add.push(aterm_render::RainHalo {
         row: 0,
         ..Default::default()
     });
-    input.free_sprites.push(aterm_core::render::FreeSprite {
-        y: 0,
-        h: u16::try_from(ch).unwrap_or(u16::MAX),
-        w: 1,
-        ..Default::default()
-    });
+    let art = aterm_render::fx::bitmap(
+        aterm_core::render::FxTexels::Rgba8Straight,
+        1,
+        u16::try_from(ch).unwrap_or(u16::MAX),
+        vec![255; ch * 4],
+    )
+    .expect("an art");
+    aterm_render::sprites::SpriteLayers::new(1).publish(
+        &[aterm_render::sprites::FreeSprite::whole(0, 0, art)],
+        &mut input.fx_layers,
+    );
 
     app.splice_find_bar(wid);
     let input = &app.windows[&wid].input_scratch;
     assert!(input.ink.is_empty());
     assert!(input.word_decorations.is_empty());
     assert!(input.nova_add.is_empty());
-    assert!(input.cat_quads.is_empty());
-    assert!(input.rain_quads.is_empty());
     assert!(input.rain_add.is_empty());
-    assert!(input.free_sprites.is_empty());
+    let band = input
+        .fx_occluders
+        .iter()
+        .find(|o| o.x0 == i32::MIN && o.x1 == i32::MAX)
+        .expect("the bar's band occludes every fx layer: the companions, the rain");
+    let rows = i32::try_from(crate::find_bar::FIND_BAR_ROWS).unwrap_or(i32::MAX);
+    let ch = i32::try_from(ch).unwrap_or(i32::MAX);
+    assert_eq!(
+        (band.y0, band.y1),
+        (0, rows * ch),
+        "…over the bar's rows, where the companion stood"
+    );
+    let companion = aterm_render::sprites::published(&input.fx_layers);
+    assert_eq!(
+        companion
+            .iter()
+            .map(|s| s.visible().intersect(*band))
+            .collect::<Vec<_>>(),
+        companion
+            .iter()
+            .map(aterm_render::sprites::FreeSprite::visible)
+            .collect::<Vec<_>>(),
+        "the band hides every pixel the companion would draw"
+    );
 }
 
 #[test]

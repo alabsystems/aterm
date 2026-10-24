@@ -28,13 +28,13 @@ use crate::supervise::classify::{
 };
 
 /// Rule identifier for the read-only Bash classifier approval rule.
-pub const RULE_READ_ONLY: &str = "read-only@classify-v8";
-/// [`RULE_READ_ONLY`]'s proof over a Bash box whose one note is Claude Code's no-rule note (`This command requires approval`), plus [`no_rule_clear`].
-pub const RULE_NO_RULE_READ_ONLY: &str = "no-rule-read-only@v3";
-/// The rm circuit-breaker rule's id.
-pub const RULE_RM_BREAKER: &str = "rm-breaker@v7";
+pub const RULE_READ_ONLY: &str = "read-only@classify-v9";
+/// [`RULE_READ_ONLY`]'s proof over a Bash box whose one note is Claude Code's no-rule note (`This command requires approval`).
+pub const RULE_NO_RULE_READ_ONLY: &str = "no-rule-read-only@v4";
+/// The rm circuit-breaker rule's id; it does not run [`proof_gaps_clear`], whose assignments the rm resolver follows.
+pub const RULE_RM_BREAKER: &str = "rm-breaker@v8";
 /// The rm circuit breaker's too-many box ([`RmBreakerKind::TooManySubstitutions`]) over a command that names no rm.
-pub const RULE_BREAKER_READ_ONLY: &str = "breaker-read-only@v8";
+pub const RULE_BREAKER_READ_ONLY: &str = "breaker-read-only@v9";
 /// The rm circuit breaker the safe rules could not prove, approved with a warning under `approve = "safe"` ([`rm_breaker_warn`]).
 pub const RULE_RM_BREAKER_WARN: &str = "rm-breaker-warn@v1";
 /// The Read-outside-cwd rule's id.
@@ -1535,11 +1535,7 @@ fn bash(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
         return Decision::escalate("a box in a bypass session is a vendor circuit breaker");
     }
     let runs_on = prompt.runs_on();
-    let proven = readings_read_only(&readings, &ctx.python_allow)
-        .and_then(|()| match rule_id {
-            RULE_NO_RULE_READ_ONLY => no_rule_clear(&readings),
-            _ => Ok(()),
-        })
+    let proven = readings_proven(&readings, &ctx.python_allow)
         .and_then(|()| shell_models_hold(&readings, runs_on.as_deref(), ctx))
         .and_then(|()| plain_under_zsh(&readings, ctx))
         .and_then(|()| git_reads_clear(&readings, runs_on.as_deref(), ctx))
@@ -1594,7 +1590,8 @@ const GLOB_SAFE: &[&str] = &[
     "md5sum",
 ];
 
-fn no_rule_clear(readings: &[String]) -> Result<(), String> {
+/// `Ok` when no reading holds a form the classifier cannot vet: an assignment, `env`, `export` or `xargs` on the walk to a program, a loop variable, or an unquoted glob beside a program off [`GLOB_SAFE`].
+fn proof_gaps_clear(readings: &[String]) -> Result<(), String> {
     let assignment = |w: &str| {
         w.split_once('=').is_some_and(|(name, _)| {
             name.chars()
@@ -1796,15 +1793,41 @@ fn brace_free(readings: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// `Ok` when every reading of a Bash box's command classifies read-only, reads no socket, holds no brace expansion, and turns on no blank the screen cannot show.
+/// `Ok` when every reading of a Bash box's command classifies read-only, reads no socket, holds no brace expansion, turns on no blank the screen cannot show, and holds no proof gap.
+pub(crate) fn readings_proven(readings: &[String], python_allow: &[String]) -> Result<(), String> {
+    read_only_every_reading(readings, python_allow)?;
+    blanks_shown(readings)?;
+    proof_gaps_clear(readings)
+}
+
+/// [`readings_proven`], then the default secret list under this process's `HOME`: the advisory word for a Bash box.
 ///
 /// # Errors
 ///
 /// The first reading that is not read-only, else the first that holds a
-/// form the shell may read otherwise than drawn, named.
+/// form the shell may read otherwise than drawn or the classifier cannot
+/// vet, else the first that reads a secret, named.
 pub fn readings_read_only(readings: &[String], python_allow: &[String]) -> Result<(), String> {
-    read_only_every_reading(readings, python_allow)?;
-    blanks_shown(readings)
+    readings_proven(readings, python_allow)?;
+    let home = advisory_home();
+    secrets_free(readings, &default_secrets(home.as_deref()), home.as_deref())
+}
+
+/// `Ok` unless `line` reads a path the default secret list names under `home`: `aterm drive classify`'s secret half.
+///
+/// # Errors
+///
+/// `a read of a secret (<rule>) (space reading): <path>`, or the
+/// classifier's refusal of a line it cannot read.
+pub fn command_reads_no_secret(line: &str, home: Option<&Path>) -> Result<(), String> {
+    secrets_free(&[line.to_string()], &default_secrets(home), home)
+}
+
+/// The home the advisory word resolves `~` and the secret list against.
+fn advisory_home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
 }
 
 fn blanks_shown(readings: &[String]) -> Result<(), String> {
@@ -1847,7 +1870,7 @@ fn breaker_read_only(
         ));
     }
     let runs_on = prompt.runs_on();
-    let proven = readings_read_only(&readings, &ctx.python_allow)
+    let proven = readings_proven(&readings, &ctx.python_allow)
         .and_then(|()| shell_models_hold(&readings, runs_on.as_deref(), ctx))
         .and_then(|()| plain_under_zsh(&readings, ctx))
         .and_then(|()| git_reads_clear(&readings, runs_on.as_deref(), ctx))

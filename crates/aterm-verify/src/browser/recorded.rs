@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The recorded-frame differential: every frame the GPU page presents, held to the frame the
-//! wgpu-WebGL module presented for the same content in the same browser.
+//! Recorded-frame differential against the committed `wgpu-WebGL` reference frames.
 
 use std::path::{Path, PathBuf};
 
@@ -15,10 +14,7 @@ pub(crate) fn wgpu_webgl_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("browser/wgpu-webgl")
 }
 
-/// The manifest's file name.
 const MANIFEST: &str = "recording.json";
-
-/// The largest frame side a recording may hold (the PNG decode's bound).
 const MAX_SIDE: u32 = 4096;
 
 /// What one session recorded: who drew the frames, and the frames by name.
@@ -30,7 +26,6 @@ pub(crate) struct Recording {
     pub frames: Vec<(String, Frame)>,
 }
 
-/// The lowercase hex SHA-256 of `bytes`.
 fn sha256(bytes: &[u8]) -> String {
     aterm_digest::Sha256::digest(bytes)
         .iter()
@@ -38,7 +33,6 @@ fn sha256(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// `frame` as an RGBA8 PNG.
 fn png(frame: &Frame) -> Result<Vec<u8>, String> {
     let (w, h) = (
         u32::try_from(frame.width).map_err(|_| "a frame wider than u32".to_string())?,
@@ -167,7 +161,6 @@ pub(crate) fn read(dir: &Path) -> Result<Recording, String> {
     })
 }
 
-/// A frame name's sequence and index: `diff-3` is (`diff`, 3).
 fn sequence(name: &str) -> Option<(&str, usize)> {
     let (seq, k) = name.rsplit_once('-')?;
     Some((seq, k.parse().ok()?))
@@ -262,7 +255,6 @@ pub(crate) fn judge(rec: &Recording, adapter: &str, run: &[(String, &Frame)]) ->
 mod tests {
     use super::*;
 
-    /// A 3x2 frame whose pixel `lit` is white on black.
     fn frame(lit: usize) -> Frame {
         let mut rgba = [0, 0, 0, 255].repeat(6);
         rgba[4 * lit..4 * lit + 3].copy_from_slice(&[255, 255, 255]);
@@ -291,8 +283,6 @@ mod tests {
         rec.frames.iter().map(|(n, f)| (n.clone(), f)).collect()
     }
 
-    /// A recording survives its own round trip through PNG and the manifest,
-    /// and a pixel edited in a PNG is refused by its digest.
     #[test]
     fn a_recording_round_trips_and_a_tampered_png_is_refused() {
         let dir = aterm_tempfile::tempdir().expect("tempdir");
@@ -306,9 +296,6 @@ mod tests {
         assert!(err.contains("do not hash"), "{err}");
     }
 
-    /// On the recording's adapter the frames must match byte for byte; one
-    /// byte off fails and names its frame, while another adapter's run is
-    /// held within the tolerance and says so.
     #[test]
     fn the_recording_s_adapter_is_held_byte_for_byte_another_within_the_tolerance() {
         let rec = recording();
@@ -329,8 +316,6 @@ mod tests {
         assert!(v.lines[0].contains("within 8"), "{:?}", v.lines);
     }
 
-    /// A page stuck on a sequence's first frame trips the negative control,
-    /// and a run with other frames than the recording's is refused by name.
     #[test]
     fn a_stalled_page_trips_the_control_and_a_missing_frame_is_named() {
         let rec = recording();

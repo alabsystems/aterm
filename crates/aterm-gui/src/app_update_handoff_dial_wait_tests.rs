@@ -22,16 +22,13 @@ use aterm_spec::derive::Model;
 use aterm_spec::interp::{self, State};
 use std::time::{Duration, Instant};
 
-/// The successor, as the harness scripted or drove it.
 const ALIVE: i64 = 0;
 const DIALLED: i64 = 1;
 const DEAD: i64 = 2;
-/// LaunchServices' answer, by what it proves.
 const NONE: i64 = 0;
 const PROVES_NOTHING: i64 = 1;
 const PROVES_EXIT: i64 = 2;
 const NAMES_PID: i64 = 3;
-/// The wait.
 const WAITING: i64 = 0;
 const ACCEPTED: i64 = 1;
 const TIMED_OUT: i64 = 2;
@@ -83,13 +80,11 @@ pub(crate) fn project(model: &Model, seen: Observed) -> State {
     state
 }
 
-/// The model must admit `prev -> next` by exactly `action`.
 fn step(model: &Model, prev: Observed, next: Observed, action: &str) {
     let (from, to) = (project(model, prev), project(model, next));
     crate::conformance_support::assert_transition(model, &from, &to, action);
 }
 
-/// What the real verdicts say of a real answer, in the model's answer terms.
 fn answer_class(answer: &Result<LaunchedSuccessor, LaunchError>) -> i64 {
     if launch_answer_proves_exit(Some(answer)) {
         PROVES_EXIT
@@ -100,7 +95,6 @@ fn answer_class(answer: &Result<LaunchedSuccessor, LaunchError>) -> i64 {
     }
 }
 
-/// The model action a real answer of `class` is.
 fn answer_action(class: i64) -> &'static str {
     match class {
         PROVES_EXIT => "AnswerExited",
@@ -113,18 +107,15 @@ fn own_pid() -> i32 {
     i32::try_from(std::process::id()).expect("a pid fits pid_t")
 }
 
-/// A real rendezvous bound in this process.
 fn bind() -> Rendezvous {
     let nonce = aterm_uds::rand::hex_token::<16>().expect("a nonce");
     Rendezvous::bind(&nonce).expect("bind a rendezvous for the Tier-1")
 }
 
-/// A deadline past the callers' one-minute bound.
 fn far() -> Instant {
     Instant::now() + Duration::from_secs(120)
 }
 
-/// A real process standing in for a named successor.
 fn named_stand_in() -> aterm_uds::spawnfd::Child {
     aterm_uds::spawnfd::command("/bin/sh")
         .args(["-c", "read _; exit 70"])
@@ -133,7 +124,6 @@ fn named_stand_in() -> aterm_uds::spawnfd::Child {
         .expect("spawn the named stand-in")
 }
 
-/// End the stand-in by its own exit and reap it.
 fn end_and_reap(mut child: aterm_uds::spawnfd::Child) {
     drop(child.stdin.take());
     let status = child.wait().expect("reap the named stand-in");
@@ -149,7 +139,6 @@ fn pid_of(child: &aterm_uds::spawnfd::Child) -> (u32, i32) {
     (pid, i32::try_from(pid).expect("a pid fits pid_t"))
 }
 
-/// The measured answers, as the completion reads an `NSRunningApplication`.
 fn launch_services_shapes() -> [(i32, bool, bool); 6] {
     [
         (-1, true, true),

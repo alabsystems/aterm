@@ -372,6 +372,7 @@ fn joined(node: u8, host: &str, ip: [u8; 4], port: u16) -> Peer {
         version: Some("0.95.0+g1a2b3c4".to_owned()),
         seen_ms: Some(1_760_000_000_000),
         via: Via::Joined,
+        fleet: None,
     }
 }
 
@@ -386,6 +387,7 @@ fn manual(host: &str, port: u16) -> Peer {
         version: None,
         seen_ms: None,
         via: Via::Manual,
+        fleet: None,
     }
 }
 
@@ -1367,6 +1369,7 @@ fn a_join_registers_the_member_with_the_issuer() {
             version: Some(reg.version.clone()),
             seen_ms: Some(1_760_000_000_000),
             via: Via::Joined,
+            fleet: None,
         }]
     );
 
@@ -2419,14 +2422,7 @@ fn a_book_that_rebinds_a_member_replaces_its_copy_and_key() {
     };
     let member = |key: NodeKey| keyed(0xd4, key, [10, 0, 0, 9], 7100);
     let peers = vec![issuer, copy(member(old.key()))];
-    let queue = || Queue {
-        peers: peers.clone(),
-        next: 0,
-        skip: vec![0],
-        live: 1,
-        started: 1,
-        keys: Arc::new(Keyring::of(&peers)),
-    };
+    let queue = || Queue::seated(peers.clone(), 0, Keyring::of(&peers));
     let book = |key: NodeKey| Book {
         node: i.node().to_owned(),
         peers: vec![member(key)],
@@ -2773,24 +2769,352 @@ fn a_read_holds_one_connection_to_an_address_at_a_time() {
 }
 
 #[test]
+fn two_entries_of_one_mac_read_its_one_answer() {
+    let b = identity(&node_of(0xb1), 1);
+    let (arrived, came) = std::sync::mpsc::channel::<()>();
+    let (gate, gated) = std::sync::mpsc::channel::<()>();
+    let (arrived, gated) = (std::sync::Mutex::new(arrived), std::sync::Mutex::new(gated));
+    let surveys = Arc::new(AtomicUsize::new(0));
+    let state = State::new("one-answer");
+    let mac = Issuing::run(
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(),
+        (secret(5), Some(b.clone())),
+        state.dir(),
+        Issuer {
+            node: node_of(0xb1),
+            ..issuer(0x11)
+        },
+        EVERY_OP,
+        Arc::new({
+            let surveys = Arc::clone(&surveys);
+            move |op| {
+                if op == FleetOp::Survey {
+                    surveys.fetch_add(1, Ordering::SeqCst);
+                    let _ = arrived.lock().unwrap().send(());
+                    let _ = gated.lock().unwrap().recv_timeout(HANG);
+                }
+                None
+            }
+        }),
+    );
+    let joined = Target {
+        host: "127.0.0.1".to_owned(),
+        addr: Some(IpAddr::from([127, 0, 0, 1])),
+        port: mac.port,
+        node: Some(node_of(0xb1)),
+        key: Some(b.key()),
+    };
+    let by_hand = Target {
+        node: None,
+        key: None,
+        ..joined.clone()
+    };
+    let (held, keys) = (Arc::new(HeldAddrs::default()), Keyring::default());
+    let read = |target: &Target| read_one(target, &keys, (&secret(5), None), HANG, "survey", &held);
+    let (first, second) = std::thread::scope(|scope| {
+        let first = scope.spawn(|| read(&joined));
+        came.recv_timeout(HANG)
+            .expect("the first entry's survey reached the Mac");
+        let second = scope.spawn(|| read(&by_hand));
+        // A third holder of the first's exchange: the second entry's dial reads it.
+        let since = Instant::now();
+        while !held
+            .open
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, open)| Arc::strong_count(open) > 2)
+        {
+            assert!(
+                since.elapsed() < HANG,
+                "the second entry never came to the Mac"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        drop(gate);
+        (first.join().unwrap(), second.join().unwrap())
+    });
+    let (first, second) = (first.unwrap(), second.unwrap());
+    assert_eq!(
+        (first.node.as_deref(), first.proven),
+        (Some(b.node()), true)
+    );
+    assert_eq!(
+        (second.node.as_deref(), second.addr),
+        (Some(b.node()), first.addr)
+    );
+    assert_eq!(second.lines, first.lines);
+    assert_eq!(
+        surveys.load(Ordering::SeqCst),
+        1,
+        "one survey answered both"
+    );
+}
+
+#[test]
+fn an_address_another_node_holds_gives_way_to_the_name_at_once() {
+    let (x, m) = (node_of(0xa1), identity(&node_of(0xa2), 1));
+    let (v6, v4, port) = twin_listeners();
+    let _x = Naming::on(v6, secret(5), x.clone());
+    let (arrived, came) = std::sync::mpsc::channel::<()>();
+    let (gate, gated) = std::sync::mpsc::channel::<()>();
+    let (arrived, gated) = (std::sync::Mutex::new(arrived), std::sync::Mutex::new(gated));
+    let state = State::new("gives-way-m");
+    let _m = Issuing::run(
+        v4,
+        (secret(5), Some(m.clone())),
+        state.dir(),
+        Issuer {
+            node: m.node().to_owned(),
+            ..issuer(0x11)
+        },
+        EVERY_OP,
+        Arc::new(move |op| {
+            if op == FleetOp::Survey {
+                let _ = arrived.lock().unwrap().send(());
+                let _ = gated.lock().unwrap().recv_timeout(HANG);
+            }
+            None
+        }),
+    );
+    let at_m = Target {
+        host: "127.0.0.1".to_owned(),
+        addr: Some(IpAddr::from([127, 0, 0, 1])),
+        port,
+        node: Some(m.node().to_owned()),
+        key: Some(m.key()),
+    };
+    let moved = Target {
+        host: "::1".to_owned(),
+        node: Some(x.clone()),
+        key: None,
+        ..at_m.clone()
+    };
+    let (held, keys) = (Arc::new(HeldAddrs::default()), Keyring::default());
+    let read = |target: &Target| read_one(target, &keys, (&secret(5), None), HANG, "survey", &held);
+    let found = std::thread::scope(|scope| {
+        let reading_m = scope.spawn(|| read(&at_m));
+        came.recv_timeout(HANG).expect("M's survey began");
+        let found = read(&moved);
+        drop(gate);
+        let _ = reading_m.join().unwrap();
+        found
+    });
+    match found {
+        Ok(surveyed) => {
+            assert_eq!(surveyed.node.as_deref(), Some(x.as_str()));
+            assert!(surveyed.addr.is_ipv6(), "{:?}", surveyed.addr);
+        }
+        Err(e) => panic!("X's name was never asked: {e}"),
+    }
+}
+
+#[test]
+fn the_issuers_book_never_waits_on_another_entrys_survey_of_it() {
+    let n = identity(&node_of(0xd9), 1);
+    let (n_asked, n_came) = std::sync::mpsc::channel::<()>();
+    let n_asked = std::sync::Mutex::new(n_asked);
+    let n_state = State::new("book-first-n");
+    let member = Issuing::run(
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(),
+        (secret(5), Some(n.clone())),
+        n_state.dir(),
+        Issuer {
+            node: node_of(0xd9),
+            ..issuer(0x22)
+        },
+        EVERY_OP,
+        Arc::new(move |op| {
+            if op == FleetOp::Survey {
+                let _ = n_asked.lock().unwrap().send(());
+            }
+            None
+        }),
+    );
+    let issuer_state = State::new("book-first-i");
+    write_book(
+        issuer_state.dir(),
+        &[Peer {
+            host: "127.0.0.1".to_owned(),
+            ..keyed(0xd9, n.key(), [127, 0, 0, 1], member.port)
+        }],
+    );
+    issue(issuer_state.dir());
+    let issuing_as = identity(&issuer(0x11).node, 9);
+    let (gate, gated) = std::sync::mpsc::channel::<()>();
+    let gated = std::sync::Mutex::new(gated);
+    // The issuer's ops being answered now, and the most there were at once.
+    let (answering, most) = (AtomicUsize::new(0), Arc::new(AtomicUsize::new(0)));
+    let issuing = Issuing::run(
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(),
+        (secret(5), Some(issuing_as.clone())),
+        issuer_state.dir(),
+        issuer(0x11),
+        EVERY_OP,
+        Arc::new({
+            let most = Arc::clone(&most);
+            move |op| {
+                most.fetch_max(
+                    answering.fetch_add(1, Ordering::SeqCst) + 1,
+                    Ordering::SeqCst,
+                );
+                match op {
+                    FleetOp::Survey => {
+                        let _ = gated.lock().unwrap().recv_timeout(HANG);
+                    }
+                    // Long past the entry's dial, which begins at once.
+                    FleetOp::Book => std::thread::sleep(Duration::from_millis(300)),
+                    _ => {}
+                }
+                answering.fetch_sub(1, Ordering::SeqCst);
+                None
+            }
+        }),
+    );
+    let peers = [
+        Peer {
+            key: Some(issuing_as.key()),
+            ..issuer_entry(0x11, issuing.port)
+        },
+        manual("127.0.0.1", issuing.port),
+    ];
+    let (reads, book) = std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let _ = n_came.recv_timeout(HANG);
+            drop(gate);
+        });
+        read_whole(
+            &peers,
+            &Keyring::of(&peers),
+            None,
+            (&secret(5), None),
+            HANG,
+            "survey",
+        )
+    });
+    assert!(
+        matches!(&book, BookRead::Fetched(book) if book.proven),
+        "{book:?}"
+    );
+    let read: Vec<(Via, Option<String>)> = reads
+        .iter()
+        .map(|read| match &read.read {
+            Ok(surveyed) => (read.peer.via, surveyed.node.clone()),
+            Err(e) => panic!("{:?} at {}: {e:?}", read.peer.via, read.peer.target()),
+        })
+        .collect();
+    assert_eq!(
+        read,
+        [
+            (Via::Issuer, Some(issuer(0x11).node)),
+            (Via::Manual, Some(issuer(0x11).node)),
+            (Via::IssuerBook, Some(node_of(0xd9))),
+        ]
+    );
+    assert_eq!(
+        most.load(Ordering::SeqCst),
+        1,
+        "the issuer was asked twice at once"
+    );
+}
+
+#[test]
+fn an_entry_refused_by_the_copys_key_is_read_again_by_the_books() {
+    let (old, new) = (identity(&node_of(0xda), 1), identity(&node_of(0xda), 2));
+    let (dialled, came) = std::sync::mpsc::channel::<()>();
+    let (dialled, came) = (std::sync::Mutex::new(dialled), std::sync::Mutex::new(came));
+    let (m_state, issuer_state) = (State::new("again-m"), State::new("again-i"));
+    let m = Issuing::run(
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(),
+        (secret(5), Some(new.clone())),
+        m_state.dir(),
+        Issuer {
+            node: node_of(0xda),
+            ..issuer(0x11)
+        },
+        EVERY_OP,
+        Arc::new(move |op| {
+            if op == FleetOp::Survey {
+                let _ = dialled.lock().unwrap().send(());
+            }
+            None
+        }),
+    );
+    write_book(
+        issuer_state.dir(),
+        &[Peer {
+            host: "127.0.0.1".to_owned(),
+            ..keyed(0xda, new.key(), [127, 0, 0, 1], m.port)
+        }],
+    );
+    issue(issuer_state.dir());
+    let issuing_as = identity(&issuer(0x11).node, 9);
+    let issuing = Issuing::run(
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(),
+        (secret(5), Some(issuing_as.clone())),
+        issuer_state.dir(),
+        issuer(0x11),
+        EVERY_OP,
+        // The book once N's place was dialled under the copy's key.
+        Arc::new(move |op| {
+            if op == FleetOp::Book {
+                let _ = came.lock().unwrap().recv_timeout(HANG);
+            }
+            None
+        }),
+    );
+    let peers = [
+        Peer {
+            key: Some(issuing_as.key()),
+            ..issuer_entry(0x11, issuing.port)
+        },
+        manual("127.0.0.1", m.port),
+        copy(Peer {
+            host: "127.0.0.1".to_owned(),
+            ..keyed(0xda, old.key(), [127, 0, 0, 1], m.port)
+        }),
+    ];
+    let (reads, book) = read_whole(
+        &peers,
+        &Keyring::of(&peers),
+        None,
+        (&secret(5), None),
+        HANG,
+        "survey",
+    );
+    assert!(
+        matches!(&book, BookRead::Fetched(book) if book.proven),
+        "{book:?}"
+    );
+    let at_n: Vec<_> = reads
+        .into_iter()
+        .filter(|read| read.peer.port == m.port)
+        .map(|read| (read.peer.via, read.read))
+        .collect();
+    assert!(
+        matches!(
+            at_n.as_slice(),
+            [(Via::Manual, Ok(by_hand)), (Via::IssuerBook, Ok(booked))]
+                if by_hand.proven && booked.proven
+                    && by_hand.node.as_deref() == Some(new.node())
+        ),
+        "{at_n:?}"
+    );
+}
+
+#[test]
 fn a_peer_past_the_first_at_once_dials_waits_for_a_place_of_its_own() {
     let peers: Vec<Peer> = (0..AT_ONCE + 5)
         .map(|n| joined(0, "127.0.0.1", [127, 0, 0, 1], 7000 + n as u16))
         .collect();
-    let mut queued = Queue {
-        peers,
-        next: 0,
-        skip: vec![3],
-        live: 1,
-        started: 1,
-        keys: std::sync::Arc::default(),
-    };
+    let mut queued = Queue::seated(peers, 3, Keyring::default());
     assert_eq!(queued.hands(), AT_ONCE - 1, "the seat holds one place");
     assert_eq!(queued.hands(), 0, "every place is held");
+    let deadline = (Instant::now() + HANG, Duration::from_secs(1));
     let mut waited = Vec::new();
-    while let Some((at, _, past)) = queued.take() {
+    while let Some((at, _, by, _)) = queued.take(deadline) {
         assert_ne!(at, 3, "a skipped place is never taken");
-        waited.push(past);
+        waited.push(by.0 != deadline.0);
     }
     assert_eq!(waited.len(), AT_ONCE + 4);
     let first = waited.iter().position(|past| *past);
@@ -3456,7 +3780,7 @@ fn a_name_is_looked_up_as_itself_and_a_bare_one_as_dot_local() {
             (&secret(5), None),
             FleetOp::Survey,
             (Instant::now() + HANG, HANG),
-            (&[], resolver, None),
+            (&[], resolver),
         )
     };
     let nowhere: Resolver = |_, _| Vec::new();

@@ -346,6 +346,7 @@ fn the_book_says_whether_this_mac_knows_only_its_issuer() {
         version: None,
         seen_ms: None,
         via,
+        fleet: None,
     };
     let book = |peers: Vec<Peer>| {
         update_peers(&dir, |book| {

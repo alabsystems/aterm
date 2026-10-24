@@ -9152,10 +9152,14 @@ impl App {
             }
             AuxTarget::Overview => self.open_overview(),
             AuxTarget::AutopilotMenu => self.open_front_autopilot_menu(),
-            AuxTarget::FactMenu => Err(
-                "open fact-menu names its fact: model | effort | path | branch | context | usage"
-                    .to_string(),
-            ),
+            AuxTarget::FactMenu => {
+                use crate::claude_lights::Fact;
+                let names: Vec<&str> = Fact::EVERY.into_iter().map(Fact::key).collect();
+                Err(format!(
+                    "open fact-menu names its fact: {}",
+                    names.join(" | ")
+                ))
+            }
             AuxTarget::Front => {
                 Err("the front terminal window is already open (use window/chrome)".to_string())
             }

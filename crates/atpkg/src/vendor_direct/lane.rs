@@ -12,7 +12,7 @@ use super::decide::{
 use super::digests::{AuthenticatedDigest, DigestSeen, record_or_conflict};
 use super::policy::Policy;
 use super::record::{RECORD_SCHEMA, VendorRecord, complete_record};
-use super::resolve::{self, Candidate, Head, Resolution};
+use super::resolve::{self, Candidate, Head, Resolution, Vouch};
 use super::stamp::ProgramStamp;
 use super::table::VendorSpec;
 use super::version::{Version, is_vendor_build};
@@ -888,13 +888,25 @@ fn admit_candidate(lane: &Lane<'_>, pending: Pending, inputs: &super::decide::In
         why,
         keeping: pending.installed,
     };
+    let Some(digest) = c.vouch.digest() else {
+        // No document names grok's digest: the first-seen log and the memo judge the bytes
+        // once they are measured ([`measure`]). An earlier refusal of this version holds
+        // without a download, since nothing short of the bytes could tell a new cut from it.
+        if pending.stamp.refused_at(c.version) {
+            return fall_back(refuse(refused_unmeasured(spec.program, c.version)), true);
+        }
+        if let Err(e) = resolve::admit(&c.artifact, &c.vouch) {
+            return fall_back(refuse(e.to_string()), true);
+        }
+        return Step::Land(Box::new(pending));
+    };
     let record = c.anchor.vouches_before_download();
     match record_or_conflict(
         lane.layout,
         spec.program,
         c.version,
         lane.triple,
-        &c.digest,
+        digest,
         record,
     ) {
         Ok(DigestSeen::Conflict { first }) => {
@@ -904,7 +916,7 @@ fn admit_candidate(lane: &Lane<'_>, pending: Pending, inputs: &super::decide::In
                 spec.program,
                 &verdict_line(spec, &v),
                 c.version,
-                &c.digest,
+                digest,
             );
             return fall_back(v, true);
         }
@@ -918,37 +930,159 @@ fn admit_candidate(lane: &Lane<'_>, pending: Pending, inputs: &super::decide::In
             return fall_back(v, false);
         }
     }
-    if pending.stamp.is_refused(c.version, &c.digest) {
-        return fall_back(
-            refuse(String::from(
-                "an earlier pass refused these exact bytes; they are not fetched again until \
-                 the vendor's head or digest changes",
-            )),
-            true,
-        );
+    if pending.stamp.is_refused(c.version, digest) {
+        return fall_back(refuse(String::from(REFUSED_BYTES)), true);
     }
-    if let Err(e) = resolve::admit(&c.artifact) {
+    if let Err(e) = resolve::admit(&c.artifact, &c.vouch) {
         return fall_back(refuse(e.to_string()), true);
     }
     Step::Land(Box::new(pending))
+}
+
+const REFUSED_BYTES: &str = "an earlier pass refused these exact bytes; they are not fetched \
+                             again until the vendor's head or digest changes";
+
+fn refused_unmeasured(program: &str, version: Version) -> String {
+    format!(
+        "an earlier pass refused {version}'s bytes, and no document names their digest; they \
+         are not fetched again until the vendor's head moves (`aterm pkg update {program}` \
+         asks again)"
+    )
 }
 
 fn recut(c: &Candidate, first: &AuthenticatedDigest) -> String {
     format!(
         "its {} differs from the one first seen for {} ({}) — a re-cut release is never an \
          update",
-        c.digest.alg(),
+        c.anchor.digest_alg(),
         c.version,
         first.as_str()
     )
 }
 
+/// THE MEASURE STEP, for a candidate no document names a digest for (grok): its bytes are
+/// downloaded to the staging path the landing reads, held to their exact size, hashed, and the
+/// digest held to the first-seen log and the refusal memo before anything is staged.
+/// [`land`] then reuses the file ([`crate::flow::land_artifact`]), and only once the darwin
+/// team pin has passed those bytes is their digest logged.
+///
+/// # Errors
+/// [`FlowError::Download`] for a download that failed or came up short (nothing is memoized);
+/// [`FlowError::VendorRefused`] for a digest other than the one first seen for the version (a
+/// re-cut, memoized) or one an earlier pass refused; the disk gate's and the first-seen log's
+/// own errors. The downloaded file is removed on every error.
+fn measure(lane: &Lane<'_>, pending: &Pending) -> Result<Pending, FlowError> {
+    let (spec, c) = (pending.spec, &pending.candidate);
+    let art = c.artifact.artifact();
+    resolve::admit(&c.artifact, &c.vouch)?;
+    let dl = crate::flow::staged_download_path(lane.layout, spec.program, &art.asset)?;
+    crate::flow::disk_gate(
+        crate::flow::LandingBytes::of(art).need(),
+        crate::freespace::available_bytes(&dl),
+    )?;
+    crate::flow::make_staging_dir(&dl).map_err(|e| FlowError::Download(e.to_string()))?;
+    let _ = std::fs::remove_file(&dl);
+    crate::flow::sweep_foreign_partials(&dl);
+    let fail = |e: FlowError| {
+        let _ = std::fs::remove_file(&dl);
+        e
+    };
+    crate::progress::note_build(spec.program, c.version.build_id());
+    if let Some(ticket) = lane.download_turn {
+        ticket.wait();
+    }
+    let watch = crate::progress::watch_download(spec.program, &dl, art.size);
+    let fetched = lane
+        .fetcher
+        .vendor_download(spec.program, &art.url, &dl, art.size);
+    drop(watch);
+    if let Some(ticket) = lane.download_turn {
+        ticket.release();
+    }
+    if let Err(e) = fetched {
+        crate::flow::note_fetch_fault();
+        return Err(fail(FlowError::Download(e.to_string())));
+    }
+    let got = std::fs::symlink_metadata(&dl)
+        .ok()
+        .filter(std::fs::Metadata::is_file)
+        .map(|m| m.len());
+    if got != Some(art.size) {
+        return Err(fail(FlowError::Download(format!(
+            "{} answered {} of its {} bytes",
+            art.url,
+            got.map_or_else(|| String::from("no file"), |n| n.to_string()),
+            art.size
+        ))));
+    }
+    let alg = c.anchor.digest_alg();
+    let digest = crate::tree::file_digest(&dl, alg)
+        .ok()
+        .and_then(|hex| AuthenticatedDigest::measured(alg, &hex))
+        .ok_or_else(|| {
+            fail(FlowError::Download(format!(
+                "{} could not be hashed",
+                art.asset
+            )))
+        })?;
+    match record_or_conflict(
+        lane.layout,
+        spec.program,
+        c.version,
+        lane.triple,
+        &digest,
+        false,
+    ) {
+        Ok(DigestSeen::Conflict { first }) => {
+            let why = recut(c, &first);
+            let v = Verdict::Refused {
+                version: Some(c.version),
+                why: why.clone(),
+                keeping: pending.installed,
+            };
+            let _ = ProgramStamp::record_refusal(
+                lane.layout,
+                spec.program,
+                &verdict_line(spec, &v),
+                c.version,
+                &digest,
+            );
+            return Err(fail(FlowError::VendorRefused(why)));
+        }
+        Ok(DigestSeen::New | DigestSeen::Same) => {}
+        Err(e) => {
+            return Err(fail(FlowError::Download(format!(
+                "the first-seen digest log could not be checked: {e}"
+            ))));
+        }
+    }
+    if pending.stamp.is_refused(c.version, &digest) {
+        return Err(fail(FlowError::VendorRefused(String::from(REFUSED_BYTES))));
+    }
+    let Some(candidate) = c.measured(digest) else {
+        return Err(fail(FlowError::VendorRefused(String::from(
+            "the measured digest is not the candidate's anchor's",
+        ))));
+    };
+    resolve::admit(&candidate.artifact, &candidate.vouch).map_err(fail)?;
+    Ok(Pending {
+        candidate,
+        ..pending.clone()
+    })
+}
+
 /// Download, verify, stage (the darwin Developer ID gate inside), activate and shim a candidate [`plan_one`] verified.
 pub(crate) fn land_one(lane: &Lane<'_>, pending: &Pending) -> Outcome {
     let spec = pending.spec;
+    let mut measured = None;
+    let landed = match pending.candidate.vouch {
+        Vouch::Measure => measure(lane, pending).and_then(|p| land(lane, measured.insert(p))),
+        Vouch::Documents(_) | Vouch::Measured(_) => land(lane, pending),
+    };
+    let pending = measured.as_ref().unwrap_or(pending);
     let c = &pending.candidate;
     let asset = Some(c.artifact.artifact().asset.clone());
-    let verdict = match land(lane, pending) {
+    let verdict = match landed {
         Ok((shimmed, refused_shims, tree_root)) => Verdict::Installed {
             from: pending.installed,
             to: c.version,
@@ -983,13 +1117,15 @@ pub(crate) fn land_one(lane: &Lane<'_>, pending: &Pending) -> Outcome {
                     keeping: pending.installed,
                 }
             };
-            if matches!(&e, FlowError::Stage(StageError::SignerRefused(_))) {
+            if let (FlowError::Stage(StageError::SignerRefused(_)), Some(digest)) =
+                (&e, c.vouch.digest())
+            {
                 let _ = ProgramStamp::record_refusal(
                     lane.layout,
                     spec.program,
                     &verdict_line(spec, &v),
                     c.version,
-                    &c.digest,
+                    digest,
                 );
             }
             let inputs = super::decide::Inputs {
@@ -1025,7 +1161,12 @@ fn land(
     let program = spec.program;
     let c = &pending.candidate;
     let art = c.artifact.artifact();
-    resolve::admit(&c.artifact)?;
+    resolve::admit(&c.artifact, &c.vouch)?;
+    let Some(digest) = c.vouch.digest() else {
+        return Err(FlowError::VendorRefused(String::from(
+            "a payload no document vouches for is landed only once it is measured",
+        )));
+    };
     let record = VendorRecord {
         schema: RECORD_SCHEMA,
         program: program.to_string(),
@@ -1051,15 +1192,9 @@ fn land(
         let demoted = crate::macho::demote_foreign_executables(tree)?;
         gate(tree)?;
         if !c.anchor.vouches_before_download() {
-            let seen = record_or_conflict(
-                lane.layout,
-                program,
-                c.version,
-                lane.triple,
-                &c.digest,
-                true,
-            )
-            .map_err(StageError::Io)?;
+            let seen =
+                record_or_conflict(lane.layout, program, c.version, lane.triple, digest, true)
+                    .map_err(StageError::Io)?;
             if let DigestSeen::Conflict { first } = seen {
                 return Err(StageError::SignerRefused(recut(c, &first)));
             }
@@ -2462,6 +2597,273 @@ mod tests {
         f.payload(&url, exe);
     }
 
+    fn kimi() -> &'static VendorSpec {
+        super::super::spec("kimi").unwrap()
+    }
+
+    fn grok() -> &'static VendorSpec {
+        super::super::spec("grok").unwrap()
+    }
+
+    /// Publish kimi `version` as Moonshot's latest: the head, the CDN manifest and the
+    /// GitHub release manifest (answered through GitHub's storage) naming `exe`'s sha256,
+    /// and the CDN payload; its URL.
+    fn publish_kimi(f: &Fake, version: &str, exe: &[u8]) -> String {
+        let (key, file) = resolve::kimi_platform(world::triple()).unwrap();
+        let tag = format!("@moonshot-ai/kimi-code@{version}");
+        let manifest = format!(
+            "{{\"version\":\"{version}\",\"tag\":\"{tag}\",\"platforms\":{{\"{key}\":\
+             {{\"filename\":\"{file}\",\"checksum\":\"{}\"}}}}}}",
+            world::sha(exe)
+        );
+        f.doc(kimi().head_url, format!("{version}\n").as_bytes());
+        let cdn = format!("https://cdn.kimi.com/kimi-code/binaries/{version}/");
+        f.doc(&format!("{cdn}manifest.json"), manifest.as_bytes());
+        let github = format!(
+            "https://github.com/MoonshotAI/kimi-code/releases/download/{tag}/manifest.json"
+        );
+        f.doc(&github, manifest.as_bytes());
+        f.redirect(
+            &github,
+            "https://release-assets.githubusercontent.com/github-production-release-asset/1/2",
+        );
+        let url = format!("{cdn}{file}");
+        f.payload(&url, exe);
+        url
+    }
+
+    /// Publish grok `version` as xAI's stable pointer and its bucket payload; its URL. grok is
+    /// served on darwin only, so elsewhere the landing half could not run.
+    fn publish_grok(f: &Fake, version: &str, exe: &[u8]) -> String {
+        let Some(platform) = resolve::grok_platform(world::triple()) else {
+            aterm_uds::host::could_not_run(format!(
+                "grok is not served for {}, so the landing half did not run",
+                world::triple()
+            ));
+        };
+        f.doc(grok().head_url, version.as_bytes());
+        let url = format!(
+            "https://storage.googleapis.com/grok-build-public-artifacts/cli/grok-{version}-{platform}"
+        );
+        f.payload(&url, exe);
+        url
+    }
+
+    fn staged(l: &Layout, program: &str) -> Vec<String> {
+        std::fs::read_dir(l.staging_dir(program))
+            .map(|d| {
+                d.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_fresh_kimi_lands_the_binary_both_moonshot_manifests_name() {
+        let l = world::layout("fresh-kimi");
+        let f = Fake::default();
+        let exe = native_exe("kimi 2.3.2");
+        let url = publish_kimi(&f, "2.3.2", &exe);
+        let o = run(&l, &f, &Policy::default(), kimi());
+        assert!(
+            matches!(
+                o.verdict,
+                Verdict::Installed {
+                    reason: InstallReason::Fresh,
+                    ..
+                }
+            ),
+            "{o:?}"
+        );
+        let build = world::build_dir(&l, "kimi", "2.3.2");
+        assert_eq!(std::fs::read(build.join(world::bin("kimi"))).unwrap(), exe);
+        let record = complete_record(&build).expect("a complete record");
+        assert_eq!(
+            (record.sha256.as_str(), record.anchor),
+            (
+                world::sha(&exe).as_str(),
+                super::super::Anchor::MoonshotTwoHost
+            )
+        );
+        assert_eq!(record.source_url, url);
+        let env = crate::shim_env::read_sidecar(&build);
+        assert_eq!(env.spelled(), "KIMI_CODE_NO_AUTO_UPDATE=1");
+        let shim =
+            std::fs::read_to_string(l.shim(&crate::store::ToolName::new("kimi").unwrap())).unwrap();
+        assert!(shim.contains("KIMI_CODE_NO_AUTO_UPDATE"), "{shim}");
+        assert_eq!(f.downloads.borrow().as_slice(), [url]);
+        let log = super::super::digests::digests_path(&l, "kimi");
+        assert!(
+            log.ends_with("vendor/digests-kimi.toml"),
+            "{}",
+            log.display()
+        );
+        assert!(
+            std::fs::read_to_string(&log)
+                .unwrap()
+                .contains(&world::sha(&exe))
+        );
+    }
+
+    #[test]
+    fn a_fresh_grok_is_measured_once_and_logged_once_its_team_pin_passed() {
+        let l = world::layout("fresh-grok");
+        let f = Fake::default();
+        let exe = native_exe("grok 1.0.68");
+        let url = publish_grok(&f, "1.0.68", &exe);
+        let o = run(&l, &f, &Policy::default(), grok());
+        assert!(
+            matches!(
+                o.verdict,
+                Verdict::Installed {
+                    reason: InstallReason::Fresh,
+                    ..
+                }
+            ),
+            "{o:?}"
+        );
+        assert_eq!(
+            f.downloads.borrow().as_slice(),
+            std::slice::from_ref(&url),
+            "the landing staged the measured file: no second request"
+        );
+        let build = world::build_dir(&l, "grok", "1.0.68");
+        assert_eq!(std::fs::read(build.join("bin/grok")).unwrap(), exe);
+        let record = complete_record(&build).expect("a complete record");
+        assert_eq!(
+            (record.sha256.as_str(), record.anchor),
+            (
+                world::sha(&exe).as_str(),
+                super::super::Anchor::XaiDeveloperId
+            )
+        );
+        assert_eq!(record.apple_team.as_deref(), Some("5Y6N3AJ54S"));
+        let log = super::super::digests::digests_path(&l, "grok");
+        assert!(
+            std::fs::read_to_string(&log)
+                .unwrap()
+                .contains(&world::sha(&exe))
+        );
+        assert_eq!(
+            crate::shim_env::read_sidecar(&build).spelled(),
+            "GROK_DISABLE_AUTOUPDATER=1"
+        );
+        assert!(staged(&l, "grok").is_empty(), "{:?}", staged(&l, "grok"));
+    }
+
+    #[test]
+    fn a_grok_recut_is_refused_once_measured_and_never_fetched_again() {
+        let l = world::layout("grok-recut");
+        let f = Fake::default();
+        publish_grok(&f, "1.0.68", &native_exe("first cut"));
+        let o = run(&l, &f, &Policy::default(), grok());
+        assert!(matches!(o.verdict, Verdict::Installed { .. }), "{o:?}");
+        crate::ops::uninstall(&l, "grok").unwrap();
+        publish_grok(&f, "1.0.68", &native_exe("second cut"));
+        let downloads = f.downloads.borrow().len();
+        let o = run(&l, &f, &Policy::default(), grok());
+        assert!(matches!(o.verdict, Verdict::Refused { .. }), "{o:?}");
+        assert!(o.line().contains("first seen for 1.0.68"), "{}", o.line());
+        assert!(
+            !o.line().contains("signer refused"),
+            "the measured digest refused it before anything was staged: {}",
+            o.line()
+        );
+        assert_eq!(f.downloads.borrow().len(), downloads + 1, "measured once");
+        assert!(staged(&l, "grok").is_empty(), "{:?}", staged(&l, "grok"));
+        assert_eq!(shim_build(&l, "grok"), None, "nothing laid");
+        assert!(!world::build_dir(&l, "grok", "1.0.68").exists());
+        let o = run(&l, &f, &Policy::default(), grok());
+        assert!(matches!(o.verdict, Verdict::Refused { .. }), "{o:?}");
+        assert!(o.line().contains("head moves"), "{}", o.line());
+        assert_eq!(
+            f.downloads.borrow().len(),
+            downloads + 1,
+            "not fetched again"
+        );
+    }
+
+    #[test]
+    fn a_short_grok_download_fails_unmemoized_and_lands_on_the_next_pass() {
+        let l = world::layout("grok-short");
+        let f = Fake::default();
+        let exe = native_exe("grok 1.0.68");
+        let url = publish_grok(&f, "1.0.68", &exe);
+        let lane = Lane {
+            layout: &l,
+            fetcher: &f,
+            triple: world::triple(),
+            policy: &Policy::default(),
+            trust: &world::trust(),
+            legacy_index: None,
+            asked: false,
+            now: NOW,
+            download_turn: None,
+        };
+        let Step::Land(pending) = plan_one(&lane, grok(), false) else {
+            panic!("a grok to land");
+        };
+        f.payload(&url, &exe[..exe.len() - 1]);
+        let o = land_one(&lane, &pending);
+        assert!(matches!(o.verdict, Verdict::Failed { .. }), "{o:?}");
+        assert!(o.line().contains("of its"), "{}", o.line());
+        assert!(staged(&l, "grok").is_empty(), "{:?}", staged(&l, "grok"));
+        assert_eq!(ProgramStamp::read(&l, "grok").unwrap().refused, None);
+        assert!(!super::super::digests::digests_path(&l, "grok").exists());
+        f.payload(&url, &exe);
+        let o = run(&l, &f, &Policy::default(), grok());
+        assert!(matches!(o.verdict, Verdict::Installed { .. }), "{o:?}");
+    }
+
+    /// THE TEAM PIN, for each new row: a darwin Mach-O signed by another team is refused and
+    /// memoized; grok's measured digest is never logged for it, and its version is not
+    /// fetched again until a person asks; kimi's documented digest was logged before the
+    /// download, as codex's is.
+    #[test]
+    fn a_build_signed_by_another_team_is_refused_and_memoized_for_kimi_and_grok() {
+        let refusing = world::trust_refusing_signers();
+        let l = world::layout("kimi-team");
+        let f = Fake::default();
+        publish_kimi(&f, "2.3.2", &native_exe("not Moonshot's"));
+        let o = run_with(&l, &f, &Policy::default(), &refusing, kimi(), false);
+        if !cfg!(target_os = "macos") {
+            assert!(
+                matches!(o.verdict, Verdict::Installed { .. }),
+                "no gate off darwin: {o:?}"
+            );
+            return;
+        }
+        assert!(o.line().contains("signer refused"), "{}", o.line());
+        let downloads = f.downloads.borrow().len();
+        run_with(&l, &f, &Policy::default(), &refusing, kimi(), false);
+        assert_eq!(f.downloads.borrow().len(), downloads, "memoized");
+        assert_eq!(shim_build(&l, "kimi"), None);
+
+        let l = world::layout("grok-team");
+        let f = Fake::default();
+        publish_grok(&f, "1.0.68", &native_exe("not xAI's"));
+        let o = run_with(&l, &f, &Policy::default(), &refusing, grok(), false);
+        assert!(o.line().contains("signer refused"), "{}", o.line());
+        let log = super::super::digests::digests_path(&l, "grok");
+        assert!(!log.exists(), "nothing the pin refused is logged");
+        assert!(staged(&l, "grok").is_empty(), "{:?}", staged(&l, "grok"));
+        let downloads = f.downloads.borrow().len();
+        let o = run_with(&l, &f, &Policy::default(), &refusing, grok(), false);
+        assert!(o.line().contains("head moves"), "{}", o.line());
+        assert_eq!(f.downloads.borrow().len(), downloads, "not fetched again");
+        ProgramStamp::clear_refusal(&l, "grok").unwrap();
+        let genuine = native_exe("xAI's");
+        publish_grok(&f, "1.0.68", &genuine);
+        let o = run(&l, &f, &Policy::default(), grok());
+        assert!(matches!(o.verdict, Verdict::Installed { .. }), "{o:?}");
+        assert!(
+            std::fs::read_to_string(&log)
+                .unwrap()
+                .contains(&world::sha(&genuine))
+        );
+    }
+
     #[test]
     fn a_fresh_agy_lands_its_one_file_under_the_sha512_both_google_hosts_name() {
         let l = world::layout("fresh-agy");
@@ -2632,6 +3034,29 @@ mod tests {
                 Box::new(|f: &Fake| {
                     f.publish_claude("2.1.282", &native_exe("x"));
                     f.doc(&format!("{CLAUDE}latest"), b"2.1.0281\n");
+                }),
+            ),
+            (
+                "kimi-manifests-disagree",
+                kimi(),
+                Box::new(|f: &Fake| {
+                    publish_kimi(f, "2.3.2", &native_exe("x"));
+                    let url = "https://cdn.kimi.com/kimi-code/binaries/2.3.2/manifest.json";
+                    let body = String::from_utf8(f.body(url)).unwrap();
+                    let other = body.replace(&world::sha(&native_exe("x")), &"a".repeat(64));
+                    f.doc(url, other.as_bytes());
+                }),
+            ),
+            (
+                "kimi-github-off-host",
+                kimi(),
+                Box::new(|f: &Fake| {
+                    publish_kimi(f, "2.3.2", &native_exe("x"));
+                    f.redirect(
+                        "https://github.com/MoonshotAI/kimi-code/releases/download/\
+                         @moonshot-ai/kimi-code@2.3.2/manifest.json",
+                        "https://raw.githubusercontent.com/MoonshotAI/kimi-code/x",
+                    );
                 }),
             ),
             (
@@ -3571,12 +3996,14 @@ mod tests {
             (claude(), "2.1.282"),
             (codex(), "0.157.0"),
             (agy(), "1.3.7"),
+            (kimi(), "2.3.2"),
         ] {
             let publish = |f: &Fake, cut: &str| {
                 let exe = native_exe(cut);
                 match spec.program {
                     "claude" => f.publish_claude(version, &exe),
                     "codex" => f.publish_codex(version, &[("bin/codex", &exe, 0o755)]),
+                    "kimi" => drop(publish_kimi(f, version, &exe)),
                     _ => drop(publish_agy(f, version, &exe)),
                 }
             };

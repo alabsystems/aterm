@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use aterm_agent::harness::accounts;
 use aterm_agent::harness::accounts_sync::UpkeepStep;
+use aterm_agent::harness::laps;
 use aterm_agent::harness::login_latch::{self, LoginLatches};
 use aterm_agent::harness::netwatch::Route;
 use aterm_agent::harness::profile;
@@ -1086,6 +1087,9 @@ pub(crate) struct Kept {
     lost: Option<Lost>,
     /// A relaunch after aterm ended landed in the tab.
     carry_asked: bool,
+    /// The relaunch snapshot read an idle point started that is still out
+    /// ([`refresh_snapshot_at_point`]).
+    point_read: Option<Arc<PointRead>>,
 }
 
 /// Whether a relaunch's answer says it took (`adopted`, `relaunched`, `continued`, `done`, each with or without its `:<detail>`).
@@ -1699,6 +1703,13 @@ type OccupancyPaceFn = dyn Fn(
     ) -> aterm_agent::supervise::occupancy::PaceGrant
     + Send
     + Sync;
+/// The task door's fact word on session `sid`'s task record, `None` clearing it ([`Acts::task_fact`]).
+type TaskFactFn = dyn Fn(
+        &str,
+        Option<aterm_agent::supervise::occupancy::FactWord>,
+    ) -> aterm_agent::supervise::occupancy::NoteOutcome
+    + Send
+    + Sync;
 type FollowFn = dyn Fn(&str, &mut Snapshot) -> Foreground + Send + Sync;
 type StatusFn = dyn Fn(&str) -> Option<String> + Send + Sync;
 type ExitLookFn = dyn Fn(&str, &Snapshot) -> Option<ExitLook> + Send + Sync;
@@ -2146,7 +2157,13 @@ pub(crate) struct Acts {
     pub(crate) occupancy: Arc<OccupancyFn>,
     /// The board's pace and reservation table the worker takes a fact line's pace from ([`WorkerIdle::occupancy_pace`], live [`crate::occupancy_host::pace_for`]).
     pub(crate) occupancy_pace: Arc<OccupancyPaceFn>,
+    /// The task record's fact word the worker's task door notes or clears ([`WorkerIdle::task_fact`], live [`task_fact_live`]).
+    pub(crate) task_fact: Arc<TaskFactFn>,
     pub(crate) snapshot: Arc<SnapshotFn>,
+    /// How long an idle point waits for its relaunch snapshot read ([`refresh_snapshot_at_point`]):
+    /// [`POINT_READ_BOUND`] live; [`Acts::inert`]'s a hang detector's minute, so a test's read lands
+    /// before its point goes on unless the test shortens the wait.
+    pub(crate) point_read: Duration,
     pub(crate) follow: Arc<FollowFn>,
     pub(crate) status: Arc<StatusFn>,
     /// One look at an agent that left.
@@ -3250,6 +3267,20 @@ impl IdleHost for WorkerIdle {
         }
     }
 
+    /// The task door's fact word on this session's record ([`Acts::task_fact`]), refused
+    /// (`Closed`) unless the owner's mode in force here is `prompt` ([`crate::occupancy_host::prompt_now`]):
+    /// the GUI's own gate beside the loop's grant, so no loop's word, replay or older build writes
+    /// a fact under `observe` or `off`.
+    fn task_fact(
+        &self,
+        word: Option<aterm_agent::supervise::occupancy::FactWord>,
+    ) -> aterm_agent::supervise::occupancy::NoteOutcome {
+        if !crate::occupancy_host::prompt_now() {
+            return aterm_agent::supervise::occupancy::NoteOutcome::Closed;
+        }
+        (self.hooks.acts.task_fact)(&self.sid, word)
+    }
+
     /// A supervisor's information for a person (Codex's save-then-wait hold among them).
     fn inform(&self, text: &str) {
         (self.hooks.note)(HostNote::Inform {
@@ -3361,69 +3392,16 @@ impl IdleHost for WorkerIdle {
         self.at_idle_on(IdlePoint::default())
     }
 
-    /// [`Self::at_idle`] at a point the loop describes ([`IdlePoint`]).
+    /// [`Self::at_idle`] at a point the loop describes ([`IdlePoint`]), timed: a step that took
+    /// [`SLOW_STEP`] or more is logged with where its time went ([`WorkerIdle::idle_point`]).
     fn at_idle_on(&self, point: IdlePoint) -> Option<HostStep> {
-        if !self.on() || self.beside() {
-            return None;
-        }
-        if self.program_check_stuck() {
-            return None;
-        }
-        self.points.offered(crate::upgrade_host::now_s());
-        let mut look = self.look_at.lock().unwrap_or_else(PoisonError::into_inner);
-        if look.is_some_and(|at| at <= Instant::now()) {
-            *look = None;
-        }
-        self.park.store(false, Ordering::SeqCst);
-        drop(look);
-        with_kept_of(&self.kept, |k| k.carry_asked = false);
-        let owed = disk_owed(self.hooks.acts.disk_board, &self.sid);
-        if owed.is_some()
-            && let Some(why) = self.disk_resume_unowed()
-        {
-            disk_resume_stepped(self.hooks.acts.disk_board, &self.sid, true);
+        let (step, took) = laps::within(|| self.idle_point(point));
+        if took.total() >= SLOW_STEP {
             aterm_log::info!(
-                "harness @{}: {} step=done:{why}: nothing typed",
+                "harness @{}: its idle step took {} ms ({took})",
                 self.sid,
-                aterm_agent::harness::disk::RULE_DISK_RESUME
+                took.total().as_millis()
             );
-        } else if let Some(text) = owed {
-            let step = (self.hooks.acts.disk_resume)(&self.sid, &text);
-            let typed = step == "typed";
-            disk_resume_stepped(self.hooks.acts.disk_board, &self.sid, typed);
-            aterm_log::info!(
-                "harness @{}: {} step={step}",
-                self.sid,
-                aterm_agent::harness::disk::RULE_DISK_RESUME
-            );
-            if typed {
-                return Some(HostStep {
-                    line: format!(
-                        "{} step={step}",
-                        aterm_agent::harness::disk::RULE_DISK_RESUME
-                    ),
-                    moved: true,
-                    typed: Some(aterm_agent::supervise::policy::turn_end::HostTurn::CarryOn),
-                    repeat: false,
-                });
-            }
-        }
-        if with_kept_of(&self.kept, |k| k.account.reset_owed.is_some())
-            && let Some(seat) = (self.hooks.acts.account_seat)()
-        {
-            self.reset_flush(&seat);
-        }
-        let step = self.idle_step(point);
-        if !self.on() {
-            return None;
-        }
-        if self.unnamed() {
-            let mut look = self.look_at.lock().unwrap_or_else(PoisonError::into_inner);
-            if look.is_none() {
-                *look = Some(Instant::now() + (self.hooks.pause)(upgrade_drive::first_look()));
-                drop(look);
-                ring();
-            }
         }
         step
     }
@@ -3614,10 +3592,10 @@ impl IdleHost for WorkerIdle {
     /// What the host measures of the agent's route to its API (asked only while the loop waits at a wall the network answers).
     fn reach(&self) -> Reach {
         let probed = match self.agent {
-            Program::Claude => self.switches.probe_api(),
-            Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => {
-                false
+            Program::Claude | Program::Agy | Program::Muse | Program::Gemini => {
+                self.switches.probe_api()
             }
+            Program::Codex | Program::Generic => false,
         };
         if !probed {
             return Reach::Unknown;
@@ -4454,7 +4432,77 @@ impl WorkerIdle {
             })
     }
 
-    /// The host's step at an idle point ([`IdleHost::at_idle`], which sets a look after it while the conversation is unnamed).
+    /// The host's step at an idle point ([`IdleHost::at_idle_on`]), each part marked ([`laps::lap`]).
+    fn idle_point(&self, point: IdlePoint) -> Option<HostStep> {
+        if !self.on() || self.beside() {
+            return None;
+        }
+        if self.program_check_stuck() {
+            return None;
+        }
+        laps::lap("check");
+        self.points.offered(crate::upgrade_host::now_s());
+        let mut look = self.look_at.lock().unwrap_or_else(PoisonError::into_inner);
+        if look.is_some_and(|at| at <= Instant::now()) {
+            *look = None;
+        }
+        self.park.store(false, Ordering::SeqCst);
+        drop(look);
+        with_kept_of(&self.kept, |k| k.carry_asked = false);
+        let owed = disk_owed(self.hooks.acts.disk_board, &self.sid);
+        if owed.is_some()
+            && let Some(why) = self.disk_resume_unowed()
+        {
+            disk_resume_stepped(self.hooks.acts.disk_board, &self.sid, true);
+            aterm_log::info!(
+                "harness @{}: {} step=done:{why}: nothing typed",
+                self.sid,
+                aterm_agent::harness::disk::RULE_DISK_RESUME
+            );
+        } else if let Some(text) = owed {
+            let step = (self.hooks.acts.disk_resume)(&self.sid, &text);
+            let typed = step == "typed";
+            disk_resume_stepped(self.hooks.acts.disk_board, &self.sid, typed);
+            aterm_log::info!(
+                "harness @{}: {} step={step}",
+                self.sid,
+                aterm_agent::harness::disk::RULE_DISK_RESUME
+            );
+            if typed {
+                return Some(HostStep {
+                    line: format!(
+                        "{} step={step}",
+                        aterm_agent::harness::disk::RULE_DISK_RESUME
+                    ),
+                    moved: true,
+                    typed: Some(aterm_agent::supervise::policy::turn_end::HostTurn::CarryOn),
+                    repeat: false,
+                });
+            }
+        }
+        laps::lap("disk");
+        if with_kept_of(&self.kept, |k| k.account.reset_owed.is_some())
+            && let Some(seat) = (self.hooks.acts.account_seat)()
+        {
+            self.reset_flush(&seat);
+        }
+        laps::lap("account");
+        let step = self.idle_step(point);
+        if !self.on() {
+            return None;
+        }
+        if self.unnamed() {
+            let mut look = self.look_at.lock().unwrap_or_else(PoisonError::into_inner);
+            if look.is_none() {
+                *look = Some(Instant::now() + (self.hooks.pause)(upgrade_drive::first_look()));
+                drop(look);
+                ring();
+            }
+        }
+        step
+    }
+
+    /// The host's step at an idle point ([`Self::idle_point`], which sets a look after it while the conversation is unnamed).
     fn idle_step(&self, point: IdlePoint) -> Option<HostStep> {
         let upgraded = upgrades(self.agent);
         let relaunched = relaunches(self.agent);
@@ -4463,11 +4511,14 @@ impl WorkerIdle {
         }
         let hooks = &self.hooks;
         if relaunched {
-            refresh_snapshot(&self.sid, &self.kept, hooks);
+            refresh_snapshot_at_point(&self.sid, &self.kept, hooks, hooks.acts.point_read);
         }
+        laps::lap("snapshot");
         self.hold_clock();
+        laps::lap("clock");
         if upgraded && self.switches.upgrade() {
             ask_note(&self.sid, &self.note, hooks);
+            laps::lap("note");
         }
         let mut run = self.run.lock().unwrap_or_else(PoisonError::into_inner);
         let activations = self.activations.of(self.agent);
@@ -4483,7 +4534,9 @@ impl WorkerIdle {
             }
         };
         let only = carries_only(self.agent);
-        let (what, step) = if (hooks.acts.owed)(&self.sid, only) {
+        let owed = (hooks.acts.owed)(&self.sid, only);
+        laps::lap("owed");
+        let (what, step) = if owed {
             if !self.on() {
                 return None;
             }
@@ -4493,6 +4546,7 @@ impl WorkerIdle {
                 only,
             };
             let step = (hooks.acts.resume)(&self.sid, self.grace, carry);
+            laps::lap("resume");
             if step == "done:lost" {
                 (hooks.note)(HostNote::Relaunch {
                     sid: self.sid.clone(),
@@ -4502,6 +4556,7 @@ impl WorkerIdle {
             ("carry-on", step)
         } else {
             let due = due();
+            laps::lap("due");
             if !self.on() {
                 return None;
             }
@@ -4511,6 +4566,7 @@ impl WorkerIdle {
                         return None;
                     }
                     let step = self.act(|| (hooks.acts.step)(&self.sid, self.grace));
+                    laps::lap("upgrade");
                     ("upgrade", step)
                 }
                 Due::Unread(why) => {
@@ -4543,6 +4599,7 @@ impl WorkerIdle {
         note_upgrade_act();
         if relaunched {
             refresh_snapshot(&self.sid, &self.kept, hooks);
+            laps::lap("snapshot.after");
         }
         match run.after(&step, self.grace) {
             After::NextIdle => {
@@ -5952,26 +6009,177 @@ fn refresh_snapshot_guarded(
     revoked: Option<&AtomicBool>,
 ) -> bool {
     match (hooks.acts.snapshot)(sid) {
-        Some(mut snap) => {
-            let (moved, said) = {
-                let mut kept = kept.lock().unwrap_or_else(PoisonError::into_inner);
-                if revoked.is_some_and(|revoked| revoked.load(Ordering::SeqCst)) {
-                    return false;
-                }
-                keep_session(kept.snapshot.as_ref(), &mut snap);
-                let moved = publish_snapshot(sid, Some(&snap));
-                let said = asked_runs(sid, &mut kept, &snap);
-                kept.snapshot = Some(snap);
-                (moved, said)
-            };
-            tell_published(sid, moved, hooks);
-            told_asked_runs(sid, said, hooks);
-            true
-        }
+        Some(snap) => land_snapshot(sid, kept, hooks, snap, |_| {
+            revoked.is_some_and(|revoked| revoked.load(Ordering::SeqCst))
+        }),
         None => {
             follow_snapshot_guarded(sid, kept, hooks, revoked);
             false
         }
+    }
+}
+
+/// Land the relaunch snapshot `snap` in what the host keeps of `sid` unless `stale` says not: whether it landed.
+fn land_snapshot(
+    sid: &str,
+    kept: &Mutex<Kept>,
+    hooks: &Hooks,
+    mut snap: Snapshot,
+    stale: impl FnOnce(&Kept) -> bool,
+) -> bool {
+    let (moved, said) = {
+        let mut kept = kept.lock().unwrap_or_else(PoisonError::into_inner);
+        if stale(&kept) {
+            return false;
+        }
+        keep_session(kept.snapshot.as_ref(), &mut snap);
+        let moved = publish_snapshot(sid, Some(&snap));
+        let said = asked_runs(sid, &mut kept, &snap);
+        kept.snapshot = Some(snap);
+        (moved, said)
+    };
+    tell_published(sid, moved, hooks);
+    told_asked_runs(sid, said, hooks);
+    true
+}
+
+/// How long an idle point waits for its relaunch snapshot read; under load 268 one took 57 s (v3b-gl, 2026-10-22).
+const POINT_READ_BOUND: Duration = Duration::from_millis(500);
+
+/// What [`Acts::inert`]'s idle point waits for its read: a hang detector's minute.
+#[cfg(any(test, feature = "bench-support"))]
+const INERT_POINT_READ: Duration = Duration::from_secs(60);
+
+/// An idle step that took this long is logged with where its time went ([`laps`]).
+const SLOW_STEP: Duration = Duration::from_secs(1);
+
+/// A relaunch snapshot read an idle point started on a thread of its own: whether it ended.
+#[derive(Default)]
+struct PointRead {
+    ended: Mutex<bool>,
+    end: Condvar,
+}
+
+impl PointRead {
+    /// Wait for the read to end, `bound` at most: whether it ended.
+    fn wait(&self, bound: Duration) -> bool {
+        let ended = self.ended.lock().unwrap_or_else(PoisonError::into_inner);
+        let (ended, _) = self
+            .end
+            .wait_timeout_while(ended, bound, |ended| !*ended)
+            .unwrap_or_else(PoisonError::into_inner);
+        *ended
+    }
+
+    /// The read `read` of the session `kept` is over: no longer out, and every point waiting on it goes on.
+    fn over(kept: &Mutex<Kept>, read: &Arc<Self>) {
+        with_kept_of(kept, |k| {
+            if k.point_read
+                .as_ref()
+                .is_some_and(|out| Arc::ptr_eq(out, read))
+            {
+                k.point_read = None;
+            }
+        });
+        *read.ended.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        read.end.notify_all();
+    }
+}
+
+/// Read the relaunch record again at an idle point on a thread of its own, one per session, waiting `bound` at most: whether it ended.
+fn refresh_snapshot_at_point(
+    sid: &str,
+    kept: &Arc<Mutex<Kept>>,
+    hooks: &Hooks,
+    bound: Duration,
+) -> bool {
+    let (read, begun) = {
+        let mut k = kept.lock().unwrap_or_else(PoisonError::into_inner);
+        match &k.point_read {
+            Some(out) => (Arc::clone(out), None),
+            None => {
+                let read = Arc::new(PointRead::default());
+                k.point_read = Some(Arc::clone(&read));
+                (read, Some(k.snapshot.clone()))
+            }
+        }
+    };
+    if let Some(before) = begun {
+        let (job_sid, job_kept, job_hooks, job_read) = (
+            sid.to_string(),
+            Arc::clone(kept),
+            hooks.clone(),
+            Arc::clone(&read),
+        );
+        let spawned = std::thread::Builder::new()
+            .name(format!("{THREAD_PREFIX}point-read"))
+            .spawn(move || {
+                /// The read is over as its thread returns or unwinds.
+                struct Over(Arc<Mutex<Kept>>, Arc<PointRead>);
+                impl Drop for Over {
+                    fn drop(&mut self) {
+                        PointRead::over(&self.0, &self.1);
+                    }
+                }
+                let over = Over(job_kept, job_read);
+                land_point_read(&job_sid, &over.0, &job_hooks, before.as_ref());
+            });
+        if let Err(e) = spawned {
+            aterm_log::warn!(
+                "harness @{sid}: no thread for the relaunch snapshot read ({e}); the idle point \
+                 reads it itself"
+            );
+            refresh_snapshot(sid, kept, hooks);
+            PointRead::over(kept, &read);
+            return true;
+        }
+    }
+    let ended = read.wait(bound);
+    if !ended {
+        aterm_log::info!(
+            "harness @{sid}: its relaunch snapshot read is still out after {} ms; the idle point \
+             goes on with the snapshot kept, and the read lands as it ends",
+            bound.as_millis()
+        );
+    }
+    ended
+}
+
+/// The end of an idle point's relaunch snapshot read, landed only while the kept snapshot is still `before`.
+fn land_point_read(
+    sid: &str,
+    kept: &Mutex<Kept>,
+    hooks: &Hooks,
+    before: Option<&Snapshot>,
+) -> bool {
+    match (hooks.acts.snapshot)(sid) {
+        Some(snap) => land_snapshot(sid, kept, hooks, snap, |k| k.snapshot.as_ref() != before),
+        None => {
+            if with_kept_of(kept, |k| k.snapshot.as_ref() != before) {
+                return false;
+            }
+            follow_snapshot_guarded(sid, kept, hooks, None);
+            false
+        }
+    }
+}
+
+/// Why each tab's last relaunch snapshot named no Gemini CLI conversation, said when it changes.
+fn unwitnessed_said(sid: &str, snap: &Snapshot) {
+    static SAID: Mutex<Option<HashMap<String, &'static str>>> = Mutex::new(None);
+    let why = snap.gemini().and_then(|run| run.unwitnessed);
+    let mut said = SAID.lock().unwrap_or_else(PoisonError::into_inner);
+    let said = said.get_or_insert_with(HashMap::new);
+    let before = match why {
+        Some(why) => said.insert(sid.to_string(), why.word()),
+        None => said.remove(sid),
+    };
+    if let Some(why) = why.filter(|why| before != Some(why.word())) {
+        aterm_log::info!(
+            "harness @{sid}: its Gemini CLI's conversation is not named ({}: {})",
+            why.word(),
+            why.said()
+        );
     }
 }
 
@@ -10770,6 +10978,11 @@ impl StartupHold {
                     agent.product()
                 )
             }
+            Self::NoComposer {
+                agent: Program::Codex,
+            } => "codex-alab never claimed its tab (a login or onboarding screen, or the `codex` \
+                  it ran is not codex-alab)"
+                .to_string(),
             Self::NoComposer { agent } => format!(
                 "{} shows no composer (a login or onboarding screen)",
                 agent.product()
@@ -10825,13 +11038,16 @@ pub(crate) struct HeldRead {
     pub(crate) person: Option<Instant>,
     /// A driver's hand stands on the session at this read ([`driver_holds`]: another holder's live drive lease, or a `turn` a named driver typed).
     pub(crate) driver: bool,
+    /// A proven self-claim carries the session ([`crate::self_claim`]): its program
+    /// answers for its own holds with its own attention, as codex-alab does.
+    pub(crate) carried: bool,
 }
 
 impl HeldRead {
     /// Whether the worker is at a screen the held deadline judges.
     #[must_use]
     pub(crate) fn may_be_held(&self) -> bool {
-        held_judges(&self.word) && !self.escalated
+        held_judges(&self.word) && !self.escalated && !self.carried
     }
 }
 
@@ -11175,6 +11391,36 @@ fn look_at_held_stall(
     books.started.insert(w.sid.clone());
     (hooks.acts.startup_mark)(&w.sid, &StartupMark::Moved);
     None
+}
+
+/// What a worker's screen read `seen` says of a worker of kind `expected` no proven
+/// claim carries: a codex worker starts only when codex-alab claims its tab, so a
+/// screen that reads as started is OpenAI's codex, or a codex-alab that has not
+/// carried it ([`StartupHold::NoComposer`]) — and, while codex-alab may not claim
+/// it (`claimable` false: a halt stands, or the session's Autopilot is off, where
+/// `harness policy` says `effective=off`), the tab is not judged yet
+/// ([`StartupSeen::Unread`]); any other worker's read is the screen's.
+pub(crate) fn unclaimed(
+    seen: StartupSeen,
+    expected: Option<Program>,
+    claimable: bool,
+) -> StartupSeen {
+    match (expected, seen) {
+        (
+            Some(
+                Program::Claude | Program::Agy | Program::Muse | Program::Gemini | Program::Generic,
+            )
+            | None,
+            seen,
+        ) => seen,
+        (Some(Program::Codex), _) if !claimable => StartupSeen::Unread,
+        (Some(Program::Codex), StartupSeen::Started) => {
+            StartupSeen::Holds(StartupHold::NoComposer {
+                agent: Program::Codex,
+            })
+        }
+        (Some(Program::Codex), seen) => seen,
+    }
 }
 
 /// What a worker's screen says of its start ([`look_at_startups`]).
@@ -12993,12 +13239,52 @@ fn set_badge(sock: &str, sid: &str, text: Option<&str>) {
     }
 }
 
+/// The token the window's drive presents on this instance's own socket, so what it types reads
+/// `by=harness` ([`upgrade_drive::harness_client`]).
+pub(crate) fn harness_drive_token() -> Option<upgrade_drive::HarnessToken> {
+    crate::control_auth::harness_token().map(upgrade_drive::HarnessToken::new)
+}
+
+/// What every one of the window's sweeps over `home` and `state` is told: this instance's own
+/// socket `sock` with the harness's in-memory token presented on it ([`harness_drive_token`]),
+/// so what a sweep types there reads `by=harness`, and the window's own `[harness]` switches.
+/// [`live_acts`], [`live_view`] and [`crate::upgrade_host::word_writer_at`] each start from it,
+/// so none dials the window's socket with the token beside it.
+pub(crate) fn window_drive_opts(
+    home: std::path::PathBuf,
+    state: std::path::PathBuf,
+    sock: Option<String>,
+) -> upgrade_drive::Opts {
+    upgrade_drive::Opts {
+        home,
+        state,
+        sock,
+        token: harness_drive_token(),
+        only_sid: None,
+        dry_run: false,
+        human_grace_s: 0,
+        hand_back: true,
+        background: false,
+        aterm_state: aterm_types::dirs::state_dir(),
+        ask: upgrade_ask(),
+        several_logins: several_logins(),
+        usage_credits: usage_credits(),
+        usage_tap: None,
+        instances: upgrade_drive::Instances::Machine,
+        agents_off: Vec::new(),
+        land: false,
+        timings: aterm_agent::harness::Timings::for_build(),
+    }
+}
+
 /// The worker's acts over this instance's own socket.
 fn live_acts(store: Store, sock: String) -> Acts {
     let task_sock = sock.clone();
     let startups_store = store.clone();
     let startup_store = store.clone();
+    let fact_store = store.clone();
     let resume_sock = sock.clone();
+    let disk_store = store.clone();
     let home = aterm_primer::home_dir();
     let place = home.clone().zip(harness_state());
     let exit_home = home.clone();
@@ -13022,25 +13308,13 @@ fn live_acts(store: Store, sock: String) -> Acts {
     let opts = move |sid: &str, grace: u32| {
         place.clone().map(|(home, state)| upgrade_drive::Opts {
             usage_tap: usage_tap_armed(&state),
-            home,
-            state,
-            sock: Some(sock.clone()),
             only_sid: Some(sid.to_string()),
-            dry_run: false,
             human_grace_s: grace,
-            hand_back: true,
-            background: false,
-            aterm_state: aterm_types::dirs::state_dir(),
-            ask: UPGRADE_ASK.load(Ordering::SeqCst),
-            several_logins: several_logins(),
-            usage_credits: usage_credits(),
-            instances: upgrade_drive::Instances::Machine,
             agents_off: AGENTS_OFF
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone(),
-            land: false,
-            timings: aterm_agent::harness::Timings::for_build(),
+            ..window_drive_opts(home, state, Some(sock.clone()))
         })
     };
     let opts = Arc::new(opts);
@@ -13088,7 +13362,16 @@ fn live_acts(store: Store, sock: String) -> Acts {
         }),
         owed: Arc::new(move |sid, only| o6(sid, 0).is_some_and(|o| relaunch::owed_of(&o, only))),
         disk_resume: Arc::new(move |sid, text| {
-            aterm_agent::harness::disk::type_resume(&resume_sock, sid, text)
+            disk_resumed(
+                &disk_store,
+                sid,
+                aterm_agent::harness::disk::type_resume(
+                    &resume_sock,
+                    harness_drive_token().as_ref(),
+                    sid,
+                    text,
+                ),
+            )
         }),
         disk_board: &crate::disk_board::SHELF,
         jobs_board: &crate::vitals_jobs::BOARD,
@@ -13096,6 +13379,7 @@ fn live_acts(store: Store, sock: String) -> Acts {
         program_check: &crate::program_check_watch::BOARD,
         occupancy: Arc::new(crate::occupancy_host::reading_for),
         occupancy_pace: Arc::new(crate::occupancy_host::pace_for),
+        task_fact: Arc::new(move |sid, word| task_fact_live(&fact_store, sid, word)),
         resume: Arc::new(move |sid, grace, carry| {
             let Some(o) = o7(sid, grace) else {
                 return "refused:no-home".to_string();
@@ -13124,17 +13408,26 @@ fn live_acts(store: Store, sock: String) -> Acts {
             r.step
         }),
         snapshot: Arc::new(move |sid| {
-            o3(sid, 0).and_then(|o| match relaunch::snapshot(&o) {
+            let (read, took) = laps::within(|| o3(sid, 0).map(|o| relaunch::snapshot(&o)));
+            if took.total() >= SLOW_STEP {
+                aterm_log::info!(
+                    "harness @{sid}: a relaunch snapshot read took {} ms ({took})",
+                    took.total().as_millis()
+                );
+            }
+            match read? {
                 Ok(snap) => {
                     snapshot_refused(sid, None);
+                    unwitnessed_said(sid, &snap);
                     Some(snap)
                 }
                 Err(why) => {
                     snapshot_refused(sid, Some(why));
                     None
                 }
-            })
+            }
         }),
+        point_read: POINT_READ_BOUND,
         follow: Arc::new(move |sid, snap| {
             let Some(fg) = foreground_of(&fg_store, sid) else {
                 return Foreground::Shell;
@@ -13536,14 +13829,17 @@ fn startups_of(store: &Store, judged: &std::collections::HashSet<String>) -> Vec
         .iter()
         .filter(|h| h.state != SessionState::Exited)
         .filter_map(|h| {
-            let standing = h
-                .ctx
-                .meta
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .attention_owners
-                .get(ATTENTION_OWNER)
-                .map(str::to_string);
+            let (standing, carried, autopilot_off) = {
+                let meta = h.ctx.meta.lock().unwrap_or_else(PoisonError::into_inner);
+                (
+                    meta.attention_owners
+                        .get(ATTENTION_OWNER)
+                        .map(str::to_string),
+                    meta.supervisor_proven(crate::metrics::now_us()),
+                    meta.autopilot_word() == Some(aterm_agent::supervise::Autopilot::Off),
+                )
+            };
+            let claimable = !autopilot_off && h.ctx.fabric.hold().is_none();
             let (record, program, agent, mut held) = {
                 let tl = h
                     .ctx
@@ -13569,6 +13865,7 @@ fn startups_of(store: &Store, judged: &std::collections::HashSet<String>) -> Vec
                     unread: false,
                     person: None,
                     driver: false,
+                    carried,
                 };
                 (record, publication.program.clone(), agent, held)
             };
@@ -13609,7 +13906,8 @@ fn startups_of(store: &Store, judged: &std::collections::HashSet<String>) -> Vec
                 || (state == StartupState::Working && !judged.contains(&sid));
             let for_held = matches!(state, StartupState::Working | StartupState::Reopened)
                 && held.may_be_held();
-            let rows = (for_start || for_held)
+            // A proven self-claim is a start: its program read the tab and carries it.
+            let rows = ((for_start && !carried) || for_held)
                 .then(|| match h.term.try_lock() {
                     Ok(t) => rows_of(&t),
                     Err(std::sync::TryLockError::Poisoned(p)) => rows_of(&p.into_inner()),
@@ -13617,7 +13915,12 @@ fn startups_of(store: &Store, judged: &std::collections::HashSet<String>) -> Vec
                 })
                 .flatten();
             let seen = match (&rows, for_start) {
-                (Some(rows), true) => startup_seen(rows, program.as_deref(), agent, record.agent),
+                _ if for_start && carried => StartupSeen::Started,
+                (Some(rows), true) => unclaimed(
+                    startup_seen(rows, program.as_deref(), agent, record.agent),
+                    record.agent,
+                    claimable,
+                ),
                 _ => StartupSeen::Unread,
             };
             if for_held {
@@ -13656,6 +13959,26 @@ fn startup_mark_live(store: &Store, sid: &str, mark: &StartupMark<'_>) {
     {
         crate::presence::post_meta_changed(local);
     }
+}
+
+/// The task door's fact word on session `sid`'s record ([`Acts::task_fact`]): `NoTask` where no
+/// session of this instance has that sid, else [`crate::task_record::mark_session_task_fact`]'s
+/// outcome, waiting on a committing update's fence for at most the fabric's own wait.
+fn task_fact_live(
+    store: &Store,
+    sid: &str,
+    word: Option<aterm_agent::supervise::occupancy::FactWord>,
+) -> aterm_agent::supervise::occupancy::NoteOutcome {
+    let Some(h) = store
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .by_sid(&aterm_session::SessionId::new(sid))
+        .cloned()
+    else {
+        return aterm_agent::supervise::occupancy::NoteOutcome::NoTask;
+    };
+    let fence = h.ctx.fabric.fence_wait();
+    crate::task_record::mark_session_task_fact(&h.ctx, h.local_id, word, fence)
 }
 
 /// The deadlines' marks, made in-process and conditional on the record still reading what the look read (`task_record::mark_session_task_with`, read under the locks the mark takes).
@@ -16657,25 +16980,7 @@ fn live_view(
         view.set_off(off);
         view.set_agent_off(agent_off);
         let at = view.refresh_keeping(
-            &upgrade_drive::Opts {
-                home,
-                state,
-                sock: Some(sock.clone()),
-                only_sid: None,
-                dry_run: false,
-                human_grace_s: 0,
-                hand_back: true,
-                background: false,
-                aterm_state: aterm_types::dirs::state_dir(),
-                ask: UPGRADE_ASK.load(Ordering::SeqCst),
-                several_logins: several_logins(),
-                usage_credits: usage_credits(),
-                usage_tap: None,
-                instances: upgrade_drive::Instances::Machine,
-                agents_off: Vec::new(),
-                land: false,
-                timings: aterm_agent::harness::Timings::for_build(),
-            },
+            &window_drive_opts(home, state, Some(sock.clone())),
             &mut hand,
         );
         ViewNext {
@@ -17277,28 +17582,57 @@ pub(crate) fn log_usage(store: &Store, sid: &str, h5: Option<u32>, d7: Option<u3
 fn live_row(store: Store) -> Arc<RowFn> {
     Arc::new(move |sid, kind, r| {
         aterm_log::info!("harness @{sid}: {}", r.line_as(kind));
-        log_act(&store, sid, kind, &r.step);
+        log_act(&store, sid, kind, r);
     })
 }
 
-/// The hosted lanes say they relaunched.
-pub(crate) fn log_act(store: &Store, sid: &str, kind: &str, step: &str) {
+/// The hosted lanes say they relaunched, and the harness labels its restart.
+pub(crate) fn log_act(store: &Store, sid: &str, kind: &str, r: &upgrade_drive::Report) {
+    let step = r.step.as_str();
     let Some(rule) = aterm_agent::harness::acts::relaunch_act(kind, step) else {
         return;
     };
-    let found = store
-        .read()
-        .unwrap_or_else(PoisonError::into_inner)
-        .by_sid(&aterm_session::SessionId::new(sid))
-        .map(|h| Arc::clone(&h.ctx.timeline));
-    let Some(timeline) = found else {
+    let label = aterm_agent::harness::acts::relaunch_label(kind, step, &r.to);
+    let Some(timeline) = timeline_of(store, sid) else {
         return;
     };
     let mut g = timeline.lock().unwrap_or_else(PoisonError::into_inner);
     let at = g.slog().now();
     g.slog_mut()
-        .observe_relaunch_act(&rule, upgrade_drive::started(step), at);
+        .observe_relaunch_act(&rule, upgrade_drive::started(step), label.as_deref(), at);
     g.slog_take_wake();
+}
+
+/// The disk lane's resume came back `step`: once its carry-on is typed, the harness labels the
+/// moment (`resuming after disk`).
+pub(crate) fn disk_resumed(store: &Store, sid: &str, step: String) -> String {
+    if step == "typed" {
+        log_label(store, sid, aterm_agent::harness::acts::DISK_RESUME_LABEL);
+    }
+    step
+}
+
+/// The harness labels a moment of its own in session `sid`'s log, `words` its closed template
+/// ([`crate::session_log::SessionLog::harness_label`]).
+pub(crate) fn log_label(store: &Store, sid: &str, words: &str) {
+    let Some(timeline) = timeline_of(store, sid) else {
+        return;
+    };
+    let mut g = timeline.lock().unwrap_or_else(PoisonError::into_inner);
+    let at = g.slog().now();
+    g.slog_mut().harness_label(words, at);
+    g.slog_take_wake();
+}
+
+fn timeline_of(
+    store: &Store,
+    sid: &str,
+) -> Option<Arc<Mutex<crate::session_timeline::SessionTimeline>>> {
+    store
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .by_sid(&aterm_session::SessionId::new(sid))
+        .map(|h| Arc::clone(&h.ctx.timeline))
 }
 
 /// Remove the hooks an older aterm wrote into the user's Claude Code settings, off the winit thread.
@@ -17364,7 +17698,9 @@ impl Acts {
             },
             occupancy: Arc::new(|_| aterm_agent::supervise::occupancy::OccupancyReading::default()),
             occupancy_pace: Arc::new(|_, _, _| aterm_agent::supervise::occupancy::PaceGrant::Local),
+            task_fact: Arc::new(|_, _| aterm_agent::supervise::occupancy::NoteOutcome::NoTask),
             snapshot: Arc::new(|_| None),
+            point_read: INERT_POINT_READ,
             follow: Arc::new(|_, _| Foreground::Shell),
             status: Arc::new(|_| None),
             exit_look: Arc::new(|_, _| None),

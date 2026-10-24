@@ -50,9 +50,9 @@ targo --unverified lab linux <verb> — the Linux runtime lane: a lima VM (vz, U
                            the display when one is named, with the session bus and at-spi2-core up; the build
                            output is kept for the next `exec` under `up`, else removed when CMD ends
   proof [--arch A]... [--display D]... [--weston-renderer gl|pixman] [--keep-build] [--keep-up]
-                           the lane's proof: aterm-uds, aterm-pty and aterm-libc's tests, the libc
-                           oracle's conformance cells, and the windowing crates' and the winit fork's tests
-                           with the displays up, on each arch; then aterm-gui under each
+                           the lane's proof: aterm-uds, aterm-pty and aterm-libc's tests, aterm-render's
+                           library tests, the libc oracle's conformance cells, and the windowing crates' and
+                           the winit fork's tests with the displays up, on each arch; then aterm-gui under each
                            display (and --headless):
                            a session over its control socket, typed, resized, `status` read, a frame kept;
                            then, under xvfb and weston, the display killed under a running aterm-gui, and a

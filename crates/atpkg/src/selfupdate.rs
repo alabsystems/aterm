@@ -569,6 +569,51 @@ mod tests {
         assert!(!looks_like_version(""));
     }
 
+    /// grok's one verb and kimi's two: a bare verb is the managed check; anything after it
+    /// (grok's `update --check`, kimi's `upgrade -y`) is a shape aterm declines rather than
+    /// guesses; grok's `upgrade`, which is not grok's verb, passes through to grok.
+    #[test]
+    fn grok_and_kimi_check_on_their_bare_verbs_only() {
+        let (grok, kimi) = (row_for("grok").unwrap(), row_for("kimi").unwrap());
+        assert_eq!(verbs_of("grok"), &["update"]);
+        assert_eq!(verbs_of("kimi"), &["upgrade", "update"]);
+        for (row, verb) in [(grok, "update"), (kimi, "upgrade"), (kimi, "update")] {
+            assert_eq!(
+                classify(row, &a(&[verb])),
+                Verdict::Check {
+                    verb,
+                    words: verb.to_string()
+                },
+                "{} {verb}",
+                row.program
+            );
+        }
+        for (row, typed) in [
+            (grok, &["update", "--check"][..]),
+            (grok, &["update", "1.0.70"]),
+            (kimi, &["upgrade", "-y"]),
+            (kimi, &["update", "--force"]),
+            (kimi, &["upgrade", "latest"]),
+        ] {
+            assert!(
+                matches!(
+                    classify(row, &a(typed)),
+                    Verdict::Declined(Decline::Shape { .. })
+                ),
+                "{} {typed:?}",
+                row.program
+            );
+        }
+        for (row, typed) in [
+            (grok, &["upgrade"][..]),
+            (grok, &["--resume", "update"]),
+            (kimi, &["install"]),
+        ] {
+            assert_eq!(classify(row, &a(typed)), Verdict::PassThrough, "{typed:?}");
+        }
+        assert_eq!(classify(kimi, &a(&["upgrade", "--help"])), Verdict::Help);
+    }
+
     /// A hostile target — a newline, quotes, 200 bytes — is escaped and capped before it
     /// reaches a terminal, and the cap lands on a char boundary.
     #[test]

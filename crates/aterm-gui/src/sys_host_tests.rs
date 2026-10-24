@@ -288,6 +288,58 @@ fn a_pull_asks_the_probe_once_per_gap_and_takes_its_reading() {
     assert_eq!(probe.join().unwrap(), 1, "one pull for three reads");
 }
 
+/// PRIVACY'S COUNT PULLS A READING WHEN NONE SPEAKS FOR NOW (leftover §9): with no jobs view
+/// held, the count asks the probe for one and answers from it; with no probe running it answers
+/// nothing.
+#[test]
+fn privacys_count_pulls_a_reading_when_none_speaks_for_now() {
+    use aterm_vitals::jobs::{Findings, JobsView, Named};
+    let shared = Arc::new(Shared::paced(
+        Duration::from_secs(3600),
+        Duration::from_secs(60),
+    ));
+    assert_eq!(shared.program_check_now(), None, "no probe: nothing read");
+    let (tx, rx) = std::sync::mpsc::sync_channel(2);
+    shared.install(tx);
+    let probe = {
+        let shared = Arc::clone(&shared);
+        std::thread::spawn(move || {
+            let mut pulls = 0;
+            while let Ok(msg) = rx.recv() {
+                assert!(matches!(msg, Msg::Pull));
+                pulls += 1;
+                let mut snap = synthetic(1 + pulls, 0.1);
+                snap.jobs = Some(Arc::new(JobsView {
+                    findings: Findings {
+                        program_check: vec![Named {
+                            pid: 25311,
+                            name: "gh".into(),
+                            tab: None,
+                            for_ms: 35_940_000,
+                        }],
+                        ..Findings::default()
+                    },
+                    ..JobsView::default()
+                }));
+                shared.publish_for_test(snap, Vec::new());
+            }
+            pulls
+        })
+    };
+    let (count, oldest) = shared
+        .program_check_now()
+        .expect("the pulled reading's count");
+    assert_eq!(count, 1);
+    assert!(oldest >= 35_940_000, "{oldest}");
+    assert_eq!(
+        shared.program_check_now().map(|(n, _)| n),
+        Some(1),
+        "the reading now held speaks for now"
+    );
+    shared.lock().tx = None;
+    assert_eq!(probe.join().unwrap(), 1, "one pull");
+}
+
 fn with_split(seq: u64, split: Option<u64>) -> Snapshot {
     let mut s = synthetic(seq, 0.1);
     s.coal_lane = aterm_vitals::explain::CoalLane::On;

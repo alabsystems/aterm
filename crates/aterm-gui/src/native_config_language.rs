@@ -5602,7 +5602,7 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · default auto: the Deck is Full (a header line and the seven rows, about 100 pt) once the window's grid would be 870 pt tall under the Folded deck, and folds back only below 850 pt, so a resize across one line does not flip it; Folded is two blocks of four rows in 62 pt · full: always Full · folded: always Folded · decided when a window opens, resizes, changes display or the font changes, never by what the deck shows; Full takes whole terminal rows · View ▸ Deck Size picks one · read live"
         }
         "session_log.clause" => {
-            " · on (the default): one more line after `activity:`, `now:` and what the session's log says the tab is doing (`now: running shell`, `now: approval · bash`, `now: limit · resets 14:05`; what needs you first), in the menu with how long it has held; never a label another client wrote; the tab's name is unchanged · off: a tab's tooltip and context menu are as they were · read live"
+            " · on (the default): one more line after `activity:`, `now:` and what the session's log says the tab is doing (`now: running shell`, `now: approval · bash`, `now: limit · resets 14:05`; what needs you first), in the menu with how long it has held; the harness's own moments for 30 s with their author (`now: restarting · by the harness`); never a label another client wrote; the tab's name is unchanged · off: a tab's tooltip and context menu are as they were · read live"
         }
         "update.auto_apply" => {
             " · off, a downloaded build installs only when you ask — Update to Latest Now on macOS, `aterm update apply` on Linux · the native updater runs on macOS and Linux"

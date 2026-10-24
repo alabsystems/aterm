@@ -13,7 +13,7 @@ use crate::iokit::{
 use crate::machine::{DtCpu, Level, VmPages};
 use crate::{
     CoreTicks, CpuLayout, GpuReading, LinkReading, MemoryDetail, PATH_CAP, ProcessLimits,
-    VolumeReading, pressure_of,
+    TcpCounts, VolumeReading, pressure_of,
 };
 
 /// `PROC_PIDT_SHORTBSDINFO` (`sys/proc_info.h`, 64-byte `proc_bsdshortinfo`).
@@ -1059,6 +1059,39 @@ pub(crate) fn net_links_into(scratch: &mut Vec<u8>) -> Option<Vec<LinkReading>> 
         });
     }
     Some(links)
+}
+
+/// [`crate::tcp_counts_into`] on macOS (`net.inet.tcp.pcblist64`).
+pub(crate) fn tcp_counts_into(scratch: &mut Vec<u8>) -> Option<TcpCounts> {
+    let n = iflist::read_growing(IFLIST_FIRST, IFLIST_CAP, scratch, pcblist64_sysctl)?;
+    iflist::tcp_counts_of_pcblist64(&scratch[..n])
+}
+
+/// One `sysctlbyname` of `net.inet.tcp.pcblist64` into `buf`, or, with no buffer, of the size it needs now.
+fn pcblist64_sysctl(buf: Option<&mut [u8]>) -> iflist::Asked {
+    let (ptr, mut len) = match buf {
+        Some(b) => (b.as_mut_ptr().cast::<c_void>(), b.len()),
+        None => (std::ptr::null_mut(), 0),
+    };
+    // SAFETY: `c"net.inet.tcp.pcblist64"` is NUL-terminated; `ptr` is writable
+    // for `len` bytes and the kernel writes at most that, reporting how many,
+    // or it is null, which asks only for the size, written to `len`.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"net.inet.tcp.pcblist64".as_ptr(),
+            ptr,
+            &raw mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 {
+        iflist::Asked::Bytes(len)
+    } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOMEM) {
+        iflist::Asked::TooSmall
+    } else {
+        iflist::Asked::Failed
+    }
 }
 
 /// [`crate::workqueue_limits`] on macOS.

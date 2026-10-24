@@ -1827,8 +1827,8 @@ mod tests {
     #[cfg(wgpu_arm)]
     fn full_frame_render_input_matches_wgpu_byte_for_byte() {
         use aterm_core::render::{
-            FireHaloCell, FireMode, FirePatch, FreeSprite, HaloMode, RainHalo, SceneAtlas,
-            SpriteQuad,
+            FireHaloCell, FireMode, FirePatch, FxArt, FxBlend, FxContent, FxInk, FxItem, FxLayer,
+            FxSlot, FxSpace, FxSprite, FxTexels, HaloMode, PxRect, RainHalo,
         };
         use aterm_render::{CharFg, GlowQuad, premul_rgb};
         use std::sync::Arc;
@@ -1850,16 +1850,38 @@ mod tests {
             term.process(b"\x1b[1mbold\x1b[0m plain 0123456789 \xf0\x9f\x99\x82\r\n");
             term.cell_frame(ROWS, COLS)
         };
-        let scene_atlas = |seed: usize| {
-            Arc::new(SceneAtlas {
-                width: 8,
-                height: 8,
-                rgba: (0..8 * 8 * 4)
-                    .map(|i| ((i * 13 + seed) % 256) as u8)
-                    .collect(),
-                version: 1,
-            })
+        // An 8×8 straight-RGBA art, and one Linear Grid layer of it at `(x, y)`
+        // (the rain's rows and the companions both reach the GPU this way).
+        let scene_art = |seed: usize| {
+            let rgba: Vec<u8> = (0..8 * 8 * 4)
+                .map(|i| ((i * 13 + seed) % 256) as u8)
+                .collect();
+            Arc::new(FxArt::new(8, 8, FxTexels::Rgba8Straight, rgba).expect("sized"))
         };
+        let sprite_layer =
+            |id: u64, slot: FxSlot, knock: bool, (x, y): (i32, i32), art: &Arc<FxArt>, flip_x| {
+                let mut l = FxLayer::new(
+                    id,
+                    Arc::new(FxContent::new(
+                        vec![FxItem::Sprite(FxSprite {
+                            x,
+                            y,
+                            dw: 8,
+                            dh: 8,
+                            flip_x,
+                            art: Arc::clone(art),
+                            ink: 0,
+                            clip: PxRect::EVERYWHERE,
+                        })],
+                        vec![FxInk::over(0x00ff_ffff, 255)],
+                    )),
+                    slot,
+                    FxSpace::Grid,
+                    FxBlend::Linear,
+                );
+                l.knock = knock;
+                l
+            };
 
         use crate::renderer::StreamId as S;
         let mut fixtures: Vec<(&'static str, RenderInput, &'static [S])> = Vec::new();
@@ -1932,22 +1954,18 @@ mod tests {
 
         {
             let mut input = base_input();
-            input.rain_atlas = Some(scene_atlas(5));
+            let tile = scene_art(5);
             for i in 0..3u16 {
-                input.rain_quads.push(SpriteQuad {
-                    row: 4,
-                    x: (i * 5) * cw16,
-                    y: 4 * ch16,
-                    w: 8.min(cw16),
-                    h: 8.min(ch16),
-                    ax: 0,
-                    ay: 0,
-                    aw: 8,
-                    ah: 8,
-                    tint: 0x00ff_ffff,
-                    alpha: 255,
-                    flip_x: i % 2 == 1,
-                });
+                let at = (i32::from(i * 5 * cw16), i32::from(4 * ch16));
+                let l = sprite_layer(
+                    1 + u64::from(i),
+                    FxSlot::Under,
+                    false,
+                    at,
+                    &tile,
+                    i % 2 == 1,
+                );
+                input.fx_layers.push(l);
             }
             input.rain_add.push(RainHalo {
                 row: 4,
@@ -2001,7 +2019,11 @@ mod tests {
                 ry: ch16,
                 mode: HaloMode::Over,
             });
-            fixtures.push(("rain", input, &[S::RainAdd, S::RainAddOver, S::RainUnder]));
+            fixtures.push((
+                "rain",
+                input,
+                &[S::RainAdd, S::RainAddOver, S::FxLinearUnder],
+            ));
         }
 
         {
@@ -2070,46 +2092,25 @@ mod tests {
 
         {
             let mut input = base_input();
-            input.free_atlas = Some(scene_atlas(11));
-            input.cat_atlas = Some(scene_atlas(23));
-            for (i, z) in [
-                aterm_core::render::FreeZ::UnderText,
-                aterm_core::render::FreeZ::OverText,
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                input.free_sprites.push(FreeSprite {
-                    x: (2 + i as i32) * cw as i32,
-                    y: (ch / 2) as i32,
-                    w: 8,
-                    h: 8,
-                    ax: 0,
-                    ay: 0,
-                    aw: 8,
-                    ah: 8,
-                    tint: 0x00ff_ffff,
-                    alpha: 255,
-                    flip_x: false,
-                    z,
-                    sampler: aterm_core::render::FreeSampler::Nearest,
-                });
-            }
-            input.cat_quads.push(SpriteQuad {
-                row: 5,
-                x: 10 * cw16,
-                y: 5 * ch16,
-                w: 8.min(cw16),
-                h: 8.min(ch16),
-                ax: 0,
-                ay: 0,
-                aw: 8,
-                ah: 8,
-                tint: 0x00ff_ffff,
-                alpha: 255,
-                flip_x: false,
-            });
-            fixtures.push(("sprites", input, &[S::FreeUnder, S::FreeOver, S::CatOver]));
+            let (body, cat) = (scene_art(11), scene_art(23));
+            let y = (ch / 2) as i32;
+            input.fx_layers = vec![
+                sprite_layer(1, FxSlot::Under, true, (2 * cw as i32, y), &body, false),
+                sprite_layer(2, FxSlot::Over, false, (3 * cw as i32, y), &body, false),
+                sprite_layer(
+                    3,
+                    FxSlot::Under,
+                    true,
+                    (10 * cw as i32, 5 * ch as i32),
+                    &cat,
+                    false,
+                ),
+            ];
+            fixtures.push((
+                "sprites",
+                input,
+                &[S::FxLinearUnder, S::GlyphKnock, S::FxLinearOver],
+            ));
         }
 
         {
@@ -2181,8 +2182,7 @@ mod tests {
             input.glow_under = fire.glow_under;
             input.fire_patch = fire.fire_patch;
             input.rain_add = rain.rain_add;
-            input.free_atlas = sprites.free_atlas;
-            input.free_sprites = sprites.free_sprites;
+            input.fx_layers = sprites.fx_layers;
             input
         };
         let five_streams = [
@@ -2192,8 +2192,8 @@ mod tests {
             S::Glyph,
             S::RainAdd,
             S::RainAddOver,
-            S::FreeUnder,
-            S::FreeOver,
+            S::FxLinearUnder,
+            S::FxLinearOver,
             S::CursorBlock,
         ];
         run_fixture(&mut gpu, &mut win, "five_pass", &five_pass, &five_streams);

@@ -338,7 +338,6 @@ fn busy_center(now: Instant) -> MessageCenter {
     center
 }
 
-/// Resolved `(ink, ground)` pairs under column `x`'s glyph.
 fn word_grounds(
     row: &[InkedCell],
     raster: Option<&RowRaster>,
@@ -376,8 +375,6 @@ fn word_grounds(
     }
 }
 
-/// A 42.7 % meter lights the cells left of the edge in the full accent, the cells right of it in
-/// the track, and the edge cell in their coverage mix; the glyph and title wear the row's crisp ink.
 #[test]
 fn the_meter_row_is_its_fill_and_track_and_its_words_the_crisp_ink() {
     let center = two_rows();
@@ -417,8 +414,6 @@ fn the_meter_row_is_its_fill_and_track_and_its_words_the_crisp_ink() {
     );
 }
 
-/// On a metered row, Secondary and Details capsules ride the meter track with floored value/label
-/// ink while Primary wears the accent.
 #[test]
 fn each_chip_wears_its_roles_ground_and_ink_on_a_metered_row() {
     let center = two_rows();
@@ -458,8 +453,6 @@ fn each_chip_wears_its_roles_ground_and_ink_on_a_metered_row() {
     }
 }
 
-/// Under each stock High Contrast palette every capsule cell is WINDOWTEXT on the band with no
-/// fill, the glyph on the metered row's fill is HIGHLIGHTTEXT, and a hovered capsule is HIGHLIGHT.
 #[test]
 fn high_contrast_capsules_are_one_ink_on_the_band() {
     let center = two_rows();
@@ -492,8 +485,6 @@ fn high_contrast_capsules_are_one_ink_on_the_band() {
     }
 }
 
-/// Over one comet period on dark and light bands, every comet tone clears AA against the words'
-/// anchor and keeps every word and the glyph cell on the anchor's side of the ground.
 #[test]
 fn the_comet_never_flips_a_words_ink() {
     for theme in [DEFAULT, LIGHT] {
@@ -551,8 +542,6 @@ fn the_comet_never_flips_a_words_ink() {
     }
 }
 
-/// The ETA slot stays blank while unlatched or after Complete, and wears floored value ink when
-/// latched (`… left`).
 #[test]
 fn the_time_slot_words_wear_their_meanings_ink() {
     let c = inks(DEFAULT);
@@ -627,8 +616,6 @@ fn the_time_slot_words_wear_their_meanings_ink() {
     assert_eq!(words, "");
 }
 
-/// `band_fp` is `0` with no row committed and otherwise changes with hover, window geometry, or
-/// moving motion frames (while staying fixed on held rows and still busy rows).
 #[test]
 fn band_fp_is_zero_with_no_row_and_moves_only_with_what_it_draws() {
     let g = Geometry::cells_only(100);
@@ -699,8 +686,6 @@ fn band_fp_is_zero_with_no_row_and_moves_only_with_what_it_draws() {
     );
 }
 
-/// On every builtin scheme, resting and hovered Primary, Secondary, and Details capsules clear
-/// 4.5:1 on plain, track, fill, and busy grounds while Primary keeps its polarity.
 #[test]
 fn every_chip_label_clears_aa_on_every_builtin_theme() {
     let now = t0();
@@ -802,9 +787,6 @@ fn every_chip_label_clears_aa_on_every_builtin_theme() {
     }
 }
 
-/// Across every builtin scheme and determinate-row phase (glide, glint, Complete echo, Fault
-/// flash), word cells over the fill wear the row's crisp ink at >= 4.5:1 (7:1 where reachable)
-/// without flipping polarity.
 #[test]
 #[allow(
     clippy::too_many_lines,
@@ -952,7 +934,6 @@ fn words_on_a_fill_wear_the_rows_crisp_ink_in_every_frame() {
     assert!(crisp >= 7.0, "the default ground's crisp ink: {crisp:.2}:1");
 }
 
-/// Every hover target on a row hashes to a distinct key.
 #[test]
 fn every_hover_target_on_a_row_is_its_own_key() {
     let fp = 0x1234_5678;

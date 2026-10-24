@@ -248,6 +248,9 @@ fn the_grammar_parses_what_the_help_text_advertises() {
         ("disk --help", Cmd::Help(HelpPage::Disk)),
         ("upgrade s-1 --help", Cmd::Help(HelpPage::Upgrade)),
         ("upgrade --status -h", Cmd::Help(HelpPage::UpgradeStatus)),
+        ("versions", Cmd::Versions { json: false }),
+        ("version --json", Cmd::Versions { json: true }),
+        ("versions --help", Cmd::Help(HelpPage::Versions)),
     ];
     for (line, want) in cases {
         let (got, _) = parse(&words(line)).unwrap_or_else(|e| panic!("{line}: {e}"));
@@ -6835,4 +6838,26 @@ fn a_stateful_ledger_cut_keeps_input_it_cannot_read_whole() {
     std::fs::create_dir(&side).expect("nonregular predecessor");
     assert!(!bound_ledger_cut_with_cap(&path, 1, 64, &earlier).unwrap());
     assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+#[test]
+fn versions_prints_incremental_numeric_version_for_every_cli_harness() {
+    let tmp = tmp_dir("versions");
+    let env = env_at(&tmp);
+    let (ok, text, err) = go(&Cmd::Versions { json: false }, &env);
+    assert!(ok, "err={err}");
+    for slug in ["codex", "claude", "agy", "grok", "kimi", "muse", "gemini"] {
+        assert!(text.contains(slug), "missing {slug} in:\n{text}");
+    }
+    assert!(text.contains("v0.1"), "expected v0.1 in:\n{text}");
+
+    let (ok_json, json, err_json) = go(&Cmd::Versions { json: true }, &env);
+    assert!(ok_json, "err={err_json}");
+    for slug in ["codex", "claude", "agy", "grok", "kimi", "muse", "gemini"] {
+        assert!(
+            json.contains(&format!(r#""slug":"{slug}""#)),
+            "missing {slug} in json:\n{json}"
+        );
+    }
+    assert!(json.contains(r#""version":"0.1","major":0,"minor":1"#));
 }

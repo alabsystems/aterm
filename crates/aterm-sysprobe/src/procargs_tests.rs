@@ -5,8 +5,7 @@
 
 use super::*;
 
-/// A `KERN_PROCARGS2` answer as the kernel lays one out: `argc`, the exec path
-/// and its NUL, `pad` more NULs, the words, the environment.
+/// Build a `KERN_PROCARGS2` buffer (`argc`, NUL-padded exec path, argv, and env).
 fn frame(argc: i32, exec: &[u8], pad: usize, words: &[&[u8]], env: &[&[u8]]) -> Vec<u8> {
     let mut b = argc.to_ne_bytes().to_vec();
     b.extend_from_slice(exec);
@@ -22,8 +21,6 @@ fn env_of(p: &ProcArgs2<'_>) -> Vec<Vec<u8>> {
     p.env().map(<[u8]>::to_vec).collect()
 }
 
-/// A whole answer: the exec path apart from `argv[0]`, every word (a later empty one and
-/// one that is no UTF-8 kept), and the environment after them up to its empty string.
 #[test]
 fn a_whole_answer_gives_the_path_the_words_and_the_environment() {
     let words: &[&[u8]] = &[b"-zsh", b"-c", b"a\nb", b"", b"\xff"];
@@ -35,8 +32,6 @@ fn a_whole_answer_gives_the_path_the_words_and_the_environment() {
     assert_eq!(env_of(&p), [b"HOME=/h".to_vec(), b"K=v".to_vec()]);
 }
 
-/// The padding after the exec path is any number of NULs, none included, and an empty
-/// `argv[0]` is read as more of it: the first word is the first non-empty one.
 #[test]
 fn the_padding_is_skipped_whatever_its_length() {
     for pad in [0, 1, 3, 7] {
@@ -51,8 +46,6 @@ fn the_padding_is_skipped_whatever_its_length() {
     assert!(!p.whole());
 }
 
-/// An argc of 0 is no words, whole, and the environment follows the padding; the exec
-/// path may be empty.
 #[test]
 fn an_argc_of_zero_reads_no_words_and_the_environment() {
     let b = frame(0, b"", 3, &[], &[b"A=1"]);
@@ -64,8 +57,6 @@ fn an_argc_of_zero_reads_no_words_and_the_environment() {
     assert_eq!(env_of(&p), [b"A=1".to_vec()]);
 }
 
-/// A buffer cut inside its words answers the words it holds, terminated ones only, and no
-/// environment; a count no buffer of its size could hold reserves nothing and reads as cut.
 #[test]
 fn a_cut_buffer_answers_the_words_it_holds_and_no_environment() {
     let mut cut = frame(3, b"/bin/sleep", 1, &[b"sleep"], &[]);
@@ -83,7 +74,6 @@ fn a_cut_buffer_answers_the_words_it_holds_and_no_environment() {
     assert!(p.argv.capacity() <= 1024, "reserved {}", p.argv.capacity());
 }
 
-/// No argc, a negative one, or an exec path no NUL ends: no answer.
 #[test]
 fn a_buffer_without_its_header_is_no_answer() {
     assert_eq!(parse(&[1, 0, 0]), None, "shorter than argc");
@@ -113,12 +103,7 @@ fn this_process_reads_back_as_it_was_exec_d() {
     assert_eq!(super::read(99_999_998), None, "no such pid");
 }
 
-/// A record larger than the kernel hands over is no answer, never its tail. An exec given
-/// nearly `ARG_MAX` of arguments and environment has a record past `kern.argmax` (its exec
-/// path and the kernel's own strings ride beside them), and the kernel refuses a buffer past
-/// `kern.argmax` plus the argc (`EINVAL`) and fills a smaller one with the record's LAST bytes:
-/// the exec path and the first words are gone, and what follows the argc parses as other
-/// words (`ps` prints such a process as `ptr_munge= ptr_munge=`).
+/// `KERN_PROCARGS2` past `kern.argmax` returns `EINVAL` or a tail slice; `read` returns `None`.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_record_past_what_the_kernel_hands_over_reads_as_nothing() {

@@ -4090,4 +4090,78 @@ mod tests {
             "animated rainbow kitty village advances paint commands across busy ticks"
         );
     }
+
+    #[test]
+    fn rainbow_kitty_village_builds_and_synergies_stay_stable_when_state_is_stable_while_kitties_roam()
+     {
+        let sky = [0x18, 0x16, 0x22];
+        let rim = [0x38, 0x34, 0x4C];
+        let arch_for = |states: &str, phase_ms: u64| -> Vec<crate::widget::DrawPrim> {
+            let spec = format!(
+                "phase={phase_ms};busy=0;done={};total={};states={states}",
+                states.chars().filter(|&c| c == 'G').count(),
+                states.len()
+            );
+            let (p, b, done, total, parsed) =
+                crate::settings::parse_rainbow_kitty_village_spec(&spec);
+            let mut prims = Vec::new();
+            crate::settings::paint_rainbow_kitty_village_architecture(
+                &mut prims, 0.0, 0.0, 640.0, 48.0, sky, rim, p, b, done, total, &parsed,
+            );
+            prims
+        };
+        let kitties_for = |phase_ms: u64| -> Vec<crate::widget::DrawPrim> {
+            let mut prims = Vec::new();
+            crate::settings::paint_rainbow_kitty_village_kitties(
+                &mut prims, 0.0, 640.0, 40.0, phase_ms, false,
+            );
+            prims
+        };
+
+        // 1. Progressive population as system state transitions D -> W -> G with neighbor synergies.
+        let pending = arch_for("DDDDDDDDDDDD", 0);
+        let one_done = arch_for("GDDDDDDDDDDD", 0);
+        let pair_synergy = arch_for("GGDDDDDDDDDD", 0);
+        let district_synergy = arch_for("GGGDDDDDDDDD", 0);
+        let all_verified = arch_for("GGGGGGGGGGGG", 0);
+        assert!(
+            pending.len() < one_done.len()
+                && one_done.len() < pair_synergy.len()
+                && pair_synergy.len() < district_synergy.len()
+                && district_synergy.len() < all_verified.len(),
+            "village populates buildings, gardens, paths, and synergies as stations converge: {} < {} < {} < {} < {}",
+            pending.len(),
+            one_done.len(),
+            pair_synergy.len(),
+            district_synergy.len(),
+            all_verified.len(),
+        );
+
+        // 2. When settings are stable (no 'W' stations), building & synergy geometry never changes on phase_ms.
+        for stable_states in [
+            "GGGGGGGGGGGG",
+            "GDG_GGGGGGGG",
+            "DDDDDDDDDDDD",
+            "GGGGGGGGGGGGGGGGGG",
+        ] {
+            let base = format!("{:?}", arch_for(stable_states, 0));
+            for phase in [120, 480, 1440, 5200] {
+                assert_eq!(
+                    base,
+                    format!("{:?}", arch_for(stable_states, phase)),
+                    "stable state {stable_states} must keep village architecture fixed at phase={phase}"
+                );
+            }
+        }
+
+        // 3. Even when settings are stable, kitties move around in the village across phase_ms.
+        assert_ne!(
+            format!("{:?}", kitties_for(0)),
+            format!("{:?}", kitties_for(360))
+        );
+        assert_ne!(
+            format!("{:?}", kitties_for(360)),
+            format!("{:?}", kitties_for(1200))
+        );
+    }
 }

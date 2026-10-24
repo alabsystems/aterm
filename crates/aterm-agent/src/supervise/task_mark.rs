@@ -9,7 +9,9 @@
 //! ([`crate::harness::result::snapshot`], [`DoneBy`], [`crate::harness::result::snapshot_screen`],
 //! [`crate::harness::result::with_report`], [`result::prune_results`]) and seeds loops from
 //! existing records ([`Session::task_seed`], [`TurnEndState::set_managed`],
-//! [`TurnEndState::seed_task_done`], [`TurnEndState::record_landing_holds`]).
+//! [`TurnEndState::seed_task_done`], [`TurnEndState::record_landing_holds`], and the occupancy
+//! task door's standing fact word, `Session::door_task_seed`), or at a break's write before the
+//! first fold ([`Session::managed_at_write`]).
 
 use serde::{Deserialize, Serialize};
 
@@ -133,6 +135,9 @@ pub(crate) struct TaskRead {
     pub(crate) result_path: Option<String>,
     /// What moved it to its state (`why=`), when something said.
     pub(crate) why: Option<String>,
+    /// The fact word the occupancy loop's task door noted on it (`fact=`), read as the closed
+    /// word only ([`FactWord::parse`]): `-`, or any other text, is none.
+    pub(crate) fact: Option<crate::supervise::occupancy::FactWord>,
 }
 
 /// The record one `task` reply names.
@@ -153,6 +158,7 @@ pub(crate) fn task_read(reply: &CtlReply) -> Option<TaskRead> {
             .unwrap_or(0),
         result_path: field("result_path").map(str::to_string),
         why: field("why").map(str::to_string),
+        fact: field("fact").and_then(crate::supervise::occupancy::FactWord::parse),
     })
 }
 
@@ -163,19 +169,6 @@ pub const LANDED_WHY: &str = "landed";
 /// why=landed` ([`LANDED_WHY`]).
 fn is_landing(t: &TaskRead) -> bool {
     t.state == "done" && t.why.as_deref() == Some(LANDED_WHY)
-}
-
-/// The result file's stem for the task the record at `rev` stands for, in
-/// session `sel` (`@s-…`): `<gsid>-<rev>`, the task file's own pairing.
-fn result_stem(sel: Option<&str>, rev: u64) -> String {
-    let sid: String = sel
-        .unwrap_or_default()
-        .trim_start_matches('@')
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
-        .collect();
-    let sid = if sid.is_empty() { "session" } else { &sid };
-    format!("{sid}-{rev}")
 }
 
 impl<C: Ctl> Session<'_, C> {
@@ -251,7 +244,7 @@ impl<C: Ctl> Session<'_, C> {
             return Ok(true);
         };
         let by = DoneBy::Turn;
-        let stem = result_stem(self.setup.sid.as_deref(), record.rev);
+        let stem = result::result_stem(self.setup.sid.as_deref(), record.rev);
         let transcript = opts.idle_host.as_ref().and_then(|h| h.transcript());
         let screen = if transcript.is_none() {
             self.point_said
@@ -367,6 +360,7 @@ impl<C: Ctl> Session<'_, C> {
             return Ok(());
         };
         self.turn_end.set_managed(record.state != "exited");
+        self.door_task_seed(record.fact, &opts.policy);
         if record.state == "done" {
             let holds = self.turn_end.task_done() || self.turn_end.record_landing_holds();
             if is_landing(&record) && holds && self.turn_end.seed_task_done() {
@@ -380,6 +374,34 @@ impl<C: Ctl> Session<'_, C> {
             }
         }
         Ok(())
+    }
+
+    /// THE MANAGED GUARD'S RECORD AT A LINE'S WRITE (`Session::write_guards`, past an owner's
+    /// grant): before this loop's first fold has read the record ([`Self::task_seed`]), a break's
+    /// line would be judged on a worker no one has read as managed — a managed worker's first
+    /// turn, or a loop that carried an open hold. So the write reads it once here and sets the
+    /// managed guard as the seed does. `Some(Guard::Managed)` holds the line where the read is
+    /// lost. Not on a tape slice 2's doors did not record, whose loop typed as it judged.
+    pub(super) fn managed_at_write(&mut self) -> Result<Option<Guard>, Fail> {
+        use crate::supervise::occupancy::fault::{Fault, armed};
+        if self.task_seeded
+            || self.managed_read
+            || !self.tasks_tracked
+            || !self.fx.slice2_recorded()
+            || self.claim.watching_behind().is_some()
+            || armed(Fault::ManagedUnread)
+        {
+            return Ok(None);
+        }
+        let r = self.call(&["task"])?;
+        if r.lost() {
+            return Ok(Some(Guard::Managed));
+        }
+        self.managed_read = true;
+        if let Some(record) = task_read(&r) {
+            self.turn_end.set_managed(record.state != "exited");
+        }
+        Ok(None)
     }
 
     /// The task opened again by someone else's turn: a `done` record marked
@@ -566,8 +588,38 @@ mod tests {
                 result_bytes: 12,
                 result_path: Some("/t/x.md".to_string()),
                 why: Some("marker".to_string()),
+                fact: None,
             })
         );
+        let noted = task_read(&reply(
+            0,
+            "OK task rev=4 state=working from=ctl since_ms=9 result_bytes=0 fact=hold-room@v1#2 \
+             fact_rev=3 agent=idle attention=x%20fact=wake@v1#7 changed=0\n",
+        ))
+        .expect("a record");
+        assert_eq!(
+            noted.fact.map(crate::supervise::occupancy::FactWord::word),
+            Some("hold-room@v1#2".to_string())
+        );
+        for (spelled, read) in [
+            ("fact=-", None),
+            ("fact=hold-room@v1#0", None),
+            ("fact=hold-room#1", None),
+            ("fact=hold-room@v1#01", None),
+            ("fact=wait-nudge@v1#1", Some("wait-nudge@v1#1")),
+            ("", None),
+        ] {
+            let line = format!("OK task rev=4 state=working from=ctl result_bytes=0 {spelled}\n");
+            assert_eq!(
+                task_read(&reply(0, &line))
+                    .expect("a record")
+                    .fact
+                    .map(crate::supervise::occupancy::FactWord::word)
+                    .as_deref(),
+                read,
+                "{spelled:?}"
+            );
+        }
         for none in [
             reply(0, "OK task -\n"),
             reply(1, ""),
@@ -576,8 +628,8 @@ mod tests {
         ] {
             assert_eq!(task_read(&none), None, "{none:?}");
         }
-        assert_eq!(result_stem(Some("@s-0a1b"), 3), "s-0a1b-3");
-        assert_eq!(result_stem(None, 1), "session-1");
-        assert_eq!(result_stem(Some("@../x"), 1), "x-1");
+        assert_eq!(result::result_stem(Some("@s-0a1b"), 3), "s-0a1b-3");
+        assert_eq!(result::result_stem(None, 1), "session-1");
+        assert_eq!(result::result_stem(Some("@../x"), 1), "x-1");
     }
 }

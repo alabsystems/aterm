@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A slow pointer stroke earns one existing petting response. The caller
-//! supplies contact only while the pointer touches the eligible pet's body.
-//! This detector observes inputs; it never asks the host for animation wakes.
+//! Pointer-stroke detector for pet responses; observes contact samples without
+//! requesting animation wakes.
 
 use aterm_time::{Duration, Instant};
 
@@ -106,7 +105,6 @@ mod tests {
             let expected = sparse.sample(at, Some(point), 4.0);
             assert_eq!(framed.sample(at, Some(point), 4.0), expected);
             responses += u32::from(expected);
-            // The last repeated frame is 1 ms before the next real move.
             for offset in [16, 64, 128, 192, 249] {
                 assert!(!framed.sample(at + Duration::from_millis(offset), Some(point), 4.0));
             }
@@ -190,9 +188,6 @@ mod tests {
         assert!(!detector.sample(start + Duration::from_secs(2), Some((1.8, 0.0)), 4.0));
     }
 
-    /// Tier-1 bind of `pet_stroke_detector_model` to the real detector. `event` is the input
-    /// class this trace supplies, not one inferred from the returned boolean, and the cooldown
-    /// obligation comes from the observed response's time, not the detector's own deadline.
     #[test]
     fn real_stroke_detector_transitions_conform_and_reject_negative_controls() {
         use std::collections::{BTreeMap, BTreeSet};

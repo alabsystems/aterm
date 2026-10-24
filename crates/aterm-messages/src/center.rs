@@ -3,6 +3,8 @@
 
 //! Process-wide [`MessageCenter`]: active rows, hysteresis, completion echoes, and log.
 
+use std::sync::Arc;
+
 use crate::animate::{
     Anim, BandMotion, Look, Pace, ROW, RowMotion, Surface, anim_ms, bar, bar_at, bar_glints, comet,
     comet_phase, echo, echo_span, glide, glide_q16, glide_span, glint_at, next_glint_start,
@@ -581,6 +583,7 @@ type GlassSignature = (
 /// The center.
 #[derive(Clone, Debug)]
 pub struct MessageCenter {
+    confirmations: Arc<crate::ConfirmationSource>,
     live: Vec<Live>,
     glass: Vec<MessageId>,
     echoes: Vec<Echo>,
@@ -627,10 +630,23 @@ enum LaterVerdict {
 }
 
 impl MessageCenter {
-    /// A center over a (possibly replayed) log.
+    /// A center over a (possibly replayed) log without conditional settlement.
+    /// Hosts that can obtain entropy use [`Self::with_confirmations`] instead.
     #[must_use]
     pub fn new(log: MessageLog, now: Instant) -> Self {
+        Self::with_confirmations(log, now, Arc::new(crate::ConfirmationSource::new(None)))
+    }
+
+    /// A center sharing the host incarnation's clock-independent confirmation source.
+    /// Clones keep sharing this source; restoring a log must not reset it.
+    #[must_use]
+    pub fn with_confirmations(
+        log: MessageLog,
+        now: Instant,
+        confirmations: Arc<crate::ConfirmationSource>,
+    ) -> Self {
         Self {
+            confirmations,
             live: Vec::new(),
             glass: Vec::new(),
             echoes: Vec::new(),
@@ -2488,7 +2504,7 @@ impl MessageCenter {
             }
             LaterVerdict::Repeat(i) => {
                 let e = self.digest.get_mut(i);
-                e.confirm();
+                e.confirm(&self.confirmations);
                 e.repeats = e.repeats.saturating_add(1);
                 e.ask.take_action_of(&ask);
                 return Posted {
@@ -2498,7 +2514,7 @@ impl MessageCenter {
             }
             LaterVerdict::Restate(i) => {
                 let e = self.digest.get_mut(i);
-                e.confirm();
+                e.confirm(&self.confirmations);
                 let id = e.id;
                 e.msg = msg;
                 e.ask = ask;
@@ -2526,7 +2542,7 @@ impl MessageCenter {
             posted_at: now,
             anchor_wall: stamp.unix_ms,
             repeats: 1,
-            confirmation: DigestItem::first_confirmation(stamp.unix_ms),
+            confirmation: self.confirmations.take(),
             missed_at: None,
             restated_at: now,
         });
@@ -2951,7 +2967,7 @@ impl MessageCenter {
                 posted_at: now,
                 anchor_wall: wall.unix_ms,
                 repeats: r.repeats,
-                confirmation: DigestItem::first_confirmation(wall.unix_ms),
+                confirmation: self.confirmations.take(),
                 missed_at: None,
                 restated_at: now,
             });
@@ -3443,7 +3459,11 @@ mod tests {
     fn exhausted_entry_confirmations_never_wrap_or_allow_conditional_settlement() {
         use crate::wire::{NoticeRequest, WireGate};
         let now = t0();
-        let mut c = fresh(now);
+        let mut c = MessageCenter::with_confirmations(
+            MessageLog::empty(),
+            now,
+            Arc::new(crate::ConfirmationSource::new(Some(u64::MAX - 1))),
+        );
         let NoticeRequest::Later(later) = NoticeRequest::parse(
             "later k Renew the key -- only you hold its passphrase -- Renew the key",
         )
@@ -3452,8 +3472,7 @@ mod tests {
         };
         let msg = later.into_message();
         let id = c.post(msg.clone(), stamp(0), now).id;
-        let i = c.digest.find_id(id).unwrap();
-        c.digest.get_mut(i).confirmation = u64::MAX - 1;
+        assert_eq!(c.digest_confirmation(id), Some(u64::MAX - 1));
         let before = (c.revision(), c.digest_revision(), c.projection_revision());
         for _ in 0..2 {
             assert_eq!(

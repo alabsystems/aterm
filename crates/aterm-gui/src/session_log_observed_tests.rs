@@ -1368,7 +1368,16 @@ fn relaunch_at(
     hand.set(ms);
     let mut g = tl.lock().unwrap();
     let now = g.slog().now();
-    g.slog_mut().observe_relaunch_act("relaunch", true, now);
+    let label = aterm_agent::harness::acts::relaunch_label("relaunch", "relaunched", "2.1.0");
+    g.slog_mut()
+        .observe_relaunch_act("relaunch", true, label.as_deref(), now);
+}
+
+fn harness_labels(tl: &std::sync::Mutex<crate::session_timeline::SessionTimeline>) -> usize {
+    lines_of(tl)
+        .iter()
+        .filter(|l| l.contains(" mark - label ") && l.contains(" by=harness "))
+        .count()
 }
 
 fn claude_in_front(
@@ -1411,7 +1420,7 @@ fn a_relaunch_lifts_the_failure_it_caused() {
     let tail: Vec<&str> = got
         .iter()
         .rev()
-        .take(2)
+        .take(3)
         .rev()
         .map(|l| l.split_once(' ').map_or("", |(_, b)| b))
         .collect();
@@ -1426,8 +1435,12 @@ fn a_relaunch_lifts_the_failure_it_caused() {
                 "mark - seen by=harness src=aterm conf=strong t={}",
                 super::super::tests::WALL0 + 700
             ),
+            format!(
+                "mark - label text=restarting ttl=30 by=harness src=aterm conf=strong t={}",
+                super::super::tests::WALL0 + 700
+            ),
         ],
-        "the act, then the seen: {got:?}"
+        "the act, the seen, then the harness's label: {got:?}"
     );
     let brief = crate::session_log::render_brief(
         tl.lock().unwrap().slog().log(),
@@ -1447,6 +1460,11 @@ fn a_relaunch_with_no_newer_run_open_lifts_nothing() {
     claude_in_front(&tl, &hand, 160, (0, 100, 300));
     relaunch_at(&tl, &hand, 200);
     assert_eq!(failures_and_harness_seen(&tl), (0, 0), "nothing to lift");
+    assert_eq!(
+        harness_labels(&tl),
+        1,
+        "no need is open: the restart's label"
+    );
     blocks(&tl, &hand, 400, &finished(0, Some(143), 100, 300, "claude"));
     assert_eq!(
         failures_and_harness_seen(&tl),
@@ -1458,6 +1476,12 @@ fn a_relaunch_with_no_newer_run_open_lifts_nothing() {
         failures_and_harness_seen(&tl),
         (1, 0),
         "no newer run open: {:?}",
+        lines_of(&tl)
+    );
+    assert_eq!(
+        harness_labels(&tl),
+        1,
+        "under the failure it could not lift, no second label: {:?}",
         lines_of(&tl)
     );
 }
@@ -1494,6 +1518,7 @@ fn a_relaunch_beside_a_second_failure_lifts_neither() {
         "both failures stand: {:?}",
         lines_of(&tl)
     );
+    assert_eq!(harness_labels(&tl), 0, "the tab says failed, which is true");
 }
 
 #[test]
@@ -1511,6 +1536,7 @@ fn a_restart_lifts_no_failure_of_a_command_that_ran_no_agent() {
         "make's failure stands: {:?}",
         lines_of(&tl)
     );
+    assert_eq!(harness_labels(&tl), 0, "make's failure masks no label");
     assert!(
         lines_of(&tl)
             .iter()

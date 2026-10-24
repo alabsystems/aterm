@@ -38,6 +38,14 @@ pub(crate) fn drawn_for(program: Option<&str>) -> bool {
         })
 }
 
+/// Whether `program`'s composer is left bare but for the top rule's switch under `switch` (agy while its switch is not on).
+pub(crate) fn bare_while_off(
+    program: Option<aterm_phase::Program>,
+    switch: Option<crate::autopilot::HarnessSwitch>,
+) -> bool {
+    program == Some(aterm_phase::Program::Agy) && switch.is_some_and(|s| !s.is_on())
+}
+
 /// One pane's painted light block.
 struct Lit {
     session: u64,
@@ -299,6 +307,9 @@ struct CachedPaneText {
     /// The engine's revisions of the rows `rows` were read from ([`RowStamps`],
     /// [`Self::rule_run`]).
     stamps: RowStamps,
+    /// The kept runs' rows as they were read, where no revision vouches for
+    /// them ([`KeptRows`]).
+    kept_cells: std::cell::RefCell<KeptRows>,
 }
 
 /// The D-2 row revisions of the scratch a pane's rows were read from ([`StampLane`]).
@@ -358,6 +369,79 @@ pub(crate) fn read_every_row_in<R>(f: impl FnOnce() -> R) -> R {
     let out = f();
     READ_BY_STAMP.with(|k| k.set(was));
     out
+}
+
+/// Whether copied cells may vouch for a kept run's row of `scratch`: a
+/// scratch no row revision vouches for ([`StampLane::of`]), as a split
+/// window's composed frame is.
+fn cells_vouch(scratch: &RenderInput) -> bool {
+    #[cfg(test)]
+    if !READ_BY_STAMP.with(std::cell::Cell::get) {
+        return false;
+    }
+    StampLane::of(scratch).is_none()
+}
+
+/// The rows of a pane's kept runs as they were read ([`KeptRun`], [`KeptTop`]).
+#[derive(Debug, Default)]
+struct KeptRows {
+    rule: KeptCells,
+    top: KeptCells,
+}
+
+/// One kept run's row as it was read, where no row revision vouches for it
+/// ([`cells_vouch`]): a rebuild keeps the run while the row holds these
+/// cells, all of the row a read reads but its images ([`has_images`], which
+/// a rebuild checks apart).
+#[derive(Debug, Default)]
+struct KeptCells {
+    /// The frame row the cells were copied from, `None` where none were: a
+    /// cluster or a combining mark in the span, whose reads the copy omits.
+    frame_row: Option<usize>,
+    cells: Vec<RenderCell>,
+}
+
+impl KeptCells {
+    /// Frame row `frame_row`'s cells in `cols`, where they are all a read reads.
+    fn span<'a>(
+        scratch: &'a RenderInput,
+        frame_row: usize,
+        cols: &std::ops::Range<usize>,
+    ) -> Option<&'a [RenderCell]> {
+        if touches(&scratch.clusters, frame_row, cols)
+            || touches(&scratch.combining, frame_row, cols)
+        {
+            return None;
+        }
+        let row = scratch.cells.get(frame_row)?;
+        row.get(cols.start..row.len().min(cols.end))
+    }
+
+    /// Copy frame row `frame_row`'s cells in `cols` of `scratch`, its buffer reused.
+    fn note(&mut self, scratch: &RenderInput, frame_row: usize, cols: &std::ops::Range<usize>) {
+        self.cells.clear();
+        self.frame_row = None;
+        if let Some(span) = Self::span(scratch, frame_row, cols) {
+            self.cells.extend_from_slice(span);
+            self.frame_row = Some(frame_row);
+        }
+    }
+
+    /// Forget the copy: nothing vouches for the row.
+    fn forget(&mut self) {
+        self.frame_row = None;
+    }
+
+    /// Whether frame row `frame_row` of `scratch` holds the cells copied off it.
+    fn holds(
+        &self,
+        scratch: &RenderInput,
+        frame_row: usize,
+        cols: &std::ops::Range<usize>,
+    ) -> bool {
+        self.frame_row == Some(frame_row)
+            && Self::span(scratch, frame_row, cols) == Some(self.cells.as_slice())
+    }
 }
 
 /// Whether frame row `frame_row` of `scratch` holds an image placement.
@@ -595,6 +679,7 @@ impl PaneTextCache {
             rule_run,
             panel_before,
             top_run,
+            kept_cells,
         ) = match last {
             Some(cached) => {
                 let vouched = lane.is_some() && cached.stamps.lane == lane;
@@ -628,17 +713,24 @@ impl PaneTextCache {
                         .checked_sub(region.strip + region.row_off)
                         .filter(|&r| r < region.rows)
                 };
-                let keeps = |frame: usize| {
-                    pane_row(frame).is_some_and(&unmoved) && !has_images(scratch, frame)
+                // A row a revision cannot vouch for, a split window's, is kept
+                // while it holds the cells its run was read from.
+                let by_cells = cells_vouch(scratch);
+                let pane_span = region.col_off..region.col_off + region.cols;
+                let kept_cells = cached.kept_cells.into_inner();
+                let keeps = |frame: usize, noted: &KeptCells| {
+                    pane_row(frame).is_some_and(|r| {
+                        unmoved(r) || (by_cells && noted.holds(scratch, frame, &pane_span))
+                    }) && !has_images(scratch, frame)
                 };
                 let rule_run = cached
                     .rule_run
                     .get()
-                    .filter(|kept| kept.row().is_some_and(keeps));
+                    .filter(|kept| kept.row().is_some_and(|f| keeps(f, &kept_cells.rule)));
                 let top_run = cached
                     .top_run
                     .get()
-                    .filter(|kept| kept.row().is_some_and(keeps));
+                    .filter(|kept| kept.row().is_some_and(|f| keeps(f, &kept_cells.top)));
                 let (readings, kept) = cached.readings.after(session, &rows, changed);
                 let drift = if kept { cached.drift.get() } else { None };
                 let panel_before = match cached.panel.into_inner() {
@@ -689,6 +781,7 @@ impl PaneTextCache {
                     rule_run,
                     panel_before,
                     top_run,
+                    kept_cells,
                 )
             }
             None => {
@@ -713,6 +806,7 @@ impl PaneTextCache {
                     None,
                     None,
                     None,
+                    KeptRows::default(),
                 )
             }
         };
@@ -744,6 +838,7 @@ impl PaneTextCache {
             panel_before: std::cell::Cell::new(panel_before),
             notice: std::cell::Cell::new(notice),
             stamps,
+            kept_cells: std::cell::RefCell::new(kept_cells),
         });
         text
     }
@@ -851,17 +946,26 @@ impl PaneTextCache {
             .map(|(email, plan)| (email.as_str(), plan.as_deref()))
     }
 
-    /// Muse Code's weekly quota on leaf `leaf_index`'s cached rows.
-    fn usage_weekly(&self, leaf_index: usize) -> Option<(&str, Option<&str>)> {
+    /// Muse Code's or agy's weekly quota on leaf `leaf_index`'s cached rows.
+    fn usage_weekly(
+        &self,
+        leaf_index: usize,
+        program: Option<aterm_phase::Program>,
+    ) -> Option<(&str, Option<&str>)> {
         let cached = self.panes.get(leaf_index)?.as_ref()?;
         cached
             .weekly
             .get_or_init(|| {
                 crate::reader_guard::read_or_none(
                     cached.key.session,
-                    "Muse Code usage card weekly",
+                    "usage card weekly",
                     &cached.rows,
-                    || aterm_phase::muse::usage_card_weekly(&cached.rows),
+                    || match program {
+                        Some(aterm_phase::Program::Agy) => {
+                            aterm_phase::agy::usage_card_weekly(&cached.rows)
+                        }
+                        _ => aterm_phase::muse::usage_card_weekly(&cached.rows),
+                    },
                 )
                 .flatten()
             })
@@ -908,6 +1012,13 @@ impl PaneTextCache {
                 Some(kept) if kept.frame_row == frame_row => kept.run,
                 _ => {
                     let run = read(mask);
+                    let mut noted = cached.kept_cells.borrow_mut();
+                    if cells_vouch(scratch) {
+                        let span = col_off..col_off + pane_cols;
+                        noted.rule.note(scratch, frame_row, &span);
+                    } else {
+                        noted.rule.forget();
+                    }
                     cached.rule_run.set(Some(KeptRun {
                         frame_row,
                         run,
@@ -964,6 +1075,15 @@ impl PaneTextCache {
                     .map(|(a, b)| (region.col_off + a, region.col_off + b)),
                     TopLine::Slab => None,
                 };
+                let mut noted = cached.kept_cells.borrow_mut();
+                // A slab's read reads the prompt row under it too: no copy of
+                // its own row vouches for it.
+                if line == TopLine::Rule && cells_vouch(scratch) {
+                    let span = region.col_off..region.col_off + region.cols;
+                    noted.top.note(scratch, frame_row, &span);
+                } else {
+                    noted.top.forget();
+                }
                 cached.top_run.set(Some(KeptTop {
                     frame_row,
                     line,
@@ -2800,7 +2920,7 @@ fn resolve_facts_at_with_cwd(
     let mut generation = facts.as_ref().and(fold.traffic_generation());
     let mut flight_generation = facts.as_ref().and(fold.flight_generation());
     if facts.is_none() {
-        let (non_registry_prog, prev_sub, prev_ctx) = {
+        let (non_registry_prog, prev_sub, prev_ctx, prev_card_model) = {
             let held = timeline.lock().unwrap_or_else(|p| p.into_inner());
             let prog = held
                 .agent()
@@ -2813,7 +2933,8 @@ fn resolve_facts_at_with_cwd(
                 .and_then(|f| f.subscription.clone())
                 .unwrap_or_default();
             let ctx = held.claude_footer().and_then(|f| f.context.clone());
-            (prog, sub, ctx)
+            let card_model = held.claude_card().map(|c| c.model.clone());
+            (prog, sub, ctx, card_model)
         };
         if let Some(prog) = non_registry_prog {
             let prefix = match prog {
@@ -2842,7 +2963,7 @@ fn resolve_facts_at_with_cwd(
                 .and_then(footer::footer_model_name)
                 .or(launch.model);
             let mut sub = prev_sub;
-            if prog == aterm_phase::Program::Muse
+            if matches!(prog, aterm_phase::Program::Muse | aterm_phase::Program::Agy)
                 && muse_weekly_expired(
                     sub.weekly_reset.as_ref().and_then(|reset| reset.at),
                     clock.now,
@@ -2860,6 +2981,19 @@ fn resolve_facts_at_with_cwd(
                     Some(previous) if read.email.as_deref() != Some(previous) => sub = read,
                     _ => sub.email = read.email,
                 }
+            }
+            if prog == aterm_phase::Program::Agy
+                && let (Some(args), Some(home)) = (args.as_ref(), home.as_deref())
+                && let Some(read) = aterm_agent::harness::profile::agy_subscription_for(
+                    &args.argv,
+                    &args.env,
+                    home,
+                    &sub,
+                    model.as_deref().or(prev_card_model.as_deref()),
+                    clock.now,
+                )
+            {
+                sub = read;
             }
             facts = Some(FooterFacts {
                 model_open: model.is_none(),
@@ -4437,8 +4571,7 @@ impl App {
             }
             return;
         }
-        let hide_lockup =
-            program == aterm_phase::Program::Agy && switch.is_some_and(|s| !s.face.is_on());
+        let hide_lockup = bare_while_off(Some(program), switch.map(|s| s.face));
         let key = TopKey {
             frame_row,
             term_row: region.row_off + top,
@@ -4643,9 +4776,8 @@ impl App {
                     {
                         let (_, view, supervised, _) =
                             self.session_autopilot_for(session, agent, &claims);
-                        let agy_switch_off = prog == aterm_phase::Program::Agy
-                            && crate::autopilot::HarnessSwitch::of(view)
-                                .is_some_and(|f| !f.is_on());
+                        let agy_switch_off =
+                            bare_while_off(Some(prog), crate::autopilot::HarnessSwitch::of(view));
                         if view.carries() && supervised && !agy_switch_off {
                             let row_off = leaf.rect.origin.y.round().max(0.0) as usize;
                             let col_off = leaf.rect.origin.x.round().max(0.0) as usize;
@@ -4902,11 +5034,14 @@ impl App {
                                     .is_some_and(|current| current != email)
                             });
                         let screen_acct = (!stale_muse_cards).then_some(screen_acct).flatten();
-                        let screen_weekly = (agent == Some(aterm_phase::Program::Muse)
-                            && want_acct
+                        let screen_weekly = (matches!(
+                            agent,
+                            Some(aterm_phase::Program::Muse | aterm_phase::Program::Agy)
+                        ) && want_acct
                             && !stale_muse_cards
-                            && !muse_cards_need_account)
-                            .then(|| texts.usage_weekly(leaf_index))
+                            && (agent != Some(aterm_phase::Program::Muse)
+                                || !muse_cards_need_account))
+                            .then(|| texts.usage_weekly(leaf_index, agent))
                             .flatten()
                             .map(|reading| {
                                 muse_weekly_observation(reading, shown.subscription.as_ref(), clock)
@@ -4974,7 +5109,9 @@ impl App {
                                 if let Some((weekly, reset)) = screen_weekly
                                     && let Some(sub) = facts.subscription.as_mut()
                                 {
-                                    sub.weekly = weekly.map(str::to_owned);
+                                    if weekly.is_some() || sub.weekly_figure.is_none() {
+                                        sub.weekly = weekly.map(str::to_owned);
+                                    }
                                     sub.weekly_reset = reset.map(|(words, at)| {
                                         aterm_agent::harness::profile::WeeklyReset {
                                             words: words.to_owned(),
@@ -4998,8 +5135,8 @@ impl App {
                         }
                     }
                 }
-                let agy_switch_off = agent == Some(aterm_phase::Program::Agy)
-                    && crate::autopilot::HarnessSwitch::of(view).is_some_and(|f| !f.is_on());
+                let agy_switch_off =
+                    bare_while_off(agent, crate::autopilot::HarnessSwitch::of(view));
                 cards.push(crate::claude_card::card_leaf(
                     texts,
                     self.config.claude_footer_card() && !agy_switch_off,
@@ -5134,7 +5271,10 @@ impl App {
                             &mut lists.agy_edits,
                         );
                     }
-                    if prog == aterm_phase::Program::Claude
+                    if matches!(
+                        prog,
+                        aterm_phase::Program::Claude | aterm_phase::Program::Agy
+                    ) && !agy_switch_off
                         && let Some(palette) = theme
                         && self.config.claude_footer_agents()
                         && let Some((_, bottom)) = readings.reach.and_then(|r| r.rules())
@@ -5895,14 +6035,16 @@ enum SwitchInk {
 }
 
 /// The cells a switch face may take.
-const SWITCH_FACE_MAX: usize = 34;
+const SWITCH_FACE_MAX: usize = 38;
 
 /// One harness switch face as laid ([`switch_face`]): its cells and where its parts lie in them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SwitchFace {
     cells: [(char, SwitchInk); SWITCH_FACE_MAX],
     len: usize,
+    /// The switch's own cells: its label and its state, a lit pill included.
     switch: std::ops::Range<usize>,
+    /// The off face's `on` button ([`push_on_button`]).
     button: Option<std::ops::Range<usize>>,
 }
 
@@ -5926,18 +6068,20 @@ impl SwitchFace {
         }
     }
 
-    /// The face on a line that wears a theme ([`SwitchInk::Arc`], [`compose_top`]).
+    /// The face on a line that wears a theme ([`SwitchInk::Arc`], [`compose_top`]):
+    /// the arc runs through its words, a lit pill's caps and fill keeping their inks.
     fn on_arc(&mut self) {
         let span = self.switch.clone();
-        let n = self.cells[span.clone()]
-            .iter()
-            .filter(|(ch, _)| *ch != ' ')
-            .count();
+        let arcs = |&(ch, ink): &(char, SwitchInk)| {
+            ch != ' ' && !matches!(ink, SwitchInk::Cap | SwitchInk::Button)
+        };
+        let n = self.cells[span.clone()].iter().filter(|&c| arcs(c)).count();
         let mut k = 0usize;
-        for (ch, ink) in &mut self.cells[span] {
-            if *ch == ' ' {
+        for cell in &mut self.cells[span] {
+            if !arcs(&*cell) {
                 continue;
             }
+            let ink = &mut cell.1;
             let stop = if n > 1 { k * 255 / (n - 1) } else { 0 };
             *ink = SwitchInk::Arc(u8::try_from(stop).unwrap_or(u8::MAX));
             k += 1;
@@ -5975,17 +6119,17 @@ fn switch_face(paint: SwitchPaint, tier: usize) -> Option<SwitchFace> {
             f.push(" ", SwitchInk::Label);
             f.switch.start = f.len;
             label(&mut f, words);
+            // A versioned face draws its lit state as a pill: the switch's
+            // own state, so its cells are the switch's, never the off
+            // face's `on` button.
             if paint.version.is_some() {
-                f.switch.end = f.len;
-                let at = f.len;
                 f.push("\u{2590}", SwitchInk::Cap);
                 f.push(" \u{25cf} on ", SwitchInk::Button);
                 f.push("\u{258c}", SwitchInk::Cap);
-                f.button = Some(at..f.len);
             } else {
                 f.push("\u{25cf} on", SwitchInk::Lit);
-                f.switch.end = f.len;
             }
+            f.switch.end = f.len;
             f.push(" ", SwitchInk::Label);
         }
         HarnessSwitch::Off(_) => {
@@ -5993,16 +6137,31 @@ fn switch_face(paint: SwitchPaint, tier: usize) -> Option<SwitchFace> {
             f.push(" ", SwitchInk::Label);
             f.switch.start = f.len;
             label(&mut f, words);
-            if tier < 3 {
-                f.push("\u{25cb} off", SwitchInk::Unlit);
-                f.switch.end = f.len;
-                f.push(" ", SwitchInk::Label);
+            if paint.version.is_some() {
+                if tier < 3 {
+                    f.push("\u{25cb} off", SwitchInk::Unlit);
+                    f.switch.end = f.len;
+                    f.push(" ", SwitchInk::Label);
+                } else {
+                    f.switch.end = f.len;
+                }
+                let at = f.len;
+                f.push("\u{2590}", SwitchInk::Cap);
+                f.push(" \u{25cf} on ", SwitchInk::Button);
+                f.push("\u{258c}", SwitchInk::Cap);
+                f.button = Some(at..f.len);
             } else {
-                f.switch.end = f.len;
+                if tier < 3 {
+                    f.push("\u{25cb} off", SwitchInk::Unlit);
+                    f.switch.end = f.len;
+                    f.push(" ", SwitchInk::Label);
+                } else {
+                    f.switch.end = f.len;
+                }
+                let at = f.len;
+                push_on_button(&mut f);
+                f.button = Some(at..f.len);
             }
-            let at = f.len;
-            push_on_button(&mut f);
-            f.button = Some(at..f.len);
             f.push(" ", SwitchInk::Label);
         }
         HarnessSwitch::Turning => {
@@ -7475,6 +7634,448 @@ fn agy_bottom_dialog_top(rows: &[String], max_rows: usize, cols: usize) -> Optio
     None
 }
 
+/// Append `text` in bold rainbow spectrum ink (`CardPalette::Cruise`) floored to >= 4.5:1 contrast.
+fn push_rainbow_text(
+    text: &str,
+    phase_offset: f32,
+    max_cols: usize,
+    blank: RenderCell,
+    out: &mut Vec<RenderCell>,
+) {
+    let total = text.chars().count().max(1);
+    for (idx, ch) in text.chars().enumerate() {
+        if out.len() >= max_cols {
+            break;
+        }
+        if ch == ' ' {
+            out.push(blank);
+            continue;
+        }
+        let t = if total <= 1 {
+            phase_offset.fract()
+        } else {
+            (phase_offset + idx as f32 / (total - 1) as f32).fract()
+        };
+        let fg = brand_letter_fg(aterm_effects::harness_card::CardPalette::Cruise, t, blank);
+        out.push(RenderCell {
+            ch,
+            fg,
+            bold: true,
+            ..blank
+        });
+    }
+}
+
+/// Whether `s` is a compact elapsed duration token (`4m36s`, `8s`, `1h2m`).
+fn is_compact_agy_elapsed(s: &str) -> bool {
+    let t = s.trim();
+    !t.is_empty()
+        && t.len() <= 12
+        && t.bytes().next().is_some_and(|b| b.is_ascii_digit())
+        && t.bytes()
+            .last()
+            .is_some_and(|b| matches!(b, b's' | b'm' | b'h'))
+        && t.bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b's' | b'm' | b'h' | b'.'))
+}
+
+/// Unwrap `Agent(self: Role)` -> `Role` and humanize `subagent(s)` / `task(s)` in `s`.
+fn humanize_agy_subagent_phrase(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(at) = rest.find("Agent(") {
+        out.push_str(&rest[..at]);
+        let from_agent = &rest[at..];
+        if let Some(close) = from_agent.find(')') {
+            let token = &from_agent[..=close];
+            if let Some(unwrapped) = aterm_phase::agy::unwrap_agent_token(token) {
+                out.push_str(unwrapped);
+            } else {
+                out.push_str(token);
+            }
+            rest = &from_agent[close + 1..];
+        } else {
+            out.push_str("Agent(");
+            rest = &from_agent["Agent(".len()..];
+        }
+    }
+    out.push_str(rest);
+    let mut cleaned = String::with_capacity(out.len());
+    let mut tail = out.as_str();
+    while let Some(pos) = tail.find("(s)") {
+        let prefix = &tail[..pos];
+        cleaned.push_str(prefix);
+        let singular = prefix.rsplit_once(' ').is_some_and(|(before_word, _)| {
+            before_word.ends_with("1") && !before_word.ends_with("11")
+        });
+        if !singular {
+            cleaned.push('s');
+        }
+        tail = &tail[pos + 3..];
+    }
+    cleaned.push_str(tail);
+    cleaned
+}
+
+/// Split optional ` · <elapsed>` and ` (ctrl+o to expand)` suffixes from the end of `s`.
+fn split_agy_subagent_suffixes(s: &str) -> (&str, Option<&str>, Option<&str>) {
+    let mut body = s.trim_end();
+    let mut elapsed = None;
+    if let Some((before, cand)) = body.rsplit_once(" \u{00B7} ")
+        && is_compact_agy_elapsed(cand)
+    {
+        elapsed = Some(cand.trim());
+        body = before.trim_end();
+    }
+    let mut expand = None;
+    for hint in [" (ctrl+o to expand)", " (ctrl+b to expand)"] {
+        if let Some(before) = body.strip_suffix(hint) {
+            expand = Some(hint);
+            body = before.trim_end();
+            break;
+        }
+    }
+    (body, expand, elapsed)
+}
+
+/// Render an `agy` subagent status or tree row in the transcript with rainbow bling and clean UX.
+fn render_agy_subagent_transcript_row(
+    row: &str,
+    row_idx: usize,
+    max_cols: usize,
+    orig_width: usize,
+    blank: RenderCell,
+    inks: &MarkdownInks,
+) -> Option<Vec<RenderCell>> {
+    let trimmed_end = row.trim_end_matches(' ');
+    if trimmed_end.is_empty() {
+        return None;
+    }
+    let phase = (row_idx as f32) * 0.19;
+    let quiet_cell = |ch| RenderCell {
+        ch,
+        fg: inks.quiet,
+        ..blank
+    };
+    let quote_cell = |ch| RenderCell {
+        ch,
+        fg: inks.quote,
+        ..blank
+    };
+    if let Some(rest) = trimmed_end.strip_prefix("● ") {
+        let (core, expand, elapsed) = split_agy_subagent_suffixes(rest);
+        let is_action = [
+            "Spawned ",
+            "Spawning ",
+            "Messaged ",
+            "Messaging ",
+            "Killed ",
+        ]
+        .iter()
+        .any(|v| core.starts_with(v))
+            && (core.contains("subagent") || core.contains("Agent("));
+        let is_agent_head = core.starts_with("Agent(")
+            && core
+                .find(')')
+                .is_some_and(|c| aterm_phase::agy::unwrap_agent_token(&core[..=c]).is_some());
+        let is_alert = (core.contains(" needs approval for ") || core.ends_with(" has a question"))
+            && (core.starts_with("Agent(") || core.contains("subagent"));
+        if !is_action && !is_agent_head && !is_alert {
+            return None;
+        }
+        let mut out = Vec::with_capacity(orig_width.min(max_cols));
+        out.push(RenderCell {
+            ch: '●',
+            fg: inks.mark,
+            bold: true,
+            ..blank
+        });
+        if out.len() < max_cols {
+            out.push(blank);
+        }
+        let clean_core = core.strip_suffix("...").unwrap_or(core);
+        if is_alert
+            && let Some((subj, alert_tail)) = clean_core
+                .split_once(" needs approval for ")
+                .map(|(a, b)| (a, format!(" needs approval for {b}")))
+                .or_else(|| {
+                    clean_core
+                        .strip_suffix(" has a question")
+                        .map(|a| (a, " has a question".to_owned()))
+                })
+        {
+            let human_subj = humanize_agy_subagent_phrase(subj);
+            push_rainbow_text(&human_subj, phase, max_cols, blank, &mut out);
+            for ch in alert_tail.chars() {
+                if out.len() >= max_cols {
+                    break;
+                }
+                out.push(RenderCell {
+                    ch,
+                    fg: inks.h1,
+                    bold: true,
+                    ..blank
+                });
+            }
+        } else if is_agent_head && let Some(close) = clean_core.find(')') {
+            let agent_tok = &clean_core[..=close];
+            let unwrapped = aterm_phase::agy::unwrap_agent_token(agent_tok).unwrap_or(agent_tok);
+            push_rainbow_text(unwrapped, phase, max_cols, blank, &mut out);
+            let after_tok = clean_core[close + 1..].trim_start();
+            if !after_tok.is_empty() {
+                let detail = after_tok
+                    .strip_prefix(": ")
+                    .or_else(|| after_tok.strip_prefix("\u{00B7} "))
+                    .unwrap_or(after_tok);
+                let detail = detail.strip_suffix("...").unwrap_or(detail);
+                let human_detail = humanize_agy_subagent_phrase(detail);
+                for ch in " \u{00B7} ".chars() {
+                    if out.len() < max_cols {
+                        out.push(quiet_cell(ch));
+                    }
+                }
+                for ch in human_detail.chars() {
+                    if out.len() < max_cols {
+                        out.push(quote_cell(ch));
+                    }
+                }
+            }
+        } else {
+            let human = humanize_agy_subagent_phrase(clean_core);
+            push_rainbow_text(&human, phase, max_cols, blank, &mut out);
+        }
+        if let Some(exp) = expand {
+            for ch in exp.chars() {
+                if out.len() < max_cols {
+                    out.push(quiet_cell(ch));
+                }
+            }
+        }
+        if let Some(el) = elapsed {
+            for ch in " \u{00B7} ".chars().chain(el.chars()) {
+                if out.len() < max_cols {
+                    out.push(quiet_cell(ch));
+                }
+            }
+        }
+        while out.len() < orig_width.min(max_cols) {
+            out.push(blank);
+        }
+        return Some(out);
+    }
+
+    let lead_spaces = trimmed_end.bytes().take_while(|&b| b == b' ').count();
+    if lead_spaces >= 2 {
+        let after_lead = &trimmed_end[lead_spaces..];
+        let branch = ["└ ", "├ ", "⎿  ", "⎿ "]
+            .into_iter()
+            .find_map(|p| after_lead.strip_prefix(p).map(|r| (p, r)));
+        if let Some((conn, branch_rest)) = branch
+            && (branch_rest.contains("Agent(") || branch_rest.contains("subagent"))
+        {
+            let (core, expand, elapsed) = split_agy_subagent_suffixes(branch_rest);
+            let mut out = Vec::with_capacity(orig_width.min(max_cols));
+            for _ in 0..lead_spaces.min(max_cols) {
+                out.push(blank);
+            }
+            for ch in conn.chars() {
+                if out.len() < max_cols {
+                    out.push(if ch == ' ' { blank } else { quiet_cell(ch) });
+                }
+            }
+            if let Some(at) = core.find("Agent(")
+                && let Some(close_rel) = core[at..].find(')')
+            {
+                let close = at + close_rel;
+                let before_tok = &core[..at];
+                let tok = &core[at..=close];
+                let unwrapped = aterm_phase::agy::unwrap_agent_token(tok).unwrap_or(tok);
+                let head_phrase = format!("{before_tok}{unwrapped}");
+                push_rainbow_text(&head_phrase, phase, max_cols, blank, &mut out);
+                let tail = core[close + 1..].trim_start();
+                if !tail.is_empty() {
+                    let detail = tail
+                        .strip_prefix(": ")
+                        .or_else(|| tail.strip_prefix("\u{00B7} "))
+                        .unwrap_or(tail);
+                    let detail = detail.strip_suffix("...").unwrap_or(detail);
+                    let human_detail = humanize_agy_subagent_phrase(detail);
+                    for _ in 0..2 {
+                        if out.len() < max_cols {
+                            out.push(blank);
+                        }
+                    }
+                    for ch in human_detail.chars() {
+                        if out.len() < max_cols {
+                            out.push(quote_cell(ch));
+                        }
+                    }
+                }
+            } else {
+                let clean_core = core.strip_suffix("...").unwrap_or(core);
+                let human = humanize_agy_subagent_phrase(clean_core);
+                push_rainbow_text(&human, phase, max_cols, blank, &mut out);
+            }
+            if let Some(exp) = expand {
+                for ch in exp.chars() {
+                    if out.len() < max_cols {
+                        out.push(quiet_cell(ch));
+                    }
+                }
+            }
+            if let Some(el) = elapsed {
+                for ch in " \u{00B7} ".chars().chain(el.chars()) {
+                    if out.len() < max_cols {
+                        out.push(quiet_cell(ch));
+                    }
+                }
+            }
+            while out.len() < orig_width.min(max_cols) {
+                out.push(blank);
+            }
+            return Some(out);
+        }
+    }
+    None
+}
+
+/// Render an open `agy` background panel item row (`  ● Agent(...)` or `  ● [hh:mm:ss] ...`).
+fn render_agy_panel_item_row(
+    row: &str,
+    panel_idx: usize,
+    max_cols: usize,
+    orig_width: usize,
+    blank: RenderCell,
+    inks: &MarkdownInks,
+) -> Option<Vec<RenderCell>> {
+    let trimmed = row.trim_end_matches(' ');
+    let rest = trimmed.strip_prefix("  ● ")?;
+    let mut out = Vec::with_capacity(orig_width.min(max_cols));
+    for _ in 0..2usize.min(max_cols) {
+        out.push(blank);
+    }
+    if out.len() < max_cols {
+        out.push(RenderCell {
+            ch: '●',
+            fg: inks.mark,
+            bold: true,
+            ..blank
+        });
+    }
+    if out.len() < max_cols {
+        out.push(blank);
+    }
+    if rest.starts_with("Agent(")
+        && let Some(close) = rest.find(')')
+    {
+        let agent_tok = &rest[..=close];
+        let unwrapped = aterm_phase::agy::unwrap_agent_token(agent_tok).unwrap_or(agent_tok);
+        // Column 4..4+unwrapped.chars().count() matches `agents_panel::agy_agent_row`'s `name`
+        // span so `claude_panel::make_look` paints its animated rainbow `InkCell`s on the exact
+        // same characters.
+        push_rainbow_text(
+            unwrapped,
+            (panel_idx as f32) * 0.23,
+            max_cols,
+            blank,
+            &mut out,
+        );
+        let after_agent = rest[close + 1..].trim_start();
+        if !after_agent.is_empty() {
+            let (raw_act, _, elapsed) = split_agy_subagent_suffixes(after_agent);
+            let clean_act = raw_act.strip_suffix("...").unwrap_or(raw_act).trim();
+            if !clean_act.is_empty() {
+                for _ in 0..2 {
+                    if out.len() < max_cols {
+                        out.push(blank);
+                    }
+                }
+                let is_passive = matches!(clean_act, "Idle" | "Processing");
+                let act_fg = if is_passive { inks.quiet } else { inks.quote };
+                let human_act = humanize_agy_subagent_phrase(clean_act);
+                for ch in human_act.chars() {
+                    if out.len() < max_cols {
+                        out.push(RenderCell {
+                            ch,
+                            fg: act_fg,
+                            ..blank
+                        });
+                    }
+                }
+            }
+            if let Some(el) = elapsed {
+                for ch in " \u{00B7} ".chars().chain(el.chars()) {
+                    if out.len() < max_cols {
+                        out.push(RenderCell {
+                            ch,
+                            fg: inks.quiet,
+                            ..blank
+                        });
+                    }
+                }
+            }
+        }
+        while out.len() < orig_width.min(max_cols) {
+            out.push(blank);
+        }
+        return Some(out);
+    }
+    if rest.starts_with('[')
+        && let Some(close_bracket) = rest.find(']')
+    {
+        let stamp = &rest[..=close_bracket];
+        for ch in stamp.chars() {
+            if out.len() < max_cols {
+                out.push(RenderCell {
+                    ch,
+                    fg: inks.quiet,
+                    ..blank
+                });
+            }
+        }
+        let after_stamp = rest[close_bracket + 1..].trim_start();
+        if !after_stamp.is_empty() {
+            if out.len() < max_cols {
+                out.push(blank);
+            }
+            let (cmd_part, status_part) = after_stamp
+                .rsplit_once("  ")
+                .map(|(a, b)| (a.trim_end(), Some(b.trim())))
+                .unwrap_or((after_stamp, None));
+            for ch in cmd_part.chars() {
+                if out.len() < max_cols {
+                    out.push(RenderCell {
+                        ch,
+                        fg: inks.code,
+                        ..blank
+                    });
+                }
+            }
+            if let Some(status) = status_part.filter(|s| !s.is_empty()) {
+                for _ in 0..2 {
+                    if out.len() < max_cols {
+                        out.push(blank);
+                    }
+                }
+                for ch in status.chars() {
+                    if out.len() < max_cols {
+                        out.push(RenderCell {
+                            ch,
+                            fg: inks.quote,
+                            ..blank
+                        });
+                    }
+                }
+            }
+        }
+        while out.len() < orig_width.min(max_cols) {
+            out.push(blank);
+        }
+        return Some(out);
+    }
+    None
+}
+
 /// Collect glass-only undoable markdown edits for an `agy` or `muse` pane.
 #[allow(clippy::too_many_arguments)]
 fn collect_agy_transcript_edits(
@@ -7639,6 +8240,24 @@ fn collect_agy_transcript_edits(
             }
             in_user_msg = false;
         }
+        if !is_muse
+            && let Some(cells) = render_agy_subagent_transcript_row(
+                row_str,
+                r,
+                region.cols,
+                orig_width,
+                blank,
+                &inks,
+            )
+        {
+            out.push(AgyRowEdit {
+                frame_row,
+                col: region.col_off,
+                cells,
+                ground: blank,
+            });
+            continue;
+        }
         let is_reply_row = if is_muse {
             in_muse_reply
         } else {
@@ -7685,85 +8304,198 @@ fn collect_agy_transcript_edits(
         && top_rule.is_some()
         && scratch.display_offset == 0
         && let Some((_, bottom)) = aterm_phase::agy::composer_rules(rows)
-        && let Some(row_str) = rows.get(bottom + 1)
-        && bottom + 1 < region.rows
     {
-        let r = bottom + 1;
-        let frame_row = region.strip + region.row_off + r;
-        let orig_width = row_str
-            .trim_end_matches(' ')
-            .chars()
-            .count()
-            .min(region.cols);
-        if orig_width > 0
-            && !(cursor_in_pane && scratch.cursor_row == frame_row)
-            && scratch.visual_to_logical_row(frame_row).is_empty()
-            && let Some(frame_cells) = scratch.cells.get(frame_row)
-        {
-            let pane_slice = frame_cells
-                .get(region.col_off..frame_cells.len().min(region.col_off + region.cols))
-                .unwrap_or(&[]);
-            if pane_slice.iter().all(|c| {
-                c.bg == blank.bg && !c.wide && !c.emoji_presentation && !c.text_presentation
-            }) {
-                let trimmed = row_str.trim_end_matches(' ');
-                let lead_spaces = trimmed.bytes().take_while(|&b| b == b' ').count();
-                let after_lead = &trimmed[lead_spaces..];
-                let has_shortcuts = after_lead.starts_with("? for shortcuts");
-                let model_col = trimmed.rfind("  ").and_then(|sep| {
-                    let right = trimmed[sep + 2..].trim_start();
-                    let start_byte = trimmed.len() - right.len();
-                    let mut parts = right.split(" \u{00B7} ").map(str::trim);
-                    let model = parts.next().filter(|m| {
-                        !m.is_empty() && *m != "(initializing...)" && !m.starts_with('?')
-                    })?;
-                    let _effort = parts.next().filter(|e| {
-                        matches!(
-                            e.to_ascii_lowercase().as_str(),
-                            "low" | "medium" | "high" | "xhigh" | "max"
-                        )
-                    })?;
-                    let _ = model;
-                    Some(trimmed[..start_byte].chars().count())
-                });
-                if has_shortcuts || model_col.is_some() {
-                    let style = pane_slice
-                        .iter()
-                        .find(|c| c.ch != ' ')
-                        .copied()
-                        .unwrap_or(blank);
-                    let keep_until = model_col.unwrap_or(orig_width).min(region.cols);
-                    let left_part: String = trimmed.chars().take(keep_until).collect();
-                    let left_trimmed = left_part.trim_end_matches(' ');
-                    let mut cells = Vec::with_capacity(orig_width);
-                    if has_shortcuts && lead_spaces <= 2 && left_trimmed.len() >= lead_spaces {
-                        cells.extend(std::iter::repeat_n(blank, lead_spaces));
-                        cells.extend(
-                            "YOLO on \u{00B7} "
-                                .chars()
-                                .map(|ch| RenderCell { ch, ..style }),
-                        );
-                        cells.extend(
-                            left_trimmed[lead_spaces..]
-                                .chars()
-                                .map(|ch| RenderCell { ch, ..style }),
-                        );
-                    } else {
-                        for (idx, ch) in left_trimmed.chars().enumerate() {
-                            let base = pane_slice.get(idx).copied().unwrap_or(style);
-                            cells.push(RenderCell { ch, ..base });
-                        }
-                    }
-                    while cells.len() < orig_width {
-                        cells.push(blank);
-                    }
-                    cells.truncate(region.cols);
+        let panel_bounds = aterm_phase::agy::panel_bounds_under(rows, bottom);
+        if let Some((panel_first, panel_close)) = panel_bounds {
+            for r in panel_first..panel_close.min(region.rows) {
+                let Some(row_str) = rows.get(r) else {
+                    continue;
+                };
+                let frame_row = region.strip + region.row_off + r;
+                let orig_width = row_str
+                    .trim_end_matches(' ')
+                    .chars()
+                    .count()
+                    .min(region.cols);
+                if orig_width == 0
+                    || (cursor_in_pane && scratch.cursor_row == frame_row)
+                    || !scratch.visual_to_logical_row(frame_row).is_empty()
+                {
+                    continue;
+                }
+                let Some(frame_cells) = scratch.cells.get(frame_row) else {
+                    continue;
+                };
+                let pane_slice = frame_cells
+                    .get(region.col_off..frame_cells.len().min(region.col_off + region.cols))
+                    .unwrap_or(&[]);
+                if !pane_slice.iter().all(|c| {
+                    c.bg == blank.bg && !c.wide && !c.emoji_presentation && !c.text_presentation
+                }) {
+                    continue;
+                }
+                if let Some(cells) = render_agy_panel_item_row(
+                    row_str,
+                    r - panel_first,
+                    region.cols,
+                    orig_width,
+                    blank,
+                    &inks,
+                ) {
                     out.push(AgyRowEdit {
                         frame_row,
                         col: region.col_off,
                         cells,
                         ground: blank,
                     });
+                }
+            }
+        }
+        let footer_r = panel_bounds.map_or(bottom + 1, |(_, close)| close + 1);
+        if let Some(row_str) = rows.get(footer_r)
+            && footer_r < region.rows
+        {
+            let frame_row = region.strip + region.row_off + footer_r;
+            let orig_width = row_str
+                .trim_end_matches(' ')
+                .chars()
+                .count()
+                .min(region.cols);
+            if orig_width > 0
+                && !(cursor_in_pane && scratch.cursor_row == frame_row)
+                && scratch.visual_to_logical_row(frame_row).is_empty()
+                && let Some(frame_cells) = scratch.cells.get(frame_row)
+            {
+                let pane_slice = frame_cells
+                    .get(region.col_off..frame_cells.len().min(region.col_off + region.cols))
+                    .unwrap_or(&[]);
+                if pane_slice.iter().all(|c| {
+                    c.bg == blank.bg && !c.wide && !c.emoji_presentation && !c.text_presentation
+                }) {
+                    let trimmed = row_str.trim_end_matches(' ');
+                    let lead_spaces = trimmed.bytes().take_while(|&b| b == b' ').count();
+                    let after_lead = &trimmed[lead_spaces..];
+                    let has_shortcuts = after_lead.starts_with("? for shortcuts");
+                    let mut subagents_badge: Option<String> = None;
+                    let mut tasks_badge: Option<String> = None;
+                    let right_col = trimmed.rfind("  ").and_then(|sep| {
+                        let right = trimmed[sep + 2..].trim_start();
+                        let start_byte = trimmed.len() - right.len();
+                        let parts: Vec<&str> = right.split(" \u{00B7} ").map(str::trim).collect();
+                        let mut recognized = false;
+                        for part in &parts {
+                            if part.ends_with(" subagent(s)")
+                                || part.ends_with(" subagents")
+                                || part.ends_with(" subagent")
+                            {
+                                subagents_badge = Some(humanize_agy_subagent_phrase(part));
+                                recognized = true;
+                            } else if part.ends_with(" task(s)")
+                                || part.ends_with(" tasks")
+                                || part.ends_with(" task")
+                            {
+                                tasks_badge = Some(humanize_agy_subagent_phrase(part));
+                                recognized = true;
+                            } else if matches!(
+                                part.to_ascii_lowercase().as_str(),
+                                "low" | "medium" | "high" | "xhigh" | "max"
+                            ) {
+                                recognized = true;
+                            }
+                        }
+                        let first = parts.first().copied().unwrap_or("");
+                        if !first.is_empty()
+                            && first != "(initializing...)"
+                            && !first.starts_with('?')
+                            && recognized
+                        {
+                            Some(trimmed[..start_byte].chars().count())
+                        } else {
+                            None
+                        }
+                    });
+                    if has_shortcuts
+                        || right_col.is_some()
+                        || subagents_badge.is_some()
+                        || tasks_badge.is_some()
+                    {
+                        let style = pane_slice
+                            .iter()
+                            .find(|c| c.ch != ' ')
+                            .copied()
+                            .unwrap_or(blank);
+                        let keep_until = right_col.unwrap_or(orig_width).min(region.cols);
+                        let left_part: String = trimmed.chars().take(keep_until).collect();
+                        let left_trimmed = left_part.trim_end_matches(' ');
+                        let mut cells = Vec::with_capacity(orig_width);
+                        if has_shortcuts && lead_spaces <= 2 && left_trimmed.len() >= lead_spaces {
+                            cells.extend(std::iter::repeat_n(blank, lead_spaces));
+                            cells.extend(
+                                "YOLO on \u{00B7} "
+                                    .chars()
+                                    .map(|ch| RenderCell { ch, ..style }),
+                            );
+                            cells.extend(
+                                left_trimmed[lead_spaces..]
+                                    .chars()
+                                    .map(|ch| RenderCell { ch, ..style }),
+                            );
+                        } else {
+                            for (idx, ch) in left_trimmed.chars().enumerate() {
+                                let base = pane_slice.get(idx).copied().unwrap_or(style);
+                                cells.push(RenderCell { ch, ..base });
+                            }
+                        }
+                        if subagents_badge.is_some() || tasks_badge.is_some() {
+                            let mut badge_cells = Vec::new();
+                            if let Some(tasks) = &tasks_badge {
+                                for ch in tasks.chars() {
+                                    badge_cells.push(RenderCell {
+                                        ch,
+                                        fg: inks.quote,
+                                        ..blank
+                                    });
+                                }
+                            }
+                            if let Some(subs) = &subagents_badge {
+                                if !badge_cells.is_empty() {
+                                    for ch in " \u{00B7} ".chars() {
+                                        badge_cells.push(RenderCell {
+                                            ch,
+                                            fg: inks.quiet,
+                                            ..blank
+                                        });
+                                    }
+                                }
+                                badge_cells.push(RenderCell {
+                                    ch: '●',
+                                    fg: inks.mark,
+                                    bold: true,
+                                    ..blank
+                                });
+                                badge_cells.push(blank);
+                                push_rainbow_text(subs, 0.08, region.cols, blank, &mut badge_cells);
+                            }
+                            let target_width = orig_width.min(region.cols);
+                            if cells.len() + 2 + badge_cells.len() <= target_width {
+                                let pad_to = target_width - badge_cells.len();
+                                while cells.len() < pad_to {
+                                    cells.push(blank);
+                                }
+                                cells.extend(badge_cells);
+                            }
+                        }
+                        while cells.len() < orig_width {
+                            cells.push(blank);
+                        }
+                        cells.truncate(region.cols);
+                        out.push(AgyRowEdit {
+                            frame_row,
+                            col: region.col_off,
+                            cells,
+                            ground: blank,
+                        });
+                    }
                 }
             }
         }
@@ -8069,6 +8801,61 @@ mod tests {
                 (tier + 1 < SWITCH_TIERS).then_some(tier + 1),
                 "CONTROL: a cell short of {tier}"
             );
+        }
+    }
+
+    /// A VERSIONED LIT FACE'S PILL IS THE SWITCH'S OWN STATE (agy's `▐ ● on
+    /// ▌`, review 13): in every form its cells are the switch's and no form
+    /// has the off face's `on` button, and on a themed line the arc runs
+    /// through the words while the pill keeps its caps and fill. CONTROL:
+    /// every off form keeps its button, after the switch's cells.
+    #[test]
+    fn a_lit_pill_is_the_switchs_own_state_not_an_on_button() {
+        use crate::autopilot::{HarnessSwitch, SwitchOff};
+        let pill = "\u{2590} \u{25cf} on \u{258c}";
+        let paint = |face| SwitchPaint {
+            face,
+            hover: false,
+            version: Some("0.1"),
+        };
+        let lit: Vec<SwitchFace> = (0..SWITCH_TIERS)
+            .filter_map(|t| switch_face(paint(HarnessSwitch::On), t))
+            .collect();
+        let texts: Vec<String> = lit.iter().map(SwitchFace::text).collect();
+        assert_eq!(lit.len(), 3, "{texts:?}");
+        for f in &lit {
+            let switch: String = f.cells()[f.switch.clone()].iter().map(|c| c.0).collect();
+            assert!(switch.ends_with(pill), "{:?}: {switch:?}", f.text());
+            assert_eq!(f.button, None, "{:?}", f.text());
+        }
+        let mut arced = lit[0].clone();
+        arced.on_arc();
+        let glyphs: Vec<SwitchInk> = arced.cells()[arced.switch.clone()]
+            .iter()
+            .filter(|c| c.0 != ' ')
+            .map(|c| c.1)
+            .collect();
+        let (words, caps) = glyphs.split_at(glyphs.len() - 5);
+        assert_eq!(
+            caps,
+            [
+                SwitchInk::Cap,
+                SwitchInk::Button,
+                SwitchInk::Button,
+                SwitchInk::Button,
+                SwitchInk::Cap
+            ],
+            "the pill keeps its inks on a themed line"
+        );
+        assert_eq!(
+            (words.first(), words.last()),
+            (Some(&SwitchInk::Arc(0)), Some(&SwitchInk::Arc(u8::MAX))),
+            "the arc runs through the words"
+        );
+        let off = paint(HarnessSwitch::Off(SwitchOff::Session));
+        for f in (0..SWITCH_TIERS).filter_map(|t| switch_face(off, t)) {
+            let button = f.button.clone().expect("CONTROL: every off form's button");
+            assert!(f.switch.end <= button.start, "CONTROL: {:?}", f.text());
         }
     }
 
@@ -12883,6 +13670,19 @@ mod tests {
             } else {
                 " alab harness \u{25CF} on "
             };
+            let sid = app.pool.get(session).expect("session").ctx.self_id.clone();
+            let chip_line = |app: &App| {
+                let head = format!("autopilot sid={} ", sid.as_str());
+                app.drawn_chip_lines()
+                    .into_iter()
+                    .find(|l| l.starts_with(&head))
+                    .expect("an autopilot line for the session")
+            };
+            let line_on = chip_line(&app);
+            assert!(
+                line_on.contains(" drawn=\"") && !line_on.contains(" why="),
+                "{prog}: the harness on draws its chip: {line_on}"
+            );
             let top_on = text_of(&app.windows[&wid].input_scratch.cells[strip + top_rule_row]);
             assert!(
                 top_on.starts_with(&expected_lockup) && top_on.contains(expected_switch),
@@ -12956,9 +13756,23 @@ mod tests {
 
             let top_off = text_of(&app.windows[&wid].input_scratch.cells[strip + top_rule_row]);
             let card_off = text_of(&app.windows[&wid].input_scratch.cells[strip + card_row]);
+            let line_off = chip_line(&app);
             if prog == "agy" {
                 assert!(
-                    top_off.contains(" alab harness v0.1 \u{25CB} off \u{2590} on \u{258C} ")
+                    line_off.ends_with(" face=off drawn=- why=switch-only spoken=- description=-"),
+                    "agy: chrome names the footer left bare on purpose, not a tab behind: \
+                     {line_off}"
+                );
+            } else {
+                assert!(
+                    line_off.contains(" face=off drawn=\"\u{25CB} off\" "),
+                    "{prog}: the off chip is drawn: {line_off}"
+                );
+            }
+            if prog == "agy" {
+                assert!(
+                    top_off
+                        .contains(" alab harness v0.1 \u{25CB} off \u{2590} \u{25CF} on \u{258C} ")
                         && !top_off.starts_with(&expected_lockup),
                     "agy: toggled-off harness leaves only the off switch button on the top rule: {top_off:?}"
                 );
@@ -13765,6 +14579,222 @@ mod tests {
         assert!(
             scrolled_edits.is_empty(),
             "cursor inside the agy pane's own columns skips the active cursor row"
+        );
+    }
+
+    #[test]
+    fn agy_subagent_display_rainbow_blings_transcript_panel_and_footer_rows() {
+        let rule_80 = "\u{2500}".repeat(80);
+        let screen_rows = [
+            "● Spawning 2 subagent(s)... (ctrl+o to expand) \u{00B7} 3s",
+            "  └ Agent(self: Codebase Researcher): Reading file... \u{00B7} 4m36s",
+            "● Spawned 1 subagent(s)",
+            "● Agent(self: Verifier) needs approval for RunCommand",
+            rule_80.as_str(),
+            "> ",
+            rule_80.as_str(),
+            "  ● Agent(self: Codebase Researcher)     Reading file... \u{00B7} 4m36s",
+            "  ● Agent(research: Docs Finder)         Searching web... \u{00B7} 8s",
+            "  ● [17:20:01] sleep 30                  running",
+            rule_80.as_str(),
+            "  ? for shortcuts                        Gemini 4 Argon \u{00B7} high \u{00B7} 1 task(s) \u{00B7} 2 subagent(s)",
+        ];
+        let rows: Vec<String> = screen_rows.iter().map(|r| format!("{r:<100}")).collect();
+        let blank = RenderCell {
+            ch: ' ',
+            fg: [0xd8, 0xdc, 0xe4],
+            bg: [0x14, 0x16, 0x1b],
+            ..RenderCell::default()
+        };
+        let mut scratch = RenderInput::empty();
+        scratch.rows = rows.len();
+        scratch.cols = 100;
+        scratch.cursor_visible = false;
+        scratch.cells = rows
+            .iter()
+            .map(|r| {
+                r.chars()
+                    .map(|ch| RenderCell { ch, ..blank })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        // Simulate agy coloring the panel's `●` and `Agent(...)` in ANSI blue/green.
+        scratch.cells[7][2].fg = [0x40, 0xc0, 0x60];
+        for c in &mut scratch.cells[7][4..36] {
+            c.fg = [0x5c, 0x9c, 0xff];
+        }
+        let original = scratch.cells.clone();
+
+        // 1. `claude_panel::read_panel` reads agy's open subagent panel rows even when ANSI-tinted,
+        // and `PanelRow.name` spans columns `4..4 + unwrapped.chars().count()`.
+        let pane_geom = crate::claude_card::PaneGeom {
+            strip: 0,
+            row_off: 0,
+            col_off: 0,
+            rows: scratch.rows,
+            cols: scratch.cols,
+        };
+        let panel_read = crate::claude_panel::read_panel(1, &rows, 6, &scratch, pane_geom, blank)
+            .expect("agy open subagent panel should be read by claude_panel");
+        assert_eq!(panel_read.panel.rows().len(), 2);
+        assert_eq!(
+            panel_read.panel.rows()[0].name.range(),
+            4..4 + "Codebase Researcher".len()
+        );
+        assert_eq!(
+            panel_read.panel.rows()[1].name.range(),
+            4..4 + "research: Docs Finder".len()
+        );
+        assert!(
+            panel_read.ink[0].bullet.is_some() && panel_read.ink[0].name.is_some(),
+            "ANSI-colored agy subagent bullet and name are accepted by claude_panel::read_panel"
+        );
+
+        // 2. `collect_agy_transcript_edits` rewrites transcript subagent rows, panel rows, and the
+        // footer row beneath the open panel.
+        let mut edits = Vec::new();
+        collect_agy_transcript_edits(
+            &scratch,
+            aterm_phase::Program::Agy,
+            &rows,
+            PaneTextRegion {
+                strip: 0,
+                row_off: 0,
+                col_off: 0,
+                rows: scratch.rows,
+                cols: scratch.cols,
+            },
+            Some(4),
+            blank,
+            RenderCell {
+                ch: '\u{2500}',
+                fg: [0x58, 0x5c, 0x68],
+                ..blank
+            },
+            [0xe0, 0x7a, 0x5f],
+            &mut edits,
+        );
+        let mut undo_slot = FooterUndo::default();
+        write_edits(
+            &mut undo_slot,
+            &mut scratch,
+            edits
+                .iter()
+                .map(|e| (e.frame_row, e.col, e.cells.as_slice(), e.ground)),
+        );
+        let row_str = |r: usize| -> String {
+            scratch.cells[r]
+                .iter()
+                .map(|c| c.ch)
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        };
+        assert_eq!(
+            row_str(0),
+            "● Spawning 2 subagents (ctrl+o to expand) \u{00B7} 3s"
+        );
+        assert_eq!(
+            row_str(1),
+            "  └ Codebase Researcher  Reading file \u{00B7} 4m36s"
+        );
+        assert_eq!(row_str(2), "● Spawned 1 subagent");
+        assert_eq!(row_str(3), "● Verifier needs approval for RunCommand");
+        assert_eq!(
+            row_str(7),
+            "  ● Codebase Researcher  Reading file \u{00B7} 4m36s"
+        );
+        assert_eq!(
+            row_str(8),
+            "  ● research: Docs Finder  Searching web \u{00B7} 8s"
+        );
+        assert_eq!(row_str(9), "  ● [17:20:01] sleep 30  running");
+        let footer_text = row_str(11);
+        assert!(
+            footer_text.starts_with("  YOLO on \u{00B7} ? for shortcuts"),
+            "open-panel footer keeps YOLO on prefix: {footer_text:?}"
+        );
+        assert!(
+            !footer_text.contains("Gemini 4 Argon"),
+            "redundant model/effort stripped from footer: {footer_text:?}"
+        );
+        assert!(
+            footer_text.ends_with("1 task \u{00B7} ● 2 subagents"),
+            "footer right-aligns humanized task and rainbow subagent badge: {footer_text:?}"
+        );
+
+        // Verify rainbow spectrum ink (bold, distinct hues, >= 4.5:1 contrast) on subagent names.
+        let name_range = panel_read.panel.rows()[0].name.range();
+        let name_cells = &scratch.cells[7][name_range];
+        let mut distinct_fgs = std::collections::HashSet::new();
+        for c in name_cells.iter().filter(|c| c.ch != ' ') {
+            assert!(c.bold, "subagent name cell {:?} should be bold", c.ch);
+            assert!(
+                reads_on(c.fg, blank.bg) >= 4.5,
+                "subagent rainbow ink {:?} must meet 4.5:1 contrast on {:?}",
+                c.fg,
+                blank.bg
+            );
+            distinct_fgs.insert(c.fg);
+        }
+        assert!(
+            distinct_fgs.len() >= 4,
+            "subagent name should span multiple rainbow spectrum stops, got {distinct_fgs:?}"
+        );
+
+        // Verify `undo` restores all original cells cleanly.
+        assert!(undo(&mut undo_slot, &mut scratch));
+        assert_eq!(scratch.cells, original);
+    }
+
+    #[test]
+    fn agy_usage_card_weekly_places_and_expires_iso_reset_clock() {
+        let rule = "\u{2500}".repeat(80);
+        let rows: Vec<String> = vec![
+            "● /usage".into(),
+            "  └ Gemini Models".into(),
+            "    Weekly Limit Remaining                 ████████░░  78%    2026-10-29 09:31 PDT"
+                .into(),
+            rule.clone(),
+            "> ".into(),
+            rule,
+            "  ? for shortcuts                                        Gemini 3.1 Pro \u{00B7} high"
+                .into(),
+        ];
+        let reading = aterm_phase::agy::usage_card_weekly(&rows).expect("agy /usage weekly");
+        assert_eq!(reading.text, "weekly 78% left");
+        assert_eq!(reading.reset.as_deref(), Some("2026-10-29 09:31 PDT"));
+
+        fn pdt_offset(zone: Option<&str>, _unix: i64) -> Option<i64> {
+            match zone {
+                None | Some("America/Los_Angeles") => Some(-7 * 3600),
+                Some("UTC") => Some(0),
+                _ => None,
+            }
+        }
+        // 2026-10-29 09:31 PDT = 2026-10-29 16:31:00 UTC = 1_793_291_460.
+        let reset_unix = 1_793_291_460;
+        let before = || footer::ReadClock {
+            read_at: std::time::UNIX_EPOCH,
+            now: reset_unix - 3600,
+            offset_at: &pdt_offset,
+        };
+        let (weekly, reset) =
+            muse_weekly_observation((&reading.text, reading.reset.as_deref()), None, &before);
+        assert_eq!(weekly, Some("weekly 78% left"));
+        assert_eq!(reset, Some(("2026-10-29 09:31 PDT", Some(reset_unix))));
+
+        let after = || footer::ReadClock {
+            read_at: std::time::UNIX_EPOCH,
+            now: reset_unix + 60,
+            offset_at: &pdt_offset,
+        };
+        let (expired_weekly, expired_reset) =
+            muse_weekly_observation((&reading.text, reading.reset.as_deref()), None, &after);
+        assert_eq!(expired_weekly, None);
+        assert_eq!(
+            expired_reset,
+            Some(("2026-10-29 09:31 PDT", Some(reset_unix)))
         );
     }
 }

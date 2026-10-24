@@ -2981,10 +2981,15 @@ pub fn resume_text(code: &str, freed: u64, top: &[String]) -> String {
     )
 }
 
-/// Type `text` into tab `sid` of the instance at `sock` as one fenced turn (`upgrade_drive::type_fenced`: under the hand, judged on a fresh read — a box, a draft, a person typing or an owner's hold refuses it).
+/// Type `text` into tab `sid` of the instance at `sock` as one fenced turn (`upgrade_drive::type_fenced`: under the hand, judged on a fresh read — a box, a draft, a person typing or an owner's hold refuses it), presenting `token` ([`super::upgrade_drive::harness_client`]: a window's harness token reads `by=harness`).
 #[must_use]
-pub fn type_resume(sock: &str, sid: &str, text: &str) -> String {
-    let mut c = match crate::RelayClient::connect_local_beside(sock) {
+pub fn type_resume(
+    sock: &str,
+    token: Option<&super::upgrade_drive::HarnessToken>,
+    sid: &str,
+    text: &str,
+) -> String {
+    let mut c = match super::upgrade_drive::harness_client(sock, token) {
         Ok(c) => c,
         Err(e) => return format!("wait:no-socket:{e}"),
     };

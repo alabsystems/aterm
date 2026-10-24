@@ -13,17 +13,14 @@ use std::process::ExitStatus;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// The sentence a `--wait-lock` child prints once its wait outlasts the grace.
 fn waiting_line() -> String {
     format!("atpkg: {}", atpkg::cli::LOCK_WAITING_MARKER)
 }
 
-/// The sentence that answers it once the announced wait ends in the lock.
 fn acquired_line() -> String {
     format!("atpkg: {}", atpkg::cli::LOCK_ACQUIRED_MARKER)
 }
 
-/// The sentence a declined machine's `seed` prints instead of provisioning.
 const DECLINED_SENTENCE: &str = "removed on this machine";
 
 struct Fixture {
@@ -66,7 +63,6 @@ impl Fixture {
         }
     }
 
-    /// Take the store lock in this process.
     fn hold(&self) -> atpkg::lock::StoreLock {
         let guard =
             atpkg::lock::try_lock_store(&self.layout()).expect("the fixture holds the lock");
@@ -82,7 +78,6 @@ impl Fixture {
         std::fs::write(layout.declined(), b"declined by the test fixture\n").unwrap();
     }
 
-    /// A command confined to this fixture's HOME, config and registry, both pipes captured.
     fn command(&self, program: &str) -> Command {
         let mut cmd = Command::new(program);
         cmd.env("HOME", &self.home)
@@ -104,8 +99,6 @@ impl Fixture {
     }
 }
 
-/// A spawned child with stdout collected line by line as it arrives and stderr drained
-/// concurrently.
 struct Streamed {
     child: Child,
     stdout: Arc<Mutex<Vec<String>>>,
@@ -148,7 +141,6 @@ impl Streamed {
             .any(|l| l.contains(needle))
     }
 
-    /// Block until stdout carries `needle`, or panic (killing the child) after `within`.
     fn wait_for_line(&mut self, needle: &str, within: Duration) {
         let deadline = Instant::now() + within;
         while !self.stdout_has(needle) {
@@ -170,7 +162,6 @@ impl Streamed {
         }
     }
 
-    /// Wait for the child to exit.
     fn finish(mut self, within: Duration) -> (ExitStatus, Duration, Vec<String>, String) {
         let deadline = Instant::now() + within;
         let status = loop {
@@ -204,10 +195,8 @@ fn lock_path_of(prefix: &Path) -> String {
     .to_string()
 }
 
-/// A hang detector, not a latency budget.
 const ANNOUNCE_WITHIN: Duration = Duration::from_secs(60);
 
-/// Assert that a refused pass prints only `[machine]` host lines and no window progress markers.
 fn no_progress_marker(stdout: &[String]) {
     for line in stdout {
         assert!(
@@ -462,7 +451,6 @@ fn an_unwritable_prefix_never_waits_and_keeps_exit_1() {
     no_progress_marker(&stdout);
 }
 
-/// Check whether `pid` is alive via `kill -0`.
 fn pid_alive(pid: u32) -> bool {
     Command::new("/bin/kill")
         .args(["-0", &pid.to_string()])
@@ -472,7 +460,6 @@ fn pid_alive(pid: u32) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// An orphaned waiter stands down silently before its bound.
 fn an_orphaned_waiter_stands_down(case: &str, script: &str) {
     let fx = Fixture::new(case);
     let guard = fx.hold();
@@ -559,7 +546,6 @@ fn an_orphaned_waiter_stands_down_silently_before_its_bound() {
     );
 }
 
-/// The orphaned waiter's `--wait-lock` bound.
 const ORPHAN_BOUND_SECS: u64 = 600;
 
 #[test]
@@ -649,8 +635,6 @@ fn a_waiter_whose_parent_is_init_from_the_start_is_not_an_orphan() {
     let _ = streamed.finish(Duration::from_secs(60));
 }
 
-/// `pid`'s parent, read from the kernel's process table as `ps -o ppid=` reads it, without running
-/// `ps`.
 fn parent_of(pid: u32) -> Option<u32> {
     #[cfg(target_os = "macos")]
     let parent = aterm_sysprobe::kproc::record(pid).map(|r| r.ppid);
@@ -684,7 +668,6 @@ fn a_declined_seed_without_contention_is_unchanged() {
     );
 }
 
-/// The sentence a full `update` prints when nothing is installed and the set is not owed.
 const NOTHING_TO_UPDATE: &str = "nothing installed to update";
 
 #[test]

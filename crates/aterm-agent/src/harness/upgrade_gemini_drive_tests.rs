@@ -274,6 +274,10 @@ struct Knobs {
     new_reborn: bool,
     /// The tab's shell is in the project, not its own directory.
     shell_in_project: bool,
+    /// When the parent's child [`CHILD`] started, unix ms (`None`: unread).
+    child_started: Option<u64>,
+    /// Include the current parent in the project's process-table reading.
+    list_current: bool,
 }
 
 struct Script {
@@ -363,6 +367,7 @@ impl GeminiKernel for Script {
         match pid {
             TUI => Some(self.started_ms),
             NEW => Some(self.relaunched_ms.load(Ordering::SeqCst)),
+            CHILD => self.knobs.child_started,
             _ => None,
         }
     }
@@ -395,6 +400,13 @@ impl GeminiKernel for Script {
         }
         let mut out = Vec::new();
         if root == self.project {
+            if self.knobs.list_current {
+                out.push((
+                    TUI,
+                    vec![NODE.to_string(), SCRIPT.to_string()],
+                    self.started_ms,
+                ));
+            }
             if self.knobs.argv_holder {
                 out.push((
                     OTHER,
@@ -500,6 +512,7 @@ impl Rig {
             home: base.join("user"),
             state: base.join("state"),
             sock: Some(sock),
+            token: None,
             only_sid: None,
             dry_run: false,
             human_grace_s: 120,
@@ -1505,6 +1518,126 @@ fn the_snapshot_names_the_session_by_the_start_time_rule() {
         )
         .err(),
         Some("not-gemini")
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_live_snapshot_needs_header_attribution_even_after_other_processes_leave() {
+    let tmp = aterm_tempfile::tempdir().expect("private snapshot fixture");
+    let root = tmp.path();
+    let project = root.join("project");
+    std::fs::create_dir(&project).expect("project");
+    let project = project.to_string_lossy().into_owned();
+    let hash = ug::project_hash(&project);
+    let home = root.join("home");
+    let slug = home.join(".gemini/tmp/project");
+    let chats = slug.join("chats");
+    std::fs::create_dir_all(&chats).expect("chats");
+    std::fs::write(slug.join(".project_root"), &project).expect("project marker");
+    // An injected process birth; its age carries no ownership.
+    let start = 3_600_000;
+    let older = chats.join(format!("session-older-{}.jsonl", &S1[..8]));
+    std::fs::write(&older, header(S1, &hash, start - 60_000)).expect("older header");
+    std::fs::File::options()
+        .write(true)
+        .open(&older)
+        .expect("older file")
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + Duration::from_millis(start - 60_000)),
+        )
+        .expect("old modification time");
+    let foreign_name = format!("session-foreign-{}.jsonl", &S2[..8]);
+    let foreign = chats.join(&foreign_name);
+    std::fs::write(
+        &foreign,
+        format!(
+            "{}\n{}\n",
+            header(S2, &hash, start + 30_000),
+            context(start + 30_000, "ctx-foreign")
+        ),
+    )
+    .expect("a departed process's fresh clear header");
+    let read = files_since(&chats, start).expect("actual file filter");
+    assert_eq!(read.len(), 1);
+    assert_eq!(read[0].0, foreign_name, "the older header is filtered out");
+    let opts = Opts {
+        home: home.clone(),
+        state: root.join("state"),
+        sock: None,
+        token: None,
+        only_sid: None,
+        dry_run: false,
+        human_grace_s: 120,
+        hand_back: false,
+        background: false,
+        aterm_state: None,
+        ask: true,
+        several_logins: false,
+        usage_credits: false,
+        usage_tap: None,
+        instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
+        agents_off: Vec::new(),
+        land: false,
+        timings: crate::harness::Timings::FAST,
+    };
+    let mut kernel = Script {
+        exited: Arc::new(AtomicBool::new(false)),
+        relaunched: Arc::new(AtomicBool::new(false)),
+        relaunched_ms: Arc::new(AtomicU64::new(0)),
+        started_ms: start,
+        project,
+        knobs: Knobs {
+            child_started: Some(start + 4_000),
+            list_current: true,
+            ..Knobs::default()
+        },
+        orphan_looks: AtomicUsize::new(0),
+    };
+    let bare = atpkg::caller_shell::ProcArgs {
+        exec_path: NODE.to_string(),
+        // A recognized but nonexistent private script keeps version discovery private too.
+        argv: vec![
+            NODE.to_string(),
+            root.join("absent/bin/gemini")
+                .to_string_lossy()
+                .into_owned(),
+        ],
+        env: vec![format!("HOME={}", home.display())],
+    };
+    let look = |args: &atpkg::caller_shell::ProcArgs, kernel: &Script| {
+        let snap = snapshot(&opts, TAB, TUI, START.into(), NO_SHELL, args, kernel)
+            .expect("a snapshot without control-socket reads");
+        assert_eq!(snap.gemini().expect("Gemini run").child, CHILD);
+        (
+            snap.session.clone(),
+            snap.gemini().and_then(|run| run.unwitnessed),
+        )
+    };
+    assert_eq!(
+        look(&bare, &kernel),
+        (None, Some(ug::NoWitness::LateHeader)),
+        "age and a process table containing only this parent do not own another process's header"
+    );
+    let mut named = bare.clone();
+    named.argv.extend(["--resume".to_string(), S2.to_string()]);
+    assert_eq!(
+        look(&named, &kernel),
+        (Some(S2.to_string()), None),
+        "explicit attribution still admits a late header"
+    );
+    *named.argv.last_mut().expect("named session") = S1.to_string();
+    assert_eq!(
+        look(&named, &kernel),
+        (None, Some(ug::NoWitness::LateHeader))
+    );
+    std::fs::write(&foreign, header(S2, &hash, start + 900)).expect("near-start header");
+    assert_eq!(look(&bare, &kernel), (Some(S2.to_string()), None));
+    kernel.knobs.together = true;
+    assert_eq!(
+        look(&bare, &kernel),
+        (None, Some(ug::NoWitness::StartedTogether))
     );
 }
 

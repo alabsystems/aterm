@@ -7513,11 +7513,19 @@ fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
     let manifest = prove_artifacts_on_disk(ctx)?;
     let app = ctx.app_path();
 
+    // The staged copy's first exec, stamped in its staging directory before it: only an exit
+    // of its own shows it ran, and the staging stays until then (`bundle::unproven`).
+    let staging = ctx.dist.join(bundle::staging_dir_name(ctx.build));
+    let _ = fs::remove_file(staging.join(aterm_uds::deadline::RAN));
+    aterm_uds::deadline::stamp_exec(&staging);
     let diag = Command::new(app.join("Contents/MacOS/aterm"))
         .arg("--diagnose")
         .current_dir(&ctx.repo)
         .output()
         .map_err(|e| Error::new(format!("spawn aterm --diagnose: {e}")))?;
+    if diag.status.code().is_some() {
+        let _ = fs::write(staging.join(aterm_uds::deadline::RAN), "");
+    }
     if !diag.status.success() {
         return Err(Error::new(format!(
             "self-check failed: the shipped binary's --diagnose probe exited {}",

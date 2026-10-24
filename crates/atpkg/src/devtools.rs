@@ -232,6 +232,8 @@ pub struct Facts {
     pub log: DevToolProbe,
     /// The display name of the program macOS holds responsible for this process, when it is not the subject's bundle (a doctor run in Terminal, or over ssh): aterm's switch does not reach this shell.
     pub other_responsible: Option<String>,
+    /// This user's programs macOS's program check holds now ([`aterm_uds::process::held_programs`]), read by the caller (`aterm doctor`), never by [`facts`]; `None` unread.
+    pub program_check: Option<aterm_uds::process::HeldNow>,
 }
 
 impl Facts {
@@ -243,6 +245,7 @@ impl Facts {
             list: DevToolList::refused(list),
             log: DevToolProbe::refused(log),
             other_responsible: None,
+            program_check: None,
         }
     }
 
@@ -284,6 +287,7 @@ pub fn facts() -> Option<Facts> {
                 _ => DevToolProbeLabel::RefusedOutOfBundle,
             }),
             other_responsible: None,
+            program_check: None,
         });
     }
     let log = consent::probe_devtool(ProbeGate::on(), id);
@@ -301,6 +305,7 @@ pub fn facts() -> Option<Facts> {
         list,
         log,
         other_responsible,
+        program_check: None,
     })
 }
 
@@ -401,6 +406,8 @@ pub fn row(facts: &Facts) -> Option<Row> {
         ),
         _ => String::new(),
     };
+    let held = facts.program_check.filter(|held| held.count > 0);
+    let now = held.map(held_words);
     let (level, text) = match facts.grant() {
         DevToolGrant::Granted => {
             let how = if facts.list.label == DevToolListLabel::Read
@@ -410,13 +417,21 @@ pub fn row(facts: &Facts) -> Option<Row> {
             } else {
                 "tccd allowed its latest new program"
             };
-            (
-                Level::Ok,
-                format!(
-                    "{who} is on {PANE} ({how}), so macOS should not hold the programs it \
-                     starts for its first-run check{under}"
+            let on = format!(
+                "{who} is on {PANE} ({how}), so macOS should not hold the programs it starts \
+                 for its first-run check{under}"
+            );
+            match (held, now) {
+                (Some(held), Some(now)) => (
+                    Level::Note,
+                    format!(
+                        "{on}; {now}; if aterm started {}, macOS still checks the programs \
+                         aterm starts: look at aterm's row in the Developer Tools list",
+                        if held.count == 1 { "it" } else { "them" }
+                    ),
                 ),
-            )
+                _ => (Level::Ok, on),
+            }
         }
         DevToolGrant::NotGranted => {
             let is = match (facts.list.label, facts.list.listing, facts.log.state) {
@@ -447,12 +462,13 @@ pub fn row(facts: &Facts) -> Option<Row> {
                      opens the pane for you, or `{OPEN_PANE}`)"
                 ),
             };
+            let now = now.map_or_else(String::new, |now| format!("; {now}"));
             (
                 Level::Warn,
                 format!(
                     "{who} {is} {PANE} \u{2014} macOS holds every new program it starts for a \
                      first-run check (syspolicyd), one at a time, so builds and tests wait and \
-                     timing tests flake{checked} \u{2014} {fix}{under}"
+                     timing tests flake{checked}{now} \u{2014} {fix}{under}"
                 ),
             )
         }
@@ -464,10 +480,78 @@ pub fn row(facts: &Facts) -> Option<Row> {
             } else {
                 format!("{list}, and {log}")
             };
-            (Level::Note, format!("not measured ({why}){under}"))
+            let text = match now {
+                Some(now) => {
+                    format!("{now}; whether aterm is listed is not measured ({why}){under}")
+                }
+                None => format!("not measured ({why}){under}"),
+            };
+            (Level::Note, text)
         }
     };
     Some(Row { level, text })
+}
+
+/// The `devtools:` row's words for `held` programs (at least one) of this user that macOS's program check holds now. A one-shot reading has no first sighting, so the age is the oldest one's fork age, an upper bound: "started … ago", never "held for".
+fn held_words(held: aterm_uds::process::HeldNow) -> String {
+    let age = aterm_uds::process::held_age(held.oldest_ms);
+    if held.count == 1 {
+        format!("now 1 program of this user waits for macOS's program check; it started {age} ago")
+    } else {
+        format!(
+            "now {} programs of this user wait for macOS's program check, the oldest started \
+             {age} ago",
+            held.count
+        )
+    }
+}
+
+/// Whether an app's row on the Developer Tools list is switched on, as the list reads ([`Listed::of`]): verify's run-start word for the app macOS holds responsible for it ([`listed_for_responsible`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Listed {
+    /// The list, read whole, holds the app switched on.
+    Yes,
+    /// The list, read whole, holds the app switched off, or holds no row for it.
+    No,
+    /// The list was not read.
+    Unknown,
+}
+
+impl Listed {
+    /// The word for `list` as read.
+    #[must_use]
+    pub const fn of(list: &DevToolList) -> Self {
+        match (list.label, list.listing) {
+            (DevToolListLabel::Read, DevToolListing::On) => Self::Yes,
+            (DevToolListLabel::Read, DevToolListing::Off | DevToolListing::Absent) => Self::No,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// `yes`, `no` or `unknown`.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Yes => "yes",
+            Self::No => "no",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// The app macOS holds responsible for `pid` (its display name; `None` when macOS names none) and whether the Developer Tools list holds that app's bundle switched on. The list is read under the probe's own fence ([`consent::probe_devtool_list`]), which judges the running executable: a program outside a `.app` (verify, a test binary) opens and spawns nothing and reads [`Listed::Unknown`]. Read only when called.
+#[must_use]
+pub fn listed_for_responsible(pid: i32) -> (Option<String>, Listed) {
+    let Some(app) = consent::responsible_app(pid) else {
+        return (None, Listed::Unknown);
+    };
+    let protected = consent::protected_roots(&[]);
+    let listed = consent::app_bundle_root(&app.path)
+        .and_then(|root| consent::bundle_id_of(&root, &protected))
+        .map_or(Listed::Unknown, |id| {
+            Listed::of(&consent::probe_devtool_list(ProbeGate::on(), &id))
+        });
+    (Some(app.display_name), listed)
 }
 
 /// What the hand-over to the owner did ([`hand_to_owner`]).
@@ -976,6 +1060,7 @@ mod tests {
             list,
             log,
             other_responsible: None,
+            program_check: None,
         }
     }
 
@@ -1057,6 +1142,121 @@ mod tests {
         ))
         .expect("a row");
         assert_eq!(unknown.level, Level::Note);
+    }
+
+    /// The row counts this user's programs macOS's program check holds now, word for word, under
+    /// every verdict: nothing with none held; with some, the clause after tccd's count where
+    /// aterm is not on the list, the clause and the look at aterm's row (a note) where it is,
+    /// and the clause with why aterm cannot tell where nothing was read.
+    #[test]
+    fn the_devtools_row_counts_the_live_wait() {
+        use aterm_uds::process::HeldNow;
+        const NOW: &str = "now 2 programs of this user wait for macOS's program check, the \
+                           oldest started 9 h 59 m ago";
+        const LOOK: &str = "look at aterm's row in the Developer Tools list";
+        let quiet = DevToolProbe::refused(DevToolProbeLabel::NoRecentRequest);
+        let two = HeldNow {
+            count: 2,
+            oldest_ms: 35_940_000,
+        };
+        let one = HeldNow {
+            count: 1,
+            oldest_ms: 20_000,
+        };
+        let held = |base: &Facts, held: Option<HeldNow>| {
+            row(&Facts {
+                program_check: held,
+                ..base.clone()
+            })
+            .expect("a row")
+        };
+        let off = facts(read(DevToolListing::Off, 100), quiet);
+        let on = facts(read(DevToolListing::On, 100), quiet);
+        let unread = facts(
+            DevToolList::refused(DevToolListLabel::NoFullDiskAccess),
+            DevToolProbe::refused(DevToolProbeLabel::LogUnavailable),
+        );
+        for base in [&off, &on, &unread] {
+            let plain = row(base).expect("a row");
+            for none in [None, Some(HeldNow::default())] {
+                assert_eq!(held(base, none), plain, "nothing held, no clause");
+            }
+        }
+
+        let plain = row(&off).expect("a row");
+        let warn = held(&off, Some(two));
+        assert_eq!(warn.level, Level::Warn);
+        assert_eq!(
+            warn.text,
+            plain.text.replacen(
+                "timing tests flake \u{2014}",
+                &format!("timing tests flake; {NOW} \u{2014}"),
+                1
+            ),
+            "the count after tccd's"
+        );
+
+        let plain = row(&on).expect("a row");
+        assert_eq!(plain.level, Level::Ok);
+        let listed = held(&on, Some(two));
+        assert_eq!(listed.level, Level::Note, "{}", listed.text);
+        assert_eq!(
+            listed.text,
+            format!(
+                "{}; {NOW}; if aterm started them, macOS still checks the programs aterm \
+                 starts: {LOOK}",
+                plain.text
+            )
+        );
+        assert_eq!(
+            held(&on, Some(one)).text,
+            format!(
+                "{}; now 1 program of this user waits for macOS's program check; it started \
+                 20 s ago; if aterm started it, macOS still checks the programs aterm starts: \
+                 {LOOK}",
+                plain.text
+            )
+        );
+
+        let plain = row(&unread).expect("a row");
+        let why = plain
+            .text
+            .strip_prefix("not measured (")
+            .and_then(|t| t.strip_suffix(')'))
+            .expect("the unmeasured words");
+        let unknown = held(&unread, Some(two));
+        assert_eq!(unknown.level, Level::Note);
+        assert_eq!(
+            unknown.text,
+            format!("{NOW}; whether aterm is listed is not measured ({why})")
+        );
+    }
+
+    /// Verify's word for an app's row: on is yes; off and no row are no; a list not read whole
+    /// is unknown.
+    #[test]
+    fn a_listing_reads_yes_only_for_a_row_switched_on() {
+        for (list, want) in [
+            (read(DevToolListing::On, 1), Listed::Yes),
+            (read(DevToolListing::Off, 1), Listed::No),
+            (read(DevToolListing::Absent, 0), Listed::No),
+            (read(DevToolListing::Unknown, 0), Listed::Unknown),
+            (
+                DevToolList::refused(DevToolListLabel::NoFullDiskAccess),
+                Listed::Unknown,
+            ),
+            (
+                DevToolList::refused(DevToolListLabel::RefusedOutOfBundle),
+                Listed::Unknown,
+            ),
+            (DevToolList::pending(), Listed::Unknown),
+        ] {
+            assert_eq!(Listed::of(&list), want, "{list:?}");
+        }
+        assert_eq!(
+            [Listed::Yes, Listed::No, Listed::Unknown].map(Listed::word),
+            ["yes", "no", "unknown"]
+        );
     }
 
     /// The hand-over acts only on `not_granted`: an empty list gets Terminal listed first so

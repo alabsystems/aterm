@@ -1,0 +1,50 @@
+# claude-code 2.1.309 · MEASURED 2026-10-23, `aterm ctl text` of a private headless aterm (144x50, aterm 0.121.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · C1 probe p15: env cat /etc/hosts
+✻ Cogitated for 0s · done 2:43 AM
+
+❯ toolstart
+
+  Read 1 file (ctrl+o to expand)
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Worked for 0s · done 2:43 AM
+
+❯ toolstart
+
+⏺ Bash(time FOO=1 cat /etc/hosts)
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Baked for 0s · done 2:43 AM
+
+❯ toolstart
+
+⏺ Bash(cat /etc/hosts; FOO=1 awk 'NR<3' README.md)
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Churned for 0s · done 2:43 AM
+
+❯ toolstart
+
+⏺ Bash(cat /etc/hosts; xargs cat < list.txt)
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Cooked for 0s · done 2:43 AM
+
+❯ toolstart
+
+⏺ Bash(env cat /etc/hosts)
+  ⎿  Waiting…
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command
+ Tip: auto mode handles these prompts for you — choose "switch to auto mode" below
+ Probe p15
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ env cat /etc/hosts
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, allow reading from /private/etc from this project
+   3. Yes, and switch to auto mode · auto mode handles these prompts for you
+   4. No
+
+ Esc to cancel · Tab to amend

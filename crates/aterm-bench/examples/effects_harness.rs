@@ -6,20 +6,26 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use aterm_core::render::{
-    DecoBlend, DecoGlyph, FxBlend, FxContent, FxInk, FxItem, FxLayer, FxRect, FxSlot, FxSpace,
-    InkCell, PxRect, WordDecoration,
+    DecoGlyph, FxBlend, FxContent, FxInk, FxItem, FxLayer, FxRect, FxSlot, FxSpace, InkCell,
+    PxRect, WordDecoration,
 };
 use aterm_core::terminal::Terminal;
-use aterm_effects::cursor_glow::{CURSOR_WITNESS_ROWS, CursorGlow, Geom, GlowConfig, GlowStyle};
+use aterm_effects::cursor_fx::CursorFxInput;
+use aterm_effects::cursor_glow::{
+    CURSOR_WITNESS_ROWS, CursorGlow, Geom, GlowConfig, GlowStyle, ProbeTrust,
+};
+use aterm_effects::cursor_trail::TrailConfig;
 use aterm_effects::harness_card::{
     CardFrame, CardFrames, CardPalette, CardScene, EPISODE_MS, FRAME_MS, HarnessCard, LineAt,
-    card_layer_id, dark_ground,
+    card_layer_id, dark_ground, line_star,
 };
+use aterm_effects::host::motion_print_anchor;
+use aterm_effects::pipeline::{CursorStep, EffectsPipeline, RowProbe};
 use aterm_gpu::gpu_time::{self, Settled};
 use aterm_gpu::{
     FetchProbe, FrameShape, GpuContext, GpuRenderer, UnormAblation, UnormRoute, WindowGpu,
 };
-use aterm_render::{GlowQuad, RenderInput, Renderer, Theme, WindowCpu};
+use aterm_render::{RenderInput, Renderer, Theme, WindowCpu};
 
 const FONT_PX: f32 = 30.0;
 const ROWS: usize = 26;
@@ -307,6 +313,15 @@ struct Sample {
     raster: Spent,
     fx_quads: u64,
     under_quads: u64,
+    /// The pipeline scenes' sprites ([`sprite_items`]).
+    sprites: u64,
+    /// The texel bytes the frame uploaded, across its arms ([`pipeline_scene`]).
+    uploads: u64,
+    /// The frames in flight the frame's fx atlas syncs waited for before rewriting a region
+    /// they may read, across its arms, and the nanoseconds they parked
+    /// (`FrameShape::fx_reader_waits`).
+    reader_waits: u64,
+    reader_wait_ns: u64,
     dirty_rows: u64,
     output_fingerprint: Option<u64>,
     arms: [Arm; WAYS.len()],
@@ -665,6 +680,10 @@ impl Rig {
             raster,
             fx_quads: fx_quads(input),
             under_quads: input.glow_under.len() as u64,
+            sprites: 0,
+            uploads: 0,
+            reader_waits: arms.iter().map(|a| a.shape.fx_reader_waits).sum(),
+            reader_wait_ns: arms.iter().map(|a| a.shape.fx_reader_wait_ns).sum(),
             dirty_rows,
             output_fingerprint: None,
             arms,
@@ -823,18 +842,18 @@ impl LineHost {
         );
         self.settled = still;
         let [r, g, b] = self.ink.first().map_or([0xFF; 3], |c| c.color);
+        let (color, blend) = line_star(
+            u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b),
+            scene.ground,
+        );
         self.star = Some(WordDecoration {
             row,
             col: LINE_STAR_COL,
             dx: 0,
             dy: 0,
             glyph: DecoGlyph::Star4,
-            blend: if scene.dark {
-                DecoBlend::Add
-            } else {
-                DecoBlend::Over
-            },
-            color: u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b),
+            blend,
+            color,
             alpha: u8::MAX,
         });
     }
@@ -888,19 +907,24 @@ impl CardHost {
     }
 }
 
+/// The cursor family as a window presents it: [`EffectsPipeline::cursor_step`]
+/// on the frame's cells, so every pass the shipped path runs (the letter guard
+/// among them) is priced.
 struct GlowHost {
-    glow: CursorGlow,
+    fx: EffectsPipeline,
     cfg: GlowConfig,
     geom: Geom,
-    out: Vec<GlowQuad>,
     row: Vec<char>,
+    witness: Vec<char>,
+    above: Vec<char>,
+    below: Vec<char>,
     last_fp: u64,
 }
 
 impl GlowHost {
     fn new(rig: &Rig, style: GlowStyle) -> Self {
         Self {
-            glow: CursorGlow::default(),
+            fx: EffectsPipeline::for_window(),
             cfg: GlowConfig {
                 classic_mono: false,
                 ribbon_tall: true,
@@ -922,39 +946,103 @@ impl GlowHost {
                 head_dx: 0.5,
             },
             geom: rig.glow_geom(),
-            out: Vec::new(),
             row: Vec::new(),
+            witness: Vec::new(),
+            above: Vec::new(),
+            below: Vec::new(),
             last_fp: 0,
         }
     }
 
-    fn emit(&mut self, term: &Terminal, caret: (u16, u16), now: Instant) -> (u64, Spent) {
-        let watch = Stopwatch::start();
-        term.row_cols_into(usize::from(caret.0), &mut self.row);
-        self.glow.observe_ribbon_row(caret.0, &self.row);
-        let mut rows = [0u16; CURSOR_WITNESS_ROWS];
-        let n = self.glow.ribbon_rows(&mut rows);
-        for &r in &rows[..n] {
-            if r != caret.0 && usize::from(r) < ROWS {
-                term.row_cols_into(usize::from(r), &mut self.row);
-                self.glow.observe_ribbon_row(r, &self.row);
-            }
-        }
-        let fp = self
-            .glow
-            .tick(Some(caret), now, &self.cfg, self.geom, &mut self.out);
-        (fp, watch.stop())
+    fn glow(&mut self) -> &mut CursorGlow {
+        &mut self.fx.cursor_mut().glow
     }
 
-    fn splice(&self, input: &mut RenderInput) -> u64 {
+    fn emit(
+        &mut self,
+        term: &Terminal,
+        input: &RenderInput,
+        caret: (u16, u16),
+        now: Instant,
+    ) -> (u64, Spent) {
+        let watch = Stopwatch::start();
+        let (row, col) = caret;
+        let below_row = usize::from(row) + 1 < ROWS;
+        term.row_cols_into(usize::from(row), &mut self.row);
+        if row > 0 {
+            term.row_cols_into(usize::from(row) - 1, &mut self.above);
+        }
+        if below_row {
+            term.row_cols_into(usize::from(row) + 1, &mut self.below);
+        }
+        let glow = &mut self.fx.cursor_mut().glow;
+        glow.observe_ribbon_row(row, &self.row);
+        let mut rows = [0u16; CURSOR_WITNESS_ROWS];
+        let n = glow.ribbon_rows(&mut rows);
+        for &r in &rows[..n] {
+            if r != row && usize::from(r) < ROWS {
+                term.row_cols_into(usize::from(r), &mut self.witness);
+                glow.observe_ribbon_row(r, &self.witness);
+            }
+        }
+        let (print_anchor, print_anchor_glyph) = motion_print_anchor(term);
+        let step = self.fx.cursor_step(
+            &CursorStep {
+                input: CursorFxInput {
+                    now,
+                    cur: Some(caret),
+                    live_viewport: true,
+                    cursor_style: term.cursor_style(),
+                    blink_phase: true,
+                    live_cursor: self.cfg.color,
+                    cursor_color_pinned: false,
+                    default_bg: self.cfg.theme_bg,
+                    cursor_cell_bg: None,
+                    geom: self.geom,
+                    focused: true,
+                    shed_envelope: 1.0,
+                    trail_brightness: 1.0,
+                    body_allowed: true,
+                    momentum_glow: true,
+                    user_tinted: false,
+                    accent_pinned: false,
+                },
+                glow: &self.cfg,
+                trail: TrailConfig {
+                    enabled: false,
+                    duration: self.cfg.duration,
+                    max_len: self.cfg.length,
+                    color: self.cfg.color,
+                    intensity: self.cfg.intensity,
+                    warmth: 0.0,
+                },
+                animate: true,
+                row_probe: Some(RowProbe {
+                    row,
+                    caret: col,
+                    trust: ProbeTrust::Full,
+                    cols: &self.row,
+                    flanks: Some((
+                        (row > 0).then_some(self.above.as_slice()),
+                        below_row.then_some(self.below.as_slice()),
+                    )),
+                }),
+                frame_cells: Some(input.cells.as_slice()),
+                frame_cells_at: (0, 0),
+                pending_keys: 0,
+                print_anchor,
+                print_anchor_glyph,
+                caret_drawn: true,
+            },
+            std::iter::empty(),
+        );
+        (step.frame.glow_fp, watch.stop())
+    }
+
+    fn splice(&mut self, input: &mut RenderInput) -> u64 {
         let started = Instant::now();
         clear_streams(input);
-        input.cursor_glow_add.extend_from_slice(&self.out);
-        input.glow_halo.extend_from_slice(self.glow.halos());
-        input.fire_patch.extend_from_slice(self.glow.patches());
-        input.glow_under.extend_from_slice(self.glow.under_quads());
-        input.char_fg.extend_from_slice(self.glow.charred());
-        input.fire_halo.extend_from_slice(self.glow.halo_cells());
+        self.fx.publish_cursor(input);
         input.refresh_cursor_effect_damage();
         elapsed_ns(started)
     }
@@ -1205,12 +1293,12 @@ fn typing_scene(rig: &mut Rig, style: GlowStyle, script: Script) -> Run {
         match (event, script) {
             (Some(k), Script::Type { .. }) => {
                 term.process(&[PROSE[k % PROSE.len()]]);
-                host.glow.note_synthetic_typed(now, 1);
+                host.glow().note_synthetic_typed(now, 1);
             }
             (Some(k), Script::Hop { .. }) => {
                 let col = if k % 2 == 0 { HOP_COLS.1 } else { HOP_COLS.0 };
                 term.process(cup(prompt_row, col).as_bytes());
-                host.glow.note_synthetic_move(now);
+                host.glow().note_synthetic_move(now);
             }
             (None, _) => {}
         }
@@ -1219,7 +1307,7 @@ fn typing_scene(rig: &mut Rig, style: GlowStyle, script: Script) -> Run {
             u16::try_from(input.cursor_row).unwrap_or(u16::MAX),
             u16::try_from(input.cursor_col).unwrap_or(u16::MAX),
         );
-        let (fp, emit) = host.emit(&term, caret, now);
+        let (fp, emit) = host.emit(&term, &input, caret, now);
         if event.is_none() && fp == host.last_fp {
             continue;
         }
@@ -1281,6 +1369,161 @@ fn scroll_scene(rig: &mut Rig) -> Run {
     rig.take_run(samples)
 }
 
+/// One pipeline tick: the window's frame rate.
+const PIPE_MS: f64 = 1000.0 / 30.0;
+const RAIN_TICKS: usize = 180;
+const CATS_TICKS: usize = 240;
+const CATS_EVERY: usize = 40;
+const PET_KEYS: usize = 48;
+const PET_EVERY: usize = 10;
+
+/// The sprites a frame's effects pipeline drew: the items of the matrix rain's rows and of the
+/// companions' and word cats' sprite layers.
+fn sprite_items(input: &RenderInput) -> u64 {
+    input
+        .fx_layers
+        .iter()
+        .filter(|l| {
+            aterm_effects::matrix_rain::is_rain_row(l) || aterm_render::sprites::is_sprite_layer(l)
+        })
+        .map(|l| l.content.items().len() as u64)
+        .sum()
+}
+
+/// A scene driven through the effects pipeline a window runs: `setup` configures it, `feed`
+/// gives tick `k` its input (typing, output) and says whether it fed any; a tick that fed none
+/// and folded the frame it folded before presents nothing, as a window would.
+fn pipeline_scene(
+    rig: &mut Rig,
+    name: &str,
+    ticks: usize,
+    setup: impl FnOnce(&mut EffectsPipeline),
+    mut feed: impl FnMut(usize, &mut EffectsPipeline, &mut Terminal, &RenderInput) -> bool,
+) -> Run {
+    let mut term = Terminal::new(ROWS as u16, COLS as u16);
+    for i in 0..4 {
+        term.process(format!("{} {i}\r\n", &STREAMED[..72]).as_bytes());
+    }
+    term.process(b"~/src/aterm $ ");
+    let mut p = EffectsPipeline::new();
+    p.set_focused(true);
+    setup(&mut p);
+    let mut input = RenderInput::empty();
+    let mut win = Win::new();
+    Rig::extract(&mut term, &mut input);
+    rig.settle_window(&mut win, &mut input);
+    rig.refs.clear();
+    let (mut samples, mut last_fp, mut drew) = (Vec::new(), 0, 0);
+    let cell = (usize::from(rig.cw), usize::from(rig.ch));
+    for tick in 0..ticks {
+        let fed = feed(tick, &mut p, &mut term, &input);
+        p.advance(PIPE_MS);
+        Rig::extract(&mut term, &mut input);
+        let watch = Stopwatch::start();
+        let fp = p.apply(&mut term, &mut input, cell.0, cell.1);
+        let emit = watch.stop();
+        let sprites = sprite_items(&input);
+        drew += sprites;
+        if !fed && fp == last_fp {
+            continue;
+        }
+        last_fp = fp;
+        let mut sample = rig.present(&mut win, &input, emit, 0);
+        sample.sprites = sprites;
+        // One renderer presents every arm, and its fx atlas uploads an art once: the sum is
+        // the texel bytes the frame uploaded (its instances and palette are in
+        // `instance_bytes` and `fx_upload_bytes`).
+        sample.uploads = sample
+            .arms
+            .iter()
+            .map(|arm| arm.shape.fx_atlas_bytes)
+            .sum::<u64>();
+        samples.push(sample);
+    }
+    if drew == 0 {
+        fail(format!("the {name} scene drew no sprite"));
+    }
+    rig.take_run(samples)
+}
+
+fn type_char(p: &mut EffectsPipeline, term: &mut Terminal, input: &RenderInput, b: u8) {
+    let _ = p.note_committed_char(term, input, char::from(b));
+    term.process(&[b]);
+}
+
+fn rain_scene(rig: &mut Rig, seed: u64) -> Run {
+    let (bg, fg) = (rig.theme.bg, rig.theme.fg);
+    pipeline_scene(
+        rig,
+        "rain",
+        RAIN_TICKS,
+        |p| {
+            p.set_matrix_rain(
+                30, 6, 4, 6, None, None, "matrix", None, 320, 12, false, true, true, false, seed,
+                bg, fg,
+            );
+            p.set_matrix_rain_enabled(true);
+        },
+        |_, p, _, _| {
+            p.note_keystroke();
+            false
+        },
+    )
+}
+
+fn cats_scene(rig: &mut Rig) -> Run {
+    pipeline_scene(
+        rig,
+        "cats",
+        CATS_TICKS,
+        |p| {
+            p.set_sparkle_enabled(true);
+            p.set_sparkle_classes(false, true, false);
+            p.set_sparkle_feline("cat", true, true, false);
+        },
+        |tick, _, term, _| {
+            if !tick.is_multiple_of(CATS_EVERY) {
+                return false;
+            }
+            let k = tick / CATS_EVERY;
+            term.process(
+                format!("a kitty naps by the cat flap while the kitten {k} watches\r\n").as_bytes(),
+            );
+            true
+        },
+    )
+}
+
+fn pet_scene(rig: &mut Rig, seed: u64) -> Run {
+    pipeline_scene(
+        rig,
+        "pet",
+        PET_KEYS * PET_EVERY + RUNOUT_TICKS,
+        |p| {
+            p.set_cursor_glow(
+                true,
+                "rainbow kitty",
+                aterm_effects::cursor_fx::TrailColor::Automatic,
+                None,
+                400,
+                24,
+                0.9,
+                0.8,
+                true,
+                0x0050_FA7B,
+            );
+            p.set_cursor_pet(true, seed);
+        },
+        |tick, p, term, input| {
+            if !tick.is_multiple_of(PET_EVERY) || tick / PET_EVERY >= PET_KEYS {
+                return false;
+            }
+            type_char(p, term, input, PROSE[(tick / PET_EVERY) % PROSE.len()]);
+            true
+        },
+    )
+}
+
 fn pct(v: &mut [f64], p: f64) -> f64 {
     if v.is_empty() {
         return 0.0;
@@ -1302,6 +1545,9 @@ struct Scene {
     name: &'static str,
     runs: Vec<Run>,
     rate_emit: bool,
+    /// The texel bytes the warm-up runs uploaded: the cold cost of the scene's arts, which
+    /// the measured runs find resident in the rig's one fx atlas.
+    cold_uploads: u64,
 }
 
 #[derive(Default)]
@@ -1489,7 +1735,7 @@ impl Scene {
             format!("{s}_build_stage_pct"),
             100.0 * pct(&mut build_stage, 50.0) / present_p95,
         );
-        let counts: [(&str, Figure); 11] = [
+        let counts: [(&str, Figure); 13] = [
             ("passes", |x| Some(f64::from(x.off().shape.passes))),
             ("drop_passes", |x| Some(f64::from(x.drop().shape.passes))),
             ("split_passes", |x| Some(f64::from(x.split().shape.passes))),
@@ -1510,12 +1756,40 @@ impl Scene {
             ("fx_upload_bytes", |x| {
                 Some(ns(x.off().shape.fx_upload_bytes))
             }),
+            ("sprites", |x| Some(ns(x.sprites))),
+            ("upload_bytes", |x| Some(ns(x.uploads))),
         ];
         for (what, f) in counts {
             let mut v = self.pooled(f);
             r.int(format!("{s}_{what}_p50"), pct(&mut v, 50.0) as u64);
             r.int(format!("{s}_{what}_max"), pct(&mut v, 100.0) as u64);
         }
+        let uploaded: u64 = self.pooled(|x| Some(ns(x.uploads))).iter().sum::<f64>() as u64;
+        r.int(
+            format!("{s}_upload_bytes_per_run"),
+            uploaded / self.runs.len().max(1) as u64,
+        );
+        r.int(
+            format!("{s}_upload_bytes_cold"),
+            self.cold_uploads / WARMUP.max(1) as u64,
+        );
+        let waits: u64 = self
+            .pooled(|x| Some(ns(x.reader_waits)))
+            .iter()
+            .sum::<f64>() as u64;
+        r.int(
+            format!("{s}_reader_waits_per_run"),
+            waits / self.runs.len().max(1) as u64,
+        );
+        let mut parked = self.pooled(|x| Some(ns(x.reader_wait_ns)));
+        r.int(
+            format!("{s}_reader_wait_ns_per_run"),
+            (parked.iter().sum::<f64>() / self.runs.len().max(1) as f64) as u64,
+        );
+        r.int(
+            format!("{s}_reader_wait_ns_max"),
+            pct(&mut parked, 100.0) as u64,
+        );
         let dirty = self.pooled(|x| Some(ns(x.dirty_rows)));
         r.num(
             format!("{s}_dirty_rows_mean"),
@@ -1687,7 +1961,7 @@ fn report_reference(r: &mut Report, scenes: &[Scene], clocked: bool, counted: bo
 fn main() {
     if std::env::args().skip(1).any(|a| a == "--help") {
         println!(
-            "effects_harness [--light] [--wgpu] [--damage]\n  --damage: animated card scenes and recoloured sparse FX layers, with dirty rows and full-render pixel verification"
+            "effects_harness [--light] [--wgpu] [--damage] [--only a,b,...]\n  --damage: animated card scenes and recoloured sparse FX layers, with dirty rows and full-render pixel verification\n  --only: run only the named scenes (episode, flowing, settled, typing, scroll, bolt, comet, classic, meteor, flood, rain, cats, pet; fx_sparse under --damage)"
         );
         return;
     }
@@ -1710,59 +1984,116 @@ fn main() {
         name,
         runs: Vec::new(),
         rate_emit,
+        cold_uploads: 0,
     };
     let damage = std::env::args().skip(1).any(|a| a == "--damage");
-    let mut scenes = vec![
-        scene("episode", true),
-        scene("flowing", true),
-        scene("settled", false),
-    ];
-    if damage {
-        scenes.push(scene("fx_sparse", true));
+    let only: Option<Vec<String>> = std::env::args()
+        .skip_while(|a| a != "--only")
+        .nth(1)
+        .map(|list| list.split(',').map(str::to_string).collect());
+    let wanted = |name: &str| only.as_ref().is_none_or(|o| o.iter().any(|n| n == name));
+    let cards = [("episode", true), ("flowing", true), ("settled", false)];
+    let rest: &[(&str, bool)] = if damage {
+        &[("fx_sparse", true)]
     } else {
-        scenes.extend([
-            scene("typing", true),
-            scene("scroll", true),
-            scene("bolt", true),
-            scene("comet", true),
-            scene("classic", true),
-            scene("meteor", true),
-            scene("flood", true),
-        ]);
+        &[
+            ("typing", true),
+            ("scroll", true),
+            ("bolt", true),
+            ("comet", true),
+            ("classic", true),
+            ("meteor", true),
+            ("flood", true),
+            ("rain", true),
+            ("cats", true),
+            ("pet", true),
+        ]
+    };
+    let mut scenes: Vec<Scene> = cards
+        .iter()
+        .chain(rest)
+        .filter(|(name, _)| wanted(name))
+        .map(|&(name, rate_emit)| scene(name, rate_emit))
+        .collect();
+    if scenes.is_empty() {
+        fail("--only names no scene");
     }
+    let names: Vec<&str> = scenes.iter().map(|s| s.name).collect();
+    let wanted = |name: &str| names.contains(&name);
     for run in 0..WARMUP + RUNS {
-        let (episode, flowing, settled) = card_scenes(&mut rig, 0x00C0_FFEE + run as u64);
-        let mut runs = vec![episode, flowing, settled];
-        if damage {
-            runs.push(sparse_fx_scene(&mut rig));
-        } else {
-            let typed = |keys| Script::Type {
-                keys,
-                every: KEY_TICKS,
-            };
+        let seed = 0x00C0_FFEE + run as u64;
+        let mut runs: Vec<(&str, Run)> = Vec::new();
+        if ["episode", "flowing", "settled"].iter().any(|n| wanted(n)) {
+            let (episode, flowing, settled) = card_scenes(&mut rig, seed);
+            runs.extend([
+                ("episode", episode),
+                ("flowing", flowing),
+                ("settled", settled),
+            ]);
+        }
+        if wanted("fx_sparse") {
+            runs.push(("fx_sparse", sparse_fx_scene(&mut rig)));
+        }
+        let typed = |keys| Script::Type {
+            keys,
+            every: KEY_TICKS,
+        };
+        if wanted("typing") {
             let typing = typing_scene(&mut rig, GlowStyle::RainbowKitty, typed(TYPING_KEYS));
-            let scroll = scroll_scene(&mut rig);
-            let bolt = typing_scene(&mut rig, GlowStyle::Laser, typed(PRODUCER_KEYS));
-            let comet = typing_scene(&mut rig, GlowStyle::Comet, typed(PRODUCER_KEYS));
-            let classic = typing_scene(&mut rig, GlowStyle::Classic, typed(PRODUCER_KEYS));
+            runs.push(("typing", typing));
+        }
+        if wanted("scroll") {
+            runs.push(("scroll", scroll_scene(&mut rig)));
+        }
+        for (name, style) in [
+            ("bolt", GlowStyle::Laser),
+            ("comet", GlowStyle::Comet),
+            ("classic", GlowStyle::Classic),
+        ] {
+            if wanted(name) {
+                runs.push((name, typing_scene(&mut rig, style, typed(PRODUCER_KEYS))));
+            }
+        }
+        if wanted("meteor") {
             let hops = Script::Hop {
                 hops: HOPS,
                 every: HOP_TICKS,
             };
-            let meteor = typing_scene(&mut rig, GlowStyle::RainbowKitty, hops);
+            runs.push((
+                "meteor",
+                typing_scene(&mut rig, GlowStyle::RainbowKitty, hops),
+            ));
+        }
+        if wanted("flood") {
             let flood = Script::Type {
                 keys: FLOOD_KEYS,
                 every: 1,
             };
             let flood = typing_scene(&mut rig, GlowStyle::RainbowKitty, flood);
             at_the_ribbon_budget(&flood);
-            runs.extend([typing, scroll, bolt, comet, classic, meteor, flood]);
+            runs.push(("flood", flood));
+        }
+        if wanted("rain") {
+            runs.push(("rain", rain_scene(&mut rig, seed)));
+        }
+        if wanted("cats") {
+            runs.push(("cats", cats_scene(&mut rig)));
+        }
+        if wanted("pet") {
+            runs.push(("pet", pet_scene(&mut rig, seed)));
         }
         if run < WARMUP {
+            for (name, run) in runs {
+                if let Some(scene) = scenes.iter_mut().find(|s| s.name == name) {
+                    scene.cold_uploads += run.samples.iter().map(|x| x.uploads).sum::<u64>();
+                }
+            }
             continue;
         }
-        for (scene, run) in scenes.iter_mut().zip(runs) {
-            scene.runs.push(run);
+        for (name, run) in runs {
+            if let Some(scene) = scenes.iter_mut().find(|s| s.name == name) {
+                scene.runs.push(run);
+            }
         }
         eprintln!("effects_harness: run {}/{RUNS} done", run + 1 - WARMUP);
     }
@@ -1847,6 +2178,25 @@ fn main() {
             get("raster_kins_p50"),
             get("encode_kins_p50"),
         );
+        if get("sprites_max") != "0" {
+            eprintln!(
+                "effects_harness: {:<8} sprites p50 {} max {} | uploads p50 {} max {} per run {} \
+                 cold {} bytes | fx instances p50 {} max {} | reader waits per run {} ({} ns, \
+                 max {} ns a frame)",
+                scene.name,
+                get("sprites_p50"),
+                get("sprites_max"),
+                get("upload_bytes_p50"),
+                get("upload_bytes_max"),
+                get("upload_bytes_per_run"),
+                get("upload_bytes_cold"),
+                get("fx_instances_p50"),
+                get("fx_instances_max"),
+                get("reader_waits_per_run"),
+                get("reader_wait_ns_per_run"),
+                get("reader_wait_ns_max"),
+            );
+        }
     }
     println!("{}", report.json());
 }

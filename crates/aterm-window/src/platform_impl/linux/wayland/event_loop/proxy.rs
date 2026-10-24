@@ -5,10 +5,6 @@
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
 //! An event loop proxy.
-//!
-//! Modified by the aterm project in 2026; see the repository NOTICE. (A channel and the loop's
-//! `common::poll::Waker`, where upstream sent through calloop's channel:
-//! docs/AUDIT-third-party-2026-10-15.md, LW.7.)
 
 use std::sync::mpsc::{SendError, Sender};
 

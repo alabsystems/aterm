@@ -2427,6 +2427,71 @@ fn a_head_in_flight_is_counted_on_the_receipt_of_completed_checks_only() {
     let _ = std::fs::remove_dir_all(&staging.root);
 }
 
+/// A CHECK THAT STAGES NOTHING STILL RECLAIMS WHAT A STAGE LEFT. A bundle a stage's probe
+/// left unproven stays while its exec stamp is live and while another holds the stage
+/// lock, and the first up-to-date check after both end takes it and its stamp, though
+/// no release is staged after it.
+#[test]
+fn an_up_to_date_check_reclaims_a_bundle_a_stage_left_once_its_stamp_is_spent() {
+    let _guard = crate::STRANDED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let staging = Staging::scratch("left-incoming");
+    let left = staging
+        .staged_dir()
+        .join(format!(".aterm-incoming-{}.app", "ab".repeat(16)));
+    let exe = left.join("Contents/MacOS/aterm");
+    std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+    std::fs::write(&exe, "left\n").unwrap();
+    let home = staging
+        .staged_dir()
+        .join(format!(".aterm-incoming-{}.app.exec", "ab".repeat(16)));
+    std::fs::create_dir(&home).unwrap();
+    aterm_uds::deadline::try_stamp_exec(&home).unwrap();
+    let check = || {
+        write_ledger(&staging, WEB_TAG, WEB_BUILD, "alabsystems/aterm");
+        let mut head = |_: &str| redirect_to(WEB_TAG);
+        let world = CheckWorld {
+            installed_parent: None,
+            staging: (*staging).clone(),
+            head: &mut head,
+            master_pubkeys: &[],
+            team: "",
+        };
+        let outcome = check_and_stage_in(world, WEB_BUILD, &test_source(), Asked::Schedule);
+        assert_eq!(outcome, Ok(None), "an up-to-date check stages nothing");
+        let status = std::fs::read_to_string(&staging.status).unwrap();
+        assert!(status.contains("up to date (channel head"), "{status}");
+    };
+
+    check();
+    assert!(exe.is_file(), "a live stamp holds its bundle");
+    assert!(home.is_dir());
+
+    let awake = aterm_uds::process::awake_ms().expect("the awake clock");
+    std::fs::write(
+        home.join(aterm_uds::deadline::EXEC_STAMP),
+        (awake + 3_600_000).to_string(),
+    )
+    .unwrap();
+    let held =
+        aterm_update_core::FileLock::acquire_within(&staging.stage_lock, std::time::Duration::ZERO)
+            .expect("the stage lock is free");
+    check();
+    assert!(
+        exe.is_file(),
+        "with the stage lock held, a stage may be in flight: nothing is swept"
+    );
+    drop(held);
+
+    check();
+    assert!(
+        !left.exists(),
+        "its stamp spent (a restart came between), the check reclaims it"
+    );
+    assert!(!home.exists(), "and its stamp");
+}
+
 /// The app-container lane end to end, over real curl (`github_e2e_tests.rs`).
 #[path = "github_e2e_tests.rs"]
 mod e2e;

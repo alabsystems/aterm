@@ -4,6 +4,7 @@
 //! `App` integration for the unified message center, band geometry sync, log persistence, and update/toolchain rows.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use aterm_messages::page::{self, act_feedback};
@@ -18,6 +19,20 @@ use crate::native_settings::SettingsRoute;
 use crate::toolchain_words::{self, HookDialect, SnapshotWords};
 use crate::update_words;
 use crate::{App, WindowId};
+
+/// Every center in this process shares one CSPRNG-seeded confirmation sequence.
+pub(crate) fn new_center(
+    log: aterm_messages::MessageLog,
+    now: Instant,
+) -> aterm_messages::MessageCenter {
+    static SOURCE: OnceLock<Arc<aterm_messages::ConfirmationSource>> = OnceLock::new();
+    let source = SOURCE.get_or_init(|| {
+        Arc::new(aterm_messages::ConfirmationSource::from_entropy(|bytes| {
+            aterm_uds::rand::fill(bytes).is_ok()
+        }))
+    });
+    aterm_messages::MessageCenter::with_confirmations(log, now, Arc::clone(source))
+}
 
 pub(crate) const MESSAGES_FLUSH_UI_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
 

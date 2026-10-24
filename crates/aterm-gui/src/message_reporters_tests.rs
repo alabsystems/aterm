@@ -946,6 +946,25 @@ fn every_reporter_message() -> Vec<Message> {
     all.push(gpu_lost());
     all.push(program_check_stuck(95, Some(90)));
     all.push(program_check_stuck(512, None));
+    {
+        let episode = aterm_vitals::jobs::HeldEpisode {
+            opened_ms: 60_000,
+            for_ms: 36_300_000,
+            peak: 3,
+            oldest_ms: 35_940_000,
+        };
+        for aterm in [0, 2] {
+            all.push(program_check_episode(HeldEdge::Opened(episode), aterm));
+            all.push(program_check_episode(
+                HeldEdge::Opened(aterm_vitals::jobs::HeldEpisode { peak: 1, ..episode }),
+                aterm,
+            ));
+        }
+        all.push(program_check_episode(
+            HeldEdge::Drained(aterm_vitals::jobs::HeldEpisode { peak: 1, ..episode }),
+            0,
+        ));
+    }
     all.extend(integration_lost_fixtures());
     all.push(integration_rekey_waits("in tab 2", "s-0123456789abcdef"));
     for place in ["in tab 2", "in window 12, tab 10", "in its tab"] {
@@ -3010,6 +3029,127 @@ fn the_disk_full_alert_says_what_ends_it() {
             moved.detail[2]
         );
         assert!(!moved.detail[2].contains(&figure), "{cause:?}");
+    }
+}
+
+/// THE DEVTOOLS ENTRY LEADS WITH THE LIVE WAIT WHILE ONE STANDS: for each step the live line
+/// takes the first line behind Details, the one every step keeps, in place of why the list
+/// matters, and the step's own lines follow it whole within `MORE_LINES`; a row already on has no
+/// switch-on line.
+#[test]
+fn the_devtools_entry_leads_with_the_live_wait_while_one_stands() {
+    use aterm_messages::exceptions::MORE_LINES;
+    use atpkg::devtools::Step;
+    let skips = aterm_containment::SpikeEvidence::MEASURED.devtool_skips_first_run_check;
+    let more = |step, live| {
+        let msg = super::devtools_entry(step, live)
+            .message()
+            .expect("the entry passes the digest rule");
+        msg.detail[2..].to_vec()
+    };
+    let nine = super::HeldLine {
+        count: 9,
+        oldest_ms: 35_940_000,
+    };
+    let words = "now: 9 programs aterm started wait for macOS's program check, the oldest 9 h 59 m";
+    assert_eq!(nine.words(), words);
+    assert_eq!(
+        super::HeldLine {
+            count: 1,
+            oldest_ms: 20_000
+        }
+        .words(),
+        "now: 1 program aterm started waits for macOS's program check, for 20 s"
+    );
+    for step in [Step::Add, Step::SwitchOn, Step::ListedOn] {
+        let plain = more(step, None);
+        let held = more(step, Some(nine));
+        assert_eq!(plain[0], atpkg::devtools::why(skips), "{step:?}");
+        assert_eq!(held[0], words, "{step:?}: the live line leads");
+        assert_eq!(
+            held[1..],
+            plain[1..],
+            "{step:?}: the step's own lines follow"
+        );
+        assert_eq!(
+            held.len(),
+            MORE_LINES,
+            "{step:?}: every line kept: {held:?}"
+        );
+        assert_eq!(
+            held.iter().any(|l| l.starts_with("Once it is on")),
+            step != Step::ListedOn,
+            "{step:?}: {held:?}"
+        );
+    }
+    assert_eq!(
+        more(Step::ListedOn, Some(nine))[1],
+        atpkg::devtools::HELPER_LISTED_ON
+    );
+}
+
+/// A BACKED-UP EPISODE OF MACOS'S PROGRAM CHECK IS A RECORD AT EACH EDGE: the opening says how
+/// many are held and the oldest, and, when aterm started none of them, that aterm's grant does
+/// not reach them; the drain says how long it lasted (at least its longest wait) and the most at
+/// once; both under the `program-check.` stem, never on any glass.
+#[test]
+fn a_held_episode_is_a_record_at_its_opening_and_its_drain() {
+    use super::HeldEdge;
+    let episode = aterm_vitals::jobs::HeldEpisode {
+        opened_ms: 60_000,
+        for_ms: 36_300_000,
+        peak: 3,
+        oldest_ms: 35_940_000,
+    };
+    let opened = super::program_check_episode(HeldEdge::Opened(episode), 2);
+    assert_eq!(opened.title, "macOS's program check is holding 3 programs");
+    assert_eq!(
+        opened.detail,
+        ["the oldest for 9 h 59 m; only this user's programs are counted"],
+        "aterm started some: its grant may reach them"
+    );
+    let outside = super::program_check_episode(HeldEdge::Opened(episode), 0);
+    assert_eq!(
+        outside.detail,
+        [
+            "the oldest for 9 h 59 m; only this user's programs are counted",
+            "they started outside aterm, so aterm's grant does not reach them"
+        ],
+        "aterm started none of them"
+    );
+    let drained = super::program_check_episode(HeldEdge::Drained(episode), 0);
+    assert_eq!(drained.title, "macOS's program check caught up");
+    assert_eq!(
+        drained.detail,
+        ["drained after 10 h 05 m, at most 3 programs held at once"]
+    );
+    let one = super::program_check_episode(
+        HeldEdge::Opened(aterm_vitals::jobs::HeldEpisode { peak: 1, ..episode }),
+        0,
+    );
+    assert_eq!(one.title, "macOS's program check is holding 1 program");
+    assert_eq!(
+        one.detail[1],
+        "it started outside aterm, so aterm's grant does not reach it"
+    );
+    let short = super::program_check_episode(
+        HeldEdge::Drained(aterm_vitals::jobs::HeldEpisode {
+            for_ms: 0,
+            peak: 1,
+            oldest_ms: 27_228,
+            ..episode
+        }),
+        0,
+    );
+    assert_eq!(
+        short.detail,
+        ["drained after 27 s, at most 1 program held at once"],
+        "an episode that spanned one reading drains after its longest wait"
+    );
+    for msg in [&opened, &outside, &drained, &one] {
+        assert!(matches!(msg.need(), aterm_messages::need::Need::Record));
+        assert_eq!(msg.key.as_deref(), Some(super::PROGRAM_CHECK_EPISODE_KEY));
+        assert!(super::PROGRAM_CHECK_EPISODE_KEY.starts_with("program-check."));
     }
 }
 

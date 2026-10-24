@@ -849,6 +849,11 @@ pub const AGY_ANCHORS: &[Anchor] = &[
         "Your AI credits balance is too low to continue",
         "1.4.0",
     ),
+    lit(
+        "agy.wall.network",
+        "There was a network issue connecting to the server",
+        "1.4.0",
+    ),
     lit("agy.subagent.approval", " needs approval for ", "1.4.0"),
     lit("agy.subagent.question", " has a question", "1.4.0"),
     lit(

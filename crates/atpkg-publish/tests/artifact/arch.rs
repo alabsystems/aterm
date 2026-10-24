@@ -1,9 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The arch gate: the reader over crafted headers, the claim checked against the bytes for
-//! every client target and every mismatch, and the tree gate the bundle lane runs over its
-//! `bin/`.
+//! Tests for binary header architecture gating across client targets and bundle trees.
 
 use std::path::{Path, PathBuf};
 
@@ -23,7 +21,6 @@ fn obj(format: Format, cpus: Vec<Cpu>) -> Object {
     Object { format, cpus }
 }
 
-/// One correctly built binary per client target, by name.
 fn per_target(dir: &Path) -> Vec<(Triple, PathBuf)> {
     [
         ("aarch64-apple-darwin", macho(CPU_ARM64)),
@@ -144,10 +141,6 @@ fn the_reader_agrees_with_the_host_about_a_real_binary() {
     assert!(read > 0, "a unix host carries /bin/sh");
 }
 
-/// Every client target's claim against every target's binary: the matching binary passes;
-/// one of another OS is a format mismatch (an arch word alone cannot see that an ELF does
-/// not exec on macOS); one of the same OS and another architecture is an architecture
-/// mismatch.
 #[test]
 fn every_claim_against_every_targets_binary_passes_only_its_own() {
     let tmp = scratch("arch-matrix");

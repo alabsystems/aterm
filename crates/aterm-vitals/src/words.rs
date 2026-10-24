@@ -1599,6 +1599,25 @@ fn network_details(snap: &Snapshot) -> Vec<Clause> {
         };
         out.push(Clause::new(1, forms));
     }
+    if let Some(tcp) = snap.net.as_ref().and_then(|n| n.tcp) {
+        let est = grouped(u64::from(tcp.established));
+        let lis = grouped(u64::from(tcp.listen));
+        let conn = plural(
+            u64::from(tcp.established),
+            "TCP connection established",
+            "TCP connections established",
+        );
+        out.push(
+            Clause::new(
+                2,
+                vec![
+                    format!("{est} TCP established, {lis} listening"),
+                    format!("{est} TCP"),
+                ],
+            )
+            .said(format!("{est} {conn}, {lis} listening.")),
+        );
+    }
     out
 }
 
@@ -2224,14 +2243,14 @@ mod tests {
     fn fig(now: f64) -> ScopeFig {
         ScopeFig {
             now: Some(now),
-            missing: None,
+            ..ScopeFig::default()
         }
     }
 
     fn missing(why: NoFigure) -> ScopeFig {
         ScopeFig {
-            now: None,
             missing: Some(why),
+            ..ScopeFig::default()
         }
     }
 
@@ -3375,6 +3394,20 @@ mod tests {
              Learning its peak: 1 of 24 hours read. No per-app figure. Steady near 9 percent. \
              Sending 0.3 of 22.9 megabytes per second. Wi-Fi en0, link 22.9 megabytes per \
              second."
+        );
+        s.net = Some(crate::NetView {
+            tcp: Some(crate::TcpCounts {
+                established: 14,
+                listen: 6,
+                time_wait: 3,
+                ..crate::TcpCounts::default()
+            }),
+            ..crate::NetView::default()
+        });
+        assert!(
+            row_sentence(Resource::Network, &s, Some(2), &MAC)
+                .ends_with("14 TCP connections established, 6 listening."),
+            "network row sentence reports TCP connection counts when present"
         );
 
         let mut s = snap();

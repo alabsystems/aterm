@@ -21,22 +21,9 @@ const STANDIN: &str = "#!/bin/sh\n\
     case \"$1\" in --version) echo '2.1.0 (Claude Code)'; exit 0 ;; esac\n\
     exec /bin/bash -c 'exec -a claude /bin/sh \"$HOME/fake.sh\" \"$HOME/screens\"'\n";
 
-/// The fake worker, in raw mode, drawing as Claude Code draws: a conversation
-/// (`ready.top`), then its framed composer (`rule`) holding what is typed,
-/// wrapped, the cursor after its last character. At `ready` the first Enter
-/// submits what was typed (the harness's LAND instruction) and draws the
-/// conversation with it and the worker's clean defense (`defense.top`), its
-/// composer empty again: `landed`. The submitted prompt is drawn as Claude
-/// Code draws one in the conversation — a `❯ ` row, wrapped at word
-/// boundaries onto rows indented two columns — and no busy frame comes
-/// between the Enter and the defense, so the harness knows its act was
-/// taken only by that row over the answer (`aterm_phase::answered_prompt`,
-/// the lab's measured `d1l` answer drawn faster than any read): a prompt
-/// split mid-word under a `> ` head reads as no answer, and the land act's
-/// defense would land nothing. There an Enter (the manager's follow-up)
-/// draws `box`; at `box` an Esc draws `back`. It reads what is there at once
-/// (raw mode returns what is pending), so a long instruction is drawn whole
-/// in one frame; end of input ends it.
+/// Fake raw-mode Claude worker: transitions `ready` -> `landed` (on LAND Enter,
+/// word-wrapping the submitted prompt under `❯ ` so `answered_prompt` matches) ->
+/// `box` (on follow-up Enter) -> `back` (on Esc).
 const FAKE: &str = r#"#!/bin/sh
 dir="$1"
 stty raw -echo
@@ -81,11 +68,8 @@ while :; do
 done
 "#;
 
-/// A wait for something that MUST happen (AGENTS.md: a hang detector).
 const HANG: Duration = Duration::from_secs(60);
-/// [`HANG`] as a server-side wait's bound.
 const HANG_MS: &str = "timeout=60000";
-/// The instance's width: every rule the screens draw is this wide.
 const COLUMNS: usize = 100;
 
 /// Claude Code's framed composer, empty, under `rows`; the cursor's row (0-based).
@@ -99,7 +83,6 @@ fn composed(rows: &[&str]) -> (Vec<String>, usize) {
     (out, caret)
 }
 
-/// The rows, then the cursor moved to `(row, col)` (0-based).
 fn render(rows: &[String], cursor: (usize, usize)) -> String {
     format!(
         "{}\x1b[{};{}H",
@@ -118,15 +101,12 @@ const TASK_TURN: [&str; 4] = [
     "⏺ Fixed the parser; the suite is green. The task is complete.",
     "",
 ];
-/// The worker's answer to the LAND instruction: a clean defense.
 const DEFENSE: [&str; 2] = [
     "⏺ Nothing left: the parser fix is verified, committed and on the remote main branch.",
     "",
 ];
-/// The follow-up the manager types.
 const FOLLOW_UP: &str = "go on with the docs";
 
-/// Write the fake and its three screens into the instance's scratch home.
 fn write_worker(home: &Path) {
     let dir = home.join("screens");
     std::fs::create_dir_all(&dir).expect("the screens' folder");
@@ -194,8 +174,6 @@ fn boot(tag: &str, held_ms: &str) -> Instance {
     )
 }
 
-/// Start a worker on `task` as session `manager` runs `aterm ctl @self spawn
-/// agent=claude -`, from the instance's work folder: its sid.
 fn spawn_worker(inst: &Instance, manager: &str, task: &str) -> String {
     let mut cmd = client_command(
         inst,
@@ -225,7 +203,6 @@ fn spawn_worker(inst: &Instance, manager: &str, task: &str) -> String {
         .to_string()
 }
 
-/// The worker as the instance sees it, for a failed wait.
 fn diagnosis(inst: &Instance, worker: &str) -> String {
     let ask = |args: &[&str]| String::from_utf8_lossy(&ctl(inst, args).stdout).into_owned();
     format!(
@@ -237,8 +214,6 @@ fn diagnosis(inst: &Instance, worker: &str) -> String {
     )
 }
 
-/// `aterm ctl await task <target> timeout=60000`: the one row it prints, or
-/// a panic with the worker's diagnosis.
 fn await_task(inst: &Instance, target: &str, worker: &str) -> String {
     let out = ctl(inst, &["await", "task", target, HANG_MS]);
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -255,7 +230,6 @@ fn await_task(inst: &Instance, target: &str, worker: &str) -> String {
         .to_string()
 }
 
-/// Undo the wire's pct-encoding.
 fn pct_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());

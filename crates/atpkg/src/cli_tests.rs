@@ -4616,6 +4616,31 @@ fn a_wanted_vendor_program_serves_the_seed_without_the_index() {
         &all_but_muse,
         &none
     ));
+    let opt_in = ["grok", "kimi"];
+    let only_opt_in = excluding(
+        programs()
+            .filter(|p| !opt_in.contains(&p.as_str()))
+            .collect(),
+    );
+    for triple in [darwin, "x86_64-unknown-linux-gnu"] {
+        assert!(
+            !vendor_set_wanted_on(triple, &only_opt_in, &none),
+            "grok and kimi land only when a person installs them ({triple})"
+        );
+    }
+    for program in opt_in {
+        assert!(!vendor_wanted(
+            &crate::config::PackagesConfig::default(),
+            &none,
+            program
+        ));
+    }
+    for program in ["claude", "codex", "codex-old", "agy", "muse", "ay"] {
+        assert!(
+            vendor_wanted(&crate::config::PackagesConfig::default(), &none, program),
+            "{program}"
+        );
+    }
 }
 
 #[test]
@@ -12871,5 +12896,42 @@ fn only_root_holds_a_relay_pass_back() {
     );
     for euid in [1, 501, 65534] {
         assert_eq!(super::relay_not_own_account_with(euid), None, "{euid}");
+    }
+}
+
+#[test]
+fn clt_install_aliases_are_recognized_by_atpkg_install() {
+    for alias in ["clt", "base.clt", "command-line-tools"] {
+        assert!(super::is_clt_alias(alias), "{alias}");
+    }
+    assert!(!super::is_clt_alias("trust"));
+    assert!(!super::is_clt_alias("claude"));
+
+    #[cfg(unix)]
+    {
+        let root = crate::testdir::dir("atpkg-clt-which-");
+        let shim = root.join("shim");
+        let developer = root.join("CommandLineTools");
+        std::fs::create_dir_all(&shim).unwrap();
+        let cc = shim.join("cc");
+        std::fs::write(&cc, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&cc, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let host = crate::prereq::CcHost {
+            shim_dir: Some(shim.clone()),
+            xcode_select_link: root.join("no-link"),
+            default_developer_dir: developer.clone(),
+            bound: std::time::Duration::from_secs(60),
+            tmp_root: root.to_path_buf(),
+        };
+        let clang = developer.join("usr/bin/clang");
+        std::fs::create_dir_all(clang.parent().unwrap()).unwrap();
+        std::fs::write(&clang, "").unwrap();
+        std::fs::set_permissions(&clang, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        for alias in ["clt", "base.clt", "command-line-tools"] {
+            let line =
+                super::clt_which_line(alias, Some(shim.as_os_str()), &host).expect("ready clt");
+            assert!(line.starts_with(&format!("{alias} → ")), "{line}");
+        }
     }
 }

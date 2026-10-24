@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A LINE AN ENTER SCROLLS UP KEEPS ITS LIGHT IN ITS ROW (the 2026-10-23 `enter-bottom` capture:
-//! the echo's core lay across the tops of `the quick brown fox` printed under it, `b`, `i` and
-//! `k` at 1.5:1 by the lab's local judge). Typed on the bottom row, a command's light is laid
-//! inside its row (the pane's last row has no row under it). Enter scrolls it up over the line it
-//! prints, and from the first frame after it, through the scroll's frame (which clears the
-//! probe) and the retract, no light lies on the printed line's ascenders. Driven at the host
-//! seam (`trail_host`, with the caret row's flanks sent as `app_render.rs` sends them). Control:
-//! an Enter that prints nothing leaves a blank row under the echo, and the same reading sees the
-//! free line's light reach into it.
+//! Tests that an echoed line scrolled up by Enter keeps its glow within its row.
 
 use crate::trail_host::{Pace, PacedHost};
 use std::time::Duration;
@@ -19,8 +11,6 @@ const COLS: usize = 72;
 const TYPED: &str = "echo the quick brown fox";
 const PRINTED: &str = "the quick brown fox";
 
-/// The light (pixels × opacity) the bed's quads lay on the top `share` of `row`'s band over
-/// columns `c0..c1`.
 fn on_top_of(h: &PacedHost, row: u16, share: f32, c0: usize, c1: usize) -> f32 {
     let (cw, ch) = (h.g.cw as f32, h.g.ch as f32);
     let y0 = f32::from(h.g.origin_y) + f32::from(row) * ch;
@@ -40,9 +30,6 @@ fn on_top_of(h: &PacedHost, row: u16, share: f32, c0: usize, c1: usize) -> f32 {
         .sum()
 }
 
-/// `seq 1 40` on the screen, `$ ` on the bottom row, `TYPED` at 60 ms a key, Enter 90 ms later,
-/// then `printed` (if any) and a new prompt. Each frame from Enter on for 700 ms, `(ms after
-/// Enter, the light on the top third of the row under the echo, the light in the echo's row)`.
 fn enter_at_the_bottom(printed: &str) -> Vec<(u64, f32, f32)> {
     let mut h = PacedHost::new(ROWS, COLS, Pace::Flat(16), false);
     h.c.flanks = true;

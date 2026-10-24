@@ -6,6 +6,8 @@
 use std::path::{Component, Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use aterm_agent::supervise::occupancy::{FactWord, NoteOutcome};
+
 use crate::SessionCtx;
 use crate::control::Scope;
 use crate::turn_ledger::TurnBy;
@@ -116,7 +118,7 @@ pub(crate) struct TaskRecord {
     pub(crate) result_bytes: u64,
     /// Path to the result file under [`tasks_dir`], if any.
     pub(crate) result_path: Option<PathBuf>,
-    /// Whether supervisor attention stands on the session.
+    /// Whether supervisor, `NEEDS YOU:` or codex-alab's own attention stands on the session ([`supervisor_attention`]).
     pub(crate) attention: bool,
     /// Wall-clock timestamp (unix ms) when the current state was entered.
     pub(crate) since_unix_ms: u64,
@@ -128,6 +130,13 @@ pub(crate) struct TaskRecord {
     pub(crate) agent: Option<aterm_phase::Program>,
     /// Canonical `cwd` trusted by the starter when spawning the worker.
     pub(crate) trusted_cwd: Option<String>,
+    /// THE FACT WORD the harness loop noted for a managed worker under the owner's `prompt`
+    /// ([`mark_session_task_fact`], `fact=`): the line it would have typed but for the manager.
+    /// Only the closed [`FactWord`] stands here; a mark never touches it.
+    pub(crate) fact: Option<FactWord>,
+    /// The fact word's own revision (`fact_rev=`): moved by every edit of [`Self::fact`], never by
+    /// a mark, and never moving [`Self::rev`], so no `await task` past a rev wakes on it.
+    pub(crate) fact_rev: u64,
 }
 
 impl TaskRecord {
@@ -155,7 +164,18 @@ impl TaskRecord {
             self.result_bytes
         );
         self.push_optional(&mut out);
+        self.push_fact(&mut out);
         out
+    }
+
+    /// ` fact=<word|-> fact_rev=<n>` once the fact word was ever edited (`fact_rev` past 0): a
+    /// record the harness never noted reads as it did before the word.
+    pub(crate) fn push_fact(&self, out: &mut String) {
+        if self.fact_rev == 0 {
+            return;
+        }
+        let word = self.fact.map_or_else(|| "-".to_string(), FactWord::word);
+        out.push_str(&format!(" fact={word} fact_rev={}", self.fact_rev));
     }
 
     /// ` why= exit= result_path=`, each only when set.
@@ -195,10 +215,24 @@ impl TaskRecord {
             out.push_str(" trusted_cwd=");
             out.push_str(&crate::control::pct_encode(folder));
         }
+        if self.fact_rev > 0 {
+            if let Some(word) = self.fact {
+                out.push_str(" fact=");
+                out.push_str(&word.word());
+            }
+            out.push_str(&format!(" fact_rev={}", self.fact_rev));
+        }
         out
     }
 
     /// Restores and validates a [`TaskRecord`] from a seamless-update carry row.
+    ///
+    /// The fact word crosses with its `fact_rev=` (absent, or not a number, reads 0), read as the
+    /// closed [`FactWord`] alone: a word that does not parse, or one with no rev past 0, reads
+    /// `None` and keeps the record. The successor's loop then finds the word its predecessor
+    /// noted standing, as after a plain restart, so noting the same episode again moves nothing
+    /// and wakes no `facts=1` waiter twice (`Session::door_task_seed` clears a word no open hold
+    /// stands for, under the owner's `prompt` alone).
     #[must_use]
     pub(crate) fn from_carry_row(
         row: &str,
@@ -217,6 +251,9 @@ impl TaskRecord {
         let since_unix_ms = field("since")?.parse::<u64>().ok()?;
         let age = std::time::Duration::from_millis(now_unix_ms.saturating_sub(since_unix_ms));
         let rev = field("rev")?.parse::<u64>().ok().filter(|rev| *rev > 0)?;
+        let fact_rev = field("fact_rev")
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(0);
         Some(Self {
             rev,
             state: TaskState::parse(field("state")?)?,
@@ -244,6 +281,10 @@ impl TaskRecord {
             entered: rev,
             agent: field("agent").and_then(worker_agent),
             trusted_cwd: field("trusted_cwd").and_then(trusted_folder),
+            fact: field("fact")
+                .filter(|_| fact_rev > 0)
+                .and_then(FactWord::parse),
+            fact_rev,
         })
     }
 }
@@ -380,6 +421,8 @@ impl TaskMark {
                 entered: 1,
                 agent: None,
                 trusted_cwd: None,
+                fact: None,
+                fact_rev: 0,
             };
             return (record, true);
         };
@@ -453,20 +496,26 @@ fn spelled_as_its_parts(path: &Path) -> bool {
     }
 }
 
+/// The attention owner codex-alab raises its own points left to a person under (a box it left unanswered, a wall, a login): a worker that carries itself, waiting on someone.
+pub(crate) const SELF_CLAIM_ATTENTION_OWNER: &str = "codex-alab";
+
+/// The attention owners whose entries move the task record's attention flag.
+const TASK_ATTENTION_OWNERS: [&str; 3] = [
+    crate::harness_host::ATTENTION_OWNER,
+    crate::harness_host::NEEDS_ATTENTION_OWNER,
+    SELF_CLAIM_ATTENTION_OWNER,
+];
+
 /// Whether an attention entry written by `owner` updates the task record's attention flag.
 pub(crate) fn owner_moves_task(owner: &str) -> bool {
-    owner == crate::harness_host::ATTENTION_OWNER
-        || owner == crate::harness_host::NEEDS_ATTENTION_OWNER
+    TASK_ATTENTION_OWNERS.contains(&owner)
 }
 
-/// Whether supervisor or worker `NEEDS YOU:` attention stands in `meta`.
+/// Whether supervisor, worker `NEEDS YOU:` or codex-alab's own attention stands in `meta`.
 pub(crate) fn supervisor_attention(meta: &crate::session_timeline::SessionMeta) -> bool {
-    [
-        crate::harness_host::ATTENTION_OWNER,
-        crate::harness_host::NEEDS_ATTENTION_OWNER,
-    ]
-    .iter()
-    .any(|owner| meta.attention_owners.get(owner).is_some())
+    TASK_ATTENTION_OWNERS
+        .iter()
+        .any(|owner| meta.attention_owners.get(owner).is_some())
 }
 
 /// Error returned when a mark times out waiting on a committing update's session fence.
@@ -534,6 +583,25 @@ pub(crate) struct MarkedWith {
     pub(crate) attention_moved: bool,
 }
 
+/// [`mark_session_task_within`] applied only when `when` holds on the session's whole timeline (its record and its task face, read together under the lock the mark takes).
+pub(crate) fn mark_session_task_seen(
+    ctx: &SessionCtx,
+    local_id: u64,
+    mark: &TaskMark,
+    fence_wait: std::time::Duration,
+    when: impl FnOnce(&crate::session_timeline::SessionTimeline) -> bool,
+) -> Result<Option<(TaskRecord, bool)>, MarkFenced> {
+    let marked = mark_on_timeline(
+        ctx,
+        local_id,
+        Some(mark),
+        AttentionEdit::Keep,
+        fence_wait,
+        |timeline, _| when(timeline),
+    )?;
+    Ok(marked.and_then(|m| m.record.map(|record| (record, m.moved))))
+}
+
 /// Atomically applies `mark` and `attention` under the session timeline lock when `when` holds.
 pub(crate) fn mark_session_task_with(
     ctx: &SessionCtx,
@@ -543,13 +611,32 @@ pub(crate) fn mark_session_task_with(
     fence_wait: std::time::Duration,
     when: impl FnOnce(Option<&TaskRecord>, Option<&str>) -> bool,
 ) -> Result<Option<MarkedWith>, MarkFenced> {
+    mark_on_timeline(
+        ctx,
+        local_id,
+        mark,
+        edit,
+        fence_wait,
+        |timeline, standing| when(timeline.task(), standing),
+    )
+}
+
+/// [`mark_session_task_with`], its `when` reading the whole timeline.
+fn mark_on_timeline(
+    ctx: &SessionCtx,
+    local_id: u64,
+    mark: Option<&TaskMark>,
+    edit: AttentionEdit<'_>,
+    fence_wait: std::time::Duration,
+    when: impl FnOnce(&crate::session_timeline::SessionTimeline, Option<&str>) -> bool,
+) -> Result<Option<MarkedWith>, MarkFenced> {
     let outcome = ctx
         .fabric
         .run_unfenced(fence_wait, || {
             let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
             let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             let owner = crate::harness_host::ATTENTION_OWNER;
-            if !when(timeline.task(), meta.attention_owners.get(owner)) {
+            if !when(&timeline, meta.attention_owners.get(owner)) {
                 return None;
             }
             let attention_moved = match edit {
@@ -603,6 +690,64 @@ pub(crate) fn mark_session_task_with(
         crate::harness_host::ring();
     }
     Ok(outcome)
+}
+
+/// THE FACT WORD'S EDIT (`fact=`, the occupancy design's manager door): `word` set on
+/// `ctx`'s task record, or cleared with `None`, under the lock a mark takes
+/// ([`mark_session_task_with`]) and the fence a committing update holds (waiting at most
+/// `fence_wait`). It moves [`TaskRecord::fact_rev`] alone, never `rev`, `entered`, `since` or
+/// `state`, so every `await task` past a rev and `result`'s repair CAS read the record as before;
+/// a waiter that asked for facts (`facts=1`) and the session's `EVENT … task` see it. A word
+/// already standing is noted again without a move, and a clear with none standing moves nothing.
+///
+/// [`NoteOutcome::NoTask`] with no record, [`NoteOutcome::Closed`] for a word on an `exited`
+/// record (a clear is always taken), [`NoteOutcome::Fenced`] when the fence held past
+/// `fence_wait`. The caller gates on the owner's mode ([`crate::occupancy_host::prompt_now`]).
+pub(crate) fn mark_session_task_fact(
+    ctx: &SessionCtx,
+    local_id: u64,
+    word: Option<FactWord>,
+    fence_wait: std::time::Duration,
+) -> NoteOutcome {
+    let edited = ctx.fabric.run_unfenced(fence_wait, || {
+        let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        let edited = timeline.note_task_fact(word);
+        timeline.slog_take_wake();
+        edited
+    });
+    let Some((outcome, moved)) = edited else {
+        return NoteOutcome::Fenced;
+    };
+    if moved {
+        crate::presence::post_task_changed(local_id);
+    }
+    outcome
+}
+
+/// What [`TaskRecord`] the fact edit `word` makes of `current`, and the outcome: `None` for no
+/// move ([`mark_session_task_fact`]'s rules).
+pub(crate) fn fact_edit(
+    current: &TaskRecord,
+    word: Option<FactWord>,
+) -> (NoteOutcome, Option<TaskRecord>) {
+    let outcome = if word.is_some() {
+        NoteOutcome::Noted
+    } else {
+        NoteOutcome::Cleared
+    };
+    if word.is_some() && current.state == TaskState::Exited {
+        return (NoteOutcome::Closed, None);
+    }
+    if current.fact == word {
+        return (outcome, None);
+    }
+    let mut next = current.clone();
+    next.fact = word;
+    next.fact_rev = next.fact_rev.saturating_add(1);
+    if crate::occupancy_host::fault::armed(crate::occupancy_host::fault::Fault::NoteBumpsNews) {
+        next.rev = next.rev.saturating_add(1);
+    }
+    (outcome, Some(next))
 }
 
 /// Reopens a finished worker's task to `working` when a new turn is sent to it.
@@ -820,8 +965,9 @@ pub(crate) enum Combine {
 pub(crate) const MAX_AWAIT_TARGETS: usize = 64;
 
 /// Usage error line for `await task`.
-pub(crate) const AWAIT_TASK_USAGE: &str = "ERR usage: await task [@<sel>[:<rev>][,@<sel>…]] \
-     [any|all] [since=<rev>] [timeout=<ms>]\n";
+pub(crate) const AWAIT_TASK_USAGE: &str = "ERR usage: await task \
+     [@<sel>[:<rev>[:<fact_rev>]][,@<sel>…]] [any|all] [since=<rev>] [facts=1 \
+     [fact_since=<fact_rev>]] [timeout=<ms>]\n";
 
 /// Single target selector and optional per-target `since` revision for `await task`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -830,6 +976,8 @@ pub(crate) struct TargetArg {
     pub(crate) selector: String,
     /// Per-target `since` revision override.
     pub(crate) since: Option<u64>,
+    /// Per-target `fact_since` override (`@<sel>:<rev>:<fact_rev>`, with `facts=1` only).
+    pub(crate) fact_since: Option<u64>,
 }
 
 /// Parsed `await task` arguments.
@@ -841,6 +989,12 @@ pub(crate) struct AwaitTaskArgs {
     pub(crate) combine: Combine,
     /// Default `since` revision for targets without an explicit `:rev`.
     pub(crate) since: Option<u64>,
+    /// `facts=1`: a fact word noted past a target's fact edge is news too
+    /// ([`TaskRecord::fact_rev`]).
+    pub(crate) facts: bool,
+    /// Default fact edge (`fact_since=`) for targets without an explicit `:<fact_rev>`: else the
+    /// target's `fact_rev` when the wait parks.
+    pub(crate) fact_since: Option<u64>,
     /// Optional timeout in milliseconds.
     pub(crate) timeout_ms: Option<u64>,
 }
@@ -852,6 +1006,8 @@ pub(crate) fn parse_await_task(words: &[&str], list: bool) -> Result<AwaitTaskAr
         targets: Vec::new(),
         combine: Combine::Any,
         since: None,
+        facts: false,
+        fact_since: None,
         timeout_ms: None,
     };
     let (mut combine_seen, mut list_seen) = (false, false);
@@ -864,11 +1020,21 @@ pub(crate) fn parse_await_task(words: &[&str], list: bool) -> Result<AwaitTaskAr
             list_seen = true;
             for element in word.split(',') {
                 let body = element.strip_prefix('@').ok_or_else(usage)?;
-                let (selector, since) = match body.split_once(':') {
-                    Some((selector, rev)) => {
-                        (selector, Some(rev.parse::<u64>().map_err(|_| usage())?))
+                let (selector, since, fact_since) = match body.split_once(':') {
+                    Some((selector, revs)) => {
+                        let (rev, fact) = match revs.split_once(':') {
+                            Some((rev, fact)) => {
+                                (rev, Some(fact.parse::<u64>().map_err(|_| usage())?))
+                            }
+                            None => (revs, None),
+                        };
+                        (
+                            selector,
+                            Some(rev.parse::<u64>().map_err(|_| usage())?),
+                            fact,
+                        )
                     }
-                    None => (body, None),
+                    None => (body, None, None),
                 };
                 if !aterm_types::control_verbs::selector_body_names_something(selector) {
                     return Err(format!("{}\n", aterm_types::control_verbs::EMPTY_SELECTOR));
@@ -881,6 +1047,7 @@ pub(crate) fn parse_await_task(words: &[&str], list: bool) -> Result<AwaitTaskAr
                 args.targets.push(TargetArg {
                     selector: selector.to_string(),
                     since,
+                    fact_since,
                 });
             }
         } else if matches!(word, "any" | "all") {
@@ -898,6 +1065,16 @@ pub(crate) fn parse_await_task(words: &[&str], list: bool) -> Result<AwaitTaskAr
                 return Err(usage());
             }
             args.since = Some(rev.parse::<u64>().map_err(|_| usage())?);
+        } else if word == "facts=1" {
+            if args.facts {
+                return Err(usage());
+            }
+            args.facts = true;
+        } else if let Some(rev) = word.strip_prefix("fact_since=") {
+            if args.fact_since.is_some() {
+                return Err(usage());
+            }
+            args.fact_since = Some(rev.parse::<u64>().map_err(|_| usage())?);
         } else {
             let value = match word.strip_prefix("timeout=") {
                 Some(value) => value,
@@ -910,10 +1087,16 @@ pub(crate) fn parse_await_task(words: &[&str], list: bool) -> Result<AwaitTaskAr
             args.timeout_ms = Some(aterm_control::wire::wait_ms(value).ok_or_else(usage)?);
         }
     }
+    let fact_edge =
+        args.fact_since.is_some() || args.targets.iter().any(|t| t.fact_since.is_some());
+    if fact_edge && !args.facts {
+        return Err(usage());
+    }
     Ok(args)
 }
 
-/// Formats a single `await task` reply row.
+/// Formats a single `await task` reply row (` fact= fact_rev=` at its end once the record's fact
+/// word was ever edited, [`TaskRecord::push_fact`]).
 #[must_use]
 pub(crate) fn await_row(
     sid: &str,
@@ -925,9 +1108,13 @@ pub(crate) fn await_row(
     let (rev, state, result_bytes) =
         record.map_or((0, "-", 0), |r| (r.rev, r.state.as_str(), r.result_bytes));
     let state = if closed { "closed" } else { state };
-    format!(
+    let mut row = format!(
         "@{sid} rev={rev} state={state} agent={agent} attention={attention} result_bytes={result_bytes}"
-    )
+    );
+    if let Some(record) = record {
+        record.push_fact(&mut row);
+    }
+    row
 }
 
 /// Formats `task_state=` and `task_rev=` tokens for `status` and `sessions`.

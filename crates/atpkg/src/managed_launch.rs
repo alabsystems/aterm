@@ -116,6 +116,7 @@ fn package_root(target: &Path) -> Option<PathBuf> {
     Some(root)
 }
 
+// A captured dev image can outlive its link marker; `producer_target` confers route authority.
 /// A captured dev image can outlive its link marker: publication of B must not revoke
 /// raw A's resume route. Its physical bytes are evidence only of the running image;
 /// the independently configured current producer below confers route authority.

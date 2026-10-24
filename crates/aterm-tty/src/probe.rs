@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The capability probe (docs/DESIGN-amacs-2026-10-19.md §5.2).
+//! Terminal capability probe.
 
 use std::io;
 use std::time::Duration;
@@ -10,32 +10,31 @@ use crate::decode::{Decoder, Event, ModeState, Reply};
 use crate::signals::Signals;
 use crate::tty::{Readiness, Tty};
 
-/// How long the probe waits for the terminal's DA1.
+/// How long the probe waits for DA1.
 pub const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// The probe's one write: XTVERSION, kitty's flags, DECRQM for 2026, 2048, 1004 and 2004, and DA1
-/// last.
+/// Probe query: XTVERSION, kitty flags, DECRQM (2026, 2048, 1004, 2004), and DA1.
 pub const QUERY: &[u8] = b"\x1b[>0q\x1b[?u\x1b[?2026$p\x1b[?2048$p\x1b[?1004$p\x1b[?2004$p\x1b[c";
 
-/// What the terminal said it can do.
+/// Terminal capabilities reported by [`probe`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Caps {
-    /// It reported kitty keyboard flags, so it takes a kitty push.
+    /// Supports kitty keyboard protocol push.
     pub kitty: bool,
-    /// DEC 2026: frames can be synchronized updates.
+    /// Supports DEC 2026 synchronized updates.
     pub sync_2026: bool,
-    /// DEC 2048: resizes can come in band, as reports.
+    /// Supports DEC 2048 in-band resize reports.
     pub resize_2048: bool,
-    /// DEC 1004: focus changes can be reported.
+    /// Supports DEC 1004 focus reports.
     pub focus: bool,
-    /// DEC 2004: pastes can be bracketed.
+    /// Supports DEC 2004 bracketed paste.
     pub paste: bool,
-    /// Its XTVERSION name: aterm says `aterm(<version>)`.
+    /// XTVERSION name (`aterm(<version>)` on aterm).
     pub name: Option<String>,
 }
 
 impl Caps {
-    /// Read one reply in; `true` for DA1, the last.
+    /// Record one reply; returns `true` on DA1.
     fn read(&mut self, reply: Reply) -> bool {
         match reply {
             Reply::Version(name) => self.name = Some(name),
@@ -59,20 +58,17 @@ impl Caps {
     }
 }
 
-/// What [`probe`] learned, and what arrived for the caller's loop while it waited.
+/// Probe results and events or signals received while waiting.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Probed {
     pub caps: Caps,
-    /// The events read that were not the probe's replies (typeahead, a resize report), in order.
+    /// Non-reply events (typeahead, resize reports) read during the probe, in order.
     pub events: Vec<Event>,
-    /// The signals taken meanwhile, to be handled as if the loop had taken them: after
-    /// [`Signals::CONT`] the terminal is raw again and wants a repaint; after [`Signals::WINCH`], a
-    /// new size.
+    /// Signals taken during the probe (`CONT` restores raw mode; `WINCH` updates size).
     pub signals: Signals,
 }
 
-/// Ask the terminal what it can do, reading its replies through `decoder` until DA1 or
-/// [`PROBE_TIMEOUT`] (on the terminal's clock).
+/// Query terminal capabilities through `decoder` until DA1 or [`PROBE_TIMEOUT`].
 /// # Errors
 /// The write's or a read's OS error, or setting the terminal raw again after a SIGCONT.
 pub fn probe<T: Tty + ?Sized>(tty: &mut T, decoder: &mut Decoder) -> io::Result<Probed> {
@@ -121,7 +117,6 @@ mod tests {
         }
     }
 
-    /// aterm's own engine answering the probe.
     fn aterm_replies(setup: &[u8]) -> Vec<u8> {
         let mut term = Terminal::new(24, 80);
         term.process(setup);

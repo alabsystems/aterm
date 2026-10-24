@@ -736,11 +736,11 @@ impl KittyFixtures {
     }
 }
 
-/// Render one deterministic classic companion and return its sprite and first atlas texel.
+/// Render one deterministic classic companion and return its sprite and its art's first texel.
 fn installed_custom_kitty_projection(
     app: &mut crate::App,
     wid: crate::WindowId,
-) -> (aterm_core::render::FreeSprite, [u8; 4]) {
+) -> (aterm_render::sprites::FreeSprite, [u8; 4]) {
     let (cell_w, cell_h) = app
         .spawn_cell_px(wid)
         .expect("headless renderer has admitted cell metrics");
@@ -775,11 +775,8 @@ fn installed_custom_kitty_projection(
         .expect("installed custom kitty emits");
     assert_ne!(fp, 0, "custom kitty contributes a repaint identity");
     assert_eq!(free.len(), 1, "custom source emits one body");
-    let sprite = free[0];
-    let atlas = ws.fx.decos_mut().free_atlas().expect("custom kitty atlas");
-    let offset = (usize::from(sprite.ay) * atlas.width as usize + usize::from(sprite.ax)) * 4;
-    let pixel =
-        <[u8; 4]>::try_from(&atlas.rgba[offset..offset + 4]).expect("addressed custom atlas texel");
+    let sprite = free[0].clone();
+    let pixel = <[u8; 4]>::try_from(&sprite.art.data()[..4]).expect("the art's first texel");
     (sprite, pixel)
 }
 

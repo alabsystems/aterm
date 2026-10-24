@@ -86,12 +86,6 @@ fn combining_and_presentation_changes_advance_content_generation() {
     }
 }
 
-/// A combining mark with no preceding cell is kept on the cell under the
-/// cursor, so it is a content change and `content_seq` moves.
-///
-/// Unicode 16.0 §3 D57: a defective combining sequence is not ill-formed and
-/// may be presented as if the mark were a base character; xterm and iTerm2
-/// both keep it. A zero-width mark never advances the cursor.
 #[test]
 fn combining_without_a_preceding_cell_is_kept_and_advances_content() {
     let mut term = Terminal::new(8, 48);
@@ -113,7 +107,6 @@ fn combining_without_a_preceding_cell_is_kept_and_advances_content() {
     );
 }
 
-/// `abc` + CR + U+0301 accents the 'a' and bumps `content_seq`.
 #[test]
 fn combining_after_carriage_return_accents_the_first_cell() {
     let mut term = Terminal::new(8, 48);

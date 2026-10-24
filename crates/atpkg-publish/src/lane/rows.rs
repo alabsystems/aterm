@@ -42,7 +42,6 @@ pub fn unproven(m: &PkgManifest) -> BTreeSet<Triple> {
 /// A manifest this lane staged (unsigned, on local disk), read into the client's type.
 ///
 /// # Errors
-///
 /// A refusal when it cannot be read or does not parse.
 pub fn local(path: &Path) -> Result<PkgManifest> {
     let text = std::fs::read_to_string(path)

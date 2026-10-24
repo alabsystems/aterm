@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aterm_agent::supervise::approvals::{RULE_POINT, RULE_TASK_DONE, TASK_DONE};
 use aterm_agent::supervise::policy::needs::NEEDS_ACK;
@@ -4033,6 +4033,121 @@ fn at_composer(door: &Door<'_>, sid: &str, agent: &str) -> Option<String> {
     crate::screen::composer_row(agent, &on(door, sid, &["text"]))
 }
 
+/// A hang detector for a tab coming to its agent's empty composer ([`empty_composer`]): a
+/// minute in which the tab's screen did not change, never a budget, since a starved agent may
+/// take minutes to draw.
+const COMPOSER_HANG: Duration = Duration::from_secs(60);
+
+/// How a wait for an agent's empty composer ended ([`composer_wait`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ComposerWait {
+    /// The composer stood empty.
+    Ready,
+    /// The composer held text before the lab typed anything: input no one gave reached the
+    /// agent (a terminal's reply read as keys, say), a real failure, reported at once.
+    Draft(String),
+    /// An editor held the tab before the lab typed anything (its status row): input no one
+    /// gave opened it, a real failure, reported at once.
+    Editor(String),
+    /// The screen stood unchanged [`COMPOSER_HANG`] with no empty composer: a hang.
+    Hung,
+}
+
+impl ComposerWait {
+    /// Why the wait failed, for `agent` (`None`: it did not).
+    fn why(&self, agent: &str) -> Option<String> {
+        match self {
+            Self::Ready => None,
+            Self::Draft(text) => Some(format!(
+                "{agent}'s composer held a draft no one typed before its prompt: {text:?}"
+            )),
+            Self::Editor(row) => Some(format!(
+                "an editor held {agent}'s tab before its prompt, opened by no one's keys: {row:?}"
+            )),
+            Self::Hung => Some(format!(
+                "{agent} never stood at an empty composer: its screen stood unchanged {} s",
+                COMPOSER_HANG.as_secs()
+            )),
+        }
+    }
+}
+
+/// What one look at a tab found ([`composer_wait`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Stand {
+    /// The agent's composer, its first row holding this text (empty: nothing in it).
+    Composer(String),
+    /// An editor holding the tab, its status row ([`crate::screen::editor_row`]).
+    Editor(String),
+    /// Neither: the agent is still starting.
+    Starting,
+}
+
+/// Looks at a tab until its composer stands empty: each `look` gives the screen (any value that
+/// changes when the screen does) and what stands on it. A composer holding text or an editor
+/// holding the tab ends it at once ([`ComposerWait::Draft`], [`ComposerWait::Editor`]); a screen
+/// that stood unchanged `hang` with neither ends it as a hang; `pause` waits between looks and
+/// says the time.
+///
+/// # Errors
+/// The run was interrupted.
+fn composer_wait<S: PartialEq>(
+    mut look: impl FnMut() -> (S, Stand),
+    hang: Duration,
+    start: Instant,
+    mut pause: impl FnMut() -> Result<Instant, stop::Stopped>,
+) -> Result<ComposerWait, stop::Stopped> {
+    let mut still: Option<(S, Instant)> = None;
+    let mut now = start;
+    loop {
+        let (screen, stand) = look();
+        match stand {
+            Stand::Composer(text) if text.is_empty() => return Ok(ComposerWait::Ready),
+            Stand::Composer(text) => return Ok(ComposerWait::Draft(text)),
+            Stand::Editor(row) => return Ok(ComposerWait::Editor(row)),
+            Stand::Starting => {}
+        }
+        let since = match still.take() {
+            Some((seen, since)) if seen == screen => {
+                still = Some((seen, since));
+                since
+            }
+            _ => {
+                still = Some((screen, now));
+                now
+            }
+        };
+        if now.saturating_duration_since(since) >= hang {
+            return Ok(ComposerWait::Hung);
+        }
+        now = pause()?;
+    }
+}
+
+/// Waits for `agent`'s empty composer in tab `sid` ([`composer_wait`] over `ctl text`, looking
+/// every 100 ms).
+///
+/// # Errors
+/// The run was interrupted.
+fn empty_composer(door: &Door<'_>, sid: &str, agent: &str) -> Result<ComposerWait, Fail> {
+    Ok(composer_wait(
+        || {
+            let text = on(door, sid, &["text"]);
+            let stand = match crate::screen::composer_row(agent, &text) {
+                Some(row) => Stand::Composer(row),
+                None => crate::screen::editor_row(&text).map_or(Stand::Starting, Stand::Editor),
+            };
+            (text, stand)
+        },
+        COMPOSER_HANG,
+        Instant::now(),
+        || {
+            stop::sleep(Duration::from_millis(100))?;
+            Ok(Instant::now())
+        },
+    )?)
+}
+
 fn tab_turn(door: &Door<'_>, sid: &str, agent: &str, text: &str) -> Result<bool, Fail> {
     let at = format!("@{sid}");
     if door.ctl(&[&at, "send", text])?.code != 0 {
@@ -5560,14 +5675,8 @@ fn agent_again(
     let _ = on(door, &tab.sid, &["send", &line]);
     let _ = on(door, &tab.sid, &["key", "enter"]);
     let launched_ms = now_ms();
-    let ready = crate::wait_until(Duration::from_secs(90), || {
-        at_composer(door, &tab.sid, to.name()).is_some_and(|c| c.is_empty())
-    });
-    if !ready {
-        return give_up(format!(
-            "{} never stood at an empty composer within 90 s",
-            to.name()
-        ));
+    if let Some(why) = empty_composer(door, &tab.sid, to.name())?.why(to.name()) {
+        return give_up(why);
     }
     stop::sleep(Duration::from_secs(1))?;
     let prompt_ms = now_ms();
@@ -6128,18 +6237,11 @@ fn run_check(
         );
     }
     for tab in &mut tabs {
-        let ready = crate::wait_until(Duration::from_secs(90), || {
-            at_composer(&door, &tab.sid, h.name()).is_some_and(|c| c.is_empty())
-        });
-        if !ready {
+        if let Some(why) = empty_composer(&door, &tab.sid, h.name())?.why(h.name()) {
             for l in tail_rows(&door, &tab.sid, 12) {
                 println!("    | {l}");
             }
-            return Err(could_not(&format!(
-                "{} never stood at an empty composer in {} within 90 s",
-                h.name(),
-                tab.chain.name()
-            )));
+            return Err(could_not(&format!("{why}, in {}", tab.chain.name())));
         }
         stop::sleep(Duration::from_secs(1))?;
         let opening = tab.chain.opening();

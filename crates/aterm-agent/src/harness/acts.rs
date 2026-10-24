@@ -241,6 +241,69 @@ pub fn relaunch_act(row: &str, step: &str) -> Option<String> {
     (!rule.is_empty()).then_some(rule)
 }
 
+/// How long one of the harness's own labels lasts (`ttl=`, seconds): its moment's words, gone
+/// before the work beneath them grows old.
+pub const HARNESS_LABEL_TTL_S: u64 = 30;
+
+/// The harness's label once it relaunched a session's agent.
+pub const RESTARTING_LABEL: &str = "restarting";
+
+/// The harness's label once it typed its resume after a full disk.
+pub const DISK_RESUME_LABEL: &str = "resuming after disk";
+
+/// The harness's label once it typed its carry-on after a usage wall.
+pub const LIMIT_RESUME_LABEL: &str = "resuming after limit";
+
+const UPGRADING_LABEL: &str = "upgrading";
+
+/// The longest version an `upgrading to <ver>` label names: 32 graphemes in all, the `mark`
+/// verb's bound on a label.
+const LABEL_VERSION_MAX: usize = 19;
+
+/// The harness's own label for a hosted lane's row `row` at its `step`, once a new agent came up
+/// ([`super::upgrade_drive::started`]): `upgrading to <ver>` for an upgrade's restart (`to`, the
+/// build it moved to, without its build metadata or the `(<source>)` the drive's rows add;
+/// `upgrading` when that is not a version), `restarting` for any other; `None` for a step that
+/// started nothing. The words are closed templates and a version's characters, never the
+/// worker's text.
+#[must_use]
+pub fn relaunch_label(row: &str, step: &str, to: &str) -> Option<String> {
+    if !super::upgrade_drive::started(step) {
+        return None;
+    }
+    if !matches!(row, "upgrade" | "upgrade-at-break") {
+        return Some(RESTARTING_LABEL.to_string());
+    }
+    let ver = to.split(['+', '(']).next().unwrap_or_default();
+    let named = ver.len() <= LABEL_VERSION_MAX
+        && ver.bytes().any(|b| b.is_ascii_digit())
+        && ver
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'));
+    Some(if named {
+        format!("{UPGRADING_LABEL} to {ver}")
+    } else {
+        UPGRADING_LABEL.to_string()
+    })
+}
+
+/// The label the loop writes beside a ledger row of its own (`rule_id`, `outcome`): its
+/// carry-on after a usage wall; `None` for every other row.
+#[must_use]
+pub fn loop_label(rule_id: &str, outcome: Outcome) -> Option<&'static str> {
+    (outcome == Outcome::Typed && rule_id == RULE_LIMIT_RESUME).then_some(LIMIT_RESUME_LABEL)
+}
+
+/// The `mark` verb's arguments after `mark -` for the harness's label `words`:
+/// `label text=<pct> ttl=<HARNESS_LABEL_TTL_S>`.
+#[must_use]
+pub fn label_mark(words: &str) -> String {
+    format!(
+        "label text={} ttl={HARNESS_LABEL_TTL_S}",
+        aterm_codec::pct::encode(words)
+    )
+}
+
 const RULE_APPROVE_ALL: &str = "approve-all@v1";
 /// Codex-alab's re-exec onto a re-linked build (the proof's `upgrade` leg).
 pub const RULE_UPGRADE: &str = "upgrade@v1";
@@ -670,6 +733,108 @@ mod tests {
         let long = format!("{}@v1 x", "r".repeat(60));
         let mark = log_mark(&long, Outcome::Escalated, "").expect("an escalation");
         assert_eq!(mark, format!("act word=escalate rule={}", "r".repeat(40)));
+    }
+
+    /// The harness labels only its own moments, in closed words: a restart once a new agent came
+    /// up (an upgrade's naming the build it moved to), and the loop's carry-on after a usage wall;
+    /// every label fits the `mark` verb's 32 graphemes and 40 bytes, and goes on the wire as one
+    /// `text=` word.
+    #[test]
+    fn the_harness_labels_its_own_moments_in_closed_words() {
+        let cases = [
+            ("relaunch", "relaunched", "2.1.0", Some("restarting")),
+            ("relaunch", "adopted", "-", Some("restarting")),
+            (
+                "carry-on-after-update",
+                "done:fresh",
+                "2.1.0",
+                Some("restarting"),
+            ),
+            (
+                "self-claimed-relaunch",
+                "relaunched",
+                "",
+                Some("restarting"),
+            ),
+            ("restart:account", "relaunched", "2.1.0", Some("restarting")),
+            (
+                "upgrade",
+                "relaunched",
+                "2.1.304",
+                Some("upgrading to 2.1.304"),
+            ),
+            (
+                "upgrade",
+                "relaunched",
+                "2.2.0(npm)",
+                Some("upgrading to 2.2.0"),
+            ),
+            ("upgrade", "relaunched", "(npm)", Some("upgrading")),
+            (
+                "upgrade",
+                "done:unconfirmed",
+                "0.164.0-dev.12521+g3d3eb12d8",
+                Some("upgrading to 0.164.0-dev.12521"),
+            ),
+            (
+                "upgrade-at-break",
+                "adopted",
+                "2.1.304",
+                Some("upgrading to 2.1.304"),
+            ),
+            ("upgrade", "relaunched", "-", Some("upgrading")),
+            ("upgrade", "relaunched", "2.1.304 ; rm", Some("upgrading")),
+            (
+                "upgrade",
+                "relaunched",
+                "1.2.3-a-very-long-pre-release",
+                Some("upgrading"),
+            ),
+            ("relaunch", "wait:held", "2.1.0", None),
+            ("carry-on", "continued", "2.1.0", None),
+            ("upgrade-at-break", "announced:1", "2.1.304", None),
+            ("carry-restart", "terminated", "2.1.0", None),
+            ("restart:account", "exited", "2.1.0", None),
+        ];
+        for (row, step, to, want) in cases {
+            assert_eq!(
+                relaunch_label(row, step, to).as_deref(),
+                want,
+                "{row} {step} {to}"
+            );
+        }
+        assert_eq!(
+            loop_label(RULE_LIMIT_RESUME, Outcome::Typed),
+            Some(LIMIT_RESUME_LABEL)
+        );
+        for (rule, outcome) in [
+            (RULE_LIMIT_RESUME, Outcome::Waiting),
+            (RULE_LIMIT_RESUME, Outcome::Skipped),
+            (RULE_CONTINUE, Outcome::Typed),
+            (RULE_API_RETRY, Outcome::Typed),
+            (RULE_LOGIN_BACK, Outcome::Typed),
+            (RULE_LAND, Outcome::Typed),
+        ] {
+            assert_eq!(loop_label(rule, outcome), None, "{rule} {outcome:?}");
+        }
+        assert_eq!(
+            label_mark(LIMIT_RESUME_LABEL),
+            "label text=resuming%20after%20limit ttl=30"
+        );
+        for words in [
+            RESTARTING_LABEL,
+            DISK_RESUME_LABEL,
+            LIMIT_RESUME_LABEL,
+            "upgrading to 0.164.0-dev.12521",
+            "upgrading to 1234567890123456789",
+        ] {
+            assert!(
+                words.len() <= 40 && words.chars().count() <= 32,
+                "{words}: within the mark verb's label bound"
+            );
+            assert!(!label_mark(words).contains("  "), "{words}");
+            assert_eq!(label_mark(words).split(' ').count(), 3, "{words}");
+        }
     }
 
     #[test]

@@ -21,6 +21,7 @@ pub mod animate;
 pub(crate) mod carry;
 pub(crate) mod center;
 pub mod chrome;
+mod confirmations;
 pub(crate) mod digest;
 pub mod drive;
 pub mod exceptions;
@@ -50,6 +51,7 @@ pub use carry::{CarriedMessage, Carry};
 pub use center::{
     CatchUp, DigestSync, Echo, EchoKind, Live, MessageCenter, Outcome, PostOutcome, Posted, Settled,
 };
+pub use confirmations::ConfirmationSource;
 pub use digest::{DigestEntry, DigestView, RECENT_FILED, ReportScope, report as exceptions_report};
 pub use glass::{CapsuleLayout, CapsuleRole, Hit, Links, Presentation, RowKind, RowLayout};
 pub use log::{CodecError, LogLine, LogRecord, LogState, MessageLog, Retired, Shelf};

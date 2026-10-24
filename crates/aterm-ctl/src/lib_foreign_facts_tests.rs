@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-use super::{ForeignFacts, Parent, ProcessReading, foreign_note_text};
+use super::{
+    DirOutcome, ForeignFacts, Parent, Probe, ProcessReading, discovery_report, foreign_note_text,
+};
 use crate::census::Image;
 use aterm_uds::process::{Identity, Lineage, ProcessBirth};
 use std::path::PathBuf;
@@ -41,6 +43,14 @@ const LAUNCHD: i32 = 4_100;
 
 fn lineage(birth: ProcessBirth, launcher_version: i32) -> Lineage {
     Lineage {
+        launcher_version: Some(launcher_version),
+        ..unversioned(birth)
+    }
+}
+
+/// A lineage that keeps no launcher version, as Linux's.
+fn unversioned(birth: ProcessBirth) -> Lineage {
+    Lineage {
         identity: Identity {
             pid: 42199,
             birth: birth.into(),
@@ -49,7 +59,7 @@ fn lineage(birth: ProcessBirth, launcher_version: i32) -> Lineage {
         uniqueid: 9_000,
         parent: 1,
         pgid: 42199,
-        launcher_version: Some(launcher_version),
+        launcher_version: None,
         tty: None,
     }
 }
@@ -281,6 +291,92 @@ fn a_lineage_of_another_birth_proves_nothing() {
     assert!(!note.contains("kill"), "{note}");
 }
 
+/// A lineage that keeps no launcher version (Linux's) says nothing of who launched the process,
+/// whether launchd's own version reads or not: init's child is never judged adopted from it.
+#[test]
+fn a_lineage_without_a_launcher_version_proves_nothing() {
+    let born = at(WRITTEN - 60);
+    for launchd in [Some(LAUNCHD), None] {
+        let mut r = orphan_reading(born);
+        r.lineage = Some(unversioned(born));
+        r.launchd = launchd;
+        let facts = judge(r);
+        assert!(
+            matches!(
+                facts,
+                ForeignFacts::Writer {
+                    parent: Parent::Unjudged,
+                    ..
+                }
+            ),
+            "launchd {launchd:?}: {facts:?}"
+        );
+        let note = foreign_note_text(&[(42199, "/tmp/aq/a.sock", &facts)]).expect("a note");
+        assert!(!note.contains("kill"), "{note}");
+    }
+}
+
+/// `aterm ctl`'s hint, when private instances are what it found, offers `kill` for exactly the
+/// writers launchd adopted: never one launchd started, an unjudged one, or a stale entry, and no
+/// hint at all when every entry's writer is gone.
+#[test]
+fn a_foreign_hint_offers_kill_for_exactly_the_adopted_writers() {
+    let born = at(WRITTEN - 60);
+    let writer = |lineage: Option<Lineage>| {
+        let mut r = orphan_reading(born);
+        r.lineage = lineage;
+        judge(r)
+    };
+    let adopted = writer(Some(lineage(born, 31)));
+    let started = writer(Some(lineage(born, LAUNCHD)));
+    let unjudged = writer(None);
+    let foreign = |pid: u32, facts: &ForeignFacts| {
+        (
+            pid,
+            format!("/tmp/aq/aterm-{pid}.sock"),
+            Probe::Foreign {
+                token: PathBuf::from(format!("/tmp/aq/aterm-{pid}.token")),
+                facts: facts.clone(),
+            },
+        )
+    };
+    let hint = |probes: &[(u32, String, Probe)]| {
+        let found = DirOutcome::Found {
+            path: PathBuf::from("/tmp/aq"),
+            n: probes.len(),
+        };
+        let (report, _) = discovery_report(found, probes);
+        report
+            .lines()
+            .find_map(|l| l.trim_start().strip_prefix("hint: ").map(str::to_string))
+    };
+    let said = hint(&[
+        foreign(42199, &adopted),
+        foreign(501, &started),
+        foreign(502, &unjudged),
+        foreign(503, &ForeignFacts::Stale),
+    ])
+    .expect("a hint");
+    assert!(said.contains("`kill 42199` ends it"), "{said}");
+    for other in ["501", "502", "503"] {
+        assert!(!said.contains(other), "{said}");
+    }
+    let said = hint(&[foreign(501, &started), foreign(502, &unjudged)]).expect("a hint");
+    assert!(
+        said.starts_with("only whoever started a `foreign` instance can drive it"),
+        "{said}"
+    );
+    assert!(!said.contains("kill"), "{said}");
+    assert_eq!(
+        hint(&[
+            foreign(503, &ForeignFacts::Stale),
+            foreign(504, &ForeignFacts::NotAterm("Safari".to_string())),
+        ]),
+        None,
+        "every writer gone: no hint"
+    );
+}
+
 /// Live (macOS): a process whose launcher exited reads as adopted through both readers, the
 /// reads `ForeignFacts` judges and the census's kernel, so each one reads the lineage of that
 /// process and launchd's version.
@@ -288,10 +384,16 @@ fn a_lineage_of_another_birth_proves_nothing() {
 #[test]
 fn a_process_whose_launcher_exited_reads_as_adopted_through_both_readers() {
     use crate::census::{Kernel as _, LiveKernel};
+    use aterm_uds::process::{
+        END_GRACE, EndControlLive, end_proven, read_identity, read_lineage, read_process_path,
+    };
     use std::io::BufRead as _;
     let mut launcher = aterm_uds::spawnfd::command("/bin/sh")
-        .args(["-c", "/bin/sleep 60 </dev/null >/dev/null 2>&1 & echo $!"])
-        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .args([
+            "-c",
+            "/bin/sleep 60 </dev/null >/dev/null 2>&1 & echo $!; read _ || :",
+        ])
+        .stdin(aterm_uds::spawnfd::Stdio::piped())
         .stdout(aterm_uds::spawnfd::Stdio::piped())
         .spawn()
         .expect("spawn the launcher");
@@ -300,20 +402,41 @@ fn a_process_whose_launcher_exited_reads_as_adopted_through_both_readers() {
         .read_line(&mut line)
         .expect("the launcher prints its child's pid");
     let pid: u32 = line.trim().parse().expect("a pid");
-    struct Ends(u32);
-    impl Drop for Ends {
-        fn drop(&mut self) {
-            unsafe extern "C" {
-                fn kill(pid: i32, sig: i32) -> i32;
-            }
-            const SIGKILL: i32 = 9;
-            if let Ok(pid) = i32::try_from(self.0) {
-                // SAFETY: SIGKILL to the one pid this test started.
-                unsafe { kill(pid, SIGKILL) };
-            }
+    let p = i32::try_from(pid).expect("a pid");
+    let started = std::time::Instant::now();
+    while read_process_path(p).as_deref() != Some(std::path::Path::new("/bin/sleep")) {
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "pid {pid} never ran /bin/sleep"
+        );
+        std::thread::yield_now();
+    }
+    let shell = read_identity(i32::try_from(launcher.id()).expect("a pid"))
+        .expect("the launcher reads while it waits on its stdin");
+    let sleep = read_lineage(p).expect("the sleep reads");
+    assert_eq!(
+        sleep.launched_by(&shell),
+        Some(true),
+        "the pid the launcher printed is its own child: {sleep:?} {shell:?}"
+    );
+    /// Ends the proven sleep through the end protocol, its identity (read once it ran
+    /// `/bin/sleep`: the pid version moves at the exec) re-read before each signal; a test
+    /// that fails first ends it on the way out.
+    struct Ends(Option<aterm_uds::process::Identity>);
+    impl Ends {
+        fn end(
+            &mut self,
+        ) -> Option<Result<aterm_uds::process::Ended, aterm_uds::process::EndRefusal>> {
+            let token = self.0.take()?;
+            Some(end_proven(token, END_GRACE, &mut EndControlLive, |_| true))
         }
     }
-    let _ends = Ends(pid);
+    impl Drop for Ends {
+        fn drop(&mut self) {
+            let _ = self.end();
+        }
+    }
+    let mut ends = Ends(Some(sleep.identity));
     assert!(launcher.wait().expect("reap the launcher").success());
 
     let reading = ProcessReading::read(pid).expect("the sleep reads");
@@ -351,5 +474,13 @@ fn a_process_whose_launcher_exited_reads_as_adopted_through_both_readers() {
         ),
         Parent::Adopted,
         "{row:?} {lineage:?}"
+    );
+    let ended = ends.end();
+    assert!(
+        matches!(
+            ended,
+            Some(Ok(aterm_uds::process::Ended { gone: true, .. }))
+        ),
+        "the proven sleep is ended: {ended:?}"
     );
 }

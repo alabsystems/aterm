@@ -219,10 +219,11 @@ fn suppress_torn_cursor_projection(input: &mut aterm_core::render::RenderInput) 
     input.cursor_trail.clear();
     input.cursor_effect_style_override = None;
     input.cursor_fill_override = None;
-    input.cat_quads.clear();
-    input.cat_atlas = None;
-    input.free_sprites.clear();
-    input.free_atlas = None;
+    // The kitty cursor, the pet and the word cats: the companions' sprite
+    // layers (the rain's rows are no projection of the cursor and stay).
+    input
+        .fx_layers
+        .retain(|l| aterm_render::sprites::FreeSprite::of_layer(l).is_none());
 }
 
 #[cfg(test)]
@@ -3181,24 +3182,9 @@ fn scrub_overlay_row_band(
         bottom <= y0 || top >= y1
     });
     input.nova_add.retain(|quad| !tagged(quad.row));
-    input.cat_quads.retain(|quad| !tagged(quad.row));
-    input.rain_quads.retain(|quad| !tagged(quad.row));
     input.rain_add.retain(|quad| !tagged(quad.row));
-    input.free_sprites.retain(|sprite| {
-        let top = i64::from(sprite.y);
-        let bottom = top.saturating_add(i64::from(sprite.h));
-        bottom <= y0 || top >= y1
-    });
-
-    if input.cat_quads.is_empty() {
-        input.cat_atlas = None;
-    }
-    if input.free_sprites.is_empty() {
-        input.free_atlas = None;
-    }
-    if input.rain_quads.is_empty() {
-        input.rain_atlas = None;
-    }
+    // The companions' and the rain's fx layers need no scrub: the occluder
+    // pushed above cuts every fx layer at the band.
 }
 
 /// The card is on top: a menu card the host painted into the frame's cells at `card` (frame cells, row 0 the strip's first row), after the overlays were published, takes its cells back from every overlay that would paint over them.
@@ -3287,23 +3273,8 @@ pub(crate) fn scrub_overlay_card(
     input
         .rain_add
         .retain(|q| !(tag_in(q.row) && meets_x(q.x, q.w, 0)));
-    let card_px = (x0, y0, x1, y1);
-    cut_sprite_quads(&mut input.cat_quads, card_px);
-    cut_sprite_quads(&mut input.rain_quads, card_px);
-    let mut kept = Vec::with_capacity(input.free_sprites.len());
-    for sprite in input.free_sprites.drain(..) {
-        cut_free_sprite(sprite, card_px, &mut kept);
-    }
-    input.free_sprites = kept;
-    if input.cat_quads.is_empty() {
-        input.cat_atlas = None;
-    }
-    if input.free_sprites.is_empty() {
-        input.free_atlas = None;
-    }
-    if input.rain_quads.is_empty() {
-        input.rain_atlas = None;
-    }
+    // The companions' and the rain's fx layers need no cut: the card's
+    // occluder, pushed above, cuts every fx layer at its box.
 }
 
 /// [`scrub_overlay_card`]'s chrome rule, run once the card's cells are in `cells`.
@@ -3453,139 +3424,6 @@ fn clip_selections_off_card(input: &mut RenderInput, card: crate::tab_menu::Menu
     }
 }
 
-fn off_card_parts(
-    (x, y, w, h): (i64, i64, i64, i64),
-    (x0, y0, x1, y1): (i64, i64, i64, i64),
-) -> Vec<(i64, i64, i64, i64)> {
-    let (right, bottom) = (x + w, y + h);
-    if w <= 0 || h <= 0 || right <= x0 || x >= x1 || bottom <= y0 || y >= y1 {
-        return vec![(x, y, w, h)];
-    }
-    let mut parts = Vec::with_capacity(4);
-    if y < y0 {
-        parts.push((x, y, w, y0 - y));
-    }
-    if bottom > y1 {
-        parts.push((x, y1, w, bottom - y1));
-    }
-    let (mid0, mid1) = (y.max(y0), bottom.min(y1));
-    if x < x0 {
-        parts.push((x, mid0, x0 - x, mid1 - mid0));
-    }
-    if right > x1 {
-        parts.push((x1, mid0, right - x1, mid1 - mid0));
-    }
-    parts
-}
-
-fn part_ax(ax: u16, aw: u16, offset: i64, part_w: i64, flip_x: bool) -> Option<u16> {
-    let start = if flip_x {
-        i64::from(ax) + i64::from(aw) - offset - part_w
-    } else {
-        i64::from(ax) + offset
-    };
-    u16::try_from(start).ok()
-}
-
-fn cut_free_sprite(
-    sprite: aterm_core::render::FreeSprite,
-    card: (i64, i64, i64, i64),
-    out: &mut Vec<aterm_core::render::FreeSprite>,
-) {
-    let rect = (
-        i64::from(sprite.x),
-        i64::from(sprite.y),
-        i64::from(sprite.w),
-        i64::from(sprite.h),
-    );
-    let parts = off_card_parts(rect, card);
-    if parts == [rect] {
-        out.push(sprite);
-        return;
-    }
-    if sprite.w != sprite.aw || sprite.h != sprite.ah {
-        return;
-    }
-    for (x, y, w, h) in parts {
-        let (Ok(nx), Ok(ny), Ok(nw), Ok(nh)) = (
-            i32::try_from(x),
-            i32::try_from(y),
-            u16::try_from(w),
-            u16::try_from(h),
-        ) else {
-            continue;
-        };
-        let Some(ax) = part_ax(sprite.ax, sprite.aw, x - rect.0, w, sprite.flip_x) else {
-            continue;
-        };
-        let Ok(ay) = u16::try_from(i64::from(sprite.ay) + (y - rect.1)) else {
-            continue;
-        };
-        out.push(aterm_core::render::FreeSprite {
-            x: nx,
-            y: ny,
-            w: nw,
-            h: nh,
-            ax,
-            ay,
-            aw: nw,
-            ah: nh,
-            ..sprite
-        });
-    }
-}
-
-fn cut_sprite_quads(quads: &mut Vec<aterm_core::render::SpriteQuad>, card: (i64, i64, i64, i64)) {
-    if quads.is_empty() {
-        return;
-    }
-    let mut kept = Vec::with_capacity(quads.len());
-    for q in quads.drain(..) {
-        let rect = (
-            i64::from(q.x),
-            i64::from(q.y),
-            i64::from(q.w),
-            i64::from(q.h),
-        );
-        let parts = off_card_parts(rect, card);
-        if parts == [rect] {
-            kept.push(q);
-            continue;
-        }
-        if q.w != q.aw || q.h != q.ah {
-            continue;
-        }
-        for (x, y, w, h) in parts {
-            let (Ok(nx), Ok(ny), Ok(nw), Ok(nh)) = (
-                u16::try_from(x),
-                u16::try_from(y),
-                u16::try_from(w),
-                u16::try_from(h),
-            ) else {
-                continue;
-            };
-            let Some(ax) = part_ax(q.ax, q.aw, x - rect.0, w, q.flip_x) else {
-                continue;
-            };
-            let Ok(ay) = u16::try_from(i64::from(q.ay) + (y - rect.1)) else {
-                continue;
-            };
-            kept.push(aterm_core::render::SpriteQuad {
-                x: nx,
-                y: ny,
-                w: nw,
-                h: nh,
-                ax,
-                ay,
-                aw: nw,
-                ah: nh,
-                ..q
-            });
-        }
-    }
-    *quads = kept;
-}
-
 #[cfg(test)]
 mod overlay_scrub_selection_tests {
     use super::*;
@@ -3659,21 +3497,6 @@ mod overlay_scrub_selection_tests {
             alpha2: 0,
             row: 0,
         });
-        input.cat_quads.push(aterm_core::render::SpriteQuad {
-            row: 0,
-            x: 0,
-            y: 0,
-            w: 8,
-            h: 16,
-            ax: 0,
-            ay: 0,
-            aw: 8,
-            ah: 16,
-            tint: 0x00ff_ffff,
-            alpha: 255,
-            flip_x: false,
-        });
-
         scrub_overlay_row_band(&mut input, 0..1, aterm_render::RowBands::new(0, 16));
 
         assert_eq!(
@@ -3682,10 +3505,13 @@ mod overlay_scrub_selection_tests {
             "a selection in rows 2..4 is untouched by a top-row chrome band"
         );
         assert!(
-            input.cursor_trail.is_empty()
-                && input.cursor_glow_add.is_empty()
-                && input.cat_quads.is_empty(),
+            input.cursor_trail.is_empty() && input.cursor_glow_add.is_empty(),
             "overlay effects in the spliced band must still be scrubbed when selection clips are disjoint"
+        );
+        assert_eq!(
+            input.fx_occluders,
+            [aterm_core::render::PxRect::new(i32::MIN, 0, i32::MAX, 16)],
+            "…and the band occludes every fx layer (the companions, the rain)"
         );
     }
 }
@@ -4776,13 +4602,7 @@ pub(crate) fn clear_effect_overlays_for_compose(dst: &mut RenderInput) {
     dst.cursor_trail.clear();
     dst.word_decorations.clear();
     dst.ink.clear();
-    dst.cat_quads.clear();
-    dst.cat_atlas = None;
-    dst.free_sprites.clear();
-    dst.free_atlas = None;
     dst.nova_add.clear();
-    dst.rain_quads.clear();
-    dst.rain_atlas = None;
     dst.rain_add.clear();
     dst.fx_layers.clear();
     dst.fx_occluders.clear();

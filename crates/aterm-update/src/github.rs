@@ -1656,6 +1656,7 @@ fn check_and_stage_in(
     if let Some(parent) = installed_parent {
         install::reap_abandoned_copy_attempts(parent);
     }
+    install::sweep_left_incoming_unless_staging(&staging);
     crate::status::clear_check_note();
     if !crate::is_uncommitted_handoff_candidate() {
         crate::health::Health::expire_stale_apply_streak(&staging.health(), current_build);

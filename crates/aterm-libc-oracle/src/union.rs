@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Reads and renders ([`Union::render`]) `libc-oracle/union.json` for [`crate::cells::CELLS`]
-//! and [`crate::closure`].
+//! Reads and renders ([`Union::render`]) `libc-oracle/union.json`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};

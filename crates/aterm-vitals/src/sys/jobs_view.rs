@@ -2,7 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Scoped text and JSON formatting for `sys jobs` ([`crate::jobs::JobsView`]).
-//! Formats rows using [`JobRow::wire`] and [`Findings::wire_lines`].
 
 use super::json::Jv;
 use super::view::Line;
@@ -41,12 +40,10 @@ pub fn missing_why(s: &Snapshot) -> &'static str {
     }
 }
 
-/// Whether a row is running: its class says so and it has not exited.
 fn running(r: &JobRow) -> bool {
     r.class == Class::Running && r.verdict != Verdict::Exited
 }
 
-/// Ordered verdicts counted in the summary.
 const SAID: [Verdict; 8] = [
     Verdict::WaitingYou,
     Verdict::Parked,
@@ -58,7 +55,6 @@ const SAID: [Verdict; 8] = [
     Verdict::Exited,
 ];
 
-/// The suspect row with the highest φ, for `worst:`.
 fn worst<'a>(rows: &[&'a JobRow]) -> Option<&'a JobRow> {
     rows.iter()
         .copied()
@@ -103,7 +99,6 @@ pub fn summary(rows: &[&JobRow]) -> String {
     parts.join(" · ")
 }
 
-/// How much a verdict asks for a look, most first.
 fn urgency(v: Verdict) -> Option<u8> {
     Some(match v {
         Verdict::Stuck => 0,
@@ -224,7 +219,6 @@ pub fn overflow(rows: usize, top: usize) -> Option<String> {
     (rows > top).then(|| format!("{} jobs · top={}", rows - top, rows.min(64)))
 }
 
-/// `kind`/`consumer` words as JSON enum strings: `agent-call` → `agent_call`.
 fn enum_word(w: &str) -> String {
     w.replace('-', "_")
 }

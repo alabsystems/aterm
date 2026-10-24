@@ -20,7 +20,7 @@ impl PkgId {
         }
     }
 
-    /// The unambiguous cargo `-p` spelling. Never emit a bare name.
+    /// The unambiguous cargo `-p` spelling.
     pub fn spec(&self) -> String {
         format!("{}@{}", self.name, self.version)
     }

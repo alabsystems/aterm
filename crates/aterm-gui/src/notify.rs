@@ -491,7 +491,14 @@ fn deliver(title: Option<&str>, body: &str, silent: bool, session: u64) {
     }
     freedesktop::POSTER.with(|poster| {
         if let Some(poster) = poster.get_or_init(freedesktop::Poster::session) {
-            post(poster, title, body, silent, session);
+            post(
+                poster,
+                title,
+                body,
+                silent,
+                session,
+                freedesktop::CALL_TIMEOUT,
+            );
         }
     });
 }
@@ -500,12 +507,19 @@ fn deliver(title: Option<&str>, body: &str, silent: bool, session: u64) {
 const NO_SESSION: u64 = u64::MAX;
 
 #[cfg(target_os = "linux")]
-fn post(poster: &freedesktop::Poster, title: Option<&str>, body: &str, silent: bool, session: u64) {
+fn post(
+    poster: &freedesktop::Poster,
+    title: Option<&str>,
+    body: &str,
+    silent: bool,
+    session: u64,
+    bound: std::time::Duration,
+) {
     let session = (session != NO_SESSION).then_some(session);
     if let Ok(call) =
         freedesktop::notify_call(title.unwrap_or("aterm"), body, silent, session.is_some())
     {
-        poster.post(call, session);
+        poster.post(call, session, bound);
     }
 }
 
@@ -791,11 +805,7 @@ mod freedesktop {
             Some(Self { posts, wake })
         }
 
-        pub(super) fn post(&self, call: Message, session: Option<u64>) {
-            self.post_within(call, session, CALL_TIMEOUT);
-        }
-
-        pub(super) fn post_within(&self, call: Message, session: Option<u64>, bound: Duration) {
+        pub(super) fn post(&self, call: Message, session: Option<u64>, bound: Duration) {
             if self
                 .posts
                 .send(Post {
@@ -826,19 +836,23 @@ mod freedesktop {
             }
         }
 
-        let subscribed = || {
-            let mut conn = open()?;
-            if let Err(e) = conn.add_match(SIGNALS, CALL_TIMEOUT) {
-                aterm_log::debug!("notices: the bus refused {SIGNALS} ({e}); clicks go nowhere");
-            }
-            Ok(conn)
-        };
         let mut bus = Bus { conn: None };
         let mut clicks = Clicks::default();
         loop {
             loop {
                 match posts.try_recv() {
                     Ok(post) => {
+                        // A connection dialled for this notice asks for the
+                        // server's signals within the notice's own bound.
+                        let subscribed = || {
+                            let mut conn = open()?;
+                            if let Err(e) = conn.add_match(SIGNALS, post.bound) {
+                                aterm_log::debug!(
+                                    "notices: the bus refused {SIGNALS} ({e}); clicks go nowhere"
+                                );
+                            }
+                            Ok(conn)
+                        };
                         let posted = bus.notify(&post.call, post.bound, &subscribed, &mut |msg| {
                             hear(&mut clicks, msg, clicked);
                         });
@@ -1998,8 +2012,8 @@ mod tests {
             },
         )
         .expect("the bus thread starts");
-        super::post(&poster, Some("tab A"), "build done", false, tab_a);
-        super::post(&poster, Some("tab B"), "tests done", false, tab_b);
+        super::post(&poster, Some("tab A"), "build done", false, tab_a, HANG);
+        super::post(&poster, Some("tab B"), "tests done", false, tab_b, HANG);
 
         let wake = wakes
             .recv_timeout(HANG)
@@ -2104,7 +2118,7 @@ mod tests {
             (tab_c, "tab C", HANG),
         ] {
             let call = super::freedesktop::notify_call(summary, "done", false, true).unwrap();
-            poster.post_within(call, Some(tab), bound);
+            poster.post(call, Some(tab), bound);
         }
 
         let (_server, seen) = served.join().unwrap();

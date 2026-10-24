@@ -8,10 +8,6 @@ use aterm_core::render::RenderInput;
 use aterm_core::terminal::{RenderCell, Terminal};
 use aterm_predict::Seen;
 
-/// One cell of an extracted row in the frame's column order: its glyph, opaque
-/// on either half of a wide glyph, on marks (`marked`), or anywhere on a row
-/// the frame draws in another order or size (`row_opaque`). A column past a
-/// trimmed row is the implicit blank.
 fn seen_of(
     cells: &[RenderCell],
     marked: impl Fn(usize) -> bool,
@@ -30,7 +26,6 @@ fn seen_of(
     Seen::of_cell(cell.ch, opaque)
 }
 
-/// Whether column `col` of a row carries a grapheme cluster or combining marks.
 fn has_marks(
     clusters: &[(usize, Box<str>)],
     combining: &[(usize, Box<[char]>)],
@@ -102,7 +97,6 @@ pub(crate) fn seen_row(t: &Terminal, row: u16, out: &mut KeyRow) {
     read_row(t, row, out);
 }
 
-/// Read visible row `row` of `t` into `out.seen`, one [`Seen`] per column.
 fn read_row(t: &Terminal, row: u16, out: &mut KeyRow) {
     let logical = t.logical_row_into(
         usize::from(row),
@@ -122,17 +116,12 @@ fn read_row(t: &Terminal, row: u16, out: &mut KeyRow) {
 mod tests {
     use super::*;
 
-    /// A terminal of one 12-column row holding `bytes`.
     fn row_of(bytes: &[u8]) -> Terminal {
         let mut term = Terminal::new(2, 12);
         term.process(bytes);
         term
     }
 
-    /// The press's row and the frame's observe agree on every cell, for rows
-    /// holding a wide glyph, a combining mark, an emoji cluster, a right prompt
-    /// in italics, and right-to-left text the frame reorders; and they mark the
-    /// cells they must as opaque.
     #[test]
     fn the_key_row_and_the_frame_observe_agree_cell_by_cell() {
         let rows: [(&str, &[u8]); 6] = [
@@ -167,9 +156,6 @@ mod tests {
         }
     }
 
-    /// The press also reads the row UNDER the cursor row (`KeySample::below`, the
-    /// predictor's floor), projected as the frame's observe projects that row,
-    /// and none under the last row.
     #[test]
     fn the_key_row_reads_the_row_under_it_as_the_frame_does() {
         let mut term = row_of("$ ab\r\nPassword: \x1b[A\x1b[5G".as_bytes());
@@ -190,11 +176,6 @@ mod tests {
         assert_eq!(key.cells(), under.as_slice());
     }
 
-    /// The one cell the projections disagree on: a bracket inside right-to-left
-    /// text, which the frame draws mirrored and the key row, read before the
-    /// reordering, does not. Each such cell is opaque on both sides and holds the
-    /// other side's mirror image; every other cell agrees. So the tail guard sees
-    /// a change there and the line fails closed.
     #[test]
     fn a_mirrored_bracket_is_the_one_cell_they_disagree_on() {
         let mut term = row_of("$ \u{5d0}(\u{5d1}) x".as_bytes());
@@ -228,8 +209,6 @@ mod tests {
         );
     }
 
-    /// The glyph each projection carries is what the plain observe answered: the
-    /// cell's char, `None` for a blank or a wide glyph's right half.
     #[test]
     fn an_opaque_cell_carries_the_plain_answer() {
         let term = row_of("$ a日b".as_bytes());

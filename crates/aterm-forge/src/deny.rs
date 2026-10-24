@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Evaluates `deny.toml`'s `[bans] deny` list and `[sources]` policy over each cell's resolved graph.
+//! Evaluates `deny.toml` `[bans]` and `[sources]` policies over each cell's resolved graph.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -171,7 +171,7 @@ pub fn findings(
     out
 }
 
-/// Whether `version` satisfies comma-separated comparators (`<`, `<=`, `>`, `>=`, `=`), or `None` if unsupported.
+/// Whether `version` satisfies comma-separated comparators (`<`, `<=`, `>`, `>=`, `=`).
 #[must_use]
 pub fn satisfies(req: &str, version: &str) -> Option<bool> {
     let have = parse_version(version)?;

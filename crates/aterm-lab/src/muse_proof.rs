@@ -504,11 +504,12 @@ fn checks(run: &Run) -> Result<Before, Fail> {
     let twin_ok = crate::verbs::twin_link_refused(run);
     let orphan = jail_orphan(run);
     let orphan_ok = orphan > 1 && orphan_seen(run, orphan);
-    let before = crate::sys::jail_pids(&run.mark).unwrap_or_default();
+    let members = crate::sys::jail_pids(&run.mark);
     println!(
         "== the jail's members, by its mark (pid, ppid, command; the orphan control is {orphan}, adopted by launchd)"
     );
-    print!("{}", members_table(&before));
+    print!("{}", members_table(&members));
+    let before = members.unwrap_or_default();
 
     let egress = fs::read_to_string(run.run.join("egress.log")).unwrap_or_default();
     let (requests, other_auth) = muse_auths(&stub_log);

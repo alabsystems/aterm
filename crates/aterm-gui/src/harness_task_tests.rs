@@ -1064,6 +1064,189 @@ fn a_proven_self_claims_landing_shows_and_anyones_later_turn_reopens_it() {
     host.shutdown_and_join();
 }
 
+/// One line of a Codex rollout: `payload` under `kind`.
+fn rollout_line(kind: &str, payload: &str) -> String {
+    format!(r#"{{"timestamp":"2026-10-23T10:00:00.000Z","type":"{kind}","payload":{payload}}}"#)
+}
+
+/// A CODEX-ALAB WORKER'S LANDING ON ITS TASK RECORD: beside a proven
+/// self-claim, the landing marks the worker's open record `done why=landed`
+/// with the report its rollout holds — a mark an update's fence refused made
+/// at the next status sweep, whatever codex-alab's own attention did to the
+/// record's `rev` meanwhile — and the next turn reopens it `working why=turn`,
+/// a reopen the fence refused likewise made at the next sweep.
+#[test]
+fn a_proven_self_claims_landing_marks_its_workers_task_done_with_its_rollout_report() {
+    use crate::task_record::{TaskMark, TaskState, mark_session_task};
+    let state = aterm_tempfile::Builder::new()
+        .prefix("aterm-codex-landing")
+        .tempdir()
+        .expect("scratch state home");
+    let thread = "0c0ffee0-0000-4000-8000-000000000001";
+    let home = state.path().join("codex-home");
+    let day = home.join("sessions").join("2026").join("10").join("23");
+    std::fs::create_dir_all(&day).expect("the rollout's day");
+    let rollout = [
+        rollout_line(
+            "event_msg",
+            r#"{"type":"task_started","turn_id":"t-1","turn_attribution":{"turn_id":"t-1","turn_trigger":"user"}}"#,
+        ),
+        rollout_line(
+            "response_item",
+            r#"{"type":"message","role":"user","content":[{"type":"input_text","text":"Fix the parser."}]}"#,
+        ),
+        rollout_line(
+            "response_item",
+            r#"{"type":"message","role":"assistant","content":[{"type":"output_text","text":"The parser is fixed; 12 tests pass."}],"phase":"final_answer"}"#,
+        ),
+        rollout_line(
+            "event_msg",
+            r#"{"type":"task_complete","turn_id":"t-1","last_agent_message":"The parser is fixed; 12 tests pass."}"#,
+        ),
+    ]
+    .join("\n");
+    std::fs::write(
+        day.join(format!("rollout-2026-10-23T10-00-00-{thread}.jsonl")),
+        rollout + "\n",
+    )
+    .expect("the rollout");
+    crate::test_env::scoped("ATERM_STATE_HOME", state.path(), || {
+        let mut app = App::headless_for_test();
+        let host = idle_host();
+        app.harness = Some(host.clone());
+        let sid = under(&mut app, "land");
+        let ctx = app.pool.get(0).unwrap().ctx.clone();
+        mark_session_task(&ctx, 0, &TaskMark::new(TaskState::Working)).expect("unfenced");
+        let proven = crate::self_claim::stand_in::running();
+        crate::session_timeline::claim_supervisor_as(
+            &ctx,
+            &format!("codex-alab@{}", std::process::id()),
+            Some(1),
+            None,
+            Some(proven.clone()),
+            crate::metrics::now_us(),
+            aterm_slog::Actor::Ctl,
+        )
+        .expect("a proof takes a free session");
+        crate::self_claim::set_copy_for_test(
+            &sid,
+            Some(aterm_agent::harness::self_claimed::Copy {
+                pid: proven.pid,
+                start: proven.start.clone(),
+                home: home.clone(),
+                seen: aterm_agent::harness::self_claimed::Seen::Present(
+                    aterm_agent::harness::self_claimed::Record {
+                        pid: proven.pid,
+                        session_id: Some(thread.to_string()),
+                        resume_argv: None,
+                        env: Vec::new(),
+                        status: Some("idle".to_string()),
+                        exit: None,
+                        cwd: None,
+                        draft_empty: None,
+                        frame: None,
+                        initializing: false,
+                    },
+                ),
+                resume: Err("no-resume-line"),
+            }),
+        );
+        let record = || {
+            ctx.timeline
+                .lock()
+                .unwrap()
+                .task()
+                .cloned()
+                .expect("the record")
+        };
+        let hang = Instant::now() + Duration::from_secs(60);
+        ctx.fabric.set_fence_wait(Duration::from_millis(1));
+        let _ = ctx.fabric.fence_hold(false);
+        ctx.timeline
+            .lock()
+            .unwrap()
+            .queue_self_task(TaskFace::Landed);
+        app.apply_harness_fact(&sid, crate::HarnessFact::SelfTask(TaskFace::Landed));
+        while crate::harness_task::landing_in_flight(&sid) {
+            assert!(Instant::now() < hang, "the landing's thread never ended");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let before = record();
+        assert_eq!(before.state, TaskState::Working, "fenced: its mark refused");
+        for edit in [
+            crate::session_timeline::MetaEdit::Set("codex-alab: a box waits"),
+            crate::session_timeline::MetaEdit::Clear,
+        ] {
+            crate::session_timeline::write_attention_owned(
+                &ctx,
+                crate::task_record::SELF_CLAIM_ATTENTION_OWNER,
+                edit,
+                aterm_slog::Actor::Ctl,
+            )
+            .expect("written");
+        }
+        let bumped = record();
+        assert_eq!(
+            (bumped.state, bumped.rev),
+            (TaskState::Working, before.rev + 2),
+            "not yet marked, its rev moved twice"
+        );
+        ctx.fabric.lift_hold_fence();
+        let sweep = |app: &mut App| {
+            app.session_factory.edge_inbox.push(0);
+            let _ = app.observe_session_statuses(Instant::now());
+        };
+        sweep(&mut app);
+        while record().state != TaskState::Done {
+            assert!(
+                Instant::now() < hang,
+                "the landing never marked the task done"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let done = record();
+        assert_eq!(done.why, Some(crate::task_record::WHY_LANDED));
+        let path = done.result_path.clone().expect("the result it names");
+        assert!(
+            path.starts_with(state.path().join("tasks")),
+            "{}",
+            path.display()
+        );
+        let report = "The parser is fixed; 12 tests pass.";
+        assert_eq!(done.result_bytes, report.len() as u64);
+        let shown = aterm_agent::harness::result::answer(&path, false);
+        assert!(
+            shown.contains(&format!(" source=rollout thread={thread} turn=t-1 "))
+                && shown.ends_with(&format!("{report}\n")),
+            "{shown}"
+        );
+
+        ctx.timeline.lock().unwrap().publish_agent(
+            "busy",
+            None,
+            None,
+            Some(aterm_phase::Program::Codex),
+            crate::session_timeline::AgentStamp {
+                generation: crate::control::ScreenGen { epoch: 1, seq: 1 },
+                fp: 1,
+            },
+        );
+        let _ = ctx.fabric.fence_hold(false);
+        app.reopen_self_claim_landing(0);
+        assert_eq!(app.chip_glass(0).task, Some(TaskFace::Open));
+        assert_eq!(record().state, TaskState::Done, "fenced: no reopen yet");
+        ctx.fabric.lift_hold_fence();
+        sweep(&mut app);
+        let reopened = record();
+        assert_eq!(
+            (reopened.state, reopened.why),
+            (TaskState::Working, Some("turn"))
+        );
+        crate::self_claim::set_copy_for_test(&sid, None);
+        host.shutdown_and_join();
+    });
+}
+
 #[test]
 fn a_proven_self_claims_landing_counts_only_under_land() {
     for word in ["cruise", "off", "land"] {

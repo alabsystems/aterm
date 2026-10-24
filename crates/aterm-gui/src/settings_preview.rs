@@ -4444,6 +4444,7 @@ impl CursorScene {
         cat: Option<aterm_effects::kitty_cursor::CatFrame>,
     ) {
         use aterm_effects::word_decorations::{EffectGeom, KittySpriteSource, WordDecorations};
+        use aterm_render::sprites::{FreeSprite, SpriteLayers, WORD_SPRITE_SALT};
 
         if self.companion == SceneCompanion::None {
             return;
@@ -4483,12 +4484,15 @@ impl CursorScene {
             self.theme.fg,
         );
         thread_local! {
-            static COMPANIONS: std::cell::RefCell<Option<(u64, WordDecorations)>> =
+            // The companion's decorations and its layer publisher, so a still
+            // preview frame keeps its sprite layers (identity damage repaints
+            // nothing for them).
+            static COMPANIONS: std::cell::RefCell<Option<(u64, WordDecorations, SpriteLayers)>> =
                 const { std::cell::RefCell::new(None) };
         }
         COMPANIONS.with_borrow_mut(|slot| {
             let key = asset.fingerprint();
-            if slot.as_ref().is_none_or(|(held, _)| *held != key) {
+            if slot.as_ref().is_none_or(|(held, ..)| *held != key) {
                 let mut decorations = WordDecorations::default();
                 if let crate::app_config::KittySpriteAsset::Ready { w, h, rgba, fp, .. } = asset {
                     decorations.set_kitty_sprite_source(KittySpriteSource::Custom {
@@ -4498,9 +4502,9 @@ impl CursorScene {
                         rgba: Arc::clone(rgba),
                     });
                 }
-                *slot = Some((key, decorations));
+                *slot = Some((key, decorations, SpriteLayers::new(WORD_SPRITE_SALT)));
             }
-            let Some((_, decorations)) = slot.as_mut() else {
+            let Some((_, decorations, layers)) = slot.as_mut() else {
                 return;
             };
             let mut sprites = Vec::new();
@@ -4509,7 +4513,7 @@ impl CursorScene {
             });
             let floor = i32::from(shown_rows.max(1)) * i32::from(cell_h);
             let ink = (geom, colors);
-            let mut emit = |fit: f32, sprites: &mut Vec<aterm_core::render::FreeSprite>| {
+            let mut emit = |fit: f32, sprites: &mut Vec<FreeSprite>| {
                 for _ in 0..3 {
                     decorations.begin_host_frame();
                     self.emit_companion(
@@ -4536,15 +4540,10 @@ impl CursorScene {
                     sprites = fitted;
                 }
             }
-            if let Some(atlas) = decorations.free_atlas()
-                && !sprites.is_empty()
-            {
-                for sprite in &mut sprites {
-                    sprite.y = sprite.y.min(floor - i32::from(sprite.h)).max(0);
-                }
-                input.free_sprites = sprites;
-                input.free_atlas = Some(atlas);
+            for sprite in &mut sprites {
+                sprite.y = sprite.y.min(floor - i32::from(sprite.h)).max(0);
             }
+            layers.publish(&sprites, &mut input.fx_layers);
         });
     }
 
@@ -4561,7 +4560,7 @@ impl CursorScene {
         settled_ms: u64,
         flight: Option<aterm_effects::kitty_cursor::CatFrame>,
         fit: f32,
-        sprites: &mut Vec<aterm_core::render::FreeSprite>,
+        sprites: &mut Vec<aterm_render::sprites::FreeSprite>,
     ) {
         use aterm_effects::kitty_pet::{
             PET_DEPARTURES_MAX, PET_MOTES_MAX, PetAction, PetBrain, PetFrame,
@@ -5084,6 +5083,11 @@ mod tests {
 
     use super::*;
     use crate::native_ui::{GroupSpec, SemanticRole, UiTree};
+
+    /// The companions a preview frame draws: its sprite layers, read back.
+    fn sprites(input: &RenderInput) -> Vec<aterm_render::sprites::FreeSprite> {
+        aterm_render::sprites::published(&input.fx_layers)
+    }
 
     const VIEWPORT: LogicalRect = LogicalRect::new(0.0, 0.0, 480.0, 210.0);
     const NORD: PreviewTerminalTheme = PreviewTerminalTheme::new(
@@ -7604,17 +7608,9 @@ mod tests {
                 &SettingsPreviewSpec::cursor(rainbow_cursor(raw)).with_phase(900),
                 Theme::default(),
             );
-            let sprite = *input.free_sprites.first().expect("a drawn companion");
-            let atlas = input.free_atlas.expect("its atlas");
-            let width = atlas.width as usize;
-            let texels = (0..usize::from(sprite.ah))
-                .flat_map(|y| {
-                    let start = ((usize::from(sprite.ay) + y) * width + usize::from(sprite.ax)) * 4;
-                    atlas.rgba[start..start + usize::from(sprite.aw) * 4].to_vec()
-                })
-                .collect::<Vec<_>>();
+            let sprite = sprites(&input).first().cloned().expect("a drawn companion");
             let mut hash = std::collections::hash_map::DefaultHasher::new();
-            texels.hash(&mut hash);
+            sprite.art.data().hash(&mut hash);
             hash.finish()
         };
         assert_ne!(
@@ -7697,9 +7693,8 @@ mod tests {
                     "the caret types on the prompt"
                 );
                 let caret_x = input.cursor_col as i32 * cell_w;
-                let sprite = input
-                    .free_sprites
-                    .iter()
+                let sprite = sprites(&input)
+                    .into_iter()
                     .max_by_key(|sprite| u32::from(sprite.w) * u32::from(sprite.h))
                     .unwrap_or_else(|| panic!("{raw} at {phase} ms draws its companion"));
                 assert!(
@@ -7735,14 +7730,14 @@ mod tests {
         for raw in ["rainbow kitty pet", "rainbow dog pet"] {
             let input = reduced_input(raw);
             assert!(
-                !input.free_sprites.is_empty() && input.free_atlas.is_some(),
+                !sprites(&input).is_empty(),
                 "{raw} remains a static resident under Reduced Motion"
             );
         }
 
         let flying = reduced_input("rainbow kitty flying");
         assert!(
-            flying.free_sprites.is_empty() && flying.free_atlas.is_none(),
+            sprites(&flying).is_empty(),
             "ordinary flying-kitty motion stays suppressed"
         );
 
@@ -7751,7 +7746,7 @@ mod tests {
             Theme::default(),
         );
         assert!(
-            !live_flying.free_sprites.is_empty() && live_flying.free_atlas.is_some(),
+            !sprites(&live_flying).is_empty(),
             "negative control: the selected flying companion is drawable outside Reduced Motion"
         );
     }
@@ -7773,11 +7768,9 @@ mod tests {
                         build_terminal_specimen_input_rows(&spec, Theme::default(), rows);
                     let input =
                         CursorScene::new(&spec, Theme::default(), rows).decorate(&base, cell);
-                    let sprite = input
-                        .free_sprites
-                        .iter()
+                    let sprite = sprites(&input)
+                        .into_iter()
                         .max_by_key(|sprite| u32::from(sprite.w) * u32::from(sprite.h))
-                        .copied()
                         .unwrap_or_else(|| panic!("{raw} at {phase} ms is drawn"));
                     (input.rows, sprite)
                 };
@@ -7821,7 +7814,7 @@ mod tests {
             input.fire_halo,
             input.cursor_trail,
             input.cursor_fill_override,
-            input.free_sprites,
+            sprites(input),
         )
     }
 
@@ -8404,16 +8397,16 @@ mod tests {
         for phase in [0, 700] {
             let early = at("rainbow kitty flying", phase);
             assert!(
-                early.free_sprites.is_empty(),
+                sprites(&early).is_empty(),
                 "no kitty yet at {phase} ms: {} sprites",
-                early.free_sprites.len()
+                sprites(&early).len()
             );
             assert!(
-                !at("rainbow kitty pet", phase).free_sprites.is_empty(),
+                !sprites(&at("rainbow kitty pet", phase)).is_empty(),
                 "negative control: the walking cat is there at {phase} ms"
             );
         }
-        assert!(!at("rainbow kitty flying", 2_300).free_sprites.is_empty());
+        assert!(!sprites(&at("rainbow kitty flying", 2_300)).is_empty());
         let diagnostic = played(
             &SettingsPreviewSpec::cursor(rainbow_cursor("rainbow kitty flying"))
                 .with_focus(crate::prefs::EDIT_CURSOR_NYAN_SPRITE, "")
@@ -8421,7 +8414,7 @@ mod tests {
             Theme::default(),
         );
         assert!(
-            !diagnostic.free_sprites.is_empty(),
+            !sprites(&diagnostic).is_empty(),
             "the sprite control previews its kitty at once"
         );
     }
@@ -8515,8 +8508,7 @@ mod tests {
         assert!(Arc::ptr_eq(carried, &rgba));
 
         let input = played(&custom, Theme::default());
-        assert!(!input.free_sprites.is_empty());
-        assert!(input.free_atlas.is_some());
+        assert!(!sprites(&input).is_empty());
         assert!(
             differences(
                 &pixels(custom),

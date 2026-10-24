@@ -959,7 +959,7 @@ fn parked_input_state_rearms_only_on_external_input_intent() {
 fn earliest_deadline_retains_its_diagnostic_owner() {
     let now = Instant::now();
     let mut deadline = None;
-    let mut owner = DeadlineOwner::None;
+    let mut owner = crate::deadline_heal::DeadlineFold::default();
     fold_owned_deadline(
         &mut deadline,
         &mut owner,
@@ -973,7 +973,7 @@ fn earliest_deadline_retains_its_diagnostic_owner() {
         DeadlineOwner::PresentRetry,
     );
     assert_eq!(deadline, Some(now + Duration::from_millis(16)));
-    assert_eq!(owner, DeadlineOwner::PresentRetry);
+    assert_eq!(owner.owner(), DeadlineOwner::PresentRetry);
 
     fold_owned_deadline(
         &mut deadline,
@@ -981,7 +981,7 @@ fn earliest_deadline_retains_its_diagnostic_owner() {
         now + Duration::from_millis(16),
         DeadlineOwner::Predictor,
     );
-    assert_eq!(owner, DeadlineOwner::PresentRetry);
+    assert_eq!(owner.owner(), DeadlineOwner::PresentRetry);
     fold_owned_deadline(
         &mut deadline,
         &mut owner,
@@ -989,7 +989,7 @@ fn earliest_deadline_retains_its_diagnostic_owner() {
         DeadlineOwner::TitleDrift,
     );
     assert_eq!(deadline, Some(now + Duration::from_millis(8)));
-    assert_eq!(owner, DeadlineOwner::TitleDrift);
+    assert_eq!(owner.owner(), DeadlineOwner::TitleDrift);
 }
 
 #[test]

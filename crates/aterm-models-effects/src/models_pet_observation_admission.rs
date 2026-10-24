@@ -5,19 +5,7 @@
 
 use aterm_spec::derive::Model;
 
-/// A missing observation and a failed observation carry different authority. A host that never
-/// supplied a world keeps moving. While the host admits console presentation, a supplied but
-/// incoherent world freezes existing locomotion and commissions no new motion; coherence restores
-/// normal admission. Paths without console custody are not frozen by this rule; their host
-/// withholds the caret instead.
-///
-/// The host admits presentation throughout; host-level suppression is a separate policy.
-/// `legacy` projects `PetBrain::console_legacy_motion_pending`; `moved` records a changed body
-/// position during the current tick, at fixed pane geometry. Motion outcomes are
-/// nondeterministic: the trajectory, animation clock, protection policy and the timers/input
-/// bookkeeping that continue while movement is suspended are out of the model. Tier-1 binds the
-/// suspended transition to real Terminal/PetBrain frames. `Buggy=1` falls through into legacy
-/// locomotion on a failed observation, catching both newly commissioned and active motion.
+/// A missing observation and a failed observation carry different authority.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn console_observation_admission_model() -> Model {
@@ -61,8 +49,6 @@ pub fn console_observation_admission_model() -> Model {
                 if ticked == 1 && observed == 1 && coherent == 0 {
                     legacy == prior_legacy && moved == 0
                 } else { moved <= 1 };
-            // A coherence verdict is an observation's (dial 2 forgets the observation on a
-            // tick and keeps its stale verdict).
             invariant CoherenceIsObserved: coherent <= observed;
             bound ObservedBounded: observed <= 1;
             bound LegacyBounded: legacy <= 1;

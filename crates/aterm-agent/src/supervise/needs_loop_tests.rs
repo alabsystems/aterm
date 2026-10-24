@@ -578,25 +578,26 @@ fn beside_a_self_claim_a_given_back_or_released_claim_unsets_no_needs_entry() {
     let given_back = || claim::Claim::GivenBack {
         behind: Some(SELF_CLAIM.to_string()),
     };
-    for (claim, end) in [(given_back(), false), (claim::Claim::Off, true)] {
-        let (calls, standing, noted, forgot) = lowered(true, claim, end);
+    for (beside, claim, end) in [
+        (true, given_back(), false),
+        (true, claim::Claim::Off, true),
+        (false, claim::Claim::GivenBack { behind: None }, false),
+    ] {
+        let (calls, standing, noted, forgot) = lowered(beside, claim, end);
         assert!(calls.is_empty(), "{calls:#?}");
         assert_eq!(standing, Some(self_claims_entry()));
         assert!(
-            !noted.iter().any(|l| l.contains(CLEARED_NEEDS)),
+            !noted
+                .iter()
+                .any(|l| l.starts_with("CLEARED ") && l.contains(CLEARED_NEEDS)),
             "{noted:#?}"
         );
         assert!(forgot, "the set is forgotten");
     }
-    for (claim, end) in [
-        (claim::Claim::GivenBack { behind: None }, false),
-        (claim::Claim::Off, true),
-    ] {
-        let (calls, standing, _, forgot) = lowered(false, claim, end);
-        assert_eq!(calls, ["unset attention owner=needs"]);
-        assert_eq!(standing, None);
-        assert!(forgot);
-    }
+    let (calls, standing, _, forgot) = lowered(false, claim::Claim::Off, true);
+    assert_eq!(calls, ["unset attention owner=needs"]);
+    assert_eq!(standing, None);
+    assert!(forgot);
 }
 
 const LONG_NEED: &str = "grant Screen Recording to com.aterm.aterm in System Settings ▸ Privacy \
@@ -889,6 +890,255 @@ fn needs_point(s: &mut Session<'_, Mock>, seq: u64, need: &str) -> Screen {
     screen
 }
 
+fn needs_before_handover(unavailable: bool) {
+    let mut m = Mock::new(vec![idle_screen()]);
+    m.autopilot = Some("cruise");
+    let host = Arc::new(Hears::default());
+    let mut notes = Notes::default();
+    let mut s = virtual_session(&mut m, None);
+    s.stall_host = Some(Arc::clone(&host) as Arc<dyn IdleHost>);
+    if unavailable {
+        s.ctl
+            .claim_replies
+            .push_back(err("unknown metadata key supervisor"));
+        s.take_claim(&mut notes);
+        assert!(matches!(s.claim, claim::Claim::Unavailable { .. }));
+    } else {
+        assert!(matches!(s.claim, claim::Claim::Off));
+    }
+    let point = needs_point(&mut s, 101, NEED);
+    s.sync_needs(&point, &auto(30), &mut notes).expect("set");
+    let before = (
+        s.ctl.needs_attention.clone(),
+        host.told(),
+        s.ctl.needs_calls.len(),
+        s.needs_told,
+    );
+    s.stop = Some(Arc::new(AtomicBool::new(true)));
+    s.set_handover(Arc::new(AtomicBool::new(true)));
+    s.needs_down(point.seq, "the earlier close", &mut notes)
+        .expect("close considered");
+    assert_eq!(
+        (
+            s.ctl.needs_attention.clone(),
+            host.told(),
+            s.ctl.needs_calls.len(),
+            s.needs_told,
+        ),
+        before,
+        "handover preserves native and host needs without a new write"
+    );
+}
+
+#[test]
+fn ordinary_metadata_handover_keeps_unclaimed_needs() {
+    needs_before_handover(false);
+}
+
+#[test]
+fn ordinary_metadata_handover_keeps_initially_unsupported_needs() {
+    needs_before_handover(true);
+}
+
+#[test]
+fn ordinary_metadata_handover_during_needs_proof_keeps_both_projections() {
+    let mut m = Mock::new(vec![idle_screen()]);
+    m.autopilot = Some("cruise");
+    let host = Arc::new(Hears::default());
+    let mut notes = Notes::default();
+    let mut s = virtual_session(&mut m, None);
+    active_metadata_claim(&mut s);
+    s.stall_host = Some(Arc::clone(&host) as Arc<dyn IdleHost>);
+    let point = needs_point(&mut s, 101, NEED);
+    s.sync_needs(&point, &auto(30), &mut notes).expect("set");
+    let before = (
+        s.ctl.needs_attention.clone(),
+        host.told(),
+        s.ctl.needs_calls.len(),
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    s.stop = Some(Arc::clone(&stop));
+    s.set_handover(Arc::new(AtomicBool::new(true)));
+    s.ctl.stop_on_meta = Some((s.ctl.metas + 1, Arc::clone(&stop)));
+    s.needs_down(point.seq, "the earlier close", &mut notes)
+        .expect("close considered");
+    assert!(stop.load(Ordering::SeqCst), "the proof observed handover");
+    assert_eq!(
+        (
+            s.ctl.needs_attention.clone(),
+            host.told(),
+            s.ctl.needs_calls.len(),
+        ),
+        before,
+        "the fresh read must precede both cleanup effects"
+    );
+}
+
+#[derive(Debug)]
+struct HandoverOnClear {
+    heard: Arc<Hears>,
+    stop: Arc<AtomicBool>,
+    handover: Arc<AtomicBool>,
+}
+
+impl IdleHost for HandoverOnClear {
+    fn wants(&self) -> bool {
+        false
+    }
+    fn at_idle(&self) -> Option<HostStep> {
+        None
+    }
+    fn owns_turn_end(&self) -> bool {
+        false
+    }
+    fn needs_standing(&self, needs: &[String], entry: &str) {
+        self.heard.needs_standing(needs, entry);
+        if needs.is_empty() {
+            self.handover.store(true, Ordering::SeqCst);
+            self.stop.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+#[test]
+fn ordinary_metadata_handover_from_host_callback_stops_needs_wire() {
+    let mut m = Mock::new(vec![idle_screen()]);
+    m.autopilot = Some("cruise");
+    let heard = Arc::new(Hears::default());
+    let stop = Arc::new(AtomicBool::new(false));
+    let handover = Arc::new(AtomicBool::new(false));
+    let host = Arc::new(HandoverOnClear {
+        heard: Arc::clone(&heard),
+        stop: Arc::clone(&stop),
+        handover: Arc::clone(&handover),
+    });
+    let mut notes = Notes::default();
+    let mut s = virtual_session(&mut m, None);
+    s.stall_host = Some(host as Arc<dyn IdleHost>);
+    s.stop = Some(Arc::clone(&stop));
+    s.set_handover(handover);
+    let point = needs_point(&mut s, 101, NEED);
+    s.sync_needs(&point, &auto(30), &mut notes).expect("set");
+    let before = (s.ctl.needs_attention.clone(), s.ctl.needs_calls.len());
+    s.needs_down(point.seq, "the earlier close", &mut notes)
+        .expect("close considered");
+    assert!(stop.load(Ordering::SeqCst), "the callback began handover");
+    assert_eq!(
+        (s.ctl.needs_attention.clone(), s.ctl.needs_calls.len()),
+        before,
+        "no metadata write follows an observed handover"
+    );
+    assert_eq!(
+        heard.told().len(),
+        2,
+        "the callback's own host update is not rolled back"
+    );
+}
+
+#[test]
+fn ordinary_metadata_stop_cleans_unclaimed_and_unsupported_needs() {
+    for unavailable in [false, true] {
+        let mut m = Mock::new(vec![idle_screen()]);
+        m.autopilot = Some("cruise");
+        let host = Arc::new(Hears::default());
+        let mut notes = Notes::default();
+        let mut s = virtual_session(&mut m, None);
+        s.stall_host = Some(Arc::clone(&host) as Arc<dyn IdleHost>);
+        if unavailable {
+            s.ctl
+                .claim_replies
+                .push_back(err("unknown metadata key supervisor"));
+            s.take_claim(&mut notes);
+        }
+        let point = needs_point(&mut s, 101, NEED);
+        s.sync_needs(&point, &auto(30), &mut notes).expect("set");
+        s.stop = Some(Arc::new(AtomicBool::new(true)));
+        s.needs_down(point.seq, "the ordinary stop", &mut notes)
+            .expect("cleanup");
+        assert_eq!(s.ctl.needs_attention, None);
+        assert_eq!(s.ctl.needs_calls.len(), 2);
+        assert_eq!(host.told().last(), Some(&(Vec::new(), String::new())));
+        assert!(s.needs_told.is_none() && !s.needs_pending);
+    }
+}
+
+#[test]
+fn ordinary_metadata_handover_keeps_the_prior_host_need_on_replacement() {
+    let mut m = Mock::new(vec![idle_screen()]);
+    m.autopilot = Some("cruise");
+    let host = Arc::new(Hears::default());
+    let mut notes = Notes::default();
+    let mut s = virtual_session(&mut m, None);
+    s.stall_host = Some(Arc::clone(&host) as Arc<dyn IdleHost>);
+    let first = needs_point(&mut s, 101, NEED);
+    s.sync_needs(&first, &auto(30), &mut notes).expect("set");
+    let before = (
+        s.ctl.needs_attention.clone(),
+        host.told(),
+        s.ctl.needs_calls.len(),
+    );
+    let replacement = needs_point(&mut s, 102, "the later credential");
+    s.stop = Some(Arc::new(AtomicBool::new(true)));
+    s.set_handover(Arc::new(AtomicBool::new(true)));
+    s.sync_needs(&replacement, &auto(30), &mut notes)
+        .expect("replacement considered");
+    assert_eq!(
+        (
+            s.ctl.needs_attention.clone(),
+            host.told(),
+            s.ctl.needs_calls.len(),
+        ),
+        before,
+        "an observed handover preserves the last projection"
+    );
+}
+
+fn fresh_global_needs(global: Autopilot) {
+    let mut m = Mock::new(vec![idle_screen()]);
+    m.autopilot = Some("cruise");
+    let host = Arc::new(Hears::default());
+    let mut notes = Notes::default();
+    let mut s = virtual_session(&mut m, None);
+    active_metadata_claim(&mut s);
+    s.stall_host = Some(Arc::clone(&host) as Arc<dyn IdleHost>);
+    let point = needs_point(&mut s, 101, NEED);
+    s.note_meta(&format!(
+        "OK autopilot=cruise supervisor={}\n",
+        s.setup.holder()
+    ));
+    let mut opts = auto(30);
+    opts.policy.autopilot = global;
+    s.ctl.autopilot = Some("-");
+    let claims = s.ctl.claims.len();
+    s.sync_needs(&point, &opts, &mut notes)
+        .expect("fresh publication considered");
+    assert_eq!(s.autopilot(&opts), global);
+    assert_eq!(s.ctl.claims.len(), claims, "no new lease was acquired");
+    assert!(
+        !s.ctl
+            .requests
+            .iter()
+            .any(|r| claim::is_input(&r.split_whitespace().collect::<Vec<_>>()))
+    );
+    assert_eq!(
+        s.ctl.needs_calls.len(),
+        usize::from(global != Autopilot::Off),
+        "the first ordinary write resolves the fresh global mode"
+    );
+    assert_eq!(s.ctl.needs_attention.is_some(), global != Autopilot::Off);
+    assert_eq!(host.told().is_empty(), global == Autopilot::Off);
+}
+
+#[test]
+fn ordinary_metadata_fresh_global_off_withholds_needs() {
+    fresh_global_needs(Autopilot::Off);
+}
+
+#[test]
+fn ordinary_metadata_fresh_global_cruise_publishes_needs() {
+    fresh_global_needs(Autopilot::Cruise);
+}
+
 #[test]
 fn an_unacknowledged_needs_write_is_cleared_or_relinquished() {
     for (applied, behind) in [(false, false), (true, false), (true, true)] {
@@ -1044,6 +1294,7 @@ fn unchanged_points_retry_needs_metadata_without_redeciding_the_policy() {
                 let (expected_due, actual_due);
                 {
                     let mut s = virtual_session(&mut m, None);
+                    active_metadata_claim(&mut s);
                     s.set_clock(TEST_NOW, PDT);
                     s.set_zone_lookup(test_zones);
                     if zero_pause {
@@ -1115,6 +1366,7 @@ fn unchanged_needs_retries_stop_after_acknowledgement_off_or_handoff() {
         let mut notes = Notes::default();
         {
             let mut s = virtual_session(&mut m, None);
+            active_metadata_claim(&mut s);
             s.set_clock(TEST_NOW, PDT);
             s.set_zone_lookup(test_zones);
             let point = needs_point(&mut s, 101, NEED);
@@ -1172,6 +1424,7 @@ fn failed_retry_policy_reads_keep_needs_paced_without_admitting_input() {
         let mut notes = Notes::default();
         {
             let mut s = virtual_session(&mut m, None);
+            active_metadata_claim(&mut s);
             s.set_clock(TEST_NOW, PDT);
             s.set_zone_lookup(test_zones);
             let point = needs_point(&mut s, 101, NEED);
@@ -1223,6 +1476,7 @@ fn slow_needs_metadata_never_starves_an_existing_look() {
     let mut notes = Notes::default();
     {
         let mut s = virtual_session(&mut m, None);
+        active_metadata_claim(&mut s);
         s.set_clock(TEST_NOW, PDT);
         s.set_zone_lookup(test_zones);
         let point = needs_point(&mut s, 101, NEED);

@@ -3304,6 +3304,39 @@ fn text_well(c: Ctx<'_>, focus: Instrument) -> LensDoc<'_> {
     let f = &snap.facts;
     match res {
         Resource::Network => {
+            if let Some(net) = snap.net.as_ref() {
+                if let Some(tcp) = net.tcp {
+                    let mut states = Vec::new();
+                    if tcp.time_wait > 0 {
+                        states.push(format!(
+                            "{} time-wait",
+                            words::grouped(u64::from(tcp.time_wait))
+                        ));
+                    }
+                    if tcp.close_wait > 0 {
+                        states.push(format!(
+                            "{} close-wait",
+                            words::grouped(u64::from(tcp.close_wait))
+                        ));
+                    }
+                    if tcp.connecting() > 0 {
+                        states.push(format!(
+                            "{} connecting",
+                            words::grouped(u64::from(tcp.connecting()))
+                        ));
+                    }
+                    if !states.is_empty() {
+                        lines.push(format!("TCP states: {}", states.join(" \u{b7} ")));
+                    }
+                }
+                if let Some(r) = net.rates {
+                    let errs = r.rx_err_ps + r.tx_err_ps;
+                    let drops = r.rx_drop_ps + r.tx_drop_ps.unwrap_or(0.0);
+                    if errs > 0.0 || drops > 0.0 {
+                        lines.push(format!("errors {errs:.1}/s \u{b7} drops {drops:.1}/s"));
+                    }
+                }
+            }
             let counted = f.link.as_ref().and_then(|link| match link.kind {
                 LinkKind::Vpn => Some(format!(
                     "{}: VPN, its bytes are counted on the link that carries them",

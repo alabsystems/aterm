@@ -14,7 +14,7 @@ pub enum EvidenceGrade {
     Tested,
 }
 
-/// The assumptions every M2 witness rests on.
+/// The assumptions every [`EvidenceGrade::Tested`] witness rests on.
 pub const TESTED_ASSUMPTIONS: [&str; 5] = [
     "the log is the complete, ordered input history from the ancestor checkpoint to the paused head",
     "each step is a pure function of its state, its input and the effects handed back to it",
@@ -134,7 +134,7 @@ impl Witness {
         &self.live_code
     }
 
-    /// The live code's verdict (the faulty code of a repair fails it).
+    /// The live code's verdict.
     #[inline]
     #[must_use]
     pub const fn live_verdict(&self) -> &Verdict {
@@ -155,7 +155,7 @@ impl Witness {
         &self.candidate_code
     }
 
-    /// The candidate's verdict (always [`Verdict::Pass`] in a witness `prepare` returned).
+    /// The candidate's verdict.
     #[inline]
     #[must_use]
     pub const fn candidate_verdict(&self) -> &Verdict {
@@ -169,7 +169,7 @@ impl Witness {
         self.candidate_observation_chain
     }
 
-    /// The digest of the state the candidate's replay reached (the state commit installs).
+    /// The digest of the state the candidate's replay reached.
     #[inline]
     #[must_use]
     pub const fn candidate_state_digest(&self) -> Digest {

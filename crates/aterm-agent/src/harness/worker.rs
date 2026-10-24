@@ -26,6 +26,12 @@ enum Launches {
     /// `store_build` says it is a build in atpkg's store — atpkg's managed
     /// twin (the path its relaunch lane types), else the word.
     Image { store_build: fn(&Path) -> bool },
+    /// codex-alab: an image of ALab bytes ([`super::codex_alab::alab_bytes`]),
+    /// typed as atpkg's managed twin where that twin execs ALab bytes too, else
+    /// as itself. A vendor Codex image is no starter: the worker's line is then
+    /// [`WorkerCli::unstarted`]'s, and a `codex` that never claims its tab is
+    /// stalled `why=startup`.
+    Alab,
 }
 
 /// One harness a worker can run ([`WORKERS`]).
@@ -64,8 +70,76 @@ const fn no_flags(_: &[String]) -> Result<Vec<String>, String> {
     Ok(Vec::new())
 }
 
+/// The flags of a Codex starter's argv that move its config or say how it
+/// reaches its provider; its model, folders and approval posture stay its own,
+/// set by flag or by a `-c` of [`CODEX_OWN_KEYS`] ([`codex_flag_rides`]). A
+/// `--profile` rides whole, whatever it sets.
+const CODEX_CONFIG_FLAGS: &[&str] = &[
+    "-c",
+    "--config",
+    "-p",
+    "--profile",
+    "--enable",
+    "--disable",
+    "--strict-config",
+    "--oss",
+    "--local-provider",
+];
+
+/// The config keys a Codex starter's `-c`/`--config` sets that stay its own: its
+/// model (the worker's is `model=`'s), and its approval and sandbox posture (the
+/// legacy keys and the permission profiles that select a sandbox alike).
+const CODEX_OWN_KEYS: &[&str] = &[
+    "model",
+    "approval_policy",
+    "approvals_reviewer",
+    "sandbox_mode",
+    "sandbox_workspace_write",
+    "sandbox_permissions",
+    "default_permissions",
+    "permissions",
+];
+
+/// Whether a Codex starter's flag `name`, as `tokens` spell it, rides onto its
+/// worker's line ([`CODEX_CONFIG_FLAGS`]).
+fn codex_flag_rides(name: &str, tokens: &[String]) -> bool {
+    if !CODEX_CONFIG_FLAGS.contains(&name) {
+        return false;
+    }
+    if name != "-c" && name != "--config" {
+        return true;
+    }
+    let value = match tokens {
+        [_, value, ..] => value.as_str(),
+        [attached] => attached
+            .strip_prefix(name)
+            .map_or("", |rest| rest.strip_prefix('=').unwrap_or(rest)),
+        [] => "",
+    };
+    let key = value.split('=').next().unwrap_or("").trim();
+    !CODEX_OWN_KEYS
+        .iter()
+        .any(|own| key == *own || key.strip_prefix(own).is_some_and(|r| r.starts_with('.')))
+}
+
+/// The `CODEX_HOME` a Codex starter's worker carries: the starter's own, where
+/// set; else, for a starter run under another `HOME` than `user`'s, that home's
+/// `.codex` (Codex's default), so the worker reads the starter's config and login.
+fn codex_home_env(args: &ProcArgs, user: &Path) -> Vec<(String, String)> {
+    let env = super::codex_alab::HOME_ENV;
+    if let Some(home) = args.env_var(env).filter(|home| !home.is_empty()) {
+        return vec![(env.to_string(), home.to_string())];
+    }
+    args.env_var("HOME")
+        .map(Path::new)
+        .filter(|home| home.is_absolute() && *home != user)
+        .and_then(|home| home.join(".codex").to_str().map(str::to_string))
+        .map(|codex| vec![(env.to_string(), codex)])
+        .unwrap_or_default()
+}
+
 /// Every worker harness `spawn` can start, one row per harness.
-pub static WORKERS: [WorkerCli; 4] = [
+pub static WORKERS: [WorkerCli; 5] = [
     WorkerCli {
         agent: Program::Claude,
         word: "claude",
@@ -79,6 +153,26 @@ pub static WORKERS: [WorkerCli; 4] = [
         launches: Launches::Claude,
         homes: |_, _| Vec::new(),
         flags: no_flags,
+    },
+    WorkerCli {
+        agent: Program::Codex,
+        word: "codex",
+        operand: upgrade::TASK_OPERAND,
+        model_flag: "--model",
+        trust_flag: None,
+        trust_file_env: None,
+        session_flag: None,
+        nicety: &[],
+        dirs: &[super::codex_alab::HOME_ENV],
+        launches: Launches::Alab,
+        homes: codex_home_env,
+        flags: |argv| match super::codex_alab::kept_flags(argv, codex_flag_rides) {
+            Ok(kept) => Ok(kept),
+            // A starter no relaunch could resume (`codex exec`, `--remote`, …)
+            // lends no flags; its worker is a fresh interactive codex-alab.
+            Err(upgrade::ArgvRefusal::NotResumable(_)) => Ok(Vec::new()),
+            Err(upgrade::ArgvRefusal::UnknownFlag(flag)) => Err(flag),
+        },
     },
     WorkerCli {
         agent: Program::Gemini,
@@ -178,6 +272,27 @@ impl WorkerCli {
             args: Ok(Vec::new()),
         }
     }
+
+    /// The line's program where no starter of this kind was found: for
+    /// codex-alab, atpkg's managed twin where it execs ALab bytes; else
+    /// [`Self::plain`]'s word.
+    #[must_use]
+    pub fn unstarted(&self) -> Starter {
+        self.unstarted_by(|| super::upgrade_drive::managed_agent_twin(self.word))
+    }
+
+    /// [`Self::unstarted`] with the managed twin read by `twin`.
+    #[must_use]
+    pub fn unstarted_by(&self, twin: impl FnOnce() -> Option<PathBuf>) -> Starter {
+        let exe = match self.launches {
+            Launches::Alab => twin().and_then(super::self_claimed::alab_twin),
+            _ => None,
+        };
+        Starter {
+            exe: exe.unwrap_or_else(|| PathBuf::from(self.word)),
+            ..self.plain()
+        }
+    }
 }
 
 /// Read process `pid` under `home` as a starter of `cli`'s kind, or `None`.
@@ -225,6 +340,14 @@ pub(crate) fn starter_of(
             } else {
                 image.to_path_buf()
             }
+        }
+        Launches::Alab => {
+            let image = image
+                .filter(|i| i.file_name().and_then(|n| n.to_str()) == Some(cli.word))
+                .filter(|i| super::codex_alab::alab_bytes(i))?;
+            twin()
+                .and_then(super::self_claimed::alab_twin)
+                .unwrap_or_else(|| image.to_path_buf())
         }
     };
     Some(Starter {

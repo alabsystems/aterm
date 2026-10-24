@@ -4393,7 +4393,9 @@ fn dispatch_await_task(
         Ok(args) => args,
         Err(usage) => return usage,
     };
-    let mut held: Vec<(u64, Arc<SessionCtx>, Option<u64>)> = Vec::new();
+    /// A target resolved: its local id, its session, its `rev` edge and its fact edge.
+    type Held = (u64, Arc<SessionCtx>, Option<u64>, Option<u64>);
+    let mut held: Vec<Held> = Vec::new();
     for target in &args.targets {
         // A list element that names nothing is refused like a bare `@`
         // ([`empty_selector_refusal`]), never read as the active tab.
@@ -4423,15 +4425,24 @@ fn dispatch_await_task(
             );
             return "ERR denied\n".to_string();
         }
-        held.push((local_id, ctx, target.since.or(args.since)));
+        held.push((
+            local_id,
+            ctx,
+            target.since.or(args.since),
+            target.fact_since.or(args.fact_since),
+        ));
     }
     let targets: Vec<control_session::TaskTarget<'_>> = held
         .iter()
-        .map(|(local_id, ctx, since)| control_session::TaskTarget {
-            local_id: *local_id,
-            ctx,
-            since: *since,
-        })
+        .map(
+            |(local_id, ctx, since, fact_since)| control_session::TaskTarget {
+                local_id: *local_id,
+                ctx,
+                since: *since,
+                facts: args.facts,
+                fact_since: *fact_since,
+            },
+        )
         .collect();
     control_session::await_task(
         store,
@@ -6146,7 +6157,7 @@ fn drive_spawn(
     rest: &str,
     hosts: &dyn Fn(&SessionId) -> bool,
 ) -> Result<String, String> {
-    const USAGE: &str = "a drive spawns only a worker: spawn agent=<claude|gemini|agy|muse> \
+    const USAGE: &str = "a drive spawns only a worker: spawn agent=<claude|codex|gemini|agy|muse> \
                          [model=<m>] [cwd=<absolute>] [from=<sid>] [raise=false] len=<n>";
     let tokens = control_media::split_quoted_tokens(rest).ok_or(USAGE)?;
     let (mut agent, mut framed, mut raise) = (false, false, false);

@@ -69,7 +69,11 @@ fn uuids(text: &str) -> Vec<String> {
 
 /// A task's id in a `RUNNING` row's content (`…task id: <conv>/task-N\n…`).
 fn started_task(content: &str) -> Option<&str> {
-    let rest = content.split_once(TASK_STARTED)?.1;
+    let rest = content
+        .lines()
+        .take(3)
+        .find_map(|l| l.split_once(TASK_STARTED))?
+        .1;
     let id = rest.split(char::is_whitespace).next()?;
     (!id.is_empty()).then_some(id)
 }
@@ -199,10 +203,24 @@ pub fn open_work(text: &str, from_s: u64) -> Result<(), Open> {
                 if let Some(id) = cancelled_task(content) {
                     tasks.remove(id);
                 }
-                if let Some((_, spawned)) = content.split_once(SUBAGENTS_CREATED) {
-                    subagents.extend(uuids(spawned));
+                if content
+                    .lines()
+                    .take(4)
+                    .any(|l| l.trim() == SUBAGENTS_CREATED)
+                    && let Some((_, spawned)) = content.split_once(SUBAGENTS_CREATED)
+                {
+                    subagents.extend(
+                        spawned
+                            .lines()
+                            .filter(|l| l.contains("\"conversationId\""))
+                            .flat_map(uuids),
+                    );
                 }
-                if content.contains(SUBAGENTS_KILLED) {
+                if content
+                    .lines()
+                    .take(4)
+                    .any(|l| l.starts_with(SUBAGENTS_KILLED))
+                {
                     match kill.take() {
                         Some(Kill::All) => subagents.clear(),
                         Some(Kill::These(ids)) => {

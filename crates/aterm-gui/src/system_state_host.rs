@@ -148,8 +148,11 @@ pub(crate) struct Host {
 }
 
 impl Host {
+    /// The wake [`App::tick_system_state`] serves: the next tick, and the next
+    /// status poll unless one is in flight (its reply wakes the loop itself).
     pub(crate) fn deadline(&self, now: Instant) -> Option<Instant> {
         self.next_status
+            .filter(|_| !self.status_in_flight)
             .into_iter()
             .chain(self.next_tick)
             .min()
@@ -447,6 +450,9 @@ impl App {
             .next_tick
             .is_some_and(|next| next > now)
         {
+            // The status keeps its own clock: one due before the next tick is asked
+            // for now, or its deadline would wake the loop every turn until the tick.
+            self.poll_system_state_status(now);
             return;
         }
         let Some(instance) = self.native_runtime.instance_by_kind(AppKind::SystemState) else {
@@ -791,6 +797,34 @@ mod tests {
             cancel: |_| false,
             status: SetupStatus::default,
         }
+    }
+
+    #[test]
+    fn a_status_due_before_the_next_tick_is_asked_for_and_owes_no_wake_until_the_tick() {
+        let now = Instant::now();
+        let tick = now + Duration::from_millis(250);
+        let in_flight = Host {
+            next_status: Some(now),
+            status_in_flight: true,
+            next_tick: Some(tick),
+            ..Host::default()
+        };
+        assert_eq!(
+            in_flight.deadline(now),
+            Some(tick),
+            "a status in flight owes no wake"
+        );
+
+        let mut app = App::headless_for_test();
+        app.system_state_host.next_tick = Some(tick);
+        app.system_state_host.next_status = Some(now);
+        assert_eq!(app.system_state_host.deadline(now), Some(now));
+        app.tick_system_state(now);
+        assert_eq!(
+            app.system_state_host.deadline(now),
+            Some(tick),
+            "one turn serves the due status, so the next wake is the tick"
+        );
     }
 
     #[test]
@@ -3593,10 +3627,10 @@ mod tests {
         let due = now + Duration::from_millis(250);
         app.system_state_host.next_tick = Some(due);
         let mut deadline = None;
-        let mut owner = crate::metrics::DeadlineOwner::None;
+        let mut owner = crate::deadline_heal::DeadlineFold::default();
         app.fold_consent_lane_deadlines(now, &mut deadline, &mut owner);
         assert_eq!(deadline, Some(due));
-        assert_eq!(owner, crate::metrics::DeadlineOwner::ConsentCard);
+        assert_eq!(owner.owner(), crate::metrics::DeadlineOwner::ConsentCard);
     }
 
     #[test]

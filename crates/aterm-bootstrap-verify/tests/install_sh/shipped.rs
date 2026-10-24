@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The shipped build: the static release executable a release publishes, which the Linux
-//! guest lane builds as the release producer does and names in
-//! `ATERM_TEST_BOOTSTRAP_VERIFIER_SHIPPED`. It is a static ELF that trusts the paper master
-//! alone: the test anchor the suite's own build reads is not compiled into it.
+//! The shipped build.
 
 use std::path::PathBuf;
 
@@ -12,7 +9,6 @@ use crate::chain::{self, Case, Keys, Laid, Rule, Verifier as _};
 use crate::support::Scratch;
 use crate::verifier::Built;
 
-/// The variable the Linux guest lane names the shipped build in.
 const SHIPPED: &str = "ATERM_TEST_BOOTSTRAP_VERIFIER_SHIPPED";
 
 fn shipped() -> PathBuf {
@@ -26,8 +22,6 @@ fn shipped() -> PathBuf {
         })
 }
 
-/// Whether `elf` is a 64-bit little-endian executable with no program interpreter: one
-/// the kernel runs with no dynamic loader, on any glibc or none.
 fn is_static_elf(elf: &[u8]) -> bool {
     let at = |offset: usize, len: usize| elf.get(offset..offset + len);
     let n = |offset: usize, len: usize| {
@@ -50,11 +44,6 @@ fn is_static_elf(elf: &[u8]) -> bool {
     })
 }
 
-/// `built` over the whole corpus, each case run with the corpus's own master named as the
-/// test anchor: whether every answer is a refusal, and each case the updater admits under
-/// the shared rules is refused as unsigned by the pinned paper master (an installer-only
-/// rule may refuse its case first, before the roster is read); how many such cases there
-/// were.
 fn paper_master_alone(built: &Built) -> Result<usize, String> {
     let scratch = Scratch::new();
     let keys = Keys::new();
@@ -82,9 +71,6 @@ fn paper_master_alone(built: &Built) -> Result<usize, String> {
     Ok(admitted_elsewhere)
 }
 
-/// The shipped build is a static ELF, and it ignores the test anchor: a release the
-/// suite's master signed, which the suite's build admits, it refuses as unsigned by the
-/// paper master, as it refuses every case of the corpus.
 #[test]
 #[ignore = "the Linux guest lane runs it with ATERM_TEST_BOOTSTRAP_VERIFIER_SHIPPED"]
 fn the_shipped_verifier_is_static_and_trusts_the_paper_master_alone() {
@@ -103,16 +89,12 @@ fn the_shipped_verifier_is_static_and_trusts_the_paper_master_alone() {
     );
 }
 
-/// Negative control: the suite's own build, which reads the test anchor, admits what the
-/// corpus's master signed, and the shipped build's check refuses it on the first such case.
 #[test]
 fn the_paper_master_check_catches_a_build_that_reads_the_test_anchor() {
     let why = paper_master_alone(&Built::new()).expect_err("the suite's build reads the anchor");
     assert!(why.starts_with("a valid release: ok\t"), "{why}");
 }
 
-/// The reader of the ELF the shipped test holds the build to, on the corpus's own ELF
-/// headers (no program headers: static) and one with an interpreter.
 #[test]
 fn the_static_elf_reader_finds_an_interpreter() {
     let mut header = chain::elf("x86_64");

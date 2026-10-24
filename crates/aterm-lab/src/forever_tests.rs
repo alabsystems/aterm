@@ -5547,6 +5547,172 @@ fn end_passes_on_a_window_at_rest_and_each_chain_drawn_as_its_face() {
 }
 
 #[test]
+fn end_takes_agys_off_tab_as_its_switch_alone() {
+    const REST: &str = "timer_wakes=0 event_wakes=3 deadline_owner=presence deadline_arms_by_owner=presence:1/0 deadline_fires_by_owner=none wakes_by_variant=HostNote:2,HarnessFact:1";
+    let front = |line: &str| surfaces::Window {
+        front: Some((T0, line.to_string())),
+        ..window("x")
+    };
+    let end = |program: &str, off: &str| {
+        let n = front(&format!(
+            "window=2 program={program} face=cruise drawn=\"∞\" spoken=\"x\""
+        ));
+        let off = front(off);
+        let v = surfaces::judge_end(
+            &rest_desk(REST, "0"),
+            &[(Chain::CruiseN, &n), (Chain::Off, &off)],
+            program,
+        );
+        (v.word(), v.why().to_string())
+    };
+    let bare = "window=2 program=agy face=off drawn=- why=switch-only spoken=- description=-";
+    let (w, why) = end("agy", bare);
+    assert_eq!(w, "PASS", "{why}");
+    assert!(why.contains("off: drawn=- why=switch-only"), "{why}");
+    for face in ["agent-off", "master-off"] {
+        let line = format!(
+            "window=2 program=agy face={face} drawn=- why=switch-only spoken=- description=-"
+        );
+        let (w, why) = end("agy", &line);
+        assert_eq!(w, "PASS", "{face}: {why}");
+    }
+    let (w, why) = end(
+        "agy",
+        "window=2 program=agy face=unhosted drawn=\"⊘ off\" spoken=\"x\"",
+    );
+    assert_eq!(
+        w, "PASS",
+        "agy unhosted has no switch and draws its chip: {why}"
+    );
+    let (w, why) = end(
+        "agy",
+        "window=2 program=agy face=off drawn=\"○ off\" spoken=\"x\"",
+    );
+    assert_eq!(
+        w, "FAIL",
+        "agy's footer drew its chip under an off switch: {why}"
+    );
+    assert!(why.contains("wanted drawn=- why=switch-only"), "{why}");
+    for (program, line) in [
+        (
+            "agy",
+            "window=2 program=agy face=agent-off drawn=\"⊘ off\" spoken=\"x\"",
+        ),
+        (
+            "agy",
+            "window=2 program=agy face=off drawn=- why=not-drawn spoken=- description=-",
+        ),
+        (
+            "agy",
+            "window=2 program=agy face=cruise drawn=- why=switch-only spoken=- description=-",
+        ),
+        (
+            "claude",
+            "window=2 program=claude face=off drawn=- why=switch-only spoken=- description=-",
+        ),
+        (
+            "muse",
+            "window=2 program=muse face=off drawn=- why=switch-only spoken=- description=-",
+        ),
+    ] {
+        let (w, why) = end(program, line);
+        assert_eq!(w, "FAIL", "{program}: {line}: {why}");
+    }
+}
+
+#[test]
+fn end_allows_the_wake_watchs_recheck_beside_writes_only() {
+    const WROTE: &str = "timer_wakes=14 event_wakes=108 deadline_owner=session_status deadline_arms_by_owner=wake_heal:1/0,session_status:26/0,presence:81/0 deadline_fires_by_owner=session_status:14 wakes_by_variant=ReadSessionStatus:60,Output:32,HostNote:1,Vitals:1 wake_heals=0 output_wake_late=0";
+    let front = |line: &str| surfaces::Window {
+        front: Some((T0, line.to_string())),
+        ..window("x")
+    };
+    let n = front("window=2 program=muse face=cruise drawn=\"∞\" spoken=\"x\"");
+    let end = |metrics: &str| {
+        let v = surfaces::judge_end(&rest_desk(metrics, "0"), &[(Chain::CruiseN, &n)], "muse");
+        (v.word(), v.why().to_string())
+    };
+    let (w, why) = end(WROTE);
+    assert_eq!(w, "PASS", "{why}");
+    assert!(
+        why.contains(
+            "the output-wake watch's recheck armed 1 time(s) and fired 0 time(s), wake_heals=0"
+        ),
+        "{why}"
+    );
+    let (w, why) = end(&WROTE.replace("wake_heal:1/0,", ""));
+    assert_eq!(w, "PASS", "{why}");
+    assert!(!why.contains("output-wake watch"), "{why}");
+    let (w, why) = end(&WROTE.replace("wake_heal:1/0", "wake_heal:32/0"));
+    assert_eq!(w, "PASS", "once a write, every write: {why}");
+    let fired = WROTE
+        .replace("timer_wakes=14", "timer_wakes=15")
+        .replace("wake_heal:1/0", "wake_heal:1/1")
+        .replace(
+            "fires_by_owner=session_status:14",
+            "fires_by_owner=wake_heal:1,session_status:14",
+        )
+        .replace("output_wake_late=0", "output_wake_late=1");
+    let (w, why) = end(&fired);
+    assert_eq!(
+        w, "PASS",
+        "a late wake's recheck fired, healing nothing: {why}"
+    );
+    assert!(
+        why.contains("armed 1 time(s) and fired 1 time(s), wake_heals=0 output_wake_late=1"),
+        "{why}"
+    );
+    let quiet = "timer_wakes=0 event_wakes=3 deadline_owner=presence deadline_arms_by_owner=wake_heal:1/0,presence:1/0 deadline_fires_by_owner=none wakes_by_variant=HostNote:2,HarnessFact:1 wake_heals=0 output_wake_late=0";
+    for bent in [
+        quiet.to_string(),
+        quiet
+            .replace("timer_wakes=0", "timer_wakes=1")
+            .replace("fires_by_owner=none", "fires_by_owner=wake_heal:1"),
+        fired.replace("timer_wakes=15", "timer_wakes=14"),
+        fired.replace("wake_heals=0", "wake_heals=1"),
+        fired
+            .replace("wake_heal:1/1,", "")
+            .replace("wake_heals=0", "wake_heals=1"),
+        fired
+            .replace("timer_wakes=15", "timer_wakes=47")
+            .replace("wake_heal:1,", "wake_heal:33,"),
+        WROTE.replace("wake_heals=0", "wake_heals=1"),
+        WROTE.replace(" wake_heals=0", ""),
+        WROTE.replace("wake_heal:1/0", "wake_heal:33/0"),
+    ] {
+        let (w, why) = end(&bent);
+        assert_eq!(w, "FAIL", "{bent}: {why}");
+    }
+}
+
+#[test]
+fn end_reads_the_wake_watchs_counts_from_the_metrics_reply() {
+    const REPLY: &str = "OK schema=1 n_present=0 sync_armed=0 sync_rel_end=0 sync_rel_timeout=0 sync_holding=0 perf_reduced=0 shed_transitions=0 wake_heals=0 output_wake_late=0 output_wake_reposts=0 redraw_attempts=0 event_wakes=108 timer_wakes=14 deadline_owner=session_status deadline_arms_by_owner=wake_heal:1/0,session_status:26/0,presence:81/0 deadline_fires_by_owner=session_status:14 past_arms=0 wakes_by_variant=ReadSessionStatus:60,Output:32,HostNote:1,Vitals:1 fg_rss_mb=-";
+    let n = surfaces::Window {
+        front: Some((
+            T0,
+            "window=2 program=muse face=cruise drawn=\"∞\" spoken=\"x\"".to_string(),
+        )),
+        ..window("x")
+    };
+    let end = |reply: &str| {
+        let kept = surfaces::idle_metrics(reply);
+        let v = surfaces::judge_end(&rest_desk(&kept, "0"), &[(Chain::CruiseN, &n)], "muse");
+        (kept, v.word(), v.why().to_string())
+    };
+    let (kept, w, why) = end(REPLY);
+    assert!(kept.contains("wake_heals=0 output_wake_late=0"), "{kept}");
+    assert_eq!(w, "PASS", "{why}");
+    assert!(
+        why.contains("wake_heals=0 output_wake_late=0: allowed at rest"),
+        "{why}"
+    );
+    let (_, w, why) = end(&REPLY.replace("wake_heals=0", "wake_heals=1"));
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("wake_heals=1"), "{why}");
+}
+
+#[test]
 fn every_chain_and_scenario_of_the_pass_has_its_window_wants() {
     let wanted = |c: Chain, s: Scenario| {
         let mut seen = Seen::default();
@@ -6928,4 +7094,131 @@ fn the_hide_waits_on_the_walls_wait_either_side_of_its_point() {
     waited.push((156_500, resets));
     assert!(waits_on_the_wall(&seen(&waited)));
     assert!(!waits_on_the_wall(&seen(&muse)));
+}
+
+/// A TAB'S WAIT FOR ITS EMPTY COMPOSER IS A HANG DETECTOR OVER ITS SCREEN, AND A
+/// DRAFT OR AN EDITOR NO ONE OPENED ENDS IT AT ONCE: a starved agent whose screen
+/// moves every 30 s for five minutes is waited for; the same start whose screen
+/// stood still from the 100th second is a hang a minute later; a composer holding
+/// text before the lab typed (`ty-umf2`: Muse Code's composer holding aterm's OSC
+/// 10 reply, read by the lab's own reader off the screen it drew at seq 314) ends
+/// the wait at the look that saw it; and so does vim holding the tab
+/// (`b2cvu-muse`'s `land-q`, seq 227: the stray replies in Muse Code's prompt
+/// file), which the lab's reader tells from Muse Code's screens.
+#[test]
+fn a_composer_is_waited_for_while_its_screen_moves_and_input_no_one_gave_ends_it_at_once() {
+    let t0 = Instant::now();
+    let clock = std::cell::Cell::new(0u64);
+    let tick = || {
+        clock.set(clock.get() + 1);
+        Ok(t0 + Duration::from_secs(clock.get()))
+    };
+    let empty_from = |n: u64| {
+        if clock.get() >= n {
+            Stand::Composer(String::new())
+        } else {
+            Stand::Starting
+        }
+    };
+    let started = composer_wait(
+        || (clock.get() / 30, empty_from(300)),
+        COMPOSER_HANG,
+        t0,
+        tick,
+    );
+    assert_eq!(
+        started,
+        Ok(ComposerWait::Ready),
+        "a starved start is no hang"
+    );
+    clock.set(0);
+    let hung = composer_wait(
+        || (clock.get().min(100), empty_from(300)),
+        COMPOSER_HANG,
+        t0,
+        tick,
+    );
+    assert_eq!(hung, Ok(ComposerWait::Hung));
+    assert_eq!(
+        clock.get(),
+        160,
+        "the hang is named a minute after the last move"
+    );
+    let rule = "─".repeat(144);
+    let voice = format!("── Voice input (⌥ + v to start) {}", "─".repeat(112));
+    let umf2 = [
+        "",
+        "  Muse Code 1.4.12",
+        "",
+        voice.as_str(),
+        "❯ ]10;rgb:d0d0/d0d0/d0d0",
+        rule.as_str(),
+        "  lab-stub · high · /private/tmp/at.oBb0/proj/land-c · Auto-review",
+        "",
+    ]
+    .join("\n");
+    let leak = crate::screen::composer_row("muse", &umf2);
+    assert_eq!(leak.as_deref(), Some("]10;rgb:d0d0/d0d0/d0d0"));
+    clock.set(0);
+    let drafted = composer_wait(
+        || {
+            let stand = match &leak {
+                Some(text) if clock.get() >= 5 => Stand::Composer(text.clone()),
+                _ => Stand::Starting,
+            };
+            (clock.get(), stand)
+        },
+        COMPOSER_HANG,
+        t0,
+        tick,
+    );
+    assert_eq!(
+        drafted,
+        Ok(ComposerWait::Draft("]10;rgb:d0d0/d0d0/d0d0".into()))
+    );
+    assert_eq!(clock.get(), 5, "reported at the look that saw it");
+    let status = "</tmp/at.lab-501/aterm-ty2b-9671b4d1/runs/b2cvu-muse/scratch/tmp/tbh-prompt-\
+                  5cc2c6c5-b051-4111-b461-496566263d38.md\" [noeol] 1L, 92B";
+    let mut vim = vec![
+        "]10;rgb:d0d0/d0d0/d0d0]4;0;rgb:0000/0000/0000]4;8;rgb:8a8a/8f8f/9999]4;12;rgb:5c5c/5c5c/ffff",
+    ];
+    vim.extend(["~"; 48]);
+    vim.push(status);
+    let vim = vim.join("\n");
+    assert_eq!(crate::screen::composer_row("muse", &vim), None);
+    assert_eq!(crate::screen::editor_row(&vim).as_deref(), Some(status));
+    let first_row = vim.split('\n').next().unwrap_or_default();
+    for (what, screen) in [
+        ("ty-umf2's composer", umf2.as_str()),
+        ("vim's first row alone", first_row),
+    ] {
+        assert_eq!(crate::screen::editor_row(screen), None, "{what}");
+    }
+    clock.set(0);
+    let opened = composer_wait(
+        || {
+            let stand = if clock.get() >= 3 {
+                crate::screen::editor_row(&vim).map_or(Stand::Starting, Stand::Editor)
+            } else {
+                Stand::Starting
+            };
+            (clock.get(), stand)
+        },
+        COMPOSER_HANG,
+        t0,
+        tick,
+    );
+    assert_eq!(opened, Ok(ComposerWait::Editor(status.into())));
+    assert_eq!(clock.get(), 3, "reported at the look that saw it");
+    assert!(
+        ComposerWait::Editor(status.into())
+            .why("muse")
+            .is_some_and(|w| w.contains("an editor held muse's tab"))
+    );
+    assert!(
+        ComposerWait::Draft("x".into())
+            .why("muse")
+            .is_some_and(|w| w.contains("no one typed"))
+    );
+    assert_eq!(ComposerWait::Ready.why("muse"), None);
 }

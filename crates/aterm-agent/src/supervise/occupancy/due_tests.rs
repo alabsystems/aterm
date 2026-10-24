@@ -8,8 +8,6 @@ use crate::supervise::occupancy::fault::{self, Fault};
 
 const LOOK: i64 = LOOK_EVERY_MS;
 
-/// Feeds key 1 due at each look from `from` to `to`, held by `guard(look)`, sampling after each:
-/// the first look it stands raised at.
 fn first_raise(
     clock: &mut DueClock<u8>,
     from: i64,
@@ -30,8 +28,6 @@ fn draft(_: i64) -> Option<Guard> {
     Some(Guard::Draft)
 }
 
-/// A LINE DUE K LOOKS RAISES AT LOOK K, NOT BEFORE, and stands raised while it stays due, with
-/// the guard holding it and its start. NEGATIVE CONTROL: `LateRaise` raises a look late.
 #[test]
 fn a_due_line_raises_at_look_k_not_before() {
     let mut clock = DueClock::default();
@@ -53,9 +49,6 @@ fn a_due_line_raises_at_look_k_not_before() {
     assert_eq!(late, Some(K_LOOKS + 1));
 }
 
-/// A GUARD THAT CHANGES ITS WORD NEVER RESTARTS THE CLOCK: a draft, a person's hand, a draft
-/// again, and the line raises at look 10 from its first look. NEGATIVE CONTROL: `KFromLastWord`
-/// (a clock from the rule's last word) raises past look 10.
 #[test]
 fn a_guard_that_changes_its_word_keeps_the_clock() {
     let flap = |look: i64| match look {
@@ -79,9 +72,6 @@ fn a_guard_that_changes_its_word_keeps_the_clock() {
     );
 }
 
-/// A PERSON'S HAND HOLDS THE RAISE: a line a person holds at look 10 raises nothing, and passed to
-/// a draft at look 12 it raises at once, its clock having run. A line a person holds for ever
-/// never raises. CONTROL: the same clock with the draft from the start raises at 10.
 #[test]
 fn a_person_holds_the_raise_and_a_hand_over_past_k_raises_at_once() {
     let handed = |look: i64| {
@@ -102,8 +92,6 @@ fn a_person_holds_the_raise_and_a_hand_over_past_k_raises_at_once() {
     );
 }
 
-/// A LINE TOLD BEFORE K NEVER RAISES: no longer due at look 9, its clock is forgotten, and a new
-/// episode of the same key starts its own. CONTROL: the key due through look 10 raises.
 #[test]
 fn a_line_told_before_k_never_raises() {
     let mut clock = DueClock::default();
@@ -119,9 +107,6 @@ fn a_line_told_before_k_never_raises() {
     assert_eq!(first_raise(&mut clock, 20, 20, draft), Some(20));
 }
 
-/// A SEEDED SUCCESSOR RAISES ON TIME: a successor that begins at look 10 of a line its
-/// predecessor saw due from look 0 raises at its first look. A later seed never moves an earlier
-/// clock. NEGATIVE CONTROL: `KUnseeded` raises ten looks late.
 #[test]
 fn a_seeded_successor_raises_on_time() {
     let succeed = || {
@@ -138,7 +123,6 @@ fn a_seeded_successor_raises_on_time() {
     );
 }
 
-/// Each key keeps its own clock, and a seed no observe names is forgotten at the next look.
 #[test]
 fn each_key_keeps_its_own_clock() {
     let mut clock: DueClock<u8> = DueClock::default();

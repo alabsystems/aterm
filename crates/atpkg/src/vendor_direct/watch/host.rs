@@ -80,8 +80,7 @@ impl HostClaim {
         }
     }
 
-    /// Whether this host may start a round now, and the one line a changed standing is worth (a
-    /// session's only: a window's claim is taken once and kept).
+    /// Returns whether this host may start a round now and any standing-change note.
     pub(super) fn admit(&mut self) -> (Admit, Option<String>) {
         #[cfg(test)]
         {
@@ -156,8 +155,7 @@ impl HostClaim {
         self.host == Host::Session && self.seat.is_some() && self.hosts.is_some()
     }
 
-    /// A seated session refused only because a window owns the rendezvous retries on the next park
-    /// slice; another tab without the seat waits the watch's minute cadence.
+    /// Whether this session is seated and waiting only because a window holds the rendezvous.
     pub(super) fn window_watches(&self) -> bool {
         self.host == Host::Session && self.standing == Some(Standing::WindowWatches)
     }
@@ -209,8 +207,7 @@ fn read_pid(file: &mut File) -> Option<u32> {
     text.trim().parse().ok()
 }
 
-/// Which host watches this store's vendor heads right now, as `aterm pkg doctor` says it
-/// ([`watcher`]).
+/// Which host watches this store's vendor heads right now ([`watcher`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Watcher {
     /// An aterm window holds the watch.

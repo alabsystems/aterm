@@ -12,7 +12,7 @@ use crate::flow::{Fetcher, FlowError, VendorFetchError, VendorGet};
 use crate::manifest::{Artifact, Cost, DigestAlg};
 use crate::openpgp::PinnedRsaKey;
 
-const CLAUDE_HEAD_CAP: u64 = 64;
+const PLAIN_HEAD_CAP: u64 = 64;
 const CODEX_HEAD_CAP: u64 = 1024 * 1024;
 const SMALL_JSON_CAP: u64 = 4 * 1024;
 const MANIFEST_CAP: u64 = 64 * 1024;
@@ -21,6 +21,12 @@ const ARCHIVE_UNPACK_RATIO: u64 = 4;
 const CODEX_DOWNLOADS: &str = "https://github.com/openai/codex/releases/download/";
 const AGY_BUCKET: &str = "https://storage.googleapis.com/antigravity-public/antigravity-cli/";
 const MUSE_DOWNLOAD: &str = "https://lookaside.facebook.com/lookaside/muse/download/";
+const KIMI_CDN: &str = "https://cdn.kimi.com/kimi-code/";
+const KIMI_GITHUB: &str = "https://github.com/MoonshotAI/kimi-code/releases/download/";
+const GROK_BUCKET: &str = "https://storage.googleapis.com/grok-build-public-artifacts/cli/";
+/// The largest grok payload the lane downloads: with no published digest, the size the bucket
+/// answers is the only bound on the bytes fetched before the team pin judges them.
+const GROK_MAX_BYTES: u64 = 1 << 30;
 
 /// What the head said.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,8 +81,47 @@ pub(crate) struct Candidate {
     pub build_date: Option<BuildDate>,
     /// What authenticated the digest.
     pub anchor: Anchor,
-    /// The payload's authenticated digest.
-    pub digest: AuthenticatedDigest,
+    /// What vouches for the payload's digest.
+    pub vouch: Vouch,
+}
+
+/// What vouches for a candidate's payload digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Vouch {
+    /// The anchor's documents named it before any byte moved.
+    Documents(AuthenticatedDigest),
+    /// No document names one (grok): the lane measures the bytes it downloads before it stages
+    /// them ([`super::lane`]).
+    Measure,
+    /// Measured from the downloaded bytes; the darwin team pin judges those bytes at stage.
+    Measured(AuthenticatedDigest),
+}
+
+impl Vouch {
+    /// The digest, once a document named it or the lane measured it.
+    #[must_use]
+    pub(crate) const fn digest(&self) -> Option<&AuthenticatedDigest> {
+        match self {
+            Self::Documents(d) | Self::Measured(d) => Some(d),
+            Self::Measure => None,
+        }
+    }
+}
+
+impl Candidate {
+    /// This candidate with the digest the lane measured from its downloaded bytes, its row
+    /// carrying it as every other row carries its documents' digest; `None` unless the
+    /// candidate is still [`Vouch::Measure`] and `digest` is its anchor's algorithm.
+    #[must_use]
+    pub(crate) fn measured(&self, digest: AuthenticatedDigest) -> Option<Self> {
+        if self.vouch != Vouch::Measure || digest.alg() != self.anchor.digest_alg() {
+            return None;
+        }
+        let mut out = self.clone();
+        (out.artifact.artifact.sha256, out.artifact.artifact.sha512) = digest.keyed();
+        out.vouch = Vouch::Measured(digest);
+        Some(out)
+    }
 }
 
 /// What verifying a head's documents came to.
@@ -130,7 +175,9 @@ pub(crate) fn read_head_via(
     if_none_match: Option<&str>,
 ) -> Head {
     let cap = match spec.anchor {
-        Anchor::AnthropicOpenPgp => CLAUDE_HEAD_CAP,
+        Anchor::AnthropicOpenPgp | Anchor::MoonshotTwoHost | Anchor::XaiDeveloperId => {
+            PLAIN_HEAD_CAP
+        }
         Anchor::OpenAiTwoHost => CODEX_HEAD_CAP,
         Anchor::GoogleTwoHost | Anchor::MetaDeveloperId => SMALL_JSON_CAP,
     };
@@ -166,7 +213,9 @@ pub(crate) fn read_head_via(
 fn head_version(spec: &VendorSpec, body: &[u8]) -> Result<Version, String> {
     let canonical = || String::from("the release channel's head names no canonical version");
     match spec.anchor {
-        Anchor::AnthropicOpenPgp => claude_head_version(body).ok_or_else(canonical),
+        Anchor::AnthropicOpenPgp | Anchor::MoonshotTwoHost | Anchor::XaiDeveloperId => {
+            plain_head_version(body).ok_or_else(canonical)
+        }
         Anchor::OpenAiTwoHost => strict_json(body)
             .ok()
             .and_then(|doc| codex_tag_version(&doc).ok())
@@ -193,6 +242,8 @@ pub(crate) fn verify(
         Anchor::OpenAiTwoHost => verify_codex(spec, triple, fetcher, version, head_body),
         Anchor::GoogleTwoHost => verify_agy(spec, triple, fetcher, version, head_body),
         Anchor::MetaDeveloperId => verify_muse(spec, triple, fetcher, version),
+        Anchor::MoonshotTwoHost => verify_kimi(spec, triple, fetcher, version),
+        Anchor::XaiDeveloperId => verify_grok(spec, triple, fetcher, version),
     };
     match verified {
         Ok(candidate) => Resolution::Candidate(Box::new(candidate)),
@@ -213,14 +264,20 @@ pub(crate) fn serves(anchor: Anchor, triple: &str) -> bool {
         Anchor::OpenAiTwoHost => true,
         Anchor::GoogleTwoHost => agy_platform(triple).is_some(),
         Anchor::MetaDeveloperId => muse_platform(triple).is_some(),
+        Anchor::MoonshotTwoHost => kimi_platform(triple).is_some(),
+        Anchor::XaiDeveloperId => grok_platform(triple).is_some(),
     }
 }
 
-/// Admits a synthetic row before any byte moves.
+/// Admits a synthetic row before any byte moves, and again before it is staged.
+///
+/// The row carries no digest only while `vouch` is [`Vouch::Measure`] for an anchor that
+/// publishes none (grok, before the lane measures its bytes); otherwise its one digest is the
+/// one `vouch` names.
 ///
 /// # Errors
 /// [`FlowError::VendorRefused`] naming the first field that does not fit.
-pub(crate) fn admit(row: &SyntheticArtifact) -> Result<(), FlowError> {
+pub(crate) fn admit(row: &SyntheticArtifact, vouch: &Vouch) -> Result<(), FlowError> {
     let refuse = |why: &str| Err(FlowError::VendorRefused(why.to_string()));
     let Some(spec) = super::spec(row.program) else {
         return refuse("not a vendor-direct program");
@@ -246,10 +303,16 @@ pub(crate) fn admit(row: &SyntheticArtifact) -> Result<(), FlowError> {
         return refuse("a vendor-direct row carries no strip, links or signed root");
     }
     let alg = spec.anchor.digest_alg();
-    if a.digest()
-        .is_none_or(|(got, hex)| got != alg || !alg.is_lower_hex(hex))
-        || a.size == 0
-    {
+    let digest_ok = match vouch.digest() {
+        None => !spec.anchor.publishes_digest() && a.sha256.is_empty() && a.sha512.is_empty(),
+        Some(d) => {
+            d.alg() == alg
+                && a.digest().is_some_and(|(got, hex)| {
+                    got == alg && alg.is_lower_hex(hex) && hex == d.as_str()
+                })
+        }
+    };
+    if !digest_ok || a.size == 0 {
         return refuse("a vendor-direct row needs its anchor's one digest and an exact size");
     }
     if a.asset != asset_name(row.program, row.version, &a.target, &a.payload) {
@@ -272,7 +335,10 @@ pub(crate) fn staging_asset(spec: &VendorSpec, version: Version, triple: &str) -
 fn payload_of(anchor: Anchor, triple: &str) -> &'static str {
     let windows = triple.contains("-windows-");
     match anchor {
-        Anchor::AnthropicOpenPgp | Anchor::MetaDeveloperId => "raw-binary",
+        Anchor::AnthropicOpenPgp
+        | Anchor::MetaDeveloperId
+        | Anchor::MoonshotTwoHost
+        | Anchor::XaiDeveloperId => "raw-binary",
         Anchor::GoogleTwoHost if windows => "raw-binary",
         Anchor::GoogleTwoHost => "tar-gz-binary",
         Anchor::OpenAiTwoHost if windows => "zip",
@@ -335,7 +401,8 @@ fn off_pin(requested: &str, effective: &str) -> String {
     format!("{requested} was answered from {effective}, off its pinned host")
 }
 
-fn claude_head_version(body: &[u8]) -> Option<Version> {
+/// A plain-text head (claude's, kimi's and grok's): one canonical version, at most one `\n` after it.
+fn plain_head_version(body: &[u8]) -> Option<Version> {
     let text = std::str::from_utf8(body).ok()?;
     Version::parse(text.strip_suffix('\n').unwrap_or(text))
 }
@@ -434,7 +501,15 @@ fn verify_claude(
     };
     let url = format!("{base}{version}/{platform}/{binary}");
     let payload = payload_of(spec.anchor, triple);
-    let row = vouched(spec, version, triple, &url, digest, size, payload);
+    let row = vouched(
+        spec,
+        version,
+        triple,
+        &url,
+        Vouch::Documents(digest),
+        size,
+        payload,
+    );
     Ok(Candidate { build_date, ..row })
 }
 
@@ -497,7 +572,8 @@ fn verify_codex(
     } else {
         "tar-gz"
     };
-    Ok(vouched(spec, version, triple, &url, digest, size, payload))
+    let vouch = Vouch::Documents(digest);
+    Ok(vouched(spec, version, triple, &url, vouch, size, payload))
 }
 
 /// agy's platform for the client's own triple: `(Run manifest key, bucket directory, payload
@@ -592,8 +668,9 @@ fn verify_agy(
         return refused(format!("{} answered no content length", head.url));
     }
     let payload = payload_of(spec.anchor, triple);
+    let vouch = Vouch::Documents(digest);
     Ok(vouched(
-        spec, version, triple, &head.url, digest, size, payload,
+        spec, version, triple, &head.url, vouch, size, payload,
     ))
 }
 
@@ -687,7 +764,156 @@ fn verify_muse(
         ));
     };
     let payload = payload_of(spec.anchor, triple);
-    Ok(vouched(spec, version, triple, &url, digest, size, payload))
+    let vouch = Vouch::Documents(digest);
+    Ok(vouched(spec, version, triple, &url, vouch, size, payload))
+}
+
+/// kimi's manifest platform key and payload file for `triple`: darwin, Linux on glibc and
+/// Windows, as Moonshot's release manifests spell them (no musl build is published).
+pub(super) fn kimi_platform(triple: &str) -> Option<(&'static str, &'static str)> {
+    Some(match triple {
+        "aarch64-apple-darwin" => ("darwin-arm64", "kimi-code-darwin-arm64"),
+        "x86_64-apple-darwin" => ("darwin-x64", "kimi-code-darwin-x64"),
+        "x86_64-unknown-linux-gnu" => ("linux-x64", "kimi-code-linux-x64"),
+        "aarch64-unknown-linux-gnu" => ("linux-arm64", "kimi-code-linux-arm64"),
+        "x86_64-pc-windows-msvc" => ("win32-x64", "kimi-code-win32-x64.exe"),
+        "aarch64-pc-windows-msvc" => ("win32-arm64", "kimi-code-win32-arm64.exe"),
+        _ => return None,
+    })
+}
+
+/// The `/platforms/<platform>/checksum` one kimi release manifest (`which`) names, once the
+/// manifest is strict JSON for `version` under `tag` and names `file` for `platform`.
+fn kimi_checksum(
+    doc: &[u8],
+    which: &str,
+    version: Version,
+    tag: &str,
+    (platform, file): (&str, &str),
+) -> Result<String, String> {
+    let Ok(doc) = strict_json(doc) else {
+        return Err(format!(
+            "kimi's {which} release manifest is not strict JSON (a key repeats or it does not parse)"
+        ));
+    };
+    let field = |v: &aterm_json::Value, key: &str| {
+        v.get(key)
+            .and_then(aterm_json::Value::as_str)
+            .map(str::to_string)
+    };
+    if field(&doc, "version") != Some(version.to_string()) {
+        return Err(format!(
+            "kimi's {which} release manifest is not for {version}"
+        ));
+    }
+    if field(&doc, "tag").as_deref() != Some(tag) {
+        return Err(format!(
+            "kimi's {which} release manifest is not tagged {tag}"
+        ));
+    }
+    let Some(row) = doc.pointer(&format!("/platforms/{platform}")) else {
+        return Err(format!(
+            "kimi's {which} release manifest names no {platform} build"
+        ));
+    };
+    if field(row, "filename").as_deref() != Some(file) {
+        return Err(format!(
+            "kimi's {which} release manifest names a {platform} file other than {file}"
+        ));
+    }
+    field(row, "checksum")
+        .ok_or_else(|| format!("kimi's {which} release manifest carries no sha256 for {platform}"))
+}
+
+fn verify_kimi(
+    spec: &'static VendorSpec,
+    triple: &str,
+    fetcher: &dyn Fetcher,
+    version: Version,
+) -> Result<Candidate, Fault> {
+    let Some(platform) = kimi_platform(triple) else {
+        return refused(format!(
+            "Moonshot AI publishes no kimi build aterm can verify for {triple}"
+        ));
+    };
+    let tag = format!("@moonshot-ai/kimi-code@{version}");
+    let alg = spec.anchor.digest_alg();
+    let named = |which: &str, url: &str| -> Result<AuthenticatedDigest, Fault> {
+        let doc = digest_doc(spec, fetcher, url, MANIFEST_CAP)?;
+        let checksum =
+            kimi_checksum(&doc, which, version, &tag, platform).map_err(Fault::Refused)?;
+        AuthenticatedDigest::authenticated(alg, &checksum).ok_or_else(|| {
+            Fault::Refused(format!(
+                "kimi's {which} release manifest's {alg} for {} is not 64 hex digits",
+                platform.0
+            ))
+        })
+    };
+    let cdn = named(
+        "CDN",
+        &format!("{KIMI_CDN}binaries/{version}/manifest.json"),
+    )?;
+    let github = named("GitHub", &format!("{KIMI_GITHUB}{tag}/manifest.json"))?;
+    if cdn != github {
+        return refused(format!(
+            "kimi's CDN and GitHub release manifests disagree on {}'s {alg}",
+            platform.1
+        ));
+    }
+    let url = format!("{KIMI_CDN}binaries/{version}/{}", platform.1);
+    let size = fetcher.vendor_content_length(spec.program, &url)?;
+    if size == 0 {
+        return refused(format!("{url} answered no content length"));
+    }
+    let payload = payload_of(spec.anchor, triple);
+    let vouch = Vouch::Documents(cdn);
+    Ok(vouched(spec, version, triple, &url, vouch, size, payload))
+}
+
+/// grok's payload platform for `triple`: darwin only, where the Developer ID team pin is the
+/// one check that vouches for bytes no document names.
+pub(super) fn grok_platform(triple: &str) -> Option<&'static str> {
+    Some(match triple {
+        "aarch64-apple-darwin" => "macos-aarch64",
+        "x86_64-apple-darwin" => "macos-x86_64",
+        _ => return None,
+    })
+}
+
+/// grok's candidate: the bucket path the client builds for the head's version, sized by the
+/// bucket and measured by the lane once downloaded ([`Vouch::Measure`]); no payload byte moves.
+fn verify_grok(
+    spec: &'static VendorSpec,
+    triple: &str,
+    fetcher: &dyn Fetcher,
+    version: Version,
+) -> Result<Candidate, Fault> {
+    let Some(platform) = grok_platform(triple) else {
+        return refused(format!(
+            "xAI publishes no grok build aterm can verify for {triple}"
+        ));
+    };
+    let url = format!("{GROK_BUCKET}grok-{version}-{platform}");
+    let size = fetcher.vendor_content_length(spec.program, &url)?;
+    if size == 0 {
+        return refused(format!("{url} answered no content length"));
+    }
+    if size > GROK_MAX_BYTES {
+        return refused(format!(
+            "{url} is {size} bytes, over the {GROK_MAX_BYTES}-byte bound on a payload no \
+             document vouches for"
+        ));
+    }
+    let payload = payload_of(spec.anchor, triple);
+    Ok(vouched(
+        spec,
+        version,
+        triple,
+        &url,
+        Vouch::Measure,
+        size,
+        payload,
+    ))
 }
 
 fn vouched(
@@ -695,7 +921,7 @@ fn vouched(
     version: Version,
     triple: &str,
     url: &str,
-    digest: AuthenticatedDigest,
+    vouch: Vouch,
     size: u64,
     payload: &str,
 ) -> Candidate {
@@ -709,7 +935,9 @@ fn vouched(
     } else {
         size.saturating_mul(ARCHIVE_UNPACK_RATIO)
     };
-    let (sha256, sha512) = digest.keyed();
+    let (sha256, sha512) = vouch
+        .digest()
+        .map_or_else(Default::default, AuthenticatedDigest::keyed);
     let artifact = SyntheticArtifact {
         program: spec.program,
         version,
@@ -742,7 +970,7 @@ fn vouched(
         artifact,
         build_date: None,
         anchor: spec.anchor,
-        digest,
+        vouch,
     }
 }
 
@@ -908,6 +1136,10 @@ mod tests {
     const AGY_WINDOWS_X64: &[u8] = include_bytes!("fixtures/agy-1.3.6-windows_amd64.json");
     const MUSE_CHANNEL: &[u8] = include_bytes!("fixtures/muse-stable-channel.json");
     const MUSE_MANIFEST: &[u8] = include_bytes!("fixtures/muse-1.4.9-R6297.1-manifest.json");
+    const KIMI_LATEST: &[u8] = include_bytes!("fixtures/kimi-latest");
+    const KIMI_CDN_MANIFEST: &[u8] = include_bytes!("fixtures/kimi-2.3.1-cdn-manifest.json");
+    const KIMI_GITHUB_MANIFEST: &[u8] = include_bytes!("fixtures/kimi-2.3.1-github-manifest.json");
+    const GROK_STABLE: &[u8] = include_bytes!("fixtures/grok-stable");
     const NOW: i64 = 1_790_035_200;
 
     fn v(text: &str) -> Version {
@@ -972,7 +1204,7 @@ mod tests {
             ));
             let a = c.artifact.artifact();
             assert_eq!(c.version, v("2.1.280"));
-            assert_eq!(c.digest.as_str(), sha, "{triple}");
+            assert_eq!(c.vouch.digest().unwrap().as_str(), sha, "{triple}");
             assert_eq!(a.sha256, sha);
             assert_eq!(a.size, size);
             assert_eq!(a.url, format!("{CLAUDE}2.1.280/{platform}/{suffix}"));
@@ -981,7 +1213,7 @@ mod tests {
             let ext = if suffix.ends_with(".exe") { ".exe" } else { "" };
             assert_eq!(a.asset, format!("claude-2.1.280-{triple}{ext}"));
             assert_eq!(c.build_date, BuildDate::parse("2026-09-21T20:55:27Z"));
-            admit(&c.artifact).unwrap();
+            admit(&c.artifact, &c.vouch).unwrap();
         }
         let test_key = crate::openpgp::testkit::test_key();
         match verify(
@@ -1065,20 +1297,20 @@ mod tests {
                 NOW,
             ));
             let a = c.artifact.artifact();
-            assert_eq!(c.digest.as_str(), sha, "{triple}");
+            assert_eq!(c.vouch.digest().unwrap().as_str(), sha, "{triple}");
             assert_eq!(a.url, url);
             assert_eq!(a.size, 1631, "the exact cap is the HEAD content length");
             assert_eq!(a.payload, "tar-gz");
             assert_eq!(a.asset, format!("codex-0.156.0-{triple}.tar.gz"));
             assert_eq!(c.build_date, None);
-            admit(&c.artifact).unwrap();
+            admit(&c.artifact, &c.vouch).unwrap();
         }
     }
 
     #[test]
     fn the_heads_name_canonical_versions_only() {
-        assert_eq!(claude_head_version(b"2.1.280\n"), Some(v("2.1.280")));
-        assert_eq!(claude_head_version(b"2.1.280"), Some(v("2.1.280")));
+        assert_eq!(plain_head_version(b"2.1.280\n"), Some(v("2.1.280")));
+        assert_eq!(plain_head_version(b"2.1.280"), Some(v("2.1.280")));
         for bad in [
             &b"2.1.280\n\n"[..],
             b" 2.1.280",
@@ -1087,7 +1319,7 @@ mod tests {
             b"latest",
             b"",
         ] {
-            assert_eq!(claude_head_version(bad), None, "{bad:?}");
+            assert_eq!(plain_head_version(bad), None, "{bad:?}");
         }
         let release = strict_json(REAL_RELEASE).unwrap();
         assert_eq!(codex_tag_version(&release), Ok(v("0.156.0")));
@@ -1192,7 +1424,7 @@ mod tests {
         f.doc(&format!("{CLAUDE}2.1.280/manifest.json"), REAL_MANIFEST);
         f.doc(&format!("{CLAUDE}2.1.280/manifest.json.sig"), REAL_SIG);
         let key = crate::openpgp::ANTHROPIC_CLAUDE_CODE_RELEASE_KEY;
-        let good = candidate(verify(
+        let c = candidate(verify(
             spec("claude"),
             "aarch64-apple-darwin",
             &f,
@@ -1200,9 +1432,9 @@ mod tests {
             b"",
             &key,
             NOW,
-        ))
-        .artifact;
-        admit(&good).unwrap();
+        ));
+        let (good, vouch) = (c.artifact.clone(), c.vouch.clone());
+        admit(&good, &vouch).unwrap();
         type Tweak = Box<dyn Fn(&mut Artifact)>;
         let tweaks: Vec<Tweak> = vec![
             Box::new(|a| a.url = "https://evil.example/claude".into()),
@@ -1216,6 +1448,7 @@ mod tests {
             Box::new(|a| a.strip_components = 1),
             Box::new(|a| a.size = 0),
             Box::new(|a| a.sha256 = "A".repeat(64)),
+            Box::new(|a| a.sha256 = "b".repeat(64)),
             Box::new(|a| a.sha512 = "5".repeat(128)),
             Box::new(|a| {
                 a.sha256 = String::new();
@@ -1232,8 +1465,14 @@ mod tests {
         for (i, tweak) in tweaks.iter().enumerate() {
             let mut row = good.clone();
             tweak(&mut row.artifact);
-            assert!(admit(&row).is_err(), "tweak {i} was admitted");
+            assert!(admit(&row, &vouch).is_err(), "tweak {i} was admitted");
         }
+        let mut digestless = good.clone();
+        digestless.artifact.sha256 = String::new();
+        assert!(
+            admit(&digestless, &Vouch::Measure).is_err(),
+            "claude's anchor publishes its digest, so nothing of it is measured"
+        );
         let a = good.artifact();
         let sha512 = AuthenticatedDigest::authenticated(DigestAlg::Sha512, &"5".repeat(128));
         let by_512 = vouched(
@@ -1241,23 +1480,25 @@ mod tests {
             good.version,
             &a.target,
             &a.url,
-            sha512.unwrap(),
+            Vouch::Documents(sha512.unwrap()),
             a.size,
             &a.payload,
-        )
-        .artifact;
+        );
         assert_eq!(
-            by_512.artifact().digest(),
+            by_512.artifact.artifact().digest(),
             Some((DigestAlg::Sha512, "5".repeat(128).as_str()))
         );
-        assert!(by_512.artifact().sha256.is_empty());
+        assert!(by_512.artifact.artifact().sha256.is_empty());
         assert!(
-            admit(&by_512).is_err(),
+            admit(&by_512.artifact, &by_512.vouch).is_err(),
             "claude's anchor vouches for a sha256"
         );
         let mut other = good;
         other.program = "codex";
-        assert!(admit(&other).is_err(), "a claude row is not codex's");
+        assert!(
+            admit(&other, &vouch).is_err(),
+            "a claude row is not codex's"
+        );
     }
 
     fn refusal(r: Resolution) -> String {
@@ -1320,8 +1561,12 @@ mod tests {
             let c = candidate(verify_agy_on(&f, triple, "1.3.6", head));
             let a = c.artifact.artifact();
             let sha512 = agy_manifest(head).unwrap().sha512;
-            assert_eq!(c.digest.alg(), DigestAlg::Sha512, "{triple}");
-            assert_eq!(c.digest.as_str(), sha512);
+            assert_eq!(
+                c.vouch.digest().unwrap().alg(),
+                DigestAlg::Sha512,
+                "{triple}"
+            );
+            assert_eq!(c.vouch.digest().unwrap().as_str(), sha512);
             assert_eq!(
                 (a.sha256.as_str(), a.sha512.as_str()),
                 ("", sha512.as_str())
@@ -1332,11 +1577,11 @@ mod tests {
             assert_eq!(a.cost.disk_installed, 1234 * ratio);
             assert_eq!(a.asset, format!("agy-1.3.6-{triple}{ext}"));
             assert_eq!((c.build_date, c.anchor), (None, Anchor::GoogleTwoHost));
-            admit(&c.artifact).unwrap();
+            admit(&c.artifact, &c.vouch).unwrap();
             let mut by_256 = c.artifact.clone();
             by_256.artifact.sha512 = String::new();
             by_256.artifact.sha256 = "a".repeat(64);
-            assert!(admit(&by_256).is_err(), "{triple}");
+            assert!(admit(&by_256, &c.vouch).is_err(), "{triple}");
         }
         f.doc(spec("agy").head_url, AGY_DARWIN_ARM);
         assert!(matches!(
@@ -1465,7 +1710,10 @@ mod tests {
             ));
             let a = c.artifact.artifact();
             assert_eq!(
-                (c.digest.alg(), c.digest.as_str()),
+                (
+                    c.vouch.digest().unwrap().alg(),
+                    c.vouch.digest().unwrap().as_str()
+                ),
                 (DigestAlg::Sha256, sha)
             );
             assert_eq!((a.sha256.as_str(), a.size), (sha, size));
@@ -1482,7 +1730,7 @@ mod tests {
             );
             assert_eq!(a.asset, format!("muse-1.4.9-R6297.1-{triple}"));
             assert_eq!(c.anchor, Anchor::MetaDeveloperId);
-            admit(&c.artifact).unwrap();
+            admit(&c.artifact, &c.vouch).unwrap();
         }
         let asked = f.gets.borrow().len();
         for triple in ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"] {
@@ -1597,5 +1845,389 @@ mod tests {
             read_head(spec("claude"), &f, None),
             Head::Named { .. }
         ));
+    }
+
+    const KIMI_CDN_DOC: &str = "https://cdn.kimi.com/kimi-code/binaries/2.3.1/manifest.json";
+    const KIMI_GITHUB_DOC: &str = "https://github.com/MoonshotAI/kimi-code/releases/download/\
+                                   @moonshot-ai/kimi-code@2.3.1/manifest.json";
+    const GITHUB_STORAGE: &str = "https://release-assets.githubusercontent.com/github-production-release-asset/1246459259/1d";
+
+    fn verify_kimi_on(f: &Fake, triple: &str, version: &str) -> Resolution {
+        let key = crate::openpgp::ANTHROPIC_CLAUDE_CODE_RELEASE_KEY;
+        verify(spec("kimi"), triple, f, v(version), b"", &key, NOW)
+    }
+
+    /// Both kimi 2.3.1 manifests as Moonshot serves them (the GitHub one through its storage
+    /// redirect) and a sized payload for every served platform.
+    fn kimi_world() -> Fake {
+        let f = Fake::default();
+        f.doc(KIMI_CDN_DOC, KIMI_CDN_MANIFEST);
+        f.doc(KIMI_GITHUB_DOC, KIMI_GITHUB_MANIFEST);
+        f.redirect(KIMI_GITHUB_DOC, GITHUB_STORAGE);
+        for file in [
+            "kimi-code-darwin-arm64",
+            "kimi-code-darwin-x64",
+            "kimi-code-linux-x64",
+            "kimi-code-linux-arm64",
+            "kimi-code-win32-x64.exe",
+            "kimi-code-win32-arm64.exe",
+        ] {
+            f.payload(
+                &format!("https://cdn.kimi.com/kimi-code/binaries/2.3.1/{file}"),
+                &[0u8; 4321],
+            );
+        }
+        f
+    }
+
+    #[test]
+    fn the_real_kimi_release_resolves_when_the_cdn_and_github_agree() {
+        let f = kimi_world();
+        f.doc(spec("kimi").head_url, KIMI_LATEST);
+        assert!(matches!(
+            read_head(spec("kimi"), &f, None),
+            Head::Named { version, .. } if version == v("2.3.1")
+        ));
+        for (triple, file, sha) in [
+            (
+                "aarch64-apple-darwin",
+                "kimi-code-darwin-arm64",
+                "f06ba6a3bb7ed2fc1f82590f7c22570736d9ee7344059fa92404ca75dc2d5b45",
+            ),
+            (
+                "x86_64-apple-darwin",
+                "kimi-code-darwin-x64",
+                "c88f0d8ffa7d7a330199e63e0b9a4b8857e900c3b8f58fd5e90411d3e3ad1a87",
+            ),
+            (
+                "x86_64-unknown-linux-gnu",
+                "kimi-code-linux-x64",
+                "781ec1c24e5e79a01aaaa31ad859e8818ae11ffe792e93645cdc0c068a264ba0",
+            ),
+            (
+                "aarch64-unknown-linux-gnu",
+                "kimi-code-linux-arm64",
+                "9572c66402643ea16e97db239d739096a31454e74daa5ec12af04519e9916d68",
+            ),
+            (
+                "x86_64-pc-windows-msvc",
+                "kimi-code-win32-x64.exe",
+                "93878ac2bd12a8cf21b4e148e7f7705a7a6252c1398fd34eb50f8998ba0bf795",
+            ),
+            (
+                "aarch64-pc-windows-msvc",
+                "kimi-code-win32-arm64.exe",
+                "f15999373de18e1c84d5a5e96ddc0eb6ffdddaa3b056968c378117046b88fe26",
+            ),
+        ] {
+            let c = candidate(verify_kimi_on(&f, triple, "2.3.1"));
+            let a = c.artifact.artifact();
+            assert_eq!(
+                c.vouch,
+                Vouch::Documents(
+                    AuthenticatedDigest::authenticated(DigestAlg::Sha256, sha).unwrap()
+                ),
+                "{triple}"
+            );
+            assert_eq!((a.sha256.as_str(), a.sha512.as_str()), (sha, ""));
+            assert_eq!(
+                a.url,
+                format!("https://cdn.kimi.com/kimi-code/binaries/2.3.1/{file}")
+            );
+            assert_eq!(a.size, 4321, "the exact cap is the HEAD content length");
+            assert_eq!(
+                (a.payload.as_str(), a.entry.as_str()),
+                ("raw-binary", "kimi")
+            );
+            let ext = if triple.contains("-windows-") {
+                ".exe"
+            } else {
+                ""
+            };
+            assert_eq!(a.asset, format!("kimi-2.3.1-{triple}{ext}"));
+            assert_eq!((c.build_date, c.anchor), (None, Anchor::MoonshotTwoHost));
+            admit(&c.artifact, &c.vouch).unwrap();
+        }
+    }
+
+    #[test]
+    fn kimi_refuses_two_manifests_that_do_not_vouch_for_one_payload() {
+        const TRIPLE: &str = "aarch64-apple-darwin";
+        let sha = "f06ba6a3bb7ed2fc1f82590f7c22570736d9ee7344059fa92404ca75dc2d5b45";
+        let f = kimi_world();
+        candidate(verify_kimi_on(&f, TRIPLE, "2.3.1"));
+        for (url, doc, from, to, said) in [
+            (
+                KIMI_GITHUB_DOC,
+                KIMI_GITHUB_MANIFEST,
+                &sha[..8],
+                "00000000",
+                "disagree",
+            ),
+            (
+                KIMI_CDN_DOC,
+                KIMI_CDN_MANIFEST,
+                &sha[..8],
+                "00000000",
+                "disagree",
+            ),
+            (
+                KIMI_GITHUB_DOC,
+                KIMI_GITHUB_MANIFEST,
+                "\"tag\": \"@moonshot-ai/kimi-code@2.3.1\"",
+                "\"tag\": \"@moonshot-ai/kimi-code@2.3.0\"",
+                "not tagged @moonshot-ai/kimi-code@2.3.1",
+            ),
+            (
+                KIMI_CDN_DOC,
+                KIMI_CDN_MANIFEST,
+                "\"filename\": \"kimi-code-darwin-arm64\"",
+                "\"filename\": \"kimi-code-darwin-x64\"",
+                "other than kimi-code-darwin-arm64",
+            ),
+            (
+                KIMI_GITHUB_DOC,
+                KIMI_GITHUB_MANIFEST,
+                "\"version\": \"2.3.1\"",
+                "\"version\": \"2.3.2\"",
+                "GitHub release manifest is not for 2.3.1",
+            ),
+            (
+                KIMI_CDN_DOC,
+                KIMI_CDN_MANIFEST,
+                sha,
+                &sha[..63],
+                "not 64 hex",
+            ),
+            (
+                KIMI_GITHUB_DOC,
+                KIMI_GITHUB_MANIFEST,
+                "\"darwin-arm64\"",
+                "\"darwin-arm\"",
+                "names no darwin-arm64 build",
+            ),
+            (
+                KIMI_CDN_DOC,
+                KIMI_CDN_MANIFEST,
+                "{",
+                "{\"version\": \"2.3.1\",",
+                "strict JSON",
+            ),
+        ] {
+            f.doc(url, &edit(doc, from, to));
+            if url == KIMI_GITHUB_DOC {
+                f.redirect(url, GITHUB_STORAGE);
+            }
+            let why = refusal(verify_kimi_on(&f, TRIPLE, "2.3.1"));
+            assert!(why.contains(said), "{to}: {why}");
+            f.doc(url, doc);
+            if url == KIMI_GITHUB_DOC {
+                f.redirect(url, GITHUB_STORAGE);
+            }
+        }
+        candidate(verify_kimi_on(&f, TRIPLE, "2.3.1"));
+        f.payload(
+            "https://cdn.kimi.com/kimi-code/binaries/2.3.1/kimi-code-darwin-arm64",
+            b"",
+        );
+        let why = refusal(verify_kimi_on(&f, TRIPLE, "2.3.1"));
+        assert!(why.contains("no content length"), "{why}");
+        let next = kimi_world();
+        next.doc(
+            "https://cdn.kimi.com/kimi-code/binaries/2.3.2/manifest.json",
+            KIMI_CDN_MANIFEST,
+        );
+        let why = refusal(verify_kimi_on(&next, TRIPLE, "2.3.2"));
+        assert!(
+            why.contains("CDN release manifest is not for 2.3.2"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn each_kimi_manifest_is_read_only_where_its_own_host_answers() {
+        const TRIPLE: &str = "x86_64-unknown-linux-gnu";
+        let f = kimi_world();
+        for (url, effective) in [
+            (KIMI_CDN_DOC, GITHUB_STORAGE),
+            (
+                KIMI_CDN_DOC,
+                "https://cdn.kimi.com/kimi-code/binaries/2.3.2/manifest.json",
+            ),
+            (KIMI_GITHUB_DOC, "https://evil.example/manifest.json"),
+            (KIMI_GITHUB_DOC, KIMI_CDN_DOC),
+            (
+                KIMI_GITHUB_DOC,
+                "https://release-assets.githubusercontent.com.evil.com/x",
+            ),
+        ] {
+            f.redirect(url, effective);
+            let why = refusal(verify_kimi_on(&f, TRIPLE, "2.3.1"));
+            assert!(
+                why.contains("off its pinned host"),
+                "{url} -> {effective}: {why}"
+            );
+            f.doc(url, &f.body(url));
+            if url == KIMI_GITHUB_DOC {
+                f.redirect(url, GITHUB_STORAGE);
+            }
+        }
+        f.redirect(KIMI_GITHUB_DOC, "https://objects.githubusercontent.com/x");
+        candidate(verify_kimi_on(&f, TRIPLE, "2.3.1"));
+        f.doc(KIMI_GITHUB_DOC, KIMI_GITHUB_MANIFEST);
+        candidate(verify_kimi_on(&f, TRIPLE, "2.3.1"));
+        let head = spec("kimi").head_url;
+        f.doc(head, KIMI_LATEST);
+        f.redirect(head, "https://code.kimi.com/kimi-code/latest");
+        assert!(matches!(
+            read_head(spec("kimi"), &f, None),
+            Head::Refused(_)
+        ));
+    }
+
+    #[test]
+    fn the_real_grok_pointer_names_a_bucket_path_the_lane_measures() {
+        let f = Fake::default();
+        let grok = spec("grok");
+        f.doc(grok.head_url, GROK_STABLE);
+        assert!(matches!(
+            read_head(grok, &f, None),
+            Head::Named { version, .. } if version == v("1.0.67")
+        ));
+        let key = crate::openpgp::ANTHROPIC_CLAUDE_CODE_RELEASE_KEY;
+        for (triple, file) in [
+            ("aarch64-apple-darwin", "grok-1.0.67-macos-aarch64"),
+            ("x86_64-apple-darwin", "grok-1.0.67-macos-x86_64"),
+        ] {
+            let url =
+                format!("https://storage.googleapis.com/grok-build-public-artifacts/cli/{file}");
+            f.payload(&url, &[0u8; 777]);
+            let c = candidate(verify(
+                grok,
+                triple,
+                &f,
+                v("1.0.67"),
+                GROK_STABLE,
+                &key,
+                NOW,
+            ));
+            let a = c.artifact.artifact();
+            assert_eq!(c.vouch, Vouch::Measure, "no document names grok's digest");
+            assert_eq!((a.sha256.as_str(), a.sha512.as_str()), ("", ""));
+            assert_eq!((a.url.as_str(), a.size), (url.as_str(), 777));
+            assert_eq!(
+                (a.payload.as_str(), a.entry.as_str()),
+                ("raw-binary", "grok")
+            );
+            assert_eq!(a.asset, format!("grok-1.0.67-{triple}"));
+            assert_eq!(c.anchor, Anchor::XaiDeveloperId);
+            admit(&c.artifact, &c.vouch).unwrap();
+            let fake = AuthenticatedDigest::authenticated(DigestAlg::Sha256, &"c".repeat(64));
+            assert!(
+                admit(&c.artifact, &Vouch::Documents(fake.clone().unwrap())).is_err(),
+                "a digestless row is admitted only while it is to be measured"
+            );
+            let measured = c.measured(fake.clone().unwrap()).unwrap();
+            assert_eq!(measured.artifact.artifact().sha256, "c".repeat(64));
+            admit(&measured.artifact, &measured.vouch).unwrap();
+            assert!(
+                admit(&measured.artifact, &Vouch::Measure).is_err(),
+                "a measured row carries the digest its bytes have"
+            );
+            assert!(measured.measured(fake.unwrap()).is_none(), "measured once");
+            let by_512 = AuthenticatedDigest::authenticated(DigestAlg::Sha512, &"c".repeat(128));
+            assert!(
+                c.measured(by_512.unwrap()).is_none(),
+                "grok's measure is a sha256"
+            );
+            f.payload(&url, b"");
+            let why = refusal(verify(grok, triple, &f, v("1.0.67"), b"", &key, NOW));
+            assert!(why.contains("no content length"), "{why}");
+        }
+        f.redirect(grok.head_url, "https://x.ai/cli/stable");
+        assert!(matches!(read_head(grok, &f, None), Head::Refused(_)));
+    }
+
+    #[test]
+    fn an_unserved_triple_is_refused_before_any_request() {
+        let key = crate::openpgp::ANTHROPIC_CLAUDE_CODE_RELEASE_KEY;
+        let f = kimi_world();
+        for (program, triple, said) in [
+            (
+                "kimi",
+                "x86_64-unknown-linux-musl",
+                "no kimi build aterm can verify",
+            ),
+            (
+                "kimi",
+                "aarch64-unknown-linux-musl",
+                "no kimi build aterm can verify",
+            ),
+            (
+                "grok",
+                "x86_64-unknown-linux-gnu",
+                "no grok build aterm can verify",
+            ),
+            (
+                "grok",
+                "aarch64-unknown-linux-gnu",
+                "no grok build aterm can verify",
+            ),
+            (
+                "grok",
+                "x86_64-pc-windows-msvc",
+                "no grok build aterm can verify",
+            ),
+            (
+                "grok",
+                "aarch64-pc-windows-msvc",
+                "no grok build aterm can verify",
+            ),
+            (
+                "grok",
+                "x86_64-unknown-linux-musl",
+                "no grok build aterm can verify",
+            ),
+        ] {
+            let row = spec(program);
+            assert!(!row.serves(triple), "{program} {triple}");
+            let version = if program == "kimi" { "2.3.1" } else { "1.0.67" };
+            let why = refusal(verify(row, triple, &f, v(version), b"", &key, NOW));
+            assert!(why.contains(said), "{program} {triple}: {why}");
+        }
+        assert!(f.gets.borrow().is_empty(), "nothing was asked");
+        for triple in crate::manifest::TARGETS {
+            assert_eq!(
+                spec("kimi").serves(triple),
+                !triple.ends_with("-musl"),
+                "kimi on {triple}"
+            );
+            assert_eq!(
+                spec("grok").serves(triple),
+                triple.ends_with("-apple-darwin"),
+                "grok on {triple}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_plain_heads_name_one_canonical_version() {
+        assert_eq!(plain_head_version(KIMI_LATEST), Some(v("2.3.1")));
+        assert_eq!(plain_head_version(GROK_STABLE), Some(v("1.0.67")));
+        for bad in [
+            &b"1.0.67\n\n"[..],
+            b"1.0.67 ",
+            b"v1.0.67",
+            b"1.0",
+            b"2.4.0-beta.1\n",
+        ] {
+            assert_eq!(plain_head_version(bad), None, "{bad:?}");
+        }
+        let f = Fake::default();
+        f.doc(spec("grok").head_url, b"1.0.70-R1");
+        match read_head(spec("grok"), &f, None) {
+            Head::Refused(why) => assert!(why.contains("grok's grammar"), "{why}"),
+            other => panic!("{other:?}"),
+        }
     }
 }

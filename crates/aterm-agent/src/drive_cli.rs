@@ -11,8 +11,8 @@ use crate::supervise::limit::tz_offset_s;
 use crate::supervise::tape::acts::Candidate;
 use crate::supervise::tape::{corpus, explain, replay, show, store};
 use crate::supervise::{
-    self, ClockAnchor, LedgerFormat, LedgerHost, LedgerOpts, LedgerSource, Session,
-    SupervisorConfig, classify_command_with, render_phase_and_survey,
+    self, ANCHOR_REMOVED, LedgerFormat, LedgerHost, LedgerOpts, Session, SupervisorConfig,
+    classify_command_with, render_phase_and_survey,
 };
 use crate::{CtlClient, DRIVE_HELP};
 
@@ -88,8 +88,6 @@ struct SubArgs {
     out: Option<PathBuf>,
     /// `ledger --since`: Unix ms, from a time word.
     since_ms: Option<i64>,
-    /// `ledger --source log|anchor`: what places its times (`anchor` is deprecated).
-    source: Option<LedgerSource>,
     /// Positional words (the command text for `classify`, the answer for
     /// `answer`).
     rest: Vec<String>,
@@ -138,16 +136,22 @@ fn parse_sub(verb: &str, args: &[String]) -> Result<SubArgs, String> {
                 );
             }
             s if s == "--source" || s.starts_with("--source=") => {
-                ledgers("--source", "log or anchor")?;
-                let what = "log (the default) or anchor (deprecated)";
+                ledgers("--source", "log")?;
+                let what = "log, the one source";
                 let v = match s.strip_prefix("--source=") {
                     Some(v) => v.to_string(),
                     None => need("--source", what, it.next())?,
                 };
-                out.source = Some(
-                    LedgerSource::parse(&v)
-                        .ok_or_else(|| format!("{verb}: --source needs {what}"))?,
-                );
+                match v.as_str() {
+                    "log" => {}
+                    "anchor" => {
+                        return Err(format!(
+                            "{verb}: --source anchor was removed on {ANCHOR_REMOVED}: the \
+                             session log places every time; leave the flag out"
+                        ));
+                    }
+                    _ => return Err(format!("{verb}: --source needs {what}")),
+                }
             }
             "--journal" => {
                 ledgers("--journal", "supervisor journal")?;
@@ -184,6 +188,14 @@ fn parse_sub(verb: &str, args: &[String]) -> Result<SubArgs, String> {
 }
 
 fn classify_verb(args: &[String]) -> Result<Reply, String> {
+    let home = std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from);
+    classify_verb_at(args, home.as_deref())
+}
+
+/// [`classify_verb`] under `home`: the classifier's verdict, then the default secret list's.
+fn classify_verb_at(args: &[String], home: Option<&std::path::Path>) -> Result<Reply, String> {
     let sub = parse_sub("classify", args)?;
     let cmd = sub.rest.join(" ");
     if cmd.trim().is_empty() {
@@ -194,13 +206,17 @@ fn classify_verb(args: &[String]) -> Result<Reply, String> {
     }
     let allow = python_allow(&sub);
     let v = classify_command_with(&cmd, &allow);
-    Ok(if v.read_only {
-        Reply::text("read-only\n".to_string())
+    let verdict = if v.read_only {
+        supervise::policy::approval::command_reads_no_secret(&cmd, home)
     } else {
-        Reply {
-            text: format!("not-read-only {}\n", v.reason),
+        Err(v.reason)
+    };
+    Ok(match verdict {
+        Ok(()) => Reply::text("read-only\n".to_string()),
+        Err(why) => Reply {
+            text: format!("not-read-only {why}\n"),
             code: 1,
-        }
+        },
     })
 }
 
@@ -359,13 +375,11 @@ fn ledger_verb(opts: &Opts, args: &[String]) -> Result<Reply, String> {
     };
     let lopts = ledger_opts(&sub, worker);
     let mut client = CtlClient::own_at(crate::own_exe()?, opts.socket.clone());
-    let mut anchor = clock_anchor;
-    let mut host = LedgerHost {
+    let host = LedgerHost {
         now_ms: supervise::journal::unix_ms(),
         tz_offset_s: tz_offset_s(),
-        anchor: &mut anchor,
     };
-    let ledger = supervise::gather(&mut client, &lopts, &mut host);
+    let ledger = supervise::gather(&mut client, &lopts, &host);
     let text = supervise::render_ledger(&ledger, sub.format.unwrap_or_default());
     match &sub.out {
         None => Ok(Reply::text(text)),
@@ -376,14 +390,12 @@ fn ledger_verb(opts: &Opts, args: &[String]) -> Result<Reply, String> {
     }
 }
 
-/// What `ledger` reads for `worker`: the session log places its times unless
-/// `--source anchor` (deprecated) says otherwise.
+/// What `ledger` reads for `worker`.
 fn ledger_opts(sub: &SubArgs, worker: String) -> LedgerOpts {
     LedgerOpts {
         worker,
         journal: sub.journal.clone(),
         since_ms: sub.since_ms,
-        source: sub.source.unwrap_or_default(),
     }
 }
 
@@ -414,36 +426,6 @@ fn journal_sid(path: Option<&std::path::Path>) -> Option<String> {
         [one] => Some((*one).to_string()),
         _ => None,
     }
-}
-
-fn clock_anchor(sid: &str) -> Result<ClockAnchor, String> {
-    let sessions = aterm_ctl::fleet_sessions().map_err(|e| format!("`ls` found nothing: {e}"))?;
-    let pid = sessions
-        .iter()
-        .find(|s| s.sid() == Some(sid))
-        .map(|s| s.pid)
-        .ok_or_else(|| format!("no live instance hosts @{sid}"))?;
-    let instances =
-        aterm_ctl::local_instances().map_err(|e| format!("`instances` found nothing: {e}"))?;
-    let sock = instances
-        .iter()
-        .find(|(p, _)| *p == pid)
-        .map(|(_, sock)| sock.clone())
-        .ok_or_else(|| format!("instance {pid} has no control socket"))?;
-    let meta = std::fs::metadata(&sock).map_err(|e| format!("{sock}: {e}"))?;
-    let when = meta
-        .created()
-        .or_else(|_| meta.modified())
-        .map_err(|e| format!("{sock}: no birth time: {e}"))?;
-    let epoch_ms = when
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| format!("{sock}: a birth time before 1970: {e}"))?
-        .as_millis();
-    Ok(ClockAnchor {
-        pid,
-        epoch_ms: i64::try_from(epoch_ms).unwrap_or(i64::MAX),
-        how: "its control socket's birth time".to_string(),
-    })
 }
 
 fn tape_verb(args: &[String]) -> Reply {
@@ -957,6 +939,45 @@ mod tests {
         assert_eq!(o.cmd, args(&["classify", "ls -la"]));
         assert_eq!(run(&o).expect("pure verb needs no host").code, 0);
     }
+
+    #[test]
+    fn classify_refuses_a_read_of_a_secret_under_the_default_list() {
+        let home = Some(std::path::Path::new("/Users/_owner"));
+        for line in [
+            "cat ~/.ssh/id_rsa",
+            "head -3 .env",
+            "awk 'NR<3' ~/.aws/credentials",
+            "cat /Users/_owner/.claude.json",
+            "grep -m 1 key ~/.config/gh/hosts.yml",
+            "git show HEAD:.env",
+        ] {
+            let r = classify_verb_at(&args(&[line]), home).expect("ok");
+            assert_eq!(r.code, 1, "{line}: {r:?}");
+            assert!(
+                r.text.starts_with("not-read-only a read of a secret"),
+                "{line}: {r:?}"
+            );
+        }
+        // NEGATIVE CONTROLS
+        for line in [
+            "grep -rn credentials src/",
+            "grep -m 1 credentials src/",
+            "wc -l src/credentials.rs",
+            "ls -la ~/.ssh",
+            "cat README.md",
+        ] {
+            let r = classify_verb_at(&args(&[line]), home).expect("ok");
+            assert_eq!(r, Reply::text("read-only\n".to_string()), "{line}");
+        }
+        let unknown_home =
+            classify_verb_at(&args(&["cat /Users/_owner/.claude.json"]), None).expect("ok");
+        assert_eq!(unknown_home.code, 0, "{unknown_home:?}");
+        // The classifier's own refusal still comes first.
+        let r = classify_verb_at(&args(&["cat ~/.ssh/id_rsa > out"]), home).expect("ok");
+        assert!(!r.text.contains("a read of a secret"), "{r:?}");
+        assert_eq!(r.code, 1);
+    }
+
     #[test]
     fn phase_ends_with_the_context_left() {
         let rule = "─".repeat(120);
@@ -1141,19 +1162,9 @@ mod tests {
                 "{bad}: {err}"
             );
         }
-        assert_eq!(
-            parse_sub("ledger", &args(&["@s-1"]))
-                .expect("parses")
-                .source,
-            None
-        );
-        for (words, want) in [
-            (&["--source", "log"][..], LedgerSource::Log),
-            (&["--source=log"][..], LedgerSource::Log),
-            (&["--source", "anchor"][..], LedgerSource::Anchor),
-        ] {
-            let sub = parse_sub("ledger", &args(words)).expect("a source");
-            assert_eq!(sub.source, Some(want), "{words:?}");
+        for words in [&["--source", "log"][..], &["--source=log"][..]] {
+            let sub = parse_sub("ledger", &args(words)).expect("the one source");
+            assert_eq!(sub, parse_sub("ledger", &[]).expect("none"), "{words:?}");
         }
         for bad in [
             &["--source", "clock"][..],
@@ -1189,19 +1200,46 @@ mod tests {
         }
     }
 
-    /// `ledger` reads the session log unless `--source anchor` (deprecated) is named.
+    /// THE REMOVED SOURCE IS A USAGE ERROR: `ledger --source anchor`, either spelling, is
+    /// refused before any host with the day it was removed and what to do instead;
+    /// `--source log` reads as no flag; NEGATIVE CONTROL: the anchor parsed as a source again
+    /// is caught here.
     #[test]
-    fn the_ledger_reads_the_log_unless_told_otherwise() {
-        let source = |words: &[&str]| {
-            let sub = parse_sub("ledger", &args(words)).expect("parses");
-            ledger_opts(&sub, "@s-1".to_string()).source
-        };
-        assert_eq!(source(&["@s-1"]), LedgerSource::Log, "the default");
-        assert_eq!(source(&["@s-1", "--source", "log"]), LedgerSource::Log);
+    fn a_removed_source_is_a_usage_error_naming_its_date() {
+        for words in [
+            &["@s-1", "--source", "anchor"][..],
+            &["@s-1", "--source=anchor"][..],
+        ] {
+            let err = parse_sub("ledger", &args(words)).expect_err("removed");
+            assert_eq!(
+                err,
+                format!(
+                    "ledger: --source anchor was removed on {ANCHOR_REMOVED}: the session log \
+                     places every time; leave the flag out"
+                ),
+                "{words:?}"
+            );
+        }
+        let err = ledger_verb(
+            &Opts {
+                socket: Some("/nonexistent/aterm.sock".to_string()),
+                cmd: args(&["ledger"]),
+            },
+            &args(&["@s-1", "--source", "anchor"]),
+        )
+        .expect_err("refused before any host");
+        assert!(err.contains("was removed on"), "{err}");
+        assert!(
+            DRIVE_HELP.contains(&format!("was removed on {ANCHOR_REMOVED}.")),
+            "the help names the same day"
+        );
+        let sub = parse_sub("ledger", &args(&["@s-1", "--source", "log"])).expect("parses");
         assert_eq!(
-            source(&["@s-1", "--source=anchor"]),
-            LedgerSource::Anchor,
-            "the deprecated path, by name"
+            ledger_opts(&sub, "@s-1".to_string()),
+            ledger_opts(
+                &parse_sub("ledger", &args(&["@s-1"])).expect("parses"),
+                "@s-1".to_string()
+            )
         );
     }
 

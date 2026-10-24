@@ -2859,6 +2859,15 @@ pub fn agents_panel_under_with(
     bottom: usize,
     width: aterm_phase::agents_panel::Width,
 ) -> Option<aterm_phase::agents_panel::AgentsPanel> {
+    claude_agents_panel_under_with(rows, bottom, width)
+        .or_else(|| agy_agents_panel_under_with(rows, bottom, width))
+}
+
+fn claude_agents_panel_under_with(
+    rows: &[String],
+    bottom: usize,
+    width: aterm_phase::agents_panel::Width,
+) -> Option<aterm_phase::agents_panel::AgentsPanel> {
     use aterm_phase::agents_panel::{AgentsPanel, RowKind, parse_row};
     let blank = |i: usize| rows.get(i).is_some_and(|r| r.trim().is_empty());
     let read = |i: usize| rows.get(i).and_then(|r| parse_row(r, width));
@@ -2906,6 +2915,37 @@ pub fn agents_panel_under_with(
         at += 1;
     }
     Some(panel)
+}
+
+fn agy_agents_panel_under_with(
+    rows: &[String],
+    bottom: usize,
+    width: aterm_phase::agents_panel::Width,
+) -> Option<aterm_phase::agents_panel::AgentsPanel> {
+    use aterm_phase::agents_panel::{AgentsPanel, Bullet, RowKind, parse_row};
+    let (first, close) = aterm_phase::agy::panel_bounds_under(rows, bottom)?;
+    let mut panel = AgentsPanel::EMPTY;
+    for (at, line) in rows.iter().enumerate().take(close).skip(first) {
+        let Some(parsed) = parse_row(line, width) else {
+            continue;
+        };
+        if parsed.kind != RowKind::Agent
+            || parsed.bullet.map(|(_, b)| b) != Some(Bullet::Filled)
+            || !line
+                .trim_start()
+                .strip_prefix("● ")
+                .is_some_and(|rest| rest.starts_with("Agent("))
+        {
+            continue;
+        }
+        let Ok(row) = u16::try_from(at) else {
+            break;
+        };
+        if !panel.push(row, parsed) {
+            break;
+        }
+    }
+    (!panel.is_empty()).then_some(panel)
 }
 
 /// The footer's marked values, in order.

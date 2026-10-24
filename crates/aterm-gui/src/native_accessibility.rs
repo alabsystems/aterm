@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Accessibility projection (`aterm_a11y::model`) for first-party native tab applications.
-//!
-//! The input is the compiled [`CompiledUi`] semantic snapshot. This adapter never walks
-//! [`crate::native_ui::UiTree`], lays out, or reads app side tables, so pixels, hit
-//! testing, introspection and accessibility share the same keys, clipped bounds, values
-//! and state.
+//! Accessibility projection from [`CompiledUi`] without walking [`crate::native_ui::UiTree`].
 
 use std::ops::Range;
 
@@ -287,7 +282,6 @@ const fn normalized_window_title(title: &str) -> &str {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PublishedNativeAccessibility {
     /// Primary owner: the fallback for an unqualified route when there is a single owner.
-    /// Composite routing consults each route's own owner.
     pub(crate) view: ViewId,
     pub(crate) generation: u64,
     owners: Vec<AccessibilityOwner>,
@@ -1232,7 +1226,6 @@ fn lower_node(
     Ok(node)
 }
 
-/// Mark `node` a live region that speaks `announced` on every platform (setting both label and value).
 fn announce_live(node: &mut Node, politeness: Live, announced: &str) {
     node.set_label(announced.to_string());
     node.set_value(announced.to_string());

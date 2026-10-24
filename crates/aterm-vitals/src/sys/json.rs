@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `sys` JSON (§13.4): ONE SHAPE PER FIGURE, so a parser can always tell a bound from a range
-//! from an unknown.
+//! `sys` JSON value representation and shape contract checker.
 
 /// A JSON value.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -163,7 +162,7 @@ fn write_str(out: &mut String, s: &str) {
     out.push('"');
 }
 
-/// The keys a split object holds, and nothing else (§13.4).
+/// Required keys of a split object.
 pub const SPLIT_PARTS: [&str; 5] = ["tab", "aterm_rest", "others", "services", "unaccounted"];
 
 /// Every way `v` breaks the shape contract, as `path: what` lines; empty when it holds.

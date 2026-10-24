@@ -71,6 +71,13 @@ impl StatLine {
     pub const fn kernel_thread(&self) -> bool {
         self.flags & 0x0020_0000 != 0
     }
+
+    /// Whether it is exiting (`PF_EXITING`, set as its exit starts and never cleared): its exit
+    /// closes every descriptor before it is a zombie.
+    #[must_use]
+    pub const fn exiting(&self) -> bool {
+        self.flags & 0x0000_0004 != 0
+    }
 }
 
 /// The controlling terminal's device from `stat`'s `tty_nr`: the kernel prints its encoded
@@ -187,7 +194,7 @@ pub enum FdLink {
     EventPoll,
     /// `anon_inode:inotify`.
     Inotify,
-    /// A terminal under `/dev`.
+    /// A terminal ([`super::terminal_path`]).
     Tty,
     /// Any other device under `/dev`.
     Device,
@@ -209,11 +216,7 @@ pub fn parse_fd_link(target: &str) -> FdLink {
         FdLink::EventPoll
     } else if target == "anon_inode:inotify" {
         FdLink::Inotify
-    } else if target.starts_with("/dev/pts/")
-        || target.starts_with("/dev/tty")
-        || target == "/dev/console"
-        || target == "/dev/ptmx"
-    {
+    } else if super::terminal_path(target.as_bytes()) {
         FdLink::Tty
     } else if target.starts_with("/dev/") {
         FdLink::Device

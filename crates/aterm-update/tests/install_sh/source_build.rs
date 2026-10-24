@@ -158,9 +158,9 @@ const LINUX_UNAME: &str =
 
 const BARE_ATERM: &str = "#!/bin/sh\necho \"atpkg: ${3:-it} is not installed (fix: aterm pkg install ${3:-it})\" >&2\nexit 1\n";
 
-/// `id` for an account that owns none of the lab: `-u` names a uid no file has.
-const NOT_ME_ID: &str =
-    "#!/bin/sh\ncase \"${1:-}\" in -u) echo 424242424 ;; *) exec /usr/bin/id \"$@\" ;; esac\n";
+/// A PATH-supplied id cannot choose the installer's account. If it is asked,
+/// the dry-run's existing no-execution log catches it.
+const NOT_ME_ID: &str = "#!/bin/sh\necho fake-id >>\"${SHIM_LOG:?}\"\ncase \"${1:-}\" in -u) echo 424242424 ;; *) exec /usr/bin/id \"$@\" ;; esac\n";
 
 const REMEDIES: &[&str] = &[
     "aterm pkg install trust",
@@ -1294,13 +1294,29 @@ fn under_root_the_proof_runs_no_toolchain_file_another_account_can_change() {
         "../../theirs/pin-rustc",
         &scratch.join("lab/rootchain/bin/rustc"),
     );
-    // Root, over a lab every file of which is root's but those under theirs/.
+    // Root, over a lab every file of which is root's and carries no ACL but those
+    // under theirs/, with modes a umask of 002 (Ubuntu's) would not leave
+    // group-writable, below folders that show as plain root ones whatever ACL
+    // the host gives them (a macOS home's `everyone deny delete`, which root
+    // refuses). The lab's uname says Darwin, so on a host whose ls takes no -e
+    // (GNU's) the ACL listings drop it.
+    let top = scratch.join("lab");
+    let top = q(s(top.parent().expect("the scratch")));
     let mut lib = lab.lib();
-    lib.step(
-        "id() { if [ \"$1\" = -u ]; then echo 0; else command id \"$@\"; fi; }; \
-         ls_entry() { local last; for last; do :; done; case \"$last\" in */theirs/*) command ls \"$@\" ;; \
-         *) command ls \"$@\" | awk '{ $3 = 0; print }' ;; esac; }",
-    );
+    lib.step(format!(
+        "umask 022; chmod -R go-w {top}\n\
+         HOST_LS_E=1; /bin/ls -lde / >/dev/null 2>&1 || HOST_LS_E=\n\
+         host_ls() {{ local a; local -a v=(); for a; do \
+         case \"$a\" in -?*) [ -n \"$HOST_LS_E\" ] || [ \"$a\" = -- ] || a=\"${{a//e/}}\" ;; *) break ;; esac; \
+         [ \"$a\" = -- ] && break; [ \"$a\" = - ] || v+=(\"$a\"); \
+         shift; done; command ls ${{v[@]+\"${{v[@]}}\"}} \"$@\"; }}\n\
+         id() {{ if [ \"$1\" = -u ]; then echo 0; else command id \"$@\"; fi; }}; \
+         ls_entry() {{ local last t=-; for last; do :; done; case \"$last\" in */theirs/*) host_ls \"$@\" ;; \
+         {top} | {top}/*) host_ls \"$@\" | \
+         awk '/^[[:blank:]]+[0-9]+:/ {{ next }} {{ sub(/[+@]$/, \"\", $1); $3 = 0; print }}' ;; \
+         *) if [ -L \"$last\" ]; then t=l; elif [ -d \"$last\" ]; then t=d; fi; \
+         echo \"${{t}}rwxr-xr-x 2 0 0 64 Apr 22 2024 $last\" ;; esac; }}"
+    ));
     let own = format!(
         "export FAKE_TOOLCHAIN_CARGO={}",
         q(&lab.p("toolchain/bin/cargo"))
@@ -1627,8 +1643,6 @@ fn the_dry_run_plan_reports_the_source_build_as_the_run_would() {
     let stock = checkout(&scratch, "stock-checkout", "1.97.1");
     let stale = checkout(&scratch, "stale-checkout", "trust");
     std::fs::create_dir_all(stale.join("target/release")).expect("target/release");
-    let stale_target = s(&stale.join("target")).to_string();
-    let lab_cargo_home = lab.p("cargo-home");
     let ro = scratch.mkdir("ro");
     chmod(&ro, 0o555);
     let ro_store = format!("{}/store", s(&ro));
@@ -1746,22 +1760,12 @@ fn the_dry_run_plan_reports_the_source_build_as_the_run_would() {
             pinned("cargo-home/bin/cargo"),
         ),
         row(
-            "a target dir and cargo home the build cannot write",
+            "a PATH id cannot change the running account",
             &stale,
             &["not-me", "shadow"],
             "cargo-home",
             vec![],
-            Want::skip(
-                &[
-                    "building from source writes in",
-                    &stale_target,
-                    &lab_cargo_home,
-                    "sudo chown -R",
-                    &stale_target,
-                    &lab_cargo_home,
-                ],
-                &[],
-            ),
+            pinned("cargo-home/bin/cargo"),
         ),
         row(
             "a keg rustup behind the shadow",

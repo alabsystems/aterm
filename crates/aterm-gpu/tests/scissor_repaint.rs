@@ -624,7 +624,7 @@ fn gpu_scissor_animating_rain_byte_identical() {
         "the priming rain frame diverges from a fresh full render"
     );
 
-    let mut prev_quads = in0.rain_quads.clone();
+    let mut prev_cells = scene.cells.clone();
     let mut moved = 0usize;
     let mut haloed = 0usize;
     for i in 0..10 {
@@ -644,13 +644,13 @@ fn gpu_scissor_animating_rain_byte_identical() {
             got == fresh_render(&input, true, None),
             "animating rain frame {i} is NOT byte-identical to a fresh full render"
         );
-        if input.rain_quads != prev_quads {
+        if scene.cells != prev_cells {
             moved += 1;
         }
         if !input.rain_add.is_empty() {
             haloed += 1;
         }
-        prev_quads.clone_from(&input.rain_quads);
+        prev_cells.clone_from(&scene.cells);
         prev_px = got;
     }
     assert!(

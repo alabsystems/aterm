@@ -1,8 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The compile-time transition table, after the vt100.net DEC ANSI parser
-//! (<https://vt100.net/emu/dec_ansi_parser>).
+//! The compile-time transition table, after the vt100.net DEC ANSI parser.
 
 mod dcs_osc;
 mod types;
@@ -11,7 +10,6 @@ pub use types::{ActionType, Transition};
 
 use crate::state::State;
 
-/// Set `state`'s transition for every byte in `start..=end`.
 const fn set_range(
     table: &mut [[Transition; 256]; State::COUNT],
     state: State,
@@ -83,7 +81,6 @@ const fn apply_ground_transitions(table: &mut [[Transition; 256]; State::COUNT])
         0x7E,
         Transition::new(State::Ground, ActionType::Print),
     );
-    // DEL (0x7F) is ignored in Ground, as in the DEC parser.
     table[State::Ground as usize][0x7F] = Transition::new(State::Ground, ActionType::Ignore);
 }
 
@@ -352,8 +349,7 @@ const fn apply_csi_ignore_transitions(table: &mut [[Transition; 256]; State::COU
     table[State::CsiIgnore as usize][0x7F] = Transition::new(State::CsiIgnore, ActionType::Ignore);
 }
 
-/// Build the 14 x 256 table (~7 KB) mapping (state, byte) to (next state,
-/// action): the "anywhere" entries first, then each state's own over them.
+/// Build the 14 x 256 table (~7 KB) mapping (state, byte) to (next state, action).
 pub(crate) const fn generate_table() -> [[Transition; 256]; State::COUNT] {
     let mut table = [[Transition::new(State::Ground, ActionType::None); 256]; State::COUNT];
 

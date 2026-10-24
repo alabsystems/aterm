@@ -38,6 +38,14 @@ impl AuthenticatedDigest {
         alg.is_lower_hex(&hex).then_some(Self { alg, hex })
     }
 
+    /// `hex` (one `alg` digest, either case), which the lane measured from the bytes it
+    /// downloaded for an anchor no document of which names a digest (grok): what vouches for
+    /// those bytes is the darwin Developer ID team pin at stage, not a document.
+    #[must_use]
+    pub(crate) fn measured(alg: DigestAlg, hex: &str) -> Option<Self> {
+        Self::authenticated(alg, hex)
+    }
+
     /// One read back from a record an earlier pass wrote when its anchor vouched for it.
     #[must_use]
     pub(crate) fn recorded(sha256: &str, sha512: &str) -> Option<Self> {

@@ -225,9 +225,42 @@ fn serious_mode_drains_fun_state_without_touching_functional_ui() {
     ws.composed_cursor_fill = Some(0x0011_2233);
     ws.composed_cursor_style_override = Some(aterm_core::terminal::CursorStyle::Bolt);
     ws.composed_cursor_trail_color = 0x0044_5566;
-    ws.input_scratch
-        .rain_quads
-        .push(aterm_render::SpriteQuad::default());
+    let tiles = {
+        let rom = aterm_effects::matrix_rain::rom::rasterize_master();
+        let mut tiles = aterm_effects::matrix_rain::RainBaker::default();
+        tiles.begin_frame(8, 16);
+        while !tiles.complete() {
+            tiles.bake_tiles(&rom);
+        }
+        tiles
+    };
+    let cell = aterm_effects::matrix_rain::RainCell {
+        w: 8,
+        h: 16,
+        tint: 0x0028_D75F,
+        alpha: 96,
+        ..Default::default()
+    };
+    let body = tiles.tile(1).expect("baked").clone();
+    ws.fx.publish_for_test(
+        &[aterm_render::sprites::FreeSprite::whole(0, 0, body)],
+        (&[cell], &tiles),
+        &mut ws.input_scratch,
+    );
+    let rain_rows = |input: &aterm_render::RenderInput| {
+        let layers = input.fx_layers.iter();
+        layers
+            .filter(|l| aterm_effects::matrix_rain::is_rain_row(l))
+            .count()
+    };
+    let sprites = |input: &aterm_render::RenderInput| {
+        aterm_render::sprites::published(&input.fx_layers).len()
+    };
+    assert_eq!(
+        (rain_rows(&ws.input_scratch), sprites(&ws.input_scratch)),
+        (1, 1),
+        "negative-control: the window's publishers put a rain row and a companion in the frame"
+    );
 
     ws.bell_flash.ring(now);
     let bell_deadline = ws.bell_flash.deadline();
@@ -269,7 +302,11 @@ fn serious_mode_drains_fun_state_without_touching_functional_ui() {
     assert!(ws.input_scratch.glow_halo.is_empty());
     assert!(ws.input_scratch.cursor_effect_style_override.is_none());
     assert!(ws.input_scratch.cursor_fill_override.is_none());
-    assert!(ws.input_scratch.rain_quads.is_empty());
+    assert_eq!(
+        (rain_rows(&ws.input_scratch), sprites(&ws.input_scratch)),
+        (0, 0),
+        "serious mode takes the rain rows and the companions out of the frame"
+    );
     assert!(!ws.composed_cursor_effect_valid);
     assert!(ws.composed_cursor_effect_session.is_none());
     assert!(ws.composed_cursor_fill.is_none());

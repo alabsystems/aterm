@@ -1253,6 +1253,12 @@ mod tests {
             Anchor::MetaDeveloperId => format!(
                 "https://lookaside.facebook.com/lookaside/muse/download/?channel=muse&version={version}&file=muse-aarch64-macos"
             ),
+            Anchor::MoonshotTwoHost => {
+                format!("https://cdn.kimi.com/kimi-code/binaries/{version}/kimi-code-darwin-arm64")
+            }
+            Anchor::XaiDeveloperId => format!(
+                "https://storage.googleapis.com/grok-build-public-artifacts/cli/grok-{version}-macos-aarch64"
+            ),
         };
         let record = VendorRecord {
             schema: RECORD_SCHEMA,

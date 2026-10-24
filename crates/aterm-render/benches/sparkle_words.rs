@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Frame-cost benchmarks for sprite pass-1c row stamping and ink merge-walk.
+//! Frame-cost benchmarks for a sprite layer under every row and the ink merge-walk.
 
-#[allow(dead_code, unused_imports)]
-#[path = "../tests/cat_sprites.rs"]
-mod cat_sprites;
 #[allow(dead_code, unused_imports)]
 #[path = "../tests/ink.rs"]
 mod ink;
+#[allow(dead_code, unused_imports)]
+#[path = "../tests/common/sprites.rs"]
+mod sprites;
 
 fn main() {
     if cfg!(debug_assertions) {
@@ -20,7 +20,8 @@ fn main() {
 
 fn bench_render_row_under_sprites() {
     use std::time::Instant;
-    let mut rend = cat_sprites::renderer();
+    let mut rend = aterm_render::Renderer::from_system(18.0, aterm_render::Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature");
     let (cw, ch) = rend.cell_size();
     let (rows, cols) = (40usize, 120usize);
     let mut term = aterm_core::terminal::Terminal::new(rows as u16, cols as u16);
@@ -32,18 +33,15 @@ fn bench_render_row_under_sprites() {
 
     let base_input = term.cell_frame(rows, cols);
     let mut sprite_input = base_input.clone();
-    sprite_input.cat_atlas = Some(std::sync::Arc::new(cat_sprites::patterned_atlas(
-        128, ch as u32, 1,
-    )));
-    sprite_input.cat_quads = (0..rows as u16)
-        .map(|r| {
-            cat_sprites::quad(
-                r,
-                [(4 * cw) as u16, r * ch as u16, 80, ch as u16],
-                [0, 0, 80, ch as u16],
-            )
-        })
+    let art = sprites::patterned(80, ch as u16);
+    let row_sprites: Vec<aterm_render::sprites::FreeSprite> = (0..rows)
+        .map(|r| sprites::under((4 * cw) as i32, (r * ch) as i32, art.clone()))
         .collect();
+    sprites::put(&mut sprite_input, &row_sprites);
+    // The rain's kind of row layer (no knock-out), as the old per-row quads were.
+    for l in &mut sprite_input.fx_layers {
+        l.knock = false;
+    }
 
     for _ in 0..4 {
         let _ = rend.render_input(&base_input);
@@ -66,7 +64,7 @@ fn bench_render_row_under_sprites() {
     println!(
         "bench_render_row_under_sprites: baseline full-frame median {mb:?} \
          ({:.1} us/row), with a sprite under EVERY row median {ms:?} ({:.1} us/row) \
-         — pass-1c cost {:.2} us/row (120x40, {}x{} px cells, 80 px quad/row)",
+         — sprite cost {:.2} us/row (120x40, {}x{} px cells, an 80 px sprite layer a row)",
         mb.as_nanos() as f64 / rows as f64 / 1000.0,
         ms.as_nanos() as f64 / rows as f64 / 1000.0,
         per_row_ns / 1000.0,
@@ -75,7 +73,7 @@ fn bench_render_row_under_sprites() {
     );
     assert!(
         per_row_ns < 10_000.0,
-        "§7.4 gate: pass-1c row cost {per_row_ns:.0} ns/row >= 10 us/row"
+        "§7.4 gate: sprite row cost {per_row_ns:.0} ns/row >= 10 us/row"
     );
 }
 

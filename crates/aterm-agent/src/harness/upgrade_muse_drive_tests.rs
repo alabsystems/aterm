@@ -403,6 +403,7 @@ impl Rig {
             home: base.join("home"),
             state: base.join("state"),
             sock: Some(sock),
+            token: None,
             only_sid: None,
             dry_run: false,
             human_grace_s: 120,

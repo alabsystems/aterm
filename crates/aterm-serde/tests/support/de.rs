@@ -388,8 +388,6 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'de> {
     }
 }
 
-//////////////////////////////////////////////////////////////////////////
-
 struct DeserializerSeqVisitor<'a, 'de: 'a> {
     de: &'a mut Deserializer<'de>,
     len: Option<usize>,
@@ -414,8 +412,6 @@ impl<'de, 'a> SeqAccess<'de> for DeserializerSeqVisitor<'a, 'de> {
         self.len
     }
 }
-
-//////////////////////////////////////////////////////////////////////////
 
 struct DeserializerMapVisitor<'a, 'de: 'a> {
     de: &'a mut Deserializer<'de>,
@@ -448,8 +444,6 @@ impl<'de, 'a> MapAccess<'de> for DeserializerMapVisitor<'a, 'de> {
         self.len
     }
 }
-
-//////////////////////////////////////////////////////////////////////////
 
 struct DeserializerEnumVisitor<'a, 'de: 'a> {
     de: &'a mut Deserializer<'de>,
@@ -571,8 +565,6 @@ impl<'de, 'a> VariantAccess<'de> for DeserializerEnumVisitor<'a, 'de> {
         }
     }
 }
-
-//////////////////////////////////////////////////////////////////////////
 
 struct EnumMapVisitor<'a, 'de: 'a> {
     de: &'a mut Deserializer<'de>,

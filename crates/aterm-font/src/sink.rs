@@ -9,19 +9,14 @@
 
 /// Receives a glyph outline as segments, in font units, y up.
 pub trait OutlineSink {
-    /// Appends a MoveTo segment: the start of a contour.
     fn move_to(&mut self, x: f32, y: f32);
 
-    /// Appends a LineTo segment.
     fn line_to(&mut self, x: f32, y: f32);
 
-    /// Appends a QuadTo segment.
     fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32);
 
-    /// Appends a CurveTo segment.
     fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32);
 
-    /// Appends a ClosePath segment: the end of a contour.
     fn close(&mut self);
 }
 
@@ -41,8 +36,7 @@ impl OutlineSink for NullSink {
     fn close(&mut self) {}
 }
 
-/// Forwards an outline to `inner` with every point mapped through `(x, y) -> (x * sx + dx, y * sy +
-/// dy)`: font units to a raster's pixels.
+/// Forwards an outline to `inner` mapped through an affine transform.
 pub struct ScaledSink<'a, S: OutlineSink + ?Sized> {
     inner: &'a mut S,
     sx: f32,
@@ -125,10 +119,8 @@ pub enum PointKind {
 
 /// Receives a glyph outline as points, in font units, y up.
 pub trait PointSink {
-    /// The next point of the current contour.
     fn point(&mut self, x: f32, y: f32, kind: PointKind);
 
-    /// The current contour is complete.
     fn end_contour(&mut self);
 }
 
@@ -242,8 +234,6 @@ mod tests {
 
     use PointKind::{OffCurveCubic as Cubic, OnCurve as On};
 
-    /// A closing line back to the start is the implicit close: dropped. A
-    /// closing curve keeps its controls and drops only its end point.
     #[test]
     fn a_contour_closing_on_its_start_drops_the_repeat() {
         let mut log = Log::default();
@@ -273,8 +263,6 @@ mod tests {
         assert_eq!(log.1, 2);
     }
 
-    /// An end point elsewhere stays, and a contour the stream leaves open is
-    /// ended by `finish`.
     #[test]
     fn an_open_contour_keeps_its_last_point() {
         let mut log = Log::default();

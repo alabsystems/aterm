@@ -98,7 +98,6 @@ fn percent_decode(value: &str) -> Result<String, UriError> {
     String::from_utf8(decoded).map_err(|_| UriError::InvalidEncoding)
 }
 
-/// One hex digit's value, either case.
 const fn nibble(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
@@ -140,7 +139,6 @@ pub fn path_to_file_uri(path: &Path) -> Result<String, UriError> {
     Ok(uri)
 }
 
-/// Appends `byte` as `%XY` using two uppercase hex digits.
 fn push_percent_escape(uri: &mut String, byte: u8) {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     uri.push('%');
@@ -149,7 +147,7 @@ fn push_percent_escape(uri: &mut String, byte: u8) {
 }
 
 trust_contract_fn! {
-    /// Whether [`path_to_file_uri`] writes `byte` unescaped (`A-Z`, `a-z`, `0-9`, `/`, `-`, `_`, dot, `~`, or `:`).
+    /// Whether [`path_to_file_uri`] writes `byte` unescaped.
     #[expect(
         clippy::manual_range_contains,
         reason = "Trust kernel-imports a bool tree of comparisons, not a call to `RangeInclusive::contains` (E6 refuses calls)"
@@ -199,7 +197,6 @@ mod tests {
         }
     }
 
-    /// An absolute path in this host's spelling.
     fn absolute(tail: &str) -> PathBuf {
         if cfg!(windows) {
             PathBuf::from(format!(r"C:\{}", tail.replace('/', r"\")))

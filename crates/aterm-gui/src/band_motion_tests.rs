@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Host-side message band motion tests: idle wakeup behavior, hidden/unfocused windows, frame
-//! cadence and damage cost, still looks, capture determinism, `appstatus`, and Settings ▸ Messages.
+//! Host-side message band motion, cadence, damage, and visibility tests.
 
 use std::time::{Duration, Instant};
 
@@ -50,7 +49,6 @@ fn download(done: u64) -> Message {
         .key("update.progress")
 }
 
-/// Fill `input_scratch` from the terminal and splice the message band.
 fn compose(app: &mut App) {
     let (rows, cols) = {
         let ws = &app.windows[&WID];
@@ -69,7 +67,6 @@ fn compose(app: &mut App) {
     app.splice_message_band(WID, aterm_render::Theme::default());
 }
 
-/// The terminal's PTY size as the session holds it.
 fn pty_dims(app: &App) -> (u16, u16) {
     let terminal = app
         .front_terminal(WID)
@@ -80,8 +77,7 @@ fn pty_dims(app: &App) -> (u16, u16) {
     (term.rows(), term.cols())
 }
 
-/// An idle `App` arms no state or motion wake, lists no window due, and folds a zero band term
-/// into `RepaintKey`, both initially and after `Hold::LogOnly` records or a folded live row.
+/// An idle `App` arms no state or motion wake and contributes zero to `RepaintKey`.
 #[test]
 fn an_idle_app_arms_nothing_and_a_record_or_a_folded_row_leaves_it_idle() {
     let mut app = on_screen_app();
@@ -126,8 +122,7 @@ fn an_idle_app_arms_nothing_and_a_record_or_a_folded_row_leaves_it_idle() {
     idle(&mut app, "after the row folded");
 }
 
-/// Occluded and headless windows schedule no animation frame or text tick, while an unfocused
-/// on-screen window schedules only elapsed-word ticks.
+/// Hidden windows schedule no wakes; unfocused on-screen windows schedule only elapsed ticks.
 #[test]
 fn a_hidden_window_schedules_no_animation_frames() {
     let mut app = on_screen_app();
@@ -186,8 +181,7 @@ fn a_hidden_window_schedules_no_animation_frames() {
     }
 }
 
-/// Same-frame event and park queries reuse the cell-surface scan, while new progress, heartbeats,
-/// width changes, or focus transitions recompute the next visible transition.
+/// Same-frame queries reuse the deadline scan until progress, layout, or focus changes.
 #[test]
 fn repeated_event_and_park_queries_share_the_next_visible_transition() {
     let mut app = on_screen_app();
@@ -244,7 +238,6 @@ fn repeated_event_and_park_queries_share_the_next_visible_transition() {
         "new progress retires the memo"
     );
 
-    // An identical restatement advances `motion_input_epoch` without changing `revision`.
     let revision = app.messages.revision();
     let epoch = app.messages.motion_input_epoch();
     assert!(app.messages.restate(
@@ -297,8 +290,7 @@ fn repeated_event_and_park_queries_share_the_next_visible_transition() {
     );
 }
 
-/// Under 7 ms wakeups over 3 s, the band is due at most once per `ANIM_FRAME` grid step and
-/// deadlines stay on the grid in the future.
+/// Frequent loop wakeups advance the band at most once per `ANIM_FRAME` grid step.
 #[test]
 fn the_band_is_due_at_most_once_per_frame_whatever_wakes_the_loop() {
     let mut app = on_screen_app();
@@ -324,7 +316,6 @@ fn the_band_is_due_at_most_once_per_frame_whatever_wakes_the_loop() {
         }
         t += Duration::from_millis(7);
     }
-    // The first prepared frame may sit up to one grid step before `t0`.
     let first = *frames.first().expect("the band animates");
     let span = (t0 + Duration::from_secs(3)).saturating_duration_since(first);
     let cap = (span.as_millis() / ANIM_FRAME.as_millis()) as usize + 1;
@@ -340,8 +331,7 @@ fn the_band_is_due_at_most_once_per_frame_whatever_wakes_the_loop() {
     );
 }
 
-/// A motion frame reuses the cached layout, changes only glyph and time slots, damages only the
-/// band row, and never re-grids or resizes the PTY.
+/// Motion frames reuse cached layout, damage only the band row, and never resize the PTY.
 #[test]
 fn a_motion_frame_repaints_only_the_band_row_and_never_reruns_the_layout() {
     let mut app = on_screen_app();
@@ -437,8 +427,7 @@ fn a_motion_frame_repaints_only_the_band_row_and_never_reruns_the_layout() {
     assert_eq!(pty_dims(&app), dims, "…nor resizes the PTY");
 }
 
-/// Serious mode, reduce motion, `motion = "reduced"`, and `perf_reduced` each draw static meters
-/// and arm at most 1 Hz text-tick deadlines.
+/// Still-motion gates draw static meters and arm at most 1 Hz text ticks.
 #[test]
 fn every_still_gate_draws_static_frames_and_arms_no_frame_deadline() {
     type Gate = fn(&mut App, bool);
@@ -506,8 +495,7 @@ fn every_still_gate_draws_static_frames_and_arms_no_frame_deadline() {
     }
 }
 
-/// Headless captures use the still form as a pure function of the capture instant, keeping the
-/// meter static while reflecting the instant's elapsed clock.
+/// Headless captures render the still form as a pure function of the capture instant.
 #[test]
 fn a_headless_capture_is_still_and_a_pure_function_of_its_instant() {
     let mut app = App::headless_for_test();
@@ -538,7 +526,6 @@ fn a_headless_capture_is_still_and_a_pure_function_of_its_instant() {
             .unwrap_or_else(|| panic!("the elapsed words in {row:?}"));
         words[at + 1].parse().unwrap()
     };
-    // Sample 500 ms past each second boundary to avoid 33 ms frame-floor rounding.
     let at20 = text(&shoot(&mut app, now + Duration::from_millis(20_500)));
     let at21 = text(&shoot(&mut app, now + Duration::from_millis(21_500)));
     assert_eq!(clock(&at20), 20, "{at20:?}");
@@ -568,8 +555,7 @@ fn appstatus_carries_no_motion_words() {
     assert_eq!(read(&app, now + Duration::from_secs(30)), first);
 }
 
-/// A `Hold::LogOnly` message never reaches the glass and arms nothing, yet Settings ▸ Messages
-/// lists it as `recorded`, newest first, with its detail.
+/// `Hold::LogOnly` messages stay off the glass and appear in Settings ▸ Messages newest first.
 #[test]
 fn the_messages_page_lists_log_only_records() {
     let mut app = on_screen_app();

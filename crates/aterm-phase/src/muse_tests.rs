@@ -36,6 +36,10 @@ fn captures() -> Vec<(String, String)> {
         .collect()
 }
 
+fn unnamed(file: &str, text: &str) -> bool {
+    file.contains("-exited-") || text == crate::muse::fixtures::LAUNCH_LINE
+}
+
 #[test]
 fn a_fresh_session_is_idle_at_its_composer() {
     let r = muse(IDLE);
@@ -245,7 +249,7 @@ fn a_shell_quoting_muse_is_not_muse() {
     }
     assert_eq!(identify(Some("muse"), &r).program(), Program::Muse);
     for (file, text) in captures() {
-        if file.contains("-exited-") {
+        if unnamed(&file, &text) {
             assert_eq!(identify(None, &screen(&text)).program(), Program::Generic);
             continue;
         }
@@ -277,7 +281,7 @@ fn the_muse_sniff_claims_no_other_programs_screen() {
     for (name, text) in crate::text::fixture_files() {
         let r = screen(&text);
         if name.starts_with("muse-") {
-            assert_eq!(is_muse_screen(&r), !name.contains("-exited-"), "{name}");
+            assert_eq!(is_muse_screen(&r), !unnamed(&name, &text), "{name}");
             continue;
         }
         swept += 1;
@@ -1205,6 +1209,22 @@ fn a_failed_model_call_is_an_api_wall() {
     assert_eq!(wall(&bad).map(|w| w.kind), Some(api(Some(400), false)));
     let unnamed = edited(&rows, "◆ model failed", "◆ model failed: connection failed");
     assert_eq!(wall(&unnamed).map(|w| w.kind), Some(api(None, true)));
+    for msg in [
+        "◆ model failed: connection refused",
+        "◆ model failed: error sending request (timed out)",
+        "◆ model failed: fetch failed",
+    ] {
+        let net = edited(&rows, "◆ model failed", msg);
+        assert_eq!(
+            wall(&net).map(|w| w.kind),
+            Some(WallKind::ApiError {
+                code: None,
+                retryable: true,
+                cause: ApiCause::Unreachable,
+            }),
+            "{msg}"
+        );
+    }
     let quoted = edited(
         &rows,
         "◆ model failed",

@@ -20,10 +20,10 @@ use crate::{App, WindowId};
 
 /// Ink colors for each part of a panel row, where uniform and plain ([`plain_cell`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct RowInk {
+pub(crate) struct RowInk {
     pointer: Option<[u8; 3]>,
-    bullet: Option<[u8; 3]>,
-    name: Option<[u8; 3]>,
+    pub(crate) bullet: Option<[u8; 3]>,
+    pub(crate) name: Option<[u8; 3]>,
     /// The bar's filled cells and its empty cells.
     fill: Option<[u8; 3]>,
     empty: Option<[u8; 3]>,
@@ -34,8 +34,8 @@ struct RowInk {
 /// One reading of a pane's agents panel ([`read_panel`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PanelRead {
-    panel: AgentsPanel,
-    ink: [RowInk; PANEL_ROWS_MAX],
+    pub(crate) panel: AgentsPanel,
+    pub(crate) ink: [RowInk; PANEL_ROWS_MAX],
     /// What the fold is told of each row's bullet colour.
     tints: [Tint; PANEL_ROWS_MAX],
     /// What each task row is matched to its agent's file by
@@ -68,7 +68,18 @@ pub(crate) fn read_panel(
     for (i, row) in panel.rows().iter().enumerate() {
         let frame_row = pane.strip + pane.row_off + usize::from(row.row);
         let cells = scratch.cells.get(frame_row).map_or(&[][..], Vec::as_slice);
+        let agy_agent = row.kind == RowKind::Agent
+            && row
+                .bullet
+                .is_some_and(|(_, b)| b == aterm_phase::agents_panel::Bullet::Filled);
         let part = |span: Span| part_ink(scratch, cells, frame_row, pane, span, blank);
+        let part_or_agy = |span: Span| {
+            part(span).or_else(|| {
+                agy_agent
+                    .then(|| part_ink_any_fg(scratch, cells, frame_row, pane, span, blank))
+                    .flatten()
+            })
+        };
         read.keys[i] = rows
             .get(usize::from(row.row))
             .and_then(|text| RowKey::of(text, row));
@@ -76,7 +87,7 @@ pub(crate) fn read_panel(
             .bullet
             .and_then(|(span, _)| cells.get(pane.col_off + usize::from(span.start)))
         {
-            Some(cell) if !plain_fg(cell.fg, blank) => Tint::Marked,
+            Some(cell) if !agy_agent && !plain_fg(cell.fg, blank) => Tint::Marked,
             _ => Tint::Plain,
         };
         let (fill, empty) = row.bar.map_or((None, None), |bar| {
@@ -98,8 +109,8 @@ pub(crate) fn read_panel(
         });
         read.ink[i] = RowInk {
             pointer: row.pointer.and_then(part),
-            bullet: row.bullet.and_then(|(span, _)| part(span)),
-            name: part(row.name),
+            bullet: row.bullet.and_then(|(span, _)| part_or_agy(span)),
+            name: part_or_agy(row.name),
             fill,
             empty,
             bidi: !scratch.visual_to_logical_row(frame_row).is_empty(),
@@ -134,6 +145,32 @@ fn part_ink(
         .then_some(fg)
 }
 
+/// Fallback ink (`blank.fg`) for an `agy` subagent span when `agy` colored its
+/// bullet or token in ANSI ink on the pane's ground.
+fn part_ink_any_fg(
+    scratch: &RenderInput,
+    cells: &[RenderCell],
+    frame_row: usize,
+    pane: PaneGeom,
+    span: Span,
+    blank: RenderCell,
+) -> Option<[u8; 3]> {
+    if span.is_empty() || usize::from(span.end) > pane.cols {
+        return None;
+    }
+    let cols = pane.col_off + usize::from(span.start)..pane.col_off + usize::from(span.end);
+    let part = cells.get(cols.clone())?;
+    if touches(&scratch.clusters, frame_row, &cols)
+        || touches(&scratch.combining, frame_row, &cols)
+        || touches(&scratch.images, frame_row, &cols)
+    {
+        return None;
+    }
+    part.iter()
+        .all(|c| unadorned_cell(c, blank))
+        .then_some(blank.fg)
+}
+
 /// Whether a column-keyed side channel holds an entry in `cols` of `row`.
 fn touches<T>(channel: &[Vec<(usize, T)>], row: usize, cols: &std::ops::Range<usize>) -> bool {
     channel
@@ -141,8 +178,8 @@ fn touches<T>(channel: &[Vec<(usize, T)>], row: usize, cols: &std::ops::Range<us
         .is_some_and(|entries| entries.iter().any(|(col, _)| cols.contains(col)))
 }
 
-/// Whether `cell` is plain single-width text on the pane's ground.
-fn plain_cell(cell: &RenderCell, blank: RenderCell) -> bool {
+/// Whether `cell` is single-width unadorned text on the pane's ground.
+fn unadorned_cell(cell: &RenderCell, blank: RenderCell) -> bool {
     cell.bg == blank.bg
         && !cell.wide
         && !cell.emoji_presentation
@@ -153,7 +190,11 @@ fn plain_cell(cell: &RenderCell, blank: RenderCell) -> bool {
         && cell.underline_color.is_none()
         && cell.overline_color.is_none()
         && cell.script == Script::Normal
-        && plain_fg(cell.fg, blank)
+}
+
+/// Whether `cell` is plain single-width text on the pane's ground.
+fn plain_cell(cell: &RenderCell, blank: RenderCell) -> bool {
+    unadorned_cell(cell, blank) && plain_fg(cell.fg, blank)
 }
 
 /// Maximum per-channel deviation for a plain ink.

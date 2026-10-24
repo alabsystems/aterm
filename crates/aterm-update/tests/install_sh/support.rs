@@ -556,6 +556,9 @@ fn parse_record(record: &str, code: &str) -> Rec {
 
 const DRIVER_PRELUDE: &str = r#"ATERM_INSTALL_LIBRARY_ONLY=1
 . "$1"
+# Identity in this private library driver is an explicit injected observation;
+# production installer_uid reads Bash's readonly EUID instead of this fake id.
+installer_uid() { id -u; }
 __d="$2"
 __tick() { printf . >>"$__d/progress"; }
 __tick
