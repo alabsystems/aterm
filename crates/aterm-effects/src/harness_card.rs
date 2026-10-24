@@ -1778,15 +1778,17 @@ fn glint_spots_at(
         .unwrap_or(0)
         .clamp(1, GLINTS_MAX);
     let stripes = TRAIL_STOPS.len() as i64;
+    let two_stripes = 2 * stripes;
     let first = (mix(seed ^ 0x474C_494E) % 4) as usize;
     let span_f = (room.x1 - room.x0) as f32;
+    let n_f = n as f32;
     let th = t.y1 - t.y0;
     let row_of = |py: i64| (py - g.oy).div_euclid(g.ch);
     for (i, spot) in out.spots[..n].iter_mut().enumerate() {
-        let at = (i as f32 + 0.2 + 0.6 * unit(seed, 0x474C_0000 | i as u64)) / n as f32;
+        let at = (i as f32 + 0.2 + 0.6 * unit(seed, 0x474C_0000 | i as u64)) / n_f;
         let x = room.x0 + (span_f * at) as i64;
         let k = 1 + [0i64, 2, 1, 3][(first + i) % 4];
-        let centre = t.y0 + th * (2 * k + 1) / (2 * stripes);
+        let centre = t.y0 + th * (2 * k + 1) / two_stripes;
         let mut y = centre.clamp(room.y0, room.y1 - 1);
         if row_of(y - m) != row_of(y + m) {
             let line = g.band(row_of(y + m));
@@ -1887,11 +1889,18 @@ fn field_spots_at(
             x1: r.x1 + m,
             y1: r.y1 + m,
         });
+        let room_w = (room.x1 - room.x0) as f32;
+        let slice_w = (slice.x1 - slice.x0) as f32;
         let room_h = (room.y1 - room.y0) as f32;
+        let i_salt = (i as u64) << 8;
         for k in 0..STAR_TRIES {
-            let salt = ((i as u64) << 8) | k;
-            let within = if k < STAR_TRIES / 2 { slice } else { room };
-            let x = within.x0 + (unit(seed, salt * 2) * (within.x1 - within.x0) as f32) as i64;
+            let salt = i_salt | k;
+            let (within_x0, within_w) = if k < STAR_TRIES / 2 {
+                (slice.x0, slice_w)
+            } else {
+                (room.x0, room_w)
+            };
+            let x = within_x0 + (unit(seed, salt * 2) * within_w) as i64;
             let y = room.y0 + (unit(seed, salt * 2 + 1) * room_h) as i64;
             let on_kitty = kitty_pad.is_some_and(|r| r.contains(x, y));
             let crowded = spots[..n]
@@ -2713,8 +2722,10 @@ impl<'a> Emit<'a> {
             }
         }
         let bands = (o.y0 - g.oy).div_euclid(g.ch)..=(o.y1 - 1 - g.oy).div_euclid(g.ch);
+        let (o_y0_t, o_y1_t) = (o.y0 + t, o.y1 - t);
         for left in [false, true] {
             let x0 = if left { o.x0 } else { o.x1 - t };
+            let mid_x = (x0 + t / 2) as f32;
             let arc = |y: i64| {
                 if left {
                     (2 * w + h + (o.y1 - y)) as f32
@@ -2723,15 +2734,13 @@ impl<'a> Emit<'a> {
                 }
             };
             for r in bands.clone() {
-                let ya = g.band(r).max(o.y0 + t);
-                let yb = g.band(r + 1).min(o.y1 - t);
+                let ya = g.band(r).max(o_y0_t);
+                let yb = g.band(r + 1).min(o_y1_t);
                 if yb <= ya {
                     continue;
                 }
-                let p = self.border_paint(
-                    arc((ya + yb) / 2) / per,
-                    ((x0 + t / 2) as f32, ((ya + yb) / 2) as f32),
-                );
+                let mid_y = (ya + yb) / 2;
+                let p = self.border_paint(arc(mid_y) / per, (mid_x, mid_y as f32));
                 let slice = Rect {
                     x0,
                     y0: ya,

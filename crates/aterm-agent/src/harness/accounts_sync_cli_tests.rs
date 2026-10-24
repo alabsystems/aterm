@@ -464,12 +464,14 @@ fn a_grok_rows_background_renewal_starts_on_macos() {
         Ok(())
     };
     let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let logins = accounts::Logins::default();
     let renew = |label: &str| {
         spawn_vendor_renewal(
             Cli::Grok,
             &bed.home,
             &bed.state,
             &roster,
+            &logins,
             roster.row(label).cloned().unwrap(),
             NOW,
             &guard,
@@ -484,4 +486,264 @@ fn a_grok_rows_background_renewal_starts_on_macos() {
         "CONTROL: no email"
     );
     assert_eq!(*handed.lock().unwrap(), 1);
+}
+
+#[test]
+fn interrupted_vendor_staging_renewal_recovers_binding_and_proof_only_when_complete_and_idle() {
+    let bed = Bed::new("vendor-recovery");
+    bed.keep_roster(Cli::Kimi);
+    fs::write(
+        bed.roster(Cli::Kimi),
+        "[[account]]\nlabel = \"kimi-1\"\nclass = \"dedicated\"\n\
+         email = \"Kimi-One@Example.com\"\nregion = \"global\"\n",
+    )
+    .unwrap();
+    let roster = Roster::load_for(Cli::Kimi, &bed.roster(Cli::Kimi)).unwrap();
+    let store = accounts::Store::at_for(&bed.state, Cli::Kimi, &bed.home);
+    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+
+    // CONTROL 1: a checkpoint written for another CLI is never adopted by Kimi's pool.
+    let wrong_cli = store.claim_staging_dir("kimi-1").unwrap();
+    fs::create_dir_all(wrong_cli.join("credentials")).unwrap();
+    fs::write(wrong_cli.join("credentials/kimi-code.json"), "{}").unwrap();
+    accounts::write_renewal_checkpoint_for(
+        Cli::Grok,
+        "kimi-1",
+        "kimi-one@example.com",
+        wrong_cli.to_str().unwrap(),
+        None,
+        Some(accounts::Proof::Page),
+        NOW - 20,
+    )
+    .unwrap();
+
+    // CONTROL 2: a Kimi checkpoint without Kimi's credential file is never adopted.
+    let missing_creds = store.claim_staging_dir("kimi-1").unwrap();
+    accounts::write_renewal_checkpoint_for(
+        Cli::Kimi,
+        "kimi-1",
+        "kimi-one@example.com",
+        missing_creds.to_str().unwrap(),
+        None,
+        Some(accounts::Proof::Status),
+        NOW - 15,
+    )
+    .unwrap();
+
+    assert!(
+        !recover_interrupted_staging_renewals_for(Cli::Kimi, &store, &roster, &guard, NOW),
+        "CONTROLS: neither wrong-CLI checkpoint nor credential-less staging dir may recover"
+    );
+
+    // Valid completed staging dir interrupted before binding `logins.json`.
+    let completed = store.claim_staging_dir("kimi-1").unwrap();
+    fs::create_dir_all(completed.join("credentials")).unwrap();
+    fs::write(completed.join("credentials/kimi-code.json"), "{}").unwrap();
+    accounts::write_renewal_checkpoint_for(
+        Cli::Kimi,
+        "kimi-1",
+        "kimi-one@example.com",
+        completed.to_str().unwrap(),
+        None,
+        Some(accounts::Proof::Status),
+        NOW - 5,
+    )
+    .unwrap();
+
+    // CONTROL 3: while a live sign-in holds `signin.lock`, recovery yields instead of racing it.
+    let live_lock = store.signin_now().unwrap().expect("signin lock free");
+    assert!(
+        !recover_interrupted_staging_renewals_for(Cli::Kimi, &store, &roster, &guard, NOW),
+        "CONTROL: recovery yields while signin.lock is held"
+    );
+    drop(live_lock);
+
+    fake_headless_browser(&bed.home);
+    assert_eq!(
+        upkeep_over(&bed, UpkeepStep::Renew),
+        0,
+        "upkeep adopts the completed staging login instead of spawning a duplicate renewal"
+    );
+    let (state, _) = store.load(NOW).unwrap();
+    let (logins, _) = store.load_logins(NOW).unwrap();
+    assert_eq!(
+        state.accounts.get("kimi-1").map(|a| a.auth),
+        Some(accounts::Auth::Ok)
+    );
+    let binding = logins.get("kimi-1").expect("kimi-1 bound");
+    assert_eq!(binding.dir.as_deref(), completed.to_str());
+    assert_eq!(binding.renewed_at, Some(NOW - 5));
+    assert_eq!(binding.proved_by, Some(accounts::Proof::Status));
+}
+
+#[test]
+fn vendor_renewal_holds_without_cooldown_on_signin_lock_or_wrong_account_and_skips_limited_rows() {
+    let bed = Bed::new("vendor-admission");
+    fake_headless_browser(&bed.home);
+    bed.keep_roster(Cli::Kimi);
+    let kimi_fleet_toml = "\
+[[account]]
+label = \"kimi-1\"
+email = \"kimi-one@example.com\"
+machines = [\"m16\"]
+region = \"global\"
+
+[[account]]
+label = \"kimi-2\"
+email = \"kimi-two@example.com\"
+machines = [\"m16\"]
+region = \"global\"
+
+[[account]]
+label = \"kimi-3\"
+email = \"kimi-three@example.com\"
+machines = [\"m16\"]
+region = \"global\"
+";
+    bed.secret(&cli_fleet_file(Cli::Kimi), kimi_fleet_toml);
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap()
+        + 1_000;
+    assert!(matches!(bed.sync(Cli::Kimi, None), Ok(CliSync::Synced(_))));
+    let roster = Roster::load_for(Cli::Kimi, &bed.roster(Cli::Kimi)).unwrap();
+    let store = accounts::Store::at_for(&bed.state, Cli::Kimi, &bed.home);
+
+    let spawned: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+    let count = Arc::clone(&spawned);
+    let spawn = move |_work: Box<dyn FnOnce() + Send>| {
+        *count.lock().unwrap() += 1;
+        Ok(())
+    };
+    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+
+    // 1. Contended `signin.lock` returns Held without stamping `last_attempt` cooldown.
+    let held_lock = store.signin_now().unwrap().expect("signin lock free");
+    let empty_logins = accounts::Logins::default();
+    assert_eq!(
+        spawn_vendor_renewal(
+            Cli::Kimi,
+            &bed.home,
+            &bed.state,
+            &roster,
+            &empty_logins,
+            roster.row("kimi-1").cloned().unwrap(),
+            now,
+            &guard,
+            &spawn,
+        ),
+        RenewalDispatch::Held
+    );
+    assert!(
+        !guard
+            .lock()
+            .unwrap()
+            .last_attempt
+            .contains_key("kimi:kimi-1"),
+        "contended signin.lock must not burn the 15-minute cooldown"
+    );
+    drop(held_lock);
+
+    // 2. Recent `wrong_at` holds without burning cooldown until mailbox config updates.
+    let mut wrong_logins = accounts::Logins::default();
+    accounts::note_wrong_account(&mut wrong_logins, "kimi-1", now - 60);
+    assert_eq!(
+        spawn_vendor_renewal(
+            Cli::Kimi,
+            &bed.home,
+            &bed.state,
+            &roster,
+            &wrong_logins,
+            roster.row("kimi-1").cloned().unwrap(),
+            now,
+            &guard,
+            &spawn,
+        ),
+        RenewalDispatch::Held
+    );
+    assert!(
+        !guard
+            .lock()
+            .unwrap()
+            .last_attempt
+            .contains_key("kimi:kimi-1"),
+        "wrong_at cooldown must not stamp AutoRenewGuard::last_attempt"
+    );
+
+    let shared = store.shared_dir();
+    aterm_types::fs_restricted::ensure_private_dir(&shared).unwrap();
+    let mailbox_toml = shared.join("mailbox.toml");
+    fs::write(&mailbox_toml, "# updated mailbox routing\n").unwrap();
+    let updated_time =
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(u64::try_from(now - 10).unwrap());
+    fs::File::options()
+        .write(true)
+        .open(&mailbox_toml)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(updated_time))
+        .unwrap();
+    assert_eq!(
+        spawn_vendor_renewal(
+            Cli::Kimi,
+            &bed.home,
+            &bed.state,
+            &roster,
+            &wrong_logins,
+            roster.row("kimi-1").cloned().unwrap(),
+            now,
+            &guard,
+            &spawn,
+        ),
+        RenewalDispatch::Started,
+        "CONTROL: updated mailbox config clears the wrong_at hold"
+    );
+    assert_eq!(*spawned.lock().unwrap(), 1);
+
+    // 3. `renew_pool_due` skips rate-limited rows (`kimi-1`) and prefers clean rows (`kimi-3`)
+    // ahead of `wrong_at` rows (`kimi-2`).
+    fs::remove_file(&mailbox_toml).unwrap();
+    for label in ["kimi-1", "kimi-2", "kimi-3"] {
+        signed_out_kimi_login(&bed, label);
+    }
+    let mut note = None;
+    store
+        .transact_logins(now, &mut note, |state, logins| {
+            let _ = accounts::note_wall(state, "kimi-1", "weekly", Some(now + 3_600), now, now);
+            accounts::note_wrong_account(logins, "kimi-2", now - 120);
+            Ok(Vec::new())
+        })
+        .unwrap();
+    let fresh_guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let cooldown = Mutex::new(None);
+    let fetch = |_: &Env, s: &str| -> Result<String, String> { Err(s.to_owned()) };
+    let fx = UpkeepEffects {
+        fetch: &fetch,
+        spawn_renewal: &spawn,
+        sync_cooldown: &cooldown,
+        renew_guard: &fresh_guard,
+    };
+    assert!(renew_pool_due(
+        Cli::Kimi,
+        &bed.home,
+        &bed.state,
+        &bed.roster(Cli::Kimi),
+        now,
+        &fx,
+    ));
+    let keys: Vec<String> = fresh_guard
+        .lock()
+        .unwrap()
+        .last_attempt
+        .keys()
+        .cloned()
+        .collect();
+    assert_eq!(
+        keys,
+        ["kimi:kimi-3"],
+        "rate-limited kimi-1 is skipped and clean kimi-3 runs ahead of wrong_at kimi-2"
+    );
 }

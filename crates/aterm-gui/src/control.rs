@@ -3860,31 +3860,28 @@ fn serve_meta(
     scope: Scope,
     on_change: impl FnOnce(),
 ) -> String {
-    let snapshot = control_session::harness_act_face(rest)
-        .is_some_and(|face| {
-            crate::harness_task::holds_until_another_turn(face)
-                || face == aterm_agent::harness::acts::TaskFace::Open
-        })
-        .then(|| {
-            use aterm_core::terminal::program_state::ProgramStateWord as W;
-            let report = term_lock(term).program_state();
-            let left_at_rest = report
-                .state
-                .is_some_and(|state| matches!(state.state, W::Idle | W::Done | W::Error));
-            let busy_entries = ctx
-                .timeline
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .agent()
-                .busy_entries;
-            control_session::HarnessActSnapshot {
-                mark: crate::session_timeline::LandingMark {
-                    program_turns: report.turns,
-                    busy_entries,
-                },
-                left_at_rest,
-            }
-        });
+    let snapshot = control_session::harness_act_reads_counts(rest).then(|| {
+        use aterm_core::terminal::program_state::ProgramStateWord as W;
+        // The program wrote its turn's marks before this act: count them first.
+        crate::act_barrier::before_act(ctx);
+        let report = term_lock(term).program_state();
+        let left_at_rest = report
+            .state
+            .is_some_and(|state| matches!(state.state, W::Idle | W::Done | W::Error));
+        let busy_entries = ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .agent()
+            .busy_entries;
+        control_session::HarnessActSnapshot {
+            mark: crate::session_timeline::LandingMark {
+                program_turns: report.turns,
+                busy_entries,
+            },
+            left_at_rest,
+        }
+    });
     let (resp, changed) =
         control_session::cmd_meta_supervisor(ctx, scope, serving_connection(), prove, rest)
             .or_else(|| {

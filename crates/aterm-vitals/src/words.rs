@@ -7,8 +7,8 @@ use crate::explain::{Context, deck_cause};
 use crate::history::Filling;
 use crate::jobs::Verdict;
 use crate::model::{
-    CapBasis, DiskLevel, HeatCell, LinkKind, NoFigure, Pressure, ProcScope, Resource, ResourceView,
-    RowFacts, ScopeFig, Snapshot, State, TabView, VolumeSample,
+    CapBasis, CpuView, DiskLevel, HeatCell, LinkKind, NoFigure, Pressure, ProcScope, Resource,
+    ResourceView, RowFacts, ScopeFig, Snapshot, State, TabView, VolumeSample,
 };
 use crate::peaks::{NET_LEARN_S, TOKENS_LEARN_S};
 use crate::ring::BUCKET_MS;
@@ -507,19 +507,26 @@ pub fn bytes_dec(bytes: u64) -> String {
 /// Format standalone bytes in decimal units to two significant digits.
 #[must_use]
 pub fn bytes_lone(bytes: u64) -> String {
-    let (sig, e) = sig3(bytes);
+    let (figure, unit) = lone(bytes);
+    format!("{figure} {unit}")
+}
+
+/// `value` to two significant digits (three from 100 of its unit: `40`, `1.2`, `880`) and its
+/// decimal unit ([`DEC_UNITS`]).
+fn lone(value: u64) -> (String, &'static str) {
+    let (sig, e) = sig3(value);
     let (dec, unit) = sig_unit(sig, e);
     if dec == 0 {
-        return format!("{} {unit}", point(sig, 0));
+        return (point(sig, 0), unit);
     }
     let q = 10u128.pow(e + 1);
-    let mut n = u64::try_from((u128::from(bytes) + q / 2) / q).unwrap_or(u64::MAX);
+    let mut n = u64::try_from((u128::from(value) + q / 2) / q).unwrap_or(u64::MAX);
     let mut dec = dec - 1;
     if n >= 100 && dec > 0 {
         n /= 10;
         dec -= 1;
     }
-    format!("{} {unit}", point(n, dec))
+    (point(n, dec), unit)
 }
 
 /// Format `whole` and `parts` in `whole`'s decimal unit so the parts sum to the whole.
@@ -1540,7 +1547,7 @@ fn disk_details(snap: &Snapshot, loc: &Locale) -> Vec<Clause> {
         .and_then(|d| d.level)
         .is_some_and(|l| matches!(l, DiskLevel::Low | DiskLevel::Short | DiskLevel::Emergency));
     if let Some(free) = disk_free(snap).filter(|_| !level_says_free) {
-        out.push(Clause::new(5, vec![format!("{} free", bytes_lone(free))]));
+        out.push(Clause::new(5, vec![free_words(free)]));
     }
     if let Some(h) = facts.disk.as_ref().and_then(|d| d.hogs.first()) {
         let size = format!(
@@ -1835,7 +1842,7 @@ pub fn disk_space_line(v: &VolumeSample) -> String {
     )
 }
 
-const SPOKEN_UNITS: [(&str, &str, &str); 13] = [
+const SPOKEN_UNITS: [(&str, &str, &str); 23] = [
     ("TB", "terabytes", "terabyte"),
     ("GB", "gigabytes", "gigabyte"),
     ("MB", "megabytes", "megabyte"),
@@ -1847,6 +1854,16 @@ const SPOKEN_UNITS: [(&str, &str, &str); 13] = [
     ("MiB/s", "mebibytes per second", "mebibyte per second"),
     ("GB/min", "gigabytes per minute", "gigabyte per minute"),
     ("MB/min", "megabytes per minute", "megabyte per minute"),
+    ("TB/h", "terabytes per hour", "terabyte per hour"),
+    ("GB/h", "gigabytes per hour", "gigabyte per hour"),
+    ("MB/h", "megabytes per hour", "megabyte per hour"),
+    ("kB/h", "kilobytes per hour", "kilobyte per hour"),
+    ("B/h", "bytes per hour", "byte per hour"),
+    ("Tb/s", "terabits per second", "terabit per second"),
+    ("Gb/s", "gigabits per second", "gigabit per second"),
+    ("Mb/s", "megabits per second", "megabit per second"),
+    ("kb/s", "kilobits per second", "kilobit per second"),
+    ("b/s", "bits per second", "bit per second"),
     ("min", "minutes", "minute"),
     ("h", "hours", "hour"),
 ];
@@ -1887,6 +1904,9 @@ fn speak_figure(w: &str) -> String {
         } else {
             format!("{rest} percent")
         };
+    }
+    if let Some(rest) = w.strip_prefix('<').filter(|r| digit(r)) {
+        return format!("less than {}", speak_figure(rest));
     }
     if !digit(w) {
         return w.to_string();
@@ -2108,6 +2128,280 @@ pub fn row_sentence(res: Resource, snap: &Snapshot, panes: &[u64], loc: &Locale)
             .map(|c| c.spoken),
     );
     out.join(" ")
+}
+
+// The merged deck's words (`docs/DESIGN-top-deck-merged-2026-10-21.md` §3–§7). Minutes go
+// through `duration` and `up_words`, never a formatter of their own.
+
+/// The needs rail's head while any need is open (§6).
+pub const NEEDS_RAIL_HEAD: &str = "Needs you";
+/// The needs rail's words while none is, after a drawn check (§6).
+pub const NEEDS_RAIL_CALM: &str = "Nothing needs you";
+/// What the Processes block's gauge measures against, named over it (§5).
+pub const PER_USER_LIMIT: &str = "per-user limit";
+/// The front tab's row and place.
+const THIS_TAB: &str = "this tab";
+/// Cores-worth waiting under which nothing is drawn past CPU's wall, so nothing is said.
+const WAITING_GATE: f64 = 0.05;
+
+/// A row of the merged deck: the Mac and the scopes inside it (§7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DeckScope {
+    /// The whole machine.
+    Mac,
+    /// aterm and everything its tabs run.
+    AllTabs,
+    /// The front tab, all its panes.
+    ThisTab,
+}
+
+impl DeckScope {
+    /// Every row, top first.
+    pub const ALL: [Self; 3] = [Self::Mac, Self::AllTabs, Self::ThisTab];
+
+    /// Its name in the deck: `Mac` (off macOS, [`Platform::machine`]'s `computer`), `all tabs`,
+    /// `this tab`.
+    #[must_use]
+    pub fn word(self, platform: Platform) -> &'static str {
+        match self {
+            Self::Mac => platform.machine().trim_start_matches("this "),
+            Self::AllTabs => "all tabs",
+            Self::ThisTab => THIS_TAB,
+        }
+    }
+}
+
+/// What the Mac row's count counts, said once after its name (`Mac procs 897`): `procs`, or
+/// `threads` on Linux, whose machine count is its tasks.
+#[must_use]
+pub const fn count_word(platform: Platform) -> &'static str {
+    if platform.counts_threads() {
+        "threads"
+    } else {
+        "procs"
+    }
+}
+
+/// CPU's capacity in row A: the core kinds the OS names, fastest first (`Super, Perf`), each
+/// name over five letters cut before its second vowel group (`Perf`, `Eff`); `18 cores` where
+/// the OS names none.
+#[must_use]
+pub fn cpu_capacity(cpu: &CpuView) -> String {
+    let kinds: Vec<String> = cpu
+        .clusters
+        .iter()
+        .filter(|c| c.name != "CPU")
+        .map(|c| kind_word(&c.name))
+        .collect();
+    if kinds.is_empty() {
+        let n = cpu.total() as u64;
+        format!("{n} {}", plural(n, "core", "cores"))
+    } else {
+        kinds.join(", ")
+    }
+}
+
+fn kind_word(name: &str) -> String {
+    if name.chars().count() <= 5 {
+        return name.to_owned();
+    }
+    let (mut vowel_seen, mut consonant_after) = (false, false);
+    for (i, c) in name.char_indices() {
+        if "aeiouAEIOU".contains(c) {
+            if consonant_after {
+                return name[..i].to_owned();
+            }
+            vowel_seen = true;
+        } else if vowel_seen {
+            consonant_after = true;
+        }
+    }
+    name.to_owned()
+}
+
+/// Memory's capacity in row A, physical memory `total` in bytes: `128 GiB`.
+#[must_use]
+pub fn memory_capacity(total: u64) -> String {
+    format!("{} GiB", gib_total(total))
+}
+
+/// GPU's capacity in row A: `40 cores`.
+#[must_use]
+pub fn gpu_capacity(cores: u16) -> String {
+    format!("{cores} {}", plural(u64::from(cores), "core", "cores"))
+}
+
+/// Disk's capacity in row A, the volume's size `total` in bytes as [`bytes_lone`] says it but
+/// for a `.0`: `2 TB`, `995 GB`.
+#[must_use]
+pub fn disk_capacity(total: u64) -> String {
+    let (figure, unit) = lone(total);
+    format!("{} {unit}", whole(&figure))
+}
+
+/// Network's capacity in row A, its basis `bytes_per_s` said in bits and as approximate,
+/// whichever basis is in force (§9): `~1 Gb/s`, `~867 Mb/s`.
+#[must_use]
+pub fn link_capacity(bytes_per_s: f64) -> String {
+    let (figure, unit) = lone(half_up(bytes_per_s.max(0.0) * 8.0) as u64);
+    format!("~{} {}/s", whole(&figure), unit.replace('B', "b"))
+}
+
+fn whole(figure: &str) -> &str {
+    figure.strip_suffix(".0").unwrap_or(figure)
+}
+
+/// CPU's orange words past its wall, `wait` being the cores-worth waiting (the 1-minute load
+/// average less the cores, §5): `~8 waiting`, or `<1 waiting` for under half a core. `None`
+/// under 0.05, where no slat is drawn, and on Linux, whose load average counts threads waiting
+/// on disk too ([`details`]' rule).
+#[must_use]
+pub fn waiting_words(wait: f64, platform: Platform) -> Option<String> {
+    if platform == Platform::Linux || wait.is_nan() || wait < WAITING_GATE {
+        return None;
+    }
+    let n = half_up(wait);
+    Some(if n < 1.0 {
+        "<1 waiting".into()
+    } else {
+        format!("~{n:.0} waiting")
+    })
+}
+
+/// Memory's orange words past its wall, swap in use `bytes` by the GiB rule ([`gib_words`]):
+/// `6 GiB swap`. `None` under 0.05 GiB, where no swap tile shows.
+#[must_use]
+pub fn swap_words(bytes: u64) -> Option<String> {
+    (half_up(bytes as f64 / GIB * 10.0) >= 1.0).then(|| format!("{} swap", gib_words(bytes)))
+}
+
+/// Memory in GiB as the merged deck says it, chips and swap alike: one decimal under 10 GiB
+/// and none from there, a whole figure without its `.0` (`0.3 GiB`, `1.1 GiB`, `6 GiB`,
+/// `16 GiB`), and `<0.1 GiB` for a little, never `0`.
+#[must_use]
+pub fn gib_words(bytes: u64) -> String {
+    let g = bytes as f64 / GIB;
+    let tenths = half_up(g * 10.0) as u64;
+    if tenths >= 100 {
+        format!("{} GiB", half_up(g) as u64)
+    } else if tenths == 0 && bytes > 0 {
+        "<0.1 GiB".into()
+    } else if tenths.is_multiple_of(10) {
+        format!("{} GiB", tenths / 10)
+    } else {
+        format!("{} GiB", point(tenths, 1))
+    }
+}
+
+/// What a run covers, its ends named over it, oldest at its left and now at its right (§4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RunSpan {
+    /// The last 10 minutes: CPU, Memory, GPU, Network and Processes.
+    TenMinutes,
+    /// The last 24 hours: Disk.
+    Day,
+}
+
+impl RunSpan {
+    /// The words at its oldest and its newest end (§4's `10m … now`, `24h … now`).
+    #[must_use]
+    pub const fn ends(self) -> (&'static str, &'static str) {
+        match self {
+            Self::TenMinutes => ("10m", "now"),
+            Self::Day => ("24h", "now"),
+        }
+    }
+
+    /// The span as a screen reader says it.
+    #[must_use]
+    pub const fn spoken(self) -> &'static str {
+        match self {
+            Self::TenMinutes => "the last 10 minutes",
+            Self::Day => "the last 24 hours",
+        }
+    }
+}
+
+/// Free space on the front tab's volume, `bytes` free: `40 GB free`, `1.2 TB free`.
+#[must_use]
+pub fn free_words(bytes: u64) -> String {
+    format!("{} free", bytes_lone(bytes))
+}
+
+/// Disk's writer line after the program's name, `bytes_per_hour` it wrote
+/// ([`crate::writes::ProgramHour::per_hour`]): `writes 68 GB/h`.
+#[must_use]
+pub fn writes_words(bytes_per_hour: f64) -> String {
+    format!(
+        "writes {}/h",
+        bytes_lone(half_up(bytes_per_hour.max(0.0)) as u64)
+    )
+}
+
+/// One phrase at each of the merged deck's widths (§3), none longer than a wider form's.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct FormWords {
+    /// Full.
+    pub full: String,
+    /// Mid.
+    pub mid: String,
+    /// Narrow, and the rail and row A narrower still.
+    pub narrow: String,
+}
+
+impl FormWords {
+    fn every(words: String) -> Self {
+        Self {
+            full: words.clone(),
+            mid: words.clone(),
+            narrow: words,
+        }
+    }
+
+    /// Full's, Mid's and Narrow's words.
+    #[must_use]
+    pub fn forms(&self) -> [&str; 3] {
+        [&self.full, &self.mid, &self.narrow]
+    }
+}
+
+/// The Drive pill (§6): the front tab's volume is full in `secs`, floored to the minute
+/// ([`duration`]): `Disk full in 34 min` at every width, the place and the verb being all of
+/// it.
+#[must_use]
+pub fn disk_full_pill(secs: f64) -> FormWords {
+    let ms = (secs.max(0.0) * 1000.0) as u64;
+    FormWords::every(format!("Disk full in {}", duration(ms)))
+}
+
+/// The Lock pill (§6): the tab labelled `tab` waits for the owner's `what`, the need's own word
+/// (`password` for the jobs engine's waiting-you, else the needs system's: `approval`, `login`):
+/// `Tab 1 password` at every width.
+#[must_use]
+pub fn waiting_pill(tab: &str, what: &str) -> FormWords {
+    FormWords::every(format!("{tab} {what}"))
+}
+
+/// The Hourglass pill (§6): the front tab's `program` is stuck, `quiet_ms` its quiet age
+/// ([`duration`]), `tab` the tab's label. Full says `node stuck 12 min · this tab`, Mid drops
+/// the minutes, and Narrow names the place by the label where that is shorter (`node stuck ·
+/// Tab 3`): the verb and the place stay at every width.
+#[must_use]
+pub fn stuck_pill(program: &str, quiet_ms: Option<u64>, tab: &str) -> FormWords {
+    let minutes = quiet_ms.map(|q| format!(" {}", duration(q)));
+    let short = if !tab.is_empty() && tab.chars().count() < THIS_TAB.len() {
+        tab
+    } else {
+        THIS_TAB
+    };
+    FormWords {
+        full: format!(
+            "{program} stuck{} · {THIS_TAB}",
+            minutes.unwrap_or_default()
+        ),
+        mid: format!("{program} stuck · {THIS_TAB}"),
+        narrow: format!("{program} stuck · {short}"),
+    }
 }
 
 #[cfg(test)]
@@ -3709,5 +4003,531 @@ mod tests {
             Some((Mark::Zombie, InkKind::Warn))
         );
         assert_eq!(well(Resource::Cpu, &row(1.0, 2.0)), None);
+    }
+
+    /// One merged word: what it is, ours, the mockup's (`docs/design-studies/top-deck-*-2026-10-23`,
+    /// gen.py's strings), and where the two differ, the words meant instead and why.
+    struct Said {
+        what: String,
+        ours: String,
+        mockup: &'static str,
+        differs: Option<(&'static str, &'static str)>,
+    }
+
+    fn said(what: impl Into<String>, ours: impl Into<String>, mockup: &'static str) -> Said {
+        Said {
+            what: what.into(),
+            ours: ours.into(),
+            mockup,
+            differs: None,
+        }
+    }
+
+    /// The merged deck's words for a scene, read from its fixture snapshot the way the deck
+    /// will read them, beside the mockup's. An absence is the empty string on both sides.
+    fn merged_table(scene: crate::fixtures::DeckScene) -> Vec<Said> {
+        use crate::fixtures::{self, DeckScene, Owner};
+        let s = fixtures::snapshot(scene);
+        let busy = scene == DeckScene::Busy;
+        let mac = Platform::MacOs;
+        let cpu = s.cpu.as_ref().expect("the scene reads its CPU");
+        let mem = &s.mem.as_ref().expect("the scene reads its memory").sample;
+        let vol = s.volume.as_ref().expect("the scene reads its volume");
+        let gib_of = |name: Option<&str>, owner: &dyn Fn(Owner) -> bool| {
+            gib_words(
+                fixtures::programs(scene)
+                    .iter()
+                    .filter(|p| name.is_none_or(|n| p.name == n) && owner(p.owner))
+                    .map(|p| (p.gib * fixtures::GIB) as u64)
+                    .sum(),
+            )
+        };
+        let pane = |k: u64| move |o: Owner| o == Owner::Pane(k);
+        let (span, day) = (RunSpan::TenMinutes.ends(), RunSpan::Day.ends());
+        let writer = &s.facts.hour_writers[0];
+        let per_hour = writer
+            .per_hour(s.facts.writes_covered_s)
+            .expect("a whole hour read");
+        let wait = s.facts.load1.expect("load read") - cpu.total() as f64;
+        let link = s.resources[Resource::Network.index()]
+            .binding()
+            .capacity
+            .expect("the link's rate");
+        let mut out = vec![
+            said("Mac row", DeckScope::Mac.word(mac), "Mac"),
+            said("all-tabs row", DeckScope::AllTabs.word(mac), "all tabs"),
+            said("this-tab row", DeckScope::ThisTab.word(mac), "this tab"),
+            said("CPU capacity", cpu_capacity(cpu), "Super, Perf"),
+            said("Memory capacity", memory_capacity(mem.total), "128 GiB"),
+            said(
+                "GPU capacity",
+                gpu_capacity(s.gpu.as_ref().and_then(|g| g.cores).expect("cores")),
+                "40 cores",
+            ),
+            said("Disk capacity", disk_capacity(vol.total), "2 TB"),
+            said("Network capacity", link_capacity(link), "~1 Gb/s"),
+            said(
+                "CPU past its wall",
+                waiting_words(wait, mac).unwrap_or_default(),
+                if busy { "~8 waiting" } else { "" },
+            ),
+            said(
+                "Memory past its wall",
+                swap_words(mem.swap_used).unwrap_or_default(),
+                if busy { "6 GiB swap" } else { "" },
+            ),
+            said(
+                "10-minute run",
+                format!("{} … {}", span.0, span.1),
+                "10m … now",
+            ),
+            said("Disk's run", format!("{} … {}", day.0, day.1), "24h … now"),
+            said(
+                "Disk free",
+                free_words(vol.available),
+                if busy { "40 GB free" } else { "880 GB free" },
+            ),
+            Said {
+                differs: (!busy).then_some((
+                    "Safari writes 200 MB/h",
+                    "the byte ladder: under 1 GB an hour says MB",
+                )),
+                ..said(
+                    "Disk's writer",
+                    format!("{} {}", writer.name, writes_words(per_hour)),
+                    if busy {
+                        "rustc writes 68 GB/h"
+                    } else {
+                        "Safari writes 0.2 GB/h"
+                    },
+                )
+            },
+            said("Mac's count", count_word(mac), "procs"),
+            said("Processes gauge", PER_USER_LIMIT, "per-user limit"),
+            said(
+                "needs rail",
+                if busy {
+                    NEEDS_RAIL_HEAD
+                } else {
+                    NEEDS_RAIL_CALM
+                },
+                if busy {
+                    "Needs you"
+                } else {
+                    "Nothing needs you"
+                },
+            ),
+        ];
+        if busy {
+            out.extend([
+                said("Mac chip rustc", gib_of(Some("rustc"), &pane(3)), "16 GiB"),
+                said("all-tabs chip Tab 1", gib_of(None, &pane(1)), "22 GiB"),
+                said("all-tabs chip Tab 4", gib_of(None, &pane(4)), "20 GiB"),
+                said(
+                    "this-tab chip rustc",
+                    gib_of(Some("rustc"), &pane(3)),
+                    "16 GiB",
+                ),
+                said(
+                    "this-tab chip node",
+                    gib_of(Some("node"), &pane(5)),
+                    "1.1 GiB",
+                ),
+                // The scene reads no birth: gen.py's 47 minutes.
+                said(
+                    "rustc's age",
+                    up_words(Some(47 * 60_000), false).unwrap_or_default(),
+                    "up 47 min",
+                ),
+            ]);
+            let jobs = s.jobs.as_deref().expect("the jobs engine's rows");
+            let label = |tab: u64| s.tab(tab).map_or("", |t| t.label.as_str());
+            let row = |v: Verdict| jobs.rows.iter().find(|r| r.verdict == v).expect("a job");
+            let waits = row(Verdict::WaitingYou);
+            let stuck = row(Verdict::Stuck);
+            let drive = disk_full_pill(s.facts.filling.expect("filling").secs);
+            let lock = waiting_pill(label(waits.tab), "password");
+            let hourglass = stuck_pill(&stuck.exe, stuck.quiet_ms, label(stuck.tab));
+            let full_mid_narrow = ["Full", "Mid", "Narrow"];
+            for (i, form) in full_mid_narrow.into_iter().enumerate() {
+                let what = |kind: &str| format!("{kind} pill, {form}");
+                out.push(said(what("Drive"), drive.forms()[i], "Disk full in 34 min"));
+                out.push(said(what("Lock"), lock.forms()[i], "Tab 1 password"));
+                out.push(Said {
+                    differs: Some((
+                        [
+                            "node stuck 12 min · this tab",
+                            "node stuck · this tab",
+                            "node stuck · Tab 3",
+                        ][i],
+                        "§6: the jobs engine's verdict, stuck, not the mockup's hung",
+                    )),
+                    ..said(
+                        what("Hourglass"),
+                        hourglass.forms()[i],
+                        [
+                            "node hung 12 min · this tab",
+                            "node hung · this tab",
+                            "node hung · Tab 3",
+                        ][i],
+                    )
+                });
+            }
+        } else {
+            let outside = |o: Owner| matches!(o, Owner::Outside(_));
+            out.extend([
+                said(
+                    "Mac chip Safari",
+                    gib_of(Some("Safari"), &outside),
+                    "6.1 GiB",
+                ),
+                said("all-tabs chip Tab 1", gib_of(None, &pane(1)), "3.6 GiB"),
+                said(
+                    "all-tabs chip aterm",
+                    gib_of(None, &|o: Owner| o == Owner::Aterm),
+                    "1.1 GiB",
+                ),
+                said(
+                    "this-tab chip claude",
+                    gib_of(Some("claude"), &pane(2)),
+                    "1.4 GiB",
+                ),
+                said(
+                    "this-tab chip node",
+                    gib_of(Some("node"), &pane(2)),
+                    "0.3 GiB",
+                ),
+                said(
+                    "claude's age",
+                    up_words(Some(3 * 3_600_000), false).unwrap_or_default(),
+                    "up 3 h",
+                ),
+            ]);
+        }
+        out
+    }
+
+    /// THE SLICE'S PROOF: busy's and calm's merged words, read from their fixture snapshots,
+    /// beside the mockups' (gen.py's strings), printed as a table (`--nocapture`). Each word
+    /// matches the mockup's but where a reason is named, and there it is the words meant.
+    #[test]
+    fn merged_words_beside_the_mockups() {
+        use crate::fixtures::DeckScene;
+        for scene in [DeckScene::Busy, DeckScene::Calm] {
+            println!("\n{} | ours | mockup", scene.name());
+            for row in merged_table(scene) {
+                let mark = if row.ours == row.mockup { "=" } else { "≠" };
+                println!(
+                    "  {:<24} {:<30} {mark} {:<30} {}",
+                    row.what,
+                    format!("{:?}", row.ours),
+                    format!("{:?}", row.mockup),
+                    row.differs.map_or("", |d| d.1)
+                );
+                let want = row.differs.map_or(row.mockup, |d| d.0);
+                assert_eq!(row.ours, want, "{}: {}", scene.name(), row.what);
+                assert_eq!(row.differs.is_some(), want != row.mockup, "{}", row.what);
+            }
+        }
+    }
+
+    #[test]
+    fn merged_words_round_at_their_edges() {
+        let gib = |g: f64| (g * GIB).round() as u64;
+        assert_eq!(gib_words(gib(9.94)), "9.9 GiB");
+        assert_eq!(gib_words(gib(9.95)), "10 GiB", "a decimal only under 10");
+        assert_eq!(gib_words(gib(15.6)), "16 GiB");
+        assert_eq!(gib_words(gib(1.1)), "1.1 GiB");
+        assert_eq!(gib_words(gib(6.0)), "6 GiB", "a whole figure has no .0");
+        assert_eq!(gib_words(gib(0.3)), "0.3 GiB");
+        assert_eq!(gib_words(gib(0.04)), "<0.1 GiB", "a little is never 0");
+        assert_eq!(gib_words(0), "0 GiB");
+        assert_eq!(gib_words(gib(127.6)), "128 GiB");
+
+        assert_eq!(free_words(999_400_000_000), "999 GB free");
+        assert_eq!(
+            free_words(999_500_000_000),
+            "1.0 TB free",
+            "999 GB rounds up to TB"
+        );
+        assert_eq!(free_words(40_000_000_000), "40 GB free");
+        assert_eq!(free_words(1_240_000_000_000), "1.2 TB free");
+        assert_eq!(free_words(400_000_000), "400 MB free");
+
+        for (wait, want) in [
+            (0.04, None),
+            (WAITING_GATE, Some("<1 waiting")),
+            (0.49, Some("<1 waiting")),
+            (0.5, Some("~1 waiting")),
+            (1.5, Some("~2 waiting")),
+            (7.7, Some("~8 waiting")),
+            (-3.0, None),
+            (f64::NAN, None),
+        ] {
+            assert_eq!(
+                waiting_words(wait, Platform::MacOs).as_deref(),
+                want,
+                "{wait}"
+            );
+        }
+        assert_eq!(swap_words(gib(0.049)), None, "no swap tile shows");
+        assert_eq!(swap_words(gib(0.051)).as_deref(), Some("0.1 GiB swap"));
+        assert_eq!(swap_words(gib(6.0)).as_deref(), Some("6 GiB swap"));
+        assert_eq!(swap_words(gib(9.95)).as_deref(), Some("10 GiB swap"));
+
+        assert_eq!(writes_words(68e9), "writes 68 GB/h");
+        assert_eq!(writes_words(0.2e9), "writes 200 MB/h");
+        assert_eq!(writes_words(f64::NAN), "writes 0 B/h");
+
+        assert_eq!(disk_capacity(2_000_000_000_000), "2 TB");
+        assert_eq!(
+            disk_capacity(1_995_218_165_760),
+            "2 TB",
+            "a 2 TB drive as APFS reports it"
+        );
+        assert_eq!(disk_capacity(994_662_584_320), "995 GB");
+        assert_eq!(disk_capacity(500_107_862_016), "500 GB");
+        assert_eq!(link_capacity(125e6), "~1 Gb/s");
+        assert_eq!(link_capacity(312.5e6), "~2.5 Gb/s");
+        assert_eq!(link_capacity(1.25e9), "~10 Gb/s");
+        assert_eq!(link_capacity(866.7e6 / 8.0), "~867 Mb/s");
+        assert_eq!(memory_capacity(128 << 30), "128 GiB");
+        assert_eq!(memory_capacity(gib(7.7)), "7.7 GiB");
+        assert_eq!(gpu_capacity(40), "40 cores");
+        assert_eq!(gpu_capacity(1), "1 core");
+
+        assert_eq!(speak(&link_capacity(125e6)), "about 1 gigabit per second");
+        assert_eq!(speak(&writes_words(68e9)), "writes 68 gigabytes per hour");
+        assert_eq!(speak(&writes_words(50.0)), "writes 50 bytes per hour");
+        assert_eq!(speak(&link_capacity(10.0)), "about 80 bits per second");
+        assert_eq!(speak("<1 waiting"), "less than 1 waiting");
+        assert_eq!(speak("<1%"), "less than 1 percent");
+    }
+
+    #[test]
+    fn cpu_capacity_names_the_core_kinds() {
+        let cpu = |kinds: &[(&str, usize)]| {
+            let mut clusters = Vec::new();
+            let mut n = 0;
+            for &(name, count) in kinds {
+                clusters.push(crate::model::ClusterView {
+                    name: name.into(),
+                    short: name[..1].into(),
+                    cores: (n..n + count).collect(),
+                });
+                n += count;
+            }
+            CpuView {
+                cores: vec![crate::model::CoreView::default(); n],
+                clusters,
+                ..CpuView::default()
+            }
+        };
+        assert_eq!(
+            cpu_capacity(&cpu(&[("Super", 6), ("Performance", 12)])),
+            "Super, Perf"
+        );
+        assert_eq!(
+            cpu_capacity(&cpu(&[("Performance", 4), ("Efficiency", 6)])),
+            "Perf, Eff"
+        );
+        assert_eq!(
+            cpu_capacity(&cpu(&[("Performance", 8), ("Mid 1", 2), ("Efficiency", 2)])),
+            "Perf, Mid 1, Eff"
+        );
+        assert_eq!(
+            cpu_capacity(&cpu(&[("CPU", 8)])),
+            "8 cores",
+            "the OS names no kind"
+        );
+        assert_eq!(cpu_capacity(&cpu(&[("CPU", 1)])), "1 core");
+    }
+
+    /// The scopes' names follow the platform, and so does what the Mac's count counts.
+    #[test]
+    fn scope_names_follow_the_platform() {
+        let names = |p: Platform| DeckScope::ALL.map(|s| s.word(p));
+        assert_eq!(names(Platform::MacOs), ["Mac", "all tabs", "this tab"]);
+        assert_eq!(names(Platform::Linux), ["computer", "all tabs", "this tab"]);
+        assert_eq!(
+            names(Platform::Windows),
+            ["computer", "all tabs", "this tab"]
+        );
+        assert_eq!(count_word(Platform::MacOs), "procs");
+        assert_eq!(count_word(Platform::Windows), "procs");
+        assert_eq!(
+            count_word(Platform::Linux),
+            "threads",
+            "Linux counts its tasks"
+        );
+        assert_eq!(RunSpan::TenMinutes.spoken(), "the last 10 minutes");
+    }
+
+    /// Linux says no CPU wait, as CPU's Details says none there (its load average counts
+    /// threads waiting on disk too). NEGATIVE CONTROL: the same busy scene on macOS and Windows
+    /// says it, in both places.
+    #[test]
+    fn linux_says_no_cpu_wait() {
+        use crate::fixtures::{DeckScene, snapshot};
+        let s = snapshot(DeckScene::Busy);
+        let wait = s.facts.load1.expect("load") - s.cpu.as_ref().expect("cpu").total() as f64;
+        for (platform, said) in [
+            (Platform::MacOs, true),
+            (Platform::Windows, true),
+            (Platform::Linux, false),
+        ] {
+            let loc = Locale {
+                platform,
+                utc_offset_s: 0,
+            };
+            let first = &details(Resource::Cpu, &s, &loc)[0].forms[0];
+            assert_eq!(first.contains("waiting"), said, "{platform:?}: {first}");
+            assert_eq!(
+                waiting_words(wait, platform).as_deref(),
+                said.then_some("~8 waiting"),
+                "{platform:?}"
+            );
+        }
+        for wait in [0.3, 1.5, 40.0] {
+            assert_eq!(waiting_words(wait, Platform::Linux), None, "{wait}");
+        }
+    }
+
+    /// Every need pill keeps its verb and its place at every width, and no narrower form is
+    /// longer than a wider one. NEGATIVE CONTROL: a pill that drops its place fails the check.
+    #[test]
+    fn need_pills_keep_the_verb_and_the_place_at_every_width() {
+        const MIN: u64 = 60_000;
+        let keeps = |p: &FormWords, verb: &str, places: &[&str]| {
+            p.forms()
+                .iter()
+                .all(|f| f.contains(verb) && places.iter().any(|at| f.contains(at)))
+        };
+        let narrowing = |p: &FormWords| {
+            p.forms()
+                .windows(2)
+                .all(|w| w[1].chars().count() <= w[0].chars().count())
+        };
+        for secs in [0.0, 59.0, 2_057.0, 3_599.0, 86_399.0, f64::NAN] {
+            let p = disk_full_pill(secs);
+            assert!(keeps(&p, "full in", &["Disk"]) && narrowing(&p), "{p:?}");
+        }
+        assert_eq!(
+            disk_full_pill(2_057.0).narrow,
+            "Disk full in 34 min",
+            "floored"
+        );
+        assert_eq!(disk_full_pill(30.0).full, "Disk full in under 1 min");
+        for (tab, what) in [
+            ("Tab 1", "password"),
+            ("Tab 12", "approval"),
+            ("Tab 4", "login"),
+        ] {
+            let p = waiting_pill(tab, what);
+            assert!(keeps(&p, what, &[tab]) && narrowing(&p), "{p:?}");
+        }
+        assert_eq!(waiting_pill("Tab 1", "password").mid, "Tab 1 password");
+        let stuck = stuck_pill("node", Some(12 * MIN), "Tab 3");
+        assert_eq!(
+            stuck.forms(),
+            [
+                "node stuck 12 min · this tab",
+                "node stuck · this tab",
+                "node stuck · Tab 3"
+            ]
+        );
+        for (quiet, tab) in [
+            (Some(12 * MIN), "Tab 3"),
+            (Some(185 * MIN), "Tab 12"),
+            (None, "Tab 3"),
+            (Some(0), ""),
+            (Some(MIN), "Tab 1234"),
+        ] {
+            let p = stuck_pill("node", quiet, tab);
+            let places = [THIS_TAB, tab];
+            let places = if tab.is_empty() {
+                &places[..1]
+            } else {
+                &places[..]
+            };
+            assert!(
+                keeps(&p, "stuck", places) && keeps(&p, "node", places),
+                "{p:?}"
+            );
+            assert!(narrowing(&p), "{p:?}");
+        }
+        assert_eq!(
+            stuck_pill("node", None, "Tab 3").full,
+            "node stuck · this tab"
+        );
+        assert_eq!(
+            stuck_pill("node", Some(MIN), "").narrow,
+            "node stuck · this tab"
+        );
+        assert_eq!(
+            stuck_pill("node", Some(MIN), "Tab 1234").narrow,
+            "node stuck · this tab",
+            "a label no shorter keeps this tab"
+        );
+        let dropped = FormWords {
+            narrow: "node stuck".into(),
+            ..stuck.clone()
+        };
+        assert!(
+            !keeps(&dropped, "stuck", &[THIS_TAB, "Tab 3"]),
+            "the check sees a lost place"
+        );
+    }
+
+    /// No merged word writes minutes as a bare `m` (§6: it reads as megabytes) but §4's `10m`
+    /// over a run, which names a span, not an amount. NEGATIVE CONTROL: the check sees `sys
+    /// jobs`' own `12m`.
+    #[test]
+    fn no_merged_word_writes_a_bare_m() {
+        use crate::fixtures::DeckScene;
+        let bare_m = |w: &str| {
+            w.split(' ').any(|t| {
+                t.strip_suffix('m')
+                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            })
+        };
+        let mut words: Vec<String> = [DeckScene::Busy, DeckScene::Calm]
+            .into_iter()
+            .flat_map(merged_table)
+            .map(|row| row.ours)
+            .collect();
+        for ms in [
+            0,
+            59_999,
+            60_000,
+            12 * 60_000,
+            47 * 60_000 + 5,
+            185 * 60_000,
+            86_400_000 * 3,
+        ] {
+            words.extend(
+                disk_full_pill(ms as f64 / 1000.0)
+                    .forms()
+                    .map(str::to_owned),
+            );
+            words.extend(
+                stuck_pill("node", Some(ms), "Tab 3")
+                    .forms()
+                    .map(str::to_owned),
+            );
+            words.extend(up_words(Some(ms), true));
+        }
+        let bare: Vec<&String> = words.iter().filter(|w| bare_m(w)).collect();
+        let span = format!(
+            "{} … {}",
+            RunSpan::TenMinutes.ends().0,
+            RunSpan::TenMinutes.ends().1
+        );
+        assert!(bare.iter().all(|w| **w == span), "{bare:?}");
+        assert!(!bare.is_empty(), "the run's span is read");
+        assert!(
+            bare_m(&crate::jobs::wire::age_words(12 * 60_000)),
+            "sys jobs' 12m is seen"
+        );
     }
 }

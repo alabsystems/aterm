@@ -357,7 +357,8 @@ pub enum FdKind {
     },
     /// A file-change watch (Linux inotify).
     Watch,
-    /// Anything else.
+    /// Anything else, or a socket left unread (macOS: its process was not settled, or was
+    /// spawning).
     Other,
 }
 
@@ -664,6 +665,24 @@ pub struct Lanes {
     pub pipe_flags: Lane,
 }
 
+/// Whether another process's sockets may be read in detail now by a reader on a timer of its own
+/// (one that runs `lsof -i` on it each second): on macOS, it is not exiting and not a fork under
+/// 2 s old that has not exec'd, which may be mid-spawn (`macos::sockets_readable`); `true`
+/// elsewhere. A close that starts after the call, a spawn's or a fresh program's, such a reader
+/// meets by chance alone.
+#[must_use]
+pub fn sockets_readable(pid: u32) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        macos::sockets_readable(pid, now_us())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
 /// The job probe.
 #[derive(Debug)]
 pub struct JobsReader {
@@ -676,7 +695,8 @@ pub struct JobsReader {
     /// The last size seen per `(pid, start, fd, ino)`.
     tails: HashMap<TailKey, u64>,
     /// The processes the last pass found running a program they exec'd, by `(pid, start)`, each
-    /// with its short name then: the ones whose sockets this pass may read (`macos::settled`).
+    /// with its short name then: the exec'd ones whose sockets this pass may read
+    /// (`macos::settled`). Each pass replaces it, so a process a pass leaves out is new to the next.
     execd: HashMap<(u32, u64), String>,
 }
 
@@ -714,6 +734,9 @@ impl JobsReader {
     }
 
     /// Read every process `reqs` names, in order; a process gone or refused meanwhile is left out.
+    /// The call is a pass: a process that ran a program it exec'd has its sockets read only when
+    /// the last pass read it running that program too, so one this call leaves out reads its
+    /// sockets `Other` at the next.
     pub fn read_all(&mut self, reqs: &[ReadReq]) -> Vec<ProcFacts> {
         self.read_all_at(reqs, now_us())
     }
@@ -772,7 +795,8 @@ impl JobsReader {
         out
     }
 
-    /// Read one process; `None` when it is gone or unreadable.
+    /// Read one process; `None` when it is gone or unreadable. A pass of its own
+    /// ([`Self::read_all`]): every other process is new to the next.
     pub fn read(&mut self, req: ReadReq) -> Option<ProcFacts> {
         self.read_all(&[req]).pop()
     }

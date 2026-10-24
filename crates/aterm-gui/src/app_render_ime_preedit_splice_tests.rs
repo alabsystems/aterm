@@ -84,11 +84,17 @@ fn native_view_composition_stays_out_of_the_find_well() {
         .unwrap()
         .set_query("ab".to_string());
     fill_scratch(&mut app, wid);
-    app.windows.get_mut(&wid).unwrap().front_content =
-        Some(crate::front_content::FrontContent::Native {
-            instance: crate::tab_model::AppInstanceId::from_stored(7),
-            view: crate::tab_model::ViewId::from_stored(44),
-        });
+    let retained_find = app.windows.get_mut(&wid).unwrap().search.take();
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Appearance));
+    app.dispatch_native_event(
+        wid,
+        crate::native_app::AppEvent::Action(crate::native_app::ActionInvocation {
+            id: crate::native_ui::ActionId::new("settings/search"),
+            value: None,
+        }),
+    )
+    .unwrap();
+    app.windows.get_mut(&wid).unwrap().search = retained_find;
     app.on_ime_preedit(wid, "中".to_string(), Some((0, "中".len())));
     assert_eq!(
         app.preedit_owner(wid),

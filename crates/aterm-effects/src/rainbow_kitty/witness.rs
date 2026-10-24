@@ -638,6 +638,7 @@ impl Witness {
                 continue;
             };
             let v = Self::follow_verdict(&self.follow_armed, there.cols, k, relaid);
+            let bit = 1u8 << k;
             let counted = armed.saturating_sub(v.neutral + v.relaid);
             let sole_stands = v.found == 1
                 && counted == 1
@@ -651,7 +652,7 @@ impl Witness {
                                 .binary_search_by_key(&glyph, |a| a.0)
                                 .is_ok_and(|i| {
                                     let (col, unit, _, arrivals) = self.follow_armed[i];
-                                    arrivals & (1 << k) != 0 && unit_at(there.cols, col) == unit
+                                    arrivals & bit != 0 && unit_at(there.cols, col) == unit
                                 })
                     }
                 };
@@ -662,7 +663,7 @@ impl Witness {
             }
             let (mut lo, mut hi) = (v.lo, v.hi);
             let neutral = |col: u16, unit: Unit, arrivals: u8| {
-                arrivals & (1 << k) == 0 && unit_at(there.cols, col) == unit
+                arrivals & bit == 0 && unit_at(there.cols, col) == unit
             };
             let is_cell = |col: u16| {
                 cells.iter().any(|c| {
@@ -736,12 +737,13 @@ impl Witness {
             block: true,
         };
         let relaid_from = armed.len().saturating_sub(relaid);
+        let bit = 1u8 << k;
         let mut after = false;
         let mut lead: Option<u16> = None;
         let mut ext_hi = 0u16;
         for (i, &(col, unit, _, arrivals)) in armed.iter().enumerate() {
             let here = unit_at(there, col) == unit;
-            let twin = arrivals & (1 << k) == 0;
+            let twin = arrivals & bit == 0;
             if here && !twin {
                 v.found += 1;
                 if after {
@@ -1027,17 +1029,18 @@ impl Witness {
                 return false;
             }
             s.row -= rows;
-            if bottom > 0 {
+            if bottom > 0 && s.row.saturating_add(2) >= first_new {
+                let pend_ms = last_walk.map_or(0, |t| {
+                    u32::try_from(t.saturating_duration_since(s.born).as_millis())
+                        .unwrap_or(u32::MAX)
+                });
                 for (k, dr) in FOLLOW_DRS.into_iter().enumerate() {
                     if s.row
                         .checked_add_signed(dr)
                         .is_some_and(|r| r >= first_new && r < bottom)
                     {
                         s.pending |= 1 << k;
-                        s.pend_ms[k] = last_walk.map_or(0, |t| {
-                            u32::try_from(t.saturating_duration_since(s.born).as_millis())
-                                .unwrap_or(u32::MAX)
-                        });
+                        s.pend_ms[k] = pend_ms;
                     }
                 }
             }
@@ -1812,15 +1815,6 @@ impl Witness {
                     s
                 }
             };
-            let over_released = seen.is_some_and(|s| !s.restorable) && {
-                let start = self
-                    .seen
-                    .partition_point(|s| (s.row, s.col) < (cell.row, cell.col));
-                self.seen[start..]
-                    .iter()
-                    .take_while(|s| (s.row, s.col) == (cell.row, cell.col))
-                    .any(|s| s.released)
-            };
             let run = &mut self.restore_runs[i];
             match (seen, sample) {
                 (Some(seen), Some(sample)) if run.stamp.is_some() => {
@@ -1829,13 +1823,19 @@ impl Witness {
                     run.returned_ink |= seen.released && !seen.unit.is_blank() && seen.unit == now;
                 }
                 (Some(seen), Some(sample)) => {
-                    let standing = seen.unit == unit_at(sample.cols, cell.col);
                     run.exact &= if seen.restorable {
+                        let standing = seen.unit == unit_at(sample.cols, cell.col);
                         (!cell.leaving() || cell.released_at.is_some())
                             && run.row == cell.row
                             && standing
                     } else {
-                        !over_released
+                        let start = self
+                            .seen
+                            .partition_point(|s| (s.row, s.col) < (cell.row, cell.col));
+                        !self.seen[start..]
+                            .iter()
+                            .take_while(|s| (s.row, s.col) == (cell.row, cell.col))
+                            .any(|s| s.released)
                     };
                     run.returned_ink |= seen.released && !seen.unit.is_blank();
                 }

@@ -248,6 +248,31 @@ fn a_probe_cut_at_any_read_is_never_a_clean_repository() {
     }
 }
 
+/// A REPOSITORY WHOSE STATE CANNOT BE READ IS NEVER CLEAN ([`RepoRead::Unread`]):
+/// with its index broken, `git status` fails in a repository `rev-parse` found,
+/// and the probe reads unread whatever the repository held, where it read
+/// nothing found before. NEGATIVE CONTROL: the same repositories with their
+/// index whole read as they hold.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_repository_whose_state_cannot_be_read_is_never_clean() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let clean = repo(&tmp.path().join("clean"), true);
+    let dirty = repo(&tmp.path().join("dirty"), false);
+    std::fs::write(dirty.join("a.txt"), "changed\n").expect("a.txt");
+    assert_eq!(found(&clean), None, "the control");
+    assert!(found(&dirty).is_some(), "the control finds the change");
+    for work in [&clean, &dirty] {
+        std::fs::write(work.join(".git").join("index"), "DIRC").expect("index");
+        assert_eq!(
+            probe(work, Some(work), PROBE_LIMIT),
+            RepoRead::Unread,
+            "a broken index in {}",
+            work.display()
+        );
+    }
+}
+
 #[test]
 fn a_branchs_stash_entries_are_those_written_on_it() {
     let list = "WIP on main: 1a2b3c4 one\nOn main: a message\nWIP on side: 5d6e7f8 two\n\

@@ -2214,3 +2214,49 @@ fn a_raw_send_longer_than_the_fold_is_drawn_as_words() {
         Some("[Pasted Text: 1600 chars]")
     );
 }
+
+#[test]
+fn a_turn_runs_tools_by_its_tool_rows_or_boxes_under_its_message() {
+    let rows = screen(QUESTION_ANSWERED);
+    assert!(turn_ran_tools(&rows), "its `│ ✓  Ask User` box");
+    let status = rows
+        .iter()
+        .position(|r| r.trim_end().ends_with("? for shortcuts"))
+        .expect("the status row");
+    let bottom = rows[..status]
+        .iter()
+        .rposition(|r| r.starts_with("▀▀▀"))
+        .expect("the message's band");
+    assert!(!turn_opens_above(&rows), "its message drawn");
+    assert!(
+        turn_opens_above(&rows[bottom + 1..]),
+        "the rows under its message"
+    );
+    let ended = rows
+        .iter()
+        .rposition(|r| r.starts_with("✦ Tool call done."))
+        .expect("the last reply");
+    let band = rows
+        .iter()
+        .position(|r| r.starts_with("▄▄▄"))
+        .expect("a message's band");
+    let mut later = rows.clone();
+    let turn = [
+        String::new(),
+        rows[band].clone(),
+        " > thanks".to_string(),
+        rows[band + 2].clone(),
+        String::new(),
+        "✦ You're welcome.".to_string(),
+    ];
+    later.splice(ended + 1..ended + 1, turn);
+    assert_eq!(said_tail(&later).as_deref(), Some("You're welcome."));
+    assert!(
+        !turn_ran_tools(&later),
+        "the control: the box is a turn before"
+    );
+    assert!(
+        !turn_ran_tools(&screen(END_OF_TURN)),
+        "the control: no call"
+    );
+}

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The egress witness (`aterm-lab sampler <run-dir>`, started by `up`, unjailed): every second it lists the network sockets (`lsof -nP -i`) of every process in the lab's jail — the stub, the private instance's whole tree (its shells, the real Claude Code or Codex), what the lab started in the jail outside that tree (`codex-run`, the agents' `--version`, the selftests' controls) and whatever any of them left behind (an orphan launchd adopted, a process in a session of its own).
+//! The egress witness (`aterm-lab sampler <run-dir>`, started by `up`, unjailed): every second it lists the network sockets (`lsof -nP -i`) of every process in the lab's jail — the stub, the private instance's whole tree (its shells, the real Claude Code or Codex), what the lab started in the jail outside that tree (`codex-run`, the agents' `--version`, the selftests' controls) and whatever any of them left behind (an orphan launchd adopted, a process in a session of its own). A fork under 2 s old that has not exec'd, and a process exiting, wait for a later second (`aterm_sysprobe::jobs::sockets_readable`).
 
 use std::collections::BTreeSet;
 use std::io::Write as _;
@@ -209,12 +209,26 @@ pub fn main(args: &[String]) -> i32 {
             let body: String = ever.iter().map(|p| format!("{p}\n")).collect();
             let _ = crate::util::atomic_write(&dir.join("members.txt"), body.as_bytes());
         }
-        let pids: Vec<String> = m.iter().map(ToString::to_string).collect();
-        let now = aterm_uds::spawnfd::command("/usr/sbin/lsof")
-            .args(["-nP", "-i", "-a", "-p", &pids.join(","), "-F", "pcPtn"])
-            .output()
-            .map(|o| endpoints(&String::from_utf8_lossy(&o.stdout)))
-            .unwrap_or_default();
+        // `lsof -i` reads every descriptor of each member it lists (`PROC_PIDFDSOCKETINFO` for a
+        // socket), and a read of a socket its holder closes meanwhile drains it. A fork that may be
+        // mid-spawn (its exec closes each socket it inherited) and a member exiting are left to a
+        // later second (`aterm_sysprobe::jobs::sockets_readable`); a spawn's or a fresh program's
+        // closes this timer meets by chance alone. The kernel's TCP and UDP tables read no
+        // descriptor, but show a reader that is no Apple platform binary its own sockets alone.
+        let pids: Vec<String> = m
+            .iter()
+            .filter(|p| u32::try_from(**p).is_ok_and(aterm_sysprobe::jobs::sockets_readable))
+            .map(ToString::to_string)
+            .collect();
+        let now = if pids.is_empty() {
+            BTreeSet::new()
+        } else {
+            aterm_uds::spawnfd::command("/usr/sbin/lsof")
+                .args(["-nP", "-i", "-a", "-p", &pids.join(","), "-F", "pcPtn"])
+                .output()
+                .map(|o| endpoints(&String::from_utf8_lossy(&o.stdout)))
+                .unwrap_or_default()
+        };
         for line in now.difference(&seen) {
             let ts = crate::util::hms(crate::util::now_secs());
             let _ = sockets.write_all(format!("{ts} {line}\n").as_bytes());

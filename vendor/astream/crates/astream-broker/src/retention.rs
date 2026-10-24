@@ -63,6 +63,10 @@
 //! floor for a filter: the base for what the prefix rule and the last-value rules can match,
 //! the matching subjects' floors (and where the rules took effect) for the rest.
 //!
+//! A TAIL is told too (R4's addendum, A9): one whose cursor is below its filter's oldest is
+//! sent a gap notice before its next record, counted from the `Ledger` of what the hold
+//! rules gave up where that names every record of the filter it lost (`counted_from`).
+//!
 //! # Record times
 //!
 //! The log's records carry no time. The retention tick STAMPS what it has not seen yet with
@@ -111,6 +115,132 @@ const fn slack(max: u64) -> u64 {
 /// of them instead: a bound on the work a `Fetch` does under the log lock, never a
 /// guess below a floor (the fallback is larger, never smaller).
 pub(crate) const FLOOR_SCAN_MAX: usize = 65_536;
+
+/// The most records a [`Ledger`] names: as many as the held store keeps floors for.
+pub(crate) const LEDGER_MAX: usize = 65_536;
+
+/// The most bytes of subject names a [`Ledger`] takes, as the floors' names are bounded.
+pub(crate) const LEDGER_BYTES_MAX: usize = 8 << 20;
+
+/// THE LEDGER of what the hold rules gave up, record by record (R4's addendum, A9): each
+/// record's offset and subject and the order it was given up in, so a tail below the base
+/// can be told how many records of its filter it will not be delivered
+/// ([`BrokerLog::gap_notice`](crate::BrokerLog::gap_notice)). It is WHOLE FROM an offset:
+/// at and above it every record a hold rule gave up is named; below it records went that
+/// it does not name. In memory only, never in the held store's file, so a restart starts
+/// one whole from the base it opens at. Bounded: past [`LEDGER_MAX`] records or
+/// [`LEDGER_BYTES_MAX`] bytes of names the lowest offsets go, and it is whole only from
+/// above them. A planning collects its give-ups in one ([`Plan::given`]), which the held
+/// store's takes when the job lands.
+#[derive(Debug, Default)]
+pub(crate) struct Ledger {
+    /// By offset: the order it was given up in (`seq`) and its subject.
+    at: BTreeMap<u64, (u64, String)>,
+    bytes: usize,
+    /// How many records have been named, ever: the `seq` of the newest.
+    seq: u64,
+    whole: u64,
+}
+
+impl Ledger {
+    /// Name the record at `off`, of `subject`, given up (nothing below where it is whole).
+    pub(crate) fn note(&mut self, off: u64, subject: &str) {
+        if off < self.whole {
+            return;
+        }
+        self.seq = self.seq.saturating_add(1);
+        if let Some((_, old)) = self.at.insert(off, (self.seq, subject.to_string())) {
+            self.bytes = self.bytes.saturating_sub(old.len());
+        }
+        self.bytes = self.bytes.saturating_add(subject.len());
+        while self.at.len() > LEDGER_MAX || self.bytes > LEDGER_BYTES_MAX {
+            let Some((o, (_, s))) = self.at.pop_first() else {
+                break;
+            };
+            self.bytes = self.bytes.saturating_sub(s.len());
+            self.whole = self.whole.max(o.saturating_add(1));
+        }
+    }
+
+    /// Whole from `off` only, from here: what it names below is forgotten (records went
+    /// there that it was never told of: a compaction no rules planned, an open).
+    pub(crate) fn whole_from(&mut self, off: u64) {
+        if off <= self.whole {
+            return;
+        }
+        self.whole = off;
+        while let Some((&o, _)) = self.at.first_key_value() {
+            if o >= off {
+                break;
+            }
+            if let Some((_, (_, s))) = self.at.pop_first() {
+                self.bytes = self.bytes.saturating_sub(s.len());
+            }
+        }
+    }
+
+    /// Take what one planning gave up (`given`), after what this names.
+    pub(crate) fn take(&mut self, given: Ledger) {
+        self.whole_from(given.whole);
+        for (off, (_, subject)) in given.at {
+            self.note(off, &subject);
+        }
+    }
+
+    /// From where every record a hold rule gave up is named.
+    pub(crate) const fn whole(&self) -> u64 {
+        self.whole
+    }
+
+    /// How many records have been named, ever (the newest's order).
+    pub(crate) const fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// How many records it names now.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.at.len()
+    }
+
+    /// How many records of `filter` it names in `from..to` that a tail TOLD up to `told`
+    /// when the ledger stood at `seen` was not counted: each at or above `told`, and below
+    /// it each given up since. At most [`LEDGER_MAX`] subjects matched, under the log lock,
+    /// once per landed retention per tail below the base.
+    pub(crate) fn count(&self, filter: &Filter, from: u64, to: u64, told: u64, seen: u64) -> u64 {
+        let mut n = 0u64;
+        for (&off, (seq, subject)) in self.at.range(from..to.max(from)) {
+            if (off >= told || *seq > seen) && filter.matches_str(subject) {
+                n = n.saturating_add(1);
+            }
+        }
+        n
+    }
+}
+
+/// Whether a [`Ledger`] whole from `from` names every record of `filter` retention gave up
+/// from `from` on: every class the filter can reach ([`Retention::reached_by`]) keeps its
+/// records one by one ([`Keep::All`] hold), and is whole from at or below `from` (`since`,
+/// by class; the base for a class it does not name). The prefix rule's records and a
+/// last-value class's are dropped as a range by the cut, never one by one, and below where
+/// a class is whole older rules dropped its records: there no count is given.
+pub(crate) fn counted_from(
+    rules: Option<&Retention>,
+    since: &[u64],
+    base: u64,
+    from: u64,
+    filter: &Filter,
+) -> bool {
+    let Some(rules) = rules else {
+        return false;
+    };
+    for c in rules.reached_by(filter) {
+        if !rules.rule(c).holds_records() || since.get(c).copied().unwrap_or(base) > from {
+            return false;
+        }
+    }
+    true
+}
 
 /// A rule's class (see the module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -770,6 +900,9 @@ pub(crate) struct Plan {
     pub(crate) floors: BTreeMap<String, u64>,
     /// Unread records given up, by subject and why: how many, for the log line.
     pub(crate) lost: BTreeMap<(String, Why), u64>,
+    /// Every record given up, read or not, one by one: what the held store's [`Ledger`]
+    /// takes when the job lands.
+    pub(crate) given: Ledger,
     /// Each class's bytes in the retained suffix the cut keeps.
     pub(crate) kept: Vec<u64>,
     /// What the planning leaves each class before it is past its own bytes, retained above
@@ -796,6 +929,7 @@ impl Plan {
         let floor = rec.seq.0.saturating_add(1);
         let f = self.floors.entry(rec.subject.clone()).or_insert(0);
         *f = (*f).max(floor);
+        self.given.note(rec.seq.0, &rec.subject);
         if why != Why::Read {
             let n = self.lost.entry((rec.subject.clone(), why)).or_insert(0);
             *n = n.saturating_add(1);

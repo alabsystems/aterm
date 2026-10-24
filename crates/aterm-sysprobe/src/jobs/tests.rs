@@ -200,8 +200,8 @@ fn a_socket_answer_names_tcp_state_peer_and_queue() {
     assert_eq!(darwin::socket(&b[..100]), None);
 }
 
-/// A `net.local.stream.pcblist_n` read: its `xinpgen` head, `records` each padded to 8, and its
-/// `xinpgen` tail.
+/// A `net.local.stream.pcblist_n` read: its `xunpgen` head, `records` each padded to 8, and its
+/// `xunpgen` tail.
 fn unix_table(records: &[Vec<u8>]) -> Vec<u8> {
     let mut b = vec![0u8; 24];
     put(&mut b, 0, &24u32.to_ne_bytes());
@@ -924,51 +924,300 @@ fn this_process_reads_itself_with_threads_counters_and_descriptors() {
     }
 }
 
-/// A PROCESS'S SOCKETS ARE READ ONLY ONCE IT IS SETTLED (`macos::settled`): it ran this program at
-/// the reader's last pass too, and it is not exiting. A fork that never exec'd, a program the last
-/// pass did not see run, and one on its way out of `exit` are not.
+/// A PROCESS'S SOCKETS ARE READ ONLY ONCE IT IS SETTLED (`macos::settled`): a program it exec'd
+/// that the reader's last pass found running too, or its parent's program kept for `SETTLE_US`,
+/// and it is not exiting.
 #[cfg(target_os = "macos")]
 #[test]
 fn only_a_settled_process_has_its_sockets_read() {
     use darwin::{PROC_FLAG_EXEC as EXEC, PROC_FLAG_INEXIT as EXIT};
-    assert!(macos::settled(EXEC, true));
+    use macos::{SETTLE_US, settled};
+    assert!(settled(EXEC, true, None));
     assert!(
-        !macos::settled(EXEC, false),
+        !settled(EXEC, false, Some(u64::MAX)),
         "a program the last pass did not see run"
     );
-    assert!(!macos::settled(0, true), "a fork that never exec'd");
-    assert!(!macos::settled(EXEC | EXIT, true), "on its way out of exit");
+    assert!(
+        settled(0, false, Some(SETTLE_US)),
+        "a fork that kept its parent's program that long"
+    );
+    assert!(!settled(0, true, Some(SETTLE_US - 1)), "a younger fork");
+    assert!(!settled(0, true, None), "a fork of no known age");
+    assert!(!settled(EXEC | EXIT, true, None), "on its way out of exit");
+    assert!(
+        !settled(EXIT, false, Some(u64::MAX)),
+        "a fork on its way out"
+    );
 }
 
-/// THE READER WAITS ONE PASS BEFORE IT READS A SOCKET: this process's socket reads `Other` at a
-/// reader's first pass and in detail at the next, which finds the same program running. NEGATIVE
-/// CONTROL: a fresh reader, with no last pass, reads it `Other` again.
+/// The spawn guard cannot clear a positively listed child whose birth was not read, even after
+/// a known-old sibling. A complete empty list and known-old births permit; failed or full lists
+/// and zero, future or young births defer, with the exact settle boundary as a negative control.
 #[cfg(target_os = "macos")]
 #[test]
-fn a_socket_reads_in_detail_from_the_second_pass_that_finds_its_program() {
+fn only_complete_child_observations_clear_the_spawn_guard() {
+    use macos::{SETTLE_US, spawning_with};
+    let now = 10 * SETTLE_US;
+    let kids = [41, 42, 0, 0];
+    let old = now - SETTLE_US;
+    let mut read = Vec::new();
+    assert!(spawning_with(now, &kids, 2, 0, |pid| {
+        read.push(pid);
+        (pid == 41).then_some(old)
+    }));
+    assert_eq!(
+        read,
+        [41, 42],
+        "the old sibling does not hide the unread child"
+    );
+    assert!(!spawning_with(now, &kids, 2, 0, |_| Some(old)));
+    for birth in [None, Some(0), Some(now + 1), Some(old + 1)] {
+        assert!(spawning_with(now, &kids, 1, 0, |_| birth), "{birth:?}");
+    }
+    assert!(!spawning_with(now, &kids, 1, 0, |_| Some(old - 1)));
+    assert!(!spawning_with(now, &kids, 0, 0, |_| {
+        panic!("an empty list reads no child")
+    }));
+    for (listed, errno) in [(0, libc::EPERM), (-1, 0), (4, 0), (5, 0)] {
+        assert!(
+            spawning_with(now, &kids, listed, errno, |_| {
+                panic!("an incomplete list reads no child")
+            }),
+            "listed={listed} errno={errno}"
+        );
+    }
+}
+
+/// A `/bin/bash -c script` child in a session of its own, its stdin one end of a socket pair, once
+/// it runs bash: the other end and the child.
+#[cfg(target_os = "macos")]
+fn bash_on_a_socket(script: &str) -> (std::os::unix::net::UnixStream, aterm_uds::spawnfd::Child) {
+    let (mine, theirs) = std::os::unix::net::UnixStream::pair().expect("a socket pair");
+    let child = aterm_uds::spawnfd::command("/bin/bash")
+        .args(["-c", script])
+        .stdin(std::os::fd::OwnedFd::from(theirs))
+        .setsid(true)
+        .spawn()
+        .expect("bash starts");
+    let pid = child.id();
+    wait_for(&format!("{pid} runs bash"), || {
+        row(pid).is_some_and(|p| p.exec == Some(true) && p.name == "bash")
+    });
+    (mine, child)
+}
+
+/// `pid`'s sweep row.
+#[cfg(target_os = "macos")]
+fn row(pid: u32) -> Option<crate::procs::ProcessReading> {
+    crate::processes()?.procs.into_iter().find(|p| p.pid == pid)
+}
+
+/// Polls `done` every 10 ms; a one-minute hang detector.
+#[cfg(target_os = "macos")]
+fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !done() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "hang detector: {what}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// What descriptor `fd` of `pid` reads at a pass of `reader` at `now` (µs since the epoch).
+#[cfg(target_os = "macos")]
+fn fd_kind(reader: &mut JobsReader, pid: u32, fd: i32, now: u64) -> Option<FdKind> {
+    reader
+        .read_all_at(&[ReadReq { pid, fds: true }], now)
+        .pop()
+        .and_then(|f| f.fds)
+        .and_then(|fds| fds.into_iter().find(|d| d.fd == fd))
+        .map(|d| d.kind)
+}
+
+/// Kills the session `child` leads, its own children too, and reaps it.
+#[cfg(target_os = "macos")]
+fn end_session(mut child: aterm_uds::spawnfd::Child) {
+    let leader = i32::try_from(child.id()).expect("pid");
+    // SAFETY: `kill` takes no pointers; the group is this test's own child's session.
+    unsafe { libc::kill(-leader, libc::SIGKILL) };
+    child.wait().expect("reaped");
+}
+
+/// A PROGRAM'S SOCKETS READ FROM THE SECOND PASS THAT FINDS IT RUNNING: a child's stdin socket
+/// reads `Other` at a reader's first pass and in detail at the next; `Other` again at the pass
+/// after it exec'd another program (`sleep`), and at the pass after one that left it out.
+/// NEGATIVE CONTROL: a fresh reader, with no last pass, reads it `Other`.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_programs_socket_reads_from_the_second_pass_that_finds_it_running() {
+    use std::io::Write as _;
+    let (mut mine, child) = bash_on_a_socket("read x; exec /bin/sleep 60");
+    let pid = child.id();
+    let mut reader = JobsReader::new();
+    let kind = |reader: &mut JobsReader| fd_kind(reader, pid, 0, now_us());
+    let first = (
+        kind(&mut reader),
+        kind(&mut reader),
+        kind(&mut JobsReader::new()),
+    );
+    mine.write_all(b"go\n").expect("bash reads its line");
+    wait_for("bash execs sleep", || {
+        row(pid).is_some_and(|p| p.name == "sleep")
+    });
+    let after_exec = (kind(&mut reader), kind(&mut reader));
+    reader.read_all(&[]);
+    let after_gap = kind(&mut reader);
+    end_session(child);
+    assert_eq!(
+        first,
+        (
+            Some(FdKind::Other),
+            Some(FdKind::Socket),
+            Some(FdKind::Other)
+        ),
+        "the first pass reads no socket, the second reads it, a fresh reader none"
+    );
+    assert_eq!(
+        after_exec,
+        (Some(FdKind::Other), Some(FdKind::Socket)),
+        "the pass after its exec reads no socket, the next reads it"
+    );
+    assert_eq!(after_gap, Some(FdKind::Other), "a pass left it out");
+}
+
+/// A SPAWNER'S SOCKETS ARE LEFT UNREAD WHILE ITS CHILD IS YOUNG (`macos::spawning`): a settled
+/// bash's stdin socket reads `Other` at a pass `SETTLE_US` less 1 µs after its child started.
+/// NEGATIVE CONTROL: the pass at `SETTLE_US` reads it in detail.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_spawners_socket_reads_other_while_its_child_is_young() {
+    use std::io::Write as _;
+    let (mut mine, child) = bash_on_a_socket("read x; /bin/sleep 60 & read y");
+    let pid = child.id();
+    let mut reader = JobsReader::new();
+    let settled = (
+        fd_kind(&mut reader, pid, 0, now_us()),
+        fd_kind(&mut reader, pid, 0, now_us()),
+    );
+    mine.write_all(b"go\n").expect("bash reads its line");
+    let mut kid = None;
+    wait_for("bash spawns sleep", || {
+        kid = crate::processes().and_then(|s| s.procs.into_iter().find(|p| p.ppid == pid));
+        kid.is_some()
+    });
+    let born = JobsReader::new()
+        .read(ReadReq {
+            pid: kid.map_or(0, |k| k.pid),
+            fds: false,
+        })
+        .and_then(|f| f.start)
+        .expect("the child's start");
+    let young = fd_kind(&mut reader, pid, 0, born + macos::SETTLE_US - 1);
+    let grown = fd_kind(&mut reader, pid, 0, born + macos::SETTLE_US);
+    end_session(child);
+    assert_eq!(settled, (Some(FdKind::Other), Some(FdKind::Socket)));
+    assert_eq!(
+        (young, grown),
+        (Some(FdKind::Other), Some(FdKind::Socket)),
+        "unread while its child is under SETTLE_US old, read once it is not"
+    );
+}
+
+/// A TIMED READER'S GATE (`macos::sockets_readable`) PASSES A PROGRAM AT FIRST SIGHT, A SPAWNER
+/// TOO, AND A FORK ONCE IT HAS KEPT ITS PARENT'S PROGRAM FOR `SETTLE_US`: a bash on a socket passes
+/// at once and while its child is 1 µs old, and a fork that never exec'd fails at `SETTLE_US` less
+/// 1 µs after it started and passes at `SETTLE_US`. NEGATIVE CONTROLS: pid 0, a pid past
+/// `i32::MAX` and a pid nobody has fail.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_timed_readers_gate_passes_a_program_at_once_and_a_fork_once_it_is_settled() {
+    use std::io::Write as _;
+    let start_of = |pid: u32| {
+        JobsReader::new()
+            .read(ReadReq { pid, fds: false })
+            .and_then(|f| f.start)
+    };
+    let (mut mine, child) = bash_on_a_socket("read x; /bin/sleep 60 & read y");
+    let pid = child.id();
+    let at_once = sockets_readable(pid);
+    mine.write_all(b"go\n").expect("bash reads its line");
+    let mut kid = None;
+    wait_for("bash spawns sleep", || {
+        kid = crate::processes().and_then(|s| s.procs.into_iter().find(|p| p.ppid == pid));
+        kid.is_some()
+    });
+    let born = start_of(kid.map_or(0, |k| k.pid)).expect("the child's start");
+    let spawner = macos::sockets_readable(pid, born + 1);
+    end_session(child);
+    // SAFETY: the child calls only `pause`, async-signal-safe, until the SIGKILL below.
+    let fork = unsafe { libc::fork() };
+    assert!(fork >= 0, "fork: {}", std::io::Error::last_os_error());
+    if fork == 0 {
+        loop {
+            // SAFETY: async-signal-safe, with no state of the parent's touched.
+            unsafe { libc::pause() };
+        }
+    }
+    let forked = fork.cast_unsigned();
+    let fork_gate = start_of(forked).map(|b| {
+        (
+            macos::sockets_readable(forked, b + macos::SETTLE_US - 1),
+            macos::sockets_readable(forked, b + macos::SETTLE_US),
+        )
+    });
+    // SAFETY: our own child, killed and reaped once.
+    unsafe {
+        libc::kill(fork, libc::SIGKILL);
+        libc::waitpid(fork, std::ptr::null_mut(), 0);
+    }
+    assert!(at_once, "a program it has not read before");
+    assert!(spawner, "a spawner, its child 1 µs old");
+    assert_eq!(fork_gate, Some((false, true)), "a fork, then settled");
+    assert!(!sockets_readable(0), "pid 0");
+    assert!(!macos::sockets_readable(u32::MAX, 0), "a pid past i32::MAX");
+    assert!(
+        !sockets_readable(i32::MAX.cast_unsigned()),
+        "no such process"
+    );
+}
+
+/// A FORK'S SOCKETS READ ONCE IT HAS KEPT ITS PARENT'S PROGRAM FOR `SETTLE_US` (a pre-fork
+/// server's worker): a forked child's socket reads `Other` at a pass `SETTLE_US` less 1 µs after it
+/// started and in detail at `SETTLE_US`.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_forks_socket_reads_once_it_kept_its_parents_program_long_enough() {
     use std::os::fd::AsRawFd as _;
     let (end, _peer) = std::os::unix::net::UnixStream::pair().expect("a socket pair");
     let fd = end.as_raw_fd();
-    let me = std::process::id();
-    let kind = |reader: &mut JobsReader| {
-        reader
-            .read(ReadReq { pid: me, fds: true })
-            .and_then(|f| f.fds)
-            .and_then(|fds| fds.into_iter().find(|d| d.fd == fd))
-            .map(|d| d.kind)
-    };
+    // SAFETY: the child calls only `pause`, async-signal-safe, until the SIGKILL below.
+    let fork = unsafe { libc::fork() };
+    assert!(fork >= 0, "fork: {}", std::io::Error::last_os_error());
+    if fork == 0 {
+        loop {
+            // SAFETY: async-signal-safe, with no state of the parent's touched.
+            unsafe { libc::pause() };
+        }
+    }
+    let pid = fork.cast_unsigned();
     let mut reader = JobsReader::new();
-    assert_eq!(
-        kind(&mut reader),
-        Some(FdKind::Other),
-        "the first pass reads no socket"
-    );
-    assert_eq!(
-        kind(&mut reader),
-        Some(FdKind::Socket),
-        "the second reads it"
-    );
-    assert_eq!(kind(&mut JobsReader::new()), Some(FdKind::Other));
+    let born = reader
+        .read(ReadReq { pid, fds: false })
+        .and_then(|f| f.start);
+    let kinds = born.map(|b| {
+        (
+            fd_kind(&mut reader, pid, fd, b + macos::SETTLE_US - 1),
+            fd_kind(&mut reader, pid, fd, b + macos::SETTLE_US),
+        )
+    });
+    // SAFETY: our own child, killed and reaped once.
+    unsafe {
+        libc::kill(fork, libc::SIGKILL);
+        libc::waitpid(fork, std::ptr::null_mut(), 0);
+    }
+    assert_eq!(kinds, Some((Some(FdKind::Other), Some(FdKind::Socket))));
 }
 
 /// Both lanes pass their self-check in a plain test binary.

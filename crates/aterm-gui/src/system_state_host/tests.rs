@@ -22,6 +22,179 @@ thread_local! {
     static CALLS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
+#[cfg(target_os = "macos")]
+mod queued_panes {
+    use super::*;
+    use crate::InitialSetupPermissionPolicy;
+    use crate::system_state_access::StepsReach;
+    use aterm_types::macos_setup::{AccessOutcome, Observation, Standing, Subject};
+
+    thread_local! {
+        static QUEUED_PANE_OPENS: RefCell<Vec<Access>> = const { RefCell::new(Vec::new()) };
+        static QUEUED_PANE_FRONT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    fn queued_pane_front(_app: &App) -> bool {
+        QUEUED_PANE_FRONT.with(std::cell::Cell::get)
+    }
+    fn set_queued_pane_front(front: bool) {
+        QUEUED_PANE_FRONT.with(|cell| cell.set(front));
+    }
+
+    fn queued_pane_privacy(off: Option<&str>) -> crate::app_config::PrivacyConfig {
+        let mut privacy = crate::app_config::PrivacyConfig::default();
+        match off {
+            Some("enabled") => privacy.enabled = Some(false),
+            Some("check") => privacy.check = Some(false),
+            Some("notice") => privacy.notice = Some(false),
+            _ => {}
+        }
+        privacy
+    }
+
+    fn queued_accessibility_status(plan: Plan, standing: Standing) -> SetupStatus {
+        SetupStatus {
+            plan: Some(plan),
+            permissions: Some(InitialSetupPermissionPolicy {
+                revision: 1,
+                allowed: true,
+            }),
+            observed: vec![Observation {
+                subject: Subject::Access(Access::Accessibility),
+                standing,
+                now: None,
+                wanted: Access::Accessibility.wanted().into(),
+                note: None,
+                detail: None,
+            }],
+            ..SetupStatus::default()
+        }
+    }
+    fn page_with_queued_accessibility() -> (App, crate::WindowId, crate::native_app::ViewId) {
+        use crate::native_app::{ActionInvocation, AppEvent};
+        use crate::native_ui::ActionId;
+        let mut app = App::headless_for_test();
+        // The windowed queue with fully inert reaches: no platform effect is possible.
+        app.headless = false;
+        app.access_steps.set_reach(StepsReach {
+            frontmost: queued_pane_front,
+            open_pane: |_, access| {
+                QUEUED_PANE_OPENS.with(|opened| opened.borrow_mut().push(access));
+                true
+            },
+            recorded: |_, _| Some(AccessOutcome::Triggered),
+            quiet: |_, _| true,
+            ..StepsReach::INERT
+        });
+        app.config.privacy = Some(queued_pane_privacy(None));
+        app.set_system_state_handlers_for_test(crate::system_state_host::InitialSetupHandlers {
+            apply: |_, _, _, receipt| {
+                receipt.accept();
+                true
+            },
+            ..crate::system_state_host::InitialSetupHandlers::inert_for_test()
+        });
+        let wid = crate::WindowId(0);
+        assert!(app.open_system_state_tab());
+        app.receive_system_state_status(
+            Some(app.system_state_host.generation),
+            queued_accessibility_status(Plan::default(), Standing::NeedsYou),
+        );
+        app.tick_local_network_step(Instant::now());
+        let (_, view) = app.active_native_view(wid).unwrap();
+        set_queued_pane_front(false);
+        QUEUED_PANE_OPENS.with(|opened| opened.borrow_mut().clear());
+        app.with_gesture_source(true, |app| {
+            app.dispatch_native_view_event(
+                wid,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new("system-state/row/accessibility/open"),
+                    value: None,
+                }),
+            )
+        })
+        .unwrap();
+        app.tick_queued_pane(Instant::now());
+        assert!(QUEUED_PANE_OPENS.with(|opened| opened.borrow().is_empty()));
+        (app, wid, view)
+    }
+
+    #[test]
+    fn queued_pane_discards_accessibility_after_accounts_are_left_unmanaged() {
+        use crate::native_app::{ActionInvocation, AppEvent};
+        use crate::native_ui::ActionId;
+        let (mut app, wid, view) = page_with_queued_accessibility();
+        app.with_gesture_source(true, |app| {
+            app.dispatch_native_view_event(
+                wid,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new("system-state/group/3/leave"),
+                    value: None,
+                }),
+            )
+        })
+        .unwrap();
+        app.resolve_system_state_apply();
+        let accepted = app.system_state_host.latest_status().plan.clone().unwrap();
+        assert!(!accepted.selection.contains(Setting::Messages));
+        assert!(!accepted.selection.contains(Setting::FaceTime));
+        // Its old physical reading can still say NeedsYou: the current choice no longer needs it.
+        app.receive_system_state_status(
+            Some(app.system_state_host.generation),
+            queued_accessibility_status(accepted, Standing::NeedsYou),
+        );
+        assert_eq!(
+            app.access_revision(),
+            Some(1),
+            "Permissions stayed approved"
+        );
+        set_queued_pane_front(true);
+        app.tick_queued_pane(Instant::now());
+        assert!(
+            QUEUED_PANE_OPENS.with(|opened| opened.borrow().is_empty()),
+            "the old row action is obsolete"
+        );
+    }
+
+    #[test]
+    fn queued_pane_discards_accessibility_after_a_current_grant_reading() {
+        let (mut app, _, _) = page_with_queued_accessibility();
+        app.receive_system_state_status(
+            Some(app.system_state_host.generation),
+            queued_accessibility_status(Plan::default(), Standing::InPlace),
+        );
+        assert_eq!(app.access_revision(), Some(1));
+        set_queued_pane_front(true);
+        app.tick_queued_pane(Instant::now());
+        assert!(
+            QUEUED_PANE_OPENS.with(|opened| opened.borrow().is_empty()),
+            "the grant needs no pane now"
+        );
+    }
+
+    #[test]
+    fn queued_pane_current_needs_you_survives_privacy_pause_and_opens_once() {
+        for off in ["enabled", "check", "notice"] {
+            let (mut app, _, _) = page_with_queued_accessibility();
+            set_queued_pane_front(true);
+            app.config.privacy = Some(queued_pane_privacy(Some(off)));
+            app.tick_queued_pane(Instant::now());
+            assert!(QUEUED_PANE_OPENS.with(|opened| opened.borrow().is_empty()));
+            app.config.privacy = Some(queued_pane_privacy(None));
+            let now = Instant::now();
+            app.tick_queued_pane(now);
+            assert_eq!(
+                QUEUED_PANE_OPENS.with(|opened| opened.borrow().clone()),
+                [Access::Accessibility]
+            );
+            app.tick_queued_pane(now);
+            assert_eq!(QUEUED_PANE_OPENS.with(|opened| opened.borrow().len()), 1);
+        }
+    }
+}
+
 fn note(call: String) {
     CALLS.with(|calls| calls.borrow_mut().push(call));
 }
@@ -1594,6 +1767,15 @@ fn only_a_join_tells_the_worker_its_vault_was_typed() {
         });
         press(&mut app, wid, view, key);
         app.resolve_system_state_apply();
+        // The accepted pass ends before the next independent action is enabled.
+        let accepted = app.system_state_host.latest_status.plan.clone().unwrap();
+        fresh(
+            &mut app,
+            SetupStatus {
+                plan: Some(accepted),
+                ..SetupStatus::default()
+            },
+        );
     }
     let applied: Vec<String> = calls()
         .into_iter()

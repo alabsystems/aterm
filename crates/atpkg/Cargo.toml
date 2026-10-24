@@ -43,7 +43,8 @@ dev-seams = ["aterm-update-core/dev-seams", "aterm-types/dev-seams"]
 # The crypto root for both signatures atpkg checks: Ed25519 over every signed index and
 # manifest (docs/TOOLCHAIN-PACKAGE-MANAGER.md S8/S13), and RSA-4096 PKCS#1 v1.5 over SHA-512
 # for a vendor's OpenPGP-signed digest document (`openpgp`,
-# docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md §1.2). A direct edge, not only
+# docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md §1.2), and ECDSA P-256 over SHA-256
+# for npm's registry signature over grok's tarball digest (`vendor_direct::npm`). A direct edge, not only
 # rustls's transitive one, so a rustls switch to aws-lc-rs cannot drop it; `deny.toml`
 # floors its version. `alloc` because ring gates RSA behind it; `std` and the RNG fallback
 # stay off. Also `tree::BulkSha256`, the bulk-content SHA-256 (the signed archive digest and
@@ -98,8 +99,12 @@ aterm-digest = { workspace = true }
 # and `src/tarread.rs` (read-only USTAR/PAX/GNU) parses it. Extraction runs per entry so
 # every entry passes the tar-slip-safe `vet_entry` gate before a byte is written, modes are
 # sanitized, and one escape aborts the whole stage. aterm-zstd also writes the test
-# fixtures' frames (`frame::write_raw`).
+# fixtures' frames (`frame::write_raw`), and decodes xAI's bucket `.zst` of grok, which the
+# binary from npm's tarball must agree with.
 aterm-zstd = { workspace = true }
+# grok's npm tarball packs its binary as `package/bin/grok.br`: the first-party streaming
+# RFC 7932 decoder unpacks it into the build as it is read, held to the binary's exact size.
+aterm-brotli = { workspace = true }
 # The window's Claude Code defaults (`aterm_primer::CLAUDE_DEFAULTS`) and the rules that
 # hold them back: the doctor reads the table itself, so a row says only what a window start
 # does. Use `CLAUDE_TOP_EFFORT_KEY`, never the key spelled out: the publication baseline
@@ -136,8 +141,9 @@ aterm-sysprobe = { workspace = true }
 aterm-spec = { workspace = true }
 # The models its tests drive (a model edit rebuilds only their tests).
 aterm-models-atpkg = { workspace = true }
-# Test fixtures sign: Ed25519 manifests (`Ed25519KeyPair::from_seed_unchecked`) and the
-# `openpgp` RSA vectors (`RsaKeyPair::sign` under a committed test key). ring's default
+# Test fixtures sign: Ed25519 manifests (`Ed25519KeyPair::from_seed_unchecked`), the
+# `openpgp` RSA vectors (`RsaKeyPair::sign` under a committed test key) and npm registry
+# signatures (`EcdsaKeyPair::sign` under `npm-test-key.p8`, a P-256 key made for them). ring's default
 # features reach the test build only; the normal build keeps the minimal edge above.
 ring = { workspace = true, features = ["default"] }
 # The tty test's pseudo-terminal (`open_pty_pair`): both ends close-on-exec from birth. An

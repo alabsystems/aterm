@@ -3,7 +3,7 @@
 The astream crates aterm builds against (the fabric bridge, crates/aterm-link,
 and the conformance suite's differential VT oracle) —
 `astream-aead`, `astream-broker`, `astream-cap`, `astream-digest`, `astream-effects`, `astream-sys`, `astream-term`, `astream-wire` — as plain
-files from astream commit `5269710ba8ddeebc2de61489ff04c609fa1e63c4`: each crate's tree but its `tests/`,
+files from astream commit `72b02cbe24f6b95a2539134f75a173b551e9db9b`: each crate's tree but its `tests/`,
 `examples/` and `benches/`, and astream's root `Cargo.toml`, whose workspace
 fields they inherit, with its member list emptied (it names crates not copied
 here). Apache-2.0 (`LICENSE`).

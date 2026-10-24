@@ -1216,11 +1216,16 @@ pub(super) fn file_holders(file: &Path) -> Option<Vec<u32>> {
     complete_file_holders(aterm_uds::holders::scan_file_holders(file, &[]).ok()?)
 }
 
-/// `lsof -t`'s holders of `file`: the oracle [`file_holders`] is held to.
+/// `lsof -t`'s holders of `file` among `pids` alone: the oracle [`file_holders`] is held to.
+/// lsof describes every descriptor of each process it reads, a socket or kqueue too, and that
+/// read drains one its holder closes meanwhile, so it reads only `pids`: quiet children that
+/// have exec'd and hold no socket.
 #[cfg(all(test, target_os = "macos"))]
-pub(super) fn lsof_holders(file: &Path) -> Option<Vec<u32>> {
+pub(super) fn lsof_holders(file: &Path, pids: &[u32]) -> Option<Vec<u32>> {
+    let list: Vec<String> = pids.iter().map(u32::to_string).collect();
     let mut cmd = aterm_uds::spawnfd::command(aterm_uds::os_path!("lsof"));
-    cmd.args(["-n", "-P", "-t"]).arg(file);
+    cmd.args(["-n", "-P", "-t", "-a", "-p", &list.join(","), "--"])
+        .arg(file);
     let out = aterm_uds::deadline::output_until(&mut cmd, Instant::now() + Duration::from_secs(10))
         .ok()?;
     lsof_holder_pids(&out)

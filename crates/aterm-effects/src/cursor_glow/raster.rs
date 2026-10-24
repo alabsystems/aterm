@@ -734,6 +734,7 @@ pub(crate) fn push_soft_veil(
     let a = f32::from(cap) / 255.0;
     let layer = 1.0 - (1.0 - a).powf(1.0 / SOFT_VEIL_LAYERS as f32);
     let layer_cap = ((layer * 255.0).round() as u32).clamp(1, u32::from(cap));
+    let color = (ink & 0x00FF_FFFF) | (layer_cap << 24);
     for k in 0..SOFT_VEIL_LAYERS {
         let shrink = 1.0 - k as f32 / SOFT_VEIL_LAYERS as f32;
         push_halo_rows(
@@ -741,7 +742,7 @@ pub(crate) fn push_soft_veil(
             geom,
             (cx, cy),
             (rx * shrink, ry * shrink),
-            (ink & 0x00FF_FFFF) | (layer_cap << 24),
+            color,
             HaloMode::Over,
         );
     }
@@ -918,11 +919,13 @@ pub(super) fn push_crescent(
         cy + CRESCENT_SHADOW_OFFSET.1 * r,
     );
     let sr = CRESCENT_SHADOW_R * r;
+    let full_premul = premul_rgb(rgb, cov);
+    let full_alpha = if over { cov } else { 0 };
     let mut span = |y: i32, xl: f32, xr: f32| {
         if xr - xl < 0.05 {
             return;
         }
-        let mut lay = |x: i32, w: i32, f: f32| {
+        let lay = |out: &mut Vec<GlowQuad>, x: i32, w: i32, f: f32| {
             let a = (f32::from(cov) * f.clamp(0.0, 1.0)) as u8;
             if a > 0 {
                 let alpha = if over { a } else { 0 };
@@ -931,14 +934,23 @@ pub(super) fn push_crescent(
         };
         let (pl, pr) = (xl.floor() as i32, (xr.ceil() as i32) - 1);
         if pl == pr {
-            lay(pl, 1, xr - xl);
+            lay(out, pl, 1, xr - xl);
             return;
         }
-        lay(pl, 1, (pl + 1) as f32 - xl);
+        lay(out, pl, 1, (pl + 1) as f32 - xl);
         if pr > pl + 1 {
-            lay(pl + 1, pr - pl - 1, 1.0);
+            push_fx_quad(
+                out,
+                geom,
+                pl + 1,
+                y,
+                pr - pl - 1,
+                1,
+                full_premul,
+                full_alpha,
+            );
         }
-        lay(pr, 1, xr - pr as f32);
+        lay(out, pr, 1, xr - pr as f32);
     };
     let (r2, sr2) = (r * r, sr * sr);
     let (y0, y1) = ((cy - r).floor() as i32, (cy + r).ceil() as i32);
@@ -1010,9 +1022,10 @@ pub(crate) fn push_halo_rows(
     let rx_u = rxi as u16;
     let ry_u = ryi as u16;
     let mut yy = y0;
+    let mut row = (yy - oy).div_euclid(ch);
+    let mut next_band = oy + (row + 1) * ch;
     while yy < y1 {
-        let row = (yy - oy).div_euclid(ch);
-        let band_end = (oy + (row + 1) * ch).min(y1);
+        let band_end = next_band.min(y1);
         out.push(RainHalo {
             row: row.max(0) as u16,
             x: x0_u,
@@ -1027,6 +1040,8 @@ pub(crate) fn push_halo_rows(
             mode,
         });
         yy = band_end;
+        row += 1;
+        next_band += ch;
     }
 }
 

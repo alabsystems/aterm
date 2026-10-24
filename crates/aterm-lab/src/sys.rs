@@ -867,6 +867,51 @@ pub fn main_thread_priority(pid: i32) -> Option<i32> {
     thread_priority(pid, *ids.get(..n)?.iter().min()?)
 }
 
+/// How many descriptors `pid` has open, counted from its table alone (`PROC_PIDLISTFDS`): no
+/// descriptor is described, so none of its sockets or kqueues is referenced by the read. `None`
+/// once it has exited, or for a table this user may not list.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn fd_count(pid: i32) -> Option<usize> {
+    const ENTRY: usize = std::mem::size_of::<libc::proc_fdinfo>();
+    // SAFETY: a null buffer asks only for the size the table needs.
+    let need =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+    let mut slots = usize::try_from(need).ok().filter(|n| *n > 0)? / ENTRY + 32;
+    for _ in 0..4 {
+        let mut table = vec![
+            libc::proc_fdinfo {
+                proc_fd: 0,
+                proc_fdtype: 0,
+            };
+            slots
+        ];
+        let size = libc::c_int::try_from(slots * ENTRY).ok()?;
+        // SAFETY: errno is this thread's own.
+        unsafe { *libc::__error() = 0 };
+        // SAFETY: `table` is `size` writable bytes of the entries this flavor writes.
+        let got = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDLISTFDS,
+                0,
+                table.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        if got == 0 && io::Error::last_os_error().raw_os_error() == Some(0) {
+            return Some(0);
+        }
+        let got = usize::try_from(got).ok().filter(|n| *n > 0)?;
+        // A full buffer may have cut the table short: read it again with more room.
+        if got < slots * ENTRY {
+            return Some(got / ENTRY);
+        }
+        slots *= 2;
+    }
+    None
+}
+
 /// Request `QOS_CLASS_USER_INTERACTIVE` on the calling thread and return its resulting base priority.
 #[cfg(target_os = "macos")]
 pub fn ui_request_lands() -> io::Result<i32> {

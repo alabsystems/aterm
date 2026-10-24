@@ -4370,10 +4370,14 @@ fn tail(cfg: &Config, bodies: bool, from: Option<u64>, want: Option<&str>) -> io
     }
     let mut sub = conn.subscribe(start, &filter)?;
     closer.set_read_timeout(None)?;
-    while let Some((off, subject, raw)) = sub
-        .recv_live(&closer, astream_broker::IDLE_MARK_DEADLINE)
-        .map_err(|e| silent_link(e, &broker))?
-    {
+    loop {
+        let read = sub.recv_live(&closer, astream_broker::IDLE_MARK_DEADLINE);
+        if let Some(gap) = sub.take_gap() {
+            tail_gap(&filter, &gap);
+        }
+        let Some((off, subject, raw)) = read.map_err(|e| silent_link(e, &broker))? else {
+            break;
+        };
         let t = traffic_of(&cfg.fleet, off, &subject, &raw);
         let line = tail_line(&t, crate::now_ms(), offset.unwrap_or(0), bodies);
         if writeln!(out, "{line}").and_then(|()| out.flush()).is_err() {
@@ -4383,6 +4387,14 @@ fn tail(cfg: &Config, bodies: bool, from: Option<u64>, want: Option<&str>) -> io
     Err(io::Error::other(format!(
         "the broker at {broker} closed the stream"
     )))
+}
+
+fn tail_gap(filter: &str, gap: &astream_broker::Gap) {
+    eprintln!(
+        "aterm fabric tail: {filter}: the broker's retention gave up {} before this tail read \
+         them",
+        transport::gap_lost(gap)
+    );
 }
 
 fn silent_link(e: io::Error, broker: &str) -> io::Error {
@@ -4418,11 +4430,13 @@ fn tail_faces(
         closer.set_read_timeout(None)?;
         let tx = tx.clone();
         let broker = broker.clone();
+        let face = face.clone();
         std::thread::spawn(move || loop {
-            match sub
-                .recv_live(&closer, astream_broker::IDLE_MARK_DEADLINE)
-                .map_err(|e| silent_link(e, &broker))
-            {
+            let read = sub.recv_live(&closer, astream_broker::IDLE_MARK_DEADLINE);
+            if let Some(gap) = sub.take_gap() {
+                tail_gap(&face, &gap);
+            }
+            match read.map_err(|e| silent_link(e, &broker)) {
                 Ok(Some(rec)) => {
                     if tx.send(Ok(rec)).is_err() {
                         return;

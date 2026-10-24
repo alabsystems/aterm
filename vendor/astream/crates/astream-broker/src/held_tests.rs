@@ -25,8 +25,22 @@
 //! an open that restamps the retained suffix
 //! (`an_age_rule_cuts_by_when_a_record_was_first_seen_across_restarts`); stamps read back
 //! that are not cut to the head recovered, or cut in memory only
-//! (`a_crash_that_loses_stamped_records_never_ages_the_ones_after_it`); and a rewrite's
-//! snapshot without the stamps (`a_rewritten_store_keeps_the_ticks_stamps`).
+//! (`a_crash_that_loses_stamped_records_never_ages_the_ones_after_it`); a rewrite's
+//! snapshot without the stamps (`a_rewritten_store_keeps_the_ticks_stamps`); and, for the
+//! gap notice a tail below the base is owed (R4's addendum, A9), a count that skips its
+//! checks (`a_tail_below_what_the_rules_gave_up_is_told_the_range_and_the_count`,
+//! `a_cut_no_rules_planned_is_told_by_its_range_alone`), a planning that ledgers nothing
+//! (`a_tail_below_what_the_rules_gave_up_is_told_the_range_and_the_count`), no count of
+//! what was given up since the tail last looked
+//! (`a_later_give_up_inside_a_told_range_is_told_again_and_counted_once`), a compaction no
+//! rules planned that leaves the ledger whole or the floors where they were
+//! (`a_cut_no_rules_planned_is_told_by_its_range_alone`), or that raises the spill in memory
+//! only (`a_cut_no_rules_planned_is_told_after_a_restart`), a ledger that never drops
+//! (`the_ledger_is_bounded_and_whole_only_above_what_it_dropped`), a range told again only
+//! when it grows, and a ledger that takes a planning's give-ups as if it were whole below
+//! them (`a_give_up_the_ledger_can_no_longer_count_is_told_by_its_range_again`), and a look
+//! that moves the range told while it tells nothing
+//! (`a_look_that_tells_nothing_leaves_the_range_still_owed`).
 
 use super::*;
 use crate::compact::{intent_path, kept_path, staged_state_path, Meter, Seam, Step};
@@ -1054,4 +1068,466 @@ fn a_created_log_carries_no_predecessors_held_store() {
     assert_eq!(log.retention(), None);
     assert_eq!(log.stats().held_records, 0);
     assert!(std::fs::symlink_metadata(held_path(&fx.path)).is_err());
+}
+
+/// `Some` gap notice from `from` to `to`, counting `records`.
+fn gap(from: u64, to: u64, records: Option<u64>) -> Option<crate::proto::Gap> {
+    Some(crate::proto::Gap { from, to, records })
+}
+
+/// A TAIL IS TOLD WHAT THE RULES GAVE UP BELOW IT (R4's addendum, A9): with the mail class
+/// past its bytes, the two oldest of five mails go. A tail on the mail from 0 is owed the
+/// range up to the class's oldest, 2, and the count, 2, once. A tail that looked before the
+/// cut is told at its next look. A tail from the held mail or above the base is owed
+/// nothing, and one subject's tail counts only its own records. A filter that reaches the
+/// prefix rule is told the range to the base and no count, because the cut dropped those
+/// records as a range. After a restart the counts are not known, so the range alone is
+/// told. Mail aged out past that range then widens it, and the wider range is told again.
+/// NC: a count that skips its checks (a guess) counts the prefix filter's range. A planning
+/// that ledgers nothing reads `Some(0)` and tells nothing.
+#[test]
+fn a_tail_below_what_the_rules_gave_up_is_told_the_range_and_the_count() {
+    use crate::store::Told;
+    let mut fx = Fx::new("held-gap", false);
+    let mut log = fx.create();
+    let ruled = || rules(Some(2 * rb(EV)), None, Some(3 * rb(MAIL)), 7 * DAY, false);
+    log.set_retention(ruled()).unwrap();
+    fx.batch(&mut log, &[MAIL, MAIL, MAIL, MAIL, MAIL, EV, EV, EV]);
+    let mail = filter("/f/F/in/>");
+    let mut early = Told::at(0);
+    assert_eq!(
+        log.gap_notice(&mail, 0, &mut early),
+        None,
+        "nothing given up yet"
+    );
+    let tick = log.retain_by_rules(T0).unwrap();
+    assert_eq!((tick.base, tick.carried), (6, 3));
+    assert_eq!(tick.lost, vec![(MAIL.to_string(), 2)]);
+
+    let mut told = Told::at(0);
+    assert_eq!(
+        log.gap_notice(&mail, 0, &mut told),
+        gap(0, 2, Some(2)),
+        "the two mails past the class's bytes"
+    );
+    assert_eq!(log.gap_notice(&mail, 0, &mut told), None, "told once");
+    assert_eq!(
+        log.gap_notice(&mail, 0, &mut early),
+        gap(0, 2, Some(2)),
+        "a tail that looked before the cut is told at its next look"
+    );
+    assert_eq!(
+        log.gap_notice(&mail, 2, &mut Told::at(2)),
+        None,
+        "from the held mail"
+    );
+    assert_eq!(
+        log.gap_notice(&mail, 6, &mut Told::at(6)),
+        None,
+        "above the base"
+    );
+    assert_eq!(
+        log.gap_notice(&filter("/f/F/in/n1/>"), 1, &mut Told::at(1)),
+        gap(1, 2, Some(1)),
+        "a tail from 1 lost only the mail at 1"
+    );
+    assert_eq!(
+        log.gap_notice(&filter("/f/F/>"), 0, &mut Told::at(0)),
+        gap(0, 6, None),
+        "the prefix rule's records went as a range: no count"
+    );
+
+    drop(log);
+    let mut log = fx.open();
+    let mut after = Told::at(0);
+    assert_eq!(
+        log.gap_notice(&mail, 0, &mut after),
+        gap(0, 2, None),
+        "after a restart: the range, never a guessed count"
+    );
+    assert_eq!(log.gap_notice(&mail, 0, &mut after), None, "told once");
+    // The same rules again, and a day past the mail's age: the three held mails go too.
+    log.set_retention(ruled()).unwrap();
+    let tick = log.retain_by_rules(T0 + 8 * DAY).unwrap();
+    assert_eq!(tick.released, 3);
+    assert_eq!(
+        log.gap_notice(&mail, 0, &mut after),
+        gap(0, 5, None),
+        "the range grew: told again"
+    );
+}
+
+/// A LATER GIVE-UP INSIDE A RANGE ALREADY TOLD IS TOLD AGAIN, counted once. n2's mail at 0
+/// and n1's at 1 are held below the base at 4. When n1's reader reads its mail, that mail
+/// goes, and a tail on all mail from 0 is told `0..2`, counting 1: n1's mail. n2's mail at
+/// 0 is still held, so the tail is still delivered it (`Fetch` of all mail refuses below
+/// the oldest, 2; of n2's mail it reads it). When n2's mail ages out, inside the
+/// range already told, the tail is told `0..2` again, counting 1: n2's mail, and not n1's a
+/// second time. NC: a count of only what lies at or above the range told (no `seq > seen`)
+/// reads `Some(0)` for n2's mail and tells nothing.
+#[test]
+fn a_later_give_up_inside_a_told_range_is_told_again_and_counted_once() {
+    use crate::store::Told;
+    let mut fx = Fx::new("held-gap-again", false);
+    let mut log = fx.create();
+    log.set_retention(rules(Some(rb(EV)), None, None, 7 * DAY, true))
+        .unwrap();
+    fx.batch(&mut log, &[MAIL2, MAIL, EV, EV, EV]);
+    let tick = log.retain_by_rules(T0).unwrap();
+    assert_eq!((tick.base, tick.carried), (4, 2));
+    let mail = filter("/f/F/in/>");
+    let mut told = Told::at(0);
+    assert_eq!(
+        log.gap_notice(&mail, 0, &mut told),
+        None,
+        "every mail is held"
+    );
+
+    log.commit(INBOX.into(), 1).unwrap();
+    let tick = log.retain_by_rules(T0 + MINUTE).unwrap();
+    assert_eq!(tick.released, 1, "n1's reader read its mail");
+    assert_eq!(
+        log.gap_notice(&mail, 0, &mut told),
+        gap(0, 2, Some(1)),
+        "n1's read mail: not this tail's to have read"
+    );
+    assert_eq!(read(&log, "/f/F/in/n2/>"), vec![0], "n2's is still held");
+
+    let tick = log.retain_by_rules(T0 + 8 * DAY).unwrap();
+    assert_eq!(
+        tick.lost,
+        vec![(MAIL2.to_string(), 1)],
+        "n2's mail aged out"
+    );
+    assert_eq!(
+        log.gap_notice(&mail, 0, &mut told),
+        gap(0, 2, Some(1)),
+        "told again inside the range, its own count"
+    );
+    assert_eq!(log.gap_notice(&mail, 0, &mut told), None);
+}
+
+/// A COMPACTION NO RULES PLANNED is told by its range alone: it drops records the ledger
+/// never names, so a count would be a guess. On a log no rules ever held, the range runs to
+/// the base. On one whose rules were read back from the held store and not set again (they
+/// answer reads and plan no cut), the mail it dropped unnamed is told too: every hold class
+/// reads from at least the cut (`HeldStore::cut_unplanned`). NC: a cut that leaves the
+/// ledger whole from the open counts the mail filter's range at `Some(0)` and tells
+/// nothing; one that leaves the hold classes' floors where they were tells nothing either.
+#[test]
+fn a_cut_no_rules_planned_is_told_by_its_range_alone() {
+    use crate::store::Told;
+    let mut fx = Fx::new("held-gap-norules", false);
+    let mut log = fx.create();
+    fx.batch(&mut log, &[MAIL, EV, EV]);
+    let all = filter("/>");
+    let mut told = Told::at(0);
+    assert_eq!(log.gap_notice(&all, 0, &mut told), None);
+    assert_eq!(log.retain_before(Offset(2)).unwrap(), 2);
+    assert_eq!(log.gap_notice(&all, 0, &mut told), gap(0, 2, None));
+    assert_eq!(log.gap_notice(&all, 0, &mut told), None, "told once");
+    assert_eq!(log.gap_notice(&all, 2, &mut Told::at(2)), None);
+
+    let mut fx = Fx::new("held-gap-readback", false);
+    let mut log = fx.create();
+    log.set_retention(rules(None, None, None, 7 * DAY, false))
+        .unwrap();
+    fx.batch(&mut log, &[MAIL, EV, EV]);
+    drop(log);
+    let mut log = fx.open();
+    assert!(log.retention_active().is_none(), "read back, not set again");
+    let mail = filter("/f/F/in/>");
+    let mut told = Told::at(0);
+    assert_eq!(log.gap_notice(&mail, 0, &mut told), None);
+    assert_eq!(log.retain_before(Offset(2)).unwrap(), 2);
+    assert_eq!(
+        log.oldest(&mail),
+        Offset(2),
+        "the hold class reads from the cut"
+    );
+    assert_eq!(
+        log.gap_notice(&mail, 0, &mut told),
+        gap(0, 2, None),
+        "the mail the cut dropped unnamed"
+    );
+    assert_eq!(log.gap_notice(&mail, 0, &mut told), None, "told once");
+}
+
+/// A COMPACTION NO RULES PLANNED IS TOLD AFTER A RESTART TOO: on a log whose rules were read
+/// back and not set again, `retain_before(2)` drops the mail at 0 unnamed. Its held-store
+/// job writes the spill before the copy (`HeldStore::unplanned_job`), so a reopen reads the
+/// mail from 2 and tells a tail from 0 the range `0..2`, with no count. A crash after that
+/// frame, before the compaction landed, cuts it away at the open: the mail reads from 0
+/// again, still in the log. NC: a cut that raises the spill in memory only (no job) reads
+/// the mail from 0 after the restart and tells nothing.
+#[test]
+fn a_cut_no_rules_planned_is_told_after_a_restart() {
+    use crate::store::Told;
+    let mail = filter("/f/F/in/>");
+    let ruled = || rules(None, None, None, 7 * DAY, false);
+    let mut fx = Fx::new("held-gap-unplanned-restart", false);
+    let mut log = fx.create();
+    log.set_retention(ruled()).unwrap();
+    fx.batch(&mut log, &[MAIL, EV, EV]);
+    drop(log);
+    let mut log = fx.open();
+    assert!(log.retention_active().is_none(), "read back, not set again");
+    assert_eq!(log.retain_before(Offset(2)).unwrap(), 2);
+    drop(log);
+    let log = fx.open();
+    assert_eq!(
+        log.oldest(&mail),
+        Offset(2),
+        "the spill the cut's frame raised, read back"
+    );
+    assert_eq!(
+        log.gap_notice(&mail, 0, &mut Told::at(0)),
+        gap(0, 2, None),
+        "after a restart: the mail the cut dropped unnamed"
+    );
+    drop(log);
+
+    let mut fx = Fx::new("held-gap-unplanned-crash", false);
+    let mut log = fx.create();
+    log.set_retention(ruled()).unwrap();
+    fx.batch(&mut log, &[MAIL, EV, EV]);
+    drop(log);
+    let mut log = fx.open();
+    log.arm_compact_seam(Seam {
+        crash_after: Some(Step::Held),
+        ..Seam::default()
+    });
+    let err = log.retain_before(Offset(2)).expect_err("the armed crash");
+    assert!(err.to_string().contains("injected crash"), "{err}");
+    drop(log);
+    let log = fx.open();
+    assert_eq!(
+        (log.base(), log.oldest(&mail)),
+        (Offset(0), Offset(0)),
+        "the frame of a cut that never landed is cut away"
+    );
+    assert_eq!(read(&log, "/f/F/in/>"), vec![0]);
+    assert!(fx.leftovers().is_empty(), "{:?}", fx.leftovers());
+}
+
+/// THE LEDGER IS BOUNDED as the floors are, and is whole only above what its bound dropped:
+/// past [`retention::LEDGER_MAX`] records the lowest goes; past
+/// [`retention::LEDGER_BYTES_MAX`] bytes of names the lowest go too; a record below where
+/// it is whole is not taken; and `whole_from` forgets what is below. NC: a ledger that
+/// never drops holds every record it was handed.
+#[test]
+fn the_ledger_is_bounded_and_whole_only_above_what_it_dropped() {
+    use crate::retention::{Ledger, LEDGER_BYTES_MAX, LEDGER_MAX};
+    let mail = filter("/f/F/in/>");
+    let mut l = Ledger::default();
+    let max = LEDGER_MAX as u64;
+    for off in 0..=max {
+        l.note(off, MAIL);
+    }
+    assert_eq!(l.len(), LEDGER_MAX);
+    assert_eq!(
+        l.whole(),
+        1,
+        "the lowest went, and it is whole only above it"
+    );
+    assert_eq!(l.seq(), max + 1);
+    assert_eq!(l.count(&mail, 0, u64::MAX, 0, 0), max);
+    l.note(0, MAIL);
+    assert_eq!(
+        (l.len(), l.seq()),
+        (LEDGER_MAX, max + 1),
+        "below where it is whole"
+    );
+    l.whole_from(max - 1);
+    assert_eq!((l.len(), l.whole()), (2, max - 1));
+    assert_eq!(l.count(&mail, 0, u64::MAX, 0, 0), 2);
+
+    let long = format!("/f/F/in/n1/{}", "x".repeat(1 << 20));
+    let fit = LEDGER_BYTES_MAX / long.len();
+    let mut l = Ledger::default();
+    for off in 0..=fit as u64 {
+        l.note(off, &long);
+    }
+    assert_eq!(l.len(), fit, "past the bytes of names, the lowest went");
+    assert_eq!(l.whole(), 1);
+}
+
+/// [`rules`]'s stream, kept by one record's bytes, and its mail, held a week (and, when
+/// `readers`, until its node's inbox group reads it), beside a class of its own, `box`, that
+/// holds its records a day.
+fn boxed_rules(readers: bool) -> Retention {
+    let mut mail = Rule::hold("/f/F/in/>")
+        .unwrap()
+        .max_age(Duration::from_millis(7 * DAY));
+    if readers {
+        mail = mail.until_read("/f/{2}/cur/{4}/node/inbox").unwrap();
+    }
+    Retention::new(
+        vec![
+            Rule::prefix("/f/F/pub/*/*/ev").unwrap().max_bytes(rb(EV)),
+            mail,
+            Rule::hold("/f/F/box/>")
+                .unwrap()
+                .max_age(Duration::from_millis(DAY)),
+        ],
+        Rule::default_hold(),
+    )
+    .unwrap()
+}
+
+/// A `box` subject of a mebibyte, the `i`th: a few of them give up more names than the
+/// ledger and the floors take ([`retention::LEDGER_BYTES_MAX`], [`FLOOR_BYTES_MAX`]).
+fn big_box(i: usize) -> String {
+    format!("/f/F/box/{i:02}{}", "x".repeat(1 << 20))
+}
+
+/// A GIVE-UP THE LEDGER CAN NO LONGER COUNT, inside a range a counted notice told, is told
+/// by the range again. n2's mail at 0 and n1's at 1 are held. n1's reader reads its mail,
+/// and a tail on all mail from 0 is told `0..2`, counting 1. Then, in one planning, n2's
+/// mail ages out beside nine `box` records of a mebibyte's name: more names than the ledger
+/// takes, so it drops its lowest, n2's mail and n1's among them, and is whole only above
+/// them. The range has not grown, and its count is no longer known: the tail is told `0..2`
+/// with no count, once. NC: a range told again only when it grows (no `|| told.counted`)
+/// tells nothing; a ledger that takes a planning's give-ups without being whole only from
+/// where the planning's was (no `whole_from` in `Ledger::take`) counts none, and tells
+/// nothing.
+#[test]
+fn a_give_up_the_ledger_can_no_longer_count_is_told_by_its_range_again() {
+    use crate::store::Told;
+    let mut fx = Fx::new("held-gap-uncounted", false);
+    let mut log = fx.create();
+    log.set_retention(boxed_rules(true)).unwrap();
+    fx.batch(&mut log, &[MAIL2, MAIL]);
+    let big = big_box(0);
+    for _ in 0..9 {
+        fx.batch(&mut log, &[big.as_str()]);
+    }
+    fx.batch(&mut log, &[EV, EV, EV]);
+    let tick = log.retain_by_rules(T0).unwrap();
+    assert_eq!((tick.base, tick.carried), (13, 11));
+    let mail = filter("/f/F/in/>");
+    let mut told = Told::at(0);
+    assert_eq!(
+        log.gap_notice(&mail, 0, &mut told),
+        None,
+        "every mail is held"
+    );
+
+    log.commit(INBOX.into(), 1).unwrap();
+    let tick = log.retain_by_rules(T0 + MINUTE).unwrap();
+    assert_eq!(tick.released, 1, "n1's reader read its mail");
+    assert_eq!(log.gap_notice(&mail, 0, &mut told), gap(0, 2, Some(1)));
+
+    let tick = log.retain_by_rules(T0 + 8 * DAY).unwrap();
+    assert!(
+        tick.lost.iter().any(|(s, n)| s == MAIL2 && *n == 1),
+        "n2's mail aged out"
+    );
+    assert_eq!(
+        log.gap_notice(&mail, 0, &mut told),
+        gap(0, 2, None),
+        "told again by its range: its count is not known"
+    );
+    assert_eq!(log.gap_notice(&mail, 0, &mut told), None, "told once");
+    assert!(
+        log.held_store_mut().ledger.whole() > 1,
+        "the ledger names neither mail now"
+    );
+}
+
+/// A LOOK THAT TELLS NOTHING LEAVES THE RANGE STILL OWED. A tail on all mail from n2's mail
+/// at `M` is owed nothing while it is held. Then the `box` records age out, one more of
+/// them, each of its own subject, than the floors take ([`FLOORS_MAX`]): half below the mail
+/// and the rest above it. The floors fold into the spill (`HeldStore::raise`) past the first
+/// above it, so the mail reads from `M + 2`; the ledger drops only its lowest, below the
+/// mail, so it is whole there and names no mail in `M..M + 2`: the look counts none, and
+/// tells nothing. When the mail ages out beside eight `box` records of a mebibyte's name
+/// (more names than the ledger takes, [`retention::LEDGER_BYTES_MAX`]), the ledger drops it,
+/// and is whole only above it: the range is the same, and no count can be given, so the
+/// tail is told the range, once. NC: a look that moves the range told as it tells nothing
+/// never tells it.
+#[test]
+fn a_look_that_tells_nothing_leaves_the_range_still_owed() {
+    use crate::store::Told;
+    const HALF: u64 = (FLOORS_MAX / 2) as u64;
+    const M: u64 = HALF;
+    let mut fx = Fx::new("held-gap-owed", false);
+    let mut log = fx.create();
+    log.set_retention(boxed_rules(false)).unwrap();
+    // Each `box` record a subject of its own, so each raises a floor. A producer creates at
+    // most `MAX_SUBJECTS_PER_PRODUCER` subjects: a fresh one every 4096 records.
+    let mut staged = 0u64;
+    let mut boxes = |log: &mut BrokerLog, from: u64, to: u64| {
+        for i in from..to {
+            staged += 1;
+            log.stage_publish(
+                100 + staged / 4096,
+                staged,
+                format!("/f/F/box/{i:05}"),
+                BODY.to_vec(),
+            )
+            .unwrap();
+            if staged.is_multiple_of(4096) || i + 1 == to {
+                log.commit_batch().unwrap();
+            }
+        }
+    };
+    boxes(&mut log, 0, HALF);
+    assert_eq!(fx.batch(&mut log, &[MAIL2]), vec![M]);
+    boxes(&mut log, HALF, 2 * HALF + 1);
+    fx.batch(&mut log, &[EV, EV, EV]);
+    let base = 2 * HALF + 4;
+    let tick = log.retain_by_rules(T0).unwrap();
+    assert_eq!((tick.base, tick.carried), (base, 2 * HALF as usize + 2));
+    let mail = filter("/f/F/in/>");
+    let mut told = Told::at(M);
+    assert_eq!(
+        log.gap_notice(&mail, M, &mut told),
+        None,
+        "the mail is held"
+    );
+
+    let tick = log.retain_by_rules(T0 + 2 * DAY).unwrap();
+    assert_eq!(
+        tick.released,
+        2 * HALF as usize + 1,
+        "every box record aged out"
+    );
+    assert_eq!(
+        log.oldest(&mail),
+        Offset(M + 2),
+        "the spill the folded floors raised"
+    );
+    assert!(log.held_store_mut().ledger.whole() <= M);
+    assert_eq!(
+        log.gap_notice(&mail, M, &mut told),
+        None,
+        "no mail was given up: nothing to tell"
+    );
+
+    let big = big_box(0);
+    for _ in 0..8 {
+        fx.batch(&mut log, &[big.as_str()]);
+    }
+    fx.batch(&mut log, &[EV, EV, EV]);
+    let tick = log.retain_by_rules(T0 + 3 * DAY).unwrap();
+    assert_eq!((tick.base, tick.carried), (base + 11, 8));
+    assert_eq!(log.gap_notice(&mail, M, &mut told), None);
+
+    let tick = log.retain_by_rules(T0 + 8 * DAY).unwrap();
+    assert!(
+        tick.lost.iter().any(|(s, n)| s == MAIL2 && *n == 1),
+        "the mail aged out"
+    );
+    assert!(
+        log.held_store_mut().ledger.whole() > M,
+        "the ledger dropped it"
+    );
+    assert_eq!(log.oldest(&mail), Offset(M + 2), "the range is the same");
+    assert_eq!(
+        log.gap_notice(&mail, M, &mut told),
+        gap(M, M + 2, None),
+        "the range still owed, told"
+    );
+    assert_eq!(log.gap_notice(&mail, M, &mut told), None, "told once");
 }

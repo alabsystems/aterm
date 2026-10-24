@@ -352,21 +352,106 @@ fn pipe_kind(pid: c_int, fd: i32) -> FdKind {
     }
 }
 
+/// How long a fork must have kept its parent's program, and how long ago a process's youngest
+/// child must have started, before its sockets are read ([`settled`], [`spawning`]).
+pub(super) const SETTLE_US: u64 = 2_000_000;
+
 /// Whether a process's socket descriptors may be read in detail (`PROC_PIDFDSOCKETINFO`), from
-/// its `pbi_flags` now and whether it ran this same program at the reader's last pass.
+/// its `pbi_flags` now, whether it ran this same program at the reader's last pass, and how long
+/// ago it started.
 ///
 /// That read holds an I/O reference on the descriptor. A close of it meanwhile (a `close`, an
 /// `exit`, an exec's close-on-exec sweep) drains the socket: XNU's `soo_drain` sets
 /// `SS_DRAINING`, which nothing clears, on the socket every process holding it shares, and from
-/// then on each blocking wait on it fails `EBADF` everywhere. Reading children while their execs
-/// closed the copies they inherited drained their parent's sockets that way, measured on macOS
-/// 27.0.1: this reader broke 8 blocked readers in the parent in 160 s, and none once it read only
-/// settled processes. So only a settled process's sockets are read: one that runs a program it
-/// exec'd before the last pass (no fork's inherited copies left for an exec to close) and is not
-/// exiting. A close of a socket another process shares, by a settled program while it is read,
-/// still drains it.
-pub(super) fn settled(flags: u32, execd_then: bool) -> bool {
-    execd_then && flags & darwin::PROC_FLAG_EXEC != 0 && flags & darwin::PROC_FLAG_INEXIT == 0
+/// then on each blocking wait on it fails `EBADF` everywhere (a `kevent` or non-blocking wait
+/// still works). Reading children while their execs closed the copies they inherited drained
+/// their parent's sockets that way, measured on macOS 27.0.1: this reader broke 8 blocked readers
+/// in the parent in 160 s, and none once it read only settled processes. A process exiting is not
+/// settled. One that exec'd is settled once the last pass found it running the same program: its
+/// `P_EXEC` alone shows its first exec's sweep is over (the flag and the short name move only after
+/// it, measured), and the pass between keeps a fresh program's startup closes of what it inherited
+/// (a `closefrom`, a `dup2` over its stdio) unread, which a fork's or exec's edge pass would land on.
+/// A fork that never exec'd (a pre-fork server's worker, a subshell) is settled once it has kept
+/// its parent's program for [`SETTLE_US`], far past a spawn's fork-to-exec. A close by a settled
+/// program while it is read still drains the socket: a re-exec in progress (no flag shows one), a
+/// fork's late exec, or a worker that exits or drops the listener it shares while it is read.
+pub(super) fn settled(flags: u32, execd_then: bool, age_us: Option<u64>) -> bool {
+    if flags & darwin::PROC_FLAG_INEXIT != 0 {
+        false
+    } else if flags & darwin::PROC_FLAG_EXEC != 0 {
+        execd_then
+    } else {
+        age_us.is_some_and(|a| a >= SETTLE_US)
+    }
+}
+
+/// Whether `pid` may be closing descriptors it shares now, checked right before its sockets are
+/// read: it is exiting, or a child of its started within [`SETTLE_US`] of `now_us` (a start that
+/// reads 0 or cannot be read counts too). A spawner closes its copy of each end it handed the
+/// child once the spawn returns (libuv's stdio socket pairs), and a close of one while it is read
+/// drains the child's end; a fork's edge pass lands right on it. Measured on macOS 27.0.1 with
+/// 2000 spawns of a child on a socket pair's end: a reader of the spawner's sockets broke 812
+/// children's stdin, and one that skipped a spawner with a child under 100 µs old read as often
+/// and broke none (92 at 1 µs).
+fn spawning(pid: c_int, now_us: u64) -> bool {
+    unsafe extern "C" {
+        fn proc_listchildpids(ppid: c_int, buffer: *mut c_void, buffersize: c_int) -> c_int;
+    }
+    const MAX_CHILDREN: usize = 256;
+    if bsd_info(pid).is_none_or(|b| b.pbi_flags & darwin::PROC_FLAG_INEXIT != 0) {
+        return true;
+    }
+    let mut kids = vec![0 as libc::pid_t; MAX_CHILDREN];
+    let Ok(size) = c_int::try_from(kids.len() * std::mem::size_of::<libc::pid_t>()) else {
+        return true;
+    };
+    // SAFETY: `kids` is `size` writable bytes of pid slots; libproc writes at most that many.
+    // `__error` supplies this thread's live errno slot; capture it with the zero-or-failed call.
+    let (n, errno) = unsafe {
+        *libc::__error() = 0;
+        let n = proc_listchildpids(pid, kids.as_mut_ptr().cast(), size);
+        (n, *libc::__error())
+    };
+    spawning_with(now_us, &kids, n, errno, |kid| {
+        kinfo(kid).map(|k| k.start_us)
+    })
+}
+
+/// The spawn guard's captured child-list and birth observations. An incomplete list or any
+/// listed child's unread birth defers socket reads, including a child gone since the listing.
+pub(super) fn spawning_with(
+    now_us: u64,
+    kids: &[c_int],
+    listed: c_int,
+    errno: c_int,
+    mut start_us: impl FnMut(c_int) -> Option<u64>,
+) -> bool {
+    let Some(n) = crate::machine::owned_count(i64::from(listed), errno, kids.len())
+        .and_then(|n| usize::try_from(n).ok())
+    else {
+        return true;
+    };
+    kids[..n].iter().filter(|k| **k > 0).any(|k| {
+        start_us(*k).is_none_or(|start| start == 0 || now_us.saturating_sub(start) < SETTLE_US)
+    })
+}
+
+/// Whether `pid`'s sockets may be read now by a reader on a timer of its own (`lsof -i` every
+/// second): it is [`settled`] as a program such a reader saw before, so a fork that may be
+/// mid-spawn (its exec's sweep closes each socket it inherited) and a process exiting are not. A
+/// spawner's close of the end it handed its child, and a fresh program's startup closes, are left
+/// to chance: a fork's or exec's edge pass lands right on them and a timer only by chance, and a
+/// look at the children now ([`spawning`]) cannot see a spawn that starts between this call and
+/// the read. A process this user may not read is not.
+pub(super) fn sockets_readable(pid: u32, now_us: u64) -> bool {
+    let Some(p) = c_int::try_from(pid).ok().filter(|p| *p > 0) else {
+        return false;
+    };
+    let Some(b) = bsd_info(p) else {
+        return false;
+    };
+    let age = from_bsd(pid, &b).start.map(|s| now_us.saturating_sub(s));
+    settled(b.pbi_flags, true, age)
 }
 
 fn socket_kind(pid: c_int, fd: i32) -> FdKind {
@@ -422,35 +507,56 @@ fn knotes_of(pid: c_int, fd: i32) -> Option<Vec<Knote>> {
     )
 }
 
-/// `pid`'s descriptors; its sockets in detail only when `sockets` ([`settled`]), else `Other`.
+/// `pid`'s descriptors; its sockets in detail only when it is [`settled`] and not [`spawning`] at
+/// `now_us`, else `Other`. Each descriptor of a kind read in detail takes one of
+/// [`MAX_FD_DETAILS`] in descriptor order, a socket left unread too, so every pass cuts at the
+/// same descriptor; the sockets are read first, right after the spawn check.
 fn fds(
     pid: c_int,
     nfiles: u32,
     lanes: Lanes,
     start_us: Option<u64>,
-    sockets: bool,
+    now_us: u64,
+    settled: bool,
 ) -> Option<(Vec<FdReading>, bool)> {
     let (list, mut truncated) = fd_list(pid, nfiles)?;
-    let mut out = Vec::with_capacity(list.len());
+    let kind_of = |f: &libc::proc_fdinfo| i32::try_from(f.proc_fdtype).unwrap_or(-1);
     let mut details = 0usize;
-    for f in list {
-        let detail = |details: &mut usize| {
-            *details += 1;
-            *details <= MAX_FD_DETAILS
-        };
-        let kind = match i32::try_from(f.proc_fdtype).unwrap_or(-1) {
-            libc::PROX_FDTYPE_VNODE if detail(&mut details) => vnode_kind(pid, f.proc_fd, start_us),
-            libc::PROX_FDTYPE_PIPE if detail(&mut details) => pipe_kind(pid, f.proc_fd),
-            libc::PROX_FDTYPE_SOCKET if !sockets => FdKind::Other,
-            libc::PROX_FDTYPE_SOCKET if detail(&mut details) => socket_kind(pid, f.proc_fd),
-            libc::PROX_FDTYPE_KQUEUE if detail(&mut details) => kqueue_kind(pid, f.proc_fd, lanes),
+    let within: Vec<bool> = list
+        .iter()
+        .map(|f| match kind_of(f) {
             libc::PROX_FDTYPE_VNODE
             | libc::PROX_FDTYPE_PIPE
             | libc::PROX_FDTYPE_SOCKET
             | libc::PROX_FDTYPE_KQUEUE => {
-                truncated = true;
-                FdKind::Other
+                details += 1;
+                truncated |= details > MAX_FD_DETAILS;
+                details <= MAX_FD_DETAILS
             }
+            _ => false,
+        })
+        .collect();
+    let sockets = || {
+        list.iter()
+            .zip(&within)
+            .filter(|(f, w)| **w && kind_of(f) == libc::PROX_FDTYPE_SOCKET)
+    };
+    let mut read = if settled && sockets().next().is_some() && !spawning(pid, now_us) {
+        sockets()
+            .map(|(f, _)| socket_kind(pid, f.proc_fd))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    }
+    .into_iter();
+    let mut out = Vec::with_capacity(list.len());
+    for (f, within) in list.iter().zip(within) {
+        let kind = match kind_of(f) {
+            _ if !within => FdKind::Other,
+            libc::PROX_FDTYPE_VNODE => vnode_kind(pid, f.proc_fd, start_us),
+            libc::PROX_FDTYPE_PIPE => pipe_kind(pid, f.proc_fd),
+            libc::PROX_FDTYPE_SOCKET => read.next().unwrap_or(FdKind::Other),
+            libc::PROX_FDTYPE_KQUEUE => kqueue_kind(pid, f.proc_fd, lanes),
             _ => FdKind::Other,
         };
         out.push(FdReading {
@@ -463,7 +569,8 @@ fn fds(
 
 /// Read one process (see the parent module), with the [`StartFacts`] its thread list gives at
 /// `now_us` and whether it runs a program it exec'd; `execd_then(start, name)` says whether the
-/// reader's last pass found it running that program then ([`settled`]).
+/// reader's last pass found it running that program then ([`settled`]). Ages, a child's for
+/// [`spawning`] too, are taken at `now_us`.
 pub(super) fn read(
     pid: u32,
     want_fds: bool,
@@ -534,8 +641,9 @@ pub(super) fn read(
     }
     if want_fds {
         let nfiles = all.as_ref().map_or(64, |a| a.pbsd.pbi_nfiles);
-        let sockets = flags.is_some_and(|f| settled(f, execd_then(facts.start, &facts.name)));
-        if let Some((list, cut)) = fds(p, nfiles, lanes, facts.start, sockets) {
+        let age = facts.start.map(|s| now_us.saturating_sub(s));
+        let settled = flags.is_some_and(|f| settled(f, execd_then(facts.start, &facts.name), age));
+        if let Some((list, cut)) = fds(p, nfiles, lanes, facts.start, now_us, settled) {
             facts.fds = Some(list);
             facts.fds_truncated = cut;
         }

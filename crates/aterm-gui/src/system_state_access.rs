@@ -1002,6 +1002,21 @@ impl App {
         if !self.access_step_moment(now) {
             return;
         }
+        let eligible = self
+            .native_runtime
+            .instance_by_kind(crate::native_app::AppKind::SystemState)
+            .is_some_and(|instance| {
+                matches!(self.native_runtime.app(instance),
+                    Some(crate::native_app::NativeApp::SystemState(state)) if state.can_open_access(access))
+            });
+        if !eligible {
+            self.access_steps.pane_act = None;
+            aterm_log::info!(
+                "system state: {} no longer needs its queued pane (a client's act)",
+                access.name()
+            );
+            return;
+        }
         if !self.reserve_access_dialog() {
             return;
         }

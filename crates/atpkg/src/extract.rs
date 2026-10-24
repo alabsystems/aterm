@@ -35,6 +35,12 @@ pub enum ExtractReject {
     Respelled,
     /// Single-file archive does not contain exactly one bare-named regular file.
     NotSingleFile,
+    /// An npm binary package member other than `package/package.json`, the files beside it,
+    /// and one `package/bin/<exe>.br` ([`stage_npm_brotli_binary`]).
+    NotNpmBinary,
+    /// An npm binary package's binary decoded to a length other than the one the vendor
+    /// names for it.
+    DecodedSize,
 }
 
 /// Archive entry classification.
@@ -310,6 +316,22 @@ impl std::fmt::Display for ExtractError {
                 f,
                 "rejected entry {p:?}: the archive must hold exactly one regular file, named \
                  at its root (this is a second member or a name that is not one bare component)"
+            ),
+            ExtractError::Rejected(ExtractReject::NotNpmBinary, p) if p.as_os_str().is_empty() => f
+                .write_str(
+                    "the npm package holds no package/package.json or no package/bin binary; it \
+                     must hold one of each",
+                ),
+            ExtractError::Rejected(ExtractReject::NotNpmBinary, p) => write!(
+                f,
+                "rejected entry {p:?}: an npm binary package holds only regular files named \
+                 package/<name>, among them one package.json, and one package/bin/<exe>.br \
+                 (this is another kind, another place, or a second one)"
+            ),
+            ExtractError::Rejected(ExtractReject::DecodedSize, p) => write!(
+                f,
+                "rejected entry {p:?}: it decodes to a length other than the binary's, which \
+                 the vendor's own copy names"
             ),
             ExtractError::Rejected(r, p) => write!(f, "rejected entry {p:?}: {r:?}"),
             ExtractError::TooLarge(r) => std::fmt::Display::fmt(r, f),
@@ -1375,6 +1397,131 @@ pub(crate) fn stage_tar_gz_member(
         )?);
     }
     written.ok_or_else(|| ExtractError::Rejected(ExtractReject::NotSingleFile, PathBuf::new()))
+}
+
+/// The largest `package/package.json` an npm binary package carries (grok 1.0.70's are under
+/// 400 bytes).
+const NPM_PACKAGE_JSON_CAP: u64 = 4 * 1024;
+
+/// What the files beside an npm binary package's manifest (its README, its third-party
+/// notices) may add up to; they are read and dropped.
+const NPM_BESIDE_CAP: u64 = 4 << 20;
+
+/// What [`stage_npm_brotli_binary`] staged.
+#[derive(Debug)]
+pub(crate) struct NpmBinary {
+    /// The binary written to the destination.
+    pub(crate) written: WrittenFile,
+    /// The package's `package/package.json`, for the caller to hold to its version document.
+    pub(crate) package_json: Vec<u8>,
+}
+
+/// Stage an npm binary package (the vendor-direct lane's `npm-brotli-binary`, grok's
+/// `@xai-official/grok-<plat>`): from the gzip'd tar at `archive`, its one
+/// `package/bin/<br_name>` streamed through Brotli into `dest` with `mode` at exactly `size`
+/// bytes, and its `package/package.json` handed back. Every member is a regular file named
+/// `package/<name>` or `package/bin/<name>` by one bare component; the files in `package/`
+/// beside the manifest are read and dropped.
+///
+/// # Errors
+/// [`ExtractError::Rejected`] with [`ExtractReject::NotNpmBinary`] for a member of another
+/// kind or place, a second manifest or binary, or a package lacking either; with
+/// [`ExtractReject::DecodedSize`] for a binary decoding to other than `size` bytes;
+/// [`ExtractError::TooLarge`] for a manifest over 4 KiB, files beside it over 4 MiB, or tar
+/// structure past its budgets; [`ExtractError::Io`] for a gzip, tar or Brotli stream that
+/// does not read, or a write that fails.
+pub(crate) fn stage_npm_brotli_binary(
+    archive: &Path,
+    br_name: &str,
+    dest: &Path,
+    mode: u32,
+    size: u64,
+) -> Result<NpmBinary, ExtractError> {
+    let file = std::fs::File::open(archive).map_err(|e| io_at(e, "open", archive))?;
+    let budget = Rc::new(Cell::new(TAR_ENTRY_STRUCTURAL_BUDGET));
+    let mut tar = crate::tarread::Archive::new(CappedReader {
+        inner: aterm_codec::inflate::stream::GzipReader::new(file),
+        budget: Rc::clone(&budget),
+    });
+    let mut entries = tar.entries().map_err(map_tar_io)?;
+    let mut structure = size.saturating_add(NPM_BESIDE_CAP);
+    let mut beside = NPM_BESIDE_CAP;
+    let mut buf = vec![0u8; 64 * 1024];
+    let (mut written, mut manifest) = (None, None);
+    loop {
+        budget.set(TAR_ENTRY_STRUCTURAL_BUDGET);
+        let next = entries.next_entry().map_err(map_tar_io)?;
+        structure = structure
+            .checked_sub(TAR_ENTRY_STRUCTURAL_BUDGET.saturating_sub(budget.get()))
+            .ok_or(ExtractError::TooLarge(TooLargeReason::StructureCap))?;
+        let Some(mut entry) = next else {
+            break;
+        };
+        let raw = entry.path()?.into_owned();
+        let not_npm = |raw: PathBuf| ExtractError::Rejected(ExtractReject::NotNpmBinary, raw);
+        if classify(entry.header().entry_type()) != EntryKind::Regular {
+            return Err(not_npm(raw));
+        }
+        let place = raw
+            .to_str()
+            .and_then(|name| name.strip_prefix("package/"))
+            .map(|rest| match rest.strip_prefix("bin/") {
+                Some(in_bin) => (true, in_bin),
+                None => (false, rest),
+            });
+        match place {
+            Some((true, name)) if name == br_name && written.is_none() => {
+                let file = crate::platform::open_create_write(dest, mode)
+                    .map_err(|e| io_at(e, "open", dest))?;
+                let mut remaining = size;
+                let w = write_capped(
+                    aterm_brotli::Decoder::new(&mut entry),
+                    Sink { file, dest, mode },
+                    &mut remaining,
+                    &budget,
+                    &mut buf,
+                    true,
+                )
+                .map_err(|e| match e {
+                    ExtractError::TooLarge(TooLargeReason::ContentCap) => {
+                        ExtractError::Rejected(ExtractReject::DecodedSize, raw.clone())
+                    }
+                    other => other,
+                })?;
+                if w.len != size {
+                    return Err(ExtractError::Rejected(ExtractReject::DecodedSize, raw));
+                }
+                written = Some(w);
+            }
+            Some((false, "package.json")) if manifest.is_none() => {
+                let mut bytes = Vec::new();
+                (&mut entry)
+                    .take(NPM_PACKAGE_JSON_CAP + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(|e| map_tar_io_at(e, "read", &raw))?;
+                if bytes.len() as u64 > NPM_PACKAGE_JSON_CAP {
+                    return Err(ExtractError::TooLarge(TooLargeReason::ContentCap));
+                }
+                manifest = Some(bytes);
+            }
+            Some((false, name))
+                if name != "package.json" && crate::vendor::bare_file_name(name) =>
+            {
+                drain_capped(&mut entry, &mut beside, &budget, &mut buf)?;
+            }
+            _ => return Err(not_npm(raw)),
+        }
+    }
+    match (written, manifest) {
+        (Some(written), Some(package_json)) => Ok(NpmBinary {
+            written,
+            package_json,
+        }),
+        _ => Err(ExtractError::Rejected(
+            ExtractReject::NotNpmBinary,
+            PathBuf::new(),
+        )),
+    }
 }
 
 /// Test archive builders shared across extraction and installation tests.
@@ -3237,6 +3384,225 @@ mod tests {
         assert_eq!(
             w.content_sha_hex,
             aterm_codec::hex::encode_lower(&h.finalize())
+        );
+    }
+
+    fn brotli(content: &[u8]) -> Vec<u8> {
+        let mut br = Vec::new();
+        aterm_brotli::write_uncompressed(&mut br, content).unwrap();
+        br
+    }
+
+    const NPM_JSON: &[u8] = b"{\"name\":\"@xai-official/grok-linux-x64\",\"version\":\"1.0.70\"}";
+
+    /// A tar member: name, type flag, link target, content, mode.
+    type Member<'a> = (&'a str, u8, &'a str, &'a [u8], u32);
+
+    /// Stage the npm package `members` as `bin/grok` of `size` bytes.
+    fn stage_npm(
+        label: &str,
+        members: &[Member<'_>],
+        size: u64,
+    ) -> (crate::testdir::Dir, Result<NpmBinary, ExtractError>) {
+        let d = dest(label);
+        let archive = d.join("grok.tgz");
+        std::fs::write(&archive, gzip_bytes(&tar_bytes(members))).unwrap();
+        std::fs::create_dir_all(d.join("tree/bin")).unwrap();
+        let got =
+            stage_npm_brotli_binary(&archive, "grok.br", &d.join("tree/bin/grok"), 0o755, size);
+        (d, got)
+    }
+
+    /// An npm binary package stages its one `package/bin/grok.br`, decoded, at the vendor's
+    /// size and 0755, hands back its package.json, and reads and drops the files beside it.
+    #[test]
+    fn an_npm_binary_package_stages_its_decoded_binary_and_hands_back_its_manifest() {
+        let exe: Vec<u8> = (0..70_000u32).map(|i| (i % 253) as u8).collect();
+        let br = brotli(&exe);
+        let (d, got) = stage_npm(
+            "npm-ok",
+            &[
+                ("package/bin/grok.br", b'0', "", &br, 0o644),
+                ("package/package.json", b'0', "", NPM_JSON, 0o644),
+                ("package/README.md", b'0', "", b"# Grok\n", 0o644),
+                (
+                    "package/THIRD_PARTY_NOTICES.md",
+                    b'0',
+                    "",
+                    &[b'n'; 9000],
+                    0o644,
+                ),
+            ],
+            exe.len() as u64,
+        );
+        let npm = got.unwrap();
+        assert_eq!(npm.package_json, NPM_JSON);
+        assert_eq!(npm.written.len, exe.len() as u64);
+        assert_eq!(std::fs::read(d.join("tree/bin/grok")).unwrap(), exe);
+        let mut h = aterm_digest::Sha256::new();
+        h.update(&exe);
+        assert_eq!(
+            npm.written.content_sha_hex,
+            aterm_codec::hex::encode_lower(&h.finalize())
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(d.join("tree/bin/grok"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        let laid: Vec<_> = std::fs::read_dir(d.join("tree/bin"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(laid, ["grok"], "nothing beside the binary is written");
+    }
+
+    /// Every member an npm binary package may not carry, and every way its binary or manifest
+    /// is malformed, is refused: kinds other than a regular file, places other than
+    /// `package/<name>` and `package/bin/<exe>.br`, a second binary or manifest, a missing one,
+    /// a stream that does not decode or decodes to another length, a manifest over 4 KiB.
+    #[test]
+    fn an_npm_binary_package_refuses_every_other_member_and_length() {
+        let exe = b"\x7fELF grok build".to_vec();
+        let n = exe.len() as u64;
+        let br = brotli(&exe);
+        let json = ("package/package.json", b'0', "", NPM_JSON, 0o644);
+        let bin = ("package/bin/grok.br", b'0', "", &br[..], 0o644);
+        let not_npm = |r: &Result<NpmBinary, ExtractError>, path: &str| matches!(r, Err(ExtractError::Rejected(ExtractReject::NotNpmBinary, p)) if p == Path::new(path));
+        let refused_member: Vec<(&str, Vec<Member<'_>>, &str)> = vec![
+            (
+                "hardlink",
+                vec![
+                    json,
+                    (
+                        "package/bin/grok.br",
+                        b'1',
+                        "package/package.json",
+                        b"",
+                        0o644,
+                    ),
+                ],
+                "package/bin/grok.br",
+            ),
+            (
+                "symlink",
+                vec![
+                    json,
+                    ("package/README.md", b'2', "../../x", b"", 0o777),
+                    bin,
+                ],
+                "package/README.md",
+            ),
+            (
+                "fifo",
+                vec![json, ("package/bin/grok.br", b'6', "", b"", 0o644)],
+                "package/bin/grok.br",
+            ),
+            (
+                "dir",
+                vec![("package/bin/", b'5', "", b"", 0o755), json, bin],
+                "package/bin/",
+            ),
+            (
+                "dot",
+                vec![json, ("./package/bin/grok.br", b'0', "", &br, 0o644)],
+                "./package/bin/grok.br",
+            ),
+            (
+                "raw",
+                vec![json, ("package/bin/grok", b'0', "", &exe, 0o755)],
+                "package/bin/grok",
+            ),
+            (
+                "other-root",
+                vec![json, bin, ("pkg/README.md", b'0', "", b"x", 0o644)],
+                "pkg/README.md",
+            ),
+            (
+                "bare",
+                vec![json, bin, ("README.md", b'0', "", b"x", 0o644)],
+                "README.md",
+            ),
+            (
+                "deep-bin",
+                vec![json, ("package/bin/x/grok.br", b'0', "", &br, 0o644)],
+                "package/bin/x/grok.br",
+            ),
+            (
+                "doubled-slash",
+                vec![json, ("package//bin/grok.br", b'0', "", &br, 0o644)],
+                "package//bin/grok.br",
+            ),
+            ("second-json", vec![json, bin, json], "package/package.json"),
+            ("second-br", vec![json, bin, bin], "package/bin/grok.br"),
+            (
+                "dotdot",
+                vec![json, bin, ("package/..", b'0', "", b"x", 0o644)],
+                "package/..",
+            ),
+        ];
+        for (label, members, path) in refused_member {
+            let (_d, got) = stage_npm(&format!("npm-{label}"), &members, n);
+            assert!(not_npm(&got, path), "{label}: {got:?}");
+        }
+        for (label, members) in [
+            ("no-json", vec![bin]),
+            (
+                "no-br",
+                vec![json, ("package/README.md", b'0', "", b"x", 0o644)],
+            ),
+            ("empty", vec![]),
+        ] {
+            let (_d, got) = stage_npm(&format!("npm-{label}"), &members, n);
+            assert!(not_npm(&got, ""), "{label}: {got:?}");
+            let shown = got.unwrap_err().to_string();
+            assert!(shown.contains("must hold one of each"), "{label}: {shown}");
+        }
+        let mut trailing = br.clone();
+        trailing.push(0);
+        for (label, stream, size) in [
+            ("truncated", br[..br.len() - 1].to_vec(), n),
+            ("trailing", trailing, n),
+            ("not-brotli", exe.clone(), n),
+        ] {
+            let (_d, got) = stage_npm(
+                &format!("npm-{label}"),
+                &[json, ("package/bin/grok.br", b'0', "", &stream, 0o644)],
+                size,
+            );
+            assert!(
+                matches!(got, Err(ExtractError::Io { .. })),
+                "{label}: {got:?}"
+            );
+        }
+        for size in [n - 1, n + 1, 0] {
+            let (_d, got) = stage_npm("npm-size", &[json, bin], size);
+            assert!(
+                matches!(&got, Err(ExtractError::Rejected(ExtractReject::DecodedSize, p)) if p == Path::new("package/bin/grok.br")),
+                "{size}: {got:?}"
+            );
+        }
+        let big = vec![b' '; 4097];
+        let (_d, got) = stage_npm(
+            "npm-big-json",
+            &[("package/package.json", b'0', "", &big, 0o644), bin],
+            n,
+        );
+        assert!(matches!(got, Err(ExtractError::TooLarge(_))), "{got:?}");
+        let (_d, got) = stage_npm(
+            "npm-4k-json",
+            &[("package/package.json", b'0', "", &big[..4096], 0o644), bin],
+            n,
+        );
+        assert_eq!(
+            got.unwrap().package_json.len(),
+            4096,
+            "4 KiB is the bound, not past it"
         );
     }
 }

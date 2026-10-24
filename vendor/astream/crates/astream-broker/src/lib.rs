@@ -181,16 +181,16 @@ pub use logid::{
     identity_path, logid_generation_advance, logid_lineage_within_cap, Lineage, LogIdentity,
 };
 pub use proto::{
-    HelloHealth, NonceExt, Request, Response, ServedInfo, ServedReason, Tier, ERR_RETIRE_REFUSED,
-    HELLO_REASON_MAX, REQUEST_RETIRE,
+    Gap, HelloHealth, NonceExt, Request, Response, ServedInfo, ServedReason, Tier,
+    ERR_RETIRE_REFUSED, HELLO_REASON_MAX, REQUEST_GAP_NOTICES, REQUEST_RETIRE,
 };
 pub use recover::{recover_keep_within_len, recover_unit_start_advance};
 #[cfg(feature = "retention")]
 pub use retention::{parse_rule_line, parse_rules, record_bytes, Class, Keep, Retention, Rule};
 #[cfg(unix)]
 pub use sharded::{
-    sharded_clamp_index, sharded_count_nonzero, ShardedBroker, ShardedClient, ShardedHandle,
-    ShardedSubscription,
+    sharded_clamp_index, sharded_count_nonzero, ShardedBroker, ShardedClient, ShardedEvent,
+    ShardedHandle, ShardedSubscription,
 };
 pub use storage::{storage_len_advance, storage_truncate_within_len};
 #[cfg(feature = "retention")]

@@ -17,6 +17,9 @@ mod remembered_limit;
 #[path = "walls_tests.rs"]
 mod walls;
 
+#[path = "same_reply_tests.rs"]
+mod same_reply;
+
 #[path = "hold_journal_tests.rs"]
 mod hold_journal;
 
@@ -5333,17 +5336,21 @@ fn gemini_clis_per_day_usage_limit_answered_stop_is_kept_trying_while_a_person_i
     };
     let turns = verb_at("turn");
     let keys = verb_at("key");
-    assert_eq!(turns.len(), 1, "{lines:#?}\n{:#?}", all());
-    assert_eq!(keys.len(), 1, "{:#?}", m.requests);
-    assert!(turns[0] < keys[0], "{:#?}", m.requests);
-    assert!(m.presses()[0].ends_with(" 1"), "{:?}", m.presses());
     let typed: Vec<_> = records
         .iter()
         .filter(|r| r.line.starts_with("CONTINUED "))
         .collect();
-    assert_eq!(typed.len(), 1, "{:#?}", all());
+    assert_eq!(turns.len(), typed.len(), "{lines:#?}\n{:#?}", all());
+    assert_eq!(keys.len(), 1, "{:#?}", m.requests);
+    assert!(turns[0] < keys[0], "{:#?}", m.requests);
+    assert!(m.presses()[0].ends_with(" 1"), "{:?}", m.presses());
+    // The resume, then at most the continuation the work it led to earns.
     assert!(
-        typed[0].line.contains("rule=usage-resume@v1"),
+        typed[0].line.contains("rule=usage-resume@v1")
+            && typed.len() <= 2
+            && typed[1..]
+                .iter()
+                .all(|r| r.line.contains("rule=continue@v1")),
         "{:#?}",
         all()
     );
@@ -5614,9 +5621,11 @@ fn gemini_clis_bucket_dialog_is_waited_on_then_tried_by_its_stop_and_a_resume() 
             .filter(|l| l.starts_with("CONTINUED "))
             .collect();
         if bucket {
-            assert_eq!(typed.len(), 1, "{tag}: {:#?}", all());
+            // The resume, then at most the continuation the work it led to earns.
             assert!(
-                typed[0].contains("rule=usage-resume@v1"),
+                typed[0].contains("rule=usage-resume@v1")
+                    && typed.len() <= 2
+                    && typed[1..].iter().all(|l| l.contains("rule=continue@v1")),
                 "{tag}: {typed:?}"
             );
             let turn = m
@@ -16910,6 +16919,7 @@ fn an_act_in_a_limits_place_is_the_try_a_successor_backs_off_from() {
                 Carried {
                     short: s.turn_end.short_streak(),
                     retry: None,
+                    said: s.turn_end.replies(),
                 },
                 s.turn_end.limit_try()
             )),
@@ -18170,6 +18180,15 @@ fn a_limits_try_the_workers_work_answered_is_no_seed_of_a_loop_that_follows() {
         let direct = new_wall.starts_with("the try's own work");
         let again = if new_wall.starts_with("a window") {
             walled("You've hit your session limit")
+        } else if direct {
+            // The try's own 70 min ran tools: its work, as the screen shows it.
+            let mut r = rows(&[
+                "⏺ Bash(targo --unverified test)",
+                "  ⎿  test result: ok",
+                "",
+            ]);
+            r.extend(spend.iter().cloned());
+            r
         } else {
             spend.clone()
         };
@@ -18542,6 +18561,16 @@ fn a_wall_read_inside_a_tries_take_window_is_no_try_met_again_where_it_is_taken(
         r.extend(composer("  ? for shortcuts"));
         r
     };
+    // The try's turn ran tools: its work, as the screen shows it.
+    let worked_spend = {
+        let mut r = rows(&[
+            "⏺ Bash(targo --unverified test)",
+            "  ⎿  test result: ok",
+            "",
+        ]);
+        r.extend(spend.iter().cloned());
+        r
+    };
     let live = |prompt: &str| {
         let mut r = rows(&[
             &format!("❯ {prompt}"),
@@ -18662,8 +18691,9 @@ fn a_wall_read_inside_a_tries_take_window_is_no_try_met_again_where_it_is_taken(
         } else {
             (try_at + 20 * 60, 19 * 60)
         };
+        let ended = if person { &spend } else { &worked_spend };
         s.set_clock(end_at, PDT);
-        let first = decided(&mut s, &spend, 105, Some(Duration::from_secs(work)));
+        let first = decided(&mut s, ended, 105, Some(Duration::from_secs(work)));
         drop(s);
         let rows = std::fs::read_to_string(&books).unwrap_or_default();
         let taken = rows.lines().filter(|l| l.contains(WALL_TAKEN)).count();
@@ -18683,7 +18713,7 @@ fn a_wall_read_inside_a_tries_take_window_is_no_try_met_again_where_it_is_taken(
             seeded_at,
         );
         s2.seed_wall_memory(open_wall(&books, Some("@s-1")));
-        let next = decided(&mut s2, &spend, 101, Some(Duration::from_secs(10 * 60)));
+        let next = decided(&mut s2, ended, 101, Some(Duration::from_secs(10 * 60)));
         drop(s2);
         let _ = std::fs::remove_dir_all(&dir);
         let due = |d: Decided| d.filter(|&(_, rule)| rule == Some(RULE_LIMIT_RESUME));
@@ -24542,6 +24572,21 @@ fn a_tries_own_short_turn_ending_on_its_limit_is_where_its_next_rung_counts_from
         r.extend(composer("  ? for shortcuts"));
         r
     };
+    // A try's turn long enough to restart the ladder ran tools: its work, as the screen shows it.
+    let worked_spend = {
+        let mut r = rows(&[
+            "⏺ Bash(targo --unverified test)",
+            "  ⎿  test result: ok. 12 passed; 0 failed",
+            "",
+            "⏺ Running the suite.",
+            "  ⎿  You've hit your monthly spend limit.",
+            "",
+            "✻ Worked for 6m 2s · done 4:51 PM",
+            "",
+        ]);
+        r.extend(composer("  ? for shortcuts"));
+        r
+    };
     let live = {
         let mut r = rows(&[
             "❯ keep going",
@@ -24628,10 +24673,15 @@ fn a_tries_own_short_turn_ending_on_its_limit_is_where_its_next_rung_counts_from
         if !after {
             std::fs::write(&books_path, books.join("\n") + "\n").expect("the books");
         }
+        let ended = if work_s >= 5 * 60 {
+            &worked_spend
+        } else {
+            &spend
+        };
         s.set_clock(end_at, PDT);
         let first = decided(
             &mut s,
-            &spend,
+            ended,
             103,
             Some(Duration::from_secs(work_s.unsigned_abs())),
         );
@@ -24655,12 +24705,12 @@ fn a_tries_own_short_turn_ending_on_its_limit_is_where_its_next_rung_counts_from
         );
         s2.seed_wall_memory(open_wall(&books_path, Some("@s-1")));
         let next = if after {
-            decided(&mut s2, &spend, 101, None)
+            decided(&mut s2, ended, 101, None)
         } else {
             s2.set_clock(end_at, PDT);
             decided(
                 &mut s2,
-                &spend,
+                ended,
                 101,
                 Some(Duration::from_secs((work_s / 2).unsigned_abs())),
             )
@@ -24707,6 +24757,21 @@ fn a_try_inside_its_take_window_is_awaited_by_a_loop_that_follows() {
             "  ⎿  You've hit your monthly spend limit.",
             "",
             "✻ Worked for 3m 2s · done 4:51 PM",
+            "",
+        ]);
+        r.extend(composer("  ? for shortcuts"));
+        r
+    };
+    // The try's own turn of hours ran tools: its work, as the screen shows it.
+    let worked_spend = {
+        let mut r = rows(&[
+            "⏺ Bash(targo --unverified test)",
+            "  ⎿  test result: ok. 12 passed; 0 failed",
+            "",
+            "⏺ Running the suite.",
+            "  ⎿  You've hit your monthly spend limit.",
+            "",
+            "✻ Worked for 3h 0m 2s · done 4:51 PM",
             "",
         ]);
         r.extend(composer("  ? for shortcuts"));
@@ -24827,7 +24892,7 @@ fn a_try_inside_its_take_window_is_awaited_by_a_loop_that_follows() {
                 s.set_clock(end_at, PDT);
                 let first = decided(
                     &mut s,
-                    &spend,
+                    &worked_spend,
                     104,
                     Some(Duration::from_secs(work.unsigned_abs())),
                 );
@@ -24835,7 +24900,7 @@ fn a_try_inside_its_take_window_is_awaited_by_a_loop_that_follows() {
                 events.push((try_at + 20, live("keep going"), true, None));
                 events.push((
                     end_at,
-                    spend.clone(),
+                    worked_spend.clone(),
                     false,
                     Some(Duration::from_secs(work.unsigned_abs())),
                 ));

@@ -193,6 +193,7 @@ fn mixed_ime_paint_respects_width_cancel_history_and_find_ownership() {
     );
 
     crate::term_lock(&term).scroll_display(-100);
+    app.on_ime_preedit(wid, String::new(), None);
     app.search_enter_direction_in(wid, true);
     app.on_ime_preedit(wid, "候補".to_string(), Some((3, 3)));
     assert!(matches!(

@@ -4282,10 +4282,12 @@ fn a_title_stands_beside_the_facts_as_they_fit_without_it() {
         short: 0,
         reason: false,
     };
-    let whole_title = "autopilot: cruise \u{2014} keeps going for ever, finding more to do \u{b7} \
-                       click: land \u{b7} right-click: more";
-    let v1 =
-        "autopilot: cruise \u{2014} keeps going for ever, finding more to do \u{b7} click: land";
+    let sentence =
+        crate::supervise::mode_words::mode_words(crate::supervise::Autopilot::Cruise).chip;
+    let whole_title = format!(
+        "autopilot: cruise \u{2014} {sentence} \u{b7} click: land \u{b7} right-click: more"
+    );
+    let v1 = format!("autopilot: cruise \u{2014} {sentence} \u{b7} click: land");
     let clicks = "autopilot: cruise \u{b7} click: land \u{b7} right-click: more";
     let click = "autopilot: cruise \u{b7} click: land";
     let hover = LightsWidth {

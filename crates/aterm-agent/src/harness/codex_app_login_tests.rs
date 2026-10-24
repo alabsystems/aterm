@@ -44,7 +44,7 @@ pub(crate) fn serve(script: String, heard: Arc<Mutex<Vec<String>>>) -> AppServer
                     return;
                 }
             }
-            if !wrote {
+            if !wrote || lines.is_empty() {
                 break;
             }
         }
@@ -229,5 +229,128 @@ fn a_rate_limits_read_gives_the_rows_sample_and_a_full_window_its_wall() {
             week_only.wall
         ),
         (None, Some(0), None)
+    );
+}
+
+#[test]
+fn finished_ignores_unrelated_login_id_and_wakes_on_matching_completion_or_server_close() {
+    struct Probe<F>(F);
+    impl<F: FnMut(&Handoff<'_>) -> Approval> Approver for Probe<F> {
+        fn approve(&mut self, handoff: &Handoff<'_>) -> Approval {
+            (self.0)(handoff)
+        }
+    }
+
+    // 1. Stale `account/login/completed` with a different loginId does not flip `finished()`,
+    //    whereas the matching loginId flips `finished()` to true.
+    let stale_note = r#"{"method":"account/login/completed","params":{"loginId":"00000000-0000-4000-8000-999999999999","success":false,"error":"cancelled","onboardingEntrypoint":null},"emittedAtMs":1792808199415}"#;
+    let lines: Vec<&str> = REPLAY.lines().collect();
+    // Rpc reading response id 2 proves the reader already processed the preceding stale note.
+    let script_stale_only = [lines[0], lines[1], stale_note, lines[2], lines[4]].join("\n");
+    let heard = Arc::new(Mutex::new(Vec::new()));
+    let server = serve(script_stale_only, Arc::clone(&heard));
+    let mut stale_finished = true;
+    let mut probe = Probe(|handoff: &Handoff<'_>| {
+        stale_finished = (handoff.finished)();
+        Approval::Refused("stop after stale check".to_owned())
+    });
+    let drove = login(
+        server,
+        &mut probe,
+        HOSTS,
+        Some("codex-one@example.com"),
+        Instant::now() + Duration::from_secs(60),
+    );
+    assert!(
+        !stale_finished,
+        "stale loginId completion must not mark current handoff finished"
+    );
+    assert_eq!(
+        drove.outcome,
+        Outcome::Refused("stop after stale check".to_owned())
+    );
+
+    // Control: matching loginId in REPLAY marks `finished()` true.
+    let heard = Arc::new(Mutex::new(Vec::new()));
+    let server = serve(REPLAY.to_owned(), Arc::clone(&heard));
+    let mut matching_finished = false;
+    let mut probe = Probe(|handoff: &Handoff<'_>| {
+        let start = Instant::now();
+        while !(handoff.finished)() && start.elapsed() < Duration::from_secs(60) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        matching_finished = (handoff.finished)();
+        Approval::Approved { page: true }
+    });
+    let drove = login(
+        server,
+        &mut probe,
+        HOSTS,
+        Some("codex-one@example.com"),
+        Instant::now() + Duration::from_secs(60),
+    );
+    assert!(
+        matching_finished,
+        "matching loginId completion marks finished"
+    );
+    assert_eq!(
+        drove.outcome,
+        Outcome::SignedIn {
+            email: Some("codex-one@example.com".to_owned()),
+            page: true
+        }
+    );
+
+    // 2. Server closing stdout right after `account/login/start` flips `finished()` to true
+    //    and yields `Outcome::Exited(None)`.
+    let script_truncated = [lines[0], lines[1], lines[2]].join("\n");
+    let heard = Arc::new(Mutex::new(Vec::new()));
+    let server = serve(script_truncated, Arc::clone(&heard));
+    let mut closed_finished = false;
+    let mut probe = Probe(|handoff: &Handoff<'_>| {
+        let start = Instant::now();
+        while !(handoff.finished)() && start.elapsed() < Duration::from_secs(60) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        closed_finished = (handoff.finished)();
+        Approval::Approved { page: true }
+    });
+    let drove = login(
+        server,
+        &mut probe,
+        HOSTS,
+        Some("codex-one@example.com"),
+        Instant::now() + Duration::from_secs(60),
+    );
+    assert!(closed_finished, "server stdout EOF marks finished");
+    assert_eq!(drove.outcome, Outcome::Exited(None));
+
+    // 3. Next-line `Want::Url` in `Scan::feed` rejects lines containing spaces/control chars.
+    let route = crate::ai::connector::CODEX_SIGNIN
+        .route(Some(crate::ai::connector::Flow::Device))
+        .expect("codex device route");
+    let crate::ai::connector::Drive::Lines { grammar: g, .. } = &route.drive else {
+        panic!("expected line route");
+    };
+    let mut bad_scan = crate::harness::login_drive::Scan::default();
+    bad_scan.feed(g, "Follow these steps to sign in:");
+    bad_scan.feed(
+        g,
+        "1. Open this link in your browser and sign in to your account",
+    );
+    bad_scan.feed(g, "   https://auth.openai.com/codex/device (copy link)");
+    assert_eq!(
+        bad_scan.url, None,
+        "multi-word line after URL lead must not be captured as URL"
+    );
+    let mut good_scan = crate::harness::login_drive::Scan::default();
+    good_scan.feed(
+        g,
+        "1. Open this link in your browser and sign in to your account",
+    );
+    good_scan.feed(g, "   https://auth.openai.com/codex/device");
+    assert_eq!(
+        good_scan.url.as_deref(),
+        Some("https://auth.openai.com/codex/device")
     );
 }

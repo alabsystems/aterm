@@ -218,6 +218,11 @@ fn paint_eye_dots(
     let core_min_w_px = EYE_DOT_FAR_CORE_MIN_W_FRAC * xform.scale_y;
     let sx_eps = xform.scale_x.max(f32::EPSILON);
     let sy_eps = xform.scale_y.max(f32::EPSILON);
+    let fx = |v: f32| {
+        (v * f32::from(FIXED_ONE))
+            .round()
+            .clamp(0.0, f32::from(FIXED_ONE)) as u16
+    };
     for (i, path) in eye_meta.paths.iter().enumerate() {
         let Some((x0, y0, x1, y1)) = bounds[i] else {
             continue;
@@ -300,11 +305,6 @@ fn paint_eye_dots(
             let plug_h = EYE_DASH_CORE_PX.min(h_px * ky);
             let hw = plug_w * 0.5 / sx_eps;
             let hh = plug_h * 0.5 / sy_eps;
-            let fx = |v: f32| {
-                (v * f32::from(FIXED_ONE))
-                    .round()
-                    .clamp(0.0, f32::from(FIXED_ONE)) as u16
-            };
             let (x_lo, x_hi, y_lo, y_hi) = (fx(gx - hw), fx(gx + hw), fx(cy - hh), fx(cy + hh));
             let plug = [
                 PathSeg::Move(x_lo, y_lo),

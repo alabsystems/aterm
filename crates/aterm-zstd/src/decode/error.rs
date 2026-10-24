@@ -34,6 +34,9 @@ pub enum DecodeError {
     },
     /// The frame carries no content checksum and [`crate::Decoder::require_checksum`] is set.
     NoChecksum,
+    /// The stream holds a skippable frame, or bytes after its first frame, and
+    /// [`crate::Decoder::one_frame`] is set.
+    NotOneFrame,
     /// A block breaks a rule of the format; the text names the rule.
     Corrupt(&'static str),
 }
@@ -59,6 +62,9 @@ impl fmt::Display for DecodeError {
             ),
             Self::NoChecksum => {
                 f.write_str("zstd: frame carries no content checksum, and this reader requires one")
+            }
+            Self::NotOneFrame => {
+                f.write_str("zstd: the stream is more than the one zstd frame this reader takes")
             }
             Self::Corrupt(what) => write!(f, "zstd: corrupt block: {what}"),
         }

@@ -3874,15 +3874,7 @@ impl Canvas {
 
     fn band_icon(&mut self, x: f32, y: f32, size: f32, icon: aterm_render::BandIcon, c: [u8; 4]) {
         let n = size.round().max(2.0) as usize;
-        let side = n as f32;
-        let cap = (side * 0.68).round();
-        let metrics = aterm_render::procedural::IconMetrics {
-            baseline: (side * 0.84).round(),
-            cap,
-            stem: (side / 9.0).round().max(1.0),
-            head: (side * 0.08).round(),
-            disc: cap,
-        };
+        let metrics = aterm_render::procedural::boxed_icon_metrics(n);
         let coverage = aterm_render::procedural::band_icon_coverage(icon, n, n, metrics, false);
         let (x0, y0) = (x.round() as i32, y.round() as i32);
         for (row, line) in coverage.chunks(n).enumerate() {
@@ -8432,6 +8424,47 @@ mod tests {
                 !lit_at(cx + (0.15 * px) as usize, cy),
                 "{face:?}: the ring is hollow beside the stem"
             );
+        }
+    }
+
+    /// The top deck draws its need pictograms through [`DrawPrim::BandIcon`]: at 1x and 2x, at an origin off the pixel grid, each inks only the prim's square and draws.
+    #[test]
+    fn a_pictogram_prim_inks_only_its_square() {
+        for scale in [1.0f32, 2.0] {
+            for size in [11.0f32, 12.0, 13.0] {
+                for icon in aterm_render::BandIcon::ALL
+                    .into_iter()
+                    .filter(|i| i.is_pictogram())
+                {
+                    let (x, y) = (3.25, 2.5);
+                    let prims = [DrawPrim::BandIcon {
+                        x,
+                        y,
+                        size,
+                        icon,
+                        color: [255, 255, 255, 255],
+                    }];
+                    let (buf, w, _) = rasterize_tray(&prims, 20, 20, scale, [0, 0, 0, 255]);
+                    let (x0, y0) = ((x * scale).round() as usize, (y * scale).round() as usize);
+                    let side = (size * scale).round() as usize;
+                    let inked: Vec<(usize, usize)> = buf
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| c[0] > 0)
+                        .map(|(i, _)| (i % w as usize, i / w as usize))
+                        .collect();
+                    let at = format!("{icon:?} {size} pt at {scale}x");
+                    assert!(inked.len() > side, "{at}: draws ({} px)", inked.len());
+                    for &(px, py) in &inked {
+                        assert!(
+                            (x0..x0 + side).contains(&px) && (y0..y0 + side).contains(&py),
+                            "{at}: ink at ({px}, {py}) outside its square at ({x0}, {y0})"
+                        );
+                    }
+                }
+            }
         }
     }
 }

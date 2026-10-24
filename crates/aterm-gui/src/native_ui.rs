@@ -2574,32 +2574,44 @@ fn repaints(a: &InkMark, b: &InkMark) -> bool {
     }
 }
 
+/// Merges the icon strokes from `start` on that touch (within [`INK_OVERLAP_LEAST`]) into one
+/// mark, repeatedly merging the first touching pair `(a, b)` in index order into `a`.
 fn merge_icon_strokes(marks: &mut Vec<InkMark>, start: usize) {
-    let mut merged = true;
-    while merged {
-        merged = false;
-        'pairs: for a in start..marks.len() {
-            if marks[a].words.is_some() || marks[a].art.is_some() {
-                continue;
+    let stroke = |m: &InkMark| m.words.is_none() && m.art.is_none();
+    let touches = |one: LogicalRect, other: LogicalRect| {
+        LogicalRect::new(
+            one.x - INK_OVERLAP_LEAST,
+            one.y - INK_OVERLAP_LEAST,
+            one.width + 2.0 * INK_OVERLAP_LEAST,
+            one.height + 2.0 * INK_OVERLAP_LEAST,
+        )
+        .intersect(other)
+        .is_some()
+    };
+    // Every pair before `(a, from)` in index order is known apart, so the next touching pair
+    // is the first at or after it. A merge changes only the pairs with `a`, which grew: the
+    // first earlier stroke it now touches comes next, or else `a`'s own pairs again.
+    let (mut a, mut from) = (start, start + 1);
+    while a < marks.len() {
+        let hit = stroke(&marks[a])
+            .then(|| {
+                (from..marks.len())
+                    .find(|&b| stroke(&marks[b]) && touches(marks[a].rect, marks[b].rect))
+            })
+            .flatten();
+        let Some(b) = hit else {
+            a += 1;
+            from = a + 1;
+            continue;
+        };
+        marks[a].rect = marks[a].rect.union(marks[b].rect);
+        marks.remove(b);
+        match (start..a).find(|&p| stroke(&marks[p]) && touches(marks[p].rect, marks[a].rect)) {
+            Some(p) => {
+                a = p;
+                from = p + 1;
             }
-            for b in a + 1..marks.len() {
-                if marks[b].words.is_some() || marks[b].art.is_some() {
-                    continue;
-                }
-                let (one, other) = (marks[a].rect, marks[b].rect);
-                let grown = LogicalRect::new(
-                    one.x - INK_OVERLAP_LEAST,
-                    one.y - INK_OVERLAP_LEAST,
-                    one.width + 2.0 * INK_OVERLAP_LEAST,
-                    one.height + 2.0 * INK_OVERLAP_LEAST,
-                );
-                if grown.intersect(other).is_some() {
-                    marks[a].rect = one.union(other);
-                    marks.remove(b);
-                    merged = true;
-                    break 'pairs;
-                }
-            }
+            None => from = a + 1,
         }
     }
 }
@@ -5798,7 +5810,7 @@ pub(crate) fn native_button_label_width(value: &str) -> f32 {
 }
 
 /// The one separator between facts a native page paints in a run.
-pub(crate) const FACT_SEPARATOR: &str = " \u{b7} ";
+pub(crate) const FACT_SEPARATOR: &str = aterm_agent::harness::acts::FACT_SEPARATOR;
 
 /// Bounded visual projection for a one-line native body label.
 pub(crate) fn fit_native_text_label(value: &str, max_width: f32) -> String {
@@ -8528,6 +8540,84 @@ fn resolve_length(length: Length, available: f32) -> f32 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// [`merge_icon_strokes`] merges what restarting the pair scan after every merge merged,
+    /// in the same order, so every union is the same float: random strokes, words and art
+    /// among them, and a prefix before `start` left alone.
+    #[test]
+    fn icon_strokes_merge_as_a_restarted_scan_merges_them() {
+        fn restarted(marks: &mut Vec<InkMark>, start: usize) {
+            let stroke = |m: &InkMark| m.words.is_none() && m.art.is_none();
+            'again: loop {
+                for a in start..marks.len() {
+                    for b in a + 1..marks.len() {
+                        let one = marks[a].rect;
+                        let grown = LogicalRect::new(
+                            one.x - INK_OVERLAP_LEAST,
+                            one.y - INK_OVERLAP_LEAST,
+                            one.width + 2.0 * INK_OVERLAP_LEAST,
+                            one.height + 2.0 * INK_OVERLAP_LEAST,
+                        );
+                        if stroke(&marks[a])
+                            && stroke(&marks[b])
+                            && grown.intersect(marks[b].rect).is_some()
+                        {
+                            marks[a].rect = one.union(marks[b].rect);
+                            marks.remove(b);
+                            continue 'again;
+                        }
+                    }
+                }
+                return;
+            }
+        }
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        for round in 0..400 {
+            let count = 1 + next(40) as usize;
+            let spread = 20.0 + next(200) as f32;
+            let specs: Vec<(LogicalRect, u64)> = (0..count)
+                .map(|_| {
+                    let at = |n: &mut dyn FnMut(u64) -> u64| n(1000) as f32 / 1000.0 * spread;
+                    let rect = LogicalRect::new(
+                        at(&mut next),
+                        at(&mut next),
+                        0.5 + next(30) as f32 / 3.0,
+                        0.5 + next(30) as f32 / 3.0,
+                    );
+                    (rect, next(8))
+                })
+                .collect();
+            let marks = || -> Vec<InkMark> {
+                specs
+                    .iter()
+                    .enumerate()
+                    .map(|(node, &(rect, kind))| InkMark {
+                        node,
+                        words: (kind == 0).then(|| String::from("words")),
+                        rect,
+                        art: (kind == 1)
+                            .then_some((crate::widget::ImageArt::BrandKitty { dark: false }, rect)),
+                    })
+                    .collect()
+            };
+            let start = next(count as u64 + 1) as usize;
+            let (mut want, mut got) = (marks(), marks());
+            restarted(&mut want, start);
+            merge_icon_strokes(&mut got, start);
+            let shape = |m: &[InkMark]| {
+                m.iter()
+                    .map(|m| (m.node, m.rect.x, m.rect.y, m.rect.width, m.rect.height))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(shape(&got), shape(&want), "round {round}, start {start}");
+        }
+    }
 
     #[test]
     fn a_status_is_cut_after_a_whole_word() {

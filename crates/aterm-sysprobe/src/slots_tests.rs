@@ -1290,11 +1290,12 @@ mod live {
     fn a_refused_descriptor_table_is_unproven_until_the_lock_says() {
         // SAFETY: `geteuid` reads this process's effective uid.
         assert_ne!(unsafe { libc::geteuid() }, 0, "run as a user, not root");
-        let daemon = kproc::records()
-            .expect("the process table")
-            .into_iter()
-            .find(|p| p.uid == 0 && p.pid > 1 && !p.zombie)
-            .expect("a root daemon");
+        // launchd: a root process that outlives the test. The first root process the table
+        // listed could exit between the reads below (a loaded machine starts and ends short
+        // root jobs), and its writer then read gone, not unproven.
+        let daemon = kproc::record(1)
+            .filter(|p| p.uid == 0 && !p.zombie)
+            .expect("launchd, pid 1, a live root process");
         let table = crate::jobs::macos_vnode_ids(daemon.pid);
         assert_eq!(table, None, "a refused table read as a list");
         let writer = rec(daemon.pid, now_us());

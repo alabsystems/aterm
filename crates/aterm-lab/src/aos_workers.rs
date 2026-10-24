@@ -188,6 +188,23 @@ pub fn frame_bytes(payload: &[u8]) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
+/// The step worker `w`'s frame `payload` takes, as `--frames` says it: `G.S.A.K` for item `K` of
+/// search `G`'s slot `S` on attempt `A`, `G.S.A.end` for that lease's result or stop, `hello.W`
+/// for worker `W`'s hello, and `-` for a payload that is no worker's message. A run takes each
+/// step at most once, so one that trades frames without finishing names none it has not named.
+fn frame_step(w: WorkerId, payload: &[u8]) -> String {
+    match Msg::decode(payload, Sender::Worker) {
+        Ok(Msg::Hello { .. }) => format!("hello.{}", w.0),
+        Ok(Msg::Progress { token, k }) => {
+            format!("{}.{}.{}.{k}", token.search, token.slot, token.attempt)
+        }
+        Ok(Msg::Result { token, .. } | Msg::Cancelled { token, .. }) => {
+            format!("{}.{}.{}.end", token.search, token.slot, token.attempt)
+        }
+        Ok(Msg::Lease { .. } | Msg::Cancel { .. }) | Err(_) => "-".to_owned(),
+    }
+}
+
 /// What this binary contributes to its [`ExecIdentity`]: the toolchain and profile `build.rs`
 /// stamped, the digest of its own file, and the faults armed.
 /// # Errors
@@ -771,6 +788,10 @@ pub struct PoolArgs {
     pub lease_ms: Option<u64>,
     /// The faults armed on every worker (debug builds).
     pub faults: Vec<String>,
+    /// `--frames` (debug builds): each worker frame taken is said on stderr with its step
+    /// ([`frame_step`]), so the process tests' hang detector waits for the run's next new step,
+    /// not for a whole run a loaded host stretches.
+    pub frames: bool,
 }
 
 impl PoolArgs {
@@ -1117,6 +1138,9 @@ impl Pool {
                     .wire
                     .bytes_in
                     .saturating_add(u64::try_from(p.len() + HEADER_SIZE).unwrap_or(u64::MAX));
+                if self.args.frames {
+                    eprintln!("aos-workers frame from={} step={}", w.0, frame_step(w, p));
+                }
             }
             Event::Eof | Event::Broken(_) => {
                 if let Some(p) = self.procs.get_mut(i) {

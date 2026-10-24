@@ -168,12 +168,12 @@ fn row_content(cells: &[RainCell], tiles: &RainBaker) -> FxContent {
     let mut palette: Vec<FxInk> = Vec::new();
     let mut items = Vec::with_capacity(cells.len());
     for c in cells {
-        let Some(art) = tiles.tile(c.glyph) else {
-            continue;
-        };
         if c.alpha == 0 || c.w == 0 || c.h == 0 {
             continue;
         }
+        let Some(art) = tiles.tile(c.glyph) else {
+            continue;
+        };
         let ink = FxInk::over(c.tint & 0x00FF_FFFF, c.alpha);
         let k = palette.iter().position(|&p| p == ink).unwrap_or_else(|| {
             palette.push(ink);

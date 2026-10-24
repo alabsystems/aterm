@@ -4512,7 +4512,8 @@ fn a_zombie_writes_nothing() {
 /// it its own. A pass a moment after the last teaches no rate, so a working `gradle` keeps its
 /// lines beside `tail -f &`, and judges one as over a whole tick, so a hung `python3 client.py`
 /// takes none of the line that ran it; a JVM in front whose wakes vary wrote nothing at the
-/// most they make.
+/// most they make. A JVM's line read a moment after a pass is its own by its calls since the pass
+/// before, beside a `curl` hung in front, also when the reader feeds it after that pass.
 #[test]
 fn a_process_ticking_at_its_idle_rate_wrote_nothing() {
     let mut w = World::new();
@@ -4620,6 +4621,39 @@ fn a_process_ticking_at_its_idle_rate_wrote_nothing() {
         "{}",
         wire(&v, "b9")
     );
+
+    // `./gradlew bootRun &`'s JVM, its threads waking it 35 times a second, logs a line now and
+    // then (its write's calls on top), read by a pass 800 ms after the last, or fed just after
+    // that pass, while a `curl` hangs in front.
+    for late in [false, true] {
+        let mut w = World::new();
+        let mut java = sleeper(1400, "java");
+        java.syscalls_per_s = 35;
+        w.run_bg(1, java);
+        w.run_fg(1, 9, "curl -O https://host/big.iso", curl(1300));
+        w.tty_mode(1, true, true);
+        for _ in 0..20 {
+            for _ in 0..19 {
+                let _ = w.tick(TICK_MS);
+            }
+            w.advance(800);
+            *w.p(1400).counters.syscalls.get_or_insert(0) += 20;
+            if late {
+                let _ = w.observe();
+                w.advance(1);
+            }
+            w.line_from(1, &[]);
+            let _ = w.observe();
+        }
+        let v = w.tick(TICK_MS);
+        assert!(
+            v.row("b9")
+                .and_then(|r| r.quiet_ms)
+                .is_some_and(|q| q >= 700_000),
+            "late {late}: {}",
+            wire(&v, "b9")
+        );
+    }
 }
 
 /// A NESTED SESSION THE PERSON'S KEYS REACH STAYS SO: once two wakes of its reader at the
@@ -4906,8 +4940,9 @@ fn a_nested_line_read_is_the_leaders_alone_waiting_on_nothing_else() {
 /// a pass read the tab before the `C` (or, without marks, the line editor's raw word) and the
 /// root after the exec; the steps it starts in groups of their own are its block's, which runs
 /// while they compile, as are those of a ninja in the shell's own group (`exec cmake --build`,
-/// `out=$(ninja)`), whose hung step keeps a row of its own in a tab without marks. After `exec
-/// python3` the REPL's raw prompt shows no shell: hung on a lock, its block reads no line.
+/// `out=$(ninja)`), whose hung step keeps a row of its own in a tab without marks, but not those
+/// of a ninja a pwsh `Start-Job` left in pwsh's group before the block. After `exec python3` the
+/// REPL's raw prompt shows no shell: hung on a lock, its block reads no line.
 #[test]
 fn the_tabs_root_does_job_control_while_it_is_the_shell_a_pass_saw() {
     let mut w = World::new();
@@ -5060,12 +5095,21 @@ fn the_tabs_root_does_job_control_while_it_is_the_shell_a_pass_saw() {
     );
 
     // `exec cmake --build build`, whose ninja runs in the root's group, and `out=$(ninja)`, whose
-    // ninja runs in the shell's: the steps are each one's block's.
-    for exec in [true, false] {
+    // ninja runs in the shell's: the steps are each one's block's. A ninja whose pid belonged
+    // to an older process before the block is new too when its known birth changed between polls.
+    for (exec, reused) in [(true, false), (false, false), (false, true)] {
         let mut w = World::new();
         let shell = w.tab(1).tab.shell_pid;
         let shell_pgid = w.p(shell).pgid;
         w.mark(1);
+        if reused {
+            let mut old = sleeper(1100, "ninja");
+            old.ppid = shell;
+            old.pgid = shell_pgid;
+            old.sid = shell;
+            old.tty = true;
+            w.add(old);
+        }
         let _ = w.tick(TICK_MS);
         let at = w.at;
         w.tab(1).tab.block = Some(Block {
@@ -5091,6 +5135,9 @@ fn the_tabs_root_does_job_control_while_it_is_the_shell_a_pass_saw() {
         ninja.pgid = shell_pgid;
         ninja.sid = shell;
         ninja.tty = true;
+        if reused {
+            ninja.start += 1;
+        }
         w.add(ninja);
         let v = run_to(&mut w, 600_000, |w, rel| {
             let born = 3_000 + u32::try_from(rel / TICK_MS).unwrap_or(0);
@@ -5111,7 +5158,7 @@ fn the_tabs_root_does_job_control_while_it_is_the_shell_a_pass_saw() {
                 v.rows.iter().filter(|r| r.id != "b7").count()
             ),
             (Some(Class::Running), 0),
-            "exec {exec}: {rows:?}"
+            "exec {exec}, reused {reused}: {rows:?}"
         );
     }
 
@@ -5166,16 +5213,50 @@ fn the_tabs_root_does_job_control_while_it_is_the_shell_a_pass_saw() {
         "{}",
         wire(&v, "b8")
     );
+
+    // A pwsh tab's `Start-Job { ninja }` left ninja building in pwsh's group, each step in a group
+    // of its own; a later `git fetch` hangs on its remote.
+    let mut w = World::new();
+    let shell = w.tab(1).tab.shell_pid;
+    let shell_pgid = w.p(shell).pgid;
+    w.p(shell).name = "pwsh".into();
+    w.mark(1);
+    let mut ninja = sleeper(1100, "ninja");
+    ninja.ppid = shell;
+    ninja.pgid = shell_pgid;
+    ninja.sid = shell;
+    ninja.tty = true;
+    w.add(ninja);
+    let _ = w.tick(TICK_MS);
+    let mut git = sleeper(1200, "git");
+    git.fds.push(tcp_fd(5));
+    w.run_fg(1, 7, "git fetch", git);
+    let v = run_to(&mut w, 1_200_000, |w, rel| {
+        let born = 3_000 + u32::try_from(rel / TICK_MS).unwrap_or(0);
+        w.exit(born - 1, false);
+        let mut cc = Proc::new(born, 1100, "cc");
+        cc.sid = shell;
+        cc.tty = true;
+        cc.state = ProcState::Running;
+        cc.cpu_per_s = 900_000_000;
+        cc.counters.cpu_ns = 400_000_000;
+        w.add(cc);
+    });
+    assert!(
+        v.row("b7").is_some_and(|r| r.class != Class::Running),
+        "{:?}",
+        v.rows.iter().map(|r| r.wire()).collect::<Vec<_>>()
+    );
 }
 
 /// A SHELL THAT GAVE WAY TO ANOTHER IN PLACE ENDS ITS BLOCK AT THE NEW ONE'S PROMPT: after `exec
 /// zsh` the new shell writes no marks (its integration does not load again), so two passes that
-/// find it alone at its line editor in front, a shell seen doing job control, close the block,
-/// with no status. A background job then takes the tab's lines, and the next command is a row of
-/// its own. One such pass is the shell's own `read -q`, answered, a program in the shell's group
-/// reading raw keys (`vim $(fzf)`) is no prompt, and pwsh, which never put a group in front (a
-/// shell it ran did), runs a cmdlet in its own process at a raw word: each block keeps its
-/// command.
+/// find it alone at its line editor in front, a shell doing job control, close the block, with
+/// no status. A background job then takes the tab's lines, and the next command is a row of its
+/// own. One such pass is the shell's own `read -q` before an `exec ./deploy.sh`, answered, a
+/// cooked `read -r host` before an `exec ssh "$host"` is none, and a program in the shell's group
+/// reading raw keys (`exec vim "$(fzf)"`) is no prompt; a block whose command ran no `exec` keeps
+/// its command, as pwsh runs a cmdlet or a script in itself at a raw word.
 #[test]
 fn a_shell_exec_in_place_ends_its_block_at_the_new_ones_prompt() {
     let mut w = World::new();
@@ -5223,9 +5304,9 @@ fn a_shell_exec_in_place_ends_its_block_at_the_new_ones_prompt() {
         ran_one(&mut w);
         let at = w.at;
         let command = if fzf {
-            "vim $(fzf)"
+            "exec vim \"$(fzf)\""
         } else {
-            "read -q '?Deploy? ' && ./deploy.sh"
+            "read -q '?Deploy? ' && exec ./deploy.sh"
         };
         w.tab(1).tab.block = Some(Block {
             id: 7,
@@ -5247,13 +5328,11 @@ fn a_shell_exec_in_place_ends_its_block_at_the_new_ones_prompt() {
         } else {
             let _ = w.tick(TICK_MS);
         }
-        let mut p = Proc::new(1300, shell, if fzf { "vim" } else { "sh" });
-        p.sid = shell;
-        p.tty = true;
-        w.add(p);
-        w.tab(1).tpgid = 1300;
+        let root = w.p(shell);
+        root.name = if fzf { "vim" } else { "sh" }.into();
+        root.exec += 1;
         w.tty_mode(1, !fzf, !fzf);
-        let v = run_to(&mut w, 60_000, |w, _| w.line_from(1, &[1300]));
+        let v = run_to(&mut w, 60_000, |w, _| w.line_from(1, &[shell]));
         assert!(
             v.row("b7").is_some_and(|r| r.class == Class::Running)
                 && v.rows.iter().all(|r| !r.id.starts_with('j')),
@@ -5262,10 +5341,30 @@ fn a_shell_exec_in_place_ends_its_block_at_the_new_ones_prompt() {
         );
     }
 
+    let mut w = World::new();
+    ran_one(&mut w);
+    let at = w.at;
+    w.tab(1).tab.block = Some(Block {
+        id: 7,
+        started_ms: at,
+        open: true,
+        command: "read -r host && exec ssh \"$host\"".to_owned(),
+        status: None,
+        stopped: false,
+    });
+    w.tty_mode(1, true, true);
+    let v = run_to(&mut w, 60_000, |_, _| {});
+    assert!(
+        v.row("b7").is_some_and(|r| r.verdict != Verdict::Exited),
+        "{:?}",
+        v.rows.iter().map(|r| r.wire()).collect::<Vec<_>>()
+    );
+
     // `Invoke-WebRequest https://host/big.iso -OutFile big.iso` in a pwsh tab: the download runs
-    // in pwsh itself, at the raw word its console left, and pwsh never put a group in front, also
-    // after `exec pwsh` from a zsh that did, or once a zsh it ran put its `make` in front.
-    for case in 0..3 {
+    // in pwsh itself, at the raw word its console left, also after `exec pwsh`, or once a zsh it
+    // ran took a group of its own in front and put its `make` in front; so does a script pwsh
+    // runs in itself, `./execute-migrations.ps1`.
+    for case in 0..4 {
         let mut w = World::new();
         let shell = w.tab(1).tab.shell_pid;
         let shell_pgid = w.p(shell).pgid;
@@ -5287,10 +5386,11 @@ fn a_shell_exec_in_place_ends_its_block_at_the_new_ones_prompt() {
                 stopped: false,
             });
             let mut zsh = Proc::new(1100, shell, "zsh");
-            zsh.pgid = shell_pgid;
             zsh.sid = shell;
             zsh.tty = true;
             w.add(zsh);
+            w.tab(1).tpgid = 1100;
+            let _ = run_to(&mut w, 4_000, |_, _| {});
             let mut make = Proc::new(1200, 1100, "make");
             make.sid = shell;
             make.tty = true;
@@ -5312,7 +5412,12 @@ fn a_shell_exec_in_place_ends_its_block_at_the_new_ones_prompt() {
             id: 4,
             started_ms: at,
             open: true,
-            command: "Invoke-WebRequest https://host/big.iso -OutFile big.iso".to_owned(),
+            command: if case == 3 {
+                "./execute-migrations.ps1"
+            } else {
+                "Invoke-WebRequest https://host/big.iso -OutFile big.iso"
+            }
+            .to_owned(),
             status: None,
             stopped: false,
         });
@@ -5423,10 +5528,17 @@ fn a_background_job_takes_no_lines_from_what_holds_the_terminal() {
 /// A PARENT THAT REAPS LATE WAITS ALL THE SAME: `tail -F app.log | xargs -P4 -I{} ./notify {}`,
 /// whose xargs reaps a finished `notify` only before its next fork, waits on the log: fine,
 /// its zombie a finding of its own. A `./ingest` there deadlocked, reading nothing, or hung on
-/// its server, leaves its zombies to the zombie class, whatever tail waits on.
+/// its server, leaves its zombies to the zombie class, whatever tail waits on, and one whose
+/// other `notify` hangs on its server is judged by that. A `python3` at its `>>>`, a `Popen`
+/// child it has not reaped, waits on the person.
 #[test]
 fn a_parent_that_reaps_late_waits_all_the_same() {
-    for (deadlocked, served) in [(false, false), (true, false), (true, true)] {
+    for (deadlocked, served, hung) in [
+        (false, false, false),
+        (true, false, false),
+        (true, true, false),
+        (false, false, true),
+    ] {
         let mut w = World::new();
         let shell = w.tab(1).tab.shell_pid;
         let mut tail = sleeper(2000, "tail");
@@ -5457,9 +5569,20 @@ fn a_parent_that_reaps_late_waits_all_the_same() {
         z.tty = true;
         z.state = ProcState::Zombie;
         w.add(z);
+        if hung {
+            let mut n = curl(2011);
+            n.name = "notify".into();
+            n.ppid = 2001;
+            n.pgid = 2000;
+            n.sid = shell;
+            n.tty = true;
+            w.add(n);
+        }
         let v = run_to(&mut w, 1_200_000, |_, _| {});
         assert!(
-            v.row("b9").is_some_and(|r| if deadlocked {
+            v.row("b9").is_some_and(|r| if hung {
+                r.class != Class::Zombie
+            } else if deadlocked {
                 r.class == Class::Zombie && r.verdict != Verdict::Fine
             } else {
                 (r.class, r.verdict) == (Class::Waiting, Verdict::Fine)
@@ -5468,6 +5591,25 @@ fn a_parent_that_reaps_late_waits_all_the_same() {
             wire(&v, "b9")
         );
     }
+
+    let mut w = World::new();
+    let shell = w.tab(1).tab.shell_pid;
+    w.run_fg(1, 9, "python3", sleeper(2000, "python3"));
+    w.tty_mode(1, false, false);
+    let mut z = sleeper(2010, "sh");
+    z.ppid = 2000;
+    z.pgid = 2000;
+    z.sid = shell;
+    z.tty = true;
+    z.state = ProcState::Zombie;
+    w.add(z);
+    let v = run_to(&mut w, 1_200_000, |_, _| {});
+    assert!(
+        v.row("b9")
+            .is_some_and(|r| r.class != Class::Zombie && r.verdict == Verdict::Fine),
+        "{}",
+        wire(&v, "b9")
+    );
 }
 
 /// A NESTED SESSION IS JUDGED BY ITS OWN LINES ONCE THEY REACH THE TAB: `script -q rec.log npm
@@ -5581,7 +5723,8 @@ fn a_nested_session_is_judged_by_its_own_lines_once_they_reach_the_tab() {
 
 /// A NESTED SESSION TAKES NONE OF ITS OPENER'S ECHO: `until curl -sf localhost:8080/health; do
 /// sleep 1; done` in nvim's terminal, against a server that never answers, while the person
-/// edits in another window: nvim redraws the person's keys, which are none of the loop's lines.
+/// edits in another window: nvim redraws the person's keys, which are none of the loop's lines,
+/// nor are nvim's own repaints of its statusline beside a `gradle` deadlocked there.
 #[test]
 fn a_nested_session_takes_none_of_its_openers_echo() {
     let mut w = World::new();
@@ -5602,6 +5745,48 @@ fn a_nested_session_takes_none_of_its_openers_echo() {
         w.fronts.insert(1310, born);
         w.typed(1, 1300);
         w.line_from(1, &[1300]);
+    });
+    assert_ne!(
+        v.row("n1310").map(|r| r.class),
+        Some(Class::Running),
+        "{}",
+        wire(&v, "n1310")
+    );
+
+    // `./gradlew build` there printed its first lines, then its daemon deadlocked, its threads
+    // waking it 40 times a second.
+    let mut w = World::new();
+    w.run_fg(1, 5, "nvim", sleeper(1300, "nvim"));
+    let mut sh = Proc::new(1310, 1300, "zsh");
+    sh.sid = 1310;
+    sh.tty = true;
+    w.add(sh);
+    let mut java = Proc::new(1311, 1310, "java");
+    java.sid = 1310;
+    java.tty = true;
+    java.syscalls_per_s = 40;
+    w.add(java);
+    w.fronts.insert(1310, 1311);
+    w.terms.insert(
+        1310,
+        TermWord {
+            canonical: true,
+            echo: true,
+            queued: 0,
+        },
+    );
+    w.tty_mode(1, false, false);
+    let v = run_to(&mut w, 600_000, |w, rel| {
+        if rel < 20_000 {
+            w.line_from(1, &[1300, 1311]);
+        } else if rel % 30_000 == 0 {
+            *w.p(1300).counters.syscalls.get_or_insert(0) += 1;
+            let at = w.at;
+            let t = &mut w.tab(1).tab;
+            t.output_ms = Some(at);
+            t.output_bytes += 12;
+            t.drawn_ms = Some(at);
+        }
     });
     assert_ne!(
         v.row("n1310").map(|r| r.class),

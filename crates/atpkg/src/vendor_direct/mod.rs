@@ -8,6 +8,7 @@ pub(crate) mod decide;
 pub(crate) mod digests;
 pub(crate) mod durable;
 pub(crate) mod lane;
+pub(crate) mod npm;
 pub mod policy;
 mod record;
 pub(crate) mod resolve;

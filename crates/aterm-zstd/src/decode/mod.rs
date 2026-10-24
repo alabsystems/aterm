@@ -75,6 +75,8 @@ pub struct Decoder<R> {
     hash: Xxh64,
     /// Refuse a frame that carries no content checksum.
     require_checksum: bool,
+    /// Refuse a skippable frame, and any byte after the first frame ends.
+    one_frame: bool,
 }
 
 impl<R: Read> Decoder<BufReader<R>> {
@@ -98,6 +100,7 @@ impl<R: BufRead> Decoder<R> {
             produced: 0,
             hash: Xxh64::new(0),
             require_checksum: false,
+            one_frame: false,
         }
     }
 
@@ -105,6 +108,14 @@ impl<R: BufRead> Decoder<R> {
     #[must_use]
     pub const fn require_checksum(mut self) -> Self {
         self.require_checksum = true;
+        self
+    }
+
+    /// Takes the stream as exactly one zstd frame: a skippable frame, or any byte after the
+    /// first frame ends, is [`DecodeError::NotOneFrame`], refused before it is read.
+    #[must_use]
+    pub const fn one_frame(mut self) -> Self {
+        self.one_frame = true;
         self
     }
 
@@ -154,10 +165,16 @@ impl<R: BufRead> Decoder<R> {
             self.state = State::Done;
             return Ok(false);
         }
+        if self.one_frame && self.frames > 0 {
+            return Err(DecodeError::NotOneFrame.into());
+        }
         let mut word = [0u8; 4];
         self.input.read_exact(&mut word).map_err(inside_frame)?;
         let magic = u32::from_le_bytes(word);
         if SKIPPABLE_MAGIC.contains(&magic) {
+            if self.one_frame {
+                return Err(DecodeError::NotOneFrame.into());
+            }
             self.input.read_exact(&mut word).map_err(inside_frame)?;
             let len = u64::from(u32::from_le_bytes(word));
             let skipped = io::copy(&mut (&mut self.input).take(len), &mut io::sink())?;
@@ -278,6 +295,23 @@ impl<R> std::fmt::Debug for Decoder<R> {
     }
 }
 
+/// The `Frame_Content_Size` the frame at the start of `input` declares, read from its magic
+/// number and header alone: `None` when the header declares none. No block is read.
+///
+/// # Errors
+/// [`io::ErrorKind::InvalidData`] carrying a [`DecodeError`] when `input` does not start with
+/// a zstd frame (a skippable frame included) or its header breaks a rule the decoder holds it
+/// to; [`io::ErrorKind::UnexpectedEof`] when it ends inside the header; errors from `input`.
+pub fn declared_content_size(mut input: impl Read) -> io::Result<Option<u64>> {
+    let mut word = [0u8; 4];
+    input.read_exact(&mut word).map_err(inside_frame)?;
+    let magic = u32::from_le_bytes(word);
+    if magic != MAGIC {
+        return Err(DecodeError::BadMagic(magic).into());
+    }
+    Ok(header::read(&mut input).map_err(inside_frame)?.content_size)
+}
+
 /// The stream ended where a frame was required.
 fn early_end() -> io::Error {
     io::Error::new(
@@ -314,6 +348,34 @@ mod tests {
         zst
     }
 
+    /// The declared size is read from the header alone, and only a frame's header answers.
+    #[test]
+    fn the_declared_content_size_is_the_headers() {
+        let mut zst = Vec::new();
+        frame::write_raw(&mut zst, &[7u8; 70_000], Checksum::Xxh64).unwrap();
+        assert_eq!(
+            super::declared_content_size(&zst[..18]).unwrap(),
+            Some(70_000)
+        );
+        let mut empty = Vec::new();
+        frame::write_raw(&mut empty, b"", Checksum::Omitted).unwrap();
+        assert_eq!(super::declared_content_size(&empty[..]).unwrap(), Some(0));
+        // No Frame_Content_Size: FCS flag 0, not single-segment, a 1 KiB window.
+        let none = [0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00];
+        assert_eq!(super::declared_content_size(&none[..]).unwrap(), None);
+        let skippable = stream()[zst_len(b"checked")..].to_vec();
+        let e = super::declared_content_size(&skippable[..]).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        let e = super::declared_content_size(&zst[..5]).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    fn zst_len(content: &[u8]) -> usize {
+        let mut zst = Vec::new();
+        frame::write_raw(&mut zst, content, Checksum::Xxh64).unwrap();
+        zst.len()
+    }
+
     #[test]
     fn require_checksum_refuses_at_the_first_frame_without_one() {
         let zst = stream();
@@ -332,6 +394,73 @@ mod tests {
             Some(&DecodeError::NoChecksum)
         );
         assert!(decoder.read(&mut buf).is_err(), "the stream stays failed");
+    }
+
+    /// One frame decodes; a skippable frame, an empty second frame or a stray byte after the
+    /// first frame is refused before it is read, and only with `one_frame` set.
+    #[test]
+    fn one_frame_refuses_whatever_follows_or_precedes_the_frame() {
+        let one = {
+            let mut zst = Vec::new();
+            frame::write_raw(&mut zst, b"exe", Checksum::Xxh64).unwrap();
+            zst
+        };
+        let mut out = Vec::new();
+        Decoder::new(&one[..])
+            .one_frame()
+            .read_to_end(&mut out)
+            .unwrap();
+        assert_eq!(out, b"exe");
+        let skippable = [0x184D_2A50u32.to_le_bytes(), 2u32.to_le_bytes()].concat();
+        let empty = {
+            let mut zst = Vec::new();
+            frame::write_raw(&mut zst, b"", Checksum::Xxh64).unwrap();
+            zst
+        };
+        for (label, zst, before) in [
+            (
+                "an empty frame after",
+                [&one[..], &empty].concat(),
+                &b"exe"[..],
+            ),
+            (
+                "a skippable frame after",
+                [&one[..], &skippable, b"sk"].concat(),
+                b"exe",
+            ),
+            ("a stray byte after", [&one[..], &[0]].concat(), b"exe"),
+            (
+                "a skippable frame before",
+                [&skippable[..], b"sk", &one].concat(),
+                b"",
+            ),
+            (
+                "a skippable frame alone",
+                [&skippable[..], b"sk"].concat(),
+                b"",
+            ),
+        ] {
+            let plain = Decoder::new(&zst[..]).read_to_end(&mut Vec::new());
+            assert_ne!(
+                plain
+                    .as_ref()
+                    .err()
+                    .and_then(|e| e.get_ref())
+                    .and_then(|e| e.downcast_ref::<DecodeError>()),
+                Some(&DecodeError::NotOneFrame),
+                "{label}: only one_frame refuses it"
+            );
+            let mut decoder = Decoder::new(&zst[..]).one_frame();
+            let mut out = Vec::new();
+            let e = decoder.read_to_end(&mut out).unwrap_err();
+            assert_eq!(
+                e.get_ref().and_then(|e| e.downcast_ref::<DecodeError>()),
+                Some(&DecodeError::NotOneFrame),
+                "{label}: {e}"
+            );
+            assert_eq!(out, before, "{label}");
+            assert!(decoder.between_frames(), "{label}");
+        }
     }
 
     #[test]

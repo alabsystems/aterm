@@ -134,7 +134,8 @@ pub fn pinned(url: &str, hosts: &[&str]) -> bool {
 }
 
 fn is_url(word: &str) -> bool {
-    word.starts_with("https://") || word.starts_with("http://")
+    (word.starts_with("https://") || word.starts_with("http://"))
+        && !word.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
 /// Whether `word` reads as a sign-in code: [`CODE_LEN`] letters, digits and dashes, a letter or
@@ -199,7 +200,7 @@ impl Scan {
         for lead in grammar.url {
             if let Some(at) = line.find(lead) {
                 let rest = line[at + lead.len()..].trim();
-                if is_url(rest) && !rest.contains(char::is_whitespace) {
+                if is_url(rest) {
                     self.url.get_or_insert_with(|| rest.to_owned());
                 } else {
                     self.pending = Some(Want::Url);

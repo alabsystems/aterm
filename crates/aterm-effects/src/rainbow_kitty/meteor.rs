@@ -1959,9 +1959,10 @@ impl<'a> Behind<'a> {
             if dx_sq >= min_sq {
                 continue;
             }
+            let y0_f = y0 as f32;
             let ch = (y1 - y0) as f32;
-            let by0 = y0 as f32 + band0 * ch - pad;
-            let by1 = y0 as f32 + band1 * ch + pad;
+            let by0 = y0_f + band0 * ch - pad;
+            let by1 = y0_f + band1 * ch + pad;
             let dy = (by0 - y).max(y - by1).max(0.0);
             let d_sq = dx_sq + dy * dy;
             if d_sq <= 0.0 {
@@ -2863,9 +2864,10 @@ fn burst_lance(
     let clip = ctx.geom.beam_clip();
     let cw = (ctx.geom.cw as f32).max(1.0);
     let page = light.then_some(ctx.cfg.theme_bg);
-    let hue = |s: f32| landing_ink_at(l, ox + dir.0 * s, cw, page);
+    let hue_at_x = |px: f32| landing_ink_at(l, px, cw, page);
     let inv_span = 1.0 / span;
     let inv_stations = 1.0 / (BURST_SEC_STATIONS - 1) as f32;
+    let light_ink = (cov * LIGHT_INK_GAIN).min(LIGHT_ALPHA_CAP);
     let mut s0 = root;
     let mut done = 0.0_f32;
     for (k, &thick_ch) in sec_thick_px.iter().enumerate() {
@@ -2881,21 +2883,21 @@ fn burst_lance(
         }
         let thick = thick_ch.max(1.0);
         if light {
-            let ink = (cov * LIGHT_INK_GAIN).min(LIGHT_ALPHA_CAP);
             let side = (thick.round() as i32).max(1);
             let half_side = side / 2;
             let stride = (thick * BURST_LIGHT_STEP_SHARE).max(1.0);
             let mut s = s0;
             while s <= s1 {
                 let t = (s - root) * inv_span;
-                let a = (ink * (1.0 - BURST_TIP_FADE * t)) as u8;
+                let a = (light_ink * (1.0 - BURST_TIP_FADE * t)) as u8;
+                let px = ox + dir.0 * s;
                 let rect = (
-                    (ox + dir.0 * s).round() as i32 - half_side,
+                    px.round() as i32 - half_side,
                     (oy + dir.1 * s).round() as i32 - half_side,
                     side,
                     side,
                 );
-                push_ink_rect(frame.out, ctx.geom, rect, hue(s), a);
+                push_ink_rect(frame.out, ctx.geom, rect, hue_at_x(px), a);
                 s += stride;
             }
         } else {
@@ -2905,10 +2907,11 @@ fn burst_lance(
                 let f = j as f32 * inv_stations;
                 let s = s0 + ds * f;
                 let t = (s - root) * inv_span;
+                let px = ox + dir.0 * s;
                 frame.beams.push(BeamVertex {
-                    x: ox + dir.0 * s,
+                    x: px,
                     y: oy + dir.1 * s,
-                    color: hue(s),
+                    color: hue_at_x(px),
                     cov: (cov * (1.0 - BURST_TIP_FADE * t)).clamp(0.0, 255.0) as u8,
                 });
             }
@@ -2940,6 +2943,7 @@ fn burst_jet(
     }
     let clip = ctx.geom.beam_clip();
     let ink_gain = if light { LIGHT_INK_GAIN } else { 1.0 };
+    let alpha_cap = if light { LIGHT_ALPHA_CAP } else { 255.0 };
     let page = light.then_some(ctx.cfg.theme_bg);
     let step = burst_step(ch, JET_STEP_CH_SHARE, JET_STEP_PX);
     let sec_end = [root + span * JET_SEC_SHARE[0], tip];
@@ -2961,10 +2965,11 @@ fn burst_jet(
         for j in 0..stations {
             let share = j as f32 / denom;
             let d = s0 + seg * share;
-            let cell = ((dir.0 * d) / cw).round() as i32;
+            let dx = dir.0 * d;
+            let cell = (dx / cw).round() as i32;
             let t_all = ((d - root) / span).clamp(0.0, 1.0);
             let fade = 1.0 - smoothstep01((t_all - JET_FEATHER_SHARE) / (1.0 - JET_FEATHER_SHARE));
-            let c = (cov * fade * ink_gain).min(if light { LIGHT_ALPHA_CAP } else { 255.0 });
+            let c = (cov * fade * ink_gain).min(alpha_cap);
             if !sky.row_blank(cell) || c < 1.0 {
                 if !light {
                     comet_beam(frame.out, clip, frame.beams, thick, step, 0.0);
@@ -2972,10 +2977,11 @@ fn burst_jet(
                 }
                 continue;
             }
-            let stop = landing_ink_at(l, l.x + dir.0 * d, cw, page);
+            let px = l.x + dx;
+            let stop = landing_ink_at(l, px, cw, page);
             if light {
                 let rect = (
-                    (l.x + dir.0 * d).round() as i32 - half_w,
+                    px.round() as i32 - half_w,
                     (l.y + dir.1 * d).round() as i32 - half_h,
                     w,
                     h,
@@ -2983,7 +2989,7 @@ fn burst_jet(
                 push_ink_rect(frame.out, ctx.geom, rect, stop, c as u8);
             } else {
                 frame.beams.push(BeamVertex {
-                    x: l.x + dir.0 * d,
+                    x: px,
                     y: l.y + dir.1 * d,
                     color: stop,
                     cov: c as u8,
@@ -3091,9 +3097,21 @@ fn mint_spark(seed: u32, k: usize, ch: f32) -> Spark {
     }
 }
 
+#[cfg(test)]
 #[inline]
 #[must_use]
 const fn spark_at(spark: Spark, age_ms: f32, ch: f32) -> Option<((f32, f32), f32)> {
+    let g = SPARK_G_CH_PER_S2 * ch / 1_000_000.0;
+    spark_at_with_gravity(spark, age_ms, 0.5 * g * age_ms * age_ms)
+}
+
+#[inline]
+#[must_use]
+const fn spark_at_with_gravity(
+    spark: Spark,
+    age_ms: f32,
+    gravity_dy: f32,
+) -> Option<((f32, f32), f32)> {
     let u = age_ms / spark.life.max(1.0);
     if !(u >= 0.0 && u < 1.0) {
         return None;
@@ -3106,9 +3124,8 @@ const fn spark_at(spark: Spark, age_ms: f32, ch: f32) -> Option<((f32, f32), f32
     if alpha < CHROMA_CULL_ALPHA {
         return None;
     }
-    let g = SPARK_G_CH_PER_S2 * ch / 1_000_000.0;
     let dx = spark.vx * age_ms;
-    let dy = spark.vy * age_ms + 0.5 * g * age_ms * age_ms;
+    let dy = spark.vy * age_ms + gravity_dy;
     Some(((dx, dy), alpha))
 }
 
@@ -3130,10 +3147,12 @@ fn draw_sparks(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>, halo_cap: usiz
     if intensity <= 0.0 {
         return;
     }
+    let g = SPARK_G_CH_PER_S2 * ch / 1_000_000.0;
+    let gravity_dy = 0.5 * g * age * age;
     let light = !ctx.cfg.dark_theme;
     let mut light_stops = [None; SPECTRUM_STOPS];
     for spark in l.spark.iter().take(usize::from(l.sparks)) {
-        let Some(((dx, dy), alpha)) = spark_at(*spark, age, ch) else {
+        let Some(((dx, dy), alpha)) = spark_at_with_gravity(*spark, age, gravity_dy) else {
             continue;
         };
         let cov = TRANSIENT_STAR_COV_CEIL * alpha * intensity;
@@ -3194,6 +3213,7 @@ fn shed(m: &mut Meteor, f: &Flight, ctx: &Ctx<'_>, sown: &mut Vec<Sow>) {
     let passed = f.head_travel_share();
     let t_ms = (m.t_flight.as_secs_f32() * 1000.0).max(1.0);
     let speed = head_speed(f.l, t_ms, f.u);
+    let v_head = (f.unit.0 * speed, f.unit.1 * speed);
     for i in 0..n {
         let bit = 1_u8 << i;
         if m.shed & bit != 0 {
@@ -3213,7 +3233,7 @@ fn shed(m: &mut Meteor, f: &Flight, ctx: &Ctx<'_>, sown: &mut Vec<Sow>) {
             at: ctx.now,
             spec: ShedSow {
                 at_px,
-                v_head: (f.unit.0 * speed, f.unit.1 * speed),
+                v_head,
                 tint_t: m.arc((f.l - s) / cw),
                 seed: mix32(m.seed ^ (i as u32).wrapping_mul(0x9E37_79B9)),
                 n: 1,

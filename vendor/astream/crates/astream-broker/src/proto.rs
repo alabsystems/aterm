@@ -280,15 +280,21 @@ const TAG_KEEPALIVE: u8 = 0x0D;
 const TAG_IDLE_MARKS: u8 = 0x0E;
 const TAG_BUDGET: u8 = 0x0F;
 const TAG_RETIRE: u8 = 0x10;
+const TAG_GAP_NOTICES: u8 = 0x11;
 const TAG_ACK: u8 = 0x81;
 const TAG_DELIVERY: u8 = 0x82;
 const TAG_ERROR: u8 = 0x83;
 const TAG_MARK: u8 = 0x84;
 const TAG_NONCE: u8 = 0x85;
 const TAG_BUDGET_REPLY: u8 = 0x86;
+const TAG_GAP: u8 = 0x87;
 
 /// Bit 0 of [`NonceExt::requests`]: the broker accepts [`Request::Retire`] (`0x10`).
 pub const REQUEST_RETIRE: u64 = 1 << 0;
+
+/// Bit 1 of [`NonceExt::requests`]: the broker accepts [`Request::GapNotices`] (`0x11`)
+/// and tells a tail that asked what retention gave up below it ([`Response::Gap`]).
+pub const REQUEST_GAP_NOTICES: u64 = 1 << 1;
 
 /// Commit-tag byte in a [`Request::Replicate`] frame for a marked `/a/retire` record:
 /// an older follower only knows `0` (none) and `1` (group commit) and refuses `2` as
@@ -631,6 +637,56 @@ pub enum Request {
         offset: u64,
         log: LogIdentity,
     },
+    /// Opt in to GAP NOTICES ([`Response::Gap`]) on this connection's next `Subscribe` or
+    /// `SubscribeGroup` (`REQUIREMENTS-fabric-operations` R4, addendum A9): before it
+    /// delivers any record past ones retention gave up, the tail says so. Answered with a
+    /// `Mark` before the stream handoff, as [`IdleMarks`](Request::IdleMarks) is; appends
+    /// nothing. A broker that predates the verb answers `Error 5 "malformed request"` and
+    /// keeps the connection, and its tail says nothing of what it skipped, as before.
+    ///
+    /// Without this request a tail sends no notice: a client that predates them reads its
+    /// tail exactly as it did. On a guarded broker any unexpired capability permits it (the
+    /// acknowledgement names the head), as for `IdleMarks`. Hello's request set announces
+    /// it ([`REQUEST_GAP_NOTICES`]).
+    GapNotices,
+}
+
+/// A GAP NOTICE ([`Response::Gap`]): every record of the tail's filter at an offset in
+/// `from..to` that the tail is not delivered was given up by retention. `from` is the
+/// tail's cursor and `to` the oldest offset its filter can reach (`Fetch` refuses below
+/// it); a record it IS delivered inside the range is one retention still held below the
+/// base. `records` is how many records of the filter in the range were given up that no
+/// notice on this stream counted before, where the broker's held store knows it; `None`
+/// where it cannot (the prefix rule's or a last-value class's records, which a cut drops
+/// as a range; give-ups before the broker's last restart), and then the range alone is
+/// told, and covers every later give-up inside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Gap {
+    /// The tail's cursor when it was told.
+    pub from: u64,
+    /// The oldest offset the tail's filter can reach.
+    pub to: u64,
+    /// How many records of the filter in `from..to` were given up and not counted
+    /// before on this stream; `None`: not known.
+    pub records: Option<u64>,
+}
+
+impl Gap {
+    /// What `self` and a LATER notice on the same stream say together: one range from the
+    /// lower `from` to the higher `to`, and the counts summed (unknown if either is). Sound
+    /// because a stream's notices never count a record twice, and every record between
+    /// two ranges that the tail was not delivered lies in one of them.
+    #[must_use]
+    pub fn and(self, later: Gap) -> Gap {
+        Gap {
+            from: self.from.min(later.from),
+            to: self.to.max(later.to),
+            records: match (self.records, later.records) {
+                (Some(a), Some(b)) => Some(a.saturating_add(b)),
+                _ => None,
+            },
+        }
+    }
 }
 
 /// A broker → client response.
@@ -725,6 +781,12 @@ pub enum Response {
         reserved: u64,
         max: u64,
     },
+    /// A GAP NOTICE on a `Subscribe` or `SubscribeGroup` stream that asked for them
+    /// ([`Request::GapNotices`]): written before anything the tail delivers after the
+    /// records retention gave up below it (see [`Gap`]). The body is `from u64, to u64`,
+    /// a flag byte (`1`: `records` is known) and `records u64` (`0` when unknown); bytes
+    /// after it are a later build's, skipped. A wire frame, never a log record.
+    Gap(Gap),
 }
 
 impl PartialEq for Response {
@@ -808,6 +870,7 @@ impl PartialEq for Response {
                     max: b_m,
                 },
             ) => *a_s == *b_s && *a_r == *b_r && *a_m == *b_m,
+            (Response::Gap(a), Response::Gap(b)) => a == b,
             _ => false,
         }
     }
@@ -1056,7 +1119,7 @@ const fn take_ext_entry_header(b: &[u8]) -> Option<(u8, usize, &[u8])> {
 /// |------|------------|-------|
 /// | 0x01 | durability | `requested u8, served u8, reason u8, horizon_ms u32 LE, rules u16 LE` ([`ServedInfo`]) |
 /// | 0x02 | lineage    | `n u8`, then `n × (generation u64 LE, common u64 LE)` ([`Lineage`]) |
-/// | 0x03 | 8 bytes    | the request set a broker announces (`u64` LE bitmask; bit 0 = [`REQUEST_RETIRE`]) |
+/// | 0x03 | 8 bytes    | the request set a broker announces (`u64` LE bitmask; bit 0 = [`REQUEST_RETIRE`], bit 1 = [`REQUEST_GAP_NOTICES`]) |
 /// | 0x04 | health     | `flags u8` (bit 0: poisoned), `barrier u64 LE, full u64 LE, skipped u64 LE, failed u64 LE`, `n u16 LE`, `n` bytes of the poison's reason (UTF-8); bytes after it are a later build's, skipped ([`HelloHealth`]) |
 /// | 0x05 | retention  | the rules the log is retained by, as `Retention::encode` writes them (the `retention` feature) |
 ///
@@ -1072,7 +1135,8 @@ pub struct NonceExt {
     pub durability: Option<ServedInfo>,
     /// Tag 0x02: where the log's generations agree.
     pub lineage: Option<Lineage>,
-    /// Tag 0x03: the request-set bitmask announced by the broker (bit 0 = [`REQUEST_RETIRE`]).
+    /// Tag 0x03: the request-set bitmask announced by the broker (bit 0 = [`REQUEST_RETIRE`],
+    /// bit 1 = [`REQUEST_GAP_NOTICES`]).
     pub requests: Option<u64>,
     /// Tag 0x04: whether the log is poisoned, and the flushes it has issued.
     pub health: Option<HelloHealth>,
@@ -1193,6 +1257,15 @@ impl NonceExt {
     pub const fn supports_retire(&self) -> bool {
         match self.requests {
             Some(r) => (r & REQUEST_RETIRE) != 0,
+            None => false,
+        }
+    }
+
+    /// Whether this `Hello` extension block announces [`Request::GapNotices`] (`0x11`).
+    #[must_use]
+    pub const fn supports_gap_notices(&self) -> bool {
+        match self.requests {
+            Some(r) => (r & REQUEST_GAP_NOTICES) != 0,
             None => false,
         }
     }
@@ -1483,6 +1556,7 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
         Request::Hello => p[1] = TAG_HELLO,
         Request::Keepalive => p[1] = TAG_KEEPALIVE,
         Request::IdleMarks => p[1] = TAG_IDLE_MARKS,
+        Request::GapNotices => p[1] = TAG_GAP_NOTICES,
         Request::Budget { producer_id } => {
             p[1] = TAG_BUDGET;
             p.extend_from_slice(&encode_u64_le_bytes(*producer_id));
@@ -1634,6 +1708,7 @@ pub fn decode_request(p: &[u8]) -> Option<Request> {
         TAG_HELLO => Some(Request::Hello),
         TAG_KEEPALIVE => Some(Request::Keepalive),
         TAG_IDLE_MARKS => Some(Request::IdleMarks),
+        TAG_GAP_NOTICES => Some(Request::GapNotices),
         TAG_BUDGET => Some(Request::Budget {
             producer_id: r.u64()?,
         }),
@@ -1770,6 +1845,17 @@ pub fn encode_response(resp: &Response) -> Vec<u8> {
             p.extend_from_slice(&encode_u64_le_bytes(*subjects));
             p.extend_from_slice(&encode_u64_le_bytes(*reserved));
             p.extend_from_slice(&encode_u64_le_bytes(*max));
+        }
+        Response::Gap(g) => {
+            p[1] = TAG_GAP;
+            p.extend_from_slice(&encode_u64_le_bytes(g.from));
+            p.extend_from_slice(&encode_u64_le_bytes(g.to));
+            let (known, n) = match g.records {
+                Some(n) => (1u8, n),
+                None => (0u8, 0),
+            };
+            p.push(known);
+            p.extend_from_slice(&encode_u64_le_bytes(n));
         }
     }
     p
@@ -2062,6 +2148,23 @@ pub fn decode_response(p: &[u8]) -> Option<Response> {
             reserved: r.u64()?,
             max: r.u64()?,
         }),
+        TAG_GAP => {
+            let from = r.u64()?;
+            let to = r.u64()?;
+            let known = r.u8()?;
+            let n = r.u64()?;
+            // A range that ends below where it starts, or a flag this build does not
+            // know, is no notice: malformed, never read as one that says less.
+            if from > to {
+                return None;
+            }
+            let records = match known {
+                0 => None,
+                1 => Some(n),
+                _ => return None,
+            };
+            Some(Response::Gap(Gap { from, to, records }))
+        }
         _ => None,
     }
 }
@@ -2374,17 +2477,18 @@ mod tests {
     /// PROTOCOL ECONOMY, PINNED. The whole fabric —
     /// retained values, bounded reads, a last will, a proof-of-possession attach, an
     /// exactly-once inbox, request/reply, barriers, presence, negotiated liveness and a
-    /// producer's view of its own subject budget — rides on FIFTEEN request tags and SIX
-    /// response tags. This test is the budget: it enumerates every byte and fails if a
-    /// sixteenth request tag or a seventh response tag ever decodes, and it pins each
-    /// tag's NUMBER, so a renumbering that would silently re-interpret an old client's
-    /// frames breaks the build instead. `Keepalive` at 0x0D, `IdleMarks` at 0x0E,
-    /// `Budget` at 0x0F and `Budget`'s reply at 0x86 took numbers no earlier version
-    /// decoded: an older broker refuses either request as malformed and keeps the
-    /// connection, and never sends the reply. Additions, not reinterpretations; no
-    /// version change.
+    /// producer's view of its own subject budget, a conditional retire and a tail told what
+    /// retention gave up — rides on SEVENTEEN request tags and SEVEN response tags. This
+    /// test is the budget: it enumerates every byte and fails if an eighteenth request tag
+    /// or an eighth response tag ever decodes, and it pins each tag's NUMBER, so a
+    /// renumbering that would silently re-interpret an old client's frames breaks the
+    /// build instead. `Keepalive` at 0x0D, `IdleMarks` at 0x0E, `Budget` at 0x0F, `Retire`
+    /// at 0x10, `GapNotices` at 0x11, `Budget`'s reply at 0x86 and `Gap` at 0x87 took
+    /// numbers no earlier version decoded: an older broker refuses each request as
+    /// malformed and keeps the connection, and never sends the reply (a `Gap` only to a
+    /// tail that asked). Additions, not reinterpretations; no version change.
     #[test]
-    fn the_tag_budget_is_fifteen_requests_and_six_responses() {
+    fn the_tag_budget_is_seventeen_requests_and_seven_responses() {
         // Version 2: `Attach` kept its tag (0x07) and its wire SHAPE (a str then a
         // byte string) while its MEANING changed (`{grant, proof}`, answered with a
         // Mark), so under an unchanged version byte a version-1 Attach would decode
@@ -2402,7 +2506,7 @@ mod tests {
         );
 
         // Every tag's NUMBER, pinned against the variant that carries it.
-        let request_tags: [(u8, Request); 16] = [
+        let request_tags: [(u8, Request); 17] = [
             (
                 0x01,
                 Request::Publish {
@@ -2513,6 +2617,7 @@ mod tests {
                     },
                 },
             ),
+            (0x11, Request::GapNotices),
         ];
         for (tag, req) in &request_tags {
             let bytes = encode_request(req);
@@ -2524,7 +2629,7 @@ mod tests {
             );
         }
 
-        let response_tags: [(u8, Response); 6] = [
+        let response_tags: [(u8, Response); 7] = [
             (
                 0x81,
                 Response::PublishAck {
@@ -2573,6 +2678,14 @@ mod tests {
                     max: 0,
                 },
             ),
+            (
+                0x87,
+                Response::Gap(Gap {
+                    from: 0,
+                    to: 0,
+                    records: None,
+                }),
+            ),
         ];
         for (tag, resp) in &response_tags {
             let bytes = encode_response(resp);
@@ -2606,11 +2719,11 @@ mod tests {
         }
         assert_eq!(
             decodable_requests, declared_requests,
-            "exactly sixteen request tags decode, and no other byte does"
+            "exactly seventeen request tags decode, and no other byte does"
         );
         assert_eq!(
             decodable_responses, declared_responses,
-            "exactly six response tags decode, and no other byte does"
+            "exactly seven response tags decode, and no other byte does"
         );
 
         // And the version byte still gates every tag, response tags included: the
@@ -2635,6 +2748,98 @@ mod tests {
                 "response tag {tag:#04x} decoded under a wrong version byte"
             );
         }
+    }
+
+    /// THE GAP NOTICE ON THE WIRE (R4 addendum A9): a known count and an unknown one each
+    /// read back as sent; the body is exactly `from, to, flag, records` (25 bytes after
+    /// the tag), every shorter body is malformed, a later build's trailer is skipped, and a
+    /// flag this build does not know or a range that ends below its start is no notice at
+    /// all. Hello's request set announces the verb by its own bit, which the retire bit
+    /// does not set. NC: a decoder that reads a body cut after `to` as one whose count is
+    /// unknown (an optional trailer) decodes it.
+    #[test]
+    fn a_gap_notice_round_trips_and_a_short_one_is_malformed() {
+        for records in [Some(3), Some(0), None] {
+            let g = Response::Gap(Gap {
+                from: 7,
+                to: 1_000_000,
+                records,
+            });
+            let bytes = encode_response(&g);
+            assert_eq!(bytes.len(), 2 + 8 + 8 + 1 + 8, "{records:?}");
+            assert_eq!(decode_response(&bytes), Some(g.clone()), "{records:?}");
+            for cut in 2..bytes.len() {
+                assert_eq!(
+                    decode_response(&bytes[..cut]),
+                    None,
+                    "a body cut to {cut} bytes decoded"
+                );
+            }
+            let mut later = bytes.clone();
+            later.extend_from_slice(&[0xAB; 5]);
+            assert_eq!(
+                decode_response(&later),
+                Some(g),
+                "a later trailer is skipped"
+            );
+        }
+        let mut bad_flag = encode_response(&Response::Gap(Gap {
+            from: 1,
+            to: 2,
+            records: Some(1),
+        }));
+        bad_flag[18] = 2;
+        assert_eq!(decode_response(&bad_flag), None, "an unknown flag");
+        let backwards = encode_response(&Response::Gap(Gap {
+            from: 9,
+            to: 2,
+            records: None,
+        }));
+        assert_eq!(
+            decode_response(&backwards),
+            None,
+            "a range that ends below its start"
+        );
+        let ext = |requests| NonceExt {
+            requests,
+            ..NonceExt::default()
+        };
+        assert!(ext(Some(REQUEST_GAP_NOTICES)).supports_gap_notices());
+        assert!(!ext(Some(REQUEST_RETIRE)).supports_gap_notices());
+        assert!(!ext(Some(REQUEST_GAP_NOTICES)).supports_retire());
+        assert!(!ext(None).supports_gap_notices());
+        assert_eq!(
+            Gap {
+                from: 4,
+                to: 9,
+                records: Some(2)
+            }
+            .and(Gap {
+                from: 6,
+                to: 12,
+                records: Some(1)
+            }),
+            Gap {
+                from: 4,
+                to: 12,
+                records: Some(3)
+            }
+        );
+        assert_eq!(
+            Gap {
+                from: 4,
+                to: 9,
+                records: Some(2)
+            }
+            .and(Gap {
+                from: 6,
+                to: 9,
+                records: None
+            })
+            .records,
+            None,
+            "an unknown count makes the sum unknown"
+        );
     }
 
     #[test]

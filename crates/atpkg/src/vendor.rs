@@ -87,6 +87,19 @@ pub const PAYLOADS: &[&str] = &[
 
 const BINARY_PAYLOADS: &[&str] = &["raw-binary", "tar-gz-binary"];
 
+/// The vendor-direct lane's npm binary package (grok's `@xai-official/grok-<plat>`): a gzip'd
+/// tar whose one `package/bin/<exe>.br` is the binary, Brotli-packed
+/// ([`crate::extract::stage_npm_brotli_binary`]). Only a row the lane builds from npm's signed
+/// documents names it; [`PAYLOADS`] leaves it out, so no index row can.
+pub(crate) const NPM_BROTLI_BINARY: &str = "npm-brotli-binary";
+
+/// Whether `payload` stages exactly one binary into `bin/`: [`BINARY_PAYLOADS`], and the
+/// vendor-direct lane's [`NPM_BROTLI_BINARY`].
+#[must_use]
+pub(crate) fn stages_one_binary(payload: &str) -> bool {
+    is_binary_payload(payload) || payload == NPM_BROTLI_BINARY
+}
+
 const ARCHIVE_PAYLOADS: &[&str] = &["tar-gz", "tar-zst", "zip"];
 
 /// Whether `payload` names a single-binary lane (see [`BINARY_PAYLOADS`]).
@@ -1104,7 +1117,33 @@ mod tests {
         (
             "grok",
             "https://storage.googleapis.com/grok-build-public-artifacts/cli/\
-             grok-1.0.67-macos-aarch64",
+             grok-1.0.70-linux-x86_64",
+        ),
+        (
+            "grok",
+            "https://storage.googleapis.com/grok-build-public-artifacts/cli/\
+             grok-1.0.70-linux-x86_64.zst",
+        ),
+        (
+            "grok",
+            "https://registry.npmjs.org/@xai-official/grok-linux-x64/1.0.70",
+        ),
+        (
+            "grok",
+            "https://registry.npmjs.org/@xai-official/grok-linux-x64/-/grok-linux-x64-1.0.70.tgz",
+        ),
+        (
+            "grok",
+            "https://registry.npmjs.org/@xai-official/grok-darwin-arm64/-/\
+             grok-darwin-arm64-1.0.70.tgz",
+        ),
+        (
+            "grok",
+            "https://registry.npmjs.org/@xai-official/grok-darwin-x64/1.0.70",
+        ),
+        (
+            "grok",
+            "https://registry.npmjs.org/@xai-official/grok-linux-arm64/1.0.70",
         ),
     ];
 
@@ -1225,6 +1264,23 @@ mod tests {
             "https://storage.googleapis.com/grok-build-public-artifacts/cli",
             "https://storage.googleapis.com/grok-build-public-artifacts/cli/a%2Fb",
             "https://storage.googleapis.com/xai-org/grok-build-public-artifacts/cli/stable",
+            "https://registry.npmjs.org/@xai-official/grok/1.0.70",
+            "https://registry.npmjs.org/@xai-official/grok/-/grok-1.0.70.tgz",
+            "https://registry.npmjs.org/@xai-official/grok-linux-x64",
+            "https://registry.npmjs.org/@xai-official/grok-linux-x64/",
+            "https://registry.npmjs.org/@xai-official%2Fgrok-linux-x64/1.0.70",
+            "https://registry.npmjs.org/@xai-official/grok-linux-x64/-%2Fgrok-linux-x64-1.0.70.tgz",
+            "https://registry.npmjs.org/@xai-official/grok-linux-x64/1.0.70?write=true",
+            "https://registry.npmjs.org/@xai-official/grok-linux-x64/../grok/1.0.70",
+            "https://registry.npmjs.org/@xai-official/grok-linux-x64/%2e%2e/grok/1.0.70",
+            "https://registry.npmjs.org/@xai-officia1/grok-linux-x64/1.0.70",
+            "https://registry.npmjs.org/@evil/grok-linux-x64/1.0.70",
+            "https://registry.npmjs.org/grok-linux-x64/1.0.70",
+            "https://registry.npmjs.org/-/npm/v1/keys",
+            "https://registry.npmjs.org.evil.com/@xai-official/grok-linux-x64/1.0.70",
+            "https://registry.npmjs.com/@xai-official/grok-linux-x64/1.0.70",
+            "https://registry.yarnpkg.com/@xai-official/grok-linux-x64/1.0.70",
+            "https://registry.npmjs.org/@xai-official/grok-win32-x64/1.0.70",
             "",
         ] {
             for program in crate::vendor_direct::VENDORS.iter().map(|s| s.program) {

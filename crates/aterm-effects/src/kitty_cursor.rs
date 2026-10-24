@@ -1511,14 +1511,14 @@ const EXIT_HEART_PINK: u32 = 0x00FF_5C8A;
 
 /// The exit flourish's light-theme inks, through the shared recipe.
 #[inline]
-fn exit_heart_light() -> u32 {
-    static INK: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *INK.get_or_init(|| InkRole::OverText.ink(EXIT_HEART_PINK))
+const fn exit_heart_light() -> u32 {
+    const INK: u32 = InkRole::OverText.ink(EXIT_HEART_PINK);
+    INK
 }
 #[inline]
-fn exit_star_light() -> u32 {
-    static INK: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *INK.get_or_init(|| InkRole::OverText.ink(twinkle_rgb(true)))
+const fn exit_star_light() -> u32 {
+    const INK: u32 = InkRole::OverText.ink(twinkle_rgb(true));
+    INK
 }
 
 /// Draw the fade-out flourish (a rising heart for HeartMeow, a sparkling star for StarWink) near the cat anchor `(ax, ay)` in window-absolute pixels.

@@ -306,16 +306,18 @@ impl Spine {
         } else if rise < DISP_SNAP_ZERO {
             self.slamming = false;
         }
-        let ease = if rise <= 0.0 {
-            DISP_RELEASE_TAU
-        } else if self.slamming {
-            DISP_SLAM_S
-        } else {
-            DISP_ATTACK_S
-        };
-        self.disp += rise * (1.0 - (-dt / ease).exp());
-        if self.disp < DISP_SNAP_ZERO {
-            self.disp = 0.0;
+        if rise != 0.0 {
+            let ease = if rise < 0.0 {
+                DISP_RELEASE_TAU
+            } else if self.slamming {
+                DISP_SLAM_S
+            } else {
+                DISP_ATTACK_S
+            };
+            self.disp += rise * (1.0 - (-dt / ease).exp());
+            if self.disp < DISP_SNAP_ZERO {
+                self.disp = 0.0;
+            }
         }
         self.disp_peak = if self.disp >= self.disp_peak {
             self.disp

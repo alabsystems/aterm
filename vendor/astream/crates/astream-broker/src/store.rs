@@ -509,6 +509,31 @@ pub struct LogStats {
     pub held_bytes: u64,
 }
 
+/// What one tail has been TOLD of the records retention gave up below it
+/// ([`BrokerLog::gap_notice`]): up to where its last notice told (`to`: the tail's start
+/// before any; a look that tells nothing leaves it), the ledger's order when it last looked
+/// (`seen`), whether its last notice carried a count, and the retention epoch it last
+/// looked at (`None`: never yet).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Told {
+    to: u64,
+    seen: u64,
+    counted: bool,
+    epoch: Option<u64>,
+}
+
+impl Told {
+    /// A tail starting at `start`, told nothing yet.
+    pub(crate) const fn at(start: u64) -> Told {
+        Told {
+            to: start,
+            seen: 0,
+            counted: false,
+            epoch: None,
+        }
+    }
+}
+
 /// A durable, single-writer message log with exactly-once ingest and durable
 /// consumer-group commit offsets.
 pub struct BrokerLog {
@@ -768,6 +793,10 @@ pub struct BrokerLog {
     /// or an earlier open's `<log>.held` is read.
     #[cfg(feature = "retention")]
     hold: crate::held::HeldStore,
+    /// Moves whenever what a tail below the base is owed may have changed — a compaction
+    /// landed, the held store gave records up, the rules changed — so a tail looks again
+    /// only then ([`gap_notice`](Self::gap_notice)).
+    retention_epoch: u64,
     /// Encrypt-at-rest key. `Some` seals every record's payload on disk under
     /// XChaCha20-Poly1305 (bound to its log index as AAD); `None` writes plaintext
     /// frames. Set only by the `open_encrypted*` constructors. The key is never
@@ -3503,6 +3532,10 @@ impl BrokerLog {
         } else {
             crate::held::HeldStore::default()
         };
+        // What was given up before this open is not known one by one (`held.rs`, "The
+        // ledger, in memory only").
+        #[cfg(feature = "retention")]
+        hold.ledger.whole_from(base.0);
         let prior = if created {
             Prior::Absent
         } else {
@@ -3706,6 +3739,7 @@ impl BrokerLog {
             compact_seam: crate::compact::Seam::default(),
             #[cfg(feature = "retention")]
             hold,
+            retention_epoch: 0,
             at_rest_key,
             head_watermark,
             replication_epoch: 0,
@@ -7091,6 +7125,90 @@ impl BrokerLog {
         self.read_range(Offset(*cursor), behind.min(max))
     }
 
+    /// THE GAP NOTICE a tail reading `filter` is owed at `cursor` before its next record
+    /// (`REQUIREMENTS-fabric-operations` R4, addendum A9), `told` what it was told before:
+    /// `Some` when records of its filter at or above the cursor were given up that no notice
+    /// told it of. The range runs from the cursor to the filter's [`oldest`](Self::oldest);
+    /// below it every record of the filter the tail is not delivered — [`read_chunk`]
+    /// delivers the held ones — was given up. The count is the held store's ledger's where
+    /// that names every one (`HeldStore::gap_count`): each record not counted before (a
+    /// later give-up inside a range already told is told again, with its own count). Where
+    /// it cannot be known the range alone is told, once, and covers every later give-up
+    /// inside it; a range a count found nothing in is not told at all.
+    ///
+    /// Under the log lock, so no compaction lands between it and the chunk read after it.
+    /// It looks again only when the retention epoch has moved since its last look, and a
+    /// cursor at or above the base is owed nothing: what retention gives up is all below
+    /// the base it leaves, which never passes the visible head.
+    ///
+    /// [`read_chunk`]: Self::read_chunk
+    pub(crate) fn gap_notice(
+        &self,
+        filter: &Filter,
+        cursor: u64,
+        told: &mut Told,
+    ) -> Option<crate::proto::Gap> {
+        if told.epoch == Some(self.retention_epoch) {
+            return None;
+        }
+        told.epoch = Some(self.retention_epoch);
+        let seen = self.ledger_seq();
+        if cursor >= self.base.0 {
+            told.seen = seen;
+            return None;
+        }
+        let to = told.to.max(self.oldest(filter).0);
+        let notice = if cursor < to {
+            match self.gap_count(filter, cursor, to, told) {
+                Some(0) => None,
+                Some(n) => Some(Some(n)),
+                None if to > told.to || told.counted => Some(None),
+                None => None,
+            }
+        } else {
+            None
+        };
+        told.seen = seen;
+        // `to` moves only with a notice: a look that told nothing (a count of none, or a
+        // range it cannot count and need not tell again) leaves the range still owed where
+        // it was, so a give-up inside it that can no longer be counted is still told.
+        let records = notice?;
+        told.to = to;
+        told.counted = records.is_some();
+        Some(crate::proto::Gap {
+            from: cursor,
+            to,
+            records,
+        })
+    }
+
+    /// The order of the newest record the held store's ledger names (`0` without it).
+    fn ledger_seq(&self) -> u64 {
+        #[cfg(feature = "retention")]
+        {
+            self.hold.ledger.seq()
+        }
+        #[cfg(not(feature = "retention"))]
+        {
+            0
+        }
+    }
+
+    /// [`HeldStore::gap_count`](crate::held::HeldStore::gap_count) for a tail at `cursor`
+    /// owed up to `to`; `None` without the `retention` feature (nothing is ledgered).
+    fn gap_count(&self, filter: &Filter, cursor: u64, to: u64, told: &Told) -> Option<u64> {
+        #[cfg(feature = "retention")]
+        {
+            self.hold
+                .gap_count(self.base.0, filter, cursor, to, told.to, told.seen)
+        }
+        #[cfg(not(feature = "retention"))]
+        {
+            let _ = (filter, cursor, to, told);
+            None
+        }
+    }
+
     /// The retained record at ABSOLUTE offset `off` (records are held base-relative),
     /// or `None` if it was pruned or is not committed.
     fn record_at(&self, off: u64) -> Option<&Arc<BrokerRecord>> {
@@ -7203,14 +7321,15 @@ impl BrokerLog {
             return Ok(None);
         }
         // A log its rules retain carries, at any cut, what they hold below it, and its
-        // state: the planning at that cut, its clock the tick's last stamp.
+        // state: the planning at that cut, its clock the tick's last stamp. A log whose
+        // rules were read back and not set again writes what the cut drops unnamed.
+        let perms = self.file.os()?.metadata()?.permissions();
         let held = if self.hold.active {
             let now = match self.hold.stamps.last() {
                 Some(&(_, ms)) => ms,
                 None => 0,
             };
             let plan = self.retention_plan(now, min, Some(min));
-            let perms = self.file.os()?.metadata()?.permissions();
             Some(self.hold.job(
                 &self.path,
                 self.at_rest_key.as_ref(),
@@ -7219,21 +7338,28 @@ impl BrokerLog {
                 plan,
             )?)
         } else {
-            None
+            self.hold.unplanned_job(
+                &self.path,
+                self.at_rest_key.as_ref(),
+                &perms,
+                self.base.0,
+                min,
+            )?
         };
-        self.compact_open(min, carry_state, held).map(Some)
+        let carry = carry_state || self.hold.active;
+        self.compact_open(min, carry, held).map(Some)
     }
 
     #[cfg(feature = "retention")]
     /// Open the copy of a compaction to `min` (above the base), carrying state when
-    /// `carry` or when the rules retain the log (`held`).
+    /// `carry` (which a log its rules retain always does), and writing `held`'s frames to
+    /// the held store first.
     fn compact_open(
         &mut self,
         min: u64,
         carry: bool,
         held: Option<crate::held::HeldJob>,
     ) -> io::Result<Compaction> {
-        let carry = carry || held.is_some();
         if !carry {
             self.refuse_retention_blocker(min)?;
         }
@@ -7311,7 +7437,10 @@ impl BrokerLog {
             &perms,
             self.base.0,
             rules,
-        )
+        )?;
+        // What a filter's oldest is, and whether its give-ups are counted, read the rules.
+        self.retention_epoch = self.retention_epoch.wrapping_add(1);
+        Ok(())
     }
 
     #[cfg(feature = "retention")]
@@ -7400,8 +7529,16 @@ impl BrokerLog {
             ));
         }
         if !self.hold.active {
+            let perms = self.file.os()?.metadata()?.permissions();
+            let held = self.hold.unplanned_job(
+                &self.path,
+                self.at_rest_key.as_ref(),
+                &perms,
+                self.base.0,
+                at_least,
+            )?;
             return Ok(Some(RetentionJob::Compact(
-                self.compact_open(at_least, true, None)?,
+                self.compact_open(at_least, true, held)?,
             )));
         }
         let mut plan = self.retention_plan(now, ceiling, None);
@@ -7482,6 +7619,7 @@ impl BrokerLog {
         tick.lost = lost.into_iter().collect();
         self.hold.finish(job);
         self.hold.prune_stamps(self.base.0);
+        self.retention_epoch = self.retention_epoch.wrapping_add(1);
     }
 
     #[cfg(feature = "retention")]
@@ -7656,9 +7794,14 @@ impl BrokerLog {
             dropped: c.drop_count,
             ..RetentionTick::default()
         };
-        if let Some(job) = c.held.take() {
-            self.held_finish(job, &mut tick);
+        match c.held.take() {
+            // A planned job, or one that says what a cut no rules planned dropped unnamed
+            // (`HeldStore::unplanned_job`).
+            Some(job) => self.held_finish(job, &mut tick),
+            // No rules: what the cut dropped is not named one by one.
+            None => self.hold.cut_unplanned(c.min),
         }
+        self.retention_epoch = self.retention_epoch.wrapping_add(1);
         Ok(tick)
     }
 

@@ -104,6 +104,7 @@ mod a11y_backend;
 mod a11y_tree;
 mod about;
 mod accessibility;
+mod act_barrier;
 #[cfg(test)]
 mod active_handle_conformance;
 mod alert_keys;
@@ -6796,6 +6797,7 @@ struct WindowState {
     preedit: String,
     preedit_caret: Option<usize>,
     ime_compose: Option<(std::time::Instant, bool)>,
+    ime_recipient: Option<app_input::ImeComposition>,
     preedit_shown: bool,
     last_ime_rect: Option<(i32, i32, u32, u32)>,
     search: Option<SearchState>,
@@ -7765,6 +7767,7 @@ impl WindowState {
             preedit: String::new(),
             preedit_caret: None,
             ime_compose: None,
+            ime_recipient: None,
             preedit_shown: false,
             last_ime_rect: None,
             search: None,

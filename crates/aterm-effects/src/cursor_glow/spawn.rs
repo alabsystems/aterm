@@ -492,9 +492,10 @@ impl CursorGlow {
                     }
                 };
                 let (x0, y0) = geom.cell_center(rr, rc);
+                let (sin_a, cos_a) = a.sin_cos();
                 self.spawn_bolt(
                     (x0, y0),
-                    (x0 + a.cos() * len, y0 + a.sin() * len),
+                    (x0 + cos_a * len, y0 + sin_a * len),
                     chf,
                     false,
                     now,
@@ -612,6 +613,7 @@ impl CursorGlow {
                 1 + (self.heat * 3.0) as usize
             };
             let cell = geom.ch as f32;
+            let cwf = geom.cw as f32;
             let hue0 = self.hue;
             let laser_cov_scale = if burst > 0 {
                 (burst as f32).sqrt().recip()
@@ -642,7 +644,7 @@ impl CursorGlow {
                             let (fx, fy) = leap_from;
                             (fx + (ox - fx) * r0, fy + (oy - fy) * r0)
                         } else {
-                            (ox + (r0 - 0.5) * geom.cw as f32, oy)
+                            (ox + (r0 - 0.5) * cwf, oy)
                         };
                         if r5 < pop_p {
                             Particle {
@@ -658,7 +660,7 @@ impl CursorGlow {
                             }
                         } else if r5 < pop_p + smolder_p {
                             Particle {
-                                x0: bx + (r1 - 0.5) * 1.2 * geom.cw as f32,
+                                x0: bx + (r1 - 0.5) * 1.2 * cwf,
                                 y0: by + (r1 - 0.5) * 0.5 * cell,
                                 vx: (r1 - 0.5) * 0.5 * cell,
                                 vy: -(0.2 + r2 * 0.45) * cell,
@@ -705,7 +707,7 @@ impl CursorGlow {
                                 }
                             } else {
                                 Particle {
-                                    x0: ox + (r0 - 0.5) * geom.cw as f32,
+                                    x0: ox + (r0 - 0.5) * cwf,
                                     y0: oy,
                                     vx: (r1 - 0.5) * 2.2 * cell,
                                     vy: -(0.8 + r2 * 1.6) * cell,
@@ -719,7 +721,7 @@ impl CursorGlow {
                         } else {
                             if r5 < bubble_p {
                                 Particle {
-                                    x0: ox - (0.4 + r0 * 1.6) * geom.cw as f32,
+                                    x0: ox - (0.4 + r0 * 1.6) * cwf,
                                     y0: oy + (r1 - 0.5) * 0.5 * cell,
                                     vx: -(0.2 + r1 * 0.3) * cell,
                                     vy: -(0.15 + r2 * 0.35) * cell,
@@ -731,7 +733,7 @@ impl CursorGlow {
                                 }
                             } else if r5 < bubble_p + drip_p {
                                 Particle {
-                                    x0: ox + (r0 - 0.5) * 0.8 * geom.cw as f32,
+                                    x0: ox + (r0 - 0.5) * 0.8 * cwf,
                                     y0: oy + 0.35 * cell,
                                     vx: (r1 - 0.5) * 0.15 * cell,
                                     vy: 0.05 * cell,
@@ -743,7 +745,7 @@ impl CursorGlow {
                                 }
                             } else {
                                 Particle {
-                                    x0: ox + (r0 - 0.5) * geom.cw as f32,
+                                    x0: ox + (r0 - 0.5) * cwf,
                                     y0: oy,
                                     vx: (r1 - 0.5) * (1.2 + 1.6 * heat) * cell,
                                     vy: -(0.5 + r2 * (0.9 + 1.3 * heat)) * cell,
@@ -757,13 +759,13 @@ impl CursorGlow {
                         }
                     }
                     GlowStyle::Laser => {
-                        let a = r0 * std::f32::consts::TAU;
+                        let (sin_a, cos_a) = (r0 * std::f32::consts::TAU).sin_cos();
                         let speed = (1.1 + r1 * 2.6) * cell;
                         Particle {
                             x0: ox,
                             y0: oy,
-                            vx: a.cos() * speed * 1.4,
-                            vy: a.sin() * speed * 0.5 - 0.25 * cell,
+                            vx: cos_a * speed * 1.4,
+                            vy: sin_a * speed * 0.5 - 0.25 * cell,
                             gy: 3.6 * cell,
                             life: 0.16 + r3 * 0.28,
                             hue: r4,
@@ -779,10 +781,7 @@ impl CursorGlow {
                                 fy + (oy - fy) * r0 + (r1 - 0.5) * 0.8 * cell,
                             )
                         } else {
-                            (
-                                ox - (0.3 + r0 * 2.2) * geom.cw as f32,
-                                oy + (r1 - 0.5) * 0.9 * cell,
-                            )
+                            (ox - (0.3 + r0 * 2.2) * cwf, oy + (r1 - 0.5) * 0.9 * cell)
                         };
                         Particle {
                             x0: bx,
@@ -801,11 +800,11 @@ impl CursorGlow {
                         let (bx, by) = if dist >= 2.0 {
                             (fx + (ox - fx) * r0, fy + (oy - fy) * r0)
                         } else {
-                            (ox + (r0 - 0.5) * geom.cw as f32, oy)
+                            (ox + (r0 - 0.5) * cwf, oy)
                         };
                         let (tx, ty) = comet_drift.unwrap_or_else(|| {
-                            let a = r0 * std::f32::consts::TAU;
-                            (a.cos(), a.sin())
+                            let (sin_a, cos_a) = (r0 * std::f32::consts::TAU).sin_cos();
+                            (cos_a, sin_a)
                         });
                         let speed = (0.25 + r1 * 0.55) * cell;
                         Particle {
@@ -821,7 +820,7 @@ impl CursorGlow {
                         }
                     }
                     GlowStyle::Sparkle => {
-                        let a = r0 * std::f32::consts::TAU;
+                        let (sin_a, cos_a) = (r0 * std::f32::consts::TAU).sin_cos();
                         let speed = (0.35 + r1 * 1.3) * cell;
                         let (bx, by) = if dist >= 2.0 {
                             let (fx, fy) = leap_from;
@@ -830,16 +829,13 @@ impl CursorGlow {
                                 fy + (oy - fy) * r2 + (r4 - 0.5) * 0.6 * cell,
                             )
                         } else {
-                            (
-                                ox + (r2 - 0.5) * geom.cw as f32,
-                                oy + (r4 - 0.5) * 0.5 * cell,
-                            )
+                            (ox + (r2 - 0.5) * cwf, oy + (r4 - 0.5) * 0.5 * cell)
                         };
                         Particle {
                             x0: bx,
                             y0: by,
-                            vx: a.cos() * speed,
-                            vy: a.sin() * speed - 0.15 * cell,
+                            vx: cos_a * speed,
+                            vy: sin_a * speed - 0.15 * cell,
                             gy: 1.1 * cell,
                             life: 0.5 + r3 * 0.7,
                             hue: (hue0 + r5 * 0.3).fract(),
@@ -848,7 +844,7 @@ impl CursorGlow {
                         }
                     }
                     _ => {
-                        let a = r0 * std::f32::consts::TAU;
+                        let (sin_a, cos_a) = (r0 * std::f32::consts::TAU).sin_cos();
                         let speed = (0.4 + r1 * 1.6) * cell;
                         let (bx, by) = if dist >= 2.0 {
                             let (fx, fy) = leap_from;
@@ -857,16 +853,13 @@ impl CursorGlow {
                                 fy + (oy - fy) * r2 + (r4 - 0.5) * 0.6 * cell,
                             )
                         } else {
-                            (
-                                ox + (r2 - 0.5) * geom.cw as f32,
-                                oy + (r4 - 0.5) * 0.5 * cell,
-                            )
+                            (ox + (r2 - 0.5) * cwf, oy + (r4 - 0.5) * 0.5 * cell)
                         };
                         Particle {
                             x0: bx,
                             y0: by,
-                            vx: a.cos() * speed,
-                            vy: a.sin() * speed,
+                            vx: cos_a * speed,
+                            vy: sin_a * speed,
                             gy: 2.2 * cell,
                             life: 0.35 + r3 * 0.45,
                             hue: (hue0 + r5 * 0.3).fract(),
@@ -932,7 +925,7 @@ impl CursorGlow {
                 let (tx, ty) = (root.0 - prevp.0, root.1 - prevp.1);
                 let tl = (tx * tx + ty * ty).sqrt().max(1e-3);
                 let bend = (self.frand() - 0.5) * 1.9;
-                let (bc, bs) = (bend.cos(), bend.sin());
+                let (bs, bc) = bend.sin_cos();
                 let (ux, uy) = (tx / tl, ty / tl);
                 let (bx, by) = (ux * bc - uy * bs, ux * bs + uy * bc);
                 let blen = (len * (0.14 + self.frand() * 0.22)).max(cell);
@@ -1206,6 +1199,8 @@ impl CursorGlow {
             GlowStyle::Water | GlowStyle::Comet => {
                 let comet = matches!(cfg.style, GlowStyle::Comet);
                 let drops = (3 + (n as usize) / 8).min(5);
+                let drops_f = drops as f32;
+                let gy = if comet { 0.25 * cell } else { 3.0 * cell };
                 for k in 0..drops {
                     if self.particles.len() >= Self::MAX_PARTICLES {
                         break;
@@ -1216,11 +1211,11 @@ impl CursorGlow {
                     let r3 = self.frand();
                     let r4 = self.frand();
                     self.particles.push(Particle {
-                        x0: span_x0 + ((k as f32 + 0.5) / drops as f32) * span_w + (r0 - 0.5) * cwf,
+                        x0: span_x0 + ((k as f32 + 0.5) / drops_f) * span_w + (r0 - 0.5) * cwf,
                         y0: oy,
                         vx: (r1 - 0.5) * 1.4 * cell,
                         vy: -(0.5 + r2 * 0.9) * cell,
-                        gy: if comet { 0.25 * cell } else { 3.0 * cell },
+                        gy,
                         life: if comet {
                             0.45 + r3 * 0.6
                         } else {
@@ -1234,7 +1229,8 @@ impl CursorGlow {
             }
             GlowStyle::Fire => {
                 let puffs = ((1.0 + nf.sqrt()) as usize).clamp(1, 5);
-                let x_at = |k: usize| span_x0 + ((k as f32 + 0.5) / puffs as f32) * span_w;
+                let puffs_f = puffs as f32;
+                let x_at = |k: usize| span_x0 + ((k as f32 + 0.5) / puffs_f) * span_w;
                 self.spawn_quench_steam(puffs, x_at, oy, cell, cwf, now);
             }
             _ => {
@@ -1267,6 +1263,7 @@ impl CursorGlow {
             1.0
         };
         let stars = ((ERASE_POOF_STARS * drive) as usize).clamp(4, ERASE_POOF_CAP);
+        let stars_f = stars as f32;
         let speed = 0.55 + 0.85 * mom.clamp(0.0, 1.0);
         let heft = erase_weight(n) / ERASE_WEIGHT_CAP;
         let spread_w = span_w.min(cwf * ERASE_POOF_SPREAD_CELLS);
@@ -1282,7 +1279,7 @@ impl CursorGlow {
             let r2 = self.frand();
             let r3 = self.frand();
             let r4 = self.frand();
-            let f = (k as f32 + 0.5) / stars as f32;
+            let f = (k as f32 + 0.5) / stars_f;
             self.particles.push(Particle {
                 x0: span_x0 + spread_w * f * f + (r0 - 0.5) * cwf,
                 y0: oy + (r1 - 0.5) * cell * heft_y,
@@ -1328,13 +1325,14 @@ impl CursorGlow {
         now: Instant,
     ) {
         let puffs = ((1.0 + f32::from(n).sqrt() * 1.4) as usize).clamp(1, 8);
+        let puffs_f = puffs as f32;
         let spread_w = span_w.min(cwf * ERASE_POOF_SPREAD_CELLS);
         for k in 0..puffs {
             if self.vapor.len() >= Self::MAX_VAPOR {
                 break;
             }
             let (r0, r1, r2) = (self.frand(), self.frand(), self.frand());
-            let f = (k as f32 + 0.5) / puffs as f32;
+            let f = (k as f32 + 0.5) / puffs_f;
             self.vapor.push(Vapor {
                 x0: span_x0 + spread_w * f * f + (r0 - 0.5) * cwf,
                 y0: oy,

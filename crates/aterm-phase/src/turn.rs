@@ -527,6 +527,138 @@ pub fn turn_whole(rows: &[String]) -> bool {
     turn_before(rows).is_some_and(|(opened, _)| opened)
 }
 
+/// Returns whether the last turn on `rows` ran a tool: a call's row (`⏺ Bash(…)`, [`stop_task`]) or a collapsed tool group's ([`tool_group`]) under the `❯` prompt that opened it.
+#[must_use]
+pub fn turn_ran_tools(rows: &[String]) -> bool {
+    let end = crate::phase::composer_frame(rows).map_or(rows.len(), |f| f.top);
+    let width = crate::question::screen_width(rows);
+    (0..end)
+        .rev()
+        .take_while(|&i| !rows[i].starts_with('❯'))
+        .any(|i| {
+            is_tool_call(&rows[i]) || stop_task(rows, i, end) || tool_group(rows, i, end, width)
+        })
+}
+
+/// TaskStop's call row, drawn with no `(…)` as its use message is empty: `⏺ Stop Task`, its `⎿` output row under it.
+fn stop_task(rows: &[String], i: usize, until: usize) -> bool {
+    rows[i].strip_prefix("⏺ ").is_some_and(|name| {
+        crate::text::trim_end(name) == const { crate::anchor!("turn.call.stop_task") }
+    }) && i + 1 < until
+        && rows[i + 1].starts_with("  ⎿")
+}
+
+/// Returns whether the `❯` prompt that opened the last turn is above `rows`, so [`turn_ran_tools`] read the turn's lower rows only.
+#[must_use]
+pub fn turn_opens_above(rows: &[String]) -> bool {
+    let end = crate::phase::composer_frame(rows).map_or(rows.len(), |f| f.top);
+    !rows[..end].iter().any(|r| r.starts_with('❯'))
+}
+
+/// The verbs a collapsed tool group's first clause opens with, a count and its nouns after (`Read 1 file`, `Running 2 shell commands…`).
+const GROUP_VERBS: [&str; 8] = [
+    crate::anchor!("turn.group.reading"),
+    crate::anchor!("turn.group.read"),
+    crate::anchor!("turn.group.searched"),
+    crate::anchor!("turn.group.searching"),
+    crate::anchor!("turn.group.listed"),
+    crate::anchor!("turn.group.listing"),
+    crate::anchor!("turn.group.running"),
+    crate::anchor!("turn.group.ran"),
+];
+
+/// The nouns a group's clause counts with no expand hint, singular or plural (`Read 1 file`, `Ran 2 shell commands`).
+const GROUP_NOUNS: [&str; 4] = [
+    crate::anchor!("turn.group.file"),
+    crate::anchor!("turn.group.pattern"),
+    crate::anchor!("turn.group.directory"),
+    crate::anchor!("turn.group.shell_command"),
+];
+
+/// Whether row `i` opens Claude Code's collapsed tool group, read across the rows it wraps onto: a `⏺ ` or two-space row whose first clause is a verb, a count and up to three lower-case nouns (`⏺ Reading 1 file… (ctrl+o to expand)`), or `Called` and a server, then the expand hint; with no hint, every clause such a count of a [`GROUP_NOUNS`] noun, a two-space row standing alone under a blank row, another group or the screen's top (`  Read 1 file`), never a reply's next row. A stop hook's summary is no tool.
+fn tool_group(rows: &[String], i: usize, until: usize, width: usize) -> bool {
+    let row = rows[i].as_str();
+    let headed = row.starts_with("⏺ ");
+    if !headed && !(row.starts_with("  ") && leading_spaces(row) == 2) {
+        return false;
+    }
+    let (_, line) = crate::phase::line_at(rows, i, until, width);
+    let text = crate::text::trim(&line);
+    let text = text.strip_prefix('⏺').map_or(text, crate::text::trim_start);
+    let hinted = text.strip_suffix(const { crate::anchor!("turn.group.expand") });
+    let text = crate::text::trim_end(hinted.unwrap_or(text));
+    let text = text.strip_suffix('…').unwrap_or(text);
+    let mut clauses = text.split(", ");
+    let first = clauses.next().unwrap_or_default();
+    match hinted {
+        Some(_) => counted(first, false, false) || called(first),
+        None => {
+            let alone = headed
+                || i == 0
+                || crate::text::trim(&rows[i - 1]).is_empty()
+                || tool_group(rows, i - 1, until, width);
+            alone && counted(first, false, true) && clauses.all(|c| counted(c, true, true))
+        }
+    }
+}
+
+/// A group's clause of a verb ([`GROUP_VERBS`], lower-case past the first), a count and up to three lower-case nouns, `named` one of [`GROUP_NOUNS`]; a stop hook's is none.
+fn counted(clause: &str, later: bool, named: bool) -> bool {
+    GROUP_VERBS.iter().any(|verb| {
+        let Some((n, nouns)) = clause
+            .get(..verb.len())
+            .filter(|head| {
+                if later {
+                    head.eq_ignore_ascii_case(verb)
+                        && head.starts_with(|c: char| c.is_ascii_lowercase())
+                } else {
+                    head == verb
+                }
+            })
+            .and_then(|_| clause[verb.len()..].strip_prefix(' '))
+            .and_then(|r| r.split_once(' '))
+        else {
+            return false;
+        };
+        let words: Vec<&str> = nouns.split(' ').collect();
+        !n.is_empty()
+            && n.bytes().all(|b| b.is_ascii_digit())
+            && words.len() <= 3
+            && words
+                .iter()
+                .all(|w| !w.is_empty() && w.bytes().all(|b| b.is_ascii_lowercase()))
+            && !nouns.starts_with(const { crate::anchor!("hook.ran.stop") })
+            && (!named || GROUP_NOUNS.iter().any(|noun| group_noun(nouns, noun)))
+    })
+}
+
+/// Whether `nouns` is `noun`, or its plural (`files`, `directories`).
+fn group_noun(nouns: &str, noun: &str) -> bool {
+    nouns == noun
+        || nouns.strip_suffix('s') == Some(noun)
+        || noun
+            .strip_suffix('y')
+            .is_some_and(|stem| nouns.strip_suffix("ies") == Some(stem))
+}
+
+/// A group's `Called` clause: the server's name, and how many times past one (`Called github 2 times`).
+fn called(clause: &str) -> bool {
+    clause
+        .strip_prefix(const { crate::anchor!("turn.group.called") })
+        .and_then(|r| r.strip_prefix(' '))
+        .is_some_and(|r| {
+            let (server, times) = r.split_once(' ').unwrap_or((r, ""));
+            !server.is_empty()
+                && server
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+                && (times.is_empty()
+                    || times
+                        .strip_suffix(" times")
+                        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())))
+        })
+}
+
 /// Returns whether `row` is a column-0 turn header that stops a scrollback history scan.
 #[must_use]
 pub fn turn_history_stop(row: &str) -> bool {
@@ -747,6 +879,213 @@ mod tests {
         let mut r = rows(body);
         r.extend(composer(footer));
         r
+    }
+
+    #[test]
+    fn a_turn_runs_tools_by_the_call_rows_under_its_prompt() {
+        let shells = screen(crate::prompt::fixtures::IDLE_SHELLS_2_1_271);
+        assert!(turn_ran_tools(&shells), "its two Bash calls");
+        let frame = crate::phase::composer_frame(&shells)
+            .expect("the composer")
+            .top;
+        let mut later = shells[..frame].to_vec();
+        later.extend(rows(&["❯ thanks", "", "⏺ You're welcome.", ""]));
+        later.extend(shells[frame..].iter().cloned());
+        assert!(
+            !turn_ran_tools(&later),
+            "the control: the calls are a turn before"
+        );
+        assert!(!turn_ran_tools(&framed(
+            &["⏺ Done.", ""],
+            "  ? for shortcuts"
+        )));
+    }
+
+    #[test]
+    fn a_turn_opens_above_the_screen_when_no_prompt_is_drawn_over_its_composer() {
+        let turn = framed(&["❯ go on", "", "⏺ Done.", ""], "  ? for shortcuts");
+        assert!(!turn_opens_above(&turn), "its prompt drawn");
+        assert!(turn_opens_above(&turn[1..]), "the rows under its prompt");
+        assert!(
+            turn_opens_above(&screen(crate::prompt::fixtures::IDLE_SHELLS_2_1_271)),
+            "a screen of a turn's last calls and words"
+        );
+    }
+
+    #[test]
+    fn a_turn_runs_tools_by_its_collapsed_group_row() {
+        use crate::prompt::fixtures::{
+            BOX_BASH_FIND_CONTINUED_2_1_308, BOX_EDIT, BOX_FETCH_2_1_287, BOX_READ_OUTSIDE_2_1_284,
+            BOX_READ_OUTSIDE_2_1_292, COLLAPSED_GROUP_CONTEXT_WALL_MEASURED,
+            IDLE_AFTER_LIMIT_AND_MODEL_SWITCH, SHELL_MODE_OUTPUT_ENDS_TURN_MEASURED,
+            STOP_HOOK_CONTEXT_WALL_MEASURED, STOP_HOOK_STOP_REASON_DETAILED_MEASURED,
+            STOP_HOOKS_VERBOSE_PROMPT_ROW_MEASURED, WRAPPED_GROUP_ROW_CONTEXT_WALL,
+        };
+        // A turn of the measured `row` alone, under the screen above it.
+        let ended_on = |text: &str, row: &str| -> Vec<String> {
+            let r = screen(text);
+            let at = r.iter().rposition(|x| x == row).expect("the row measured");
+            let mut out = r[..at].to_vec();
+            out.extend(rows(&["❯ go on", "", row, ""]));
+            out.extend(composer("  ? for shortcuts"));
+            out
+        };
+        let swapped = |rows: &[String], from: &str, to: &str| -> Vec<String> {
+            let at = rows.iter().rposition(|r| r == from).expect("the group row");
+            let mut out = rows.to_vec();
+            out[at] = to.to_owned();
+            out
+        };
+        for (name, text, group) in [
+            ("2.1.280, no hint", BOX_EDIT, "  Read 1 file"),
+            (
+                "2.1.284",
+                BOX_READ_OUTSIDE_2_1_284,
+                "⏺ Reading 1 file… (ctrl+o to expand)",
+            ),
+            (
+                "2.1.292",
+                BOX_READ_OUTSIDE_2_1_292,
+                "⏺ Reading 1 file… (ctrl+o to expand)",
+            ),
+            (
+                "2.1.287",
+                BOX_FETCH_2_1_287,
+                "  Read 1 file (ctrl+o to expand)",
+            ),
+            (
+                "2.1.294",
+                COLLAPSED_GROUP_CONTEXT_WALL_MEASURED,
+                "  Read 1 file (ctrl+o to expand)",
+            ),
+            (
+                "2.1.294, an MCP server's",
+                SHELL_MODE_OUTPUT_ENDS_TURN_MEASURED,
+                "  Called github (ctrl+o to expand)",
+            ),
+            (
+                "2.1.308",
+                BOX_BASH_FIND_CONTINUED_2_1_308,
+                "  Listed 1 directory (ctrl+o to expand)",
+            ),
+            (
+                "2.1.308",
+                BOX_BASH_FIND_CONTINUED_2_1_308,
+                "⏺ Searching for 1 pattern… (ctrl+o to expand)",
+            ),
+            (
+                "the 2026-09-12 capture, shell commands",
+                IDLE_AFTER_LIMIT_AND_MODEL_SWITCH,
+                "  Ran 2 shell commands",
+            ),
+        ] {
+            let r = ended_on(text, group);
+            assert!(turn_ran_tools(&r), "{name}: {group:?}");
+            for prose in [
+                "⏺ Reading the parser.",
+                "  Read 1 file before the rest",
+                "  Read 2 files, then fixed the parser",
+                "  Ran 2 shell commands.",
+                "  Called github about it",
+            ] {
+                assert!(
+                    !turn_ran_tools(&swapped(&r, group, prose)),
+                    "the control, {name}: {prose:?} is words"
+                );
+            }
+        }
+        for (name, text, hook) in [
+            (
+                "2.1.294",
+                STOP_HOOK_CONTEXT_WALL_MEASURED,
+                "⏺ Ran 1 stop hook (ctrl+o to expand)",
+            ),
+            (
+                "2.1.302, no hint",
+                STOP_HOOK_STOP_REASON_DETAILED_MEASURED,
+                "⏺ Ran 1 stop hook",
+            ),
+            (
+                "2.1.304",
+                STOP_HOOKS_VERBOSE_PROMPT_ROW_MEASURED,
+                "⏺ Ran 2 stop hooks",
+            ),
+        ] {
+            assert!(
+                !turn_ran_tools(&ended_on(text, hook)),
+                "the control, {name}: a stop hook is no tool"
+            );
+        }
+        // A reply's next row is its words, a count or not; standing alone, a noun no group counts is words too.
+        for said in [
+            &[
+                "⏺ Nothing changed since my last report:",
+                "  Ran 312 tests",
+                "  The suite is green and I am waiting on review.",
+            ][..],
+            &["⏺ Rebuilt and reran the suite:", "  Ran 2 shell commands"],
+            &[
+                "⏺ Nothing changed since my last report.",
+                "",
+                "  Ran 312 tests",
+            ],
+        ] {
+            let mut turn = rows(&["❯ go on", ""]);
+            turn.extend(rows(said));
+            turn.extend(rows(&["", "✻ Cogitated for 3s"]));
+            turn.extend(composer("  ? for shortcuts"));
+            assert!(!turn_ran_tools(&turn), "the control: {said:?} is words");
+        }
+        // TaskStop's row, as the 2026-09-12 capture draws it, its output under it.
+        let r = screen(IDLE_AFTER_LIMIT_AND_MODEL_SWITCH);
+        let at = r
+            .iter()
+            .rposition(|x| x == "⏺ Stop Task")
+            .expect("the row measured");
+        let mut stopped = rows(&["❯ go on", ""]);
+        stopped.extend(r[at..at + 3].iter().cloned());
+        stopped.extend(rows(&[
+            "",
+            "⏺ Stopped the rebuild.",
+            "",
+            "✻ Cogitated for 3s",
+        ]));
+        stopped.extend(composer("  ? for shortcuts"));
+        assert!(turn_ran_tools(&stopped), "{:?}", &r[at..at + 3]);
+        assert!(
+            !turn_ran_tools(&swapped(&stopped, "⏺ Stop Task", "⏺ Stop Task now")),
+            "the control: words"
+        );
+        let mut said = stopped.clone();
+        said.drain(3..5);
+        assert!(!turn_ran_tools(&said), "the control: no output under it");
+        // ExitPlanMode's row hands a plan to a person: no tool run by design (2.1.300).
+        let plan = screen(crate::prompt::fixtures::PLAN_READY_70_2_1_300);
+        let at = plan
+            .iter()
+            .position(|x| x == "⏺ Exited plan mode")
+            .expect("the row measured");
+        let mut planned = rows(&["❯ go on", ""]);
+        planned.extend(plan[at..at + 2].iter().cloned());
+        planned.extend(rows(&["⏺ Tool call done.", "", "✻ Sautéed for 0s"]));
+        planned.extend(composer("  ? for shortcuts"));
+        assert!(!turn_ran_tools(&planned), "{planned:?}");
+        // Hand-built; `Searched for` unwrapped is measured (2.1.295) in aterm-agent's
+        // `claude_codes_measured_group_rows_are_a_tool_run`.
+        let wrapped = screen(WRAPPED_GROUP_ROW_CONTEXT_WALL);
+        assert!(
+            turn_ran_tools(&wrapped),
+            "the group row wrapped at its hint"
+        );
+        let hooked = swapped(
+            &wrapped,
+            "  Searched for 2 patterns, read 1 file (ctrl+o",
+            "⏺ Ran 1 stop hook (ctrl+o",
+        );
+        assert!(
+            !turn_ran_tools(&hooked),
+            "the control: a stop hook is no tool"
+        );
     }
 
     #[test]

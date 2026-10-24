@@ -1245,6 +1245,7 @@ fn channel_contrast(linear: &[f32; 256], a: u8, b: u8) -> f32 {
 }
 
 /// Whether a composited pixel is still a stop.
+#[cfg(test)]
 #[inline]
 #[must_use]
 pub(crate) fn seen(rgb: u32, bg: u32) -> bool {
@@ -1431,6 +1432,8 @@ impl BedInkLut {
             self.key = Some(key);
             return;
         }
+        let light_a = (cov_cap(cfg) + 16.0).min(255.0) as u8;
+        let linear = &crate::color_math::relative_luminance_table().linear;
         for i in 0..BED_INK_LUT_LEN {
             let bed = if let Some(max_lut) = dark_max {
                 max_lut[i]
@@ -1440,13 +1443,14 @@ impl BedInkLut {
                     dim_edge_held(bed_ink(arc, budget), cfg.theme_fg, cfg.theme_bg)
                 } else {
                     let paper = paper_ink(arc, cfg.theme_fg, cfg.theme_bg, role);
-                    let a = (cov_cap(cfg) + 16.0).min(255.0) as u8;
-                    let shows = seen(
-                        over_premul(cfg.theme_bg, premul_rgb(paper, a), a) & 0x00FF_FFFF,
+                    let shows = seen_with(
+                        linear,
+                        over_premul(cfg.theme_bg, premul_rgb(paper, light_a), light_a)
+                            & 0x00FF_FFFF,
                         cfg.theme_bg,
                     );
                     if cfg.ribbon_tall && !shows {
-                        crate::cursor_glow::light_body_ink(arc, cfg.theme_fg, cfg.theme_bg, a)
+                        crate::cursor_glow::light_body_ink(arc, cfg.theme_fg, cfg.theme_bg, light_a)
                     } else {
                         paper
                     }
@@ -1572,7 +1576,11 @@ pub const fn walk_t(d: f32) -> f32 {
 #[inline]
 #[must_use]
 pub fn expiry_melt(u: f32) -> f32 {
-    let taper = smoothstep01((1.0 - clamp01(u)) / EXPIRY_MELT_SHARE);
+    let rem = 1.0 - clamp01(u);
+    if rem >= EXPIRY_MELT_SHARE {
+        return 1.0;
+    }
+    let taper = smoothstep01(rem / EXPIRY_MELT_SHARE);
     if taper >= 1.0 {
         1.0
     } else {
@@ -4491,6 +4499,7 @@ impl Ribbon {
             return;
         }
         let now = ctx.now;
+        let pane_col0 = self.pane.map_or(0, |(c0, _)| c0);
         let mut reach = [(0u16, 0u16, 0u32); REACH_STAGE];
         let mut n_reach = 0usize;
         for i in 0..self.cohorts.len() {
@@ -4521,10 +4530,7 @@ impl Ribbon {
                 .clamp(0, i32::from(REACH_BEATS)) as u16;
             let span = coh.col1.saturating_sub(coh.col0);
             let want = FOUR_LETTER_CELLS.saturating_sub(span).min(beats);
-            let reach_floor = self
-                .hand_floor_on(coh.row)
-                .unwrap_or(0)
-                .max(self.pane.map_or(0, |(c0, _)| c0));
+            let reach_floor = self.hand_floor_on(coh.row).unwrap_or(0).max(pane_col0);
             for k in 0..want {
                 let Some(c) = coh.col0.checked_sub(k + 1) else {
                     break;
@@ -4605,12 +4611,12 @@ impl Ribbon {
             return;
         }
         let cohorts = &self.cohorts;
-        let mut cached_coh: Option<(Cohort, bool)> = None;
+        let mut cached_coh: Option<(&Cohort, bool)> = None;
         self.cells.retain(|cell| {
             let (coh, phase_live) = match cached_coh {
                 Some((c, live)) if c.id == cell.cohort => (c, live),
                 _ => {
-                    let Some(&c) = cohorts.iter().find(|c| c.id == cell.cohort) else {
+                    let Some(c) = cohorts.iter().find(|c| c.id == cell.cohort) else {
                         return false;
                     };
                     let live = c.phase_at(c.idle_s(now)).is_some();
@@ -5006,11 +5012,12 @@ impl Ribbon {
         let chf = ctx.geom.ch as f32;
         let prof = Self::body_profile(ctx.cfg);
         let reduced = ctx.cfg.reduced_motion;
+        let disp = clamp01(ctx.disp);
         let room = (DN_TOP_CH - DN_FLOOR_CH) * chf;
         let amp = if reduced {
             0.0
         } else {
-            (WAVE_AMP_CELLS * chf * clamp01(ctx.disp)).min(room)
+            (WAVE_AMP_CELLS * chf * disp).min(room)
                 * smoothstep01(sp / WAVE_HEAD_PIN)
                 * (1.0 - settle)
         };
@@ -5022,20 +5029,26 @@ impl Ribbon {
         };
         let span = coh.map_or(1.0, |c| f32::from(c.col1.saturating_sub(c.col0)).max(1.0));
         let behind = sp * span;
-        let bloom = clamp01(ctx.disp) * (1.0 - smoothstep01(behind / BLOOM_REACH_CELLS));
+        let bloom = clamp01(disp * (1.0 - smoothstep01(behind / BLOOM_REACH_CELLS)));
         let row_bot = f32::from(ctx.geom.origin_y) + (f32::from(cell.row) + 1.0) * chf;
+        let dn_floor = DN_FLOOR_CH * chf;
+        let settle_scale = 1.0 - FLOW_SETTLE_SHARE * settle;
+        let breath_scale = 1.0 - breath;
+        let comet = Self::comet(ctx.cfg);
+        let fx_top = ctx.geom.fx_top() as f32;
+        let wave_pos = wave.max(0.0);
+        let wave_neg = wave.min(0.0);
+        let spine_raw = row_bot + wave;
         // The body over a floor at `pane_bot`: a held row's floor is its own
         // bottom, where it is laid as a last row is.
         let shape = |pane_bot: f32| -> (f32, f32, f32) {
             let room_below = pane_bot - row_bot;
             let last_row = room_below < prof.dn_ch * chf;
             let dn_ch = if last_row { DN_TOP_CH } else { prof.dn_ch };
-            let dn_open = chf * (DN_FLOOR_CH + (dn_ch - DN_FLOOR_CH) * clamp01(bloom));
-            let dn = (dn_open - wave.max(0.0)).max(DN_FLOOR_CH * chf);
-            let dn = (DN_FLOOR_CH * chf
-                + (dn - DN_FLOOR_CH * chf) * (1.0 - FLOW_SETTLE_SHARE * settle))
-                * (1.0 - breath);
-            let up_ch = if Self::comet(ctx.cfg) && !last_row {
+            let dn_open = chf * (DN_FLOOR_CH + (dn_ch - DN_FLOOR_CH) * bloom);
+            let dn = (dn_open - wave_pos).max(dn_floor);
+            let dn = (dn_floor + (dn - dn_floor) * settle_scale) * breath_scale;
+            let up_ch = if comet && !last_row {
                 prof.up_ch
                     * (1.0
                         - (1.0 - COMET_UP_TAIL_CH / TALL_UP_CH)
@@ -5043,12 +5056,8 @@ impl Ribbon {
             } else {
                 prof.up_ch
             };
-            let up = (up_ch * chf + wave.min(0.0)).max(0.0)
-                * (1.0 - FLOW_SETTLE_SHARE * settle)
-                * (1.0 - breath);
-            let spine = (row_bot + wave)
-                .min(pane_bot - dn)
-                .max(ctx.geom.fx_top() as f32);
+            let up = (up_ch * chf + wave_neg).max(0.0) * settle_scale * breath_scale;
+            let spine = spine_raw.min(pane_bot - dn).max(fx_top);
             (spine, up, dn)
         };
         let pane_bot = self.pane_bot(ctx, chf);
@@ -5650,6 +5659,7 @@ impl Ribbon {
                 verts.clear();
                 verts.reserve(run.hi - run.lo);
                 let mut head_rev = 0usize;
+                let head_rel = Some(run.head - run.lo);
                 #[cfg(test)]
                 let stair = self.tail_stair;
                 #[cfg(not(test))]
@@ -5665,7 +5675,7 @@ impl Ribbon {
                 if rail_layer {
                     let rail_scale = RAIL_GAIN * (1.0 - run.hold);
                     for_each_feathered(&plan[run.lo..run.hi], fine_feather, end_fine, |i, seg| {
-                        if i == Some(run.head - run.lo) {
+                        if i == head_rel {
                             head_rev = verts.len();
                         }
                         // The vivid rail lies a hairline below the row's bottom.
@@ -5686,7 +5696,7 @@ impl Ribbon {
                     });
                 } else {
                     for_each_feathered(&plan[run.lo..run.hi], fine_feather, end_fine, |i, seg| {
-                        if i == Some(run.head - run.lo) {
+                        if i == head_rel {
                             head_rev = verts.len();
                         }
                         let cov = seg.cov * feather(seg.x);
@@ -5945,12 +5955,13 @@ impl Ribbon {
         #[cfg(not(test))]
         let inset = 0.5 * HOT_EDGE_THICKNESS;
         let inv_reach = 1.0 / reach;
+        let neg_dir = -dir;
         frame.beams.clear();
         for seg in self.plan[run.lo..run.hi]
             .iter()
             .step_by(self.slabs_per_cell())
         {
-            let behind = (mouth_x - seg.x) * (-dir);
+            let behind = (mouth_x - seg.x) * neg_dir;
             let in_seam = seam.is_some_and(|(floor_x, _)| behind >= 0.0 && seg.x >= floor_x);
             if !(0.0..=reach).contains(&behind) && !in_seam {
                 continue;
@@ -6158,7 +6169,7 @@ impl Ribbon {
         let ember_left = self.ember_at.map(|at| FOCUS_EMBER_S - since(at));
         let ember_u = self.ember_at.map(|at| clamp01(since(at) / FOCUS_EMBER_S));
         let ember_spend = ember_u.map(spend);
-        let mut cached_coh: Option<(u32, Option<Cohort>)> = None;
+        let mut cached_coh: Option<(u32, Option<&Cohort>)> = None;
         for cell in &self.cells {
             if cad.at_tail_floor() {
                 break;
@@ -6166,7 +6177,7 @@ impl Ribbon {
             let coh = match cached_coh {
                 Some((id, c)) if id == cell.cohort => c,
                 _ => {
-                    let c = self.cohorts.iter().find(|c| c.id == cell.cohort).copied();
+                    let c = self.cohorts.iter().find(|c| c.id == cell.cohort);
                     cached_coh = Some((cell.cohort, c));
                     c
                 }

@@ -47,53 +47,42 @@ fn keyed<R: Clone>(rows: &[R], pid: impl Fn(&R) -> u32) -> BTreeMap<u32, R> {
     rows.iter().map(|r| (pid(r), r.clone())).collect()
 }
 
+/// The rows of the processes held still across the reads are the ones `ps` prints: the fixture
+/// shell's and this process's whole (both name paths of this user's, whose arguments are read),
+/// and launchd's ids (another user's). Only held processes are compared: a live one mid-exec or
+/// mid-exit reads as its unread `(comm)` in `ps` between two kernel reads that agree.
 #[test]
 fn the_table_is_the_one_ps_prints() {
     let shell = login_shell();
-    // SAFETY: `geteuid` reads this process's effective uid.
-    let uid = unsafe { libc::geteuid() };
-    let mine: std::collections::BTreeSet<u32> = aterm_sysprobe::kproc::records()
-        .expect("records")
-        .iter()
-        .filter(|r| r.uid == uid)
-        .map(|r| r.pid)
-        .collect();
+    let (fixture, me) = (shell.id(), std::process::id());
+    let held = [fixture, me, 1];
+    // Each held row is named at its read, while the fixture lives.
     let named = || {
         let t = table();
-        for (_, _, name) in &t {
-            name.as_str();
+        for (pid, _, name) in &t {
+            if held.contains(pid) {
+                name.as_str();
+            }
         }
         keyed(&t, |r| r.0)
     };
     let a = named();
-    let oracle = ps_table();
+    let oracle = keyed(&ps_table(), |r| r.0);
     let b = named();
-    let fixture = shell.id();
     end(shell);
-    let mut compared = 0;
-    for row in &oracle {
-        let (Some(x), Some(y)) = (a.get(&row.0), b.get(&row.0)) else {
-            continue;
+    for pid in held {
+        let (Some(x), Some(y), Some(row)) = (a.get(&pid), b.get(&pid), oracle.get(&pid)) else {
+            panic!("{pid}: in both reads and in ps's table");
         };
-        if x != y {
-            continue;
-        }
-        if mine.contains(&row.0) {
-            assert_eq!(x, row, "the row of {}", row.0);
+        assert_eq!(x, y, "{pid} is held still");
+        if pid == 1 {
+            assert_eq!((x.0, x.1), (row.0, row.1), "the row of {pid}");
         } else {
-            assert_eq!((x.0, x.1), (row.0, row.1), "the row of {}", row.0);
+            assert_eq!(x, row, "the row of {pid}");
         }
-        compared += 1;
     }
-    assert!(mine.contains(&fixture));
     assert_eq!(a[&fixture].2, "kproc-fixture");
-    assert_eq!(a[&fixture].1, std::process::id());
-    assert!(a.contains_key(&std::process::id()));
-    assert!(
-        compared * 2 >= oracle.len(),
-        "{compared} of {} rows compared",
-        oracle.len()
-    );
+    assert_eq!(a[&fixture].1, me);
 }
 
 #[test]
@@ -186,19 +175,19 @@ fn the_terminals_owner_and_opener_are_the_ones_ps_reads() {
         (opener(slept, script.id()), ps_opener(slept, script.id())),
         (opener(plain.id(), me), ps_opener(plain.id(), me)),
     ];
-    let mut compared = 0;
-    let mut seen = Vec::new();
-    for (pid, _, _, _) in &oracle {
-        let (Some(x), Some(y)) = (a.get(pid), b.get(pid)) else {
-            continue;
+    // Only the fixtures, held still across the reads, are compared: any other process may
+    // start, exec or end between them, and its terminal's owner with it.
+    for pid in fixtures {
+        let (Some(x), Some(y)) = (a.get(&pid), b.get(&pid)) else {
+            panic!("fixture {pid}: in both reads");
         };
-        if x != y {
-            continue;
-        }
-        let want = terminal_owner(*pid, &oracle).map(|(o, _)| o);
+        assert_eq!(x, y, "fixture {pid} is held still");
+        assert!(
+            oracle.iter().any(|r| r.0 == pid),
+            "fixture {pid}: in ps's table"
+        );
+        let want = terminal_owner(pid, &oracle).map(|(o, _)| o);
         assert_eq!(*x, want, "the owner of {pid}'s terminal");
-        compared += 1;
-        seen.push(*pid);
     }
     for (pid, got) in &live {
         let want = terminal_owner(*pid, &oracle).map(|(o, name)| (o, name.to_string()));
@@ -213,9 +202,6 @@ fn the_terminals_owner_and_opener_are_the_ones_ps_reads() {
     for c in [&mut script, &mut plain] {
         let _ = c.kill();
         let _ = c.wait();
-    }
-    for pid in fixtures {
-        assert!(seen.contains(&pid), "fixture {pid} compared");
     }
     assert_eq!(
         live[0].1.as_ref().map(|(o, _)| *o),
@@ -234,11 +220,6 @@ fn the_terminals_owner_and_opener_are_the_ones_ps_reads() {
         "the same opener"
     );
     assert_eq!(opened[1].0.as_deref(), Some(host.as_str()));
-    assert!(
-        compared * 2 >= oracle.len(),
-        "{compared} of {} rows compared",
-        oracle.len()
-    );
 }
 
 #[test]

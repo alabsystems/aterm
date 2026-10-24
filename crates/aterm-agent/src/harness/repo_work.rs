@@ -169,8 +169,11 @@ pub enum RepoRead {
     Clean,
     /// What the repository holds that no remote main has.
     Found(RepoWork),
-    /// The probe did not finish within its limit (a hung or starved `git`):
-    /// what the repository holds is not known.
+    /// The probe did not finish within its limit (a hung or starved `git`),
+    /// or could not read the repository it found (a `git` that could not
+    /// start for want of a file descriptor or process, one a signal ended,
+    /// a status read a broken index or submodule fails): what the repository
+    /// holds is not known.
     Unread,
 }
 
@@ -486,7 +489,8 @@ pub fn printable(text: &str) -> String {
 }
 
 /// What the repository `dir` is in holds that no remote main has.
-/// A deadline-cut read is [`RepoRead::Unread`], not a clean result.
+/// A deadline-cut read, and a repository whose reads could not be made, is
+/// [`RepoRead::Unread`], not a clean result.
 #[must_use]
 pub fn probe(dir: &Path, home: Option<&Path>, limit: Duration) -> RepoRead {
     let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
@@ -544,7 +548,11 @@ fn probe_reads(dir: &Path, reads: &Reads<'_>) -> Option<RepoWork> {
         status_args.extend(["-c", flag]);
     }
     status_args.extend(["status", "--porcelain=v1", "-z", "--untracked-files=normal"]);
-    let status = git(&root, &status_args, reads)?;
+    let Some(status) = git(&root, &status_args, reads) else {
+        // A repository whose state cannot be read holds what it holds: never nothing.
+        reads.cut.set(true);
+        return None;
+    };
     let branch = git(
         &root,
         &["symbolic-ref", "--quiet", "--short", "HEAD"],
@@ -1007,7 +1015,9 @@ struct Reads<'a> {
     home: &'a Path,
     /// The person's `XDG_CONFIG_HOME` (absolute), for [`global_excludes`]'s read alone.
     xdg: Option<&'a Path>,
-    /// Whether a read did not start, or was cut off, at the deadline.
+    /// Whether a read did not start, or was cut off, at the deadline, or could
+    /// not be made ([`git_as`]), or the repository found could not be read
+    /// ([`probe_reads`]).
     cut: Cell<bool>,
 }
 
@@ -1046,10 +1056,22 @@ fn git_as(dir: &Path, args: &[&str], reads: &Reads<'_>, global: bool) -> Option<
         cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("XDG_CONFIG_HOME", "/dev/null");
     }
-    let Ok(output) = aterm_uds::deadline::output_until_complete_stdout(&mut cmd, deadline) else {
-        reads.cut.set(reads.cut.get() || Instant::now() >= deadline);
-        return None;
+    let output = match aterm_uds::deadline::output_until_complete_stdout(&mut cmd, deadline) {
+        Ok(output) => output,
+        // No `git` here: the probe cannot run, and reads clean.
+        Err(aterm_uds::deadline::CompleteOutputError::Run(
+            aterm_uds::deadline::RunError::Spawn(e),
+        )) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => {
+            reads.cut.set(true);
+            return None;
+        }
     };
+    if output.status.code().is_none() {
+        // A signal ended it: what it would have said is not known.
+        reads.cut.set(true);
+        return None;
+    }
     if !output.status.success() {
         return None;
     }

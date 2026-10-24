@@ -1921,6 +1921,7 @@ impl CursorGlow {
         let mut first: Option<(u16, rk::ribbon::RunOrigin)> = None;
         let cohorts = ribbon.cohorts();
         let first_cohort = cohorts.first().map_or(0, |coh| coh.id);
+        let mut cached_coh: Option<(u32, Option<(&rk::ribbon::Cohort, bool)>)> = None;
         for cell in ribbon.cells() {
             if cell.row != row
                 || !(col0..col1).contains(&cell.col)
@@ -1929,15 +1930,25 @@ impl CursorGlow {
             {
                 continue;
             }
-            let id_offset = cell.cohort.wrapping_sub(first_cohort);
-            let Some(coh) = cohorts
-                .binary_search_by_key(&id_offset, |coh| coh.id.wrapping_sub(first_cohort))
-                .ok()
-                .map(|idx| &cohorts[idx])
-            else {
+            let coh_entry = match cached_coh {
+                Some((id, entry)) if id == cell.cohort => entry,
+                _ => {
+                    let id_offset = cell.cohort.wrapping_sub(first_cohort);
+                    let entry = cohorts
+                        .binary_search_by_key(&id_offset, |coh| coh.id.wrapping_sub(first_cohort))
+                        .ok()
+                        .map(|idx| {
+                            let coh = &cohorts[idx];
+                            (coh, coh.leaving_at(now))
+                        });
+                    cached_coh = Some((cell.cohort, entry));
+                    entry
+                }
+            };
+            let Some((coh, coh_leaving)) = coh_entry else {
                 continue;
             };
-            if !coh.leaving_at(now)
+            if !coh_leaving
                 && now
                     .saturating_duration_since(cell.born.max(coh.alive_at))
                     .as_secs_f32()

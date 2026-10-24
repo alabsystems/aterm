@@ -183,6 +183,40 @@ fn every_page(
     view: crate::native_app::ViewId,
     cx: &ViewCx<'_>,
 ) -> Vec<crate::native_ui::CompiledUi> {
+    pages_while(runtime, instance, view, cx, |_| true)
+}
+
+/// The pages from the first through the first that paints nothing keyed under `card` after one
+/// that did: what a law of that card reads. The route's other cards are
+/// [`the_harness_route_is_whole_on_every_host`]'s.
+fn pages_through(
+    runtime: &mut NativeRuntime,
+    instance: crate::native_app::AppInstanceId,
+    view: crate::native_app::ViewId,
+    cx: &ViewCx<'_>,
+    card: &str,
+) -> Vec<crate::native_ui::CompiledUi> {
+    let mut drawn = false;
+    pages_while(runtime, instance, view, cx, |page| {
+        let draws = page
+            .paint
+            .iter()
+            .any(|paint| paint.key.as_str().starts_with(card));
+        let on = draws || !drawn;
+        drawn |= draws;
+        on
+    })
+}
+
+/// The pages from the first, each compiled, through the last or the first `more` says ends
+/// the walk.
+fn pages_while(
+    runtime: &mut NativeRuntime,
+    instance: crate::native_app::AppInstanceId,
+    view: crate::native_app::ViewId,
+    cx: &ViewCx<'_>,
+    mut more: impl FnMut(&crate::native_ui::CompiledUi) -> bool,
+) -> Vec<crate::native_ui::CompiledUi> {
     let mut pages = Vec::new();
     let mut page = 0;
     loop {
@@ -193,7 +227,9 @@ fn every_page(
             state.scroll_page_to(page);
             state.page_reveal = None;
         }
-        pages.push(compile_settings_view(runtime, instance, view, cx));
+        let compiled = compile_settings_view(runtime, instance, view, cx);
+        let on = more(&compiled);
+        pages.push(compiled);
         let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
             unreachable!()
         };
@@ -201,7 +237,7 @@ fn every_page(
             .result_page_limit
             .get()
             .expect("the page records its bound");
-        if page >= limit {
+        if !on || page >= limit {
             return pages;
         }
         page += 1;
@@ -1103,7 +1139,7 @@ fn a_rows_setting_line_is_whole_in_its_label_on_every_host() {
             (849.0, 513.0),
         ] {
             let cx = view_cx_at(width, height);
-            let pages = every_page(&mut runtime, instance, view, &cx);
+            let pages = pages_through(&mut runtime, instance, view, &cx, "harness/session");
             let context = format!("{scale}\u{d7} {width}\u{d7}{height}");
             assert_eq!(
                 node(&pages, "harness/session/7/setting").label,
@@ -1144,6 +1180,11 @@ fn a_rows_setting_line_is_whole_in_its_label_on_every_host() {
     );
 }
 
+/// A stacked SESSIONS row with its setting, state and day lines is whole on some page, or has
+/// its buttons on one line, at 2× text on every height from 300 to 760 pt, 4 pt apart, on a
+/// phone's width and a narrow window's; and the pages through SESSIONS ([`pages_through`])
+/// clip nothing. NEGATIVE CONTROL: a stacked row's height that leaves out its setting line
+/// clips the row at 584 × 300.
 #[test]
 fn a_stacked_rows_flow_counts_its_setting_line() {
     use crate::harness_glass::Stamp;
@@ -1183,7 +1224,7 @@ fn a_stacked_rows_flow_counts_its_setting_line() {
         let (mut runtime, instance, view) = harness_route(state.clone());
         for &(width, height) in hosts.iter().skip(hand).step_by(RUNTIMES) {
             let cx = view_cx_at(width, height);
-            let pages = every_page(&mut runtime, instance, view, &cx);
+            let pages = pages_through(&mut runtime, instance, view, &cx, "harness/session");
             assert!(
                 pages.iter().all(|page| page
                     .semantic(&UiKey::new("harness/session/7/head"))
@@ -2683,7 +2724,13 @@ fn a_rows_words_keep_its_place_whole_and_its_buttons_their_faces() {
         at_each_text_scale(&[1.0, 1.25, 2.0], "Harness rows", |scale| {
             for width in [320.0, 340.0, 584.0, 760.0, 780.0, 820.0, 2_400.0] {
                 let (mut runtime, instance, view) = harness_route(state.clone());
-                let pages = every_page(&mut runtime, instance, view, &view_cx_at(width, 900.0));
+                let pages = pages_through(
+                    &mut runtime,
+                    instance,
+                    view,
+                    &view_cx_at(width, 900.0),
+                    "harness/session",
+                );
                 let find = |key: &str| {
                     pages
                         .iter()
@@ -2992,7 +3039,7 @@ fn decided_for_you_is_whole_on_every_host() {
         }
         for &(width, height) in &hosts {
             let cx = view_cx_at(width, height);
-            let pages = every_page(&mut runtime, instance, view, &cx);
+            let pages = pages_through(&mut runtime, instance, view, &cx, "harness/decided");
             for (page, compiled) in pages.iter().enumerate() {
                 let context = format!("{scale}\u{d7} {width}\u{d7}{height} page {page}");
                 compiled
@@ -3032,7 +3079,7 @@ fn decided_for_you_is_whole_on_every_host() {
             };
             view_state.harness_decided_open = false;
         }
-        let pages = every_page(&mut runtime, instance, view, &view_cx());
+        let pages = pages_through(&mut runtime, instance, view, &view_cx(), "harness/decided");
         let listed = k
             .iter()
             .filter(|key| {

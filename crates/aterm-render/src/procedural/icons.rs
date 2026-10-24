@@ -20,6 +20,20 @@ pub struct IconMetrics {
     pub disc: f32,
 }
 
+/// The metrics of an icon drawn alone in a square `side` pixels on a side (a chrome surface's `DrawPrim::BandIcon`): capitals two thirds of the box on a baseline a sixth of it over its foot, a stroke a ninth of it.
+#[must_use]
+pub fn boxed_icon_metrics(side: usize) -> IconMetrics {
+    let side = side as f32;
+    let cap = (side * 0.68).round();
+    IconMetrics {
+        baseline: (side * 0.84).round(),
+        cap,
+        stem: (side / 9.0).round().max(1.0),
+        head: (side * 0.08).round(),
+        disc: cap,
+    }
+}
+
 /// Width of an icon's raster in pixels (one cell, or three cells when `spill` is set).
 #[must_use]
 #[inline]
@@ -450,6 +464,9 @@ impl Shape {
                     ((px - self.cx).abs() + (py - cyr).abs() - r) * std::f32::consts::FRAC_1_SQRT_2;
                 diamond.max(self.mark_box(px, py))
             }
+            BandIcon::Lock => self.lock(px, py),
+            BandIcon::Hourglass => self.hourglass(px, py),
+            BandIcon::Drive => self.drive(px, py),
             BandIcon::More => {
                 let r = (t * 0.6).max(0.8);
                 let y = self.bot.round() - r;
@@ -464,6 +481,111 @@ impl Shape {
                     .fold(f32::INFINITY, f32::min)
             }
         }
+    }
+
+    /// A pictogram's rows ([`BandIcon::is_pictogram`]): its top and its bottom, whole pixels two half heights apart, standing on the row the badges stand on.
+    fn picto_rows(&self) -> (f32, f32) {
+        let bottom = self.bot.round();
+        (bottom - (2.0 * self.half).round().max(2.0), bottom)
+    }
+
+    /// A half width near `w` that puts both sides of the centre on pixel edges, held to the room.
+    fn snap(&self, w: f32) -> f32 {
+        let f = self.cx.fract();
+        ((w + f).round() - f).min(self.room).max(f.max(0.5))
+    }
+
+    /// The padlock: a body four fifths as wide as the icon is tall, its lower half, under a shackle one stroke wide that keeps a hole at least a pixel wide (two where the stroke is even) where the body is as wide as that, its legs a pixel or more inside the body's sides where the body has the room.
+    fn lock(&self, px: f32, py: f32) -> f32 {
+        let t = self.t;
+        let (y0, y1) = self.picto_rows();
+        let h = y1 - y0;
+        let bw = self.snap(0.8 * self.half);
+        let body_top = y1 - (0.5 * h).round().max(2.0);
+        let r = (0.1 * h).min(0.4 * bw);
+        let body = round_rect(px, py, self.cx - bw, body_top, self.cx + bw, y1, r);
+        let so = self
+            .snap(0.62 * self.half)
+            .min(bw - 1.0)
+            .max(t + 1.0 - self.cx.fract())
+            .min(bw);
+        let rs = so - t * 0.5;
+        let arc_y = y0 + so;
+        let dx = px - self.cx;
+        let shackle = if py < arc_y {
+            (dx.hypot(py - arc_y) - rs).abs() - t * 0.5
+        } else {
+            ((dx.abs() - rs).abs() - t * 0.5).max(py - (body_top + r))
+        };
+        body.min(shackle)
+    }
+
+    /// The hourglass: a cap at its top and its bottom, the full width, one stroke tall or a seventh of the icon where that is less (so a small bold one keeps its bulbs open), and between them the glass, one stroke drawn in to a waist at the middle row; the lower bulb holds the run-down sand, a triangle on the bottom cap.
+    fn hourglass(&self, px: f32, py: f32) -> f32 {
+        let t = self.t;
+        let (y0, y1) = self.picto_rows();
+        let bw = self.snap(self.half);
+        let cap = t.min(((y1 - y0) / 7.0).round().max(1.0));
+        let caps = rect(px, py, self.cx - bw, y0, self.cx + bw, y0 + cap).min(rect(
+            px,
+            py,
+            self.cx - bw,
+            y1 - cap,
+            self.cx + bw,
+            y1,
+        ));
+        let (gw, waist, mid) = (0.69 * bw, 0.12 * bw, (y0 + y1) * 0.5);
+        let (top, foot) = (y0 + t * 0.5, y1 - t * 0.5);
+        let dx = (px - self.cx).abs();
+        let glass = super::seg_dist(dx, py, gw, top, waist, mid)
+            .min(super::seg_dist(dx, py, waist, mid, gw, foot))
+            - t * 0.5;
+        let floor = y1 - cap;
+        let apex = mid + 0.3 * (floor - mid);
+        let sand = polygon_sd(
+            px,
+            py,
+            &[
+                (self.cx, apex),
+                (self.cx + 0.6 * gw, floor),
+                (self.cx - 0.6 * gw, floor),
+            ],
+        );
+        caps.min(glass).min(sand)
+    }
+
+    /// The drive, drawn as a drum: a filled top, an ellipse a third of the drum's height deep, its sides one stroke wide, and its bottom rim; a middle rim where it clears the top and the bottom rim by two rows or more down the centre.
+    fn drive(&self, px: f32, py: f32) -> f32 {
+        let t = self.t;
+        let (y0, y1) = self.picto_rows();
+        let h = y1 - y0;
+        let w = self.snap(0.95 * self.half);
+        let ry = (h / 6.0).max(t * 0.5 + 0.5);
+        let (top_c, foot_c) = (y0 + ry, y1 - ry - t * 0.5);
+        let a = w - t * 0.5;
+        let lid = ellipse_sd(px - self.cx, py - top_c, w, ry);
+        let sides = rect(px, py, self.cx - w, top_c, self.cx - w + t, foot_c).min(rect(
+            px,
+            py,
+            self.cx + w - t,
+            top_c,
+            self.cx + w,
+            foot_c,
+        ));
+        let rim = |c: f32| {
+            let d = if py < c {
+                ((px - self.cx).abs() - a).hypot(py - c) - t * 0.5
+            } else {
+                ellipse_sd(px - self.cx, py - c, a, ry).abs() - t * 0.5
+            };
+            d.max((px - self.cx).abs() - w)
+        };
+        let mut drum = lid.min(sides).min(rim(foot_c));
+        let gap = (foot_c - top_c - 1.5 * t) * 0.5;
+        if gap >= 2.0 {
+            drum = drum.min(rim(top_c + t * 0.5 + gap));
+        }
+        drum
     }
 
     /// The ring family's radius ([`ring_radius`]) and centre row: the face's `●` on the capitals' centre line, its sides and its top on pixel boundaries.
@@ -539,6 +661,24 @@ fn rounded_triangle(px: f32, py: f32, cx: f32, apex: f32, bottom: f32, wb: f32, 
         py,
         &[v(cx, apex), v(cx + wb, bottom), v(cx - wb, bottom)],
     ) - round
+}
+
+/// The signed distance to the box `[x0, x1) × [y0, y1)` with its corners rounded by `r` pixels.
+fn round_rect(px: f32, py: f32, x0: f32, y0: f32, x1: f32, y1: f32, r: f32) -> f32 {
+    let r = r.min((x1 - x0) * 0.5).min((y1 - y0) * 0.5).max(0.0);
+    rect(px, py, x0 + r, y0 + r, x1 - r, y1 - r) - r
+}
+
+/// The signed distance (near its edge, which is all coverage reads) to the ellipse about the origin with half axes `a` and `b`, at `(x, y)`.
+fn ellipse_sd(x: f32, y: f32, a: f32, b: f32) -> f32 {
+    let (u, v) = (x / a, y / b);
+    let k0 = u.hypot(v);
+    let k1 = (u / a).hypot(v / b);
+    if k1 > 0.0 {
+        k0 * (k0 - 1.0) / k1
+    } else {
+        -a.min(b)
+    }
 }
 
 /// The signed distance from `(px, py)` to a closed polygon (negative inside), any winding, convex or concave — the even-odd crossing test for the sign, the nearest edge for the magnitude.
@@ -1493,5 +1633,153 @@ mod tests {
             2,
             "control: SF Mono 24 px regular ○ is its stem"
         );
+    }
+
+    /// The deck's pictograms ([`BandIcon::is_pictogram`]) at the sizes they are drawn: on the grid's faces in a cell of their own and between blanks (the band-icons scene), between blanks on the small faces measured at 1x ([`SMALL_FACES`]), and alone in a chrome surface's square box ([`boxed_icon_metrics`]) of 11 to 13 px at 1x and 22 to 26 at 2x (the deck's need pills), each as `(where, raster width, raster, icon)`.
+    fn pictogram_rasters() -> Vec<(String, usize, Vec<u8>, BandIcon)> {
+        let mut drawn = Vec::new();
+        let pictograms = || BandIcon::ALL.into_iter().filter(|i| i.is_pictogram());
+        for (cw, ch, m) in FACES.into_iter().chain([(12, 24, M)]) {
+            for spill in [false, true] {
+                for icon in pictograms() {
+                    drawn.push((
+                        format!("{cw}x{ch} stem {} spill {spill}", m.stem),
+                        band_icon_width(cw, spill),
+                        band_icon_coverage(icon, cw, ch, m, spill),
+                        icon,
+                    ));
+                }
+            }
+        }
+        for (name, [cw, ch, baseline, cap, stem, head, disc]) in SMALL_FACES {
+            let (cw, ch) = (cw as usize, ch as usize);
+            let m = IconMetrics {
+                baseline,
+                cap,
+                stem,
+                head,
+                disc,
+            };
+            for icon in pictograms() {
+                drawn.push((
+                    format!("{name} spilled"),
+                    band_icon_width(cw, true),
+                    band_icon_coverage(icon, cw, ch, m, true),
+                    icon,
+                ));
+            }
+        }
+        for side in (11..=13).chain(22..=26) {
+            for icon in pictograms() {
+                drawn.push((
+                    format!("a {side} px box"),
+                    side,
+                    band_icon_coverage(icon, side, side, boxed_icon_metrics(side), false),
+                    icon,
+                ));
+            }
+        }
+        drawn
+    }
+
+    /// The pixels of a raster `w` wide under a quarter's coverage that no path of such pixels (side by side or one over another) joins to the raster's edge: the clear its ink closes in.
+    fn holes(buf: &[u8], w: usize) -> Vec<(usize, usize)> {
+        let h = buf.len() / w;
+        let clear = |i: usize| buf[i] < 64;
+        let mut open = vec![false; buf.len()];
+        let mut todo: Vec<usize> = (0..buf.len())
+            .filter(|&i| {
+                let (x, y) = (i % w, i / w);
+                clear(i) && (x == 0 || y == 0 || x + 1 == w || y + 1 == h)
+            })
+            .collect();
+        for &i in &todo {
+            open[i] = true;
+        }
+        while let Some(i) = todo.pop() {
+            let (x, y) = (i % w, i / w);
+            let next = [
+                (x.wrapping_sub(1), y),
+                (x + 1, y),
+                (x, y.wrapping_sub(1)),
+                (x, y + 1),
+            ];
+            for (nx, ny) in next {
+                if nx < w && ny < h && clear(ny * w + nx) && !open[ny * w + nx] {
+                    open[ny * w + nx] = true;
+                    todo.push(ny * w + nx);
+                }
+            }
+        }
+        (0..buf.len())
+            .filter(|&i| clear(i) && !open[i])
+            .map(|i| (i % w, i / w))
+            .collect()
+    }
+
+    /// THE PICTOGRAMS KEEP THEIR PARTS APART: no part smears into another at any size they are drawn ([`pictogram_rasters`]), so each keeps the hole its picture has, a clear its own ink closes in. The padlock's is under its shackle, over a body solid across its middle half in its lower third; the hourglass's is in its upper bulb, with more ink in the lower half, where the sand has run; the drum's is under its solid top, which puts more ink in its upper half.
+    #[test]
+    fn the_pictograms_keep_their_parts_apart() {
+        for (at, w, buf, icon) in pictogram_rasters() {
+            let at = format!("{icon:?} {at}");
+            let (x0, x1, y0, y1) = ink_box(&buf, w);
+            let mid = (y0 + y1) as f32 * 0.5;
+            let holes = holes(&buf, w);
+            let upper = |&(_, y): &(usize, usize)| (y as f32 + 0.5) < mid;
+            let ink = |rows: std::ops::Range<usize>| -> u32 {
+                rows.flat_map(|y| buf[y * w..(y + 1) * w].iter())
+                    .map(|&c| u32::from(c))
+                    .sum()
+            };
+            let (top, foot) = (ink(y0..(y0 + y1) / 2), ink((y0 + y1).div_ceil(2)..y1));
+            match icon {
+                BandIcon::Lock => {
+                    assert!(
+                        !holes.is_empty() && holes.iter().all(upper),
+                        "{at}: a hole, under the shackle {holes:?}"
+                    );
+                    let (body, side) = (y1 - (y1 - y0) / 3, (x1 - x0) / 4);
+                    for y in body..y1 {
+                        assert!(
+                            (x0 + side..x1 - side).all(|x| buf[y * w + x] == 255),
+                            "{at}: the body is solid on row {y}"
+                        );
+                    }
+                }
+                BandIcon::Hourglass => {
+                    assert!(holes.iter().any(upper), "{at}: the upper bulb is hollow");
+                    assert!(foot > top, "{at}: the sand has run down ({foot} vs {top})");
+                }
+                _ => {
+                    assert!(
+                        holes.iter().any(|h| !upper(h)),
+                        "{at}: the drum is hollow under its top {holes:?}"
+                    );
+                    assert!(top > foot, "{at}: the top is solid ({top} vs {foot})");
+                }
+            }
+        }
+    }
+
+    /// A pictogram in a chrome surface's box keeps to its square and draws at least five rows tall from 11 px: its ink stays a pixel clear of the box's sides and inside the box's rows, and it is centred on the box.
+    #[test]
+    fn a_boxed_pictogram_keeps_to_its_square() {
+        for side in (11..=13).chain(22..=26) {
+            for icon in BandIcon::ALL.into_iter().filter(|i| i.is_pictogram()) {
+                let buf = band_icon_coverage(icon, side, side, boxed_icon_metrics(side), false);
+                let (x0, x1, y0, y1) = ink_box(&buf, side);
+                let at = format!("{icon:?} in a {side} px box");
+                assert!(
+                    x0 >= 1 && x1 < side,
+                    "{at}: a clear column each side ({x0}..{x1})"
+                );
+                assert!(y0 >= 1 && y1 <= side, "{at}: inside the rows ({y0}..{y1})");
+                assert!(y1 - y0 >= 5, "{at}: {} rows tall", y1 - y0);
+                assert!(
+                    (x0 + x1).abs_diff(side) <= 1,
+                    "{at}: centred ({x0}..{x1} in {side})"
+                );
+            }
+        }
     }
 }

@@ -50,6 +50,7 @@ fn stage_hooks(gate: Option<&StageGate>) -> crate::install::StageHooks<'_> {
         pre_swap: gate,
         sidecars: None,
         aliases: &[],
+        npm_package: None,
     }
 }
 
@@ -908,7 +909,20 @@ impl DownloadTicket<'_> {
         );
     }
 
-    /// Done with the link: the next ticket's transfer may start.
+    /// Whether this ticket's transfer may run now: every ticket taken before it is done.
+    #[cfg(test)]
+    pub(crate) fn holds_the_link(&self) -> bool {
+        is_next(
+            &self
+                .turns
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            self.n,
+        )
+    }
+
+    /// Done with the link: the next ticket's transfer may start; releasing twice is releasing once.
     pub(crate) fn release(&self) {
         self.turns
             .state
@@ -2159,7 +2173,10 @@ fn record_digest_refusal(build_dir: &Path, artifact: &crate::manifest::Artifact,
     );
 }
 
-fn digest_refusal_note(
+/// The note of a stage refusal memo that still binds `program`'s `build` at `artifact`'s
+/// digests ([`crate::store::StageRefusal::binds`]): why nothing is fetched, and the command
+/// that retries it (`update --retry` when `grouped`).
+pub(crate) fn digest_refusal_note(
     layout: &Layout,
     program: &str,
     build: u64,

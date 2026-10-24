@@ -13,9 +13,9 @@ use super::super::config::SupervisorConfig;
 use super::notice::{self, Notice, NoticeText};
 use super::outlook::ExceptionKind;
 use super::turn_end::{
-    Composer, ContextFill, RULE_LOGIN, RenewStep, RosterWord, TurnEndAction, TurnEndReading,
-    TurnEndState, Unmade, bucket_model, decide_turn_end, login_wall_moves, login_wall_waits,
-    renew_step, sign_in_how, waited_login,
+    Composer, ContextFill, RULE_LOGIN, RenewStep, RosterWord, SAME_REPLY, TurnEndAction,
+    TurnEndReading, TurnEndState, Unmade, bucket_model, decide_turn_end, decide_turn_end_traced,
+    login_wall_moves, login_wall_waits, renew_step, sign_in_how, waited_login,
 };
 
 /// Whether the person is needed now or only when they next look.
@@ -123,6 +123,40 @@ impl Exception {
                 .to_string(),
             action: "Open the tab and type keep going".to_string(),
             clears: "the screen moving on, or the agent working",
+            escalated: false,
+            notice: None,
+        }
+    }
+
+    /// The same no-work reply to aterm's acts, held ([`TurnEndState::repeats`]).
+    #[must_use]
+    pub fn repeats() -> Self {
+        Self {
+            kind: ExceptionKind::Stalled,
+            when: Urgency::Later,
+            why: "Its program answers aterm's acts with the same reply and no work, so aterm types nothing more."
+                .to_string(),
+            action: "Open the tab and do what its last reply asks.".to_string(),
+            clears: "a different reply, someone's turn, or the agent working",
+            escalated: false,
+            notice: None,
+        }
+    }
+
+    /// A read limit that answered its tries the same, held ([`TurnEndState::repeats`]).
+    #[must_use]
+    pub fn limit_repeats(program: Program, reset_read: bool) -> Self {
+        Self {
+            kind: ExceptionKind::Futile,
+            when: Urgency::Later,
+            why: if reset_read {
+                "The limit still stands after its reset and answers each of aterm's tries the same."
+            } else {
+                "The limit names no reset aterm can read and answers each of aterm's tries the same."
+            }
+            .to_string(),
+            action: futile_action(program).to_string(),
+            clears: "a new reset or wall, a reset passing, someone's turn, or the agent working",
             escalated: false,
             notice: None,
         }
@@ -797,7 +831,21 @@ pub fn exception_for(
     {
         return Some(Exception::unread_limit());
     }
-    let kind = reading.wall?;
+    let held = state.replies().holds() && {
+        let mut steps = Vec::new();
+        let _ = decide_turn_end_traced(state, reading, cfg, now, &mut steps);
+        super::trace::deciding(&steps).is_some_and(|s| s.check == SAME_REPLY)
+    };
+    let Some(kind) = reading.wall else {
+        // Held at the screen's reply, or at the wall a track still stands for: a limit's, or another's.
+        return held.then(|| {
+            if state.repeats(reading) || !state.has_limit_track() {
+                Exception::repeats()
+            } else {
+                Exception::limit_repeats(reading.program, state.waits_on_named_reset())
+            }
+        });
+    };
     let attempts = state.wall_attempts(kind).unwrap_or(0);
     if let Some(label) = goal_cleared_label(&reading.wall_message) {
         return Some(Exception {
@@ -892,7 +940,7 @@ pub fn exception_for(
                 when: Urgency::Later,
                 why: "The limit still stands an hour after its reset.".to_string(),
                 action: futile_action(reading.program).to_string(),
-                clears: "the agent working",
+                clears: "a new reset or wall, someone's turn, or the agent working",
                 escalated: false,
                 notice: None,
             })
@@ -912,7 +960,15 @@ pub fn exception_for(
             state.notice_typed(),
             &reading.wall_message,
         )),
-        _ => None,
+        _ => held.then(|| match kind {
+            WallKind::UsageSession
+            | WallKind::UsageWeekly
+            | WallKind::Spend
+            | WallKind::ModelBucket { .. } => {
+                Exception::limit_repeats(reading.program, reading.reset_at.is_some())
+            }
+            _ => Exception::repeats(),
+        }),
     }
 }
 

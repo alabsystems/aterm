@@ -34,8 +34,10 @@ const STATUS: &str = "OK schema=1 sid=0 subject=%E2%97%90%20Git%20commit%20and%2
     fabric_rtt_ms=- fabric_link_age_ms=- hand=- level=quiet story=0 seq=232803 \
     hash=7adef2d5e8547a9e";
 
-/// [`file_holders`] (the holder scan) names the holders `lsof -t` names, of a lock held through
-/// descriptors: this process and two children, one given the file through a symlink.
+/// [`file_holders`] (the holder scan) names the holders of a lock held through descriptors: this
+/// process and two children, one given the file through a symlink. The children are the ones
+/// `lsof -t` names among them and a third, quiet child that holds no lock (the negative
+/// control); this process, whose sockets lsof is never let read, is held to the known set.
 #[cfg(target_os = "macos")]
 #[test]
 fn file_holders_are_lsof_s() {
@@ -65,14 +67,19 @@ fn file_holders_are_lsof_s() {
     let link = dir.join("link.lock");
     std::os::unix::fs::symlink(&lock, &link).expect("link the lock");
     let mine = std::fs::File::open(&lock).expect("open the lock");
-    let holder = |path: &std::path::Path| {
+    let sleeper = |stdin: aterm_uds::spawnfd::Stdio| {
         aterm_uds::spawnfd::command("/bin/sleep")
             .arg("600")
-            .stdin(std::fs::File::open(path).expect("open"))
+            .stdin(stdin)
             .spawn()
-            .expect("spawn a holder")
+            .expect("spawn a sleeper")
     };
+    let holder = |path: &std::path::Path| sleeper(std::fs::File::open(path).expect("open").into());
     let mut children = [holder(&lock), holder(&link)];
+    let mut quiet = sleeper(aterm_uds::spawnfd::Stdio::null());
+    let among = [children[0].id(), children[1].id(), quiet.id()];
+    let mut by_children = vec![children[0].id(), children[1].id()];
+    by_children.sort_unstable();
     let mut held = vec![std::process::id(), children[0].id(), children[1].id()];
     held.sort_unstable();
     let sorted = |h: Option<Vec<u32>>| {
@@ -88,7 +95,7 @@ fn file_holders_are_lsof_s() {
     };
     let captured_scans = [scanned(&lock), scanned(&link)];
     let while_held = [
-        sorted(lsof_holders(&lock)),
+        sorted(lsof_holders(&lock, &among)),
         sorted(file_holders(&lock)),
         sorted(file_holders(&link)),
         Some(captured_scans[0].holders.clone()),
@@ -99,8 +106,16 @@ fn file_holders_are_lsof_s() {
         let _ = child.wait();
     }
     drop(mine);
+    let gone = dir.join("gone.lock");
+    let lsof_after = [lsof_holders(&lock, &among), lsof_holders(&gone, &among)];
+    let _ = quiet.kill();
+    let _ = quiet.wait();
+    assert_eq!(
+        while_held[0],
+        Some(by_children),
+        "lsof, the oracle, among the children"
+    );
     let held = Some(held);
-    assert_eq!(while_held[0], held, "lsof, the oracle");
     assert_eq!(while_held[1], held, "the scan, by the file's path");
     assert_eq!(while_held[2], held, "the scan, by a link to it");
     assert_eq!(
@@ -130,10 +145,9 @@ fn file_holders_are_lsof_s() {
     {
         check_complete(scan, held.as_deref().expect("held set"), context);
     }
-    assert_eq!(lsof_holders(&lock), Some(Vec::new()), "lsof, once let go");
+    assert_eq!(lsof_after[0], Some(Vec::new()), "lsof, once let go");
     check_complete(scanned(&lock), &[], "once let go");
-    let gone = dir.join("gone.lock");
-    assert_eq!(lsof_holders(&gone), None, "lsof, no such file");
+    assert_eq!(lsof_after[1], None, "lsof, no such file");
     assert_eq!(file_holders(&gone), None, "the scan, no such file");
     println!("{DONE}");
 }

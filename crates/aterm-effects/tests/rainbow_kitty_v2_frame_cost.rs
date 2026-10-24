@@ -6,7 +6,6 @@
 use std::time::{Duration, Instant};
 
 use crate::alloc_count::{SIZE_SLOTS, allocations_during, assert_counter_is_per_thread};
-use crate::common::par_map;
 use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle, SoundCue, band_pos};
 use aterm_effects::rainbow_kitty::{
     CaretSeam, Config, Dir, Engine, Event, Frame, Licence, TypedClass, witness::WITNESS_ROWS,
@@ -985,6 +984,8 @@ fn print_allocs(sc: &Scenario, r: &Report) {
 /// Verify zero steady/idle allocations, idle-to-zero within [`IDLE_CEILING_MS`], and stream caps.
 #[test]
 fn rainbow_kitty_v2_steady_frames_allocate_nothing_and_idle_to_exactly_zero() {
+    use crate::common::par_map;
+
     assert_counter_is_per_thread();
     let mode = if cfg!(debug_assertions) {
         "DEBUG build (timing informational)"

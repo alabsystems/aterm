@@ -133,7 +133,8 @@ const NODE_SEED_LEN: usize = 32;
 /// This machine's node, its node id and node key, each minted the first time it is missing
 /// ([`node_id`]; the key 256 bits from the OS CSPRNG, written to [`NODE_KEY_FILE`]).
 pub fn node_identity(dir: &Path) -> io::Result<NodeIdentity> {
-    let _identity = BookLock::take(dir, Duration::ZERO)?;
+    let _identity = BookLock::take(dir, Duration::ZERO)
+        .map_err(|e| io::Error::new(e.kind(), lock_refused(dir, &e)))?;
     let node = node_id(dir)?;
     let seed = match read_node_seed(dir)? {
         Some(seed) => seed,
@@ -1034,8 +1035,8 @@ pub fn write_held<R>(
     began: Began<'_>,
     write: impl FnOnce(&HeldBook<'_>) -> R,
 ) -> Result<R, Unwritten> {
-    let lock = BookLock::take(dir, LOCK_WAIT)
-        .map_err(|e| Unwritten::Lock(format!("{PEERS_FILE}'s lock: {e}")))?;
+    let lock =
+        BookLock::take(dir, LOCK_WAIT).map_err(|e| Unwritten::Lock(lock_refused(dir, &e)))?;
     let book = HeldBook {
         dir,
         held: Held::read(dir),
@@ -1067,9 +1068,9 @@ pub fn leave_held<R>(dir: &Path, remove: impl FnOnce(&Leaving<'_>) -> R) -> Resu
                     _lock: None,
                 }));
             }
-            // There but not made private (an access list it inherits, a volume that ignores modes), or made by another writer: its lock decides, as any directory's does.
+            // There but not made private (an access list it inherits, a volume that ignores modes): its lock decides, as any directory's does.
             Err(e) if stops_every_edit(&e) => None,
-            Err(e) => return Err(Unwritten::Lock(format!("{}: {e}", dir.display()))),
+            Err(e) => return Err(Unwritten::Lock(e.to_string())),
         },
         _ => None,
     };
@@ -1077,12 +1078,12 @@ pub fn leave_held<R>(dir: &Path, remove: impl FnOnce(&Leaving<'_>) -> R) -> Resu
         Ok(lock) => Some(lock),
         Err(e) if stops_every_edit(&e) => None,
         Err(e) => {
+            let why = lock_refused(dir, &e);
             return Err(Unwritten::Lock(match narrowed {
                 Some(was) => format!(
-                    "{PEERS_FILE}'s lock: {e}; {} was open to other users ({was:o}), and is 0700 now",
-                    dir.display()
+                    "{why}; the directory was open to other users ({was:o}), and is 0700 now"
                 ),
-                None => format!("{PEERS_FILE}'s lock: {e}"),
+                None => why,
             }));
         }
     };
@@ -1127,7 +1128,7 @@ impl Leaving<'_> {
 /// Another edit holds it past the lock's wait, or it cannot be taken.
 #[cfg(any(test, debug_assertions))]
 pub fn hold_book(dir: &Path) -> Result<HeldBook<'_>, String> {
-    let lock = BookLock::take(dir, LOCK_WAIT).map_err(|e| format!("{PEERS_FILE}'s lock: {e}"))?;
+    let lock = BookLock::take(dir, LOCK_WAIT).map_err(|e| lock_refused(dir, &e))?;
     Ok(HeldBook {
         dir,
         held: Held::read(dir),
@@ -1744,6 +1745,14 @@ pub fn bound_peers(state_dir: &Path) -> Vec<Peer> {
     bound
 }
 
+/// Why the book's lock in `dir` was not taken, naming `dir` once: [`BookLock::take`]'s own refusals name it, a bare OS error does not.
+fn lock_refused(dir: &Path, e: &io::Error) -> String {
+    match e.raw_os_error() {
+        Some(_) => format!("{PEERS_FILE}'s lock in {}: {e}", dir.display()),
+        None => format!("{PEERS_FILE}'s lock: {e}"),
+    }
+}
+
 struct BookLock(std::fs::File);
 
 impl BookLock {
@@ -1761,7 +1770,7 @@ impl BookLock {
         if !file.metadata()?.is_file() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "the lock is no regular file",
+                format!("{} is no regular file", dir.join(PEERS_LOCK).display()),
             ));
         }
         let deadline = Instant::now() + within;
@@ -1782,7 +1791,10 @@ impl BookLock {
                 Err(std::fs::TryLockError::WouldBlock) => {
                     return Err(io::Error::new(
                         io::ErrorKind::WouldBlock,
-                        "another aterm is writing the book; run this again",
+                        format!(
+                            "another aterm is writing the book in {}; run this again",
+                            dir.display()
+                        ),
                     ));
                 }
             }

@@ -557,6 +557,10 @@ fn project(tier: Tier, resp: &Response) -> (String, Option<(Option<u64>, u64)>) 
             format!("budget subjects={subjects} reserved={reserved} max={max}"),
             None,
         ),
+        Response::Gap(g) => (
+            format!("gap from={} to={} records={:?}", g.from, g.to, g.records),
+            None,
+        ),
     }
 }
 
@@ -891,6 +895,7 @@ pub(crate) mod scripts {
             Step::Send(1, last("/f/f/pub/*/*/presence", "/a", 10)),
             Step::Send(1, Request::Keepalive),
             Step::Send(1, Request::IdleMarks),
+            Step::Send(1, Request::GapNotices),
             Step::Send(
                 1,
                 Request::Attach {

@@ -162,10 +162,17 @@ impl CursorGlow {
             .heat_at
             .map_or(0.0, |t| now.saturating_duration_since(t).as_secs_f32());
         if dt > 0.0 && self.heat_tau_live > 0.0 {
-            (
-                self.heat * (-dt / self.heat_tau_live).exp(),
-                self.flare * (-dt / Self::FLARE_DECAY_TAU).exp(),
-            )
+            let heat = if self.heat != 0.0 {
+                self.heat * (-dt / self.heat_tau_live).exp()
+            } else {
+                0.0
+            };
+            let flare = if self.flare != 0.0 {
+                self.flare * (-dt / Self::FLARE_DECAY_TAU).exp()
+            } else {
+                0.0
+            };
+            (heat, flare)
         } else {
             (self.heat, self.flare)
         }

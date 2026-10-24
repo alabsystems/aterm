@@ -100,6 +100,7 @@ fn base_reading() -> TurnEndReading {
         wall_remembered: false,
         answered: None,
         worked_doubt: Duration::ZERO,
+        ran_tools: false,
         record_turn: None,
         credits: None,
         repo: aterm_agent::harness::repo_work::RepoRead::Clean,

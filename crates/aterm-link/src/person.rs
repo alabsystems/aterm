@@ -448,6 +448,16 @@ fn inbox(
             }
             Some(Event::Mark { next, .. }) if next >= end => break,
             Some(Event::Mark { .. }) => {}
+            Some(Event::Gap(gap)) if gap.from >= end => break,
+            Some(Event::Gap(gap)) => {
+                let line = format!(
+                    "given up: the broker's retention gave up {} before this inbox read them\n",
+                    crate::transport::gap_lost(&gap)
+                );
+                out.write_all(line.as_bytes())
+                    .and_then(|()| out.flush())
+                    .map_err(|error| io::Error::new(error.kind(), Unprinted { error, peek }))?;
+            }
             Some(Event::Delivery {
                 offset: off,
                 subject,
@@ -1176,7 +1186,7 @@ mod tests {
                             log,
                             ext: astream_broker::NonceExt::default(),
                         }],
-                        Some(Request::IdleMarks) => vec![mark(end, end)],
+                        Some(Request::IdleMarks | Request::GapNotices) => vec![mark(end, end)],
                         Some(Request::Fetch { max: 0, .. }) => vec![mark(0, end)],
                         Some(Request::SubscribeGroup { .. }) => {
                             accepting
@@ -1435,6 +1445,53 @@ mod tests {
             *commits.lock().unwrap(),
             [("/f/f/cur/p/h-x/inbox".to_string(), 9)],
             "committed through the end mark"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_inbox_says_what_retention_gave_up_and_reads_on() {
+        use astream_broker::Response;
+        let (_dir, cfg, commits) = stand_in(
+            10,
+            vec![
+                Response::Gap(astream_broker::Gap {
+                    from: 0,
+                    to: 6,
+                    records: Some(2),
+                }),
+                Response::Delivery {
+                    offset: 7,
+                    subject: "/f/f/in/p/h-x/n-peer/note".into(),
+                    body: b"v=1 t=1 text=mail".to_vec(),
+                },
+                Response::Mark {
+                    next: 10,
+                    head: 10,
+                    resume: String::new(),
+                    durable: None,
+                    oldest: None,
+                },
+            ],
+            2,
+        );
+        let cmd = PersonCmd {
+            act: Act::Inbox { peek: false },
+            cap_files: Vec::new(),
+        };
+        let mut out = Vec::new();
+        inbox(&cfg, &cmd, "h-x", false, &mut out, STAND_IN).expect("the inbox reads past the gap");
+        let out = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2, "{out}");
+        assert!(
+            lines[0].starts_with("given up: ") && lines[0].contains("2 record(s) in @0..@6"),
+            "{out}"
+        );
+        assert!(lines[1].starts_with("@7  "), "{out}");
+        assert_eq!(
+            *commits.lock().unwrap(),
+            [("/f/f/cur/p/h-x/inbox".to_string(), 9)]
         );
     }
 

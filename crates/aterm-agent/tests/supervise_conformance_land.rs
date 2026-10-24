@@ -21,6 +21,8 @@ use aterm_spec::derive::Model;
 
 type State = BTreeMap<&'static str, i64>;
 
+/// Real work: it runs tools (a tool row on the screen, which at a wall is what tells work from
+/// the program's own retries).
 const LONG: Duration = Duration::from_secs(4 * 60);
 const SHORT: Duration = Duration::from_secs(30);
 const JOB: Duration = Duration::from_secs(12 * 60);
@@ -50,13 +52,14 @@ fn finding() -> RepoWork {
     }
 }
 
-/// What an authoritative point under Land saw.
+/// What an authoritative point under Land saw: its turn's earlier words are [`crate::common::earlier`]'s `earlier`.
 #[derive(Clone, Copy, Default)]
 struct Seen {
     walled: bool,
     busy: bool,
     dirty: bool,
     keyed: bool,
+    earlier: usize,
 }
 
 fn point(said: &str, at: Seen, worked: Option<Duration>) -> TurnEndReading {
@@ -77,7 +80,7 @@ fn point(said: &str, at: Seen, worked: Option<Duration>) -> TurnEndReading {
         said_tail: Some(said.to_string()),
         said_cut: false,
         opens_cut: false,
-        turn_said: None,
+        turn_said: Some(crate::common::earlier(at.earlier)),
         opened_by: None,
         message_drawn: false,
         submits: None,
@@ -122,6 +125,7 @@ fn point(said: &str, at: Seen, worked: Option<Duration>) -> TurnEndReading {
         wall_remembered: false,
         answered: None,
         worked_doubt: Duration::ZERO,
+        ran_tools: worked.is_some_and(|w| w >= LONG),
         record_turn: None,
         credits: None,
         repo: aterm_agent::harness::repo_work::RepoRead::of_found(at.dirty.then(finding)),
@@ -329,7 +333,19 @@ impl Real {
         self.ends(said, at, worked);
     }
 
+    /// A turn that ended as [`Self::ends`]'s, its earlier words the last's.
+    fn yields_again(&mut self, said: &'static str, worked: Duration) {
+        self.st.took();
+        self.ended(said, self.at, worked);
+    }
+
+    /// A turn that ended on `said`, its earlier words its own.
     fn ends(&mut self, said: &'static str, at: Seen, worked: Duration) {
+        let earlier = self.at.earlier + 1;
+        self.ended(said, Seen { earlier, ..at }, worked);
+    }
+
+    fn ended(&mut self, said: &'static str, at: Seen, worked: Duration) {
         self.now += worked;
         self.said = said;
         self.at = Seen { busy: false, ..at };
@@ -461,6 +477,7 @@ fn mirror(action: &str, before: &State, real: &mut Real) {
         "BackoffDue" => real.now += real.st.short_wait().expect("a back-off runs"),
         "YieldWork" => real.yields(PROGRESS, plain, LONG),
         "YieldAsk" => real.yields(QUESTION, plain, SHORT),
+        "YieldAskSame" => real.yields_again(QUESTION, SHORT),
         "YieldWall" => real.yields(
             PROGRESS,
             Seen {
@@ -569,6 +586,11 @@ fn walk_all(
             .or_default() += 1;
         if st["pending"] == 0 {
             projects(&real.st, &st);
+            assert_eq!(
+                crate::common::same(&real.st),
+                st["same"],
+                "the same reply at {st:?}"
+            );
             if m.action_enabled("SeedLanded", &st) {
                 assert!(real.st.clone().seed_task_done(), "refused at {st:?}");
             }
@@ -588,7 +610,7 @@ fn walk_all(
             {
                 assert_eq!(*text, nudge(&st, &real.st), "the nudge at {st:?}");
             }
-            if st["landed"] == 0 && st["left"] == 0 && st["other"] == 0 {
+            if st["landed"] == 0 && st["left"] == 0 && st["other"] == 0 && st["same"] <= 1 {
                 assert_ne!(got, Verdict::Nothing, "a silent point at {st:?}");
             }
             *verdicts.entry(format!("{got:?}")).or_default() += 1;
@@ -729,6 +751,31 @@ fn tier1_the_buggy_model_and_three_tellers_are_refuted() {
     assert!(buggy.fire("Nudge", &mut b), "{st:?}");
     assert!(!buggy.check_invariant("NeverTypeIntoALandedTask", &b));
     assert_eq!(verdict(&real.clone().decide()), Verdict::Nothing);
+
+    let again = [
+        "Instruction",
+        "YieldAsk",
+        "BackoffDue",
+        "Answer",
+        "YieldAskSame",
+    ];
+    let (st, real) = walk(&m, &again, base);
+    let same = aterm_spec::interp::with_buggy(&m, 3);
+    let mut b = st.clone();
+    assert!(
+        !m.action_enabled("BackoffDue", &st)
+            && same.fire("BackoffDue", &mut b)
+            && same.fire("Answer", &mut b),
+        "{st:?}"
+    );
+    assert!(!same.check_invariant("ANoWorkReplyGetsOneMoreActAtMost", &b));
+    assert_eq!(verdict(&real.clone().decide()), Verdict::Nothing);
+    let (_, real) = walk(
+        &m,
+        &[&again[..4], &["YieldAsk", "BackoffDue"]].concat(),
+        base,
+    );
+    assert_eq!(verdict(&real.clone().decide()), Verdict::Answer);
 
     let (st, mut real) = walk(&m, &["OtherTurnWall"], base);
     let mut b = st.clone();

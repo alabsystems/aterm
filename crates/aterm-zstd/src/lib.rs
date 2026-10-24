@@ -30,5 +30,5 @@ pub mod encode;
 pub mod frame;
 pub mod xxh64;
 
-pub use decode::{DecodeError, Decoder};
+pub use decode::{DecodeError, Decoder, declared_content_size};
 pub use encode::{Encoder, compress};

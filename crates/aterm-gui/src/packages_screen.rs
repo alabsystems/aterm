@@ -4086,6 +4086,8 @@ mod tests {
             anchor: spec.anchor,
             build_date: None,
             verified_at: NOW - 7200,
+            measured_sha256: None,
+            agreed_with: None,
         };
         std::fs::write(
             atpkg::vendor_direct::record_path(&build).unwrap(),

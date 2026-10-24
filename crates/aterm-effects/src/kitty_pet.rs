@@ -7070,10 +7070,19 @@ impl PetBrain {
             self.reversal_t = 0.0;
         }
         self.retreat_gap = (self.retreat_gap + secs).min(60.0);
-        let decay = (-secs / VEL_TAU).exp();
-        self.vhat *= decay;
-        self.vrun *= decay;
-        self.run_pace *= decay;
+        let decay = if self.vhat != 0.0
+            || self.vrun != 0.0
+            || self.run_pace != 0.0
+            || self.lead_room != 0.0
+        {
+            let d = (-secs / VEL_TAU).exp();
+            self.vhat *= d;
+            self.vrun *= d;
+            self.run_pace *= d;
+            d
+        } else {
+            1.0
+        };
         let carrying = self.carrying_run();
         self.run_t = (self.run_t + secs).min(60.0);
         if self.run_t > RHYTHM_WINDOW {
@@ -7494,11 +7503,12 @@ impl PetBrain {
                         live_ticks_cached = k_idx + 1;
                     }
                     let (ref boxes, n) = live_boxes[k_idx];
+                    let (bx1, by1) = (b.0 + i32::from(b.2), b.1 + i32::from(b.2));
                     meets |= boxes[..n].iter().any(|o| {
                         b.0 < o.0 + i32::from(o.2)
-                            && o.0 < b.0 + i32::from(b.2)
+                            && o.0 < bx1
                             && b.1 < o.1 + i32::from(o.2)
-                            && o.1 < b.1 + i32::from(b.2)
+                            && o.1 < by1
                     });
                 }
                 if meets || (!inside && (live.is_empty() || clear_of_them.is_some())) {
@@ -8155,10 +8165,9 @@ impl PetBrain {
         self.veil_over_letters(&mut frame, sense);
         self.last_presence = f32::from(frame.alpha) / 255.0;
         self.last_stance = Stance::of(&frame);
+        let lane_alpha_norm = f32::from(frame.lane_alpha) / 255.0;
         self.last_drawn = core::array::from_fn(|i| {
-            frame.departures[i].map_or(0.0, |d| {
-                f32::from(d.alpha) / 255.0 * (f32::from(frame.lane_alpha) / 255.0)
-            })
+            frame.departures[i].map_or(0.0, |d| f32::from(d.alpha) / 255.0 * lane_alpha_norm)
         });
         frame
     }

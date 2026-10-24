@@ -2314,3 +2314,53 @@ fn agy_usage_card_weekly_parses_gemini_and_third_party_rows() {
     assert_eq!(claude.text, "weekly 100% left");
     assert_eq!(claude.reset.as_deref(), Some("2026-10-31 00:51 PDT"));
 }
+
+#[test]
+fn a_turn_runs_tools_by_its_tool_rows_under_its_message() {
+    let rows = screen(lab::BG_TASK_ENDED);
+    assert!(turn_ran_tools(&rows), "its `● Ran (…)` row");
+    let user = last_user(&rows, frame(&rows).expect("the composer").top).expect("the message");
+    assert!(!turn_opens_above(&rows), "its message drawn");
+    assert!(
+        turn_opens_above(&rows[user + 1..]),
+        "the rows under its message"
+    );
+    let rule = rows
+        .iter()
+        .rposition(|r| r.starts_with("──────"))
+        .and_then(|bottom| rows[..bottom].iter().rposition(|r| r.starts_with("──────")))
+        .expect("the composer's top rule");
+    let mut later = rows[..rule].to_vec();
+    later.extend(
+        [
+            "─".repeat(60).as_str(),
+            "> thanks",
+            "",
+            "  You're welcome.",
+            "",
+        ]
+        .map(str::to_string),
+    );
+    later.extend(rows[rule..].iter().cloned());
+    assert!(
+        !turn_ran_tools(&later),
+        "the control: the call is a turn before"
+    );
+    assert!(
+        !turn_ran_tools(&screen(END_OF_TURN)),
+        "the control: no call"
+    );
+    // A turn of one measured row: a thought's is no tool, the call's under it is.
+    let measured = screen(BOX_CREATE_WORKSPACE);
+    let alone = |row: &str| {
+        assert!(measured.iter().any(|r| r == row), "{row:?} measured");
+        let mut r = rows[..rule].to_vec();
+        r.extend(["─".repeat(60).as_str(), "> go on", "", row, ""].map(str::to_string));
+        r.extend(rows[rule..].iter().cloned());
+        r
+    };
+    assert!(!turn_ran_tools(&alone(
+        "○ Thought for 4.9s (The target file is empty; therefore, the correct approach is to overwrite it. `write_to_file` a...)"
+    )));
+    assert!(turn_ran_tools(&alone("● Explored 1 file (x.txt)")));
+}

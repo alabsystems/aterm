@@ -24,7 +24,7 @@ use crate::proto::{
     ERR_SUBJECT_BOUND, ERR_UNAUTHORIZED, LOG_POISONED_PREFIX, PROTO_VERSION, RETAINED_FROM_PREFIX,
     RETIRE_CHARGED_PREFIX, RETIRE_CUT_PREFIX, RETIRE_LOG_PREFIX, RETIRE_WILL_PREFIX,
 };
-use crate::proto::{NonceExt, ServedInfo};
+use crate::proto::{Gap, NonceExt, ServedInfo};
 use astream_wire::{Frame, FrameError};
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -434,7 +434,7 @@ impl Client<UnixStream> {
     /// unsealed — reachability is scoped by the socket path's permissions).
     pub fn connect(socket_path: impl AsRef<Path>) -> io::Result<Client<UnixStream>> {
         let stream = UnixStream::connect(socket_path)?;
-        astream_sys::close_on_fork(std::os::fd::AsFd::as_fd(&stream))?;
+        kept_from_children(&stream)?;
         Ok(Client::from_stream(stream).nowait_by(UnixStream::set_nonblocking))
     }
 }
@@ -502,8 +502,28 @@ fn dial_tcp(addr: impl ToSocketAddrs, timeout: Option<Duration>) -> io::Result<T
         }
     };
     stream.set_nodelay(true)?;
-    astream_sys::close_on_fork(std::os::fd::AsFd::as_fd(&stream))?;
+    kept_from_children(&stream)?;
     Ok(stream)
+}
+
+/// Keep `socket` out of every child this process forks or spawns
+/// (`astream_sys::close_on_fork`, `FD_CLOFORK` on Apple): a child's exec-time close of
+/// its copy, under a descriptor scan, drains the socket for good. Every socket the
+/// broker and this client create, accept or duplicate passes through here: listeners,
+/// accepted and dialled connections, and their clones, each of which carries its own
+/// flag, since the flag belongs to the descriptor.
+///
+/// # Errors
+/// The `fcntl(2)` errno of reading or setting the descriptor's flags.
+#[cfg(unix)]
+pub(crate) fn kept_from_children(socket: &impl std::os::fd::AsFd) -> io::Result<()> {
+    astream_sys::close_on_fork(socket.as_fd())
+}
+
+/// Off Unix there is no `fork`, so no child is ever given a copy (see the Unix twin).
+#[cfg(not(unix))]
+pub(crate) fn kept_from_children<S>(_socket: &S) -> io::Result<()> {
+    Ok(())
 }
 
 /// How long the broker may take to complete the SEALED handshake when the caller gave
@@ -778,6 +798,13 @@ impl<S: Read + Write> Client<S> {
     /// `false` before any `Hello`, or against an older broker that predates the verb.
     pub const fn supports_retire(&self) -> bool {
         self.ext.supports_retire()
+    }
+
+    /// Whether the latest `Hello` answer announced [`Request::GapNotices`]: a tail on this
+    /// broker can be told what retention gave up below it ([`gap_notices`](Self::gap_notices)).
+    /// `false` before any `Hello`, or against an older broker that predates the verb.
+    pub const fn supports_gap_notices(&self) -> bool {
+        self.ext.supports_gap_notices()
     }
 
     /// The log's health as the latest `Hello` answer told it
@@ -1595,6 +1622,38 @@ impl<S: Read + Write> Client<S> {
         }
     }
 
+    /// Ask for GAP NOTICES on this connection's next subscription
+    /// (`REQUIREMENTS-fabric-operations` R4, addendum A9): before the tail delivers any
+    /// record past ones retention gave up below it, it says which range it lost and, where
+    /// the broker knows, how many records of the filter ([`Event::Gap`]). `subscribe` and
+    /// `subscribe_group` negotiate this, after [`idle_marks`](Self::idle_marks), before
+    /// handing the socket over. A broker that does not know the verb returns `Ok(false)`
+    /// and leaves the stream framed; its tail says nothing of what it skipped, as before.
+    /// Hello's request set says beforehand ([`NonceExt::supports_gap_notices`]). It arms
+    /// no deadline and appends no record; on a guarded broker it needs an attached
+    /// capability, as `idle_marks` does.
+    ///
+    /// As for `fetch`, no pipelined publish may be awaiting its acknowledgement: while
+    /// one is, the request is refused with [`AcksOwed`] and nothing is sent.
+    pub fn gap_notices(&mut self) -> io::Result<bool> {
+        self.send(&Request::GapNotices)?;
+        match self.read_mark() {
+            Ok(_) => Ok(true),
+            Err(e) if is_refused_error(&e) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The negotiation `subscribe` and `subscribe_group` make: idle marks, then gap
+    /// notices. A broker that predates idle marks predates gap notices too, so it is not
+    /// asked for them.
+    fn ask_for_tail(&mut self) -> io::Result<()> {
+        if self.idle_marks()? {
+            self.gap_notices()?;
+        }
+        Ok(())
+    }
+
     /// LAST-VALUE query: the most recent record of every subject matching `filter`
     /// whose subject sorts strictly after `after` (`""` for the first page), at most
     /// `max`, in ascending SUBJECT order. Returns the page and the `(next, head)` of
@@ -1876,9 +1935,9 @@ impl<S: Read + Write> Client<S> {
 
     /// Subscribe to every record matching `filter` from `from_offset`, then live.
     /// Consumes the client (the connection becomes a delivery stream). Negotiates
-    /// [`idle_marks`](Self::idle_marks) first, falling back to an older broker's
-    /// existing tail behavior. The acknowledgement is consumed before any
-    /// subscription event, so only a tail's own mark arms `recv_live`.
+    /// [`idle_marks`](Self::idle_marks), then [`gap_notices`](Self::gap_notices), first,
+    /// falling back to an older broker's existing tail behavior. The acknowledgement is
+    /// consumed before any subscription event, so only a tail's own mark arms `recv_live`.
     ///
     /// Refused with [`AcksOwed`], sending nothing, while pipelined acks are owed: the
     /// broker flushes them ahead of the stream, where the subscription would read them
@@ -1894,7 +1953,7 @@ impl<S: Read + Write> Client<S> {
     /// caller that pipelines reads its acks first, until
     /// [`owed_acks`](Self::owed_acks) is zero, and subscribes after.
     pub fn subscribe(mut self, from_offset: u64, filter: &str) -> io::Result<Subscription<S>> {
-        self.idle_marks()?;
+        self.ask_for_tail()?;
         self.into_subscription(&Request::Subscribe {
             from_offset,
             filter: filter.to_string(),
@@ -1944,13 +2003,14 @@ impl<S: Read + Write> Client<S> {
 
     /// Subscribe as consumer `group`: the broker resumes delivery from the group's
     /// DURABLE committed offset (no client-tracked cursor), then tails live.
-    /// Negotiates [`idle_marks`](Self::idle_marks) as [`subscribe`](Self::subscribe)
-    /// does; an older broker keeps its existing tail behavior.
+    /// Negotiates [`idle_marks`](Self::idle_marks) and
+    /// [`gap_notices`](Self::gap_notices) as [`subscribe`](Self::subscribe) does; an
+    /// older broker keeps its existing tail behavior.
     ///
     /// Refused with [`AcksOwed`] while pipelined acks are owed, and the refusal ends
     /// the connection, the acks unread, as [`subscribe`](Self::subscribe)'s does.
     pub fn subscribe_group(mut self, group: &str, filter: &str) -> io::Result<Subscription<S>> {
-        self.idle_marks()?;
+        self.ask_for_tail()?;
         self.into_subscription(&Request::SubscribeGroup {
             group: group.to_string(),
             filter: filter.to_string(),
@@ -2117,6 +2177,7 @@ impl<S: Read + Write> Client<S> {
             rx: self.rx,
             marked: false,
             durable: self.durable,
+            gap: None,
         })
     }
 }
@@ -2505,8 +2566,9 @@ pub fn take<S: Read + Write>(sub: &mut Subscription<S>, max: usize) -> io::Resul
             {
                 break
             }
-            // The catch-up mark, or one already queued: more may follow at once.
-            Ok(Some(Event::Mark { .. })) => {}
+            // The catch-up mark, or one already queued: more may follow at once. A gap
+            // notice is kept on the subscription (`take_gap`), and records follow it.
+            Ok(Some(Event::Mark { .. } | Event::Gap(_))) => {}
             Ok(None) => break, // the broker closed
             Err(e)
                 if matches!(
@@ -2632,6 +2694,8 @@ pub struct Subscription<S = UnixStream> {
     /// The durable head the newest `Mark` on this stream carried
     /// ([`seen_durable`](Subscription::seen_durable)).
     durable: Option<u64>,
+    /// The gap notices read since the last [`take_gap`](Subscription::take_gap), as one.
+    gap: Option<Gap>,
 }
 
 /// A live delivery stream from the broker (Windows twin: TCP default, as above).
@@ -2645,6 +2709,8 @@ pub struct Subscription<S = TcpStream> {
     /// The durable head the newest `Mark` on this stream carried
     /// ([`seen_durable`](Subscription::seen_durable)).
     durable: Option<u64>,
+    /// The gap notices read since the last [`take_gap`](Subscription::take_gap), as one.
+    gap: Option<Gap>,
 }
 
 #[cfg(unix)]
@@ -2670,10 +2736,11 @@ impl Subscription<UnixStream> {
 /// comes from a TCP or sealed subscription and from [`connect`].
 pub type SubscriptionCloser = Closer;
 
-/// What a subscription can carry: a record, or a `Mark`. [`Subscription::recv`] keeps
-/// its signature and SKIPS marks; a caller that needs the cursor reads
-/// [`recv_event`](Subscription::recv_event) instead, and
-/// [`recv_live`](Subscription::recv_live) turns them into liveness.
+/// What a subscription can carry: a record, a `Mark`, or a gap notice.
+/// [`Subscription::recv`] keeps its signature and SKIPS marks and notices; a caller that
+/// needs the cursor reads [`recv_event`](Subscription::recv_event) instead,
+/// [`recv_live`](Subscription::recv_live) turns marks into liveness, and
+/// [`take_gap`](Subscription::take_gap) hands back every notice a skipping read passed.
 ///
 /// On a `ForkSubscribe` stream the one `Mark` closes the snapshot. On a `Subscribe` or
 /// `SubscribeGroup` stream that negotiated idle marks a `Mark` is the broker saying
@@ -2705,6 +2772,13 @@ pub enum Event {
         head: u64,
         durable: Option<u64>,
     },
+    /// What retention gave up below the tail (`REQUIREMENTS-fabric-operations` R4,
+    /// addendum A9): every record of the filter in `from..to` that this stream does not
+    /// deliver was given up, and `records` is how many of them, where the broker knows
+    /// (see [`Gap`]). It comes before every record the tail delivers after it. Sent only
+    /// on a `Subscribe` or `SubscribeGroup` stream that asked
+    /// ([`Client::gap_notices`], which `subscribe` and `subscribe_group` do).
+    Gap(Gap),
 }
 
 impl PartialEq for Event {
@@ -2734,6 +2808,7 @@ impl PartialEq for Event {
                     durable: b_d,
                 },
             ) => *a_n == *b_n && *a_h == *b_h && *a_d == *b_d,
+            (Event::Gap(a), Event::Gap(b)) => a == b,
             _ => false,
         }
     }
@@ -2896,14 +2971,23 @@ impl<S: Read + Write> Subscription<S> {
         self.durable
     }
 
+    /// Every gap notice this stream carried since the last call ([`Event::Gap`]), as one
+    /// ([`Gap::and`]): what retention gave up below the tail. For a reader that skips them
+    /// — [`recv`](Self::recv), [`take`], [`drain`] — so it can still tell that records it
+    /// was not delivered were given up. `None` when none came.
+    pub fn take_gap(&mut self) -> Option<Gap> {
+        self.gap.take()
+    }
+
     /// Block until the next matching delivery; `Ok(None)` if the broker closes.
-    /// A `Mark` is SKIPPED (this method's signature is unchanged) — read
-    /// [`recv_event`](Self::recv_event) to see it.
+    /// A `Mark` and a gap notice are SKIPPED (this method's signature is unchanged) —
+    /// read [`recv_event`](Self::recv_event) to see them, or
+    /// [`take_gap`](Self::take_gap) for the notices passed.
     pub fn recv(&mut self) -> io::Result<Option<Record>> {
         loop {
             match self.recv_event()? {
                 None => return Ok(None),
-                Some(Event::Mark { .. }) => continue,
+                Some(Event::Mark { .. } | Event::Gap(_)) => continue,
                 Some(Event::Delivery {
                     offset,
                     subject,
@@ -2953,6 +3037,13 @@ impl<S: Read + Write> Subscription<S> {
                     durable,
                 }))
             }
+            Response::Gap(g) => {
+                self.gap = Some(match self.gap {
+                    Some(before) => before.and(g),
+                    None => g,
+                });
+                Ok(Some(Event::Gap(g)))
+            }
             other => Err(refused(other)),
         }
     }
@@ -2990,7 +3081,7 @@ impl<S: Read + Write> Subscription<S> {
         loop {
             match self.recv_live_event(closer, deadline)? {
                 None => return Ok(None),
-                Some(Event::Mark { .. }) => {}
+                Some(Event::Mark { .. } | Event::Gap(_)) => {}
                 Some(Event::Delivery {
                     offset,
                     subject,
@@ -3037,18 +3128,14 @@ impl Subscription<UnixStream> {
     /// On a socket the broker already hung up there is nothing to bound, and that is
     /// no error (see [`Closer::set_read_timeout`]).
     pub fn set_read_timeout(&self, d: Option<Duration>) -> io::Result<()> {
-        unless_hung_up(self.stream.set_read_timeout(d), || {
-            socket_hung_up(&self.stream)
-        })
+        unless_hung_up(self.stream.set_read_timeout(d), &self.stream)
     }
 }
 
 impl Subscription<TcpStream> {
     /// The TCP twin of [`Subscription::set_read_timeout`].
     pub fn set_read_timeout(&self, d: Option<Duration>) -> io::Result<()> {
-        unless_hung_up(self.stream.set_read_timeout(d), || {
-            socket_hung_up(&self.stream)
-        })
+        unless_hung_up(self.stream.set_read_timeout(d), &self.stream)
     }
 
     /// The TCP twin of [`Subscription::closer`]: a [`Closer`] on a duplicate of this
@@ -3071,9 +3158,8 @@ impl Subscription<astream_aead::SealedStream<TcpStream>> {
     /// counter (`astream_aead`'s `read_record`), and [`recv_event`](Self::recv_event)
     /// keeps the partial frame.
     pub fn set_read_timeout(&self, d: Option<Duration>) -> io::Result<()> {
-        unless_hung_up(self.stream.get_ref().set_read_timeout(d), || {
-            socket_hung_up(self.stream.get_ref())
-        })
+        let socket = self.stream.get_ref();
+        unless_hung_up(socket.set_read_timeout(d), socket)
     }
 
     /// The SEALED twin of [`Subscription::closer`]. The duplicate is of the TCP
@@ -3202,7 +3288,7 @@ impl Closer {
     #[cfg(unix)]
     fn unix(s: &UnixStream) -> io::Result<Closer> {
         let dup = s.try_clone()?;
-        astream_sys::close_on_fork(std::os::fd::AsFd::as_fd(&dup))?;
+        kept_from_children(&dup)?;
         Ok(Closer {
             socket: Arc::new(Socket::Unix(dup)),
         })
@@ -3210,7 +3296,7 @@ impl Closer {
 
     fn tcp(s: &TcpStream) -> io::Result<Closer> {
         let dup = s.try_clone()?;
-        astream_sys::close_on_fork(std::os::fd::AsFd::as_fd(&dup))?;
+        kept_from_children(&dup)?;
         Ok(Closer {
             socket: Arc::new(Socket::Tcp(dup)),
         })
@@ -3255,18 +3341,11 @@ impl Closer {
     /// The `setsockopt`, but for that refusal; a zero duration is `InvalidInput` (std's
     /// own refusal, which carries no OS error).
     pub fn set_read_timeout(&self, d: Option<Duration>) -> io::Result<()> {
-        unless_hung_up(
-            match &*self.socket {
-                #[cfg(unix)]
-                Socket::Unix(s) => s.set_read_timeout(d),
-                Socket::Tcp(s) => s.set_read_timeout(d),
-            },
-            || match &*self.socket {
-                #[cfg(unix)]
-                Socket::Unix(s) => socket_hung_up(s),
-                Socket::Tcp(s) => socket_hung_up(s),
-            },
-        )
+        match &*self.socket {
+            #[cfg(unix)]
+            Socket::Unix(s) => unless_hung_up(s.set_read_timeout(d), s),
+            Socket::Tcp(s) => unless_hung_up(s.set_read_timeout(d), s),
+        }
     }
 
     /// Bound how long a write on this connection parks on a full send buffer (a broker
@@ -3283,44 +3362,40 @@ impl Closer {
     /// The `setsockopt`, but for that refusal; a zero duration is `InvalidInput` (std's
     /// own refusal, which carries no OS error).
     pub fn set_write_timeout(&self, d: Option<Duration>) -> io::Result<()> {
-        unless_hung_up(
-            match &*self.socket {
-                #[cfg(unix)]
-                Socket::Unix(s) => s.set_write_timeout(d),
-                Socket::Tcp(s) => s.set_write_timeout(d),
-            },
-            || match &*self.socket {
-                #[cfg(unix)]
-                Socket::Unix(s) => socket_hung_up(s),
-                Socket::Tcp(s) => socket_hung_up(s),
-            },
-        )
+        match &*self.socket {
+            #[cfg(unix)]
+            Socket::Unix(s) => unless_hung_up(s.set_write_timeout(d), s),
+            Socket::Tcp(s) => unless_hung_up(s.set_write_timeout(d), s),
+        }
     }
 }
 
-/// Preserve a timeout refusal unless Apple positively observes that BOTH socket
-/// directions have ended. `EINVAL` alone is not evidence: a socket filter can refuse
-/// a valid timeout before the option is applied, including on a live connection
-/// whose previous timeout was `None`. An uncertain/failed poll keeps that error.
-/// The probe is lazy: success, zero-duration validation, and other errors never poll.
-fn unless_hung_up(set: io::Result<()>, hung_up: impl FnOnce() -> bool) -> io::Result<()> {
-    #[cfg(target_vendor = "apple")]
-    if matches!(&set, Err(e) if e.raw_os_error() == Some(XNU_EINVAL)) && hung_up() {
+/// Preserve `socket`'s timeout refusal `set` unless Apple positively observes that
+/// BOTH socket directions have ended. `EINVAL` alone is not evidence: a socket filter
+/// can refuse a valid timeout before the option is applied, including on a live
+/// connection whose previous timeout was `None`. An uncertain/failed poll keeps that
+/// error. The probe is lazy: success, zero-duration validation, and other errors never
+/// poll. It takes the socket, never a closure that polls it, so the verified lane
+/// resolves the probe at every caller.
+#[cfg(target_vendor = "apple")]
+fn unless_hung_up(set: io::Result<()>, socket: &impl std::os::fd::AsFd) -> io::Result<()> {
+    if matches!(&set, Err(e) if e.raw_os_error() == Some(XNU_EINVAL)) && socket_hung_up(socket) {
         return Ok(());
     }
-    #[cfg(not(target_vendor = "apple"))]
-    let _ = hung_up;
+    set
+}
+
+/// Off Apple a refusal is always the error (see the Apple twin).
+#[cfg(not(target_vendor = "apple"))]
+fn unless_hung_up<S>(set: io::Result<()>, _socket: &S) -> io::Result<()> {
     set
 }
 
 #[cfg(target_vendor = "apple")]
 fn socket_hung_up(socket: &impl std::os::fd::AsFd) -> bool {
+    #[cfg(test)]
+    tests::PROBES.with(|n| n.set(n.get().saturating_add(1)));
     astream_sys::socket_hung_up(socket.as_fd())
-}
-
-#[cfg(not(target_vendor = "apple"))]
-fn socket_hung_up<S>(_socket: &S) -> bool {
-    false
 }
 
 /// `EINVAL` in XNU's `<sys/errno.h>` (this crate takes no `libc`).
@@ -3402,7 +3477,7 @@ fn erase<S: AnyStream + 'static>(stream: S, closer: Closer) -> (AnyClient, Close
 #[cfg(unix)]
 fn connect_unix(endpoint: &str) -> io::Result<(AnyClient, Closer)> {
     let s = UnixStream::connect(endpoint)?;
-    astream_sys::close_on_fork(std::os::fd::AsFd::as_fd(&s))?;
+    kept_from_children(&s)?;
     let closer = Closer::unix(&s)?;
     Ok(erase(s, closer))
 }
@@ -3481,6 +3556,13 @@ mod tests {
     use crate::proto::read_frame;
     use astream_wire::{Frame, HEADER_SIZE, MAX_PAYLOAD_LEN};
     use std::io::{self, Read};
+
+    #[cfg(target_vendor = "apple")]
+    thread_local! {
+        /// How many times `socket_hung_up` polled on this thread: the probe `unless_hung_up`
+        /// makes only for an `EINVAL` refusal.
+        pub(super) static PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
 
     /// A stream that plays `script` one read at a time: `Some(n)` hands out the next
     /// `n` bytes (fewer at the end), `None` is a read timeout. Past the script it is
@@ -3568,42 +3650,38 @@ mod tests {
 
             let (ours, peer) = UnixStream::pair().unwrap();
             let refused = || Err(io::Error::from_raw_os_error(XNU_EINVAL));
+            let probes = || PROBES.with(std::cell::Cell::get);
             assert!(!socket_hung_up(&ours));
             assert_eq!(
-                unless_hung_up(refused(), || socket_hung_up(&ours))
-                    .unwrap_err()
-                    .raw_os_error(),
-                Some(XNU_EINVAL)
+                unless_hung_up(refused(), &ours).unwrap_err().raw_os_error(),
+                Some(XNU_EINVAL),
+                "negative evidence preserves the original error"
             );
             peer.shutdown(Shutdown::Write).unwrap();
             assert!(!socket_hung_up(&ours), "read EOF is not write shutdown");
             assert_eq!(
-                unless_hung_up(refused(), || socket_hung_up(&ours))
-                    .unwrap_err()
-                    .raw_os_error(),
+                unless_hung_up(refused(), &ours).unwrap_err().raw_os_error(),
                 Some(XNU_EINVAL)
             );
             drop(peer);
             assert!(socket_hung_up(&ours));
-            unless_hung_up(refused(), || socket_hung_up(&ours)).unwrap();
-            unless_hung_up(Ok(()), || panic!("success does not poll")).unwrap();
+            let before = probes();
+            unless_hung_up(refused(), &ours).unwrap();
+            assert_eq!(probes(), before + 1, "an EINVAL refusal polls, once");
+            // On the hung-up socket, which would excuse a refusal: success stays
+            // success, and any other error stays that error, and neither polls (the
+            // probe is lazy). NC: a probe made before the refusal is read polls them.
+            unless_hung_up(Ok(()), &ours).unwrap();
             for error in [
                 io::Error::new(io::ErrorKind::InvalidInput, "zero timeout"),
                 io::Error::from_raw_os_error(5),
             ] {
                 let kind = error.kind();
                 let errno = error.raw_os_error();
-                let got = unless_hung_up(Err(error), || panic!("another error does not poll"))
-                    .unwrap_err();
+                let got = unless_hung_up(Err(error), &ours).unwrap_err();
                 assert_eq!((got.kind(), got.raw_os_error()), (kind, errno));
             }
-            assert_eq!(
-                unless_hung_up(refused(), || false)
-                    .unwrap_err()
-                    .raw_os_error(),
-                Some(XNU_EINVAL),
-                "negative or uncertain evidence preserves the original error"
-            );
+            assert_eq!(probes(), before + 1, "success and other errors never poll");
         }
         let bytes = framed(&[b"payload".to_vec()]);
         for cut in 0..bytes.len() {

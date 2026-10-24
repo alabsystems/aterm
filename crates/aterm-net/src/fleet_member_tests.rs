@@ -624,6 +624,11 @@ fn a_leave_goes_on_unlocked_only_where_no_edit_could_lock() {
         assert!(!odd.is_dir(), "{what}");
     }
     mode(&unwritable, 0o700);
+    // `.` hides `gone` from `Path::parent`: the make finds no parent, as one removed under it.
+    let gone = dir.join("gone/.");
+    let refused = leave_held(&gone, |_| ()).unwrap_err().to_string();
+    let shown = gone.display().to_string();
+    assert_eq!(refused.matches(&shown).count(), 1, "{refused}");
     mode(dir, 0o750);
     let held = leave_held(dir, |leaving| {
         let bits = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
@@ -639,6 +644,8 @@ fn a_leave_goes_on_unlocked_only_where_no_edit_could_lock() {
     mode(dir, 0o750);
     let refused = leave_held(dir, |_| ()).unwrap_err().to_string();
     assert!(refused.contains("(750), and is 0700 now"), "{refused}");
+    let shown = dir.display().to_string();
+    assert_eq!(refused.matches(&shown).count(), 1, "{refused}");
     drop(other);
 
     let exe = std::env::current_exe().expect("the test binary");
@@ -655,11 +662,41 @@ fn a_leave_goes_on_unlocked_only_where_no_edit_could_lock() {
     let out = aterm_uds::deadline::output_until(&mut child, Instant::now() + HANG)
         .expect("the child ran");
     let said = String::from_utf8_lossy(&out.stdout);
+    let refused = said.lines().find(|line| line.contains("leave: refused"));
     assert!(
-        said.contains("leave: refused"),
+        refused.is_some_and(|line| line.matches(&shown).count() == 1),
         "a failure of the moment, which another edit may not meet: {said}{}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+#[test]
+fn a_lock_refusal_names_the_directory_once() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let state = State::new("lock-named");
+    let dir = state.dir();
+    let lock = dir.join(PEERS_LOCK);
+    let shown = dir.display().to_string();
+    let once = |refused: String| assert_eq!(refused.matches(&shown).count(), 1, "{refused}");
+    std::fs::create_dir(&lock).unwrap();
+    once(
+        write_held(dir, Began::Here, |_| ())
+            .unwrap_err()
+            .to_string(),
+    );
+    std::fs::remove_dir(&lock).unwrap();
+    std::os::unix::fs::symlink(dir.join("nowhere"), &lock).unwrap();
+    once(node_identity(dir).unwrap_err().to_string());
+    std::fs::remove_file(&lock).unwrap();
+    let fifo = std::ffi::CString::new(lock.as_os_str().as_bytes()).unwrap();
+    // SAFETY: a NUL-terminated path; mkfifo reads it and nothing else.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    once(node_identity(dir).unwrap_err().to_string());
+    std::fs::remove_file(&lock).unwrap();
+    let _other = BookLock::take(dir, Duration::ZERO).unwrap();
+    let busy = node_identity(dir).unwrap_err();
+    assert_eq!(busy.kind(), io::ErrorKind::WouldBlock);
+    once(busy.to_string());
 }
 
 #[test]
@@ -681,8 +718,10 @@ fn leave_with_no_descriptor_free() {
     // SAFETY: `setrlimit` reads the struct this frame owns: a soft limit under the hard one.
     let set = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
     assert_eq!(set, 0);
-    let ran = leave_held(Path::new(&dir), |_| ());
-    println!("leave: {}", if ran.is_ok() { "ran" } else { "refused" });
+    match leave_held(Path::new(&dir), |_| ()) {
+        Ok(()) => println!("leave: ran"),
+        Err(e) => println!("leave: refused: {e}"),
+    }
 }
 
 #[test]

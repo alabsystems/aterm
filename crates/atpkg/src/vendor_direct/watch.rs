@@ -1256,8 +1256,8 @@ mod tests {
             Anchor::MoonshotTwoHost => {
                 format!("https://cdn.kimi.com/kimi-code/binaries/{version}/kimi-code-darwin-arm64")
             }
-            Anchor::XaiDeveloperId => format!(
-                "https://storage.googleapis.com/grok-build-public-artifacts/cli/grok-{version}-macos-aarch64"
+            Anchor::XaiNpmRegistry | Anchor::XaiDeveloperId => format!(
+                "https://registry.npmjs.org/@xai-official/grok-darwin-arm64/-/grok-darwin-arm64-{version}.tgz"
             ),
         };
         let record = VendorRecord {
@@ -1274,6 +1274,8 @@ mod tests {
             anchor: spec.anchor,
             build_date: None,
             verified_at: 1_790_000_000,
+            measured_sha256: None,
+            agreed_with: None,
         };
         let bytes = record.record_bytes().unwrap();
         super::super::durable::write_durable(&record_path(&dir).unwrap(), &bytes).unwrap();

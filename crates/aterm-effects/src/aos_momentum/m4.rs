@@ -879,6 +879,12 @@ impl Distributed<'_> {
         &self.jobs
     }
 
+    /// The claims recorded, by slot (tests only).
+    #[cfg(test)]
+    pub(super) fn claims(&self) -> &[Option<Claim>] {
+        &self.claims
+    }
+
     /// The check level.
     #[inline]
     #[must_use]
@@ -1241,6 +1247,30 @@ impl Evaluator {
     #[inline]
     fn count_stepped(&self, n: usize) {
         self.stepped.fetch_add(wide(n), Ordering::Relaxed);
+    }
+
+    /// A new evaluator of this one's build, policy and corpus, which [`Self::v1`] checked when it
+    /// built this one, with nothing stepped, read, cached, replaced or faulted (tests only: a test
+    /// counts its own reads without measuring the baseline again).
+    #[cfg(test)]
+    pub(super) fn anew(&self) -> Evaluator {
+        Evaluator {
+            policy: self.policy.clone(),
+            corpus: self.corpus.clone(),
+            build: self.build.clone(),
+            origin: self.origin,
+            stepped: AtomicU64::new(0),
+            grid: OnceLock::new(),
+            replaced: None,
+            fault: None,
+            reads: Reads::default(),
+        }
+    }
+
+    /// Whether a search has filled the grid's selection (tests only).
+    #[cfg(test)]
+    pub(super) fn grid_cached(&self) -> bool {
+        self.grid.get().is_some()
     }
 
     /// The evaluator with the scenario of the held-out item `id` replaced by `s` (tests only).

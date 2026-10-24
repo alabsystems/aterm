@@ -586,7 +586,8 @@ fn the_coverage_chains_are_scripted_turn_by_turn() {
         Some(CLEAN)
     );
     assert_eq!(reply(Worker, &[]).as_deref(), Some(WORK));
-    assert_eq!(reply(Worker, &[LAND]).as_deref(), Some(CLEAN));
+    assert_eq!(reply(Worker, &[LAND]).as_deref(), Some(WORK));
+    assert_eq!(reply(Worker, &[LAND, LAND_NUDGE]).as_deref(), Some(CLEAN));
     assert!(Mgr.rules().is_empty());
     assert_eq!(reply(Wall, &[]).as_deref(), Some(WORK));
     assert_eq!(reply(Wall, &[LAND]).as_deref(), Some(CLEAN));
@@ -644,7 +645,7 @@ fn the_coverage_modes_pick_their_chains() {
     assert_eq!(
         Chain::of_mode(Mode::Cover),
         [
-            LandQ, LandP, LandW, WroteC, LandT, Mgr, Worker, CruiseO, Off
+            LandQ, LandT, LandP, LandW, WroteC, Mgr, Worker, CruiseO, Off
         ]
     );
     assert_eq!(Chain::of_mode(Mode::Cap), [Cap, Off]);
@@ -843,20 +844,9 @@ fn the_modes_pick_their_chains_and_off_runs_in_each() {
     assert_eq!(
         Chain::ALL
             .into_iter()
-            .filter(|c| surfaces::pauses(*c))
+            .filter(|c| surfaces::holds_at_end(*c))
             .collect::<Vec<_>>(),
-        [
-            LandB,
-            LandC,
-            LandD,
-            LandF,
-            LandG,
-            LandH,
-            LandI,
-            Cruise,
-            InstantCruise,
-            CruiseN
-        ]
+        [LandB, LandC, LandD, LandF, LandG, LandH, LandI]
     );
     assert_eq!(CruiseN.limit_ms(), CRUISE_N_LIMIT_MS);
     assert!(!LandJ.lands() && !LandK.lands() && !LandJ.tasked());
@@ -1079,12 +1069,12 @@ fn the_words_are_read() {
     .unwrap();
     assert_eq!(
         d.chains(Harness::Claude),
-        [Chain::LandQ, Chain::Mgr, Chain::Worker]
+        [Chain::LandQ, Chain::Mgr, Chain::Worker, Chain::Off]
     );
     for h in [Harness::Gemini, Harness::Agy, Harness::Muse] {
         assert_eq!(
             d.chains(h),
-            [Chain::LandQ, Chain::Mgr, Chain::Worker],
+            [Chain::LandQ, Chain::Mgr, Chain::Worker, Chain::Off],
             "{}",
             h.name()
         );
@@ -1102,7 +1092,7 @@ fn the_words_are_read() {
     for h in Harness::ALL {
         assert_eq!(
             worker.chains(h),
-            [Chain::Mgr, Chain::Worker],
+            [Chain::Mgr, Chain::Worker, Chain::Off],
             "{}",
             h.name()
         );
@@ -1128,7 +1118,7 @@ fn the_words_are_read() {
     ]))
     .unwrap()
     .unwrap();
-    assert_eq!(question.chains(Harness::Claude), [Chain::LandQ]);
+    assert_eq!(question.chains(Harness::Claude), [Chain::LandQ, Chain::Off]);
     let e = parse_args(&v(&["--harness", "muse", "--chains", "wall"]))
         .unwrap()
         .unwrap();
@@ -1146,7 +1136,7 @@ fn the_words_are_read() {
     .unwrap()
     .unwrap();
     assert!(keys.window);
-    assert_eq!(keys.chains(Harness::Muse), [Chain::LandP]);
+    assert_eq!(keys.chains(Harness::Muse), [Chain::LandP, Chain::Off]);
     assert!(!question.window);
     assert!(
         parse_args(&v(&["--harness", "claude", "--mode", "cover", "--window"]))
@@ -4558,6 +4548,31 @@ fn hold(line: (i64, String), held: &str, nudges: &str, since: &str) -> (i64, Str
 
 const LAND_SINCE: &str = "1125";
 
+/// Its opening sweep's read (5d): its chip drawn in front before its first prompt, the title its
+/// mode's sentence from MODE_WORDS (Gemini CLI, no footer: no title).
+fn opened(program: &str, mode: &str) -> Option<(i64, String)> {
+    use aterm_agent::supervise::Autopilot;
+    use aterm_agent::supervise::mode_words::mode_words;
+    let line = if program == "gemini" {
+        "window=2 program=gemini face=- drawn=- why=no-footer spoken=- description=- title=-"
+            .to_string()
+    } else {
+        let m = Autopilot::ALL
+            .into_iter()
+            .find(|m| m.word() == mode)
+            .expect("a mode");
+        let title = format!(
+            "autopilot: {mode} \u{2014} {} \u{b7} click: x \u{b7} right-click: more",
+            mode_words(m).chip
+        );
+        format!(
+            "window=2 program={program} face={mode} drawn={:?} spoken=\"x\" description=- title={title:?}",
+            surfaces::face_cells(mode).expect("a face")
+        )
+    };
+    Some((T0 - 30_000, line))
+}
+
 fn behind(program: &str, face: &str) -> String {
     if program == "gemini" {
         "window=2 program=gemini face=- drawn=- why=no-footer spoken=-".to_string()
@@ -4627,6 +4642,7 @@ fn seen_land_a(program: &str) -> Seen {
             ),
             j(377_000, "head=land-a: Window 2, tab 2\nstate=landed 03:24"),
         ],
+        opening: opened(program, "land"),
         ..window("land-a")
     };
     s
@@ -4873,6 +4889,7 @@ fn seen_cruise_n() -> Seen {
                     &format!("needs you: {NEED_A} (+1 more); carrying on · pausing"),
                 ),
             ],
+            opening: opened("claude", "cruise"),
             ..window("cruise-n")
         },
         ..Seen::default()
@@ -5063,6 +5080,7 @@ fn a_tab_behind_passes_on_its_face_with_nothing_drawn() {
     s.window = surfaces::Window {
         chip: vec![j(1_000, &behind("claude", "cruise"))],
         strip: vec![j(1_000, "index=10 selected=0 states=-")],
+        opening: opened("claude", "cruise"),
         ..window("cruise")
     };
     assert_eq!(
@@ -5164,6 +5182,7 @@ fn seen_land_j(label: &str) -> Seen {
                     "step=press end=1792578282 end_seen=1 selected=1 states=selected done_row=no pressed=OK",
                 ),
             ],
+            opening: opened("claude", "land"),
             ..window(label)
         },
         ..Seen::default()
@@ -5302,13 +5321,14 @@ fn land_e_passes_on_its_row_and_this_mac_counting_every_landed_tab() {
                 "done-head|Done for you (1) rows=1\ndone|✓ land-e — landed #",
             )],
             rest: rest.map(str::to_string),
+            opening: opened("gemini", "land"),
             ..window("land-e")
         };
         s
     };
     let rest = |here: &str, landed: usize, today: &str, every: &str| {
         format!(
-            "here=\"{here}\" landed_tabs={landed} landing_tabs=6 landings=3 today=\"{today}\" every=\"{every}\""
+            "here=\"{here}\" landed_tabs={landed} landing_tabs=6 landings=3 today=\"{today}\" every=\"{every}\" did=\"Landed: 3 today \u{b7} 3 in 7 days\""
         )
     };
     const TODAY: &str = "3 landed today · 2 kept going · 7 land prompts";
@@ -5395,7 +5415,7 @@ fn rest_desk(metrics: &str, n_render: &str) -> surfaces::Desk {
             moved: Vec::new(),
             relogged: Vec::new(),
             ends: vec!["land-j".into(), "land-k".into()],
-            holds: vec!["cruise".into()],
+            holds: vec!["land-b(open, since 1792000060)".into()],
             page_open: true,
         }),
         ..surfaces::Desk::default()
@@ -5532,18 +5552,23 @@ fn end_passes_on_a_window_at_rest_and_each_chain_drawn_as_its_face() {
     if let Some(i) = d.idle.as_mut() {
         i.holds.clear();
     }
-    let v = surfaces::judge_end(&d, &tabs, "claude");
+    let b = front("window=2 program=claude face=land drawn=\"⤓ land\" spoken=\"x\"");
+    let held = [(Chain::CruiseN, &n), (Chain::LandB, &b), (Chain::Off, &off)];
+    let v = surfaces::judge_end(&d, &held, "claude");
     assert_eq!(v.word(), "UNOBSERVED", "{}", v.why());
     assert!(v.why().contains("no hold stood in it"), "{}", v.why());
-    let k = front("window=2 program=claude face=landed drawn=\"✓ landed\" spoken=\"x\"");
-    let unpaused = [(Chain::LandJ, &j_), (Chain::LandK, &k), (Chain::Off, &off)];
-    let v = surfaces::judge_end(&d, &unpaused, "claude");
-    assert_eq!(v.word(), "PASS", "{}", v.why());
-    assert!(
-        v.why().contains("no chain of the run pauses"),
-        "{}",
+    let v = surfaces::judge_end(&d, &tabs, "claude");
+    assert_eq!(
+        v.word(),
+        "PASS",
+        "a run with no chain under Land that holds wants none: {}",
         v.why()
     );
+    assert!(v.why().contains("no chain of the run holds"), "{}", v.why());
+    let k = front("window=2 program=claude face=landed drawn=\"✓ landed\" spoken=\"x\"");
+    let unheld = [(Chain::LandJ, &j_), (Chain::LandK, &k), (Chain::Off, &off)];
+    let v = surfaces::judge_end(&d, &unheld, "claude");
+    assert_eq!(v.word(), "PASS", "{}", v.why());
 }
 
 #[test]
@@ -5743,7 +5768,16 @@ fn every_chain_and_scenario_of_the_pass_has_its_window_wants() {
     ] {
         assert!(wanted(c, s), "{s:?}");
     }
-    assert!(!wanted(Chain::LandQ, Scenario::L12));
+    for (c, s) in [
+        (Chain::LandQ, Scenario::L12),
+        (Chain::LandT, Scenario::P5),
+        (Chain::Worker, Scenario::L15),
+        (Chain::LandW, Scenario::L14),
+    ] {
+        assert!(wanted(c, s), "5d's: {s:?}");
+    }
+    assert!(!wanted(Chain::Wall, Scenario::W1));
+    assert!(!wanted(Chain::Cap, Scenario::Cap));
 }
 
 #[test]
@@ -7221,4 +7255,66 @@ fn a_composer_is_waited_for_while_its_screen_moves_and_input_no_one_gave_ends_it
             .is_some_and(|w| w.contains("no one typed"))
     );
     assert_eq!(ComposerWait::Ready.why("muse"), None);
+}
+
+/// END wants the Land hold on each chain that neither lands nor ends (`holds_at_end`), read off
+/// that chain's own hold: one chain's hold standing does not stand for another's lost at rest.
+#[test]
+fn end_wants_each_holding_chains_own_hold() {
+    const REST: &str = "timer_wakes=0 event_wakes=3 deadline_owner=presence deadline_arms_by_owner=presence:1/0 deadline_fires_by_owner=none wakes_by_variant=HostNote:2,HarnessFact:1";
+    let front = |line: &str| surfaces::Window {
+        front: Some((T0, line.to_string())),
+        ..window("x")
+    };
+    let n = front("window=2 program=claude face=cruise drawn=\"∞\" spoken=\"x\"");
+    let j_ = front("window=2 program=claude face=landed drawn=\"✓ landed\" spoken=\"x\"");
+    let b = front("window=2 program=claude face=land drawn=\"⤓ land\" spoken=\"x\"");
+    let c = front("window=2 program=claude face=land drawn=\"⤓ land\" spoken=\"x\"");
+    let off = front("-");
+    let tabs = [
+        (Chain::CruiseN, &n),
+        (Chain::LandJ, &j_),
+        (Chain::LandB, &b),
+        (Chain::LandC, &c),
+        (Chain::Off, &off),
+    ];
+    let v = surfaces::judge_end(&rest_desk(REST, "0"), &tabs, "claude");
+    assert_eq!(v.word(), "FAIL", "land-c's hold lost at rest: {}", v.why());
+    assert!(v.why().contains("land-c"), "{}", v.why());
+    let mut both = rest_desk(REST, "0");
+    if let Some(i) = both.idle.as_mut() {
+        i.holds.push("land-c(repo, since 1792000070)".into());
+    }
+    let v = surfaces::judge_end(&both, &tabs, "claude");
+    assert_eq!(v.word(), "PASS", "{}", v.why());
+    let mut none = rest_desk(REST, "0");
+    if let Some(i) = none.idle.as_mut() {
+        i.holds.clear();
+    }
+    let v = surfaces::judge_end(&none, &tabs, "claude");
+    assert_eq!(v.word(), "UNOBSERVED", "{}", v.why());
+}
+
+/// How many sessions' rows Settings ▸ Harness draws on its one screen at the lab's 144x50
+/// (§12.5.4): a row past them is never read.
+const PAGE_ROWS: usize = 3;
+
+/// P5's and L12's wants read the hold's state line on Settings ▸ Harness, which draws one screen
+/// of rows in tab order ([`PAGE_ROWS`]): land-q and land-t open among a cover run's first tabs, so
+/// their rows stand on it; cruise-n opens first wherever the window is read.
+#[test]
+fn the_chains_whose_state_line_is_judged_open_on_the_pages_one_screen() {
+    let cover = Chain::of_mode(Mode::Cover);
+    let on_screen: Vec<Chain> = opening_order(&cover, true)
+        .into_iter()
+        .map(|i| cover[i])
+        .filter(|c| c.opening() != Opening::Spawned)
+        .take(PAGE_ROWS)
+        .collect();
+    for c in [Chain::LandQ, Chain::LandT] {
+        assert!(on_screen.contains(&c), "{} on {on_screen:?}", c.name());
+    }
+    let both = Chain::of_mode(Mode::Both);
+    assert_eq!(both[opening_order(&both, true)[0]], Chain::CruiseN);
+    assert_eq!(opening_order(&both, false)[0], 0);
 }

@@ -13,6 +13,7 @@ use aterm_phase::{ApiCause, Program};
 use super::super::config::{Autopilot, SupervisorConfig};
 use super::super::limit::ResetClock;
 use super::approval::QuestionPriority;
+use super::exception::FUTILE_AFTER_TRIES;
 use super::login::LoginShared;
 use super::needs::{self, NEEDS_ACK, NEEDS_HINT};
 use super::reset::{RESET_CONTINUES_WAIT, ResetOutcome};
@@ -145,6 +146,118 @@ fn said_letters(tail: Option<&str>) -> String {
             .filter(|c| c.is_alphanumeric()),
     );
     letters
+}
+
+/// THE REPLY A TURN SAID ([`TurnEndState::repeats`]): its words, or a read wall's kind and words, a word with a digit one number.
+fn reply_mark(reading: &TurnEndReading) -> u64 {
+    let mut letters = String::new();
+    let words: [Option<&str>; 2] = match reading.wall {
+        Some(kind) => {
+            letters.push_str(kind.name());
+            [Some(&reading.wall_message), None]
+        }
+        None => [reading.turn_said.as_deref(), reading.said_tail.as_deref()],
+    };
+    for word in words.into_iter().flatten().flat_map(str::split_whitespace) {
+        if word.contains(char::is_numeric) {
+            letters.push('#');
+        } else {
+            letters.extend(word.chars().filter(|c| c.is_alphanumeric()));
+        }
+    }
+    aterm_hash::fnv1a_64(letters.as_bytes())
+}
+
+/// The decider's check that holds an act at the same reply ([`TurnEndState::repeats`]).
+pub const SAME_REPLY: &str = "same-reply";
+
+/// HOW MANY REPLIES THE SHORT STREAK KEEPS ([`Replies`]).
+pub const REPLIES_KEPT: usize = 3;
+
+/// HOW MANY NO-WORK ACTS IN A ROW HOLD WHATEVER THEIR WORDING ([`Replies::run`]): two through each reply the streak keeps, so the same-reply hold always comes first.
+pub const NO_WORK_ACTS: usize = 2 * REPLIES_KEPT;
+
+/// ONE REPLY THE SHORT STREAK KEEPS: its mark ([`reply_mark`]), the no-work answers that settled to it, whether a read wall said it, and those answering the wall's own acts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Kept {
+    pub mark: u64,
+    pub answers: usize,
+    pub walled: bool,
+    pub tries: usize,
+}
+
+impl Kept {
+    /// Two no-work answers settled to it: the reply came again ([`TurnEndState::repeats`]).
+    #[must_use]
+    pub const fn holds(&self) -> bool {
+        self.answers >= 2
+    }
+}
+
+/// THE REPLIES THE SHORT STREAK KEEPS, the newest [`REPLIES_KEPT`] last, and how many no-work answers came in a row ([`TurnEndState::repeats`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Replies {
+    pub kept: [Option<Kept>; REPLIES_KEPT],
+    pub run: usize,
+}
+
+impl Replies {
+    pub const NONE: Self = Self {
+        kept: [None; REPLIES_KEPT],
+        run: 0,
+    };
+
+    #[must_use]
+    pub fn last(&self) -> Option<Kept> {
+        self.kept.iter().rev().find_map(|k| *k)
+    }
+
+    pub fn kept(&self) -> impl Iterator<Item = Kept> + '_ {
+        self.kept.iter().filter_map(|k| *k)
+    }
+
+    /// The newest reply came again, or [`NO_WORK_ACTS`] no-work answers came in a row.
+    #[must_use]
+    pub fn holds(&self) -> bool {
+        self.last().is_some_and(|k| k.holds()) || self.run >= NO_WORK_ACTS
+    }
+
+    /// One more answer that settled to `mark` (`own`: to a wall's own act; `idle`: no work): a reply kept already counts it again.
+    fn count(&mut self, mark: u64, walled: bool, own: bool, idle: bool) {
+        let before = self.kept().find(|k| k.mark == mark);
+        let mut kept: Vec<Kept> = self.kept().filter(|k| k.mark != mark).collect();
+        kept.push(Kept {
+            mark,
+            answers: before.map_or(1, |k| k.answers.saturating_add(1)),
+            walled,
+            tries: before
+                .map_or(0, |k| k.tries)
+                .saturating_add(usize::from(own)),
+        });
+        let run = if idle { self.run.saturating_add(1) } else { 0 };
+        *self = Self {
+            run,
+            ..Self::of(&kept)
+        };
+    }
+
+    fn has(&self, mark: u64) -> bool {
+        self.kept().any(|k| k.mark == mark)
+    }
+
+    /// The newest [`REPLIES_KEPT`] of `kept`.
+    #[must_use]
+    pub fn of(kept: &[Kept]) -> Self {
+        let mut out = Self::default();
+        for (slot, k) in out
+            .kept
+            .iter_mut()
+            .zip(&kept[kept.len().saturating_sub(REPLIES_KEPT)..])
+        {
+            *slot = Some(*k);
+        }
+        out
+    }
 }
 
 fn words_end_with(tail: Option<&str>, mark: Option<u64>, len: usize) -> bool {
@@ -9714,6 +9827,8 @@ pub struct TurnEndReading {
     pub screen_mark: Option<u64>,
     pub worked: Option<Duration>,
     pub worked_doubt: Duration,
+    /// The turn ran a tool ([`aterm_phase::reader::ScreenReader::turn_ran_tools`]), read on the whole turn, or the history to its start, where it opens above the screen, or may have, neither read: work, however short ([`TurnEndState::repeats`]).
+    pub ran_tools: bool,
     pub rules: Option<String>,
     /// The `aterm:` fact the act typed here may carry ([`FACT_RIDES`],
     /// [`crate::supervise::facts`]): the session's untold one, filled by the loop only at the
@@ -10023,6 +10138,7 @@ impl TurnEndReading {
             worked_doubt: worked.map_or(Duration::ZERO, |w| {
                 less(w, asleep.least).saturating_sub(less(w, asleep.most))
             }),
+            ran_tools: reading.program.reader().turn_ran_tools(rows),
             rules,
             fact: None,
             pending_input: claude
@@ -10476,6 +10592,8 @@ struct Awaited {
     host: Option<HostTurn>,
     off_stood: bool,
     wall_retry: bool,
+    /// A wall's own act: its retry, or the continuation its command owed ([`Kept::tries`]).
+    own: bool,
     said: Option<u64>,
     over: Option<u64>,
     lead: Option<u64>,
@@ -10595,6 +10713,23 @@ struct CompactOwes {
     land: bool,
 }
 
+/// An act's answer read at a wall, settled again by the next point's read ([`TurnEndState::observe`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Settling {
+    before: (Replies, Option<Instant>),
+    at: Instant,
+    seen: bool,
+    own: bool,
+}
+
+/// The act a loop before this one typed last, its answer this loop's to read ([`TurnEndState::seed_yield`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct YieldSeed {
+    continues: bool,
+    typed: bool,
+    own: bool,
+}
+
 /// What the policy remembers of one session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnEndState {
@@ -10608,6 +10743,10 @@ pub struct TurnEndState {
     followed: Option<&'static str>,
     point_worked: Duration,
     short: u32,
+    /// The replies no-work answers to acts settled to ([`Self::repeats`]), and when the newest did.
+    replies: Replies,
+    replies_at: Option<Instant>,
+    settling: Option<Settling>,
     point_at: Option<Instant>,
     points: u64,
     done_at: Option<Instant>,
@@ -10706,11 +10845,13 @@ pub struct TurnEndState {
     login_returned: bool,
     login_seed: Option<Instant>,
     login_retaken: bool,
-    yield_seed: Option<bool>,
+    yield_seed: Option<YieldSeed>,
     left_judged: bool,
     point_last: bool,
     ran: bool,
     gap: bool,
+    /// The point the gap was taken at answers a turn no loop timed ([`Self::take_gap`]).
+    gap_turn: bool,
     credits: Option<CreditsEpisode>,
 }
 
@@ -10751,6 +10892,9 @@ impl TurnEndState {
             followed: None,
             point_worked: Duration::ZERO,
             short: 0,
+            replies: Replies::default(),
+            replies_at: None,
+            settling: None,
             point_at: None,
             points: 0,
             done_at: None,
@@ -10848,6 +10992,7 @@ impl TurnEndState {
             point_last: true,
             ran: false,
             gap: false,
+            gap_turn: false,
             credits: None,
         }
     }
@@ -11209,6 +11354,7 @@ impl TurnEndState {
             host: None,
             off_stood: false,
             wall_retry,
+            own: wall_retry,
             said: None,
             over: None,
             lead: None,
@@ -11296,12 +11442,23 @@ impl TurnEndState {
     }
 
     pub(crate) fn take_gap(&mut self) -> bool {
-        std::mem::take(&mut self.gap) && self.awaiting.is_none()
+        let gap = std::mem::take(&mut self.gap) && self.awaiting.is_none();
+        self.gap_turn |= gap;
+        gap
+    }
+
+    /// The act a loop before this one typed last, its answer unread ([`Self::seed_yield`]).
+    #[must_use]
+    pub fn seeded_act_typed(&self) -> Option<Instant> {
+        self.yield_seed.and(self.acts.back().copied())
     }
 
     pub(crate) const fn launched_since_books(&mut self) {
         self.gap = false;
+        self.gap_turn = false;
         self.ran_turn_seed = None;
+        self.replies = Replies::NONE;
+        self.replies_at = None;
     }
 
     /// …AND WHEN.
@@ -11362,7 +11519,9 @@ impl TurnEndState {
     #[must_use]
     pub fn reads_turn_whole(&self, r: &TurnEndReading, worked: bool) -> bool {
         let first_point = self.point_at.is_none() && !r.program.reader().bounds_messages();
-        if !(worked || first_point) || matches!(r.phase, Phase::Busy | Phase::Prompt) {
+        // A kept reply is compared at every point ([`Self::repeats`]), so as it was read at its answer.
+        let compared = self.replies.last().is_some();
+        if !(worked || first_point || compared) || matches!(r.phase, Phase::Busy | Phase::Prompt) {
             return false;
         }
         let folds_needs = r.wall.is_none() && !r.pending_input;
@@ -11387,6 +11546,12 @@ impl TurnEndState {
         self.point_last = false;
     }
 
+    /// Seed the replies a previous loop recorded `ago` ([`Self::replies`]).
+    pub fn seed_replies(&mut self, said: Replies, ago: Duration, now: Instant) {
+        self.replies = said;
+        self.replies_at = (said != Replies::default()).then(|| now.checked_sub(ago).unwrap_or(now));
+    }
+
     /// THE STREAK SEEDED WAS RECORDED AT A POINT a loop before this one judged `ago` ago ([`crate::supervise::approvals::RULE_POINT`]).
     pub fn seed_point(&mut self, ago: Duration, now: Instant) {
         self.point_seed = Some(now.checked_sub(ago).unwrap_or(now));
@@ -11406,7 +11571,11 @@ impl TurnEndState {
 
     /// THE STREAK SEEDED IS THE ONE THE ACT `rule` A LOOP BEFORE THIS ONE TYPED LAST WAS TYPED AFTER.
     pub fn seed_yield(&mut self, rule: &str) {
-        self.yield_seed = Some(is_continue_rule(rule));
+        self.yield_seed = Some(YieldSeed {
+            continues: is_continue_rule(rule),
+            typed: !matches!(rule, RULE_COMPACT | RULE_LOGIN),
+            own: is_wall_retry(rule),
+        });
     }
 
     pub(crate) fn take_point_moved(&mut self) -> bool {
@@ -11739,6 +11908,79 @@ impl TurnEndState {
         self.short
     }
 
+    /// The replies no-work answers to acts settled to ([`reply_mark`]), the newest last.
+    #[must_use]
+    pub const fn replies(&self) -> Replies {
+        self.replies
+    }
+
+    /// Whether the next point's [`TurnEndReading::ran_tools`] weighs ([`Self::observe`]): an act's answer is read (an act awaited, a yield typed, a wall's answer settling), or a reply is kept.
+    #[must_use]
+    pub fn weighs_tools(&self) -> bool {
+        self.awaiting.is_some_and(|a| !a.command)
+            || self.yield_seed.is_some_and(|y| y.typed)
+            || self.settling.is_some()
+            || self.replies.last().is_some()
+    }
+
+    /// THE SAME REPLY AGAIN, a read wall's once its tries are spent, or [`NO_WORK_ACTS`] no-work answers in a row (past a read wall's own tries), the screen showing the newest kept: nothing is typed at it. A date or clock reset or the route back since the last answer lifts both; a relative reset, restated with each answer, only the first while the wall's tries last.
+    #[must_use]
+    pub fn repeats(&self, reading: &TurnEndReading) -> bool {
+        let Some(k) = self
+            .replies
+            .last()
+            .filter(|k| k.mark == reply_mark(reading))
+        else {
+            return false;
+        };
+        let since = |r: Instant| self.replies_at.is_none_or(|at| at < r);
+        let tries = k.tries.max(self.wall.as_ref().map_or(0, |t| t.attempts));
+        let (dated, relative) = match self.reset_known(reading) {
+            Some((r, true)) => (since(r), false),
+            Some((r, false)) => (false, since(r) && tries < FUTILE_AFTER_TRIES),
+            None => (false, false),
+        };
+        if dated || self.route_back(reading).is_some_and(since) {
+            return false;
+        }
+        let spent = !k.walled || tries >= FUTILE_AFTER_TRIES;
+        let run = if spent {
+            NO_WORK_ACTS
+        } else {
+            NO_WORK_ACTS + FUTILE_AFTER_TRIES
+        };
+        (!relative && spent && k.holds()) || self.replies.run >= run
+    }
+
+    /// The parsed reset of the limit at this point, the read wall's, else the one its track names, and whether it is a date or clock rather than a time from its notice (`in 45s`).
+    fn reset_known(&self, reading: &TurnEndReading) -> Option<(Instant, bool)> {
+        match reading.reset_at {
+            Some(at) => Some((at, reading.wall.is_none() || reading.reset_clock.is_some())),
+            None => self
+                .wall
+                .as_ref()
+                .and_then(|t| left_named(t, reading))
+                .map(|n| (n.at, n.said.is_some())),
+        }
+    }
+
+    /// When the host measured the route up ([`Reach::Up`]), at an API error the route caused.
+    fn route_back(&self, reading: &TurnEndReading) -> Option<Instant> {
+        let kind = reading
+            .wall
+            .or_else(|| self.wall.as_ref().and_then(|t| t.kind));
+        match (kind, reading.reach) {
+            (
+                Some(WallKind::ApiError {
+                    cause: ApiCause::Unreachable | ApiCause::CutOff,
+                    ..
+                }),
+                Reach::Up { since },
+            ) => Some(since),
+            _ => None,
+        }
+    }
+
     /// Where the task stands.
     #[must_use]
     pub const fn done_reports(&self) -> u8 {
@@ -11922,6 +12164,9 @@ impl TurnEndState {
         }
         self.needs = Needs::default();
         self.land = LandEpisode::default();
+        self.replies = Replies::default();
+        self.replies_at = None;
+        self.settling = None;
         self.landing = false;
         self.cut_check = false;
         self.cut_land = false;
@@ -13210,6 +13455,25 @@ impl TurnEndState {
         } else {
             reading
         };
+        // An act's answer that ran no tool, however long, is no work at a read wall or at a kept reply its tool rows are read at.
+        let retried_alone;
+        let reading = if !reading.ran_tools
+            && (self.awaiting.is_some_and(|a| !a.command)
+                || self.yield_seed.is_some_and(|y| y.typed))
+            && reading.worked.is_some_and(|w| !w.is_zero())
+            && (reading.wall.is_some()
+                || (reading.program.reader().reads_tool_rows()
+                    && self.replies.has(reply_mark(reading))))
+        {
+            retried_alone = TurnEndReading {
+                worked: Some(Duration::ZERO),
+                worked_doubt: Duration::ZERO,
+                ..reading.clone()
+            };
+            &retried_alone
+        } else {
+            reading
+        };
         if !reading.pending_input || reading.worked.is_some() {
             self.stale_input = false;
         }
@@ -13261,6 +13525,7 @@ impl TurnEndState {
         let land_point = std::mem::take(&mut self.land_point_seed);
         self.esc_seed = false;
         let seeded_yield = self.yield_seed.take();
+        let unseen_turn = std::mem::take(&mut self.gap_turn);
         let same_point =
             seeded_point.is_some() && reading.worked.is_none() && self.awaiting.is_none();
         let mut checked = std::mem::take(&mut self.checking);
@@ -13278,7 +13543,9 @@ impl TurnEndState {
         let unseen_after_off =
             self.awaiting.is_some_and(|a| a.off_stood) && reading.worked.is_none();
         let wall_retry = self.awaiting.is_some_and(|a| a.wall_retry);
+        let own_act = self.awaiting.is_some_and(|a| a.own);
         let act_taken = self.awaiting.is_some_and(|a| a.taken) || reading.worked.is_some();
+        let act_submitted = self.awaiting.is_some_and(|a| a.submitted_since(reading));
         let awaited = self.awaiting.take().map(|a| a.rule);
         if awaited.is_some() || reading.worked.is_some() {
             // THE VENDOR'S OWN CONTINUATION of the limit that cut it (Claude
@@ -13471,6 +13738,9 @@ impl TurnEndState {
                 self.new_point(now);
                 if is_continue_rule(rule) {
                     self.short = streak(self.short, d, done);
+                } else if !awaited_command && d >= min && !done {
+                    // Real work ends the streak whatever act it answered, a wall's retry included.
+                    self.short = 0;
                 }
                 if ok_to_leave {
                     land_judged = landing && !self.exchange && act_taken;
@@ -13513,12 +13783,14 @@ impl TurnEndState {
                 };
                 self.landed = lands;
                 match seeded_yield {
-                    Some(continues) => {
+                    Some(y) => {
                         if yield_stopped {
                             self.carrying = false;
                         }
-                        if continues {
+                        if y.continues {
                             self.short = streak(self.short, d, done);
+                        } else if y.typed && d >= min && !done {
+                            self.short = 0;
                         }
                     }
                     None if reading.wall.is_none() && !left => {
@@ -13591,7 +13863,72 @@ impl TurnEndState {
             }
             (None, None) => {}
         }
+        // THE SAME REPLY AGAIN ([`Self::repeats`]): an act's no-work answer seen taken counts for the reply it settles to.
+        let replies_before = self.replies;
+        let mut answered_at = now;
+        let mut settled_again = false;
+        let answered = match (awaited, seeded_yield) {
+            (Some(_), _) if awaited_command => None,
+            (Some(_), _) => Some((
+                act_taken || act_submitted || self.drawn_since(reading),
+                own_act,
+            )),
+            (None, Some(y)) if y.typed => Some((act_taken || self.drawn_since(reading), y.own)),
+            (None, _) if reading.worked.is_none() => self.settling.map(|s| {
+                (self.replies, self.replies_at) = s.before;
+                answered_at = s.at;
+                settled_again = true;
+                (s.seen, s.own)
+            }),
+            (None, _) => None,
+        };
+        self.settling = None;
+        // A turn the books say ran that no loop timed is work to it.
+        let quiet = !unseen_turn && !reading.ran_tools;
+        let idle = quiet && reading.worked.is_none_or(|w| w < min);
+        // A long answer with no tool row where the reader reads them is kept too: said again, it is no work.
+        let kept_long = quiet && reading.program.reader().reads_tool_rows();
+        let reply = reply_mark(reading);
+        match answered {
+            // An act whose row stands unanswered got no reply: the replies stand.
+            Some(_) if reading.pending_input && quiet && !settled_again => {}
+            Some((seen, own)) if idle || kept_long => {
+                if reading.wall.is_some() && !settled_again {
+                    self.settling = Some(Settling {
+                        before: (self.replies, self.replies_at),
+                        at: answered_at,
+                        seen,
+                        own,
+                    });
+                }
+                if seen {
+                    self.replies.count(reply, reading.wall.is_some(), own, idle);
+                    self.replies_at = Some(answered_at);
+                }
+            }
+            Some(_) => self.replies = Replies::default(),
+            None if awaited.is_none() && reading.worked.is_some() => {
+                self.replies = match self.replies.last() {
+                    Some(k) if idle && !reading.pending_input && k.mark == reply => {
+                        Replies::of(&[Kept { answers: 1, ..k }])
+                    }
+                    _ => Replies::default(),
+                };
+            }
+            // A loop's first point showing other than the newest reply a loop before it kept, no act of that loop's awaited: the program moved while no loop watched.
+            None if first_point && self.replies.last().is_some_and(|k| k.mark != reply) => {
+                self.replies = Replies::default();
+            }
+            None => {}
+        }
+        if self
+            .reset_known(reading)
+            .is_some_and(|(r, dated)| dated && now >= r && self.replies_at.is_some_and(|at| at < r))
+        {
+            self.replies = Replies::default();
+        }
         self.point_moved = self.short != short_before
+            || self.replies != replies_before
             || ((checked || landing) && !same_point)
             || awaited.is_some()
             || (self.point_at != point_at_before && !same_point)
@@ -14237,6 +14574,7 @@ impl TurnEndState {
             host: None,
             off_stood: false,
             wall_retry: is_wall_retry(rule) || in_limits_place,
+            own: is_wall_retry(rule) || in_limits_place || self.after.is_some(),
             said: match action {
                 TurnEndAction::Type { text, .. } | TurnEndAction::Accept { text, .. } => {
                     Some(crate::supervise::approvals::words_hash(text))
@@ -14513,6 +14851,7 @@ impl TurnEndState {
             host: Some(kind),
             off_stood: false,
             wall_retry: false,
+            own: false,
             said: None,
             over: None,
             lead: None,
@@ -14528,6 +14867,10 @@ impl TurnEndState {
     /// Record a restart the loop asked its host for ([`TurnEndAction::Restart`]).
     pub fn restarted(&mut self, why: &Restart, made: bool, reading: &TurnEndReading, now: Instant) {
         self.keyed_by_harness();
+        if made {
+            self.replies = Replies::default();
+            self.settling = None;
+        }
         if made && !matches!(why, Restart::Account { .. }) {
             self.account_startup = self.account.is_some();
         }
@@ -15729,6 +16072,10 @@ fn act_at_point(
         );
     }
     if let Some(kind) = reading.wall {
+        // THE SAME REPLY AGAIN ([`TurnEndState::repeats`]): the wall answered its spent tries the same.
+        if state.repeats(reading) {
+            return ended_at(trace, SAME_REPLY, TurnEndAction::Nothing);
+        }
         let act = wall_action(
             state,
             reading,
@@ -15812,6 +16159,16 @@ fn act_past_walls(
     continue_as: &dyn Fn(&'static str) -> TurnEndAction,
     type_as: &dyn Fn(&'static str, &str) -> TurnEndAction,
 ) -> TurnEndAction {
+    // THE SAME REPLY AGAIN ([`TurnEndState::repeats`]), the screen's or the one a wall's track stands for: no act answers it.
+    if state.repeats(reading)
+        || state
+            .wall
+            .as_ref()
+            .and_then(|t| still_shown(t, reading).or_else(|| left_retry(t, reading)))
+            .is_some_and(|(_, shown)| state.repeats(&shown))
+    {
+        return ended_at(trace, SAME_REPLY, TurnEndAction::Nothing);
+    }
     // A command's continuation, owed once it has run: where a `/compact`
     // owes the act a full context cut ([`TurnEndState::compact_owes`]), that
     // act again — the done check, the challenge or the land act as typed.

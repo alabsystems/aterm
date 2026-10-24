@@ -41,9 +41,10 @@ pub(crate) fn push_grid_quad(
     let x0_u = x0 as u16;
     let w_u = (x1 - x0) as u16;
     let mut row = y0 / ch;
+    let mut next_band = (row + 1) * ch;
     let mut yy = y0;
     while yy < y1 {
-        let band_end = ((row + 1) * ch).min(y1);
+        let band_end = next_band.min(y1);
         out.push(GlowQuad {
             row: row as u16,
             x: x0_u,
@@ -57,6 +58,7 @@ pub(crate) fn push_grid_quad(
         });
         yy = band_end;
         row += 1;
+        next_band += ch;
     }
 }
 
@@ -252,9 +254,10 @@ pub(crate) fn push_fx_ramp(
     let x0_u = x0 as u16;
     let w_u = (x1 - x0) as u16;
     let mut row = (y0 - oy).div_euclid(ch);
+    let mut next_band = oy + (row + 1) * ch;
     let mut yy = y0;
     while yy < y1 {
-        let band_end = (oy + (row + 1) * ch).min(y1);
+        let band_end = next_band.min(y1);
         out.push(GlowQuad {
             row: row.max(0) as u16,
             x: x0_u,
@@ -268,6 +271,7 @@ pub(crate) fn push_fx_ramp(
         });
         yy = band_end;
         row += 1;
+        next_band += ch;
     }
 }
 

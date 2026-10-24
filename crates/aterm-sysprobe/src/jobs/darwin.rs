@@ -562,8 +562,10 @@ pub const XSOCKET_LAST_PID_AT: usize = 68;
 /// A listening unix-domain socket in a [`UNIX_STREAM_TABLE`] read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UnixListenerRow<'a> {
-    /// The process that last bound it or listened on it (`so_last_pid`): a fork that only
-    /// accepts on it is not named (measured).
+    /// The process that last bound it, listened on it, or waited on it by `poll` or a `kevent`
+    /// (`so_last_pid`): a fork that only blocks in `accept` or `select` on it, or holds it idle,
+    /// is not named (measured on macOS 27.0.1). A pid, not a process: it may have exited, and its
+    /// number gone to another.
     pub pid: u32,
     /// The user whose credentials made it (`so_uid`).
     pub uid: u32,

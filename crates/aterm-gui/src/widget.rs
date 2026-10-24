@@ -647,26 +647,26 @@ impl ImageArt {
         MASKS[slot].get_or_init(|| {
             let h = ArtMask::HEIGHT;
             let w = (h as f32 * self.aspect()).round().max(1.0) as u32;
-            ArtMask {
+            ArtMask::new(
                 w,
                 h,
-                alpha: self
-                    .bake(w, h)
+                self.bake(w, h)
                     .as_chunks::<4>()
                     .0
                     .iter()
-                    .map(|pixel| pixel[3])
-                    .collect(),
-            }
+                    .map(|pixel| pixel[3]),
+            )
         })
     }
 }
 
-/// Which pixels of an [`ImageArt`] are drawn, at a reference size.
+/// Which pixels of an [`ImageArt`] are drawn, at a reference size: for each row, how many
+/// drawn pixels lie before each column (`w + 1` counts a row), so [`ArtMask::drawn`] finds a
+/// row's first and last drawn column in a span by two binary searches.
 pub(crate) struct ArtMask {
     w: u32,
     h: u32,
-    alpha: Vec<u8>,
+    drawn_before: Vec<u16>,
 }
 
 /// Where in an art's box its drawn pixels lie, as shares of the box (0 at its
@@ -697,20 +697,45 @@ impl ArtMask {
     /// it is no edge anyone sees.
     const DRAWN: u8 = 0x40;
 
+    /// The mask of a `w × h` art whose pixels' alphas `alpha` yields row by row.
+    fn new(w: u32, h: u32, alpha: impl Iterator<Item = u8>) -> Self {
+        assert!(w < u32::from(u16::MAX), "an art mask row counts in u16");
+        let mut drawn_before = Vec::with_capacity(((w + 1) * h) as usize);
+        let mut alpha = alpha;
+        for _ in 0..h {
+            let mut count = 0_u16;
+            drawn_before.push(count);
+            for a in alpha.by_ref().take(w as usize) {
+                count += u16::from(a >= Self::DRAWN);
+                drawn_before.push(count);
+            }
+        }
+        Self { w, h, drawn_before }
+    }
+
     /// What the art draws within `part` of its box: the span of its drawn
     /// pixels there, or `None` where it draws nothing.
     pub(crate) fn drawn(&self, part: ArtSpan) -> Option<ArtSpan> {
         let (w, h) = (self.w as f32, self.h as f32);
         let cols = (part.left * w).floor().max(0.0) as u32..(part.right * w).ceil().min(w) as u32;
         let rows = (part.top * h).floor().max(0.0) as u32..(part.bottom * h).ceil().min(h) as u32;
+        let (c0, c1) = (cols.start as usize, cols.end as usize);
         let mut seen: Option<(u32, u32, u32, u32)> = None;
-        for row in rows {
-            for col in cols.clone() {
-                if self.alpha[(row * self.w + col) as usize] < Self::DRAWN {
+        if c0 < c1 {
+            let stride = self.w as usize + 1;
+            for row in rows {
+                let before = &self.drawn_before[row as usize * stride..][..stride];
+                let (at_start, at_end) = (before[c0], before[c1]);
+                if at_start == at_end {
                     continue;
                 }
-                seen = Some(seen.map_or((col, row, col, row), |(l, t, r, b)| {
-                    (l.min(col), t.min(row), r.max(col), b.max(row))
+                // The first column whose pixel is drawn moves the count past `at_start`; the
+                // last is the last column the count is still below `at_end` at.
+                let first = c0 + before[c0 + 1..=c1].partition_point(|&n| n == at_start);
+                let last = c0 + before[c0..c1].partition_point(|&n| n < at_end) - 1;
+                let (first, last) = (first as u32, last as u32);
+                seen = Some(seen.map_or((first, row, last, row), |(l, t, r, b)| {
+                    (l.min(first), t.min(row), r.max(last), b.max(row))
                 }));
             }
         }
@@ -826,6 +851,79 @@ mod tests {
     use std::hash::Hasher;
 
     use super::*;
+
+    /// [`ArtMask::drawn`] answers what a scan of every pixel in the span answers, for spans
+    /// inside, across and outside the box, inverted, and NaN.
+    #[test]
+    fn an_art_masks_counts_find_what_a_pixel_scan_finds() {
+        let scan = |alpha: &[u8], w: u32, h: u32, part: ArtSpan| {
+            let (wf, hf) = (w as f32, h as f32);
+            let cols =
+                (part.left * wf).floor().max(0.0) as u32..(part.right * wf).ceil().min(wf) as u32;
+            let rows =
+                (part.top * hf).floor().max(0.0) as u32..(part.bottom * hf).ceil().min(hf) as u32;
+            let mut seen: Option<(u32, u32, u32, u32)> = None;
+            for row in rows {
+                for col in cols.clone() {
+                    if alpha[(row * w + col) as usize] >= ArtMask::DRAWN {
+                        seen = Some(seen.map_or((col, row, col, row), |(l, t, r, b)| {
+                            (l.min(col), t.min(row), r.max(col), b.max(row))
+                        }));
+                    }
+                }
+            }
+            seen.map(|(l, t, r, b)| ArtSpan {
+                left: (l as f32 / wf).max(part.left),
+                top: (t as f32 / hf).max(part.top),
+                right: ((r + 1) as f32 / wf).min(part.right),
+                bottom: ((b + 1) as f32 / hf).min(part.bottom),
+            })
+        };
+        let edges = [
+            -0.3, 0.0, 0.01, 0.1, 0.25, 0.333, 0.5, 0.6, 0.77, 0.9, 0.999, 1.0, 1.4,
+        ];
+        for art in [
+            ImageArt::BrandKitty { dark: false },
+            ImageArt::BrandKitty { dark: true },
+        ] {
+            let mask = art.mask();
+            let alpha: Vec<u8> = art
+                .bake(mask.w, mask.h)
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|p| p[3])
+                .collect();
+            let mut spans = vec![
+                ArtSpan::BOX,
+                ArtSpan {
+                    left: f32::NAN,
+                    ..ArtSpan::BOX
+                },
+            ];
+            for &left in &edges {
+                for &right in &edges {
+                    for (top, bottom) in
+                        [(0.0, 1.0), (0.2, 0.45), (0.5, 0.5), (0.9, 0.1), (-1.0, 2.0)]
+                    {
+                        spans.push(ArtSpan {
+                            left,
+                            top,
+                            right,
+                            bottom,
+                        });
+                    }
+                }
+            }
+            for part in spans {
+                assert_eq!(
+                    mask.drawn(part),
+                    scan(&alpha, mask.w, mask.h, part),
+                    "{art:?} {part:?}"
+                );
+            }
+        }
+    }
 
     fn fp(p: &DrawPrim) -> u64 {
         let mut state = std::collections::hash_map::DefaultHasher::new();

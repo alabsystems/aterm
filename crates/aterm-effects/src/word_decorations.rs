@@ -2548,18 +2548,17 @@ impl WordDecorations {
             [const { None }; crate::kitty_pet::PET_MOTES_MAX];
         if pet.alpha > 0 {
             let pet_alpha_f = f32::from(pet.alpha);
+            let cell_dims = (geom.cell_w, geom.cell_h);
+            let grid_dims = (geom.cols, geom.rows);
             let mut side = 0u16;
             for (slot, m) in mote_sprites.iter_mut().zip(pet.motes.iter().flatten()) {
                 let alpha = (f32::from(m.alpha) * pet_alpha_f / 255.0) as u8;
                 if alpha == 0 {
                     continue;
                 }
-                let Some((x, y, dest)) = crate::kitty_pet::mote_box_px(
-                    (m.col, m.row),
-                    m.scale,
-                    (geom.cell_w, geom.cell_h),
-                    (geom.cols, geom.rows),
-                ) else {
+                let Some((x, y, dest)) =
+                    crate::kitty_pet::mote_box_px((m.col, m.row), m.scale, cell_dims, grid_dims)
+                else {
                     continue;
                 };
                 if side == 0 {
@@ -3532,27 +3531,39 @@ impl WordDecorations {
         let mut cutoff = 0usize;
         for r in (0..rows).rev() {
             load_row(r, row_cells);
-            self.scan_text.clear();
+            let need_text = cutoff == 0;
+            if need_text {
+                self.scan_text.clear();
+            }
             let mut ink_first = u16::MAX;
             let mut ink_end = 0u16;
             let mut occupied = false;
             for (c, cell) in row_cells.iter().enumerate() {
                 let col = c as u16;
-                let inked = if cell.wide {
-                    ink_end == col
-                } else {
-                    let non_ws = cell.ch != ' ' && !cell.ch.is_whitespace();
-                    occupied |= non_ws;
-                    non_ws
-                };
-                if inked {
+                if cell.wide {
+                    if ink_end == col {
+                        ink_first = ink_first.min(col);
+                        ink_end = col.saturating_add(1);
+                    }
+                    continue;
+                }
+                if cell.ch != ' ' && !cell.ch.is_whitespace() {
+                    if !occupied {
+                        occupied = true;
+                        if need_text {
+                            for prev in &row_cells[..c] {
+                                if !prev.wide {
+                                    self.scan_text.push(prev.ch);
+                                }
+                            }
+                        }
+                    }
                     ink_first = ink_first.min(col);
                     ink_end = col.saturating_add(1);
                 }
-                if cell.wide {
-                    continue;
+                if need_text && occupied {
+                    self.scan_text.push(cell.ch);
                 }
-                self.scan_text.push(cell.ch);
             }
             self.pet_ink_spans[r] = if ink_end > ink_first {
                 (ink_first, ink_end)
@@ -3621,22 +3632,30 @@ impl WordDecorations {
         let mut occupied = false;
         for (c, cell) in row_cells.iter().enumerate() {
             let col = c as u16;
-            let inked = if cell.wide {
-                ink_end == col
-            } else {
-                let non_ws = cell.ch != ' ' && !cell.ch.is_whitespace();
-                occupied |= non_ws;
-                non_ws
-            };
-            if inked {
+            if cell.wide {
+                if ink_end == col {
+                    ink_first = ink_first.min(col);
+                    ink_end = col.saturating_add(1);
+                }
+                continue;
+            }
+            if cell.ch != ' ' && !cell.ch.is_whitespace() {
+                if !occupied {
+                    occupied = true;
+                    for (prev_c, prev) in row_cells[..c].iter().enumerate() {
+                        if !prev.wide {
+                            self.scan_text.push(prev.ch);
+                            self.scan_colmap.push(prev_c as u16);
+                        }
+                    }
+                }
                 ink_first = ink_first.min(col);
                 ink_end = col.saturating_add(1);
             }
-            if cell.wide {
-                continue;
+            if occupied {
+                self.scan_text.push(cell.ch);
+                self.scan_colmap.push(col);
             }
-            self.scan_text.push(cell.ch);
-            self.scan_colmap.push(c as u16);
         }
         if self.pet_ink_spans.len() <= r {
             self.pet_ink_spans.resize(r + 1, (0, 0));
@@ -4564,17 +4583,20 @@ impl WordDecorations {
                         let until = occ.appeared + anim;
                         arm_until(&mut active_until, until);
                         let density = cfg.density.clamp(1, 12);
+                        let frame_rot = self.frame.rotate_left(17);
+                        let frame_term = self.frame.wrapping_mul(0x9E37_79B1);
+                        let glyphs_len = cfg.glyphs.len().max(1);
                         for k in 0..density {
                             if out.len() >= MAX_DECORATIONS {
                                 break;
                             }
                             let s = mix(occ.seed
                                 ^ u64::from(k).wrapping_mul(0xA24B_AED4_963E_E407)
-                                ^ self.frame.rotate_left(17));
+                                ^ frame_rot);
                             let col = occ.start_col + (s % width) as u16;
                             let glyph = cfg
                                 .glyphs
-                                .get((s >> 11) as usize % cfg.glyphs.len().max(1))
+                                .get((s >> 11) as usize % glyphs_len)
                                 .copied()
                                 .unwrap_or(DecoGlyph::Star4);
                             let color = pick_color(cfg, s);
@@ -4590,7 +4612,7 @@ impl WordDecorations {
                                 color,
                                 alpha,
                             };
-                            fp = fold_deco(fp, &d) ^ self.frame.wrapping_mul(0x9E37_79B1);
+                            fp = fold_deco(fp, &d) ^ frame_term;
                             out.push(d);
                         }
                     } else {
@@ -4980,6 +5002,9 @@ impl WordDecorations {
             return until;
         }
         let scope = self.scan_scope();
+        let ch = i32::from(geom.cell_h);
+        let grid_h = i32::from(geom.rows) * ch;
+        let r_max = supernova::r_max_for(ch, grid_h);
         for (i, occ) in self.occ.iter().enumerate() {
             if occ.spec.burst.map(|b| b.kind) != Some(BurstKind::SuperNova) {
                 continue;
@@ -4990,10 +5015,7 @@ impl WordDecorations {
             if !ep.burst_roll || ep.nova_done || ep.inert() {
                 continue;
             }
-            let ch = i32::from(geom.cell_h);
             let (cx, cy) = burst_center(occ, geom);
-            let grid_h = i32::from(geom.rows) * ch;
-            let r_max = supernova::r_max_for(ch, grid_h);
             if ep.nova_start.is_none() {
                 // Deferred while selected (§3.2 safety) or while another
                 // supernova holds the mutex (MAX_ACTIVE_SUPERNOVAE = 1).
@@ -5056,8 +5078,10 @@ impl WordDecorations {
             return None;
         }
         let super_busy = self.super_until.is_some_and(|t| now < t);
+        let super_wake = self.super_until.map(|su| su + Duration::from_millis(1));
         let mut until: Option<Instant> = None;
         let scope = self.scan_scope();
+        let ch_f = i32::from(geom.cell_h).max(1) as f32;
         for (i, occ) in self.occ.iter().enumerate() {
             // v3 §6 dispatch: the classic nova is the `BurstKind::Nova` arm
             // (profanity `style = "nova"` and custom specs alike).
@@ -5070,9 +5094,8 @@ impl WordDecorations {
             if ep.nova_done {
                 continue;
             }
-            let ch = i32::from(geom.cell_h);
             let (cx, cy) = burst_center(occ, geom);
-            let r_max = nova_radius(occ.genome.gkey) * ch.max(1) as f32;
+            let r_max = nova_radius(occ.genome.gkey) * ch_f;
             if ep.nova_start.is_none() {
                 // `chance_pct`: a rolled-off burst never ignites (episodes with
                 // a pre-granted `nova_start` are past the roll).
@@ -5083,8 +5106,7 @@ impl WordDecorations {
                     continue;
                 }
                 if super_busy {
-                    if let Some(su) = self.super_until {
-                        let wake = su + Duration::from_millis(1);
+                    if let Some(wake) = super_wake {
                         until = Some(until.map_or(wake, |u: Instant| u.max(wake)));
                     }
                     continue;
@@ -5245,6 +5267,7 @@ fn grant_ignition(
         return None;
     }
     let overlap_dist2 = overlap_dist * overlap_dist;
+    let check_overlap = overlap_dist > 0.0;
     let mut slot = now;
     loop {
         let mut count = 0usize;
@@ -5257,7 +5280,7 @@ fn grant_ignition(
             }
             count += 1;
             let (dx, dy) = ((c.0 - center.0) as f32, (c.1 - center.1) as f32);
-            if !overlap && overlap_dist > 0.0 && dx * dx + dy * dy < overlap_dist2 {
+            if !overlap && check_overlap && dx * dx + dy * dy < overlap_dist2 {
                 overlap = true;
             }
             let free = t + IGNITION_WINDOW;
@@ -6546,10 +6569,15 @@ fn emit_ink(
     let frame_term = frame.wrapping_mul(0x9E37_79B1);
     let cols = &base_cols[occ.ink_base..occ.ink_base + occ.ink_cells as usize];
     let fgs = &base_fg[occ.ink_base..occ.ink_base + occ.ink_cells as usize];
+    let start_col = occ.start_col;
+    let row = occ.row;
+    let has_glare = glare > 0.0;
+    let dim = fx.dim;
+    let has_dim = dim < 1.0;
     for (&col, &fg_rgb) in cols.iter().zip(fgs) {
-        let u = f32::from(col.saturating_sub(occ.start_col)) / span;
+        let u = f32::from(col.saturating_sub(start_col)) / span;
         let base = mix_rgb(c0, c1, u);
-        let raw = if glare > 0.0 {
+        let raw = if has_glare {
             let lobe = glare * spec_lobe(u, center);
             if lobe > 0.0 {
                 mix_rgb(base, 0x00FF_FFFF, lobe)
@@ -6560,11 +6588,11 @@ fn emit_ink(
             base
         };
         let mut color = mix_rgb(rgb3_to_u32(fg_rgb), raw, strength);
-        if fx.dim < 1.0 {
-            color = dim_rgb(color, fx.dim);
+        if has_dim {
+            color = dim_rgb(color, dim);
         }
         let cell = InkCell {
-            row: occ.row,
+            row,
             col,
             color: u32_to_rgb3(color),
         };
@@ -6674,25 +6702,30 @@ fn emit_rainbow_ink(
     let frame_term = frame.wrapping_mul(0x9E37_79B1);
     let cols = &base_cols[occ.ink_base..occ.ink_base + occ.ink_cells as usize];
     let fgs = &base_fg[occ.ink_base..occ.ink_base + occ.ink_cells as usize];
+    let cols_len = cols.len();
+    let row = occ.row;
+    let has_lift = fx.lift > 0.0;
+    let dim = fx.dim;
+    let has_dim = dim < 1.0;
     for (i, (&col, &fg_rgb)) in cols.iter().zip(fgs).enumerate() {
         let target = if span_used == 0.0 || i == 0 {
             guard_hues[0]
-        } else if cols.len() == 4 {
+        } else if cols_len == 4 {
             guard_hues[i]
-        } else if i + 1 == cols.len() {
+        } else if i + 1 == cols_len {
             guard_hues[3]
         } else {
             hue_at(i as f32 / denom)
         };
         let mut color = mix_rgb(rgb3_to_u32(fg_rgb), target, strength);
-        if fx.lift > 0.0 {
+        if has_lift {
             color = mix_rgb(color, lift_target, lift_t);
         }
-        if fx.dim < 1.0 {
-            color = dim_rgb(color, fx.dim);
+        if has_dim {
+            color = dim_rgb(color, dim);
         }
         let cell = InkCell {
-            row: occ.row,
+            row,
             col,
             color: u32_to_rgb3(color),
         };
@@ -6740,6 +6773,7 @@ fn emit_rainbow_sparkles(
     let seed_phase = (occ.seed & 0xff) as f32 * 0.013;
     let width_f = f32::from(width);
     let env_intensity = cfg.intensity * envelope;
+    let hue_drift = 45.0 * p;
     for i in 0..count {
         let u = i as f32 / denom;
         let phase = p_tau + i as f32 * 2.094 + seed_phase;
@@ -6756,7 +6790,7 @@ fn emit_rainbow_sparkles(
                 DecoGlyph::Star4
             },
             blend: DecoBlend::Add,
-            color: hsv2rgb(base_hue + 120.0 * i as f32 + 45.0 * p, 0.72, 1.0),
+            color: hsv2rgb(base_hue + 120.0 * i as f32 + hue_drift, 0.72, 1.0),
             alpha: scale_u8(env_intensity * shimmer * 0.82),
         };
         *fp = fold_deco(*fp, &d);

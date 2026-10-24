@@ -218,6 +218,30 @@ pub fn start_time(pid: i32) -> String {
         .unwrap_or_default()
 }
 
+/// The paths `pid` uses that `lsof -p <pid> -Fn` names, read in this process with no reference
+/// taken on any socket or kqueue of it: its working directory, its executable, then each file
+/// it holds open through a descriptor, in descriptor order ([`aterm_uds::holders::open_files`];
+/// a PTY master reads as `/dev/ptmx`). The rest lsof names (the libraries and other files it
+/// maps, its sockets' addresses) are not read.
+///
+/// # Errors
+/// [`aterm_uds::holders::open_files`]'s: `NotFound` once `pid` has exited, `PermissionDenied`
+/// for a table this user may not read.
+pub fn open_paths(pid: i32) -> std::io::Result<Vec<PathBuf>> {
+    let pid = u32::try_from(pid).map_err(|_| std::io::ErrorKind::InvalidInput)?;
+    let files = aterm_uds::holders::open_files(pid)?;
+    let exe = match aterm_uds::holders::exe_of(pid) {
+        aterm_uds::holders::Exe::At(path) => Some(path),
+        aterm_uds::holders::Exe::Unnamed => None,
+        aterm_uds::holders::Exe::Exited => return Err(std::io::ErrorKind::NotFound.into()),
+    };
+    Ok(aterm_sysprobe::process_cwd(pid)
+        .into_iter()
+        .chain(exe)
+        .chain(files)
+        .collect())
+}
+
 /// Returns the path to `<run_dir>/jailed.pids`.
 #[must_use]
 pub fn jailed_file(run_dir: &Path) -> PathBuf {
@@ -452,6 +476,55 @@ mod tests {
             settled(me, true, Duration::from_secs(60)),
             "not ours: read once"
         );
+    }
+
+    /// A child's paths ([`open_paths`]) are its working directory, its executable and each file
+    /// it holds through a descriptor, in descriptor order, a PTY master as `/dev/ptmx`; its table
+    /// counts those descriptors ([`crate::sys::fd_count`]). Once it is reaped neither reads.
+    #[test]
+    fn a_childs_paths_and_descriptors_are_read_in_process() {
+        let dir = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("lab-procs-open-paths-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let held = dir.join("held");
+        let master = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/ptmx")
+            .expect("a PTY master");
+        let mut child = aterm_uds::spawnfd::command("/bin/sleep")
+            .arg("600")
+            .current_dir(&dir)
+            .stdin(master)
+            .stdout(std::fs::File::create(&held).unwrap())
+            .stderr(aterm_uds::spawnfd::Stdio::null())
+            .spawn()
+            .expect("spawn a holder");
+        let pid = i32::try_from(child.id()).unwrap();
+        let (paths, count) = (open_paths(pid), crate::sys::fd_count(pid));
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        let want: Vec<PathBuf> = [
+            dir.as_path(),
+            Path::new("/bin/sleep"),
+            Path::new("/dev/ptmx"),
+            held.as_path(),
+            Path::new("/dev/null"),
+        ]
+        .map(Path::to_path_buf)
+        .into();
+        assert_eq!(paths.expect("its paths"), want);
+        assert_eq!(count, Some(3), "stdin, stdout and stderr");
+        assert_eq!(
+            open_paths(pid).map_err(|e| e.kind()).err(),
+            Some(std::io::ErrorKind::NotFound),
+            "reaped"
+        );
+        assert_eq!(crate::sys::fd_count(pid), None, "reaped");
     }
 
     #[test]

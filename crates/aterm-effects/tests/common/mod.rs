@@ -328,4 +328,5 @@ pub fn recording(src: &str, per_ms: u64) -> Vec<(u64, Rec)> {
 }
 
 #[allow(unused_imports)]
+#[cfg(debug_assertions)]
 pub use aterm_effects::test_pool::par_map;

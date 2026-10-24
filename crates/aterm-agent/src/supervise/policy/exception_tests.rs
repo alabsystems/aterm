@@ -78,6 +78,7 @@ fn walled(kind: WallKind, message: &str) -> TurnEndReading {
         wall_remembered: false,
         answered: None,
         worked_doubt: Duration::ZERO,
+        ran_tools: false,
         record_turn: None,
         credits: None,
         repo: crate::harness::repo_work::RepoRead::Clean,
@@ -426,6 +427,8 @@ fn tried_past_the_reset(
                 now += Duration::from_secs(5);
             }
             TurnEndAction::WaitUntil { until, .. } => now = until,
+            // The same answer to each of the ladder's tries holds it after them.
+            TurnEndAction::Nothing if tries == FUTILE_AFTER_TRIES => break,
             other => panic!("{other:?}"),
         }
     }
@@ -658,18 +661,22 @@ fn a_wall_that_answers_three_tries_an_hour_past_its_reset_is_futile() {
     ] {
         let mut cfg = cfg();
         cfg.model_fallback = None;
-        let mut r = walled(kind, "You've hit your weekly limit · resets 4pm");
+        let said = "You've hit your weekly limit · resets 4pm";
+        let mut r = walled(kind, said);
         r.reset_at = Some(t);
         let mut st = TurnEndState::default();
         let mut now = t + MIN;
         let mut tries = 0;
         let mut futile_after = Vec::new();
+        // Each try answered in its own words: no reply comes again, and the hour bounds the word.
+        let words = ["", " · later", " · try later", " · still"];
         while tries < FUTILE_AFTER_TRIES + 1 {
             r.worked = Some(if tries == 0 {
                 3 * MIN
             } else {
                 Duration::from_secs(4)
             });
+            r.wall_message = format!("{said}{}", words[tries]);
             st.observe(&r, now);
             match decide_turn_end(&st, &r, &cfg, now) {
                 a @ TurnEndAction::Type { .. } => {
@@ -692,6 +699,20 @@ fn a_wall_that_answers_three_tries_an_hour_past_its_reset_is_futile() {
         assert!(
             exception_for(&st, &r, &cfg, t + 61 * MIN)
                 .is_some_and(|e| e.kind == ExceptionKind::Futile),
+            "{kind:?}"
+        );
+        // The same answer to each holds the ladder after its tries, and says so at once.
+        let mut same = walled(kind, said);
+        same.reset_at = Some(t);
+        let held = tried_past_the_reset(&mut same, &cfg, t);
+        assert_eq!(
+            decide_turn_end(&held, &same, &cfg, t + 45 * MIN),
+            TurnEndAction::Nothing,
+            "{kind:?}"
+        );
+        assert_eq!(
+            exception_for(&held, &same, &cfg, t + 45 * MIN),
+            Some(Exception::limit_repeats(same.program, true)),
             "{kind:?}"
         );
         let mut two = TurnEndState::default();
@@ -964,4 +985,53 @@ fn a_weekly_usage_limit_does_not_raise_a_nag_exception() {
     };
     let e = exception_for(&st, &left_lost, &cfg(), t + MIN).expect("told");
     assert_eq!(e.notice.as_ref().map(|n| n.id), Some("login-left"), "{e:?}");
+}
+
+#[test]
+fn an_api_errors_wall_held_after_its_notice_left_is_told_stalled_not_a_limit() {
+    let kind = WallKind::ApiError {
+        code: Some(500),
+        retryable: true,
+        cause: aterm_phase::ApiCause::Server,
+    };
+    let mut r = walled(kind, "API Error: 500 Internal server error");
+    let mut st = TurnEndState::default();
+    let mut now = t0();
+    let mut tries = 0;
+    // Each retry answered by the same error at once, until the ladder holds.
+    loop {
+        let (a, _) = point(&mut st, &r, &cfg(), now);
+        match a {
+            TurnEndAction::WaitUntil { until, .. } => {
+                now = until;
+                r.worked = None;
+            }
+            TurnEndAction::Nothing => break,
+            a => {
+                st.acted(&a, &r, now);
+                tries += 1;
+                now += Duration::from_secs(5);
+                r.worked = Some(Duration::from_secs(4));
+            }
+        }
+        assert!(tries <= FUTILE_AFTER_TRIES, "{tries} tries");
+    }
+    assert_eq!(tries, FUTILE_AFTER_TRIES);
+    // The wall read once more where it holds: the last answer settled to it.
+    r.worked = None;
+    let (a, told) = point(&mut st, &r, &cfg(), now + MIN);
+    assert_eq!(a, TurnEndAction::Nothing);
+    assert_eq!(told, Some(Exception::repeats()));
+    let left = TurnEndReading {
+        wall: None,
+        wall_message: String::new(),
+        ..r
+    };
+    let (a, told) = point(&mut st, &left, &cfg(), now + 2 * MIN);
+    assert_eq!(a, TurnEndAction::Nothing, "its track still holds");
+    assert_eq!(
+        told,
+        Some(Exception::repeats()),
+        "an API error's track is no limit"
+    );
 }

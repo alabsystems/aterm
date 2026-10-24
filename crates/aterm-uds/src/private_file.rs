@@ -296,41 +296,73 @@ pub fn judge_private_dir(dir: &Path) -> io::Result<PrivateDir> {
 
 /// Ensures `dir` exists as a mode-`0700` private directory, returning prior mode bits if narrowed.
 /// # Errors
-/// Returns an error if `dir` cannot be created or fails owner/symlink/ACL checks, or is not private once made or narrowed (a volume that ignores modes; `NotFound` where it is gone by then).
+/// Returns an error naming `dir` if it cannot be created or fails owner/symlink/ACL checks, or is not private once made or narrowed (a volume that ignores modes; `NotFound` where it is gone by then).
 pub fn ensure_private_dir(dir: &Path) -> io::Result<Option<u32>> {
-    use std::os::unix::fs::PermissionsExt as _;
-    ensure_private_dir_by(dir, |dir| {
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-    })
+    ensure_private_dir_by(dir, make_0700, narrow_0700)
 }
 
-/// [`ensure_private_dir`], with `narrow` making `dir` 0700.
+fn make_0700(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    std::fs::DirBuilder::new().mode(0o700).create(dir)
+}
+
+fn narrow_0700(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+}
+
+/// [`ensure_private_dir`], with `make` making `dir` and `narrow` making it 0700.
 fn ensure_private_dir_by(
     dir: &Path,
+    make: impl FnOnce(&Path) -> io::Result<()>,
     narrow: impl FnOnce(&Path) -> io::Result<()>,
 ) -> io::Result<Option<u32>> {
-    use std::os::unix::fs::DirBuilderExt as _;
-    let was = match judge_private_dir(dir)? {
-        PrivateDir::Private => return Ok(None),
-        PrivateDir::Missing => {
-            if let Some(parent) = dir.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::DirBuilder::new().mode(0o700).create(dir)?;
-            None
-        }
-        PrivateDir::Open(mode) => Some(mode),
+    let named = |e: io::Error| match e.raw_os_error() {
+        Some(_) => io::Error::new(e.kind(), format!("the directory {}: {e}", dir.display())),
+        None => e,
     };
-    narrow(dir)?;
-    match judge_private_dir(dir)? {
-        PrivateDir::Private => Ok(was),
-        PrivateDir::Missing => Err(io::Error::new(
+    let judge = || judge_private_dir(dir).map_err(named);
+    let removed = || {
+        io::Error::new(
             io::ErrorKind::NotFound,
             format!(
                 "the directory {} was removed as it was made 0700",
                 dir.display()
             ),
-        )),
+        )
+    };
+    let was = match judge()? {
+        PrivateDir::Private => return Ok(None),
+        PrivateDir::Missing => {
+            if let Some(parent) = dir.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    io::Error::new(
+                        e.kind(),
+                        format!(
+                            "the directory {}: {} could not be made: {e}",
+                            dir.display(),
+                            parent.display()
+                        ),
+                    )
+                })?;
+            }
+            match make(dir) {
+                Ok(()) => None,
+                // Another writer made it since the judge: judged again before a chmod, which follows a symlink.
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => match judge()? {
+                    PrivateDir::Private => return Ok(None),
+                    PrivateDir::Missing => return Err(removed()),
+                    PrivateDir::Open(mode) => Some(mode),
+                },
+                Err(e) => return Err(named(e)),
+            }
+        }
+        PrivateDir::Open(mode) => Some(mode),
+    };
+    narrow(dir).map_err(named)?;
+    match judge()? {
+        PrivateDir::Private => Ok(was),
+        PrivateDir::Missing => Err(removed()),
         PrivateDir::Open(_) => Err(dir_refused(
             dir,
             "is not 0700 and this user's after it was made so",
@@ -684,7 +716,8 @@ mod tests {
         let root = aterm_tempfile::tempdir().unwrap();
         let open = dir_in(root.path(), "open", 0o755);
         // A volume that ignores modes: the chmod succeeds and changes nothing.
-        let refusal = super::ensure_private_dir_by(&open, |_| Ok(())).unwrap_err();
+        let refusal =
+            super::ensure_private_dir_by(&open, super::make_0700, |_| Ok(())).unwrap_err();
         assert_eq!(refusal.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(refusal.to_string().contains("is not 0700"), "{refusal}");
         assert_eq!(judge_private_dir(&open).unwrap(), PrivateDir::Open(0o755));
@@ -696,12 +729,85 @@ mod tests {
         let root = aterm_tempfile::tempdir().unwrap();
         let open = dir_in(root.path(), "open", 0o755);
         for dir in [open, root.path().join("missing")] {
-            let gone =
-                super::ensure_private_dir_by(&dir, |dir| std::fs::remove_dir(dir)).unwrap_err();
+            let gone = super::ensure_private_dir_by(&dir, super::make_0700, |dir| {
+                std::fs::remove_dir(dir)
+            })
+            .unwrap_err();
             assert_eq!(gone.kind(), std::io::ErrorKind::NotFound, "{gone}");
             assert!(gone.to_string().contains("was removed"), "{gone}");
             assert_eq!(judge_private_dir(&dir).unwrap(), PrivateDir::Missing);
         }
+    }
+
+    #[test]
+    fn ensure_private_dir_judges_one_another_writer_made_first() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        for (name, mode, was) in [("private", 0o700, None), ("open", 0o755, Some(0o755))] {
+            let dir = root.path().join(name);
+            let made = super::ensure_private_dir_by(
+                &dir,
+                |dir| {
+                    dir_in(root.path(), name, mode);
+                    super::make_0700(dir)
+                },
+                super::narrow_0700,
+            );
+            assert_eq!(made.unwrap(), was, "{name}");
+            assert_eq!(mode_of(&dir), 0o700, "{name}");
+        }
+
+        let gone = root.path().join("gone");
+        let refusal = super::ensure_private_dir_by(
+            &gone,
+            |_| Err(std::io::ErrorKind::AlreadyExists.into()),
+            super::narrow_0700,
+        )
+        .unwrap_err();
+        assert_eq!(refusal.kind(), std::io::ErrorKind::NotFound, "{refusal}");
+        assert!(refusal.to_string().contains("was removed"), "{refusal}");
+
+        let target = dir_in(root.path(), "target", 0o755);
+        let link = root.path().join("link");
+        let refusal = super::ensure_private_dir_by(
+            &link,
+            |dir| {
+                std::os::unix::fs::symlink(&target, dir).unwrap();
+                super::make_0700(dir)
+            },
+            super::narrow_0700,
+        )
+        .unwrap_err();
+        assert_eq!(
+            refusal.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "{refusal}"
+        );
+        assert!(refusal.to_string().contains("is a symlink"), "{refusal}");
+        assert_eq!(mode_of(&target), 0o755);
+    }
+
+    #[test]
+    fn ensure_private_dir_names_the_directory_once_in_a_bare_refusal() {
+        use std::io::ErrorKind;
+        let root = aterm_tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a-file"), b"x").unwrap();
+        std::os::unix::fs::symlink(root.path().join("nowhere"), root.path().join("dangling"))
+            .unwrap();
+        let unwritable = dir_in(root.path(), "unwritable", 0o500);
+        for (odd, kind) in [
+            ("a-file/state", ErrorKind::NotADirectory),
+            ("dangling/state", ErrorKind::AlreadyExists),
+            ("unwritable/state", ErrorKind::PermissionDenied),
+            // `.` hides `gone` from `Path::parent`: the make finds no parent.
+            ("gone/.", ErrorKind::NotFound),
+        ] {
+            let dir = root.path().join(odd);
+            let refusal = ensure_private_dir(&dir).unwrap_err();
+            assert_eq!(refusal.kind(), kind, "{odd}: {refusal}");
+            let shown = dir.display().to_string();
+            assert_eq!(refusal.to_string().matches(&shown).count(), 1, "{refusal}");
+        }
+        std::fs::set_permissions(&unwritable, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]

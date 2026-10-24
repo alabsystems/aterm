@@ -408,11 +408,31 @@ pub fn program_drawn(rows: &[String]) -> bool {
     is_gemini_screen(rows) || rows.iter().any(|r| is_banner_row(r))
 }
 
+const TOOL_GLYPHS: [&str; 4] = ["✓  ", "✕  ", "⊷  ", "?  "];
+
 fn is_tool_row(row: &str) -> bool {
     leading_spaces(row) == 2
-        && ["✓  ", "✕  ", "⊷  ", "?  "]
+        && TOOL_GLYPHS
             .iter()
             .any(|g| crate::text::trim_start(row).starts_with(g))
+}
+
+/// WHETHER THE LAST TURN RAN A TOOL: a tool's row, or its box's (`│ ✓  Ask User`), under the band of the person's message that opened it.
+#[must_use]
+pub fn turn_ran_tools(rows: &[String]) -> bool {
+    ended_on(rows).is_some_and(|(from, end)| {
+        rows[from.min(end)..end].iter().any(|r| {
+            is_tool_row(r)
+                || r.strip_prefix("│ ")
+                    .is_some_and(|inner| TOOL_GLYPHS.iter().any(|g| inner.starts_with(g)))
+        })
+    })
+}
+
+/// WHETHER THE BAND OF THE PERSON'S MESSAGE THAT OPENED THE LAST TURN IS ABOVE `rows`, so [`turn_ran_tools`] read the turn's lower rows only.
+#[must_use]
+pub fn turn_opens_above(rows: &[String]) -> bool {
+    ended_on(rows).is_some_and(|(from, _)| from == 0)
 }
 
 /// The agent's last words: the reply under the last message — its `✦ ` row and the rows under it, each indented, one line per row, the `✦` and the indent stripped; the visible rows from the top when its head scrolled away.

@@ -311,11 +311,12 @@ impl CursorComet {
             let r_i = r as i32;
             let mut dy = -r_i;
             while dy < r_i {
-                if cyi + dy >= cell_y1 {
+                let cy_dy = cyi + dy;
+                if cy_dy >= cell_y1 {
                     break;
                 }
                 let h = slab.min(r_i - dy);
-                let (y0, y1) = ((cyi + dy).max(cell_y0), (cyi + dy + h).min(cell_y1));
+                let (y0, y1) = (cy_dy.max(cell_y0), (cy_dy + h).min(cell_y1));
                 if y1 > y0 {
                     let ym = dy as f32 + h as f32 * 0.5;
                     let hw = ((r2 - ym * ym).max(0.0).sqrt() * wobble(ym)) as i32;
@@ -377,10 +378,13 @@ impl CursorComet {
 
         let glint_r = radius * 0.72;
         let arm = ((ch * 0.11) as i32).max(1);
+        let two_arm_plus_1 = 2 * arm + 1;
         let cov_base = cov_core * (0.35 + 0.65 * e);
+        let phase2 = phase * 2.0;
+        let phase_ang = phase * 0.55;
         for i in 0..GLINTS {
             let fi = i as f32;
-            let tw = 0.5 + 0.5 * (phase * 2.0 + fi * 2.4).sin();
+            let tw = 0.5 + 0.5 * (phase2 + fi * 2.4).sin();
             if tw < 0.55 {
                 continue;
             }
@@ -388,12 +392,12 @@ impl CursorComet {
             if cov == 0 {
                 continue;
             }
-            let ang = fi / GLINTS as f32 * std::f32::consts::TAU + phase * 0.55;
+            let ang = fi / GLINTS as f32 * std::f32::consts::TAU + phase_ang;
             let (sin_a, cos_a) = ang.sin_cos();
             let gx = (cx + cos_a * glint_r) as i32;
             let gy = (cy + sin_a * glint_r * 0.9) as i32;
             let spark = premul_rgb(ICE_WHITE, cov);
-            push_rect(out, geom, gx - arm, gy, 2 * arm + 1, 1, spark);
+            push_rect(out, geom, gx - arm, gy, two_arm_plus_1, 1, spark);
             push_rect(out, geom, gx, gy - arm, 1, arm, spark);
             push_rect(out, geom, gx, gy + 1, 1, arm, spark);
         }

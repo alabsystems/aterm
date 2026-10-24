@@ -674,7 +674,10 @@ fn find_in_row(
     exact_only: bool,
 ) -> Option<Hit> {
     let (first, caret, back) = (*seq.first()?, i64::from(caret_col), i64::from(back_chars));
-    let reach = i64::from(TYPED_EDIT_REACH_COLS) + 2 * back + 2;
+    let two_back = 2 * back;
+    let (caret_plus_back, caret_plus_two_back) = (caret + back, caret + two_back);
+    let three_plus_two_back = 3 + two_back;
+    let reach = i64::from(TYPED_EDIT_REACH_COLS) + two_back + 2;
     let cursor = cursor_col.map(i64::from);
     let max_start =
         usize::try_from(caret + reach).map_or(0, |m| m.saturating_add(1).min(cells.len()));
@@ -713,19 +716,21 @@ fn find_in_row(
             continue;
         }
         let (start, end) = (start as i64, at as i64 - 1);
-        if caret < start - reach || caret > end + 1 + reach {
+        let end_1 = end + 1;
+        if caret < start - reach || caret > end_1 + reach {
             continue;
         }
-        let typed_left = caret == end + 1 + back || caret == end + 1 + 2 * back;
-        let committed_right = caret + back == start || caret + 2 * back == start;
+        let end_1_two_back = end_1 + two_back;
+        let typed_left = caret == end_1 + back || caret == end_1_two_back;
+        let committed_right = caret_plus_back == start || caret_plus_two_back == start;
         if exact_only && !typed_left {
             continue;
         }
         let anchor = if typed_left || committed_right {
             Anchor::Exact
-        } else if (start - 2 * back..=end + 1 + 2 * back).contains(&caret) {
+        } else if (start - two_back..=end_1_two_back).contains(&caret) {
             Anchor::Inside
-        } else if cursor.is_some_and(|at| (end + 1..=end + 3 + 2 * back).contains(&at)) {
+        } else if cursor.is_some_and(|at| (end_1..=end + three_plus_two_back).contains(&at)) {
             Anchor::Slack
         } else {
             continue;

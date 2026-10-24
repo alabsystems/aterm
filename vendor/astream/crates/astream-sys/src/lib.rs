@@ -272,11 +272,14 @@ pub fn socket_hung_up(socket: std::os::fd::BorrowedFd<'_>) -> bool {
 /// answers `EBADF` at once, and a drained LISTENER hands the drain to every connection
 /// it accepts afterwards. A child holds a copy of each of its parent's descriptors
 /// until its `exec` closes it, so a scan of a child being spawned drains the parent's
-/// sockets; a descriptor marked here is never copied into a child. Non-Apple targets
-/// have no such drain and return `Ok(())` without a call.
+/// sockets; a descriptor marked here is never copied into a child. Other Unix targets
+/// have no such drain and return `Ok(())` without a call. Unix only, as the descriptor
+/// type is: Windows has no `fork` and no `std::os::fd`, so a caller that also builds
+/// there keeps its own no-op twin (astream-broker's `kept_from_children`).
 ///
 /// # Errors
 /// The `fcntl(2)` errno of reading or setting the descriptor's flags.
+#[cfg(unix)]
 pub fn close_on_fork(socket: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
     #[cfg(target_vendor = "apple")]
     {

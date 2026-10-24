@@ -348,7 +348,7 @@ fn the_chip_line_names_no_chip_for_gemini() {
         line,
         format!(
             "autopilot sid={} window=0 program=gemini face=- drawn=- why=no-footer spoken=- \
-             description=-",
+             description=- title=-",
             sid.as_str()
         )
     );
@@ -584,6 +584,77 @@ fn the_hovered_title_on_the_glass_says_the_need_and_the_hold() {
     );
 }
 
+/// `chrome`'s `title=` (a development build's) is the whole title the chip's hover draws, read
+/// with no hover and no frame since: Cruise's sentence from `MODE_WORDS` at rest, the need beside
+/// it, and a read Land hold's title form in place of Land's sentence (5d, the forever lab's read of
+/// the title's words).
+#[test]
+fn chrome_says_the_title_its_hover_draws() {
+    use super::super::gesture_tests::{footer_row, row_text};
+    use crate::autopilot::mode_words;
+    use crate::harness_glass::hold_tests::held;
+    let (mut app, wid, session, _reader, _host) = desk();
+    assert!(app.apply_term_resize(wid, 24, 600));
+    draw_claude(&app, session, BYPASS);
+    frame(&mut app, wid);
+    let title = |app: &App| {
+        let line = line_of(app, session);
+        quoted(&line, "title").unwrap_or_else(|| panic!("a drawn chip's title: {line}"))
+    };
+    let hovered = |app: &mut App| {
+        app.hover_claude_chip(wid, Some((session, super::Chip::Autopilot)));
+        frame(app, wid);
+        let rule = row_text(app, wid, footer_row(app, wid));
+        app.hover_claude_chip(wid, None);
+        frame(app, wid);
+        rule
+    };
+    let at_rest = title(&app);
+    assert!(
+        at_rest.starts_with(&format!(
+            "autopilot: cruise \u{2014} {}",
+            mode_words(Autopilot::Cruise).chip
+        )),
+        "Cruise's sentence: {at_rest:?}"
+    );
+    let rule = hovered(&mut app);
+    assert!(
+        rule.contains(&at_rest),
+        "{at_rest:?} on the glass: {rule:?}"
+    );
+    need(
+        &mut app,
+        session,
+        Some("claude needs you: approve the 0.48.0 release notes \u{2014} carrying on"),
+    );
+    frame(&mut app, wid);
+    let with_need = title(&app);
+    assert!(
+        with_need.contains("needs you: approve the 0.48.0 release notes"),
+        "the need beside the sentence: {with_need:?}"
+    );
+    let rule = hovered(&mut app);
+    assert!(
+        rule.contains(&with_need),
+        "{with_need:?} on the glass: {rule:?}"
+    );
+    set_word(&app, session, Autopilot::Land);
+    assert!(crate::harness_glass::on_land_held(
+        &mut app,
+        session,
+        Some(held())
+    ));
+    frame(&mut app, wid);
+    let land = title(&app);
+    assert!(
+        land.starts_with("autopilot: land \u{2014} not landed yet: ")
+            && !land.contains(mode_words(Autopilot::Land).chip),
+        "a read hold says why in place of Land's sentence: {land:?}"
+    );
+    let rule = hovered(&mut app);
+    assert!(rule.contains(&land), "{land:?} on the glass: {rule:?}");
+}
+
 #[test]
 fn a_shell_pane_prints_no_chip_line() {
     let (mut app, wid, session, _reader) = app();
@@ -655,4 +726,35 @@ fn a_chip_the_rule_did_not_take_names_no_cells() {
         "control: no host, no chip"
     );
     assert_eq!(w.drawn_chip(8, 0, shown), Drawn::NoHost);
+}
+
+/// `chrome`'s `title=` is the hover's own reading, composed from the view and glass the last
+/// frame noted (`title_parts`, as the hover's `TitleReading` is), never from a glass no frame has
+/// drawn: a landing shows in the title once a frame draws it, as on the glass.
+#[test]
+fn chrome_reads_the_title_from_the_glass_the_frame_noted() {
+    use aterm_agent::harness::acts::TaskFace;
+    let (mut app, wid, session, _reader, _host) = desk();
+    assert!(app.apply_term_resize(wid, 24, 600));
+    set_word(&app, session, Autopilot::Land);
+    frame(&mut app, wid);
+    let title = |app: &App| {
+        let line = line_of(app, session);
+        quoted(&line, "title").unwrap_or_else(|| panic!("a drawn chip's title: {line}"))
+    };
+    let open = title(&app);
+    assert!(open.starts_with("autopilot: land \u{2014} "), "{open:?}");
+    assert!(crate::harness_glass::on_task(
+        &mut app,
+        session,
+        Some(TaskFace::Landed),
+        1_792_000_000_000
+    ));
+    assert_eq!(title(&app), open, "no frame has drawn the landing yet");
+    frame(&mut app, wid);
+    let landed = title(&app);
+    assert!(
+        landed.starts_with("autopilot: land, landed"),
+        "the frame drew it: {landed:?}"
+    );
 }

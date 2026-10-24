@@ -13,7 +13,7 @@ use super::decide::{
 use super::digests::{AuthenticatedDigest, DigestSeen, record_or_conflict};
 use super::policy::Policy;
 use super::record::{RECORD_SCHEMA, VendorRecord, complete_record};
-use super::resolve::{self, Candidate, Head, Resolution, Vouch};
+use super::resolve::{self, Candidate, Head, Resolution};
 use super::stamp::ProgramStamp;
 use super::table::VendorSpec;
 use super::version::{Version, is_vendor_build};
@@ -30,14 +30,25 @@ pub(crate) struct Trust {
     pub claude_key: PinnedRsaKey,
     /// How one darwin Mach-O is judged against the program's Developer ID team.
     pub team_check: TeamCheck,
+    /// npm's registry keys: grok's digest anchor.
+    pub npm_keys: &'static [super::npm::NpmKey],
 }
 
 impl Trust {
-    /// The compiled anchors: Anthropic's key and `/usr/bin/codesign`.
+    /// The compiled anchors: Anthropic's key, npm's registry keys and `/usr/bin/codesign`.
     pub(crate) const PRODUCTION: Self = Self {
         claude_key: crate::openpgp::ANTHROPIC_CLAUDE_CODE_RELEASE_KEY,
         team_check: crate::install::codesign_team_check,
+        npm_keys: super::npm::NPM_REGISTRY_KEYS,
     };
+
+    /// The keys [`resolve::verify`] holds documents to.
+    pub(crate) const fn keys(&self) -> resolve::Keys<'_> {
+        resolve::Keys {
+            claude: &self.claude_key,
+            npm: self.npm_keys,
+        }
+    }
 }
 
 /// Everything the lane reads besides the program.
@@ -60,7 +71,8 @@ pub(crate) struct Lane<'a> {
     /// The clock (Unix seconds).
     pub now: i64,
     /// This landing's place in line for the link among lanes landing side by side
-    /// ([`crate::flow::DownloadTurns`]); only its payload's download waits for it.
+    /// ([`crate::flow::DownloadTurns`]); only its downloads wait for it (grok's bucket copy and
+    /// its payload, in one turn), and the landing gives it up when it ends ([`land_one`]).
     pub download_turn: Option<&'a crate::flow::DownloadTicket<'a>>,
 }
 
@@ -414,25 +426,40 @@ impl Pending {
         self.spec.program
     }
 
-    /// The exact download size, from the verified documents.
+    /// The exact download size, from the verified documents: the payload, and the vendor's own
+    /// copy it is checked against (grok's bucket `.zst`).
     #[must_use]
-    pub(crate) const fn download_bytes(&self) -> u64 {
-        self.candidate.artifact.artifact().size
+    pub(crate) fn download_bytes(&self) -> u64 {
+        let companion = self.candidate.companion.as_ref().map_or(0, |c| c.size);
+        self.candidate
+            .artifact
+            .artifact()
+            .size
+            .saturating_add(companion)
     }
 
-    /// What stays on disk once it lands, when the documents say exactly (a raw binary is its
-    /// download; an archive's unpacked size is not published).
+    /// What stays on disk once it lands, when the vendor says exactly (a raw binary is its
+    /// download, an npm binary package's binary the size its vendor's own copy has; an archive's
+    /// unpacked size is not published).
     #[must_use]
     pub(crate) fn disk_bytes(&self) -> Option<u64> {
         let a = self.candidate.artifact.artifact();
-        (a.payload == "raw-binary").then_some(a.size)
+        match a.payload.as_str() {
+            "raw-binary" => Some(a.size),
+            crate::vendor::NPM_BROTLI_BINARY => Some(a.cost.disk_installed),
+            _ => None,
+        }
     }
 
-    /// What its landing's disk gate checks: the download and the tree it unpacks to, an archive's
-    /// at its unpack bound.
+    /// What its landing's disk gate checks: the downloads and the tree it unpacks to, an
+    /// archive's at its unpack bound.
     #[must_use]
-    pub(crate) const fn landing_bytes(&self) -> crate::flow::LandingBytes {
-        crate::flow::LandingBytes::of(self.candidate.artifact.artifact())
+    pub(crate) fn landing_bytes(&self) -> crate::flow::LandingBytes {
+        let companion = crate::flow::LandingBytes {
+            asset: self.candidate.companion.as_ref().map_or(0, |c| c.size),
+            tree: 0,
+        };
+        crate::flow::LandingBytes::of(self.candidate.artifact.artifact()).and(companion)
     }
 }
 
@@ -490,15 +517,8 @@ pub(crate) fn read_ahead(
             if installed_of(layout, program, active).version() != Some(*version)
                 && !crate::pin::is_pinned(layout, program) =>
         {
-            let verified = resolve::verify(
-                spec,
-                triple,
-                fetcher,
-                *version,
-                body,
-                &trust.claude_key,
-                now,
-            );
+            let verified =
+                resolve::verify(spec, triple, fetcher, *version, body, trust.keys(), now);
             Some((*version, verified))
         }
         _ => None,
@@ -818,7 +838,7 @@ pub(crate) fn plan_one_with(
                         lane.fetcher,
                         version,
                         &body,
-                        &lane.trust.claude_key,
+                        lane.trust.keys(),
                         lane.now,
                     ),
                 };
@@ -919,18 +939,7 @@ fn admit_candidate(lane: &Lane<'_>, pending: Pending, inputs: &super::decide::In
         why,
         keeping: pending.installed,
     };
-    let Some(digest) = c.vouch.digest() else {
-        // No document names grok's digest: the first-seen log and the memo judge the bytes once
-        // [`measure`] has them. An earlier refusal of this version holds without a download, since
-        // nothing short of the bytes could tell a new cut from it.
-        if pending.stamp.refused_at(c.version) {
-            return fall_back(refuse(refused_unmeasured(spec.program, c.version)), true);
-        }
-        if let Err(e) = resolve::admit(&c.artifact, &c.vouch) {
-            return fall_back(refuse(e.to_string()), true);
-        }
-        return Step::Land(Box::new(pending));
-    };
+    let digest = c.vouch.digest();
     let record = c.anchor.vouches_before_download();
     match record_or_conflict(
         lane.layout,
@@ -973,14 +982,6 @@ fn admit_candidate(lane: &Lane<'_>, pending: Pending, inputs: &super::decide::In
 const REFUSED_BYTES: &str = "an earlier pass refused these exact bytes; they are not fetched \
                              again until the vendor's head or digest changes";
 
-fn refused_unmeasured(program: &str, version: Version) -> String {
-    format!(
-        "an earlier pass refused {version}'s bytes, and no document names their digest; they \
-         are not fetched again until the vendor's head moves (`aterm pkg update {program}` \
-         asks again)"
-    )
-}
-
 fn recut(c: &Candidate, first: &AuthenticatedDigest) -> String {
     format!(
         "its {} differs from the one first seen for {} ({}) — a re-cut release is never an \
@@ -991,129 +992,175 @@ fn recut(c: &Candidate, first: &AuthenticatedDigest) -> String {
     )
 }
 
-/// The measure step, for a candidate no document names a digest for (grok): its bytes are
-/// downloaded to the staging path the landing reads, held to their exact size and hashed, and the
-/// digest is held to the first-seen log and the refusal memo before anything is staged. [`land`]
-/// then reuses the file ([`crate::flow::land_artifact`]) and logs the digest only once the darwin
-/// team pin has passed those bytes.
+/// What xAI's bucket copy of a build decoded to ([`agree`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Agreement {
+    /// The bucket `.zst` it decoded from.
+    url: String,
+    /// The decoded binary's sha256, lowercase hex.
+    sha256: String,
+    /// Its length.
+    len: u64,
+}
+
+/// The agreement step, for a candidate with a [`resolve::Companion`] (grok): the vendor's own
+/// `.zst` of the binary is downloaded at its exact size, decoded as one checksummed zstd frame
+/// declaring the binary's size, hashed and deleted, before the signed payload is fetched; the
+/// binary staged from the payload must then be these bytes ([`land`]'s pre-swap).
 ///
 /// # Errors
-/// [`FlowError::Download`] for a staging directory that cannot be made, a download that failed
-/// or came up short (nothing is memoized), a file that cannot be hashed or a first-seen log that
-/// cannot be checked; [`FlowError::VendorRefused`] for a row [`resolve::admit`] refuses, a digest
-/// other than the one first seen for the version (a re-cut, memoized), one an earlier pass
-/// refused, or one the candidate's anchor does not take; the staging path's and the disk gate's
-/// own errors. Every error from the download on removes the file.
-fn measure(lane: &Lane<'_>, pending: &Pending) -> Result<Pending, FlowError> {
+/// [`FlowError::StageRefused`] while a refusal of the payload's signed digests still binds
+/// (the landing would refuse it before its download, so the copy is not fetched either); the
+/// staging path's own errors; [`FlowError::Download`] for a staging directory that cannot
+/// be made, a companion download that failed or came up short, or a frame that does not decode
+/// to the binary's size and checksum (nothing is memoized: a torn or half-published copy heals
+/// on a later pass); the disk gate's own, which holds room for the companion, the payload and
+/// the binary at once. The downloaded copy is removed once it is decoded or refused.
+fn agree(lane: &Lane<'_>, pending: &Pending) -> Result<Option<Agreement>, FlowError> {
     let (spec, c) = (pending.spec, &pending.candidate);
+    let Some(companion) = c.companion.as_ref() else {
+        return Ok(None);
+    };
     let art = c.artifact.artifact();
-    resolve::admit(&c.artifact, &c.vouch)?;
-    let dl = crate::flow::staged_download_path(lane.layout, spec.program, &art.asset)?;
+    if let Some(note) = crate::flow::digest_refusal_note(
+        lane.layout,
+        spec.program,
+        c.version.build_id(),
+        art,
+        false,
+    ) {
+        return Err(FlowError::StageRefused(note));
+    }
+    let asset = format!("{}-{}-{}.zst", spec.program, c.version, lane.triple);
+    let dl = crate::flow::staged_download_path(lane.layout, spec.program, &asset)?;
     crate::flow::disk_gate(
-        crate::flow::LandingBytes::of(art).need(),
+        pending.landing_bytes().need(),
         crate::freespace::available_bytes(&dl),
     )?;
     crate::flow::make_staging_dir(&dl).map_err(|e| FlowError::Download(e.to_string()))?;
     let _ = std::fs::remove_file(&dl);
-    crate::flow::sweep_foreign_partials(&dl);
-    let fail = |e: FlowError| {
-        let _ = std::fs::remove_file(&dl);
-        e
-    };
     crate::progress::note_build(spec.program, c.version.build_id());
     if let Some(ticket) = lane.download_turn {
         ticket.wait();
     }
-    let watch = crate::progress::watch_download(spec.program, &dl, art.size);
+    let watch = crate::progress::watch_download(spec.program, &dl, companion.size);
     let fetched = lane
         .fetcher
-        .vendor_download(spec.program, &art.url, &dl, art.size);
+        .vendor_download(spec.program, &companion.url, &dl, companion.size);
     drop(watch);
-    if let Some(ticket) = lane.download_turn {
-        ticket.release();
-    }
-    if let Err(e) = fetched {
-        crate::flow::note_fetch_fault();
-        return Err(fail(FlowError::Download(e.to_string())));
-    }
-    let got = std::fs::symlink_metadata(&dl)
+    // The turn stays this landing's: the payload's download follows on it ([`land_one`]).
+    let decoded = fetched
+        .map_err(|e| {
+            crate::flow::note_fetch_fault();
+            e.to_string()
+        })
+        .and_then(|()| decode_companion(&dl, companion));
+    let _ = std::fs::remove_file(&dl);
+    let (sha256, len) = decoded.map_err(|why| {
+        FlowError::Download(format!(
+            "xAI's own copy of {} {} at {} could not be checked: {why}",
+            spec.program, c.version, companion.url
+        ))
+    })?;
+    Ok(Some(Agreement {
+        url: companion.url.clone(),
+        sha256,
+        len,
+    }))
+}
+
+/// The sha256 and length of the binary the companion at `dl` decodes to: exactly its size on
+/// disk, one zstd frame that declares the binary's size and carries its XXH64 checksum, and
+/// nothing else (no skippable frame, no frame after it).
+fn decode_companion(dl: &Path, companion: &resolve::Companion) -> Result<(String, u64), String> {
+    use std::io::Read as _;
+    let got = std::fs::symlink_metadata(dl)
         .ok()
         .filter(std::fs::Metadata::is_file)
         .map(|m| m.len());
-    if got != Some(art.size) {
-        return Err(fail(FlowError::Download(format!(
-            "{} answered {} of its {} bytes",
-            art.url,
+    if got != Some(companion.size) {
+        return Err(format!(
+            "it answered {} of its {} bytes",
             got.map_or_else(|| String::from("no file"), |n| n.to_string()),
-            art.size
-        ))));
+            companion.size
+        ));
     }
-    let alg = c.anchor.digest_alg();
-    let digest = crate::tree::file_digest(&dl, alg)
-        .ok()
-        .and_then(|hex| AuthenticatedDigest::measured(alg, &hex))
-        .ok_or_else(|| {
-            fail(FlowError::Download(format!(
-                "{} could not be hashed",
-                art.asset
-            )))
-        })?;
-    match record_or_conflict(
-        lane.layout,
-        spec.program,
-        c.version,
-        lane.triple,
-        &digest,
-        false,
-    ) {
-        Ok(DigestSeen::Conflict { first }) => {
-            let why = recut(c, &first);
-            let v = Verdict::Refused {
-                version: Some(c.version),
-                why: why.clone(),
-                keeping: pending.installed,
-            };
-            let _ = ProgramStamp::record_refusal(
-                lane.layout,
-                spec.program,
-                &verdict_line(spec, &v),
-                c.version,
-                &digest,
-            );
-            return Err(fail(FlowError::VendorRefused(why)));
+    let open = || std::fs::File::open(dl).map_err(|e| format!("open the download: {e}"));
+    let declared = aterm_zstd::declared_content_size(open()?).map_err(|e| e.to_string())?;
+    if declared != Some(companion.binary_size) {
+        return Err(format!(
+            "its zstd frame declares {}, not the binary's {} bytes",
+            declared.map_or_else(|| String::from("no size"), |n| format!("{n} bytes")),
+            companion.binary_size
+        ));
+    }
+    let mut decoder = aterm_zstd::Decoder::new(open()?)
+        .require_checksum()
+        .one_frame();
+    let mut sha = crate::tree::BulkSha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut len: u64 = 0;
+    loop {
+        let n = decoder.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
         }
-        Ok(DigestSeen::New | DigestSeen::Same) => {}
-        Err(e) => {
-            return Err(fail(FlowError::Download(format!(
-                "the first-seen digest log could not be checked: {e}"
-            ))));
+        len = len.saturating_add(n as u64);
+        if len > companion.binary_size {
+            return Err(format!(
+                "it decodes past the binary's {} bytes",
+                companion.binary_size
+            ));
         }
+        sha.update(&buf[..n]);
     }
-    if pending.stamp.is_refused(c.version, &digest) {
-        return Err(fail(FlowError::VendorRefused(String::from(REFUSED_BYTES))));
+    if len != companion.binary_size {
+        return Err(format!(
+            "it decodes to {len} bytes, not the binary's {}",
+            companion.binary_size
+        ));
     }
-    let Some(candidate) = c.measured(digest) else {
-        return Err(fail(FlowError::VendorRefused(String::from(
-            "the measured digest is not the candidate's anchor's",
-        ))));
-    };
-    resolve::admit(&candidate.artifact, &candidate.vouch).map_err(fail)?;
-    Ok(Pending {
-        candidate,
-        ..pending.clone()
-    })
+    Ok((sha.finalize_hex(), len))
+}
+
+/// Whether the binary staged in `tree` is the one `vendor`'s own copy decoded to.
+///
+/// # Errors
+/// [`StageError::SignerRefused`] naming both digests when it is not (memoized for the
+/// candidate's version and digest, its line short enough for the memo to keep both whole);
+/// [`StageError::Io`] when the staged binary does not read.
+fn hold_to_agreement(
+    tree: &Path,
+    exe: &str,
+    vendor: &str,
+    agreed: &Agreement,
+) -> Result<(), StageError> {
+    let path = tree.join("bin").join(exe);
+    let len = std::fs::symlink_metadata(&path)
+        .map_err(StageError::Io)?
+        .len();
+    let sha256 = crate::tree::file_digest(&path, crate::manifest::DigestAlg::Sha256)
+        .map_err(StageError::Io)?;
+    if sha256 == agreed.sha256 && len == agreed.len {
+        return Ok(());
+    }
+    Err(StageError::SignerRefused(format!(
+        "bin/{exe} from npm's signed tarball, sha256 {sha256} ({len} bytes), is not \
+         {vendor}'s own build, sha256 {} ({} bytes)",
+        agreed.sha256, agreed.len
+    )))
 }
 
 /// Download, verify, stage (the darwin Developer ID gate inside), activate and shim a candidate
 /// [`plan_one`] verified.
 pub(crate) fn land_one(lane: &Lane<'_>, pending: &Pending) -> Outcome {
     let spec = pending.spec;
-    let mut measured = None;
-    let landed = match pending.candidate.vouch {
-        Vouch::Measure => measure(lane, pending).and_then(|p| land(lane, measured.insert(p))),
-        Vouch::Documents(_) | Vouch::Measured(_) => land(lane, pending),
-    };
-    let pending = measured.as_ref().unwrap_or(pending);
+    let landed = agree(lane, pending).and_then(|agreed| land(lane, pending, agreed.as_ref()));
+    // One turn on the link spans the bucket copy and the payload; it ends with the landing,
+    // landed or not, so the next ticket's transfer may start.
+    if let Some(ticket) = lane.download_turn {
+        ticket.release();
+    }
     let c = &pending.candidate;
     let asset = Some(c.artifact.artifact().asset.clone());
     let verdict = match landed {
@@ -1151,15 +1198,13 @@ pub(crate) fn land_one(lane: &Lane<'_>, pending: &Pending) -> Outcome {
                     keeping: pending.installed,
                 }
             };
-            if let (FlowError::Stage(StageError::SignerRefused(_)), Some(digest)) =
-                (&e, c.vouch.digest())
-            {
+            if let FlowError::Stage(StageError::SignerRefused(_)) = &e {
                 let _ = ProgramStamp::record_refusal(
                     lane.layout,
                     spec.program,
                     &verdict_line(spec, &v),
                     c.version,
-                    digest,
+                    c.vouch.digest(),
                 );
             }
             let inputs = super::decide::Inputs {
@@ -1190,17 +1235,22 @@ pub(crate) fn land_one(lane: &Lane<'_>, pending: &Pending) -> Outcome {
 fn land(
     lane: &Lane<'_>,
     pending: &Pending,
+    agreed: Option<&Agreement>,
 ) -> Result<(Vec<String>, Vec<String>, String), FlowError> {
     let spec = pending.spec;
     let program = spec.program;
     let c = &pending.candidate;
     let art = c.artifact.artifact();
     resolve::admit(&c.artifact, &c.vouch)?;
-    let Some(digest) = c.vouch.digest() else {
+    let digest = c.vouch.digest();
+    if c.companion.is_some() != agreed.is_some() {
         return Err(FlowError::VendorRefused(String::from(
-            "a payload no document vouches for is landed only once it is measured",
+            "a build the vendor's own copy vouches for is landed only once that copy agreed",
         )));
-    };
+    }
+    let exe = crate::store::ToolName::new(&art.entry)
+        .map(|t| t.exe_file())
+        .unwrap_or_default();
     let record = VendorRecord {
         schema: RECORD_SCHEMA,
         program: program.to_string(),
@@ -1215,6 +1265,8 @@ fn land(
         anchor: c.anchor,
         build_date: c.build_date,
         verified_at: lane.now,
+        measured_sha256: agreed.map(|a| a.sha256.clone()),
+        agreed_with: agreed.map(|a| a.url.clone()),
     };
     record
         .record_bytes()
@@ -1225,6 +1277,9 @@ fn land(
     let pre_swap = |tree: &Path| -> Result<(), StageError> {
         let demoted = crate::macho::demote_foreign_executables(tree)?;
         gate(tree)?;
+        if let Some(agreed) = agreed {
+            hold_to_agreement(tree, &exe, spec.vendor, agreed)?;
+        }
         if !c.anchor.vouches_before_download() {
             let seen =
                 record_or_conflict(lane.layout, program, c.version, lane.triple, digest, true)
@@ -1249,10 +1304,22 @@ fn land(
             .map_err(|e| StageError::Payload(e.to_string()))?;
         Ok(vec![(crate::store::VENDOR_SIDECAR_SUFFIX, bytes)])
     };
+    let npm_package = |bytes: &[u8]| -> Result<(), StageError> {
+        let Some(companion) = c.companion.as_ref() else {
+            return Err(StageError::Payload(String::from(
+                "an npm binary package is staged only for a build with its vendor's own copy",
+            )));
+        };
+        let package = companion.platform.package();
+        let tarball = companion.platform.tarball(c.version);
+        let want = companion.platform.expected(&package, c.version, &tarball);
+        super::npm::check_package_json(bytes, &want).map_err(StageError::Payload)
+    };
     let hooks = StageHooks {
         pre_swap: Some(&pre_swap),
         sidecars: Some(&sidecars),
         aliases: spec.aliases,
+        npm_package: Some(&npm_package),
     };
     let exposes: Vec<String> = spec.exposes.iter().map(|t| (*t).to_string()).collect();
     let shim_env = spec.shim_env();
@@ -1797,6 +1864,9 @@ pub(crate) mod world {
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
 
+    use super::super::npm::{NpmKey, keyid_of};
+    use super::super::resolve::{self, GrokPlatform};
+    use super::super::version::Version;
     use super::Trust;
     use crate::flow::{Fetcher, VendorFetchError, VendorGet};
     use crate::store::Layout;
@@ -1885,12 +1955,119 @@ pub(crate) mod world {
         }
     }
 
-    /// The test key and a codesign stand-in that passes.
+    /// The test keys and a codesign stand-in that passes.
     pub(crate) fn trust() -> Trust {
         Trust {
             claude_key: crate::openpgp::testkit::test_key(),
             team_check: pass_check,
+            npm_keys: npm_test_keys(),
         }
+    }
+
+    /// The signing half of the test npm registry key: `npm-test-key.p8`, a P-256 PKCS#8 key
+    /// made for these tests (`openssl genpkey -algorithm EC -pkeyopt
+    /// ec_paramgen_curve:P-256 -pkeyopt ec_param_enc:named_curve`, then `openssl pkcs8
+    /// -topk8 -nocrypt -outform DER`).
+    fn npm_signer() -> ring::signature::EcdsaKeyPair {
+        ring::signature::EcdsaKeyPair::from_pkcs8(
+            &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+            include_bytes!("fixtures/npm-test-key.p8"),
+            &ring::rand::SystemRandom::new(),
+        )
+        .unwrap()
+    }
+
+    /// The test npm registry key, as [`Trust::npm_keys`] holds it.
+    pub(crate) fn npm_test_keys() -> &'static [NpmKey] {
+        static KEYS: std::sync::OnceLock<[NpmKey; 1]> = std::sync::OnceLock::new();
+        KEYS.get_or_init(|| {
+            use ring::signature::KeyPair as _;
+            let point: [u8; 65] = npm_signer().public_key().as_ref().try_into().unwrap();
+            [NpmKey {
+                keyid: Box::leak(keyid_of(&point).into_boxed_str()),
+                point,
+                not_after: None,
+            }]
+        })
+    }
+
+    /// The test registry key's signature over `message`, base64 as npm serves it.
+    pub(crate) fn npm_sign(message: &str) -> String {
+        let sig = npm_signer()
+            .sign(&ring::rand::SystemRandom::new(), message.as_bytes())
+            .unwrap();
+        aterm_codec::base64::encode(sig.as_ref()).unwrap()
+    }
+
+    /// grok's npm and bucket names for [`triple`]; `None` where xAI serves no build
+    /// (Windows), so a test's landing half could not run.
+    pub(crate) fn grok_platform() -> Option<GrokPlatform> {
+        resolve::grok_platform(triple())
+    }
+
+    /// What [`Fake::publish_grok`] served.
+    pub(crate) struct GrokServed {
+        /// npm's tarball URL.
+        pub tarball: String,
+        /// xAI's bucket `.zst` of the binary.
+        pub zst: String,
+        /// xAI's bucket binary, which is only ever sized.
+        pub binary: String,
+        /// The tarball's sha512, lowercase hex.
+        pub sha512: String,
+    }
+
+    /// `exe` as a Brotli stream ([`aterm_brotli::write_uncompressed`]).
+    pub(crate) fn brotli(exe: &[u8]) -> Vec<u8> {
+        let mut br = Vec::new();
+        aterm_brotli::write_uncompressed(&mut br, exe).unwrap();
+        br
+    }
+
+    /// `exe` as one checksummed zstd frame, as xAI's bucket serves its `.zst`.
+    pub(crate) fn zstd(exe: &[u8]) -> Vec<u8> {
+        let mut zst = Vec::new();
+        aterm_zstd::frame::write_raw(&mut zst, exe, aterm_zstd::frame::Checksum::Xxh64).unwrap();
+        zst
+    }
+
+    /// The `package/package.json` npm's package of grok `version` for this host carries.
+    pub(crate) fn grok_package_json(platform: GrokPlatform, version: &str) -> String {
+        format!(
+            "{{\n  \"name\": \"{}\",\n  \"version\": \"{version}\",\n  \"license\": \
+             \"Apache-2.0\",\n  \"os\": [\"{}\"],\n  \"cpu\": [\"{}\"]\n}}\n",
+            platform.package(),
+            platform.os,
+            platform.cpu
+        )
+    }
+
+    /// A gzip'd tar of `members` (`(path, type flag, link, bytes, mode)`) and nothing else:
+    /// no directory entries, as npm packs a package.
+    pub(crate) fn npm_tgz(members: &[(&str, u8, &str, &[u8], u32)]) -> Vec<u8> {
+        crate::extract::fixtures::gzip_bytes(&crate::extract::fixtures::tar_bytes(members))
+    }
+
+    /// npm's package of grok `version` for this host as xAI packs it: `package/bin/grok.br`
+    /// (`exe`), `package/package.json`, `package/README.md` and the third-party notices.
+    pub(crate) fn grok_tgz(platform: GrokPlatform, version: &str, exe: &[u8]) -> Vec<u8> {
+        let json = grok_package_json(platform, version);
+        npm_tgz(&[
+            ("package/bin/grok.br", b'0', "", &brotli(exe), 0o644),
+            ("package/package.json", b'0', "", json.as_bytes(), 0o644),
+            ("package/README.md", b'0', "", b"# Grok Build\n", 0o644),
+            (
+                "package/THIRD_PARTY_NOTICES.md",
+                b'0',
+                "",
+                &[b'n'; 7995],
+                0o644,
+            ),
+        ])
+    }
+
+    pub(crate) fn sha512_hex(bytes: &[u8]) -> String {
+        aterm_codec::hex::encode_lower(ring::digest::digest(&ring::digest::SHA512, bytes).as_ref())
     }
 
     /// [`trust`] with a codesign stand-in that refuses every Mach-O.
@@ -1955,6 +2132,8 @@ pub(crate) mod world {
     pub(crate) struct Fake {
         docs: Shared<BTreeMap<String, Doc>>,
         payloads: Shared<BTreeMap<String, Vec<u8>>>,
+        /// Payloads only ever sized, at a size no test holds in memory.
+        sized: Shared<BTreeMap<String, u64>>,
         /// Every `vendor_get`, `(url, if-none-match)`.
         pub gets: Shared<Vec<(String, Option<String>)>>,
         /// Every payload download's URL.
@@ -2007,6 +2186,18 @@ pub(crate) mod world {
         /// Stop serving `url`: it answers 404.
         pub(crate) fn forget(&self, url: &str) {
             self.docs.borrow_mut().remove(url);
+        }
+
+        /// Stop serving the payload at `url`: it answers 404.
+        pub(crate) fn forget_payload(&self, url: &str) {
+            self.payloads.borrow_mut().remove(url);
+            self.sized.borrow_mut().remove(url);
+        }
+
+        /// Answer `url`'s size as `size`, for a payload a test only sizes (a download of it
+        /// fails).
+        pub(crate) fn payload_sized(&self, url: &str, size: u64) {
+            self.sized.borrow_mut().insert(url.to_string(), size);
         }
 
         /// The document served at `url`.
@@ -2152,6 +2343,64 @@ pub(crate) mod world {
                 &format!("{CLAUDE}latest"),
                 format!("{version}\n").as_bytes(),
             );
+        }
+
+        /// Publish grok `version` as xAI's stable pointer names it, npm's registry signs it
+        /// (under the test key) and xAI's bucket serves it: npm's version document and its
+        /// tarball of `exe` ([`grok_tgz`]), and the bucket's raw `exe` and `.zst` of it. `None`
+        /// where xAI serves no build for this host.
+        pub(crate) fn publish_grok(&self, version: &str, exe: &[u8]) -> Option<GrokServed> {
+            let platform = grok_platform()?;
+            let served = self.publish_grok_tarball(version, &grok_tgz(platform, version, exe));
+            self.publish_grok_bucket(version, exe, exe);
+            Some(served)
+        }
+
+        /// Serve `tgz` as npm's tarball of grok `version` for this host, and its version
+        /// document signed by the test key over `tgz`'s sha512; the head names `version`.
+        pub(crate) fn publish_grok_tarball(&self, version: &str, tgz: &[u8]) -> GrokServed {
+            let platform = grok_platform().unwrap();
+            let v = Version::parse(version).unwrap();
+            let digest = ring::digest::digest(&ring::digest::SHA512, tgz);
+            let sha512 = aterm_codec::hex::encode_lower(digest.as_ref());
+            let integrity = format!(
+                "sha512-{}",
+                aterm_codec::base64::encode(digest.as_ref()).unwrap()
+            );
+            let name = platform.package();
+            let tarball = platform.tarball(v);
+            let sig = npm_sign(&format!("{name}@{version}:{integrity}"));
+            let doc = format!(
+                "{{\"name\":\"{name}\",\"version\":\"{version}\",\"os\":[\"{}\"],\
+                 \"cpu\":[\"{}\"],\"dist\":{{\"integrity\":\"{integrity}\",\"tarball\":\
+                 \"{tarball}\",\"signatures\":[{{\"keyid\":\"{}\",\"sig\":\"{sig}\"}}]}}}}",
+                platform.os,
+                platform.cpu,
+                npm_test_keys()[0].keyid
+            );
+            self.doc(
+                super::super::spec("grok").unwrap().head_url,
+                version.as_bytes(),
+            );
+            self.doc(&platform.version_doc(v), doc.as_bytes());
+            self.payload(&tarball, tgz);
+            let binary = platform.binary(v);
+            GrokServed {
+                tarball,
+                zst: format!("{binary}.zst"),
+                binary,
+                sha512,
+            }
+        }
+
+        /// Serve xAI's bucket copy of grok `version` for this host: a raw object as long as
+        /// `raw`, and the `.zst` of `zst`.
+        pub(crate) fn publish_grok_bucket(&self, version: &str, raw: &[u8], zst: &[u8]) {
+            let binary = grok_platform()
+                .unwrap()
+                .binary(Version::parse(version).unwrap());
+            self.payload(&binary, raw);
+            self.payload(&format!("{binary}.zst"), &zstd(zst));
         }
 
         /// The codex package name for [`triple`].
@@ -2329,6 +2578,9 @@ pub(crate) mod world {
             );
             if self.offline.get() {
                 return unreachable(url);
+            }
+            if let Some(size) = self.sized.borrow().get(url) {
+                return Ok(*size);
             }
             self.payloads
                 .borrow()
@@ -2586,13 +2838,7 @@ mod tests {
         );
     }
 
-    fn sha512_hex(bytes: &[u8]) -> String {
-        ring::digest::digest(&ring::digest::SHA512, bytes)
-            .as_ref()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect()
-    }
+    use world::sha512_hex;
 
     fn agy() -> &'static VendorSpec {
         super::super::spec("agy").unwrap()
@@ -2680,21 +2926,16 @@ mod tests {
         url
     }
 
-    /// Publish grok `version` as xAI's stable pointer and its bucket payload; its URL. grok is
-    /// served on darwin only, so elsewhere the landing half could not run.
-    fn publish_grok(f: &Fake, version: &str, exe: &[u8]) -> String {
-        let Some(platform) = resolve::grok_platform(world::triple()) else {
+    /// Publish grok `version` of `exe`: npm's signed tarball and xAI's bucket copy
+    /// ([`Fake::publish_grok`]). Where xAI serves no build for this host (Windows) the landing
+    /// half could not run.
+    fn publish_grok(f: &Fake, version: &str, exe: &[u8]) -> world::GrokServed {
+        f.publish_grok(version, exe).unwrap_or_else(|| {
             aterm_uds::host::could_not_run(format!(
                 "grok is not served for {}, so the landing half did not run",
                 world::triple()
-            ));
-        };
-        f.doc(grok().head_url, version.as_bytes());
-        let url = format!(
-            "https://storage.googleapis.com/grok-build-public-artifacts/cli/grok-{version}-{platform}"
-        );
-        f.payload(&url, exe);
-        url
+            ))
+        })
     }
 
     fn staged(l: &Layout, program: &str) -> Vec<String> {
@@ -2754,12 +2995,15 @@ mod tests {
         );
     }
 
+    /// A fresh grok: npm's registry-signed tarball (its sha512 logged before a byte moved)
+    /// lands its decoded `bin/grok` once xAI's bucket `.zst` decoded to the same bytes; the
+    /// bucket's raw binary is only sized, and nothing is left in staging.
     #[test]
-    fn a_fresh_grok_is_measured_once_and_logged_once_its_team_pin_passed() {
+    fn a_fresh_grok_lands_npms_signed_binary_once_xais_bucket_agrees() {
         let l = world::layout("fresh-grok");
         let f = Fake::default();
-        let exe = native_exe("grok 1.0.68");
-        let url = publish_grok(&f, "1.0.68", &exe);
+        let exe = native_exe("grok 1.0.70");
+        let served = publish_grok(&f, "1.0.70", &exe);
         let o = run(&l, &f, &Policy::default(), grok());
         assert!(
             matches!(
@@ -2773,26 +3017,62 @@ mod tests {
         );
         assert_eq!(
             f.downloads.borrow().as_slice(),
-            std::slice::from_ref(&url),
-            "the landing staged the measured file: no second request"
+            [served.zst.clone(), served.tarball.clone()],
+            "the bucket's .zst, then npm's tarball; never {}",
+            served.binary
         );
-        let build = world::build_dir(&l, "grok", "1.0.68");
+        let build = world::build_dir(&l, "grok", "1.0.70");
         assert_eq!(std::fs::read(build.join("bin/grok")).unwrap(), exe);
+        let bin: Vec<_> = std::fs::read_dir(build.join("bin"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(bin, ["grok"], "the .br is decoded, nothing else is laid");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(build.join("bin/grok"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o111, 0o111, "{mode:o}");
+            let sealed = std::fs::metadata(build.join("bin"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(
+                sealed,
+                crate::store::SEALED_BIN_MODE,
+                "a one-binary bin/: {sealed:o}"
+            );
+        }
         let record = complete_record(&build).expect("a complete record");
         assert_eq!(
-            (record.sha256.as_str(), record.anchor),
             (
-                world::sha(&exe).as_str(),
-                super::super::Anchor::XaiDeveloperId
+                record.sha512.as_str(),
+                record.sha256.as_str(),
+                record.anchor
+            ),
+            (
+                served.sha512.as_str(),
+                "",
+                super::super::Anchor::XaiNpmRegistry
             )
         );
-        assert_eq!(record.apple_team.as_deref(), Some("5Y6N3AJ54S"));
-        let log = super::super::digests::digests_path(&l, "grok");
-        assert!(
-            std::fs::read_to_string(&log)
-                .unwrap()
-                .contains(&world::sha(&exe))
+        assert_eq!(record.source_url, served.tarball);
+        assert_eq!(
+            record.measured_sha256.as_deref(),
+            Some(world::sha(&exe).as_str())
         );
+        assert_eq!(record.agreed_with.as_deref(), Some(served.zst.as_str()));
+        assert_eq!(
+            record.apple_team.as_deref(),
+            cfg!(target_os = "macos").then_some("5Y6N3AJ54S")
+        );
+        let log = std::fs::read_to_string(super::super::digests::digests_path(&l, "grok")).unwrap();
+        assert!(log.contains(&served.sha512), "{log}");
         assert_eq!(
             crate::shim_env::read_sidecar(&build).spelled(),
             "GROK_DISABLE_AUTOUPDATER=1"
@@ -2800,44 +3080,184 @@ mod tests {
         assert!(staged(&l, "grok").is_empty(), "{:?}", staged(&l, "grok"));
     }
 
+    /// A build xAI's bucket does not serve: the binary npm's signed tarball decodes to is
+    /// refused when the bucket's copy (as long, other bytes) is not it, and memoized for that
+    /// tarball's sha512, which was logged before the download; a person clearing the memo
+    /// lands it once the bucket agrees.
     #[test]
-    fn a_grok_recut_is_refused_once_measured_and_never_fetched_again() {
-        let l = world::layout("grok-recut");
+    fn a_binary_the_bucket_does_not_agree_with_is_refused_and_memoized() {
+        let l = world::layout("grok-disagree");
         let f = Fake::default();
-        publish_grok(&f, "1.0.68", &native_exe("first cut"));
-        let o = run(&l, &f, &Policy::default(), grok());
-        assert!(matches!(o.verdict, Verdict::Installed { .. }), "{o:?}");
-        crate::ops::uninstall(&l, "grok").unwrap();
-        publish_grok(&f, "1.0.68", &native_exe("second cut"));
-        let downloads = f.downloads.borrow().len();
+        let exe = native_exe("grok 1.0.70");
+        let served = publish_grok(&f, "1.0.70", &exe);
+        let mut other = exe.clone();
+        *other.last_mut().unwrap() ^= 1;
+        f.publish_grok_bucket("1.0.70", &exe, &other);
         let o = run(&l, &f, &Policy::default(), grok());
         assert!(matches!(o.verdict, Verdict::Refused { .. }), "{o:?}");
-        assert!(o.line().contains("first seen for 1.0.68"), "{}", o.line());
         assert!(
-            !o.line().contains("signer refused"),
-            "the measured digest refused it before anything was staged: {}",
+            o.line().contains(&format!(
+                "is not xAI's own build, sha256 {} ({} bytes)",
+                world::sha(&other),
+                other.len()
+            )),
+            "{}",
             o.line()
         );
-        assert_eq!(f.downloads.borrow().len(), downloads + 1, "measured once");
+        assert_eq!(f.downloads.borrow().len(), 2, "the .zst and the tarball");
+        let stamp = ProgramStamp::read(&l, "grok").unwrap();
+        assert_eq!(
+            stamp.refused.as_ref().map(|(v, d)| (*v, d.as_str())),
+            Some((v("1.0.70"), served.sha512.as_str()))
+        );
+        let log = std::fs::read_to_string(super::super::digests::digests_path(&l, "grok")).unwrap();
+        assert!(log.contains(&served.sha512), "first seen at plan: {log}");
         assert!(staged(&l, "grok").is_empty(), "{:?}", staged(&l, "grok"));
         assert_eq!(shim_build(&l, "grok"), None, "nothing laid");
-        assert!(!world::build_dir(&l, "grok", "1.0.68").exists());
+        assert!(!crate::store::build_is_complete(&world::build_dir(
+            &l, "grok", "1.0.70"
+        )));
+        let o = run(&l, &f, &Policy::default(), grok());
+        assert!(
+            o.line().contains("refused these exact bytes"),
+            "{}",
+            o.line()
+        );
+        assert_eq!(f.downloads.borrow().len(), 2, "not fetched again");
+        let memo = crate::store::stage_refusal(&world::build_dir(&l, "grok", "1.0.70"))
+            .expect("the store's memo of the refusal");
+        assert!(
+            memo.why.contains(&world::sha(&other)) && memo.why.contains(&world::sha(&exe)),
+            "the memo keeps both digests whole: {}",
+            memo.why
+        );
+        ProgramStamp::clear_refusal(&l, "grok").unwrap();
+        assert_eq!(
+            crate::store::clear_stage_refusals(&l, "grok"),
+            1,
+            "a person's retry"
+        );
+        f.publish_grok_bucket("1.0.70", &exe, &exe);
+        let o = run(&l, &f, &Policy::default(), grok());
+        assert!(matches!(o.verdict, Verdict::Installed { .. }), "{o:?}");
+    }
+
+    /// npm's tarball must be the bytes its signed document names: one flipped byte, at the
+    /// size the registry answered, is a digest mismatch, refused before anything is staged.
+    /// As for every vendor the first retry is free; once two passes saw the same bytes the
+    /// refusal binds, and the bucket's copy is not fetched for a tarball the landing would
+    /// refuse before its download.
+    #[test]
+    fn a_tarball_other_than_the_signed_one_is_refused_before_staging() {
+        let l = world::layout("grok-tampered");
+        let f = Fake::default();
+        let exe = native_exe("grok 1.0.70");
+        let served = publish_grok(&f, "1.0.70", &exe);
+        let mut tgz = world::grok_tgz(world::grok_platform().unwrap(), "1.0.70", &exe);
+        assert_eq!(
+            world::sha512_hex(&tgz),
+            served.sha512,
+            "the signed tarball, rebuilt"
+        );
+        let middle = tgz.len() / 2;
+        tgz[middle] ^= 1;
+        f.payload(&served.tarball, &tgz);
         let o = run(&l, &f, &Policy::default(), grok());
         assert!(matches!(o.verdict, Verdict::Refused { .. }), "{o:?}");
-        assert!(o.line().contains("head moves"), "{}", o.line());
+        assert!(o.line().contains("sha512"), "{}", o.line());
+        assert_eq!(f.downloads.borrow().len(), 2, "the .zst and the tarball");
+        assert!(staged(&l, "grok").is_empty(), "{:?}", staged(&l, "grok"));
+        assert_eq!(shim_build(&l, "grok"), None, "nothing laid");
+        assert!(!crate::store::build_is_complete(&world::build_dir(
+            &l, "grok", "1.0.70"
+        )));
+        let o = run(&l, &f, &Policy::default(), grok());
+        assert!(matches!(o.verdict, Verdict::Refused { .. }), "{o:?}");
+        assert_eq!(f.downloads.borrow().len(), 4, "the first retry is free");
+        let o = run(&l, &f, &Policy::default(), grok());
+        assert!(matches!(o.verdict, Verdict::Refused { .. }), "{o:?}");
+        assert!(o.line().contains("not downloaded again"), "{}", o.line());
         assert_eq!(
             f.downloads.borrow().len(),
-            downloads + 1,
-            "not fetched again"
+            4,
+            "two identical verdicts: neither download again"
         );
     }
 
+    /// A bucket copy that is not one frame decoding to the binary's declared size and checksum
+    /// fails the pass before npm's tarball is fetched, memoizing nothing (a torn or
+    /// half-published copy heals), and the next pass lands once it is.
     #[test]
-    fn a_short_grok_download_fails_unmemoized_and_lands_on_the_next_pass() {
-        let l = world::layout("grok-short");
+    fn a_bucket_copy_that_does_not_decode_fails_unmemoized() {
+        let exe = native_exe("grok 1.0.70");
+        let mut longer = exe.clone();
+        longer.push(b'!');
+        let checksum_flipped = {
+            let mut zst = world::zstd(&exe);
+            *zst.last_mut().unwrap() ^= 1;
+            zst
+        };
+        let unchecked = {
+            let mut zst = Vec::new();
+            aterm_zstd::frame::write_raw(&mut zst, &exe, aterm_zstd::frame::Checksum::Omitted)
+                .unwrap();
+            zst
+        };
+        let one_frame = "more than the one zstd frame";
+        let trailing_empty = [world::zstd(&exe), world::zstd(b"")].concat();
+        let skippable = [0x184D_2A50u32.to_le_bytes(), 7u32.to_le_bytes()].concat();
+        let trailing_skippable = [&world::zstd(&exe)[..], &skippable, b"padding"].concat();
+        let leading_skippable = [&skippable[..], b"padding", &world::zstd(&exe)].concat();
+        for (label, zst, why) in [
+            ("declares", world::zstd(&longer), "its zstd frame declares"),
+            ("checksum", checksum_flipped, "could not be checked"),
+            ("unchecked", unchecked, "could not be checked"),
+            ("empty", Vec::new(), "no content length"),
+            ("trailing-empty", trailing_empty, one_frame),
+            ("trailing-skippable", trailing_skippable, one_frame),
+            ("leading-skippable", leading_skippable, "not a frame"),
+        ] {
+            let l = world::layout(&format!("grok-zst-{label}"));
+            let f = Fake::default();
+            let served = publish_grok(&f, "1.0.70", &exe);
+            f.payload(&served.zst, &zst);
+            let o = run(&l, &f, &Policy::default(), grok());
+            assert!(
+                !matches!(o.verdict, Verdict::Installed { .. }),
+                "{label}: {o:?}"
+            );
+            assert!(o.line().contains(why), "{label}: {}", o.line());
+            assert!(
+                !f.downloads.borrow().contains(&served.tarball),
+                "{label}: npm's tarball is not fetched"
+            );
+            assert_eq!(
+                ProgramStamp::read(&l, "grok").and_then(|s| s.refused),
+                None,
+                "{label}: nothing memoized"
+            );
+            assert!(
+                staged(&l, "grok").is_empty(),
+                "{label}: {:?}",
+                staged(&l, "grok")
+            );
+            f.publish_grok_bucket("1.0.70", &exe, &exe);
+            let o = run(&l, &f, &Policy::default(), grok());
+            assert!(
+                matches!(o.verdict, Verdict::Installed { .. }),
+                "{label}: {o:?}"
+            );
+        }
+    }
+
+    /// A grok landing's disk gate holds room for npm's tarball, the bucket's `.zst` and the
+    /// binary at once; planning it downloads nothing.
+    #[test]
+    fn a_grok_landing_needs_room_for_the_tarball_the_bucket_copy_and_the_binary() {
+        let l = world::layout("grok-room");
         let f = Fake::default();
-        let exe = native_exe("grok 1.0.68");
-        let url = publish_grok(&f, "1.0.68", &exe);
+        let exe = native_exe("grok 1.0.70");
+        let served = publish_grok(&f, "1.0.70", &exe);
         let lane = Lane {
             layout: &l,
             fetcher: &f,
@@ -2852,22 +3272,347 @@ mod tests {
         let Step::Land(pending) = plan_one(&lane, grok(), false) else {
             panic!("a grok to land");
         };
-        f.payload(&url, &exe[..exe.len() - 1]);
+        let tgz = world::grok_tgz(world::grok_platform().unwrap(), "1.0.70", &exe).len() as u64;
+        let zst = world::zstd(&exe).len() as u64;
+        let need = pending.landing_bytes().need();
+        assert_eq!(need, tgz + zst + exe.len() as u64);
+        assert_eq!(pending.download_bytes(), tgz + zst);
+        assert_eq!(pending.disk_bytes(), Some(exe.len() as u64));
+        assert!(f.downloads.borrow().is_empty(), "{:?}", served.tarball);
+    }
+
+    /// The agreement step downloads the bucket's `.zst` alone, decodes it to the binary's
+    /// sha256 and length, and deletes it before npm's tarball is requested.
+    #[test]
+    fn the_bucket_copy_is_decoded_and_deleted_before_the_tarball_is_fetched() {
+        let l = world::layout("grok-agree");
+        let f = Fake::default();
+        let exe = native_exe("grok 1.0.70");
+        let served = publish_grok(&f, "1.0.70", &exe);
+        let lane = Lane {
+            layout: &l,
+            fetcher: &f,
+            triple: world::triple(),
+            policy: &Policy::default(),
+            trust: &world::trust(),
+            legacy_index: None,
+            asked: false,
+            now: NOW,
+            download_turn: None,
+        };
+        let Step::Land(pending) = plan_one(&lane, grok(), false) else {
+            panic!("a grok to land");
+        };
+        let agreed = agree(&lane, &pending)
+            .unwrap()
+            .expect("grok has a bucket copy");
+        assert_eq!(
+            agreed,
+            Agreement {
+                url: served.zst.clone(),
+                sha256: world::sha(&exe),
+                len: exe.len() as u64,
+            }
+        );
+        assert_eq!(f.downloads.borrow().as_slice(), [served.zst]);
+        assert!(staged(&l, "grok").is_empty(), "{:?}", staged(&l, "grok"));
+    }
+
+    /// A grok landing's bucket copy and npm's tarball are one turn on the link: it keeps the
+    /// turn it took for the copy, so the tarball's download, which waits on that same ticket,
+    /// starts at once, and the next ticket's transfer starts only once the landing ends,
+    /// landed or failed.
+    #[test]
+    fn a_grok_landing_holds_its_download_turn_from_the_bucket_copy_to_the_tarball() {
+        let turns = crate::flow::DownloadTurns::default();
+        let (first, second, third) = (turns.ticket(), turns.ticket(), turns.ticket());
+        let (policy, trust) = (Policy::default(), world::trust());
+        let lane = |l, f, ticket| Lane {
+            layout: l,
+            fetcher: f,
+            triple: world::triple(),
+            policy: &policy,
+            trust: &trust,
+            legacy_index: None,
+            asked: false,
+            now: NOW,
+            download_turn: Some(ticket),
+        };
+        let l = world::layout("grok-turn");
+        let f = Fake::default();
+        publish_grok(&f, "1.0.70", &native_exe("grok 1.0.70"));
+        let landing = lane(&l, &f, &first);
+        let Step::Land(pending) = plan_one(&landing, grok(), false) else {
+            panic!("a grok to land");
+        };
+        agree(&landing, &pending)
+            .unwrap()
+            .expect("grok has a bucket copy");
+        assert!(
+            first.holds_the_link() && !second.holds_the_link(),
+            "the bucket copy gave up the turn npm's tarball still needs"
+        );
+        let o = land_one(&landing, &pending);
+        assert!(matches!(o.verdict, Verdict::Installed { .. }), "{o:?}");
+        assert!(
+            second.holds_the_link(),
+            "the landing ended: the next transfer may start"
+        );
+        let l = world::layout("grok-turn-failed");
+        let f = Fake::default();
+        publish_grok(&f, "1.0.70", &native_exe("grok 1.0.70"));
+        f.downloads_fail.set(true);
+        let failing = lane(&l, &f, &second);
+        let Step::Land(pending) = plan_one(&failing, grok(), false) else {
+            panic!("a grok to land");
+        };
+        let o = land_one(&failing, &pending);
+        assert!(matches!(o.verdict, Verdict::Failed { .. }), "{o:?}");
+        assert!(third.holds_the_link(), "a failed landing gave up its turn");
+    }
+
+    /// A short bucket download (fewer bytes than the bucket sized) fails unmemoized and lands on
+    /// the next pass.
+    #[test]
+    fn a_short_bucket_download_fails_unmemoized_and_lands_on_the_next_pass() {
+        let l = world::layout("grok-short");
+        let f = Fake::default();
+        let exe = native_exe("grok 1.0.70");
+        let served = publish_grok(&f, "1.0.70", &exe);
+        let lane = Lane {
+            layout: &l,
+            fetcher: &f,
+            triple: world::triple(),
+            policy: &Policy::default(),
+            trust: &world::trust(),
+            legacy_index: None,
+            asked: false,
+            now: NOW,
+            download_turn: None,
+        };
+        let Step::Land(pending) = plan_one(&lane, grok(), false) else {
+            panic!("a grok to land");
+        };
+        let zst = world::zstd(&exe);
+        f.payload(&served.zst, &zst[..zst.len() - 1]);
         let o = land_one(&lane, &pending);
         assert!(matches!(o.verdict, Verdict::Failed { .. }), "{o:?}");
         assert!(o.line().contains("of its"), "{}", o.line());
+        assert_eq!(
+            f.downloads.borrow().as_slice(),
+            std::slice::from_ref(&served.zst)
+        );
         assert!(staged(&l, "grok").is_empty(), "{:?}", staged(&l, "grok"));
         assert_eq!(ProgramStamp::read(&l, "grok").unwrap().refused, None);
-        assert!(!super::super::digests::digests_path(&l, "grok").exists());
-        f.payload(&url, &exe);
+        f.payload(&served.zst, &zst);
         let o = run(&l, &f, &Policy::default(), grok());
         assert!(matches!(o.verdict, Verdict::Installed { .. }), "{o:?}");
     }
 
+    /// A document or copy not served (npm's version document, the bucket's binary or its
+    /// `.zst`) is no verdict: nothing is downloaded or memoized, and the build lands once it
+    /// is served.
+    #[test]
+    fn an_unserved_npm_document_or_bucket_copy_is_no_verdict() {
+        let exe = native_exe("grok 1.0.70");
+        for which in ["npm", "binary", "zst", "tarball"] {
+            let l = world::layout(&format!("grok-unserved-{which}"));
+            let f = Fake::default();
+            let served = publish_grok(&f, "1.0.70", &exe);
+            let version_doc = world::grok_platform().unwrap().version_doc(v("1.0.70"));
+            let doc = f.body(&version_doc);
+            match which {
+                "npm" => f.forget(&version_doc),
+                "binary" => f.forget_payload(&served.binary),
+                "zst" => f.forget_payload(&served.zst),
+                _ => f.forget_payload(&served.tarball),
+            }
+            let o = run(&l, &f, &Policy::default(), grok());
+            assert!(
+                matches!(o.verdict, Verdict::Unreachable { why: Some(_), .. }),
+                "{which}: {o:?}"
+            );
+            assert!(!o.is_failure(), "{which}");
+            assert!(f.downloads.borrow().is_empty(), "{which}: nothing fetched");
+            assert_eq!(
+                ProgramStamp::read(&l, "grok").and_then(|s| s.refused),
+                None,
+                "{which}"
+            );
+            f.doc(&version_doc, &doc);
+            f.publish_grok_bucket("1.0.70", &exe, &exe);
+            f.payload(
+                &served.tarball,
+                &world::grok_tgz(world::grok_platform().unwrap(), "1.0.70", &exe),
+            );
+            let o = run(&l, &f, &Policy::default(), grok());
+            assert!(
+                matches!(o.verdict, Verdict::Installed { .. }),
+                "{which}: {o:?}"
+            );
+        }
+    }
+
+    /// npm's version document signed by a key aterm does not ship (the test key, against the
+    /// compiled registry key) is refused before a byte moves, naming the key.
+    #[test]
+    fn a_version_document_under_a_key_aterm_does_not_ship_is_refused_before_any_download() {
+        let l = world::layout("grok-unknown-key");
+        let f = Fake::default();
+        publish_grok(&f, "1.0.70", &native_exe("grok 1.0.70"));
+        let production = Trust {
+            npm_keys: super::super::npm::NPM_REGISTRY_KEYS,
+            ..world::trust()
+        };
+        let o = run_with(&l, &f, &Policy::default(), &production, grok(), false);
+        assert!(matches!(o.verdict, Verdict::Refused { .. }), "{o:?}");
+        assert!(
+            o.line().contains(&format!(
+                "aterm does not ship ({})",
+                world::npm_test_keys()[0].keyid
+            )),
+            "{}",
+            o.line()
+        );
+        assert!(f.downloads.borrow().is_empty(), "nothing fetched");
+        assert!(!super::super::digests::digests_path(&l, "grok").exists());
+    }
+
+    /// A tarball npm signed but the stager refuses — a member out of place or of another kind,
+    /// a binary decoding to other than the bucket's size, a package.json naming another
+    /// version — lays nothing.
+    #[test]
+    fn a_signed_tarball_the_stager_refuses_lays_nothing() {
+        let Some(platform) = world::grok_platform() else {
+            aterm_uds::host::could_not_run("grok is not served for this host");
+        };
+        let exe = native_exe("grok 1.0.70");
+        let mut longer = exe.clone();
+        longer.push(b'!');
+        let json = world::grok_package_json(platform, "1.0.70");
+        let other_version = world::grok_package_json(platform, "1.0.69");
+        let br = world::brotli(&exe);
+        let mut trailing = br.clone();
+        trailing.push(0);
+        let cases: Vec<(&str, Vec<u8>, &[u8], &str)> = vec![
+            (
+                "symlink",
+                world::npm_tgz(&[
+                    ("package/package.json", b'0', "", json.as_bytes(), 0o644),
+                    ("package/bin/grok.br", b'2', "../../evil", b"", 0o777),
+                ]),
+                &exe,
+                "an npm binary package holds only regular files",
+            ),
+            (
+                "directory",
+                world::npm_tgz(&[
+                    ("package/", b'5', "", b"", 0o755),
+                    ("package/package.json", b'0', "", json.as_bytes(), 0o644),
+                    ("package/bin/grok.br", b'0', "", &br, 0o644),
+                ]),
+                &exe,
+                "an npm binary package holds only regular files",
+            ),
+            (
+                "beside-in-bin",
+                world::npm_tgz(&[
+                    ("package/package.json", b'0', "", json.as_bytes(), 0o644),
+                    ("package/bin/grok.br", b'0', "", &br, 0o644),
+                    ("package/bin/helper", b'0', "", b"x", 0o755),
+                ]),
+                &exe,
+                "\"package/bin/helper\"",
+            ),
+            (
+                "deeper",
+                world::npm_tgz(&[
+                    ("package/package.json", b'0', "", json.as_bytes(), 0o644),
+                    ("package/bin/grok.br", b'0', "", &br, 0o644),
+                    ("package/lib/x.js", b'0', "", b"x", 0o644),
+                ]),
+                &exe,
+                "\"package/lib/x.js\"",
+            ),
+            (
+                "second-br",
+                world::npm_tgz(&[
+                    ("package/package.json", b'0', "", json.as_bytes(), 0o644),
+                    ("package/bin/grok.br", b'0', "", &br, 0o644),
+                    ("package/bin/grok.br", b'0', "", &br, 0o644),
+                ]),
+                &exe,
+                "or a second one",
+            ),
+            (
+                "no-manifest",
+                world::npm_tgz(&[("package/bin/grok.br", b'0', "", &br, 0o644)]),
+                &exe,
+                "holds no package/package.json",
+            ),
+            (
+                "trailing",
+                world::npm_tgz(&[
+                    ("package/package.json", b'0', "", json.as_bytes(), 0o644),
+                    ("package/bin/grok.br", b'0', "", &trailing, 0o644),
+                ]),
+                &exe,
+                "bytes follow the stream's last meta-block",
+            ),
+            (
+                "shorter",
+                world::grok_tgz(platform, "1.0.70", &exe),
+                &longer,
+                "decodes to a length other than the binary's",
+            ),
+            (
+                "longer",
+                world::grok_tgz(platform, "1.0.70", &longer),
+                &exe,
+                "decodes to a length other than the binary's",
+            ),
+            (
+                "manifest",
+                world::npm_tgz(&[
+                    (
+                        "package/package.json",
+                        b'0',
+                        "",
+                        other_version.as_bytes(),
+                        0o644,
+                    ),
+                    ("package/bin/grok.br", b'0', "", &br, 0o644),
+                ]),
+                &exe,
+                "is version \"1.0.69\", not 1.0.70",
+            ),
+        ];
+        for (label, tgz, bucket, why) in cases {
+            let l = world::layout(&format!("grok-tar-{label}"));
+            let f = Fake::default();
+            f.publish_grok_tarball("1.0.70", &tgz);
+            f.publish_grok_bucket("1.0.70", bucket, bucket);
+            let o = run(&l, &f, &Policy::default(), grok());
+            assert!(
+                !matches!(o.verdict, Verdict::Installed { .. }),
+                "{label}: {o:?}"
+            );
+            assert!(
+                o.line().contains(why),
+                "{label}: want {why:?} in {}",
+                o.line()
+            );
+            assert_eq!(shim_build(&l, "grok"), None, "{label}");
+            assert!(
+                !crate::store::build_is_complete(&world::build_dir(&l, "grok", "1.0.70")),
+                "{label}"
+            );
+        }
+    }
+
     /// The team pin, for each new row: a darwin Mach-O signed by another team is refused and
-    /// memoized; grok's measured digest is never logged for it, and its version is not fetched
-    /// again until a person asks; kimi's documented digest was logged before the download, as
-    /// codex's is.
+    /// memoized, and its version is not fetched again until a person asks; kimi's and grok's
+    /// documented digests were logged before the download, as codex's is.
     #[test]
     fn a_build_signed_by_another_team_is_refused_and_memoized_for_kimi_and_grok() {
         let refusing = world::trust_refusing_signers();
@@ -2890,26 +3635,33 @@ mod tests {
 
         let l = world::layout("grok-team");
         let f = Fake::default();
-        publish_grok(&f, "1.0.68", &native_exe("not xAI's"));
+        let served = publish_grok(&f, "1.0.70", &native_exe("not xAI's"));
         let o = run_with(&l, &f, &Policy::default(), &refusing, grok(), false);
         assert!(o.line().contains("signer refused"), "{}", o.line());
         let log = super::super::digests::digests_path(&l, "grok");
-        assert!(!log.exists(), "nothing the pin refused is logged");
-        assert!(staged(&l, "grok").is_empty(), "{:?}", staged(&l, "grok"));
-        let downloads = f.downloads.borrow().len();
-        let o = run_with(&l, &f, &Policy::default(), &refusing, grok(), false);
-        assert!(o.line().contains("head moves"), "{}", o.line());
-        assert_eq!(f.downloads.borrow().len(), downloads, "not fetched again");
-        ProgramStamp::clear_refusal(&l, "grok").unwrap();
-        let genuine = native_exe("xAI's");
-        publish_grok(&f, "1.0.68", &genuine);
-        let o = run(&l, &f, &Policy::default(), grok());
-        assert!(matches!(o.verdict, Verdict::Installed { .. }), "{o:?}");
         assert!(
             std::fs::read_to_string(&log)
                 .unwrap()
-                .contains(&world::sha(&genuine))
+                .contains(&served.sha512),
+            "npm's signed digest was logged before the download"
         );
+        assert!(staged(&l, "grok").is_empty(), "{:?}", staged(&l, "grok"));
+        let downloads = f.downloads.borrow().len();
+        let o = run_with(&l, &f, &Policy::default(), &refusing, grok(), false);
+        assert!(
+            o.line().contains("refused these exact bytes"),
+            "{}",
+            o.line()
+        );
+        assert_eq!(f.downloads.borrow().len(), downloads, "not fetched again");
+        ProgramStamp::clear_refusal(&l, "grok").unwrap();
+        assert_eq!(
+            crate::store::clear_stage_refusals(&l, "grok"),
+            1,
+            "a person's retry"
+        );
+        let o = run(&l, &f, &Policy::default(), grok());
+        assert!(matches!(o.verdict, Verdict::Installed { .. }), "{o:?}");
     }
 
     #[test]
@@ -3484,7 +4236,7 @@ mod tests {
             crate::verify::VerifyOutcome::VendorRoot {
                 build: v("0.157.0").build_id(),
                 vendor: "OpenAI".into(),
-                measured: false,
+                staged_from: crate::verify::StagedFrom::Documents,
                 drift: None,
             }
         );
@@ -3575,7 +4327,7 @@ mod tests {
             crate::verify::VerifyOutcome::VendorRoot {
                 build: v("0.163.0").build_id(),
                 vendor: "OpenAI".into(),
-                measured: false,
+                staged_from: crate::verify::StagedFrom::Documents,
                 drift: None,
             }
         );
@@ -4042,18 +4794,23 @@ mod tests {
 
     #[test]
     fn a_same_version_digest_change_is_refused() {
-        for (spec, version) in [
+        let mut rows = vec![
             (claude(), "2.1.282"),
             (codex(), "0.157.0"),
             (agy(), "1.3.7"),
             (kimi(), "2.3.2"),
-        ] {
+        ];
+        if world::grok_platform().is_some() {
+            rows.push((grok(), "1.0.70"));
+        }
+        for (spec, version) in rows {
             let publish = |f: &Fake, cut: &str| {
                 let exe = native_exe(cut);
                 match spec.program {
                     "claude" => f.publish_claude(version, &exe),
                     "codex" => f.publish_codex(version, &[("bin/codex", &exe, 0o755)]),
                     "kimi" => drop(publish_kimi(f, version, &exe)),
+                    "grok" => drop(publish_grok(f, version, &exe)),
                     _ => drop(publish_agy(f, version, &exe)),
                 }
             };

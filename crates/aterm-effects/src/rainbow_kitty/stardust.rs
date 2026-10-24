@@ -1939,6 +1939,7 @@ impl Stardust {
         let (vx, vy) = spec.v_head;
         let speed = vx.hypot(vy).max(f32::EPSILON);
         let (ux, uy) = (vx / speed, vy / speed);
+        let (along_x, along_y) = (ux * speed * SHED_ALONG_SHARE, uy * speed * SHED_ALONG_SHARE);
         let scale = px_scale(ctx.geom.ch as f32);
         let tint = spectrum_snap(spec.tint_t);
         for k in 0..spec.n {
@@ -1950,10 +1951,7 @@ impl Stardust {
             let perp = side
                 * (SHED_PERP_MIN + (SHED_PERP_MAX - SHED_PERP_MIN) * hash01(mix32(seed ^ 1)))
                 * scale;
-            let v0 = (
-                ux * speed * SHED_ALONG_SHARE - uy * perp,
-                uy * speed * SHED_ALONG_SHARE + ux * perp,
-            );
+            let v0 = (along_x - uy * perp, along_y + ux * perp);
             self.throw(
                 Throw {
                     class: StarClass::M3,
@@ -1976,6 +1974,7 @@ impl Stardust {
     /// the hero coloured by the landing walk at its rest column.
     pub fn sow_fan(&mut self, at: Instant, spec: FanSow, ctx: &Ctx<'_>) {
         let n = usize::from(spec.n).max(1);
+        let nf = n as f32;
         let cw = (ctx.geom.cw as f32).max(1.0);
         let (rise_up, rise_down) = fan_rise(spec.reach, spec.at_px, ctx.geom);
         for k in 0..n {
@@ -1984,7 +1983,7 @@ impl Stardust {
             if class == StarClass::M3 && !light_keeps(seed, ctx.cfg) {
                 continue;
             }
-            let a = (k as f32 / n as f32 + hash01(seed) / n as f32) * std::f32::consts::TAU;
+            let a = (k as f32 / nf + hash01(seed) / nf) * std::f32::consts::TAU;
             let reach = spec.reach
                 * (FAN_THROW_JITTER_MIN
                     + (FAN_THROW_JITTER_MAX - FAN_THROW_JITTER_MIN) * hash01(mix32(seed ^ 3)));
@@ -2362,8 +2361,9 @@ impl Stardust {
         let m3 = m2 + scale / DEAL_M3_IN as f32;
         let earned = matches!(class, TypedClass::Capital | TypedClass::Bang);
         let (row, head) = ctx.caret;
-        for k in 0..cells.max(1) {
-            let col = head.saturating_sub(cells.max(1) - k);
+        let n_cells = cells.max(1);
+        for k in 0..n_cells {
+            let col = head.saturating_sub(n_cells - k);
             let cell = (row, col);
             let h = cell_hash(row, col, 0);
 
@@ -2399,7 +2399,7 @@ impl Stardust {
             } else {
                 None
             };
-            let rung = (k + 1 == cells.max(1) && !mended)
+            let rung = (k + 1 == n_cells && !mended)
                 .then(|| ladder_rung(ctx.flow.combo))
                 .flatten();
             let (dealt, earned, tint) = match rung {
@@ -2999,17 +2999,19 @@ impl Stardust {
     #[inline]
     fn finish_field(&mut self, caret: (u16, u16), span_ms: f32, at: Instant, geom: Geom) {
         let (row, col) = caret;
+        let col_i32 = i32::from(col);
+        let span_s = span_ms / 1000.0;
         for s in &mut self.stars {
             if s.lane != StarLane::Field {
                 continue;
             }
-            if px_col(s.x, geom) >= i32::from(col) && in_sky_of_row(s.y, row, geom) {
-                s.finish_by(at, span_ms / 1000.0);
+            if px_col(s.x, geom) >= col_i32 && in_sky_of_row(s.y, row, geom) {
+                s.finish_by(at, span_s);
             }
         }
         for v in &mut self.veil {
             if v.row == row && v.col >= col {
-                v.finish_by(at, span_ms / 1000.0);
+                v.finish_by(at, span_s);
             }
         }
     }
@@ -3030,11 +3032,12 @@ impl Stardust {
 
     #[inline]
     fn ember(&mut self, at: Instant) {
+        const EMBER_S: f32 = FOCUS_EMBER_MS / 1000.0;
         for s in &mut self.stars {
-            s.finish_by(at, FOCUS_EMBER_MS / 1000.0);
+            s.finish_by(at, EMBER_S);
         }
         for v in &mut self.veil {
-            v.finish_by(at, FOCUS_EMBER_MS / 1000.0);
+            v.finish_by(at, EMBER_S);
         }
     }
 
@@ -3111,24 +3114,12 @@ impl Stardust {
                 lit: at,
                 finish: None,
             };
-            let mut oldest: Option<(usize, Instant)> = None;
-            let mut placed = false;
-            for (i, v) in self.veil.iter_mut().enumerate() {
-                if v.row == row && v.col == col {
-                    *v = veil;
-                    placed = true;
-                    break;
-                }
-                if oldest.is_none_or(|(_, t)| v.lit < t) {
-                    oldest = Some((i, v.lit));
-                }
-            }
-            if !placed {
-                if self.veil.len() < AURORA_CAP {
-                    self.veil.push(veil);
-                } else if let Some((i, _)) = oldest {
-                    self.veil[i] = veil;
-                }
+            if let Some(v) = self.veil.iter_mut().find(|v| v.row == row && v.col == col) {
+                *v = veil;
+            } else if self.veil.len() < AURORA_CAP {
+                self.veil.push(veil);
+            } else if let Some((i, _)) = self.veil.iter().enumerate().min_by_key(|(_, v)| v.lit) {
+                self.veil[i] = veil;
             }
         }
     }
@@ -3892,12 +3883,13 @@ fn push_halo_quads_clipped(
     let rx_u = rx as u16;
     let ry_u = ry as u16;
     let mut yy = y0;
+    let mut row = (yy - oy).div_euclid(ch);
+    let mut next_band = oy + (row + 1) * ch;
     while yy < y1 {
         if out.len() >= cap {
             return;
         }
-        let row = (yy - oy).div_euclid(ch);
-        let band_end = (oy + (row + 1) * ch).min(y1);
+        let band_end = next_band.min(y1);
         out.push(RainHalo {
             row: row.max(0) as u16,
             x: x0_u,
@@ -3912,6 +3904,8 @@ fn push_halo_quads_clipped(
             mode,
         });
         yy = band_end;
+        row += 1;
+        next_band += ch;
     }
 }
 
@@ -4124,9 +4118,12 @@ impl SkyIndex {
 
     #[inline]
     const fn slot((cx, cy): (i32, i32)) -> usize {
-        let k = (cx as u32)
-            .wrapping_mul(0x9E37_79B9)
-            .wrapping_add((cy as u32).wrapping_mul(0x85EB_CA6B));
+        Self::slot_with_cy(cx, (cy as u32).wrapping_mul(0x85EB_CA6B))
+    }
+
+    #[inline]
+    const fn slot_with_cy(cx: i32, cy_term: u32) -> usize {
+        let k = (cx as u32).wrapping_mul(0x9E37_79B9).wrapping_add(cy_term);
         (k >> 13) as usize & (SKY_INDEX_SLOTS - 1)
     }
 
@@ -4146,19 +4143,21 @@ impl SkyIndex {
             self.spilled = true;
             return;
         }
+        let idx = i as u32;
         for cy in cy0..=cy1 {
+            let cy_term = (cy as u32).wrapping_mul(0x85EB_CA6B);
             for cx in cx0..=cx1 {
-                let s = Self::slot((cx, cy));
+                let s = Self::slot_with_cy(cx, cy_term);
                 if self.quad_head[s] == SKY_INDEX_END && self.halo_head[s] == SKY_INDEX_END {
                     self.dirty.push(s as u32);
                 }
                 if quads {
                     let next = self.quad_head[s];
-                    self.quad_node.push((i as u32, next));
+                    self.quad_node.push((idx, next));
                     self.quad_head[s] = self.quad_node.len() as u32 - 1;
                 } else {
                     let next = self.halo_head[s];
-                    self.halo_node.push((i as u32, next));
+                    self.halo_node.push((idx, next));
                     self.halo_head[s] = self.halo_node.len() as u32 - 1;
                 }
             }
@@ -4604,14 +4603,19 @@ pub(crate) fn push_twinkle_over_twin(
     if cov == 0 || mass < 0.75 {
         return;
     }
-    let lay_of = |role: InkRole| -> u32 {
-        let cap_a = u32::from(cov).clamp(1, role.alpha_cap() as u32);
+    let lay_of = |cap_a: u32| -> u32 {
         let a = cap_a as f32 / 255.0;
         let lay = (1.0 - (1.0 - a).powf(STAR_OVER_CENTRE_LAYS / STAR_OVER_LAYS as f32)) * 255.0;
         (rgb & 0x00FF_FFFF) | ((lay.round() as u32).clamp(1, cap_a) << 24)
     };
-    let core_ink = lay_of(InkRole::Leading);
-    let arm_ink = lay_of(InkRole::OverText);
+    let core_cap = u32::from(cov).clamp(1, InkRole::Leading.alpha_cap() as u32);
+    let arm_cap = u32::from(cov).clamp(1, InkRole::OverText.alpha_cap() as u32);
+    let core_ink = lay_of(core_cap);
+    let arm_ink = if arm_cap == core_cap {
+        core_ink
+    } else {
+        lay_of(arm_cap)
+    };
     let px = |v: f32| (v.round() as i32).max(1);
     let waist = px((mass * STAR_WAIST).max(1.0));
     let body = px((mass * STAR_TAPER_BODY).max(1.0));

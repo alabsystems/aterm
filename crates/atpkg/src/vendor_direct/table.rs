@@ -26,9 +26,17 @@ pub enum Anchor {
     /// kimi's CDN release manifest paired with the GitHub release manifest on `{version, tag, filename, sha256}`.
     #[serde(rename = "moonshot-two-host")]
     MoonshotTwoHost,
-    /// grok's stable pointer in xAI's bucket. Nothing on xAI's own hosts carries a digest (npm's registry signs one for xAI's `@xai-official/grok-<plat>` copy of the same bytes, which aterm does not read), so the lane measures the bytes and the darwin team pin vouches for them.
+    /// What vouched for a grok build before [`Self::XaiNpmRegistry`]: the lane measured the
+    /// bucket's raw bytes and the darwin team pin judged them. Kept only so the records those
+    /// builds carry still read; no row names it.
     #[serde(rename = "xai-developer-id")]
     XaiDeveloperId,
+    /// grok's `@xai-official/grok-<plat>` version document on npm's registry, signed by a
+    /// compiled registry key over its tarball's sha512, for the version xAI's bucket pointer
+    /// names; the binary decoded from the tarball must agree with the bucket's own copy, and on
+    /// darwin its Developer ID team.
+    #[serde(rename = "xai-npm-registry")]
+    XaiNpmRegistry,
 }
 
 impl Anchor {
@@ -38,17 +46,31 @@ impl Anchor {
         !matches!(self, Self::MetaDeveloperId | Self::XaiDeveloperId)
     }
 
-    /// Whether any vendor document names the payload's digest: false only for grok, whose digest the lane measures from the bytes it downloads.
+    /// Whether a record written under `recorded` reads as one of a row anchored by `self`: its
+    /// own anchor, and the one it succeeded (a grok build xAI's Developer ID vouched for, staged
+    /// before npm's registry did).
     #[must_use]
-    pub(crate) const fn publishes_digest(self) -> bool {
-        !matches!(self, Self::XaiDeveloperId)
+    pub(crate) const fn reads_record_of(self, recorded: Self) -> bool {
+        matches!(
+            (self, recorded),
+            (Self::AnthropicOpenPgp, Self::AnthropicOpenPgp)
+                | (Self::OpenAiTwoHost, Self::OpenAiTwoHost)
+                | (Self::GoogleTwoHost, Self::GoogleTwoHost)
+                | (Self::MetaDeveloperId, Self::MetaDeveloperId)
+                | (Self::MoonshotTwoHost, Self::MoonshotTwoHost)
+                | (Self::XaiDeveloperId, Self::XaiDeveloperId)
+                | (
+                    Self::XaiNpmRegistry,
+                    Self::XaiNpmRegistry | Self::XaiDeveloperId
+                )
+        )
     }
 
     /// The payload digest this anchor vouches for.
     #[must_use]
     pub(crate) const fn digest_alg(self) -> DigestAlg {
         match self {
-            Self::GoogleTwoHost => DigestAlg::Sha512,
+            Self::GoogleTwoHost | Self::XaiNpmRegistry => DigestAlg::Sha512,
             Self::AnthropicOpenPgp
             | Self::OpenAiTwoHost
             | Self::MetaDeveloperId
@@ -532,19 +554,44 @@ pub const VENDORS: &[VendorSpec] = &[
         program: "grok",
         vendor: "xAI",
         product: "Grok Build",
-        description: "xAI Grok Build — Apache-2.0, ~180 MB, downloaded from \
+        description: "xAI Grok Build — Apache-2.0, ~103 MB (~180 MB on disk), downloaded \
+                      from registry.npmjs.org and checked against \
                       storage.googleapis.com/grok-build-public-artifacts",
         head_url: "https://storage.googleapis.com/grok-build-public-artifacts/cli/stable",
-        anchor: Anchor::XaiDeveloperId,
+        anchor: Anchor::XaiNpmRegistry,
         apple_team: "5Y6N3AJ54S",
         exposes: &["grok"],
         aliases: &[],
-        url_prefixes: &["https://storage.googleapis.com/grok-build-public-artifacts/cli/"],
+        url_prefixes: &[
+            "https://storage.googleapis.com/grok-build-public-artifacts/cli/",
+            "https://registry.npmjs.org/@xai-official/grok-darwin-arm64/",
+            "https://registry.npmjs.org/@xai-official/grok-darwin-x64/",
+            "https://registry.npmjs.org/@xai-official/grok-linux-x64/",
+            "https://registry.npmjs.org/@xai-official/grok-linux-arm64/",
+        ],
         url_query: &[],
-        digest_docs: &[DocPin {
-            prefix: "https://storage.googleapis.com/grok-build-public-artifacts/cli/",
-            redirect_hosts: &[],
-        }],
+        digest_docs: &[
+            DocPin {
+                prefix: "https://storage.googleapis.com/grok-build-public-artifacts/cli/",
+                redirect_hosts: &[],
+            },
+            DocPin {
+                prefix: "https://registry.npmjs.org/@xai-official/grok-darwin-arm64/",
+                redirect_hosts: &[],
+            },
+            DocPin {
+                prefix: "https://registry.npmjs.org/@xai-official/grok-darwin-x64/",
+                redirect_hosts: &[],
+            },
+            DocPin {
+                prefix: "https://registry.npmjs.org/@xai-official/grok-linux-x64/",
+                redirect_hosts: &[],
+            },
+            DocPin {
+                prefix: "https://registry.npmjs.org/@xai-official/grok-linux-arm64/",
+                redirect_hosts: &[],
+            },
+        ],
         shim_env: &["GROK_DISABLE_AUTOUPDATER=1"],
         warm: None,
         self_update_verbs: &["update"],
@@ -727,6 +774,63 @@ mod tests {
         }
     }
 
+    /// EVERY ROW'S PINS NEST: each URL prefix is https, ends at a `/` and has an admissible
+    /// host; the head lies under one; each digest-document pin lies under one, no two pins
+    /// are prefixes of each other (so the first match is the only match), and every redirect
+    /// host is admissible. grok's npm pins name the four platform packages, never the scope,
+    /// so the umbrella `@xai-official/grok` is outside every pin.
+    #[test]
+    fn every_rows_pins_nest_under_its_url_prefixes() {
+        for row in VENDORS {
+            let under = |url: &str| {
+                row.url_prefixes
+                    .iter()
+                    .any(|p| url.starts_with(p) && url.len() > p.len())
+            };
+            for prefix in row.url_prefixes {
+                assert!(
+                    prefix.starts_with("https://") && prefix.ends_with('/'),
+                    "{}: {prefix}",
+                    row.program
+                );
+                assert!(crate::vendor::https_host(prefix).is_some(), "{prefix}");
+            }
+            assert!(under(row.head_url), "{}: {}", row.program, row.head_url);
+            for (i, pin) in row.digest_docs.iter().enumerate() {
+                assert!(
+                    row.url_prefixes.iter().any(|p| pin.prefix.starts_with(p)),
+                    "{}: {} is under no url prefix",
+                    row.program,
+                    pin.prefix
+                );
+                for other in &row.digest_docs[i + 1..] {
+                    assert!(
+                        !pin.prefix.starts_with(other.prefix)
+                            && !other.prefix.starts_with(pin.prefix),
+                        "{}: {} and {}",
+                        row.program,
+                        pin.prefix,
+                        other.prefix
+                    );
+                }
+                for host in pin.redirect_hosts {
+                    assert!(
+                        crate::vendor::https_host(&format!("https://{host}/")).is_some(),
+                        "{host}"
+                    );
+                }
+            }
+        }
+        let grok = spec("grok").unwrap();
+        for umbrella in [
+            "https://registry.npmjs.org/@xai-official/grok/1.0.70",
+            "https://registry.npmjs.org/@xai-official/grok-cli/1.0.70",
+        ] {
+            assert!(!grok.digest_doc_admitted(umbrella, umbrella), "{umbrella}");
+            assert!(!crate::vendor::vendor_direct_url_allowed("grok", umbrella));
+        }
+    }
+
     /// THE ALIASES ARE THE ROW'S OWN: each `(name, target)` names one of the row's exposed
     /// tools and a target it does not expose — a clone inside the program's own build, never
     /// a shim into another program's — both admissible tool names; and no tool is exposed by
@@ -787,6 +891,7 @@ mod tests {
             (Anchor::MetaDeveloperId, "meta-developer-id"),
             (Anchor::MoonshotTwoHost, "moonshot-two-host"),
             (Anchor::XaiDeveloperId, "xai-developer-id"),
+            (Anchor::XaiNpmRegistry, "xai-npm-registry"),
         ] {
             let text = aterm_toml::to_string(&Row { a }).unwrap();
             assert_eq!(text.trim(), format!("a = \"{spelled}\""));
@@ -887,31 +992,44 @@ mod tests {
             assert!(!kimi.digest_doc_admitted(github, effective), "{effective}");
         }
         let grok = spec("grok").unwrap();
-        assert!(!grok.anchor.publishes_digest(), "grok's bytes are measured");
-        assert!(grok.digest_doc_admitted(grok.head_url, grok.head_url));
+        let npm_doc = "https://registry.npmjs.org/@xai-official/grok-linux-x64/1.0.70";
+        for doc in [grok.head_url, npm_doc] {
+            assert!(grok.digest_doc_admitted(doc, doc), "{doc}");
+        }
         for effective in [
             "https://x.ai/cli/stable",
             "https://storage.googleapis.com/grok-build-public-artifacts/cli/alpha",
             "https://storage.googleapis.com/antigravity-public/antigravity-cli/stable",
+            npm_doc,
         ] {
             assert!(
                 !grok.digest_doc_admitted(grok.head_url, effective),
                 "grok's pointer from {effective}"
             );
         }
-        for row in VENDORS {
-            assert_eq!(
-                row.anchor.publishes_digest(),
-                row.anchor != Anchor::XaiDeveloperId,
-                "{}",
-                row.program
-            );
+        for effective in [
+            "https://registry.npmjs.org/@xai-official/grok-linux-x64/1.0.69",
+            "https://registry.npmjs.com/@xai-official/grok-linux-x64/1.0.70",
+            "https://www.npmjs.com/package/@xai-official/grok-linux-x64",
+            grok.head_url,
+        ] {
             assert!(
-                row.anchor.publishes_digest() || !row.anchor.vouches_before_download(),
-                "{}: a measured digest vouches for nothing before the bytes",
-                row.program
+                !grok.digest_doc_admitted(npm_doc, effective),
+                "npm's version document from {effective}"
             );
         }
+        assert_eq!(
+            grok.anchor.digest_alg(),
+            DigestAlg::Sha512,
+            "npm signs a sha512"
+        );
+        for row in VENDORS {
+            assert_ne!(row.anchor, Anchor::XaiDeveloperId, "{}", row.program);
+            assert!(row.anchor.reads_record_of(row.anchor), "{}", row.program);
+        }
+        assert!(Anchor::XaiNpmRegistry.reads_record_of(Anchor::XaiDeveloperId));
+        assert!(!Anchor::XaiDeveloperId.reads_record_of(Anchor::XaiNpmRegistry));
+        assert!(!Anchor::MetaDeveloperId.reads_record_of(Anchor::XaiDeveloperId));
     }
 
     /// THE DEFAULT SET IS THE OWNER'S ROSTER: every machine a row serves gets claude, codex

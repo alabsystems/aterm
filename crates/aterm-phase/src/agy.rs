@@ -684,6 +684,30 @@ pub fn turn_whole(rows: &[String]) -> bool {
     said_whole(rows) && turn_before(rows).is_some_and(|(opened, _)| opened)
 }
 
+/// WHETHER THE LAST TURN RAN A TOOL: a tool's `●`/`○` row under the person's message that opened it, a thought's (`○ Thought for 4.9s (…)`) none.
+#[must_use]
+pub fn turn_ran_tools(rows: &[String]) -> bool {
+    let Some(f) = frame(rows) else {
+        return false;
+    };
+    let from = last_user(rows, f.top).map_or(0, |u| u + 1);
+    rows[from.min(f.top)..f.top].iter().any(|r| {
+        !is_reply_row(r)
+            && crate::text::trim_start(r)
+                .strip_prefix(['●', '○'])
+                .is_some_and(|t| {
+                    !crate::text::trim_start(t)
+                        .starts_with(const { crate::anchor!("agy.turn.thought") })
+                })
+    })
+}
+
+/// WHETHER THE PERSON'S MESSAGE THAT OPENED THE LAST TURN IS ABOVE `rows`, so [`turn_ran_tools`] read the turn's lower rows only.
+#[must_use]
+pub fn turn_opens_above(rows: &[String]) -> bool {
+    frame(rows).is_some_and(|f| last_user(rows, f.top).is_none())
+}
+
 /// Where a walk up the history above the screen stops for a turn [`turn_whole`] finds cut: a
 /// plain rule, the separator over the person's message that opened the turn.
 #[must_use]

@@ -6,7 +6,7 @@
 use aterm_agent::supervise::policy::turn_end;
 
 use super::super::{at, word};
-use super::{Ctx, Seen, Verdict, observed, page_field, told};
+use super::{Ctx, Seen, Verdict, observed, page_field, standing, told, worker_field};
 use crate::util::one_line;
 
 /// How far before the land act's journal line a read may already show its
@@ -275,6 +275,30 @@ pub const L11: Legs = Legs {
     not: &others(4),
 };
 
+/// The defense leg's words on the hover, the state line and the tip, read from the app's own
+/// ([`HoldLeg::fixed_words`](aterm_agent::harness::acts::HoldLeg::fixed_words)).
+pub const DEFENSE_WORDS: &str = match aterm_agent::harness::acts::HoldLeg::Defense.fixed_words() {
+    Some(w) => w,
+    None => "",
+};
+
+/// P5 and L12 (cover's `land-t` and `land-q`): a work reply, or a question, under Land, and no
+/// `Nothing left:` defense in it.
+pub const DEFENSE: Legs = Legs {
+    legs: "defense",
+    line: &[DEFENSE_WORDS],
+    hover: &[DEFENSE_WORDS],
+    not: &[
+        "needs you",
+        "in its report",
+        "changed file",
+        "untracked file",
+        "stash",
+        "unpushed commit",
+        "not on the remote main",
+    ],
+};
+
 /// The words the open leg in `line` names (`open work in its report:
 /// follow-up, still open; …`: `follow-up`, `still open`), up to the next
 /// leg, the line's next part or the hover's end; split as the nudge's suffix
@@ -517,6 +541,141 @@ pub fn gone(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
         &bad,
         &unread,
     )
+}
+
+/// The hold's tip form (`hold_words`' `Tip`, `SessionRow::landing_tip`) for a read defense hold
+/// after `nudges` nudges, as the app composes it
+/// ([`held_tip`](aterm_agent::harness::acts::held_tip)).
+#[must_use]
+pub fn defense_tip(nudges: usize) -> String {
+    aterm_agent::harness::acts::held_tip(DEFENSE_WORDS, u32::try_from(nudges).unwrap_or(u32::MAX))
+}
+
+/// L15 (cover's `worker`, spawned by `mgr` under Land, whose first land reply holds): its row
+/// one level into its manager's submenu says `● <label> — working` before Land's instruction
+/// (§12.4.1: a worker on its first task works) and `● <label> — landing` once the instruction
+/// was typed and its hold stands, its manager's row counting it `1 landing`; once `status`
+/// reads the hold, its tip is the hold's tip form ([`defense_tip`]); never `landing` once
+/// landed.
+pub fn worker_row(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
+    let Some((t1, _)) = began(seen) else {
+        return Verdict::Unobserved("no land act (its records)".into());
+    };
+    let until = landed_after(seen, t1);
+    let w = &seen.window;
+    let label = &w.label;
+    let row_of = |e: &str| worker_field(e, "row").map(str::to_string);
+    let mut bad = Vec::new();
+    let mut unread = Vec::new();
+    let working = format!("\u{25cf} {label} \u{2014} working ");
+    let landing = format!("\u{25cf} {label} \u{2014} landing ");
+    let before = standing(&w.worker, cx.t0, t1 - TOLD_SLACK_MS);
+    let mut worked = None;
+    for (t, e) in &before {
+        let Some(row) = row_of(e) else {
+            continue;
+        };
+        if !row.starts_with(&working)
+            || worker_field(e, "tip").is_some()
+            || !worker_field(e, "mgr").is_some_and(|m| m.ends_with(": 1 working"))
+        {
+            bad.push(format!(
+                "+{} before Land's instruction: {}",
+                at(cx.t0, *t),
+                one_line(e, 200)
+            ));
+        } else if worked.is_none() {
+            worked = Some((*t, row));
+        }
+    }
+    if worked.is_none() && bad.is_empty() {
+        unread.push("no read of its row before Land's instruction".to_string());
+    }
+    let held = match reads(seen, t1, until) {
+        Ok(d) => d.into_iter().find(|(_, f)| f[0] != "-").map(|(t, _)| t),
+        Err(e) => return Verdict::Fail(e),
+    };
+    let during = if until > t1 + HOVER_SLACK_MS {
+        standing(&w.worker, t1 + HOVER_SLACK_MS, until)
+    } else {
+        Vec::new()
+    };
+    let mut landed_row = None;
+    let mut tipped = None;
+    for (t, e) in &during {
+        let row = row_of(e);
+        let ok = row.as_deref().is_some_and(|r| r.starts_with(&landing))
+            && worker_field(e, "mgr").is_some_and(|m| m.ends_with(": 1 landing"));
+        if !ok {
+            bad.push(format!(
+                "+{} while it holds (land@v1 at +{}): {}",
+                at(cx.t0, *t),
+                at(cx.t0, t1),
+                one_line(e, 200)
+            ));
+            continue;
+        }
+        landed_row.get_or_insert((*t, row.unwrap_or_default()));
+        let tip = worker_field(e, "tip");
+        let read = held.is_some_and(|h| *t >= h + HOVER_SLACK_MS);
+        let n = nudges_between(seen, t1, *t + NUDGE_SLACK_MS);
+        let wants = [
+            defense_tip(n),
+            defense_tip(nudges_between(seen, t1, *t - NUDGE_SLACK_MS)),
+        ];
+        match tip {
+            Some(tip) if wants.iter().any(|w| w == tip) => {
+                tipped.get_or_insert((*t, tip.to_string()));
+            }
+            Some(tip) if read || tip.starts_with("not landed yet") => bad.push(format!(
+                "+{} its tip {tip:?}, not the hold's {:?}",
+                at(cx.t0, *t),
+                wants[0]
+            )),
+            None if read => bad.push(format!(
+                "+{} no tip, though status read the hold from +{}",
+                at(cx.t0, *t),
+                held.map_or_else(|| "-".to_string(), |h| at(cx.t0, h))
+            )),
+            _ => {}
+        }
+    }
+    if landed_row.is_none() && bad.is_empty() {
+        unread.push(format!(
+            "no read of its row while it held (land@v1 at +{}, landed at +{})",
+            at(cx.t0, t1),
+            at(cx.t0, until)
+        ));
+    } else if tipped.is_none() && bad.is_empty() {
+        unread.push("no read of its row with the hold's tip".to_string());
+    }
+    if let Some((t, e)) = standing(&w.worker, until + HOVER_SLACK_MS, i64::MAX)
+        .into_iter()
+        .find(|(_, e)| row_of(e).is_some_and(|r| r.starts_with(&landing)))
+    {
+        bad.push(format!(
+            "+{} still landing after the landing at +{}: {}",
+            at(cx.t0, *t),
+            at(cx.t0, until),
+            one_line(e, 200)
+        ));
+    }
+    let said = format!(
+        "working {}; landing {}; tip {}",
+        worked.map_or_else(
+            || "-".to_string(),
+            |(t, r)| format!("+{} {r}", at(cx.t0, t))
+        ),
+        landed_row.map_or_else(
+            || "-".to_string(),
+            |(t, r)| format!("+{} {r}", at(cx.t0, t))
+        ),
+        tipped.map_or_else(
+            || "-".to_string(),
+            |(t, r)| format!("+{} {r}", at(cx.t0, t))
+        )
+    );
+    told(said, &bad, &unread)
 }
 
 /// L16, L17: a hold from Land's instruction ([`begins`]), gone at the landing ([`gone`]).

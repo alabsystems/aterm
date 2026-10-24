@@ -87,11 +87,20 @@ impl IdleHost for Faces {
     }
 }
 
+/// A turn of work: a call it ran, then its words.
 fn ended(said: &str) -> Vec<String> {
     let mut lines: Vec<String> = said.lines().map(|l| format!("⏺ {l}")).collect();
     for l in lines.iter_mut().skip(1) {
         *l = l.replacen("⏺ ", "  ", 1);
     }
+    lines.splice(
+        0..0,
+        [
+            "⏺ Bash(git push origin main)".to_string(),
+            "  ⎿  main -> main".to_string(),
+            String::new(),
+        ],
+    );
     lines.extend([
         String::new(),
         "✻ Worked for 3m 2s · done 4:24 PM".to_string(),

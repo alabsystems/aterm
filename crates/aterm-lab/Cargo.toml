@@ -46,7 +46,7 @@ aterm-regex = { workspace = true }
 aterm-png = { workspace = true }
 # The build slots' lockless reader (`slot-capture`, `slot-lane`): the record
 # parse the capture holds to the real build-slot, and the reader the watch sets
-# beside lsof. Already in the graph through aterm-uds.
+# beside the holder scan. Already in the graph through aterm-uds.
 aterm-sysprobe = { workspace = true }
 # The far end's own screen, replayed from a link take (`predict-live`): the
 # engine aterm draws with, so the oracle is the instance's own fold.

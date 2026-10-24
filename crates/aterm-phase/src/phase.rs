@@ -866,8 +866,30 @@ pub fn is_rule(row: &str) -> bool {
         return false;
     }
     let t = crate::text::trim_end(row);
+    // Most rules are `─` and nothing else: one compare with a run of them
+    // answers what `rule_run` would, without its walk of every char.
+    if t.len() >= 10 * "─".len()
+        && PLAIN_RULE
+            .get(..t.len())
+            .is_some_and(|dashes| t.as_bytes() == dashes)
+    {
+        return true;
+    }
     t.ends_with('─') && rule_run(t)
 }
+
+/// `─` 1024 times, wider than any terminal row: a plain rule is a prefix of it.
+const PLAIN_RULE: [u8; 3 * 1024] = {
+    let mut run = [0u8; 3 * 1024];
+    let mut i = 0;
+    while i < run.len() {
+        run[i] = 0xE2;
+        run[i + 1] = 0x94;
+        run[i + 2] = 0x80;
+        i += 3;
+    }
+    run
+};
 
 /// Whether `t` holds ten `─` or more and none of the box's joins and sides (`┬ ┴ ┼ ├ ┤ ┌ ┐ └ ┘ │`).
 const fn rule_run(t: &str) -> bool {
@@ -2511,6 +2533,30 @@ mod tests {
         let mut r = rows(body);
         r.extend(composer(footer));
         r
+    }
+
+    /// `is_rule`'s compare with `PLAIN_RULE` reads every row as the walk of its chars reads it:
+    /// plain rules of every width to past the run's end, and each with trailing spaces, a join,
+    /// a label or another char.
+    #[test]
+    fn a_rule_read_by_its_compare_is_the_rule_its_walk_reads() {
+        let walked = |row: &str| {
+            let t = crate::text::trim_end(row);
+            t.starts_with('─') && t.ends_with('─') && rule_run(t)
+        };
+        for n in 0..=PLAIN_RULE.len() / 3 + 2 {
+            let dashes = "─".repeat(n);
+            for row in [
+                dashes.clone(),
+                format!("{dashes}  \u{a0}"),
+                format!("{dashes}┬"),
+                format!("{dashes} title ─"),
+                format!("{dashes}x"),
+                format!("─┼{dashes}"),
+            ] {
+                assert_eq!(is_rule(&row), walked(&row), "{n} dashes: {row:?}");
+            }
+        }
     }
 
     #[test]

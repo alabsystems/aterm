@@ -1344,6 +1344,7 @@ pub(super) struct RenewalCheckpoint {
     pub dir: String,
     pub checked_at: i64,
     pub subscription: Option<String>,
+    pub proved_by: Option<Proof>,
 }
 
 impl RenewalCheckpoint {
@@ -1375,6 +1376,7 @@ pub(super) fn write_renewal_checkpoint(
         email,
         staging_text,
         subscription,
+        None,
         checked_at,
     )
 }
@@ -1389,6 +1391,7 @@ pub(super) fn write_renewal_checkpoint_for(
     email: &str,
     staging_text: &str,
     subscription: Option<&str>,
+    proved_by: Option<Proof>,
     checked_at: i64,
 ) -> io::Result<()> {
     let staging = Path::new(staging_text);
@@ -1399,6 +1402,7 @@ pub(super) fn write_renewal_checkpoint_for(
         dir: staging_text.to_owned(),
         checked_at,
         subscription: subscription.map(str::to_owned),
+        proved_by,
     };
     if !checkpoint.valid() {
         return Err(io::Error::new(
@@ -1417,6 +1421,9 @@ pub(super) fn write_renewal_checkpoint_for(
         "subscription".into(),
         checkpoint.subscription.map_or(Value::Null, Value::from),
     );
+    if let Some(proof) = checkpoint.proved_by {
+        doc.insert("proved_by".into(), Value::from(proof.as_str()));
+    }
     let text = Value::Object(doc).to_string();
     if text.len() as u64 > RENEWAL_CHECKPOINT_MAX {
         return Err(io::Error::new(
@@ -1434,6 +1441,7 @@ pub(super) fn write_renewal_checkpoint_for(
 }
 
 /// Reads a bounded regular checkpoint without following a link or waiting on a FIFO.
+#[cfg(test)]
 #[must_use]
 pub(super) fn read_renewal_checkpoint(
     staging: &Path,
@@ -1481,6 +1489,10 @@ pub(super) fn read_renewal_checkpoint_for(
         subscription: match doc.get("subscription")? {
             Value::Null => None,
             value => Some(value.as_str()?.to_owned()),
+        },
+        proved_by: match doc.get("proved_by") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(Proof::parse(value.as_str()?)?),
         },
     };
     (checkpoint.valid()

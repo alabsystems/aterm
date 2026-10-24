@@ -12589,16 +12589,21 @@ fn pkg_post_verify_refusal(verified: &crate::VerifiedBytes) -> Option<String> {
     }
 }
 
-/// What `pkg verify` says a vendor-direct tree was staged from: the vendor's authenticated
-/// digest, or, where no vendor document names one (`measured`), the bytes its Developer ID
-/// signature vouched for, whose digest the lane measured.
-fn staged_from(vendor: &str, measured: bool) -> String {
-    if measured {
-        format!(
+/// What `pkg verify` says `program`'s vendor-direct tree was staged from: the vendor's
+/// authenticated digest; npm's registry-signed tarball, its binary matched by the vendor's own
+/// copy; or, for a build staged before that, the bytes its Developer ID signature vouched for,
+/// whose digest the lane measured.
+fn staged_from(program: &str, vendor: &str, from: &crate::verify::StagedFrom) -> String {
+    use crate::verify::StagedFrom;
+    match from {
+        StagedFrom::Documents => format!("{vendor}'s authenticated digest"),
+        StagedFrom::DeveloperIdMeasured => format!(
             "bytes signed with {vendor}'s Developer ID, whose digest no {vendor} document names"
-        )
-    } else {
-        format!("{vendor}'s authenticated digest")
+        ),
+        StagedFrom::RegistryAgreed { sha256 } => format!(
+            "npm's registry-signed tarball of {vendor}'s build; bin/{program} sha256 {sha256} \
+             measured from it and matched by {vendor}'s own copy"
+        ),
     }
 }
 
@@ -12623,23 +12628,23 @@ fn cmd_verify(program: Option<&String>) -> ExitCode {
             VendorRoot {
                 build,
                 vendor,
-                measured,
+                staged_from: from,
                 drift: None,
             } => println!(
                 "atpkg: {} OK (matches the tree staged from {})",
                 crate::vendor_direct::display_build(name, *build),
-                staged_from(vendor, *measured)
+                staged_from(name, vendor, from)
             ),
             VendorRoot {
                 build,
                 vendor,
-                measured,
+                staged_from: from,
                 ..
             } => {
                 eprintln!(
                     "atpkg: {} DRIFT — the store tree no longer matches the tree staged from {}",
                     crate::vendor_direct::display_build(name, *build),
-                    staged_from(vendor, *measured)
+                    staged_from(name, vendor, from)
                 );
             }
             Match { build } => {

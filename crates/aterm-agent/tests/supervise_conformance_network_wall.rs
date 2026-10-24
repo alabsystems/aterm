@@ -23,7 +23,7 @@ type State = BTreeMap<&'static str, i64>;
 const MIN: Duration = Duration::from_secs(60);
 /// The vendor's own retries before it gives up (about 3 minutes): busy work short of the real `progress`.
 const VENDOR_RETRIES: Duration = Duration::from_secs(3 * 60);
-/// Real work between an act and the wall's next appearance: past `progress`.
+/// Real work between an act and the wall's next appearance: past `progress`, its tools run.
 const REAL_WORK: Duration = Duration::from_secs(10 * 60);
 
 const ENOTFOUND: &str =
@@ -53,8 +53,8 @@ fn cause_of(st: &State) -> ApiCause {
     }
 }
 
-/// The screen the model state stands for: at a wall that shows, the vendor's message as the reader reads it, with the host's measure; else a worker at work (the act in flight, or its turn after the wall left).
-fn reading(st: &State, worked: Option<Duration>, at: Instant) -> TurnEndReading {
+/// The screen the model state stands for: at a wall that shows, the vendor's message as the reader reads it, with the host's measure (made `measured`); else a worker at work (the act in flight, or its turn after the wall left).
+fn reading(st: &State, worked: Option<Duration>, measured: Instant) -> TurnEndReading {
     let showing = st["wall"] == 1;
     let cause = cause_of(st);
     TurnEndReading {
@@ -107,8 +107,8 @@ fn reading(st: &State, worked: Option<Duration>, at: Instant) -> TurnEndReading 
         reset_clock: None,
         person: None,
         reach: match st["verdict"] {
-            1 => Reach::Down { since: at },
-            2 => Reach::Up { since: at },
+            1 => Reach::Down { since: measured },
+            2 => Reach::Up { since: measured },
             _ => Reach::Unknown,
         },
         program: aterm_phase::Program::Claude,
@@ -127,6 +127,7 @@ fn reading(st: &State, worked: Option<Duration>, at: Instant) -> TurnEndReading 
         wall_remembered: false,
         answered: None,
         worked_doubt: Duration::ZERO,
+        ran_tools: worked.is_some_and(|w| w >= REAL_WORK),
         record_turn: None,
         credits: None,
         repo: aterm_agent::harness::repo_work::RepoRead::Clean,
@@ -148,11 +149,13 @@ fn taken(at: Instant) -> TurnEndReading {
     }
 }
 
-/// The real side of one walk: the decider's state and the loop's clock.
+/// The real side of one walk: the decider's state, the loop's clock, and when the host's verdict
+/// last changed (a moment after whatever came before it).
 #[derive(Clone)]
 struct Real {
     st: TurnEndState,
     now: Instant,
+    measured: Instant,
 }
 
 /// What the decider says, as one of the model's words.
@@ -175,13 +178,24 @@ fn model_rule(st: &State) -> &'static str {
     }
 }
 
-/// What the model says the decider does at `st`: at a wall that shows, the act where `Act` is enabled, else a wait until the first tick it is — found by moving `waited` alone, as time alone would.
+/// The wall answered its tries the same (`Futile`: its cause's answers twice or more, its tries
+/// spent), and the route was not measured back up since.
+fn held(m: &Model, st: &State) -> bool {
+    let futile = cnst(m, "Futile");
+    let same = if st["cause"] == 0 { st["mu"] } else { st["mc"] };
+    same >= 2 && (same >= futile || st["att"] >= futile) && !(st["up"] == 1 && st["verdict"] == 2)
+}
+
+/// What the model says the decider does at `st`: at a wall that shows, the act where `Act` is enabled, nothing where the wall answered its tries the same, else a wait until the first tick it is — found by moving `waited` alone, as time alone would.
 fn expected(m: &Model, st: &State) -> Verdict {
     if st["wall"] != 1 {
         return Verdict::Nothing;
     }
     if m.action_enabled("Act", st) {
         return Verdict::Act(model_rule(st));
+    }
+    if held(m, st) {
+        return Verdict::Nothing;
     }
     let hold = cnst(m, "Hold");
     let due = (st["waited"] + 1..=hold)
@@ -206,9 +220,16 @@ fn verdict(a: &TurnEndAction, st: &State, now: Instant) -> Verdict {
             );
             Verdict::Act(rule_id)
         }
-        TurnEndAction::WaitUntil { until, .. } => {
-            Verdict::Wait(until.saturating_duration_since(now))
-        }
+        // In whole seconds: a measure moves the clock a millisecond ([`Real::measured`]).
+        TurnEndAction::WaitUntil { until, .. } => Verdict::Wait(Duration::from_secs(
+            u64::try_from(
+                until
+                    .saturating_duration_since(now)
+                    .as_millis()
+                    .div_ceil(1000),
+            )
+            .unwrap_or(u64::MAX),
+        )),
         TurnEndAction::Nothing => Verdict::Nothing,
         other => panic!("an act the model has no word for at {st:?}: {other:?}"),
     }
@@ -222,21 +243,26 @@ fn mirror(
     real: &mut Real,
     cfg: &SupervisorConfig,
 ) -> bool {
-    let now = real.now;
+    if before["verdict"] != after["verdict"] {
+        real.now += Duration::from_millis(1);
+        real.measured = real.now;
+    }
+    let (now, measured) = (real.now, real.measured);
     match action {
         "NetFails" | "NetReturns" | "MeasureDown" | "MeasureUp" | "MeasureLost" | "MeasureLies"
         | "MeasureWrongDown" => {}
         "Unreachable" | "CutOff" | "MetUnreachable" | "MetCutOff" => {
             real.st
-                .observe(&reading(after, Some(VENDOR_RETRIES), now), now);
+                .observe(&reading(after, Some(VENDOR_RETRIES), measured), now);
         }
         "WorkedThenUnreachable" | "WorkedThenCutOff" => {
-            real.st.observe(&reading(after, Some(REAL_WORK), now), now);
+            real.st
+                .observe(&reading(after, Some(REAL_WORK), measured), now);
         }
         "Taken" => real.st.observe(&taken(now), now),
         "Tick" => real.now += MIN,
         "Act" => {
-            let r = reading(before, None, now);
+            let r = reading(before, None, measured);
             real.st.observe(&r, now);
             let a = decide_turn_end(&real.st, &r, cfg, now);
             if !matches!(a, TurnEndAction::Type { .. }) {
@@ -256,6 +282,7 @@ fn walk(m: &Model, strict: bool) -> (BTreeMap<&'static str, usize>, Vec<State>) 
     let init = Real {
         st: TurnEndState::new(timing(m)),
         now: base,
+        measured: base,
     };
     let mut seen: BTreeSet<State> = BTreeSet::new();
     let mut queue = VecDeque::from([(m.init_state(), init)]);
@@ -271,7 +298,7 @@ fn walk(m: &Model, strict: bool) -> (BTreeMap<&'static str, usize>, Vec<State>) 
             }
         }
         let mut at = real.st.clone();
-        let here = reading(&st, None, real.now);
+        let here = reading(&st, None, real.measured);
         at.observe(&here, real.now);
         let got = verdict(&decide_turn_end(&at, &here, &cfg, real.now), &st, real.now);
         let want = expected(m, &st);
@@ -365,5 +392,18 @@ fn the_models_words_read_as_the_causes_it_stands_for() {
     assert_eq!(
         aterm_phase::classify_wall(OVERLONG),
         api(ApiCause::Overlong)
+    );
+}
+
+/// Negative control: the `Buggy = 2` model (a wall tried after it answered its tries the same) types where the real decider holds.
+#[test]
+fn the_model_that_tries_past_the_bound_disagrees_with_the_real_decider() {
+    let m = supervisor_network_wall_model();
+    let more = aterm_spec::interp::with_buggy(&m, 2);
+    let (_, disagree) = walk(&more, false);
+    assert!(
+        disagree.iter().any(|st| held(&m, st)),
+        "no disagreement where the wall answered its tries the same: {} states",
+        disagree.len()
     );
 }

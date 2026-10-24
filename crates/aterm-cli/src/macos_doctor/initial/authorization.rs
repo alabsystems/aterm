@@ -47,8 +47,9 @@ enum AuthorizationWrite {
     /// An upgrade's plan and recoverable, unadmitted progress share one rename.
     UpgradePlan(Plan, scope::UpgradeProgress),
     Progress(Progress),
-    /// A matching staged choice keeps the Restore history its narrow pass still owes.
-    Workstation(Plan, Option<Restored>),
+    /// The first-run decision ([`save_admitted_decision`]): what of a Restore still stands,
+    /// else whether the Mac settings read applied.
+    Workstation(Option<Restored>, bool),
 }
 
 impl AuthorizationWrite {
@@ -57,8 +58,9 @@ impl AuthorizationWrite {
             Self::Plan(plan, provisional) => save_plan_as(root, plan, *provisional),
             Self::UpgradePlan(plan, recovery) => recovery.save(root, plan),
             Self::Progress(progress) => save_progress(root, *progress),
-            Self::Workstation(_, Some(restored)) => save_restored_decision(root, false, *restored),
-            Self::Workstation(plan, None) => save_workstation_authorization(root, plan),
+            Self::Workstation(restored, applied) => {
+                save_admitted_decision(root, *restored, *applied)
+            }
         }
     }
 
@@ -74,9 +76,8 @@ impl AuthorizationWrite {
                 records.progress = Some(recovery.pending);
             }
             Self::Progress(progress) => records.progress = Some(*progress),
-            Self::Workstation(plan, restored) => {
-                records.decision = if restored.is_none() && plan.selection.workstation().is_empty()
-                {
+            Self::Workstation(restored, applied) => {
+                records.decision = if restored.is_none() && *applied {
                     Decision::Applied(true)
                 } else {
                     Decision::Pending
@@ -104,7 +105,26 @@ impl AuthorizationCommit {
         } else {
             Progress::for_plan(plan)
         };
-        if admission == Admission::Upgrade
+        let restored = baseline.records.restored;
+        let mut still_restored = None;
+        if restored.is_some() {
+            // After a Restore no startup answer is Set up now: whichever plan it admits (the
+            // one it staged, a group choice made while the offer waited, a Join, or the plan
+            // presented in a vault joined since), it is a choice over the Restore, measured
+            // as System State measures one, so it sets only what the person turned on and
+            // keeps every stage it left as it was.
+            let restart = Restart {
+                chosen: true,
+                joins: admission == Admission::Join,
+            };
+            (next.done, next.only, still_restored) = admitted_keeps(
+                restart,
+                baseline.records.plan.as_ref(),
+                prior,
+                restored,
+                plan,
+            );
+        } else if admission == Admission::Upgrade
             && let (Some(previous), Some(prior)) = (previous, prior)
             && prior.belongs_to(previous)
         {
@@ -133,10 +153,11 @@ impl AuthorizationCommit {
             )
         };
         let mut writes = vec![first, AuthorizationWrite::Progress(next)];
-        if next.done & Stage::Workstation.bit() == 0 {
+        // A Restore's record is always written again: it now measures from this plan.
+        if next.done & Stage::Workstation.bit() == 0 || restored.is_some() {
             writes.push(AuthorizationWrite::Workstation(
-                plan.clone(),
-                same_plan.then_some(baseline.records.restored).flatten(),
+                still_restored,
+                mac_settings_kept(plan, next.done),
             ));
         }
         next.admitted = true;
@@ -285,6 +306,31 @@ impl InitialSetupAuthorization {
         plan: &Plan,
     ) -> InitialSetupObserved<Option<u64>> {
         self.persist_at_as(root, plan, Admission::Person)
+    }
+
+    /// [`Self::persist_join_observed`] at `root`, in the vault `configured` this Mac is in now.
+    #[cfg(test)]
+    pub(super) fn persist_join_at(
+        &mut self,
+        root: &Path,
+        plan: &Plan,
+        configured: Option<ConfiguredVault>,
+    ) -> InitialSetupObserved<Option<u64>> {
+        observe_mutation_at(
+            root,
+            observation_at(root).ok(),
+            Err("busy".into()),
+            |root| {
+                assert!(HeldLock::try_take(root)?.is_none());
+                self.persist_join_with(
+                    root,
+                    plan,
+                    || Ok(configured),
+                    AuthorizationWrite::persist,
+                    |root| observation_at(root).map_err(|error| error.to_string()),
+                )
+            },
+        )
     }
 
     #[cfg(test)]
@@ -864,12 +910,18 @@ mod tests {
                 authorize_at(root.path(), &plan).unwrap();
                 (root, plan)
             };
-            let kept = if different {
+            if different {
                 plan.selection.set(Setting::Spotlight, false);
-                None
-            } else {
-                decision_record(root.path()).unwrap().1
-            };
+            }
+            // A different plan admitted over a Restore's record keeps it, measured from that
+            // plan ([`admitted_keeps`]).
+            let kept = decision_record(root.path())
+                .unwrap()
+                .1
+                .map(|restored| Restored {
+                    selection: Some(plan.selection),
+                    ..restored
+                });
             let original = revision_at(root.path()).unwrap();
             let mut ticket = InitialSetupAuthorization::capture_at(root.path()).unwrap();
             let failed = attempt(

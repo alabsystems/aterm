@@ -2631,6 +2631,32 @@ impl SettingsViewState {
         }
     }
 
+    /// Clear the original field's marked text even after focus moved. Its
+    /// committed value, selection and the current focus are unchanged.
+    pub(crate) fn cancel_preedit(&mut self, field: Option<&UiKey>) -> bool {
+        let Some(key) = field.map(UiKey::as_str) else {
+            return false;
+        };
+        let input = if key == "settings/search" {
+            Some(&mut self.search_input)
+        } else if key == THEME_FILTER_ACTION {
+            self.choice_picker
+                .as_mut()
+                .and_then(|picker| picker.themes.as_mut())
+                .map(|themes| &mut themes.filter)
+        } else if let Some(target) = showcase_page::ShowcaseText::for_key(key) {
+            self.showcase_input_mut(target)
+        } else {
+            key.strip_prefix("settings/control/")
+                .and_then(|key| self.field_inputs.get_mut(key))
+        };
+        input.is_some_and(|input| {
+            let changed = input.preedit().is_some();
+            input.cancel_preedit();
+            changed
+        })
+    }
+
     fn discard_field_edit(&mut self) {
         self.font_text_entry = None;
         if let Some(key) = self.editing_field.take() {
@@ -37724,3 +37750,7 @@ pub(crate) mod showcase_page;
 #[cfg(test)]
 #[path = "native_settings_tests.rs"]
 pub(crate) mod tests;
+
+#[cfg(test)]
+#[path = "native_settings_ime_owner_tests.rs"]
+mod ime_owner_tests;

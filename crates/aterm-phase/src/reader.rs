@@ -297,6 +297,18 @@ pub trait ScreenReader: Sync {
     fn turn_whole(&self, rows: &[String]) -> bool {
         self.said_whole(rows)
     }
+    /// Whether the last turn ran a tool: a tool row of the program's under the message that opened it.
+    fn turn_ran_tools(&self, _rows: &[String]) -> bool {
+        false
+    }
+    /// Whether [`Self::turn_ran_tools`] reads this program's tool rows, so a turn it finds none in ran none.
+    fn reads_tool_rows(&self) -> bool {
+        false
+    }
+    /// Whether the message that opened the last turn is above `rows`, so [`Self::turn_ran_tools`] finding none there rules none out.
+    fn turn_opens_above(&self, _rows: &[String]) -> bool {
+        false
+    }
     /// Whether `row` bounds a cut turn when scanning history above the screen.
     fn turn_history_stop(&self, row: &str) -> bool {
         self.said_history_stop(row)
@@ -528,6 +540,15 @@ impl ScreenReader for ClaudeReader {
     fn turn_whole(&self, rows: &[String]) -> bool {
         crate::turn::turn_whole(rows)
     }
+    fn turn_ran_tools(&self, rows: &[String]) -> bool {
+        crate::turn::turn_ran_tools(rows)
+    }
+    fn reads_tool_rows(&self) -> bool {
+        true
+    }
+    fn turn_opens_above(&self, rows: &[String]) -> bool {
+        crate::turn::turn_opens_above(rows)
+    }
     fn turn_history_stop(&self, row: &str) -> bool {
         crate::turn::turn_history_stop(row)
     }
@@ -662,6 +683,15 @@ impl ScreenReader for AgyReader {
     fn turn_whole(&self, rows: &[String]) -> bool {
         agy::turn_whole(rows)
     }
+    fn turn_ran_tools(&self, rows: &[String]) -> bool {
+        agy::turn_ran_tools(rows)
+    }
+    fn reads_tool_rows(&self) -> bool {
+        true
+    }
+    fn turn_opens_above(&self, rows: &[String]) -> bool {
+        agy::turn_opens_above(rows)
+    }
     fn turn_history_stop(&self, row: &str) -> bool {
         agy::turn_history_stop(row)
     }
@@ -754,6 +784,15 @@ impl ScreenReader for MuseReader {
     }
     fn turn_whole(&self, rows: &[String]) -> bool {
         muse::turn_whole(rows)
+    }
+    fn turn_ran_tools(&self, rows: &[String]) -> bool {
+        muse::turn_ran_tools(rows)
+    }
+    fn reads_tool_rows(&self) -> bool {
+        true
+    }
+    fn turn_opens_above(&self, rows: &[String]) -> bool {
+        muse::turn_opens_above(rows)
     }
     fn turn_history_stop(&self, row: &str) -> bool {
         muse::turn_history_stop(row)
@@ -858,6 +897,15 @@ impl ScreenReader for GeminiReader {
     }
     fn turn_whole(&self, rows: &[String]) -> bool {
         gemini::turn_whole(rows)
+    }
+    fn turn_ran_tools(&self, rows: &[String]) -> bool {
+        gemini::turn_ran_tools(rows)
+    }
+    fn reads_tool_rows(&self) -> bool {
+        true
+    }
+    fn turn_opens_above(&self, rows: &[String]) -> bool {
+        gemini::turn_opens_above(rows)
     }
     fn turn_history_stop(&self, row: &str) -> bool {
         gemini::turn_history_stop(row)

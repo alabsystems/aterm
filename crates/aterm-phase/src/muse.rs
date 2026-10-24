@@ -838,6 +838,62 @@ pub fn turn_whole(rows: &[String]) -> bool {
     turn_before(rows).is_some_and(|(opened, _)| opened)
 }
 
+/// Returns whether the last turn ran a tool: a tool row of Muse Code's ([`tool_row`], [`ran_row`]) under the `❯` message that opened it.
+#[must_use]
+pub fn turn_ran_tools(rows: &[String]) -> bool {
+    let Some(f) = open_frame(rows) else {
+        return false;
+    };
+    let (_, _, from) = scope(rows, f.top);
+    rows[from.min(f.top)..f.top].iter().any(|r| {
+        r.strip_prefix("◆ ")
+            .map(crate::text::trim)
+            .is_some_and(|head| tool_row(head) || ran_row(head))
+            || read_row(r)
+            || search_row(r)
+    })
+}
+
+/// Returns whether the `❯` message that opened the last turn is above `rows`: no message or banner over the composer, so [`turn_ran_tools`] read the turn's lower rows only.
+#[must_use]
+pub fn turn_opens_above(rows: &[String]) -> bool {
+    open_frame(rows).is_some_and(|f| {
+        let (banner, user, _) = scope(rows, f.top);
+        banner.is_none() && user.is_none()
+    })
+}
+
+/// A tool's row [`tool_row`] leaves to a reply's read: one drawn with the expander (`ping(hi) · probe · ✓ · 2.1s · ctrl+o`), a monitor's or a stopped terminal's with its outcome, or a schedule's (`Scheduled 7 3 * * *: lab probe`, `Unscheduled 109c3489`).
+fn ran_row(head: &str) -> bool {
+    let cron = |c: &str| {
+        let fields: Vec<&str> = c.split(' ').collect();
+        fields.len() == 5
+            && fields.iter().all(|f| {
+                !f.is_empty()
+                    && f.bytes()
+                        .all(|b| b.is_ascii_digit() || b"*/,-".contains(&b))
+            })
+    };
+    head.strip_suffix(const { crate::anchor!("muse.tool.expand") })
+        .is_some_and(|h| !h.is_empty())
+        || head
+            .strip_prefix(const { crate::anchor!("muse.tool.monitor") })
+            .is_some_and(ran_tail)
+        || head
+            .strip_prefix(const { crate::anchor!("muse.tool.stopped") })
+            .and_then(|r| r.strip_prefix(' '))
+            .is_some_and(ran_tail)
+        || head
+            .strip_prefix(const { crate::anchor!("muse.tool.scheduled") })
+            .and_then(|r| r.strip_prefix(' '))
+            .and_then(|r| r.split_once(": "))
+            .is_some_and(|(c, label)| cron(c) && !label.is_empty())
+        || head
+            .strip_prefix(const { crate::anchor!("muse.tool.unscheduled") })
+            .and_then(|r| r.strip_prefix(' '))
+            .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric()))
+}
+
 /// Returns whether `row` is the opening `❯` user message that stops a scrollback history scan.
 #[must_use]
 pub fn turn_history_stop(row: &str) -> bool {
@@ -936,6 +992,34 @@ fn signed_out(rows: &[String]) -> Option<usize> {
     })
 }
 
+/// `text` to the end of its first clock (`5:00 PM`, `17:00`), or all of it with none: rows Muse Code may draw under its reset are not the reset.
+fn through_clock(text: &str) -> &str {
+    let mut words = text.split(' ').scan(0, |at, w| {
+        let start = *at;
+        *at += w.len() + 1;
+        Some((start, w))
+    });
+    while let Some((start, word)) = words.next() {
+        let bare = word.trim_end_matches(['.', ',']);
+        if !is_clock(bare) {
+            continue;
+        }
+        return match words.next() {
+            Some((next, w)) if w.starts_with("AM") || w.starts_with("PM") => &text[..next + 2],
+            _ => &text[..start + bare.len()],
+        };
+    }
+    text
+}
+
+fn is_clock(word: &str) -> bool {
+    word.split_once(':').is_some_and(|(h, m)| {
+        (1..=2).contains(&h.len())
+            && m.len() == 2
+            && h.bytes().chain(m.bytes()).all(|b| b.is_ascii_digit())
+    })
+}
+
 fn wall_of(message: &str) -> Option<(WallKind, Option<String>)> {
     let auth = [
         crate::anchor!("muse.wall.key"),
@@ -958,6 +1042,20 @@ fn wall_of(message: &str) -> Option<(WallKind, Option<String>)> {
     if let Some(rest) = message.strip_prefix(const { crate::anchor!("muse.wall.usage") }) {
         if matches!(rest, "" | ".") {
             return Some((WallKind::UsageSession, None));
+        }
+        if let Some(at) = rest
+            .strip_prefix(' ')
+            .and_then(|r| r.strip_prefix(const { crate::anchor!("muse.wall.usage.resets") }))
+            .filter(|at| at.is_empty() || at.starts_with(' '))
+        {
+            let at = through_clock(crate::text::trim(at).trim_end_matches('.'));
+            // A dated reset is labelled the weekly limit's (both are waited out alike): the measured /usage card dates its Weekly reset, times its Current one.
+            let kind = if at.contains(" at ") {
+                WallKind::UsageWeekly
+            } else {
+                WallKind::UsageSession
+            };
+            return Some((kind, (!at.is_empty()).then(|| at.to_string())));
         }
         let rest = rest.strip_prefix(const { crate::anchor!("muse.wall.usage.upgrade") })?;
         let (_, tail) = rest.split_once(const { crate::anchor!("muse.wall.usage.more") })?;
@@ -984,6 +1082,11 @@ fn wall_of(message: &str) -> Option<(WallKind, Option<String>)> {
         .and_then(|r| r.get(..4))
         .and_then(|c| c.strip_suffix(':'))
         .and_then(|c| c.parse::<u16>().ok());
+    // The API's usage limit with no reset: the usage wall, not an error time answers.
+    if code == Some(429) && rest.contains(const { crate::anchor!("muse.wall.usage_limit_reached") })
+    {
+        return Some((WallKind::UsageSession, None));
+    }
     let unreachable = code.is_none()
         && (crate::wall::is_unreachable(rest) || rest.to_lowercase().contains("fetch failed"));
     Some((
@@ -2261,6 +2364,8 @@ pub mod fixtures {
         include_str!("fixtures/muse-1.4.11-R6667.1-usage-signed-in.txt");
     pub const USAGE_WALL_RULES_UNDER: &str =
         include_str!("fixtures/muse-1.4.10-R6427.1-limit-rules-under.txt");
+    pub const USAGE_WALL_RESETS_DATED: &str =
+        include_str!("fixtures/muse-1.4.11-R6667.1-limit-resets-dated.txt");
     pub const USAGE_WALL_STATUS_CARDS: &str =
         include_str!("fixtures/muse-1.4.10-R6427.1-limit-status-cards.txt");
     pub const STATUS_MID_TURN: &str =

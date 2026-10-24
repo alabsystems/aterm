@@ -8,7 +8,7 @@ use std::path::Path;
 #[cfg(target_os = "macos")]
 use crate::support::Home;
 use crate::support::{
-    Lib, Run, Scratch, bash, hermetic, install_sh, installer, q, read, run, s, symlink,
+    Lib, Run, Scratch, bash, group_run, hermetic, install_sh, installer, q, read, run, s, symlink,
     system_path, tree, write,
 };
 
@@ -130,6 +130,105 @@ fn a_truncated_pipe_runs_nothing() {
     let text = std::fs::read_to_string(install_sh()).expect("install.sh");
     let breaches = guard_breaches(&scratch, &text, |all| all);
     assert!(breaches.is_empty(), "{}", breaches.join("\n"));
+}
+
+/// Stands for `curl | bash`: writes <prefix> into `bash -s` in a process group of
+/// its own, waits for bash to create <mark>, Ctrl-Cs the group and closes the
+/// pipe, as a Ctrl-C does to curl; prints how bash ended.
+const FEED: &str = r#"use POSIX ();
+my ($prefix, $mark, $bash) = @ARGV;
+setpgrp(0, 0);
+pipe(my $r, my $w) or die "pipe: $!";
+my $pid = fork // die "fork: $!";
+if (!$pid) {
+    close $w;
+    POSIX::dup2(fileno($r), 0) // die "dup2: $!";
+    $SIG{INT} = "DEFAULT";
+    exec $bash, "-s" or die "exec: $!";
+}
+close $r;
+$SIG{INT} = "IGNORE";
+open(my $in, "<", $prefix) or die "$prefix: $!";
+my $text = do { local $/; <$in> };
+for (my $at = 0; $at < length $text;) {
+    $at += syswrite($w, $text, length($text) - $at, $at) // die "write: $!";
+}
+for (1 .. 600) { last if -e $mark; select(undef, undef, undef, 0.1) }
+-e $mark or die "bash never ran the prefix";
+kill "INT", -$$;
+close $w;
+waitpid($pid, 0);
+print $? & 127 ? "signal " . ($? & 127) : "exit " . ($? >> 8);
+"#;
+
+/// A Ctrl-C that cuts a `curl | bash` download short ends bash by the signal,
+/// so a script around it stops too. The prefix runs to the end of the test
+/// seam, past every top-level line before main, and its last line says bash ran
+/// them all. Before, the run's INT trap was set at the top level: bash only
+/// marked it pending, and the cut script ended with status 0, or mid-function
+/// with a syntax error.
+#[test]
+fn a_ctrl_c_while_the_script_arrives_ends_it_by_the_signal() {
+    let scratch = Scratch::new();
+    let text = std::fs::read_to_string(install_sh()).expect("install.sh");
+    let lines: Vec<&str> = text.lines().collect();
+    let seam = lines
+        .iter()
+        .position(|l| *l == "if [[ \"${ATERM_INSTALL_LIBRARY_ONLY:-0}\" == 1 ]]; then")
+        .expect("install.sh has its test seam");
+    let end = seam
+        + lines[seam..]
+            .iter()
+            .position(|l| *l == "fi")
+            .expect("the seam's fi");
+    let mark = scratch.join("ran");
+    let mut prefix = lines[..=end].join("\n");
+    prefix.push_str(&format!("\n: >{}\n", q(s(&mark))));
+    let prefix = scratch.write("prefix.sh", prefix);
+    let feed = scratch.write("feed.pl", FEED);
+    let mut lib = Lib::new();
+    let call = lib.call(
+        format!(
+            "ATERM_INSTALL_LIBRARY_ONLY=0 /usr/bin/perl {} {} {} {}",
+            q(s(&feed)),
+            q(s(&prefix)),
+            q(s(&mark)),
+            q(s(&bash()))
+        ),
+        &[],
+    );
+    let recs = lib.run(&scratch);
+    assert_eq!(recs[call].out, "signal 2", "{}", recs[call].err);
+}
+
+/// A whole run ends by a Ctrl-C the child it lands in catches: main sets the
+/// run's INT trap first. The stand-in `cat` that prints the help catches it and
+/// exits 0, which bash, waiting, read as an answer, and the run went on to exit 0.
+#[test]
+fn a_ctrl_c_a_child_catches_ends_a_whole_run() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    lib.step(
+        "mkdir -p \"$TMPDIR/bin\" && cat >\"$TMPDIR/bin/cat\" <<'EOF'
+#!/bin/sh
+IFS= read -r first || :
+case \"$first\" in
+'usage: install.sh'*) trap 'exit 0' INT; kill -s INT 0 ;;
+*) printf '%s\\n' \"$first\"; exec /bin/cat ;;
+esac
+exit 0
+EOF
+chmod +x \"$TMPDIR/bin/cat\"",
+    );
+    let call = lib.call(
+        format!(
+            "PATH=\"$TMPDIR/bin:$PATH\" ATERM_INSTALL_LIBRARY_ONLY=0 {}",
+            group_run(&format!("{} --help", q(s(&install_sh()))))
+        ),
+        &[],
+    );
+    let recs = lib.run(&scratch);
+    assert_eq!(recs[call].out, "signal 2", "{}", recs[call].err);
 }
 
 #[test]

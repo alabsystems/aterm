@@ -436,9 +436,11 @@ fn grok_1_0_70s_sandboxed_lines_still_name_its_url_and_code() {
     assert_eq!(done.email.as_deref(), Some("grok-one@example.com"));
 }
 
-/// The approver found the row's profile signed out.
+/// The approver found the row's profile signed out. Unix's, as its one test is.
+#[cfg(unix)]
 struct SignedOut;
 
+#[cfg(unix)]
 impl Approver for SignedOut {
     fn approve(&mut self, _: &Handoff<'_>) -> Approval {
         Approval::NeedsSignIn("the page waits on a person to sign in".to_owned())

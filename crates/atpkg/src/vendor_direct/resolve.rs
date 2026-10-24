@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::digests::AuthenticatedDigest;
+use super::npm::NpmKey;
 use super::table::{Anchor, VendorSpec};
 use super::version::{BuildDate, Version};
 use crate::flow::{Fetcher, FlowError, VendorFetchError, VendorGet};
@@ -24,9 +25,12 @@ const MUSE_DOWNLOAD: &str = "https://lookaside.facebook.com/lookaside/muse/downl
 const KIMI_CDN: &str = "https://cdn.kimi.com/kimi-code/";
 const KIMI_GITHUB: &str = "https://github.com/MoonshotAI/kimi-code/releases/download/";
 const GROK_BUCKET: &str = "https://storage.googleapis.com/grok-build-public-artifacts/cli/";
-/// The largest grok payload the lane downloads: with no published digest, the size the bucket
-/// answers is the only bound on the bytes fetched before the team pin judges them.
-const GROK_MAX_BYTES: u64 = 1 << 30;
+const NPM_REGISTRY: &str = "https://registry.npmjs.org/";
+/// The largest grok binary the lane stages: the bucket's raw object size is the exact length
+/// the npm tarball's `bin/grok.br` must decode to, and no document signs that length.
+const GROK_MAX_BINARY: u64 = 1 << 30;
+/// The largest npm tarball or bucket `.zst` of grok the lane downloads (1.0.70's are 50 to 58 MB).
+const GROK_MAX_DOWNLOAD: u64 = 256 << 20;
 
 /// What the head said.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +87,8 @@ pub(crate) struct Candidate {
     pub anchor: Anchor,
     /// What vouches for the payload's digest.
     pub vouch: Vouch,
+    /// The vendor's own copy of the binary the staged one must agree with (grok's bucket).
+    pub companion: Option<Companion>,
 }
 
 /// What vouches for a candidate's payload digest.
@@ -90,37 +96,31 @@ pub(crate) struct Candidate {
 pub(crate) enum Vouch {
     /// The anchor's documents named it before any byte moved.
     Documents(AuthenticatedDigest),
-    /// No document names one (grok): the lane measures the bytes it downloads before it stages
-    /// them ([`super::lane`]).
-    Measure,
-    /// Measured from the downloaded bytes; the darwin team pin judges those bytes at stage.
-    Measured(AuthenticatedDigest),
 }
 
 impl Vouch {
-    /// The digest, once a document named it or the lane measured it.
+    /// The digest the documents named.
     #[must_use]
-    pub(crate) const fn digest(&self) -> Option<&AuthenticatedDigest> {
+    pub(crate) const fn digest(&self) -> &AuthenticatedDigest {
         match self {
-            Self::Documents(d) | Self::Measured(d) => Some(d),
-            Self::Measure => None,
+            Self::Documents(d) => d,
         }
     }
 }
 
-impl Candidate {
-    /// This candidate with the digest the lane measured from its downloaded bytes, set in its
-    /// row; `None` unless it is still [`Vouch::Measure`] and `digest` is its anchor's algorithm.
-    #[must_use]
-    pub(crate) fn measured(&self, digest: AuthenticatedDigest) -> Option<Self> {
-        if self.vouch != Vouch::Measure || digest.alg() != self.anchor.digest_alg() {
-            return None;
-        }
-        let mut out = self.clone();
-        (out.artifact.artifact.sha256, out.artifact.artifact.sha512) = digest.keyed();
-        out.vouch = Vouch::Measured(digest);
-        Some(out)
-    }
+/// xAI's bucket copy of a grok build, which the binary decoded from npm's signed tarball must
+/// equal byte for byte ([`super::lane`]'s agreement step).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Companion {
+    /// The bucket's zstd frame of the binary (`grok-<v>-<platform>.zst`).
+    pub url: String,
+    /// Its exact size, from the bucket.
+    pub size: u64,
+    /// The binary's exact size: the bucket's raw object's, which the frame must declare and
+    /// the tarball's `bin/grok.br` must decode to.
+    pub binary_size: u64,
+    /// The npm package the tarball is, for its own `package.json` to name.
+    pub platform: GrokPlatform,
 }
 
 /// What verifying a head's documents came to.
@@ -174,9 +174,10 @@ pub(crate) fn read_head_via(
     if_none_match: Option<&str>,
 ) -> Head {
     let cap = match spec.anchor {
-        Anchor::AnthropicOpenPgp | Anchor::MoonshotTwoHost | Anchor::XaiDeveloperId => {
-            PLAIN_HEAD_CAP
-        }
+        Anchor::AnthropicOpenPgp
+        | Anchor::MoonshotTwoHost
+        | Anchor::XaiDeveloperId
+        | Anchor::XaiNpmRegistry => PLAIN_HEAD_CAP,
         Anchor::OpenAiTwoHost => CODEX_HEAD_CAP,
         Anchor::GoogleTwoHost | Anchor::MetaDeveloperId => SMALL_JSON_CAP,
     };
@@ -212,9 +213,10 @@ pub(crate) fn read_head_via(
 fn head_version(spec: &VendorSpec, body: &[u8]) -> Result<Version, String> {
     let canonical = || String::from("the release channel's head names no canonical version");
     match spec.anchor {
-        Anchor::AnthropicOpenPgp | Anchor::MoonshotTwoHost | Anchor::XaiDeveloperId => {
-            plain_head_version(body).ok_or_else(canonical)
-        }
+        Anchor::AnthropicOpenPgp
+        | Anchor::MoonshotTwoHost
+        | Anchor::XaiDeveloperId
+        | Anchor::XaiNpmRegistry => plain_head_version(body).ok_or_else(canonical),
         Anchor::OpenAiTwoHost => strict_json(body)
             .ok()
             .and_then(|doc| codex_tag_version(&doc).ok())
@@ -226,6 +228,15 @@ fn head_version(spec: &VendorSpec, body: &[u8]) -> Result<Version, String> {
     }
 }
 
+/// The keys the anchors' signatures are held to.
+#[derive(Clone, Copy)]
+pub(crate) struct Keys<'a> {
+    /// Anthropic's release key: claude's digest anchor.
+    pub claude: &'a PinnedRsaKey,
+    /// npm's registry keys: grok's.
+    pub npm: &'a [NpmKey],
+}
+
 /// Verify the documents behind `version`.
 pub(crate) fn verify(
     spec: &'static VendorSpec,
@@ -233,16 +244,19 @@ pub(crate) fn verify(
     fetcher: &dyn Fetcher,
     version: Version,
     head_body: &[u8],
-    key: &PinnedRsaKey,
+    keys: Keys<'_>,
     now: i64,
 ) -> Resolution {
     let verified = match spec.anchor {
-        Anchor::AnthropicOpenPgp => verify_claude(spec, triple, fetcher, version, key, now),
+        Anchor::AnthropicOpenPgp => verify_claude(spec, triple, fetcher, version, keys.claude, now),
         Anchor::OpenAiTwoHost => verify_codex(spec, triple, fetcher, version, head_body),
         Anchor::GoogleTwoHost => verify_agy(spec, triple, fetcher, version, head_body),
         Anchor::MetaDeveloperId => verify_muse(spec, triple, fetcher, version),
         Anchor::MoonshotTwoHost => verify_kimi(spec, triple, fetcher, version),
-        Anchor::XaiDeveloperId => verify_grok(spec, triple, fetcher, version),
+        Anchor::XaiNpmRegistry => verify_grok(spec, triple, fetcher, version, keys.npm, now),
+        Anchor::XaiDeveloperId => refused(String::from(
+            "xAI's Developer ID alone no longer vouches for a build aterm installs",
+        )),
     };
     match verified {
         Ok(candidate) => Resolution::Candidate(Box::new(candidate)),
@@ -264,15 +278,13 @@ pub(crate) fn serves(anchor: Anchor, triple: &str) -> bool {
         Anchor::GoogleTwoHost => agy_platform(triple).is_some(),
         Anchor::MetaDeveloperId => muse_platform(triple).is_some(),
         Anchor::MoonshotTwoHost => kimi_platform(triple).is_some(),
-        Anchor::XaiDeveloperId => grok_platform(triple).is_some(),
+        Anchor::XaiNpmRegistry => grok_platform(triple).is_some(),
+        Anchor::XaiDeveloperId => false,
     }
 }
 
-/// Admits a synthetic row before any byte moves, and again before it is staged.
-///
-/// The row carries no digest only while `vouch` is [`Vouch::Measure`] for an anchor that
-/// publishes none (grok, before the lane measures its bytes); otherwise its one digest is the
-/// one `vouch` names.
+/// Admits a synthetic row before any byte moves, and again before it is staged: its one
+/// digest is the one `vouch` names.
 ///
 /// # Errors
 /// [`FlowError::VendorRefused`] naming the first field that does not fit.
@@ -302,15 +314,10 @@ pub(crate) fn admit(row: &SyntheticArtifact, vouch: &Vouch) -> Result<(), FlowEr
         return refuse("a vendor-direct row carries no strip, links or signed root");
     }
     let alg = spec.anchor.digest_alg();
-    let digest_ok = match vouch.digest() {
-        None => !spec.anchor.publishes_digest() && a.sha256.is_empty() && a.sha512.is_empty(),
-        Some(d) => {
-            d.alg() == alg
-                && a.digest().is_some_and(|(got, hex)| {
-                    got == alg && alg.is_lower_hex(hex) && hex == d.as_str()
-                })
-        }
-    };
+    let d = vouch.digest();
+    let digest_ok = d.alg() == alg
+        && a.digest()
+            .is_some_and(|(got, hex)| got == alg && alg.is_lower_hex(hex) && hex == d.as_str());
     if !digest_ok || a.size == 0 {
         return refuse("a vendor-direct row needs its anchor's one digest and an exact size");
     }
@@ -338,6 +345,7 @@ fn payload_of(anchor: Anchor, triple: &str) -> &'static str {
         | Anchor::MetaDeveloperId
         | Anchor::MoonshotTwoHost
         | Anchor::XaiDeveloperId => "raw-binary",
+        Anchor::XaiNpmRegistry => crate::vendor::NPM_BROTLI_BINARY,
         Anchor::GoogleTwoHost if windows => "raw-binary",
         Anchor::GoogleTwoHost => "tar-gz-binary",
         Anchor::OpenAiTwoHost if windows => "zip",
@@ -348,6 +356,7 @@ fn payload_of(anchor: Anchor, triple: &str) -> &'static str {
 fn asset_name(program: &str, version: Version, triple: &str, payload: &str) -> String {
     let ext = match payload {
         "tar-gz" | "tar-gz-binary" => ".tar.gz",
+        crate::vendor::NPM_BROTLI_BINARY => ".tgz",
         "zip" => ".zip",
         _ if triple.contains("-windows-") => ".exe",
         _ => "",
@@ -869,50 +878,144 @@ fn verify_kimi(
     Ok(vouched(spec, version, triple, &url, vouch, size, payload))
 }
 
-/// grok's payload platform for `triple`: darwin only, where the Developer ID team pin is the
-/// one check that vouches for bytes no document names.
-pub(super) fn grok_platform(triple: &str) -> Option<&'static str> {
-    Some(match triple {
-        "aarch64-apple-darwin" => "macos-aarch64",
-        "x86_64-apple-darwin" => "macos-x86_64",
+/// grok's platform for `triple`: npm's package for it, the words npm's documents name it by,
+/// and the name xAI's bucket gives its binary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GrokPlatform {
+    /// npm's package platform: `@xai-official/grok-<npm>`.
+    pub npm: &'static str,
+    /// npm's `os` word.
+    pub os: &'static str,
+    /// npm's `cpu` word.
+    pub cpu: &'static str,
+    /// The bucket's: `grok-<version>-<bucket>`.
+    pub bucket: &'static str,
+}
+
+impl GrokPlatform {
+    /// npm's package name.
+    #[must_use]
+    pub(crate) fn package(self) -> String {
+        format!("@xai-official/grok-{}", self.npm)
+    }
+
+    /// npm's version document for `version`.
+    #[must_use]
+    pub(crate) fn version_doc(self, version: Version) -> String {
+        format!("{NPM_REGISTRY}{}/{version}", self.package())
+    }
+
+    /// npm's tarball of `version`, at the URL npm's own client builds for it.
+    #[must_use]
+    pub(crate) fn tarball(self, version: Version) -> String {
+        format!(
+            "{NPM_REGISTRY}{}/-/grok-{}-{version}.tgz",
+            self.package(),
+            self.npm
+        )
+    }
+
+    /// xAI's bucket object of `version`'s binary.
+    #[must_use]
+    pub(crate) fn binary(self, version: Version) -> String {
+        format!("{GROK_BUCKET}grok-{version}-{}", self.bucket)
+    }
+
+    /// What npm's documents of `version` must say ([`super::npm::Expected`]).
+    #[must_use]
+    pub(crate) fn expected<'a>(
+        self,
+        package: &'a str,
+        version: Version,
+        tarball: &'a str,
+    ) -> super::npm::Expected<'a> {
+        super::npm::Expected {
+            name: package,
+            version,
+            tarball,
+            os: self.os,
+            cpu: self.cpu,
+        }
+    }
+}
+
+/// grok's platform for `triple`: darwin and Linux (xAI's Linux builds are static, so a musl
+/// client runs the same one), as npm's `@xai-official/grok-<plat>` packages and xAI's
+/// bucket spell them.
+pub(crate) fn grok_platform(triple: &str) -> Option<GrokPlatform> {
+    let (npm, os, cpu, bucket) = match triple {
+        "aarch64-apple-darwin" => ("darwin-arm64", "darwin", "arm64", "macos-aarch64"),
+        "x86_64-apple-darwin" => ("darwin-x64", "darwin", "x64", "macos-x86_64"),
+        "x86_64-unknown-linux-gnu" | "x86_64-unknown-linux-musl" => {
+            ("linux-x64", "linux", "x64", "linux-x86_64")
+        }
+        "aarch64-unknown-linux-gnu" | "aarch64-unknown-linux-musl" => {
+            ("linux-arm64", "linux", "arm64", "linux-aarch64")
+        }
         _ => return None,
+    };
+    Some(GrokPlatform {
+        npm,
+        os,
+        cpu,
+        bucket,
     })
 }
 
-/// grok's candidate: the bucket path the client builds for the head's version, sized by the
-/// bucket and measured by the lane once downloaded ([`Vouch::Measure`]); no payload byte moves.
+/// A size `url` answers, held to `cap`.
+fn sized(spec: &VendorSpec, fetcher: &dyn Fetcher, url: &str, cap: u64) -> Result<u64, Fault> {
+    let size = fetcher.vendor_content_length(spec.program, url)?;
+    if size == 0 {
+        return refused(format!("{url} answered no content length"));
+    }
+    if size > cap {
+        return refused(format!("{url} is {size} bytes, over its {cap}-byte bound"));
+    }
+    Ok(size)
+}
+
+/// grok's candidate: npm's registry-signed tarball of the head's version, the sha512 its
+/// version document's integrity names (signed by a compiled registry key), sized by npm; the
+/// binary's exact size and its bucket `.zst` beside it, sized by xAI's bucket. No payload byte
+/// moves.
 fn verify_grok(
     spec: &'static VendorSpec,
     triple: &str,
     fetcher: &dyn Fetcher,
     version: Version,
+    keys: &[NpmKey],
+    now: i64,
 ) -> Result<Candidate, Fault> {
     let Some(platform) = grok_platform(triple) else {
         return refused(format!(
             "xAI publishes no grok build aterm can verify for {triple}"
         ));
     };
-    let url = format!("{GROK_BUCKET}grok-{version}-{platform}");
-    let size = fetcher.vendor_content_length(spec.program, &url)?;
-    if size == 0 {
-        return refused(format!("{url} answered no content length"));
-    }
-    if size > GROK_MAX_BYTES {
-        return refused(format!(
-            "{url} is {size} bytes, over the {GROK_MAX_BYTES}-byte bound on a payload no \
-             document vouches for"
-        ));
-    }
+    let (package, tarball) = (platform.package(), platform.tarball(version));
+    let doc = digest_doc(spec, fetcher, &platform.version_doc(version), MANIFEST_CAP)?;
+    let sha512 = super::npm::verify_dist(
+        &doc,
+        &platform.expected(&package, version, &tarball),
+        keys,
+        now,
+    )
+    .map_err(Fault::Refused)?;
+    let size = sized(spec, fetcher, &tarball, GROK_MAX_DOWNLOAD)?;
+    let binary = platform.binary(version);
+    let binary_size = sized(spec, fetcher, &binary, GROK_MAX_BINARY)?;
+    let zst = format!("{binary}.zst");
+    let zst_size = sized(spec, fetcher, &zst, GROK_MAX_DOWNLOAD)?;
     let payload = payload_of(spec.anchor, triple);
-    Ok(vouched(
-        spec,
-        version,
-        triple,
-        &url,
-        Vouch::Measure,
-        size,
-        payload,
-    ))
+    let vouch = Vouch::Documents(sha512);
+    let mut c = vouched(spec, version, triple, &tarball, vouch, size, payload);
+    c.artifact.artifact.cost.disk_installed = binary_size;
+    c.companion = Some(Companion {
+        url: zst,
+        size: zst_size,
+        binary_size,
+        platform,
+    });
+    Ok(c)
 }
 
 fn vouched(
@@ -934,9 +1037,7 @@ fn vouched(
     } else {
         size.saturating_mul(ARCHIVE_UNPACK_RATIO)
     };
-    let (sha256, sha512) = vouch
-        .digest()
-        .map_or_else(Default::default, AuthenticatedDigest::keyed);
+    let (sha256, sha512) = vouch.digest().keyed();
     let artifact = SyntheticArtifact {
         program: spec.program,
         version,
@@ -970,6 +1071,7 @@ fn vouched(
         build_date: None,
         anchor: spec.anchor,
         vouch,
+        companion: None,
     }
 }
 
@@ -1046,7 +1148,8 @@ fn json_asset_digest(release: &aterm_json::Value, name: &str) -> Result<String, 
         .ok_or_else(|| format!("the release JSON carries no sha256 digest for {name}"))
 }
 
-fn strict_json(bytes: &[u8]) -> Result<aterm_json::Value, ()> {
+/// `bytes` as JSON in which no object repeats a key, at any depth.
+pub(super) fn strict_json(bytes: &[u8]) -> Result<aterm_json::Value, ()> {
     aterm_json::from_slice::<Strict>(bytes)
         .map(|s| s.0)
         .map_err(|_| ())
@@ -1149,6 +1252,14 @@ mod tests {
         super::super::spec(program).unwrap()
     }
 
+    /// Anthropic's `key` beside npm's compiled registry keys.
+    fn keys(key: &PinnedRsaKey) -> Keys<'_> {
+        Keys {
+            claude: key,
+            npm: super::super::npm::NPM_REGISTRY_KEYS,
+        }
+    }
+
     fn candidate(r: Resolution) -> Candidate {
         match r {
             Resolution::Candidate(c) => *c,
@@ -1198,12 +1309,12 @@ mod tests {
                 &f,
                 v("2.1.280"),
                 b"2.1.280\n",
-                &key,
+                keys(&key),
                 NOW,
             ));
             let a = c.artifact.artifact();
             assert_eq!(c.version, v("2.1.280"));
-            assert_eq!(c.vouch.digest().unwrap().as_str(), sha, "{triple}");
+            assert_eq!(c.vouch.digest().as_str(), sha, "{triple}");
             assert_eq!(a.sha256, sha);
             assert_eq!(a.size, size);
             assert_eq!(a.url, format!("{CLAUDE}2.1.280/{platform}/{suffix}"));
@@ -1221,7 +1332,7 @@ mod tests {
             &f,
             v("2.1.280"),
             b"",
-            &test_key,
+            keys(&test_key),
             NOW,
         ) {
             Resolution::Refused { reason, .. } => {
@@ -1235,7 +1346,7 @@ mod tests {
             &f,
             v("2.1.281"),
             b"",
-            &key,
+            keys(&key),
             NOW,
         ) {
             Resolution::Unserved(why) => assert!(why.contains("404"), "{why}"),
@@ -1249,7 +1360,7 @@ mod tests {
             &f,
             v("2.1.281"),
             b"",
-            &key,
+            keys(&key),
             NOW,
         ) {
             Resolution::Refused { reason, .. } => {
@@ -1292,11 +1403,11 @@ mod tests {
                 &f,
                 v("0.156.0"),
                 REAL_RELEASE,
-                &key,
+                keys(&key),
                 NOW,
             ));
             let a = c.artifact.artifact();
-            assert_eq!(c.vouch.digest().unwrap().as_str(), sha, "{triple}");
+            assert_eq!(c.vouch.digest().as_str(), sha, "{triple}");
             assert_eq!(a.url, url);
             assert_eq!(a.size, 1631, "the exact cap is the HEAD content length");
             assert_eq!(a.payload, "tar-gz");
@@ -1429,7 +1540,7 @@ mod tests {
             &f,
             v("2.1.280"),
             b"",
-            &key,
+            keys(&key),
             NOW,
         ));
         let (good, vouch) = (c.artifact.clone(), c.vouch.clone());
@@ -1469,8 +1580,8 @@ mod tests {
         let mut digestless = good.clone();
         digestless.artifact.sha256 = String::new();
         assert!(
-            admit(&digestless, &Vouch::Measure).is_err(),
-            "claude's anchor publishes its digest, so nothing of it is measured"
+            admit(&digestless, &vouch).is_err(),
+            "a row carries the digest its anchor vouched for"
         );
         let a = good.artifact();
         let sha512 = AuthenticatedDigest::authenticated(DigestAlg::Sha512, &"5".repeat(128));
@@ -1518,7 +1629,7 @@ mod tests {
 
     fn verify_agy_on(f: &Fake, triple: &str, version: &str, head: &[u8]) -> Resolution {
         let key = crate::openpgp::ANTHROPIC_CLAUDE_CODE_RELEASE_KEY;
-        verify(spec("agy"), triple, f, v(version), head, &key, NOW)
+        verify(spec("agy"), triple, f, v(version), head, keys(&key), NOW)
     }
 
     #[test]
@@ -1560,12 +1671,8 @@ mod tests {
             let c = candidate(verify_agy_on(&f, triple, "1.3.6", head));
             let a = c.artifact.artifact();
             let sha512 = agy_manifest(head).unwrap().sha512;
-            assert_eq!(
-                c.vouch.digest().unwrap().alg(),
-                DigestAlg::Sha512,
-                "{triple}"
-            );
-            assert_eq!(c.vouch.digest().unwrap().as_str(), sha512);
+            assert_eq!(c.vouch.digest().alg(), DigestAlg::Sha512, "{triple}");
+            assert_eq!(c.vouch.digest().as_str(), sha512);
             assert_eq!(
                 (a.sha256.as_str(), a.sha512.as_str()),
                 ("", sha512.as_str())
@@ -1704,15 +1811,12 @@ mod tests {
                 &f,
                 release,
                 MUSE_CHANNEL,
-                &key,
+                keys(&key),
                 NOW,
             ));
             let a = c.artifact.artifact();
             assert_eq!(
-                (
-                    c.vouch.digest().unwrap().alg(),
-                    c.vouch.digest().unwrap().as_str()
-                ),
+                (c.vouch.digest().alg(), c.vouch.digest().as_str()),
                 (DigestAlg::Sha256, sha)
             );
             assert_eq!((a.sha256.as_str(), a.size), (sha, size));
@@ -1740,7 +1844,7 @@ mod tests {
                 &f,
                 release,
                 MUSE_CHANNEL,
-                &key,
+                keys(&key),
                 NOW,
             ));
             assert!(why.contains("no muse build aterm can verify"), "{why}");
@@ -1782,7 +1886,7 @@ mod tests {
                 f,
                 release,
                 b"",
-                &key,
+                keys(&key),
                 NOW,
             )
         };
@@ -1853,7 +1957,7 @@ mod tests {
 
     fn verify_kimi_on(f: &Fake, triple: &str, version: &str) -> Resolution {
         let key = crate::openpgp::ANTHROPIC_CLAUDE_CODE_RELEASE_KEY;
-        verify(spec("kimi"), triple, f, v(version), b"", &key, NOW)
+        verify(spec("kimi"), triple, f, v(version), b"", keys(&key), NOW)
     }
 
     /// Both kimi 2.3.1 manifests as Moonshot serves them (the GitHub one through its storage
@@ -2084,67 +2188,344 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn the_real_grok_pointer_names_a_bucket_path_the_lane_measures() {
+    const GROK_BUCKET_CLI: &str = "https://storage.googleapis.com/grok-build-public-artifacts/cli/";
+    const NPM_XAI: &str = "https://registry.npmjs.org/@xai-official/";
+    const GROK_NPM_LINUX_X64: &[u8] = include_bytes!("fixtures/grok-1.0.70-npm-linux-x64.json");
+    const GROK_NPM_LINUX_ARM64: &[u8] = include_bytes!("fixtures/grok-1.0.70-npm-linux-arm64.json");
+    const GROK_NPM_DARWIN_ARM64: &[u8] =
+        include_bytes!("fixtures/grok-1.0.70-npm-darwin-arm64.json");
+
+    /// grok 1.0.70 as npm and xAI's bucket served it on 2026-10-24: the real version documents
+    /// of three platforms, and every size the lane asks for, as measured that day.
+    fn grok_world() -> Fake {
         let f = Fake::default();
-        let grok = spec("grok");
-        f.doc(grok.head_url, GROK_STABLE);
-        assert!(matches!(
-            read_head(grok, &f, None),
-            Head::Named { version, .. } if version == v("1.0.67")
-        ));
-        let key = crate::openpgp::ANTHROPIC_CLAUDE_CODE_RELEASE_KEY;
-        for (triple, file) in [
-            ("aarch64-apple-darwin", "grok-1.0.67-macos-aarch64"),
-            ("x86_64-apple-darwin", "grok-1.0.67-macos-x86_64"),
+        for (npm, doc) in [
+            ("linux-x64", GROK_NPM_LINUX_X64),
+            ("linux-arm64", GROK_NPM_LINUX_ARM64),
+            ("darwin-arm64", GROK_NPM_DARWIN_ARM64),
         ] {
-            let url =
-                format!("https://storage.googleapis.com/grok-build-public-artifacts/cli/{file}");
-            f.payload(&url, &[0u8; 777]);
-            let c = candidate(verify(
-                grok,
-                triple,
-                &f,
-                v("1.0.67"),
-                GROK_STABLE,
-                &key,
-                NOW,
-            ));
+            f.doc(&format!("{NPM_XAI}grok-{npm}/1.0.70"), doc);
+        }
+        for (npm, bucket, tgz, raw, zst) in [
+            (
+                "linux-x64",
+                "linux-x86_64",
+                55_485_055,
+                195_700_192,
+                57_553_935,
+            ),
+            (
+                "linux-arm64",
+                "linux-aarch64",
+                50_533_753,
+                166_639_048,
+                54_274_393,
+            ),
+            (
+                "darwin-arm64",
+                "macos-aarch64",
+                49_911_569,
+                179_063_008,
+                53_423_354,
+            ),
+        ] {
+            f.payload_sized(&format!("{NPM_XAI}grok-{npm}/-/grok-{npm}-1.0.70.tgz"), tgz);
+            f.payload_sized(&format!("{GROK_BUCKET_CLI}grok-1.0.70-{bucket}"), raw);
+            f.payload_sized(&format!("{GROK_BUCKET_CLI}grok-1.0.70-{bucket}.zst"), zst);
+        }
+        f
+    }
+
+    fn verify_grok_on(f: &Fake, triple: &str) -> Resolution {
+        verify(
+            spec("grok"),
+            triple,
+            f,
+            v("1.0.70"),
+            b"1.0.70",
+            keys(&crate::openpgp::ANTHROPIC_CLAUDE_CODE_RELEASE_KEY),
+            NOW,
+        )
+    }
+
+    /// The real grok 1.0.70: on each platform npm and the bucket serve, the candidate is
+    /// npm's tarball under the sha512 its registry-signed version document names, sized by
+    /// npm, staged to the bucket's binary size and checked against the bucket's `.zst`; a
+    /// musl host gets the same static build.
+    #[test]
+    fn the_real_grok_release_resolves_under_npms_registry_key() {
+        let f = grok_world();
+        assert!(matches!(
+            read_head(spec("grok"), &f, None),
+            Head::Unserved(_)
+        ));
+        f.doc(spec("grok").head_url, b"1.0.70");
+        assert!(matches!(
+            read_head(spec("grok"), &f, None),
+            Head::Named { version, .. } if version == v("1.0.70")
+        ));
+        for (triple, npm, bucket, sha512, size, binary_size, zst_size) in [
+            (
+                "x86_64-unknown-linux-gnu",
+                "linux-x64",
+                "linux-x86_64",
+                "ac496c872733ffa4a03d2922146b4a1c0e2f495388f2a43a7748c57aee08f768\
+                 5708c7efc603223af352cee0619b63fc25dfb8acd180b72db35b45709a01d278",
+                55_485_055,
+                195_700_192,
+                57_553_935,
+            ),
+            (
+                "x86_64-unknown-linux-musl",
+                "linux-x64",
+                "linux-x86_64",
+                "ac496c872733ffa4a03d2922146b4a1c0e2f495388f2a43a7748c57aee08f768\
+                 5708c7efc603223af352cee0619b63fc25dfb8acd180b72db35b45709a01d278",
+                55_485_055,
+                195_700_192,
+                57_553_935,
+            ),
+            (
+                "aarch64-unknown-linux-gnu",
+                "linux-arm64",
+                "linux-aarch64",
+                "ac7d137d6393fc26bfb0132d00927e189f54c9996bfd3913a881eaf052fba3e6\
+                 53cc93015af0afe34242e13fd7bb0119dd6326c4e1c688f6a9ec7f41e126c34b",
+                50_533_753,
+                166_639_048,
+                54_274_393,
+            ),
+            (
+                "aarch64-apple-darwin",
+                "darwin-arm64",
+                "macos-aarch64",
+                "4efcd9e1be98c2988aed4c9b246278017c400fb7f3f18f75d90d2db18e959280\
+                 c5460a7121458175ba7a031f080899f54447fbaa7b0b71146eca268e4f025b9a",
+                49_911_569,
+                179_063_008,
+                53_423_354,
+            ),
+        ] {
+            let c = candidate(verify_grok_on(&f, triple));
             let a = c.artifact.artifact();
-            assert_eq!(c.vouch, Vouch::Measure, "no document names grok's digest");
-            assert_eq!((a.sha256.as_str(), a.sha512.as_str()), ("", ""));
-            assert_eq!((a.url.as_str(), a.size), (url.as_str(), 777));
+            assert_eq!(c.anchor, Anchor::XaiNpmRegistry);
+            assert_eq!(c.vouch.digest().alg(), DigestAlg::Sha512, "{triple}");
+            assert_eq!(c.vouch.digest().as_str(), sha512, "{triple}");
+            assert_eq!((a.sha256.as_str(), a.sha512.as_str()), ("", sha512));
+            assert_eq!(
+                a.url,
+                format!("{NPM_XAI}grok-{npm}/-/grok-{npm}-1.0.70.tgz")
+            );
+            assert_eq!((a.size, a.cost.disk_installed), (size, binary_size));
             assert_eq!(
                 (a.payload.as_str(), a.entry.as_str()),
-                ("raw-binary", "grok")
+                ("npm-brotli-binary", "grok")
             );
-            assert_eq!(a.asset, format!("grok-1.0.67-{triple}"));
-            assert_eq!(c.anchor, Anchor::XaiDeveloperId);
+            assert_eq!(a.asset, format!("grok-1.0.70-{triple}.tgz"));
+            let companion = c.companion.as_ref().expect("the bucket's copy");
+            assert_eq!(
+                companion.url,
+                format!("{GROK_BUCKET_CLI}grok-1.0.70-{bucket}.zst")
+            );
+            assert_eq!(
+                (companion.size, companion.binary_size),
+                (zst_size, binary_size)
+            );
+            assert_eq!(
+                companion.platform.package(),
+                format!("@xai-official/grok-{npm}")
+            );
             admit(&c.artifact, &c.vouch).unwrap();
-            let fake = AuthenticatedDigest::authenticated(DigestAlg::Sha256, &"c".repeat(64));
-            assert!(
-                admit(&c.artifact, &Vouch::Documents(fake.clone().unwrap())).is_err(),
-                "a digestless row is admitted only while it is to be measured"
-            );
-            let measured = c.measured(fake.clone().unwrap()).unwrap();
-            assert_eq!(measured.artifact.artifact().sha256, "c".repeat(64));
-            admit(&measured.artifact, &measured.vouch).unwrap();
-            assert!(
-                admit(&measured.artifact, &Vouch::Measure).is_err(),
-                "a measured row carries the digest its bytes have"
-            );
-            assert!(measured.measured(fake.unwrap()).is_none(), "measured once");
-            let by_512 = AuthenticatedDigest::authenticated(DigestAlg::Sha512, &"c".repeat(128));
-            assert!(
-                c.measured(by_512.unwrap()).is_none(),
-                "grok's measure is a sha256"
-            );
-            f.payload(&url, b"");
-            let why = refusal(verify(grok, triple, &f, v("1.0.67"), b"", &key, NOW));
-            assert!(why.contains("no content length"), "{why}");
         }
-        f.redirect(grok.head_url, "https://x.ai/cli/stable");
-        assert!(matches!(read_head(grok, &f, None), Head::Refused(_)));
+        let asked: Vec<String> = f.gets.borrow().iter().map(|(u, _)| u.clone()).collect();
+        assert!(
+            asked.iter().all(|u| u == spec("grok").head_url
+                || (u.starts_with(NPM_XAI) && u.ends_with("/1.0.70") && !u.contains("/grok/"))),
+            "only the bucket's pointer and the platform packages' version documents: {asked:?}"
+        );
+    }
+
+    /// Every way grok's documents and sizes fail: an unserved document or copy is no verdict
+    /// (healing when served), and a document off its pin, under a key aterm does not ship, or
+    /// a size out of bounds is refused.
+    #[test]
+    fn grok_is_unserved_or_refused_as_its_documents_and_sizes_say() {
+        const T: &str = "x86_64-unknown-linux-gnu";
+        let doc = format!("{NPM_XAI}grok-linux-x64/1.0.70");
+        let tgz = format!("{NPM_XAI}grok-linux-x64/-/grok-linux-x64-1.0.70.tgz");
+        let raw = format!("{GROK_BUCKET_CLI}grok-1.0.70-linux-x86_64");
+        let zst = format!("{raw}.zst");
+        for gone in [&doc, &tgz, &raw, &zst] {
+            let f = grok_world();
+            f.forget(gone);
+            f.forget_payload(gone);
+            match verify_grok_on(&f, T) {
+                Resolution::Unserved(why) => assert!(why.contains("404"), "{gone}: {why}"),
+                other => panic!("{gone}: {other:?}"),
+            }
+        }
+        for (url, size, why) in [
+            (&tgz, 0, "no content length"),
+            (&tgz, (256 << 20) + 1, "over its"),
+            (&raw, 0, "no content length"),
+            (&raw, (1 << 30) + 1, "over its"),
+            (&zst, (256 << 20) + 1, "over its"),
+        ] {
+            let f = grok_world();
+            f.payload_sized(url, size);
+            let why_got = refusal(verify_grok_on(&f, T));
+            assert!(why_got.contains(why), "{url} {size}: {why_got}");
+        }
+        let f = grok_world();
+        f.redirect(&doc, "https://registry.npmjs.org/@xai-official/grok/1.0.70");
+        let why = refusal(verify_grok_on(&f, T));
+        assert!(why.contains("off its pinned host"), "{why}");
+        let f = grok_world();
+        f.redirect(
+            &doc,
+            "https://registry.npmjs.org/@xai-official/grok-linux-x64/1.0.70",
+        );
+        candidate(verify_grok_on(&f, T));
+        let f = grok_world();
+        let why = refusal(verify(
+            spec("grok"),
+            T,
+            &f,
+            v("1.0.70"),
+            b"1.0.70",
+            Keys {
+                claude: &crate::openpgp::ANTHROPIC_CLAUDE_CODE_RELEASE_KEY,
+                npm: &[],
+            },
+            NOW,
+        ));
+        assert!(why.contains("aterm does not ship"), "{why}");
+        assert!(
+            matches!(
+                verify(
+                    spec("grok"),
+                    T,
+                    &f,
+                    v("1.0.69"),
+                    b"1.0.69",
+                    keys(&crate::openpgp::ANTHROPIC_CLAUDE_CODE_RELEASE_KEY),
+                    NOW,
+                ),
+                Resolution::Unserved(_)
+            ),
+            "a version npm has no document for"
+        );
+        f.doc(
+            &format!("{NPM_XAI}grok-linux-x64/1.0.69"),
+            GROK_NPM_LINUX_X64,
+        );
+        let why = refusal(verify(
+            spec("grok"),
+            T,
+            &f,
+            v("1.0.69"),
+            b"1.0.69",
+            keys(&crate::openpgp::ANTHROPIC_CLAUDE_CODE_RELEASE_KEY),
+            NOW,
+        ));
+        assert!(
+            why.contains("is version \"1.0.70\", not 1.0.69"),
+            "the head's version, never the document's: {why}"
+        );
+        let f = grok_world();
+        f.doc(spec("grok").head_url, b"1.0.70");
+        f.redirect(spec("grok").head_url, "https://x.ai/cli/stable");
+        assert!(matches!(
+            read_head(spec("grok"), &f, None),
+            Head::Refused(_)
+        ));
+    }
+
+    /// grok's platforms: npm's package, its `os` and `cpu` words, and the bucket's name, for
+    /// each triple xAI builds; none for Windows.
+    #[test]
+    fn grok_platforms_name_npms_package_and_the_buckets_binary() {
+        for (triple, npm, os, cpu, bucket) in [
+            (
+                "aarch64-apple-darwin",
+                "darwin-arm64",
+                "darwin",
+                "arm64",
+                "macos-aarch64",
+            ),
+            (
+                "x86_64-apple-darwin",
+                "darwin-x64",
+                "darwin",
+                "x64",
+                "macos-x86_64",
+            ),
+            (
+                "x86_64-unknown-linux-gnu",
+                "linux-x64",
+                "linux",
+                "x64",
+                "linux-x86_64",
+            ),
+            (
+                "x86_64-unknown-linux-musl",
+                "linux-x64",
+                "linux",
+                "x64",
+                "linux-x86_64",
+            ),
+            (
+                "aarch64-unknown-linux-gnu",
+                "linux-arm64",
+                "linux",
+                "arm64",
+                "linux-aarch64",
+            ),
+            (
+                "aarch64-unknown-linux-musl",
+                "linux-arm64",
+                "linux",
+                "arm64",
+                "linux-aarch64",
+            ),
+        ] {
+            let p = grok_platform(triple).unwrap();
+            assert_eq!(
+                (p.npm, p.os, p.cpu, p.bucket),
+                (npm, os, cpu, bucket),
+                "{triple}"
+            );
+            let version = v("1.0.70");
+            assert_eq!(
+                p.tarball(version),
+                format!("{NPM_XAI}grok-{npm}/-/grok-{npm}-1.0.70.tgz")
+            );
+            assert_eq!(
+                p.version_doc(version),
+                format!("{NPM_XAI}grok-{npm}/1.0.70")
+            );
+            assert_eq!(
+                p.binary(version),
+                format!("{GROK_BUCKET_CLI}grok-1.0.70-{bucket}")
+            );
+            for url in [
+                p.tarball(version),
+                p.version_doc(version),
+                p.binary(version),
+            ] {
+                assert!(
+                    crate::vendor::vendor_direct_url_allowed("grok", &url),
+                    "{url}"
+                );
+            }
+        }
+        for triple in crate::manifest::TARGETS {
+            assert_eq!(
+                grok_platform(triple).is_some(),
+                !triple.contains("-windows-"),
+                "{triple}"
+            );
+        }
     }
 
     #[test]
@@ -2164,16 +2545,6 @@ mod tests {
             ),
             (
                 "grok",
-                "x86_64-unknown-linux-gnu",
-                "no grok build aterm can verify",
-            ),
-            (
-                "grok",
-                "aarch64-unknown-linux-gnu",
-                "no grok build aterm can verify",
-            ),
-            (
-                "grok",
                 "x86_64-pc-windows-msvc",
                 "no grok build aterm can verify",
             ),
@@ -2182,16 +2553,11 @@ mod tests {
                 "aarch64-pc-windows-msvc",
                 "no grok build aterm can verify",
             ),
-            (
-                "grok",
-                "x86_64-unknown-linux-musl",
-                "no grok build aterm can verify",
-            ),
         ] {
             let row = spec(program);
             assert!(!row.serves(triple), "{program} {triple}");
-            let version = if program == "kimi" { "2.3.1" } else { "1.0.67" };
-            let why = refusal(verify(row, triple, &f, v(version), b"", &key, NOW));
+            let version = if program == "kimi" { "2.3.1" } else { "1.0.70" };
+            let why = refusal(verify(row, triple, &f, v(version), b"", keys(&key), NOW));
             assert!(why.contains(said), "{program} {triple}: {why}");
         }
         assert!(f.gets.borrow().is_empty(), "nothing was asked");
@@ -2203,7 +2569,7 @@ mod tests {
             );
             assert_eq!(
                 spec("grok").serves(triple),
-                triple.ends_with("-apple-darwin"),
+                !triple.contains("-windows-"),
                 "grok on {triple}"
             );
         }

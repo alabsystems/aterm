@@ -1076,13 +1076,13 @@ impl Chain {
     ];
 
     /// The coverage chains (`--mode cover`): what the measured pass left unobserved, and the Off
-    /// control.
+    /// control. land-q and land-t open first, so P5 and L12 read their rows on the page's one screen.
     pub const COVER: [Chain; 9] = [
         Chain::LandQ,
+        Chain::LandT,
         Chain::LandP,
         Chain::LandW,
         Chain::WroteC,
-        Chain::LandT,
         Chain::Mgr,
         Chain::Worker,
         Chain::CruiseO,
@@ -1666,11 +1666,15 @@ impl Chain {
                 ]
             }
             Chain::Mgr => Vec::new(),
-            Chain::InstantLand | Chain::Worker => vec![
+            Chain::InstantLand => vec![
                 rule(NUDGE_KEY, CLEAN),
                 rule(LAND_KEY, CLEAN),
                 rule("", WORK),
             ],
+            // Its first land reply holds (a work reply, no defense), so its row under its
+            // manager reads `landing` with the hold's tip until the nudge's defense lands it
+            // (§12.3.11's 5d); its result is still its task's reply and the defense.
+            Chain::Worker => vec![rule(NUDGE_KEY, CLEAN), rule("", WORK)],
             Chain::InstantCruise | Chain::InstantPerson => vec![
                 rule(ASK_KEY, ASK_REPLY),
                 rule(CHECK_KEY, CLEAN),
@@ -4663,6 +4667,18 @@ fn spawn_worker(
     Ok((tab, slot))
 }
 
+/// The order a run opens its tabs in, as indexes into `chains`: as listed, but cruise-n first
+/// where the window is read (`read`), so its rows (N1–N4's page state) stand at the page's top.
+/// A spawned chain is listed in its place and opened by its manager.
+fn opening_order(chains: &[Chain], read: bool) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..chains.len()).collect();
+    if read && let Some(i) = chains.iter().position(|c| *c == Chain::CruiseN) {
+        order.remove(i);
+        order.insert(0, i);
+    }
+    order
+}
+
 fn orchestrator_due(chain: Chain, seen: &Seen, now: i64) -> bool {
     if seen.cover.turn_ms.is_some() {
         return false;
@@ -6367,14 +6383,10 @@ fn run_check(
         Some(d)
     };
     let mut tabs: Vec<Tab> = Vec::new();
-    let mut order: Vec<usize> = (0..chains.len()).collect();
-    if desk.is_some()
-        && let Some(i) = chains.iter().position(|c| *c == Chain::CruiseN)
+    for (chain, dir) in opening_order(chains, desk.is_some())
+        .into_iter()
+        .map(|i| (chains[i], &dirs[i]))
     {
-        order.remove(i);
-        order.insert(0, i);
-    }
-    for (chain, dir) in order.into_iter().map(|i| (chains[i], &dirs[i])) {
         if chain.opening() == Opening::Spawned {
             continue;
         }
@@ -6491,6 +6503,15 @@ fn run_check(
             }
             return Err(could_not(&format!("{why}, in {}", tab.chain.name())));
         }
+    }
+    let front_label = desk
+        .as_ref()
+        .and_then(|d| tabs.iter().find(|t| t.sid == d.front_sid))
+        .map(|t| t.seen.window.label.clone());
+    if desk.is_some() {
+        surfaces::opening_sweep(&door, &mut tabs, front_label.as_deref(), false);
+    }
+    for tab in &mut tabs {
         stop::sleep(Duration::from_secs(1))?;
         let opening = tab.chain.opening();
         if opening == Opening::Person {
@@ -6564,7 +6585,10 @@ fn run_check(
         .zip(&dirs)
         .find(|(c, _)| c.opening() == Opening::Spawned)
     {
-        let (tab, slot) = spawn_worker((tag, &run, h), &door, &tabs, wdir)?;
+        let (mut tab, slot) = spawn_worker((tag, &run, h), &door, &tabs, wdir)?;
+        if let Some(d) = &desk {
+            surfaces::open_worker(&door, &mut tab, front_label.as_deref(), &d.front_sid);
+        }
         tabs.push(tab);
         awaiting = Some(slot);
     }

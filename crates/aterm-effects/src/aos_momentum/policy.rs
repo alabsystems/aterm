@@ -135,7 +135,7 @@ const fn nibble(c: u8) -> u8 {
     }
 }
 
-const fn hex_digest(hex: &str) -> Digest {
+pub(super) const fn hex_digest(hex: &str) -> Digest {
     let b = hex.as_bytes();
     assert!(b.len() == 64, "a digest pin is 64 hex digits");
     let mut out = [0u8; 32];
@@ -721,7 +721,7 @@ pub(super) struct Measured {
 }
 
 /// What a policy binds, in descriptor order.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Terms {
     stranded_light: ArtifactId,
     lane_fidelity: ArtifactId,
@@ -873,7 +873,7 @@ impl Terms {
 }
 
 /// The acceptance policy `momentum-glow.m4-acceptance` v1.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AcceptancePolicy {
     id: ArtifactId,
     terms: Terms,
@@ -897,12 +897,22 @@ impl AcceptancePolicy {
     }
 
     /// [`Self::v1`], returned only when its digest is the pin, generator v1's corpus is the one it
-    /// binds and the shipped baseline, measured now from `origin` (the library reads no clock, and
+    /// binds and the shipped baseline, measured from `origin` (the library reads no clock, and
     /// the origin changes no value), gives every pinned value and is still admitted.
+    ///
+    /// The process checks once, from the first caller's `origin`, and every later call is that
+    /// answer: nothing a check reads changes while the process runs.
     /// # Errors
     /// [`PolicyRefusal::PolicyMutated`], then [`PolicyRefusal::CorpusDrift`], then
     /// [`PolicyRefusal::BaselineDrift`]: the first check that fails, in that order.
     pub fn pinned(origin: Instant) -> Result<AcceptancePolicy, PolicyRefusal> {
+        static PINNED: std::sync::OnceLock<Result<AcceptancePolicy, PolicyRefusal>> =
+            std::sync::OnceLock::new();
+        PINNED.get_or_init(|| Self::checked(origin)).clone()
+    }
+
+    /// [`Self::pinned`]'s checks, run.
+    fn checked(origin: Instant) -> Result<AcceptancePolicy, PolicyRefusal> {
         let policy = Self::v1();
         policy.check_pin()?;
         let corpus = Corpus::generate().map_err(|_| PolicyRefusal::CorpusDrift {

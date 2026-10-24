@@ -1,0 +1,40 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 AND BSD-2-Clause
+#
+# The decoder is first-party, written from the text of RFC 7932. The format's
+# static data in `src/dictionary.bin` and `src/tables.rs` (the dictionary, the
+# context lookup tables and the word transforms) are Code Components of RFC
+# 7932, which the IETF Trust licenses under the Simplified BSD License; see
+# `LICENSE-BSD-2` in this directory.
+
+[package]
+name = "aterm-brotli"
+# Integration tests are declared below, not discovered: the files are modules
+# of one suite binary. With autotests off a `tests/*.rs` file listed nowhere
+# never compiles.
+autotests = false
+version.workspace = true
+edition.workspace = true
+license = "Apache-2.0 AND BSD-2-Clause"
+repository.workspace = true
+description = "First-party Brotli for aterm: a safe streaming RFC 7932 decoder and an uncompressed-block stream writer"
+
+[lib]
+name = "aterm_brotli"
+path = "src/lib.rs"
+
+[dependencies]
+# None, on purpose: no third-party crate outside rustls and ring is kept
+# (docs/AUDIT-third-party-2026-10-15.md §1).
+
+[dev-dependencies]
+# SHA-256 of what the recorded streams decode to: the brotli 1.2.0 CLI's own
+# answers (tests/recorded), which are the decoder's oracle.
+aterm-digest = { workspace = true }
+
+[[test]]
+name = "brotli_suite"
+path = "tests/brotli_suite.rs"
+
+[lints]
+workspace = true

@@ -25,10 +25,12 @@
 //! (`automatic_state_carrying_compaction_caps_retained_records_and_preserves_state`);
 //! `set_retention` without the compaction lock
 //! (`rules_set_while_a_tick_compacts_wait_for_it_and_keep_what_it_carried`,
-//! `rules_set_while_the_caps_compact_hold_from_the_base_that_compaction_lands`).
+//! `rules_set_while_the_caps_compact_hold_from_the_base_that_compaction_lands`); and a caps
+//! compaction on read-back rules that writes no held-store job
+//! (`the_caps_on_read_back_rules_keep_what_they_dropped_unnamed_across_a_restart`).
 //!
-//! The wire's half of R4 (`retained-from=`, the oldest, Hello's rules) is `wire`'s
-//! (`retention_wire_tests.rs`), on these helpers.
+//! The wire's half of R4 (`retained-from=`, the oldest, Hello's rules, and the gap notice a
+//! tail is told: addendum A9) is `wire`'s (`retention_wire_tests.rs`), on these helpers.
 
 use super::*;
 use crate::test_scratch::Scratch;
@@ -144,7 +146,9 @@ fn next_delivery(sub: &mut crate::client::Subscription, deadline: Instant) -> (u
             Some(crate::client::Event::Delivery {
                 offset, subject, ..
             }) => return (offset, subject),
-            Some(crate::client::Event::Mark { .. }) => {}
+            // The marks, and the notice of what the cut gave up below the cursor: the
+            // tests of what a tail is told read those themselves (`wire`).
+            Some(crate::client::Event::Mark { .. } | crate::client::Event::Gap(_)) => {}
             None => panic!("the broker closed the subscription"),
         }
     }
@@ -506,6 +510,49 @@ fn automatic_state_carrying_compaction_caps_retained_records_and_preserves_state
     assert_eq!(rows[0].2, b"sticky-state");
 
     h.shutdown();
+}
+
+/// THE CAPS ON A LOG WHOSE RULES WERE READ BACK (a broker given none since its open, which
+/// compacts by its caps alone, planning nothing) keep what they dropped unnamed across a
+/// restart: the mail at 0 goes with the cut to 2, and the cut's own held-store frame raises
+/// the spill, so after a reopen a read of the mail answers from the cut, and a tail from 0
+/// is still told the range (`HeldStore::unplanned_job`). NC: a caps compaction that writes
+/// no held-store job reads the mail from 0 after the reopen.
+#[test]
+fn the_caps_on_read_back_rules_keep_what_they_dropped_unnamed_across_a_restart() {
+    let root = Scratch::new("caps-read-back");
+    let path = root.path().join("log");
+    let mail = Filter::new("/f/F/in/>").unwrap();
+    {
+        let mut log = BrokerLog::open(&path).unwrap();
+        log.set_retention(rules(100)).unwrap();
+        for (seq, subject) in [MAIL, EV, EV].into_iter().enumerate() {
+            log.publish(1, seq as u64 + 1, subject.into(), BODY.to_vec())
+                .unwrap();
+        }
+    }
+    let b = Broker::open(&path).unwrap();
+    b.set_retention_interval(HOUR);
+    assert_eq!(b.retention(), None, "read back, not retained by");
+    b.set_max_retained_records(1);
+    b.retention_tick_at(b.now_ms()).unwrap();
+    assert_eq!(b.base(), 2, "the caps cut to the newest record");
+    assert_eq!(b.oldest(&mail), 2);
+    drop(b);
+    let log = BrokerLog::open(&path).unwrap();
+    assert_eq!(
+        log.oldest(&mail),
+        Offset(2),
+        "the spill the cut's frame raised, read back"
+    );
+    assert_eq!(
+        log.gap_notice(&mail, 0, &mut crate::store::Told::at(0)),
+        Some(crate::proto::Gap {
+            from: 0,
+            to: 2,
+            records: None
+        })
+    );
 }
 
 /// THE TICK'S LIFE: a broker nothing retains starts no tick and never ticks, however much

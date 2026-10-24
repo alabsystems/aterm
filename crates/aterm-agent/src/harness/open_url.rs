@@ -315,6 +315,21 @@ fn multipart_boundary(headers: &str) -> Option<String> {
     None
 }
 
+/// RFC 2046 §5.1.1 delimiter check after the leading `--`: matches `boundary` (returning
+/// `Some(false)`) or `boundary--` (`Some(true)`) only when followed solely by optional
+/// transport padding (`' '` or `'\t'`) and line ending.
+fn matches_declared_boundary(after_dashes: &str, boundary: &str) -> Option<bool> {
+    let rest = after_dashes.strip_prefix(boundary)?;
+    let (closed, padding) = match rest.strip_prefix("--") {
+        Some(tail) => (true, tail),
+        None => (false, rest),
+    };
+    padding
+        .trim_matches([' ', '\t', '\r', '\n'])
+        .is_empty()
+        .then_some(closed)
+}
+
 /// Active declared delimiters at each header/body transition. Only real header blocks
 /// contribute parameters; text in a part cannot declare a boundary. Nested multiparts keep
 /// their ancestors until a closing delimiter or an outer boundary ends them.
@@ -326,12 +341,11 @@ fn mime_boundary_contexts(input: &str) -> Option<Vec<(usize, Vec<String>)>> {
     for line in input.split_inclusive('\n') {
         let next = offset + line.len();
         let after_dashes = line.strip_prefix("--");
-        if let Some((at, boundary)) =
-            active.iter().enumerate().rev().find(|(_, boundary)| {
-                after_dashes.is_some_and(|s| s.starts_with(boundary.as_str()))
-            })
-        {
-            let closed = after_dashes.is_some_and(|s| s[boundary.len()..].starts_with("--"));
+        if let Some((at, closed)) = active.iter().enumerate().rev().find_map(|(at, boundary)| {
+            after_dashes
+                .and_then(|s| matches_declared_boundary(s, boundary))
+                .map(|closed| (at, closed))
+        }) {
             active.truncate(at + usize::from(!closed));
             contexts.push((next, active.clone()));
             header_start = (!closed).then_some(next);
@@ -367,7 +381,7 @@ pub(super) fn is_mime_boundary_line(line: &str, declared: &[String]) -> bool {
         return line.strip_prefix("--").is_some_and(|tail| {
             declared
                 .iter()
-                .any(|boundary| tail.starts_with(boundary.as_str()))
+                .any(|boundary| matches_declared_boundary(tail, boundary).is_some())
         });
     }
     // Headerless MIME fragments from mailbox JSON have no boundary parameter. Keep their

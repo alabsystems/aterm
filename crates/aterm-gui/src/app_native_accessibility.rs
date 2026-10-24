@@ -850,6 +850,195 @@ mod tests {
         }
     }
 
+    fn vault_page_with_draft() -> (App, WindowId, ViewId, crate::native_app::AppInstanceId) {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let window = app.windows.get_mut(&wid).unwrap();
+        window.rows = 90;
+        window.cols = 160;
+        assert!(app.open_system_state_tab());
+        app.set_system_state_handlers_for_test(
+            crate::system_state_host::InitialSetupHandlers::inert_for_test(),
+        );
+        app.publish_system_state(crate::SetupStatus {
+            plan: Some(aterm_types::macos_setup::Plan::default()),
+            ..crate::SetupStatus::default()
+        });
+        let (instance, view) = app.active_native_view(wid).unwrap();
+        for (key, text) in [
+            ("system-state/url", "http://draft.invalid:7484/v1/team"),
+            ("system-state/password", "inert-password"),
+        ] {
+            app.dispatch_native_view_event(
+                wid,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: crate::native_ui::ActionId::new(key),
+                    value: Some(crate::native_app::SemanticInput::Text(text.into())),
+                }),
+            )
+            .unwrap();
+        }
+        (app, wid, view, instance)
+    }
+
+    fn publish_vault_action(
+        app: &mut App,
+        wid: WindowId,
+        view: ViewId,
+        key: &str,
+        value: Option<&str>,
+    ) -> ActionRequest {
+        set_a11y_active(app, wid, true);
+        assert!(app.prepare_native_input_scratch(wid));
+        let (update, published) = app.take_native_accessibility_update(wid).unwrap().unwrap();
+        let node = stable_node_id_for_view(view, &UiKey::new(key));
+        let action = if value.is_some() {
+            Action::SetValue
+        } else {
+            Action::Click
+        };
+        let control = &update.nodes.iter().find(|(id, _)| *id == node).unwrap().1;
+        assert!(
+            control.supports_action(action),
+            "the saved control was enabled"
+        );
+        let context = control.action_context();
+        assert!(context.is_some());
+        app.windows.get_mut(&wid).unwrap().native_a11y_published = Some(published);
+        ActionRequest {
+            context,
+            action,
+            target_tree: TreeId::ROOT,
+            target_node: node,
+            data: value.map(|text| aterm_a11y::model::ActionData::Value(text.into())),
+        }
+    }
+
+    #[test]
+    fn deferred_vault_join_cannot_run_after_a_same_plan_busy_publication() {
+        thread_local! {
+            static APPLIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        }
+        for busy in [false, true] {
+            APPLIED.with(|applied| applied.set(0));
+            let (mut app, wid, view, _) = vault_page_with_draft();
+            app.set_system_state_handlers_for_test(
+                crate::system_state_host::InitialSetupHandlers {
+                    apply: |plan, typed, password, receipt| {
+                        assert!(typed);
+                        assert_eq!(plan.vault_url, "http://draft.invalid:7484/v1/team");
+                        assert_eq!(
+                            password
+                                .as_ref()
+                                .and_then(aterm_secrets::SecretBytes::as_str),
+                            Some("inert-password")
+                        );
+                        APPLIED.with(|applied| applied.set(applied.get() + 1));
+                        receipt.accept();
+                        true
+                    },
+                    ..crate::system_state_host::InitialSetupHandlers::inert_for_test()
+                },
+            );
+            let saved = publish_vault_action(&mut app, wid, view, "system-state/vault/join", None);
+            let idle = crate::SetupStatus {
+                plan: Some(aterm_types::macos_setup::Plan::default()),
+                ..crate::SetupStatus::default()
+            };
+            app.publish_system_state(crate::SetupStatus {
+                busy,
+                ..idle.clone()
+            });
+            app.on_native_accessibility_action(wid, saved);
+            assert_eq!(
+                APPLIED.with(std::cell::Cell::get),
+                usize::from(!busy),
+                "only the idle saved Join is enabled"
+            );
+            if !busy {
+                continue;
+            }
+
+            app.publish_system_state(idle);
+            let current =
+                publish_vault_action(&mut app, wid, view, "system-state/vault/join", None);
+            app.on_native_accessibility_action(wid, current);
+            assert_eq!(
+                APPLIED.with(std::cell::Cell::get),
+                1,
+                "an idle current Join works"
+            );
+        }
+    }
+
+    #[test]
+    fn deferred_vault_values_cannot_edit_after_a_same_plan_busy_publication() {
+        use crate::native_app::NativeApp;
+        for busy in [false, true] {
+            let (mut app, wid, view, instance) = vault_page_with_draft();
+            let values = |app: &App| {
+                let Some(NativeApp::SystemState(page)) = app.native_runtime.app(instance) else {
+                    panic!("the page is open");
+                };
+                (
+                    page.field_projection("system-state/url").unwrap().text,
+                    page.field_projection("system-state/password").unwrap().text,
+                )
+            };
+            let before = values(&app);
+            let url = publish_vault_action(
+                &mut app,
+                wid,
+                view,
+                "system-state/url",
+                Some("http://later.invalid:7484/v1/team"),
+            );
+            let password = publish_vault_action(
+                &mut app,
+                wid,
+                view,
+                "system-state/password",
+                Some("different-inert-password"),
+            );
+            let idle = crate::SetupStatus {
+                plan: Some(aterm_types::macos_setup::Plan::default()),
+                ..crate::SetupStatus::default()
+            };
+            app.publish_system_state(crate::SetupStatus {
+                busy,
+                ..idle.clone()
+            });
+            app.on_native_accessibility_action(wid, url);
+            app.on_native_accessibility_action(wid, password);
+            let expected = if busy {
+                before
+            } else {
+                (
+                    "http://later.invalid:7484/v1/team".into(),
+                    "•".repeat("different-inert-password".len()),
+                )
+            };
+            assert_eq!(values(&app), expected, "only idle saved fields may change");
+
+            app.publish_system_state(idle);
+            for (key, text) in [
+                ("system-state/url", "http://current.invalid:7484/v1/team"),
+                ("system-state/password", "current-inert-password"),
+            ] {
+                let current = publish_vault_action(&mut app, wid, view, key, Some(text));
+                app.on_native_accessibility_action(wid, current);
+            }
+            assert_eq!(
+                values(&app),
+                (
+                    "http://current.invalid:7484/v1/team".into(),
+                    "•".repeat("current-inert-password".len()),
+                )
+            );
+        }
+    }
+
     #[test]
     fn queued_accessibility_choice_cannot_answer_a_replacement_setup_offer() {
         use crate::workstation_setup::Request;

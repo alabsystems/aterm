@@ -129,6 +129,8 @@ fn idle(said: &str, worked: Option<Duration>) -> TurnEndReading {
         wall_remembered: false,
         answered: None,
         worked_doubt: Duration::ZERO,
+        // A hand-built turn of real work ran a tool.
+        ran_tools: worked.is_some_and(|w| w >= MIN_WORK),
         record_turn: None,
         credits: None,
         repo: crate::harness::repo_work::RepoRead::Clean,
@@ -139,6 +141,7 @@ fn walled(kind: WallKind, message: &str, worked: Option<Duration>) -> TurnEndRea
     TurnEndReading {
         wall: Some(kind),
         wall_message: message.to_string(),
+        ran_tools: false,
         ..idle("Suites are running.", worked)
     }
 }
@@ -1779,7 +1782,10 @@ fn a_successor_works_the_limit_from_the_attempts_its_last_try_left() {
         };
         let at = reset + 11 * MIN;
         assert_eq!(act(&mut st, &point, at), checked());
-        let met = again(worked.then_some(JOB));
+        let met = TurnEndReading {
+            ran_tools: worked,
+            ..again(worked.then_some(JOB))
+        };
         let standing = again(None);
         let mut k = 1;
         loop {
@@ -7834,7 +7840,10 @@ fn a_retry_that_led_to_real_work_ends_the_episode() {
     let mut st = TurnEndState::default();
     let mut now = t;
     for worked in [14, 49, 63, 10, 32, 20] {
-        let r = api_wall(ApiCause::CutOff, sleep, Some(worked * MIN), Reach::Unknown);
+        let r = TurnEndReading {
+            ran_tools: true,
+            ..api_wall(ApiCause::CutOff, sleep, Some(worked * MIN), Reach::Unknown)
+        };
         assert_eq!(
             act(&mut st, &r, now),
             retried(RULE_API_CUTOFF, ApiCause::CutOff, &r),
@@ -7844,6 +7853,52 @@ fn a_retry_that_led_to_real_work_ends_the_episode() {
     }
     let vendor_only = api_wall(ApiCause::CutOff, sleep, Some(3 * MIN), Reach::Unknown);
     assert!(waits_until(&at(&mut st, &vendor_only, now), now + MIN));
+}
+
+#[test]
+fn real_work_after_a_walls_taken_retry_ends_the_short_streak() {
+    let t = t0();
+    let server = walled(
+        WallKind::ApiError {
+            code: Some(500),
+            retryable: true,
+            cause: ApiCause::Server,
+        },
+        "API Error: 500 Internal server error",
+        Some(Duration::from_secs(20)),
+    );
+    for worked in [10 * MIN, Duration::from_secs(3)] {
+        let mut st = TurnEndState::default();
+        // Two short answers to continuations, then the wall: the streak stands.
+        let mut now = t;
+        for said in ["Renamed the helper.", "Renamed it again."] {
+            let (a, at_) = past_backoff(&mut st, &idle(said, Some(Duration::from_secs(5))), now);
+            assert_eq!(a, typed(RULE_CONTINUE), "{said}");
+            st.acted(&a, &idle(said, None), at_);
+            now = at_ + Duration::from_secs(10);
+        }
+        let TurnEndAction::WaitUntil { until, .. } = at(&mut st, &server, now) else {
+            panic!("the retry's rung");
+        };
+        let streak = st.short_streak();
+        assert!(streak >= 2, "{streak}");
+        let a = act(&mut st, &again(&server), until);
+        assert!(matches!(a, TurnEndAction::Type { .. }), "{a:?}");
+        // The retry taken, its answer `worked` long.
+        now = until + worked;
+        let answer = idle("Fixed the parser and ran the suite.", Some(worked));
+        let a = at(&mut st, &answer, now);
+        let real = worked >= MIN_WORK;
+        assert_eq!(
+            (st.short_streak() == 0, a == typed(RULE_CONTINUE)),
+            (real, real),
+            "{worked:?}: real work types on at once, a short answer waits its back-off: {a:?}"
+        );
+        assert!(
+            real || st.short_streak() >= streak,
+            "{worked:?}: the streak stands"
+        );
+    }
 }
 
 #[test]
@@ -7877,7 +7932,7 @@ fn a_refused_request_backs_off_slowly_and_is_the_owners_after_three_tries() {
     assert!(!text.to_lowercase().contains("rewind"), "{text}");
     assert_eq!(exception_for(&st, &back, &cfg(), t + MIN), None);
     let mut now = t + MIN;
-    for (tries, wait) in [(1, 30), (2, 120), (3, 360), (4, 360)] {
+    for (tries, wait) in [(1, 30), (2, 120)] {
         now += 3 * MIN;
         let a = at(&mut st, &back, now);
         assert!(waits_until(&a, now + wait * MIN), "{wait} min: {a:?}");
@@ -7888,14 +7943,11 @@ fn a_refused_request_backs_off_slowly_and_is_the_owners_after_three_tries() {
                 ..
             }
         ));
-        let told = exception_for(&st, &back, &cfg(), now);
-        if tries < 3 {
-            assert_eq!(told, None, "{tries} tries");
-        } else {
-            let e = told.unwrap_or_else(|| panic!("{tries} tries: told"));
-            assert_eq!((e.kind, e.when), (ExceptionKind::Refused, Urgency::Later));
-            assert!(e.action.contains("/rewind"), "{e:?}");
-        }
+        assert_eq!(
+            exception_for(&st, &back, &cfg(), now),
+            None,
+            "{tries} tries"
+        );
         now += wait * MIN;
         assert_eq!(
             act(&mut st, &same, now),
@@ -7903,6 +7955,12 @@ fn a_refused_request_backs_off_slowly_and_is_the_owners_after_three_tries() {
             "{wait} min"
         );
     }
+    // The third try answered the same: the ladder types nothing more, and the owner is told.
+    now += 3 * MIN;
+    assert_eq!(at(&mut st, &back, now), TurnEndAction::Nothing);
+    let e = exception_for(&st, &back, &cfg(), now).expect("told");
+    assert_eq!((e.kind, e.when), (ExceptionKind::Refused, Urgency::Later));
+    assert!(e.action.contains("/rewind"), "{e:?}");
     assert_eq!(
         outlook(kind, false, false, &cfg(), true),
         Outlook::ResumesAndAsks(ExceptionKind::Refused)
@@ -7925,6 +7983,7 @@ fn a_refused_request_backs_off_slowly_and_is_the_owners_after_three_tries() {
     }
     let worked = TurnEndReading {
         worked: Some(10 * MIN),
+        ran_tools: true,
         ..r.clone()
     };
     let later = t + 20 * 60 * MIN;
@@ -7949,7 +8008,7 @@ fn a_refused_request_backs_off_slowly_and_is_the_owners_after_three_tries() {
     let mut st = TurnEndState::default();
     let mut now = t;
     let mut waits = Vec::new();
-    for i in 0..6 {
+    for i in 0..=FUTILE_AFTER_TRIES {
         let shown = if i == 0 { &server } else { &server_back };
         match at(&mut st, shown, now) {
             TurnEndAction::WaitUntil { until, .. } => {
@@ -7957,11 +8016,16 @@ fn a_refused_request_backs_off_slowly_and_is_the_owners_after_three_tries() {
                 act(&mut st, &again(&server), until);
                 now = until + 3 * MIN;
             }
+            // The same answer to each of the ladder's tries holds it after them.
+            TurnEndAction::Nothing if i == FUTILE_AFTER_TRIES => {}
             other => panic!("{other:?}"),
         }
     }
-    assert_eq!(waits, [1, 5, 15, 30, 60, 60]);
-    assert_eq!(exception_for(&st, &server, &cfg(), now), None);
+    assert_eq!(waits, [1, 5, 15]);
+    assert_eq!(
+        exception_for(&st, &server_back, &cfg(), now),
+        Some(super::super::exception::Exception::repeats())
+    );
     let off = SupervisorConfig {
         retry_api_errors: false,
         ..cfg()
@@ -7978,7 +8042,11 @@ fn a_refused_request_backs_off_slowly_and_is_the_owners_after_three_tries() {
 fn an_overlong_reply_climbs_its_ladder_across_work() {
     const OVERLONG: &str = "API Error: Claude's response exceeded the 32000 output token maximum. To configure this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable.";
     let t = t0();
-    let r = api_wall(ApiCause::Overlong, OVERLONG, Some(8 * MIN), Reach::Unknown);
+    // The 8 min ran tools (a file it wrote too long, say): work, which leaves the ladder climbing.
+    let r = TurnEndReading {
+        ran_tools: true,
+        ..api_wall(ApiCause::Overlong, OVERLONG, Some(8 * MIN), Reach::Unknown)
+    };
     let mut st = TurnEndState::default();
     let a = act(&mut st, &r, t);
     assert_eq!(a, retried(RULE_API_CUTOFF, ApiCause::Overlong, &r));
@@ -8006,6 +8074,30 @@ fn an_overlong_reply_climbs_its_ladder_across_work() {
         acts.iter().filter(|&&m| m < 180).count() <= 6,
         "no more than six acts in three hours: {acts:?}"
     );
+    // Control: 8 min only writing, no tool run, is the same reply again: its tries, then nothing.
+    let written = TurnEndReading {
+        ran_tools: false,
+        ..r.clone()
+    };
+    let mut st = TurnEndState::default();
+    let (mut now, mut seen, mut tries) = (t, written.clone(), 0);
+    loop {
+        match at(&mut st, &seen, now) {
+            TurnEndAction::WaitUntil { until, .. } => {
+                now = until;
+                seen = again(&written);
+            }
+            TurnEndAction::Nothing => break,
+            a => {
+                st.acted(&a, &seen, now);
+                tries += 1;
+                now += 8 * MIN;
+                seen = written.clone();
+            }
+        }
+        assert!(tries <= FUTILE_AFTER_TRIES, "{tries} tries");
+    }
+    assert_eq!(tries, FUTILE_AFTER_TRIES, "held after its tries");
 }
 
 #[test]
@@ -8047,16 +8139,17 @@ fn a_context_wall_compact_cannot_lower_climbs_its_ladder_and_is_the_owners() {
                 now = until;
                 r = again(&r);
             }
+            // The wall answered each of its tries the same: held after them.
+            TurnEndAction::Nothing => {
+                now += 30 * MIN;
+                r = again(&r);
+            }
             other => panic!("{other:?}"),
         }
     }
-    let gaps: Vec<u64> = compacts.windows(2).map(|w| w[1] - w[0]).collect();
-    assert_eq!(&gaps[..2], &[5, 30], "{compacts:?}");
-    assert!(
-        gaps[2..].iter().all(|&g| g == 60),
-        "hourly after: {compacts:?}"
-    );
-    assert!(acts <= 2 * 6, "{acts} acts in four hours: {compacts:?}");
+    // Each compact and its owed continuation a try of the wall's: two rounds spend its three.
+    assert_eq!(compacts, [0, 5]);
+    assert_eq!(acts, 4, "{compacts:?}");
     assert!(st.compaction_exhausted());
     let raised: Vec<_> = told.iter().flatten().collect();
     assert!(!raised.is_empty(), "told once tried three times");
@@ -8590,6 +8683,67 @@ fn a_wall_no_reset_ends_is_retried_on_the_entitlement_ladder() {
         decide_turn_end(&st, &window, &off, t + 90 * MIN + GRACE),
         TurnEndAction::Nothing
     );
+}
+
+/// Each resumption at a limit answered by a busy spell of min_work: no tool run is the program's own retries, held once the wall's tries are spent, for every reader whose walls are read; a tool run is work.
+#[test]
+fn a_long_answer_at_a_read_wall_is_no_work_whether_or_not_its_reader_reads_tool_rows() {
+    use aterm_phase::Program;
+    // The resumptions typed before the hold, or none held in four.
+    let typed_before_held = |program: Program, ran_tools: bool| -> Option<usize> {
+        let mut st = TurnEndState::default();
+        let mut r = TurnEndReading {
+            program,
+            ..walled(WallKind::UsageSession, "Usage limit reached", Some(3 * MIN))
+        };
+        r.reset_at = None;
+        let mut now = t0();
+        for k in 0..4 {
+            let a = at(&mut st, &r, now);
+            let TurnEndAction::WaitUntil { until, .. } = a else {
+                assert!(
+                    a == TurnEndAction::Nothing && st.repeats(&r),
+                    "{program:?}: {a:?}"
+                );
+                return Some(k);
+            };
+            now = until;
+            let a = at(&mut st, &r, now);
+            assert_eq!(a, typed(RULE_LIMIT_RESUME), "{program:?}");
+            st.acted(&a, &r, now);
+            st.took();
+            now += MIN_WORK;
+            st.observe(
+                &TurnEndReading {
+                    worked: Some(MIN_WORK),
+                    ran_tools,
+                    ..r.clone()
+                },
+                now,
+            );
+            // The next point reads the same wall, no turn since.
+            r.worked = None;
+        }
+        None
+    };
+    for (program, rows_read) in [
+        (Program::Claude, true),
+        (Program::Muse, true),
+        (Program::Kimi, false),
+        (Program::Grok, false),
+    ] {
+        assert_eq!(program.reader().reads_tool_rows(), rows_read, "{program:?}");
+        assert_eq!(
+            typed_before_held(program, false),
+            Some(FUTILE_AFTER_TRIES),
+            "{program:?}, tool rows read: {rows_read}"
+        );
+        assert_eq!(
+            typed_before_held(program, true),
+            None,
+            "the control, {program:?}: a tool run is work"
+        );
+    }
 }
 
 #[test]
@@ -9201,25 +9355,29 @@ fn a_workers_check_and_answer_go_without_the_back_off() {
 
 #[test]
 fn a_worker_that_keeps_asking_waits_the_back_off_past_its_bound() {
-    const ASKS: &str = "Does the parser have to keep the old syntax?";
+    // Each question its own words (a number is no word: [`TurnEndState::repeats`] holds the same one again).
+    let asks = |k: u32| {
+        let case = char::from(b'a' + u8::try_from(k).unwrap_or(0));
+        format!("Does the parser have to keep the old syntax, case {case}?")
+    };
     const QUICK: Duration = Duration::from_secs(30);
     let answered = |a: &TurnEndAction| matches!(a, TurnEndAction::Type { rule_id, .. } if is_answer_rule(rule_id));
     let t = t0();
     let mut st = TurnEndState::default();
     st.set_managed(true);
-    let a = act(&mut st, &idle(ASKS, None), t);
+    let a = act(&mut st, &idle(&asks(1), None), t);
     assert!(answered(&a), "{a:?}");
     let mut now = t;
     for k in 2..=MANAGED_SHORT_TURNS {
         st.took();
         now += QUICK;
-        let a = act(&mut st, &idle(ASKS, Some(QUICK)), now);
+        let a = act(&mut st, &idle(&asks(k), Some(QUICK)), now);
         assert_eq!(st.short_streak(), k);
         assert!(answered(&a), "{k}: {a:?}");
     }
     st.took();
     now += QUICK;
-    let r = idle(ASKS, Some(QUICK));
+    let r = idle(&asks(MANAGED_SHORT_TURNS + 1), Some(QUICK));
     let a = at(&mut st, &r, now);
     assert_eq!(st.short_streak(), MANAGED_SHORT_TURNS + 1);
     let TurnEndAction::WaitUntil { until, why, .. } = &a else {
@@ -9231,9 +9389,313 @@ fn a_worker_that_keeps_asking_waits_the_back_off_past_its_bound() {
     assert!(answered(&a), "past the wait: {a:?}");
     st.acted(&a, &r, *until);
     st.took();
-    let a = at(&mut st, &idle(ASKS, Some(10 * MIN)), *until + 10 * MIN);
+    let a = at(
+        &mut st,
+        &idle(&asks(MANAGED_SHORT_TURNS + 2), Some(10 * MIN)),
+        *until + 10 * MIN,
+    );
     assert_eq!(st.short_streak(), 0);
     assert!(answered(&a), "{a:?}");
+}
+
+#[test]
+fn a_worker_that_asks_the_same_again_is_answered_once_more_then_held_until_it_changes() {
+    use super::super::exception::{Exception, exception_for};
+    const ASKS: &str = "Does the parser have to keep the old syntax?";
+    const QUICK: Duration = Duration::from_secs(30);
+    let answered = |a: &TurnEndAction| matches!(a, TurnEndAction::Type { rule_id, .. } if is_answer_rule(rule_id));
+    let t = t0();
+    let mut st = TurnEndState::default();
+    st.set_managed(true);
+    assert!(answered(&act(&mut st, &idle(ASKS, None), t)));
+    st.took();
+    let a = act(&mut st, &idle(ASKS, Some(QUICK)), t + QUICK);
+    assert!(
+        answered(&a),
+        "the first same answer is answered once more: {a:?}"
+    );
+    st.took();
+    let r = idle(ASKS, Some(QUICK));
+    let a = act(&mut st, &r, t + 2 * QUICK);
+    assert_eq!(a, TurnEndAction::Nothing, "the second is held");
+    assert_eq!(
+        exception_for(&st, &r, &cfg(), t + 2 * QUICK),
+        Some(Exception::repeats()),
+        "the tab says so, and nothing escalates"
+    );
+    assert_eq!(
+        decide_turn_end(&st, &r, &cfg(), t + 30 * MIN),
+        TurnEndAction::Nothing
+    );
+    let other = idle("Should the parser warn on the old syntax?", None);
+    assert!(
+        answered(&act(&mut st, &other, t + 31 * MIN)),
+        "a different reply ends the hold"
+    );
+}
+
+#[test]
+fn a_restart_made_is_a_change_the_same_reply_is_answered_once_more() {
+    const SAME: &str = "Stage 3 of 5 is still open.";
+    const QUICK: Duration = Duration::from_secs(30);
+    let t = t0();
+    let typed = |a: &TurnEndAction| matches!(a, TurnEndAction::Type { .. });
+    let held = |restart: bool| {
+        let mut st = TurnEndState::default();
+        st.set_managed(true);
+        let mut now = t;
+        assert!(typed(&act(&mut st, &idle(SAME, Some(10 * MIN)), now)));
+        for _ in 0..2 {
+            st.took();
+            now += QUICK;
+            let r = idle(SAME, Some(QUICK));
+            let mut a = at(&mut st, &r, now);
+            if let TurnEndAction::WaitUntil { until, .. } = a {
+                now = until;
+                a = decide_turn_end(&st, &r, &cfg(), now);
+            }
+            st.acted(&a, &r, now);
+        }
+        let r = idle(SAME, None);
+        if restart {
+            st.restarted(&Restart::Memory, true, &r, now);
+        }
+        decide_turn_end(&st, &r, &cfg(), now + 60 * MIN)
+    };
+    assert_eq!(held(false), TurnEndAction::Nothing, "the same reply twice");
+    let after = held(true);
+    assert!(
+        typed(&after),
+        "a restart made lets one more act go: {after:?}"
+    );
+}
+
+#[test]
+fn a_program_whose_reader_reads_no_words_is_held_at_its_second_same_answer() {
+    const QUICK: Duration = Duration::from_secs(30);
+    let typed = |a: &TurnEndAction| matches!(a, TurnEndAction::Type { .. });
+    let wordless = |worked| TurnEndReading {
+        program: Program::Generic,
+        said_tail: None,
+        ..idle("", Some(worked))
+    };
+    let mut st = TurnEndState::default();
+    st.set_managed(true);
+    let mut now = t0();
+    assert!(
+        typed(&act(&mut st, &wordless(10 * MIN), now)),
+        "the act after the work"
+    );
+    let answer = |st: &mut TurnEndState, now: &mut Instant, worked| {
+        st.took();
+        *now += QUICK;
+        let r = wordless(worked);
+        let mut a = at(st, &r, *now);
+        if let TurnEndAction::WaitUntil { until, .. } = a {
+            *now = until;
+            a = decide_turn_end(st, &r, &cfg(), *now);
+        }
+        st.acted(&a, &r, *now);
+        a
+    };
+    let a = answer(&mut st, &mut now, QUICK);
+    assert!(
+        typed(&a),
+        "the first no-work answer is answered once more: {a:?}"
+    );
+    let a = answer(&mut st, &mut now, QUICK);
+    assert_eq!(a, TurnEndAction::Nothing, "the second is held");
+    let a = answer(&mut st, &mut now, 10 * MIN);
+    assert!(typed(&a), "the control: real work ends the hold: {a:?}");
+}
+
+#[test]
+fn claude_codes_measured_group_rows_are_a_tool_run() {
+    // MEASURED 2026-10-09 on Claude Code 2.1.295: a turn whose one tool was a search, drawn as
+    // the collapsed `Searched for` row (the anchor's only other screen is hand-built and wrapped).
+    const MEASURED: &str = include_str!("fixtures/claude-2.1.295-box-bash-sed-edit-ask-rule.txt");
+    const GROUP: &str = "  Searched for 1 pattern (ctrl+o to expand)";
+    let rows = screen(MEASURED);
+    let end = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.starts_with("✻ Churned for"))
+        .nth(1)
+        .map(|(i, _)| i)
+        .expect("the second turn's end");
+    let mut turn = rows[..=end].to_vec();
+    assert_eq!(
+        turn[end - 4],
+        GROUP,
+        "the second turn's group row, as measured"
+    );
+    turn.push(String::new());
+    turn.extend(aterm_phase::prompt::fixtures::composer("  ? for shortcuts"));
+    assert!(read_screen(&turn, Some(MIN)).ran_tools, "its group row");
+    turn[end - 4] = "  Searched for the pattern in the notes first.".to_owned();
+    assert!(
+        !read_screen(&turn, Some(MIN)).ran_tools,
+        "the control: the same verb in words"
+    );
+    // A turn of one measured row: 2.1.283's hint-less groups, 2.1.308's `Listing`.
+    for (text, row) in [
+        (
+            include_str!("fixtures/cap-taken-box-2-redrawn.txt"),
+            "  Listed 1 directory",
+        ),
+        (
+            include_str!("fixtures/cap-taken-box-2-redrawn.txt"),
+            "  Running 2 shell commands…",
+        ),
+        (
+            include_str!("fixtures/claude-2.1.308-box-bash-note-n25-brace-expansion.txt"),
+            "  Listing 1 directory… (ctrl+o to expand)",
+        ),
+    ] {
+        assert!(screen(text).iter().any(|r| r == row), "{row:?} measured");
+        let mut turn = aterm_phase::prompt::fixtures::rows(&["❯ go on", "", row, ""]);
+        turn.extend(aterm_phase::prompt::fixtures::composer("  ? for shortcuts"));
+        assert!(read_screen(&turn, Some(MIN)).ran_tools, "{row:?}");
+        turn[2] = "  Running the command exactly as given:".to_owned();
+        assert!(
+            !read_screen(&turn, Some(MIN)).ran_tools,
+            "the control: the measured words above it"
+        );
+    }
+}
+
+#[test]
+fn a_short_turn_counts_its_earlier_words_and_a_tool_or_new_words_after_min_work_is_real_work() {
+    const FAILS: &str = "The build still fails: `parse_expr` is missing a lifetime.";
+    const RAN: Duration = Duration::from_secs(90);
+    let typed = |a: &TurnEndAction| matches!(a, TurnEndAction::Type { .. });
+    // The acts typed, each once the back-off is waited out, answering up to four answers in a row
+    // before one is held (and stays held an hour on).
+    let run_as = |program: aterm_phase::Program,
+                  said_before: &dyn Fn(u32) -> Option<String>,
+                  worked: Duration,
+                  tools: bool|
+     -> u32 {
+        let mut st = TurnEndState::default();
+        let mut now = t0();
+        let first = act(&mut st, &idle(FAILS, Some(10 * MIN)), now);
+        assert!(typed(&first), "{first:?}");
+        for k in 1..=4 {
+            st.took();
+            now += worked;
+            let r = TurnEndReading {
+                turn_said: said_before(k),
+                ran_tools: tools,
+                program,
+                ..idle(FAILS, Some(worked))
+            };
+            let mut a = at(&mut st, &r, now);
+            if let TurnEndAction::WaitUntil { until, .. } = a {
+                now = until;
+                a = decide_turn_end(&st, &r, &cfg(), now);
+            }
+            if !typed(&a) {
+                assert_eq!(a, TurnEndAction::Nothing);
+                assert_eq!(
+                    decide_turn_end(&st, &r, &cfg(), now + 60 * MIN),
+                    TurnEndAction::Nothing
+                );
+                return k - 1;
+            }
+            st.acted(&a, &r, now);
+        }
+        4
+    };
+    let run = |said_before: &dyn Fn(u32) -> Option<String>, worked: Duration, tools: bool| {
+        run_as(aterm_phase::Program::Claude, said_before, worked, tools)
+    };
+    let fix = |k: u32| {
+        [
+            "a named lifetime",
+            "an elided one",
+            "a 'static bound",
+            "a clone",
+        ][k as usize - 1]
+    };
+    assert_eq!(
+        run(&|k| Some(format!("Trying {}.", fix(k))), RAN, false),
+        4,
+        "earlier words that change are another reply"
+    );
+    assert_eq!(
+        run(&|k| Some(format!("Trying fix {k} of 4.")), RAN, false),
+        1,
+        "the control: a number is no word, so a count alone changes nothing"
+    );
+    assert_eq!(
+        run(&|_| Some("Rebuilding.".to_string()), RAN, false),
+        1,
+        "the same words, before and last, under min_work and no tool are the same reply"
+    );
+    assert_eq!(
+        run(&|_| Some("Rebuilding.".to_string()), RAN, true),
+        4,
+        "a turn that ran a tool did real work, however short"
+    );
+    assert_eq!(
+        run(&|_| None, MIN_WORK, false),
+        1,
+        "min_work's busy spell that ran no tool where tool rows are read is no work said again"
+    );
+    assert_eq!(
+        run(&|k| Some(format!("Trying {}.", fix(k))), MIN_WORK, false),
+        4,
+        "the control: min_work's busy spell in new words is work"
+    );
+    assert_eq!(
+        run_as(aterm_phase::Program::Generic, &|_| None, MIN_WORK, false),
+        4,
+        "the control: where no tool row is read, min_work's busy spell is work"
+    );
+}
+
+#[test]
+fn an_act_whose_row_stands_unanswered_past_its_take_leaves_the_replies_though_the_screen_drew() {
+    const FAILS: &str = "The build still fails: `parse_expr` is missing a lifetime.";
+    const RAN: Duration = Duration::from_secs(90);
+    // The replies after a second act whose answer is read once `take_within` passes, its row unanswered or taken.
+    let run = |pending_input: bool| {
+        let mut st = TurnEndState::default();
+        let mut now = t0();
+        let first = act(&mut st, &idle(FAILS, Some(10 * MIN)), now);
+        assert!(matches!(first, TurnEndAction::Type { .. }), "{first:?}");
+        st.took();
+        now += RAN;
+        let short = idle(FAILS, Some(RAN));
+        let mut a = at(&mut st, &short, now);
+        if let TurnEndAction::WaitUntil { until, .. } = a {
+            now = until;
+            a = decide_turn_end(&st, &short, &cfg(), now);
+        }
+        assert!(matches!(a, TurnEndAction::Type { .. }), "{a:?}");
+        st.acted(&a, &short, now);
+        let kept = st.replies();
+        let unseen = TurnEndReading {
+            worked: None,
+            pending_input,
+            screen_mark: Some(1),
+            ..short
+        };
+        st.observe(&unseen, now);
+        st.observe(&unseen, now + st.timing.take_within);
+        (kept, st.replies())
+    };
+    let (kept, after) = run(true);
+    assert!(kept.last().is_some(), "the short answer's reply is kept");
+    assert_eq!(
+        after, kept,
+        "a redraw over the act's unanswered row is no answer to it"
+    );
+    let (kept, after) = run(false);
+    assert_ne!(
+        after, kept,
+        "the control: the same redraw with the act taken answers it"
+    );
 }
 
 #[test]
@@ -11698,6 +12160,7 @@ fn a_latch_ends_where_a_new_wall_of_the_same_class_begins() {
         let now = due + 30 * MIN;
         let mut next = advised(&session_wall(now), "work-2");
         next.worked = Some(30 * MIN);
+        next.ran_tools = true;
         let a = at(&mut st, &next, now);
         assert!(
             !st.account_refused(),
@@ -15627,6 +16090,67 @@ fn a_seeded_check_a_529_cut_is_typed_again_after_the_compaction() {
         now += MIN;
         assert_eq!(act(&mut st, &compacted, now), want, "{case}");
     }
+}
+
+#[test]
+fn a_reply_that_came_again_holds_a_commands_owed_continuation_and_a_resets_own() {
+    let t = t0();
+    let after = idle("Conversation compacted.", None);
+    let held = Replies::of(&[Kept {
+        mark: reply_mark(&after),
+        answers: 2,
+        walled: false,
+        tries: 0,
+    }]);
+    type Owe = fn(&mut TurnEndState, Instant);
+    let owing: [(&str, Owe); 2] = [
+        ("a command's owed continuation", |st, _| {
+            st.seed_compact_check(RULE_DONE_CHECK);
+        }),
+        ("a reset's own continuation", |st, t| {
+            st.reset_told(&ResetOutcome::Kept, t);
+        }),
+    ];
+    for (what, owe) in owing {
+        let decided = |replies| {
+            let mut st = TurnEndState::default();
+            owe(&mut st, t);
+            st.seed_replies(replies, MIN, t);
+            at(&mut st, &after, t + Duration::from_secs(1))
+        };
+        assert_eq!(
+            decided(held),
+            TurnEndAction::Nothing,
+            "{what}: the reply came again"
+        );
+        let typed = decided(Replies::default());
+        assert!(
+            matches!(typed, TurnEndAction::Type { .. }),
+            "the control: {what} is typed: {typed:?}"
+        );
+    }
+}
+
+#[test]
+fn the_run_of_no_work_answers_holds_only_while_the_screen_shows_its_newest_reply() {
+    let shown = idle("This week's allowance is gone.", None);
+    let moved = idle("Fixed the parser's lifetime; the suite passes now.", None);
+    let run = Replies {
+        run: NO_WORK_ACTS,
+        ..Replies::of(&[Kept {
+            mark: reply_mark(&shown),
+            answers: 1,
+            walled: false,
+            tries: 0,
+        }])
+    };
+    let mut st = TurnEndState::default();
+    st.seed_replies(run, MIN, t0());
+    assert!(st.repeats(&shown), "held at its newest reply");
+    assert!(!st.repeats(&moved), "a screen in other words is no run's");
+    // The program started again since the books: another process's replies.
+    st.launched_since_books();
+    assert!(!st.repeats(&shown), "{:?}", st.replies());
 }
 
 #[test]

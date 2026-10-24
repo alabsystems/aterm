@@ -1576,11 +1576,15 @@ impl PetWorld {
         });
         let last_band = (cov.rows - span_r) as i64;
         let last_col = (cov.cols - span_c) as i64;
-        let home_band = ((near.row - inset_r - cov.row as f32).round() as i64).clamp(0, last_band);
-        let home_x = near.col - inset_c - cov.col as f32;
+        let cov_row_f = cov.row as f32;
+        let cov_col_f = cov.col as f32;
+        let span_c_i64 = span_c as i64;
+        let span_c_u16 = span_c as u16;
+        let home_band = ((near.row - inset_r - cov_row_f).round() as i64).clamp(0, last_band);
+        let home_x = near.col - inset_c - cov_col_f;
         let home_col = (home_x.round() as i64).clamp(0, last_col);
-        let top = |band: i64| cov.row as f32 + band as f32 + inset_r;
-        let left = |col: i64| cov.col as f32 + col as f32 + inset_c;
+        let top = |band: i64| cov_row_f + band as f32 + inset_r;
+        let left = |col: i64| cov_col_f + col as f32 + inset_c;
         let prefix = self.ground_prefixes().0;
         let mut best = None;
         let mut best_distance = f32::INFINITY;
@@ -1590,7 +1594,8 @@ impl PetWorld {
                 if !(0..=last_band).contains(&band) || (step == 0 && band != home_band) {
                     continue;
                 }
-                let row_distance = (top(band) - near.row).abs() * 2.0;
+                let band_top = top(band);
+                let row_distance = (band_top - near.row).abs() * 2.0;
                 let reach = max_distance.min(best_distance);
                 if row_distance > max_distance || row_distance >= best_distance {
                     continue;
@@ -1599,7 +1604,7 @@ impl PetWorld {
                 let r0 = band as usize;
                 let r1 = r0 + span_r;
                 let (reach_lo, reach_hi) = match from {
-                    Some((from, feet)) if (top(band) + near.rows - feet).abs() < 0.5 => {
+                    Some((from, feet)) if (band_top + near.rows - feet).abs() < 0.5 => {
                         match self.reach_span(from, (r0, r1)) {
                             Some(span) => span,
                             None => continue,
@@ -1622,8 +1627,7 @@ impl PetWorld {
                 }
                 let (c_lo, c_hi) = (lo as usize, hi as usize + span_c);
                 let width = (c_hi - c_lo) as u16;
-                if (r0..r1)
-                    .any(|r| width - self.blocked(prefix, r, c_lo, r + 1, c_hi) < span_c as u16)
+                if (r0..r1).any(|r| width - self.blocked(prefix, r, c_lo, r + 1, c_hi) < span_c_u16)
                 {
                     continue;
                 }
@@ -1653,7 +1657,7 @@ impl PetWorld {
                 let mut c = home_col.max(lo);
                 while c <= hi {
                     if seat_blocked(c) {
-                        let mut x = c + span_c as i64 - 1;
+                        let mut x = c + span_c_i64 - 1;
                         while x > c && !column_blocked(x) {
                             x -= 1;
                         }
@@ -1670,23 +1674,24 @@ impl PetWorld {
                 let mut c = (home_col - 1).min(hi);
                 while c >= lo && near.col - left(c) < r_dx {
                     if seat_blocked(c) {
-                        let end = c + span_c as i64 - 1;
+                        let end = c + span_c_i64 - 1;
                         let mut x = c;
                         while x < end && !column_blocked(x) {
                             x += 1;
                         }
-                        c = x - span_c as i64;
+                        c = x - span_c_i64;
                     } else if let Some((start, _)) = hulls(c) {
-                        c = i64::from(start) - span_c as i64;
+                        c = i64::from(start) - span_c_i64;
                     } else {
                         leftward = Some(c);
                         break;
                     }
                 }
                 for col in [right, leftward].into_iter().flatten() {
-                    let distance = row_distance.hypot((left(col) - near.col).abs());
+                    let col_left = left(col);
+                    let distance = row_distance.hypot((col_left - near.col).abs());
                     if distance <= max_distance && distance < best_distance {
-                        best = Some(PetRect::new(top(band), left(col), near.rows, near.cols));
+                        best = Some(PetRect::new(band_top, col_left, near.rows, near.cols));
                         best_distance = distance;
                     }
                 }
@@ -1850,12 +1855,13 @@ impl PetWorld {
             } else {
                 None
             };
-            let row_first_col = ((target.1 - max_distance.min(best_distance) - cov_left - margin)
+            let mut max_min_best = max_distance.min(best_distance);
+            let row_first_col = ((target.1 - max_min_best - cov_left - margin)
                 .floor()
                 .max(0.0) as usize)
                 .max(first_col);
             let mut stop_after = |col: f32| {
-                if col > target.1 && col - target.1 > max_distance.min(best_distance) {
+                if col > target.1 && col - target.1 > max_min_best {
                     return true;
                 }
                 let col_dist = (col - target.1).abs();
@@ -1877,6 +1883,7 @@ impl PetWorld {
                                 best = Some(rect);
                                 best_distance = distance;
                                 best_tie = tie;
+                                max_min_best = max_distance.min(best_distance);
                                 return col_dist == 0.0;
                             }
                         }

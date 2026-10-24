@@ -5,7 +5,7 @@
 
 use std::os::unix::fs::MetadataExt as _;
 
-use crate::support::{Lib, Scratch, install_sh, q, read, s, system_path};
+use crate::support::{Lib, Scratch, group_run, install_sh, q, read, s, system_path};
 
 #[test]
 fn a_root_run_acts_on_a_home_only_as_its_account() {
@@ -3187,9 +3187,8 @@ fn an_interrupted_root_run_leaves_no_staging_folder_behind() {
          ( install_app_cleanup ); ls -A \"$DEST\"; echo +; ls -A \"$DEST/aterm.app\"",
         &[],
     );
-    // The set-aside bundle is back before the cleanup's first child, a DMG's
-    // detach: under bash 5 a second Ctrl-C ends the trap at the next child it
-    // waits on.
+    // The set-aside bundle is back before the DMG's detach, the one step of the
+    // cleanup a Ctrl-C can still cut.
     let back_first = lib.call(
         "mkdir -p \"$TMPDIR/dmg/aterm.app\" && staged dmg >/dev/null && OLD=\"$DEST/.aterm.app.old.x\" && \
          mv \"$DEST/aterm.app\" \"$OLD\" && ( CONTAINER_KIND=dmg; \
@@ -3226,6 +3225,99 @@ fn an_interrupted_root_run_leaves_no_staging_folder_behind() {
             "{label}: the EXIT trap leaves no staging folder, and puts back what the swap set aside"
         );
     }
+}
+
+/// A Ctrl-C while install_app's EXIT trap cleans up never cuts it short: the
+/// first one after a refusal, a second one in a run a Ctrl-C ended (which still
+/// dies of it), and one that cuts a wedged DMG detach, which goes on to the
+/// -force fallback and to the download's removal, which a Ctrl-C does not cut
+/// either. Before, the run ended at the step the Ctrl-C killed and left
+/// the staging copy, the set-aside old copy and the download behind. A
+/// set-aside copy the cleanup could not put back stays, and it says where, and
+/// so does an image no detach could release, which rm never walks into.
+#[test]
+fn a_ctrl_c_never_cuts_the_cleanup_short() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    lib.env("INSTALL_SH", s(&install_sh()));
+    lib.step(
+        "mkdir -p \"$TMPDIR/bin\" && cat >\"$TMPDIR/bin/rm\" <<'EOF'
+#!/bin/sh
+for last; do :; done
+[ \"$last\" != \"$CUT\" ] || { echo cut >>\"$TMPDIR/cut-$ROW\"; kill -s INT 0; }
+exec /bin/rm \"$@\"
+EOF
+cat >\"$TMPDIR/bin/hdiutil\" <<'EOF'
+#!/bin/sh
+echo \"$3\" >>\"$TMPDIR/hdiutil-$ROW\"
+[ \"$ROW\" != mounted ] || exit 1
+[ \"$3\" = -force ] && exit 0
+kill -s INT 0
+exec /bin/sleep 30
+EOF
+chmod +x \"$TMPDIR/bin/rm\" \"$TMPDIR/bin/hdiutil\" && cat >\"$TMPDIR/cleanup.bash\" <<'EOF'
+ATERM_INSTALL_LIBRARY_ONLY=1
+. \"$INSTALL_SH\"
+# A bracket in TMP, as a TMPDIR can have, which a glob would not match.
+DEST=\"$TMPDIR/$1\" TMP=\"$TMPDIR/$1.[t]mp\" CONTAINER_KIND=zip STAGE_DIR=\"\"
+MNT=\"$TMP/mnt\" STAGE=\"$DEST/aterm.app.installing.x\" OLD=\"$DEST/.aterm.app.old.x\"
+mkdir -p \"$DEST/aterm.app\" \"$STAGE\" \"$OLD\" \"$MNT\"
+# rm sends the Ctrl-C as it starts on CUT.
+export ROW=$1 CUT=\"$STAGE\"
+PATH=\"$TMPDIR/bin:$PATH\"
+trap install_app_cleanup EXIT
+case \"$1\" in
+refusal) exit 1 ;;
+second) kill -s INT 0 ;;
+detach) CUT=\"$TMP\" CONTAINER_KIND=dmg; sleep() { :; }; exit 1 ;;
+restore) CUT=\"\"; command rmdir \"$DEST/aterm.app\"; mv() { return 1; }; exit 1 ;;
+mounted) CUT=\"\" CONTAINER_KIND=dmg; sleep() { :; }; mkdir \"$MNT/aterm.app\"; : >\"$TMP/aterm.dmg\"; exit 1 ;;
+esac
+EOF",
+    );
+    let tags = ["refusal", "second", "detach", "restore", "mounted"];
+    let calls: Vec<usize> = tags
+        .iter()
+        .map(|tag| {
+            lib.call(
+                format!(
+                    "echo \"$({})\" $(ls -A \"$TMPDIR/{tag}\") $([ ! -e \"$TMPDIR/{tag}.[t]mp\" ] || echo tmp) \
+                     $(ls -A \"$TMPDIR/{tag}.[t]mp\" 2>/dev/null) $(cat \"$TMPDIR/hdiutil-{tag}\" \"$TMPDIR/cut-{tag}\" 2>/dev/null)",
+                    group_run(&format!("\"$TMPDIR/cleanup.bash\" {tag}"))
+                ),
+                &[],
+            )
+        })
+        .collect();
+    let recs = lib.run(&scratch);
+    // `cut`: the rm stand-in sent its Ctrl-C.
+    for (tag, call, want) in [
+        ("refusal", calls[0], "exit 1 aterm.app cut"),
+        ("second", calls[1], "signal 2 aterm.app cut"),
+        ("detach", calls[2], "exit 1 aterm.app -quiet -force cut"),
+        ("restore", calls[3], "exit 1 .aterm.app.old.x"),
+        (
+            "mounted",
+            calls[4],
+            "exit 1 aterm.app tmp mnt -quiet -force",
+        ),
+    ] {
+        assert_eq!(recs[call].out, want, "{tag}: {}", recs[call].err);
+    }
+    assert!(
+        recs[calls[3]]
+            .err
+            .contains("could not put the previous aterm.app back"),
+        "{}",
+        recs[calls[3]].err
+    );
+    assert!(
+        recs[calls[4]]
+            .err
+            .contains("the disk image is still mounted at"),
+        "{}",
+        recs[calls[4]].err
+    );
 }
 
 fn gid(path: &std::path::Path) -> u32 {

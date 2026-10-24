@@ -4714,4 +4714,41 @@ fn nested_trackers_anchor_ranking_and_mime_otp_isolation() {
         Some("582019"),
         "MIME boundary resets context_lines_left so part 2's Content-ID and top address are not promoted over the real OTP"
     );
+
+    // 7. RFC 2046 §5.1.1: a body line starting with `--<boundary>` plus non-padding characters
+    // (such as CSS custom properties `--b-accent: #d97757;` when `boundary="b"`) must NOT end
+    // a quoted-printable MIME part before the magic link or OTP, while real `--b   ` / `--b--`
+    // lines with optional transport padding still delimit the part.
+    let css_custom_prop_multipart = concat!(
+        "To: sol-m27@proton.me\r\n",
+        "Subject: Sign in to Claude\r\n",
+        "Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n",
+        "--b   \r\n",
+        "Content-Type: text/html; charset=utf-8\r\n",
+        "Content-Transfer-Encoding: quoted-printable\r\n\r\n",
+        "<style>\r\n",
+        ":root {\r\n",
+        "--b-accent: #d97757;\r\n",
+        "--brand-bg: #ffffff;\r\n",
+        "}\r\n",
+        "</style>\r\n",
+        "<p><a href=3D\"https://claude.ai/magic-link?token=3Dafter-css-var&=\r\n",
+        "state=3D55\">Sign in</a></p>\r\n",
+        "<p>Your verification code is 641=3829</p>\r\n",
+        "--b--  \r\n",
+        "Trailing epilogue with https://claude.ai/magic-link?token=3Dnot-qp\r\n"
+    );
+    assert_eq!(
+        extract_magic_link_from_email(css_custom_prop_multipart, Some("sol-m27@proton.me"))
+            .as_deref(),
+        Some("https://claude.ai/magic-link?token=after-css-var&state=55"),
+        "CSS `--b-accent` line does not truncate quoted-printable decoding when boundary=\"b\""
+    );
+    assert_eq!(
+        extract_otps_from_email(css_custom_prop_multipart, Some("sol-m27@proton.me"))
+            .first()
+            .map(String::as_str),
+        Some("641829"),
+        "OTP after `--b-accent` in quoted-printable part is still decoded"
+    );
 }

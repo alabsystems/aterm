@@ -8946,6 +8946,7 @@ fn a_span_is_read_once_and_the_continuations_back_off_ten_then_thirty() {
     ]);
     m.turn_gates = vec![1, 3, 5, 7];
     m.dead_after_turns = Some(3);
+    m.end_when_parked = true;
     let opts = SuperviseOpts {
         journal: Some(path.clone()),
         ..auto(30)

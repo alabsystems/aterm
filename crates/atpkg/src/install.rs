@@ -69,6 +69,10 @@ pub(crate) type PreSwapHook<'a> = &'a dyn Fn(&Path) -> Result<(), StageError>;
 pub(crate) type SidecarHook<'a> =
     &'a dyn Fn(&str) -> Result<Vec<(&'static str, Vec<u8>)>, StageError>;
 
+/// A stage's npm manifest hook: holds the `package/package.json` an npm binary package
+/// carries ([`crate::vendor::NPM_BROTLI_BINARY`]) to the version document that vouched for it.
+pub(crate) type NpmPackageHook<'a> = &'a dyn Fn(&[u8]) -> Result<(), StageError>;
+
 /// Caller steps inside [`verify_and_stage`].
 #[derive(Clone, Copy, Default)]
 pub struct StageHooks<'a> {
@@ -80,6 +84,8 @@ pub struct StageHooks<'a> {
     /// `(name, target)` tool names laid in the verified `.incoming` tree before
     /// [`Self::pre_swap`] sees it.
     pub aliases: &'a [(&'a str, &'a str)],
+    /// Asked with an npm binary package's `package.json`; that lane refuses to stage without it.
+    pub npm_package: Option<NpmPackageHook<'a>>,
 }
 
 impl StageHooks<'_> {
@@ -88,6 +94,7 @@ impl StageHooks<'_> {
         pre_swap: None,
         sidecars: None,
         aliases: &[],
+        npm_package: None,
     };
 }
 
@@ -148,13 +155,14 @@ pub fn verify_and_stage(
     crate::store::make_build_parent(build_dir)
         .and_then(|()| crate::platform::make_dir_born(&incoming, STAGING_SCRATCH_MODE))
         .map_err(|e| io_step("create the staging scratch", e))?;
-    let (extracted_root, mut modes) = match stage_payload_modes(artifact, archive, &incoming) {
-        Ok(staged) => staged,
-        Err(e) => {
-            let _ = crate::store::remove_tree(&incoming);
-            return Err(e);
-        }
-    };
+    let (extracted_root, mut modes) =
+        match stage_payload_modes(artifact, archive, &incoming, hooks.npm_package) {
+            Ok(staged) => staged,
+            Err(e) => {
+                let _ = crate::store::remove_tree(&incoming);
+                return Err(e);
+            }
+        };
 
     let root = if artifact.tree_root.is_empty() {
         extracted_root
@@ -219,7 +227,7 @@ pub fn verify_and_stage(
         let _ = crate::store::remove_tree(&incoming);
         return Err(io_step("give the staged tree the build's mode", e));
     }
-    if crate::vendor::is_binary_payload(&artifact.payload)
+    if crate::vendor::stages_one_binary(&artifact.payload)
         && let Err(e) = crate::store::seal_bin(&incoming)
     {
         let _ = crate::store::remove_tree(&incoming);
@@ -502,7 +510,7 @@ pub fn stage_payload(
     archive: &Path,
     dest: &Path,
 ) -> Result<String, StageError> {
-    stage_payload_modes(artifact, archive, dest).map(|(root, _)| root)
+    stage_payload_modes(artifact, archive, dest, None).map(|(root, _)| root)
 }
 
 /// [`stage_payload`], also handing back the permission bits it declared per regular file
@@ -511,6 +519,7 @@ pub(crate) fn stage_payload_modes(
     artifact: &Artifact,
     archive: &Path,
     dest: &Path,
+    npm_package: Option<NpmPackageHook<'_>>,
 ) -> Result<(String, DeclaredModes), StageError> {
     let cap = size_cap(artifact);
     let vendor = ExtractOptions {
@@ -547,7 +556,9 @@ pub(crate) fn stage_payload_modes(
             extract_zip_tree(archive, dest, cap, MAX_ENTRIES, vendor)
                 .map_err(StageError::Extract)?,
         ),
-        "raw-binary" | "tar-gz-binary" => Some(stage_binary(artifact, archive, dest, cap)?),
+        "raw-binary" | "tar-gz-binary" | crate::vendor::NPM_BROTLI_BINARY => {
+            Some(stage_binary(artifact, archive, dest, cap, npm_package)?)
+        }
         "dmg" => {
             stage_dmg(archive, dest)?;
             None
@@ -573,11 +584,16 @@ fn payload2(head: &str, detail: &str) -> StageError {
     StageError::Payload(format!("{head}{detail}"))
 }
 
+/// Stage a single-binary payload as `bin/<entry>`. An npm binary package
+/// ([`crate::vendor::NPM_BROTLI_BINARY`]) is decoded to exactly `cost.disk_installed` bytes —
+/// the binary's size, which the vendor-direct lane sets from the vendor's own copy — and its
+/// `package.json` is handed to `npm_package`, without which it is not staged.
 fn stage_binary(
     artifact: &Artifact,
     archive: &Path,
     dest: &Path,
     cap: u64,
+    npm_package: Option<NpmPackageHook<'_>>,
 ) -> Result<TreeAccumulator, StageError> {
     let Some(tool) = crate::store::ToolName::new(&artifact.entry) else {
         return Err(payload2(
@@ -593,13 +609,33 @@ fn stage_binary(
     crate::extract::make_dir_exact(dest, &bin, Path::new("bin"), &mut tree)
         .map_err(StageError::Extract)?;
     let target = bin.join(tool.exe_file());
-    let written = if artifact.payload == "tar-gz-binary" {
-        crate::extract::stage_tar_gz_member(archive, &target, 0o755, cap)
-    } else {
-        let file = std::fs::File::open(archive).map_err(StageError::Io)?;
-        crate::extract::stage_file(file, &target, 0o755, cap)
-    }
-    .map_err(StageError::Extract)?;
+    let written = match artifact.payload.as_str() {
+        "tar-gz-binary" => crate::extract::stage_tar_gz_member(archive, &target, 0o755, cap)
+            .map_err(StageError::Extract)?,
+        crate::vendor::NPM_BROTLI_BINARY => {
+            let Some(check) = npm_package else {
+                return Err(StageError::Payload(String::from(
+                    "an npm binary package is staged only against the version document that \
+                     vouched for it",
+                )));
+            };
+            let br = format!("{}.br", tool.exe_file());
+            let npm = crate::extract::stage_npm_brotli_binary(
+                archive,
+                &br,
+                &target,
+                0o755,
+                artifact.cost.disk_installed,
+            )
+            .map_err(StageError::Extract)?;
+            check(&npm.package_json)?;
+            npm.written
+        }
+        _ => {
+            let file = std::fs::File::open(archive).map_err(StageError::Io)?;
+            crate::extract::stage_file(file, &target, 0o755, cap).map_err(StageError::Extract)?
+        }
+    };
     let rel = crate::extract::rel_bytes_under(dest, &target).map_err(StageError::Extract)?;
     tree.record_file(rel, written.mode, written.content_sha_hex);
     Ok(tree)
@@ -1426,21 +1462,25 @@ mod tests {
             pre_swap: Some(&watch),
             sidecars: None,
             aliases: &[],
+            npm_package: None,
         };
         let gate = StageHooks {
             pre_swap: Some(&refuse),
             sidecars: None,
             aliases: &[],
+            npm_package: None,
         };
         let render = StageHooks {
             pre_swap: None,
             sidecars: Some(&unrenderable),
             aliases: &[],
+            npm_package: None,
         };
         let suffix = StageHooks {
             pre_swap: None,
             sidecars: Some(&bogus_suffix),
             aliases: &[],
+            npm_package: None,
         };
         let cases: [(&str, &Artifact, &Path, &StageHooks<'_>, Want); 7] = [
             ("digest", &bad_digest, &b.archive, &watched, |e| {
@@ -2185,6 +2225,7 @@ mod tests {
                 pre_swap: Some(&gate),
                 sidecars: None,
                 aliases: &[],
+                npm_package: None,
             };
             let build = d.join(format!("store/agy-{member_mode:o}/1000001000003000006"));
             let root = verify_and_stage(&art, &gz, &build, &hooks).unwrap();
@@ -2936,6 +2977,7 @@ image-alias     : /tmp/stage/bar.dmg
             pre_swap: Some(&pre_swap),
             sidecars: None,
             aliases: &[],
+            npm_package: None,
         };
         verify_and_stage(&b.art, &b.archive, &build, &hooks).unwrap();
         assert_eq!(
@@ -2974,6 +3016,7 @@ image-alias     : /tmp/stage/bar.dmg
             pre_swap: Some(&pre_swap),
             sidecars: Some(&sidecars),
             aliases: &[],
+            npm_package: None,
         };
         let recording = aterm_durable::seam::Recording::start();
         let root = verify_and_stage(&b.art, &b.archive, &build, &hooks).unwrap();
@@ -3013,6 +3056,7 @@ image-alias     : /tmp/stage/bar.dmg
             pre_swap: None,
             sidecars: Some(&sidecars),
             aliases: &[],
+            npm_package: None,
         };
         let err = verify_and_stage(&b.art, &b.archive, &build, &hooks).unwrap_err();
         assert!(matches!(err, StageError::Io(_)), "{err:?}");
@@ -3221,6 +3265,7 @@ image-alias     : /tmp/stage/bar.dmg
             pre_swap: Some(&pre_swap),
             sidecars: Some(&sidecars),
             aliases: &[("ay-old", "ay")],
+            npm_package: None,
         };
         let root = verify_and_stage(&b.art, &b.archive, &build, &hooks).unwrap();
         assert!(gated.get(), "the gate saw the alias as a regular file");
@@ -3253,6 +3298,7 @@ image-alias     : /tmp/stage/bar.dmg
         let missing = bundle("alias-stage-missing");
         let hooks = StageHooks {
             aliases: &[("ay-old", "nope")],
+            npm_package: None,
             ..StageHooks::NONE
         };
         let err =

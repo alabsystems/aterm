@@ -237,8 +237,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use astream_broker::{
-    AnyClient, AnySubscription, Broker, BrokerHandle, BrokerLog, Closer, Durability, Record,
-    Transport, Walk, MAX_RECORD_PAYLOAD,
+    AnyClient, AnySubscription, Broker, BrokerHandle, BrokerLog, Closer, Durability, Event, Gap,
+    Record, Transport, Walk, MAX_RECORD_PAYLOAD,
 };
 
 // The ONE capability-file format and reader, `astream_cap::capfile`: what `mint`
@@ -346,6 +346,8 @@ const USAGE: &str = "usage: asb serve  <endpoint> [log] [--tcp] [--key-env NAME 
   --group G:                        resume from the group's durable committed offset (see `asb commit`)
   --peek:                           drain without committing: the same records are delivered again next time
   --:                               ends flag parsing; every later token is a positional (for one beginning with `-`)
+  sub/drain say on STDERR what retention gave up below the read, before the records after it:
+  `asb: sub|drain: GAP from=<F> to=<T> records=<N|unknown>` (every record of the filter in F..T not delivered is gone)
   last/fetch/drain print `<offset> <nbytes> <subject>` headers, the SUBJECT running to the end of the line (a
   subject may contain a space, never a newline), then the body's raw bytes and ONE newline; sub omits the
   subject and prints `<offset> <nbytes>`; last/fetch then MARK -- fetch's next is the page cursor (resume with
@@ -1383,13 +1385,35 @@ fn stdout_buffered() -> io::BufWriter<io::StdoutLock<'static>> {
 
 fn do_sub(mut sub: AnySubscription) -> io::Result<()> {
     let mut out = stdout_buffered();
-    while let Some((offset, _subject, body)) = sub.recv()? {
-        writeln!(out, "{offset} {}", body.len())?;
-        out.write_all(&body)?;
-        out.write_all(b"\n")?;
-        out.flush()?;
+    while let Some(event) = sub.recv_event()? {
+        match event {
+            Event::Delivery { offset, body, .. } => {
+                writeln!(out, "{offset} {}", body.len())?;
+                out.write_all(&body)?;
+                out.write_all(b"\n")?;
+                out.flush()?;
+            }
+            Event::Gap(gap) => warn_gap("sub", &gap),
+            Event::Mark { .. } => {}
+        }
     }
     Ok(())
+}
+
+/// WHAT RETENTION GAVE UP below a tail (`REQUIREMENTS-fabric-operations` R4, addendum A9),
+/// one line on STDERR: `asb: <verb>: GAP from=<F> to=<T> records=<N|unknown>`. Every record
+/// of the filter in `F..T` the read is not delivered was given up (`records`: how many,
+/// where the broker knows). Not on stdout, whose framing a consumer parses byte for byte:
+/// `sub` writes it before any record the tail delivers after it, `drain` before the batch.
+fn warn_gap(verb: &str, gap: &Gap) {
+    let records = match gap.records {
+        Some(n) => n.to_string(),
+        None => "unknown".to_string(),
+    };
+    warn(&format!(
+        "asb: {verb}: GAP from={} to={} records={records}",
+        gap.from, gap.to
+    ));
 }
 
 /// The wildcard-read framing: `<offset> <nbytes> <subject>\n<body>\n`. `sub` omits
@@ -2636,6 +2660,9 @@ fn cmd_drain(cli: &Cli) -> Result<(), AsbErr> {
         Some(committer) => astream_broker::drain(&mut sub, committer, &group, max)?,
         None => astream_broker::take(&mut sub, max)?,
     };
+    if let Some(gap) = sub.take_gap() {
+        warn_gap("drain", &gap);
+    }
     let mut out = stdout_buffered();
     print_records(&mut out, &records)?;
     let upto = records

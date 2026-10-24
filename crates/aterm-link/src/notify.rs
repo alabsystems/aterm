@@ -1209,6 +1209,12 @@ fn reader(idx: usize, sel: &Sel, cfg: &Config, root: &Path, tx: &mpsc::SyncSende
                                             }
                                         }
                                     }
+                                    Ok(Some(astream_broker::Event::Gap(gap))) => eprintln!(
+                                        "aterm-link notify: {}: the broker's retention gave up \
+                                         {} below this tail; reading on from there",
+                                        sel.label(),
+                                        transport::gap_lost(&gap)
+                                    ),
                                     Ok(None) => break,
                                     Err(e) => {
                                         eprintln!(

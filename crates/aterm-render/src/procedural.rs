@@ -8,7 +8,7 @@
 mod icons;
 mod symbols;
 
-pub use icons::{IconMetrics, band_icon_coverage, band_icon_width};
+pub use icons::{IconMetrics, band_icon_coverage, band_icon_width, boxed_icon_metrics};
 
 /// Whether `ch` is a last-resort symbol this module can draw without a font.
 #[inline]

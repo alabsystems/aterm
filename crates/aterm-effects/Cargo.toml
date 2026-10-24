@@ -57,6 +57,11 @@ aos-candidates = []
 # build. Test and debug builds have them without it; aterm-gpu's `compute`
 # feature turns it on, and no release binary names it.
 int-bag-mlp = []
+# Aos M6 online learning (the same design, §13) in a release build: today the
+# model-admission policy; the ranker, its ledger and store join it in stage C.
+# Test and debug builds have them without it; aterm-lab is to turn it on in
+# stage D, and no release binary names it.
+aos-learn = ["aos-candidates"]
 
 [target.'cfg(unix)'.dependencies]
 # Native config-referenced visual feeds are opened O_NONBLOCK/O_NOFOLLOW on

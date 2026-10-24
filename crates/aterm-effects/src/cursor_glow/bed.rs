@@ -415,13 +415,12 @@ pub(crate) fn lay_dark_bed(
             let head_k = if air_head { 0.0 } else { taper_at(head_x) };
             verts.push(vertex(head_x, &last, ink[ink.len() - 1], head_k));
             let left = caret.is_some_and(|c| c != (head_row, head_col)) && head_k > 0.0;
-            let from = head_x - dir * cwf * DARK_BED_HEAD_FEATHER_CELLS;
+            let feather_span = dir * cwf * DARK_BED_HEAD_FEATHER_CELLS;
+            let from = head_x - feather_span;
+            let taper_from = taper_at(from);
             let feather = |j: usize| {
                 let u = j as f32 / DARK_BED_HEAD_FEATHER_KNOTS as f32;
-                (
-                    from + dir * cwf * DARK_BED_HEAD_FEATHER_CELLS * u,
-                    taper_at(from) * (1.0 - smooth(u)),
-                )
+                (from + feather_span * u, taper_from * (1.0 - smooth(u)))
             };
             let feather_over =
                 |verts: &mut Vec<RibbonVertex>, at: &dyn Fn(f32, f32) -> RibbonVertex| {

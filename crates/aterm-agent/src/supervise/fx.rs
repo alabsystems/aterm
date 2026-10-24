@@ -638,7 +638,7 @@ impl ClockSource {
         match self {
             Self::Os => super::journal::unix_ms(),
             #[cfg(test)]
-            Self::Scripted(_) => super::journal::unix_ms(),
+            Self::Scripted(c) => c.stamp_ms(),
             #[cfg(test)]
             Self::Virtual(v) => v.wall_ms(),
         }
@@ -758,6 +758,8 @@ struct Script {
     boot: Option<[u8; 16]>,
     /// The machine's record of its last sleep (unix ms, asleep and woke).
     last_sleep: Option<(i64, i64)>,
+    /// Rows are stamped by the fixed clock, not the system's ([`ScriptedClock::stamp_by_script`]).
+    stamps_fixed: bool,
 }
 
 /// The boot a counting test clock counts on unless the test names another.
@@ -950,6 +952,20 @@ impl ScriptedClock {
     /// [`Self::wall_ms`] without the read.
     pub(crate) fn peek_wall_ms(&self) -> i64 {
         self.read_ms(true).unwrap_or_else(super::limit::unix_now_ms)
+    }
+
+    /// Rows written from now are stamped by the fixed clock (a replay whose loops a ledger spans).
+    pub(crate) fn stamp_by_script(&self) {
+        self.script().stamps_fixed = true;
+    }
+
+    /// The stamp a written row carries: the system's clock, or the fixed one's ([`Self::stamp_by_script`]).
+    fn stamp_ms(&self) -> i64 {
+        if self.script().stamps_fixed {
+            self.peek_wall_ms()
+        } else {
+            super::journal::unix_ms()
+        }
     }
 }
 

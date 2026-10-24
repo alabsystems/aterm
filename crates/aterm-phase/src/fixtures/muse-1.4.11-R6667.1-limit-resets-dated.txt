@@ -1,0 +1,67 @@
+# muse 1.4.11-R6667.1 · MEASURED 2026-10-23, `aterm ctl text` of a Muse Code tab in the owner's own aterm (146x66, aterm 0.128.0), read only and never typed into; the tab's process is the store's Muse Code (`muse --version`: Muse Code 1.4.11 (1.4.11-R6667.1)), carried under Autopilot Cruise at its account's weekly usage limit (its /usage card: Weekly 100% used · Resets Oct 25 at 5:00 PM) · seven two-line walls `Usage limit reached` / `Your usage resets at Oct 25 at 5:00 PM`, each the instant answer of a turn: five of the harness's Cruise continuation, one a person's `hi`, the last with the person's `/usage` card under it · the rows above the screen's 66 scrolled off
+◆ Usage limit reached
+  Your usage resets at Oct 25 at 5:00 PM
+
+❯ [aterm harness] Autopilot is Cruise: keep going. Finish everything in hand, verify it and land it, then keep hunting for what would make the
+  work more complete and more correct. Never stop to ask: put what only a person can give on a line starting NEEDS YOU: and carry on with
+  everything else.
+
+◆ Usage limit reached
+  Your usage resets at Oct 25 at 5:00 PM
+
+❯ [aterm harness] Autopilot is Cruise: keep going. Finish everything in hand, verify it and land it, then keep hunting for what would make the
+  work more complete and more correct. Never stop to ask: put what only a person can give on a line starting NEEDS YOU: and carry on with
+  everything else.
+
+◆ Usage limit reached
+  Your usage resets at Oct 25 at 5:00 PM
+
+❯ [aterm harness] Autopilot is Cruise: keep going. Finish everything in hand, verify it and land it, then keep hunting for what would make the
+  work more complete and more correct. Never stop to ask: put what only a person can give on a line starting NEEDS YOU: and carry on with
+  everything else.
+
+◆ Usage limit reached
+  Your usage resets at Oct 25 at 5:00 PM
+
+❯ [aterm harness] Autopilot is Cruise: keep going. Finish everything in hand, verify it and land it, then keep hunting for what would make the
+  work more complete and more correct. Never stop to ask: put what only a person can give on a line starting NEEDS YOU: and carry on with
+  everything else.
+
+◆ Usage limit reached
+  Your usage resets at Oct 25 at 5:00 PM
+
+❯ [aterm harness] Autopilot is Cruise: keep going. Finish everything in hand, verify it and land it, then keep hunting for what would make the
+  work more complete and more correct. Never stop to ask: put what only a person can give on a line starting NEEDS YOU: and carry on with
+  everything else.
+
+◆ Usage limit reached
+  Your usage resets at Oct 25 at 5:00 PM
+
+❯ hi
+
+◆ Usage limit reached
+  Your usage resets at Oct 25 at 5:00 PM
+
+┌────────────────────────────────────────────────────────┐
+│  Session usage                                         │
+│                                                        │
+│    Input      274,915,238                              │
+│    Cached     267,172,522                              │
+│    Output         915,383                              │
+│    Total      275,830,621                              │
+│                                                        │
+│    Turns               980                             │
+│    Subagents          none                             │
+│    Observers  939 completed (18,861,854 tokens)        │
+│                                                        │
+│  Subscription · Muse Code Max Usage                    │
+│    Current        21% used · Resets at 1:21 PM         │
+│    Weekly         100% used · Resets Oct 25 at 5:00 PM │
+│    as of Oct 22 at 1:17 PM                             │
+└────────────────────────────────────────────────────────┘
+
+── Voice input (⌥ + v to start) ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  muse-wonder-full-1.0 · xhigh · ~/aterm · Launch overrides
+

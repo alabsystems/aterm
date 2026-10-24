@@ -10,10 +10,11 @@ use aterm_agent::harness::acts::TaskFace;
 use aterm_agent::harness::upgrade::transcript_tasked;
 use aterm_agent::supervise::approvals::Typed;
 use aterm_agent::supervise::phase::Phase;
+use aterm_agent::supervise::policy::exception::FUTILE_AFTER_TRIES;
 use aterm_agent::supervise::policy::needs::NEEDS_ACK;
 use aterm_agent::supervise::policy::turn_end::{
-    Composer, DONE_CHECK, HostTurn, RULE_API_RETRY, RULE_CONTINUE, RULE_DONE_CHECK, TurnEndAction,
-    TurnEndReading, TurnEndState, TurnEndTiming, decide_turn_end,
+    Composer, DONE_CHECK, HostTurn, NO_WORK_ACTS, RULE_API_RETRY, RULE_CONTINUE, RULE_DONE_CHECK,
+    TurnEndAction, TurnEndReading, TurnEndState, TurnEndTiming, decide_turn_end,
 };
 use aterm_agent::supervise::{QuestionPriority, SupervisorConfig};
 use aterm_models_harness::supervisor_turn_end_model;
@@ -93,11 +94,12 @@ fn ours() -> Vec<Typed> {
     }]
 }
 
-/// The screen the model state stands for; `unanswered`: the act's `❯` row
-/// is last on it, never taken; `taskless`: what the conversation's record
-/// says (the real `TaskScan`'s word).
+/// The screen the model state stands for, its last turn's earlier words
+/// [`crate::common::earlier`]'s `earlier`; `unanswered`: the act's `❯` row is last on it,
+/// never taken; `taskless`: what the conversation's record says (the real
+/// `TaskScan`'s word).
 fn reading(
-    st: &State,
+    (st, earlier): (&State, usize),
     worked: Option<Duration>,
     unanswered: bool,
     taskless: bool,
@@ -136,7 +138,7 @@ fn reading(
         }),
         said_cut: false,
         opens_cut: false,
-        turn_said: None,
+        turn_said: Some(crate::common::earlier(earlier)),
         opened_by: None,
         message_drawn: false,
         submits: None,
@@ -181,6 +183,8 @@ fn reading(
         wall_remembered: false,
         answered: None,
         worked_doubt: Duration::ZERO,
+        // A turn of real work ran a tool.
+        ran_tools: worked.is_some_and(|w| w >= LONG),
         record_turn: None,
         credits: None,
         repo: aterm_agent::harness::repo_work::RepoRead::Clean,
@@ -189,15 +193,16 @@ fn reading(
 }
 
 /// The real side of one walk: the decider's state, the loop's clock,
-/// whether the act's `❯` row stands unanswered on the screen, the
-/// conversation's record as the walk wrote it and the real scan's word on
-/// it, and the person's prompts answered so far (each `HumanWork` closes a
-/// new one on the screen).
+/// whether the act's `❯` row stands unanswered on the screen, the last
+/// turn's [`crate::common::earlier`] words, the conversation's record as the walk wrote it
+/// and the real scan's word on it, and the person's prompts answered so far
+/// (each `HumanWork` closes a new one on the screen).
 #[derive(Clone)]
 struct Real {
     st: TurnEndState,
     now: Instant,
     unanswered: bool,
+    earlier: usize,
     record: String,
     /// No task, by the real scan over [`Self::record`] and the loop's ledger
     /// ([`Self::write`]): scanned again whenever the record changes, and
@@ -273,6 +278,30 @@ fn verdict(a: &TurnEndAction, st: &State) -> Verdict {
     }
 }
 
+/// The same no-work reply came again, the wall answered its tries the same (`Futile`), or `NoWork` no-work answers came in a row (past an unspent wall's tries).
+fn held(m: &Model, st: &State) -> bool {
+    let (futile, no_work) = (cnst(m, "Futile"), cnst(m, "NoWork"));
+    st["same"] == 2
+        || st["tries"] == futile
+        || (st["run"] >= no_work
+            && (st["wall"] == 0 || st["tries"] >= futile || st["run"] >= no_work + futile))
+}
+
+/// The no-work answers in a row the real side counts, as far as the model's `run` counts them.
+fn run(m: &Model, st: &TurnEndState) -> i64 {
+    i64::try_from(st.replies().run)
+        .unwrap_or(i64::MAX)
+        .min(cnst(m, "NoWork") + cnst(m, "Futile"))
+}
+
+/// The wall's tries the real side counts: the answers to its own acts kept for its reply.
+fn tries(st: &TurnEndState) -> i64 {
+    st.replies()
+        .last()
+        .filter(|k| k.walled)
+        .map_or(0, |k| i64::try_from(k.tries).unwrap_or(i64::MAX))
+}
+
 /// What the model says the decider must do at `st`.
 fn expected(m: &Model, st: &State) -> Verdict {
     // An unseen point: waited for, then — at its deadline — decided as the
@@ -303,6 +332,11 @@ fn expected(m: &Model, st: &State) -> Verdict {
     if m.action_enabled("Escalate", st) {
         return Verdict::Escalate;
     }
+    // The same reply again, or the wall's tries spent at it: no act, and no wait for one, past a
+    // person's grace.
+    if held(m, st) && st["person"] == 0 {
+        return Verdict::Nothing;
+    }
     assert!(
         st["person"] == 1 || st["wall"] == 1 || st["backoff"] == 1,
         "a free point where nothing holds and nothing is done: {st:?}"
@@ -331,6 +365,7 @@ fn mirror(action: &str, before: &State, after: &State, real: &mut Real, take: i6
     if matches!(
         action,
         "WorkedShort"
+            | "WorkedHitsTheWall"
             | "WorkedLong"
             | "WorkedClaimsDone"
             | "WorkedNeeds"
@@ -345,6 +380,23 @@ fn mirror(action: &str, before: &State, after: &State, real: &mut Real, take: i6
     if action == "ReplyUnseen" {
         real.unanswered = variant;
     }
+    // A turn ended: its earlier words its own, but for the same reply again.
+    if matches!(
+        action,
+        "WorkedShort"
+            | "WorkedHitsTheWall"
+            | "WorkedLong"
+            | "WorkedClaimsDone"
+            | "WorkedNeeds"
+            | "RetryTaken"
+            | "RetryHitsTheWall"
+            | "HumanWork"
+            | "HarnessTurn"
+            | "HarnessTurnLong"
+            | "WallAppears"
+    ) {
+        real.earlier += 1;
+    }
     match action {
         "HumanWork" => real.write(&format!("{PERSON}\n{ANSWER}\n")),
         "HarnessTurn" | "HarnessTurnLong" => {
@@ -352,9 +404,9 @@ fn mirror(action: &str, before: &State, after: &State, real: &mut Real, take: i6
         }
         _ => {}
     }
-    let unanswered = real.unanswered;
+    let (unanswered, earlier) = (real.unanswered, real.earlier);
     let taskless = real.taskless();
-    let seen = |st: &State, worked| reading(st, worked, unanswered, taskless);
+    let seen = |st: &State, worked| reading((st, earlier), worked, unanswered, taskless);
     match action {
         "BoxAppears" | "BoxLeaves" | "PersonTypes" | "GraceEnds" | "DraftLeft" => {}
         "WallAppears" => {
@@ -399,7 +451,7 @@ fn mirror(action: &str, before: &State, after: &State, real: &mut Real, take: i6
             let a = decide_turn_end(&real.st, &r, &cfg, real.now);
             real.st.acted(&a, &r, real.now);
         }
-        "WorkedShort" | "RetryHitsTheWall" => {
+        "WorkedShort" | "WorkedShortSame" | "WorkedHitsTheWall" | "RetryHitsTheWall" => {
             real.st.observe(&seen(after, Some(SHORT)), real.now);
         }
         "WorkedLong" | "WorkedClaimsDone" | "RetryTaken" => {
@@ -438,12 +490,15 @@ fn start(m: &Model, base: Instant) -> Real {
         st: TurnEndState::new(timing()),
         now: base,
         unanswered: false,
+        earlier: 0,
         record: String::new(),
         taskless: !transcript_tasked("", &ours()),
         prompts: 0,
     };
-    real.st
-        .observe(&reading(&m.init_state(), Some(LONG), false, true), real.now);
+    real.st.observe(
+        &reading((&m.init_state(), 0), Some(LONG), false, true),
+        real.now,
+    );
     real
 }
 
@@ -464,7 +519,7 @@ fn replay(m: &Model, path: &[&str], base: Instant) -> (State, Real) {
 /// it before it decides.
 fn decided(real: &Real, st: &State, cfg: &SupervisorConfig) -> TurnEndAction {
     let mut at = real.st.clone();
-    let here = reading(st, None, real.unanswered, real.taskless());
+    let here = reading((st, real.earlier), None, real.unanswered, real.taskless());
     at.observe(&here, real.now);
     decide_turn_end(&at, &here, cfg, real.now)
 }
@@ -476,11 +531,20 @@ fn walk(m: &Model, cfg: &SupervisorConfig, variant: bool) -> BTreeMap<&'static s
     let streak = cnst(m, "Streak");
     let take = cnst(m, "Take");
 
-    let mut seen: BTreeSet<State> = BTreeSet::new();
+    // A state is walked again where the real streak or replies reached it otherwise.
+    let mut seen: BTreeSet<(State, i64, i64, i64, i64)> = BTreeSet::new();
     let mut queue = VecDeque::from([(m.init_state(), start(m, base))]);
     let mut acts = BTreeMap::<&str, usize>::new();
     while let Some((st, real)) = queue.pop_front() {
-        if !seen.insert(st.clone()) {
+        let short = i64::from(real.st.short_streak()).min(streak);
+        let key = (
+            st.clone(),
+            short,
+            crate::common::same(&real.st),
+            tries(&real.st),
+            run(m, &real.st),
+        );
+        if !seen.insert(key) {
             continue;
         }
         for inv in &m.invariants {
@@ -500,6 +564,17 @@ fn walk(m: &Model, cfg: &SupervisorConfig, variant: bool) -> BTreeMap<&'static s
                 st["claim"] == 1,
                 "the done claim at {st:?}"
             );
+            assert_eq!(
+                crate::common::same(&real.st),
+                st["same"],
+                "the same reply at {st:?}"
+            );
+        }
+        if st["pending"] == 0 && st["wall"] > 0 {
+            assert_eq!(tries(&real.st), st["tries"], "the wall's tries at {st:?}");
+        }
+        if st["pending"] == 0 {
+            assert_eq!(run(m, &real.st), st["run"], "the no-work run at {st:?}");
         }
         faces(&real, &st);
         let act = decided(&real, &st, cfg);
@@ -519,6 +594,7 @@ fn walk(m: &Model, cfg: &SupervisorConfig, variant: bool) -> BTreeMap<&'static s
         if st["tasked"] == 1
             && st["other"] == 0
             && st["box_up"] == 0
+            && !held(m, &st)
             && (st["pending"] == 0 || st["pending"] == 3)
         {
             assert_ne!(got, Verdict::Nothing, "a silent point at {st:?}");
@@ -589,10 +665,23 @@ fn tier1_the_real_decider_types_exactly_where_the_model_allows() {
         }
     });
     let m = supervisor_turn_end_model();
+    assert_eq!(
+        cnst(&m, "Futile"),
+        i64::try_from(FUTILE_AFTER_TRIES).unwrap(),
+        "the model's bound is the real one"
+    );
+    assert_eq!(
+        cnst(&m, "NoWork"),
+        i64::try_from(NO_WORK_ACTS).unwrap(),
+        "the model's run is the real one"
+    );
 
     let base = Instant::now() + Duration::from_secs(3600);
     let mut real = TurnEndState::default();
-    real.observe(&reading(&m.init_state(), Some(LONG), false, false), base);
+    real.observe(
+        &reading((&m.init_state(), 0), Some(LONG), false, false),
+        base,
+    );
     let buggy = aterm_spec::interp::with_buggy(&m, 1);
     let asked = |mut st: State| {
         st.insert("asked", 1);
@@ -606,7 +695,7 @@ fn tier1_the_real_decider_types_exactly_where_the_model_allows() {
             verdict(
                 &decide_turn_end(
                     &real,
-                    &reading(&held, None, false, false),
+                    &reading((&held, 0), None, false, false),
                     &SupervisorConfig::default(),
                     base
                 ),
@@ -659,18 +748,19 @@ fn tier1_the_real_decider_types_exactly_where_the_model_allows() {
     let busy = |host: bool| {
         let mut real = TurnEndState::new(timing());
         let mut now = base;
-        real.observe(&reading(&st, Some(LONG), false, false), now);
-        for _ in 0..2 {
+        real.observe(&reading((&st, 0), Some(LONG), false, false), now);
+        // Two turns, each its own reply.
+        for earlier in [1, 2] {
             now += Duration::from_secs(30);
             if host {
                 real.host_typed(now, HostTurn::Notice);
             }
-            real.observe(&reading(&st, Some(SHORT), false, false), now);
+            real.observe(&reading((&st, earlier), Some(SHORT), false, false), now);
         }
         verdict(
             &decide_turn_end(
                 &real,
-                &reading(&st, None, false, false),
+                &reading((&st, 2), None, false, false),
                 &SupervisorConfig::default(),
                 now,
             ),
@@ -679,4 +769,143 @@ fn tier1_the_real_decider_types_exactly_where_the_model_allows() {
     };
     assert_eq!(busy(true), Verdict::Continue);
     assert_eq!(busy(false), Verdict::Wait);
+
+    let again = [
+        "HumanWork",
+        "Continue",
+        "WorkedShort",
+        "BackoffDue",
+        "Continue",
+        "WorkedShortSame",
+        "BackoffDue",
+    ];
+    let (st, real) = replay(&m, &again, base);
+    let same = aterm_spec::interp::with_buggy(&m, 3);
+    let mut b = st.clone();
+    assert!(
+        !m.action_enabled("Continue", &st) && same.fire("Continue", &mut b),
+        "{st:?}"
+    );
+    assert!(!same.check_invariant("ANoWorkReplyGetsOneMoreActAtMost", &b));
+    assert_eq!(
+        verdict(&decided(&real, &st, &policy()), &st),
+        Verdict::Nothing
+    );
+    let mut other = again;
+    other[5] = "WorkedShort";
+    let (st, real) = replay(&m, &other, base);
+    assert_eq!(
+        verdict(&decided(&real, &st, &policy()), &st),
+        Verdict::Continue
+    );
+
+    // A wall's retry the worker answers with real work ends the short streak.
+    let retried = [
+        "HumanWork",
+        "Continue",
+        "WorkedShort",
+        "BackoffDue",
+        "WallAppears",
+        "WallDue",
+        "Retry",
+        "RetryTaken",
+    ];
+    let kept = aterm_spec::interp::with_buggy(&m, 4);
+    let mut b = kept.init_state();
+    for action in retried {
+        assert!(kept.fire(action, &mut b), "{action} at {b:?}");
+    }
+    assert!(
+        !kept.check_invariant("NeverBackOffAfterRealWork", &b),
+        "{b:?}"
+    );
+    assert!(!kept.action_enabled("Continue", &b), "{b:?}");
+    let (st, real) = replay(&m, &retried, base);
+    assert_eq!(
+        verdict(&decided(&real, &st, &policy()), &st),
+        Verdict::Continue
+    );
+
+    // A wall first met as a continuation's answer keeps all its tries: that answer is none of them.
+    let mut met = vec!["HumanWork", "Continue", "WorkedHitsTheWall"];
+    for _ in 1..FUTILE_AFTER_TRIES {
+        met.extend(["WallDue", "Retry", "RetryHitsTheWall"]);
+    }
+    met.push("WallDue");
+    let early = aterm_spec::interp::with_buggy(&m, 6);
+    let mut b = early.init_state();
+    for action in &met[..3] {
+        assert!(early.fire(action, &mut b), "{action} at {b:?}");
+    }
+    assert!(
+        !early.check_invariant("AWallsTriesAreItsOwnRetries", &b),
+        "{b:?}"
+    );
+    let (st, real) = replay(&m, &met, base);
+    assert!(m.action_enabled("Retry", &st), "{st:?}");
+    assert_eq!(
+        verdict(&decided(&real, &st, &policy()), &st),
+        Verdict::Retry,
+        "the last of its tries"
+    );
+
+    // A wall that answered its tries the same gets no more of them.
+    let mut tried = vec!["HumanWork", "WallAppears"];
+    for _ in 0..FUTILE_AFTER_TRIES {
+        tried.extend(["WallDue", "Retry", "RetryHitsTheWall"]);
+    }
+    tried.push("WallDue");
+    let more = aterm_spec::interp::with_buggy(&m, 5);
+    let mut b = more.init_state();
+    for action in &tried {
+        assert!(more.fire(action, &mut b), "{action} at {b:?}");
+    }
+    assert!(more.fire("Retry", &mut b), "{b:?}");
+    assert!(
+        !more.check_invariant("AWallGetsItsTriesAndNoMore", &b),
+        "{b:?}"
+    );
+    let (st, real) = replay(&m, &tried, base);
+    assert!(!m.action_enabled("Retry", &st), "{st:?}");
+    assert_eq!(
+        verdict(&decided(&real, &st, &policy()), &st),
+        Verdict::Nothing
+    );
+    let mut fewer = tried.clone();
+    fewer.truncate(fewer.len() - 3);
+    let (st, real) = replay(&m, &fewer, base);
+    assert_eq!(
+        verdict(&decided(&real, &st, &policy()), &st),
+        Verdict::Retry,
+        "the control: a try short of the bound goes"
+    );
+
+    // NO_WORK_ACTS no-work answers in a row, each in its own words, get no more acts.
+    let mut rotated = vec!["HumanWork"];
+    for _ in 0..NO_WORK_ACTS {
+        rotated.extend(["Continue", "WorkedShort", "BackoffDue"]);
+    }
+    let past = aterm_spec::interp::with_buggy(&m, 7);
+    let mut b = past.init_state();
+    for action in &rotated {
+        assert!(past.fire(action, &mut b), "{action} at {b:?}");
+    }
+    assert!(past.fire("Continue", &mut b), "{b:?}");
+    assert!(
+        !past.check_invariant("ANoWorkRunGetsNoMoreActs", &b),
+        "{b:?}"
+    );
+    let (st, real) = replay(&m, &rotated, base);
+    assert!(!m.action_enabled("Continue", &st), "{st:?}");
+    assert_eq!(
+        verdict(&decided(&real, &st, &policy()), &st),
+        Verdict::Nothing
+    );
+    rotated.truncate(rotated.len() - 3);
+    let (st, real) = replay(&m, &rotated, base);
+    assert_eq!(
+        verdict(&decided(&real, &st, &policy()), &st),
+        Verdict::Continue,
+        "the control: an answer short of the run goes"
+    );
 }

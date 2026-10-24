@@ -17,6 +17,7 @@ pub mod ledger;
 pub mod ledger_html;
 pub mod limit;
 pub mod memory;
+pub mod mode_words;
 pub mod occupancy;
 pub mod policy;
 pub mod report;

@@ -687,6 +687,29 @@ pub(crate) enum PreeditOwner {
     Grid,
 }
 
+/// A marked-text sequence belongs to its original field, even when focus
+/// changes before the platform delivers its empty preedit and Commit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ImeRecipient {
+    surface: PreeditOwner,
+    view: Option<crate::tab_model::ViewId>,
+    native: Option<NativeImeRecipient>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NativeImeRecipient {
+    instance: crate::native_app::AppInstanceId,
+    view: crate::tab_model::ViewId,
+    generation: u64,
+    review: u64,
+    field: Option<crate::native_ui::UiKey>,
+}
+
+pub(crate) struct ImeComposition {
+    recipient: ImeRecipient,
+    cancelled: bool,
+}
+
 #[inline]
 const fn prediction_visibility_requires_redraw(was_visible: bool, is_visible: bool) -> bool {
     was_visible || is_visible
@@ -6933,11 +6956,9 @@ impl App {
         let Some((instance, view)) = self.active_native_view(wid) else {
             return false;
         };
-        if self
-            .windows
-            .get(&wid)
-            .is_some_and(|window| !window.preedit.is_empty())
-        {
+        if self.windows.get(&wid).is_some_and(|window| {
+            !window.preedit.is_empty() || window.ime_compose.is_some_and(|(_, ended)| !ended)
+        }) {
             return true;
         }
         match self.native_runtime.view_state(view) {
@@ -7340,11 +7361,10 @@ impl App {
             );
             return;
         }
-        if self
-            .windows
-            .get(&wid)
-            .is_some_and(|ws| keymap::suppress_direct_send(&ws.preedit))
-        {
+        if self.windows.get(&wid).is_some_and(|ws| {
+            keymap::suppress_direct_send(&ws.preedit)
+                || ws.ime_compose.is_some_and(|(_, ended)| !ended)
+        }) {
             self.snap_to_bottom(wid);
             self.note_consumed_press(wid, &ev);
             return;
@@ -8251,14 +8271,52 @@ impl App {
         cursor: Option<(usize, usize)>,
     ) {
         self.clear_move_license(wid);
+        let recipient = self.ime_recipient(wid);
+        let starts = !text.is_empty()
+            && self
+                .windows
+                .get(&wid)
+                .is_some_and(|window| window.ime_compose.is_none_or(|(_, ended)| ended));
+        if starts {
+            let previous = self.windows.get_mut(&wid).and_then(|window| {
+                window.ime_recipient.replace(ImeComposition {
+                    cancelled: recipient.surface == PreeditOwner::Native
+                        && recipient.native.is_none(),
+                    recipient: recipient.clone(),
+                })
+            });
+            if let Some(previous) = previous {
+                self.cancel_ime_projection(&previous.recipient);
+            }
+        }
+        let accepted = self.check_ime_recipient(wid);
         let mut changed = false;
         if let Some(ws) = self.windows.get_mut(&wid) {
             let caret = cursor.map(|(start, _end)| start);
-            changed = ws.preedit != text || ws.preedit_caret != caret;
-            ws.preedit.clone_from(&text);
-            ws.preedit_caret = caret;
+            let native =
+                ws.ime_recipient.as_ref().is_some_and(|composition| {
+                    composition.recipient.surface == PreeditOwner::Native
+                }) || recipient.surface == PreeditOwner::Native;
+            // Native fields retain their own preedit. In particular, marked
+            // password text must never enter the window's terminal overlay.
+            if native || !accepted {
+                changed = !ws.preedit.is_empty() || ws.preedit_caret.is_some();
+                ws.preedit.clear();
+                ws.preedit_caret = None;
+            } else {
+                changed = ws.preedit != text || ws.preedit_caret != caret;
+                ws.preedit.clone_from(&text);
+                ws.preedit_caret = caret;
+            }
             ws.ime_compose =
                 ime_compose_on_preedit(ws.ime_compose, !text.is_empty(), std::time::Instant::now());
+        }
+        if !accepted {
+            drop(aterm_secrets::SecretBytes::from(text));
+            if let Some(window) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
+                window.request_redraw();
+            }
+            return;
         }
         if self.active_native_view(wid).is_some() {
             let _ = self.dispatch_native_event(
@@ -8293,6 +8351,21 @@ impl App {
             ws.last_ime_rect = None;
         }
         self.on_ime_preedit(wid, String::new(), None);
+        if let Some(composition) = self
+            .windows
+            .get_mut(&wid)
+            .and_then(|window| window.ime_recipient.take())
+        {
+            self.cancel_ime_projection(&composition.recipient);
+        }
+        if self
+            .windows
+            .get_mut(&wid)
+            .and_then(|window| window.ime_compose.take())
+            .is_some()
+        {
+            crate::metrics::note_ime_cancelled();
+        }
         if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
             w.request_redraw();
         }
@@ -8361,6 +8434,7 @@ impl App {
 
     /// Composition committed (`Ime::Commit`).
     pub(crate) fn on_ime_commit(&mut self, wid: WindowId, text: String) {
+        let accepted = self.check_ime_recipient(wid);
         let route = self.ime_route(wid);
         let as_paste = keymap::committed_text_is_paste(&text) && self.typing_reaches_grid(wid);
         let reaches_pty = !text.is_empty() && matches!(route, PreeditOwner::Grid);
@@ -8376,8 +8450,9 @@ impl App {
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.preedit.clear();
             ws.preedit_caret = None;
+            ws.ime_recipient = None;
             if let Some((started, _)) = ws.ime_compose.take() {
-                if text.is_empty() {
+                if text.is_empty() || !accepted {
                     crate::metrics::note_ime_cancelled();
                 } else {
                     let ns = std::time::Instant::now()
@@ -8386,6 +8461,13 @@ impl App {
                     crate::metrics::note_ime_compose(u64::try_from(ns).unwrap_or(u64::MAX));
                 }
             }
+        }
+        if !accepted {
+            drop(aterm_secrets::SecretBytes::from(text));
+            if let Some(window) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
+                window.request_redraw();
+            }
+            return;
         }
         match route {
             PreeditOwner::Native => {
@@ -8520,8 +8602,84 @@ impl App {
         PreeditOwner::Grid
     }
 
+    fn ime_recipient(&self, wid: WindowId) -> ImeRecipient {
+        let native = self.active_native_view(wid).and_then(|(instance, view)| {
+            Some(NativeImeRecipient {
+                instance,
+                view,
+                generation: self.native_runtime.view_generation(view)?,
+                review: self
+                    .native_runtime
+                    .view_state(view)?
+                    .common()
+                    .review_revision,
+                field: self
+                    .native_runtime
+                    .view_state(view)?
+                    .common()
+                    .last_focus
+                    .clone(),
+            })
+        });
+        ImeRecipient {
+            surface: self.ime_route(wid),
+            view: self.active_visible_leaf_plan(wid).map(|plan| plan.focused),
+            native,
+        }
+    }
+
+    fn cancel_ime_projection(&mut self, recipient: &ImeRecipient) {
+        if let Some(native) = &recipient.native {
+            self.cancel_native_ime_projection(
+                native.instance,
+                native.view,
+                native.generation,
+                native.field.as_ref(),
+            );
+        }
+    }
+
+    /// A focus change retires this sequence until Commit, rather than giving
+    /// its remaining preedit or committed text to the new recipient.
+    fn check_ime_recipient(&mut self, wid: WindowId) -> bool {
+        let current = self.ime_recipient(wid);
+        let Some(composition) = self
+            .windows
+            .get_mut(&wid)
+            .and_then(|window| window.ime_recipient.as_mut())
+        else {
+            return true;
+        };
+        if composition.cancelled {
+            return false;
+        }
+        if composition.recipient == current {
+            return true;
+        }
+        composition.cancelled = true;
+        let retired = composition.recipient.clone();
+        self.cancel_ime_projection(&retired);
+        false
+    }
+
     /// Which surface owns the in-flight IME composition on window `wid`.
     pub(crate) fn preedit_owner(&self, wid: WindowId) -> PreeditOwner {
+        if let Some(composition) = self
+            .windows
+            .get(&wid)
+            .and_then(|window| window.ime_recipient.as_ref())
+        {
+            if composition.cancelled || composition.recipient != self.ime_recipient(wid) {
+                return PreeditOwner::None;
+            }
+            if composition.recipient.surface == PreeditOwner::Native {
+                return self
+                    .windows
+                    .get(&wid)
+                    .filter(|window| window.ime_compose.is_some_and(|(_, ended)| !ended))
+                    .map_or(PreeditOwner::None, |_| PreeditOwner::Native);
+            }
+        }
         if self
             .windows
             .get(&wid)
@@ -10362,6 +10520,10 @@ mod person_presence_tests {
         assert_eq!(human_events(&ctx), 1);
     }
 }
+
+#[cfg(test)]
+#[path = "app_input/native_ime_owner_tests.rs"]
+mod native_ime_owner_tests;
 
 #[cfg(test)]
 mod native_ime_selection_tests {

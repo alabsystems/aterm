@@ -552,6 +552,7 @@ pub fn check_pack(
             pre_swap: Some(&gate),
             sidecars: None,
             aliases: &[],
+            npm_package: None,
         };
         atpkg::verify_and_stage(artifact, &archive, &build_dir, &hooks).map_err(|e| {
             Error::refused(format!(

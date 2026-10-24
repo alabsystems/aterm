@@ -292,10 +292,11 @@ fn emit_ring(sink: &mut QuadSink<'_>, env: &NovaEnv, r: f32, fade: f32) {
         let ri = (rr - 0.5 * thick).max(0.0);
         (ro * ro, ri * ri, color, base_cov * scale)
     });
+    let bands_f = bands as f32;
     let mut prev_y1f = 0.0f32;
     for i in 0..bands {
         let y0f = prev_y1f;
-        let y1f = (extent * (i + 1) as f32 / bands as f32).round();
+        let y1f = (extent * (i + 1) as f32 / bands_f).round();
         prev_y1f = y1f;
         if y1f <= y0f {
             continue;
@@ -430,31 +431,32 @@ fn emit_crown(sink: &mut QuadSink<'_>, env: &NovaEnv, t_ms: u64) {
     let (cxf, cyf) = (env.cx as f32, env.cy as f32);
     let r = 1.3 * ch;
     let beam = 0.30 * ch;
+    let env_int = envl * env.intensity;
+    let r_minus_beam = r - beam;
     for (f0, f1) in [(0.0f32, 0.45f32), (0.45, 1.0)] {
         let q = 1.0 - (f0 + f1) * 0.5;
         let hw = 0.24 * ch * q * q + 0.8;
-        let cov = envl * env.intensity * (0.10 + 0.60 * q);
+        let cov = env_int * (0.10 + 0.60 * q);
         let color = mix_rgb(env.core, 0x00FF_FFFF, 0.5 * q);
+        let x0 = cxf - hw;
+        let x1 = cxf + hw;
+        let off0 = beam + r_minus_beam * f0;
+        let off1 = beam + r_minus_beam * f1;
         for side in [-1.0f32, 1.0] {
-            let ya = cyf + side * (beam + (r - beam) * f0);
-            let yb = cyf + side * (beam + (r - beam) * f1);
+            let ya = cyf + side * off0;
+            let yb = cyf + side * off1;
             let (y0, y1) = if ya <= yb { (ya, yb) } else { (yb, ya) };
-            sink.chord(cxf - hw, cxf + hw, y0 as i32, y1 as i32, color, cov);
+            sink.chord(x0, x1, y0 as i32, y1 as i32, color, cov);
         }
     }
     let color = mix_rgb(env.core, 0x00FF_FFFF, 0.7);
+    let cov = env_int * 0.85;
+    let x0 = cxf - 1.05 * ch;
+    let x1 = cxf + 1.05 * ch;
     for side in [-1.0f32, 1.0] {
         let yb = cyf + side * beam;
         let (y0, y1) = if cyf <= yb { (cyf, yb) } else { (yb, cyf) };
-        let cov = envl * env.intensity * 0.85;
-        sink.chord(
-            cxf - 1.05 * ch,
-            cxf + 1.05 * ch,
-            y0 as i32,
-            y1 as i32,
-            color,
-            cov,
-        );
+        sink.chord(x0, x1, y0 as i32, y1 as i32, color, cov);
     }
 }
 
@@ -497,6 +499,7 @@ pub fn emit_debris(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, cap:
     let grav_drop = 0.5 * (2.2 * ch_f) * age * age;
     let (cxf, cyf) = (env.cx as f32, env.cy as f32);
     let (grid_wf, grid_hf) = (env.grid_w as f32, env.grid_h as f32);
+    let (half_cw, half_ch) = (env.cell_w / 2, env.cell_h / 2);
     for m in 0..u32::from(env.feats.debris) {
         if out.len() >= cap {
             break;
@@ -524,8 +527,8 @@ pub fn emit_debris(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, cap:
         }
         let col = ((x as i32) / env.cell_w).clamp(0, cols - 1);
         let row = ((y as i32) / env.cell_h).clamp(0, rows - 1);
-        let dx = (x as i32 - col * env.cell_w - env.cell_w / 2).clamp(-127, 127) as i8;
-        let dy = (y as i32 - row * env.cell_h - env.cell_h / 2).clamp(-127, 127) as i8;
+        let dx = (x as i32 - col * env.cell_w - half_cw).clamp(-127, 127) as i8;
+        let dy = (y as i32 - row * env.cell_h - half_ch).clamp(-127, 127) as i8;
         out.push(WordDecoration {
             row: row as u16,
             col: col as u16,
@@ -569,26 +572,28 @@ pub fn emit_ring_arc(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, ca
     let col1 = ((env.cx as f32 + r) as i32 / env.cell_w).min(cols - 1);
     let alpha = (150.0 * fade * env.intensity).clamp(0.0, 255.0) as u8;
     let (cxf, cyf) = (env.cx as f32, env.cy as f32);
+    let (half_cw, half_ch) = (env.cell_w / 2, env.cell_h / 2);
     let mut emitted = 0usize;
     for row in row0..=row1 {
-        let ccy = (row * env.cell_h + env.cell_h / 2) as f32;
+        let ccy = (row * env.cell_h + half_ch) as f32;
         let dy = ccy - cyf;
         let dy2 = dy * dy;
         if dy2 > max_d2 {
             continue;
         }
+        let row_u = row as u16;
         for col in col0..=col1 {
             if emitted >= cap {
                 return;
             }
-            let ccx = (col * env.cell_w + env.cell_w / 2) as f32;
+            let ccx = (col * env.cell_w + half_cw) as f32;
             let dx = ccx - cxf;
             let d2 = dx * dx + dy2;
             if d2 < min_d2 || d2 > max_d2 {
                 continue;
             }
             out.push(WordDecoration {
-                row: row as u16,
+                row: row_u,
                 col: col as u16,
                 dx: 0,
                 dy: 0,

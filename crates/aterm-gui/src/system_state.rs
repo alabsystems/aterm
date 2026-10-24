@@ -176,16 +176,33 @@ impl SetupStatus {
         self.result_failures(plan).filter(move |_| signal)
     }
 
-    /// The results the page shows under its headline: what an observation
-    /// cannot say and someone should know (an action that did not start, a
-    /// stage that failed, a restore that finished).
-    fn notes<'a>(&'a self, plan: &'a Plan) -> impl Iterator<Item = &'a SetupStatusRow> + 'a {
-        self.results(Some(plan)).map(|(row, _)| row).filter(|row| {
-            matches!(
-                row.status.as_str(),
-                "not started" | "error" | "failed" | "unverified" | "restored"
-            )
-        })
+    /// The notes the page shows under its headline: the results an
+    /// observation cannot say and someone should know (an action that did
+    /// not start, a stage that failed, a restore that finished), each in its
+    /// own words, then one calm line naming every setting that is back as
+    /// saved but loads only at the next login (`login`). That line is no
+    /// failure: [`Self::failed_steps`], the menu line and the tab's attention
+    /// leave it out.
+    fn notes(&self, plan: &Plan) -> Vec<String> {
+        let mut notes = Vec::new();
+        let mut at_login: Vec<String> = Vec::new();
+        for (row, _) in self.results(Some(plan)) {
+            match row.status.as_str() {
+                "not started" | "error" | "failed" | "unverified" | "restored" => {
+                    notes.push(row.words());
+                }
+                "login" if !at_login.contains(&row.name) => at_login.push(row.name.clone()),
+                _ => {}
+            }
+        }
+        if !at_login.is_empty() {
+            let verb = if at_login.len() == 1 { "comes" } else { "come" };
+            notes.push(format!(
+                "{} {verb} back at your next login.",
+                crate::toolchain_words::and_list(&at_login)
+            ));
+        }
+        notes
     }
 }
 
@@ -696,9 +713,14 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Pla
     if let Some(busy) = Headline::busy(status, rows) {
         return busy;
     }
+    let result_failures: Vec<Subject> = status.result_failures(plan).flatten().collect();
     let failed: Vec<Subject> = rows
         .iter()
-        .filter(|row| row.managed && row.standing == Some(Standing::Failed))
+        .filter(|row| {
+            row.managed
+                && (row.standing == Some(Standing::Failed)
+                    || result_failures.contains(&row.subject))
+        })
         .map(|row| row.subject)
         .collect();
     if let Some(first) = failed.first() {
@@ -1137,6 +1159,15 @@ impl SystemStateApp {
         }
     }
 
+    pub(crate) fn cancel_preedit(&mut self, key: Option<&UiKey>) -> bool {
+        if key.is_some_and(|key| key.as_str() == "system-state/url") && self.url.preedit().is_some()
+        {
+            self.url.cancel_preedit();
+            return true;
+        }
+        false
+    }
+
     /// A page that knows `plan` from the start (a test's stand-in for the
     /// worker's status or the offer).
     #[cfg(test)]
@@ -1293,6 +1324,10 @@ impl SystemStateApp {
             .into_iter()
             .map(|subject| self.reviewed_row(subject))
             .collect()
+    }
+
+    pub(crate) fn can_open_access(&self, access: Access) -> bool {
+        self.plan_known && self.reviewed_row(Subject::Access(access)).open == Some(access)
     }
 
     /// The tab's attention diamond (§3.6): a managed row needs a person, or
@@ -1584,12 +1619,12 @@ impl SystemStateApp {
                     });
                 }
             }
-            "system-state/vault/join" if self.plan_known => {
+            "system-state/vault/join" if !self.status.busy && self.plan_known => {
                 self.vault_open = Some(true);
                 self.plan.selection.set(Setting::Secrets, true);
                 self.apply(Admission::of_gesture(self.by_person), Submission::Join);
             }
-            "system-state/url" | "system-state/password" => {
+            "system-state/url" | "system-state/password" if !self.status.busy => {
                 // A field someone fills shows: a draft is never hidden.
                 self.vault_open = Some(true);
                 view.common.last_focus = Some(UiKey::new(key));
@@ -1627,10 +1662,7 @@ impl SystemStateApp {
                     .strip_prefix("system-state/row/")
                     .and_then(|rest| rest.strip_suffix("/open"))
                     .and_then(|slug| Access::ALL.into_iter().find(|a| a.word() == slug))
-                    && self
-                        .reviewed_rows()
-                        .iter()
-                        .any(|row| row.open == Some(access))
+                    && self.can_open_access(access)
                 {
                     self.actions.push_back(SystemStateAction::OpenAccess {
                         access,
@@ -2550,12 +2582,7 @@ impl<'a, 'b> Page<'a, 'b> {
         let mut items: Vec<(UiNode, f32)> = Vec::new();
         let mut top = 0.0;
         let reviewed = self.app.reviewed_plan();
-        let notes: Vec<String> = self
-            .app
-            .status
-            .notes(&reviewed)
-            .map(SetupStatusRow::words)
-            .collect();
+        let notes = self.app.status.notes(&reviewed);
         for (index, note) in notes.iter().enumerate() {
             let (node, height) = crate::native_settings::wrapped_copy_node(
                 &format!("system-state/note/{index}"),
@@ -3733,7 +3760,8 @@ fn rule(key: String) -> UiNode {
 /// The page's scenarios for looking at it without a Mac to set up
 /// (`ATERM_DEV_SYSTEM_STATE_FIXTURE`): `checking`, `running`, `debugger`,
 /// `needs-you`, `vault`, `set-up`, `non-alab`, `failed`, `check-failed`, `mixed`,
-/// `vault-source-mismatch`, `plan-unread` and `fresh`. Debug and dev-seam builds only: a release build carries none of
+/// `named-result-failed`, `restore-at-login`, `vault-source-mismatch`, `plan-unread` and `fresh`.
+/// Debug and dev-seam builds only: a release build carries none of
 /// their words.
 #[cfg(any(debug_assertions, feature = "dev-seams"))]
 pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
@@ -3922,6 +3950,31 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
                     .to_owned(),
             );
             status.observed = with(in_place(), vec![repositories]);
+        }
+        "named-result-failed" => {
+            status.observed = in_place();
+            status.rows = vec![SetupStatusRow {
+                name: "GitHub repositories".into(),
+                status: "error".into(),
+                detail: "GitHub did not answer. Check again.".into(),
+            }];
+        }
+        "restore-at-login" => {
+            // The two rows a Restore's `restore_runtime` gives settings that load only at
+            // the next login: one calm note, no failure.
+            status.observed = in_place();
+            status.rows = vec![
+                SetupStatusRow {
+                    name: Setting::NaturalScrolling.name().into(),
+                    status: "login".into(),
+                    detail: "Log out and back in to use the restored scroll direction.".into(),
+                },
+                SetupStatusRow {
+                    name: Setting::CapsLock.name().into(),
+                    status: "login".into(),
+                    detail: "Log out and back in to use the restored keyboard settings.".into(),
+                },
+            ];
         }
         "mixed" => {
             let mut selection = Selection::all();

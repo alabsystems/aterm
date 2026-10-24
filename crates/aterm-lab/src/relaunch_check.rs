@@ -80,29 +80,22 @@ pub fn shown(exit: Option<i64>) -> String {
     exit.map_or_else(|| "unreadable".to_string(), |e| e.to_string())
 }
 
-/// A process's working directory (`lsof -d cwd`, from outside the jail).
+/// A process's working directory, as the kernel names it, read from outside the jail.
 pub fn cwd_of(pid: i32) -> Option<String> {
-    let out = aterm_uds::spawnfd::command("/usr/sbin/lsof")
-        .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
-        .output()
-        .ok()?;
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .find_map(|l| l.strip_prefix('n').map(str::to_string))
+    let pid = u32::try_from(pid).ok()?;
+    aterm_sysprobe::process_cwd(pid).map(|p| p.to_string_lossy().into_owned())
 }
 
-/// Every file a process holds open (`lsof -p -Fn`, from outside the jail).
+/// Every file a process holds open through a descriptor, read from outside the jail in this
+/// process ([`aterm_uds::holders::open_files`]: none of its sockets or kqueues is read).
 pub fn open_files(pid: i32) -> Vec<String> {
-    aterm_uds::spawnfd::command("/usr/sbin/lsof")
-        .args(["-n", "-P", "-w", "-p", &pid.to_string(), "-Fn"])
-        .output()
-        .map(|out| {
-            String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .filter_map(|l| l.strip_prefix('n').map(str::to_string))
-                .collect()
-        })
+    u32::try_from(pid)
+        .ok()
+        .and_then(|pid| aterm_uds::holders::open_files(pid).ok())
         .unwrap_or_default()
+        .into_iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect()
 }
 
 /// The lines of an instance log (`<unix s.ms> <pid> <level> …`) stamped at or after `ms`.
@@ -190,6 +183,37 @@ pub fn unobserved(what: &str, why: &str, list: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A child's working directory ([`cwd_of`]) and the file it holds ([`open_files`]) read
+    /// from outside it; once it is reaped neither names anything.
+    #[test]
+    fn a_childs_directory_and_open_file_read_from_outside_it() {
+        let dir = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("lab-relaunch-check-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("presence.lock");
+        std::fs::write(&lock, b"").unwrap();
+        let mut child = aterm_uds::spawnfd::command("/bin/sleep")
+            .arg("600")
+            .current_dir(&dir)
+            .stdin(std::fs::File::open(&lock).unwrap())
+            .spawn()
+            .expect("spawn a holder");
+        let pid = i32::try_from(child.id()).unwrap();
+        let (cwd, files) = (cwd_of(pid), open_files(pid));
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(cwd.as_deref(), Some(&*dir.to_string_lossy()));
+        assert!(
+            files.contains(&lock.to_string_lossy().into_owned()),
+            "{files:?}"
+        );
+        assert_eq!((cwd_of(pid), open_files(pid)), (None, Vec::new()), "reaped");
+    }
 
     #[test]
     fn a_programs_words_are_read_by_its_path() {

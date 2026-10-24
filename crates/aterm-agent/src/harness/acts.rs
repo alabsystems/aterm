@@ -431,6 +431,45 @@ impl HoldLeg {
             HoldLeg::Unread => "repo-unread",
         }
     }
+
+    /// Its words where they name nothing the reply held, the same in every written form (the
+    /// title, the state line, the hover and a row's tip); `None` for the legs whose words name
+    /// what the reply or the repository held (a need, the repository's counts, the open words).
+    #[must_use]
+    pub const fn fixed_words(self) -> Option<&'static str> {
+        match self {
+            HoldLeg::Unread => Some("a repository that could not be read"),
+            HoldLeg::Defense => Some("no \u{201c}Nothing left:\u{201d} defense yet"),
+            HoldLeg::Cut => Some("a reply too tall to read whole"),
+            HoldLeg::Needs | HoldLeg::Repo | HoldLeg::Open => None,
+        }
+    }
+}
+
+/// What a hold's words begin with once its legs are read (`not landed yet: <legs>`).
+pub const NOT_LANDED_YET: &str = "not landed yet";
+
+/// Between two facts on one line of words (`landing since 14:02 · 1 nudge`).
+pub const FACT_SEPARATOR: &str = " \u{b7} ";
+
+/// A hold's nudges in words: none before the first, then `1 nudge`, `<n> nudges`.
+#[must_use]
+pub fn nudge_words(nudges: u32) -> Option<String> {
+    match nudges {
+        0 => None,
+        1 => Some("1 nudge".to_owned()),
+        n => Some(format!("{n} nudges")),
+    }
+}
+
+/// A read hold's tip (a worker's menu row, its tab's tip): `not landed yet: <legs>`, then its
+/// nudges.
+#[must_use]
+pub fn held_tip(legs: &str, nudges: u32) -> String {
+    match nudge_words(nudges) {
+        Some(n) => format!("{NOT_LANDED_YET}: {legs}{FACT_SEPARATOR}{n}"),
+        None => format!("{NOT_LANDED_YET}: {legs}"),
+    }
 }
 
 /// One word Land's strict reading found open, as an index into its word tables.

@@ -610,10 +610,9 @@ impl CursorRainbow {
             flare_pop = flare_age.map_or(1.0, |age| {
                 1.0 + FLARE_RING_POP * (-age / FLARE_RING_TAU_S).exp()
             });
-            let radius_x =
-                (lerp(HALO_RADIUS_IDLE, HALO_RADIUS_MAX, paint) * cw as f32 * flare_pop).max(1.0);
-            let radius_y =
-                (lerp(HALO_RADIUS_IDLE, HALO_RADIUS_MAX, paint) * ch as f32 * flare_pop).max(1.0);
+            let halo_r = lerp(HALO_RADIUS_IDLE, HALO_RADIUS_MAX, paint);
+            let radius_x = (halo_r * cw as f32 * flare_pop).max(1.0);
+            let radius_y = (halo_r * ch as f32 * flare_pop).max(1.0);
             let hue_spread = lerp(HALO_HUE_SPREAD_IDLE, HALO_HUE_SPREAD_MAX, paint);
             let ring_sweep = sweep + self.spin;
             let page = cfg.ground.unwrap_or(if dark_theme {
@@ -841,9 +840,10 @@ impl CursorRainbow {
             let end = rings
                 .get(i + 1)
                 .map_or(quads.len(), |&(next, _, _, _)| next);
+            let col = best[i];
             for q in &mut quads[start..end] {
-                q.color = best[i];
-                q.color2 = best[i];
+                q.color = col;
+                q.color2 = col;
             }
         }
     }
@@ -889,11 +889,12 @@ impl CursorRainbow {
                 let x_off = (u32::from(q.x) - x0) as usize;
                 let qw = usize::from(q.w);
                 ring_pixels[i] += u32::from(q.w) * u32::from(q.h);
-                for yy in u32::from(q.y)..u32::from(q.y) + u32::from(q.h) {
-                    let row_start = (yy - y0) as usize * w + x_off;
+                let mut row_start = (u32::from(q.y) - y0) as usize * w + x_off;
+                for _ in 0..q.h {
                     for px in &mut scratch[row_start..row_start + qw] {
                         *px += bit;
                     }
+                    row_start += w;
                 }
             }
         }
@@ -924,6 +925,7 @@ impl CursorRainbow {
                 buckets_complete = false;
             }
         }
+        let rings_len = rings.len();
         let peak_of = |cols: &[u32; HALO_LAYERS as usize]| -> Option<f32> {
             if !buckets_complete {
                 return None;
@@ -934,7 +936,7 @@ impl CursorRainbow {
             for &(mask, _) in &buckets[..n_buckets] {
                 let mut px = field;
                 let mut m = mask;
-                for &c in &cols[..rings.len()] {
+                for &c in &cols[..rings_len] {
                     if m == 0 {
                         break;
                     }
@@ -952,7 +954,7 @@ impl CursorRainbow {
         };
         let pile_light = |cols: &[u32; HALO_LAYERS as usize]| -> f32 {
             let mut aurora = 0.0f32;
-            for (i, &px_count) in ring_pixels[..rings.len()].iter().enumerate() {
+            for (i, &px_count) in ring_pixels[..rings_len].iter().enumerate() {
                 aurora +=
                     px_count as f32 * crate::color_math::relative_luminance_with(table, cols[i]);
             }
@@ -960,7 +962,7 @@ impl CursorRainbow {
             for &(mask, count) in &buckets[..n_buckets] {
                 let mut px = page;
                 let mut m = mask;
-                for &c in &cols[..rings.len()] {
+                for &c in &cols[..rings_len] {
                     if m == 0 {
                         break;
                     }
@@ -1083,11 +1085,12 @@ impl CursorRainbow {
         for q in quads {
             let x_off = (u32::from(q.x) - x0) as usize;
             let qw = usize::from(q.w);
-            for yy in u32::from(q.y)..u32::from(q.y) + u32::from(q.h) {
-                let row_start = (yy - y0) as usize * w + x_off;
+            let mut row_start = (u32::from(q.y) - y0) as usize * w + x_off;
+            for _ in 0..q.h {
                 for px in &mut scratch[row_start..row_start + qw] {
                     *px = crate::spectrum::compose_on_glass(*px, q.color, q.alpha);
                 }
+                row_start += w;
             }
         }
         let mut last_px = field;
@@ -1146,14 +1149,16 @@ fn push_ring_rect(
     }
     let ch = geom.ch as i32;
     let oy = geom.origin_y as i32;
+    let x0_u = x0 as u16;
     let qw = (x1 - x0) as u16;
     let mut row = (y0 - oy).div_euclid(ch);
+    let mut next_band = oy + (row + 1) * ch;
     let mut yy = y0;
     while yy < y1 {
-        let band_end = (oy + (row + 1) * ch).min(y1);
+        let band_end = next_band.min(y1);
         out.push(GlowQuad {
             row: row.max(0) as u16,
-            x: x0 as u16,
+            x: x0_u,
             y: yy as u16,
             w: qw,
             h: (band_end - yy) as u16,
@@ -1164,6 +1169,7 @@ fn push_ring_rect(
         });
         yy = band_end;
         row += 1;
+        next_band += ch;
     }
 }
 
@@ -1239,12 +1245,9 @@ pub(crate) fn lift_to_light_floor(rgb: u32, floor: f32) -> u32 {
 #[inline]
 fn light_on_glass_with(
     table: &crate::color_math::RelativeLuminanceTable,
-    page: u32,
+    (pr, pg, pb): (usize, usize, usize),
     premul: u32,
 ) -> f32 {
-    let pr = ((page >> 16) & 0xff) as usize;
-    let pg = ((page >> 8) & 0xff) as usize;
-    let pb = (page & 0xff) as usize;
     let r = ((premul >> 16) & 0xff) as usize;
     let g = ((premul >> 8) & 0xff) as usize;
     let b = (premul & 0xff) as usize;
@@ -1265,8 +1268,13 @@ fn ring_light_on_page(arc: u32, cov: u8, page: u32, scale: f32) -> u32 {
             < 0.005,
         "RIM_LIGHT_GREY is not the encode of RIM_LIGHT"
     );
-    let light = |premul: u32| -> f32 { light_on_glass_with(table, page, premul) };
-    let base = crate::color_math::relative_luminance_with(table, page);
+    let page_rgb = (
+        ((page >> 16) & 0xff) as usize,
+        ((page >> 8) & 0xff) as usize,
+        (page & 0xff) as usize,
+    );
+    let light = |premul: u32| -> f32 { light_on_glass_with(table, page_rgb, premul) };
+    let base = crate::color_math::relative_luminance_rgb(table, page_rgb.0, page_rgb.1, page_rgb.2);
     let target = (light(premul_rgb(RIM_LIGHT_GREY, cov)) - base) * scale;
     let candidate = |u: f32| -> u32 {
         if u < 0.0 {

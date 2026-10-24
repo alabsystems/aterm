@@ -8011,6 +8011,14 @@ pub(crate) fn spawn_reader(
                 #[cfg(test)]
                 BusCloser::Sim(_) => sub.recv(),
             };
+            if let Some(gap) = sub.take_gap() {
+                eprintln!(
+                    "aterm-link: the broker's retention gave up {} below the {} subscription; \
+                     reading on from there",
+                    transport::gap_lost(&gap),
+                    face_name(source)
+                );
+            }
             if !reader_took(read, &mailbox, source, generation, &closer) {
                 return;
             }
@@ -9120,9 +9128,11 @@ mod tests {
                 durable: None,
                 oldest: None,
             };
-            let opt_in = read_frame(&mut c).expect("the opt-in").expect("a frame");
-            assert_eq!(decode_request(&opt_in), Some(Request::IdleMarks));
-            write_frame(&mut c, &encode_response(&mark)).expect("the opt-in's ack");
+            for want in [Request::IdleMarks, Request::GapNotices] {
+                let opt_in = read_frame(&mut c).expect("the opt-in").expect("a frame");
+                assert_eq!(decode_request(&opt_in), Some(want));
+                write_frame(&mut c, &encode_response(&mark)).expect("the opt-in's ack");
+            }
             let subscribe = read_frame(&mut c).expect("the subscribe").expect("a frame");
             assert!(
                 matches!(decode_request(&subscribe), Some(Request::Subscribe { .. })),
@@ -15117,6 +15127,9 @@ mod tests {
                     "{what}: nothing delivered within {:?}",
                     aterm_spec::wait::MUST_HAPPEN
                 ),
+                Some(astream_broker::Event::Gap(gap)) => {
+                    panic!("{what}: retention gave up records below the tail: {gap:?}")
+                }
                 None => panic!("{what}: the broker ended the subscription"),
             }
         }

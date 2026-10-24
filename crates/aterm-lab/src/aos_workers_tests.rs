@@ -15,8 +15,8 @@ use aterm_effects::aos_momentum::m4::Spread;
 use aterm_spec::wait::{MUST_HAPPEN, until_within};
 
 use super::{
-    Fault, FaultKind, PoolArgs, STDERR_TAIL, Tail, Threads, Timed, frame_bytes, percentiles,
-    read_frame, read_worker,
+    Fault, FaultKind, PoolArgs, STDERR_TAIL, Tail, Threads, Timed, frame_bytes, frame_step,
+    percentiles, read_frame, read_worker,
 };
 
 fn progress(k: u16) -> Vec<u8> {
@@ -74,6 +74,35 @@ fn frames_round_trip_and_each_damage_is_refused_by_name() {
     let at_bound = vec![0u8; MAX_FRAME];
     let framed = frame_bytes(&at_bound).expect("within astream's bound");
     assert_eq!(read_frame(&mut framed.as_slice()), Ok(Some(at_bound)));
+}
+
+/// `--frames` names the step a worker frame takes: an item and a lease's end by search, slot and
+/// attempt, and `-` for a payload no worker sends.
+#[test]
+fn a_frame_names_the_step_it_takes() {
+    let w = WorkerId(4);
+    let token = Token {
+        search: 2,
+        slot: 5,
+        attempt: 3,
+        worker: 4,
+    };
+    assert_eq!(frame_step(w, &progress(16)), "1.2.1.16");
+    assert_eq!(frame_step(w, &progress(0)), "1.2.1.0");
+    assert_eq!(
+        frame_step(w, &Msg::Cancelled { token, at: 7 }.encode()),
+        "2.5.3.end"
+    );
+    assert_eq!(
+        frame_step(w, &Msg::Progress { token, k: 7 }.encode()),
+        "2.5.3.7"
+    );
+    assert_eq!(
+        frame_step(w, &Msg::Cancel { token }.encode()),
+        "-",
+        "a coordinator's"
+    );
+    assert_eq!(frame_step(w, b"not a message"), "-");
 }
 
 /// Every fault spelling parses to its key; each malformed one is refused with a reason.
@@ -191,6 +220,7 @@ fn pool_limits_are_v1_but_the_window_and_the_size() {
         workers: 3,
         lease_ms: Some(10_000),
         faults: Vec::new(),
+        frames: false,
     };
     let l = args.limits();
     assert_eq!(l.window_ns, 10_000_000_000);

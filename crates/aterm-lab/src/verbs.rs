@@ -705,7 +705,12 @@ fn live_pids(run: &Run) -> Vec<String> {
         .collect()
 }
 
-/// `lsof -nP -i` of a lab's own processes: the text, or why there is none.
+/// `lsof -nP -i` of a lab's own processes: the text, or why there is none. lsof reads every
+/// descriptor of each process it lists, and a read of a socket its holder closes meanwhile drains
+/// it, so a fork that may be mid-spawn, a process exiting and one gone are left out
+/// (`aterm_sysprobe::jobs::sockets_readable`) and named on a last `#` line. The kernel's TCP and
+/// UDP tables read no descriptor, but show a reader that is no Apple platform binary its own
+/// sockets alone.
 /// # Errors
 /// No process of the lab lives.
 pub fn lsof_text(run: &Run) -> Result<String, Fail> {
@@ -716,11 +721,26 @@ pub fn lsof_text(run: &Run) -> Result<String, Fail> {
             run.tag
         )));
     }
-    let out = aterm_uds::spawnfd::command("/usr/sbin/lsof")
-        .args(["-nP", "-i", "-a", "-p", &pids.join(",")])
-        .output()
-        .map_err(|e| Fail::die(format!("lsof: {e}")))?;
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    let (read, left): (Vec<String>, Vec<String>) = pids.into_iter().partition(|p| {
+        p.parse::<u32>()
+            .is_ok_and(aterm_sysprobe::jobs::sockets_readable)
+    });
+    let mut text = if read.is_empty() {
+        String::new()
+    } else {
+        let out = aterm_uds::spawnfd::command("/usr/sbin/lsof")
+            .args(["-nP", "-i", "-a", "-p", &read.join(",")])
+            .output()
+            .map_err(|e| Fail::die(format!("lsof: {e}")))?;
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    if !left.is_empty() {
+        text.push_str(&format!(
+            "# not read now (a fork under 2 s old, exiting or gone): {}\n",
+            left.join(",")
+        ));
+    }
+    Ok(text)
 }
 
 /// `lsof [tag]`: list network sockets of this lab's processes only.

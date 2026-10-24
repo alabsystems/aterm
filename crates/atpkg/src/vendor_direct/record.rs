@@ -57,6 +57,14 @@ pub struct VendorRecord {
     pub build_date: Option<BuildDate>,
     /// When the build was verified (Unix seconds).
     pub verified_at: i64,
+    /// The staged binary's sha256 (lowercase hex), measured from it and matched by the
+    /// vendor's own copy at [`Self::agreed_with`] (grok's bucket); `None` for a build no
+    /// second copy was held to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured_sha256: Option<String>,
+    /// The vendor's own copy the staged binary agreed with, beside [`Self::measured_sha256`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agreed_with: Option<String>,
 }
 
 impl VendorRecord {
@@ -90,15 +98,23 @@ impl VendorRecord {
         let Some(row) = spec(&self.program) else {
             return false;
         };
+        let under_row = |url: &str| {
+            crate::vendor::https_host(url).is_some()
+                && row
+                    .url_prefixes
+                    .iter()
+                    .any(|p| url.strip_prefix(p).is_some_and(|rest| !rest.is_empty()))
+        };
+        let agreement_ok = match (&self.measured_sha256, &self.agreed_with) {
+            (None, None) => true,
+            (Some(sha256), Some(url)) => super::is_hex64(sha256) && under_row(url),
+            _ => false,
+        };
         self.schema == RECORD_SCHEMA
             && self.vendor == row.vendor
-            && self.anchor == row.anchor
-            && crate::vendor::https_host(&self.source_url).is_some()
-            && row.url_prefixes.iter().any(|p| {
-                self.source_url
-                    .strip_prefix(p)
-                    .is_some_and(|rest| !rest.is_empty())
-            })
+            && row.anchor.reads_record_of(self.anchor)
+            && under_row(&self.source_url)
+            && agreement_ok
             && one_digest(&self.sha256, &self.sha512)
                 .is_some_and(|(alg, hex)| alg.is_lower_hex(hex))
             && super::is_hex64(&self.tree_root)
@@ -171,6 +187,8 @@ mod tests {
             anchor: Anchor::AnthropicOpenPgp,
             build_date: BuildDate::parse("2026-09-21T20:55:27Z"),
             verified_at: 1_790_000_000,
+            measured_sha256: None,
+            agreed_with: None,
         }
     }
 
@@ -423,5 +441,100 @@ mod tests {
             assert_eq!(read_record(&dir), None, "{rec:?}");
             assert_eq!(complete_record(&dir), None, "{rec:?}");
         }
+    }
+
+    /// A grok record, from either lane: the one an earlier aterm wrote when xAI's Developer ID
+    /// vouched for the bucket's raw binary still reads, word for word, and one this lane
+    /// writes names npm's tarball beside the binary's agreed sha256 and the bucket copy it
+    /// agreed with; half an agreement, or one off the row's hosts, is not a record.
+    #[test]
+    fn a_grok_record_reads_from_either_lane() {
+        let l = layout("grok");
+        let version = Version::parse("1.0.68").unwrap();
+        let team = team("grok")
+            .map(|t| format!("apple_team = \"{t}\"\n"))
+            .unwrap_or_default();
+        let earlier = format!(
+            "schema = 1\nprogram = \"grok\"\nversion = \"1.0.68\"\nvendor = \"xAI\"\n\
+             source_url = \"https://storage.googleapis.com/grok-build-public-artifacts/cli/\
+             grok-1.0.68-macos-aarch64\"\nsha256 = \"{sha}\"\nsize = 179063008\n\
+             tree_root = \"{root}\"\n{team}anchor = \"xai-developer-id\"\n\
+             verified_at = 1790000000\n",
+            sha = "c".repeat(64),
+            root = "0".repeat(64),
+        );
+        let dir = l.build_dir("grok", version.build_id());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(record_path(&dir).unwrap(), &earlier).unwrap();
+        let old = read_record(&dir).expect("the earlier lane's record reads");
+        assert_eq!(
+            (old.anchor, old.measured_sha256.as_deref()),
+            (Anchor::XaiDeveloperId, None)
+        );
+        assert_eq!(
+            String::from_utf8(old.record_bytes().unwrap()).unwrap(),
+            earlier,
+            "and writes back as it was"
+        );
+        let agreed = VendorRecord {
+            source_url: "https://registry.npmjs.org/@xai-official/grok-darwin-arm64/-/\
+                         grok-darwin-arm64-1.0.68.tgz"
+                .into(),
+            sha256: String::new(),
+            sha512: "d".repeat(128),
+            anchor: Anchor::XaiNpmRegistry,
+            measured_sha256: Some("e".repeat(64)),
+            agreed_with: Some(
+                "https://storage.googleapis.com/grok-build-public-artifacts/cli/\
+                 grok-1.0.68-macos-aarch64.zst"
+                    .into(),
+            ),
+            ..old.clone()
+        };
+        let dir = place(&l, "grok", version.build_id(), &agreed);
+        assert_eq!(read_record(&dir), Some(agreed.clone()));
+        let text = std::fs::read_to_string(record_path(&dir).unwrap()).unwrap();
+        assert!(
+            text.contains(&format!("measured_sha256 = \"{}\"\n", "e".repeat(64)))
+                && text.contains("agreed_with = \"https://storage.googleapis.com/"),
+            "{text}"
+        );
+        for bad in [
+            VendorRecord {
+                agreed_with: None,
+                ..agreed.clone()
+            },
+            VendorRecord {
+                measured_sha256: None,
+                ..agreed.clone()
+            },
+            VendorRecord {
+                measured_sha256: Some("E".repeat(64)),
+                ..agreed.clone()
+            },
+            VendorRecord {
+                agreed_with: Some("https://storage.googleapis.com/other/grok.zst".into()),
+                ..agreed.clone()
+            },
+            VendorRecord {
+                source_url: "https://registry.npmjs.org/@xai-official/grok/-/grok-1.0.68.tgz"
+                    .into(),
+                ..agreed.clone()
+            },
+            VendorRecord {
+                anchor: Anchor::MetaDeveloperId,
+                ..agreed.clone()
+            },
+        ] {
+            assert!(bad.record_bytes().is_err(), "{bad:?}");
+        }
+        let claude_as_xai = VendorRecord {
+            anchor: Anchor::XaiDeveloperId,
+            ..record()
+        };
+        assert!(
+            claude_as_xai.record_bytes().is_err(),
+            "only grok's row reads the anchor it succeeded"
+        );
     }
 }

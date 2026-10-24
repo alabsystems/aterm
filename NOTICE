@@ -43,6 +43,13 @@ dictionaries, a bounds-checked window in place of its unsafe ring buffer).
 Its upstream-derived files are MIT-licensed and say which upstream file each
 derives from. See `crates/aterm-zstd/LICENSE-MIT`.
 
+`crates/aterm-brotli/` is aterm's own RFC 7932 decoder. Its static dictionary
+(`src/dictionary.bin`) and its transform, context and length-code tables
+(`src/tables.rs`) are Code Components of RFC 7932 by Jyrki Alakuijala and
+Zoltan Szabadka, copyright the IETF Trust and the persons identified as the
+document authors, under the Simplified BSD License. See
+`crates/aterm-brotli/LICENSE-BSD-2`.
+
 `crates/aterm-serde/` is a modified, std-only subset derived from serde_core
 1.0.228 and serde 1.0.228 by Erick Tryzelaar, David Tolnay and contributors,
 licensed MIT OR Apache-2.0. Its test suite is ported from serde's

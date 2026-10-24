@@ -11,6 +11,27 @@ use std::time::{Duration, Instant};
 const FIXTURE: &str = "ATERM_RESOURCE_RUN_FIXTURE";
 const TEST: &str = "conn::resource_run::process_tests::registered_exec_fixture";
 const HANG: Duration = Duration::from_secs(60);
+/// SIGHUP, SIGINT and SIGTERM: the group stops the signal fixture traps.
+const GROUP_STOPS: [i32; 3] = [1, 2, 15];
+
+/// Puts `signals` back to their default action in this process, so the command it
+/// execs can trap them. An ignored signal stays ignored across `exec`, and a
+/// non-interactive `sh` cannot trap a signal that was ignored when it started. A
+/// test run started as a `&` job of a non-interactive shell begins with SIGINT
+/// ignored (POSIX gives an asynchronous list SIGINT and SIGQUIT ignored), and the
+/// fixture inherited that, so its `trap … INT` did nothing.
+fn default_dispositions(signals: &[i32]) {
+    unsafe extern "C" {
+        fn signal(sig: i32, handler: usize) -> usize;
+    }
+    const SIG_DFL: usize = 0;
+    const SIG_ERR: usize = usize::MAX;
+    for &sig in signals {
+        // SAFETY: `signal` with `SIG_DFL` takes plain integers and installs no handler.
+        let previous = unsafe { signal(sig, SIG_DFL) };
+        assert_ne!(previous, SIG_ERR, "signal({sig}, SIG_DFL)");
+    }
+}
 
 #[test]
 fn registered_exec_fixture() {
@@ -24,6 +45,7 @@ fn registered_exec_fixture() {
         }
         "fds" => r#"printf 'first-descriptor\n' >&3; printf 'second-descriptor\n' >&4; exit 37"#,
         "signal" => {
+            default_dispositions(&GROUP_STOPS);
             r#"trap 'printf "SIGNAL\n"; while read release && [ "$release" != release ]; do :; done; exit 37' HUP INT TERM; printf 'READY pid=%s\n' "$$"; while :; do read request; done"#
         }
         _ => panic!("unknown fixture"),
@@ -172,7 +194,7 @@ fn signal_group(pid: u32, signal: i32) {
 
 #[test]
 fn group_stops_wait_for_the_actual_commands_delayed_exit() {
-    for signal in [1, 2, 15] {
+    for signal in GROUP_STOPS {
         let host = Host::new(false);
         let mut command = host.command("signal");
         command

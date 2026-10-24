@@ -1494,7 +1494,7 @@ fn run_prepared_setup(
 /// asks nothing; a try that did not verify is retried at a later launch once it is due.
 #[cfg(target_os = "macos")]
 fn finish_withheld_preferences() {
-    match aterm_cli::macos_doctor::finish_withheld_preferences(wait_for_initial_setup_slot) {
+    match finish_withheld_preferences_with(aterm_cli::macos_doctor::finish_withheld_preferences) {
         Ok(Some(report)) if report.needs_attention() => aterm_log::warn!(
             "setup follow-up with Full Disk Access: {}",
             report.to_text()
@@ -1506,6 +1506,26 @@ fn finish_withheld_preferences() {
         Ok(None) => {}
         Err(why) => aterm_log::warn!("setup follow-up with Full Disk Access: {why}"),
     }
+}
+
+#[cfg(target_os = "macos")]
+type WithheldReservation = (PreferenceReadings, InitialSetupBusy);
+
+#[cfg(target_os = "macos")]
+fn finish_withheld_preferences_with<T>(
+    follow_up: impl FnOnce(fn() -> WithheldReservation) -> T,
+) -> T {
+    follow_up(|| {
+        let busy = wait_for_initial_setup_slot();
+        // Tuple fields drop in order: retire and refresh the widget reading
+        // before another operation can take the setup slot.
+        (
+            PreferenceReadings::begin(vec![aterm_types::macos_setup::Subject::Setting(
+                aterm_types::macos_setup::Setting::Widgets,
+            )]),
+            busy,
+        )
+    })
 }
 
 /// The background setup worker of a window or a session. It reports to the log
@@ -1532,22 +1552,34 @@ fn run_first_run_doctor(
     // the loop before each pass once its revision reads current, never here:
     // a startup run that waited for the slot while a person's choice admitted
     // a newer run must not take that run's place for a Stop (`register`).
-    run_setup_retry(
-        &mut LiveSetupRetry {
+    with_setup_run(revision, || {
+        run_setup_retry(
+            &mut LiveSetupRetry {
+                revision,
+                password,
+                last_failure: None,
+                success_reported: false,
+                wakes_seen: SETUP_WAKES.count(),
+                park_due_seen: SetupRetryDeadlines::default(),
+            },
+            claim,
+            busy,
             revision,
-            password,
-            last_failure: None,
-            success_reported: false,
-            wakes_seen: SETUP_WAKES.count(),
-            park_due_seen: SetupRetryDeadlines::default(),
-        },
-        claim,
-        busy,
-        revision,
-    );
-    // The loop already said the run no longer retries (`StandDown`, a panicking pass included);
-    // a newer run may already hold the slot this one gave up.
-    clear_setup_run(revision);
+        );
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn with_setup_run<T>(revision: u64, run: impl FnOnce() -> T) -> T {
+    struct Registration(u64);
+    impl Drop for Registration {
+        fn drop(&mut self) {
+            // A newer run may already hold the slot this worker gave up.
+            clear_setup_run(self.0);
+        }
+    }
+    let _registration = Registration(revision);
+    run()
 }
 
 /// The scheduler owns the claim and UI reservation; the live host alone holds
@@ -1827,15 +1859,13 @@ impl SetupRetryHost for LiveSetupRetry {
     fn apply(&mut self) -> Result<PassNext, String> {
         clear_initial_setup_rows();
         self.wakes_seen = SETUP_WAKES.count();
-        let observed = aterm_cli::macos_doctor::run_initial_setup_pass(
-            self.revision,
-            &mut self.password,
-            SETUP_HOOKS,
-        );
-        // A stage that ended in an error sent no end: nothing runs now.
-        end_setup_activity();
-        // Every row is read again after a pass (System State design §3.5).
-        request_observation(None, aterm_types::macos_setup::Subject::all(), false);
+        let observed = with_setup_activity(|| {
+            aterm_cli::macos_doctor::run_initial_setup_pass(
+                self.revision,
+                &mut self.password,
+                SETUP_HOOKS,
+            )
+        });
         let Some((report, next)) = observed
             .result
             .inspect_err(|why| initial_setup_error(why.clone(), observed.observation.clone()))?
@@ -3134,12 +3164,28 @@ fn setup_stage(event: aterm_cli::macos_doctor::StageEvent<'_>) {
 #[cfg(target_os = "macos")]
 fn end_setup_activity() {
     if let Ok(mut activity) = SETUP_ACTIVITY.lock()
-        && !activity.settings.is_empty()
+        && (!activity.settings.is_empty() || !activity.subjects.is_empty())
     {
-        activity.epoch += 1;
-        activity.settings.clear();
-        activity.subjects.clear();
+        // An early error missed the normal end hook. Retire readings taken
+        // during that stage just as the hook would, before clearing its rows.
+        let subjects = std::mem::take(&mut activity.subjects);
+        activity.mark(&[], &subjects, false);
     }
+}
+
+#[cfg(target_os = "macos")]
+fn with_setup_activity<T>(pass: impl FnOnce() -> T) -> T {
+    struct Activity;
+    impl Drop for Activity {
+        fn drop(&mut self) {
+            // An error or panic may have missed the stage's normal end hook.
+            end_setup_activity();
+            // Every row is read again after a pass (System State design §3.5).
+            request_observation(None, aterm_types::macos_setup::Subject::all(), false);
+        }
+    }
+    let _activity = Activity;
+    pass()
 }
 
 /// One queued read of System State rows.
@@ -3788,7 +3834,9 @@ fn initial_setup_report_rows(
             // Setup's blocked steps are explained by their observed row, but
             // Restore's are operation results: even an in-place preference
             // can have an unknown or inaccessible original. Keep that reason
-            // visible independently of the current plan's selected groups.
+            // visible independently of the current plan's selected groups. A
+            // setting back that loads at the next login (`LOGIN`) is no
+            // failure and passes as itself.
             let not_restored = report.action == aterm_cli::macos_doctor::Action::Restore
                 && row.status == "blocked";
             aterm_gui::SetupStatusRow {
@@ -4581,35 +4629,35 @@ fn begin_check_again(
 
 #[cfg(target_os = "macos")]
 fn with_restore_readings<T>(restore: impl FnOnce() -> T) -> T {
-    let _readings = RestoreReadings::begin();
+    use aterm_types::macos_setup::{Group, Setting, Subject};
+    let _readings = PreferenceReadings::begin(
+        Setting::ALL
+            .into_iter()
+            .filter(|setting| matches!(setting.group(), Group::Input | Group::Desktop))
+            .map(Subject::Setting)
+            .collect(),
+    );
     restore()
 }
 
-/// Restore owns the setup slot while it changes the Input/Desktop preferences.
-/// Their old readings are retired before any write, and partial/error/panic
-/// paths all read them again once no Restore effect remains in flight.
+/// A preference operation holds the setup slot. Retire its old readings before
+/// any write, and read them again on success, error or unwind once its effects
+/// are no longer in flight.
 #[cfg(target_os = "macos")]
-struct RestoreReadings {
+struct PreferenceReadings {
     subjects: Vec<aterm_types::macos_setup::Subject>,
 }
 
 #[cfg(target_os = "macos")]
-impl RestoreReadings {
-    fn begin() -> Self {
-        use aterm_types::macos_setup::{Group, Setting, Subject};
-        let guard = Self {
-            subjects: Setting::ALL
-                .into_iter()
-                .filter(|setting| matches!(setting.group(), Group::Input | Group::Desktop))
-                .map(Subject::Setting)
-                .collect(),
-        };
+impl PreferenceReadings {
+    fn begin(subjects: Vec<aterm_types::macos_setup::Subject>) -> Self {
+        let guard = Self { subjects };
         {
             let mut activity = SETUP_ACTIVITY
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // These subjects are changing, but this is no setup run: the GUI
-            // keeps its Restore label and does not show a run's meter or Stop.
+            // These subjects change outside a setup stage: keep the operation's
+            // own label, without a run's meter or Stop.
             activity.mark(&[], &guard.subjects, true);
             let mut rows = OBSERVED_ROWS
                 .lock()
@@ -4627,7 +4675,7 @@ impl RestoreReadings {
 }
 
 #[cfg(target_os = "macos")]
-impl Drop for RestoreReadings {
+impl Drop for PreferenceReadings {
     fn drop(&mut self) {
         SETUP_ACTIVITY
             .lock()
@@ -4783,6 +4831,30 @@ mod initial_setup_result_tests {
             false,
             &unbound,
         )));
+    }
+
+    /// A Restore row for a setting back as saved that loads at the next login is no failure:
+    /// it reaches the page as itself, which says to log out without counting it failed.
+    #[test]
+    fn a_restore_row_back_at_the_next_login_reaches_the_page_as_itself() {
+        use aterm_cli::macos_doctor::{Action, LOGIN, Report, Row};
+        let report = Report {
+            action: Action::Restore,
+            rows: vec![Row {
+                name: "Caps Lock key".into(),
+                status: LOGIN.into(),
+                detail: "log out and back in to load the saved mappings".into(),
+            }],
+            manual_steps: Vec::new(),
+            backup: std::path::PathBuf::from("original-preferences.json"),
+        };
+        let rows = initial_setup_report_rows(&report);
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.name.as_str(), row.status.as_str()))
+                .collect::<Vec<_>>(),
+            [("Caps Lock key", "login")]
+        );
     }
 
     #[test]
@@ -6006,7 +6078,154 @@ mod initial_setup_result_tests {
     }
 
     #[test]
-    fn restore_readings_retires_cached_and_held_preference_reads() {
+    fn an_interrupted_pass_retires_held_readings_before_releasing_its_leases() {
+        use aterm_types::macos_setup::Standing;
+
+        let _globals = globals();
+        for panics in [false, true] {
+            let _io = TestIo::install();
+            struct QueueLease;
+            impl Drop for QueueLease {
+                fn drop(&mut self) {
+                    let mut queue = OBSERVE_QUEUE.lock().unwrap_or_else(PoisonError::into_inner);
+                    queue.running = false;
+                    queue.next = None;
+                }
+            }
+            OBSERVE_QUEUE.lock().unwrap().running = true;
+            let _queue = QueueLease;
+            struct Reader(Option<std::thread::JoinHandle<()>>);
+            impl Drop for Reader {
+                fn drop(&mut self) {
+                    release_readings();
+                    if let Some(reader) = self.0.take() {
+                        let _ = reader.join();
+                    }
+                }
+            }
+            // This drops after the pass helper, before the real claim and busy
+            // slot. Record the boundary without panicking during the unwind.
+            struct Boundary<'a>(&'a mut Option<(bool, bool, bool)>);
+            impl Drop for Boundary<'_> {
+                fn drop(&mut self) {
+                    *self.0 = Some((
+                        SETUP_ACTIVITY.lock().unwrap().subjects.is_empty(),
+                        OBSERVE_QUEUE.lock().unwrap().next.is_some(),
+                        INITIAL_SETUP_BUSY.load(std::sync::atomic::Ordering::Acquire),
+                    ));
+                }
+            }
+            let preference = Subject::Setting(Setting::Dock);
+            let independent = Subject::Setting(Setting::Spotlight);
+            let seen = |subject, standing| Observation {
+                standing,
+                ..Observation::unknown(subject)
+            };
+            let failed = seen(preference, Standing::Failed);
+            let unaffected = seen(independent, Standing::NeedsYou);
+            let fresh = seen(preference, Standing::Differs);
+            let plan = left_as_is();
+            let choices = {
+                let mut rows = OBSERVED_ROWS.lock().unwrap();
+                rows.plan = Some(plan.clone());
+                rows.vault_url = Some(plan.vault_url.clone());
+                rows.rows = vec![failed.clone(), Observation::unknown(independent)];
+                rows.choices
+            };
+            observe_rows(ObserveRequest {
+                plan: Some(plan.clone()),
+                choices,
+                subjects: Vec::new(),
+                forced: false,
+            });
+            change(|script| {
+                script.reads.clear();
+                script.hold = true;
+                script.readings = [
+                    vec![seen(preference, Standing::InPlace), unaffected.clone()],
+                    vec![fresh.clone()],
+                ]
+                .into();
+            });
+            let mut reader = Reader(None);
+            let mut boundary = None;
+            let mut wakes = 0;
+            let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                assert!(take_initial_setup_slot_now());
+                let _busy = InitialSetupBusy { observation: None };
+                let _claim = TestIo::claim().unwrap().unwrap();
+                let _boundary = Boundary(&mut boundary);
+                with_setup_activity(|| {
+                    setup_stage(aterm_cli::macos_doctor::StageEvent {
+                        settings: &[Setting::Dock],
+                        subjects: &[preference],
+                        running: true,
+                    });
+                    reader.0 = Some(std::thread::spawn(move || {
+                        observe_rows(ObserveRequest {
+                            plan: Some(plan),
+                            choices,
+                            subjects: vec![preference, independent],
+                            forced: false,
+                        });
+                    }));
+                    wait_until("the mid-stage reading starts", || script().reads.len() == 1);
+                    wakes = SETUP_WAKES.count();
+                    assert!(!panics, "injected setup stage panic");
+                    Err::<(), _>("injected progress save error")
+                })
+            }));
+            assert_eq!(unwound.is_err(), panics);
+            if let Ok(result) = unwound {
+                assert_eq!(result, Err("injected progress save error"));
+            }
+            assert_eq!(
+                boundary,
+                Some((true, true, true)),
+                "cleanup and refresh precede the release of the setup slot"
+            );
+            assert!(!INITIAL_SETUP_BUSY.load(std::sync::atomic::Ordering::Acquire));
+            assert!(TestIo::claim().unwrap().is_some(), "the claim was released");
+            release_readings();
+            reader.0.take().unwrap().join().unwrap();
+            {
+                let rows = OBSERVED_ROWS.lock().unwrap();
+                assert!(rows.rows.contains(&failed), "the old success was retired");
+                assert!(rows.rows.contains(&unaffected));
+            }
+            assert_eq!(SETUP_WAKES.count(), wakes, "no false recovery wake");
+            let refresh = OBSERVE_QUEUE.lock().unwrap().next.take().unwrap();
+            assert!(!refresh.forced);
+            assert_eq!(refresh.subjects, Subject::all());
+            observe_rows(refresh);
+            assert!(OBSERVED_ROWS.lock().unwrap().rows.contains(&fresh));
+            assert_eq!(script().reads.len(), 2);
+        }
+    }
+
+    #[test]
+    fn an_unwound_worker_retires_only_its_own_registration() {
+        let _globals = globals();
+        let _io = TestIo::install();
+        for panics in [false, true] {
+            for replacement in [None, Some(42)] {
+                set_setup_run(Some(41));
+                let result = std::panic::catch_unwind(|| {
+                    with_setup_run(41, || {
+                        if let Some(replacement) = replacement {
+                            set_setup_run(Some(replacement));
+                        }
+                        assert!(!panics, "injected setup worker panic");
+                    });
+                });
+                assert_eq!(result.is_err(), panics);
+                assert_eq!(setup_run(), replacement);
+            }
+        }
+    }
+
+    #[test]
+    fn preference_readings_retire_cached_and_held_reads() {
         use aterm_types::macos_setup::Standing;
 
         let _globals = globals();
@@ -6031,17 +6250,35 @@ mod initial_setup_result_tests {
                 }
             }
         }
-        let preference = Subject::Setting(Setting::CapsLock);
         let independent = Subject::Setting(Setting::Secrets);
         let seen = |subject, standing| Observation {
             standing,
             ..Observation::unknown(subject)
         };
         let plan = Plan::default();
-        for failed in [false, true] {
-            let old = seen(preference, Standing::InPlace);
+        for (follow_up, failed) in [(false, false), (false, true), (true, false), (true, true)] {
+            let preference = Subject::Setting(if follow_up {
+                Setting::Widgets
+            } else {
+                Setting::CapsLock
+            });
+            let old = seen(
+                preference,
+                if follow_up && !failed {
+                    Standing::Differs
+                } else {
+                    Standing::InPlace
+                },
+            );
             let vault = seen(independent, Standing::NeedsYou);
-            let restored = seen(preference, Standing::Differs);
+            let restored = seen(
+                preference,
+                if follow_up && !failed {
+                    Standing::InPlace
+                } else {
+                    Standing::Differs
+                },
+            );
             let choices = {
                 let mut rows = OBSERVED_ROWS.lock().unwrap();
                 rows.plan = Some(plan.clone());
@@ -6063,16 +6300,24 @@ mod initial_setup_result_tests {
                     forced: false,
                 });
             })));
-            wait_until("the pre-Restore read starts", || script().reads.len() == 1);
+            wait_until("the preference read starts", || script().reads.len() == 1);
             let mut during = Vec::new();
-            let result = with_restore_readings(|| {
+            let mut effect = || {
                 during = OBSERVED_ROWS.lock().unwrap().rows.clone();
                 if failed {
-                    Err("partial restore")
+                    Err("partial preference change")
                 } else {
                     Ok(())
                 }
-            });
+            };
+            let result = if follow_up {
+                finish_withheld_preferences_with(|reserve| {
+                    let _reserved = reserve();
+                    effect()
+                })
+            } else {
+                with_restore_readings(effect)
+            };
             assert_eq!(result.is_err(), failed);
             release_readings();
             reader.0.take().unwrap().join().unwrap();
@@ -6082,23 +6327,30 @@ mod initial_setup_result_tests {
             };
             assert!(
                 !retained.iter().any(|row| row.subject == preference),
-                "a pre-Restore preference read must not publish after Restore"
+                "an old preference read must not publish after a change (follow-up: {follow_up})"
             );
             assert!(retained.contains(&vault));
             assert_eq!(source.as_ref(), Some(&plan.vault_url));
-            assert!(!during.iter().any(|row| row.subject == preference));
+            assert!(
+                !during.iter().any(|row| row.subject == preference),
+                "the changing preference is unread while reserved (follow-up: {follow_up})"
+            );
             assert!(during.contains(&vault));
             assert!(SETUP_ACTIVITY.lock().unwrap().subjects.is_empty());
             let fresh = OBSERVE_QUEUE.lock().unwrap().next.take().unwrap();
             assert!(!fresh.forced);
             assert!(fresh.plan.is_none(), "refresh uses the plan in force");
             assert!(fresh.subjects.contains(&preference));
-            assert!(
-                fresh
-                    .subjects
-                    .iter()
-                    .all(|subject| matches!(subject.group(), Group::Input | Group::Desktop))
-            );
+            if follow_up {
+                assert_eq!(fresh.subjects, [Subject::Setting(Setting::Widgets)]);
+            } else {
+                assert!(
+                    fresh
+                        .subjects
+                        .iter()
+                        .all(|subject| matches!(subject.group(), Group::Input | Group::Desktop))
+                );
+            }
             observe_rows(fresh);
             let rows = OBSERVED_ROWS.lock().unwrap();
             assert!(rows.rows.contains(&restored));
@@ -6108,24 +6360,63 @@ mod initial_setup_result_tests {
     }
 
     #[test]
-    fn restore_readings_unwinds_without_leaving_activity_or_busy() {
+    fn preference_readings_unwind_without_leaving_activity_or_busy() {
         let _globals = globals();
         let _io = TestIo::install();
-        OBSERVE_QUEUE.lock().unwrap().running = true;
-        let result = std::panic::catch_unwind(|| {
-            assert!(take_initial_setup_slot_now());
-            let _busy = InitialSetupBusy { observation: None };
-            with_restore_readings(|| panic!("injected restore panic"));
-        });
-        assert!(result.is_err());
+        for follow_up in [false, true] {
+            OBSERVE_QUEUE.lock().unwrap().running = true;
+            let result = std::panic::catch_unwind(|| {
+                if follow_up {
+                    finish_withheld_preferences_with(|reserve| {
+                        let _reserved = reserve();
+                        panic!("injected follow-up panic");
+                    });
+                } else {
+                    assert!(take_initial_setup_slot_now());
+                    let _busy = InitialSetupBusy { observation: None };
+                    with_restore_readings(|| panic!("injected restore panic"));
+                }
+            });
+            assert!(result.is_err());
+            assert!(!INITIAL_SETUP_BUSY.load(std::sync::atomic::Ordering::Acquire));
+            assert!(SETUP_ACTIVITY.lock().unwrap().subjects.is_empty());
+            let fresh = {
+                let mut queue = OBSERVE_QUEUE.lock().unwrap();
+                queue.running = false;
+                queue.next.take()
+            };
+            assert!(
+                fresh.is_some(),
+                "an unwound preference change is read again"
+            );
+        }
+    }
+
+    #[test]
+    fn a_follow_up_that_never_reserves_leaves_its_readings_alone() {
+        let _globals = globals();
+        let _io = TestIo::install();
+        let widgets = Observation::unknown(Subject::Setting(Setting::Widgets));
+        let source = "https://example.invalid/current-vault".to_owned();
+        {
+            let mut rows = OBSERVED_ROWS.lock().unwrap();
+            rows.rows = vec![widgets.clone()];
+            rows.vault_url = Some(source.clone());
+        }
+        let epoch = SETUP_ACTIVITY.lock().unwrap().epoch;
+        let generation = OBSERVED_ROWS.lock().unwrap().generation;
+        // The CLI calls reserve only once it has found owed work and Full
+        // Disk Access. Both earlier exits take this same unreserved path.
+        assert_eq!(finish_withheld_preferences_with(|_| None::<()>), None);
         assert!(!INITIAL_SETUP_BUSY.load(std::sync::atomic::Ordering::Acquire));
-        assert!(SETUP_ACTIVITY.lock().unwrap().subjects.is_empty());
-        let fresh = {
-            let mut queue = OBSERVE_QUEUE.lock().unwrap();
-            queue.running = false;
-            queue.next.take()
-        };
-        assert!(fresh.is_some(), "an unwound partial Restore is read again");
+        assert_eq!(SETUP_ACTIVITY.lock().unwrap().epoch, epoch);
+        let rows = OBSERVED_ROWS.lock().unwrap();
+        assert_eq!(rows.rows, [widgets]);
+        assert_eq!(rows.vault_url, Some(source));
+        assert_eq!(rows.generation, generation);
+        assert!(script().reads.is_empty());
+        let queue = OBSERVE_QUEUE.lock().unwrap();
+        assert!(!queue.running && queue.next.is_none());
     }
 
     #[test]

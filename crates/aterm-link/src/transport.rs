@@ -70,6 +70,18 @@ pub fn retained_past(e: &io::Error, from: u64) -> Option<u64> {
         .filter(|oldest| *oldest > from)
 }
 
+/// What a tail's gap notice ([`astream_broker::Event::Gap`]) says retention gave up, for a log line.
+#[must_use]
+pub fn gap_lost(gap: &astream_broker::Gap) -> String {
+    match gap.records {
+        Some(n) => format!("{n} record(s) in @{}..@{}", gap.from, gap.to),
+        None => format!(
+            "an uncounted number of records in @{}..@{}",
+            gap.from, gap.to
+        ),
+    }
+}
+
 /// How many times [`fetch_kept`] follows a floor that rose under it.
 pub const KEPT_TRIES: usize = 4;
 
@@ -292,14 +304,17 @@ mod tests {
             oldest: None,
         };
         write_frame(&mut broker, &encode_response(&mark)).expect("the idle-marks answer");
+        write_frame(&mut broker, &encode_response(&mark)).expect("the gap-notices answer");
         let mut sub = conn.subscribe(0, "/f/f/>").expect("subscribe");
-        for want in ["IdleMarks", "Subscribe"] {
+        for want in ["IdleMarks", "GapNotices", "Subscribe"] {
             let frame = read_frame(&mut broker).expect("read").expect("a request");
             let got = decode_request(&frame).expect("a request frame");
             assert!(
                 matches!(
                     (want, &got),
-                    ("IdleMarks", Request::IdleMarks) | ("Subscribe", Request::Subscribe { .. })
+                    ("IdleMarks", Request::IdleMarks)
+                        | ("GapNotices", Request::GapNotices)
+                        | ("Subscribe", Request::Subscribe { .. })
                 ),
                 "{want}: {got:?}"
             );

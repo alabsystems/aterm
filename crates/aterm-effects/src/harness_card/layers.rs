@@ -341,10 +341,11 @@ impl RimArt {
                 return;
             };
             mids.push((q.x0 + q.x1, q.y0 + q.y1));
+            let (rx0, rx1) = ((q.x0 + rim) as usize, (q.x1 + rim) as usize);
             for y in q.y0..q.y1 {
                 let row = (y + rim) as usize * wu;
-                let x0 = row + (q.x0 + rim) as usize;
-                let x1 = row + (q.x1 + rim) as usize;
+                let x0 = row + rx0;
+                let x1 = row + rx1;
                 debug_assert!(
                     data[x0..x1].iter().all(|&t| t == 0),
                     "rim strips overlap on row {y}"

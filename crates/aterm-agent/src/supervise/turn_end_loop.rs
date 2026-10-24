@@ -1041,12 +1041,21 @@ impl<C: Ctl> Session<'_, C> {
         }
         let reader = reading.program.reader();
         let turn_cut = reading.said_tail.is_some() && !reader.turn_whole(&screen.rows);
+        // An answer's turn that opens above the screen ran no tool only where its whole turn says so.
+        let tools_cut = check == Check::Decide
+            && self.turn_end.weighs_tools()
+            && reader.reads_tool_rows()
+            && !reading.ran_tools
+            && reader.turn_opens_above(&screen.rows);
+        let mut whole_turn = None;
         if check == Check::Decide
             && (reading.said_cut || turn_cut)
             && (super::super::policy::turn_end::says_done(reading.said_tail.as_deref())
                 || self.turn_end.reads_turn_whole(&reading, worked.is_some()))
         {
-            let turn = self.said_read_whole(screen, reader, true);
+            let read = self.turn_read_whole(screen, reader, true);
+            whole_turn = Some(read.clone());
+            let turn = read.map(|(rows, _)| rows);
             let turn_read = turn.is_some();
             let read = turn.or_else(|| {
                 reading
@@ -1066,6 +1075,16 @@ impl<C: Ctl> Session<'_, C> {
                 }
             }
             reading.said_cut |= turn_cut && !turn_read;
+        }
+        if tools_cut {
+            let read = match whole_turn {
+                Some(read) => read,
+                None => self.turn_read_whole(screen, reader, true),
+            };
+            // Rows read up to the history's start are all the turn the terminal holds.
+            reading.ran_tools = read
+                .filter(|(rows, start)| *start || !reader.turn_opens_above(rows))
+                .is_none_or(|(rows, _)| reader.turn_ran_tools(&rows));
         }
         if check == Check::Decide {
             reading.repo = self.repo_read(&reading, host, worked.is_some());
@@ -1381,13 +1400,24 @@ impl<C: Ctl> Session<'_, C> {
         self.account_advise(r, seq, opts);
     }
 
-    /// Read the full grid and scrollback history needed to bound a cut message or turn.
+    /// [`Self::turn_read_whole`]'s rows.
     fn said_read_whole(
         &mut self,
         screen: &Screen,
         reader: &'static dyn ScreenReader,
         turn: bool,
     ) -> Option<Vec<String>> {
+        self.turn_read_whole(screen, reader, turn)
+            .map(|(rows, _)| rows)
+    }
+
+    /// Read the full grid and scrollback history needed to bound a cut message or turn, and whether the rows run from the history's start (nothing above them).
+    fn turn_read_whole(
+        &mut self,
+        screen: &Screen,
+        reader: &'static dyn ScreenReader,
+        turn: bool,
+    ) -> Option<(Vec<String>, bool)> {
         let read = |rows: &[String]| {
             if turn {
                 reader.turn_whole(rows)
@@ -1410,7 +1440,7 @@ impl<C: Ctl> Session<'_, C> {
             (whole.rows, bounded.rows)
         };
         if read(&bounded) {
-            return Some(bounded);
+            return Some((bounded, false));
         }
         let stop = |r: &str| {
             if turn {
@@ -1422,7 +1452,10 @@ impl<C: Ctl> Session<'_, C> {
         let (mut joined, first) = self.rows_up_to_at(&grid, &stop).ok().flatten()?;
         let abs = first.and_then(|f| f.checked_sub(u64::try_from(joined.len()).ok()?));
         joined.extend(grid);
-        Some(self.rows_bounded_by_cells(joined, reader, abs))
+        Some((
+            self.rows_bounded_by_cells(joined, reader, abs),
+            abs == Some(0),
+        ))
     }
 
     /// Query the host for unpushed repository work when the worker claims to be done or finished.
@@ -1460,7 +1493,7 @@ impl<C: Ctl> Session<'_, C> {
 
     /// Short-turn streak and API-error retry state persisted for subsequent loops
     /// ([`approvals::Carried`]).
-    fn carried(&self) -> approvals::Carried {
+    pub(super) fn carried(&self) -> approvals::Carried {
         approvals::Carried {
             short: self.turn_end.short_streak(),
             retry: self
@@ -1472,6 +1505,7 @@ impl<C: Ctl> Session<'_, C> {
                     ups,
                     since_ms: self.unix_ms_of(since),
                 }),
+            said: self.turn_end.replies(),
         }
     }
 
@@ -1719,7 +1753,10 @@ impl<C: Ctl> Session<'_, C> {
     /// Infer turn work from a Claude Code done row when no intermediate busy read was seen
     /// ([`act_turn_work`]).
     fn unseen_act_work(&mut self, rows: &[String]) -> Option<Duration> {
-        let at = self.turn_end.untaken_act_typed()?;
+        let at = self
+            .turn_end
+            .untaken_act_typed()
+            .or_else(|| self.turn_end.seeded_act_typed())?;
         match self.reader(rows).program() {
             Program::Claude => {}
             Program::Codex

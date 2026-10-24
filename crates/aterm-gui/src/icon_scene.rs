@@ -93,7 +93,7 @@ fn paint(scene: Option<Scene>, input: &mut RenderInput) {
     let Some(Scene::BandIcons) = scene else {
         return;
     };
-    const ROWS: [(usize, &str, bool); 3] = [
+    const ROWS: [(usize, &str, bool); 5] = [
         (2, "Band icons: H is the capitals reference", false),
         (
             4,
@@ -103,6 +103,16 @@ fn paint(scene: Option<Scene>, input: &mut RenderInput) {
         (
             6,
             "H \u{23f8} pause   H ! alert   H \u{2913}18:00 land   bold",
+            true,
+        ),
+        (
+            8,
+            "H \u{26bf} lock   H \u{29d6} hourglass   H \u{1f5b4} drive   regular",
+            false,
+        ),
+        (
+            10,
+            "H \u{26bf} lock   H \u{29d6} hourglass   H \u{1f5b4} drive   bold",
             true,
         ),
     ];
@@ -126,13 +136,7 @@ fn paint(scene: Option<Scene>, input: &mut RenderInput) {
         let mut icons = Vec::new();
         for (col, ch) in text.chars().take(input.cols).enumerate() {
             cells[col].ch = ch;
-            let icon = match ch {
-                '\u{23f8}' => Some(BandIcon::Pause),
-                '!' => Some(BandIcon::Alert),
-                '\u{2913}' => Some(BandIcon::ToBar),
-                _ => None,
-            };
-            if let Some(icon) = icon
+            if let Some(icon) = BandIcon::ALL.into_iter().find(|i| i.ch() == ch)
                 && let Ok(col) = u16::try_from(col)
             {
                 icons.push(ChromeIcon { col, icon });
@@ -200,8 +204,9 @@ mod tests {
         let mut term = aterm_core::terminal::Terminal::new(12, 60);
         term.process(b"\x1b]10;#d0d0d0\x07\x1b]11;#111318\x07x");
         let mut input = term.cell_frame(12, 60);
-        assert!(input.cells[4].is_empty());
-        assert!(input.cells[6].is_empty());
+        for row in [4, 6, 8, 10] {
+            assert!(input.cells[row].is_empty());
+        }
         let original = input.clone();
         paint(None, &mut input);
         assert_eq!(input, original);
@@ -209,11 +214,16 @@ mod tests {
         assert_eq!(input.cells[0], original.cells[0]);
         assert_eq!(input.cells[4][0].fg, original.implicit_blank.fg);
         assert_eq!(input.cells[4][0].bg, original.implicit_blank.bg);
-        assert_eq!(input.chrome_rasters.len(), 2);
+        assert_eq!(input.chrome_rasters.len(), 4);
         for raster in &input.chrome_rasters {
+            let want: &[BandIcon] = if raster.row < 8 {
+                &[BandIcon::Pause, BandIcon::Alert, BandIcon::ToBar]
+            } else {
+                &[BandIcon::Lock, BandIcon::Hourglass, BandIcon::Drive]
+            };
             assert_eq!(
                 raster.icons.iter().map(|i| i.icon).collect::<Vec<_>>(),
-                [BandIcon::Pause, BandIcon::Alert, BandIcon::ToBar]
+                want
             );
             let cells = &input.cells[usize::from(raster.row)];
             for icon in &raster.icons {
@@ -227,6 +237,8 @@ mod tests {
         }
         assert!(!input.cells[4][0].bold);
         assert!(input.cells[6][0].bold);
+        assert!(!input.cells[8][0].bold);
+        assert!(input.cells[10][0].bold);
         let painted = input.clone();
         paint(Some(Scene::BandIcons), &mut input);
         assert_eq!(input, painted, "repainting does not duplicate chrome marks");

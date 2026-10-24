@@ -112,10 +112,14 @@ pub fn scan_file_holders(_path: &std::path::Path, _skip: &[u32]) -> io::Result<H
 /// each listener's path, its user and the process that bound it. No other process's descriptor is
 /// read: a socket read through one (`PROC_PIDFDSOCKETINFO`) that its holder closes during the read
 /// fails every blocking wait on that socket from then on, in every process holding it (the drain
-/// `aterm_sysprobe::jobs::macos`'s `settled` names). So a holder is the live process that bound the
-/// listener, for as long as any process holds it: a fork that kept it is no holder, and the binder
-/// still is after closing its own copy while another process (a child mid-spawn) holds one. A bound
-/// path names `path` as [`SocketPath::names`] says. Each scan finds a listener of its own in the
+/// `aterm_sysprobe::jobs::macos`'s `settled` names). So a holder is the live process the
+/// listener's record names ([`aterm_sysprobe::jobs::darwin::UnixListenerRow::pid`]): its binder,
+/// even after closing its own copy while another process (a child mid-spawn) holds one, unless a
+/// later holder waited on it by `poll` or a `kevent` (a pre-fork server's worker), which is named
+/// instead; one that only blocks in `accept` is not. The record keeps a pid number: once the
+/// process it names has exited while another holds the listener, the scan names nobody, and,
+/// after that number is reused, the unrelated live process of this user that has it. A bound path
+/// names `path` as [`SocketPath::names`] says. Each scan finds a listener of its own in the
 /// same table read, bound for the check, so a table this build misreads is refused, never read as
 /// no holder.
 ///
@@ -250,45 +254,65 @@ impl SocketPath {
 }
 
 /// A listener this process binds for one table read to name ([`scan_listener_holders`]): it
-/// proves the read lays out a path, a user and a pid where this build reads them. Dropping it
-/// removes its file and closes it.
+/// proves the read lays out a path, a user and a pid where this build reads them. It is bound in a
+/// folder of its own, made for it (mode 0700, an unpredictable name), so no name another user laid
+/// down first (a link `bind(2)` would follow, a file) stands where it binds. Dropping it closes it
+/// and removes its file and its folder.
 #[cfg(target_vendor = "apple")]
 struct TableCheck {
+    dir: std::path::PathBuf,
     path: std::path::PathBuf,
     _listener: std::os::unix::net::UnixListener,
 }
 
 #[cfg(target_vendor = "apple")]
 impl TableCheck {
-    /// In this process's temporary folder, else in `/tmp`, whose sticky bit keeps the file this
-    /// user's: a `TMPDIR` too deep for `sun_path`, missing or closed does not stop the scan.
+    /// Under this process's temporary folder, else under `/tmp`: a `TMPDIR` that is relative, too
+    /// deep for `sun_path`, missing or closed does not stop the scan.
     fn bind() -> io::Result<Self> {
         Self::bind_in(&[std::env::temp_dir(), std::path::PathBuf::from("/tmp")])
     }
 
-    /// The next of this process's check names that binds in the first of `dirs` that takes one:
-    /// a name an earlier process of this pid left behind is passed over, never removed.
+    /// In a new folder under the first of `dirs` that is absolute and takes the folder and the
+    /// listener in it.
     fn bind_in(dirs: &[std::path::PathBuf]) -> io::Result<Self> {
-        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let mut last = io::Error::from(io::ErrorKind::AddrInUse);
-        for dir in dirs {
-            for _ in 0..8 {
-                let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let path = dir.join(format!("aterm-pcb-{}-{n}.sock", std::process::id()));
-                match std::os::unix::net::UnixListener::bind(&path) {
-                    Ok(listener) => {
-                        return Ok(Self {
-                            path,
-                            _listener: listener,
-                        });
-                    }
-                    Err(e) => {
-                        let taken = e.kind() == io::ErrorKind::AddrInUse;
-                        last = e;
-                        if !taken {
-                            break;
-                        }
-                    }
+        use std::os::unix::fs::DirBuilderExt as _;
+        let mut last = io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "no absolute folder to bind the table check in",
+        );
+        for parent in dirs.iter().filter(|d| d.is_absolute()) {
+            let made = (0..4).find_map(|_| {
+                let dir = parent.join(format!("aterm-pcb-{}", crate::rand::hex_token::<6>().ok()?));
+                match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+                    Ok(()) => Some(Ok(dir)),
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => None,
+                    Err(e) => Some(Err(e)),
+                }
+            });
+            let dir = match made {
+                Some(Ok(dir)) => dir,
+                Some(Err(e)) => {
+                    last = e;
+                    continue;
+                }
+                None => {
+                    last = io::Error::from(io::ErrorKind::AlreadyExists);
+                    continue;
+                }
+            };
+            let path = dir.join("l.sock");
+            match std::os::unix::net::UnixListener::bind(&path) {
+                Ok(listener) => {
+                    return Ok(Self {
+                        dir,
+                        path,
+                        _listener: listener,
+                    });
+                }
+                Err(e) => {
+                    drop(std::fs::remove_dir(&dir));
+                    last = e;
                 }
             }
         }
@@ -300,6 +324,7 @@ impl TableCheck {
 impl Drop for TableCheck {
     fn drop(&mut self) {
         drop(std::fs::remove_file(&self.path));
+        drop(std::fs::remove_dir(&self.dir));
     }
 }
 
@@ -2350,10 +2375,12 @@ mod tests {
         }
     }
 
-    /// A check folder that refuses the bind (missing, or too deep for `sun_path`) passes it to
-    /// the next; with none that takes it the last refusal is the answer.
+    /// The check binds in a folder of its own, made owner-only, under the first absolute folder
+    /// that takes it: a relative one, a missing one and one too deep for `sun_path` pass it on and
+    /// keep nothing. With none that takes it the last refusal is the answer.
     #[test]
-    fn the_table_check_binds_in_the_first_folder_that_takes_it() {
+    fn the_table_check_binds_in_a_folder_of_its_own_under_the_first_that_takes_it() {
+        use std::os::unix::fs::PermissionsExt as _;
         let dir = aterm_tempfile::Builder::new()
             .tempdir_in("/tmp")
             .expect("a scratch folder short enough for sun_path");
@@ -2361,24 +2388,41 @@ mod tests {
         let deep = base.join("d".repeat(120));
         std::fs::create_dir(&deep).expect("a folder too deep for sun_path");
         let missing = base.join("missing");
-        let check = super::TableCheck::bind_in(&[missing.clone(), deep.clone(), base.clone()])
-            .expect("bound in the folder that takes it");
+        let relative = std::path::PathBuf::from(".");
+        let check = super::TableCheck::bind_in(&[
+            relative.clone(),
+            missing.clone(),
+            deep.clone(),
+            base.clone(),
+        ])
+        .expect("bound in the folder that takes it");
+        assert_eq!(check.path.parent(), Some(check.dir.as_path()));
         assert_eq!(
-            check.path.parent(),
+            check.dir.parent(),
             Some(base.as_path()),
             "{}",
             check.path.display()
         );
+        let mode = std::fs::symlink_metadata(&check.dir)
+            .expect("its folder")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o7777, 0o700, "{mode:o}");
+        assert_eq!(
+            std::fs::read_dir(&deep).expect("the deep folder").count(),
+            0,
+            "the folder whose bind failed is gone"
+        );
         drop(check);
-        assert!(super::TableCheck::bind_in(&[missing, deep]).is_err());
+        assert!(super::TableCheck::bind_in(&[relative, missing, deep]).is_err());
     }
 
-    /// The check's listener is this process's at its path while it lives, and its file is gone
-    /// once it is dropped.
+    /// The check's listener is this process's at its path while it lives, and its file and folder
+    /// are gone once it is dropped.
     #[test]
     fn the_table_check_listener_leaves_no_file() {
         let check = super::TableCheck::bind().expect("a check listener");
-        let path = check.path.clone();
+        let (path, folder) = (check.path.clone(), check.dir.clone());
         assert!(
             std::fs::symlink_metadata(&path).is_ok(),
             "{}",
@@ -2396,7 +2440,8 @@ mod tests {
         );
         drop(check);
         assert!(
-            std::fs::symlink_metadata(&path).is_err(),
+            std::fs::symlink_metadata(&path).is_err()
+                && std::fs::symlink_metadata(&folder).is_err(),
             "{}",
             path.display()
         );

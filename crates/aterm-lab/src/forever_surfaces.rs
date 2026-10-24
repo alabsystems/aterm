@@ -6,8 +6,8 @@
 use std::time::Duration;
 
 use super::{
-    CARRYING_ON, Chain, DEFENSE_HEAD, NEED, NEED_A, NEED_B, NEED_C, Scenario, Seen, Tab, Verdict,
-    at, attention_text, needs_up, on, word,
+    CARRYING_ON, Chain, DEFENSE_HEAD, NEED, NEED_A, NEED_B, NEED_C, Opening, Scenario, Seen, Tab,
+    Verdict, at, attention_text, needs_up, on, word,
 };
 use crate::door::Door;
 use crate::stop;
@@ -67,6 +67,16 @@ pub struct Window {
     pub front: Option<(i64, String)>,
     /// End-of-run resting summary line (L7).
     pub rest: Option<String>,
+    /// The chip's title as its hover reads it (`chrome`'s ` title=`, a development build's), split
+    /// off [`Window::chip`]: `-` where the chip is not drawn or names none, `?` where the line
+    /// prints no such field.
+    pub title: Vec<(i64, String)>,
+    /// The opening sweep's `autopilot` line, title and all: the tab brought in front and captured
+    /// before its first prompt unless the manager's spawn already supplied its task
+    /// ([`opening_sweep`]).
+    pub opening: Option<(i64, String)>,
+    /// Its row one level into its manager's submenu ([`worker_of`]): `-` where none names it.
+    pub worker: Vec<(i64, String)>,
 }
 
 impl Window {
@@ -74,7 +84,14 @@ impl Window {
     pub fn note(&mut self, g: &Glance, sid: &str) -> Vec<(&'static str, String)> {
         self.read = true;
         let label = self.label.clone();
-        let chip = chip_of(&g.chrome, sid).unwrap_or_else(|| "-".into());
+        let (chip, title) = chip_of(&g.chrome, sid).map_or_else(
+            || ("-".to_string(), "-".to_string()),
+            |line| {
+                let (chip, title) = split_title(&line);
+                (chip, title.unwrap_or_else(|| "?".into()))
+            },
+        );
+        let worker = worker_of(&g.sub, &label);
         let tab = g.strip.iter().find(|s| s.label == label);
         let strip = tab.map_or_else(|| "-".to_string(), StripTab::words);
         let hover = tab
@@ -96,6 +113,8 @@ impl Window {
             ("hover", &mut self.hover, hover),
             ("menu", &mut self.menu, menu),
             ("page", &mut self.page, page),
+            ("title", &mut self.title, title),
+            ("worker", &mut self.worker, worker),
         ] {
             if (what == "hover" && !hover_read) || (what == "page" && !g.page_read) {
                 continue;
@@ -192,8 +211,9 @@ pub struct Idle {
     pub moved: Vec<String>,
     /// Duplicate journal lines rewritten during the idle window.
     pub relogged: Vec<String>,
-    /// Tabs with unseen ends or active holds standing during the idle window.
+    /// Tabs with unseen ends standing during the idle window.
     pub ends: Vec<String>,
+    /// Tabs whose Land hold stood as it opened ([`holds_of`]).
     pub holds: Vec<String>,
     /// Whether the Harness page remained open during the idle window.
     pub page_open: bool,
@@ -206,6 +226,8 @@ pub struct Glance {
     pub chrome: String,
     pub strip: Vec<StripTab>,
     pub menu: Vec<MenuRow>,
+    /// The rows one level into each submenu ([`sub_rows`]).
+    pub sub: Vec<SubRow>,
     /// Parsed `text key=… label=…` rows from the Harness page.
     pub page: Vec<(String, String)>,
     /// Whether `chrome` included a complete tooltip table.
@@ -236,6 +258,7 @@ impl Glance {
             chrome: chrome.to_string(),
             strip,
             menu: menu_rows(chrome),
+            sub: sub_rows(chrome),
             page,
             hover_read,
             page_read,
@@ -418,12 +441,24 @@ pub fn strip_tabs(chrome: &str) -> Vec<StripTab> {
         .enumerate()
         .map(|(index, label)| StripTab {
             index,
-            label,
+            label: team_unmarked(&label).to_string(),
             selected: selected == Some(index),
             states: states.get(index).cloned().unwrap_or_default(),
             tip: tips.get(index).cloned().flatten(),
         })
         .collect()
+}
+
+/// A strip entry's title without its team marks (`tab_bar::team_title`): `↳ ` before a worker's
+/// title and ` ⇉N` after a manager's. The lab titles each tab with its chain's name and reads the
+/// strip by that name, whoever spawned it or whatever it spawned.
+#[must_use]
+pub fn team_unmarked(shown: &str) -> &str {
+    let title = shown.strip_prefix("\u{21b3} ").unwrap_or(shown);
+    title
+        .rsplit_once(" \u{21c9}")
+        .filter(|(_, n)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        .map_or(title, |(t, _)| t)
 }
 
 /// The section an Info row heads, by its words.
@@ -534,6 +569,87 @@ pub fn menu_of(menu: &[MenuRow], tab: &str) -> String {
     lines.join("\n")
 }
 
+/// One row one level into a submenu of `chrome`'s `statusmenu` lines (printed with two spaces
+/// before it, which [`menu_rows`] passes over): the submenu's own row, its words and its tip.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SubRow {
+    pub parent: String,
+    pub label: String,
+    pub tip: Option<String>,
+}
+
+/// Parses the rows one level into each submenu of `chrome`'s `statusmenu` lines.
+#[must_use]
+pub fn sub_rows(chrome: &str) -> Vec<SubRow> {
+    let mut parent: Option<String> = None;
+    let mut out = Vec::new();
+    for line in chrome.lines() {
+        let Some(rest) = line.strip_prefix("statusmenu ") else {
+            continue;
+        };
+        if let Some(body) = rest.strip_prefix('"') {
+            let (label, tail) = unquote(body);
+            parent = tail
+                .split_whitespace()
+                .any(|w| w == "submenu")
+                .then_some(label);
+            continue;
+        }
+        if rest.starts_with("---") {
+            parent = None;
+            continue;
+        }
+        let (Some(body), Some(p)) = (rest.strip_prefix("  \""), &parent) else {
+            continue;
+        };
+        let (label, tail) = unquote(body);
+        out.push(SubRow {
+            parent: p.clone(),
+            label,
+            tip: quoted(tail, "tip"),
+        });
+    }
+    out
+}
+
+/// Whether submenu row `parent` is a manager's (`<label> — <n> worker(s): …`, `manager_line`).
+fn is_manager(parent: &str) -> bool {
+    parent
+        .split_once(" \u{2014} ")
+        .and_then(|(_, r)| r.split_once(' '))
+        .is_some_and(|(n, w)| {
+            n.parse::<usize>().is_ok() && (w.starts_with("worker: ") || w.starts_with("workers: "))
+        })
+}
+
+/// Formats tab `tab`'s row one level into its manager's submenu for [`Window::worker`]
+/// (`mgr|<the manager's row>`, `row|<its row>`, then `tip|<its tip>` where it has one), ages
+/// masked; `-` where no manager's submenu names it.
+#[must_use]
+pub fn worker_of(rows: &[SubRow], tab: &str) -> String {
+    let Some(r) = rows
+        .iter()
+        .find(|r| is_manager(&r.parent) && row_names(&r.label, tab))
+    else {
+        return "-".into();
+    };
+    let mut out = vec![
+        format!("mgr|{}", masked(&r.parent)),
+        format!("row|{}", masked(&r.label)),
+    ];
+    if let Some(tip) = &r.tip {
+        out.push(format!("tip|{tip}"));
+    }
+    out.join("\n")
+}
+
+/// A [`Window::worker`] entry's `field|` line.
+fn worker_field<'a>(entry: &'a str, field: &str) -> Option<&'a str> {
+    entry
+        .lines()
+        .find_map(|l| l.strip_prefix(field)?.strip_prefix('|'))
+}
+
 /// Replaces relative age tokens (`6s`, `3m`, `2h`, `1d`) in `s` with `#`.
 #[must_use]
 pub fn masked(s: &str) -> String {
@@ -631,6 +747,22 @@ pub fn chip_of(chrome: &str, sid: &str) -> Option<String> {
         .lines()
         .find_map(|l| l.strip_prefix(head.as_str()))
         .map(str::to_string)
+}
+
+/// An `autopilot` line's ` title=` field split off it (a development build's, §12.5.4's 5d): the
+/// line without it, and the title (`Some("-")` where it printed `title=-`, `None` where it printed
+/// no such field: a release build's, or one before 5d).
+#[must_use]
+pub fn split_title(line: &str) -> (String, Option<String>) {
+    let Some(at) = line.rfind(" title=") else {
+        return (line.to_string(), None);
+    };
+    let value = &line[at + " title=".len()..];
+    let title = match value.strip_prefix('"') {
+        Some(body) => unquote(body).0,
+        None => value.split_whitespace().next().unwrap_or("-").to_string(),
+    };
+    (line[..at].to_string(), Some(title))
 }
 
 /// Parsed fields of an `autopilot` chrome line.
@@ -772,6 +904,8 @@ pub enum Under {
     Scenario(Scenario),
     /// Evaluated on the first scenario of every chain in [`Chain::ALL`] except the listed ones.
     First(&'static [Chain]),
+    /// Evaluated on the first scenario of each listed chain, whatever its mode.
+    FirstOf(&'static [Chain]),
 }
 
 /// Window surface assertion bound to an [`Under`] scope and judge function.
@@ -791,6 +925,9 @@ impl Want {
                 Chain::ALL.contains(&chain)
                     && !but.contains(&chain)
                     && chain.scenarios().first() == Some(&s)
+            }
+            Under::FirstOf(these) => {
+                these.contains(&chain) && chain.scenarios().first() == Some(&s)
             }
         }
     }
@@ -815,18 +952,54 @@ pub fn front_of(chains: &[Chain]) -> Option<usize> {
         .find_map(|f| chains.iter().position(|c| c == f))
 }
 
-/// Whether chain `c` stands paused in a `WAITING` back-off at the end of the run.
+/// Whether chain `c` stands HELD at the end of the run (§12.3's Land hold, `land_held=`): a
+/// measured chain under Land that neither lands nor ends, so its hold stands through END.
 #[must_use]
-pub fn pauses(c: Chain) -> bool {
-    Chain::ALL.contains(&c) && !c.lands() && !ENDING.contains(&c) && c.autopilot() != "off"
+pub fn holds_at_end(c: Chain) -> bool {
+    Chain::ALL.contains(&c) && !c.lands() && !ENDING.contains(&c) && c.autopilot() == "land"
 }
 
-/// Reason a run of `chains` skips reading window surfaces, or `None` if it reads them.
+/// The chains whose chip's title is read and judged ([`title_words`]): the measured pass's and
+/// the coverage chains (`--mode cover`), each brought in front once before its first prompt
+/// ([`opening_sweep`]); the worker once it is spawned.
+pub const TITLED: [Chain; 23] = [
+    Chain::LandA,
+    Chain::LandB,
+    Chain::LandC,
+    Chain::LandD,
+    Chain::LandE,
+    Chain::LandF,
+    Chain::LandG,
+    Chain::LandH,
+    Chain::LandI,
+    Chain::Cruise,
+    Chain::Off,
+    Chain::InstantLand,
+    Chain::InstantCruise,
+    Chain::LandJ,
+    Chain::LandK,
+    Chain::CruiseN,
+    Chain::LandQ,
+    Chain::LandP,
+    Chain::LandW,
+    Chain::WroteC,
+    Chain::LandT,
+    Chain::Worker,
+    Chain::CruiseO,
+];
+
+/// Reason a run of `chains` skips reading window surfaces, or `None` if it reads them: it reads
+/// them wherever one of its chains has a want in [`WANTS`] (a cover chain run alone among them),
+/// so a want never passes as a skip for want of a read.
 #[must_use]
 pub fn unread_why(surfaces_on: bool, chains: &[Chain]) -> Option<&'static str> {
     if !surfaces_on {
         Some("--no-surfaces")
-    } else if chains.iter().any(|c| Chain::ALL.contains(c)) {
+    } else if chains.iter().any(|c| {
+        c.scenarios()
+            .iter()
+            .any(|s| WANTS.iter().any(|w| w.of(*c, *s)))
+    }) {
         None
     } else {
         Some("no chain of this run has a window want")
@@ -848,6 +1021,11 @@ pub const WANTS: &[Want] = &[
         under: Under::First(&[]),
         name: "every chip face its Autopilot's, a tab behind drawn=- why=not-drawn",
         judge: chip_faces,
+    },
+    Want {
+        under: Under::FirstOf(&TITLED),
+        name: "the chip's title says its mode's sentence from MODE_WORDS (a read hold's words in its place under Land)",
+        judge: title_words,
     },
     Want {
         under: Under::First(&[Chain::LandA, Chain::LandJ, Chain::LandK]),
@@ -948,6 +1126,26 @@ pub const WANTS: &[Want] = &[
         under: Under::Scenario(Scenario::L7),
         name: "the page counts every landing: today N landed, Every session N landed beside the landing",
         judge: l7_page,
+    },
+    Want {
+        under: Under::Scenario(Scenario::L7),
+        name: "the page's Landed row: Landed: N today · M in 7 days, N every landing, M at least N",
+        judge: l7_did,
+    },
+    Want {
+        under: Under::Scenario(Scenario::P5),
+        name: "land_held=defense; the hover and state line say no “Nothing left:” defense yet",
+        judge: |s, c| hold::legs(s, c, hold::DEFENSE),
+    },
+    Want {
+        under: Under::Scenario(Scenario::L12),
+        name: "land_held=defense; the hover and state line say no “Nothing left:” defense yet",
+        judge: |s, c| hold::legs(s, c, hold::DEFENSE),
+    },
+    Want {
+        under: Under::Scenario(Scenario::L15),
+        name: "its row under its manager: ● … — working before land@v1, ● … — landing while it holds, its tip the hold's",
+        judge: hold::worker_row,
     },
     Want {
         under: Under::Scenario(Scenario::L16),
@@ -1509,6 +1707,382 @@ fn l7_rows(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
         rest.unwrap_or("-")
     );
     told(said, &bad, &unread)
+}
+
+/// What one title read says of its chain's mode ([`title_says`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TitleSays {
+    /// `autopilot: <mode> — <its sentence>`, whole.
+    Sentence,
+    /// Under Land, a READ hold's words in the sentence's place (`not landed yet: …`, §12.4.12).
+    Held,
+    /// A face past Land's own (`land, landed`, `land, quiet`): no mode sentence to say. It holds
+    /// the `face=` that says it (`landed`, `theirs`).
+    Past(&'static str),
+    /// Anything else, and why.
+    Wrong(String),
+}
+
+/// What title `t` says of chain mode `mode` (`cruise`, `land`, `off`): its phrase, ` — `, and the
+/// mode's sentence from [`MODE_WORDS`](aterm_agent::supervise::mode_words::MODE_WORDS) whole, then
+/// the title's end or its next part (` · `).
+#[must_use]
+pub fn title_says(t: &str, mode: &str) -> TitleSays {
+    use aterm_agent::supervise::Autopilot;
+    use aterm_agent::supervise::mode_words::mode_words;
+    let Some(m) = Autopilot::ALL.into_iter().find(|m| m.word() == mode) else {
+        return TitleSays::Wrong(format!("no mode {mode:?}"));
+    };
+    let sentence = mode_words(m).chip;
+    if m == Autopilot::Land && t.starts_with("autopilot: land, landed") {
+        return TitleSays::Past("landed");
+    }
+    if m == Autopilot::Land && t.starts_with("autopilot: land, quiet") {
+        return TitleSays::Past("theirs");
+    }
+    let head = format!("autopilot: {mode} \u{2014} ");
+    let Some(rest) = t.strip_prefix(&head) else {
+        return TitleSays::Wrong(format!("not {head:?} …"));
+    };
+    if rest
+        .strip_prefix(sentence)
+        .is_some_and(|after| after.is_empty() || after.starts_with(" \u{b7} "))
+    {
+        return TitleSays::Sentence;
+    }
+    if m == Autopilot::Land && rest.starts_with("not landed yet: ") && !rest.contains(sentence) {
+        return TitleSays::Held;
+    }
+    TitleSays::Wrong(format!("its sentence is not {sentence:?}"))
+}
+
+/// Every chain's chip title says its mode's sentence (§12.4.1, 4d), read where its chip is
+/// drawn: the opening sweep, the front tab's reads, END's sweep. The opening precedes the
+/// first prompt except for a spawned worker, whose spawn supplies its task before the sweep.
+/// A tab whose chip is not drawn names no title (Gemini CLI's no footer, agy's bare footer
+/// under its off switch).
+fn title_words(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
+    let w = &seen.window;
+    let mode = cx.chain.autopilot();
+    let spawned = cx.chain.opening() == Opening::Spawned;
+    let mut reads: Vec<(i64, &str, Chip, Option<String>)> = Vec::new();
+    for (place, line) in [("opening", &w.opening), ("front", &w.front)] {
+        if let Some((t, l)) = line
+            && l != "-"
+        {
+            let (rest, title) = split_title(l);
+            reads.push((*t, place, chip(&rest), title));
+        }
+    }
+    let mut times: Vec<i64> = w.title.iter().chain(&w.chip).map(|(t, _)| *t).collect();
+    times.sort_unstable();
+    times.dedup();
+    for t in times {
+        let (Some((_, l)), Some((_, title))) = (
+            w.chip.iter().rfind(|(at, _)| *at <= t),
+            w.title.iter().rfind(|(at, _)| *at <= t),
+        ) else {
+            continue;
+        };
+        let c = chip(l);
+        if title == "-" && c.drawn.is_none() {
+            continue;
+        }
+        let title = (title != "?").then(|| title.clone());
+        reads.push((t, "drawn", c, title));
+    }
+    reads.sort_by_key(|(t, ..)| *t);
+    if reads.is_empty() {
+        return Verdict::Unobserved(format!(
+            "{}'s chip was never read in front (no opening sweep, no END)",
+            w.label
+        ));
+    }
+    if reads.iter().all(|(.., title)| title.is_none()) {
+        return Verdict::Unobserved(
+            "chrome prints no title= (a release build, or one before 5d)".into(),
+        );
+    }
+    let mut bad = Vec::new();
+    let mut said = Vec::new();
+    let mut observed = 0;
+    let mut bare = 0;
+    let mut undrawn_n = 0;
+    for (t, place, c, title) in &reads {
+        let at_t = format!("{place} +{}", at(cx.t0, *t));
+        let spawned_opening = *place == "opening" && spawned;
+        let title = title.as_deref().unwrap_or("?");
+        if c.drawn.is_none() && c.why.as_deref() == Some("not-drawn") && title == "-" {
+            undrawn_n += 1;
+            continue;
+        }
+        if footless(cx.program) || bare_under_switch(cx.program, c) && switch_only(c) {
+            if title == "-" {
+                bare += 1;
+            } else {
+                bad.push(format!("{at_t}: an undrawn chip names a title: {title:?}"));
+            }
+            continue;
+        }
+        if title == "-" || title == "?" {
+            bad.push(format!("{at_t}: face={} drawn, yet title={title}", c.face));
+            continue;
+        }
+        match title_says(title, mode) {
+            TitleSays::Sentence => {
+                observed += 1;
+                said.push(format!("{at_t} {}", one_line(title, 160)));
+            }
+            TitleSays::Held | TitleSays::Past(_) if *place == "opening" && !spawned_opening => bad
+                .push(format!(
+                    "{at_t}: before its first prompt, not its mode's sentence: {}",
+                    one_line(title, 200)
+                )),
+            TitleSays::Held if c.face == "land" => {
+                observed += usize::from(spawned_opening);
+                said.push(format!("{at_t} {}", one_line(title, 160)));
+            }
+            TitleSays::Past(face) if c.face == face => {
+                observed += usize::from(spawned_opening);
+                said.push(format!("{at_t} {}", one_line(title, 160)));
+            }
+            TitleSays::Held | TitleSays::Past(_) => bad.push(format!(
+                "{at_t}: not the words of its chip's face={}: {}",
+                c.face,
+                one_line(title, 200)
+            )),
+            TitleSays::Wrong(why) => {
+                bad.push(format!("{at_t}: {why}: {}", one_line(title, 200)));
+            }
+        }
+    }
+    let head = format!(
+        "{} read(s) in front: {}{}{}",
+        reads.len(),
+        if said.is_empty() {
+            "-".to_string()
+        } else {
+            said.join("; ")
+        },
+        if bare > 0 {
+            format!(
+                "; {bare} undrawn ({}), no title, as no chip is drawn to hover",
+                if footless(cx.program) {
+                    "no footer"
+                } else {
+                    "agy's footer bare under its off switch"
+                }
+            )
+        } else {
+            String::new()
+        },
+        if undrawn_n > 0 {
+            format!("; {undrawn_n} in front with its chip not drawn yet (why=not-drawn), no title")
+        } else {
+            String::new()
+        }
+    );
+    let mut unread = Vec::new();
+    if observed == 0 && bare == 0 && bad.is_empty() {
+        unread.push(format!("no read said {mode}'s sentence"));
+    }
+    told(head, &bad, &unread)
+}
+
+/// The page's key of WHAT THE HARNESS DID's Landed row (4c).
+const DID_LANDED: &str = "harness/did/row/landed";
+
+/// The page's HARNESS UPDATES card, which stands below WHAT THE HARNESS DID and its settings.
+const UPDATES: &str = "harness/updates";
+
+/// The most wheel steps END's read of WHAT THE HARNESS DID takes down the page.
+const DID_WHEELS: usize = 60;
+
+/// Extracts WHAT THE HARNESS DID's Landed row from Harness page `rows`.
+#[must_use]
+pub fn did_landed_of(rows: &[(String, String)]) -> Option<String> {
+    rows.iter()
+        .find(|(k, _)| k == DID_LANDED)
+        .map(|(_, l)| l.clone())
+}
+
+/// What a screen of the page, read from its top down, says of WHAT THE HARNESS DID's Landed row.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DidStep {
+    /// The row, on this screen.
+    Read(String),
+    /// HARNESS UPDATES is on the screen and the row is not: the row passed no screen, since a step
+    /// never moves more than the screen shows.
+    Past,
+    /// The row is further down.
+    Wheel,
+}
+
+/// [`DidStep`] of one screen's `rows`.
+#[must_use]
+pub fn did_step(rows: &[(String, String)]) -> DidStep {
+    if let Some(row) = did_landed_of(rows) {
+        DidStep::Read(row)
+    } else if rows.iter().any(|(k, _)| k.starts_with(UPDATES)) {
+        DidStep::Past
+    } else {
+        DidStep::Wheel
+    }
+}
+
+/// The view of window `window`'s front tab where that tab is Settings (`inspect app/v1 tabs`).
+#[must_use]
+pub fn front_page_of(tabs: &str, window: &str) -> Option<String> {
+    let (mut here, mut front) = (false, false);
+    for l in tabs.lines() {
+        let t = l.trim_start();
+        if let Some(rest) = t.strip_prefix("window ") {
+            here = word(rest, "id").as_deref() == Some(window);
+        } else if t.starts_with("tab ") {
+            front = word(t, "active").as_deref() == Some("true");
+        } else if here
+            && front
+            && t.starts_with("leaf ")
+            && t.contains(" kind=app")
+            && word(t, "app").as_deref() == Some("settings")
+        {
+            return word(t, "view");
+        }
+    }
+    None
+}
+
+/// The middle of the page's list (`settings/list`'s `rect=` in `inspect … controls`), where the
+/// wheel turns.
+#[must_use]
+pub fn list_middle(controls: &str) -> Option<(i64, i64)> {
+    let line = controls
+        .lines()
+        .find(|l| quoted(l.trim_start(), "key").as_deref() == Some("settings/list"))?;
+    let rect: Vec<f64> = word(line, "rect")?
+        .split(',')
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    let [x, y, w, h] = rect[..] else {
+        return None;
+    };
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a point on the page, well inside i64"
+    )]
+    Some(((x + w / 2.0).round() as i64, (y + h / 2.0).round() as i64))
+}
+
+/// END's read of WHAT THE HARNESS DID's Landed row, which stands past the page's one screen and no
+/// control owns, so no `act` brings it there. The read opens Settings ▸ Harness as a tab of the
+/// chains' window, in front, and turns the wheel down its list from the top, as a person scrolls,
+/// until the row is on the screen ([`did_step`]). It then closes that tab and brings back the tab
+/// that was in front. The caller has turned the person's look off, so no tab it brings in front is
+/// looked at. Returns the row (if read) and the step's words.
+fn read_did(door: &Door<'_>, desk: &Desk) -> Result<(Option<String>, String), Fail> {
+    let back = strip_tabs(&door.out(&["chrome"]))
+        .into_iter()
+        .find(|t| t.selected)
+        .map(|t| t.index.to_string());
+    let opened = door.out(&["open", "app", "settings", "/harness"]);
+    let tabs = || door.out(&["inspect", "app/v1", "tabs"]);
+    let mut view = None;
+    let shown = wait_until(STEP_WAIT, || {
+        view = front_page_of(&tabs(), &desk.chains_window);
+        view.is_some()
+    });
+    let Some(view) = view.filter(|_| shown) else {
+        return Ok((
+            None,
+            format!(
+                "Settings opened in the chains' window ({}), but no Settings tab in its front \
+                 within {} s",
+                one_line(&opened, 80),
+                STEP_WAIT.as_secs()
+            ),
+        ));
+    };
+    let middle = list_middle(&door.out(&["inspect", "app/v1", "view", &view, "controls"]));
+    let (mut found, mut wheels, mut said) = (None, 0, "row further down");
+    for _ in 0..=DID_WHEELS {
+        let rows = page_rows(&door.out(&["inspect", "app/v1", "view", &view, "text"]));
+        match did_step(&rows) {
+            DidStep::Read(row) => {
+                found = Some(row);
+                said = "read";
+                break;
+            }
+            DidStep::Past => {
+                said = "HARNESS UPDATES reached and no Landed row passed";
+                break;
+            }
+            DidStep::Wheel if wheels == DID_WHEELS => break,
+            DidStep::Wheel => {}
+        }
+        let Some((x, y)) = middle else {
+            said = "no list to turn the wheel over";
+            break;
+        };
+        let xy = format!("xy={x},{y}");
+        if !door
+            .out(&["pointer", "wheel", "dy=3", &xy])
+            .starts_with("OK")
+        {
+            said = "the wheel refused";
+            break;
+        }
+        wheels += 1;
+        stop::sleep(Duration::from_millis(300))?;
+    }
+    let _ = door.out(&["pointer", "leave"]);
+    let closed = if front_page_of(&tabs(), &desk.chains_window).as_deref() == Some(&view) {
+        door.out(&["invoke", "CloseTab"])
+    } else {
+        "not closed: the chains' window's front tab is no longer it".into()
+    };
+    let again = back.map_or_else(
+        || "no tab was in front".to_string(),
+        |i| format!("tab {i} again ({})", one_line(&door.out(&["tab", &i]), 40)),
+    );
+    let words = format!(
+        "Settings opened in the chains' window ({}, view {view}), wheeled {wheels} step(s) down: \
+         {}; closed ({}), {again}",
+        one_line(&opened, 40),
+        found.as_deref().unwrap_or(said),
+        one_line(&closed, 40),
+    );
+    Ok((found, words))
+}
+
+/// L7 on the page's WHAT THE HARNESS DID (4c), at rest: `Landed: N today · M in 7 days`, N the
+/// run's landings this local day (as the today line counts them), M at least N.
+fn l7_did(seen: &Seen, _cx: &Ctx<'_>) -> Verdict {
+    let Some(rest) = seen.window.rest.as_deref() else {
+        return Verdict::Unobserved(UNREST.into());
+    };
+    let Some(landings) = word(rest, "landings").and_then(|v| v.parse::<usize>().ok()) else {
+        return Verdict::Unobserved(format!("the rest read lacks its counts: {rest}"));
+    };
+    let Some(did) = quoted(rest, "did").filter(|d| d != "-") else {
+        return Verdict::Unobserved(
+            "WHAT THE HARNESS DID's Landed row was never on the page's screen".into(),
+        );
+    };
+    let counts = did.strip_prefix("Landed: ").and_then(|r| {
+        let (t, w) = r.split_once(" \u{b7} ")?;
+        let t = t.strip_suffix(" today")?.parse::<usize>().ok()?;
+        let w = w.strip_suffix(" in 7 days")?.parse::<usize>().ok()?;
+        Some((t, w))
+    });
+    let said = format!("the Landed row \"{did}\"; {landings} landing(s) in the run today");
+    let bad = match counts {
+        None => vec!["not `Landed: N today · M in 7 days`".to_string()],
+        Some((t, _)) if t != landings => vec![format!("{t} today, not {landings}")],
+        Some((t, w)) if w < t => vec![format!("{w} in 7 days, fewer than {t} today")],
+        Some(_) => Vec::new(),
+    };
+    told(said, &bad, &[])
 }
 
 /// Why a want of the window at rest is unread: END never read it.
@@ -2120,9 +2694,24 @@ pub fn judge_end(desk: &Desk, tabs: &[(Chain, &Window)], program: &str) -> Verdi
     if idle.ends.is_empty() {
         unread.push("no end stood unseen in it".to_string());
     }
-    let pausing = tabs.iter().any(|(c, _)| pauses(*c));
-    if idle.holds.is_empty() && pausing {
+    let holding = tabs.iter().any(|(c, _)| holds_at_end(*c));
+    let unheld: Vec<&str> = tabs
+        .iter()
+        .filter(|(c, _)| holds_at_end(*c))
+        .map(|(c, _)| c.name())
+        .filter(|n| {
+            !idle
+                .holds
+                .iter()
+                .any(|h| h.split_once('(').is_some_and(|(name, _)| name == *n))
+        })
+        .collect();
+    if idle.holds.is_empty() && holding {
         unread.push("no hold stood in it".to_string());
+    } else if !unheld.is_empty() {
+        bad.push(format!(
+            "no Land hold stood on {unheld:?}, which neither land nor end"
+        ));
     }
     if !idle.page_open {
         unread.push("the page was not open".to_string());
@@ -2133,10 +2722,10 @@ pub fn judge_end(desk: &Desk, tabs: &[(Chain, &Window)], program: &str) -> Verdi
         metric(m, "deadline_owner"),
         idle.ends,
         idle.holds,
-        if pausing {
+        if holding {
             ""
         } else {
-            " (none wanted: no chain of the run pauses)"
+            " (none wanted: no chain of the run holds)"
         },
         if idle.page_open { "open" } else { "NOT open" },
         if idle.relogged.is_empty() {
@@ -2376,6 +2965,116 @@ pub fn window_of(ls: &str, sid: &str) -> Option<String> {
         .and_then(|l| word(l, "window"))
 }
 
+/// Brings `tab` in front of the chains' window, captures it so its chip is drawn, and reads its
+/// `autopilot` line (title and all); `None` where its label is not in the front window's strip.
+fn in_front(door: &Door<'_>, tab: &Tab) -> Option<(String, String)> {
+    let label = &tab.seen.window.label;
+    let i = strip_tabs(&door.out(&["chrome"]))
+        .into_iter()
+        .find(|t| t.label == *label)?
+        .index
+        .to_string();
+    let r = door.out(&["tab", &i]);
+    let _ = on(door, &tab.sid, &["image", FRONT_IMAGE]);
+    let line = chip_of(&door.out(&["chrome"]), &tab.sid).unwrap_or_else(|| "-".into());
+    Some((format!("tab {i}: {}", r.trim()), line))
+}
+
+/// Whether an `autopilot` line says its chip was not drawn in the last frame (`why=not-drawn`),
+/// where a footer (no `no-footer`) would draw it.
+#[must_use]
+pub fn undrawn(line: &str) -> bool {
+    chip(line).why.as_deref() == Some("not-drawn")
+}
+
+/// THE OPENING SWEEP (5d): each of `tabs` brought in front once, before its first prompt unless
+/// its manager's spawn already supplied its task, so its chip is drawn and `chrome` names the
+/// title its hover reads ([`Window::opening`]); then the tab labelled `back` (the chains' window's
+/// front tab) back in front, with no look. With
+/// `until_drawn`, a tab whose chip the first capture did not draw ([`undrawn`]) is captured again
+/// until it is, the hang detector [`STEP_WAIT`]: a spawned worker comes in front while its program
+/// still starts on its task, before it draws its footer.
+pub(super) fn opening_sweep(
+    door: &Door<'_>,
+    tabs: &mut [Tab],
+    back: Option<&str>,
+    until_drawn: bool,
+) {
+    for tab in tabs.iter_mut() {
+        let label = tab.seen.window.label.clone();
+        let read = in_front(door, tab).map(|(said, mut line)| {
+            if until_drawn && undrawn(&line) {
+                let _ = wait_until(STEP_WAIT, || {
+                    let _ = on(door, &tab.sid, &["image", FRONT_IMAGE]);
+                    line = chip_of(&door.out(&["chrome"]), &tab.sid).unwrap_or_else(|| "-".into());
+                    !undrawn(&line)
+                });
+            }
+            (said, line)
+        });
+        match read {
+            Some((said, line)) => {
+                println!("  opening   {label} ({said}): {}", one_line(&line, 400));
+                tab.seen.window.opening = Some((now_ms(), line));
+            }
+            None => println!("  opening   {label}: not in the front window's strip"),
+        }
+    }
+    if let Some(label) = back
+        && let Some(i) = strip_tabs(&door.out(&["chrome"]))
+            .into_iter()
+            .find(|t| t.label == label)
+    {
+        let r = door.out(&["tab", &i.index.to_string()]);
+        println!(
+            "  opening   {label} back in front (tab {}: {})",
+            i.index,
+            r.trim()
+        );
+    }
+}
+
+/// Whether `chrome` shows tab `sid` ready to be read in front: its chip names its program (or it
+/// draws no footer) and the front window's strip lists it as `label`.
+#[must_use]
+pub fn worker_shown(chrome: &str, sid: &str, label: &str) -> bool {
+    chip_of(chrome, sid).is_some_and(|l| {
+        let c = chip(&l);
+        c.face != "-" || no_footer(&c)
+    }) && strip_tabs(chrome).iter().any(|t| t.label == label)
+}
+
+/// A spawned worker's tab, titled with its chain's name (how its strip entry, its page row and its
+/// row under its manager are matched to it), then read in front once its chip names its program
+/// and the strip lists its title ([`worker_shown`], [`opening_sweep`]); the hang detector
+/// [`STEP_WAIT`]. A headless window takes a new title into its strip when it draws, so each look
+/// that finds the title missing captures the front tab (`front_sid`) first.
+pub(super) fn open_worker(door: &Door<'_>, tab: &mut Tab, back: Option<&str>, front_sid: &str) {
+    let name = tab.chain.name();
+    let r = on(door, &tab.sid, &["meta", "set", "title", name]);
+    tab.seen.window.label = name.to_string();
+    let named = wait_until(STEP_WAIT, || {
+        worker_shown(&door.out(&["chrome"]), &tab.sid, name) || {
+            let _ = on(door, front_sid, &["image", FRONT_IMAGE]);
+            worker_shown(&door.out(&["chrome"]), &tab.sid, name)
+        }
+    });
+    println!(
+        "  worker    {name} @{}: titled ({}){}",
+        tab.sid,
+        r.trim(),
+        if named {
+            ""
+        } else {
+            "; within 60 s its chip named no program or the strip listed no such title, so its \
+             title is not read"
+        }
+    );
+    if named {
+        opening_sweep(door, std::slice::from_mut(tab), back, true);
+    }
+}
+
 /// What one tab's end step read.
 fn step_line(door: &Door<'_>, tab: &Tab, name: &str, pressed: Option<&str>) -> String {
     let s = on(door, &tab.sid, &["status"]);
@@ -2560,15 +3259,7 @@ fn idle_window(
             })
             .map(|t| t.chain.name().to_string())
             .collect();
-        let holds: Vec<String> = tabs
-            .iter()
-            .filter(|t| {
-                due_and_quiet(std::slice::from_ref(*t), now_ms())
-                    .0
-                    .is_some()
-            })
-            .map(|t| t.chain.name().to_string())
-            .collect();
+        let holds = holds_of(tabs);
         let from = now_ms();
         let _ = door.out(&["metrics", "reset"]);
         stop::sleep(Duration::from_millis(
@@ -2607,6 +3298,20 @@ fn idle_window(
         }
     }
     Ok(last_idle.unwrap_or_default())
+}
+
+/// The tabs whose last `status` read shows §12.3's Land hold standing (`land_since=` a second),
+/// each as `<chain>(<land_held=>)`: END's holds, read off the hold itself, never off a pause.
+#[must_use]
+pub(super) fn holds_of(tabs: &[Tab]) -> Vec<String> {
+    tabs.iter()
+        .filter_map(|t| {
+            let (_, s) = t.seen.status.last()?;
+            let since = word(s, "land_since").filter(|v| v != "-" && v != "?")?;
+            let held = word(s, "land_held").unwrap_or_else(|| "?".into());
+            Some(format!("{}({held}, since {since})", t.chain.name()))
+        })
+        .collect()
 }
 
 /// Counts landings recorded in `journal` on timestamps matching `today`.
@@ -2735,17 +3440,25 @@ pub(super) fn end_steps(
         };
         (today_of(&rows), every)
     };
+    let _ = door.out(&["person", "look", "off"]);
+    let did = if desk.page_view.is_empty() {
+        None
+    } else {
+        let (did, words) = read_did(door, desk)?;
+        say(desk, format!("the page's WHAT THE HARNESS DID: {words}"));
+        did
+    };
     let rest = format!(
-        "here={} landed_tabs={landed_tabs} landing_tabs={landing_tabs} landings={landings} today={} every={}",
+        "here={} landed_tabs={landed_tabs} landing_tabs={landing_tabs} landings={landings} today={} every={} did={}",
         q(&here),
         q(today.as_deref().unwrap_or("-")),
-        q(every.as_deref().unwrap_or("-"))
+        q(every.as_deref().unwrap_or("-")),
+        q(did.as_deref().unwrap_or("-"))
     );
     say(desk, format!("at rest {rest}"));
     for tab in tabs.iter_mut() {
         tab.seen.window.rest = Some(rest.clone());
     }
-    let _ = door.out(&["person", "look", "off"]);
     let index_of = |door: &Door<'_>, label: &str| {
         strip_tabs(&door.out(&["chrome"]))
             .into_iter()
@@ -2754,18 +3467,13 @@ pub(super) fn end_steps(
     };
     for tab in tabs.iter_mut() {
         let label = tab.seen.window.label.clone();
-        let Some(i) = index_of(door, &label) else {
-            say(desk, format!("{label}: not in the front window's strip"));
-            continue;
-        };
-        let r = door.out(&["tab", &i]);
-        let _ = on(door, &tab.sid, &["image", FRONT_IMAGE]);
-        let line = chip_of(&door.out(&["chrome"]), &tab.sid).unwrap_or_else(|| "-".into());
-        say(
-            desk,
-            format!("front {label} (tab {i}: {}): {line}", r.trim()),
-        );
-        tab.seen.window.front = Some((now_ms(), line));
+        match in_front(door, tab) {
+            Some((said, line)) => {
+                say(desk, format!("front {label} ({said}): {line}"));
+                tab.seen.window.front = Some((now_ms(), line));
+            }
+            None => say(desk, format!("{label}: not in the front window's strip")),
+        }
     }
     for tab in tabs.iter_mut().filter(|t| ENDING.contains(&t.chain)) {
         let l = step_line(door, tab, "sweep", None);

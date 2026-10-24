@@ -5,13 +5,7 @@
 //! master.
 
 #![cfg(unix)]
-#![allow(
-    clippy::disallowed_types,
-    reason = "test code: a stand-in child may inherit descriptors"
-)]
 
-#[cfg(target_os = "macos")]
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::headless_boot;
@@ -50,6 +44,9 @@ fn reading(inst: &Instance, pid: u32) -> Reading {
     }
 }
 
+/// How many PTY masters `pid` holds open, read in this process: on macOS by its vnode
+/// descriptors alone ([`aterm_uds::holders::open_files`], where a master reads as `/dev/ptmx`),
+/// so none of the instance's sockets or kqueues is referenced by a poll.
 fn open_masters(pid: u32) -> Option<usize> {
     #[cfg(target_os = "linux")]
     {
@@ -63,16 +60,11 @@ fn open_masters(pid: u32) -> Option<usize> {
     }
     #[cfg(target_os = "macos")]
     {
-        let out = Command::new("/usr/sbin/lsof")
-            .args(["-n", "-P", "-w", "-p", &pid.to_string()])
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-            .ok()?;
+        let files = aterm_uds::holders::open_files(pid).ok()?;
         Some(
-            String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .filter(|l| l.ends_with("/dev/ptmx"))
+            files
+                .iter()
+                .filter(|f| f.as_path() == std::path::Path::new("/dev/ptmx"))
                 .count(),
         )
     }
@@ -114,6 +106,10 @@ fn closing_the_boot_session_closes_its_pty_master() {
     assert!(spawned.starts_with("OK s-"), "spawn: {spawned}");
 
     let witnessed = open_masters(pid).is_some();
+    assert!(
+        witnessed || cfg!(not(any(target_os = "linux", target_os = "macos"))),
+        "the OS's count of the instance's PTY masters does not read"
+    );
 
     settle("two tabs hold two PTY masters", &inst, pid, 2, witnessed);
 

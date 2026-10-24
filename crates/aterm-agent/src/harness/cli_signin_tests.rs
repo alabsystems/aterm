@@ -863,7 +863,9 @@ fn a_window_hold_keeps_this_process_through_a_hangup_a_stop_and_a_quit() {
 }
 
 /// `ACCOUNTS BROWSER` opens nothing without a terminal, over SSH, under another sign-in's lock or
-/// on a profile another browser holds. CONTROL: with all of that clear it opens one window.
+/// on a profile another browser holds. CONTROL: with all of that clear it opens one window. Unix
+/// alone: the held profile is planted as Chromium's `SingletonLock` link, which only unix reads.
+#[cfg(unix)]
 #[test]
 fn accounts_browser_refuses_without_a_terminal_over_ssh_under_a_held_lock_or_an_open_profile() {
     let (tmp, env) = kimi_env("browser-refusals");

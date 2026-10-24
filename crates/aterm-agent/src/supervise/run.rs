@@ -4104,8 +4104,9 @@ impl<'a, C: Ctl> Session<'a, C> {
         }
         if let Some(seed) = &streak {
             self.turn_end.seed_short(seed.short);
+            let ago = Duration::from_millis(u64::try_from(now_ms - seed.at_ms).unwrap_or(0));
+            self.turn_end.seed_replies(seed.said, ago, self.fx.mono());
             if seed.point && !seed.ran {
-                let ago = Duration::from_millis(u64::try_from(now_ms - seed.at_ms).unwrap_or(0));
                 self.turn_end.seed_point(ago, self.fx.mono());
                 if seed.esc {
                     self.turn_end.seed_esc();

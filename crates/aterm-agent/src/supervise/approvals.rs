@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use super::journal::{Journal, json_str};
 use super::policy::sleeps::{Boot, SleepStamp};
-use super::policy::turn_end::{Conversation, LimitTry};
+use super::policy::turn_end::{Conversation, Kept, LimitTry, Replies};
 
 /// How much of a command a row keeps.
 pub const COMMAND_BYTES: usize = 4096;
@@ -1917,6 +1917,8 @@ pub struct StreakSeed {
     pub ran_ms: Option<i64>,
     pub esc: bool,
     pub retry: Option<RetryMark>,
+    /// The short streak's replies ([`Carried::said`]).
+    pub said: Replies,
 }
 
 #[must_use]
@@ -1938,6 +1940,12 @@ pub fn short_streak_in(body: &str, sid: Option<&str>) -> Option<StreakSeed> {
             continue;
         }
         let rule = text("rule_id").unwrap_or("");
+        if rule == RULE_OFF_STOOD {
+            if let Some(l) = last.as_mut() {
+                l.said = Replies::default();
+            }
+            continue;
+        }
         if rule == RULE_TURN_RAN {
             match last.as_mut() {
                 Some(l) if l.point => {
@@ -1959,6 +1967,7 @@ pub fn short_streak_in(body: &str, sid: Option<&str>) -> Option<StreakSeed> {
                             ran_ms: Some(at_ms),
                             esc: false,
                             retry: None,
+                            said: Replies::default(),
                         });
                     }
                 }
@@ -2004,6 +2013,7 @@ pub fn short_streak_in(body: &str, sid: Option<&str>) -> Option<StreakSeed> {
             ran_ms: None,
             esc,
             retry: text("reason").and_then(retry_mark_of),
+            said: text("reason").and_then(replies_note_of).unwrap_or_default(),
         });
     }
     last.map(|l| StreakSeed { recorded, ..l })
@@ -2061,9 +2071,10 @@ pub const RULE_POINT: &str = "point@v1";
 #[must_use]
 pub fn point_reason(after: Carried, esc: bool) -> String {
     format!(
-        "the turn-end policy judged the point ({SHORT_STREAK}: {}){}{}",
+        "the turn-end policy judged the point ({SHORT_STREAK}: {}){}{}{}",
         after.short,
         retry_mark(after.retry),
+        replies_note(after.said),
         if esc {
             format!(" ({PERSONS_ESC})")
         } else {
@@ -2078,13 +2089,75 @@ const PERSONS_ESC: &str = "a person's Esc stood at the point";
 pub struct Carried {
     pub short: u32,
     pub retry: Option<RetryMark>,
+    /// The short streak's replies ([`super::policy::turn_end::TurnEndState::replies`]).
+    pub said: Replies,
 }
 
 impl Carried {
     #[must_use]
     pub const fn streak(short: u32) -> Self {
-        Self { short, retry: None }
+        Self {
+            short,
+            retry: None,
+            said: Replies::NONE,
+        }
     }
+}
+
+const SAME_REPLIES: &str = "the short streak's replies";
+
+/// The ledger's note of the short streak's replies: each mark, its answers, and `w` with the wall's tries where a wall said it; then the no-work answers in a row.
+fn replies_note(said: Replies) -> String {
+    let kept: Vec<String> = said
+        .kept()
+        .map(|k| {
+            let walled = if k.walled {
+                format!("w{}", k.tries)
+            } else {
+                String::new()
+            };
+            format!("{:016x}:{}{walled}", k.mark, k.answers)
+        })
+        .collect();
+    if kept.is_empty() {
+        return String::new();
+    }
+    format!(
+        " ({SAME_REPLIES}: {}; {}{IN_A_ROW})",
+        kept.join(" "),
+        said.run
+    )
+}
+
+const IN_A_ROW: &str = " in a row";
+
+fn replies_note_of(reason: &str) -> Option<Replies> {
+    let (_, rest) = reason.split_once(&format!("({SAME_REPLIES}: "))?;
+    let note = rest.split(')').next()?;
+    let (note, run) = match note.split_once("; ") {
+        Some((kept, run)) => (kept, run.strip_suffix(IN_A_ROW)?.parse().ok()?),
+        None => (note, 0),
+    };
+    let kept = note
+        .split(' ')
+        .map(|k| {
+            let (mark, answers) = k.split_once(':')?;
+            let (answers, tries) = match answers.split_once('w') {
+                Some((n, tries)) => (n, Some(tries.parse().ok()?)),
+                None => (answers, None),
+            };
+            Some(Kept {
+                mark: u64::from_str_radix(mark, 16).ok()?,
+                answers: answers.parse().ok()?,
+                walled: tries.is_some(),
+                tries: tries.unwrap_or(0),
+            })
+        })
+        .collect::<Option<Vec<Kept>>>()?;
+    Some(Replies {
+        run,
+        ..Replies::of(&kept)
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2194,6 +2267,7 @@ pub fn act_reason_after(after: Carried, limit: Option<LimitTry>) -> String {
     let mut reason = "the turn-end policy".to_string();
     reason.push_str(&short_mark(after.short));
     reason.push_str(&retry_mark(after.retry));
+    reason.push_str(&replies_note(after.said));
     if let Some(l) = limit {
         let head = if l.in_place {
             IN_LIMITS_PLACE
@@ -2567,7 +2641,7 @@ pub const LAND_OVER: &str =
     "the land episode is over (a reading in another mode): a Land after it is a new one";
 
 pub const OFF_STOOD: &str = "autopilot off stood: the person drove the session; the land episode, \
-     the carry and an act a wall cut are over";
+     the carry, the replies the streak kept and an act a wall cut are over";
 
 pub const LIMIT_ENDED: &str = "the limit's track ended (work, or another wall): its tries are over";
 
@@ -2816,6 +2890,29 @@ fn cut(s: &str, n: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_replies_note_carries_the_run_and_an_older_note_reads_none_in_a_row() {
+        use super::{Kept, Replies, replies_note, replies_note_of};
+        let kept = Kept {
+            mark: 0x432b_225c_f708_95ef,
+            answers: 2,
+            walled: true,
+            tries: 1,
+        };
+        let said = Replies {
+            run: 4,
+            ..Replies::of(&[kept])
+        };
+        let note = replies_note(said);
+        assert_eq!(
+            replies_note_of(&format!("the turn-end policy{note}")),
+            Some(said)
+        );
+        let older = note.replace("; 4 in a row", "");
+        assert_ne!(older, note);
+        assert_eq!(replies_note_of(&older), Some(Replies::of(&[kept])));
+    }
 
     #[test]
     fn the_newest_rows_time_is_the_books_last() {
@@ -3987,6 +4084,7 @@ mod tests {
             let carried = Carried {
                 short: 2,
                 retry: Some(mark),
+                said: Replies::default(),
             };
             let reason = act_reason_after(carried, None);
             let path = seed_ledger(
@@ -4029,6 +4127,7 @@ mod tests {
                     ups: 0,
                     since_ms: 7,
                 }),
+                said: Replies::default(),
             },
             Some(limit),
         );
@@ -4245,7 +4344,14 @@ mod tests {
                 RULE_POINT,
                 Outcome::Waiting,
                 "",
-                point_reason(Carried { short: 1, retry }, false),
+                point_reason(
+                    Carried {
+                        short: 1,
+                        retry,
+                        said: Replies::default(),
+                    },
+                    false,
+                ),
             )
         };
         let retry = |ts: i64| {
@@ -4258,6 +4364,7 @@ mod tests {
                     Carried {
                         short: 1,
                         retry: Some(mark(1)),
+                        said: Replies::default(),
                     },
                     None,
                 ),
@@ -4328,7 +4435,14 @@ mod tests {
                 RULE_POINT,
                 Outcome::Waiting,
                 "",
-                point_reason(Carried { short: 0, retry }, false),
+                point_reason(
+                    Carried {
+                        short: 0,
+                        retry,
+                        said: Replies::default(),
+                    },
+                    false,
+                ),
             )
         };
         let waiting =
@@ -4513,7 +4627,14 @@ mod tests {
                 RULE_POINT,
                 Outcome::Waiting,
                 "",
-                point_reason(Carried { short: 0, retry }, false),
+                point_reason(
+                    Carried {
+                        short: 0,
+                        retry,
+                        said: Replies::default(),
+                    },
+                    false,
+                ),
             )
         };
         let waiting = |ts: i64, rule: &'static str, reason: String| -> R {

@@ -185,26 +185,40 @@ fn drawn_rows(icon: PxBox, src: Option<&IconSrc>, (ox, oy): (i32, i32), out: &mu
         return;
     }
     let (aw, ah) = (i32::from(s.art.w()), i32::from(s.art.h()));
+    let (aw_max, ah_max) = (aw - 1, ah - 1);
+    let (two_w, two_h) = (2 * w, 2 * h);
+    let w_max = w - 1;
+    let flip_x = s.flip_x;
     let kind = s.art.texels();
     let drawn = |v: u32| match kind {
         FxTexels::Index8 => v != 0,
         FxTexels::Rgba8Premul | FxTexels::Rgba8Straight => v >> 24 >= u32::from(ICON_ALPHA_EDGE),
     };
     let (lo, hi) = (icon.0.max(bx0), icon.1.min(bx0 + w));
+    let mut prev_sy: Option<(usize, Option<(i32, i32)>)> = None;
     for y in icon.2.max(by0)..icon.3.min(by0 + h) {
         let dy = y - by0;
-        let sy = ((2 * dy + 1) * ah / (2 * h)).min(ah - 1) as usize;
-        let opaque = |x: i32| {
-            let dx = x - bx0;
-            let mx = if s.flip_x { w - 1 - dx } else { dx };
-            let sx = ((2 * mx + 1) * aw / (2 * w)).min(aw - 1) as usize;
-            drawn(s.art.texel(sx, sy))
+        let sy = ((2 * dy + 1) * ah / two_h).min(ah_max) as usize;
+        let span = match prev_sy {
+            Some((ps, span)) if ps == sy => span,
+            _ => {
+                let opaque = |x: i32| {
+                    let dx = x - bx0;
+                    let mx = if flip_x { w_max - dx } else { dx };
+                    let sx = ((2 * mx + 1) * aw / two_w).min(aw_max) as usize;
+                    drawn(s.art.texel(sx, sy))
+                };
+                let span = (lo..hi).find(|&x| opaque(x)).map(|first| {
+                    let last = (first + 1..hi).rev().find(|&x| opaque(x)).unwrap_or(first);
+                    (first, last + 1)
+                });
+                prev_sy = Some((sy, span));
+                span
+            }
         };
-        let Some(first) = (lo..hi).find(|&x| opaque(x)) else {
+        let Some((x0, x1)) = span else {
             continue;
         };
-        let last = (first..hi).rev().find(|&x| opaque(x)).unwrap_or(first);
-        let (x0, x1) = (first, last + 1);
         match out.last_mut() {
             Some(b) if b.3 == y && b.0 == x0 && b.1 == x1 => b.3 = y + 1,
             _ => out.push((x0, x1, y, y + 1)),
@@ -264,6 +278,7 @@ fn cut_rect(rect: PxBox, bands: &[PxBox], out: &mut Vec<PxBox>) -> bool {
 
 /// `a` to `b` at column share `k / w` of a quad's horizontal gradient, per
 /// channel (the gradient a sub-quad starting there continues exactly).
+#[cfg(test)]
 #[inline]
 fn lerp_rgb(a: u32, b: u32, k: i32, w: i32) -> u32 {
     let w = w.max(1);
@@ -272,6 +287,17 @@ fn lerp_rgb(a: u32, b: u32, k: i32, w: i32) -> u32 {
         ((ca * (w - k) + cb * k + w / 2) / w).clamp(0, 255) as u32
     };
     (ch(16) << 16) | (ch(8) << 8) | ch(0)
+}
+
+/// Bounding box `(x0, x1, y0, y1)` of a non-empty sorted `bands` slice.
+#[inline]
+fn bands_bounds(bands: &[PxBox]) -> PxBox {
+    let (mut x0, mut x1) = (i32::MAX, i32::MIN);
+    for b in bands {
+        x0 = x0.min(b.0);
+        x1 = x1.max(b.1);
+    }
+    (x0, x1, bands[0].2, bands[bands.len() - 1].3)
 }
 
 /// Cut every quad of `quads` the icon's drawn rows reach ([`cut_rect`]); a
@@ -284,10 +310,11 @@ fn shade_quads(
     if quads.is_empty() || bands.is_empty() {
         return false;
     }
+    let (bx0, bx1, by0, by1) = bands_bounds(bands);
     let mut any = false;
     for (i, q) in quads.iter().enumerate() {
         let b = quad_box(q);
-        if !cut_rect(b, bands, cut) {
+        if b.1 <= bx0 || b.0 >= bx1 || b.3 <= by0 || b.2 >= by1 || !cut_rect(b, bands, cut) {
             if any {
                 pieces.push(*q);
             }
@@ -299,21 +326,49 @@ fn shade_quads(
             any = true;
         }
         let w = i32::from(q.w);
-        let flat = q.color == q.color2 && q.alpha == q.alpha2;
+        let w_max = w.max(1);
+        let half_w = w / 2;
+        let half_w_max = w_max / 2;
+        let (a0, a1) = (i32::from(q.alpha), i32::from(q.alpha2));
+        let flat_c = q.color == q.color2;
+        let flat_a = q.alpha == q.alpha2;
+        let flat = flat_c && flat_a;
+        let (ca, cb) = (
+            (
+                ((q.color >> 16) & 0xff) as i32,
+                ((q.color >> 8) & 0xff) as i32,
+                (q.color & 0xff) as i32,
+            ),
+            (
+                ((q.color2 >> 16) & 0xff) as i32,
+                ((q.color2 >> 8) & 0xff) as i32,
+                (q.color2 & 0xff) as i32,
+            ),
+        );
+        let lerp_c = |k: i32| {
+            let wk = w_max - k;
+            let ch =
+                |c0: i32, c1: i32| ((c0 * wk + c1 * k + half_w_max) / w_max).clamp(0, 255) as u32;
+            (ch(ca.0, cb.0) << 16) | (ch(ca.1, cb.1) << 8) | ch(ca.2, cb.2)
+        };
         for &(xa, xb, ya, yb) in cut.iter() {
             let (ka, kb) = (xa - b.0, xb - b.0);
-            let (color, color2, alpha, alpha2) = if flat || (ka == 0 && kb == w) {
+            let whole = ka == 0 && kb == w;
+            let (color, color2, alpha, alpha2) = if flat || whole {
                 (q.color, q.color2, q.alpha, q.alpha2)
             } else {
-                let a = |k: i32| {
-                    (i32::from(q.alpha) * (w - k) + i32::from(q.alpha2) * k + w / 2) / w.max(1)
+                let (c1, c2) = if flat_c {
+                    (q.color, q.color2)
+                } else {
+                    (lerp_c(ka), lerp_c(kb))
                 };
-                (
-                    lerp_rgb(q.color, q.color2, ka, w),
-                    lerp_rgb(q.color, q.color2, kb, w),
-                    a(ka).clamp(0, 255) as u8,
-                    a(kb).clamp(0, 255) as u8,
-                )
+                let (al1, al2) = if flat_a {
+                    (q.alpha, q.alpha2)
+                } else {
+                    let a = |k: i32| (a0 * (w - k) + a1 * k + half_w) / w_max;
+                    (a(ka).clamp(0, 255) as u8, a(kb).clamp(0, 255) as u8)
+                };
+                (c1, c2, al1, al2)
             };
             pieces.push(GlowQuad {
                 x: xa as u16,
@@ -344,9 +399,11 @@ fn shade_halos(
     if halos.is_empty() || bands.is_empty() {
         return false;
     }
+    let (bx0, bx1, by0, by1) = bands_bounds(bands);
     let mut any = false;
     for (i, h) in halos.iter().enumerate() {
-        if !cut_rect(halo_box(h), bands, cut) {
+        let b = halo_box(h);
+        if b.1 <= bx0 || b.0 >= bx1 || b.3 <= by0 || b.2 >= by1 || !cut_rect(b, bands, cut) {
             if any {
                 pieces.push(*h);
             }

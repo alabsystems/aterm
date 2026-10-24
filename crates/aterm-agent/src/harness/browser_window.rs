@@ -401,21 +401,21 @@ impl ProfileLock {
     /// Claims the browser profile `profile` (an existing directory) for one launch: refused
     /// where a browser holds its `SingletonLock` or another of aterm's launches its
     /// [`PROFILE_LOCK_FILE`]; else that file is locked, and this process's pid written in it.
+    /// Off unix no `SingletonLock` is read, as [`profile_holder`] reads none there, and the file
+    /// keeps the private folder's permissions rather than mode 0600.
     /// # Errors
     /// Who holds it, or why its lock could not be taken.
-    #[cfg(unix)]
     pub fn claim(profile: &Path) -> Result<ProfileLock, Refusal> {
         use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
+        #[cfg(unix)]
         if let Some(holder) = singleton_holder(profile) {
             return Err(Refusal::Held(holder));
         }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .mode(0o600)
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).truncate(false).read(true).write(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let file = options
             .open(profile.join(PROFILE_LOCK_FILE))
             .map_err(Refusal::Unlockable)?;
         match Self::try_take(file).map_err(Refusal::Unlockable)? {
@@ -493,12 +493,29 @@ pub fn idp_cookie(domain: &str) -> bool {
         return true;
     }
     let labels: Vec<&str> = host.split('.').collect();
+    if labels.iter().any(|l| {
+        l.is_empty()
+            || !l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            || l.starts_with('-')
+            || l.ends_with('-')
+    }) {
+        return false;
+    }
     labels.iter().enumerate().any(|(at, label)| {
-        IDP_SITES.contains(label)
-            && at + 1 < labels.len()
-            && labels[at + 1..]
-                .iter()
-                .all(|tld| !tld.is_empty() && tld.len() <= 3)
+        if !IDP_SITES.contains(label) {
+            return false;
+        }
+        match &labels[at + 1..] {
+            [tld] => (2..=3).contains(&tld.len()) && tld.bytes().all(|b| b.is_ascii_alphabetic()),
+            [sld, cctld] => {
+                matches!(
+                    *sld,
+                    "co" | "com" | "org" | "net" | "ac" | "gov" | "edu" | "ne" | "or"
+                ) && cctld.len() == 2
+                    && cctld.bytes().all(|b| b.is_ascii_alphabetic())
+            }
+            _ => false,
+        }
     })
 }
 

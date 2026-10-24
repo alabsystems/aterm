@@ -1077,25 +1077,28 @@ fn auto_continue_said(item: &str) -> Option<AutoContinue> {
     let text = item
         .trim_start_matches(|c: char| !c.is_alphanumeric())
         .replace('\u{2219}', "\u{b7}");
-    let opens = |id: &str| {
-        let words = crate::anchors::anchor(id);
+    let opens = |words: &str| {
         [text.as_str(), strip_ci(&text, "your ").unwrap_or("")]
             .iter()
             .any(|t| strip_ci(t, words).is_some())
     };
-    if opens("wall.auto_continue.fired") || opens("wall.auto_continue.now") {
+    if opens(crate::anchor!("wall.auto_continue.fired"))
+        || opens(crate::anchor!("wall.auto_continue.now"))
+    {
         Some(AutoContinue::Fired)
     } else if [
-        "wall.auto_continue.cancelled",
-        "wall.auto_continue.stopped",
-        "wall.auto_continue.off",
-        "wall.auto_continue.stale",
+        crate::anchor!("wall.auto_continue.cancelled"),
+        crate::anchor!("wall.auto_continue.stopped"),
+        crate::anchor!("wall.auto_continue.off"),
+        crate::anchor!("wall.auto_continue.stale"),
     ]
     .iter()
-    .any(|id| opens(id))
+    .any(|words| opens(words))
     {
         Some(AutoContinue::Unkept)
-    } else if opens("wall.auto_continue") || strip_ci(&text, "continuing shortly").is_some() {
+    } else if opens(crate::anchor!("wall.auto_continue"))
+        || strip_ci(&text, "continuing shortly").is_some()
+    {
         // The countdown's own row opens with its words; the transcript's
         // `Usage limit reached · continuing automatically at …` is the
         // limit's notice, and the walk stops there.

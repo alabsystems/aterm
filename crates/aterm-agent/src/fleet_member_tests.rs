@@ -944,7 +944,12 @@ fn a_leave_where_no_writer_can_make_the_state_takes_the_fleet_out_of_aterm_toml(
             closed_port()
         ));
         let listening = world.config();
-        assert!(init(&places, &racing_init()).is_err(), "{odd}");
+        let refused = match init(&places, &racing_init()) {
+            Err(Failure::Failed(why)) => why,
+            other => panic!("{odd}: {other:?}"),
+        };
+        let shown = places.state.display().to_string();
+        assert_eq!(refused.matches(&shown).count(), 1, "{odd}: {refused}");
         assert_eq!(
             world.config(),
             listening,

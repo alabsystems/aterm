@@ -28,16 +28,18 @@ pub fn line_cells_tail(
     out.reserve(keep as usize);
     let start = available - keep;
     if dr == 0 {
-        let sc = if origin.1 < destination.1 {
+        let step_c = if major == 0 {
+            0i64
+        } else if origin.1 < destination.1 {
             1i64
         } else {
             -1i64
         };
         let r = origin.0;
-        let c0 = i64::from(origin.1);
-        for k in start..available {
-            let c_steps = if major == 0 { 0 } else { k };
-            out.push((r, (c0 + sc * c_steps) as i32));
+        let mut c = i64::from(origin.1) + step_c * start;
+        for _ in start..available {
+            out.push((r, c as i32));
+            c += step_c;
         }
         return;
     }
@@ -47,45 +49,55 @@ pub fn line_cells_tail(
         } else {
             -1i64
         };
-        let r0 = i64::from(origin.0);
+        let mut r = i64::from(origin.0) + sr * start;
         let c = origin.1;
-        for k in start..available {
-            out.push(((r0 + sr * k) as i32, c));
+        for _ in start..available {
+            out.push((r as i32, c));
+            r += sr;
         }
         return;
     }
     let sr = if origin.0 < destination.0 {
-        1i128
+        1i64
     } else {
-        -1i128
+        -1i64
     };
     let sc = if origin.1 < destination.1 {
-        1i128
+        1i64
     } else {
-        -1i128
+        -1i64
     };
     let bias = i128::from(major.saturating_sub(1)) / 2;
-    let origin_r = i128::from(origin.0);
-    let origin_c = i128::from(origin.1);
     let major128 = i128::from(major);
+    let start128 = i128::from(start);
 
     if dc >= dr {
-        let dr128 = i128::from(dr);
-        for k in start..available {
-            let k = i128::from(k);
-            let r_steps = (k * dr128 + bias) / major128;
-            let r = origin_r + sr * r_steps;
-            let c = origin_c + sc * k;
+        let num0 = start128 * i128::from(dr) + bias;
+        let mut r = i64::from(origin.0) + sr * ((num0 / major128) as i64);
+        let mut rem = (num0 % major128) as i64;
+        let mut c = i64::from(origin.1) + sc * start;
+        for _ in start..available {
             out.push((r as i32, c as i32));
+            c += sc;
+            rem += dr;
+            if rem >= major {
+                rem -= major;
+                r += sr;
+            }
         }
     } else {
-        let dc128 = i128::from(dc);
-        for k in start..available {
-            let k = i128::from(k);
-            let c_steps = (k * dc128 + bias) / major128;
-            let r = origin_r + sr * k;
-            let c = origin_c + sc * c_steps;
+        let num0 = start128 * i128::from(dc) + bias;
+        let mut r = i64::from(origin.0) + sr * start;
+        let mut c = i64::from(origin.1) + sc * ((num0 / major128) as i64);
+        let mut rem = (num0 % major128) as i64;
+        for _ in start..available {
             out.push((r as i32, c as i32));
+            r += sr;
+            rem += dc;
+            if rem >= major {
+                rem -= major;
+                c += sc;
+            }
         }
     }
 }

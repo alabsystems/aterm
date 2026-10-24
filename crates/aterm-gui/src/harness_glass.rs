@@ -759,13 +759,10 @@ pub(crate) fn hold_words(
     form: HoldForm,
     today: Option<i64>,
 ) -> Option<String> {
+    use aterm_agent::harness::acts::{NOT_LANDED_YET, held_tip, nudge_words};
     let sep = crate::native_ui::FACT_SEPARATOR;
     let held = hold.held;
-    let nudges = match held.nudges {
-        0 => None,
-        1 => Some("1 nudge".to_owned()),
-        n => Some(format!("{n} nudges")),
-    };
+    let nudges = nudge_words(held.nudges);
     let since = |between: &str| {
         let head = match hold.since {
             Some(at) => format!("landing since {}", at.words(today)),
@@ -784,18 +781,15 @@ pub(crate) fn hold_words(
     };
     match form {
         HoldForm::Title if hold.read() => {
-            Some(format!("not landed yet: {}{sep}{}", legs(), since(", ")))
+            Some(format!("{NOT_LANDED_YET}: {}{sep}{}", legs(), since(", ")))
         }
         HoldForm::Title => Some(since(", ")),
         HoldForm::Line if hold.read() => {
-            Some(format!("not landed yet: {}{sep}{}", legs(), since(sep)))
+            Some(format!("{NOT_LANDED_YET}: {}{sep}{}", legs(), since(sep)))
         }
         HoldForm::Line => Some(since(sep)),
-        HoldForm::Hover => hold.read().then(|| format!("not landed yet, {}", legs())),
-        HoldForm::Tip if hold.read() => Some(match nudges {
-            Some(n) => format!("not landed yet: {}{sep}{n}", legs()),
-            None => format!("not landed yet: {}", legs()),
-        }),
+        HoldForm::Hover => hold.read().then(|| format!("{NOT_LANDED_YET}, {}", legs())),
+        HoldForm::Tip if hold.read() => Some(held_tip(&legs(), held.nudges)),
         HoldForm::Tip => nudges,
         HoldForm::Spoken => {
             let head = match hold.since {
@@ -844,10 +838,10 @@ fn leg_words(
             (_, None) => "a need named earlier in its reply".to_owned(),
         },
         HoldLeg::Repo => repo_words(held),
-        HoldLeg::Unread => "a repository that could not be read".to_owned(),
         HoldLeg::Open => open_leg(held.open_words()),
-        HoldLeg::Defense => "no \u{201c}Nothing left:\u{201d} defense yet".to_owned(),
-        HoldLeg::Cut => "a reply too tall to read whole".to_owned(),
+        HoldLeg::Unread | HoldLeg::Defense | HoldLeg::Cut => {
+            leg.fixed_words().unwrap_or_default().to_owned()
+        }
     }
 }
 

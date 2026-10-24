@@ -188,7 +188,19 @@ pub(crate) enum LaneOffer {
 #[derive(Default)]
 pub(crate) struct ResetLane {
     #[cfg(unix)]
-    slot: std::sync::Mutex<Option<(u64, SyncSender<crate::spawn::GatherMsg>)>>,
+    slot: std::sync::Mutex<Option<OpenLane>>,
+}
+
+/// One reader generation's lane: its parse stage's channel, and its gather's poke when it has a
+/// poke pipe (`crate::act_barrier`).
+#[cfg(unix)]
+struct OpenLane {
+    generation: u64,
+    tx: SyncSender<crate::spawn::GatherMsg>,
+    poke: Option<crate::act_barrier::Poke>,
+    /// A barrier went [`Passage::Late`](crate::act_barrier::Passage::Late) and the parse stage has
+    /// answered none since ([`ResetLane::answered`]).
+    behind: bool,
 }
 
 impl std::fmt::Debug for ResetLane {
@@ -202,11 +214,25 @@ impl std::fmt::Debug for ResetLane {
 static LANE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl ResetLane {
-    /// Install `tx` (a reader starting).
+    /// Install `tx` (a reader starting), with `poke_wr`, the write end of its gather's poke pipe,
+    /// which the lane then owns and closes.
     #[cfg(unix)]
-    pub(crate) fn open(&self, tx: SyncSender<crate::spawn::GatherMsg>) -> u64 {
+    pub(crate) fn open(
+        &self,
+        tx: SyncSender<crate::spawn::GatherMsg>,
+        poke_wr: Option<i32>,
+    ) -> u64 {
         let generation = LANE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        *self.slot.lock().unwrap_or_else(|p| p.into_inner()) = Some((generation, tx));
+        let poke = poke_wr.map(|wr| crate::act_barrier::Poke {
+            wr,
+            asked: Vec::new(),
+        });
+        *self.slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(OpenLane {
+            generation,
+            tx,
+            poke,
+            behind: false,
+        });
         generation
     }
 
@@ -214,7 +240,10 @@ impl ResetLane {
     #[cfg(unix)]
     pub(crate) fn close_if(&self, generation: u64) {
         let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
-        if slot.as_ref().is_some_and(|(g, _)| *g == generation) {
+        if slot
+            .as_ref()
+            .is_some_and(|lane| lane.generation == generation)
+        {
             *slot = None;
         }
     }
@@ -224,7 +253,110 @@ impl ResetLane {
     pub(crate) fn nudge(&self) -> bool {
         let slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
         slot.as_ref()
-            .is_some_and(|(_, tx)| tx.try_send(crate::spawn::GatherMsg::Journal).is_ok())
+            .is_some_and(|lane| lane.tx.try_send(crate::spawn::GatherMsg::Journal).is_ok())
+    }
+
+    /// Ask the session's reader for a barrier (`crate::act_barrier`): the answer comes once the
+    /// parser holds every byte the session's program wrote to its PTY before this call (off macOS,
+    /// every byte the gather had read when it took the ask), and disconnects if the reader stops
+    /// first. `None` with no live reader that takes one. [`Self::pass`] asks and waits; a test
+    /// holds the answer itself.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn ask(&self) -> Option<std::sync::mpsc::Receiver<()>> {
+        self.ask_at().map(|(_, answer)| answer)
+    }
+
+    /// Ask for a barrier (`ask` in a test), with the reader generation that took the ask.
+    #[cfg(unix)]
+    fn ask_at(&self) -> Option<(u64, std::sync::mpsc::Receiver<()>)> {
+        let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+        let lane = slot.as_mut()?;
+        let poke = lane.poke.as_mut()?;
+        let (tx, answer) = std::sync::mpsc::sync_channel(1);
+        poke.asked.push(tx);
+        // A full pipe already holds a poke the gather has yet to take.
+        aterm_pty::wake(poke.wr);
+        Some((lane.generation, answer))
+    }
+
+    /// The parse stage of generation `generation` answered a barrier: its parser has caught up.
+    #[cfg(unix)]
+    pub(crate) fn answered(&self, generation: u64) {
+        let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(lane) = slot.as_mut().filter(|lane| lane.generation == generation) {
+            lane.behind = false;
+        }
+    }
+
+    /// Whether a barrier went late and the parser has answered none since.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn behind_for_test(&self) -> bool {
+        let slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+        slot.as_ref().is_some_and(|lane| lane.behind)
+    }
+
+    /// How many barriers wait for the gather to take them ([`Self::ask`]).
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn asked_for_test(&self) -> usize {
+        let slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+        slot.as_ref()
+            .and_then(|lane| lane.poke.as_ref())
+            .map_or(0, |poke| poke.asked.len())
+    }
+
+    /// Wait, at most `patience`, on a barrier (`ask`); while an earlier one is late and
+    /// unanswered, ask none ([`Passage::Behind`](crate::act_barrier::Passage::Behind)). Holds the
+    /// lane's own lock only to ask, so the caller must hold neither the terminal's lock nor the
+    /// timeline's, which the parse stage takes.
+    pub(crate) fn pass(&self, patience: Duration) -> crate::act_barrier::Passage {
+        use crate::act_barrier::Passage;
+        #[cfg(unix)]
+        {
+            if self.behind_now() {
+                return Passage::Behind;
+            }
+            let Some((generation, answer)) = self.ask_at() else {
+                return Passage::Unbarriered;
+            };
+            match answer.recv_timeout(patience) {
+                Ok(()) => Passage::Passed,
+                Err(RecvTimeoutError::Timeout) => {
+                    let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+                    // Under the lock [`Self::answered`] takes after it answers: an answer that came
+                    // since is seen here, and one that comes later clears what is set here.
+                    if answer.try_recv().is_ok() {
+                        return Passage::Passed;
+                    }
+                    if let Some(lane) = slot.as_mut().filter(|lane| lane.generation == generation) {
+                        lane.behind = true;
+                    }
+                    Passage::Late
+                }
+                Err(RecvTimeoutError::Disconnected) => Passage::Gone,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = patience;
+            Passage::Unbarriered
+        }
+    }
+
+    #[cfg(unix)]
+    fn behind_now(&self) -> bool {
+        let slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+        slot.as_ref().is_some_and(|lane| lane.behind)
+    }
+
+    /// The barriers asked of generation `generation`'s gather since it last took them (its poke).
+    #[cfg(unix)]
+    pub(crate) fn take_asked(&self, generation: u64) -> Vec<SyncSender<()>> {
+        let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+        slot.as_mut()
+            .filter(|lane| lane.generation == generation)
+            .and_then(|lane| lane.poke.as_mut())
+            .map(|poke| std::mem::take(&mut poke.asked))
+            .unwrap_or_default()
     }
 
     /// Offer `req` to the parse stage without blocking (the main thread calls this for the menu).
@@ -232,10 +364,13 @@ impl ResetLane {
         #[cfg(unix)]
         {
             let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
-            let Some((_, tx)) = slot.as_ref() else {
+            let Some(lane) = slot.as_ref() else {
                 return LaneOffer::Closed;
             };
-            match tx.try_send(crate::spawn::GatherMsg::Reset(req.clone())) {
+            match lane
+                .tx
+                .try_send(crate::spawn::GatherMsg::Reset(req.clone()))
+            {
                 Ok(()) => LaneOffer::Queued,
                 Err(TrySendError::Full(_)) => LaneOffer::Busy,
                 Err(TrySendError::Disconnected(_)) => {
@@ -252,17 +387,20 @@ impl ResetLane {
     }
 }
 
-/// Closes a [`ResetLane`] generation when dropped.
+/// Closes a [`ResetLane`] generation when dropped, then `poke_rd`, the read end of its gather's
+/// poke pipe (`-1` for none): closed after the lane, whose write end then no longer takes a poke.
 #[cfg(unix)]
 pub(crate) struct LaneGuard {
     pub(crate) lane: Arc<ResetLane>,
     pub(crate) generation: u64,
+    pub(crate) poke_rd: i32,
 }
 
 #[cfg(unix)]
 impl Drop for LaneGuard {
     fn drop(&mut self) {
         self.lane.close_if(self.generation);
+        aterm_pty::close_fd(self.poke_rd);
     }
 }
 
@@ -484,7 +622,7 @@ mod tests {
         use std::time::Duration;
         let s = crate::stub_session(7);
         let (tx, rx) = std::sync::mpsc::sync_channel::<crate::spawn::GatherMsg>(4);
-        let generation = s.ctx.reset_lane.open(tx);
+        let generation = s.ctx.reset_lane.open(tx, None);
         s.term
             .lock()
             .expect("terminal lock")

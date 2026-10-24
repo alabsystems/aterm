@@ -658,7 +658,7 @@ pub struct ChromeIcon {
     pub icon: BandIcon,
 }
 
-/// The band's icon set: one drawn icon for every status glyph a message row can carry, so the glyph cell reads as one family whatever font holds `⚠` or `ℹ`.
+/// The band's icon set: one drawn icon for every status glyph a message row can carry, so the glyph cell reads as one family whatever font holds `⚠` or `ℹ`. The glass's marks ([`Self::glass_mark`]) and the top deck's pictograms ([`Self::is_pictogram`]) are drawn in the same family.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum BandIcon {
     /// `ℹ` — an `i` cut out of a disc.
@@ -707,11 +707,17 @@ pub enum BandIcon {
     House,
     /// `◆` — a diamond filled to the ring's box: the model a fact menu shows.
     Diamond,
+    /// A padlock, the top deck's pictogram ([`Self::is_pictogram`]) for a tab that waits for you: a password, an approval, an answer.
+    Lock,
+    /// An hourglass, its sand run down, the top deck's pictogram for the front tab's stuck job.
+    Hourglass,
+    /// A drive, drawn as a drum, the top deck's pictogram for a volume that fills within the hour.
+    Drive,
 }
 
 impl BandIcon {
     /// Every icon, in its index order ([`Self::index`]).
-    pub const ALL: [BandIcon; 23] = [
+    pub const ALL: [BandIcon; 26] = [
         Self::Info,
         Self::Success,
         Self::Warn,
@@ -735,6 +741,9 @@ impl BandIcon {
         Self::InsetDiamond,
         Self::House,
         Self::Diamond,
+        Self::Lock,
+        Self::Hourglass,
+        Self::Drive,
     ];
 
     /// THE GLASS'S DRAWN MARKS.
@@ -763,6 +772,13 @@ impl BandIcon {
         Self::glass_mark(self.ch()).is_some()
     }
 
+    /// Whether this icon is one of the top deck's pictograms (a need's kind: [`Self::Lock`], [`Self::Hourglass`], [`Self::Drive`]): drawn only where a painter names it (`DrawPrim::BandIcon`, a raster's [`ChromeIcon`]) and never for a character, so neither [`Self::for_char`] nor [`Self::glass_mark`] gives it. Its [`Self::ch`] is the stand-in a text grid keeps under it. Like a band's badge it spills into blank neighbours.
+    #[must_use]
+    #[inline]
+    pub const fn is_pictogram(self) -> bool {
+        matches!(self, Self::Lock | Self::Hourglass | Self::Drive)
+    }
+
     /// The icon that stands in for `ch`, the band's glyph; `None` for any character outside the set (it keeps its font glyph).
     #[must_use]
     #[inline]
@@ -785,7 +801,7 @@ impl BandIcon {
         })
     }
 
-    /// The character this icon is drawn for (the one a text grid keeps).
+    /// The character this icon is drawn for (the one a text grid keeps). A pictogram's ([`Self::is_pictogram`]) is a one-cell stand-in that neither [`Self::for_char`] nor [`Self::glass_mark`] maps back: `⚿` for [`Self::Lock`] (Unicode's padlock, U+1F512, is a wide emoji), `⧖` for [`Self::Hourglass`] and `🖴` for [`Self::Drive`].
     #[must_use]
     #[inline]
     pub const fn ch(self) -> char {
@@ -813,6 +829,9 @@ impl BandIcon {
             Self::InsetDiamond => '\u{25c8}',
             Self::House => '\u{2302}',
             Self::Diamond => '\u{25c6}',
+            Self::Lock => '\u{26bf}',
+            Self::Hourglass => '\u{29d6}',
+            Self::Drive => '\u{1f5b4}',
         }
     }
 
@@ -4485,6 +4504,54 @@ mod fx_input_tests {
                 Arc::ptr_eq(&f.fx_layers[0].content, &c),
                 "content untouched"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod band_icon_tests {
+    use super::BandIcon;
+    use crate::terminal::Terminal;
+
+    /// [`BandIcon::ALL`] lists every icon at its own index, so [`BandIcon::from_index`] (a glyph cache key's way back) gives each one back and nothing past the set.
+    #[test]
+    fn every_icon_round_trips_through_its_index() {
+        for (i, icon) in BandIcon::ALL.into_iter().enumerate() {
+            let i = u32::try_from(i).expect("a small set");
+            assert_eq!(icon.index(), i, "{icon:?} sits at its index in ALL");
+            assert_eq!(BandIcon::from_index(i), Some(icon));
+        }
+        let past = u32::try_from(BandIcon::ALL.len()).expect("a small set");
+        assert_eq!(BandIcon::from_index(past), None);
+        assert_eq!(BandIcon::from_index(u32::MAX), None);
+    }
+
+    /// Each icon is exactly one of a band glyph's ([`BandIcon::for_char`]), a glass mark ([`BandIcon::glass_mark`]) or a deck pictogram, which no character maps to; a pictogram's stand-in takes one cell on a grid, as every other icon's character does.
+    #[test]
+    fn each_icon_is_a_glyph_a_mark_or_a_pictogram() {
+        for icon in BandIcon::ALL {
+            let ch = icon.ch();
+            let kinds = [
+                BandIcon::for_char(ch) == Some(icon),
+                BandIcon::glass_mark(ch) == Some(icon),
+                icon.is_pictogram(),
+            ];
+            assert_eq!(
+                kinds.iter().filter(|&&k| k).count(),
+                1,
+                "{icon:?} ({ch:?}): glyph, mark, pictogram = {kinds:?}"
+            );
+            if icon.is_pictogram() {
+                assert_eq!(BandIcon::for_char(ch), None, "{icon:?}: no band glyph");
+                assert_eq!(BandIcon::glass_mark(ch), None, "{icon:?}: no glass mark");
+            }
+            let mut term = Terminal::new(1, 4);
+            let mut bytes = [0u8; 4];
+            term.process(ch.encode_utf8(&mut bytes).as_bytes());
+            term.process(b"x");
+            let row = &term.cell_frame(1, 4).cells[0];
+            assert_eq!(row[0].ch, ch, "{icon:?}: the grid keeps its character");
+            assert_eq!(row[1].ch, 'x', "{icon:?} ({ch:?}) takes one cell");
         }
     }
 }

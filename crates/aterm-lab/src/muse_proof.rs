@@ -744,24 +744,15 @@ mod tests {
         assert_eq!(owner_verdict(&held, &wrote, &[7], false), Verdict::Fail);
     }
 
-    /// Only an admitted successful report proves an absence: a timeout,
-    /// nonzero exit, warning or capture ceiling is unknown, never a clean
-    /// observer.
+    /// Only a whole read of a process's table proves an absence: a read that
+    /// failed is unknown, never a clean observer.
     #[test]
-    fn an_open_file_observer_must_return_a_complete_successful_report() {
-        use crate::selftest::complete_open_files;
-        use std::os::unix::process::ExitStatusExt as _;
-        let output = |code, stdout: Vec<u8>, stderr: Vec<u8>| std::process::Output {
-            status: std::process::ExitStatus::from_raw(code),
-            stdout,
-            stderr,
-        };
+    fn an_open_file_observer_must_read_the_whole_table() {
+        use crate::selftest::open_files_report;
         let wrote = vec![".config/muse/session".to_string()];
-        let judge = |result: Result<std::process::Output, aterm_uds::deadline::RunError>| {
-            let seen = complete_open_files(
-                7,
-                result.map_err(aterm_uds::deadline::CompleteOutputError::Run),
-            );
+        let judge = |paths: std::io::Result<&[&str]>| {
+            let read = paths.map(|p| p.iter().map(std::path::PathBuf::from).collect());
+            let seen = open_files_report(7, read);
             owner_verdict(
                 &held_under(&seen.text, &["/Users//owner".to_string()]),
                 &wrote,
@@ -769,36 +760,16 @@ mod tests {
                 seen.complete,
             )
         };
-        let clean = b"p7\nn/private/tmp/owned/home/.config/muse/session\n".to_vec();
-        assert_eq!(judge(Ok(output(0, clean.clone(), Vec::new()))), Verdict::Ok);
-        let held = b"p7\nn/Users//owner/.config/muse/auth.json\n".to_vec();
-        assert_eq!(
-            judge(Ok(output(0, held.clone(), Vec::new()))),
-            Verdict::Fail
-        );
-        assert_eq!(
-            judge(Ok(output(1 << 8, held, b"lsof: WARNING".to_vec()))),
-            Verdict::Fail,
-            "a failed report's evidence"
-        );
-        for result in [
-            Err(aterm_uds::deadline::RunError::TimedOut),
-            Err(aterm_uds::deadline::RunError::Spawn(std::io::Error::other(
-                "injected failure",
-            ))),
-            Ok(output(1 << 8, clean.clone(), Vec::new())),
-            Ok(output(0, clean, b"incomplete observer".to_vec())),
-            Ok(output(0, Vec::new(), Vec::new())),
-            Ok(output(0, b"p8\nn/elsewhere\n".to_vec(), Vec::new())),
-            Ok(output(0, b"p7\nn/no-terminator".to_vec(), Vec::new())),
-            Ok(output(0, vec![0xff], Vec::new())),
-            Ok(output(
-                0,
-                vec![b'x'; aterm_uds::deadline::OUTPUT_KEEP],
-                Vec::new(),
-            )),
+        let clean: &[&str] = &["/private/tmp/owned/home/.config/muse/session"];
+        assert_eq!(judge(Ok(clean)), Verdict::Ok);
+        let held: &[&str] = &["/Users//owner/.config/muse/auth.json"];
+        assert_eq!(judge(Ok(held)), Verdict::Fail);
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::Other,
         ] {
-            assert_eq!(judge(result), Verdict::Unproven);
+            assert_eq!(judge(Err(kind.into())), Verdict::Unproven, "{kind:?}");
         }
     }
 

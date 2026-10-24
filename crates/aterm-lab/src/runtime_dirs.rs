@@ -149,24 +149,49 @@ impl View for Disk {
     }
 }
 
-/// The `(pid, path)` pairs of `lsof -F pn` output whose path lies strictly below `root`.
+/// The `(pid, path)` pairs of `held` whose path lies strictly below `root`, launchd's never.
 #[must_use]
-pub fn held_below(lsof_f: &str, root: &str) -> Vec<(i32, String)> {
+pub fn held_below(held: &[(i32, String)], root: &str) -> Vec<(i32, String)> {
     let prefix = format!("{root}/");
-    let mut pid = 0;
-    let mut out = Vec::new();
-    for l in lsof_f.lines() {
-        if let Some(p) = l.strip_prefix('p') {
-            pid = p.parse().unwrap_or(0);
-        } else if let Some(path) = l.strip_prefix('n')
-            && pid > 1
-            && path.len() > prefix.len()
-            && path.starts_with(&prefix)
-        {
-            out.push((pid, path.to_string()));
+    held.iter()
+        .filter(|(pid, path)| *pid > 1 && path.len() > prefix.len() && path.starts_with(&prefix))
+        .cloned()
+        .collect()
+}
+
+/// What `pids` hold below `root`, read in this process with no reference taken on any socket
+/// or kqueue of theirs: each file one holds open through a descriptor
+/// ([`aterm_uds::holders::open_files`]), and each socket directly below `root` whose listener
+/// one bound, by the kernel's table of unix-domain listeners
+/// ([`aterm_uds::holders::scan_listener_holders`]). A table that does not read adds nothing.
+fn held_by(pids: &[i32], root: &str) -> Vec<(i32, String)> {
+    use std::os::unix::fs::FileTypeExt as _;
+    let mut held = Vec::new();
+    for &pid in pids {
+        let Ok(n) = u32::try_from(pid) else { continue };
+        for path in aterm_uds::holders::open_files(n).unwrap_or_default() {
+            held.push((pid, path.to_string_lossy().into_owned()));
         }
     }
-    out
+    let sockets = std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_socket()))
+        .map(|e| e.path());
+    for socket in sockets {
+        let Ok(scan) = aterm_uds::holders::scan_listener_holders(&socket, &[]) else {
+            continue;
+        };
+        for pid in scan.holders {
+            if let Ok(pid) = i32::try_from(pid)
+                && pids.contains(&pid)
+            {
+                held.push((pid, socket.to_string_lossy().into_owned()));
+            }
+        }
+    }
+    held
 }
 
 /// What an entry is, by its path below its root.
@@ -269,13 +294,9 @@ pub fn read_record(run_dir: &Path) -> Vec<Held> {
     set.into_iter().collect()
 }
 
-/// Appends new entries below each root held by `members` to `run_dir`'s record.
+/// Appends new entries below each root held by `members` ([`held_by`]) to `run_dir`'s record.
 pub fn witness(run_dir: &Path, members: &[i32], seen: &mut BTreeSet<Held>) {
-    let live: Vec<String> = members
-        .iter()
-        .filter(|&&p| p > 1)
-        .map(ToString::to_string)
-        .collect();
+    let live: Vec<i32> = members.iter().copied().filter(|&p| p > 1).collect();
     if live.is_empty() {
         return;
     }
@@ -287,14 +308,8 @@ pub fn witness(run_dir: &Path, members: &[i32], seen: &mut BTreeSet<Held>) {
         if !is_dir {
             continue;
         }
-        let Ok(out) = aterm_uds::spawnfd::command("/usr/sbin/lsof")
-            .args(["-nP", "-a", "-p", &live.join(","), "+D", &root, "-F", "pn"])
-            .output()
-        else {
-            continue;
-        };
         let mut lines = String::new();
-        for (pid, path) in held_below(&String::from_utf8_lossy(&out.stdout), &root) {
+        for (pid, path) in held_below(&held_by(&live, &root), &root) {
             let Some(st) = Disk.stat(&path) else { continue };
             if !matches!(st.kind, Kind::File | Kind::Socket) {
                 continue;
@@ -642,7 +657,7 @@ mod tests {
 
     /// The witness's record keeps a line per entry, and only its own shape.
     #[test]
-    fn a_record_line_reads_back_and_lsof_names_what_lies_below_the_root() {
+    fn a_record_line_reads_back_and_the_witness_keeps_what_lies_below_the_root() {
         let h = held(4242, 7, "ms-00ff.sock.lease");
         assert_eq!(Held::parse(h.line().trim_end()), Some(h));
         assert_eq!(
@@ -651,17 +666,72 @@ mod tests {
             "launchd is never a holder"
         );
         assert_eq!(Held::parse("7\t1\t1\trelative"), None);
-        let lsof = format!(
-            "p4242\nn{ROOT}\nn{ROOT}/ms-00ff.sock.lease\nn{ROOT}/sessions\np17\nn{ROOT}-other/x\nn{ROOT}/ms-00ff.sock\n"
-        );
+        let seen = [
+            (4242, ROOT.to_string()),
+            (4242, format!("{ROOT}/ms-00ff.sock.lease")),
+            (4242, format!("{ROOT}/sessions")),
+            (17, format!("{ROOT}-other/x")),
+            (17, format!("{ROOT}/ms-00ff.sock")),
+            (1, format!("{ROOT}/ms-00ff.sock")),
+        ];
         assert_eq!(
-            held_below(&lsof, ROOT),
+            held_below(&seen, ROOT),
             [
                 (4242, format!("{ROOT}/ms-00ff.sock.lease")),
                 (4242, format!("{ROOT}/sessions")),
                 (17, format!("{ROOT}/ms-00ff.sock")),
             ]
         );
+    }
+
+    /// What a run's processes hold below a root, read in process ([`held_by`]): a child's
+    /// open file and the listener this process bound there. NEGATIVE CONTROLS: a file below
+    /// the root that only a process outside the run holds, one nobody holds, and the listener
+    /// once its binder is not of the run, stay out.
+    #[test]
+    fn the_witness_reads_a_members_open_file_and_bound_listener() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("lab-rt-held-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sessions")).unwrap();
+        let (session, theirs, idle) = (
+            root.join("sessions/01a1.json"),
+            root.join("ms-bb22.sock.lease"),
+            root.join("ms-cc33.sock.lease"),
+        );
+        for f in [&session, &theirs, &idle] {
+            std::fs::write(f, b"{}").unwrap();
+        }
+        let socket = root.join("ms-aa11.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        let sleeper = |file: &Path| {
+            aterm_uds::spawnfd::command("/bin/sleep")
+                .arg("600")
+                .stdin(std::fs::File::open(file).unwrap())
+                .spawn()
+                .expect("spawn a holder")
+        };
+        let mut member = sleeper(&session);
+        let mut outsider = sleeper(&theirs);
+        let me = i32::try_from(std::process::id()).unwrap();
+        let pid = i32::try_from(member.id()).unwrap();
+        let at = root.to_string_lossy().into_owned();
+        let mut got = held_below(&held_by(&[pid, me], &at), &at);
+        let without_me = held_below(&held_by(&[pid], &at), &at);
+        for child in [&mut member, &mut outsider] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&root);
+        got.sort();
+        let session = (pid, session.to_string_lossy().into_owned());
+        let mut want = vec![session.clone(), (me, socket.to_string_lossy().into_owned())];
+        want.sort();
+        assert_eq!(got, want);
+        assert_eq!(without_me, [session]);
     }
 
     /// THE LAB TAKES BACK ITS OWN MUSE CODE'S LEASE, SOCKET AND SESSION

@@ -2,6 +2,25 @@
 // Copyright 2026 Andrew Yates
 
 //! Proposers, which supply Aos M4 candidates as bytes and hold no authority over how they are judged (design §10.2).
+//!
+//! A proposer is shown [`TrainFeedback`] rows, whose private fields only the evaluator builds, carrying training-split facts alone (the plan digest, admitted, the first
+//! failing law, the training sum of `T`). There is no held-out field to read:
+//!
+//! ```compile_fail,E0599
+//! use aterm_effects::aos_momentum::search::TrainFeedback;
+//! fn peek(f: &TrainFeedback) -> Option<u64> {
+//!     f.held_out_ticks()
+//! }
+//! ```
+//!
+//! and a row's fields are not public:
+//!
+//! ```compile_fail,E0616
+//! use aterm_effects::aos_momentum::search::TrainFeedback;
+//! fn peek(f: &TrainFeedback) -> Option<u64> {
+//!     f.ticks
+//! }
+//! ```
 
 use aterm_aos::Digest;
 

@@ -550,6 +550,40 @@ fn a_restore_failure_is_visible_even_when_its_group_is_left_as_is() {
     assert!(crate::system_state_access::menu_line(&status, false).is_some());
 }
 
+/// After a Restore, the Caps Lock key and a scroll direction the Mac had never set are back as
+/// saved but load only at the next login: the Restore's rows read `login`. The page says so in
+/// one calm line, and nothing failed: no menu line, no attention mark.
+#[test]
+fn a_setting_back_at_the_next_login_is_one_calm_note_and_no_failure() {
+    let status = status_of("restore-at-login");
+    let plan = status.plan.clone().unwrap();
+    const LINE: &str = "Natural scrolling and Caps Lock key come back at your next login.";
+    assert_eq!(status.notes(&plan), [LINE]);
+    let mut app = SystemStateApp::new(plan.clone());
+    app.publish(status.clone());
+    let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 4000.0);
+    assert_eq!(label(&compiled, "system-state/note/0"), LINE);
+    assert!(
+        compiled
+            .semantics
+            .iter()
+            .all(|node| !node.label.contains("failed")),
+        "no failure framing"
+    );
+    assert!(!app.needs_attention());
+    assert_eq!(status.failed_steps(Some(&plan)).count(), 0);
+    assert!(crate::system_state_access::menu_line(&status, false).is_none());
+    // One of them alone is named alone.
+    let one = SetupStatus {
+        rows: status.rows[1..].to_vec(),
+        ..status
+    };
+    assert_eq!(
+        one.notes(&plan),
+        ["Caps Lock key comes back at your next login."]
+    );
+}
+
 #[test]
 fn accessibility_is_managed_only_while_a_sign_out_is() {
     let accessibility = Subject::Access(Access::Accessibility);
@@ -762,6 +796,182 @@ fn a_step_the_run_could_not_finish_lights_the_tab() {
     assert!(!app.needs_attention(), "the vault is left as is");
 }
 
+#[test]
+fn named_result_failure_headline_survives_new_readings_until_recovery() {
+    let repository = Subject::Setting(Setting::Repositories);
+    let secrets = Subject::Setting(Setting::Secrets);
+    let settled = with_readings(
+        Selection::all(),
+        Subject::all()
+            .into_iter()
+            .map(|subject| reading(subject, Standing::InPlace, Some("as wanted")))
+            .collect(),
+    );
+    let line = |status: &SetupStatus| {
+        headline(
+            status,
+            &rows(status, Selection::all()),
+            status.plan.as_ref(),
+        )
+    };
+    let mut observed_failure = settled.clone();
+    observed_failure
+        .observed
+        .iter_mut()
+        .find(|row| row.subject == repository)
+        .unwrap()
+        .standing = Standing::Failed;
+    let expected = line(&observed_failure);
+    // execute_initial converts a Repositories stage Err to this named error.
+    let failed = SetupStatus {
+        rows: vec![SetupStatusRow {
+            name: repository.name().into(),
+            status: "error".into(),
+            detail: "injected repository stage failure".into(),
+        }],
+        ..settled.clone()
+    };
+    let mut app = SystemStateApp::opened();
+    let view = SystemStateViewState::default();
+    for retrying in [true, false] {
+        let current = SetupStatus {
+            retrying,
+            ..failed.clone()
+        };
+        app.publish(current.clone());
+        assert_eq!(
+            line(&current).show,
+            Some(repository),
+            "fresh in-place readings cannot make a failed operation successful"
+        );
+        assert_eq!(line(&current).text, expected.text);
+        assert_eq!(app.needs_attention(), !retrying);
+        let compiled = compile(&app, &view, 999.0, 740.0);
+        assert_eq!(label(&compiled, HEADLINE), expected.text);
+        assert!(
+            compiled
+                .semantic(&UiKey::new("system-state/headline/show"))
+                .is_some_and(|node| node.action.is_some() && !node.offscreen)
+        );
+    }
+    // The same failed subject is counted once, however it was reported.
+    observed_failure.rows = failed.rows.clone();
+    assert_eq!(line(&observed_failure).text, expected.text);
+    // Result order is worker order; the headline still uses page order.
+    observed_failure.rows.push(SetupStatusRow {
+        name: secrets.name().into(),
+        status: "failed".into(),
+        detail: "injected vault stage failure".into(),
+    });
+    let mut both_observed = observed_failure.clone();
+    both_observed.rows.clear();
+    both_observed
+        .observed
+        .iter_mut()
+        .find(|row| row.subject == secrets)
+        .unwrap()
+        .standing = Standing::Failed;
+    assert_eq!(line(&observed_failure).show, Some(secrets));
+    assert_eq!(line(&observed_failure).text, line(&both_observed).text);
+
+    // A subsequent successful Check replaces the previous operation result.
+    let recovered = SetupStatus {
+        check: Some(SetupCheck {
+            plan: settled.plan.clone().unwrap(),
+            rows: vec![SetupStatusRow {
+                name: format!("Check: {}", repository.name()),
+                status: "ok".into(),
+                detail: "injected successful repository check".into(),
+            }],
+        }),
+        ..settled.clone()
+    };
+    app.publish(recovered);
+    assert_eq!(
+        label(&compile(&app, &view, 999.0, 740.0), HEADLINE),
+        line(&settled).text
+    );
+    assert!(!app.needs_attention());
+    assert!(line(&app.status).show.is_none());
+}
+
+#[test]
+fn named_result_failure_headline_respects_review_scope_and_higher_priorities() {
+    let repository = Subject::Setting(Setting::Repositories);
+    let mut checked = status_of("set-up");
+    checked.check = Some(SetupCheck {
+        plan: checked.plan.clone().unwrap(),
+        rows: vec![SetupStatusRow {
+            name: format!("Check: {}", repository.name()),
+            status: "error".into(),
+            detail: "injected named check failure".into(),
+        }],
+    });
+    let plan = checked.plan.clone().unwrap();
+    let mut different_selection = plan.clone();
+    different_selection.selection.set(Setting::CapsLock, false);
+    let mut different_url = plan.clone();
+    different_url.vault_url = "http://other.local:7484/v1/team".into();
+    let mut unmanaged = plan.clone();
+    unmanaged.selection.set(Setting::Repositories, false);
+    for reviewed in [different_selection, different_url, unmanaged.clone()] {
+        let mut current = checked.clone();
+        if reviewed == unmanaged {
+            current.check.as_mut().unwrap().plan = reviewed.clone();
+        }
+        let current_rows = rows(&current, reviewed.selection);
+        let mut no_check = current.clone();
+        no_check.check = None;
+        let actual = headline(&current, &current_rows, Some(&reviewed));
+        let baseline = headline(&no_check, &current_rows, Some(&reviewed));
+        assert!(actual.show.is_none());
+        assert_eq!(actual.text, baseline.text);
+        assert!(current.failed_steps(Some(&reviewed)).next().is_none());
+    }
+    for mut priority in [status_of("needs-you"), status_of("running")] {
+        let baseline = headline(&priority, &rows(&priority, plan.selection), Some(&plan));
+        priority.check = checked.check.clone();
+        let actual = headline(&priority, &rows(&priority, plan.selection), Some(&plan));
+        assert_eq!(actual.text, baseline.text);
+        assert_eq!((actual.open, actual.show), (baseline.open, baseline.show));
+    }
+    let matched = headline(&checked, &rows(&checked, plan.selection), Some(&plan));
+    assert_eq!(matched.show, Some(repository));
+}
+
+#[test]
+fn a_restored_operation_advisory_stays_visible_without_failure_attention() {
+    let detail = "injected restored settings need a later logout";
+    let mut restored = status_of("set-up");
+    let baseline = headline(
+        &restored,
+        &rows(&restored, Selection::all()),
+        restored.plan.as_ref(),
+    );
+    restored.rows.push(SetupStatusRow {
+        name: "Restore".into(),
+        status: "restored".into(),
+        detail: detail.into(),
+    });
+    assert!(
+        restored
+            .failed_steps(restored.plan.as_ref())
+            .next()
+            .is_none()
+    );
+    let mut app = SystemStateApp::opened();
+    app.publish(restored);
+    let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 740.0);
+    assert!(
+        compiled
+            .semantics
+            .iter()
+            .any(|node| !node.offscreen && node.label.contains(detail))
+    );
+    assert_eq!(label(&compiled, HEADLINE), baseline.text);
+    assert!(!app.needs_attention());
+}
+
 fn failed_repository_check(managed: bool) -> SetupStatus {
     let mut selection = Selection::all();
     selection.set(Setting::Repositories, managed);
@@ -877,7 +1087,8 @@ fn a_failure_the_run_still_retries_leaves_the_tab_dark() {
                 shown.text.contains("failed")
                     || status
                         .notes(status.plan.as_ref().unwrap())
-                        .any(|note| note.words().contains("failed")),
+                        .iter()
+                        .any(|note| note.contains("failed")),
                 "the page says it: {}",
                 shown.text
             );

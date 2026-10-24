@@ -583,6 +583,8 @@ enum Variant {
     Baseline,
     Phase0,
     Full,
+    /// `Full` with `Rule::ProofsEndWithTheEpoch` off, unchecked: the negative control of
+    /// `class_proofs_end_with_their_line`.
     Sticky,
     /// `Full` with `Rule::ScrollKeepsFirstKey` off.
     ShutAtScroll,
@@ -590,12 +592,8 @@ enum Variant {
     PaintedOverText,
 }
 
-const VARIANTS: [Variant; 4] = [
-    Variant::Baseline,
-    Variant::Phase0,
-    Variant::Full,
-    Variant::Sticky,
-];
+/// The main matrix's predictors: the baseline, the shipped predictor with editing off and on.
+const VARIANTS: [Variant; 3] = [Variant::Baseline, Variant::Phase0, Variant::Full];
 
 impl Variant {
     fn name(self) -> &'static str {

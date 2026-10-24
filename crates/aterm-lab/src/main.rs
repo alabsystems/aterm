@@ -411,7 +411,7 @@ Outside any lab (no jail, no stub):
   disk-lane [--aterm PATH] [--keep]
                                  mount an 8 GiB sparse APFS image and verify disk-pressure tier eviction and reserve order (~1 min)
   slot-capture [--watch DUR [--dir DIR]]
-                                 verify `build-slot` record parsing in a scratch BUILD_SLOT_DIR, or watch ~/.cache/build-slot vs lsof
+                                 verify `build-slot` record parsing in a scratch BUILD_SLOT_DIR, or watch ~/.cache/build-slot vs the holder scan
   slot-lane [--aterm PATH] [--keep]
                                  verify `await sys slots>=1` wakes when a SIGKILLed stand-in releases slot-0
   trail-gallery [--aterm PATH] [--theme dark|light|both] [--scenario NAME[,NAME]]... [--extra 'key = value']...

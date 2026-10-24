@@ -122,6 +122,18 @@ pub fn bash() -> PathBuf {
     which("bash").expect("a bash on PATH")
 }
 
+/// A shell command running `bash <args>` in a process group of its own, as a
+/// terminal runs a foreground job, SIGINT at its default; it prints how bash ended,
+/// `signal <n>` or `exit <n>`, which `$?` cannot tell apart. The group's leader,
+/// bash's `$PPID`, ignores the signals sent to the group.
+pub fn group_run(args: &str) -> String {
+    format!(
+        "/usr/bin/perl -e 'setpgrp(0, 0); $SIG{{INT}} = \"IGNORE\"; my $p = fork // die; if (!$p) {{ $SIG{{INT}} = \"DEFAULT\"; exec @ARGV or die }} \
+         waitpid($p, 0); print $? & 127 ? \"signal \" . ($? & 127) : \"exit \" . ($? >> 8)' {} {args}",
+        q(s(&bash()))
+    )
+}
+
 /// The first executable `name` on this process's PATH.
 pub fn which(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;

@@ -160,11 +160,12 @@ pub fn cmd(args: &[String]) -> Res {
 struct Measured {
     text: String,
     wall: Duration,
-    /// Peak open descriptors of the reader (`None` when the read ended before `lsof` sampled it).
+    /// Peak open descriptors of the reader (`None` when the read ended before a sample of its
+    /// table).
     reader_fd: Option<usize>,
     /// The peak open descriptors of any member while it ran.
     member_fd: usize,
-    /// How many `lsof` samples were taken while it ran.
+    /// How many samples were taken while it ran.
     samples: usize,
 }
 
@@ -320,7 +321,7 @@ impl Sim {
                         "the reader ran under ulimit -n 256, its descriptors under 256",
                         stat.reader_fd.is_none_or(|fd| fd < FD_CEILING),
                         stat.reader_fd.map_or_else(
-                            || "not sampled (the read ended before lsof caught it)".to_owned(),
+                            || "not sampled (the read ended before a sample caught it)".to_owned(),
                             |fd| format!("{fd} open"),
                         ),
                     ));
@@ -443,7 +444,8 @@ impl Sim {
         }
     }
 
-    /// Run a reader call while sampling `lsof`, RSS, and footprint of the reader and live members.
+    /// Run a reader call while sampling the descriptor tables ([`world::open_fds`]), RSS, and
+    /// footprint of the reader and live members.
     fn measured(&mut self, args: &[&str]) -> Result<Measured, Fail> {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -559,7 +561,7 @@ impl Sim {
             "during the fault read, the reader's descriptors are sampled and under 256",
             m.reader_fd.is_some_and(|fd| fd > 0 && fd < FD_CEILING),
             format!(
-                "at most {} open in {} lsof passes",
+                "at most {} open in {} passes",
                 fd_word(m.reader_fd),
                 m.samples
             ),
@@ -1055,10 +1057,11 @@ impl Sim {
             s,
             "\nBudget {BUDGET} chars (the client's `DEFAULT_BUDGET`); stated wall 3.5 s. Each \
              wall is the reader's spawn to its exit; the longest clean read here took {:.3} s, \
-             often over before the first `lsof` sample of the reader (`not sampled`). The \
-             descriptor figures are SAMPLES, not peaks: `lsof` of the reader and of every \
-             member, one pass after another while the read runs (each pass takes tens of \
-             milliseconds), and each figure the most any pass saw. The reader's parallel dial \
+             often over before the first sample of the reader (`not sampled`). The descriptor \
+             figures are SAMPLES, not peaks: a count of the reader's and every member's \
+             descriptor table, one pass after another while the read runs (each pass, with \
+             its `ps` of their memory, takes tens of milliseconds), and each figure the most \
+             any pass saw. The reader's parallel dial \
              holds about one socket per peer for a few tens of milliseconds, which a pass \
              seldom catches; what bounds it is `ulimit -n {FD_CEILING}`, where running out of \
              descriptors fails the read itself.\n",
@@ -1086,7 +1089,7 @@ impl Sim {
             );
             let _ = writeln!(
                 s,
-                "- reader descriptors {}, member descriptors {}: the most any of {} `lsof` passes \
+                "- reader descriptors {}, member descriptors {}: the most any of {} passes \
                  caught over the read, about one every {} ms. Most of the read is the wait on the \
                  stopped machine; the parallel dial's brief burst of sockets seldom falls in a \
                  pass.\n",

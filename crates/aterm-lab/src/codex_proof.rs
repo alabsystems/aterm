@@ -427,16 +427,14 @@ fn selftest_checks(run: &Run) -> Result<Before, Fail> {
         .collect();
     let held: Vec<String> = pids
         .iter()
-        .flat_map(|p| {
-            aterm_uds::spawnfd::command("/usr/sbin/lsof")
-                .args(["-p", &p.to_string(), "-Fn"])
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-                .unwrap_or_default()
-                .lines()
-                .filter(|l| owner_codex.iter().any(|c| l.starts_with(&format!("n{c}"))))
-                .map(str::to_string)
-                .collect::<Vec<_>>()
+        .flat_map(|&p| match crate::procs::open_paths(p) {
+            Ok(paths) => paths
+                .into_iter()
+                .filter(|f| owner_codex.iter().any(|c| f.starts_with(c)))
+                .map(|f| f.display().to_string())
+                .collect(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => vec![format!("(pid {p} unread: {e})")],
         })
         .take(5)
         .collect();

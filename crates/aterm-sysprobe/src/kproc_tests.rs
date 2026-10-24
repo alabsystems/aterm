@@ -373,6 +373,9 @@ mod live {
         );
     }
 
+    /// `lsof` reads only the quiet `sleep` child and launchd, never this process: it reads every
+    /// socket and kqueue of a process it lists (`-d txt` narrows only what it prints), and a read
+    /// of one a sibling test closes meanwhile drains it.
     #[test]
     fn the_image_inode_is_lsofs_first_txt() {
         use std::os::unix::fs::MetadataExt as _;
@@ -405,7 +408,6 @@ mod live {
             image_inode(me),
             Some(std::fs::metadata(exe).expect("exe").ino())
         );
-        assert_eq!(image_inode(me), lsof(me));
         let slept = image_inode(sleep.id());
         assert_eq!(
             slept,

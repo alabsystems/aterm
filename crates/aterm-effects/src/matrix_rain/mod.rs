@@ -848,12 +848,13 @@ impl MatrixRain {
             (default_bg >> 8) as u8,
             default_bg as u8,
         ];
+        let last_col = cols.saturating_sub(1);
         for r in 0..rows {
             if line_sizes
                 .get(r)
                 .is_none_or(|ls| *ls != LineSize::SingleWidth)
             {
-                self.clear_occ_span(r, 0, cols.saturating_sub(1));
+                self.clear_occ_span(r, 0, last_col);
             }
         }
 
@@ -1887,6 +1888,8 @@ impl MatrixRain {
         let ry = ch.clamp(1, cap) as u16;
         let half_cw = cw / 2;
         let half_ch = ch / 2;
+        let cw_plus_half = cw + half_cw;
+        let ch_plus_half = ch + half_ch;
         let len = self.halo_cands.len();
         let mut idx = (self.tick / u64::from(self.dq.max(1))) as usize % len;
         for _ in 0..len {
@@ -1901,9 +1904,9 @@ impl MatrixRain {
             let cell_x = i32::from(c) * cw;
             let cell_y = i32::from(r) * ch;
             let x0 = (cell_x - half_cw).max(0);
-            let x1 = (cell_x + cw + half_cw).min(grid_w);
+            let x1 = (cell_x + cw_plus_half).min(grid_w);
             let y0 = (cell_y - half_ch).max(0);
-            let y1 = (cell_y + ch + half_ch).min(grid_h);
+            let y1 = (cell_y + ch_plus_half).min(grid_h);
             if x1 <= x0 || y1 <= y0 {
                 continue;
             }

@@ -3,6 +3,7 @@
 
 //! The pet types beside its guess.
 
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use aterm_core::render::RenderInput;
@@ -72,7 +73,7 @@ enum Reserve {
 
 /// One replay's host: how it reserves the guess, its display, the program's
 /// echo latency, and whether aterm's footer chips sit on the composer's rule.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Knobs {
     reserve: Reserve,
     /// The display's frame interval: 8 ms is 120 Hz, 16 ms 60 Hz.
@@ -407,6 +408,24 @@ impl Host {
     }
 }
 
+/// The shots of `TAKES[take]` replayed under `knobs`, replayed once in the suite: every test
+/// that reads that host reads the one replay (a replay is a function of its take and knobs).
+fn replayed(take: usize, knobs: Knobs) -> &'static [Shot] {
+    type Replays = Vec<((usize, Knobs), &'static OnceLock<Vec<Shot>>)>;
+    static REPLAYS: Mutex<Replays> = Mutex::new(Vec::new());
+    let cell = {
+        let mut replays = REPLAYS.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(&(_, cell)) = replays.iter().find(|(key, _)| *key == (take, knobs)) {
+            cell
+        } else {
+            let cell: &'static OnceLock<Vec<Shot>> = Box::leak(Box::new(OnceLock::new()));
+            replays.push(((take, knobs), cell));
+            cell
+        }
+    };
+    cell.get_or_init(|| Host::replay(&TAKES[take], knobs).shots)
+}
+
 type SyntheticTake = fn() -> Vec<(u64, Rec)>;
 
 fn full_transcript_composer_take() -> Vec<(u64, Rec)> {
@@ -663,8 +682,7 @@ fn a_guessed_letter_never_throws_the_pet_off_its_seat() {
             reserve,
             ..Knobs::SHIPPED
         };
-        let h = Host::replay(&TAKES[take], knobs);
-        (take, reserve, motion(&h.shots, knobs.frame_ms))
+        (take, reserve, motion(replayed(take, knobs), knobs.frame_ms))
     });
     let (mut moved, mut jumped) = (0, 0);
     for (take, reserve, m) in &seen {
@@ -747,8 +765,12 @@ fn the_legs_keep_one_gait_while_typing() {
             echo_ms,
             ..Knobs::SHIPPED
         };
-        let h = Host::replay(&TAKES[take], knobs);
-        (take, frame_ms, echo_ms, motion(&h.shots, frame_ms))
+        (
+            take,
+            frame_ms,
+            echo_ms,
+            motion(replayed(take, knobs), frame_ms),
+        )
     });
     for (take, frame_ms, echo_ms, m) in &seen {
         let label = format!(
@@ -817,8 +839,12 @@ fn a_stand_between_two_legs_lasts_a_stride() {
             echo_ms,
             ..Knobs::SHIPPED
         };
-        let h = Host::replay(&TAKES[take], knobs);
-        (take, frame_ms, echo_ms, motion(&h.shots, frame_ms))
+        (
+            take,
+            frame_ms,
+            echo_ms,
+            motion(replayed(take, knobs), frame_ms),
+        )
     });
     let mut stood = 0;
     for (take, frame_ms, echo_ms, m) in &seen {
@@ -897,10 +923,8 @@ fn the_pet_walks_the_composer_line_beside_its_caret_over_the_chips() {
         chips: true,
         ..Knobs::SHIPPED
     };
-    let h = Host::replay(&TAKES[0], knobs);
-    let chips_from = h.cols - 1 - CHIPS_COLS;
-    let line: Vec<&Shot> = h
-        .shots
+    let chips_from = TAKES[0].cols - 1 - CHIPS_COLS;
+    let line: Vec<&Shot> = replayed(0, knobs)
         .iter()
         .skip_while(|s| s.caret.1 < chips_from)
         .take_while(|s| s.caret.1 >= chips_from)
@@ -985,11 +1009,14 @@ fn a_wrap_typed_through_is_one_bound() {
         ),
     ];
     let cases = crate::common::par_map(&runs, |&(name, knobs, events)| {
-        let h = match events {
-            None => Host::replay(&TAKES[0], knobs),
-            Some(events) => Host::replay_events(&window, knobs, events()),
+        let (cols, shots) = match events {
+            None => (TAKES[0].cols, replayed(0, knobs).to_vec()),
+            Some(events) => (
+                window.cols,
+                Host::replay_events(&window, knobs, events()).shots,
+            ),
         };
-        (name, h.cols, h.shots)
+        (name, cols, shots)
     });
     for (name, cols, shots) in &cases {
         let m = motion(shots, 8);
@@ -1098,11 +1125,11 @@ fn a_flight_across_the_hosts_chrome_never_blinks_out() {
         ),
     ];
     let cases = crate::common::par_map(&runs, |&(name, knobs, events)| {
-        let h = match events {
-            None => Host::replay(&TAKES[0], knobs),
-            Some(events) => Host::replay_events(&window, knobs, events()),
+        let shots = match events {
+            None => replayed(0, knobs).to_vec(),
+            Some(events) => Host::replay_events(&window, knobs, events()).shots,
         };
-        (name, h.shots)
+        (name, shots)
     });
     let mut flights = 0;
     for (name, shots) in &cases {
@@ -1135,10 +1162,8 @@ fn the_pet_walks_the_composer_line_beside_its_caret_under_the_harness_switch() {
         brand: true,
         ..Knobs::SHIPPED
     };
-    let h = Host::replay(&TAKES[0], knobs);
-    let switch_from = h.cols - 2 - BRAND_SWITCH_COLS;
-    let line: Vec<&Shot> = h
-        .shots
+    let switch_from = TAKES[0].cols - 2 - BRAND_SWITCH_COLS;
+    let line: Vec<&Shot> = replayed(0, knobs)
         .iter()
         .skip_while(|s| s.caret.1 < switch_from)
         .take_while(|s| s.caret.1 >= switch_from)
@@ -1319,8 +1344,13 @@ fn no_pose_is_a_one_frame_flash() {
         })
         .collect();
     let seen = crate::common::par_map(&runs, |&(take, frame_ms, echo_ms, knobs)| {
-        let h = Host::replay(&TAKES[take], knobs);
-        (take, frame_ms, echo_ms, knobs.brand, pose_runs(&h.shots))
+        (
+            take,
+            frame_ms,
+            echo_ms,
+            knobs.brand,
+            pose_runs(replayed(take, knobs)),
+        )
     });
     let mut changes = 0;
     for (take, frame_ms, echo_ms, brand, runs) in &seen {
@@ -1423,8 +1453,7 @@ fn the_pet_never_turns_back_while_the_writing_runs_one_way() {
     })
     .collect();
     let seen = crate::common::par_map(&runs, |&(name, knobs)| {
-        let h = Host::replay(&TAKES[0], knobs);
-        (name, knobs, turns_against_the_writing(&h.shots))
+        (name, knobs, turns_against_the_writing(replayed(0, knobs)))
     });
     for (name, knobs, turns) in &seen {
         assert!(
@@ -1459,15 +1488,15 @@ fn a_flight_that_lands_into_writing_touches_down() {
         runs.push((kn, k, None, Some(full_transcript_composer_take)));
     }
     let seen = crate::common::par_map(&runs, |&(kn, knobs, take, events)| {
-        let (name, h) = match (take, events) {
-            (Some(t), _) => (TAKES[t].name, Host::replay(&TAKES[t], knobs)),
+        let (name, shots) = match (take, events) {
+            (Some(t), _) => (TAKES[t].name, replayed(t, knobs).to_vec()),
             (None, Some(e)) => (
                 "windowed composer",
-                Host::replay_events(&window, knobs, e()),
+                Host::replay_events(&window, knobs, e()).shots,
             ),
             _ => unreachable!("a take or a synthetic composer"),
         };
-        let shots = &h.shots;
+        let shots = &shots;
         let mut bad = Vec::new();
         for i in 1..shots.len() {
             let (prev, s) = (&shots[i - 1], &shots[i]);

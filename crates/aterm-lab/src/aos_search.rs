@@ -60,6 +60,8 @@ the wall time and the events the evaluator stepped. One search per proposer, gri
                     `distributed`, and its admitted count rests on workers' claims) or `all` (every admitted claim
                     judged in full; mode `search`)
   --lease-ms MS     (debug builds, with --workers) the lease window, for tests
+  --frames          (debug builds, with --workers) say each worker frame taken and the step it takes on stderr, for
+                    tests' hang detector
   --fault SPEC      (debug builds, with --workers; repeatable) a test fault armed on every worker: NAME@G.S.A[:K]
                     on search serial G, slot S, attempt A (kill, hang and slow take :K; late, late-lie, dup,
                     dup-lie, post-lie, lie-refusal, lie-best, inflate, garbage, flood do not), or foreign@W
@@ -139,6 +141,7 @@ pub fn parse_args(args: &[String]) -> Result<Args, Fail> {
     let check = take_value(&mut a, "--check")?;
     let lease_ms = take_value(&mut a, "--lease-ms")?;
     let faults = take_values(&mut a, "--fault")?;
+    let frames = take_flag(&mut a, "--frames");
     if let Some(extra) = a.first() {
         return Err(Fail::usage(format!(
             "aos-search: unexpected '{extra}' (aos-search --help)"
@@ -181,15 +184,15 @@ pub fn parse_args(args: &[String]) -> Result<Args, Fail> {
             )));
         }
     };
-    if lease_ms.is_some() || !faults.is_empty() {
+    if lease_ms.is_some() || !faults.is_empty() || frames {
         if workers.is_none() {
             return Err(Fail::usage(
-                "aos-search: --lease-ms and --fault are for --workers",
+                "aos-search: --lease-ms, --fault and --frames are for --workers",
             ));
         }
         if !cfg!(debug_assertions) {
             return Err(Fail::usage(
-                "aos-search: --lease-ms and --fault exist in debug builds only",
+                "aos-search: --lease-ms, --fault and --frames exist in debug builds only",
             ));
         }
     }
@@ -209,6 +212,7 @@ pub fn parse_args(args: &[String]) -> Result<Args, Fail> {
         workers,
         lease_ms,
         faults,
+        frames,
     });
     Ok(Args {
         grid,
@@ -2272,7 +2276,19 @@ not a plan
         assert!(
             usage_of(&["--grid", "--out", "o", "--fault", "dup@1.0.1"]).contains("for --workers")
         );
+        assert!(usage_of(&["--grid", "--out", "o", "--frames"]).contains("for --workers"));
+        assert_eq!(a.workers.map(|p| p.frames), Some(false));
         if cfg!(debug_assertions) {
+            let a = parse_args(&words(&[
+                "--grid",
+                "--out",
+                "o",
+                "--workers",
+                "1",
+                "--frames",
+            ]))
+            .expect("parses");
+            assert_eq!(a.workers.map(|p| p.frames), Some(true));
             let a = parse_args(&words(&[
                 "--grid",
                 "--out",

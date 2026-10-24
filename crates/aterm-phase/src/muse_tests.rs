@@ -1241,6 +1241,37 @@ fn a_failed_model_call_is_an_api_wall() {
 }
 
 #[test]
+fn the_apis_usage_limit_with_no_reset_is_the_usage_wall_not_a_retryable_error() {
+    let r = muse(LIMIT_UNNAMED);
+    let w = r.wall.expect("the wall");
+    assert_eq!((w.kind, w.reset.as_deref()), (WallKind::UsageSession, None));
+    assert!(matches!(r.phase, Phase::Limited { reset: None, .. }));
+    let rows = screen(LIMIT_UNNAMED);
+    for (control, msg) in [
+        (
+            "a rate limit time answers",
+            "◆ model failed: API error 429: Rate limit reached for requests per min. \
+             (rate_limit_exceeded) (after 3 provider attempts)",
+        ),
+        (
+            "the type under another status",
+            "◆ model failed: API error 500: The usage limit has been reached \
+             (usage_limit_reached) (after 10 provider attempts)",
+        ),
+    ] {
+        let other = edited(&rows, "◆ model failed", msg);
+        assert!(
+            matches!(
+                wall(&other).map(|w| w.kind),
+                Some(WallKind::ApiError { .. })
+            ),
+            "the control, {control}: {:?}",
+            wall(&other)
+        );
+    }
+}
+
+#[test]
 fn the_usage_wall_is_limited_until_its_reset() {
     let r = muse(USAGE_WALL);
     let w = r.wall.clone().expect("the wall");
@@ -1281,6 +1312,75 @@ fn the_usage_wall_is_limited_until_its_reset() {
         wall(&quoted),
         None,
         "the control: the wall's words past a reply's head"
+    );
+}
+
+#[test]
+fn the_two_line_usage_wall_is_limited_until_its_reset_dated_or_not() {
+    const DATED: &str = "Usage limit reached Your usage resets at Oct 25 at 5:00 PM";
+    let r = muse(USAGE_WALL_RESETS_DATED);
+    let w = r.wall.clone().expect("the wall");
+    assert_eq!(
+        (w.kind, w.message.as_str(), w.reset.as_deref()),
+        (WallKind::UsageWeekly, DATED, Some("Oct 25 at 5:00 PM"))
+    );
+    assert_eq!(
+        (r.phase.clone(), r.phase_authoritative, r.said_tail),
+        (
+            Phase::Limited {
+                message: DATED.to_string(),
+                reset: Some("Oct 25 at 5:00 PM".to_string())
+            },
+            true,
+            None
+        )
+    );
+    let rows = screen(USAGE_WALL_RESETS_DATED);
+    let reset = rows
+        .iter()
+        .rposition(|r| r.starts_with("  Your usage resets at"))
+        .expect("the reset row");
+    let with = |row: &str| {
+        let mut out = rows.clone();
+        out[reset] = row.to_string();
+        out
+    };
+    let timed = with("  Your usage resets at 1:21 PM");
+    assert_eq!(
+        wall(&timed).map(|w| (w.kind, w.reset)),
+        Some((WallKind::UsageSession, Some("1:21 PM".to_string())))
+    );
+    assert_eq!(
+        phase(&timed).0,
+        Phase::Limited {
+            message: "Usage limit reached Your usage resets at 1:21 PM".to_string(),
+            reset: Some("1:21 PM".to_string())
+        }
+    );
+    let mut third = rows.clone();
+    third.insert(reset + 1, "  /upgrade for more usage".to_string());
+    assert_eq!(
+        wall(&third).map(|w| (w.kind, w.reset)),
+        Some((WallKind::UsageWeekly, Some("Oct 25 at 5:00 PM".to_string()))),
+        "a row drawn under the reset is no part of it"
+    );
+    for (name, row) in [
+        ("another second row", "  Your plan renews on Oct 25"),
+        ("the words run on", "  Your usage resets atomically"),
+    ] {
+        let said = with(row);
+        assert_eq!(wall(&said), None, "the control: {name}");
+        assert_eq!(phase(&said), (Phase::Idle, true), "the control: {name}");
+    }
+    let quoted = edited(
+        &rows,
+        "◆ Usage limit reached",
+        "◆ It said: Usage limit reached",
+    );
+    assert_eq!(
+        wall(&quoted),
+        None,
+        "the control: the words past a reply's head"
     );
 }
 
@@ -3607,4 +3707,95 @@ fn the_bare_status_row_after_its_glyph_cycled_is_idle_with_no_evidence() {
     assert_eq!(phase(&rows), (Phase::Idle, false));
     let first = edited(&rows, "◈ Thinking", "◇ Thinking");
     assert_eq!(phase(&first), (Phase::Busy, true));
+}
+
+#[test]
+fn a_turn_runs_tools_by_its_tool_rows_under_its_message() {
+    for (name, text) in [
+        ("write", TOOL_ROW_WRITE),
+        ("bash-ran", TOOL_ROW_BASH_RAN),
+        ("search", TOOL_ROW_SEARCH),
+    ] {
+        let rows = screen(text);
+        assert!(turn_ran_tools(&rows), "{name}");
+        let user = rows
+            .iter()
+            .position(|r| r.starts_with("❯ "))
+            .expect("the message");
+        assert!(!turn_opens_above(&rows), "{name}: its message drawn");
+        assert!(
+            turn_opens_above(&rows[user + 1..]),
+            "{name}: the rows under its message"
+        );
+        let composer = rows
+            .iter()
+            .position(|r| r.starts_with("── Voice input"))
+            .expect("the composer");
+        let mut later = rows[..composer].to_vec();
+        later.extend(["❯ thanks", "", "◆ You're welcome.", ""].map(str::to_string));
+        later.extend(rows[composer..].iter().cloned());
+        assert!(
+            !turn_ran_tools(&later),
+            "the control: {name} is a turn before"
+        );
+    }
+    for (name, text) in [
+        ("an end of turn", END_OF_TURN_1_4_10),
+        ("the dated wall", USAGE_WALL_RESETS_DATED),
+    ] {
+        assert!(!turn_ran_tools(&screen(text)), "the control: {name}");
+    }
+    // A turn of one row: each measured tool row past those a reply's read takes.
+    let base = screen(END_OF_TURN_1_4_10);
+    let reply = base
+        .iter()
+        .position(|r| r.starts_with("◆ Hi!"))
+        .expect("the reply");
+    let alone = |row: &str| {
+        let mut r = base.clone();
+        r[reply] = row.to_owned();
+        r
+    };
+    for (text, row) in [
+        (
+            BUSY_WORK_RUNNING,
+            "◆ Backgrounded · Wait in the background · 3.2s · ctrl+o",
+        ),
+        (
+            END_OF_TURN_BG_FINISHED,
+            "◆ Finished · Q3 background wait · ✓ · ctrl+o",
+        ),
+        (
+            BOX_TOOL_ACTION_APPROVED,
+            "◆ ping(hi) · probe · ✓ · 2.1s · ctrl+o",
+        ),
+        (
+            BOX_NETWORK_MONITOR,
+            "◆ Message not sent to lab-no-such-session · ✗ · not found · ctrl+o",
+        ),
+        (
+            BOX_NETWORK_DIGIT_APPROVED,
+            "◆ Monitor Watch the lab socket — failed",
+        ),
+        (
+            BOX_NETWORK_DIGIT_APPROVED,
+            "◆ Stopped terminal tool operation — failed",
+        ),
+        (
+            BOX_NETWORK_DIGIT_APPROVED,
+            "◆ Scheduled 7 3 * * *: lab probe",
+        ),
+        (BOX_NETWORK_DIGIT_APPROVED, "◆ Unscheduled 109c3489"),
+    ] {
+        assert!(screen(text).iter().any(|r| r == row), "{row:?} measured");
+        assert!(turn_ran_tools(&alone(row)), "{row:?}");
+    }
+    for words in [
+        "◆ Monitor the socket and report back.",
+        "◆ Scheduled the parser work for tomorrow.",
+        "◆ Unscheduled work stays on the list.",
+        "◆ Finished: the suite passes.",
+    ] {
+        assert!(!turn_ran_tools(&alone(words)), "the control: {words:?}");
+    }
 }

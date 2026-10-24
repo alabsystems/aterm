@@ -3564,6 +3564,20 @@ pub(crate) fn harness_act_face(rest: &str) -> Option<aterm_agent::harness::acts:
     crate::harness_task::self_claim_act_face(act)
 }
 
+/// Whether `meta <rest>` is a `set harness_act` that reads the session's counts ([`HarnessActSnapshot`], under `crate::act_barrier`): a face that stands until another turn (its mark, and a point left to a person's rest check) or an opening act that types a turn ([`aterm_agent::harness::acts::self_claim_types_turn`]). Any other act reads none and waits for no barrier.
+pub(crate) fn harness_act_reads_counts(rest: &str) -> bool {
+    let Some(Ok(HarnessActRequest::Set { act, .. })) = harness_act_request(rest) else {
+        return false;
+    };
+    match crate::harness_task::self_claim_act_face(act) {
+        Some(face) if crate::harness_task::holds_until_another_turn(face) => true,
+        Some(aterm_agent::harness::acts::TaskFace::Open) => {
+            aterm_agent::harness::acts::self_claim_types_turn(act)
+        }
+        _ => false,
+    }
+}
+
 /// `meta set questions|autopilot …` / `meta unset questions|autopilot` from a connection that is not Owner-class: `ERR denied`.
 pub(crate) fn meta_questions_denied(scope: Scope, rest: &str) -> Option<(String, bool)> {
     let mut toks = rest.split_whitespace();

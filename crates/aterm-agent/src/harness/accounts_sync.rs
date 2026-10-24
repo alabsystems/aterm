@@ -1123,11 +1123,7 @@ fn toml_quote(s: &str) -> String {
     aterm_toml::Value::String(s.to_owned()).to_string()
 }
 
-fn email_machines_and_slot(email: &str) -> (Vec<String>, Option<u32>) {
-    let Some((raw_local, _)) = email.split_once('@') else {
-        return (Vec::new(), None);
-    };
-    let local = raw_local.split('+').next().unwrap_or(raw_local);
+fn parse_local_machines_and_slot(local: &str) -> (Vec<String>, Option<u32>) {
     let tokens: Vec<&str> = local.split(['.', '-', '_']).collect();
     let mut machines = Vec::new();
     let mut slot = None;
@@ -1156,6 +1152,30 @@ fn email_machines_and_slot(email: &str) -> (Vec<String>, Option<u32>) {
                 }
             }
             break;
+        }
+    }
+    (machines, slot)
+}
+
+fn email_machines_and_slot(email: &str) -> (Vec<String>, Option<u32>) {
+    let Some((raw_local, _)) = email.split_once('@') else {
+        return (Vec::new(), None);
+    };
+    let (base, plus_tag) = raw_local
+        .split_once('+')
+        .map_or((raw_local, None), |(b, t)| (b, Some(t)));
+    let (mut machines, mut slot) = parse_local_machines_and_slot(base);
+    if let Some(tag) = plus_tag {
+        if machines.is_empty() {
+            (machines, slot) = parse_local_machines_and_slot(tag);
+        } else if slot.is_none()
+            && let Some(first) = tag.split(['.', '-', '_', '+']).next()
+            && !first.is_empty()
+            && first.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(n) = first.parse::<u32>()
+            && (1..=9).contains(&n)
+        {
+            slot = Some(n);
         }
     }
     (machines, slot)
@@ -2935,6 +2955,10 @@ fn sync_cli_with(
             .map_err(|why| format!("could not write {}: {why}", write_to.display()))?;
     }
     drop(lock);
+    if let Ok(roster) = Roster::load_for(cli, &write_to) {
+        let _ =
+            recover_interrupted_staging_renewals_for(cli, &store, &roster, &AUTO_RENEW_GUARD, now);
+    }
     let _ = store.touch_wake();
     Ok(CliSync::Synced(CliSynced {
         cli,
@@ -3229,12 +3253,24 @@ fn renew_pool_due(
         return false;
     };
     let store = accounts::Store::at_for(state_dir, cli, home);
+    let recovered =
+        recover_interrupted_staging_renewals_for(cli, &store, &file_roster, fx.renew_guard, now);
     let (Ok((state, _)), Ok((logins, _))) = (store.load(now), store.load_logins(now)) else {
-        return false;
+        return recovered;
     };
     let bound = accounts::bound(&file_roster, &logins);
     let enrolled = accounts::enrolled_for(cli, &bound);
-    for label in accounts::renew_due(&bound, &logins, &state, &enrolled, now) {
+    let mut due_labels: Vec<String> = accounts::renew_due(&bound, &logins, &state, &enrolled, now)
+        .into_iter()
+        .filter(|label| {
+            !state
+                .accounts
+                .get(label)
+                .is_some_and(|a| a.limited_until(now).is_some())
+        })
+        .collect();
+    due_labels.sort_by_key(|label| logins.get(label).and_then(|b| b.wrong_at));
+    for label in due_labels {
         let Some(row) = file_roster.row(&label).cloned() else {
             continue;
         };
@@ -3255,7 +3291,7 @@ fn renew_pool_due(
             return true;
         }
     }
-    false
+    recovered
 }
 
 #[derive(Default)]
@@ -3810,6 +3846,16 @@ fn recover_interrupted_staging_renewals(
     renew_guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
     now: i64,
 ) -> bool {
+    recover_interrupted_staging_renewals_for(Cli::Claude, store, file_roster, renew_guard, now)
+}
+
+fn recover_interrupted_staging_renewals_for(
+    cli: Cli,
+    store: &accounts::Store,
+    file_roster: &Roster,
+    renew_guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
+    now: i64,
+) -> bool {
     if renew_guard
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3841,10 +3887,19 @@ fn recover_interrupted_staging_renewals(
             }
             let sequence = suffix.parse().ok()?;
             let dir = entry.path();
+            if cli != Cli::Claude
+                && !cli
+                    .connector()
+                    .stores
+                    .iter()
+                    .any(|store_file| dir.join(store_file).is_file())
+            {
+                return None;
+            }
             let actual_dir = fs::canonicalize(&dir).ok()?;
             // A vendor profile is only a local hint. Without the result of the
             // check immediately after fresh sign-in, preserve this work unadopted.
-            let proof = accounts::read_renewal_checkpoint(&dir, &actual_dir, now)?;
+            let proof = accounts::read_renewal_checkpoint_for(cli, &dir, &actual_dir, now)?;
             Some(Candidate {
                 prefix: prefix.to_owned(),
                 sequence,
@@ -3854,6 +3909,17 @@ fn recover_interrupted_staging_renewals(
             })
         })
         .collect();
+    if candidates.is_empty() {
+        return false;
+    }
+    if store
+        .shared_dir()
+        .join(accounts::SIGNIN_LOCK_FILE)
+        .is_file()
+        && matches!(store.signin_now(), Ok(None))
+    {
+        return false;
+    }
     // A check can match a row other than the requested staging prefix. Prefer
     // its recorded completion clock across prefixes, then numeric sequence
     // within a prefix for equal clocks. Neither is a vendor credential age.
@@ -3901,11 +3967,12 @@ fn recover_interrupted_staging_renewals(
                 // Another process may have renewed or limited this account
                 // since the staging check. Decide under its lock.
                 let bound = accounts::bound(file_roster, logins);
-                let enrolled = accounts::enrolled(&bound);
-                let Some(row) = bound
-                    .row(&proof.label)
-                    .filter(|r| r.email.as_deref() == Some(proof.email.as_str()))
-                else {
+                let enrolled = accounts::enrolled_for(cli, &bound);
+                let Some(row) = bound.row(&proof.label).filter(|r| {
+                    r.email
+                        .as_deref()
+                        .is_some_and(|em| accounts::email_matches(em, &proof.email))
+                }) else {
                     return Ok(Vec::new());
                 };
                 let account = state.accounts.get(&row.label);
@@ -3935,7 +4002,7 @@ fn recover_interrupted_staging_renewals(
                     return Ok(Vec::new());
                 }
                 let own_dir = file_roster.row(&row.label).and_then(|r| r.dir.as_deref());
-                Ok(accounts::note_renewed(
+                let events = accounts::note_renewed(
                     state,
                     logins,
                     &row.label,
@@ -3943,7 +4010,13 @@ fn recover_interrupted_staging_renewals(
                     &proof.dir,
                     proof.subscription.as_deref(),
                     proof.checked_at,
-                ))
+                );
+                if !events.is_empty()
+                    && let Some(proved_by) = proof.proved_by
+                {
+                    accounts::note_proof(logins, &row.label, proved_by);
+                }
+                Ok(events)
             })
             .is_ok_and(|events| !events.is_empty())
         {
@@ -3999,12 +4072,21 @@ fn auto_renew_next_account(
     recovered
 }
 
+pub(super) fn recover_staging_renewals_for(
+    cli: Cli,
+    store: &accounts::Store,
+    file_roster: &Roster,
+    now: i64,
+) -> bool {
+    recover_interrupted_staging_renewals_for(cli, store, file_roster, &AUTO_RENEW_GUARD, now)
+}
+
 pub(super) fn recover_staging_renewals(
     store: &accounts::Store,
     file_roster: &Roster,
     now: i64,
 ) -> bool {
-    recover_interrupted_staging_renewals(store, file_roster, &AUTO_RENEW_GUARD, now)
+    recover_staging_renewals_for(Cli::Claude, store, file_roster, now)
 }
 
 /// Start an interactive non-blocking staging login for the next un-enrolled successor at a wall.
@@ -4212,6 +4294,7 @@ fn spawn_row_renewal(
             home,
             state_dir,
             &file_roster,
+            logins,
             next_row,
             now,
             renew_guard,
@@ -4447,6 +4530,7 @@ fn spawn_vendor_renewal(
     home: &Path,
     state_dir: &Path,
     file_roster: &Roster,
+    logins: &accounts::Logins,
     next_row: accounts::Row,
     now: i64,
     renew_guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
@@ -4458,13 +4542,34 @@ fn spawn_vendor_renewal(
     {
         return RenewalDispatch::Failed;
     }
+    let mailbox_mtime = latest_mailbox_mtime(Some(home), &accounts::Store::at(state_dir));
+    if let Some(wrong_at) = logins.get(&next_row.label).and_then(|b| b.wrong_at)
+        && now.saturating_sub(wrong_at) < 900
+    {
+        let mailbox_updated_since = mailbox_mtime
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|d| i64::try_from(d.as_secs()).ok())
+            .is_some_and(|mtime_s| mtime_s > wrong_at);
+        if !mailbox_updated_since {
+            return RenewalDispatch::Held;
+        }
+    }
+    let store = accounts::Store::at_for(state_dir, cli, home);
+    match store.signin_now() {
+        Ok(Some(probe)) => drop(probe),
+        Ok(None) => return RenewalDispatch::Held,
+        Err(_) => return RenewalDispatch::Failed,
+    }
     let key = format!("{}:{}", cli.id(), next_row.label);
-    let Some(permit) =
-        AutoRenewPermit::claim_with_mailbox(renew_guard, &key, Instant::now(), false, None)
-    else {
+    let Some(permit) = AutoRenewPermit::claim_with_mailbox(
+        renew_guard,
+        &key,
+        Instant::now(),
+        false,
+        mailbox_mtime,
+    ) else {
         return RenewalDispatch::Held;
     };
-    let store = accounts::Store::at_for(state_dir, cli, home);
     let own_dir = file_roster.row(&next_row.label).and_then(|r| r.dir.clone());
     let parker = std::sync::Arc::clone(renew_guard);
     start_auto_renew(
@@ -5674,6 +5779,28 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         assert_eq!(
             email_machines_and_slot("solar.m27.3@example.test"),
             (vec!["m27".to_owned()], Some(3))
+        );
+        assert_eq!(
+            email_machines_and_slot("owner+m27.2@example.test"),
+            (vec!["m27".to_owned()], Some(2))
+        );
+        assert_eq!(
+            email_machines_and_slot("owner+m27@example.test"),
+            (vec!["m27".to_owned()], None)
+        );
+        assert_eq!(
+            email_machines_and_slot("sol-m27+2@example.test"),
+            (vec!["m27".to_owned()], Some(2))
+        );
+        assert_eq!(
+            email_machines_and_slot("sun.m27.2+claude@example.test"),
+            (vec!["m27".to_owned()], Some(2)),
+            "CONTROL: trailing service tag does not clobber base machine or slot"
+        );
+        assert_eq!(
+            email_machines_and_slot("owner+claude@example.test"),
+            (Vec::<String>::new(), None),
+            "CONTROL: non-machine plus tag yields neither machine nor slot"
         );
     }
 

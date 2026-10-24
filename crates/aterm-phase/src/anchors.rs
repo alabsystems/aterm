@@ -384,6 +384,24 @@ pub const ANCHORS: &[Anchor] = &[
         "2.1.300",
     ),
     lit("turn.recap", "recap:", "2.1.301"),
+    hint("turn.group.expand", "(ctrl+o to expand)", "2.1.284"),
+    composed("turn.group.reading", "Reading", "2.1.284"),
+    composed("turn.group.read", "Read", "2.1.280"),
+    composed("turn.group.searched", "Searched for", "2.1.295"),
+    composed("turn.group.searching", "Searching for", "2.1.308"),
+    composed("turn.group.listed", "Listed", "2.1.283"),
+    composed("turn.group.listing", "Listing", "2.1.308"),
+    composed("turn.group.running", "Running", "2.1.283"),
+    // Read in 2.1.268's group renderer: the 2026-09-12 captures that draw it carry no version.
+    composed("turn.group.ran", "Ran", "2.1.268"),
+    composed("turn.group.called", "Called", "2.1.294"),
+    // A hint-less group's nouns, each singular as measured; the plural is the renderer's count agreement (`shell commands` measured at 2.1.283).
+    composed("turn.group.file", "file", "2.1.280"),
+    composed("turn.group.pattern", "pattern", "2.1.295"),
+    composed("turn.group.directory", "directory", "2.1.283"),
+    composed("turn.group.shell_command", "shell command", "2.1.283"),
+    // TaskStop's userFacingName, read in 2.1.268's binary (its renderToolUseMessage empty, so no `(…)`): the captures that draw it carry no version.
+    lit("turn.call.stop_task", "Stop Task", "2.1.268"),
     lit(
         "survey.question",
         "How is Claude doing this session",
@@ -833,6 +851,7 @@ pub const AGY_ANCHORS: &[Anchor] = &[
     ),
     lit("agy.banner", "Antigravity CLI", "1.4.0"),
     lit("agy.turn.interrupted", "Interrupted · What should", "1.4.0"),
+    lit("agy.turn.thought", "Thought for ", "1.4.0"),
     lit("agy.turn.error_id", "Error ID:", "1.4.0"),
     lit(
         "agy.wall.overloaded",
@@ -1126,6 +1145,11 @@ pub const MUSE_ANCHORS: &[Anchor] = &[
         "Invalid work ID",
         "1.4.10-R6427.1",
     ),
+    composed("muse.tool.expand", " · ctrl+o", "1.4.10-R6427.1"),
+    lit("muse.tool.monitor", "Monitor ", "1.4.10-R6427.1"),
+    lit("muse.tool.stopped", "Stopped terminal", "1.4.10-R6427.1"),
+    lit("muse.tool.scheduled", "Scheduled", "1.4.10-R6427.1"),
+    lit("muse.tool.unscheduled", "Unscheduled", "1.4.10-R6427.1"),
     lit("muse.queued", "Queued input · ↑ to edit", "1.4.10-R6427.1"),
     lit(
         "muse.footer.steering",
@@ -1185,8 +1209,19 @@ pub const MUSE_ANCHORS: &[Anchor] = &[
         "wait for usage to reset at",
         "1.4.10-R6427.1",
     ),
+    lit(
+        "muse.wall.usage.resets",
+        "Your usage resets at",
+        "1.4.11-R6667.1",
+    ),
     lit("muse.wall.model_failed", "model failed: ", "1.4.10-R6427.1"),
     lit("muse.wall.api_error", "API error ", "1.4.10-R6427.1"),
+    // The error body's `type` Muse Code draws in parentheses, as the lab stub's Codex-style body sends it: unverified against Meta's API.
+    composed(
+        "muse.wall.usage_limit_reached",
+        "(usage_limit_reached)",
+        "1.4.10-R6427.1",
+    ),
     lit("muse.retry.api", "Meta Model API ", "1.4.10-R6427.1"),
     lit("muse.retry.in", " · retrying in ", "1.4.10-R6427.1"),
     lit("muse.retry.attempt", " · attempt ", "1.4.10-R6427.1"),

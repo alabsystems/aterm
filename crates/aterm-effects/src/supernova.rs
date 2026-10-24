@@ -449,7 +449,7 @@ fn peak_additive_channel(quads: &[GlowQuad]) -> u32 {
                         i += 1;
                     }
                     if read {
-                        peak = peak.max(sum.into_iter().max().unwrap_or(0));
+                        peak = peak.max(sum[0].max(sum[1]).max(sum[2]));
                     }
                 }
             }
@@ -534,13 +534,15 @@ fn emit_ring_chords(sink: &mut QuadSink<'_>, env: &SuperEnv, r: f32, thick: f32,
     } else {
         ((extent / 2.0).floor() as usize).clamp(1, SUPER_RING_BANDS)
     };
-    let top = env.cy as f32 - ro;
+    let bands_f = bands as f32;
+    let cyf = env.cy as f32;
+    let top = cyf - ro;
     let mut prev_y1 = top;
     for b in 0..bands {
         let y0 = prev_y1;
-        let y1 = top + extent * (b + 1) as f32 / bands as f32;
+        let y1 = top + extent * (b + 1) as f32 / bands_f;
         prev_y1 = y1;
-        let ym = 0.5 * (y0 + y1) - env.cy as f32;
+        let ym = 0.5 * (y0 + y1) - cyf;
         let dy = ym / 0.75;
         if dy.abs() >= ro {
             continue;
@@ -614,6 +616,9 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
             i32::from(env.start_col) + (i32::from(env.end_col) - i32::from(env.start_col)) / 2;
         let c0 = (word_mid - width as i32 / 2)
             .clamp(0, i32::from(env.cols).saturating_sub(width as i32).max(0));
+        let half_rows = rows_span as f32 / 2.0;
+        let half_w = width as f32 / 2.0;
+        let base_a = 235.0 * env_a;
         let mut stamped = 0usize;
         for dr in 0..rows_span {
             if out.len() >= cap || stamped >= MAX_VEIL_CELLS {
@@ -623,20 +628,21 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
             if r < 0 {
                 continue;
             }
-            let ny = (dr - rows_span / 2) as f32 / (rows_span as f32 / 2.0);
+            let row_u = r as u16;
+            let ny = (dr - rows_span / 2) as f32 / half_rows;
             let ny2 = ny * ny;
             for dc in 0..width as i32 {
                 if out.len() >= cap || stamped >= MAX_VEIL_CELLS {
                     break;
                 }
-                let nx = (c0 + dc - word_mid) as f32 / (width as f32 / 2.0);
+                let nx = (c0 + dc - word_mid) as f32 / half_w;
                 let d2 = (nx * nx + ny2).min(1.0);
-                let a = 235.0 * env_a * (1.0 - d2).powf(0.8);
+                let a = base_a * (1.0 - d2).powf(0.8);
                 if a < 14.0 {
                     continue;
                 }
                 out.push(WordDecoration {
-                    row: r as u16,
+                    row: row_u,
                     col: (c0 + dc) as u16,
                     dx: 0,
                     dy: 0,
@@ -690,11 +696,12 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
         let fade = 1.0 - q;
         let alpha = (170.0 * fade * env.intensity) as u8;
         let n = 16usize;
+        let n_f = n as f32;
         for k in 0..n {
             if out.len() >= cap {
                 break;
             }
-            let ang = core::f32::consts::TAU * k as f32 / n as f32;
+            let ang = core::f32::consts::TAU * k as f32 / n_f;
             let (sin_a, cos_a) = ang.sin_cos();
             let x = env.cx + (cos_a * r) as i32;
             let y = env.cy + (sin_a * r * 0.75) as i32;
@@ -729,6 +736,9 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
         };
         let alphas = [1.0, crate::effect_util::TWINKLE_FLOOR]
             .map(|tw| (255.0 * env.intensity * tw * fade_p) as u8);
+        let half_cw = env.cell_w / 2;
+        let half_ch = env.cell_h / 2;
+        let hue_drift = p * 90.0;
         for k in 0..n {
             if out.len() >= cap {
                 break;
@@ -744,14 +754,14 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
                 continue;
             }
             let (row, col) = (y / ch, x / cw);
-            let hue = env.base_hue + k as f32 * hue_step + p * 90.0;
+            let hue = env.base_hue + k as f32 * hue_step + hue_drift;
             let tone = hsv2rgb(hue, sat, val);
             let grid_phase = ((grid_tick + k as u64) & 1) as usize;
             out.push(WordDecoration {
                 row: row as u16,
                 col: col as u16,
-                dx: ((x % cw) - env.cell_w / 2).clamp(-6, 6) as i8,
-                dy: ((y % ch) - env.cell_h / 2).clamp(-6, 6) as i8,
+                dx: ((x % cw) - half_cw).clamp(-6, 6) as i8,
+                dy: ((y % ch) - half_ch).clamp(-6, 6) as i8,
                 glyph: if s & 1 == 0 {
                     DecoGlyph::Star4
                 } else {

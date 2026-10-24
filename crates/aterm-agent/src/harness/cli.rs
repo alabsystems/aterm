@@ -6553,9 +6553,7 @@ fn run_accounts_use(
             let Some((_, raw)) = accounts_read_roster_for(cli, env, err) else {
                 return ExitCode::from(1);
             };
-            if cli == Cli::Claude {
-                let _ = super::accounts_sync::recover_staging_renewals(&store, &raw, now);
-            }
+            let _ = super::accounts_sync::recover_staging_renewals_for(cli, &store, &raw, now);
             let roster = store.bound(&raw, now).unwrap_or(raw);
             let enrolled = accounts::enrolled_for(cli, &roster);
             let remedy = match roster.row(label) {
@@ -7465,8 +7463,15 @@ fn bind_signed_in(
     let now = host.now().max(floor);
     let email = row.email.as_deref().unwrap_or("");
     if !email.is_empty()
-        && let Err(why) =
-            accounts::write_renewal_checkpoint_for(cli, label, email, &plan.staging_text, None, now)
+        && let Err(why) = accounts::write_renewal_checkpoint_for(
+            cli,
+            label,
+            email,
+            &plan.staging_text,
+            None,
+            Some(proof),
+            now,
+        )
     {
         say(
             err,
@@ -7678,6 +7683,9 @@ fn run_accounts_renew_for(
         return ExitCode::from(1);
     };
     let now = env.now;
+    if due && labels.is_empty() {
+        let _ = super::accounts_sync::recover_staging_renewals_for(cli, &store, &file_roster, now);
+    }
     let (logins, logins_note) = match store.load_logins(now) {
         Ok(read) => read,
         Err(why) => {

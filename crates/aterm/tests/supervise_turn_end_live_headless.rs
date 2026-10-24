@@ -1106,12 +1106,14 @@ fn a_decision_is_answered_with_the_answer_text() {
     assert!(!meta.contains("attention_owner=supervisor"), "{meta}\n{ev}");
 }
 
-/// Under full power, a worker whose every turn is short (`min_work` an hour) is continued forever without escalating.
+/// Under full power, a worker whose every turn is short (`min_work` an hour) and says the same is continued twice, then held under the stalled exception without escalating.
 #[test]
-fn a_short_turn_loop_is_continued_and_never_escalates() {
+fn a_short_turn_loop_saying_the_same_is_continued_twice_then_held_and_never_escalates() {
+    const HELD: &str =
+        "kind=stalled when=later Its program answers aterm's acts with the same reply";
     let inst = boot("b");
     let sid = boot_session(&inst);
-    let (_keys, _subs, _events) = start_looping_worker(&inst, &sid, "done");
+    let (_keys, _subs, events) = start_looping_worker(&inst, &sid, "done");
     let sec = Duration::from_secs(1);
     submit(&inst, &sid, "go");
     await_match(&inst, &sid, "Deliberating|suite.is.green");
@@ -1126,11 +1128,28 @@ fn a_short_turn_loop_is_continued_and_never_escalates() {
         },
         SupervisorConfig::default(),
     );
-    let at = stamps_when(&inst, "submit", 4);
+    // The hold told, or a third continuation typed past it: the chain moves on either way.
+    let submits = || {
+        worker_events(&events)
+            .iter()
+            .filter(|(_, kind, _)| kind == "submit")
+            .count()
+    };
+    let told = moving(&inst, || {
+        let j = journal(&inst);
+        (j.contains(HELD) || submits() > 3).then_some(j)
+    })
+    .unwrap_or_else(|_| journal(&inst));
     let meta = ctl_ok(&inst, &[&format!("@{sid}"), "meta"]);
     let out = sup.stop();
+    let at = stamps_when(&inst, "submit", 3);
     let ev = evidence(&inst, &out);
-    assert_eq!(at.len(), 4, "`go` and three continuations; {ev}");
+    assert!(told.contains(HELD), "{ev}");
+    assert_eq!(
+        at.len(),
+        3,
+        "`go` and two continuations, then nothing; {ev}"
+    );
     assert!(!meta.contains("attention_owner=supervisor"), "{meta}\n{ev}");
 }
 

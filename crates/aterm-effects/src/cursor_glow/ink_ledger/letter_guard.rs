@@ -262,16 +262,20 @@ impl LetterGuard {
         if !additive {
             return false;
         }
+        let has_over = self.cell.iter().any(|&(stream, _)| stream != Stream::Under);
         let (w, h) = ((j.x1 - j.x0) as usize, (j.y1 - j.y0) as usize);
         let mut lu = std::mem::take(&mut self.lift_under);
         let mut lo = std::mem::take(&mut self.lift_over);
         lu.clear();
-        lo.clear();
         lu.resize(w * h, [0; 3]);
-        lo.resize(w * h, [0; 3]);
-        let add = |acc: &mut [u16; 3], c: u32| {
-            for (k, sh) in [16u32, 8, 0].into_iter().enumerate() {
-                acc[k] = acc[k].saturating_add(((c >> sh) & 0xff) as u16);
+        if has_over {
+            lo.clear();
+            lo.resize(w * h, [0; 3]);
+        }
+        let unpack_rgb = |c: u32| [16u32, 8, 0].map(|sh| ((c >> sh) & 0xff) as u16);
+        let add_rgb = |acc: &mut [u16; 3], rgb: [u16; 3]| {
+            for (a, v) in acc.iter_mut().zip(rgb) {
+                *a = a.saturating_add(v);
             }
         };
         for &(stream, i) in &self.cell {
@@ -309,11 +313,12 @@ impl LetterGuard {
                     if (q.color ^ q.color2) & 0x00FF_FFFF == 0 {
                         let c = q.color & 0x00FF_FFFF;
                         if c != 0 {
+                            let rgb = unpack_rgb(c);
                             let (rx0, rx1) = ((x0 - j.x0) as usize, (x1 - j.x0) as usize);
                             for y in y0..y1 {
                                 let row_off = (y - j.y0) as usize * w;
                                 for cell in &mut dst[row_off + rx0..row_off + rx1] {
-                                    add(cell, c);
+                                    add_rgb(cell, rgb);
                                 }
                             }
                         }
@@ -321,9 +326,10 @@ impl LetterGuard {
                         for x in x0..x1 {
                             let c = quad_at(q, x, 1.0).0;
                             if c != 0 {
+                                let rgb = unpack_rgb(c);
                                 let col_off = (x - j.x0) as usize;
                                 for y in y0..y1 {
-                                    add(&mut dst[(y - j.y0) as usize * w + col_off], c);
+                                    add_rgb(&mut dst[(y - j.y0) as usize * w + col_off], rgb);
                                 }
                             }
                         }
@@ -351,9 +357,9 @@ impl LetterGuard {
                         for x in hx0..hx1 {
                             let wt = aterm_render::halo_weight(x - cx, ny, rx2).clamp(0, 255) as u8;
                             if wt != 0 {
-                                add(
+                                add_rgb(
                                     &mut lo[row_off + (x - j.x0) as usize],
-                                    aterm_render::premul_rgb(color, wt),
+                                    unpack_rgb(aterm_render::premul_rgb(color, wt)),
                                 );
                             }
                         }
@@ -446,9 +452,6 @@ impl LetterGuard {
         let mut lum = std::mem::take(&mut self.lum);
         let mut ring_lo = std::mem::take(&mut self.ring_lo);
         let mut ring_hi = std::mem::take(&mut self.ring_hi);
-        lum.clear();
-        ring_lo.clear();
-        ring_hi.clear();
         lum.resize(w * h, 0.0);
         ring_lo.resize(w * h, 0.0);
         ring_hi.resize(w * h, 0.0);
@@ -469,7 +472,8 @@ impl LetterGuard {
             for x in 0..w {
                 let k = row + x;
                 let lg = if additive {
-                    let (a, b) = (self.lift_under[k], self.lift_over[k]);
+                    let a = self.lift_under[k];
+                    let b = if has_over { self.lift_over[k] } else { [0; 3] };
                     if a == [0; 3] && b == [0; 3] {
                         j.l_ground
                     } else {
@@ -728,6 +732,7 @@ impl InkLedger {
     /// dims ([`Self::mask_at`]), easing back to the whole light off them.
     fn guard_mask_quads(&mut self, quads: &mut Vec<GlowQuad>) {
         let (bx0, by0, bx1, by1) = self.dims_bounds();
+        let feather = self.feather();
         let mut pieces = std::mem::take(&mut self.pieces);
         pieces.clear();
         let mut cut = false;
@@ -748,33 +753,43 @@ impl InkLedger {
             cut = true;
             let w = f32::from(q.w);
             let at = |c: u32, sh: u32| ((c >> sh) & 0xff) as f32;
+            let (r0, g0, b0) = (at(q.color, 16), at(q.color, 8), at(q.color, 0));
+            let (dr, dg, db) = (
+                at(q.color2, 16) - r0,
+                at(q.color2, 8) - g0,
+                at(q.color2, 0) - b0,
+            );
+            let a0 = f32::from(q.alpha);
+            let da = f32::from(q.alpha2) - a0;
             let end = |x: i32, m: f32| {
                 let t = (x - x0) as f32 / w;
-                let ch = |sh: u32| {
-                    let v = at(q.color, sh) + (at(q.color2, sh) - at(q.color, sh)) * t;
-                    ((v * m).round() as u32).min(255)
-                };
-                let a = f32::from(q.alpha) + (f32::from(q.alpha2) - f32::from(q.alpha)) * t;
+                let ch = |c0: f32, dc: f32| (((c0 + dc * t) * m).round() as u32).min(255);
+                let a = a0 + da * t;
                 (
-                    (ch(16) << 16) | (ch(8) << 8) | ch(0),
+                    (ch(r0, dr) << 16) | (ch(g0, dg) << 8) | ch(b0, db),
                     ((a * m).round() as u32).min(255) as u8,
                 )
             };
-            for yi in 0..self.knots_y.len() - 1 {
+            let ny = self.knots_y.len() - 1;
+            let nx = self.knots_x.len() - 1;
+            let x0_knot = self.knots_x[0];
+            for yi in 0..ny {
                 let (ya, yb) = (self.knots_y[yi], self.knots_y[yi + 1]);
                 let ym = 0.5 * (ya + yb) as f32;
-                let mut xa = self.knots_x[0];
-                let mut ca = end(xa, self.mask_at(xa as f32, ym));
-                for xi in 0..self.knots_x.len() - 1 {
+                let ya_u = ya as u16;
+                let h_u = (yb - ya) as u16;
+                let mut xa = x0_knot;
+                let mut ca = end(xa, self.mask_at_with(xa as f32, ym, feather));
+                for xi in 0..nx {
                     let xb = self.knots_x[xi + 1];
-                    let cb = end(xb, self.mask_at(xb as f32, ym));
+                    let cb = end(xb, self.mask_at_with(xb as f32, ym, feather));
                     if ca.0 | cb.0 != 0 || ca.1 | cb.1 != 0 {
                         pieces.push(GlowQuad {
                             row: q.row,
                             x: xa as u16,
-                            y: ya as u16,
+                            y: ya_u,
                             w: (xb - xa) as u16,
-                            h: (yb - ya) as u16,
+                            h: h_u,
                             color: ca.0,
                             alpha: ca.1,
                             color2: cb.0,
@@ -797,6 +812,7 @@ impl InkLedger {
     /// colour, a source-over halo's opacity ceiling.
     fn guard_mask_halos(&mut self, halos: &mut Vec<RainHalo>) {
         let (bx0, by0, bx1, by1) = self.dims_bounds();
+        let feather = self.feather();
         let mut pieces = std::mem::take(&mut self.halo_pieces);
         pieces.clear();
         let mut cut = false;
@@ -815,11 +831,16 @@ impl InkLedger {
                 continue;
             }
             cut = true;
-            for yi in 0..self.knots_y.len() - 1 {
+            let ny = self.knots_y.len() - 1;
+            let nx = self.knots_x.len() - 1;
+            for yi in 0..ny {
                 let (ya, yb) = (self.knots_y[yi], self.knots_y[yi + 1]);
-                for xi in 0..self.knots_x.len() - 1 {
+                let ym = 0.5 * (ya + yb) as f32;
+                let ya_u = ya as u16;
+                let h_u = (yb - ya) as u16;
+                for xi in 0..nx {
                     let (xa, xb) = (self.knots_x[xi], self.knots_x[xi + 1]);
-                    let m = self.mask_at(0.5 * (xa + xb) as f32, 0.5 * (ya + yb) as f32);
+                    let m = self.mask_at_with(0.5 * (xa + xb) as f32, ym, feather);
                     let color = match h.mode {
                         HaloMode::Add => scale_rgb(h.color & 0x00FF_FFFF, m),
                         HaloMode::Over => match over_cap(h.color, m) {
@@ -835,9 +856,9 @@ impl InkLedger {
                     }
                     pieces.push(RainHalo {
                         x: xa as u16,
-                        y: ya as u16,
+                        y: ya_u,
                         w: (xb - xa) as u16,
-                        h: (yb - ya) as u16,
+                        h: h_u,
                         color,
                         ..h
                     });
@@ -893,6 +914,40 @@ impl CursorGlow {
             over.as_slice(),
             self.halo_out.as_slice(),
         );
+        let lit = |q: &GlowQuad| q.w > 0 && q.h > 0 && (q.color | q.color2) & 0x00FF_FFFF != 0;
+        let quad_y_bounds = |qs: &[GlowQuad]| {
+            let (mut y0, mut y1) = (i32::MAX, i32::MIN);
+            for q in qs {
+                if lit(q) {
+                    let qy = i32::from(q.y);
+                    y0 = y0.min(qy);
+                    y1 = y1.max(qy + i32::from(q.h));
+                }
+            }
+            (y0, y1)
+        };
+        let (u_y0, u_y1) = quad_y_bounds(streams.0);
+        let (o_y0, o_y1) = quad_y_bounds(streams.1);
+        let (mut ha_y0, mut ha_y1) = (i32::MAX, i32::MIN);
+        let (mut ho_y0, mut ho_y1) = (i32::MAX, i32::MIN);
+        for h in streams.2 {
+            if h.w > 0 && h.h > 0 && h.color & 0x00FF_FFFF != 0 {
+                let hy0 = i32::from(h.y);
+                let hy1 = hy0 + i32::from(h.h);
+                if h.mode == HaloMode::Add {
+                    ha_y0 = ha_y0.min(hy0);
+                    ha_y1 = ha_y1.max(hy1);
+                } else {
+                    ho_y0 = ho_y0.min(hy0);
+                    ho_y1 = ho_y1.max(hy1);
+                }
+            }
+        }
+        let all_y0 = u_y0.min(o_y0).min(ha_y0).min(ho_y0);
+        let all_y1 = u_y1.max(o_y1).max(ha_y1).max(ho_y1);
+        if all_y0 >= all_y1 {
+            return 0;
+        }
         let mut print = 0u64;
         let mut solid = None;
         let lum = |c: u32| crate::color_math::relative_luminance_with(table, c);
@@ -903,6 +958,9 @@ impl CursorGlow {
             };
             let row = text.lo + i as i32;
             let (ry0, ry1) = (oy + row * ch - RING, oy + (row + 1) * ch + RING);
+            if ry1 <= all_y0 || ry0 >= all_y1 {
+                continue;
+            }
             guard.row.clear();
             let (mut min_x, mut max_x) = (i32::MAX, i32::MIN);
             let mut push_row = |stream: Stream, k: usize, x: u16, w: u16| {
@@ -918,31 +976,41 @@ impl CursorGlow {
                 });
             };
             let meets_y = |y: u16, h: u16| i32::from(y) < ry1 && i32::from(y) + i32::from(h) > ry0;
-            let lit = |q: &GlowQuad| q.w > 0 && q.h > 0 && (q.color | q.color2) & 0x00FF_FFFF != 0;
-            for (k, q) in streams.0.iter().enumerate() {
-                if lit(q) && meets_y(q.y, q.h) {
-                    push_row(Stream::Under, k, q.x, q.w);
+            if ry1 > u_y0 && ry0 < u_y1 {
+                for (k, q) in streams.0.iter().enumerate() {
+                    if lit(q) && meets_y(q.y, q.h) {
+                        push_row(Stream::Under, k, q.x, q.w);
+                    }
                 }
             }
-            for (k, q) in streams.1.iter().enumerate() {
-                if lit(q) && meets_y(q.y, q.h) {
-                    push_row(Stream::Over, k, q.x, q.w);
+            if ry1 > o_y0 && ry0 < o_y1 {
+                for (k, q) in streams.1.iter().enumerate() {
+                    if lit(q) && meets_y(q.y, q.h) {
+                        push_row(Stream::Over, k, q.x, q.w);
+                    }
                 }
             }
-            for mode in [HaloMode::Add, HaloMode::Over] {
+            if ry1 > ha_y0 && ry0 < ha_y1 {
                 for (k, h) in streams.2.iter().enumerate() {
-                    if h.mode == mode
+                    if h.mode == HaloMode::Add
                         && h.w > 0
                         && h.h > 0
                         && h.color & 0x00FF_FFFF != 0
                         && meets_y(h.y, h.h)
                     {
-                        let s = if mode == HaloMode::Add {
-                            Stream::HaloAdd
-                        } else {
-                            Stream::HaloOver
-                        };
-                        push_row(s, k, h.x, h.w);
+                        push_row(Stream::HaloAdd, k, h.x, h.w);
+                    }
+                }
+            }
+            if ry1 > ho_y0 && ry0 < ho_y1 {
+                for (k, h) in streams.2.iter().enumerate() {
+                    if h.mode == HaloMode::Over
+                        && h.w > 0
+                        && h.h > 0
+                        && h.color & 0x00FF_FFFF != 0
+                        && meets_y(h.y, h.h)
+                    {
+                        push_row(Stream::HaloOver, k, h.x, h.w);
                     }
                 }
             }

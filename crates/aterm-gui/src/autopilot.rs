@@ -79,57 +79,11 @@ pub(crate) const fn agent_switch_off(agent: aterm_phase::Program) -> &'static st
     }
 }
 
-/// One mode's sentence in the form each surface renders it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ModeWords {
-    /// The mode the sentence says.
-    pub(crate) mode: Autopilot,
-    /// The Autopilot chip's title, after `autopilot: <mode> — `.
-    pub(crate) chip: &'static str,
-    /// The `Autopilot set to <mode>` record's line, after its tab.
-    pub(crate) record: &'static str,
-    /// Settings ▸ Harness's mode button, as its description says what a press does.
-    pub(crate) button: &'static str,
-}
-
-/// EVERY MODE'S SENTENCE, ONE TABLE (§12.4.1).
-pub(crate) const MODE_WORDS: [ModeWords; 3] = [
-    ModeWords {
-        mode: Autopilot::Cruise,
-        chip: "keeps going for ever, finding more to do",
-        record: "the harness keeps going for ever, finding more to do",
-        button: "keep going for ever, finding more to do: nothing the agent says ends it",
-    },
-    ModeWords {
-        mode: Autopilot::Land,
-        chip: "wrapping up: landing everything on the remote main branch, then stopping",
-        record: "the harness wraps it up: it lands everything on the remote main branch, then \
-                 stops",
-        button: "wrap it up: land everything on the remote main branch, then stop",
-    },
-    ModeWords {
-        mode: Autopilot::Off,
-        chip: "hands off",
-        record: "the harness keeps its hands off",
-        button: "the harness keeps its hands off this session",
-    },
-];
-
-/// A TIMED CRUISE'S SENTENCES (§12.4.1's third row): Cruise until a time, then Land.
-pub(crate) const TIMED_CRUISE_CHIP: &str = "keeps going until then, finding more to do";
-/// The record of a timed Cruise set (`message_reporters::autopilot_timer_set`).
-pub(crate) const TIMED_CRUISE_RECORD: &str =
-    "the harness keeps going until that time, then wraps it up on the remote main branch";
-
-/// `mode`'s sentences from [`MODE_WORDS`].
-#[must_use]
-pub(crate) const fn mode_words(mode: Autopilot) -> &'static ModeWords {
-    match mode {
-        Autopilot::Cruise => &MODE_WORDS[0],
-        Autopilot::Land => &MODE_WORDS[1],
-        Autopilot::Off => &MODE_WORDS[2],
-    }
-}
+/// EVERY MODE'S SENTENCE, ONE TABLE (§12.4.1): `aterm_agent::supervise::mode_words`, beside
+/// [`Autopilot`], so the forever lab judges the chip's title against the same rows.
+pub(crate) use aterm_agent::supervise::mode_words::{
+    MODE_WORDS, TIMED_CRUISE_CHIP, TIMED_CRUISE_RECORD, mode_words,
+};
 
 /// A session's EFFECTIVE Autopilot as the window shows it: the mode it runs under, or why the
 /// harness runs none at all.

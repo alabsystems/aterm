@@ -876,3 +876,45 @@ fn a_land_hold_does_not_grow_the_wake() {
     assert_eq!(std::mem::size_of::<crate::HarnessFact>(), MAIN_FACT_BYTES);
     assert!(std::mem::size_of::<crate::Wake>() <= MAIN_WAKE_BYTES);
 }
+
+/// The words a leg that names nothing of its reply says, and a read hold's tip, are the ones
+/// beside `HoldLeg` in aterm-agent, where the forever lab reads them to judge a hold: every
+/// form the glass draws says them, so the lab never holds a copy of its own.
+#[test]
+fn a_fixed_legs_words_and_the_tip_are_the_ones_beside_the_leg() {
+    use aterm_agent::harness::acts::{NOT_LANDED_YET, held_tip};
+    for leg in [HoldLeg::Defense, HoldLeg::Unread, HoldLeg::Cut] {
+        let words = leg.fixed_words().expect("a fixed leg's words");
+        for nudges in [0, 1, 3] {
+            let hold = glass(
+                LandHeld {
+                    legs: leg.bit(),
+                    nudges,
+                    ..held()
+                },
+                TODAY,
+            );
+            let said = |form| hold_words(&hold, None, form, Some(TODAY));
+            assert_eq!(
+                said(HoldForm::Tip),
+                Some(held_tip(words, nudges)),
+                "{leg:?}"
+            );
+            assert_eq!(
+                said(HoldForm::Hover),
+                Some(format!("{NOT_LANDED_YET}, {words}")),
+                "{leg:?}"
+            );
+            for form in [HoldForm::Line, HoldForm::Title] {
+                let line = said(form).expect("a read hold's line");
+                assert!(
+                    line.starts_with(&format!("{NOT_LANDED_YET}: {words}")),
+                    "{leg:?} {form:?}: {line}"
+                );
+            }
+        }
+    }
+    for leg in [HoldLeg::Needs, HoldLeg::Repo, HoldLeg::Open] {
+        assert_eq!(leg.fixed_words(), None, "{leg:?} names what its reply held");
+    }
+}

@@ -323,6 +323,7 @@ impl CursorBeamRod {
                 ink
             }
         };
+        let ch_i = geom.ch as i32;
         for (hw, share) in [(0.30, 0.45), (0.11, 1.0)] {
             let a = (LIGHT_BODY_ALPHA_CAP * share * strength) as u8;
             if a == 0 {
@@ -335,7 +336,7 @@ impl CursorBeamRod {
                 (ax - cw * hw) as i32,
                 y,
                 w,
-                geom.ch as i32,
+                ch_i,
                 premul_rgb(ink, a),
                 a,
             );
@@ -373,8 +374,9 @@ impl CursorBeamRod {
         let hw = cw * 0.5;
         let cell_x0 = (cx - hw).round() as i32;
         let cell_x1 = cell_x0 + geom.cw as i32;
-        let band_y0 = i32::from(geom.origin_y) + i32::from(cr) * geom.ch as i32;
-        let band_y1 = band_y0 + geom.ch as i32;
+        let ch_i = geom.ch as i32;
+        let band_y0 = i32::from(geom.origin_y) + i32::from(cr) * ch_i;
+        let band_y1 = band_y0 + ch_i;
         let row_h = ((ch / AURA_ROW_DIV) as i32).max(2);
         let mut y = band_y0;
         while y < band_y1 {
@@ -387,7 +389,7 @@ impl CursorBeamRod {
                 if half > hw {
                     let span = half - hw;
                     let knot = |k: usize| {
-                        let t = k as f32 / AURA_SEGMENTS as f32;
+                        let t = k as f32 * (1.0 / AURA_SEGMENTS as f32);
                         let dx = hw + span * t;
                         let (rx_i, lx_i) = ((cx + dx).round() as i32, (cx - dx).round() as i32);
                         if k == AURA_SEGMENTS {

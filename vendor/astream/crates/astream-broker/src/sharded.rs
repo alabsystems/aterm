@@ -30,9 +30,12 @@
 //! disks/nodes, or where the single writer thread rather than the disk is the
 //! bottleneck (the `Relaxed` tier).
 
-use crate::client::SubscriptionCloser;
+use crate::client::{Event, SubscriptionCloser};
+use crate::proto::Gap;
 use crate::{Broker, BrokerHandle, Client, Durability};
 use astream_wire::{assign_partition, Filter, PartitionKey};
+use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver};
@@ -298,7 +301,15 @@ impl ShardedClient {
         body: &[u8],
     ) -> io::Result<(usize, u64, bool)> {
         let s = self.shard_of(subject);
-        let (off, deduped) = self.conns[s].publish(producer_id, producer_seq, subject, body)?;
+        // `shard_of` routes below the shard count, one connection per shard; a route
+        // past them is refused rather than trusted.
+        let Some(conn) = self.conns.get_mut(s) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "subject routes past the shard connections",
+            ));
+        };
+        let (off, deduped) = conn.publish(producer_id, producer_seq, subject, body)?;
         Ok((s, off, deduped))
     }
 
@@ -310,6 +321,23 @@ impl ShardedClient {
 
 /// One merged delivery: `(shard, offset, subject, body)`.
 pub type ShardedDelivery = (usize, u64, String, Vec<u8>);
+
+/// What a fan-in carries: a delivery, or one shard's gap notice
+/// ([`Event::Gap`]): retention gave up records of the filter on
+/// that shard below its tail, so the records of `gap.from..gap.to` that shard does not
+/// deliver are gone. Offsets are per shard, so a notice is only ever that shard's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShardedEvent {
+    /// A delivery, as [`ShardedSubscription::recv`] returns it.
+    Delivery(ShardedDelivery),
+    /// A gap notice from `shard`, before every later delivery of that shard.
+    Gap {
+        /// The shard whose tail was told.
+        shard: usize,
+        /// What it was told, in that shard's offsets.
+        gap: Gap,
+    },
+}
 
 /// A fan-in subscription that merges every shard's matching deliveries onto one stream.
 /// Ordering is preserved PER SHARD (each shard's records arrive in offset order);
@@ -323,10 +351,17 @@ pub type ShardedDelivery = (usize, u64, String, Vec<u8>);
 /// cleanly".
 /// Dropping the subscription closes every shard socket and joins its forwarder
 /// thread, so nothing lingers on either side.
+///
+/// Each shard's tail asks for gap notices (R4's addendum, A9), and a notice is forwarded in
+/// the shard's order: [`recv_event`](Self::recv_event) returns it, and
+/// [`take_gaps`](Self::take_gaps) hands back, shard by shard, every notice a read passed.
 pub struct ShardedSubscription {
-    rx: Receiver<io::Result<ShardedDelivery>>,
+    rx: Receiver<io::Result<ShardedEvent>>,
     closers: Vec<SubscriptionCloser>,
     forwarders: Vec<JoinHandle<()>>,
+    /// The notices read since the last [`take_gaps`](Self::take_gaps), each shard's as one
+    /// ([`Gap::and`]).
+    gaps: Cell<BTreeMap<usize, Gap>>,
 }
 
 impl ShardedSubscription {
@@ -358,6 +393,7 @@ impl ShardedSubscription {
             rx,
             closers: Vec::new(),
             forwarders: Vec::new(),
+            gaps: Cell::new(BTreeMap::new()),
         };
         for i in 0..shards {
             let mut sub = Client::connect(dir.join(format!("shard-{i}.sock")))?
@@ -366,22 +402,28 @@ impl ShardedSubscription {
             let tx = tx.clone();
             let shard = i as usize;
             this.forwarders.push(thread::spawn(move || loop {
-                // Forward this shard's deliveries until the stream ends (broker
-                // closed, or our closer shut the socket), the consumer dropped the
-                // receiver (send fails), or the shard errors — which is forwarded,
-                // tagged with the shard, before this forwarder ends.
-                match sub.recv() {
-                    Ok(Some((off, subject, body))) => {
-                        if tx.send(Ok((shard, off, subject, body))).is_err() {
-                            break;
-                        }
-                    }
+                // Forward this shard's deliveries and gap notices, in its order, until the
+                // stream ends (broker closed, or our closer shut the socket), the consumer
+                // dropped the receiver (send fails), or the shard errors — which is
+                // forwarded, tagged with the shard, before this forwarder ends. Marks are
+                // the shard's liveness, not the fan-in's: skipped.
+                let event = match sub.recv_event() {
+                    Ok(Some(Event::Delivery {
+                        offset,
+                        subject,
+                        body,
+                    })) => ShardedEvent::Delivery((shard, offset, subject, body)),
+                    Ok(Some(Event::Gap(gap))) => ShardedEvent::Gap { shard, gap },
+                    Ok(Some(Event::Mark { .. })) => continue,
                     Ok(None) => break,
                     Err(e) => {
                         let _ =
                             tx.send(Err(io::Error::new(e.kind(), format!("shard {shard}: {e}"))));
                         break;
                     }
+                };
+                if tx.send(Ok(event)).is_err() {
+                    break;
                 }
             }));
         }
@@ -394,12 +436,46 @@ impl ShardedSubscription {
     /// NOT read `None` as a clean fan-in (every shard's broker dying yields N `Err`s
     /// and then `None`); an `Err` names the shard and the other shards keep
     /// delivering, so a caller may continue if partial fan-in is acceptable.
+    ///
+    /// A shard's gap notice is SKIPPED (this method's signature is unchanged):
+    /// [`take_gaps`](Self::take_gaps) hands back every notice it passed, and
+    /// [`recv_event`](Self::recv_event) returns them in order.
     pub fn recv(&self) -> io::Result<Option<ShardedDelivery>> {
+        loop {
+            match self.recv_event()? {
+                Some(ShardedEvent::Delivery(d)) => return Ok(Some(d)),
+                Some(ShardedEvent::Gap { .. }) => {}
+                None => return Ok(None),
+            }
+        }
+    }
+
+    /// Block for the next merged event: a delivery, or a shard's gap notice, which comes
+    /// before every later delivery of its shard. Errors and the end as for
+    /// [`recv`](Self::recv).
+    pub fn recv_event(&self) -> io::Result<Option<ShardedEvent>> {
         match self.rx.recv() {
+            Ok(Ok(ShardedEvent::Gap { shard, gap })) => {
+                let mut gaps = self.gaps.take();
+                let told = match gaps.get(&shard) {
+                    Some(before) => before.and(gap),
+                    None => gap,
+                };
+                gaps.insert(shard, told);
+                self.gaps.set(gaps);
+                Ok(Some(ShardedEvent::Gap { shard, gap }))
+            }
             Ok(Ok(d)) => Ok(Some(d)),
             Ok(Err(e)) => Err(e),
             Err(_) => Ok(None),
         }
+    }
+
+    /// Every gap notice read since the last call, by [`recv`](Self::recv) or
+    /// [`recv_event`](Self::recv_event), each shard's as one ([`Gap::and`]), in shard
+    /// order: what retention gave up below each shard's tail. Empty when none came.
+    pub fn take_gaps(&self) -> Vec<(usize, Gap)> {
+        self.gaps.take().into_iter().collect()
     }
 }
 

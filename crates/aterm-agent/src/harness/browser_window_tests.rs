@@ -9,6 +9,7 @@
 use std::ffi::OsString;
 
 use super::*;
+#[cfg(unix)]
 use crate::harness::headless_oauth::vendor_tests::stand_in_lead;
 use crate::harness::headless_oauth::{HeadlessBrowser, headless_launch_args};
 
@@ -476,6 +477,12 @@ fn identity_providers_cookies_are_named_by_their_domains_and_the_vendors_are_not
         "googleapis.com",
         "notgoogle.com",
         "google.example.org",
+        "google.foo.org",
+        "google.abc.com",
+        "youtube.bar.net",
+        "google.foo.uk",
+        "google.a.b.c.com",
+        "google.127.0.0.1",
         "mygithub.com",
         "box.com",
         "127.0.0.1",

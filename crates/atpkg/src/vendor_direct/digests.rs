@@ -38,14 +38,6 @@ impl AuthenticatedDigest {
         alg.is_lower_hex(&hex).then_some(Self { alg, hex })
     }
 
-    /// `hex` (one `alg` digest, either case), which the lane measured from the bytes it
-    /// downloaded for an anchor no document of which names a digest (grok): what vouches for
-    /// those bytes is the darwin Developer ID team pin at stage, not a document.
-    #[must_use]
-    pub(crate) fn measured(alg: DigestAlg, hex: &str) -> Option<Self> {
-        Self::authenticated(alg, hex)
-    }
-
     /// One read back from a record an earlier pass wrote when its anchor vouched for it.
     #[must_use]
     pub(crate) fn recorded(sha256: &str, sha512: &str) -> Option<Self> {
@@ -110,7 +102,10 @@ struct Entry {
     sha512: String,
 }
 
-type Key = (String, Version, String);
+/// `(program, version, triple, algorithm)`: a digest under one algorithm is first seen apart
+/// from one under another, so a row whose anchor moved to another algorithm (grok's, from a
+/// measured sha256 to npm's signed sha512) starts its sightings afresh.
+type Key = (String, Version, String, DigestAlg);
 
 const SHARED_LOG: [&str; 2] = ["claude", "codex"];
 
@@ -125,8 +120,8 @@ pub(crate) fn digests_path(layout: &Layout, program: &str) -> PathBuf {
     })
 }
 
-/// Check `digest` against the first digest seen for `(program, version, triple)` and, when
-/// `record`, record it if none was.
+/// Check `digest` against the first digest of its algorithm seen for `(program, version,
+/// triple)` and, when `record`, record it if none was.
 /// # Errors
 /// An argument is malformed (not a vendor program, or a triple that is not 2 to 5 `[a-z0-9_.]`
 /// words joined by `-`, at most 64 bytes), the log exists but does not read, or it could not be
@@ -149,7 +144,12 @@ pub(crate) fn record_or_conflict(
     let path = digests_path(layout, program);
     let _lock = durable::lock_for_update(&path)?;
     let mut log = read_log(&path)?;
-    let key: Key = (program.to_string(), version, triple.to_string());
+    let key: Key = (
+        program.to_string(),
+        version,
+        triple.to_string(),
+        digest.alg(),
+    );
     match log.get(&key) {
         Some(first) if first == digest => return Ok(DigestSeen::Same),
         Some(first) => {
@@ -166,7 +166,7 @@ pub(crate) fn record_or_conflict(
         schema: LOG_SCHEMA,
         seen: log
             .into_iter()
-            .map(|((program, version, triple), digest)| {
+            .map(|((program, version, triple, _), digest)| {
                 let (sha256, sha512) = digest.keyed();
                 Entry {
                     program,
@@ -216,7 +216,8 @@ fn read_log(path: &Path) -> io::Result<BTreeMap<Key, AuthenticatedDigest>> {
             continue;
         };
         if is_vendor(&e.program) && triple_ok(&e.triple) {
-            log.entry((e.program, version, e.triple)).or_insert(digest);
+            log.entry((e.program, version, e.triple, digest.alg()))
+                .or_insert(digest);
         }
     }
     for program in super::table::VENDORS.iter().map(|s| s.program) {
@@ -443,9 +444,17 @@ mod tests {
         );
         assert_eq!(
             rec(&l, "agy", v("1.3.6"), T, &sha('5')).unwrap(),
-            DigestSeen::Conflict { first: d512('5') },
-            "a sha256 for a key first seen with a sha512 is not the same digest"
+            DigestSeen::New,
+            "a sha256 is first seen apart from the sha512 seen for the same build"
         );
+        assert_eq!(
+            rec(&l, "agy", v("1.3.6"), T, &sha('6')).unwrap(),
+            DigestSeen::Conflict {
+                first: d256(&sha('5'))
+            },
+            "and then conflicts as any first sighting does"
+        );
+        assert_eq!(rec512(&l, "agy", "1.3.6", '5'), DigestSeen::Same);
         let both = format!(
             "[[seen]]\nprogram = \"agy\"\nversion = \"1.3.7\"\ntriple = \"{T}\"\n\
              sha256 = \"{a}\"\nsha512 = \"{b}\"\n\

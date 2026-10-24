@@ -1868,11 +1868,80 @@ pub(crate) fn seen_at(input: &RenderInput, row: usize, col: usize) -> Seen {
     Seen::of_cell(cell.ch, opaque)
 }
 
-/// Extracts a `rows` by `cols` grid of [`CellText`] from `f`.
+/// Extracts a `rows` by `cols` grid of [`CellText`] from `f`: each cell is [`cell_text`]'s,
+/// read a row at a time, its few marks placed once each instead of sought for every cell.
 pub(crate) fn frame_text(f: &RenderInput, rows: usize, cols: usize) -> Vec<Vec<CellText>> {
     (0..rows)
-        .map(|r| (0..cols).map(|c| cell_text(f, r, c)).collect())
+        .map(|r| {
+            let cells = f.cells.get(r).map_or(&[][..], Vec::as_slice);
+            let mut line: Vec<CellText> = (0..cols)
+                .map(|c| {
+                    cells
+                        .get(c)
+                        .map_or((' ', false, None), |cell| (cell.ch, cell.wide, None))
+                })
+                .collect();
+            // A cell's first cluster, then (with none) its first combining marks.
+            for (at, cluster) in f.clusters.get(r).into_iter().flatten() {
+                if let Some(text) = line.get_mut(*at)
+                    && text.2.is_none()
+                {
+                    text.2 = Some(cluster.clone());
+                }
+            }
+            for (at, marks) in f.combining.get(r).into_iter().flatten() {
+                if let Some(text) = line.get_mut(*at)
+                    && text.2.is_none()
+                {
+                    text.2 = Some(marks.iter().collect::<String>().into_boxed_str());
+                }
+            }
+            line
+        })
         .collect()
+}
+
+/// [`frame_text`] reads every cell as [`cell_text`] does: a row shorter than the grid, a missing
+/// row, a wide cell, a cluster and combining marks on one cell, a second entry at a column, and
+/// marks past the grid. NEGATIVE CONTROL: placing combining marks before clusters, or letting a
+/// later entry at a column win, changes a cell.
+#[test]
+fn frame_text_reads_each_cell_as_cell_text() {
+    let blank = Terminal::new(2, 4).implicit_blank_render_cell();
+    let at = |ch, wide| RenderCell { ch, wide, ..blank };
+    let mut f = RenderInput::empty();
+    f.cells = vec![
+        vec![
+            at('a', false),
+            at('\u{4e16}', false),
+            at(' ', true),
+            at('b', false),
+        ],
+        vec![at('c', false)],
+        Vec::new(),
+    ];
+    f.clusters = vec![
+        vec![
+            (0, Box::from("a\u{301}")),
+            (3, Box::from("b\u{300}")),
+            (0, Box::from("x")),
+        ],
+        vec![(5, Box::from("past"))],
+    ];
+    f.combining = vec![
+        vec![(0, Box::from(['\u{302}'])), (3, Box::from(['\u{303}']))],
+        vec![
+            (0, Box::from(['\u{304}'])),
+            (0, Box::from(['\u{305}'])),
+            (2, Box::from(['\u{306}'])),
+        ],
+        vec![(1, Box::from(['\u{307}', '\u{308}']))],
+    ];
+    let (rows, cols) = (4, 5);
+    let read: Vec<Vec<CellText>> = (0..rows)
+        .map(|r| (0..cols).map(|c| cell_text(&f, r, c)).collect())
+        .collect();
+    assert_eq!(frame_text(&f, rows, cols), read);
 }
 
 fn cell_text(f: &RenderInput, r: usize, c: usize) -> CellText {
@@ -3729,6 +3798,13 @@ impl Sim {
             (cluster, combining)
         };
         for r in 0..a.cells.len().max(d.cells.len()) {
+            // A row the two frames hold alike passes every cell's test below.
+            if a.cells.get(r) == d.cells.get(r)
+                && a.clusters.get(r) == d.clusters.get(r)
+                && a.combining.get(r) == d.combining.get(r)
+            {
+                continue;
+            }
             let width = [a, d]
                 .iter()
                 .map(|f| f.cells.get(r).map_or(0, Vec::len))

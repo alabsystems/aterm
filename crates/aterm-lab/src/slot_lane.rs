@@ -264,7 +264,7 @@ fn duration_of(v: &str) -> Option<Duration> {
 
 /// `slot-capture [--watch <dur>] [--dir DIR]`: the real `build-slot` admits `true` into a
 /// scratch slot directory, whose `slot-0` must parse as its record; `--watch` instead reads the
-/// real slot directory (or `DIR`) with the reader and with `lsof` for `<dur>`.
+/// real slot directory (or `DIR`) with the reader and with the holder scan for `<dur>`.
 /// # Errors
 /// Usage, or the world could not be made.
 pub fn cmd_slot_capture(args: &[String]) -> Res {
@@ -419,30 +419,31 @@ fn slot_files(dir: &Path) -> Vec<SlotFile> {
     out
 }
 
-fn lsof_holders(files: &[SlotFile]) -> Result<Vec<(PathBuf, u32)>, String> {
-    if files.is_empty() {
-        return Ok(Vec::new());
+/// What the holder scan found of the slot files: each `(file, pid)` holding one open, and each
+/// `(file, pid)` whose table did not read, which proves neither.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SlotHolders {
+    held: Vec<(PathBuf, u32)>,
+    unread: Vec<(PathBuf, u32)>,
+}
+
+/// Every same-user process holding one of `files` open through a descriptor, by the in-process
+/// holder scan ([`aterm_uds::holders::scan_file_holders`]: vnodes alone, so no process's socket
+/// or kqueue is read). A file gone since it was listed is held by nobody.
+fn slot_holders(files: &[SlotFile]) -> Result<SlotHolders, String> {
+    let mut out = SlotHolders::default();
+    for f in files {
+        let scan = match aterm_uds::holders::scan_file_holders(&f.path, &[]) {
+            Ok(scan) => scan,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("the holder scan of {}: {e}", f.path.display())),
+        };
+        out.held
+            .extend(scan.holders.into_iter().map(|pid| (f.path.clone(), pid)));
+        out.unread
+            .extend(scan.unreadable.into_iter().map(|pid| (f.path.clone(), pid)));
     }
-    let mut cmd = aterm_uds::spawnfd::command("/usr/sbin/lsof");
-    cmd.args(["-n", "-F", "pn", "--"])
-        .args(files.iter().map(|f| f.path.as_os_str()));
-    let out = Running::start(&mut cmd)?.finish(MUST)?;
-    if !matches!(out.status.code(), Some(0 | 1)) {
-        return Err(format!(
-            "lsof failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        ));
-    }
-    let mut held = Vec::new();
-    let mut pid = None;
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        if let Some(p) = line.strip_prefix('p') {
-            pid = p.parse().ok();
-        } else if let (Some(name), Some(p)) = (line.strip_prefix('n'), pid) {
-            held.push((PathBuf::from(name), p));
-        }
-    }
-    Ok(held)
+    Ok(out)
 }
 
 fn watch_slots(dir: &Path, span: Duration) -> Res {
@@ -467,7 +468,7 @@ fn watch_slots(dir: &Path, span: Duration) -> Res {
         };
         let read = reader.read(Instant::now(), now_us(), &machine, true);
         let after = slot_files(dir);
-        let held = lsof_holders(&after)?;
+        let SlotHolders { held, unread } = slot_holders(&after)?;
         reads += 1;
         let mut fail = |why: String| {
             fails += 1;
@@ -478,9 +479,10 @@ fn watch_slots(dir: &Path, span: Duration) -> Res {
             SlotsRead::Unread(_) => Vec::new(),
         };
         for pid in &proven {
-            if !held.iter().any(|(_, p)| p == pid) && aterm_uds::process::pid_alive(*pid) {
+            let seen = |list: &[(PathBuf, u32)]| list.iter().any(|(_, p)| p == pid);
+            if !seen(&held) && !seen(&unread) && aterm_uds::process::pid_alive(*pid) {
                 fail(format!(
-                    "the reader proves pid {pid} a holder; lsof shows it holding no slot"
+                    "the reader proves pid {pid} a holder; the holder scan shows it holding no slot"
                 ));
             }
         }
@@ -493,7 +495,7 @@ fn watch_slots(dir: &Path, span: Duration) -> Res {
             if own && let Some(pid) = f.pid {
                 if seen_once.contains(&(f.path.clone(), pid)) && !proven.contains(&pid) {
                     fail(format!(
-                        "lsof shows {} held by its record's pid {pid} on two reads; the reader does not prove it",
+                        "the holder scan shows {} held by its record's pid {pid} on two reads; the reader does not prove it",
                         f.path.display()
                     ));
                 }
@@ -501,7 +503,7 @@ fn watch_slots(dir: &Path, span: Duration) -> Res {
             }
             if !before.iter().any(|b| b.path == f.path)
                 && f.stamp.0 == 0
-                && !held.iter().any(|(path, _)| path == &f.path)
+                && !held.iter().chain(&unread).any(|(path, _)| path == &f.path)
             {
                 fail(format!(
                     "{} appeared, empty and unheld, across the reader's read",
@@ -807,8 +809,38 @@ fn ctl(inst: &Instance, world: &World, args: &[&str]) -> Result<Reply, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::duration_of;
+    use super::{duration_of, slot_files, slot_holders};
     use std::time::Duration;
+
+    /// The watch's holder scan ([`slot_holders`]) names each slot file a process holds open
+    /// with that process. NEGATIVE CONTROLS: a slot file nobody holds names no holder, and one
+    /// removed after the listing is held by nobody rather than failing the watch.
+    #[test]
+    fn the_watch_names_each_held_slot_file_with_its_holder() {
+        let dir = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("lab-slot-holders-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in 0..3 {
+            std::fs::write(dir.join(format!("slot-{n}")), b"").unwrap();
+        }
+        let mut holder = aterm_uds::spawnfd::command("/bin/sleep")
+            .arg("600")
+            .stdin(std::fs::File::open(dir.join("slot-0")).unwrap())
+            .spawn()
+            .expect("spawn a holder");
+        let files = slot_files(&dir);
+        std::fs::remove_file(dir.join("slot-2")).unwrap();
+        let scan = slot_holders(&files);
+        let _ = holder.kill();
+        let _ = holder.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(files.len(), 3, "the listing");
+        let scan = scan.expect("the scan");
+        assert_eq!(scan.held, [(dir.join("slot-0"), holder.id())]);
+    }
 
     #[test]
     fn watch_duration_requires_a_positive_bounded_number_and_an_ascii_unit() {

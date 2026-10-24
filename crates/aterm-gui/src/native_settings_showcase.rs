@@ -328,6 +328,17 @@ pub(super) enum ShowcaseText {
     PaletteSlot,
 }
 
+impl ShowcaseText {
+    pub(super) fn for_key(key: &str) -> Option<Self> {
+        match key {
+            SHOWCASE_FILTER => Some(Self::Filter),
+            SHOWCASE_SAVE_NAME => Some(Self::SaveName),
+            SHOWCASE_PALETTE_SLOT => Some(Self::PaletteSlot),
+            _ => None,
+        }
+    }
+}
+
 impl SettingsViewState {
     /// Whether the Themes page is visible without an active search or compact category overlay.
     pub(super) fn showcase_on_glass(&self) -> bool {
@@ -635,17 +646,17 @@ impl SettingsViewState {
         if self.route != SettingsRoute::Themes {
             return None;
         }
-        match self.common.last_focus.as_ref()?.as_str() {
-            SHOWCASE_FILTER if !self.showcase.sheet_open => Some(ShowcaseText::Filter),
-            SHOWCASE_SAVE_NAME if self.showcase.save.is_some() => Some(ShowcaseText::SaveName),
-            SHOWCASE_PALETTE_SLOT if self.showcase.slot.is_some() => {
+        match ShowcaseText::for_key(self.common.last_focus.as_ref()?.as_str())? {
+            ShowcaseText::Filter if !self.showcase.sheet_open => Some(ShowcaseText::Filter),
+            ShowcaseText::SaveName if self.showcase.save.is_some() => Some(ShowcaseText::SaveName),
+            ShowcaseText::PaletteSlot if self.showcase.slot.is_some() => {
                 Some(ShowcaseText::PaletteSlot)
             }
             _ => None,
         }
     }
 
-    fn showcase_input_mut(
+    pub(super) fn showcase_input_mut(
         &mut self,
         target: ShowcaseText,
     ) -> Option<&mut crate::native_text_input::TextInputState> {
@@ -2388,11 +2399,8 @@ impl SettingsApp {
         extend: bool,
         cx: &mut UpdateCx<'_>,
     ) -> bool {
-        let target = match action {
-            SHOWCASE_FILTER => ShowcaseText::Filter,
-            SHOWCASE_SAVE_NAME => ShowcaseText::SaveName,
-            SHOWCASE_PALETTE_SLOT => ShowcaseText::PaletteSlot,
-            _ => return false,
+        let Some(target) = ShowcaseText::for_key(action) else {
+            return false;
         };
         if let Some(input) = view.showcase_input_mut(target) {
             apply_pointer_selection(input, byte, extend);

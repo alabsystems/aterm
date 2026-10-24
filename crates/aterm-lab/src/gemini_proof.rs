@@ -791,8 +791,6 @@ mod tests {
     /// otherwise it holds only when every open-file report was complete.
     #[test]
     fn the_owner_gemini_check_fails_on_a_held_file_and_needs_complete_reports() {
-        use crate::selftest::open_files;
-        use std::os::unix::process::ExitStatusExt as _;
         let held = vec!["n/Users//owner/.gemini/oauth_creds.json".to_string()];
         let wrote = vec!["settings.json.bak".to_string()];
         assert_eq!(
@@ -811,35 +809,15 @@ mod tests {
             owner_verdict(true, &[], &[7], &wrote, false),
             Verdict::Unproven
         );
-        let out = |code, stdout: &[u8], stderr: &[u8]| {
-            Ok(std::process::Output {
-                status: std::process::ExitStatus::from_raw(code),
-                stdout: stdout.to_vec(),
-                stderr: stderr.to_vec(),
-            })
-        };
-        let failed = open_files(
+        let read = crate::selftest::open_files_report(
             7,
-            out(
-                1 << 8,
-                b"p7\nn/Users//owner/.gemini/oauth_creds.json\n",
-                b"lsof: WARNING",
-            ),
+            Ok(vec!["/Users//owner/.gemini/oauth_creds.json".into()]),
         );
-        assert!(!failed.complete);
-        assert!(
-            failed
-                .text
-                .contains("n/Users//owner/.gemini/oauth_creds.json")
-        );
-        let clean = crate::selftest::complete_open_files(
-            7,
-            out(0, b"p7\nn/private/tmp/x\n", b"")
-                .map_err(aterm_uds::deadline::CompleteOutputError::Run),
-        );
-        assert!(clean.complete);
-        let timed_out = open_files(7, Err(aterm_uds::deadline::RunError::TimedOut));
-        assert!(!timed_out.complete && timed_out.text.is_empty());
+        assert!(read.complete);
+        assert!(read.text.contains("n/Users//owner/.gemini/oauth_creds.json"));
+        let unread =
+            crate::selftest::open_files_report(7, Err(std::io::ErrorKind::PermissionDenied.into()));
+        assert!(!unread.complete && unread.text.is_empty());
     }
 
     /// The black-hole proxy's refusals name each host once, in the order first

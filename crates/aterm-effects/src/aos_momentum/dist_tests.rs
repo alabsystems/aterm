@@ -11,7 +11,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use aterm_aos::Digest;
 use aterm_aos::wire::{Enc, WireFault};
-use aterm_time::Instant;
 
 use super::bundle::{
     BundleField, BundleRefusal, CandidateBundle, Row, RowVerdict, SelectionProvenance,
@@ -26,7 +25,6 @@ use super::m4::{CheckLevel, DistNoOutcome, Evaluator, NoOutcome, Selection, Seri
 use super::m4_tests::{evaluator, gap0, plan};
 use super::plan::{SHIPPED_PLAN, SchedulePlan, Split, Wake};
 use super::search::{FileProposer, GridProposer, Mode, Proposer, ProposerId, TrainFeedback};
-use super::test_fixtures::BUILD;
 
 /// Every job on the test pool's threads.
 struct Threads;
@@ -47,8 +45,9 @@ impl Spread for Evens {
     }
 }
 
+/// An evaluator whose reads and grid cache are this test's alone.
 fn fresh() -> Evaluator {
-    Evaluator::v1(BUILD, Instant::now()).expect("the pinned policy v1")
+    evaluator().anew()
 }
 
 fn n(r: &AtomicU64) -> u64 {
@@ -191,24 +190,29 @@ fn orders(n: usize) -> Vec<Vec<usize>> {
 
 /// Honest claims, in any completion order, give the local selection, and after the one
 /// held-out read the local bundle, mode aside: the grid and a plans file, at both check levels.
+/// The order a claim arrives in reaches only how it is filed, so every order of the grid must file
+/// the claims the slot order files, and that search, finished at each level, is every order's.
 #[test]
 fn honest_claims_in_any_completion_order_give_the_local_selection() {
     let ev = evaluator();
     let plans = grid_plans();
     let local = local_grid();
     let local_bundle = ev.held_out(local.clone()).expect("useful");
-    for (i, order) in orders(plans.len()).iter().enumerate() {
-        let check = if i % 2 == 0 {
-            CheckLevel::Dominance
-        } else {
-            CheckLevel::All
-        };
+    let orders_of_the_grid = orders(plans.len());
+    for check in [CheckLevel::Dominance, CheckLevel::All] {
         // The order is the law here; that a spread judges as serial does is
         // `select_spread_equals_select`'s and `finish_with_a_skipping_spread_equals_serial`'s.
         let mut g = GridProposer::new();
-        let s = distribute(ev, &mut g, check, &grid_claim, order)
-            .finish(&Threads)
-            .expect("a winner");
+        let slot_order = distribute(ev, &mut g, check, &grid_claim, &orders_of_the_grid[0]);
+        for (i, order) in orders_of_the_grid.iter().enumerate().skip(1) {
+            let mut g = GridProposer::new();
+            let filed = distribute(ev, &mut g, check, &grid_claim, order);
+            assert!(
+                filed.claims() == slot_order.claims(),
+                "order {i} files other claims"
+            );
+        }
+        let s = slot_order.finish(&Threads).expect("a winner");
         same_selection(&s, local);
         let mut parts = ev.held_out(s).expect("useful").bundle().parts().clone();
         let want = match check {
@@ -217,7 +221,7 @@ fn honest_claims_in_any_completion_order_give_the_local_selection() {
         };
         assert_eq!(parts.selection.mode, want);
         parts.selection.mode = Mode::Search;
-        assert_eq!(&parts, local_bundle.bundle().parts(), "order {i}");
+        assert_eq!(&parts, local_bundle.bundle().parts(), "{check:?}");
     }
     let text = plans_text(&six());
     let mut file = FileProposer::from_text(&text);
@@ -539,6 +543,7 @@ fn check_all_judges_every_admitted_claim_and_records_search() {
     let s = got.expect("a winner");
     let want: usize = claims.iter().map(Claim::len).sum();
     assert_eq!(judged.len(), want);
+    assert!(ev.grid_cached(), "the search filled the grid's cache");
     let before = n(&ev.reads().train);
     let grid = ev.grid_selection().expect("the grid's selection");
     assert_eq!(
@@ -568,12 +573,7 @@ fn claims_never_fill_the_grid_cache() {
     )
     .finish(&Threads)
     .expect("a winner");
-    let before = n(&ev.reads().train);
-    ev.grid_selection().expect("the grid's selection");
-    assert!(
-        n(&ev.reads().train) > before,
-        "the grid ran: no claim filled its cache"
-    );
+    assert!(!ev.grid_cached(), "a claim filled the grid's cache");
 }
 
 /// A distributed bundle verifies with declared provenance; one naming the grid must name a grid

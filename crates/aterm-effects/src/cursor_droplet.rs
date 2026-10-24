@@ -339,6 +339,9 @@ impl CursorDroplet {
         let cut_surface = true;
         let belly = cy + radius * 0.80;
         let body = water_ramp(0.68);
+        let cov_drip = cov_core * 0.70;
+        let r_grow = radius * 0.08;
+        let r_fall = 1.2 + radius * 0.05;
         for &(dx, off, wake) in &DRIP_LANES {
             if e < wake && wake > 0.0 {
                 continue;
@@ -346,14 +349,14 @@ impl CursorDroplet {
             let u = (self.drip + off).fract();
             let (y, r, stretch, cov) = if u < 0.30 {
                 let s = u / 0.30;
-                (belly, 1.2 + radius * 0.08 * s, 1.0, cov_core * 0.70 * s)
+                (belly, 1.2 + r_grow * s, 1.0, cov_drip * s)
             } else {
                 let v = (u - 0.30) / 0.70;
                 (
                     belly + v * v * DRIP_FALL * ch,
-                    1.2 + radius * 0.05,
+                    r_fall,
                     1.0 + 0.8 * v,
-                    cov_core * 0.70 * (1.0 - v),
+                    cov_drip * (1.0 - v),
                 )
             };
             let ry = r * stretch;

@@ -134,7 +134,9 @@ and never moved.
 Only changed preference keys are backed up (no credentials). Restore preferences puts
 them back and stops automatic setup, leaving cloned repos, credentials and sign-outs
 in place; a choice after it sets only the groups it turns to Set up, a Join or a
-group turned to Leave as is sets none, and Set up now sets them all again. Without
+group turned to Leave as is sets none, and Set up now sets them all again. The
+Caps Lock key, and a scroll direction the Mac had never set, come back at your next
+login (System State and `doctor --restore` say so; nothing failed). Without
 Full Disk Access it leaves Notification Center's widget list alone and keeps its
 original in the backup (run Restore again from an app with the grant).
 `doctor --apply` applies the preference and account profile and adds aterm's
@@ -761,8 +763,9 @@ THE FOOTER
   extras: `usage` (the `Σ` working time and tokens), `acts` (what the harness just
   did, beside the chip), `card` (the decorated launch card) and `agents` (the agents
   panel's colours). Clicking the chip opens the Autopilot menu (Cruise, Cruise
-  until…, Land, Off, Take Over / Hand Back). `aterm ctl harness` and `status` report
-  the chip as drawn (`face=`, `drawn=`, `spoken=`, `description=`).
+  until…, Land, Off, Take Over / Hand Back). `aterm ctl chrome` reports the chip as
+  drawn (`face=`, `drawn=`, `spoken=`, `description=`; a debug build adds `title=`,
+  the title its hover reads).
   Settings ▸ Harness shows the supervised sessions, what the harness decided for you,
   a 7-day comparison of the Autopilot modes, and every `[harness]` key.
 

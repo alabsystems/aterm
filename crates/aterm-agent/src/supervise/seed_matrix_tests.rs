@@ -1607,16 +1607,31 @@ fn cancelled(h: &[String]) -> Vec<String> {
 const CANCELLED_NOTE: &str =
     "                             Automatic continue cancelled · /rate-limit-options to re-arm";
 
+/// A turn that ends on the spend limit: one of two minutes or more ran a tool, as working turns do.
 fn spend_turn(prompt: Option<&str>, worked_s: i64, at: i64) -> Vec<String> {
-    turn(
-        prompt,
+    spend_turn_ran(prompt, worked_s, at, worked_s >= 2 * MIN)
+}
+
+/// A turn that ends on the spend limit, its tool row drawn when it `ran` one (busy alone is no work).
+fn spend_turn_ran(prompt: Option<&str>, worked_s: i64, at: i64, ran: bool) -> Vec<String> {
+    let tool: &[&str] = if ran {
         &[
+            "⏺ Bash(targo --unverified test)",
+            "  ⎿  test result: ok",
+            "",
+        ]
+    } else {
+        &[]
+    };
+    let reply: Vec<&str> = tool
+        .iter()
+        .copied()
+        .chain([
             "⏺ Running the suite.",
             "  ⎿  You've hit your monthly spend limit.",
-        ],
-        worked_s,
-        at,
-    )
+        ])
+        .collect();
+    turn(prompt, &reply, worked_s, at)
 }
 
 fn taken(k: usize, h: &[String], prompt: &str) -> Beat {
@@ -2593,11 +2608,23 @@ fn more_scenarios() -> Vec<Scenario> {
         ),
     );
     let ob_wall = cc(&ob0, &[], "");
+    // A turn of two minutes or more ran a tool, as working turns do.
     let ob_met = |h: &[String], p: &str, work: i64| {
-        with(
-            h,
-            &turn(Some(p), &["  ⎿  You've hit your Opus limit"], work, 0),
-        )
+        let ran: &[&str] = if work >= 2 * MIN {
+            &[
+                "⏺ Bash(targo --unverified test)",
+                "  ⎿  test result: ok",
+                "",
+            ]
+        } else {
+            &[]
+        };
+        let reply: Vec<&str> = ran
+            .iter()
+            .copied()
+            .chain(["  ⎿  You've hit your Opus limit"])
+            .collect();
+        with(h, &turn(Some(p), &reply, work, 0))
     };
     for tag in [
         "met again, the ladder",
@@ -3876,8 +3903,11 @@ fn round8_scenarios() -> Vec<Scenario> {
         let p0 = cc(&with(&w0, &turn(None, &[progress], 0, T0)), &[], "");
         beats.push(beat(At::Start(0), "the worker's short turn", Ev::Point(p0)));
         let mut h = with(&w0, &turn(None, &[progress], 0, T0));
+        // Each answer its own words (a number is no word): the same reply again holds every act ([`TurnEndState::repeats`]).
         for k in 0..n {
-            h = with(&h, &turn(Some("keep going"), &[still], 20, 0));
+            let step = char::from(b'a' + u8::try_from(k).unwrap_or(0));
+            let said = format!("⏺ Stage 3 of 5: still on it, step {step}.");
+            h = with(&h, &turn(Some("keep going"), &[said.as_str()], 20, 0));
             beats.push(beat(
                 At::Act(k, 20),
                 "the act's short turn ends",
@@ -4094,11 +4124,23 @@ fn round8_scenarios() -> Vec<Scenario> {
         ));
     }
     {
+        // Five acts reach the 60 min rung and stay under the run's bound (`NO_WORK_ACTS`).
         let mut beats = Vec::new();
-        let h = short_yields(7, &mut beats);
-        beats.push(taken(7, &h, "keep going"));
+        let h = short_yields(5, &mut beats);
+        beats.push(taken(5, &h, "keep going"));
         out.push(sc(
             "RS8-F3 short turns in a row to the ladder's top".to_string(),
+            default_policy(),
+            beats,
+            6 * HOUR,
+            false,
+        ));
+    }
+    {
+        let mut beats = Vec::new();
+        short_yields(crate::supervise::policy::turn_end::NO_WORK_ACTS, &mut beats);
+        out.push(sc(
+            "RS8-F3 short turns in new words each, held after the run's bound".to_string(),
             default_policy(),
             beats,
             6 * HOUR,
@@ -4115,14 +4157,21 @@ fn round8_scenarios() -> Vec<Scenario> {
             Ev::Point(cc(&h, &[], "")),
         ));
         beats.push(taken(2, &h, "keep going"));
-        h = with(&h, &turn(Some("keep going"), &[progress], 10 * MIN, 0));
+        // Each 10 min of work ran a call, as working turns do.
+        let worked = [
+            "⏺ Bash(targo --unverified test)",
+            "  ⎿  test result: ok",
+            "",
+            progress,
+        ];
+        h = with(&h, &turn(Some("keep going"), &worked, 10 * MIN, 0));
         beats.push(beat(
             At::Act(2, 10 * MIN),
             "the try's 10 min of work ends: progress",
             Ev::Point(cc(&h, &[], "")),
         ));
         beats.push(taken(3, &h, "keep going"));
-        h = with(&h, &turn(Some("keep going"), &[progress], 10 * MIN, 0));
+        h = with(&h, &turn(Some("keep going"), &worked, 10 * MIN, 0));
         beats.push(beat(
             At::Act(3, 10 * MIN),
             "the next act's work ends: progress",
@@ -5960,7 +6009,10 @@ const SLEEP_IN_TRY: [(&str, Option<i64>, i64, i64, bool); 6] = [
 fn sleep_in_try(what: &str, ran: Option<i64>, span: i64, asleep: i64) -> Scenario {
     let w0 = work0();
     let sp0 = with(&w0, &spend_turn(None, 3 * MIN, T0 + 3 * MIN));
-    let end = with(&sp0, &spend_turn(Some("keep going"), span, 0));
+    let end = with(
+        &sp0,
+        &spend_turn_ran(Some("keep going"), span, 0, span - asleep >= 2 * MIN),
+    );
     let read_at = if asleep > 0 {
         Ev::Woke(asleep, cc(&end, &[], ""))
     } else {
@@ -6051,7 +6103,7 @@ fn answered_tries(done: bool, transcript: bool, held: bool) -> Scenario {
             Ev::Point(cc(&h, &[], "")),
         ),
     ];
-    for k in 0..4 {
+    for k in 0..3 {
         let held = held && k == 1;
         if !held {
             h = with(&h, &spend_answer("keep going", done));
@@ -6113,8 +6165,10 @@ fn a_tries_answer_dated_by(done: bool, transcript: bool, held: bool) {
     std::fs::create_dir_all(&dir).expect("dir");
     let first = run_first(&sc, &dir);
     let acts: Vec<i64> = first.acts.iter().map(|a| a.at).collect();
+    // The ladder's tries, the same answer to each holding it after them.
     assert!(
-        acts.len() >= 4 && acts[2] - acts[1] >= 6 * HOUR && acts[3] - acts[2] >= 6 * HOUR,
+        acts.len() == crate::supervise::policy::exception::FUTILE_AFTER_TRIES
+            && acts[2] - acts[1] >= 6 * HOUR,
         "{}: the first loop's tries {acts:?}\n{}",
         sc.name,
         first.log.join("\n")
@@ -6752,6 +6806,11 @@ fn books_of_0_106(rows: &[(i64, String)]) -> Vec<(i64, String)> {
                             let Some(b) = r[from..].find(')') else { break };
                             r.replace_range(a..=from + b, "");
                         }
+                    }
+                    // The build before the run's bound wrote no `; N in a row` in its replies note.
+                    while let Some(b) = r.find(" in a row)") {
+                        let Some(a) = r[..b].rfind("; ") else { break };
+                        r.replace_range(a..b + " in a row".len(), "");
                     }
                     if let Some(a) = r.find(" made=") {
                         let b = r[a..].find(')').map_or(r.len(), |b| a + b);

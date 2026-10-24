@@ -777,7 +777,8 @@ pub(crate) const STAND_IN: &str = "aterm-browser-stand-in";
 
 /// What a browser stand-in leads its arguments with: this test binary's own `--exact` run of
 /// [`browser_stand_in`], [`STAND_IN`], then `mode`'s words (a window's own arguments may
-/// follow, unread).
+/// follow, unread). Unix's, as the window tests that lead with it are.
+#[cfg(unix)]
 pub(crate) fn stand_in_lead(mode: &[&str]) -> Vec<OsString> {
     let mut lead: Vec<OsString> = [
         "harness::headless_oauth::vendor_tests::browser_stand_in",

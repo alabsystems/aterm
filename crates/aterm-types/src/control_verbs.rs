@@ -1621,7 +1621,8 @@ pub const VERBS: &[VerbSpec] = &[
          face=<cruise|cruise-until|land|landed|theirs|off|master-off|agent-off|unhosted|-> \
          drawn=\"<cells>\"|drawn=- why=<not-drawn|no-room|no-host|no-footer|switch-only> \
          spoken=\"<label>\"|spoken=- description=\"<words>\"|description=-` line per supervised \
-         pane in any window. Then `statusitem title=<❯|❯•|❯N> needs=<n> stuck=<n> exceptions=<n> \
+         pane in any window (debug builds add `title=\"<the title its hover reads>\"|title=-`). \
+         Then `statusitem title=<❯|❯•|❯N> needs=<n> stuck=<n> exceptions=<n> \
          done=<n> fleet=<off|unread|reading|failed|as_of:<unix ms>>` and, on macOS, the `❯` menu's \
          `statusmenu \"<label>\" enabled=<yes|no> [checked=<yes|no>] [tip=\"<text>\"] [indent=<n>] \
          [submenu]` lines (`statusmenu ---` for a separator; debug builds add `at=<i>[.<j>…]` for \

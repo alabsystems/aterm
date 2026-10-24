@@ -1710,21 +1710,21 @@ impl TrailSynth {
         if self.shift_octave != 1.0 && v.p.iter().any(|p| p.lvl > 0.0) {
             v.lp_cut *= self.shift_octave;
             for i in 0..v.p.len() {
+                if v.p[i].lvl <= 0.0 {
+                    continue;
+                }
+                let (fi0, fi1) = (v.p[i].f0, v.p[i].f1);
                 for j in 0..v.p.len() {
-                    if i == j || v.p[i].lvl <= 0.0 || v.p[j].lvl <= 0.0 {
+                    if i == j || v.p[j].lvl <= 0.0 {
                         continue;
                     }
-                    let r0 = v.p[j].f0 / v.p[i].f0;
+                    let r0 = v.p[j].f0 / fi0;
                     if r0 > 1.0 && r0 < DETUNE_MAX_RATIO {
-                        v.p[j].f0 = v.p[i].f0 * (1.0 + (r0 - 1.0) / self.shift_octave);
+                        v.p[j].f0 = fi0 * (1.0 + (r0 - 1.0) / self.shift_octave);
                     }
-                    let r1 = if v.p[i].f1 > 0.0 {
-                        v.p[j].f1 / v.p[i].f1
-                    } else {
-                        0.0
-                    };
+                    let r1 = if fi1 > 0.0 { v.p[j].f1 / fi1 } else { 0.0 };
                     if r1 > 1.0 && r1 < DETUNE_MAX_RATIO {
-                        v.p[j].f1 = v.p[i].f1 * (1.0 + (r1 - 1.0) / self.shift_octave);
+                        v.p[j].f1 = fi1 * (1.0 + (r1 - 1.0) / self.shift_octave);
                     }
                 }
             }

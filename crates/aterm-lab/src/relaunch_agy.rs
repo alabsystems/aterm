@@ -83,7 +83,7 @@ pub fn lock_conversation(config: &Path, path: &str) -> Option<String> {
         .filter(|c| c.len() == 36)
 }
 
-/// The conversation whose presence lock `pid` holds open (lsof), under the
+/// The conversation whose presence lock `pid` holds open (its descriptors), under the
 /// default config.
 fn conversation_of(run: &Run, pid: i32) -> Option<String> {
     let config = std::fs::canonicalize(config(run, "antigravity-cli")).ok()?;

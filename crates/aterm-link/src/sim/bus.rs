@@ -1197,7 +1197,9 @@ impl State {
                     rules: self.table.rules(),
                 }),
                 lineage: astream_broker::Lineage::from_steps(&self.lineage),
-                requests: Some(astream_broker::REQUEST_RETIRE),
+                requests: Some(
+                    astream_broker::REQUEST_RETIRE | astream_broker::REQUEST_GAP_NOTICES,
+                ),
                 health: None,
                 retention: None,
             },
@@ -1214,7 +1216,10 @@ impl State {
         }
         match req {
             Request::Hello => vec![self.hello()],
-            Request::Attach { .. } | Request::IdleMarks | Request::Keepalive => {
+            Request::Attach { .. }
+            | Request::IdleMarks
+            | Request::GapNotices
+            | Request::Keepalive => {
                 vec![self.mark(head, String::new())]
             }
             Request::Publish {

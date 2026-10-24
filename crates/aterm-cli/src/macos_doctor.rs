@@ -50,13 +50,17 @@ impl Action {
     }
 }
 
+/// A row's status for a setting that is back as it was saved but loads only at the next login:
+/// nothing failed, and the person logs out and back in for it (its detail says so).
+pub const LOGIN: &str = "login";
+
 /// One preference's observed outcome.
 #[derive(Debug)]
 pub struct Row {
     /// Human-readable setting name.
     pub name: String,
-    /// `ok`, `drift`, `applied`, `restored`, `blocked`, `waiting`, `unverified` or `error`; a
-    /// setup snapshot's rows also `pending`, `running` or `stopped`.
+    /// `ok`, `drift`, `applied`, `restored`, [`LOGIN`], `blocked`, `waiting`, `unverified` or
+    /// `error`; a setup snapshot's rows also `pending`, `running` or `stopped`.
     pub status: String,
     /// Action or failure detail, without account identifiers.
     pub detail: String,
@@ -152,21 +156,20 @@ pub fn run_observed(action: Action) -> InitialSetupObserved<Report> {
     }
     initial::observe_person_mutation(
         Err("another doctor profile pass is running".into()),
-        |root| {
-            if action == Action::Apply {
-                initial::save_explicit_workstation_plan(root)?;
-            }
-            if action == Action::Restore {
-                // Restore puts the earlier values back: nothing is "at login" now.
-                initial::forget_at_login(root);
-            }
-            let report = execute(&mut NativeHost::new(), root, action)?;
-            if action == Action::Apply && !report.needs_attention() {
-                initial::complete_explicit_workstation_plan(root)?;
-            }
-            Ok(report)
-        },
+        |root| run_mutation(&mut NativeHost::new(), root, action),
     )
+}
+
+/// The action body after its caller admitted the person and took the profile lock.
+fn run_mutation(host: &mut dyn Host, root: &Path, action: Action) -> Result<Report, String> {
+    if action == Action::Apply {
+        initial::save_explicit_workstation_plan(root)?;
+    }
+    let report = execute(host, root, action)?;
+    if action == Action::Apply && !report.needs_attention() {
+        initial::complete_explicit_workstation_plan(root)?;
+    }
+    Ok(report)
 }
 
 /// The saved checklist, or every box checked when no plan has been authorized.
@@ -1076,8 +1079,9 @@ trait Host {
     fn restart(&mut self, name: &str, reads: &[&Target]) -> Result<(), String>;
     fn workstation(&mut self, group: WorkstationGroup, apply: bool) -> Result<Vec<Row>, String>;
     /// Put the live settings `saved` holds back as well as the saved preferences. A setting
-    /// whose saved preference is back but loads only at the next login is `ok`, with a note
-    /// to log out: Restore reads a `blocked` row as a preference it could not put back.
+    /// whose saved preference is back but loads only at the next login is [`LOGIN`], named as
+    /// its System State row is, with a note to log out: `blocked` means Restore could not put
+    /// a preference back.
     fn restore_runtime(&mut self, saved: &[Saved]) -> Vec<Row>;
 }
 
@@ -1438,7 +1442,11 @@ impl Host for NativeHost {
                     },
                 });
             } else {
-                rows.push(Row { name: "Original active scroll direction".into(), status: "ok".into(), detail: "the previous implicit or non-boolean setting has no recorded runtime value; log out and back in to load its restored preference".into() });
+                rows.push(Row {
+                    name: Setting::NaturalScrolling.name().into(),
+                    status: LOGIN.into(),
+                    detail: "Log out and back in to use the restored scroll direction.".into(),
+                });
             }
         }
         if saved.iter().any(|s| {
@@ -1447,7 +1455,11 @@ impl Host for NativeHost {
                     .key
                     .starts_with("com.apple.keyboard.modifiermapping.")
         }) {
-            rows.push(Row { name: "Original active keyboard mapping".into(), status: "ok".into(), detail: "the live HID service mappings from before this setup were not recorded, so log out and back in to load the saved mappings".into() });
+            rows.push(Row {
+                name: Setting::CapsLock.name().into(),
+                status: LOGIN.into(),
+                detail: "Log out and back in to use the restored keyboard settings.".into(),
+            });
         }
         rows
     }
@@ -2587,7 +2599,7 @@ mod tests {
             runtime_changed: true,
             ..Fake::default()
         };
-        let result = execute(&mut host, root, Action::Restore);
+        let result = run_mutation(&mut host, root, Action::Restore);
         assert!(host.writes.is_empty());
         assert!(host.restarts.is_empty());
         assert!(host.runtime_changed, "Restore reached runtime activation");
@@ -2966,7 +2978,9 @@ mod tests {
 
     /// The Caps Lock mapping, and a scroll direction the Mac had never set, load only at the
     /// next login once Restore puts them back. That is a note to log out, not a setting
-    /// Restore failed to put back, so neither row reads `blocked`.
+    /// Restore failed to put back: each row reads [`LOGIN`] under its System State row's name,
+    /// never `blocked` (a failure) nor `ok` (which says nothing to do), and `aterm doctor`
+    /// still prints the advice to log out.
     #[test]
     fn a_setting_that_loads_at_the_next_login_is_restored_not_blocked() {
         let saved = [
@@ -2985,20 +2999,71 @@ mod tests {
                 granted: true,
             },
         ];
-        let (mut host, _) = inert_host(Some(true), Vec::new);
+        let (mut host, calls) = inert_host(Some(true), Vec::new);
         let rows = host.restore_runtime(&saved);
         let names: Vec<_> = rows.iter().map(|row| row.name.as_str()).collect();
         assert_eq!(
             names,
-            [
-                "Original active scroll direction",
-                "Original active keyboard mapping"
-            ]
+            [Setting::NaturalScrolling.name(), Setting::CapsLock.name()]
         );
         for row in &rows {
-            assert_eq!(row.status, "ok", "{}: {}", row.name, row.detail);
-            assert!(row.detail.contains("log out and back in"), "{}", row.detail);
+            assert_eq!(row.status, "login", "{}: {}", row.name, row.detail);
+            assert!(
+                row.detail
+                    .to_ascii_lowercase()
+                    .contains("log out and back in"),
+                "{}",
+                row.detail
+            );
         }
+        let report = Report {
+            action: Action::Restore,
+            rows,
+            manual_steps: Vec::new(),
+            backup: PathBuf::from("original-preferences.json"),
+        };
+        assert!(!report.needs_attention(), "{}", report.to_text());
+        assert!(calls.lock().unwrap().is_empty(), "no runtime value was set");
+        let text = report.to_text();
+        for row in &report.rows {
+            assert!(
+                text.contains(&format!("  {}: login — {}\n", row.name, row.detail)),
+                "the terminal still says to log out: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn restoring_a_login_time_preference_reads_the_original_value_again() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let mut trackpad = Selection::none();
+        trackpad.set(Setting::TrackpadScrolling, true);
+        let note = root.path().join("at-login.json");
+        write_json(
+            &note,
+            &json!({"profile":PROFILE,"session":"1.0:7","settings":trackpad.bits()}),
+        )
+        .unwrap();
+        let pending = std::fs::read(&note).unwrap();
+        let _lock = HeldLock::try_take(root.path()).unwrap().unwrap();
+        let target = Target::new("com.apple.AppleMultitouchTrackpad", "TrackpadScroll");
+        let mut host = Fake::default();
+        host.values.insert(target.clone(), PValue::Bool(true));
+        save_backup(
+            &root.path().join("original-preferences.json"),
+            &[Saved {
+                target: target.clone(),
+                value: Some(PValue::Bool(false)),
+                granted: true,
+            }],
+        )
+        .unwrap();
+
+        let report = run_mutation(&mut host, root.path(), Action::Restore).unwrap();
+        assert!(!report.needs_attention(), "{}", report.to_text());
+        assert_eq!(host.read(&target).unwrap(), Some(PValue::Bool(false)));
+        assert_eq!(host.writes, [target]);
+        assert_eq!(std::fs::read(note).unwrap(), pending);
     }
 
     #[test]

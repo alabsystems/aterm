@@ -5,13 +5,21 @@
 //! offset its filter can reach is refused `ERR retained-from=<off>` (`proto::RETAINED_FROM_PREFIX`)
 //! where it was clamped to the base, while one of a held subject whose records were carried
 //! reads on; a head query's `Mark` says that oldest (`Client::oldest`); and Hello's extension
-//! block advertises the rules (`Client::retention_rules`). Over a real socket, on the broker
-//! these tests' parent module drives; the cut is a hand-asked tick on the broker's own clock.
+//! block advertises the rules (`Client::retention_rules`). A tail below that oldest is sent a
+//! gap notice before any later record, where it asked (R4's addendum, A9; 6E-1d). Over a real
+//! socket, on the broker these tests' parent module drives; the cut is a hand-asked tick on
+//! the broker's own clock.
 //!
 //! NEGATIVE CONTROLS (each a planted break, scratch-reverted, that fails the test named): a
 //! `Fetch` that clamps silently (`a_fetch_below_the_cut_is_told_retained_from_and_a_held_mail_reads_on`);
 //! a Hello copy that leaves the rules out, and one that advertises the rules a reopened log
-//! read back (`hello_advertises_the_rules_the_broker_retains_by`).
+//! read back (`hello_advertises_the_rules_the_broker_retains_by`); a tail told nothing, and
+//! one that writes the notice after the chunk
+//! (`a_group_whose_unread_mail_was_given_up_is_told_the_range_and_count_first`); a tail that
+//! looks for a notice only when it starts
+//! (`a_tail_a_cut_passes_while_it_reads_is_told_before_its_next_record`); a park that drops
+//! the notice its wake read (`a_parked_tail_a_cut_passes_is_told_before_the_records_it_wakes_to`);
+//! and a broker that tells every tail (`a_client_that_did_not_ask_is_never_sent_a_notice`).
 
 use super::*;
 use crate::client::broker_refusal;
@@ -122,5 +130,240 @@ fn hello_advertises_the_rules_the_broker_retains_by() {
     c.hello().unwrap();
     assert_eq!(c.retention_rules(), Some(rules(3)), "set again: advertised");
     drop(c);
+    h.shutdown();
+}
+
+const INBOX: &str = "/f/F/cur/n1/node/inbox";
+const MAILS: &str = "/f/F/in/>";
+
+/// The stream the prefix, keeping its newest 2 `ev` records by their bytes; mail held until
+/// its node's inbox group reads it or for 7 days, and at most 3 mails' bytes: past that the
+/// oldest mail is given up unread.
+fn gap_rules() -> Retention {
+    Retention::new(
+        vec![
+            Rule::prefix(STREAM).unwrap().max_bytes(2 * rb(EV)),
+            Rule::hold(MAILS)
+                .unwrap()
+                .max_bytes(3 * rb(MAIL))
+                .max_age(Duration::from_secs(7 * 86_400))
+                .until_read("/f/{2}/cur/{4}/node/inbox")
+                .unwrap(),
+        ],
+        Rule::default_hold(),
+    )
+    .unwrap()
+}
+
+/// Five unread mails at 0 to 4, then three stream records at 5 to 7.
+fn publish_mail_then_stream(b: &Broker) {
+    for (seq, subject) in [MAIL, MAIL, MAIL, MAIL, MAIL, EV, EV, EV]
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(publish(b, seq as u64, subject), seq as u64);
+    }
+}
+
+/// [`gap_rules`] set and a tick on the broker's own clock: the base at 6 (the newest two
+/// stream records kept), the three newest mails held, and the mails at 0 and 1 given up.
+fn cut_by_gap_rules(b: &Broker) {
+    b.set_retention(gap_rules()).unwrap();
+    b.retention_tick_at(b.now_ms()).unwrap();
+    assert_eq!(b.base(), 6);
+    assert_eq!(b.stats().log.held_records, 3);
+}
+
+/// What a tail delivered or was told, its marks skipped.
+#[derive(Debug, PartialEq, Eq)]
+enum Seen {
+    Gap(crate::proto::Gap),
+    Rec(u64),
+}
+
+/// The next `n` deliveries and notices on `sub`, the marks between them skipped, within a
+/// minute: a hang detector, never a budget.
+fn seen(sub: &mut crate::client::Subscription, n: usize) -> Vec<Seen> {
+    let deadline = Instant::now() + MINUTE;
+    let mut out = Vec::new();
+    while out.len() < n {
+        assert!(Instant::now() < deadline, "not within a minute: {out:?}");
+        match sub.recv_event().unwrap() {
+            Some(crate::client::Event::Delivery { offset, .. }) => out.push(Seen::Rec(offset)),
+            Some(crate::client::Event::Gap(g)) => out.push(Seen::Gap(g)),
+            Some(crate::client::Event::Mark { .. }) => {}
+            None => panic!("the broker closed the subscription: {out:?}"),
+        }
+    }
+    out
+}
+
+fn told(from: u64, to: u64, records: Option<u64>) -> Seen {
+    Seen::Gap(crate::proto::Gap { from, to, records })
+}
+
+/// A GROUP IS TOLD WHAT RETENTION GAVE UP BEFORE IT READ (R4's addendum, A9): the inbox
+/// group never read its five mails, and the mail class's bytes gave up the two oldest.
+/// Subscribed, it is told the range `0..2` and the count, 2, before its first mail, then
+/// delivered the three held. NC: a tail that is told nothing (no `Told`) reads the mails
+/// alone; one that writes the notice after the chunk reads the mail at 2 first.
+#[test]
+fn a_group_whose_unread_mail_was_given_up_is_told_the_range_and_count_first() {
+    let root = Scratch::new("wire-gap-group");
+    let path = root.path().join("log");
+    let sock = root.path().join("sock");
+    let b = Broker::open(&path).unwrap();
+    b.set_retention_interval(HOUR);
+    publish_mail_then_stream(&b);
+    cut_by_gap_rules(&b);
+    let mut h = b.serve(&sock).unwrap();
+    let mut sub = client(&sock).subscribe_group(INBOX, MAILS).unwrap();
+    assert_eq!(
+        seen(&mut sub, 4),
+        vec![
+            told(0, 2, Some(2)),
+            Seen::Rec(2),
+            Seen::Rec(3),
+            Seen::Rec(4)
+        ]
+    );
+    assert_eq!(
+        sub.take_gap(),
+        Some(crate::proto::Gap {
+            from: 0,
+            to: 2,
+            records: Some(2)
+        })
+    );
+    drop(sub);
+    h.shutdown();
+}
+
+/// A TAIL A CUT PASSES WHILE IT READS is told before its next record: paused after its first
+/// chunk of one record (the mail at 0, delivered), the rules land and give up the mails at
+/// 0 and 1. Resumed at 1, it is told `1..2`, counting 1 (the mail at 0 it was delivered is
+/// not counted), then delivered the three held mails. NC: a tail that looks for a notice
+/// only when it starts reads the mail at 2 with nothing told.
+#[test]
+fn a_tail_a_cut_passes_while_it_reads_is_told_before_its_next_record() {
+    let root = Scratch::new("wire-gap-midway");
+    let path = root.path().join("log");
+    let sock = root.path().join("sock");
+    let b = Broker::open(&path).unwrap();
+    b.set_retention_interval(HOUR);
+    publish_mail_then_stream(&b);
+    let (reached_tx, reached) = mpsc::channel();
+    let (resume, resume_rx) = mpsc::channel();
+    *b.shared.tail_pause.lock().unwrap() = Some(TailPause {
+        chunk: 1,
+        at: PauseAt::FirstChunk,
+        reached: reached_tx,
+        resume: resume_rx,
+    });
+    let mut h = b.serve(&sock).unwrap();
+    let mut sub = client(&sock).subscribe(0, MAILS).unwrap();
+    assert_eq!(seen(&mut sub, 1), vec![Seen::Rec(0)]);
+    assert_eq!(
+        reached.recv_timeout(MINUTE),
+        Ok(1),
+        "paused after its first chunk"
+    );
+    cut_by_gap_rules(&b);
+    resume.send(()).unwrap();
+    assert_eq!(
+        seen(&mut sub, 4),
+        vec![
+            told(1, 2, Some(1)),
+            Seen::Rec(2),
+            Seen::Rec(3),
+            Seen::Rec(4)
+        ]
+    );
+    drop(sub);
+    h.shutdown();
+}
+
+/// A PARKED TAIL IS TOLD BEFORE THE RECORDS IT WAKES TO: subscribed to the mail of an empty
+/// log, the tail is caught up and stops on its way to park. Then the five mails and three
+/// stream records land, and the rules give up the mails at 0 and 1, all before it parks. Its
+/// park sees the head past it at once and reads on under the same lock: it is told `0..2`,
+/// counting 2, then delivered the three held mails. NC: a park that drops its notice reads
+/// the mail at 2 with nothing told.
+#[test]
+fn a_parked_tail_a_cut_passes_is_told_before_the_records_it_wakes_to() {
+    let root = Scratch::new("wire-gap-park");
+    let path = root.path().join("log");
+    let sock = root.path().join("sock");
+    let b = Broker::open(&path).unwrap();
+    b.set_retention_interval(HOUR);
+    let (reached_tx, reached) = mpsc::channel();
+    let (resume, resume_rx) = mpsc::channel();
+    *b.shared.tail_pause.lock().unwrap() = Some(TailPause {
+        chunk: TAIL_CHUNK,
+        at: PauseAt::Park,
+        reached: reached_tx,
+        resume: resume_rx,
+    });
+    let mut h = b.serve(&sock).unwrap();
+    let mut sub = client(&sock).subscribe(0, MAILS).unwrap();
+    assert_eq!(
+        reached.recv_timeout(MINUTE),
+        Ok(0),
+        "caught up on the empty log, about to park"
+    );
+    publish_mail_then_stream(&b);
+    cut_by_gap_rules(&b);
+    resume.send(()).unwrap();
+    assert_eq!(
+        seen(&mut sub, 4),
+        vec![
+            told(0, 2, Some(2)),
+            Seen::Rec(2),
+            Seen::Rec(3),
+            Seen::Rec(4)
+        ]
+    );
+    drop(sub);
+    h.shutdown();
+}
+
+/// A NOTICE IS NEVER SENT TO A CLIENT THAT DID NOT ASK: a connection that asked for idle
+/// marks alone, as a client that predates gap notices does, is delivered the held mail at 2
+/// first, as before. Hello announces the verb. NC: a broker that tells every tail reads the
+/// notice first.
+#[test]
+fn a_client_that_did_not_ask_is_never_sent_a_notice() {
+    use crate::proto::{decode_response, encode_request, read_frame, write_frame};
+    let root = Scratch::new("wire-gap-unasked");
+    let path = root.path().join("log");
+    let sock = root.path().join("sock");
+    let b = Broker::open(&path).unwrap();
+    b.set_retention_interval(HOUR);
+    publish_mail_then_stream(&b);
+    cut_by_gap_rules(&b);
+    let mut h = b.serve(&sock).unwrap();
+    let mut c = client(&sock);
+    c.hello().unwrap();
+    assert!(c.supports_gap_notices(), "Hello announces the verb");
+    drop(c);
+
+    let mut s = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    s.set_read_timeout(Some(MINUTE)).unwrap();
+    let next = |s: &mut std::os::unix::net::UnixStream| {
+        decode_response(&read_frame(s).unwrap().expect("a frame within a minute"))
+    };
+    write_frame(&mut s, &encode_request(&Request::IdleMarks)).unwrap();
+    assert!(matches!(next(&mut s), Some(Response::Mark { .. })));
+    let group = Request::SubscribeGroup {
+        group: INBOX.into(),
+        filter: MAILS.into(),
+    };
+    write_frame(&mut s, &encode_request(&group)).unwrap();
+    let first = next(&mut s);
+    assert!(
+        matches!(first, Some(Response::Delivery { offset: 2, .. })),
+        "{first:?}"
+    );
+    drop(s);
     h.shutdown();
 }

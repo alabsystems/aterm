@@ -1063,7 +1063,9 @@ fn vendor_get_step(
     })
 }
 
-fn vendor_head_step(run: &CurlRun<'_>, last: bool, url: &str) -> Step<u64> {
+/// A HEAD attempt: `Ok(None)` is a final 200 that names no single positive `Content-Length`
+/// (npm's registry answers its tarballs so), which [`vendor_range_step`] sizes instead.
+fn vendor_head_step(run: &CurlRun<'_>, last: bool, url: &str) -> Step<Option<u64>> {
     if run.exit != Some(0) {
         if let Some(refusal) = vendor_curl_refusal(run.exit, run.stderr, url) {
             return Step::Done(Err(refusal));
@@ -1093,11 +1095,59 @@ fn vendor_head_step(run: &CurlRun<'_>, last: bool, url: &str) -> Step<u64> {
             url: url.to_string(),
         }));
     }
-    Step::Done(content_length_header(headers).ok_or_else(|| {
+    Step::Done(Ok(content_length_header(headers)))
+}
+
+/// The total of the final hop's `Content-Range: bytes 0-0/<total>`: one positive decimal.
+fn content_range_total(headers: &str) -> Option<u64> {
+    let value = last_block_header(headers, "content-range")?;
+    let total = value.strip_prefix("bytes 0-0/")?;
+    if total.is_empty() || !total.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    total.parse::<u64>().ok().filter(|n| *n > 0)
+}
+
+/// A one-byte ranged GET's attempt (`Range: bytes=0-0`): the total its final 206 names.
+fn vendor_range_step(run: &CurlRun<'_>, last: bool, url: &str) -> Step<u64> {
+    let no_size = || {
         HttpError::Malformed(format!(
-            "the vendor host sent no usable Content-Length for {url}"
+            "the vendor host sent no usable Content-Length for {url}, and no \
+             `Content-Range: bytes 0-0/<size>` to a one-byte range"
         ))
-    }))
+    };
+    if run.exit != Some(0) {
+        if filesize_exceeded(run.exit, run.stderr) {
+            return Step::Done(Err(no_size()));
+        }
+        if let Some(refusal) = vendor_curl_refusal(run.exit, run.stderr, url) {
+            return Step::Done(Err(refusal));
+        }
+        return if last {
+            Step::Done(Err(run.failure("GET", url)))
+        } else {
+            Step::Retry
+        };
+    }
+    let (headers, trailer) = match run.stdout.rfind('\n') {
+        Some(i) => (&run.stdout[..i], run.stdout[i + 1..].trim()),
+        None => ("", run.stdout.trim()),
+    };
+    let code = trailer.split_whitespace().next().unwrap_or("");
+    if !last && transient_status(code) {
+        return Step::Retry;
+    }
+    match code.parse::<u16>() {
+        Ok(206) => Step::Done(content_range_total(headers).ok_or_else(no_size)),
+        Ok(200) => Step::Done(Err(no_size())),
+        Ok(code) => Step::Done(Err(HttpError::VendorStatus {
+            code,
+            url: url.to_string(),
+        })),
+        Err(_) => Step::Done(Err(HttpError::Malformed(format!(
+            "the vendor host answered HTTP {code} to a ranged GET of {url}"
+        )))),
+    }
 }
 
 fn vendor_download_verdict(
@@ -1182,6 +1232,35 @@ const fn vendor_head_args() -> [&'static str; 15] {
     [
         "-sS",
         "-I",
+        "--proto",
+        "=https",
+        "--proto-redir",
+        "=https",
+        "-L",
+        "--max-redirs",
+        VENDOR_MAX_REDIRS,
+        "--connect-timeout",
+        SMALL_CONNECT_SECS,
+        "--max-time",
+        "60",
+        "-w",
+        "\n%{http_code} %{time_appconnect}",
+    ]
+}
+
+/// A GET of `url`'s first byte, its headers on stdout and that byte into `body`, refused
+/// past one byte: what sizes a payload whose HEAD names no length.
+fn vendor_range_args(body: &str) -> [&str; 22] {
+    [
+        "-sS",
+        "-r",
+        "0-0",
+        "--max-filesize",
+        "1",
+        "-o",
+        body,
+        "-D",
+        "-",
         "--proto",
         "=https",
         "--proto-redir",
@@ -1375,12 +1454,14 @@ fn vendor_get_within(
     }
 }
 
-/// The final `Content-Length` of `url` after redirects.
+/// The final size of `url` after redirects: its `Content-Length` to a HEAD, or, when the
+/// final 200 names none, the total of a one-byte ranged GET's `Content-Range`.
 /// # Errors
 /// [`HttpError::VendorRefused`] for a non-https URL (before any spawn) or a
-/// [`vendor_curl_refusal`]; [`HttpError::VendorStatus`] for a final status other than
-/// 200; [`HttpError::Malformed`] for an unreadable status or a final hop with no single
-/// positive numeric `Content-Length`; [`HttpError::Transport`] for everything else, a
+/// [`vendor_curl_refusal`]; [`HttpError::VendorStatus`] for a final status other than 200
+/// (206 to the ranged GET); [`HttpError::Malformed`] for an unreadable status, or a final
+/// hop naming neither a single positive numeric `Content-Length` nor a
+/// `Content-Range: bytes 0-0/<size>`; [`HttpError::Transport`] for everything else, a
 /// network that failed every attempt included.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn vendor_content_length(url: &str) -> Result<u64, HttpError> {
@@ -1401,7 +1482,43 @@ pub fn vendor_content_length(url: &str) -> Result<u64, HttpError> {
             stderr: &stderr,
         };
         let last = !attempt_again(run.exit, handshake_in(run.stdout), attempt, CURL_ATTEMPTS);
-        if let Step::Done(result) = vendor_head_step(&run, last, url) {
+        match vendor_head_step(&run, last, url) {
+            Step::Retry => {}
+            Step::Done(Ok(Some(size))) => return Ok(size),
+            Step::Done(Ok(None)) => return vendor_range_length(url),
+            Step::Done(Err(e)) => return Err(e),
+        }
+    }
+}
+
+/// [`vendor_content_length`]'s ranged GET.
+#[cfg_attr(trust_verify, trust::skip)]
+fn vendor_range_length(url: &str) -> Result<u64, HttpError> {
+    let scratch = VendorScratch::new().map_err(HttpError::Transport)?;
+    let body = scratch.0.join("body");
+    let Some(body_s) = body.to_str() else {
+        return Err(HttpError::Transport(
+            "non-UTF-8 temporary directory".to_string(),
+        ));
+    };
+    let args = vendor_range_args(body_s);
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        back_off_before(attempt);
+        let _ = std::fs::remove_file(&body);
+        let out = vendor_fetch(&args, url).map_err(HttpError::Transport)?;
+        let (stdout, stderr) = (
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        let run = CurlRun {
+            exit: out.status.code(),
+            stdout: &stdout,
+            stderr: &stderr,
+        };
+        let last = !attempt_again(run.exit, handshake_in(run.stdout), attempt, CURL_ATTEMPTS);
+        if let Step::Done(result) = vendor_range_step(&run, last, url) {
             return result;
         }
     }
@@ -2116,7 +2233,7 @@ mod tests {
                      content-length: 0\r\n\r\nHTTP/2 200\r\ncontent-length: 1631\r\n\r\n\n200";
         assert_eq!(
             vendor_head_step(&run(Some(0), chain, ""), false, URL),
-            Step::Done(Ok(1631))
+            Step::Done(Ok(Some(1631)))
         );
         let gone = "HTTP/2 302\r\ncontent-length: 5\r\n\r\nHTTP/2 404\r\n\r\n\n404";
         assert_eq!(
@@ -2127,10 +2244,11 @@ mod tests {
             }))
         );
         let no_length = "HTTP/2 200\r\ncontent-type: text/plain\r\n\r\n\n200";
-        assert!(matches!(
+        assert_eq!(
             vendor_head_step(&run(Some(0), no_length, ""), false, URL),
-            Step::Done(Err(HttpError::Malformed(_)))
-        ));
+            Step::Done(Ok(None)),
+            "a 200 naming no length is sized by a ranged GET"
+        );
         assert!(matches!(
             vendor_head_step(&run(Some(0), "HTTP/2 200\r\n\r\n\nabc", ""), false, URL),
             Step::Done(Err(HttpError::Malformed(_)))
@@ -2157,6 +2275,85 @@ mod tests {
             vendor_head_step(&run(Some(60), "", "curl: (60) SSL"), false, URL),
             Step::Done(Err(HttpError::VendorRefused(_)))
         ));
+    }
+
+    /// npm's registry names no length to a HEAD of its tarballs (measured 2026-10-24): the
+    /// size is the total of the final hop's `Content-Range` to a one-byte range, and nothing
+    /// else a host answers stands for it.
+    #[test]
+    fn a_ranged_get_sizes_a_payload_its_head_did_not() {
+        use super::{Step, vendor_range_step};
+        const URL: &str =
+            "https://registry.npmjs.org/@xai-official/grok-linux-x64/-/grok-linux-x64-1.0.70.tgz";
+        let npm = "HTTP/2 206\r\ncontent-type: application/octet-stream\r\n\
+                   content-range: bytes 0-0/55485055\r\ncontent-length: 1\r\n\r\n\n206 0.05";
+        assert_eq!(
+            vendor_range_step(&run(Some(0), npm, ""), false, URL),
+            Step::Done(Ok(55_485_055))
+        );
+        let hop = "HTTP/2 302\r\ncontent-range: bytes 0-0/9\r\n\r\n\
+                   HTTP/2 206\r\ncontent-range: bytes 0-0/7\r\n\r\n\n206";
+        assert_eq!(
+            vendor_range_step(&run(Some(0), hop, ""), false, URL),
+            Step::Done(Ok(7)),
+            "the final hop's"
+        );
+        for bad in [
+            "HTTP/2 206\r\ncontent-range: bytes 0-0/*\r\n\r\n\n206",
+            "HTTP/2 206\r\ncontent-range: bytes 0-0/0\r\n\r\n\n206",
+            "HTTP/2 206\r\ncontent-range: bytes 0-1/9\r\n\r\n\n206",
+            "HTTP/2 206\r\ncontent-range: bytes 0-0/9, 9\r\n\r\n\n206",
+            "HTTP/2 206\r\ncontent-range: bytes 0-0/1e3\r\n\r\n\n206",
+            "HTTP/2 206\r\ncontent-range: bytes 0-0/5\r\ncontent-range: bytes 0-0/6\r\n\r\n\n206",
+            "HTTP/2 206\r\ncontent-length: 1\r\n\r\n\n206",
+            "HTTP/2 200\r\ncontent-range: bytes 0-0/9\r\n\r\n\n200",
+        ] {
+            assert!(
+                matches!(
+                    vendor_range_step(&run(Some(0), bad, ""), false, URL),
+                    Step::Done(Err(HttpError::Malformed(_)))
+                ),
+                "{bad:?}"
+            );
+        }
+        assert!(
+            matches!(
+                vendor_range_step(
+                    &run(Some(63), "", "curl: (63) Maximum file size exceeded"),
+                    false,
+                    URL
+                ),
+                Step::Done(Err(HttpError::Malformed(_)))
+            ),
+            "a host that ignores the range and sends the payload is no size"
+        );
+        assert_eq!(
+            vendor_range_step(&run(Some(0), "HTTP/2 404\r\n\r\n\n404", ""), false, URL),
+            Step::Done(Err(HttpError::VendorStatus {
+                code: 404,
+                url: URL.into()
+            }))
+        );
+        assert_eq!(
+            vendor_range_step(&run(Some(0), "HTTP/2 503\r\n\r\n\n503", ""), false, URL),
+            Step::Retry
+        );
+        let args = super::vendor_range_args("/scratch/body");
+        for (flag, value) in [
+            ("-r", "0-0"),
+            ("--max-filesize", "1"),
+            ("-o", "/scratch/body"),
+            ("-D", "-"),
+            ("--proto", "=https"),
+            ("--proto-redir", "=https"),
+            ("--max-redirs", "5"),
+        ] {
+            let i = args.iter().position(|a| *a == flag).expect(flag);
+            assert_eq!(args[i + 1], value, "{flag}");
+        }
+        for absent in ["-I", "-f", "--fail", "--retry", "--config", "--"] {
+            assert!(!args.contains(&absent), "{absent}: {args:?}");
+        }
     }
 
     #[test]

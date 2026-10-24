@@ -271,7 +271,7 @@ pub const TOOLS: &[Tool] = &[
     os(
         "lsof",
         &["/usr/sbin/lsof"],
-        "the lab's open-file reads, and the oracle the harness's libproc reader is held to (row 8)",
+        "the oracle libproc readers are held to in tests (the harness's row 8, kproc's and fabric's image inode: quiet children, and launchd, whose descriptors a user may not read), fabric's image inode on a unix other than macOS and Linux, and the lab's socket endpoints of a process `jobs::sockets_readable` passes",
     ),
     os(
         "ls",

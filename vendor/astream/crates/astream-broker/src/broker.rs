@@ -55,6 +55,7 @@
 //! stops its own writer thread the same way.
 
 use crate::brecord::{BrokerRecord, GroupCommit};
+use crate::client::kept_from_children;
 use crate::proto::{
     append_delivery_frame, append_delivery_frame_with_crc, append_frame, compute_delivery_crc,
     decode_request, decode_response, encode_protocol_refusal, encode_replicate, encode_response,
@@ -64,7 +65,7 @@ use crate::proto::{
 };
 use crate::store::{
     is_hidden_subject, replicated_reserved_msg, reserved_msg, Begun, BrokerLog, Durability,
-    FlushCounts, InjectedFaults, LogStats, OpenOptions, Prepared, StageErr, WillRecord,
+    FlushCounts, InjectedFaults, LogStats, OpenOptions, Prepared, StageErr, Told, WillRecord,
     COMMIT_SUBJECT, MAX_SUBJECTS_PER_PRODUCER, RETIRE_SUBJECT,
 };
 use astream_wire::{Filter, Offset, Subject};
@@ -84,31 +85,24 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-/// An object-safe handle that can force-close a connection's socket (both directions),
-/// so [`BrokerHandle::shutdown`] can unblock a connection thread parked in a socket
-/// read/write and let it (and its ack-writer thread + fds) be reaped promptly. Kept
-/// separate from [`Stream`] because `Stream::try_clone -> Self` makes `Stream` itself
-/// not object-safe.
-trait ConnShutdown: Send + Sync {
-    fn shutdown_both(&self);
-    /// Shut only the write direction: the peer reads EOF, and may still write.
-    fn shutdown_write(&self);
+/// A second handle to a connection's socket, held in [`Shared::conns`] so
+/// [`BrokerHandle::shutdown`] can force-close the connection (both directions) and
+/// unblock a thread parked in a socket read or write, letting it (and its ack-writer
+/// thread and fds) be reaped promptly. For the sealed transport it is the TCP socket
+/// beneath the records: shutdown never touches record bytes.
+enum Sock {
+    #[cfg(unix)]
+    Unix(UnixStream),
+    Tcp(TcpStream),
 }
-#[cfg(unix)]
-impl ConnShutdown for UnixStream {
+
+impl Sock {
     fn shutdown_both(&self) {
-        let _ = self.shutdown(Shutdown::Both);
-    }
-    fn shutdown_write(&self) {
-        let _ = self.shutdown(Shutdown::Write);
-    }
-}
-impl ConnShutdown for TcpStream {
-    fn shutdown_both(&self) {
-        let _ = self.shutdown(Shutdown::Both);
-    }
-    fn shutdown_write(&self) {
-        let _ = self.shutdown(Shutdown::Write);
+        let _ = match self {
+            #[cfg(unix)]
+            Sock::Unix(s) => s.shutdown(Shutdown::Both),
+            Sock::Tcp(s) => s.shutdown(Shutdown::Both),
+        };
     }
 }
 
@@ -893,57 +887,157 @@ pub const REPLICA_IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// well under the follower's `PIPELINE_DEPTH` so the two sides can never wedge.
 const REPLICA_WINDOW: usize = 256;
 
-/// The connection abstraction the broker serves over: any byte stream with the two
-/// socket timeouts the tail loop needs. Implemented for a local Unix socket
-/// (same-machine), plaintext TCP (multi-machine on a TRUSTED network), and — with
-/// the `aead` feature — an XChaCha20-Poly1305 `SealedStream` over TCP (confidential
-/// and authenticated: [`Broker::serve_tcp_sealed`]). The same Frame protocol rides
-/// all three; capability enforcement (the `cap` feature, [`Broker::open_guarded`])
-/// is orthogonal to the transport.
-trait Stream: Read + Write + Send + Sized + ConnShutdown + 'static {
-    fn set_read_timeout(&self, d: Option<Duration>) -> io::Result<()>;
-    fn set_write_timeout(&self, d: Option<Duration>) -> io::Result<()>;
+/// The connection the broker serves over: a local Unix socket (same machine),
+/// plaintext TCP (multi-machine on a TRUSTED network), or, with the `aead` feature, an
+/// XChaCha20-Poly1305 `SealedStream` over TCP (confidential and authenticated:
+/// [`Broker::serve_tcp_sealed`]). The same Frame protocol rides all three; capability
+/// enforcement (the `cap` feature, [`Broker::open_guarded`]) is orthogonal to the
+/// transport.
+///
+/// A closed set named by one type, not a trait the connection code is generic over:
+/// every call the serve path makes on a connection resolves to one transport's own
+/// method, so the verified lane can follow it (a read through a type parameter is a
+/// callee it cannot see, and it fails the whole path closed). Timeouts, non-blocking
+/// mode and shutdown act on the socket, for the sealed transport the TCP socket
+/// beneath the records; its `try_clone` shares the AEAD record counters, so the read
+/// half and the ack-writer half stay one ordered record sequence.
+enum Conn {
+    #[cfg(unix)]
+    Unix(UnixStream),
+    Tcp(TcpStream),
+    #[cfg(feature = "aead")]
+    Sealed(astream_aead::SealedStream<TcpStream>),
+}
+
+impl Conn {
+    fn set_read_timeout(&self, d: Option<Duration>) -> io::Result<()> {
+        match self {
+            #[cfg(unix)]
+            Conn::Unix(s) => s.set_read_timeout(d),
+            Conn::Tcp(s) => s.set_read_timeout(d),
+            #[cfg(feature = "aead")]
+            Conn::Sealed(s) => s.get_ref().set_read_timeout(d),
+        }
+    }
+
+    fn set_write_timeout(&self, d: Option<Duration>) -> io::Result<()> {
+        match self {
+            #[cfg(unix)]
+            Conn::Unix(s) => s.set_write_timeout(d),
+            Conn::Tcp(s) => s.set_write_timeout(d),
+            #[cfg(feature = "aead")]
+            Conn::Sealed(s) => s.get_ref().set_write_timeout(d),
+        }
+    }
+
     /// Switch the socket's non-blocking mode (`O_NONBLOCK`, a property of the open
-    /// socket that every handle to it shares) — only for the liveness probe's one
+    /// socket that every handle to it shares): only for the liveness probe's one
     /// read, by the one thread using the socket (see `peer_gone`).
-    fn set_nonblocking(&self, on: bool) -> io::Result<()>;
-    /// A second handle to the same socket, so the read half (draining requests) and
-    /// the ack-writer half (streaming acks back) run concurrently — single-connection
-    /// pipelining. Read and write are independent directions on the same fd. Kept out
-    /// of every child, as the first handle is (`astream_sys::close_on_fork`).
-    fn try_clone(&self) -> io::Result<Self>;
-}
-#[cfg(unix)]
-impl Stream for UnixStream {
-    fn set_read_timeout(&self, d: Option<Duration>) -> io::Result<()> {
-        UnixStream::set_read_timeout(self, d)
-    }
-    fn set_write_timeout(&self, d: Option<Duration>) -> io::Result<()> {
-        UnixStream::set_write_timeout(self, d)
-    }
     fn set_nonblocking(&self, on: bool) -> io::Result<()> {
-        UnixStream::set_nonblocking(self, on)
+        match self {
+            #[cfg(unix)]
+            Conn::Unix(s) => s.set_nonblocking(on),
+            Conn::Tcp(s) => s.set_nonblocking(on),
+            #[cfg(feature = "aead")]
+            Conn::Sealed(s) => s.get_ref().set_nonblocking(on),
+        }
     }
-    fn try_clone(&self) -> io::Result<Self> {
-        let clone = UnixStream::try_clone(self)?;
-        astream_sys::close_on_fork(std::os::fd::AsFd::as_fd(&clone))?;
-        Ok(clone)
+
+    /// A second handle to the same connection, so the read half (draining requests)
+    /// and the ack-writer half (streaming acks back) run concurrently:
+    /// single-connection pipelining. Read and write are independent directions on the
+    /// same fd. Kept out of every child, as the first handle is
+    /// (`astream_sys::close_on_fork`, a flag of the descriptor, so each duplicate
+    /// carries its own).
+    fn try_clone(&self) -> io::Result<Conn> {
+        Ok(match self {
+            #[cfg(unix)]
+            Conn::Unix(s) => {
+                let clone = s.try_clone()?;
+                kept_from_children(&clone)?;
+                Conn::Unix(clone)
+            }
+            Conn::Tcp(s) => {
+                let clone = s.try_clone()?;
+                kept_from_children(&clone)?;
+                Conn::Tcp(clone)
+            }
+            #[cfg(feature = "aead")]
+            Conn::Sealed(s) => {
+                let clone = s.try_clone()?;
+                kept_from_children(clone.get_ref())?;
+                Conn::Sealed(clone)
+            }
+        })
+    }
+
+    /// The handle [`Shared::conns`] keeps to force-close this connection's socket,
+    /// kept out of every child as [`Conn::try_clone`]'s is.
+    fn sock(&self) -> io::Result<Sock> {
+        Ok(match self {
+            #[cfg(unix)]
+            Conn::Unix(s) => {
+                let clone = s.try_clone()?;
+                kept_from_children(&clone)?;
+                Sock::Unix(clone)
+            }
+            Conn::Tcp(s) => {
+                let clone = s.try_clone()?;
+                kept_from_children(&clone)?;
+                Sock::Tcp(clone)
+            }
+            #[cfg(feature = "aead")]
+            Conn::Sealed(s) => {
+                let clone = s.get_ref().try_clone()?;
+                kept_from_children(&clone)?;
+                Sock::Tcp(clone)
+            }
+        })
+    }
+
+    /// Shut only the write direction: the peer reads EOF, and may still write.
+    fn shutdown_write(&self) {
+        let _ = match self {
+            #[cfg(unix)]
+            Conn::Unix(s) => s.shutdown(Shutdown::Write),
+            Conn::Tcp(s) => s.shutdown(Shutdown::Write),
+            #[cfg(feature = "aead")]
+            Conn::Sealed(s) => s.get_ref().shutdown(Shutdown::Write),
+        };
     }
 }
-impl Stream for TcpStream {
-    fn set_read_timeout(&self, d: Option<Duration>) -> io::Result<()> {
-        TcpStream::set_read_timeout(self, d)
+
+impl Read for Conn {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            #[cfg(unix)]
+            Conn::Unix(s) => s.read(buf),
+            Conn::Tcp(s) => s.read(buf),
+            #[cfg(feature = "aead")]
+            Conn::Sealed(s) => s.read(buf),
+        }
     }
-    fn set_write_timeout(&self, d: Option<Duration>) -> io::Result<()> {
-        TcpStream::set_write_timeout(self, d)
+}
+
+impl Write for Conn {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            #[cfg(unix)]
+            Conn::Unix(s) => s.write(buf),
+            Conn::Tcp(s) => s.write(buf),
+            #[cfg(feature = "aead")]
+            Conn::Sealed(s) => s.write(buf),
+        }
     }
-    fn set_nonblocking(&self, on: bool) -> io::Result<()> {
-        TcpStream::set_nonblocking(self, on)
-    }
-    fn try_clone(&self) -> io::Result<Self> {
-        let clone = TcpStream::try_clone(self)?;
-        astream_sys::close_on_fork(std::os::fd::AsFd::as_fd(&clone))?;
-        Ok(clone)
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            #[cfg(unix)]
+            Conn::Unix(s) => s.flush(),
+            Conn::Tcp(s) => s.flush(),
+            #[cfg(feature = "aead")]
+            Conn::Sealed(s) => s.flush(),
+        }
     }
 }
 
@@ -1104,16 +1198,22 @@ enum WakeDial {
     Tcp(#[allow(dead_code)] TcpStream),
 }
 
-/// One listener's accept loop, Unix and TCP alike: take connections and hand each to
-/// `hand_off` until shutdown clears `running` (the broker's) or `listening` (this
-/// listener's). Every `accept()` return, connection or error, re-reads both flags, so
-/// a stopping broker closes what the backlog hands it instead of spawning a handler
-/// shutdown could miss — and each of shutdown's wakeup dials is a fresh chance to see
-/// the flags, which is why a stale read cannot strand a blocking acceptor. The flags
-/// are read only after an `accept()` returns, never before the first: an acceptor
-/// that starts after shutdown began still parks in `accept()`, where shutdown's dials
-/// find it (or, when none can, abandon it), instead of leaving by itself on a timing
-/// that shutdown cannot see.
+/// One listener's accept loop, Unix and TCP alike: take connections and hand each off
+/// until shutdown clears `running` (the broker's) or `listening` (this listener's).
+/// Every `accept()` return, connection or error, re-reads both flags, so a stopping
+/// broker closes what the backlog hands it instead of spawning a handler shutdown
+/// could miss — and each of shutdown's wakeup dials is a fresh chance to see the
+/// flags, which is why a stale read cannot strand a blocking acceptor. The flags are
+/// read only after an `accept()` returns, never before the first: an acceptor that
+/// starts after shutdown began still parks in `accept()`, where shutdown's dials find
+/// it (or, when none can, abandon it), instead of leaving by itself on a timing that
+/// shutdown cannot see.
+///
+/// The loop itself is the listener's own (`Broker::serve`, `Broker::serve_tcp_with`):
+/// it calls `accept()`, asks [`turn`](Self::turn) what that return means, hands a
+/// connection off, and asks [`stopping`](Self::stopping) after the hand-off. A loop
+/// written out at each listener, not one generic over closures for the accept and the
+/// hand-off, so the verified lane resolves every call in it.
 ///
 /// `polls`: the listener is non-blocking (no wake name, [`ACCEPT_POLL`]). Counted on
 /// [`Shared`] for [`BrokerStats`]: every resumption of the thread from a blocking wait
@@ -1121,58 +1221,74 @@ enum WakeDial {
 /// every connection handed off. Counted on `turns`, this listener's own: every
 /// `accept()` return, which is what shutdown reads to know its wakeup dial reached THIS
 /// acceptor ([`AcceptWake::Blocks`]).
-fn accept_loop<S>(
-    shared: &Shared,
-    listening: &AtomicBool,
-    turns: &AtomicU64,
+struct AcceptLoop<'a> {
+    shared: &'a Shared,
+    listening: &'a AtomicBool,
+    turns: &'a AtomicU64,
     polls: bool,
-    mut accept: impl FnMut() -> io::Result<S>,
-    mut hand_off: impl FnMut(S),
-) {
-    loop {
-        let got = accept();
-        turns.fetch_add(1, Ordering::Relaxed);
-        if !polls {
-            shared.acceptor_wakeups.fetch_add(1, Ordering::Relaxed);
+}
+
+impl AcceptLoop<'_> {
+    /// Whether the broker or this listener is stopping.
+    fn stopping(&self) -> bool {
+        !self.shared.running.load(Ordering::Relaxed) || !self.listening.load(Ordering::Relaxed)
+    }
+
+    /// Count one `accept()` return and say whether the loop goes on: `failed` is the
+    /// error it returned, `None` for a connection. For a connection, `true` is "hand it
+    /// off" (the caller then asks [`stopping`](Self::stopping)) and `false` is "close
+    /// it and leave"; for an error, `true` is "accept again".
+    fn turn(&self, failed: Option<io::ErrorKind>) -> bool {
+        self.turns.fetch_add(1, Ordering::Relaxed);
+        if !self.polls {
+            self.shared.acceptor_wakeups.fetch_add(1, Ordering::Relaxed);
         }
-        let is_stopping =
-            !shared.running.load(Ordering::Relaxed) || !listening.load(Ordering::Relaxed);
-        match got {
-            Ok(s) => {
+        let is_stopping = self.stopping();
+        match failed {
+            None => {
                 // Stopping: close what the backlog handed us (a wakeup dial among them)
                 // instead of spawning a handler shutdown could miss.
                 if is_stopping {
-                    break;
+                    return false;
                 }
-                shared.accepted.fetch_add(1, Ordering::Relaxed);
-                hand_off(s);
+                self.shared.accepted.fetch_add(1, Ordering::Relaxed);
+                return true;
             }
-            Err(ref e) if polls && e.kind() == io::ErrorKind::WouldBlock => {
+            Some(io::ErrorKind::WouldBlock) if self.polls => {
                 if is_stopping {
-                    break;
+                    return false;
                 }
-                shared.acceptor_sleeps.fetch_add(1, Ordering::Relaxed);
-                thread::sleep(ACCEPT_POLL);
-                shared.acceptor_wakeups.fetch_add(1, Ordering::Relaxed);
+                self.back_off();
             }
             // ONE connection's failure (reset while it sat in the backlog): the next
             // connection is not to wait out a back-off for it. (A signal never gets
             // here: std's `accept()` retries EINTR itself.)
-            Err(ref e) if e.kind() == io::ErrorKind::ConnectionAborted => {}
+            Some(io::ErrorKind::ConnectionAborted) => {}
             // A transient accept() error (EMFILE/ENFILE) must NOT kill the listener —
             // back off briefly instead of spinning on it. Only shutdown stops it.
-            Err(_) => {
+            Some(_) => {
                 if is_stopping {
-                    break;
+                    return false;
                 }
-                shared.acceptor_sleeps.fetch_add(1, Ordering::Relaxed);
-                thread::sleep(ACCEPT_POLL);
-                shared.acceptor_wakeups.fetch_add(1, Ordering::Relaxed);
+                self.back_off();
             }
         }
-        if !shared.running.load(Ordering::Relaxed) || !listening.load(Ordering::Relaxed) {
-            break;
-        }
+        !self.stopping()
+    }
+
+    /// Sleep one [`ACCEPT_POLL`], counted.
+    fn back_off(&self) {
+        self.shared.acceptor_sleeps.fetch_add(1, Ordering::Relaxed);
+        thread::sleep(ACCEPT_POLL);
+        self.shared.acceptor_wakeups.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The error kind of an `accept()` return, `None` for a connection.
+fn accept_failure<T>(got: &io::Result<T>) -> Option<io::ErrorKind> {
+    match got {
+        Ok(_) => None,
+        Err(e) => Some(e.kind()),
     }
 }
 
@@ -1274,7 +1390,7 @@ impl HelloCopy {
                 durability: Some(log.served()),
                 lineage: Some(log.lineage().clone()),
                 retention,
-                requests: Some(crate::proto::REQUEST_RETIRE),
+                requests: Some(crate::proto::REQUEST_RETIRE | crate::proto::REQUEST_GAP_NOTICES),
                 // Never copied: the answer reads it fresh from the vitals
                 // (`hello_health`), since it moves with every batch's flush.
                 health: None,
@@ -1358,7 +1474,7 @@ struct Shared {
     writes: Sender<Queued>,
     /// Live connection sockets (a clone per accepted connection), so shutdown can
     /// force-close any thread parked in a blocking socket read/write and reap it.
-    conns: Mutex<HashMap<u64, Box<dyn ConnShutdown>>>,
+    conns: Mutex<HashMap<u64, Sock>>,
     conn_seq: AtomicU64,
     /// `Some` in the Replicated durability tier: after each batch commits locally, the
     /// writer ships every not-yet-confirmed record to the followers and an `ack` is
@@ -1425,6 +1541,10 @@ struct Shared {
     /// could install a closure that spawns), which marked every indirect-call pool in
     /// the crate "may spawn" — `ConnGuard::drop` included.
     last_round_pause: Mutex<Option<RoundPause>>,
+    /// TEST SEAM ([`TailPause`]): taken by the next tail to start. `None` unless a unit
+    /// test installs one; not in a build that is not a test.
+    #[cfg(test)]
+    tail_pause: Mutex<Option<TailPause>>,
     /// Direct-mapped cache only for immutable live `Response::Delivery` payloads.
     /// Each slot keeps the full 64-bit offset and CRC under one short lock; a fork's
     /// counterfactual delivery never enters this cache. No offset bit is a valid flag.
@@ -1583,13 +1703,9 @@ struct Shared {
     /// joined when the log closes.
     health_thread: Mutex<Option<JoinHandle<()>>>,
     /// The log's retention base (`BrokerLog::base`), updated under the log lock
-    /// whenever retention advances it so [`Broker::base`] and `tail_loop`'s caught-up
-    /// fast path can read it without locking `shared.log`.
+    /// whenever retention advances it so [`Broker::base`] can read it without locking
+    /// `shared.log`.
     base: AtomicU64,
-    /// The lowest offset a subscriber can still be delivered from
-    /// ([`BrokerLog::read_floor`]: the oldest record the retention rules hold below the
-    /// base, or the base), published beside `base` for `tail_loop`'s fast path.
-    read_floor: AtomicU64,
     /// The log's committed head (`BrokerLog::head`), updated under the log lock
     /// whenever a batch commits so [`Broker::head`] and `serve_replicate`'s hidden-subject
     /// pre-check can read it without locking `shared.log`.
@@ -1713,6 +1829,49 @@ impl Drop for WriterExit<'_> {
     }
 }
 
+/// TEST SEAM: the next tail to start reads at most `chunk` records per hold of the log
+/// lock, and stops once, `at` the point it names, its cursor sent on `reached`, until
+/// `resume` yields (or its sender is gone): the window in which a test lands a retention
+/// while the tail reads, or while it is about to park.
+#[cfg(test)]
+pub(crate) struct TailPause {
+    pub(crate) chunk: usize,
+    pub(crate) at: PauseAt,
+    pub(crate) reached: Sender<u64>,
+    pub(crate) resume: Receiver<()>,
+}
+
+/// Where a [`TailPause`] stops its tail.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PauseAt {
+    /// Once it has delivered its first chunk.
+    FirstChunk,
+    /// Caught up, its idle mark written, before it takes the log lock to park: records
+    /// that land then, and a retention that gives them up, are what its park wakes to.
+    Park,
+}
+
+/// Stop the tail at `at` if its [`TailPause`] names it, until the test resumes it.
+#[cfg(test)]
+fn tail_pause_at(pause: &mut Option<TailPause>, at: PauseAt, cursor: u64) {
+    if pause.as_ref().is_some_and(|p| p.at == at) {
+        if let Some(p) = pause.take() {
+            if p.reached.send(cursor).is_ok() {
+                let _ = p.resume.recv();
+            }
+        }
+    }
+}
+
+/// What a connection asked of its next tail before it subscribed: catch-up and idle
+/// marks ([`Request::IdleMarks`]), and gap notices ([`Request::GapNotices`]).
+#[derive(Debug, Clone, Copy, Default)]
+struct TailAsks {
+    idle_marks: bool,
+    gaps: bool,
+}
+
 /// The broker side of a [`Broker::pause_last_scan_round`] rendezvous.
 struct RoundPause {
     /// The round whose trailing boundary pauses.
@@ -1834,7 +1993,10 @@ fn attach_follower_cap(
         )
     })?;
     // One deadline covers the complete Hello/Attach exchange, not each socket read.
-    let mut bounded = Deadlined { stream, deadline };
+    let mut bounded = Deadlined {
+        stream: DeadlineOn::Follower(stream),
+        deadline,
+    };
     write_frame(&mut bounded, &crate::proto::encode_request(&Request::Hello))
         .map_err(|e| (false, e))?;
     let Some(hello_reply) = read_frame(&mut bounded).map_err(|e| (false, e))? else {
@@ -3305,7 +3467,6 @@ impl Broker {
         log.start_last_visible(head);
         let durable = log.durable_head().0;
         let base = log.base().0;
-        let read_floor = log.read_floor().0;
         #[cfg(feature = "retention")]
         let (log_bytes, retain_due) = (log.durable_len(), log.retention_due());
         let log_head = log.head().0;
@@ -3358,6 +3519,8 @@ impl Broker {
             sighup_seen: AtomicU64::new(0),
             revocation_epoch: AtomicU64::new(0),
             last_round_pause: Mutex::new(None),
+            #[cfg(test)]
+            tail_pause: Mutex::new(None),
             delivery_crc_cache: Box::new(std::array::from_fn(|_| Mutex::new(None))),
             hello: Mutex::new(hello),
             bindings: Mutex::new(bindings),
@@ -3399,7 +3562,6 @@ impl Broker {
             health: Mutex::new(None),
             health_thread: Mutex::new(None),
             base: AtomicU64::new(base),
-            read_floor: AtomicU64::new(read_floor),
             log_head: AtomicU64::new(log_head),
             is_replica: AtomicBool::new(is_replica),
             max_retained_records: AtomicUsize::new(0),
@@ -4281,7 +4443,7 @@ impl Broker {
         let listener = UnixListener::bind(&socket_path)?;
         // Out of every child this process spawns: a child's exec-time close of its copy,
         // under a descriptor scan, drains the listener and every connection it accepts.
-        astream_sys::close_on_fork(std::os::fd::AsFd::as_fd(&listener))?;
+        kept_from_children(&listener)?;
         // The wake name first: without one, shutdown could not reach a blocking
         // acceptor once the embedder unlinked `socket_path`, so the listener polls.
         let node = node_at(&socket_path);
@@ -4305,39 +4467,45 @@ impl Broker {
         let spawned = thread::Builder::new().spawn(move || {
             // Dropped as this thread returns: shutdown's signal that it left.
             let _exited = exited_tx;
-            accept_loop(
-                &shared,
-                &acc_running,
-                &acc_turns,
+            let acc = AcceptLoop {
+                shared: &shared,
+                listening: &acc_running,
+                turns: &acc_turns,
                 polls,
-                || match listener.accept() {
-                    Ok((s, _)) => Ok(s),
-                    Err(e) => Err(e),
-                },
-                |s| {
-                    // Accepted sockets MUST be blocking (the frame reader uses
-                    // read_exact); a polling listener's non-blocking mode may be
-                    // inherited (BSD accept), so clear it.
-                    if polls {
-                        let _ = s.set_nonblocking(false);
-                    }
-                    // Out of every child, as the listener is (`astream_sys::close_on_fork`).
-                    let _ = astream_sys::close_on_fork(std::os::fd::AsFd::as_fd(&s));
-                    let sh = shared.clone();
-                    // Detached per-connection thread; ends when its socket ends.
-                    // A spawn that fails (thread exhaustion) drops this socket and
-                    // keeps accepting — `thread::spawn` would panic the acceptor.
-                    // Its client reads only a close, so the reason is said here.
-                    if let Err(e) = thread::Builder::new().spawn(move || {
-                        let _ = handle_conn(&sh, s, Wire::Unix);
-                    }) {
-                        let _ = writeln!(
-                            io::stderr(),
-                            "astream-broker: warn: closed an accepted connection: its thread did not start ({e})"
-                        );
-                    }
-                },
-            );
+            };
+            loop {
+                let got = listener.accept();
+                if !acc.turn(accept_failure(&got)) {
+                    break;
+                }
+                let Ok((s, _)) = got else {
+                    continue;
+                };
+                // Accepted sockets MUST be blocking (the frame reader uses
+                // read_exact); a polling listener's non-blocking mode may be
+                // inherited (BSD accept), so clear it.
+                if polls {
+                    let _ = s.set_nonblocking(false);
+                }
+                // Out of every child, as the listener is (`astream_sys::close_on_fork`).
+                let _ = kept_from_children(&s);
+                let sh = shared.clone();
+                // Detached per-connection thread; ends when its socket ends.
+                // A spawn that fails (thread exhaustion) drops this socket and
+                // keeps accepting — `thread::spawn` would panic the acceptor.
+                // Its client reads only a close, so the reason is said here.
+                if let Err(e) = thread::Builder::new().spawn(move || {
+                    let _ = handle_conn(&sh, Conn::Unix(s), Wire::Unix);
+                }) {
+                    let _ = writeln!(
+                        io::stderr(),
+                        "astream-broker: warn: closed an accepted connection: its thread did not start ({e})"
+                    );
+                }
+                if acc.stopping() {
+                    break;
+                }
+            }
         });
         let acceptor = match spawned {
             Ok(j) => j,
@@ -4376,7 +4544,7 @@ impl Broker {
     /// read the bound address from it if you bound port 0.
     pub fn serve_tcp(&self, addr: impl std::net::ToSocketAddrs) -> io::Result<BrokerHandle> {
         // Identity wrap: the raw TcpStream IS the connection stream.
-        self.serve_tcp_with(addr, |s| Ok((s, None)))
+        self.serve_tcp_with(addr, TcpWrap::Plain)
     }
 
     /// Like [`serve_tcp`](Self::serve_tcp) but the transport is **confidential and
@@ -4399,10 +4567,7 @@ impl Broker {
         addr: impl std::net::ToSocketAddrs,
         key: [u8; astream_aead::KEY_LEN],
     ) -> io::Result<BrokerHandle> {
-        self.serve_tcp_with(addr, move |s| {
-            let sealed = astream_aead::SealedStream::handshake_server(s, key)?;
-            Ok((sealed, None))
-        })
+        self.serve_tcp_with(addr, TcpWrap::Sealed(key))
     }
 
     /// Like [`serve_tcp_sealed`](Self::serve_tcp_sealed) but with **forward secrecy**:
@@ -4418,20 +4583,7 @@ impl Broker {
         addr: impl std::net::ToSocketAddrs,
         psk: [u8; astream_aead::KEY_LEN],
     ) -> io::Result<BrokerHandle> {
-        self.serve_tcp_with(addr, move |s| {
-            // Bound the handshake I/O: a peer that connects then stalls (sends
-            // nothing, or a partial message) must not park this thread + fd
-            // forever — nothing gates the pre-handshake read, so an unauthenticated
-            // slowloris would otherwise exhaust threads unbounded. Reset to blocking
-            // once the handshake completes; the request loop and tail_loop then set
-            // their own timeouts.
-            s.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
-            s.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
-            let sealed = astream_aead::server_handshake(s, &psk)?;
-            sealed.get_ref().set_read_timeout(None)?;
-            sealed.get_ref().set_write_timeout(None)?;
-            Ok((sealed, None))
-        })
+        self.serve_tcp_with(addr, TcpWrap::Handshake(psk))
     }
 
     /// Like [`serve_tcp_handshake`](Self::serve_tcp_handshake) but with **static
@@ -4449,27 +4601,18 @@ impl Broker {
         identity: astream_aead::IdentityKeypair,
         authorized_clients: Vec<[u8; astream_aead::ID_PUB_LEN]>,
     ) -> io::Result<BrokerHandle> {
-        let shared = self.shared.clone();
-        self.serve_tcp_with(addr, move |s| {
-            s.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
-            s.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
-            let (sealed, client_id) =
-                astream_aead::server_identity_handshake(s, &identity, &authorized_clients)?;
-            if is_peer_revoked(&shared, Some(client_id)) {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "unauthorized: peer identity key has been revoked",
-                ));
-            }
-            sealed.get_ref().set_read_timeout(None)?;
-            sealed.get_ref().set_write_timeout(None)?;
-            Ok((sealed, Some(client_id)))
-        })
+        self.serve_tcp_with(
+            addr,
+            TcpWrap::Identity {
+                identity: Box::new(identity),
+                authorized_clients,
+            },
+        )
     }
 
-    /// Shared TCP accept loop, generic over how each accepted [`TcpStream`] is
-    /// wrapped into the per-connection [`Stream`] (`Ok` for plaintext, the sealed
-    /// handshake for the AEAD transport). The wrap runs on the connection's own
+    /// Shared TCP accept loop, given how each accepted [`TcpStream`] is wrapped into
+    /// the per-connection [`Conn`] ([`TcpWrap`]: as it is for plaintext, the sealed
+    /// handshake for the AEAD transports). The wrap runs on the connection's own
     /// thread, never on the acceptor, under pre-authentication bounds — a deadline
     /// and a cap on how many connections may be inside their wrap at once — so a
     /// peer that cannot authenticate can hold up neither other accepts nor a
@@ -4478,15 +4621,11 @@ impl Broker {
     /// wrap, so the instant plaintext wrap never holds a slot and a burst of
     /// plaintext accepts is never refused by it. A connection that fails to wrap
     /// is dropped.
-    fn serve_tcp_with<S, F>(
+    fn serve_tcp_with(
         &self,
         addr: impl std::net::ToSocketAddrs,
-        wrap: F,
-    ) -> io::Result<BrokerHandle>
-    where
-        S: Stream,
-        F: Fn(TcpStream) -> io::Result<(S, Option<[u8; 32]>)> + Send + Sync + 'static,
-    {
+        wrap: TcpWrap,
+    ) -> io::Result<BrokerHandle> {
         // How long a connection may take to complete its wrap (the sealed handshake):
         // the socket read timeout until the wrap returns, lifted once it has — the
         // protocol above sets its own timeouts.
@@ -4497,7 +4636,7 @@ impl Broker {
 
         let listener = TcpListener::bind(addr)?;
         // Out of every child, as a Unix listener is (`astream_sys::close_on_fork`).
-        astream_sys::close_on_fork(std::os::fd::AsFd::as_fd(&listener))?;
+        kept_from_children(&listener)?;
         // Report a *connectable* address: a wildcard bind (0.0.0.0 / ::) is not a valid
         // destination for a client, so map an unspecified host to loopback (keeping
         // the port) for `tcp_addr`. It is also what shutdown dials to get the
@@ -4520,18 +4659,24 @@ impl Broker {
             // for no measurable time — and pre-checked here so a peer beyond the
             // cap is dropped without being given a thread.
             let preauth = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            accept_loop(
-                &shared,
-                &acc_running,
-                &acc_turns,
-                false,
-                || listener.accept().map(|(s, _)| s),
-                |s| {
-                    let _ = s.set_nodelay(true);
-                    let _ = astream_sys::close_on_fork(std::os::fd::AsFd::as_fd(&s));
-                    if preauth.load(Ordering::Acquire) >= MAX_PREAUTH_CONNS {
-                        return; // dropped: beyond the pre-authentication cap
-                    }
+            let acc = AcceptLoop {
+                shared: &shared,
+                listening: &acc_running,
+                turns: &acc_turns,
+                polls: false,
+            };
+            loop {
+                let got = listener.accept();
+                if !acc.turn(accept_failure(&got)) {
+                    break;
+                }
+                let Ok((s, _)) = got else {
+                    continue;
+                };
+                let _ = s.set_nodelay(true);
+                let _ = kept_from_children(&s);
+                // Beyond the pre-authentication cap the socket is dropped here.
+                if preauth.load(Ordering::Acquire) < MAX_PREAUTH_CONNS {
                     // The pre-authentication deadline: armed BEFORE the wrap;
                     // the connection thread lifts it once the wrap succeeded.
                     let _ = s.set_read_timeout(Some(PREAUTH_TIMEOUT));
@@ -4550,7 +4695,7 @@ impl Broker {
                             preauth.fetch_sub(1, Ordering::AcqRel);
                             return;
                         }
-                        let wrapped = wrap(s);
+                        let wrapped = wrap.wrap(&sh, s);
                         preauth.fetch_sub(1, Ordering::AcqRel);
                         // Couldn't establish the (sealed) transport — the socket
                         // drops with the Err.
@@ -4559,8 +4704,11 @@ impl Broker {
                             let _ = handle_conn_with_peer(&sh, stream, Wire::Tcp, peer_id);
                         }
                     });
-                },
-            );
+                }
+                if acc.stopping() {
+                    break;
+                }
+            }
         })?;
         self.shared.active_listeners.fetch_add(1, Ordering::AcqRel);
         Ok(BrokerHandle {
@@ -4576,6 +4724,79 @@ impl Broker {
                 shown: dial.to_string(),
             },
         })
+    }
+}
+
+/// How [`Broker::serve_tcp_with`] makes each accepted [`TcpStream`] the [`Conn`] it
+/// serves: as it is (plaintext), or through one of the sealed handshakes. It runs on
+/// the connection's own thread, under the pre-authentication bounds.
+enum TcpWrap {
+    /// [`Broker::serve_tcp`]: the raw stream IS the connection stream.
+    Plain,
+    /// [`Broker::serve_tcp_sealed`]: the sealed handshake under the pre-shared key.
+    #[cfg(feature = "aead")]
+    Sealed([u8; astream_aead::KEY_LEN]),
+    /// [`Broker::serve_tcp_handshake`]: the forward-secret key agreement,
+    /// authenticated by the pre-shared key.
+    #[cfg(feature = "handshake")]
+    Handshake([u8; astream_aead::KEY_LEN]),
+    /// [`Broker::serve_tcp_identity`]: the mutual signed-DH handshake, against the
+    /// authorized client keys. The keypair is boxed: it is most of the enum's size, and
+    /// one listener holds one.
+    #[cfg(feature = "identity")]
+    Identity {
+        identity: Box<astream_aead::IdentityKeypair>,
+        authorized_clients: Vec<[u8; astream_aead::ID_PUB_LEN]>,
+    },
+}
+
+impl TcpWrap {
+    /// The connection `s` becomes, and the client identity it proved (the identity
+    /// handshake's; `None` otherwise). `shared` is read for the revocation list.
+    #[cfg_attr(not(feature = "identity"), allow(unused_variables))]
+    fn wrap(&self, shared: &Shared, s: TcpStream) -> io::Result<(Conn, Option<[u8; 32]>)> {
+        match self {
+            TcpWrap::Plain => Ok((Conn::Tcp(s), None)),
+            #[cfg(feature = "aead")]
+            TcpWrap::Sealed(key) => {
+                let sealed = astream_aead::SealedStream::handshake_server(s, *key)?;
+                Ok((Conn::Sealed(sealed), None))
+            }
+            #[cfg(feature = "handshake")]
+            TcpWrap::Handshake(psk) => {
+                // Bound the handshake I/O: a peer that connects then stalls (sends
+                // nothing, or a partial message) must not park this thread + fd
+                // forever — nothing gates the pre-handshake read, so an unauthenticated
+                // slowloris would otherwise exhaust threads unbounded. Reset to blocking
+                // once the handshake completes; the request loop and tail_loop then set
+                // their own timeouts.
+                s.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+                s.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
+                let sealed = astream_aead::server_handshake(s, psk)?;
+                sealed.get_ref().set_read_timeout(None)?;
+                sealed.get_ref().set_write_timeout(None)?;
+                Ok((Conn::Sealed(sealed), None))
+            }
+            #[cfg(feature = "identity")]
+            TcpWrap::Identity {
+                identity,
+                authorized_clients,
+            } => {
+                s.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+                s.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
+                let (sealed, client_id) =
+                    astream_aead::server_identity_handshake(s, identity, authorized_clients)?;
+                if is_peer_revoked(shared, Some(client_id)) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "unauthorized: peer identity key has been revoked",
+                    ));
+                }
+                sealed.get_ref().set_read_timeout(None)?;
+                sealed.get_ref().set_write_timeout(None)?;
+                Ok((Conn::Sealed(sealed), Some(client_id)))
+            }
+        }
     }
 }
 
@@ -4876,36 +5097,6 @@ fn stop_writer(shared: &Shared) {
     stop_log(shared);
 }
 
-/// The broker's per-connection [`Stream`] behaviours for the sealed transport:
-/// timeouts and shutdown act on the underlying socket (they never touch the
-/// record bytes), and `try_clone` shares the AEAD record counters so the
-/// read half and the ack-writer half stay one ordered record sequence.
-#[cfg(feature = "aead")]
-impl ConnShutdown for astream_aead::SealedStream<TcpStream> {
-    fn shutdown_both(&self) {
-        let _ = self.get_ref().shutdown(Shutdown::Both);
-    }
-    fn shutdown_write(&self) {
-        let _ = self.get_ref().shutdown(Shutdown::Write);
-    }
-}
-
-#[cfg(feature = "aead")]
-impl Stream for astream_aead::SealedStream<TcpStream> {
-    fn set_read_timeout(&self, d: Option<Duration>) -> io::Result<()> {
-        self.get_ref().set_read_timeout(d)
-    }
-    fn set_write_timeout(&self, d: Option<Duration>) -> io::Result<()> {
-        self.get_ref().set_write_timeout(d)
-    }
-    fn set_nonblocking(&self, on: bool) -> io::Result<()> {
-        self.get_ref().set_nonblocking(on)
-    }
-    fn try_clone(&self) -> io::Result<Self> {
-        astream_aead::SealedStream::try_clone(self)
-    }
-}
-
 /// Owns a running listener acceptor; [`shutdown`](BrokerHandle::shutdown) stops this
 /// listener and (for a Unix socket) unlinks it. When the LAST active `BrokerHandle`
 /// on a [`Broker`] shuts down, it also stops the shared writer thread, closes all live
@@ -5135,13 +5326,13 @@ enum Wire {
 /// cfg(unix): its one caller is the Unix-socket acceptor; a TCP connection, the only
 /// kind Windows has, goes straight to `handle_conn_with_peer`.
 #[cfg(unix)]
-fn handle_conn<S: Stream>(shared: &Arc<Shared>, stream: S, wire: Wire) -> io::Result<()> {
+fn handle_conn(shared: &Arc<Shared>, stream: Conn, wire: Wire) -> io::Result<()> {
     handle_conn_with_peer(shared, stream, wire, None)
 }
 
-fn handle_conn_with_peer<S: Stream>(
+fn handle_conn_with_peer(
     shared: &Arc<Shared>,
-    stream: S,
+    stream: Conn,
     wire: Wire,
     peer_id: Option<[u8; 32]>,
 ) -> io::Result<()> {
@@ -5297,7 +5488,7 @@ fn drop_will_for_conn(shared: &Arc<Shared>, conn_id: u64) {
 /// EOF) and stays open for up to [`REFUSAL_LINGER`], reading and discarding input
 /// until the client closes; at most [`MAX_LINGERING_REFUSALS`] do so at once, and past
 /// that a refusal closes immediately.
-fn linger_refused<S: Stream>(shared: &Shared, stream: &mut S) {
+fn linger_refused(shared: &Shared, stream: &mut Conn) {
     if shared.refusing.fetch_add(1, Ordering::AcqRel) >= MAX_LINGERING_REFUSALS {
         shared.refusing.fetch_sub(1, Ordering::AcqRel);
         return;
@@ -5325,28 +5516,42 @@ fn linger_refused<S: Stream>(shared: &Shared, stream: &mut S) {
 /// A connection's stream read against an absolute `deadline`: each read is bounded by
 /// the time left, so a peer that sends frame after frame, or one frame a byte at a
 /// time, cannot stretch the wait past it (a plain socket timeout re-arms on every
-/// read). Used for the pre-authentication phase ([`FIRST_FRAME_TIMEOUT`]).
-struct Deadlined<'a, S: Stream> {
-    stream: &'a mut S,
+/// read). Used for the pre-authentication phase ([`FIRST_FRAME_TIMEOUT`]), and by a
+/// leader attaching its capability to a guarded follower.
+struct Deadlined<'a> {
+    stream: DeadlineOn<'a>,
     deadline: Instant,
 }
 
-impl<S: Stream> Read for Deadlined<'_, S> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let left = self.deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "pre-authentication deadline passed",
-            ));
+/// The stream a [`Deadlined`] bounds: a served connection, or the TCP link a leader
+/// dialed to a follower.
+enum DeadlineOn<'a> {
+    Conn(&'a mut Conn),
+    #[cfg(feature = "cap")]
+    Follower(&'a mut TcpStream),
+}
+
+impl DeadlineOn<'_> {
+    fn set_read_timeout(&self, d: Option<Duration>) -> io::Result<()> {
+        match self {
+            DeadlineOn::Conn(s) => s.set_read_timeout(d),
+            #[cfg(feature = "cap")]
+            DeadlineOn::Follower(s) => s.set_read_timeout(d),
         }
-        self.stream.set_read_timeout(Some(left))?;
-        self.stream.read(buf)
+    }
+
+    fn set_write_timeout(&self, d: Option<Duration>) -> io::Result<()> {
+        match self {
+            DeadlineOn::Conn(s) => s.set_write_timeout(d),
+            #[cfg(feature = "cap")]
+            DeadlineOn::Follower(s) => s.set_write_timeout(d),
+        }
     }
 }
 
-impl<S: Stream> Write for Deadlined<'_, S> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+impl Deadlined<'_> {
+    /// The time left before the deadline, refused once none is.
+    fn left(&self) -> io::Result<Duration> {
         let left = self.deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return Err(io::Error::new(
@@ -5354,26 +5559,51 @@ impl<S: Stream> Write for Deadlined<'_, S> {
                 "pre-authentication deadline passed",
             ));
         }
-        self.stream.set_write_timeout(Some(left))?;
-        self.stream.write(buf)
+        Ok(left)
+    }
+
+    /// Bound the next write by the time left.
+    fn arm_write(&mut self) -> io::Result<()> {
+        let left = self.left()?;
+        self.stream.set_write_timeout(Some(left))
+    }
+}
+
+impl Read for Deadlined<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let left = self.left()?;
+        self.stream.set_read_timeout(Some(left))?;
+        match &mut self.stream {
+            DeadlineOn::Conn(s) => s.read(buf),
+            #[cfg(feature = "cap")]
+            DeadlineOn::Follower(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for Deadlined<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.arm_write()?;
+        match &mut self.stream {
+            DeadlineOn::Conn(s) => s.write(buf),
+            #[cfg(feature = "cap")]
+            DeadlineOn::Follower(s) => s.write(buf),
+        }
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        let left = self.deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "pre-authentication deadline passed",
-            ));
+        self.arm_write()?;
+        match &mut self.stream {
+            DeadlineOn::Conn(s) => s.flush(),
+            #[cfg(feature = "cap")]
+            DeadlineOn::Follower(s) => s.flush(),
         }
-        self.stream.set_write_timeout(Some(left))?;
-        self.stream.flush()
     }
 }
 
-fn serve_conn<S: Stream>(
+fn serve_conn(
     shared: &Arc<Shared>,
-    mut stream: S,
+    mut stream: Conn,
     wire: Wire,
     conn_id: u64,
     will: &mut Vec<(WillRecord, u64)>,
@@ -5410,7 +5640,7 @@ fn serve_conn<S: Stream>(
         // No shutdown handle would mean no cap accounting and no force-close — under
         // fd exhaustion (exactly what the cap exists for) `try_clone` is what fails
         // first. Refuse rather than serve a connection the broker cannot bound or reap.
-        let handle = match stream.try_clone() {
+        let handle = match stream.sock() {
             Ok(handle) => handle,
             Err(e) => {
                 drop(conns);
@@ -5421,7 +5651,7 @@ fn serve_conn<S: Stream>(
                 return Err(e);
             }
         };
-        conns.insert(conn_id, Box::new(handle));
+        conns.insert(conn_id, handle);
     }
     let _conn_guard = ConnGuard {
         shared,
@@ -5474,15 +5704,16 @@ fn serve_conn<S: Stream>(
     // handed one out. Kept on the DEFAULT build too, because `Hello` is answered by an
     // unguarded broker as well — one client works against either.
     let mut nonce: Option<[u8; 32]> = None;
-    // Legacy clients never ask: their recv skips marks, which would reset the
-    // socket timeout an old take/drain uses to stop on idle.
-    let mut idle_marks = false;
+    // What the connection asked of its tail. Legacy clients never ask: their recv skips
+    // marks, which would reset the socket timeout an old take/drain uses to stop on idle,
+    // and they would read a gap notice as a reply of the wrong kind.
+    let mut asks = TailAsks::default();
     loop {
         // Guarded, the deadline is ABSOLUTE; unguarded, the socket timeout set above
         // bounds each read of the first frame.
         let read = match preauth_deadline {
             Some(deadline) if preauth && guarded => read_frame(&mut Deadlined {
-                stream: &mut stream,
+                stream: DeadlineOn::Conn(&mut stream),
                 deadline,
             }),
             _ => read_frame(&mut stream),
@@ -5698,7 +5929,7 @@ fn serve_conn<S: Stream>(
             &mut pipe,
             will,
             had_will,
-            &mut idle_marks,
+            &mut asks,
             until,
             peer_id,
             #[cfg(feature = "cap")]
@@ -5745,15 +5976,15 @@ fn prune_capability_keyring(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn dispatch_request<S: Stream>(
+fn dispatch_request(
     shared: &Arc<Shared>,
-    stream: &mut S,
+    stream: &mut Conn,
     wire: Wire,
     conn_id: u64,
     pipe: &mut Option<Pipeline>,
     will: &mut Vec<(WillRecord, u64)>,
     had_will: &mut bool,
-    idle_marks: &mut bool,
+    asks: &mut TailAsks,
     until: u64,
     peer_id: Option<[u8; 32]>,
     #[cfg(feature = "cap")] keyring: &mut Vec<astream_cap::Capability>,
@@ -5857,7 +6088,7 @@ fn dispatch_request<S: Stream>(
                 from_offset,
                 filt,
                 until,
-                *idle_marks,
+                *asks,
                 peer_id,
                 cap_check,
             )?;
@@ -5928,14 +6159,7 @@ fn dispatch_request<S: Stream>(
             #[cfg(not(feature = "cap"))]
             let cap_check = StreamCapCheck::new(shared);
             tail_loop(
-                shared,
-                stream,
-                start.0,
-                filt,
-                until,
-                *idle_marks,
-                peer_id,
-                cap_check,
+                shared, stream, start.0, filt, until, *asks, peer_id, cap_check,
             )?;
             Ok(false)
         }
@@ -5982,7 +6206,13 @@ fn dispatch_request<S: Stream>(
         }
         Request::IdleMarks => {
             finish_pipe(pipe)?;
-            *idle_marks = true;
+            asks.idle_marks = true;
+            write_frame(stream, &encode_response(&mark_at_head(shared)))?;
+            Ok(true)
+        }
+        Request::GapNotices => {
+            finish_pipe(pipe)?;
+            asks.gaps = true;
             write_frame(stream, &encode_response(&mark_at_head(shared)))?;
             Ok(true)
         }
@@ -6029,9 +6259,9 @@ fn dispatch_request<S: Stream>(
     }
 }
 
-fn serve_retire<S: Stream>(
+fn serve_retire(
     shared: &Arc<Shared>,
-    stream: &mut S,
+    stream: &mut Conn,
     pipe: &mut Option<Pipeline>,
     producer_id: u64,
     subject: String,
@@ -6062,9 +6292,9 @@ fn serve_retire<S: Stream>(
     )
 }
 
-fn serve_publish<S: Stream>(
+fn serve_publish(
     shared: &Arc<Shared>,
-    stream: &mut S,
+    stream: &mut Conn,
     pipe: &mut Option<Pipeline>,
     producer_id: u64,
     producer_seq: u64,
@@ -6141,9 +6371,9 @@ fn serve_publish<S: Stream>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn serve_replicate<S: Stream>(
+fn serve_replicate(
     shared: &Arc<Shared>,
-    stream: &mut S,
+    stream: &mut Conn,
     pipe: &mut Option<Pipeline>,
     seq: u64,
     producer_id: u64,
@@ -6204,9 +6434,9 @@ fn serve_replicate<S: Stream>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn serve_fork_subscribe<S: Stream>(
+fn serve_fork_subscribe(
     shared: &Arc<Shared>,
-    stream: &mut S,
+    stream: &mut Conn,
     fork_at: u64,
     replacement_subject: String,
     replacement_body: Vec<u8>,
@@ -6267,7 +6497,9 @@ fn serve_fork_subscribe<S: Stream>(
                     v
                 }
             };
-            (next_chunk(&log, &mut cursor, visible), visible)
+            // A snapshot, never told of gaps: it asks for none.
+            let (_, chunk) = next_chunk(&log, &mut cursor, visible, &filt, None, TAIL_CHUNK);
+            (chunk, visible)
         };
         if chunk.is_empty() {
             break visible;
@@ -6307,9 +6539,9 @@ fn serve_fork_subscribe<S: Stream>(
     Ok(())
 }
 
-fn serve_last<S: Stream>(
+fn serve_last(
     shared: &Arc<Shared>,
-    stream: &mut S,
+    stream: &mut Conn,
     pipe: &mut Option<Pipeline>,
     filter: String,
     after: String,
@@ -6350,9 +6582,9 @@ fn serve_last<S: Stream>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn serve_will<S: Stream>(
+fn serve_will(
     shared: &Arc<Shared>,
-    stream: &mut S,
+    stream: &mut Conn,
     conn_id: u64,
     pipe: &mut Option<Pipeline>,
     will: &mut Vec<(WillRecord, u64)>,
@@ -6413,9 +6645,9 @@ fn serve_will<S: Stream>(
     write_frame(stream, &encode_response(&mark_at_head(shared)))
 }
 
-fn serve_fetch<S: Stream>(
+fn serve_fetch(
     shared: &Arc<Shared>,
-    stream: &mut S,
+    stream: &mut Conn,
     pipe: &mut Option<Pipeline>,
     from_offset: u64,
     filter: String,
@@ -6860,7 +7092,7 @@ fn cap_authorized_until(
         // These grant nothing, but their `Mark` names the log's head, which an
         // unattached connection is told nothing about: any capability the ring still
         // holds — genuine and unexpired — answers for it.
-        Request::Keepalive | Request::IdleMarks => (CapPred::AnyValid, None),
+        Request::Keepalive | Request::IdleMarks | Request::GapNotices => (CapPred::AnyValid, None),
         // A producer's budget is answered to whoever could spend it: a genuine,
         // unexpired read-write grant that publishes as that producer — bound to it,
         // or unbound (the god grant publishes as any). It names no subject, so no
@@ -6961,9 +7193,11 @@ fn oversized_name(req: &Request) -> Option<String> {
             },
         ],
         Request::Last { filter, after, .. } => [("filter", filter), ("cursor", after)],
-        Request::Hello | Request::Keepalive | Request::IdleMarks | Request::Budget { .. } => {
-            [NONE, NONE]
-        }
+        Request::Hello
+        | Request::Keepalive
+        | Request::IdleMarks
+        | Request::GapNotices
+        | Request::Budget { .. } => [NONE, NONE],
     };
     for (what, name) in names {
         if name.len() > MAX_NAME_LEN {
@@ -6994,7 +7228,7 @@ impl Pipeline {
     /// description: whatever the ack-writer sets here it also sets for the connection
     /// thread's own writes, for the rest of the connection's life, so anything but the
     /// configured [`Broker::set_write_timeout`] value would silently replace it.
-    fn start<S: Stream>(stream: &S, write_timeout: Duration) -> io::Result<Pipeline> {
+    fn start(stream: &Conn, write_timeout: Duration) -> io::Result<Pipeline> {
         let wr = stream.try_clone()?;
         let (tx, rx) = mpsc::sync_channel::<Receiver<AckResult>>(PIPELINE_DEPTH);
         // A failed spawn is this connection's error, not a panic that would unwind
@@ -7052,11 +7286,7 @@ impl Pipeline {
 
 /// Emit a pre-resolved response in order: through the active pipeline, or inline if no
 /// write op has started one yet. Returns false when the ack path is gone (close).
-fn emit<S: Stream>(
-    stream: &mut S,
-    pipe: &mut Option<Pipeline>,
-    res: AckResult,
-) -> io::Result<bool> {
+fn emit(stream: &mut Conn, pipe: &mut Option<Pipeline>, res: AckResult) -> io::Result<bool> {
     match pipe {
         Some(p) => Ok(p.push_result(res)),
         None => {
@@ -7068,9 +7298,9 @@ fn emit<S: Stream>(
 
 /// Submit a write op, lazily starting the connection's pipeline. Returns false when the
 /// ack path is gone (close).
-fn emit_op<S: Stream>(
+fn emit_op(
     shared: &Arc<Shared>,
-    stream: &mut S,
+    stream: &mut Conn,
     pipe: &mut Option<Pipeline>,
     kind: WriteKind,
 ) -> io::Result<bool> {
@@ -7099,8 +7329,8 @@ fn finish_pipe(pipe: &mut Option<Pipeline>) -> io::Result<()> {
 /// for the lot instead of one each. What is gathered is written before this thread
 /// blocks on anything, so no ack ever waits on a later one. A socket error tears the
 /// connection down; an ack the global writer dropped (shutdown) ends the loop.
-fn ack_writer_loop<S: Stream>(
-    mut wr: S,
+fn ack_writer_loop(
+    mut wr: Conn,
     rx: Receiver<Receiver<AckResult>>,
     write_timeout: Duration,
 ) -> io::Result<()> {
@@ -7146,7 +7376,7 @@ fn ack_response(ack: AckResult) -> Response {
 }
 
 /// Turn a writer ack into the wire response.
-fn write_ack<S: Stream>(stream: &mut S, ack: AckResult) -> io::Result<()> {
+fn write_ack(stream: &mut Conn, ack: AckResult) -> io::Result<()> {
     write_frame(stream, &encode_response(&ack_response(ack)))
 }
 
@@ -7342,13 +7572,9 @@ fn batch_settled<'a>(shared: &'a Shared, waited: &mut bool) -> std::sync::MutexG
     }
 }
 
-/// Publish the log's base and read floor where the lock-free readers find them, under the
-/// log lock, which a parked tail's predicate reads them under.
+/// Publish the log's base where the lock-free readers find it, under the log lock.
 fn publish_floor(shared: &Shared, log: &BrokerLog) {
     shared.base.store(log.base().0, Ordering::Release);
-    shared
-        .read_floor
-        .store(log.read_floor().0, Ordering::Release);
 }
 
 /// [`publish_floor`], and whether the log is due a retention tick: after the rules are set
@@ -8550,16 +8776,33 @@ fn last_page(
     ))
 }
 
-/// Up to [`TAIL_CHUNK`] records from `*cursor` up to (not including) `head`, read
-/// under the log lock the caller holds.
+/// Up to `max` records from `*cursor` up to (not including) `head`, read under the log
+/// lock the caller holds, and first, for a tail that asked (`told`), the gap notice it is
+/// owed before them ([`BrokerLog::gap_notice`]; R4's addendum, A9).
 ///
-/// Records below the retention base are gone for good, so the cursor first moves up to
-/// it. What is read is unchanged by that (`read_range` clamps there anyway), but the
-/// tail parks on `head <= cursor`, and a cursor left below a base with nothing visible
-/// above it would never park — it would spin on the lock.
-fn next_chunk(log: &BrokerLog, cursor: &mut u64, head: u64) -> Vec<Arc<BrokerRecord>> {
-    *cursor = (*cursor).max(log.read_floor().0);
-    log.read_chunk(cursor, head, TAIL_CHUNK)
+/// The cursor is not clamped: below the base, [`BrokerLog::read_chunk`] reads the held
+/// records from where it is, and moves it up to the base once none is left below, so a
+/// tail whose filter holds nothing there still reaches the base and parks. What it can no
+/// longer be delivered is what the notice tells.
+fn next_chunk(
+    log: &BrokerLog,
+    cursor: &mut u64,
+    head: u64,
+    filter: &Filter,
+    told: Option<&mut Told>,
+    max: usize,
+) -> (Option<crate::proto::Gap>, Vec<Arc<BrokerRecord>>) {
+    let gap = match told {
+        Some(t) => log.gap_notice(filter, *cursor, t),
+        None => None,
+    };
+    (gap, log.read_chunk(cursor, head, max))
+}
+
+/// Tell a tail what retention gave up below it ([`Response::Gap`]), at once: ahead of
+/// every record it is delivered after it.
+fn write_gap<S: Write>(stream: &mut S, gap: crate::proto::Gap) -> io::Result<()> {
+    write_frame(stream, &encode_response(&Response::Gap(gap)))
 }
 
 /// Stream every visible record matching `filter` from `cursor`, then tail live, until
@@ -8568,16 +8811,34 @@ fn next_chunk(log: &BrokerLog, cursor: &mut u64, head: u64) -> Vec<Arc<BrokerRec
 /// lapses at `until` (unix ms; `u64::MAX`: never), which ends the stream with an
 /// `unauthorized` error.
 #[allow(clippy::too_many_arguments)]
-fn tail_loop<S: Stream>(
+fn tail_loop(
     shared: &Arc<Shared>,
-    stream: &mut S,
+    stream: &mut Conn,
     mut cursor: u64,
     filter: Filter,
     mut until: u64,
-    idle_marks: bool,
+    asks: TailAsks,
     peer_id: Option<[u8; 32]>,
     mut cap_check: StreamCapCheck,
 ) -> io::Result<()> {
+    let idle_marks = asks.idle_marks;
+    // GAP NOTICES (R4's addendum, A9): for a tail that asked, what it has been told of
+    // the records retention gave up below it. One that did not ask is told nothing.
+    let mut told = if asks.gaps {
+        Some(Told::at(cursor))
+    } else {
+        None
+    };
+    #[cfg(test)]
+    let mut pause = shared
+        .tail_pause
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    #[cfg(test)]
+    let chunk = pause.as_ref().map_or(TAIL_CHUNK, |p| p.chunk);
+    #[cfg(not(test))]
+    let chunk = TAIL_CHUNK;
     // A short read timeout bounds the liveness probe should the socket refuse to go
     // non-blocking for it (see `peer_gone`); a generous write timeout means a wedged
     // delivery to a stuck consumer errors out (and resumes from its cursor) rather than
@@ -8605,12 +8866,12 @@ fn tail_loop<S: Stream>(
     // of the records it was shown survive a power loss (a notifier pages only those).
     let mut marked_durable: u64 = 0;
     loop {
-        // Fast path when caught up: clamp `cursor` up to the read floor (the base, or the
-        // oldest record the retention rules hold below it) atomically and, if
-        // `visible <= cursor`, skip locking `shared.log` for an empty `next_chunk`
-        // call and go straight to the Condvar park below (cutting caught-up lock
-        // acquisitions in half).
-        cursor = cursor.max(shared.read_floor.load(Ordering::Acquire));
+        // Fast path when caught up: if `visible <= cursor`, skip locking `shared.log` for
+        // an empty `next_chunk` call and go straight to the Condvar park below (cutting
+        // caught-up lock acquisitions in half). A cursor below the base is never caught
+        // up (the visible head is at or above the base), so it takes the lock, where it
+        // reads the held records from where it is and is told what it lost.
+        let mut gap = None;
         let mut batch = if shared.head.load(Ordering::Acquire) <= cursor {
             Vec::new()
         } else {
@@ -8619,8 +8880,19 @@ fn tail_loop<S: Stream>(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let visible = shared.head.load(Ordering::Relaxed);
-            next_chunk(&log, &mut cursor, visible)
+            let (g, b) = next_chunk(&log, &mut cursor, visible, &filter, told.as_mut(), chunk);
+            gap = g;
+            b
         };
+        // Told before anything after it: written at once, with nothing gathered ahead of
+        // it (`out` is flushed at the end of every pass).
+        if let Some(g) = gap.take() {
+            if let Some(failure) = stream_failure(shared, peer_id, &mut cap_check, &mut until) {
+                return end_stream_failure(stream, &mut out, failure);
+            }
+            write_gap(stream, g)?;
+            wrote_at = Instant::now();
+        }
         if batch.is_empty() {
             if let Some(failure) = stream_failure(shared, peer_id, &mut cap_check, &mut until) {
                 return end_stream_failure(stream, &mut out, failure);
@@ -8638,6 +8910,8 @@ fn tail_loop<S: Stream>(
                 said_caught_up = true;
                 wrote_at = Instant::now();
             }
+            #[cfg(test)]
+            tail_pause_at(&mut pause, PauseAt::Park, cursor);
             // Park until a new commit (head > cursor) or shutdown — releasing the
             // lock — but wake every liveness poll to check whether the peer vanished,
             // and at the latest when this stream's authority lapses.
@@ -8662,11 +8936,10 @@ fn tail_loop<S: Stream>(
                 let seen_epoch = cap_check.seen_epoch;
                 let (guard, _timed_out) = shared
                     .tail
-                    .wait_timeout_while(guard, park, |log| {
+                    .wait_timeout_while(guard, park, |_| {
                         if parked {
                             resumes = resumes.saturating_add(1);
                         }
-                        cursor = cursor.max(log.read_floor().0);
                         let sighup_pending = shared.has_revocation_file.load(Ordering::Relaxed)
                             && astream_sys::sighup_generation()
                                 != shared.sighup_seen.load(Ordering::Relaxed);
@@ -8715,8 +8988,18 @@ fn tail_loop<S: Stream>(
                     && !is_peer_revoked_raw(shared, peer_id)
                     && lapsed(until).is_none()
                 {
-                    batch = next_chunk(&guard, &mut cursor, visible);
+                    let (g, b) =
+                        next_chunk(&guard, &mut cursor, visible, &filter, told.as_mut(), chunk);
+                    gap = g;
+                    batch = b;
                 }
+            }
+            if let Some(g) = gap.take() {
+                if let Some(failure) = stream_failure(shared, peer_id, &mut cap_check, &mut until) {
+                    return end_stream_failure(stream, &mut out, failure);
+                }
+                write_gap(stream, g)?;
+                wrote_at = Instant::now();
             }
             if batch.is_empty() {
                 let head = shared.head.load(Ordering::Relaxed);
@@ -8765,6 +9048,8 @@ fn tail_loop<S: Stream>(
             }
         }
         flush_egress(stream, &mut out)?;
+        #[cfg(test)]
+        tail_pause_at(&mut pause, PauseAt::FirstChunk, cursor);
         // A subscriber whose filter matches nothing still drains the log without ever
         // writing, so the park branch (which probes for a vanished peer, and marks an
         // idle stream) is never reached under continuous traffic. Mark and probe here
@@ -8910,7 +9195,7 @@ fn flush_egress<S: Write>(stream: &mut S, out: &mut Vec<u8>) -> io::Result<()> {
 }
 
 /// [`peer_gone`], counted in [`BrokerStats::peer_probes`].
-fn probe_peer<S: Stream>(shared: &Shared, stream: &mut S) -> bool {
+fn probe_peer(shared: &Shared, stream: &mut Conn) -> bool {
     shared.peer_probes.fetch_add(1, Ordering::Relaxed);
     peer_gone(stream)
 }
@@ -8940,7 +9225,7 @@ fn probe_peer<S: Stream>(shared: &Shared, stream: &mut S) -> bool {
 /// restored the peer is reported gone: a delivery write in non-blocking mode would
 /// fail on the first full socket buffer, mid-frame, and ending the subscription here —
 /// the client resumes from its cursor — is the honest form of that failure.
-fn peer_gone<S: Stream>(stream: &mut S) -> bool {
+fn peer_gone(stream: &mut Conn) -> bool {
     let mut probe = [0u8; 1];
     let switched = stream.set_nonblocking(true).is_ok();
     let gone = match stream.read(&mut probe) {
@@ -9803,7 +10088,8 @@ mod tests {
     #[test]
     fn the_peer_probe_neither_blocks_nor_leaves_the_stream_non_blocking() {
         const LEN: usize = 1 << 20;
-        let (mut a, mut b) = UnixStream::pair().unwrap();
+        let (a, mut b) = UnixStream::pair().unwrap();
+        let mut a = Conn::Unix(a);
         b.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
         let (probed, rx) = mpsc::channel();
         let writer = thread::spawn(move || {
@@ -9822,9 +10108,12 @@ mod tests {
         let wrote = within_a_minute("the 1 MiB write", move || writer.join().unwrap());
         assert_eq!(wrote, Ok(()), "the write after the probe failed");
 
-        let (mut c, d) = UnixStream::pair().unwrap();
+        let (c, d) = UnixStream::pair().unwrap();
         drop(d);
-        assert!(peer_gone(&mut c), "a closed peer read as connected");
+        assert!(
+            peer_gone(&mut Conn::Unix(c)),
+            "a closed peer read as connected"
+        );
     }
 
     /// THE LOG LOCK IS HELD WHILE STAGING AND FREE FOR THE WRITE, read straight off the
@@ -10235,6 +10524,7 @@ mod tests {
                     crate::Event::Mark { durable, .. } => {
                         marked = durable.is_some_and(|d| d > off);
                     }
+                    crate::Event::Gap(g) => panic!("nothing is retained here, yet told {g:?}"),
                 }
             }
         }

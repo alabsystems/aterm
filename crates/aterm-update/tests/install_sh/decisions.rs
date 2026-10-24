@@ -3,7 +3,7 @@
 
 //! The installer's pure decisions: the manifest's identity fields, the official channel's signing-team pin, the app half's idempotence and its signature gate, the container election, which repository a checkout installs from, and the Linux candidate's identity line.
 
-use crate::support::{Lib, Scratch, bash, install_sh, q, root, s};
+use crate::support::{Lib, Scratch, group_run, install_sh, q, root, s};
 
 /// A required identity field occurs exactly once as a one-line string; an optional one at most once.
 #[test]
@@ -153,7 +153,9 @@ fn the_installed_bundle_gate_verifies_like_a_fresh_install() {
 /// may find CMD already gone (it ended just before the Ctrl-C), and kill's 1
 /// then ended the trap under set -e, a status 1 read as a definite answer. The
 /// callers' temporary files go with the run: first_line_bounded's, and those of
-/// a caller around it.
+/// a caller around it. The script resets the run's INT trap, as the subshells
+/// and command substitutions bounded mostly runs in do, so bounded's own traps
+/// are what end it.
 #[test]
 fn a_ctrl_c_while_bounded_waits_ends_the_run() {
     let scratch = Scratch::new();
@@ -163,7 +165,8 @@ fn a_ctrl_c_while_bounded_waits_ends_the_run() {
         "cat >\"$TMPDIR/ctrl-c.bash\" <<'EOF'
 ATERM_INSTALL_LIBRARY_ONLY=1
 . \"$INSTALL_SH\"
-G=$$ row=$1 go=\"$TMPDIR/go-$1\"
+trap - INT
+G=$PPID row=$1 go=\"$TMPDIR/go-$1\"
 trap 'echo cleaned >\"$TMPDIR/cleaned-$row\"' EXIT
 mkfifo \"$go\"
 # bounded sleeps only once its traps are set. Its first sleep opens go to
@@ -173,7 +176,9 @@ sleep() {
 \t[[ -e \"$go.read\" ]] || { : >\"$go.read\"; read -r _ <\"$go\" || :; }
 \t/bin/sleep \"$@\"
 }
-ctrl_c() { exec 9>\"$go\"; kill -INT -- \"-$G\"; exec 9>&- /bin/sleep 30; }
+# The close is an exec of its own: bash 3.2 saves the fd an `exec 9>&- cmd`
+# closes to fd 10 and leaves it open in cmd, so the reader waited out the sleep.
+ctrl_c() { exec 9>\"$go\"; kill -INT -- \"-$G\"; exec 9>&-; exec /bin/sleep 30; }
 codesign() { ctrl_c; }
 around() {
 \tlocal t
@@ -197,9 +202,8 @@ EOF",
         .map(|tag| {
             lib.call(
                 format!(
-                    "/usr/bin/perl -e '$SIG{{INT}} = \"DEFAULT\"; setpgrp(0, 0); exec @ARGV or die' {bash} \"$TMPDIR/ctrl-c.bash\" {tag}; \
-                     echo \"ended $? $(cat \"$TMPDIR/cleaned-{tag}\" 2>/dev/null), $(ls \"$TMPDIR\" | grep -c '^aterm-probe') left\"",
-                    bash = q(s(&bash())),
+                    "echo \"$({}) $(cat \"$TMPDIR/cleaned-{tag}\" 2>/dev/null), $(ls \"$TMPDIR\" | grep -c '^aterm-probe') left\"",
+                    group_run(&format!("\"$TMPDIR/ctrl-c.bash\" {tag}"))
                 ),
                 &[],
             )
@@ -208,7 +212,55 @@ EOF",
     let recs = lib.run(&scratch);
     for (tag, call) in tags.iter().zip(calls) {
         assert_eq!(
-            recs[call].out, "ended 130 cleaned, 0 left",
+            recs[call].out, "signal 2 cleaned, 0 left",
+            "{tag}: {}",
+            recs[call].err
+        );
+    }
+}
+
+/// A Ctrl-C ends the run by it when the child it lands in catches it and exits,
+/// as python3 does while it starts up. Before, bash went on
+/// (wait-and-cooperative-exit): the tools probe read the exit as no Python 3.11,
+/// and a Linux run skipped its app and seeded the toolset, and the binary's
+/// verify exited 1 with Python's error.
+#[test]
+fn a_ctrl_c_a_child_catches_ends_the_run() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    lib.env("INSTALL_SH", s(&install_sh()));
+    lib.step(
+        "mkdir -p \"$TMPDIR/bin\" && printf '#!/bin/sh\\nexit 0\\n' >\"$TMPDIR/bin/openssl\" && \
+         printf '#!/bin/sh\\ntrap \"exit 1\" INT\\nkill -s INT 0\\nexit 1\\n' >\"$TMPDIR/bin/python3\" && \
+         chmod +x \"$TMPDIR/bin/openssl\" \"$TMPDIR/bin/python3\" && cat >\"$TMPDIR/caught.bash\" <<'EOF'
+ATERM_INSTALL_LIBRARY_ONLY=1
+. \"$INSTALL_SH\"
+unset ATERM_INSTALL_VERIFIER
+PATH=\"$TMPDIR/bin:$PATH\" LINUX_VERIFIER_SHA256_AARCH64=\"\" LINUX_VERIFIER=\"\" LINUX_ARCH=aarch64 row=$1
+trap 'echo cleaned >\"$TMPDIR/cleaned-$row\"' EXIT
+case \"$1\" in
+probe) linux_verifier_ready aarch64 || echo \"went on: $LINUX_VERIFIER_WHY\" ;;
+verify) linux_release_verify \"$TMPDIR\" v1.2.0 example/aterm aarch64 \"$TMPDIR/store\" || echo \"went on ($?)\" ;;
+esac
+EOF",
+    );
+    let tags = ["probe", "verify"];
+    let calls: Vec<usize> = tags
+        .iter()
+        .map(|tag| {
+            lib.call(
+                format!(
+                    "echo \"$({}) $(cat \"$TMPDIR/cleaned-{tag}\" 2>/dev/null)\"",
+                    group_run(&format!("\"$TMPDIR/caught.bash\" {tag}"))
+                ),
+                &[],
+            )
+        })
+        .collect();
+    let recs = lib.run(&scratch);
+    for (tag, call) in tags.iter().zip(calls) {
+        assert_eq!(
+            recs[call].out, "signal 2 cleaned",
             "{tag}: {}",
             recs[call].err
         );

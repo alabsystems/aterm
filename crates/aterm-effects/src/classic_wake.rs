@@ -409,8 +409,9 @@ impl ClassicWake {
         );
         if !self.path_scratch.is_empty() {
             let n = self.path_scratch.len() as f32;
+            let (rows_i32, cols_i32) = (geom.rows as i32, geom.cols as i32);
             for (i, &(r, c)) in self.path_scratch.iter().enumerate() {
-                if r < 0 || c < 0 || r as usize >= geom.rows || c as usize >= geom.cols {
+                if r < 0 || c < 0 || r >= rows_i32 || c >= cols_i32 {
                     continue;
                 }
                 let pos = (i as f32 + 1.0) / n;
@@ -555,13 +556,13 @@ impl ClassicWake {
         }
         let chf = geom.ch as f32;
         let core_thick = (chf * 0.13).max(2.0);
+        let s = core_thick as i32;
         let straighten = (geom.cw as f32).max(chf) * 0.8;
         let clip = geom.beam_clip();
 
         for r in &self.comet_runs[..live] {
             if r.len() < 2 {
                 let s0 = r[0];
-                let s = core_thick.max(2.0) as i32;
                 push_rect(
                     out,
                     geom,
@@ -643,6 +644,7 @@ impl ClassicWake {
         );
         let chf = geom.ch as f32;
         let core_thick = (chf * 0.13).max(2.0);
+        let s = core_thick as i32;
         let straighten = (geom.cw as f32).max(chf) * 0.8;
         let clip = geom.beam_clip();
         let caret_cell = cur.map(|(cr, cc)| CursorGlow::caret_box(geom, cr, cc));
@@ -653,7 +655,6 @@ impl ClassicWake {
             let from = out.len();
             if r.len() < 2 {
                 let s0 = r[0];
-                let s = core_thick.max(2.0) as i32;
                 push_rect(
                     out,
                     geom,
@@ -748,14 +749,9 @@ impl ClassicWake {
                 [] => continue,
                 [lone] => {
                     let v = ink(lone);
-                    verts.push(BeamVertex {
-                        x: v.x - cwf * 0.45,
-                        ..v
-                    });
-                    verts.push(BeamVertex {
-                        x: v.x + cwf * 0.45,
-                        ..v
-                    });
+                    let dx = cwf * 0.45;
+                    verts.push(BeamVertex { x: v.x - dx, ..v });
+                    verts.push(BeamVertex { x: v.x + dx, ..v });
                 }
                 [first, .., last] => {
                     let (ax, ay, bx, by) = (first.x, first.y, last.x, last.y);
@@ -826,23 +822,25 @@ impl ClassicWake {
             },
         );
         let boost = self.typing_boost();
+        let k_f = k as f32;
         for layer in 0..k {
             if out.len() >= Self::MAX_QUADS {
                 return;
             }
             let grow = r * (k - layer) / k;
-            let cov = (base_cov * (layer as f32 + 1.0) / k as f32 * fade * cfg.intensity * boost)
+            let cov = (base_cov * (layer as f32 + 1.0) / k_f * fade * cfg.intensity * boost)
                 .min(255.0) as u8;
             if cov == 0 {
                 continue;
             }
+            let two_grow = 2 * grow;
             push_rect(
                 out,
                 geom,
                 cx - grow,
                 cy - grow,
-                cw + 2 * grow,
-                ch + 2 * grow,
+                cw + two_grow,
+                ch + two_grow,
                 premul_rgb(color, cov),
             );
         }
@@ -952,10 +950,12 @@ impl ClassicWake {
         let th = (geom.ch as i32 / 8).max(2);
         let (cx, cy) = geom.cell_center(ring.row, ring.col);
         let (cx, cy) = (cx as i32, cy as i32);
-        push_rect(out, geom, cx - s, cy - s, 2 * s, th, premul);
-        push_rect(out, geom, cx - s, cy + s - th, 2 * s, th, premul);
-        push_rect(out, geom, cx - s, cy - s, th, 2 * s, premul);
-        push_rect(out, geom, cx + s - th, cy - s, th, 2 * s, premul);
+        let (x0, y0) = (cx - s, cy - s);
+        let two_s = 2 * s;
+        push_rect(out, geom, x0, y0, two_s, th, premul);
+        push_rect(out, geom, x0, cy + s - th, two_s, th, premul);
+        push_rect(out, geom, x0, y0, th, two_s, premul);
+        push_rect(out, geom, cx + s - th, y0, th, two_s, premul);
     }
 
     fn emit_light_ring(

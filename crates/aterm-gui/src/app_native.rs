@@ -2900,6 +2900,20 @@ impl App {
         Ok(outcome.result)
     }
 
+    pub(crate) fn cancel_native_ime_projection(
+        &mut self,
+        instance: crate::native_app::AppInstanceId,
+        view: crate::tab_model::ViewId,
+        generation: u64,
+        field: Option<&crate::native_ui::UiKey>,
+    ) {
+        if self.native_runtime.view_generation(view) == Some(generation)
+            && self.native_runtime.cancel_preedit(instance, view, field)
+        {
+            self.repaint_native_instance(instance, DamageRegion::All);
+        }
+    }
+
     /// Dispatch to one exact native view.
     pub(crate) fn dispatch_native_view_event(
         &mut self,

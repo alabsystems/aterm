@@ -942,6 +942,18 @@ fn a_security_pages_person_press_transfers_its_dialog_before_recording() {
     );
 }
 
+fn show_accessibility_needs_you(app: &mut App) {
+    assert!(app.open_system_state_tab());
+    app.publish_system_state(status(
+        Selection::all(),
+        vec![observed(
+            Subject::Access(Access::Accessibility),
+            Standing::NeedsYou,
+            None,
+        )],
+    ));
+}
+
 #[test]
 fn queued_access_panes_own_the_dialog_slot_before_opening() {
     use aterm_types::macos_setup::{MacosDialog, macos_dialog_up};
@@ -969,6 +981,7 @@ fn queued_access_panes_own_the_dialog_slot_before_opening() {
         });
         approve(&mut app, 1);
         app.access_steps.local_network_done = Some(1);
+        show_accessibility_needs_you(&mut app);
         app.access_steps.pane_act = Some((Access::Accessibility, now));
         let worker = MacosDialog::when_none_up(Duration::ZERO).unwrap();
         DIALOG_AVAILABLE.with(|read| read.borrow_mut().clear());
@@ -2154,6 +2167,7 @@ fn a_clients_act_on_a_row_waits_for_the_step_moment() {
     // Local Network and Accessibility.
     set_front(false);
     let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
+    show_accessibility_needs_you(&mut app);
     let _ = crate::platform::take_opened_urls();
     let t0 = Instant::now();
     assert!(!app.open_access_from_system_state(Access::Accessibility, false));
@@ -2735,6 +2749,7 @@ fn a_privacy_switch_off_pauses_a_clients_queued_act() {
         let mut t = Instant::now();
         let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
         app.config.privacy = Some(switches(None));
+        show_accessibility_needs_you(&mut app);
         let _ = crate::platform::take_opened_urls();
         assert!(!app.open_access_from_system_state(Access::Accessibility, false));
         app.config.privacy = Some(switches(Some(off)));

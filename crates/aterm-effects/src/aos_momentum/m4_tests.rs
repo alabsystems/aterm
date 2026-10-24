@@ -490,7 +490,7 @@ fn cadence_is_admitted_and_not_useful() {
 
 #[test]
 fn size_and_decode_are_refused_first() {
-    let fresh = Evaluator::v1(BUILD, Instant::now()).expect("the pinned policy v1");
+    let fresh = evaluator().anew();
     let ev = &fresh;
     let long = vec![1u8; MAX_PROPOSAL_BYTES + 1];
     assert_eq!(
@@ -531,7 +531,7 @@ fn an_unreadable_trace_an_unlogged_lane_and_an_unreproduced_log_are_refused() {
     let mut damaged = GOLDEN_TRACE.to_vec();
     let mid = damaged.len() / 2;
     damaged[mid] ^= 0x01;
-    let fresh = || Evaluator::v1(BUILD, Instant::now()).expect("the pinned policy v1");
+    let fresh = || evaluator().anew();
     let p = gap0();
 
     let ev = fresh().faulting("golden", Fault::GoldenBytes(damaged));
@@ -609,9 +609,7 @@ fn a_reset_at_rest_is_judged_as_the_host_logged_it() {
     let shipped = Sched::Prebuilt(MomentumCode::Shipped);
     let (plain, refusal) = evaluator().judge(shipped, k).expect("an item");
     assert!(refusal.is_none(), "{refusal:?}");
-    let ev = Evaluator::v1(BUILD, Instant::now())
-        .expect("the pinned policy v1")
-        .replacing(id, resting);
+    let ev = evaluator().anew().replacing(id, resting);
     let (row, refusal) = ev.judge(shipped, k).expect("an item");
     assert_eq!(refusal, None, "the shipped code is admitted there");
     assert_eq!(
@@ -644,7 +642,7 @@ impl Proposer for Spy {
 
 #[test]
 fn held_out_never_reaches_the_proposer_and_is_read_once() {
-    let ev = Evaluator::v1(BUILD, Instant::now()).expect("the pinned policy v1");
+    let ev = evaluator().anew();
     let cadence = plan(Split::Shipped, Wake::Cadence);
     let mut spy = Spy {
         plans: vec![SHIPPED_PLAN, gap0(), cadence, DEMO_PLAN],
@@ -717,9 +715,7 @@ fn a_failure_on_one_held_out_item_leaves_no_outcome() {
         last + 50_000_000,
     )
     .expect("an admitted scenario");
-    let ev = Evaluator::v1(BUILD, Instant::now())
-        .expect("the pinned policy v1")
-        .replacing("held-104", lit);
+    let ev = evaluator().anew().replacing("held-104", lit);
     let runner_up = plan(Split::SettleAtStep { gap_us: 8_333 }, Wake::NextStep);
     let mut spy = Spy {
         plans: vec![runner_up, gap0()],
@@ -769,7 +765,7 @@ fn a_selection_is_held_out_only_in_its_build() {
 
 #[test]
 fn a_winner_without_a_training_gain_is_no_outcome() {
-    let ev = Evaluator::v1(BUILD, Instant::now()).expect("the pinned policy v1");
+    let ev = evaluator().anew();
     let mut spy = Spy {
         plans: vec![plan(Split::Shipped, Wake::Cadence), SHIPPED_PLAN],
         asked: Vec::new(),

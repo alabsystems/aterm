@@ -2089,6 +2089,10 @@ pub enum ReadOutcome {
     Exited,
     /// The session's process watch (`proc_rd`, `aterm_uds::procwatch`) has events queued.
     Proc,
+    /// The poke pipe (`poke_rd`, [`read_or_poke`]) fired, or its write end closed: something asks
+    /// the reader to answer before it reads the master again. Nothing was read; [`drain_pokes`]
+    /// empties the pipe and says whether it can fire again.
+    Poke,
 }
 
 const fn proc_fired(entry: &libc::pollfd) -> bool {
@@ -2109,6 +2113,19 @@ pub fn read_or_wake(
     exit_rd: i32,
     proc_rd: i32,
 ) -> ReadOutcome {
+    read_or_poke(master, buf, wake_rd, exit_rd, proc_rd, -1)
+}
+
+/// [`read_or_wake`] that also answers [`ReadOutcome::Poke`] when `poke_rd` (`-1` for none) fires,
+/// before it reads the master.
+pub fn read_or_poke(
+    master: i32,
+    buf: &mut [u8],
+    wake_rd: i32,
+    exit_rd: i32,
+    proc_rd: i32,
+    poke_rd: i32,
+) -> ReadOutcome {
     let exit_watch = libc::pollfd {
         fd: exit_rd,
         events: libc::POLLIN,
@@ -2116,6 +2133,11 @@ pub fn read_or_wake(
     };
     let proc_watch = libc::pollfd {
         fd: proc_rd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let poke_watch = libc::pollfd {
+        fd: poke_rd,
         events: libc::POLLIN,
         revents: 0,
     };
@@ -2128,9 +2150,10 @@ pub fn read_or_wake(
             },
             exit_watch,
             proc_watch,
+            poke_watch,
         ];
-        // SAFETY: `fds` is a valid 3-element `pollfd` array live for the `poll` call.
-        let r = unsafe { libc::poll(fds.as_mut_ptr(), 3, WAKELESS_POLL_TIMEOUT_MS) };
+        // SAFETY: `fds` is a valid 4-element `pollfd` array live for the `poll` call.
+        let r = unsafe { libc::poll(fds.as_mut_ptr(), 4, WAKELESS_POLL_TIMEOUT_MS) };
         if r < 0 {
             let e = io::Error::last_os_error();
             return if e.kind() == io::ErrorKind::Interrupted {
@@ -2141,6 +2164,9 @@ pub fn read_or_wake(
         }
         if r == 0 {
             return ReadOutcome::Idle;
+        }
+        if fds[3].revents != 0 {
+            return ReadOutcome::Poke;
         }
         if exit_fired(&fds[1]) {
             return ReadOutcome::Exited;
@@ -2179,10 +2205,11 @@ pub fn read_or_wake(
         },
         exit_watch,
         proc_watch,
+        poke_watch,
     ];
     loop {
-        // SAFETY: `fds` is a valid 4-element `pollfd` array live for the `poll` call.
-        let r = unsafe { libc::poll(fds.as_mut_ptr(), 4, -1) };
+        // SAFETY: `fds` is a valid 5-element `pollfd` array live for the `poll` call.
+        let r = unsafe { libc::poll(fds.as_mut_ptr(), 5, -1) };
         if r < 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::Interrupted {
@@ -2192,6 +2219,9 @@ pub fn read_or_wake(
         }
         if fds[1].revents != 0 {
             return ReadOutcome::Wake;
+        }
+        if fds[4].revents != 0 {
+            return ReadOutcome::Poke;
         }
         if exit_fired(&fds[2]) {
             return ReadOutcome::Exited;
@@ -2683,6 +2713,28 @@ pub fn wake(wake_wr: i32) {
     // SAFETY: `wake_wr` is the pipe write end; a 1-byte write is atomic (never partial).
     unsafe {
         libc::write(wake_wr, b.as_ptr() as *const libc::c_void, 1);
+    }
+}
+
+/// Reads a non-blocking [`make_wake_pipe`] read end until it is empty (a [`ReadOutcome::Poke`]).
+///
+/// Returns `false` once the pipe's write end is closed (or `poke_rd` is no pipe), when it can never
+/// fire again and the caller stops polling it.
+#[must_use]
+pub fn drain_pokes(poke_rd: i32) -> bool {
+    let mut sink = [0u8; 64];
+    loop {
+        // SAFETY: `poke_rd` is the caller's non-blocking pipe read end; `sink` is a live buffer
+        // of `sink.len()` bytes.
+        let n = unsafe { libc::read(poke_rd, sink.as_mut_ptr().cast(), sink.len()) };
+        if n > 0 {
+            continue;
+        }
+        return n < 0
+            && matches!(
+                io::Error::last_os_error().kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            );
     }
 }
 

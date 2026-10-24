@@ -173,9 +173,11 @@ pub fn login(
     deadline: Instant,
 ) -> Drove {
     let (tx, rx) = mpsc::channel();
-    let completed = Arc::new(AtomicBool::new(false));
+    let completed = Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
+    let closed = Arc::new(AtomicBool::new(false));
     {
         let completed = Arc::clone(&completed);
+        let closed = Arc::clone(&closed);
         let from = server.from;
         std::thread::spawn(move || {
             super::login_drive::read_lines_within(from, MESSAGE_MAX, MESSAGES_MAX, |line| {
@@ -183,10 +185,17 @@ pub fn login(
                     return;
                 };
                 if message.get("method").and_then(Value::as_str) == Some(COMPLETED) {
-                    completed.store(true, Ordering::SeqCst);
+                    let id = message
+                        .pointer("/params/loginId")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    if let Ok(mut ids) = completed.lock() {
+                        ids.push(id);
+                    }
                 }
                 let _ = tx.send(message);
             });
+            closed.store(true, Ordering::SeqCst);
         });
     }
     let mut rpc = Rpc {
@@ -232,7 +241,14 @@ pub fn login(
             host,
         };
     }
-    let finished = || completed.load(Ordering::SeqCst);
+    let login_id = started.login_id.clone();
+    let finished = || {
+        closed.load(Ordering::SeqCst)
+            || completed.lock().is_ok_and(|ids| {
+                ids.iter()
+                    .any(|id| id.as_deref().is_none_or(|id| id == login_id))
+            })
+    };
     let page = match approver.approve(&Handoff {
         url: &started.auth_url,
         code: None,

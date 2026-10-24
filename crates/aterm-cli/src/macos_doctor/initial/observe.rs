@@ -530,13 +530,9 @@ pub(in crate::macos_doctor) fn note_at_login(root: &Path, settings: Selection) {
     );
 }
 
-/// Forget every change held for the next login (Restore put the values back).
-pub(in crate::macos_doctor) fn forget_at_login(root: &Path) {
-    // A record left behind marks only rows that still read as the run wrote them.
-    let _ = std::fs::remove_file(root.join(AT_LOGIN));
-}
-
 /// The settings held "at login" in this login session.
+/// A Restore keeps this evidence: originals that read differently do not receive the
+/// annotation, while a failed Restore leaves unchanged settings pending until login.
 fn held_at_login(root: &Path) -> Selection {
     login_session().map_or_else(Selection::none, |session| held_at_login_in(root, &session))
 }
@@ -557,6 +553,46 @@ fn held_at_login_in(root: &Path, session: &str) -> Selection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_restore_refused_before_effects_keeps_the_pending_login_reading() {
+        for failure in ["stop", "backup", "activation"] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let root = root.path();
+            let mut trackpad = Selection::none();
+            trackpad.set(Setting::TrackpadScrolling, true);
+            write_json(
+                &root.join(AT_LOGIN),
+                &json!({"profile":PROFILE,"session":"1.0:7","settings":trackpad.bits()}),
+            )
+            .unwrap();
+            let pending = std::fs::read(root.join(AT_LOGIN)).unwrap();
+            let _lock = HeldLock::try_take(root).unwrap().unwrap();
+            match failure {
+                "stop" => std::fs::create_dir(root.join("first-run.json")).unwrap(),
+                "backup" => {
+                    std::fs::write(root.join("original-preferences.json"), b"invalid").unwrap()
+                }
+                "activation" => {
+                    std::fs::write(root.join("pending-refresh.json"), b"invalid").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(super::super::super::tests::restore_without_effects(root).is_err());
+            let unchanged = Observation {
+                standing: Standing::InPlace,
+                now: Some("All on".into()),
+                ..Observation::unknown(Subject::Setting(Setting::TrackpadScrolling))
+            };
+            let seen = at_login(
+                unchanged,
+                held_at_login_in(root, "1.0:7").contains(Setting::TrackpadScrolling),
+            );
+            assert_eq!(seen.standing, Standing::AtLogin, "{failure}");
+            assert_eq!(std::fs::read(root.join(AT_LOGIN)).unwrap(), pending);
+            assert_eq!(held_at_login_in(root, "1.0:8"), Selection::none());
+        }
+    }
 
     #[test]
     fn a_change_for_the_next_login_holds_only_in_the_session_that_made_it() {

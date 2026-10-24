@@ -641,7 +641,8 @@ fn managed_title(
     (!parts.is_empty()).then(|| parts.join("; "))
 }
 
-fn and_list(words: &[String]) -> String {
+/// `a`, `a and b`, `a, b and c`.
+pub(crate) fn and_list(words: &[String]) -> String {
     match words {
         [] => String::new(),
         [one] => one.clone(),

@@ -13907,8 +13907,20 @@ mod tests {
             let card_off = text_of(&app.windows[&wid].input_scratch.cells[strip + card_row]);
             let line_off = chip_line(&app);
             if prog == "agy" {
-                assert!(
-                    line_off.ends_with(" face=off drawn=- why=switch-only spoken=- description=-"),
+                let field = |key: &str| {
+                    line_off
+                        .split_whitespace()
+                        .find_map(|w| w.strip_prefix(key)?.strip_prefix('='))
+                };
+                assert_eq!(
+                    ["face", "drawn", "why", "spoken", "description"].map(field),
+                    [
+                        Some("off"),
+                        Some("-"),
+                        Some("switch-only"),
+                        Some("-"),
+                        Some("-")
+                    ],
                     "agy: chrome names the footer left bare on purpose, not a tab behind: \
                      {line_off}"
                 );

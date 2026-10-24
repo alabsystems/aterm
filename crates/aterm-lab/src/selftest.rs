@@ -217,81 +217,40 @@ pub fn members_table(members: &Result<Vec<i32>, String>) -> String {
         .unwrap_or_default()
 }
 
-/// Validates `lsof -Fn` output shape and returns its text if non-empty.
-#[must_use]
-pub fn lsof_report(
-    pid: i32,
-    output: Result<std::process::Output, aterm_uds::deadline::RunError>,
-) -> Option<String> {
-    let out = output.ok()?;
-    if !out.status.success()
-        || !out.stderr.is_empty()
-        || out.stdout.len() >= aterm_uds::deadline::OUTPUT_KEEP
-    {
-        return None;
-    }
-    let text = String::from_utf8(out.stdout).ok()?;
-    (text.starts_with(&format!("p{pid}\n")) && text.ends_with('\n')).then_some(text)
-}
-
 /// Open-file observation for a process ([`observe_open_files`]).
 #[derive(Debug, Default)]
 pub struct OpenFiles {
-    /// Captured `lsof -Fn` output.
+    /// The paths read, in `lsof -Fn`'s shape: `p<pid>`, then an `n<path>` line for each, a
+    /// newline in a name written `\n`.
     pub text: String,
-    /// Whether strict stdout capture and shape validation both succeeded.
+    /// Whether the whole table read.
     pub complete: bool,
 }
 
-/// Builds an uncertified diagnostic [`OpenFiles`] report.
-#[cfg(test)]
+/// The [`OpenFiles`] report of one read of `pid`'s paths: complete when the read is, and empty
+/// when it is not.
 #[must_use]
-pub fn open_files(
-    pid: i32,
-    output: Result<std::process::Output, aterm_uds::deadline::RunError>,
-) -> OpenFiles {
-    describe_open_files(pid, output, false)
-}
-
-fn describe_open_files(
-    pid: i32,
-    output: Result<std::process::Output, aterm_uds::deadline::RunError>,
-    captured_complete: bool,
-) -> OpenFiles {
-    let text = output
-        .as_ref()
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default();
+pub fn open_files_report(pid: i32, read: std::io::Result<Vec<std::path::PathBuf>>) -> OpenFiles {
+    let Ok(paths) = read else {
+        return OpenFiles::default();
+    };
+    let mut text = format!("p{pid}\n");
+    for path in paths {
+        text.push('n');
+        text.push_str(&path.to_string_lossy().replace('\n', "\\n"));
+        text.push('\n');
+    }
     OpenFiles {
-        complete: captured_complete && lsof_report(pid, output).is_some(),
         text,
+        complete: true,
     }
 }
 
-/// Builds a certified [`OpenFiles`] report from strict stdout capture.
-#[must_use]
-pub fn complete_open_files(
-    pid: i32,
-    output: Result<std::process::Output, aterm_uds::deadline::CompleteOutputError>,
-) -> OpenFiles {
-    match output {
-        Ok(out) => describe_open_files(pid, Ok(out), true),
-        Err(_) => OpenFiles::default(),
-    }
-}
-
-/// Observes open files of agent process `pid` via `lsof` ([`complete_open_files`]).
+/// Observes the open files of agent process `pid` in this process, none of its sockets or
+/// kqueues read ([`crate::procs::open_paths`], [`open_files_report`]).
 #[must_use]
 pub fn observe_open_files(pid: i32) -> OpenFiles {
-    let mut cmd = aterm_uds::spawnfd::command("/usr/sbin/lsof");
-    cmd.args(["-p", &pid.to_string(), "-Fn"]);
-    complete_open_files(
-        pid,
-        aterm_uds::deadline::output_until_complete_stdout(
-            &mut cmd,
-            std::time::Instant::now() + Duration::from_secs(60),
-        ),
-    )
+    open_files_report(pid, crate::procs::open_paths(pid))
 }
 
 /// Owner home directories watched by lab witnesses ([`crate::paths::Paths::guarded_homes`]).
@@ -698,59 +657,36 @@ mod tests {
         assert_eq!(strays_verdict(&[], &[], true), Verdict::Unproven);
         assert_eq!(strays_verdict(&[], &[7], false), Verdict::Unproven);
     }
-    /// Typed strict capture admits ordinary complete reports; a legacy
-    /// diagnostic prefix has no EOF proof, even if it ends on a full line.
+    /// Only a whole read of an agent's table proves an absence: a read that failed is
+    /// UNPROVEN and names nothing, a whole one names each path as `lsof -Fn` would, and a
+    /// newline in a name starts no line of its own.
     #[test]
-    fn an_open_file_absence_requires_proven_stdout_completion() {
-        use aterm_uds::deadline::{CompleteOutputError, RunError};
-        use std::os::unix::process::ExitStatusExt as _;
-        let out = |bytes: &[u8]| std::process::Output {
-            status: std::process::ExitStatus::from_raw(0),
-            stdout: bytes.to_vec(),
-            stderr: Vec::new(),
-        };
-        let clean = b"p7\nn/private/tmp/scratch/home/file\n";
-        let seen = complete_open_files(7, Ok(out(clean)));
-        assert!(seen.complete);
+    fn an_open_file_absence_requires_a_whole_read() {
+        use std::path::PathBuf;
+        let home = ["/Users//owner".to_string()];
+        let read = |paths: &[&str]| Ok(paths.iter().map(PathBuf::from).collect());
+        let clean = open_files_report(7, read(&["/private/tmp/scratch/home/file"]));
+        assert_eq!(clean.text, "p7\nn/private/tmp/scratch/home/file\n");
         assert_eq!(
-            strays_verdict(
-                &owner_strays(&seen.text, &["/Users//owner".to_string()], &[]),
-                &[7],
-                seen.complete
-            ),
+            strays_verdict(&owner_strays(&clean.text, &home, &[]), &[7], clean.complete),
             Verdict::Ok
         );
-        for failure in [
-            CompleteOutputError::StdoutIncomplete,
-            CompleteOutputError::StdoutRead(std::io::Error::other("injected read failure")),
-            CompleteOutputError::StdoutTooLarge {
-                limit: aterm_uds::deadline::OUTPUT_KEEP,
-            },
-            CompleteOutputError::Run(RunError::TimedOut),
-        ] {
-            let seen = complete_open_files(7, Err(failure));
-            assert!(!seen.complete && seen.text.is_empty());
-            assert_eq!(strays_verdict(&[], &[7], seen.complete), Verdict::Unproven);
-        }
-        let held = open_files(7, Ok(out(b"p7\nn/Users//owner/private.txt\n")));
+        let held = open_files_report(7, read(&["/Users//owner/private.txt"]));
         assert_eq!(
-            strays_verdict(
-                &owner_strays(&held.text, &["/Users//owner".to_string()], &[]),
-                &[7],
-                held.complete
-            ),
+            strays_verdict(&owner_strays(&held.text, &home, &[]), &[7], held.complete),
             Verdict::Fail
         );
-        let mut admitted_prefixes = Vec::new();
-        for bytes in [clean.as_slice(), b"p7\n".as_slice()] {
-            let prefix = open_files(7, Ok(out(bytes)));
-            if strays_verdict(&[], &[7], prefix.complete) != Verdict::Unproven {
-                admitted_prefixes.push(String::from_utf8_lossy(bytes).into_owned());
-            }
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::Other,
+        ] {
+            let seen = open_files_report(7, Err(kind.into()));
+            assert!(!seen.complete && seen.text.is_empty(), "{kind:?}");
+            assert_eq!(strays_verdict(&[], &[7], seen.complete), Verdict::Unproven);
         }
-        assert!(
-            admitted_prefixes.is_empty(),
-            "LAB-STDOUT-COMPLETENESS: {admitted_prefixes:?}"
-        );
+        let forged = open_files_report(7, read(&["/private/tmp/x\nn/Users//owner/y"]));
+        assert_eq!(forged.text.lines().count(), 2, "{:?}", forged.text);
+        assert!(owner_strays(&forged.text, &home, &[]).is_empty());
     }
 }

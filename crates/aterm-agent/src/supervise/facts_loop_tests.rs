@@ -180,7 +180,7 @@ impl<'a> Run<'a> {
                 before(&mut s, &self.host, i);
                 let rows = match step {
                     Step::Break => break_screen(),
-                    Step::End => ended(&format!(
+                    Step::End => ran_then_ended(&format!(
                         "Stage {i} of the parser is in; the lexer is next."
                     )),
                 };
@@ -239,6 +239,25 @@ impl<'a> Run<'a> {
             told,
         }
     }
+}
+
+/// A turn of work ([`ended`]) that ran a call before its words.
+fn ran_then_ended(said: &str) -> Vec<String> {
+    let mut r = ended(said);
+    let at = r
+        .iter()
+        .position(|row| row.starts_with("⏺ "))
+        .expect("the words");
+    r.splice(
+        at..at,
+        [
+            "⏺ Bash(targo --unverified test -p parser)",
+            "  ⎿  test result: ok",
+            "",
+        ]
+        .map(str::to_owned),
+    );
+    r
 }
 
 fn took(s: &mut Session<'_, Logged<'_>>) {

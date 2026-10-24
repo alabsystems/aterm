@@ -3,17 +3,22 @@
 
 //! `aos-search --workers` as processes (design §11.7): the six-line plans file on three workers at
 //! a ten-second lease, honest and under each injected fault, against one local run. Each run is
-//! held to the one-minute hang detector and never retried. A run is CPU-bound, so one past the
-//! detector on a host whose load exceeds its CPUs is COULD NOT RUN, naming the load.
+//! held to the one-minute hang detector on its next new step (a worker frame's step its
+//! coordinator says under `--frames`, or its end), never on its whole length, and never retried.
+//! A run is CPU-bound, so one past the detector on a host whose load exceeds its CPUs is COULD NOT
+//! RUN, naming the load.
 
 #![cfg(target_os = "macos")]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
+use std::sync::mpsc::Receiver;
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 use aterm_effects::aos_momentum::bundle::UncheckedBundle;
+use aterm_effects::aos_momentum::lease::LIMITS_V1;
 use aterm_effects::aos_momentum::search::Mode;
 use aterm_spec::wait::{MUST_HAPPEN, until_within};
 use aterm_uds::spawnfd::{Child, Stdio};
@@ -141,26 +146,87 @@ fn drain(mut r: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<
     })
 }
 
+/// `r`'s text once it ends, and each line as it is said.
+fn said(
+    r: impl std::io::Read + Send + 'static,
+) -> (Receiver<String>, std::thread::JoinHandle<String>) {
+    let (tell, told) = std::sync::mpsc::channel();
+    let text = std::thread::spawn(move || {
+        let mut r = BufReader::new(r);
+        let mut text = String::new();
+        let mut line = Vec::new();
+        while r.read_until(b'\n', &mut line).is_ok_and(|n| n > 0) {
+            let said = String::from_utf8_lossy(&line).into_owned();
+            text.push_str(&said);
+            line.clear();
+            let _ = tell.send(said);
+        }
+        text
+    });
+    (told, text)
+}
+
+/// Whether the coordinator's stderr `line` names a step of the run not taken before (`--frames`):
+/// a worker's hello, or item `k < items` or the end of a lease on an attempt within
+/// `max_attempts` ([`LIMITS_V1`]). A slot has at most `max_attempts × (items + 1)` such steps and
+/// the command's plans fix its slots, so a run that keeps trading frames without finishing (a
+/// lease re-run without end, a frame said again) takes no new step, and the detector ends it.
+fn advanced(line: &str, taken: &mut BTreeSet<String>) -> bool {
+    let Some(step) = line
+        .strip_prefix("aos-workers frame ")
+        .and_then(|l| l.split_whitespace().find_map(|w| w.strip_prefix("step=")))
+    else {
+        return false;
+    };
+    let number = |n: &str| n.parse::<u32>().is_ok();
+    let bounded = match step.split('.').collect::<Vec<_>>().as_slice() {
+        ["hello", w] => w.parse::<usize>().is_ok_and(|w| w < LIMITS_V1.max_workers),
+        [search, slot, attempt, k] => {
+            number(search)
+                && number(slot)
+                && attempt
+                    .parse::<u8>()
+                    .is_ok_and(|a| (1..=LIMITS_V1.max_attempts).contains(&a))
+                && (*k == "end" || k.parse::<u16>().is_ok_and(|k| k < LIMITS_V1.items))
+        }
+        _ => false,
+    };
+    bounded && taken.insert(step.to_owned())
+}
+
 fn finish(mut child: Child, dir: aterm_tempfile::TempDir, out: PathBuf) -> Run {
     let stdout = drain(child.stdout.take().expect("piped"));
-    let stderr = drain(child.stderr.take().expect("piped"));
-    let status = match aterm_spec::wait::within(MUST_HAPPEN, Duration::from_millis(50), || {
-        child.try_wait().ok().flatten()
-    }) {
-        Some(s) => s,
-        None => {
-            let _ = child.kill();
-            let _ = child.wait();
-            // The search is CPU-bound: the longest run, two searches, takes 8-9 s alone here and
-            // 53 s held to the efficiency cores (`taskpolicy -b`), and a full verify's load
-            // stretched it past the detector twice. On such a host the detector times the load.
-            if let Some(load) = aterm_spec::host::oversubscribed() {
-                aterm_spec::host::could_not_run(format!(
-                    "aos-search did not end within {MUST_HAPPEN:?} on an oversubscribed host \
-                     ({load})"
-                ));
+    let (told, stderr) = said(child.stderr.take().expect("piped"));
+    let mut taken = BTreeSet::new();
+    // The detector waits for the run's next new step ([`advanced`]) or its end.
+    let status = loop {
+        let next =
+            aterm_spec::wait::within(MUST_HAPPEN, Duration::from_millis(50), || {
+                match child.try_wait().ok().flatten() {
+                    Some(s) => Some(Some(s)),
+                    None => told
+                        .try_iter()
+                        .any(|line| advanced(&line, &mut taken))
+                        .then_some(None),
+                }
+            });
+        match next {
+            Some(Some(s)) => break s,
+            Some(None) => {}
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                // A run's stretches without a frame (the workers' evaluator builds before their
+                // hellos, the coordinator's own judging) are CPU-bound, and a full verify's load
+                // has stretched a run past the detector; on such a host it times the load.
+                if let Some(load) = aterm_spec::host::oversubscribed() {
+                    aterm_spec::host::could_not_run(format!(
+                        "aos-search took no new step and did not end within {MUST_HAPPEN:?} on \
+                         an oversubscribed host ({load})"
+                    ));
+                }
+                panic!("aos-search took no new step and did not end within {MUST_HAPPEN:?}");
             }
-            panic!("aos-search did not end within {MUST_HAPPEN:?}");
         }
     };
     Run {
@@ -172,10 +238,14 @@ fn finish(mut child: Child, dir: aterm_tempfile::TempDir, out: PathBuf) -> Run {
     }
 }
 
-/// `aos-search --plans SIX` with `args`, to its end.
+/// `aos-search --plans SIX` with `args`, to its end; a pool run says its frames (`--frames`).
 fn run(args: &[&str]) -> Run {
     let _slot = slot();
-    let (child, dir, out) = spawn(args);
+    let mut args = args.to_vec();
+    if args.contains(&"--workers") {
+        args.push("--frames");
+    }
+    let (child, dir, out) = spawn(&args);
     finish(child, dir, out)
 }
 
@@ -250,6 +320,41 @@ fn voided(r: &Run, refusal: &str) {
         "a void leaves no bundle"
     );
     r.reaped_all();
+}
+
+/// The detector's steps: each counts once, and only within the ledger's bounds; no other line
+/// counts.
+#[test]
+fn a_step_counts_once_and_only_within_the_ledgers_bounds() {
+    let mut taken = BTreeSet::new();
+    let line = |step: &str| format!("aos-workers frame from=0 step={step}\n");
+    for step in [
+        "hello.0",
+        "1.0.1.0",
+        "1.0.1.16",
+        "1.0.1.end",
+        "1.0.3.0",
+        "2.53.2.end",
+    ] {
+        assert!(advanced(&line(step), &mut taken), "{step}: new");
+        assert!(!advanced(&line(step), &mut taken), "{step}: said again");
+    }
+    for step in [
+        format!("1.0.{}.0", LIMITS_V1.max_attempts + 1),
+        format!("1.0.1.{}", LIMITS_V1.items),
+        format!("hello.{}", LIMITS_V1.max_workers),
+        "1.0.0.0".to_owned(),
+        "x.0.1.0".to_owned(),
+        "1.0.1".to_owned(),
+        "-".to_owned(),
+    ] {
+        assert!(!advanced(&line(&step), &mut taken), "{step}: out of bounds");
+    }
+    assert!(
+        !advanced("aos-workers worker=0 pid=1\n", &mut taken),
+        "a pid line"
+    );
+    assert!(!advanced("aos-search: any other line\n", &mut taken));
 }
 
 #[test]

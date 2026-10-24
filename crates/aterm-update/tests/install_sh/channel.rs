@@ -3,7 +3,7 @@
 
 //! Release download transport (`web_curl`) and Linux head-only target selection tests.
 
-use crate::support::{Lib, Scratch, bash, follows_redirects, install_sh, q, read, s};
+use crate::support::{Lib, Scratch, follows_redirects, group_run, install_sh, q, read, s};
 
 const DOWNLOAD: &str = "https://github.com/example/aterm/releases/download";
 
@@ -187,7 +187,8 @@ fn a_download_is_held_to_the_named_size() {
 /// failed download. The group leader stands for a terminal's foreground group,
 /// and the curl web_curl runs sends that group the Ctrl-C and dies of it. Under
 /// bash 3.2 web_curl's subshell then exited 130, the run went on, said the
-/// download failed and exited 1.
+/// download failed and exited 1. The download runs in a subshell, as
+/// linux_verifier_ready's does, which starts with the run's INT trap reset.
 #[test]
 fn a_ctrl_c_during_a_download_ends_the_run() {
     let scratch = Scratch::new();
@@ -200,19 +201,18 @@ ATERM_INSTALL_LIBRARY_ONLY=1
 . \"$INSTALL_SH\"
 PATH=\"$TMPDIR/bin:$PATH\" REPO_SLUG=example/aterm
 trap 'echo cleaned >\"$TMPDIR/cleaned\"' EXIT
-download_release_asset v0.92.0 aterm-appcast.toml 3 \"$TMPDIR/got\" || echo \"went on ($?)\"
+( download_release_asset v0.92.0 aterm-appcast.toml 3 \"$TMPDIR/got\" ) || echo \"went on ($?)\"
 EOF",
     );
     let call = lib.call(
         format!(
-            "/usr/bin/perl -e '$SIG{{INT}} = \"DEFAULT\"; setpgrp(0, 0); exec @ARGV or die' {} \"$TMPDIR/download.bash\"; \
-             echo \"ended $? $(cat \"$TMPDIR/cleaned\" 2>/dev/null)\"",
-            q(s(&bash()))
+            "echo \"$({}) $(cat \"$TMPDIR/cleaned\" 2>/dev/null)\"",
+            group_run("\"$TMPDIR/download.bash\"")
         ),
         &[],
     );
     let recs = lib.run(&scratch);
-    assert_eq!(recs[call].out, "ended 130 cleaned", "{}", recs[call].err);
+    assert_eq!(recs[call].out, "signal 2 cleaned", "{}", recs[call].err);
     assert!(!recs[call].err.contains("failed"), "{}", recs[call].err);
 }
 

@@ -20,7 +20,8 @@ use aterm_spec::derive::Model;
 
 type State = BTreeMap<&'static str, i64>;
 
-/// Real work, long enough that no turn is short for its length.
+/// Real work, long enough that no turn is short for its length; it runs tools (a tool row on the
+/// screen, which at a wall is what tells work from the program's own retries).
 const LONG: Duration = Duration::from_secs(4 * 60);
 /// A turn too short to be work: a yield that asks is one.
 const SHORT: Duration = Duration::from_secs(30);
@@ -58,12 +59,12 @@ fn finding() -> RepoWork {
 }
 
 /// An authoritative idle point under Cruise whose turn worked `worked`,
-/// ending on `said` — or on a `529 Overloaded` wall; `over_shell`, the BUSY
-/// screen of a turn that ended while a shell it left runs on; `dirty`, the
-/// host's probe finds the session's repository holds work no remote main has
-/// ([`finding`]).
+/// ending on `said` after [`crate::common::earlier`]'s `earlier` — or on a `529 Overloaded`
+/// wall; `over_shell`, the BUSY screen of a turn that ended while a shell it
+/// left runs on; `dirty`, the host's probe finds the session's repository
+/// holds work no remote main has ([`finding`]).
 fn point(
-    said: &str,
+    (said, earlier): (&str, usize),
     walled: bool,
     over_shell: bool,
     worked: Option<Duration>,
@@ -86,7 +87,7 @@ fn point(
         said_tail: Some(said.to_string()),
         said_cut: false,
         opens_cut: false,
-        turn_said: None,
+        turn_said: Some(crate::common::earlier(earlier)),
         opened_by: None,
         message_drawn: false,
         submits: None,
@@ -131,6 +132,7 @@ fn point(
         wall_remembered: false,
         answered: None,
         worked_doubt: Duration::ZERO,
+        ran_tools: worked.is_some_and(|w| w >= LONG),
         record_turn: None,
         credits: None,
         repo: aterm_agent::harness::repo_work::RepoRead::of_found(dirty.then(finding)),
@@ -204,14 +206,15 @@ fn expected(m: &Model, st: &State) -> Verdict {
 }
 
 /// The real side: the decider's state, the loop's clock, and the last words
-/// of the point it stands at (whether it shows the wall, whether it is the
-/// busy screen over a running shell, and whether the probe finds work in the
-/// repository there).
+/// of the point it stands at (with the [`crate::common::earlier`] words before them, whether
+/// it shows the wall, whether it is the busy screen over a running shell, and
+/// whether the probe finds work in the repository there).
 #[derive(Clone)]
 struct Real {
     st: TurnEndState,
     now: Instant,
     said: &'static str,
+    earlier: usize,
     walled: bool,
     over_shell: bool,
     dirty: bool,
@@ -222,7 +225,13 @@ impl Real {
     /// ladder's clock, which the model does not count) — never the short
     /// back-off's, which the model's `BackoffDue` moves.
     fn decide(&mut self) -> TurnEndAction {
-        let r = point(self.said, self.walled, self.over_shell, None, self.dirty);
+        let r = point(
+            (self.said, self.earlier),
+            self.walled,
+            self.over_shell,
+            None,
+            self.dirty,
+        );
         self.st.observe(&r, self.now);
         let cfg = SupervisorConfig::default();
         for _ in 0..4 {
@@ -239,17 +248,25 @@ impl Real {
     }
 
     /// A turn — a live one, read busy — that ended on `said` after `worked`,
-    /// or on the wall; `dirty`: the probe finds work no remote main has at
-    /// its end.
+    /// or on the wall, its earlier words its own; `dirty`: the
+    /// probe finds work no remote main has at its end.
     fn turn(&mut self, said: &'static str, walled: bool, worked: Duration, dirty: bool) {
+        self.earlier += 1;
+        self.said_again(said, walled, worked, dirty);
+    }
+
+    /// A turn that ended as [`Self::turn`]'s, its earlier words the last's.
+    fn said_again(&mut self, said: &'static str, walled: bool, worked: Duration, dirty: bool) {
         self.st.took();
         self.now += worked;
         self.said = said;
         self.walled = walled;
         self.over_shell = false;
         self.dirty = dirty;
-        self.st
-            .observe(&point(said, walled, false, Some(worked), dirty), self.now);
+        self.st.observe(
+            &point((said, self.earlier), walled, false, Some(worked), dirty),
+            self.now,
+        );
     }
 
     /// A turn that claimed done while a shell it left runs on: the busy
@@ -257,12 +274,19 @@ impl Real {
     fn turn_over_shell(&mut self) {
         let before = self.st.point_number();
         self.st.took();
+        self.earlier += 1;
         self.said = FINISHED_OVER_SHELL;
         self.walled = false;
         self.over_shell = true;
         self.dirty = false;
         self.st.observe(
-            &point(FINISHED_OVER_SHELL, false, true, None, false),
+            &point(
+                (FINISHED_OVER_SHELL, self.earlier),
+                false,
+                true,
+                None,
+                false,
+            ),
             self.now,
         );
         assert_eq!(
@@ -277,8 +301,10 @@ impl Real {
     fn shell_ends(&mut self) {
         self.now += LONG;
         self.over_shell = false;
-        self.st
-            .observe(&point(self.said, false, false, Some(LONG), false), self.now);
+        self.st.observe(
+            &point((self.said, self.earlier), false, false, Some(LONG), false),
+            self.now,
+        );
     }
 }
 
@@ -298,7 +324,13 @@ fn mirror(action: &str, before: &State, real: &mut Real) {
                 !matches!(verdict(&a), Verdict::Nothing | Verdict::Wait),
                 "{action} at {before:?}: {a:?}"
             );
-            let r = point(real.said, real.walled, false, None, real.dirty);
+            let r = point(
+                (real.said, real.earlier),
+                real.walled,
+                false,
+                None,
+                real.dirty,
+            );
             real.st.acted(&a, &r, real.now);
         }
         "BackoffDue" => real.now += real.st.short_wait().expect("a back-off runs"),
@@ -313,6 +345,7 @@ fn mirror(action: &str, before: &State, real: &mut Real) {
             false,
         ),
         "YieldAsk" => real.turn(QUESTION, false, SHORT, false),
+        "YieldAskSame" => real.said_again(QUESTION, false, SHORT, false),
         other => panic!("an action this bind does not mirror: {other}"),
     }
 }
@@ -324,12 +357,15 @@ fn start(base: Instant) -> Real {
         st: TurnEndState::default(),
         now: base,
         said: PROGRESS,
+        earlier: 0,
         walled: false,
         over_shell: false,
         dirty: false,
     };
-    real.st
-        .observe(&point(PROGRESS, false, false, Some(LONG), false), real.now);
+    real.st.observe(
+        &point((PROGRESS, 0), false, false, Some(LONG), false),
+        real.now,
+    );
     real
 }
 
@@ -385,6 +421,11 @@ fn tier1_the_real_decider_defends_every_claim_and_never_rests() {
                 real.st.repo_owed().is_some(),
                 st["open"] == 2,
                 "the repository's work at {st:?}"
+            );
+            assert_eq!(
+                crate::common::same(&real.st),
+                st["same"],
+                "the same reply at {st:?}"
             );
         }
         if st["pending"] == 0 {
@@ -473,6 +514,19 @@ fn tier1_the_buggy_model_is_refuted_by_the_real_decider() {
     assert_eq!(st["short"], 4);
     assert!(buggy.action_enabled("Answer", &st) && !m.action_enabled("Answer", &st));
     assert_eq!(verdict(&real.clone().decide()), Verdict::Wait);
+
+    let again = ["Tasked", "Continue", "YieldAsk", "Answer", "YieldAskSame"];
+    let (st, real) = walk(&m, &again, base);
+    let same = aterm_spec::interp::with_buggy(&m, 2);
+    let mut b = st.clone();
+    assert!(
+        !m.action_enabled("Answer", &st) && same.fire("Answer", &mut b),
+        "{st:?}"
+    );
+    assert!(!same.check_invariant("ANoWorkReplyGetsOneMoreActAtMost", &b));
+    assert_eq!(verdict(&real.clone().decide()), Verdict::Nothing);
+    let (_, real) = walk(&m, &[&again[..4], &["YieldAsk"]].concat(), base);
+    assert_eq!(verdict(&real.clone().decide()), Verdict::Answer);
 
     let (st, mut real) = walk(&m, &["OtherTurnClaim"], base);
     let mut b = st.clone();

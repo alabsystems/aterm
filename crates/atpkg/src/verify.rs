@@ -3,6 +3,37 @@
 
 use crate::store::Layout;
 
+/// What a vendor-direct tree was staged from, as its `.vendor` record says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StagedFrom {
+    /// The payload digest the vendor's own documents named.
+    Documents,
+    /// Bytes signed with the vendor's Developer ID, whose digest the lane measured, no vendor
+    /// document naming one (grok before npm's registry vouched for it,
+    /// [`crate::vendor_direct::Anchor`]).
+    DeveloperIdMeasured,
+    /// npm's registry-signed tarball of the vendor's build, its binary measured at stage and
+    /// matched by the vendor's own copy.
+    RegistryAgreed {
+        /// The staged binary's sha256 (lowercase hex).
+        sha256: String,
+    },
+}
+
+impl StagedFrom {
+    /// What `record` says its tree was staged from.
+    #[must_use]
+    pub(crate) fn of(record: &crate::vendor_direct::VendorRecord) -> Self {
+        match (&record.anchor, &record.measured_sha256) {
+            (crate::vendor_direct::Anchor::XaiDeveloperId, _) => Self::DeveloperIdMeasured,
+            (_, Some(sha256)) => Self::RegistryAgreed {
+                sha256: sha256.clone(),
+            },
+            (_, None) => Self::Documents,
+        }
+    }
+}
+
 /// The result of verifying one program's active build against its recorded signed root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerifyOutcome {
@@ -45,9 +76,8 @@ pub enum VerifyOutcome {
         build: u64,
         /// Who published it.
         vendor: String,
-        /// Whether the lane measured the payload's digest from bytes the vendor's Developer ID
-        /// signature vouched for, no vendor document naming it ([`crate::vendor_direct::Anchor`]).
-        measured: bool,
+        /// What the tree was staged from.
+        staged_from: StagedFrom,
         /// `None` when the tree matches; the recomputed root when it drifted.
         drift: Option<String>,
     },
@@ -152,8 +182,8 @@ fn verify_vendor_build(layout: &Layout, program: &str, build: u64) -> VerifyOutc
     match walked_root(&build_dir) {
         Ok(got) => VerifyOutcome::VendorRoot {
             build,
+            staged_from: StagedFrom::of(&record),
             vendor: record.vendor,
-            measured: !record.anchor.publishes_digest(),
             drift: (!got.eq_ignore_ascii_case(&record.tree_root)).then_some(got),
         },
         Err(e) => VerifyOutcome::Unreadable {
@@ -345,6 +375,8 @@ mod tests {
             anchor: crate::vendor_direct::Anchor::AnthropicOpenPgp,
             build_date: crate::vendor_direct::BuildDate::parse("2026-09-25T01:39:37Z"),
             verified_at: 1_790_526_112,
+            measured_sha256: None,
+            agreed_with: None,
         };
         crate::vendor_direct::durable::write_durable(
             &crate::vendor_direct::record_path(&dir).unwrap(),
@@ -356,7 +388,7 @@ mod tests {
             VerifyOutcome::VendorRoot {
                 build,
                 vendor: "Anthropic".into(),
-                measured: false,
+                staged_from: StagedFrom::Documents,
                 drift: None
             }
         );
@@ -390,10 +422,42 @@ mod tests {
             VerifyOutcome::VendorRoot {
                 build: grok_build,
                 vendor: "xAI".into(),
-                measured: true,
+                staged_from: StagedFrom::DeveloperIdMeasured,
                 drift: None
             },
-            "grok's digest is the lane's measure, no xAI document's"
+            "an older grok's digest is the lane's measure, no xAI document's"
+        );
+        let agreed = crate::vendor_direct::VendorRecord {
+            source_url: "https://registry.npmjs.org/@xai-official/grok-darwin-arm64/-/\
+                         grok-darwin-arm64-1.0.70.tgz"
+                .into(),
+            sha256: String::new(),
+            sha512: "ab".repeat(64),
+            anchor: crate::vendor_direct::Anchor::XaiNpmRegistry,
+            measured_sha256: Some("cd".repeat(32)),
+            agreed_with: Some(
+                "https://storage.googleapis.com/grok-build-public-artifacts/cli/\
+                 grok-1.0.70-macos-aarch64.zst"
+                    .into(),
+            ),
+            ..measured.clone()
+        };
+        crate::vendor_direct::durable::write_durable(
+            &crate::vendor_direct::record_path(&grok).unwrap(),
+            &agreed.record_bytes().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            verify_program(&l, "grok"),
+            VerifyOutcome::VendorRoot {
+                build: grok_build,
+                vendor: "xAI".into(),
+                staged_from: StagedFrom::RegistryAgreed {
+                    sha256: "cd".repeat(32)
+                },
+                drift: None
+            },
+            "grok's tarball is npm's registry-signed one, its binary matched by xAI's bucket"
         );
         std::fs::write(dir.join("bin").join(exe_name("claude")), b"tampered").unwrap();
         assert!(
@@ -479,7 +543,7 @@ mod tests {
         let vendor = |drift| V::VendorRoot {
             build: 1,
             vendor: "Anthropic".into(),
-            measured: false,
+            staged_from: StagedFrom::Documents,
             drift,
         };
         for (o, pass) in [

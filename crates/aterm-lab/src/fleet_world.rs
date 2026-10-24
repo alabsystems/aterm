@@ -593,30 +593,33 @@ pub fn malloc_large_empty(pid: i32) -> Option<LargeEmpty> {
     })
 }
 
-/// Counts open numbered file descriptors for each PID in `pids` via `lsof`.
+/// Counts the open descriptors of each PID in `pids` from its table alone
+/// ([`crate::sys::fd_count`]: none of its sockets or kqueues is referenced), the numbered rows
+/// `lsof -a -d 0-65535` lists; a PID whose table does not read is left out.
 #[must_use]
 pub fn open_fds(pids: &[i32]) -> std::collections::BTreeMap<i32, usize> {
-    let list: Vec<String> = pids.iter().map(i32::to_string).collect();
-    let out = aterm_uds::spawnfd::command("/usr/sbin/lsof")
-        .args([
-            "-n",
-            "-P",
-            "-w",
-            "-a",
-            "-p",
-            &list.join(","),
-            "-d",
-            "0-65535",
-        ])
-        .stdin(Stdio::null())
-        .output();
-    let mut map = std::collections::BTreeMap::new();
-    if let Ok(out) = out {
-        for line in String::from_utf8_lossy(&out.stdout).lines().skip(1) {
-            if let Some(Ok(pid)) = line.split_whitespace().nth(1).map(str::parse::<i32>) {
-                *map.entry(pid).or_insert(0) += 1;
-            }
-        }
+    pids.iter()
+        .filter_map(|&pid| crate::sys::fd_count(pid).map(|n| (pid, n)))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::open_fds;
+
+    /// A member's descriptors are counted from its table; a reaped one is left out.
+    #[test]
+    fn a_members_descriptors_are_counted_and_a_gone_one_left_out() {
+        let mut child = aterm_uds::spawnfd::command("/bin/sleep")
+            .arg("600")
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .spawn()
+            .expect("spawn a member");
+        let pid = i32::try_from(child.id()).unwrap();
+        let counted = open_fds(&[pid]);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(counted.get(&pid), Some(&3), "stdin, stdout and stderr");
+        assert!(open_fds(&[pid]).is_empty(), "reaped");
     }
-    map
 }

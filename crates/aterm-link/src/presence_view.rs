@@ -410,6 +410,12 @@ fn follow(
                     return Ok(());
                 }
             }
+            Some(astream_broker::Event::Gap(gap)) => {
+                return Err(io::Error::other(format!(
+                    "the broker's retention gave up {} below its tail, so it is exact no more",
+                    crate::transport::gap_lost(&gap)
+                )));
+            }
         }
     }
 }
@@ -572,6 +578,79 @@ mod tests {
         assert!(view.hold(g, Arc::new(closer)));
         view.open();
         assert!(!alive(&mut held), "a reopen hangs up the previous reader");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_gap_below_the_tail_ends_the_view() {
+        use astream_broker::proto::{
+            decode_request, encode_response, read_frame, write_frame, Request, Response,
+        };
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("al-pv-gap")
+            .tempdir_in("/tmp")
+            .expect("a scratch dir");
+        let socket = dir.path().join("b.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        let path = socket.to_string_lossy().into_owned();
+        let view = Arc::new(PresenceView::default());
+        let g = view.open();
+        spawn_reader(
+            move || crate::transport::connect(&path, aterm_spec::wait::MUST_HAPPEN),
+            "f",
+            Arc::clone(&view),
+            g,
+        )
+        .expect("the reader thread");
+        let (mut c, _) = listener.accept().expect("accept");
+        let mark = |next, head| Response::Mark {
+            next,
+            head,
+            resume: String::new(),
+            durable: None,
+            oldest: None,
+        };
+        let send = |c: &mut std::os::unix::net::UnixStream, r: &Response| {
+            write_frame(c, &encode_response(r)).expect("write");
+        };
+        loop {
+            let frame = read_frame(&mut c).expect("read").expect("a request");
+            match decode_request(&frame) {
+                Some(Request::Last { .. } | Request::IdleMarks | Request::GapNotices) => {
+                    send(&mut c, &mark(5, 5));
+                }
+                Some(Request::Subscribe { from_offset: 5, .. }) => break,
+                other => panic!("the view sends no {other:?}"),
+            }
+        }
+        send(
+            &mut c,
+            &Response::Gap(astream_broker::Gap {
+                from: 5,
+                to: 8,
+                records: Some(2),
+            }),
+        );
+        send(&mut c, &mark(9, 10));
+        send(
+            &mut c,
+            &Response::Delivery {
+                offset: 9,
+                subject: row("n-a", "s-a"),
+                body: LIVE.to_vec(),
+            },
+        );
+        assert!(
+            view.wait_for(aterm_spec::wait::MUST_HAPPEN, |phase, reached| {
+                phase == Phase::Dead || reached > 9
+            })
+        );
+        assert_eq!(
+            view.phase(),
+            Phase::Dead,
+            "a view that missed records is exact no more"
+        );
+        assert_eq!(view.snapshot("s-a"), None);
     }
 
     #[test]

@@ -96,6 +96,13 @@ impl SplitMix {
         SplitMix(seed)
     }
 
+    /// Its state, from which [`Self::new`] continues the same sequence.
+    #[inline]
+    #[must_use]
+    pub const fn state(&self) -> u64 {
+        self.0
+    }
+
     /// The next 64-bit draw.
     #[inline]
     pub fn next_u64(&mut self) -> u64 {

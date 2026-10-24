@@ -532,3 +532,667 @@ fn the_window_is_read_for_the_main_pass_and_end_needs_both_ends() {
     assert!(!end_runs(&[Chain::LandJ, Chain::CruiseN]));
     assert_eq!(unread_why(true, &[Chain::Wall, Chain::CruiseN]), None);
 }
+
+/// `chrome`'s menu with a need's submenu and a manager's: a row one level in is its submenu's,
+/// a row two levels in and a row after a top-level separator are no one's.
+const SUBMENUS: &str = r#"statusmenu "Needs you (1)" enabled=no at=0
+statusmenu "◇ worker needs you: approve the notes · 2m" enabled=yes submenu at=1
+statusmenu   "● worker — asked 2m" enabled=yes checked=no at=1.0
+statusmenu --- at=2
+statusmenu "This Mac — 1 landing · 3 shells" enabled=no at=3
+statusmenu "mgr — 1 worker: 1 landing" enabled=yes submenu at=4
+statusmenu   "Go to mgr" enabled=yes checked=no at=4.0
+statusmenu   --- at=4.1
+statusmenu   "● worker — landing 3m" enabled=yes checked=no tip="not landed yet: no “Nothing left:” defense yet · 1 nudge" at=4.2
+statusmenu     "● worker — deeper 1m" enabled=no at=4.2.0
+statusmenu --- at=5
+statusmenu   "● stray — working 1s" enabled=yes checked=no at=6.0"#;
+
+/// The worker's row is read one level into its MANAGER's submenu (a need's submenu naming it is
+/// not its manager's), ages masked, its tip whole; the flat reader passes all of them over.
+#[test]
+fn a_workers_row_is_read_under_its_managers_submenu() {
+    let sub = sub_rows(SUBMENUS);
+    assert_eq!(
+        sub.iter().map(|r| r.label.as_str()).collect::<Vec<_>>(),
+        ["● worker — asked 2m", "Go to mgr", "● worker — landing 3m"]
+    );
+    assert_eq!(
+        worker_of(&sub, "worker"),
+        "mgr|mgr — 1 worker: 1 landing\nrow|● worker — landing #\ntip|not landed yet: no \u{201c}Nothing left:\u{201d} defense yet \u{b7} 1 nudge"
+    );
+    assert_eq!(worker_of(&sub, "mgr"), "-");
+    assert_eq!(worker_of(&sub, "stray"), "-");
+    assert!(
+        !menu_rows(SUBMENUS)
+            .iter()
+            .any(|r| r.label.contains("worker \u{2014}")),
+        "the flat reader passes submenu rows over"
+    );
+    assert!(is_manager("lab-sweep — 3 workers: 1 landing, 2 landed"));
+    assert!(!is_manager("◇ worker needs you: approve the notes · 2m"));
+    let mut w = Window {
+        label: "worker".into(),
+        ..Window::default()
+    };
+    let said = w.note(&Glance::of(5, SUBMENUS, ""), "s-w");
+    assert!(said.iter().any(|(what, _)| *what == "worker"), "{said:?}");
+    assert_eq!(
+        w.worker.last().map(|(_, e)| worker_field(e, "row")),
+        Some(Some("● worker — landing #"))
+    );
+}
+
+/// A debug build's ` title=` is split off the chip line: the chip's reads stay as they were, and
+/// the title is a read of its own (`-` where none is drawn, `?` where none is printed).
+#[test]
+fn the_title_is_split_off_the_chip_line() {
+    let line = "window=2 program=claude face=cruise drawn=\"∞\" spoken=\"Autopilot: cruise.\" \
+                description=- title=\"autopilot: cruise — keeps going for ever, finding more to \
+                do · click: land · right-click: more\"";
+    let (chip_line, title) = split_title(line);
+    assert_eq!(
+        chip_line,
+        "window=2 program=claude face=cruise drawn=\"∞\" spoken=\"Autopilot: cruise.\" description=-"
+    );
+    assert_eq!(
+        title.as_deref(),
+        Some(
+            "autopilot: cruise — keeps going for ever, finding more to do · click: land · right-click: more"
+        )
+    );
+    assert_eq!(
+        split_title("face=cruise drawn=- why=not-drawn spoken=- description=- title=-")
+            .1
+            .as_deref(),
+        Some("-")
+    );
+    assert_eq!(
+        split_title("face=cruise drawn=- why=not-drawn spoken=-").1,
+        None
+    );
+    let chrome = format!(
+        "autopilot sid=s-c {line}\nautopilot sid=s-d window=2 program=claude face=land drawn=- why=not-drawn spoken=- description=- title=-"
+    );
+    let g = Glance::of(7, &chrome, "");
+    let mut front = Window::default();
+    let _ = front.note(&g, "s-c");
+    assert_eq!(front.chip, [(7, chip_line)]);
+    assert_eq!(front.title.len(), 1);
+    assert!(
+        front.title[0]
+            .1
+            .starts_with("autopilot: cruise — keeps going")
+    );
+    let mut behind = Window::default();
+    let _ = behind.note(&g, "s-d");
+    assert_eq!(behind.title, [(7, "-".to_string())]);
+    let mut old = Window::default();
+    let _ = old.note(
+        &Glance::of(
+            7,
+            "autopilot sid=s-e window=2 program=claude face=off drawn=\"○ off\" spoken=\"x\"",
+            "",
+        ),
+        "s-e",
+    );
+    assert_eq!(old.title, [(7, "?".to_string())]);
+}
+
+/// A chip line drawn in front with `title`.
+fn drawn_title(program: &str, face: &str, drawn: &str, title: &str) -> String {
+    format!(
+        "window=2 program={program} face={face} drawn={drawn} spoken=\"x\" description=- title={title}"
+    )
+}
+
+/// A title as `chrome` prints it.
+fn qt(t: &str) -> String {
+    format!("{t:?}")
+}
+
+fn title_seen(opening: Option<String>, front: Option<String>) -> Seen {
+    Seen {
+        window: Window {
+            read: true,
+            label: "x".into(),
+            opening: opening.map(|l| (900, l)),
+            front: front.map(|l| (9_000, l)),
+            ..Window::default()
+        },
+        ..Seen::default()
+    }
+}
+
+fn title_cx(chain: Chain, program: &'static str) -> Ctx<'static> {
+    Ctx {
+        chain,
+        program,
+        t0: 1_000,
+    }
+}
+
+/// THE TITLE'S WORDS (5d): every chain's chip title says its mode's sentence from MODE_WORDS
+/// before its first prompt; a spawn supplies its worker's task before the opening sweep.
+/// Under Land a read hold's words stand in its place, and a landed face says none. Each mode's
+/// title is the others' negative control.
+#[test]
+fn every_chip_title_says_its_modes_sentence_from_mode_words() {
+    use aterm_agent::supervise::Autopilot;
+    use aterm_agent::supervise::mode_words::mode_words;
+    let title = |mode: &str, m: Autopilot| {
+        format!(
+            "autopilot: {mode} \u{2014} {} \u{b7} click: x \u{b7} right-click: more",
+            mode_words(m).chip
+        )
+    };
+    let (cruise, land, off) = (
+        title("cruise", Autopilot::Cruise),
+        title("land", Autopilot::Land),
+        title("off", Autopilot::Off),
+    );
+    assert_eq!(title_says(&cruise, "cruise"), TitleSays::Sentence);
+    assert_eq!(title_says(&land, "land"), TitleSays::Sentence);
+    assert_eq!(title_says(&off, "off"), TitleSays::Sentence);
+    for (t, mode) in [(&cruise, "land"), (&land, "off"), (&off, "cruise")] {
+        assert!(
+            matches!(title_says(t, mode), TitleSays::Wrong(_)),
+            "{t} as {mode}"
+        );
+    }
+    let old = "autopilot: cruise \u{2014} keeps the work moving \u{b7} click: land";
+    assert!(matches!(title_says(old, "cruise"), TitleSays::Wrong(_)));
+    let cut = format!(
+        "autopilot: land \u{2014} {}",
+        &mode_words(Autopilot::Land).chip[..20]
+    );
+    assert!(matches!(title_says(&cut, "land"), TitleSays::Wrong(_)));
+    let held = "autopilot: land \u{2014} not landed yet: no \u{201c}Nothing left:\u{201d} defense yet \u{b7} landing since 14:02 \u{b7} click: off";
+    assert_eq!(title_says(held, "land"), TitleSays::Held);
+    assert!(matches!(title_says(held, "cruise"), TitleSays::Wrong(_)));
+    let unread = format!(
+        "autopilot: land \u{2014} {} \u{b7} landing since 14:02",
+        mode_words(Autopilot::Land).chip
+    );
+    assert_eq!(title_says(&unread, "land"), TitleSays::Sentence);
+    assert_eq!(
+        title_says(
+            "autopilot: land, landed 14:05 \u{2014} all of the work is on the remote main branch",
+            "land"
+        ),
+        TitleSays::Past("landed")
+    );
+
+    let ok = |s: &Seen, c: Chain, p: &'static str| title_words(s, &title_cx(c, p));
+    let n = title_seen(
+        Some(drawn_title("claude", "cruise", "\"∞\"", &qt(&cruise))),
+        None,
+    );
+    assert!(
+        matches!(ok(&n, Chain::CruiseN, "claude"), Verdict::Pass(_)),
+        "{:?}",
+        ok(&n, Chain::CruiseN, "claude")
+    );
+    assert!(
+        matches!(ok(&n, Chain::LandB, "claude"), Verdict::Fail(_)),
+        "a cruise title on a Land chain"
+    );
+    assert!(
+        matches!(ok(&n, Chain::Worker, "claude"), Verdict::Fail(_)),
+        "a spawned worker still needs its own mode's words"
+    );
+    let b = title_seen(
+        Some(drawn_title("claude", "land", "\"⤓ land\"", &qt(&land))),
+        Some(drawn_title("claude", "land", "\"⤓ land\"", &qt(held))),
+    );
+    assert!(
+        matches!(ok(&b, Chain::LandB, "claude"), Verdict::Pass(_)),
+        "{:?}",
+        ok(&b, Chain::LandB, "claude")
+    );
+    let early = title_seen(
+        Some(drawn_title("claude", "land", "\"⤓ land\"", &qt(held))),
+        None,
+    );
+    assert!(
+        matches!(ok(&early, Chain::LandB, "claude"), Verdict::Fail(_)),
+        "a hold before its first prompt"
+    );
+    assert!(
+        matches!(ok(&early, Chain::Worker, "claude"), Verdict::Pass(_)),
+        "the spawn already supplied the worker's task"
+    );
+    let blank = title_seen(Some(drawn_title("claude", "off", "\"○ off\"", "-")), None);
+    assert!(
+        matches!(ok(&blank, Chain::Off, "claude"), Verdict::Fail(_)),
+        "a drawn chip with no title"
+    );
+    let o = title_seen(
+        Some(drawn_title("claude", "off", "\"○ off\"", &qt(&off))),
+        None,
+    );
+    assert!(matches!(ok(&o, Chain::Off, "claude"), Verdict::Pass(_)));
+    let not_yet =
+        "window=2 program=claude face=land drawn=- why=not-drawn spoken=- description=- title=-";
+    let v = ok(
+        &title_seen(Some(not_yet.into()), None),
+        Chain::Worker,
+        "claude",
+    );
+    assert!(
+        matches!(v, Verdict::Unobserved(_)),
+        "a chip not drawn yet has no title to judge: {v:?}"
+    );
+    let later = title_seen(
+        Some(not_yet.into()),
+        Some(drawn_title("claude", "land", "\"⤓ land\"", &qt(&land))),
+    );
+    let v = ok(&later, Chain::Worker, "claude");
+    assert!(
+        matches!(v, Verdict::Pass(ref w) if w.contains("not drawn yet")),
+        "{v:?}"
+    );
+    let drawn_blank = title_seen(Some(drawn_title("claude", "land", "\"⤓ land\"", "-")), None);
+    assert!(
+        matches!(ok(&drawn_blank, Chain::Worker, "claude"), Verdict::Fail(_)),
+        "a drawn chip with no title still fails"
+    );
+    let g = title_seen(
+        Some(
+            "window=2 program=gemini face=- drawn=- why=no-footer spoken=- description=- title=-"
+                .into(),
+        ),
+        None,
+    );
+    let v = ok(&g, Chain::LandB, "gemini");
+    assert!(
+        matches!(v, Verdict::Pass(ref w) if w.contains("no footer")),
+        "{v:?}"
+    );
+    let agy = title_seen(
+        Some(
+            "window=2 program=agy face=off drawn=- why=switch-only spoken=- description=- title=-"
+                .into(),
+        ),
+        None,
+    );
+    assert!(
+        matches!(ok(&agy, Chain::Off, "agy"), Verdict::Pass(_)),
+        "{:?}",
+        ok(&agy, Chain::Off, "agy")
+    );
+    let release = title_seen(
+        Some("window=2 program=claude face=off drawn=\"○ off\" spoken=\"x\" description=-".into()),
+        None,
+    );
+    assert!(matches!(
+        ok(&release, Chain::Off, "claude"),
+        Verdict::Unobserved(_)
+    ));
+    for c in [Chain::Off, Chain::Worker] {
+        assert!(matches!(
+            ok(&title_seen(None, None), c, "claude"),
+            Verdict::Unobserved(_)
+        ));
+    }
+    let mut drawn = title_seen(None, None);
+    drawn.window.chip = vec![(
+        2_000,
+        "window=2 program=claude face=cruise drawn=\"∞\" spoken=\"x\" description=-".into(),
+    )];
+    drawn.window.title = vec![(2_000, cruise.clone())];
+    assert!(matches!(
+        ok(&drawn, Chain::Cruise, "claude"),
+        Verdict::Pass(_)
+    ));
+    drawn.window.title.push((3_000, off.clone()));
+    assert!(
+        matches!(ok(&drawn, Chain::Cruise, "claude"), Verdict::Fail(_)),
+        "a later read in front says Off's"
+    );
+    let w = WANTS
+        .iter()
+        .find(|w| w.name.starts_with("the chip's title"))
+        .unwrap();
+    for c in TITLED {
+        let s = c.scenarios()[0];
+        assert!(w.of(c, s), "{c:?}");
+    }
+    assert!(!w.of(Chain::Wall, Scenario::W1) && !w.of(Chain::CruiseN, Scenario::N2));
+}
+
+/// L7's Landed row (4c, WHAT THE HARNESS DID): today the run's landings, the week at least that.
+#[test]
+fn the_landed_row_counts_every_landing() {
+    let rest = |did: &str| {
+        format!(
+            "here=\"This Mac — 5 landed\" landed_tabs=5 landing_tabs=7 landings=5 today=\"5 landed today\" every=\"x\" did=\"{did}\""
+        )
+    };
+    let judge = |r: Option<String>| {
+        let s = Seen {
+            window: Window {
+                read: true,
+                rest: r,
+                ..Window::default()
+            },
+            ..Seen::default()
+        };
+        l7_did(&s, &title_cx(Chain::LandE, "claude"))
+    };
+    assert!(matches!(
+        judge(Some(rest("Landed: 5 today \u{b7} 5 in 7 days"))),
+        Verdict::Pass(_)
+    ));
+    assert!(matches!(
+        judge(Some(rest("Landed: 5 today \u{b7} 9 in 7 days"))),
+        Verdict::Pass(_)
+    ));
+    for bad in [
+        "Landed: 4 today \u{b7} 5 in 7 days",
+        "Landed: 5 today \u{b7} 4 in 7 days",
+        "Land prompts: 5 today \u{b7} 5 in 7 days",
+        "Landed: five today",
+    ] {
+        assert!(matches!(judge(Some(rest(bad))), Verdict::Fail(_)), "{bad}");
+    }
+    assert!(matches!(judge(Some(rest("-"))), Verdict::Unobserved(_)));
+    assert!(matches!(judge(None), Verdict::Unobserved(_)));
+    let rows = page_rows(
+        "text key=\"harness/did/row/land-prompts\" role=Group label=\"Land prompts: 9 today · 9 in 7 days\"\ntext key=\"harness/did/row/landed\" role=Group label=\"Landed: 5 today · 5 in 7 days\"",
+    );
+    assert_eq!(
+        did_landed_of(&rows).as_deref(),
+        Some("Landed: 5 today · 5 in 7 days")
+    );
+}
+
+/// END's wheel down the page reads the Landed row where a screen shows it, turns again while the
+/// row is further down, and stops once HARNESS UPDATES shows with no Landed row, since a step
+/// never moves past a row unseen.
+#[test]
+fn the_wheel_stops_at_the_landed_row_or_past_it() {
+    let row = |key: &str, label: &str| (key.to_string(), label.to_string());
+    let landed = row("harness/did/row/landed", "Landed: 5 today · 5 in 7 days");
+    let prompts = row(
+        "harness/did/row/land-prompts",
+        "Land prompts: 9 today · 9 in 7 days",
+    );
+    let updates = row("harness/updates/heading", "HARNESS UPDATES");
+    let sessions = row("harness/session/0", "land-a: land");
+    assert_eq!(
+        did_step(&[prompts.clone(), landed.clone(), updates.clone()]),
+        DidStep::Read("Landed: 5 today · 5 in 7 days".into())
+    );
+    assert_eq!(did_step(&[prompts.clone(), updates]), DidStep::Past);
+    assert_eq!(did_step(&[sessions, prompts]), DidStep::Wheel);
+    assert_eq!(did_step(&[]), DidStep::Wheel);
+}
+
+/// `inspect app/v1 tabs` with Settings in the page's window (1) and, in front of the chains'
+/// window (2), the Settings tab END opened; the chains' window's Settings view only while it is
+/// that window's front tab.
+#[test]
+fn the_opened_page_is_the_chains_windows_front_settings_tab() {
+    let tabs = |active: &str| {
+        format!(
+            "app-inspection version=app/v1 revision=1 subject=tabs
+window id=1 focused=false tabs=2 active=3
+  tab id=2 index=0 kind=terminal title=\"proj\" state=clean active=false
+    leaf path=/ view=2 rect_px=0.0,0.0,1008.0,700.0 focused=true kind=terminal session=1
+  tab id=3 index=1 kind=app title=\"Settings\" state=clean active=true
+    leaf path=/ view=3 rect_px=0.0,0.0,1008.0,700.0 focused=true kind=app app=settings title=\"Settings\"
+window id=2 focused=true tabs=2 active=9
+  tab id=4 index=0 kind=terminal title=\"land-a\" state=busy active={}
+    leaf path=/ view=4 rect_px=0.0,0.0,1008.0,700.0 focused=true kind=terminal session=2
+  tab id=9 index=1 kind=app title=\"Settings\" state=clean active={}
+    leaf path=/ view=7 rect_px=0.0,0.0,1008.0,700.0 focused=true kind=app app=settings title=\"Settings\"
+",
+            active == "terminal",
+            active == "settings"
+        )
+    };
+    assert_eq!(front_page_of(&tabs("settings"), "2").as_deref(), Some("7"));
+    assert_eq!(front_page_of(&tabs("terminal"), "2"), None);
+    assert_eq!(front_page_of(&tabs("settings"), "1").as_deref(), Some("3"));
+    assert_eq!(front_page_of(&tabs("settings"), "5"), None);
+}
+
+/// A spawned worker is read in front only once its chip names its program and the strip lists its
+/// title: a strip a headless window has not drawn since the title was set lacks it.
+#[test]
+fn a_worker_is_read_in_front_once_its_strip_lists_its_title() {
+    assert!(worker_shown(CHROME, "s-aa", "land-a"));
+    assert!(
+        !worker_shown(CHROME, "s-aa", "worker"),
+        "the strip lacks the title"
+    );
+    assert!(
+        !worker_shown(CHROME, "s-zz", "land-a"),
+        "no chip for that tab"
+    );
+    let unnamed = CHROME.replace(
+        "autopilot sid=s-aa window=2 program=claude face=land drawn=\"⤓ land\" spoken=\"Autopilot: land.\"",
+        "autopilot sid=s-aa window=2 program=claude face=- drawn=- why=not-drawn spoken=-",
+    );
+    assert_ne!(unnamed, CHROME);
+    assert!(
+        !worker_shown(&unnamed, "s-aa", "land-a"),
+        "its chip names no program yet"
+    );
+    let bare = unnamed.replace("why=not-drawn", "why=no-footer");
+    assert!(
+        worker_shown(&bare, "s-aa", "land-a"),
+        "a program with no footer draws no chip"
+    );
+}
+
+/// The strip marks a spawned worker `↳ worker` and its manager `mgr ⇉1`; the lab reads each by
+/// the title it gave the tab, and leaves a title that only looks like a mark as it is.
+#[test]
+fn the_strip_is_read_by_title_without_its_team_marks() {
+    let chrome = "toolbar-tabs count=3 selected=0 labels=[\"off\", \"mgr \u{21c9}1\", \"\u{21b3} worker\"] icons=[None, None, None] states=[[\"selected\"], [\"busy\"], [\"busy\"]] tooltips=[None, None, None]\nautopilot sid=s-ww window=2 program=claude face=land drawn=- why=not-drawn spoken=-";
+    let labels: Vec<String> = strip_tabs(chrome).into_iter().map(|t| t.label).collect();
+    assert_eq!(labels, ["off", "mgr", "worker"]);
+    assert!(worker_shown(chrome, "s-ww", "worker"));
+    for kept in [
+        "mgr \u{21c9}",
+        "mgr \u{21c9}1a",
+        "\u{21b3}worker",
+        "a\u{21b3} b",
+    ] {
+        assert_eq!(team_unmarked(kept), kept);
+    }
+    assert_eq!(team_unmarked("\u{21b3} mgr \u{21c9}12"), "mgr");
+}
+
+/// A worker's opening read waits only on a chip its footer would draw and the last frame did not:
+/// a drawn chip, and a program with no footer, are read at once.
+#[test]
+fn only_a_chip_the_frame_left_undrawn_is_waited_on() {
+    assert!(undrawn(
+        "autopilot sid=s-ww window=2 program=claude face=land drawn=- why=not-drawn spoken=- description=- title=-"
+    ));
+    for read in [
+        "autopilot sid=s-ww window=2 program=claude face=land drawn=\"⤓ land\" spoken=\"Autopilot: land.\" description=- title=\"autopilot: land\"",
+        "autopilot sid=s-ww window=2 program=gemini face=- drawn=- why=no-footer spoken=- description=- title=-",
+        "autopilot sid=s-ww window=2 program=agy face=off drawn=- why=switch-only spoken=- description=- title=-",
+    ] {
+        assert!(!undrawn(read), "{read}");
+    }
+}
+
+/// The wheel turns over the middle of the page's list, read off `settings/list`'s rect.
+#[test]
+fn the_wheel_turns_over_the_lists_middle() {
+    let controls = "ui key=\"settings/list/scroll\" role=Group label=\"\" value=- action=- state=- rect=0.0,0.0,10.0,10.0
+ui key=\"settings/list\" role=List label=\"Harness\" value=- action=- state=- rect=234.0,106.0,798.0,582.0";
+    assert_eq!(list_middle(controls), Some((633, 397)));
+    assert_eq!(
+        list_middle("ui key=\"settings/list/scroll\" role=Group rect=0.0,0.0,10.0,10.0"),
+        None
+    );
+    assert_eq!(
+        list_middle("ui key=\"settings/list\" role=List rect=1.0,2.0"),
+        None
+    );
+}
+
+/// END's holds are the Land hold itself (`land_since=`), read off each tab's last `status`,
+/// never a pause: a Cruise chain paused in a back-off holds nothing.
+#[test]
+fn ends_holds_are_read_off_the_hold() {
+    let tab = |chain: Chain, status: &str| Tab {
+        chain,
+        seen: Seen {
+            status: vec![(1, status.to_string())],
+            journal: vec![(
+                1,
+                "WAITING seq=2 until=2099-10-21T10:24:00Z 2 short turn(s) in a row: 4 min back-off"
+                    .to_string(),
+            )],
+            ..Seen::default()
+        },
+        ..tab_with(&[])
+    };
+    let tabs = [
+        tab(
+            Chain::LandB,
+            "task=open land_held=open land_nudges=1 land_since=1792000060",
+        ),
+        tab(
+            Chain::Cruise,
+            "task=open land_held=- land_nudges=- land_since=-",
+        ),
+        tab(
+            Chain::LandA,
+            "task=landed land_held=- land_nudges=- land_since=-",
+        ),
+        tab(
+            Chain::LandC,
+            "task=open land_held=- land_nudges=0 land_since=1792000070",
+        ),
+        tab(Chain::LandD, "task=open needs=ask"),
+    ];
+    assert_eq!(
+        holds_of(&tabs),
+        [
+            "land-b(open, since 1792000060)",
+            "land-c(-, since 1792000070)"
+        ]
+    );
+}
+
+/// Every chain whose chip title is judged has a window want, so a run of it alone (`--chains
+/// land-t`, a red rerun alone) reads the window: 5d gave the cover chains wants of their own
+/// (P5's and L12's defense hold, L15's worker row, the title), and a run that read none of them
+/// would pass them as skips. The wall's chain alone still has none.
+#[test]
+fn a_chain_with_a_window_want_reads_its_window_when_run_alone() {
+    for c in TITLED {
+        assert_eq!(unread_why(true, &[c]), None, "{} alone", c.name());
+    }
+    assert_eq!(unread_why(true, &[Chain::Mgr, Chain::Worker]), None);
+    assert_eq!(
+        unread_why(true, &[Chain::Wall]),
+        Some("no chain of this run has a window want")
+    );
+    assert_eq!(unread_why(false, &[Chain::LandT]), Some("--no-surfaces"));
+}
+
+/// The front tab's chip drawn mid-run with no title fails (`title=-` on a drawn chip is a
+/// title lost), as the opening's and END's reads do; a read whose chip is not drawn names none.
+#[test]
+fn a_drawn_chip_that_loses_its_title_mid_run_fails() {
+    use aterm_agent::supervise::Autopilot;
+    use aterm_agent::supervise::mode_words::mode_words;
+    let cruise = format!(
+        "autopilot: cruise \u{2014} {} \u{b7} click: land \u{b7} right-click: more",
+        mode_words(Autopilot::Cruise).chip
+    );
+    let opening = Some(drawn_title("claude", "cruise", "\"∞\"", &qt(&cruise)));
+    let drawn = "window=2 program=claude face=cruise drawn=\"∞\" spoken=\"x\" description=-";
+    let undrawn =
+        "window=2 program=claude face=cruise drawn=- why=not-drawn spoken=- description=-";
+    let judge = |chip: Vec<(i64, String)>, title: Vec<(i64, String)>| {
+        let mut s = title_seen(opening.clone(), None);
+        s.window.chip = chip;
+        s.window.title = title;
+        title_words(&s, &title_cx(Chain::CruiseN, "claude"))
+    };
+    let lost = judge(vec![(2_000, drawn.into())], vec![(2_000, "-".into())]);
+    assert!(matches!(lost, Verdict::Fail(_)), "drawn, title=-: {lost:?}");
+    let became = judge(
+        vec![(2_000, undrawn.into()), (3_000, drawn.into())],
+        vec![(2_000, "-".into())],
+    );
+    assert!(
+        matches!(became, Verdict::Fail(_)),
+        "drawn at +2 s with the title still -: {became:?}"
+    );
+    let kept = judge(vec![(2_000, drawn.into())], vec![(2_000, cruise.clone())]);
+    assert!(matches!(kept, Verdict::Pass(_)), "drawn, titled: {kept:?}");
+    let hidden = judge(vec![(2_000, undrawn.into())], vec![(2_000, "-".into())]);
+    assert!(
+        matches!(hidden, Verdict::Pass(_)),
+        "not drawn, no title: {hidden:?}"
+    );
+}
+
+/// A hold's words or a landed or quiet title stand only over the face that says them: a
+/// title says `land, landed` only over `face=landed`, `land, quiet` only over `face=theirs`,
+/// a hold only over `face=land`. A title out of step with the chip it hovers fails.
+#[test]
+fn a_past_or_held_title_is_judged_against_its_own_chips_face() {
+    use aterm_agent::supervise::Autopilot;
+    use aterm_agent::supervise::mode_words::mode_words;
+    let land = format!(
+        "autopilot: land \u{2014} {} \u{b7} click: off \u{b7} right-click: more",
+        mode_words(Autopilot::Land).chip
+    );
+    let landed =
+        "autopilot: land, landed 06:12 \u{2014} all of the work is on the remote main branch";
+    let quiet = "autopilot: land, quiet \u{2014} a person's own exchange";
+    let held = "autopilot: land \u{2014} not landed yet: no \u{201c}Nothing left:\u{201d} defense yet \u{b7} landing since 14:02";
+    let at_end = |face: &str, drawn: &str, title: &str| {
+        let s = title_seen(
+            Some(drawn_title("claude", "land", "\"⤓ land\"", &qt(&land))),
+            Some(drawn_title("claude", face, drawn, &qt(title))),
+        );
+        title_words(&s, &title_cx(Chain::LandB, "claude"))
+    };
+    let at_opening = |chain: Chain, face: &str, drawn: &str, title: &str| {
+        let s = title_seen(Some(drawn_title("claude", face, drawn, &qt(title))), None);
+        title_words(&s, &title_cx(chain, "claude"))
+    };
+    for (face, drawn, title) in [
+        ("landed", "\"✓ landed\"", landed),
+        ("theirs", "\"⤓ quiet\"", quiet),
+        ("land", "\"⤓ land\"", held),
+    ] {
+        let v = at_end(face, drawn, title);
+        assert!(matches!(v, Verdict::Pass(_)), "{face}: {v:?}");
+        let v = at_opening(Chain::Worker, face, drawn, title);
+        assert!(matches!(v, Verdict::Pass(_)), "spawned {face}: {v:?}");
+        let v = at_opening(Chain::LandB, face, drawn, title);
+        assert!(matches!(v, Verdict::Fail(_)), "before prompt {face}: {v:?}");
+    }
+    for (face, drawn, title) in [
+        ("land", "\"⤓ land\"", landed),
+        ("land", "\"⤓ land\"", quiet),
+        ("theirs", "\"⤓ quiet\"", landed),
+        ("landed", "\"✓ landed\"", quiet),
+        ("landed", "\"✓ landed\"", held),
+    ] {
+        let v = at_end(face, drawn, title);
+        assert!(
+            matches!(v, Verdict::Fail(_)),
+            "{title:?} over face={face}: {v:?}"
+        );
+        let v = at_opening(Chain::Worker, face, drawn, title);
+        assert!(
+            matches!(v, Verdict::Fail(_)),
+            "spawned {title:?} over face={face}: {v:?}"
+        );
+    }
+}

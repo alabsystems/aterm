@@ -3414,6 +3414,44 @@ impl NativeRuntime {
         }
     }
 
+    /// Retire only the transient marked text of its original native field.
+    /// Values, selections and the view's current focus remain unchanged.
+    pub(crate) fn cancel_preedit(
+        &mut self,
+        instance: AppInstanceId,
+        view: ViewId,
+        field: Option<&UiKey>,
+    ) -> bool {
+        if matches!(self.views.get(&view), Some(AppViewState::SystemState(_))) {
+            if !matches!(
+                self.instances.get(&instance),
+                Some(NativeApp::SystemState(_))
+            ) {
+                return false;
+            }
+            return self.update_system_state(|state| state.cancel_preedit(field));
+        }
+        let Some(state) = self.views.get_mut(&view) else {
+            return false;
+        };
+        let changed = match state {
+            AppViewState::Settings(state) => state.cancel_preedit(field),
+            AppViewState::Editor(state) => {
+                let changed = !state.preedit.is_empty() || state.preedit_caret.is_some();
+                state.preedit.clear();
+                state.preedit_caret = None;
+                changed
+            }
+            _ => false,
+        };
+        if changed {
+            state.touch();
+            let common = state.common_mut();
+            common.presentation_revision = common.presentation_revision.wrapping_add(1);
+        }
+        changed
+    }
+
     pub(crate) fn view_state(&self, view: ViewId) -> Option<&AppViewState> {
         self.views.get(&view)
     }

@@ -53,6 +53,17 @@
 //! are at most [`FLOORS_MAX`] subjects and [`FLOOR_BYTES_MAX`] bytes of names: past either,
 //! the lowest floors fold into one SPILL floor that every hold class's reads answer at least
 //! (it tells more than it must, never less).
+//!
+//! # The ledger, in memory only
+//!
+//! Beside the floors the store keeps the LEDGER of every record the rules gave up, one by
+//! one ([`retention::Ledger`], bounded as the floors are), from which a tail below the base
+//! is told how many records of its filter it lost (R4's addendum, A9). It is not in the
+//! file: an open starts it whole from the base it opens at, so the counts of what was given
+//! up before a restart are not known after it, and the file's format is unchanged. What a
+//! compaction no rules planned dropped unnamed is in the file all the same, as the spill
+//! floor its own `D` frame raises ([`HeldStore::unplanned_job`]), so the range is still
+//! told after a restart.
 
 use crate::brecord::BrokerRecord;
 use crate::retention::{self, Held, Retention, Stamps};
@@ -311,6 +322,8 @@ pub(crate) struct HeldJob {
     pub(crate) floors: BTreeMap<String, u64>,
     /// Unread records given up, by subject and why, and how many: the log lines.
     pub(crate) lost: BTreeMap<(String, retention::Why), u64>,
+    /// Every record given up, one by one: what the store's ledger takes at the finish.
+    given: retention::Ledger,
     file: Option<File>,
     path: PathBuf,
     tmp: PathBuf,
@@ -463,6 +476,8 @@ pub(crate) struct HeldStore {
     pub(crate) room: Vec<u64>,
     pub(crate) taken: Vec<u64>,
     pub(crate) due: bool,
+    /// What the rules gave up, record by record, since the open (see the module docs).
+    pub(crate) ledger: retention::Ledger,
     file: Option<File>,
     len: u64,
     frames: u64,
@@ -890,6 +905,70 @@ impl HeldStore {
         )
     }
 
+    /// How many records of `filter` at offsets in `from..to` the rules gave up that a tail
+    /// told up to `told`, when the ledger stood at `seen`, was not counted
+    /// ([`retention::Ledger::count`]), on a log at `base`: `None` unless the ledger names
+    /// every one of them (whole from `from`, and [`retention::counted_from`]).
+    pub(crate) fn gap_count(
+        &self,
+        base: u64,
+        filter: &Filter,
+        from: u64,
+        to: u64,
+        told: u64,
+        seen: u64,
+    ) -> Option<u64> {
+        if self.ledger.whole() > from
+            || !retention::counted_from(self.rules.as_ref(), &self.since, base, from, filter)
+        {
+            return None;
+        }
+        Some(self.ledger.count(filter, from, to, told, seen))
+    }
+
+    /// THE JOB OF A COMPACTION NO RULES PLANNED to `min`, on a log whose rules were read
+    /// back and not set again (the writer's caps, a plain `retain_before`): it drops every
+    /// record below `min` the store does not hold, of every class, naming none. So every
+    /// hold class reads from at least `min` (the spill floor, which tells more than it must,
+    /// never less), and the ledger is whole only from there. The spill is its `D` frame's
+    /// one floor, the empty name's (as a rewrite keeps it), appended and flushed before the
+    /// compaction's copy as a planned job's frames are: an open after the compaction landed
+    /// reads it back, and one after a crash before it cuts the frame away (it names a cut
+    /// above the base). The file's format is unchanged. `None` for a store that holds by no
+    /// rules, where nothing reads a floor ([`cut_unplanned`](Self::cut_unplanned)).
+    pub(crate) fn unplanned_job(
+        &self,
+        log: &Path,
+        key: Option<&[u8; 32]>,
+        perms: &Permissions,
+        base: u64,
+        min: u64,
+    ) -> io::Result<Option<HeldJob>> {
+        if self.rules.is_none() || self.file.is_none() {
+            return Ok(None);
+        }
+        let mut plan = retention::Plan {
+            cut: min,
+            ..retention::Plan::default()
+        };
+        plan.floors.insert(String::new(), min);
+        plan.given.whole_from(min);
+        self.job(log, key, perms, base, plan).map(Some)
+    }
+
+    /// A COMPACTION NO RULES PLANNED landed at `min` with no job ([`unplanned_job`]): the
+    /// ledger is whole only from `min`, and a store with rules but no file (none this build
+    /// opens) reads every hold class from at least `min`, in memory.
+    ///
+    /// [`unplanned_job`]: Self::unplanned_job
+    pub(crate) fn cut_unplanned(&mut self, min: u64) {
+        if self.rules.is_some() {
+            self.spill = self.spill.max(min);
+            self.floor_max = self.floor_max.max(min);
+        }
+        self.ledger.whole_from(min);
+    }
+
     /// The lowest offset a subscriber can still be delivered from: the oldest held record,
     /// or the base.
     pub(crate) fn read_floor(&self, base: u64) -> u64 {
@@ -1032,6 +1111,7 @@ impl HeldStore {
             remove: plan.remove,
             floors: plan.floors,
             lost: plan.lost,
+            given: plan.given,
             file,
             path: held_path(log),
             tmp: held_tmp_path(log),
@@ -1062,6 +1142,7 @@ impl HeldStore {
         self.len = self.len.saturating_add(n);
         self.frames = self.frames.saturating_add(frames);
         self.stamped_to = self.stamped_to.max(job.stamped_to);
+        self.ledger.take(std::mem::take(&mut job.given));
         for o in &job.remove {
             self.remove_entry(*o);
         }

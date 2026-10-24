@@ -756,6 +756,7 @@ impl OutputStreak {
         }
         let before = out.len();
         let mut fp: u64 = 0;
+        let (cw_i, ch_i) = (geom.cw as i32, geom.ch as i32);
 
         for c in self.comets.iter().flatten() {
             let life = 1.0 - c.progress;
@@ -763,7 +764,7 @@ impl OutputStreak {
             let tail_f = f32::from(c.tail);
             let tail_denom = tail_f.max(1.0);
             let tail_start = (head - tail_f).max(c.from_col as f32);
-            let row = i32::from(c.row);
+            let y = i32::from(c.row) * ch_i;
             for col in tail_start.floor() as i32..=head.round() as i32 {
                 let u = ((head - col as f32) / tail_denom).clamp(0.0, 1.0);
                 let shape = (1.0 - u) * (1.0 - u);
@@ -772,7 +773,8 @@ impl OutputStreak {
                     geom,
                     cfg,
                     amp,
-                    row,
+                    (cw_i, ch_i),
+                    y,
                     col,
                     c.hue + u * HUE_SPAN,
                     shape * life,
@@ -788,11 +790,11 @@ impl OutputStreak {
             let fade =
                 1.0 - (r.since_output_s / (RIBBON_LINGER_MS as f32 / 1000.0)).clamp(0.0, 1.0) * 0.5;
             let cols_f = geom.cols.max(1) as f32;
-            let row = i32::from(r.row);
+            let y = i32::from(r.row) * ch_i;
             let shape = 0.55 * fade;
             for col in r.from_col..=r.to_col {
                 let t = r.hue + (col as f32 / cols_f) * HUE_SPAN;
-                self.push_cell(out, geom, cfg, amp, row, col, t, shape);
+                self.push_cell(out, geom, cfg, amp, (cw_i, ch_i), y, col, t, shape);
             }
             fp = fp
                 .wrapping_mul(31)
@@ -819,12 +821,13 @@ impl OutputStreak {
         geom: Geom,
         cfg: &StreakConfig,
         amp: f32,
-        row: i32,
+        (w, h): (i32, i32),
+        y: i32,
         col: i32,
         hue_t: f32,
         shape: f32,
     ) {
-        if row < 0 || col < 0 || shape <= 0.0 {
+        if y < 0 || col < 0 || shape <= 0.0 {
             return;
         }
         let a = (amp * shape.clamp(0.0, 1.0) * 255.0).round() as u8;
@@ -832,9 +835,7 @@ impl OutputStreak {
             return;
         }
         let base = spectrum(hue_t.rem_euclid(1.0));
-        let x = col * geom.cw as i32;
-        let y = row * geom.ch as i32;
-        let (w, h) = (geom.cw as i32, geom.ch as i32);
+        let x = col * w;
 
         if cfg.dark_theme {
             push_grid_quad(out, geom, x, y, w, h, premul_rgb(base, a), 0);

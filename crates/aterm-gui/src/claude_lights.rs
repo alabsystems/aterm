@@ -910,20 +910,67 @@ impl TitleReading {
         }
         self.generation = generation;
         self.built = built;
-        let (hold, need) = read_words();
-        (self.trail, self.today) = read_trail(title_stamped(&built.1) || hold.is_some());
-        (self.whole, self.short) = autopilot_title(
-            built.0,
-            &built.1,
-            &self.trail,
-            self.today,
-            TitleWords {
-                hold: hold.as_ref(),
-                need: need.as_ref(),
-            },
-        );
+        let parts = compose_title(&built, read_words, read_trail);
+        (self.trail, self.today, self.whole, self.short) =
+            (parts.trail, parts.today, parts.whole, parts.short);
         true
     }
+}
+
+/// A chip title's parts as [`compose_title`] builds them.
+pub(crate) struct TitleParts {
+    /// The trail as the title lists it, and the day it was read on.
+    pub(crate) trail: String,
+    pub(crate) today: Option<i64>,
+    /// The whole title and the short one.
+    pub(crate) whole: String,
+    pub(crate) short: String,
+}
+
+/// THE ONE COMPOSITION of an Autopilot chip's title under `built` (the view and glass a frame
+/// noted), from the words and the trail its readers give: the hover's reading
+/// ([`TitleReading::refresh`] and its first build) and `chrome`'s `title=` ([`title_parts`]).
+fn compose_title(
+    built: &(AutopilotView, ChipGlass),
+    read_words: impl FnOnce() -> (
+        Option<crate::harness_glass::HeldGlass>,
+        Option<crate::needs::HarnessAsk>,
+    ),
+    read_trail: impl FnOnce(bool) -> (String, Option<i64>),
+) -> TitleParts {
+    let (hold, need) = read_words();
+    let (trail, today) = read_trail(title_stamped(&built.1) || hold.is_some());
+    let (whole, short) = autopilot_title(
+        built.0,
+        &built.1,
+        &trail,
+        today,
+        TitleWords {
+            hold: hold.as_ref(),
+            need: need.as_ref(),
+        },
+    );
+    TitleParts {
+        trail,
+        today,
+        whole,
+        short,
+    }
+}
+
+/// Session `session`'s Autopilot chip title under `built`, with the hold, the need and the trail
+/// it reads now ([`compose_title`]).
+pub(crate) fn title_parts(
+    harness_glass: &std::collections::HashMap<u64, crate::harness_glass::SessionGlass>,
+    pool: &crate::SessionPool,
+    session: u64,
+    built: &(AutopilotView, ChipGlass),
+) -> TitleParts {
+    compose_title(
+        built,
+        || title_words_of(harness_glass, pool, session),
+        |stamped| crate::harness_glass::trail_title(harness_glass, session, stamped),
+    )
 }
 
 /// How many painted blocks a window keeps for reuse (`App::recycle_claude_lights_block`).
@@ -2939,35 +2986,29 @@ impl App {
                 .map_or((AutopilotView::Unhosted, ChipGlass::default()), |s| {
                     (s.autopilot.unwrap_or(AutopilotView::Unhosted), s.glass)
                 });
-            let read_words = || title_words_of(&self.harness_glass, &self.pool, session);
             match at {
                 Some(i) => {
                     let reading = &mut lights.readings[i];
-                    if reading.refresh(generation, built, read_words, |stamped| {
-                        crate::harness_glass::trail_title(&self.harness_glass, session, stamped)
-                    }) {
+                    if reading.refresh(
+                        generation,
+                        built,
+                        || title_words_of(&self.harness_glass, &self.pool, session),
+                        |stamped| {
+                            crate::harness_glass::trail_title(&self.harness_glass, session, stamped)
+                        },
+                    ) {
                         lights.fits += 1;
                         reading.laid = lights.fits;
                     }
                     Some(i)
                 }
                 None => {
-                    let (hold, need) = read_words();
-                    let (trail, today) = crate::harness_glass::trail_title(
-                        &self.harness_glass,
-                        session,
-                        title_stamped(&built.1) || hold.is_some(),
-                    );
-                    let (whole, short) = autopilot_title(
-                        built.0,
-                        &built.1,
-                        &trail,
+                    let TitleParts {
+                        trail,
                         today,
-                        TitleWords {
-                            hold: hold.as_ref(),
-                            need: need.as_ref(),
-                        },
-                    );
+                        whole,
+                        short,
+                    } = title_parts(&self.harness_glass, &self.pool, session, &built);
                     lights.fits += 1;
                     lights.readings.push(TitleReading {
                         session,

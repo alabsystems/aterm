@@ -17,7 +17,7 @@ pub use authorization::InitialSetupAuthorization;
 mod access;
 mod observe;
 pub use observe::observe_initial_setup;
-pub(super) use observe::{changed_at_login, forget_at_login, note_at_login};
+pub(super) use observe::{changed_at_login, note_at_login};
 mod scope;
 pub use scope::{alab_mac, upgrade_provisional_setup};
 mod secrets_retry;
@@ -1152,37 +1152,11 @@ fn stage_restart(
     let mut next = prior.unwrap_or_default().next_for_plan(plan)?;
     next.access = carried_access(previous.as_ref().map(|(plan, _)| plan), prior, plan);
     next.admitted_vault = vault;
-    (next.done, next.only) = chosen_keeps(restart, previous.as_ref(), prior, plan);
-    // Restore put the Mac preferences back, and only the person sets them again: Set
-    // up now sets every one the plan selects; a choice or a Join sets what the restored
-    // record queues ([`Restored::queued_after`]): the groups a choice turned on since the
-    // Restore that no pass has set yet, never a group left as it was or turned to Leave
-    // as is. The record, not the run's progress, holds that queue and the plan it was
-    // measured from, so nothing staged before the Restore runs after it, and a choice cut
-    // short before its record landed is measured again from the plan before it. Nothing
-    // restored is recorded applied until a pass sets it (the pass writes that itself,
-    // [`record_applied`]). An unreadable decision is rewritten below, as before.
+    // An unreadable decision is rewritten below, as before.
     let restored = decision_record(root).map_or(None, |(_, restored)| restored);
-    let mut still_restored = None;
-    if let Some(restored) = restored {
-        next.done &= !Stage::Workstation.bit();
-        next.only = None;
-        if chosen {
-            let saved = previous.as_ref().map(|(saved, _)| saved);
-            let queued = restored.queued_after(prior, saved, plan);
-            if queued.is_empty() {
-                next.done |= Stage::Workstation.bit();
-            } else {
-                next.only = Some(queued);
-            }
-            still_restored = Some(Restored {
-                queued: Some(queued),
-                selection: Some(plan.selection),
-                ..restored
-            })
-            .filter(|restored| restored.owes(plan.selection));
-        }
-    }
+    let still_restored;
+    (next.done, next.only, still_restored) =
+        admitted_keeps(restart, previous.as_ref(), prior, restored, plan);
     // Only a person's choice makes a provisional plan theirs (`InitialSetupRestart::chosen`).
     let provisional = !chosen
         && previous
@@ -1202,14 +1176,70 @@ fn stage_restart(
             Err(error) => return Err(format!("cannot reset {what}: {error}")),
         }
     }
-    if let Some(restored) = still_restored {
-        save_restored_decision(root, false, restored)?;
-    } else if mac_settings_kept(plan, next.done) {
-        save_workstation_decision(root, true)?;
-    } else {
-        save_workstation_authorization(root, plan)?;
-    }
+    save_admitted_decision(root, still_restored, mac_settings_kept(plan, next.done))?;
     Ok(next)
+}
+
+/// What an admission of `plan` keeps of the run it replaces ([`chosen_keeps`]), and what of a
+/// Restore's record (`restored`) still stands after it: one path for a choice on System State
+/// ([`stage_restart`]) and for a startup offer's answer, whatever plan it admits
+/// ([`InitialSetupAuthorization`]).
+///
+/// Restore put the Mac preferences back, and only the person sets them again: Set up now, or the
+/// window resuming the plan in force (`restart.chosen` false), sets every one the plan selects; a
+/// choice or a Join sets what the restored record queues ([`Restored::queued_after`]): the groups
+/// a choice turned on since the Restore that no pass has set yet, never a group left as it was or
+/// turned to Leave as is (a Join, or a plan presented in a vault joined since, turns none on).
+/// The record, not the run's progress, holds
+/// that queue and the plan it was measured from, so nothing staged before the Restore runs after
+/// it, and a choice cut short before its record landed is measured again from the plan before
+/// it. Nothing restored is recorded applied until a pass sets it (the pass writes that itself,
+/// [`record_applied`]).
+fn admitted_keeps(
+    restart: Restart,
+    previous: Option<&(Plan, bool)>,
+    prior: Option<Progress>,
+    restored: Option<Restored>,
+    plan: &Plan,
+) -> (u16, Option<Selection>, Option<Restored>) {
+    let (mut done, only) = chosen_keeps(restart, previous, prior, plan);
+    let Some(restored) = restored else {
+        return (done, only, None);
+    };
+    done &= !Stage::Workstation.bit();
+    if !restart.chosen {
+        return (done, None, None);
+    }
+    let saved = previous.map(|(saved, _)| saved);
+    let queued = restored.queued_after(prior, saved, plan);
+    if queued.is_empty() {
+        done |= Stage::Workstation.bit();
+    }
+    let still = Some(Restored {
+        queued: Some(queued),
+        selection: Some(plan.selection),
+        ..restored
+    })
+    .filter(|restored| restored.owes(plan.selection));
+    (
+        done,
+        Some(queued).filter(|queued| !queued.is_empty()),
+        still,
+    )
+}
+
+/// The first-run decision an admission writes once [`admitted_keeps`] decided it: what of a
+/// Restore still stands (`restored`), else `applied` (every Mac settings stage the plan selects
+/// is kept finished, [`mac_settings_kept`]), else pending.
+fn save_admitted_decision(
+    root: &Path,
+    restored: Option<Restored>,
+    applied: bool,
+) -> Result<(), String> {
+    match restored {
+        Some(restored) => save_restored_decision(root, false, restored),
+        None => save_workstation_decision(root, applied),
+    }
 }
 
 /// The preferences `plan` selects that `before` did not: what a choice turned on.
@@ -2172,7 +2202,7 @@ impl SetupNext {
         } else if !rows.is_empty()
             && rows
                 .iter()
-                .all(|row| matches!(row.status.as_str(), "ok" | "applied" | WAITING))
+                .all(|row| row_ready(row) || row.status == WAITING)
         {
             Self::Park
         } else {
@@ -2893,10 +2923,13 @@ fn readiness_row(name: &str, ready: bool, detail: String) -> Row {
 }
 
 fn rows_ready(rows: &[Row]) -> bool {
-    !rows.is_empty()
-        && rows
-            .iter()
-            .all(|row| matches!(row.status.as_str(), "ok" | "applied"))
+    !rows.is_empty() && rows.iter().all(row_ready)
+}
+
+/// A row with nothing left to do: in place, set, or back as saved and loading at the next login
+/// ([`super::LOGIN`]), which no pass can hurry.
+fn row_ready(row: &Row) -> bool {
+    matches!(row.status.as_str(), "ok" | "applied" | super::LOGIN)
 }
 
 enum SecretsTry {
@@ -8750,23 +8783,120 @@ mod tests {
         assert_ne!(workstation_row(root.path()).status, "applied");
     }
 
+    /// After a Restore, a choice turned Desktop & Dock on and its process ended before the
+    /// admission; the next launch's offer is answered with another plan than the one staged: a
+    /// group choice made while the offer waited, a Join, or, with no person at all, the staged
+    /// plan presented in a vault the Mac joined since. Each is a choice over the Restore, as
+    /// the same one made on System State is (design §3.4): it sets only the group the person
+    /// turned on, keeps the sign-outs and the access revision, and leaves Keyboard & Trackpad
+    /// restored.
     #[test]
-    fn a_different_restored_startup_choice_still_sets_its_whole_plan() {
-        let (root, mut plan) = staged_restored_choice();
-        plan.selection.set(Setting::Spotlight, false);
-        let mut startup = InitialSetupAuthorization::capture_at(root.path()).unwrap();
-        let revision = startup
-            .persist_at(root.path(), &plan)
-            .result
-            .unwrap()
-            .unwrap();
-        assert_eq!(progress(root.path()).unwrap().unwrap().only, None);
-        assert_eq!(decision_record(root.path()).unwrap().1, None);
-        let host = run_pass(root.path(), revision);
-        assert_eq!(host.only, [None]);
-        assert!(finished_at(root.path()).unwrap());
-        assert_eq!(decision_at(root.path()).unwrap(), Decision::Applied(true));
-        assert_eq!(workstation_row(root.path()).status, "applied");
+    fn a_restored_startup_answer_of_another_plan_sets_only_what_the_person_turned_on() {
+        use aterm_types::macos_setup::Group;
+        let desktop = group_selection(Group::Desktop);
+        for route in ["group choice", "join", "vault joined since"] {
+            let (root, staged) = staged_restored_choice();
+            let before = progress(root.path()).unwrap().unwrap();
+            let home = aterm_tempfile::tempdir().unwrap();
+            let url = "https://joined.example/v1/joined";
+            let joined = configure_vault(&aterm_secrets::client::Paths::for_home(home.path()), url);
+            let mut startup = InitialSetupAuthorization::capture_at(root.path()).unwrap();
+            let (plan, answer) = match route {
+                "group choice" => {
+                    let offered = startup.offer_reading(root.path(), || Ok(None)).unwrap();
+                    let mut plan = offered;
+                    plan.selection.set(Setting::Spotlight, false);
+                    let answer = startup.persist_at(root.path(), &plan);
+                    (plan, answer)
+                }
+                "join" => {
+                    startup.offer_reading(root.path(), || Ok(None)).unwrap();
+                    let plan = Plan {
+                        vault_url: url.into(),
+                        ..staged.clone()
+                    };
+                    let answer = startup.persist_join_at(root.path(), &plan, Some(joined));
+                    (plan, answer)
+                }
+                _ => {
+                    let plan = startup
+                        .offer_reading(root.path(), || Ok(Some(joined.clone())))
+                        .unwrap();
+                    assert_ne!(plan, staged, "the offer is presented in the joined vault");
+                    let answer = startup.persist_at(root.path(), &plan);
+                    (plan, answer)
+                }
+            };
+            let revision = answer.result.unwrap().expect("admitted");
+            let admitted = progress(root.path()).unwrap().unwrap();
+            assert!(admitted.belongs_to(&plan), "{route}");
+            assert_eq!(admitted.only, Some(desktop), "{route}");
+            assert_eq!(
+                admitted.access_revision(),
+                before.access_revision(),
+                "{route}: the grants are not handed to macOS again"
+            );
+            assert_eq!(
+                decision_record(root.path()).unwrap(),
+                (
+                    Decision::Pending,
+                    Some(Restored {
+                        left: preferences(Selection::all()),
+                        queued: Some(desktop),
+                        selection: Some(plan.selection),
+                    })
+                ),
+                "{route}: the Restore's record measures from the admitted plan"
+            );
+            let host = run_pass(root.path(), revision);
+            assert_eq!(host.only, [Some(desktop)], "{route}");
+            for kept in [Stage::Accounts, Stage::Permissions] {
+                assert!(!host.calls.contains(&kept), "{route}: {:?}", host.calls);
+            }
+            assert!(finished_at(root.path()).unwrap(), "{route}");
+            assert_eq!(
+                restored_left(root.path()),
+                (Decision::Pending, Some(group_selection(Group::Input))),
+                "{route}: Keyboard & Trackpad were restored and nobody turned them on"
+            );
+            assert_ne!(workstation_row(root.path()).status, "applied", "{route}");
+        }
+    }
+
+    /// The startup answer and System State's own choice of the same plan over the same
+    /// records admit the same run: one path admits a plan over a Restore's record.
+    #[test]
+    fn a_restored_startup_answer_admits_what_the_same_choice_on_system_state_does() {
+        let mut no_spotlight = Plan::default();
+        no_spotlight.selection.set(Setting::Spotlight, false);
+        for plan in [Plan::default(), no_spotlight] {
+            let (startup_root, _) = staged_restored_choice();
+            let mut startup = InitialSetupAuthorization::capture_at(startup_root.path()).unwrap();
+            startup
+                .persist_at(startup_root.path(), &plan)
+                .result
+                .unwrap();
+            let (window_root, _) = staged_restored_choice();
+            system_state_choice(window_root.path(), &plan);
+            let (by_startup, by_window) = (
+                progress(startup_root.path()).unwrap().unwrap(),
+                progress(window_root.path()).unwrap().unwrap(),
+            );
+            assert_eq!(
+                (
+                    by_startup.done,
+                    by_startup.only,
+                    by_startup.access_revision()
+                ),
+                (by_window.done, by_window.only, by_window.access_revision()),
+                "{plan:?}"
+            );
+            assert_eq!(
+                decision_record(startup_root.path()).unwrap(),
+                decision_record(window_root.path()).unwrap(),
+                "{plan:?}"
+            );
+        }
     }
 
     /// The first-run decision, and the Mac preferences it keeps restored, if any.

@@ -5,7 +5,7 @@
 
 use aterm_core::terminal::RenderCell;
 
-use super::{Chip, ChipFace, SessionLights, WindowLights};
+use super::{Chip, ChipFace, ChipGlass, SessionLights, WindowLights};
 use crate::App;
 use crate::autopilot::AutopilotView;
 
@@ -59,6 +59,19 @@ fn cells_text(cells: &[RenderCell]) -> String {
     cells.iter().filter(|c| !c.wide).map(|c| c.ch).collect()
 }
 
+/// Whether `chrome`'s `autopilot` lines end with the chip's ` title=`: a development build's (a
+/// test build too) alone, so a release's lines are main's, byte for byte.
+const CHROME_TITLE: bool = cfg!(any(test, debug_assertions));
+
+/// What the chip's node says on one `autopilot` line: its label (`spoken=`), its description and,
+/// in a development build, the title its hover reads ([`App::hovered_title`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Said<'a> {
+    pub(crate) spoken: &'a str,
+    pub(crate) description: Option<&'a str>,
+    pub(crate) title: Option<&'a str>,
+}
+
 /// Formats one `autopilot` line for `aterm ctl chrome`.
 pub(crate) fn drawn_chip_line(
     sid: &str,
@@ -66,7 +79,7 @@ pub(crate) fn drawn_chip_line(
     program: aterm_phase::Program,
     face: Option<ChipFace>,
     drawn: &Drawn,
-    spoken: Option<(&str, Option<&str>)>,
+    said: Option<Said<'_>>,
 ) -> String {
     let face = face.map_or("-", face_word);
     let mut line = format!(
@@ -83,15 +96,21 @@ pub(crate) fn drawn_chip_line(
             }
         }
     }
-    match spoken {
-        Some((spoken, description)) => {
-            line.push_str(&format!(" spoken={spoken:?}"));
-            match description {
+    match said {
+        Some(said) => {
+            line.push_str(&format!(" spoken={:?}", said.spoken));
+            match said.description {
                 Some(description) => line.push_str(&format!(" description={description:?}")),
                 None => line.push_str(" description=-"),
             }
         }
         None => line.push_str(" spoken=- description=-"),
+    }
+    if CHROME_TITLE {
+        match said.and_then(|said| said.title) {
+            Some(title) => line.push_str(&format!(" title={title:?}")),
+            None => line.push_str(" title=-"),
+        }
     }
     line
 }
@@ -207,13 +226,19 @@ impl App {
                             })
                         });
                     let spoken = matches!(drawn, Drawn::Cells(_)).then(|| {
-                        let noted = ws
+                        let built = ws
                             .claude_lights
                             .sessions
                             .get(&session)
-                            .and_then(|s| s.autopilot)
-                            .unwrap_or(AutopilotView::Unhosted);
-                        self.autopilot_spoken(session, noted, &glass)
+                            .map_or((AutopilotView::Unhosted, ChipGlass::default()), |s| {
+                                (s.autopilot.unwrap_or(AutopilotView::Unhosted), s.glass)
+                            });
+                        let (label, description) = self.autopilot_spoken(session, built.0, &glass);
+                        let title = CHROME_TITLE.then(|| {
+                            super::title_parts(&self.harness_glass, &self.pool, session, &built)
+                                .whole
+                        });
+                        (label, description, title)
                     });
                     lines.push(drawn_chip_line(
                         sid,
@@ -221,9 +246,11 @@ impl App {
                         program,
                         Some(face),
                         &drawn,
-                        spoken
-                            .as_ref()
-                            .map(|(label, description)| (label.as_str(), description.as_deref())),
+                        spoken.as_ref().map(|(label, description, title)| Said {
+                            spoken: label,
+                            description: description.as_deref(),
+                            title: title.as_deref(),
+                        }),
                     ));
                 }
             }

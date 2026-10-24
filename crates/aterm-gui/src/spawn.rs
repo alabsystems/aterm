@@ -3649,6 +3649,10 @@ mod foreground_handback_conformance;
 #[path = "cwd_report_reader_tests.rs"]
 mod cwd_report_reader_tests;
 
+#[cfg(all(test, target_os = "macos"))]
+#[path = "act_barrier_reader_tests.rs"]
+mod act_barrier_reader_tests;
+
 #[cfg(all(test, unix))]
 #[path = "holder_image_reader_tests.rs"]
 mod holder_image_reader_tests;
@@ -6085,6 +6089,10 @@ pub(crate) enum GatherMsg {
     Reset(crate::manual_reset::ManualReset),
     /// A host path changed the engine with no output to follow (a resize, a config or cell size).
     Journal,
+    /// Every byte the master held when the gather took these act barriers (off macOS, where its
+    /// queue cannot be read, every byte the gather had read) went out in the batches before this
+    /// one (`crate::act_barrier`): the parse stage answers each once it holds them.
+    Barrier(Vec<std::sync::mpsc::SyncSender<()>>),
 }
 
 #[cfg(unix)]
@@ -6114,7 +6122,8 @@ fn spawn_pty_gather(
         format!("aterm-pty-gather-{id}"),
         crate::qos::Role::Responsive,
         move || {
-            let _lane_guard = lane_guard;
+            let mut lane_guard = lane_guard;
+            let mut barriers = crate::act_barrier::Countdown::default();
             if let Some(gate) = &start_gate
                 && !gate.wait_until_released(&stop)
             {
@@ -6181,7 +6190,14 @@ fn spawn_pty_gather(
                     break;
                 }
                 let outcome = match after_exit {
-                    None => aterm_pty::read_or_wake(master, &mut buf, wake_rd, exit_rd, proc_rd),
+                    None => aterm_pty::read_or_poke(
+                        master,
+                        &mut buf,
+                        wake_rd,
+                        exit_rd,
+                        proc_rd,
+                        lane_guard.poke_rd,
+                    ),
                     Some(left) => {
                         let room = left.min(buf.len());
                         match aterm_pty::drain_more(master, &mut buf[..room], 0) {
@@ -6220,6 +6236,21 @@ fn spawn_pty_gather(
                     aterm_pty::ReadOutcome::Wake => {
                         let _ = filled_tx.send(GatherMsg::Wake);
                         break;
+                    }
+                    aterm_pty::ReadOutcome::Poke => {
+                        // The top of the loop: every byte read so far has gone out, so what the
+                        // master holds now is all the program wrote before the ask that is not.
+                        if !aterm_pty::drain_pokes(lane_guard.poke_rd) {
+                            aterm_pty::close_fd(lane_guard.poke_rd);
+                            lane_guard.poke_rd = -1;
+                        }
+                        let asked = lane_guard.lane.take_asked(lane_guard.generation);
+                        let queued = aterm_pty::output_queue_len(master);
+                        if let Some(now) = barriers.ask(asked, queued)
+                            && filled_tx.send(GatherMsg::Barrier(now)).is_err()
+                        {
+                            break;
+                        }
                     }
                     aterm_pty::ReadOutcome::Idle => {
                         // Wake-pipe-less fallback (fd exhaustion): honor the stop flag.
@@ -6303,6 +6334,11 @@ fn spawn_pty_gather(
                             if owed == 0 {
                                 let _ = filled_tx.send(GatherMsg::CaughtUp);
                             }
+                        }
+                        let due = barriers
+                            .sent(filled, || aterm_pty::output_queue_len(master) == Some(0));
+                        if !due.is_empty() && filled_tx.send(GatherMsg::Barrier(due)).is_err() {
+                            break;
                         }
                         if let Some(x) = exec.as_mut()
                             && x.has_deferred()
@@ -6763,10 +6799,12 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
     let (filled_rx, free_tx, parse_in_flight, lane_generation, probe_sink, start_gather) = {
         let (filled_tx, filled_rx) =
             std::sync::mpsc::sync_channel::<GatherMsg>(GATHER_RING_BUFFERS + 4);
-        let lane_generation = reset_lane.open(filled_tx.clone());
+        let (poke_rd, poke_wr) = aterm_pty::make_wake_pipe().unzip();
+        let lane_generation = reset_lane.open(filled_tx.clone(), poke_wr);
         let lane_guard = crate::manual_reset::LaneGuard {
             lane: reset_lane.clone(),
             generation: lane_generation,
+            poke_rd: poke_rd.unwrap_or(-1),
         };
         let (free_tx, free_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(GATHER_RING_BUFFERS);
         for _ in 1..GATHER_RING_BUFFERS {
@@ -7470,6 +7508,12 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                         if let Some(j) = &journal {
                             j.on_nudge(&term);
                         }
+                    }
+                    Ok(GatherMsg::Barrier(asked)) => {
+                        for waiter in asked {
+                            let _ = waiter.try_send(());
+                        }
+                        reset_lane.answered(lane_generation);
                     }
                 }
             }
