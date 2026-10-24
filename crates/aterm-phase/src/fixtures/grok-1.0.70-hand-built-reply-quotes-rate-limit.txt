@@ -1,0 +1,13 @@
+# grok 1.0.70 · HAND-BUILT 2026-10-23: a reply whose prose quotes the plan rate limit, assembled as grok-1.0.70-hand-built-wall-plan-rate-limit is, with no error card — every row is the reply's own words, so none opens with the limit's text
+  ~/proj
+
+  › why does the API answer 429?
+
+  When you hit the rate limit for your plan, the xAI API answers 429 and the
+  CLI says so: it prints "You've hit the rate limit for your plan." and waits.
+  A rate limit clears by itself; upgrading the plan raises it.
+
+
+
+
+                                                 ctrl+q  quit

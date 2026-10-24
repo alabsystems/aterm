@@ -3633,6 +3633,44 @@ mod tests {
         assert!(!refresh_view(&fx.layout, "trust").unwrap().changed);
     }
 
+    /// A build laid aside in `<build>.noindex` ([`aterm_toolchain::layout`]) is read through
+    /// its `<build>` link: moving it changes nothing the view holds, and a build that arrives
+    /// aside is presented like any other.
+    #[cfg(unix)]
+    #[test]
+    fn the_view_reads_a_build_laid_aside_through_its_link() {
+        let fx = Fixture::new("view-aside");
+        let build = fx.install_trust(6808);
+        assert!(refresh_view(&fx.layout, "trust").unwrap().changed);
+        crate::store::lay_aside(&build).unwrap();
+        let again = refresh_view(&fx.layout, "trust").unwrap();
+        assert_eq!(
+            again.build, build,
+            "the view names the build, not its folder"
+        );
+        assert!(!again.changed, "the same tree, so the same view");
+
+        let next = fx.install_trust(6809);
+        crate::store::lay_aside(&next).unwrap();
+        let r = refresh_view(&fx.layout, "trust").unwrap();
+        assert_eq!(r.build, next);
+        assert!(r.changed);
+        let view = view_dir(&fx.layout, "trust");
+        assert!(
+            std::fs::symlink_metadata(view.join("lib"))
+                .unwrap()
+                .is_dir()
+        );
+        assert!(cloned(
+            &next.join("lib").join("libtrust.dylib"),
+            &view.join("lib").join("libtrust.dylib")
+        ));
+        assert!(cloned(
+            &next.join("bin").join("trustc"),
+            &view.join("bin").join("rustc")
+        ));
+    }
+
     /// A stock-name copy an older bundle shipped is not presented.
     #[cfg(unix)]
     #[test]

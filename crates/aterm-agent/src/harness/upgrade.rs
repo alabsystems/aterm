@@ -284,7 +284,9 @@ impl Agent {
             aterm_phase::Program::Agy => Some(Agent::Agy),
             aterm_phase::Program::Muse => Some(Agent::Muse),
             aterm_phase::Program::Gemini => Some(Agent::Gemini),
-            aterm_phase::Program::Generic => None,
+            aterm_phase::Program::Grok
+            | aterm_phase::Program::Kimi
+            | aterm_phase::Program::Generic => None,
         }
     }
 }

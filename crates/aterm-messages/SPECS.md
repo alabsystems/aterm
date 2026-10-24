@@ -55,11 +55,11 @@ Result: **148 specs**, covering **474 tests**. **11 tests are not spec samples**
 - **`Reach`**: the `MessageCenter` states reachable from `MessageCenter::new(log, t)`, where `log` is
   `MessageLog::empty()` or a `replay`/`replay_all` of drained lines, through any finite sequence of public
   operations at injected instants that never decrease: post, restate, resolve, resolve_key_prefix, withdraw,
-  withdraw_with, keep_as_record, dismiss, mark_seen, act, settle, commit_rows, quit,
+  withdraw_key_prefix, withdraw_with, keep_as_record, dismiss, mark_seen, act, settle, commit_rows, quit,
   drain_new_for_persist, drain_shelved_for_persist, carried, seed_carried, raise_next_id,
   after_handoff_commit, merge_reloaded_log, end_carried_rows_the_parent_ended, close_uncarried,
   reword_record, supersede_record, fix_closed, the digest operations (post_later, sync_digest, settle_digest,
-  file_digest, clear_digest, adopt_digest, catch_up, act_digest) and `wire::apply`.
+  file_digest, clear_digest, withdraw_digest, adopt_digest, catch_up, act_digest) and `wire::apply`.
 - `Glass(c)` = `c.on_glass()` ids, in order. `Queue(c)` = the live rows not on glass, unrevealed rows included.
   `committed` = `c.committed_rows()`. `span(hold)` = the hold's fold span: the severity default for
   Default, d for For(d), the ask's span for Ask.

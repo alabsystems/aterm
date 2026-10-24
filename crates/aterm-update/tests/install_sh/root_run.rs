@@ -774,7 +774,10 @@ fn under_root_an_install_folder_with_an_acl_is_refused() {
          chmod +a 'group:everyone allow add_subdirectory' \"$D\" && ! root_dest_acl_open \"$D\" )",
         &[],
     );
+    // A deny-delete entry left on the folder would keep it when the scratch goes.
+    let cleared = lib.call("chmod -N \"$D\"", &[]);
     let recs = lib.run(&scratch);
+    assert_eq!(recs[cleared].rc, 0, "chmod -N: {}", recs[cleared].err);
     for ((label, _, want), i) in rows.iter().zip(calls) {
         assert_eq!(recs[i].rc, 0, "{label}: {}", recs[i].err);
         assert_eq!(
@@ -1812,72 +1815,365 @@ fn under_root_a_build_takes_no_name_a_link_another_account_can_redirect() {
     );
 }
 
+/// What `under_root_a_walk_through_a_filesystem_whose_owners_say_nothing_refuses` walks:
+/// folders, a way of 42 links in a mounted folder and in a plain one with a bin folder's
+/// `cc` at the start of each, folders the first look after a walk swaps for another while
+/// `SWAP` names one, and a mountinfo fixture of each kind of Linux mount, read by the real
+/// reader (`kernel_linux_mounts`) on both platforms. `$W/roots` lists each mount as
+/// `<dev> <statfs type> <folder>` (`-` for a type stat cannot read), and `folder_ids` and
+/// `folder_types` answer from it what this host's stat would for a real one, matching a
+/// folder to a mount by identity; elsewhere `folder_ids` reads the host on macOS and gives
+/// Linux's root device, whose type the fixture says is FUSE.
+const FOREIGN_MOUNTS: &str = r#"FOREIGN_LIST="$TMPDIR/foreign"; : >"$FOREIGN_LIST"
+umask 022; W="$TMPDIR/w"; ABC="$W/a b"$'\t'"c\\d"
+mkdir -p "$W/vol/d" "$W/net/d" "$W/ok/d" "$W/fl/d" "$W/tree/sub/d" "$W/bad/d" "$W/stack/d" \
+	"$W/tree2/at on it" "$W/tree3/sub" "$W/pbin" "$W/obin" "$W/sib/d" "$W/sib (old)" "$W/dn/d" \
+	"$W/swap/d" "$W/swap2/d" "$W/cbin" "$W/ocbin" "$W/rb/d" "$W/loc/d" "$W/fm" "$ABC/d" \
+	"$W/dno/d" "$W/xt/sub" "$W/sys/d" "$W/lt/sub" "$W/xg" "$W/tt/sub" && ln -s "$W/tt" "$W/tl"
+printf '#!/bin/sh\n' >"$W/pbin/cc" && chmod 755 "$W/pbin/cc"
+cp "$W/pbin/cc" "$W/obin/cc" && cp "$W/pbin/cc" "$W/fm/prog" && cp "$W/pbin/cc" "$W/fm/other"
+i=0
+while [ "$i" -lt 42 ]; do
+	ln -s "l$((i + 1))" "$W/vol/l$i" && ln -s "l$((i + 1))" "$W/ok/l$i"
+	i=$((i + 1))
+done
+ln -s "$W/vol/l0" "$W/cbin/cc" && ln -s "$W/ok/l0" "$W/ocbin/cc"
+moved() { [ -z "${SWAP:-}" ] || [ -e "$W/$SWAP.old" ] || { mv "$W/$SWAP" "$W/$SWAP.old" && mkdir -p "$W/$SWAP/d"; }; }
+esc() { local p="${1//\\/\\134}"; p="${p// /\\040}"; printf '%s' "${p//$'\t'/\\011}"; }
+eval "kernel_$(declare -f linux_mounts)"
+: >"$W/empty"
+printf '%s\n' "21 1 0:31 / / rw - fuse.fuse-overlayfs fuse-overlayfs rw,user_id=0" \
+	"22 21 0:31 /x $(esc "$W/rb") rw - fuse.fuse-overlayfs fuse-overlayfs rw" \
+	"23 21 0:40 / $(esc "$W/vol") rw,nosuid shared:5 - fuse.sshfs u@h:/ rw,user_id=1000" \
+	"24 21 0:41 / $(esc "$W/net") rw - nfs4 h:/x rw" \
+	"25 21 8:1 / $(esc "$W/ok") rw - ext4 /dev/sda1 rw" \
+	"26 21 0:42 / $(esc "$W/tree/sub") rw - fuse.sshfs u@h:/ rw" \
+	"27 21 0:43 / $(esc "$W/bad") rw - fuse.weird x rw" \
+	"28 21 0:44 / $(esc "$W/pbin/cc") rw - fuse.sshfs x rw" \
+	"29 21 0:45 / $(esc "$ABC") rw - 9p x rw" \
+	"30 21 0:46 / $(esc "$W/fm/prog") rw - fuse.sshfs x rw" \
+	"31 21 0:47 / $(esc "$W/loc") rw - newfs x rw" "32 21 0:48 / $(esc "$W/lt/sub") rw - newfs x rw" \
+	"33 21 0:49 / $(esc "$W/tl/sub") rw - fuse.sshfs x rw" >"$W/mountinfo"
+printf '%s\n' "0:31 65735546 $W/rb" "0:40 65735546 $W/vol" "0:41 6969 $W/net" "8:1 ef53 $W/ok" \
+	"0:42 65735546 $W/tree/sub" "0:43 - $W/bad" "0:44 65735546 $W/pbin/cc" "0:45 1021997 $ABC" \
+	"0:46 65735546 $W/fm/prog" "0:47 ef53 $W/loc" "0:48 ef53 $W/lt/sub" "0:49 65735546 $W/tl/sub" \
+	>"$W/roots"
+fixture_mount() {
+	local dev hex r hit=""
+	while IFS=' ' read -r dev hex r; do
+		[ -e "$r" ] && in_folder "$1" "$r" && hit="$dev $hex $r"
+	done <"$W/roots"
+	[ -z "$hit" ] || printf '%s\n' "$hit"
+}
+folder_ids() {
+	local p m dev root ino s=0
+	moved
+	for p; do
+		if [ ! -e "$p" ]; then
+			echo "stat: $p: No such file or directory" >&2
+			s=1
+			continue
+		fi
+		m="$(fixture_mount "$p")"
+		if [ -n "$m" ]; then
+			dev="${m%% *}"
+			root="${m#* * }"
+			ino=2
+			[ "$p" -ef "$root" ] || ino=9
+			echo "$dev $ino"
+		elif [[ "$OSTYPE" == darwin* ]]; then
+			command stat -f '%d %i' -- "$p" || s=1
+		elif [ "$p" -ef / ]; then
+			echo "0:31 2"
+		else
+			echo "0:31 9"
+		fi
+	done
+	return "$s"
+}
+folder_types() {
+	local p m s=0
+	for p; do
+		m="$(fixture_mount "$p")"
+		m="${m#* }"
+		m="${m%% *}"
+		if [ ! -e "$p" ] || [ "$m" = - ]; then s=1; else echo "${m:-65735546}"; fi
+	done
+	return "$s"
+}"#;
+
+/// The Mac's mount table for that walk: `mount`'s lines, the kernel's own after them, and
+/// the fixture's macOS-only mounts (`$W/tree2/at on it` and `$W/sib (old)` among them; the
+/// lines naming `$W/hm/x on $W/sys`, `$W/hm/y on $W/obin/cc` and `$W/hm/z on /usr/bin` are
+/// each one mount at a folder whose name holds ` on `, not one at `$W/sys`, `$W/obin/cc` or
+/// `/usr/bin`). Each `/dev/disk9s<n>` a line starts with has the device `$W/nodes` gives it
+/// (the real nodes, the host's): `$W/gr` is a graft that shows Preboot's device with no mount
+/// of its own, `$W/un` a volume no line names, `$W/fs` a FUSE volume over a local one,
+/// `$W/uf` an account's disk that a forged local line names too, and `$W/lf` a local volume
+/// with a tree in it.
+const FOREIGN_MACOS: &str = r#"mkdir -p "$W/gr/d" "$W/un/d" "$W/lf/d" "$W/lf/t/x" "$W/fs/d" "$W/uf/d" &&
+	ln -s x "$W/lf/t/l"
+printf '%s\n' "1:50 - /System/Volumes/Data$W/fl" "1:51 - $W/stack" \
+	"1:52 - $W/tree2/at on it" "1:53 - /System/Volumes/Data$W/tree3/sub" "1:54 - $W/sib (old)" \
+	"1:55 - $W/dn" "1:56 - $W/dno" "1:57 - $W/xt/sub" "1:59 - $W/un" "1:60 - $W/lf" \
+	"$(command stat -f %d /System/Volumes/Preboot) - $W/gr" "1:62 - $W/uf" "1:64 - $W/fs" \
+	>>"$W/roots"
+n=1
+for d in 0:40 8:1 1:50 0:42 1:71 1:51 1:52 1:53 0:44 1:54 0:45 0:46 1:73 1:74 1:75 1:60 1:76 1:77 \
+	1:78 1:62 1:79; do
+	echo "/dev/disk9s$n $d" >>"$W/nodes"
+	n=$((n + 1))
+done
+disk_devices() {
+	local p d s=0
+	for p; do
+		d="$(awk -v p="$p" '$1 == p { print $2 }' "$W/nodes")"
+		if [ -n "$d" ]; then echo "$d"; else command stat -f %r -- "$p" || s=1; fi
+	done
+	return "$s"
+}
+macos_mounts() {
+	printf '%s\n' "/dev/disk9s1 on $W/vol (apfs, local, nodev, nosuid, journaled, mounted by someone)" \
+		"//u@h/s on $W/net (smbfs, nodev, nosuid)" "/dev/disk9s2 on $W/ok (apfs, local, journaled)" \
+		"/dev/disk9s3 on /System/Volumes/Data$W/fl (apfs, local, nodev, nosuid, mounted by someone)" \
+		"/dev/disk9s4 on $W/tree/sub (apfs, local, nodev, nosuid, mounted by someone)" \
+		"/dev/disk9s5 on $W/stack (apfs, local, journaled)" \
+		"/dev/disk9s6 on $W/stack (apfs, local, nodev, nosuid, mounted by someone)" \
+		"/dev/disk9s7 on $W/tree2/at on it (apfs, local, nodev, nosuid, mounted by someone)" \
+		"/dev/disk9s8 on /System/Volumes/Data$W/tree3/sub (apfs, local, nodev, nosuid, mounted by someone)" \
+		"/dev/disk9s9 on $W/pbin/cc (apfs, local, nodev, nosuid, mounted by someone)" \
+		"/dev/disk9s10 on $W/sib (old) (apfs, local, nodev, nosuid, mounted by someone)" \
+		"x on y on $W/dn (macfuse, nodev, nosuid, synchronous, mounted by someone)" \
+		"x on on $W/dno (macfuse, nodev, nosuid, synchronous, mounted by someone)" \
+		"u@h:/x on on $W/xt/sub (nfs, nodev, nosuid)" \
+		"/dev/disk9s11 on $ABC (apfs, local, nodev, nosuid, mounted by someone)" \
+		"/dev/disk9s12 on $W/fm/prog (apfs, local, nodev, nosuid, mounted by someone)" \
+		"/dev/disk9s13 on $W/hm/x on $W/sys (apfs, local, nodev, nosuid, mounted by someone)" \
+		"/dev/disk9s14 on $W/hm/y on $W/obin/cc (apfs, local, nodev, nosuid, mounted by someone)" \
+		"/dev/disk9s15 on $W/hm/z on /usr/bin (apfs, local, nodev, nosuid, mounted by someone)" \
+		"$W/net/g on $W/xg/gone (macfuse, nodev, nosuid, mounted by someone)" \
+		"/dev/disk9s16 on $W/lf (apfs, local, journaled)" \
+		"/dev/disk9s19 on $W/lt/sub (apfs, local, journaled)" \
+		"/dev/disk9s20 on $W/hm/q (apfs, local, journaled)" "/dev/disk9s20 on $W/u" \
+		"f (apfs, local, nodev, nosuid, mounted by someone)" \
+		"/dev/disk9s21 on $W/fs (apfs, local, journaled)" \
+		"x on $W/fs (macfuse, nodev, nosuid, mounted by someone)" \
+		"/dev/disk1 x on $W/xj (macfuse, nodev, nosuid, mounted by someone)"
+	/sbin/mount
+}
+no_table() { macos_mounts() { return 1; }; }"#;
+
+/// Linux's for that walk: the fixture, read by the real reader.
+const FOREIGN_LINUX: &str = r#"linux_mounts() { kernel_linux_mounts "$W/mountinfo"; }
+no_table() { linux_mounts() { return 1; }; }"#;
+
 /// A walk proves nothing through a filesystem whose owners and modes do not say who may
 /// change it: one a server or another account's daemon serves (on Linux a network or FUSE
-/// one), or on macOS a volume that is not local or that an account mounted, which it can
-/// take away and attach another in place of. The way to a folder in one, a tree or a
-/// folder root takes programs from with one in it, a mount table that cannot be read, and a
-/// folder gone by the time the walk ends each refuse.
+/// one, but for the one / is on), or on macOS a volume that is not local or that an account
+/// mounted, which it can take away and attach another in place of. The way to a folder or
+/// file in one, by any spelling, a tree or a folder root takes programs from with one in
+/// it, a way of more than 40 links through one, a mount table that cannot be read when it
+/// is needed, and a folder gone or swapped by the time the walk ends each refuse, whether
+/// or not its held descriptor's /dev/fd name can be read. Only what the walk crosses is
+/// looked at: on macOS a walk that crosses no volume reads no mount table (and a folder
+/// that only a mount's name spells is no mount), a volume it crosses is judged by its disk
+/// alone, and no mount's folder is stat'd; on Linux a mount outside the tree is never asked
+/// its type, nor its folder stat'd, as one whose server stopped answering would hang the
+/// look. On macOS a volume the walk crosses passes only from a disk a local mount no
+/// account made names, which a graft's device is too.
 #[test]
 fn under_root_a_walk_through_a_filesystem_whose_owners_say_nothing_refuses() {
     let scratch = Scratch::new();
     let mut lib = Lib::new();
     let table = if cfg!(target_os = "macos") {
-        // `mount`'s lines, the kernel's own after them: one in the data volume,
-        // one mounted over another, one whose folder's name holds " on ".
-        "macos_mounts() { printf '%s\\n' \"/dev/disk9s1 on $W/vol (apfs, local, nodev, nosuid, journaled, mounted by someone)\" \
-         \"//u@h/s on $W/net (smbfs, nodev, nosuid)\" \"/dev/disk9s2 on $W/ok (apfs, local, journaled)\" \
-         \"/dev/disk9s3 on /System/Volumes/Data$W/fl (apfs, local, nodev, nosuid, mounted by someone)\" \
-         \"/dev/disk9s4 on $W/tree/sub (apfs, local, nodev, nosuid, mounted by someone)\" \
-         \"/dev/disk9s5 on $W/stack (apfs, local, journaled)\" \
-         \"/dev/disk9s6 on $W/stack (apfs, local, nodev, nosuid, mounted by someone)\" \
-         \"/dev/disk9s7 on $W/tree2/at on it (apfs, local, nodev, nosuid, mounted by someone)\" \
-         \"/dev/disk9s8 on /System/Volumes/Data$W/tree3/sub (apfs, local, nodev, nosuid, mounted by someone)\" \
-         \"/dev/disk9s9 on $W/pbin/cc (apfs, local, nodev, nosuid, mounted by someone)\"; \
-         /sbin/mount; }\n\
-         no_table() { macos_mounts() { return 1; }; }"
+        FOREIGN_MACOS
     } else {
-        // The kernel's mount points, and the type stat reads for each.
-        "eval \"kernel_$(declare -f linux_mount_points)\"\n\
-         linux_mount_points() { printf '%s\\n' \"$W/vol\" \"$W/net\" \"$W/ok\" \"$W/fl\" \"$W/tree/sub\" \"$W/bad\" \
-         \"$W/pbin/cc\"; \
-         kernel_linux_mount_points; }\n\
-         stat() { case \"${!#}\" in \"$W/vol\" | \"$W/fl\" | \"$W/tree/sub\" | \"$W/pbin/cc\") echo 65735546 ;; \
-         \"$W/net\") echo 6969 ;; \"$W/ok\") echo ef53 ;; \"$W/bad\") return 1 ;; *) command stat \"$@\" ;; esac; }\n\
-         no_table() { linux_mount_points() { return 1; }; }"
+        FOREIGN_LINUX
     };
     lib.step(format!(
-        "{FOREIGN_FIND}\n{FAKE_ROOT}\nFOREIGN_LIST=\"$TMPDIR/foreign\"; : >\"$FOREIGN_LIST\"\n\
-         umask 022; W=\"$TMPDIR/w\"; mkdir -p \"$W/vol/d\" \"$W/net/d\" \"$W/ok/d\" \"$W/fl/d\" \
-         \"$W/tree/sub/d\" \"$W/bad/d\" \"$W/stack/d\" \"$W/tree2/at on it\" \"$W/tree3/sub\" \"$W/pbin\" \"$W/obin\" && \
-         printf '#!/bin/sh\\n' >\"$W/pbin/cc\" && chmod 755 \"$W/pbin/cc\" && cp \"$W/pbin/cc\" \"$W/obin/cc\"\n{table}"
+        "{FOREIGN_FIND}\n{FAKE_ROOT}\n{FOREIGN_MOUNTS}\n{table}"
     ));
     // (what is walked, what it names)
     let mut rows = vec![
         ("folder_failing sealed_entry \"$W/vol/d\"", "$W/vol"),
         ("folder_failing sealed_entry \"$W/net/d\"", "$W/net"),
         ("folder_failing sealed_entry \"$W/ok/d\"", ""),
-        ("folder_failing sealed_entry \"$W/fl/d\"", "$W/fl"),
         ("folder_failing sealed_entry \"$W/vol\"", "$W/vol"),
+        ("folder_failing sealed_entry \"$ABC/d\"", "$ABC"),
+        ("folder_failing sealed_entry \"/$W/vol/d\"", "$W/vol"),
+        (
+            "folder_failing sealed_entry \"/System/Volumes/Data$W/vol/d\"",
+            if cfg!(target_os = "macos") {
+                "/System/Volumes/Data$W/vol"
+            } else {
+                "/System/Volumes/Data$W/vol/d"
+            },
+        ),
         ("root_entries_offender \"$W/tree\"", "$W/tree/sub"),
+        ("root_entries_offender \"/$W/tree\"", "$W/tree/sub"),
+        // A mount at the tree itself is the end of the walk to it.
+        ("root_tree_failing \"$W/vol\"", "$W/vol"),
         ("root_entries_offender \"$W/ok\"", ""),
-        ("no_table; folder_failing sealed_entry \"$W/ok/d\"", "/"),
+        // A local mount in a tree.
+        ("root_entries_offender \"$W/lt\"", ""),
         ("no_table; root_entries_offender \"$W/ok\"", "$W/ok"),
-        ("foreign_mount_among \"$W/ok\" \"$W/gone\"", "$W/gone"),
+        ("foreign_on_way \"$W/ok\" \"$W/gone\"", "$W/gone"),
+        // A folder whose own folder the walk did not pass is looked at too.
+        ("foreign_on_way \"$W/vol\"", "$W/vol"),
         // A folder root takes programs from by name, with one mounted on a
-        // file in it (Linux mounts on a file too).
+        // file in it (Linux mounts on a file too), by any spelling.
         ("root_bin_dir \"$W/pbin\" || echo refused", "refused"),
+        ("root_bin_dir \"/$W/pbin\" || echo refused", "refused"),
         ("root_bin_dir \"$W/obin\" || echo refused", ""),
+        // A way of more than 40 links leads the kernel nowhere, but through a
+        // mount its account can swap it for one that leads somewhere.
+        ("root_bin_dir \"$W/cbin\" || echo refused", "refused"),
+        ("root_bin_dir \"$W/ocbin\" || echo refused", ""),
+        ("may_run \"$W/fm/prog\" || echo refused", "refused"),
+        ("may_run \"$W/fm/other\" || echo refused", ""),
+        // The folder judged is another by the first look after the walk.
+        (
+            "SWAP=swap; folder_failing sealed_entry \"$W/swap/d\"",
+            "$W/swap",
+        ),
+        // macOS's /dev/fd fails a stat now and then under load: then the
+        // descriptors' own stat decides, alike or not.
+        (
+            "dev_fd_alike() { : >\"$W/asked\"; return 1; }; folder_failing sealed_entry \"$W/ok/d\"; \
+             [ -e \"$W/asked\" ] || echo unasked",
+            "",
+        ),
+        (
+            "dev_fd_alike() { return 1; }; SWAP=swap2; folder_failing sealed_entry \"$W/swap2/d\"",
+            "$W/swap2",
+        ),
+        // The reader of Linux's table, on its text.
+        (
+            "kernel_linux_mounts \"$W/mountinfo\" | grep -Fxc \"$ABC\"",
+            "1",
+        ),
+        (
+            "kernel_linux_mounts \"$W/mountinfo\" | grep -Fxc \"$W/vol\"",
+            "1",
+        ),
+        (
+            "kernel_linux_mounts \"$W/mountinfo\" | grep -Fxc \"$W/ok\"",
+            "0",
+        ),
+        (
+            "kernel_linux_mounts \"$W/mountinfo\" | grep -Fxc \"$W/rb\"",
+            "0",
+        ),
+        ("kernel_linux_mounts \"$W/mountinfo\" | grep -Fxc /", "0"),
+        ("kernel_linux_mounts \"$W/empty\" || echo unread", "unread"),
     ];
     if cfg!(target_os = "linux") {
-        rows.push(("folder_failing sealed_entry \"$W/bad/d\"", "$W/bad"));
+        rows.extend([
+            ("folder_failing sealed_entry \"$W/bad/d\"", "$W/bad"),
+            // The filesystem / is on, FUSE here, and another mount of its device.
+            ("folder_failing sealed_entry \"$W/rb/d\"", ""),
+            // A type the reader does not know, which stat reads as a disk's.
+            ("folder_failing sealed_entry \"$W/loc/d\"", ""),
+            // A walk asks statfs of each folder on it and reads no table.
+            (
+                "linux_mounts() { : >\"$W/read\"; return 1; }; folder_failing sealed_entry \"$W/vol/d\"; \
+                 [ ! -e \"$W/read\" ] || echo read",
+                "$W/vol",
+            ),
+            ("no_table; folder_failing sealed_entry \"$W/ok/d\"", ""),
+            // A mount's folder is placed by its text: a link that leads into
+            // the tree from outside it is not the tree.
+            ("root_entries_offender \"$W/tt\"", ""),
+            // A tree's check asks statfs of no mount outside it.
+            (
+                ": >\"$W/typed\"; eval \"typed_$(declare -f folder_types)\"; \
+                 folder_types() { printf '%s\\n' \"$@\" >>\"$W/typed\"; typed_folder_types \"$@\"; }; \
+                 root_entries_offender \"$W/tree\" >/dev/null; grep -Fxc \"$W/net\" \"$W/typed\"",
+                "0",
+            ),
+        ]);
     } else {
         rows.extend([
+            ("folder_failing sealed_entry \"$W/fl/d\"", "$W/fl"),
             ("folder_failing sealed_entry \"$W/stack/d\"", "$W/stack"),
+            ("folder_failing sealed_entry \"$W/sib/d\"", ""),
+            ("folder_failing sealed_entry \"$W/dn/d\"", "$W/dn"),
+            // A device name that ends in ` on`.
+            ("folder_failing sealed_entry \"$W/dno/d\"", "$W/dno"),
+            ("root_entries_offender \"$W/xt\"", "$W/xt/sub"),
+            // A mount in a tree that root may not stat.
+            ("root_entries_offender \"$W/xg\"", "$W/xg/gone"),
             ("root_entries_offender \"$W/tree2\"", "$W/tree2/at on it"),
             (
                 "root_entries_offender \"$W/tree3\"",
                 "/System/Volumes/Data$W/tree3/sub",
+            ),
+            // A folder only a mount's name spells is no volume.
+            ("folder_failing sealed_entry \"$W/sys/d\"", ""),
+            ("folder_failing sealed_entry /usr/bin", ""),
+            // A walk that crosses no volume reads no table.
+            (
+                "macos_mounts() { : >\"$W/read\"; }; folder_failing sealed_entry \"$W/obin\"; \
+                 [ ! -e \"$W/read\" ] || echo read",
+                "",
+            ),
+            ("no_table; folder_failing sealed_entry \"$W/ok/d\"", "$W/ok"),
+            // A local volume passes, and a graft shows the device of the
+            // volume it is from; a volume no line names, one put over a local
+            // one, and an account's disk a forged local line names too each
+            // refuse.
+            ("folder_failing sealed_entry \"$W/lf/d\"", ""),
+            ("folder_failing sealed_entry \"$W/gr/d\"", ""),
+            ("folder_failing sealed_entry \"$W/un/d\"", "$W/un"),
+            ("folder_failing sealed_entry \"$W/fs/d\"", "$W/fs"),
+            ("folder_failing sealed_entry \"$W/uf/d\"", "$W/uf"),
+            // A walk across a volume stats no mount's folder and no line's
+            // source that is no disk's.
+            (
+                ": >\"$W/ids\"; eval \"logged_$(declare -f folder_ids)\"; \
+                 folder_ids() { printf '%s\\n' \"$@\" >>\"$W/ids\"; logged_folder_ids \"$@\"; }; \
+                 eval \"logged_$(declare -f disk_devices)\"; \
+                 disk_devices() { printf '%s\\n' \"$@\" >>\"$W/ids\"; logged_disk_devices \"$@\"; }; \
+                 folder_failing sealed_entry \"$W/lf/d\" >/dev/null; \
+                 grep -Fxc -e \"$W/net\" -e \"$W/net/g\" -e \"$W/vol\" -e \"$W/fs\" \"$W/ids\"",
+                "0",
+            ),
+            // A disk whose node cannot be read refuses a volume, with no
+            // word from the shell, and a line that only starts like a node's
+            // is no disk's.
+            (
+                "eval \"base_$(declare -f macos_mounts)\"; macos_mounts() { base_macos_mounts; \
+                 echo \"/dev/disk9s99 on $W/gone2 (apfs, local, journaled)\"; }; \
+                 folder_failing sealed_entry \"$W/lf/d\" 2>&1",
+                "$W/lf",
+            ),
+            // The kernel's own devfs at /dev passes, but not one a line says
+            // an account mounted there.
+            ("sealed_end /dev/null", "/dev/null"),
+            (
+                "eval \"base_$(declare -f macos_mounts)\"; macos_mounts() { base_macos_mounts; \
+                 echo \"devfs on /dev (devfs, local, nobrowse, mounted by someone)\"; }; \
+                 sealed_end /dev/null || echo refused",
+                "refused",
+            ),
+            (
+                "eval \"base_$(declare -f folder_ids)\"; \
+                 folder_ids() { [ \"$1\" != /dev ] || return 1; base_folder_ids \"$@\"; }; \
+                 sealed_end /dev/null 2>&1 || echo refused",
+                "refused",
+            ),
+            // A link in a tree on a volume reads no table.
+            (
+                "macos_mounts() { : >\"$W/read\"; }; sealed_end \"$W/lf/t/l\" \"$W/lf/t\" >/dev/null || \
+                 echo refused; [ ! -e \"$W/read\" ] || echo read",
+                "",
+            ),
+            // APFS's names ignore case; on a volume whose names do not, the
+            // variant is not there to walk.
+            (
+                "if [ -d \"$TMPDIR/W\" ]; then folder_failing sealed_entry \"$TMPDIR/W/vol/d\"; \
+                 else echo \"$TMPDIR/W/vol\"; fi",
+                "$TMPDIR/W/vol",
             ),
         ]);
     }
@@ -2306,10 +2602,11 @@ fn root_build_authority_includes_acls_and_the_folders_program_names_pass_through
     lib.step(
         r#"eval "$(declare -f ls_entry | sed '1s/ls_entry/base_ls_entry/')"
 uname() { if [ "$1" = -s ]; then echo "$PLATFORM"; else command uname "$@"; fi; }
-# Each platform's mount table, one local filesystem at /.
+# Each platform's mount table, one local filesystem at /, and a disk's type
+# for each folder statfs reads on Linux.
 macos_mounts() { echo '/dev/disk1s1 on / (apfs, local, journaled)'; }
-linux_mount_points() { echo /; }
-stat() { if [ "$1" = -f ]; then echo ef53; else command stat "$@"; fi; }
+linux_mounts() { :; }
+folder_types() { local p; for p; do echo ef53; done; }
 ls_entry() {
 	local p="${!#}" arg flags="" within=0 listing
 	local -a args=()

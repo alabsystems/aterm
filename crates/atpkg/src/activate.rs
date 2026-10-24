@@ -684,7 +684,9 @@ pub(crate) fn remove_refused_name_shims(layout: &Layout, program: Option<&str>) 
 
 /// Remove `bin/` shims this program owns that point at a different build, and every alias of
 /// this program's no longer wanted (`aliases` is [`Aliases::Off`], or its base is neither in
-/// `installed` nor another tool of this build).
+/// `installed` nor another tool of this build: one whose shim resolves into this build, or one
+/// the build records it exposes ([`crate::store::recorded_exposes`]) whose shim a file that does
+/// not resolve into this program's store holds while the alias itself still runs this build).
 fn prune_stale_shims(layout: &Layout, build_dir: &Path, installed: &[ToolName], aliases: Aliases) {
     let _publication = crate::lay::PUBLICATION_TURN
         .lock()
@@ -695,6 +697,13 @@ fn prune_stale_shims(layout: &Layout, build_dir: &Path, installed: &[ToolName], 
     };
     let Ok(entries) = crate::ops::read_bin_dir(layout) else {
         return;
+    };
+    let recorded = crate::store::recorded_exposes(build_dir).unwrap_or_default();
+    let runs_this_build = |shim: &Path| {
+        crate::platform::resolve_shim(shim).is_some_and(|t| {
+            crate::ops::store_build_of(&layout.prefix, &t)
+                .is_some_and(|(p, b)| p == program && b == build)
+        })
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -714,10 +723,18 @@ fn prune_stale_shims(layout: &Layout, build_dir: &Path, installed: &[ToolName], 
         let alias_wanted = aliases == Aliases::Alab
             && tool.alias_base().is_some_and(|base| {
                 installed.contains(&base)
-                    || crate::platform::resolve_shim(&layout.shim(&base)).is_some_and(|t| {
-                        crate::ops::store_build_of(&layout.prefix, &t)
-                            .is_some_and(|(p, b)| p == program && b == build)
-                    })
+                    || runs_this_build(&layout.shim(&base))
+                    // The base's shim is a file outside this program's store (the user's, another
+                    // program's) while the alias still runs this build: the alias is the one way
+                    // left to run its tool. This program's own shim at another build is not one:
+                    // this loop removes it, so keeping the alias for it would turn on the order
+                    // `bin/` lists in.
+                    || (recorded.contains(&base)
+                        && std::fs::symlink_metadata(layout.shim(&base)).is_ok()
+                        && !crate::platform::resolve_shim(&layout.shim(&base))
+                            .and_then(|t| crate::ops::store_build_of(&layout.prefix, &t))
+                            .is_some_and(|(p, _)| p == program)
+                        && runs_this_build(&entry.path()))
             });
         if alias_wanted {
             continue;
@@ -925,6 +942,61 @@ mod tests {
             "only `aylint` (stale at build 18) and its alias go; a dev link, another \
              program's shims, a hand-made file, a refused name and a tombstone all stay"
         );
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
+    /// The prune keeps the alias of a recorded tool whose shim a file outside this program's
+    /// store holds, but this program's own shim at another build is not such a file: the same
+    /// pass removes it, so its alias goes too, whichever of the two `bin/` lists first.
+    #[test]
+    fn the_alias_of_a_recorded_tool_whose_shim_is_this_programs_at_another_build_goes() {
+        let layout = temp_prefix("prune-alias-order");
+        // Names `read_dir` lists on either side of their alias, so a rule that read `bin/`
+        // mid-pass would keep some of these aliases and drop others.
+        let names = [
+            "ab", "pb", "kk", "x1", "q", "fmt", "b", "c", "ay-pb", "ma", "zq", "lint",
+        ];
+        let b17 = make_build(&layout, "ay", 17, &names);
+        let mut bins = vec!["ay"];
+        bins.extend(names);
+        let b18 = make_build(&layout, "ay", 18, &bins);
+        let recorded: Vec<ToolName> = bins.iter().map(|n| tool(n)).collect();
+        crate::store::write_exposes(&b18, &recorded).unwrap();
+        layout.ensure_dir(&layout.bin_dir()).unwrap();
+        let lay = |shim: &str, build: &PathBuf, target: &str| {
+            platform::install_shim_env(
+                &build.join("bin"),
+                &tool(target),
+                &layout.shim(&tool(shim)),
+                &crate::shim_env::ShimEnv::NONE,
+            )
+            .unwrap();
+        };
+        lay("ay", &b18, "ay");
+        lay("alab-ay", &b18, "ay");
+        for n in names {
+            lay(n, &b17, n);
+            lay(&format!("alab-{n}"), &b18, n);
+        }
+
+        prune_stale_shims(&layout, &b18, &[tool("ay")], Aliases::Alab);
+
+        let kept: Vec<String> = names
+            .iter()
+            .flat_map(|n| [n.to_string(), format!("alab-{n}")])
+            .filter(|s| std::fs::symlink_metadata(shim_of(&layout, s)).is_ok())
+            .collect();
+        assert!(
+            kept.is_empty(),
+            "a shim stale at build 17 goes, and so does its alias: kept {kept:?}"
+        );
+        for t in ["ay", "alab-ay"] {
+            assert!(
+                crate::platform::resolve_shim(&shim_of(&layout, t))
+                    .is_some_and(|p| p.starts_with(&b18)),
+                "{t}: the laid tool and its alias stay"
+            );
+        }
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 

@@ -48,9 +48,9 @@ mod gl;
 mod gl_shaders;
 #[cfg(target_os = "macos")]
 mod metal;
-/// First-frame Metal warm types (`metal/warm.rs`).
+/// Launch Metal warm types (`metal/warm.rs`).
 #[cfg(target_os = "macos")]
-pub use metal::warm::{FirstFrameKnobs, FirstFrameWarm};
+pub use metal::warm::{FirstFrameKnobs, FirstFrameWarm, PresentKnobs, ShaderCacheWarm};
 /// First-frame compile benchmark entry points (`benches/first_frame_compile.rs`).
 #[cfg(target_os = "macos")]
 #[doc(hidden)]
@@ -243,6 +243,43 @@ fn parse_gpu_power(v: &str) -> Option<wgpu::PowerPreference> {
 #[cfg(wgpu_arm)]
 static GPU_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// The GPU turn of a test or debug build on Windows: the thread that makes a device keeps it until
+/// the thread exits ([`take_gpu_turn`]), so one thread at a time draws.
+///
+/// D3D12 devices are singletons per adapter, so the devices parallel tests make are one
+/// `ID3D12Device` driven from a command queue each. WARP (`d3d10warp.dll` 10.0.26100.9278 in the
+/// lane) crashes when two queues JIT shaders at once: `STATUS_ACCESS_VIOLATION` in its
+/// `Task_CompileShader` (`FeCleanup::Pass2`, `PixelJitProgram::ClassifyVars`) under concurrent
+/// `ExecuteCommandLists` (docs/measured/windows-warp-parallel-2026-10-23.md). Queues are
+/// free-threaded, so the fault is WARP's, and a person's aterm never reaches it: it makes one device
+/// at a time, and wgpu submits to one device one submission at a time. Creation alone is serialized
+/// already (`GPU_INIT`); the crash is in drawing, so the turn lasts as long as the thread. Every
+/// device takes it ([`GpuContext::one_at_a_time`]), so no test has to remember to. A debug aterm
+/// makes its device on a startup worker that exits, or on its main thread, so its turn is never
+/// contended; a thread that makes a device while another thread holds the turn waits for that thread
+/// to exit.
+#[cfg(all(windows, any(test, debug_assertions)))]
+static GPU_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(all(windows, any(test, debug_assertions)))]
+std::thread_local! {
+    /// This thread's hold on [`GPU_TURN`], released when the thread (a test) exits.
+    static HELD_GPU_TURN: std::cell::OnceCell<std::sync::MutexGuard<'static, ()>> =
+        const { std::cell::OnceCell::new() };
+}
+
+/// Gives the calling thread [`GPU_TURN`] until it exits, at once if it holds it.
+#[cfg(all(windows, any(test, debug_assertions)))]
+fn take_gpu_turn() {
+    HELD_GPU_TURN.with(|held| {
+        held.get_or_init(|| {
+            GPU_TURN
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
+    });
+}
+
 /// `wgpu::Instance::new`, under a name of its own.
 #[cfg(wgpu_arm)]
 fn fresh_instance(desc: wgpu::InstanceDescriptor) -> wgpu::Instance {
@@ -301,12 +338,28 @@ pub fn begin_first_frame_warm() -> Option<FirstFrameWarm> {
     metal::warm::FIRST_FRAME.begin()
 }
 
+/// Claims the process-once headless launch warm for background execution: the first frames' compiles, and under [`PresentKnobs`] the rest a frame can bind, made before a deferred renderer's first pixel demand and awaited by nothing ([`ShaderCacheWarm::run`]).
+#[cfg(target_os = "macos")]
+#[must_use]
+#[inline]
+pub fn begin_shader_cache_warm() -> Option<ShaderCacheWarm> {
+    ShaderCacheWarm::begin()
+}
+
 /// Whether [`begin_first_frame_warm`] has been claimed in this process.
 #[cfg(target_os = "macos")]
 #[must_use]
 #[inline]
 pub fn first_frame_warm_began() -> bool {
     metal::warm::FIRST_FRAME.began()
+}
+
+/// Whether [`begin_shader_cache_warm`] has been claimed in this process.
+#[cfg(target_os = "macos")]
+#[must_use]
+#[inline]
+pub fn shader_cache_warm_began() -> bool {
+    ShaderCacheWarm::began()
 }
 
 /// The `ATERM_GPU_POWER` seam, parsed.
@@ -479,6 +532,10 @@ impl GpuContext {
     /// Acquires a wgpu adapter and device from `desc`, serialized across threads.
     #[cfg(wgpu_arm)]
     pub(crate) fn one_at_a_time(desc: wgpu::InstanceDescriptor) -> Result<Self, String> {
+        // The turn before `GPU_INIT`: a thread that holds the turn never waits for `GPU_INIT` on
+        // one that holds it and waits for the turn.
+        #[cfg(all(windows, any(test, debug_assertions)))]
+        take_gpu_turn();
         let _one_at_a_time = GPU_INIT
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);

@@ -2481,6 +2481,77 @@ pub fn cold_login(
     Some(accounts::login_env(row).1)
 }
 
+/// How a session of a pooled CLI other than Claude Code is relaunched ([`pool_line`]).
+#[derive(Debug, Clone, Copy)]
+pub struct PoolRelaunch<'a> {
+    /// The shell that reads the line.
+    pub dialect: Dialect,
+    /// The folder the line starts in, where it names one.
+    pub cd: Option<&'a str>,
+    /// The program's executable.
+    pub exe: &'a Path,
+    /// The launch flags it carries over.
+    pub flags: &'a [String],
+    /// The session it resumes, where one is known.
+    pub resume: Option<&'a str>,
+}
+
+/// The argv that resumes session `id` of `cli`'s program, as each CLI's own `--help` spells it:
+/// codex's `resume <id>` subcommand (codex-old 0.164.0), grok's `--resume <id>` (grok 1.0.70's
+/// `-r, --resume [<SESSION_ID_OR_TITLE>]`), kimi's `--session <id>` (kimi 2.3.1's
+/// `-S, --session [id]`), and Claude Code's `--resume <id>`.
+#[must_use]
+pub fn resume_argv(cli: accounts::Cli, id: &str) -> [String; 2] {
+    let word = match cli {
+        accounts::Cli::Codex => "resume",
+        accounts::Cli::Claude | accounts::Cli::Grok => "--resume",
+        accounts::Cli::Kimi => "--session",
+    };
+    [word.to_string(), id.to_string()]
+}
+
+/// The line that relaunches `cli`'s program as `how` says under the login `env` names
+/// ([`super::accounts_pool::login_env`]): the seam's variable exported with the row's value, or
+/// unset for the machine's default login; nothing of another CLI's seam. Codex's resume is a
+/// subcommand, so its pair leads the flags; every other CLI's follows them.
+///
+/// # Errors
+///
+/// Why the dialect cannot spell the line.
+pub fn pool_line(
+    how: &PoolRelaunch<'_>,
+    cli: accounts::Cli,
+    env: &super::accounts_pool::LoginEnv,
+) -> Result<String, String> {
+    let resume = how.resume.map(|id| resume_argv(cli, id));
+    let resume = resume.iter().flatten().cloned();
+    let args: Vec<String> = match cli {
+        accounts::Cli::Codex => resume.chain(how.flags.iter().cloned()).collect(),
+        accounts::Cli::Claude | accounts::Cli::Grok | accounts::Cli::Kimi => {
+            how.flags.iter().cloned().chain(resume).collect()
+        }
+    };
+    match env.value.as_deref() {
+        Some(value) => upgrade::relaunch_line_env(
+            how.dialect,
+            None,
+            how.cd,
+            &[(env.var, value)],
+            how.exe,
+            &args,
+        ),
+        None => upgrade::relaunch_line_env_clear(
+            how.dialect,
+            None,
+            how.cd,
+            &[],
+            &[env.var],
+            how.exe,
+            &args,
+        ),
+    }
+}
+
 /// [`restart_here`] from `snap`, the tab's agent as [`snapshot`] read it (or why it could not).
 pub(super) fn restart_from(
     opts: &Opts,
@@ -3007,6 +3078,8 @@ pub fn launched(
         Some(aterm_phase::Program::Claude) => true,
         Some(
             aterm_phase::Program::Codex
+            | aterm_phase::Program::Grok
+            | aterm_phase::Program::Kimi
             | aterm_phase::Program::Agy
             | aterm_phase::Program::Muse
             | aterm_phase::Program::Gemini
@@ -3068,7 +3141,12 @@ pub(super) fn snapshot_lane(image: Option<&Path>, argv: &[String]) -> SnapshotLa
         }
         Some(aterm_phase::Program::Muse) => SnapshotLane::Muse,
         Some(aterm_phase::Program::Agy) => SnapshotLane::Agy,
-        Some(aterm_phase::Program::Codex | aterm_phase::Program::Gemini) => SnapshotLane::None,
+        Some(
+            aterm_phase::Program::Codex
+            | aterm_phase::Program::Grok
+            | aterm_phase::Program::Kimi
+            | aterm_phase::Program::Gemini,
+        ) => SnapshotLane::None,
         Some(aterm_phase::Program::Claude | aterm_phase::Program::Generic) | None => {
             SnapshotLane::Claude
         }

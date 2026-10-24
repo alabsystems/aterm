@@ -382,6 +382,8 @@ impl SessionLog {
                     && match a.who {
                         aterm_phase::Program::Claude => true,
                         aterm_phase::Program::Codex
+                        | aterm_phase::Program::Grok
+                        | aterm_phase::Program::Kimi
                         | aterm_phase::Program::Agy
                         | aterm_phase::Program::Muse
                         | aterm_phase::Program::Gemini

@@ -121,11 +121,10 @@ impl RainLayers {
             if entry.content.items().is_empty() {
                 continue;
             }
-            let content = Arc::clone(&entry.content);
             let id = crate::genome::mix(RAIN_SALT ^ u64::from(row));
             let layer = FxLayer::new(
                 id,
-                Arc::clone(&content),
+                Arc::clone(&entry.content),
                 FxSlot::Under,
                 FxSpace::Grid,
                 FxBlend::Linear,

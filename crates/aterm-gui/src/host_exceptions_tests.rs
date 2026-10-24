@@ -4261,3 +4261,56 @@ fn the_owners_mode_leaving_prompt_ends_every_tabs_occupancy_entries() {
     }
     crate::occupancy_host::set_mode(Occupancy::Observe);
 }
+
+/// ANOTHER CLI'S POOL'S LINES (`HostNote::Pools`): a Kimi login due opens Kimi's own line under
+/// its own key, naming `--cli kimi`, and a pool that says nothing more clears it. CONTROL: the
+/// note opens no Claude Code line, and Claude Code's due line stands through it.
+#[test]
+fn another_pools_due_line_follows_its_note_and_leaves_claudes_alone() {
+    use crate::harness_host::PoolSaid;
+    use aterm_agent::harness::accounts::Cli;
+    let mut app = App::headless_for_test();
+    let keys = |app: &App| -> Vec<String> {
+        let mut keys: Vec<String> = app
+            .messages
+            .digest()
+            .entries
+            .iter()
+            .map(|e| e.key.clone())
+            .collect();
+        keys.sort();
+        keys
+    };
+    app.note_harness_host(HostNote::Accounts(AccountsSaid::Listed {
+        signed_out: Vec::new(),
+        credits: Vec::new(),
+        window_full: Vec::new(),
+        due: vec!["m16".to_string()],
+        none_soon: false,
+        wrong: Vec::new(),
+    }));
+    assert_eq!(keys(&app), [mr::ACCOUNTS_DUE_KEY.to_string()]);
+    let kimi_due = mr::pool_notice_key(Cli::Kimi, "due");
+    app.note_harness_host(HostNote::Pools(vec![PoolSaid {
+        cli: Cli::Kimi,
+        due: vec!["kimi-1".to_string()],
+        wrong: Vec::new(),
+    }]));
+    let mut both = vec![mr::ACCOUNTS_DUE_KEY.to_string(), kimi_due.clone()];
+    both.sort();
+    assert_eq!(keys(&app), both);
+    let digest = app.messages.digest();
+    let line = digest
+        .entries
+        .iter()
+        .find(|e| e.key == kimi_due)
+        .expect("Kimi's line is open");
+    assert_eq!(line.title, "Kimi login due for renewal");
+    assert!(line.then.contains("--cli kimi"), "{}", line.then);
+    app.note_harness_host(HostNote::Pools(Vec::new()));
+    assert_eq!(
+        keys(&app),
+        [mr::ACCOUNTS_DUE_KEY.to_string()],
+        "CONTROL: Claude Code's line stands; Kimi's is cleared"
+    );
+}

@@ -16,6 +16,7 @@ use crate::cursor_glow::{InkRole, band_pos, band_row};
 use crate::effect_util::lerp_rgb;
 use crate::spectrum::{spectrum, spectrum_with_min_saturation};
 
+use super::companion::KeepOut;
 use super::meteor::tri;
 use super::spine::{DISP_RELEASE_TAU, PHASE_RATE};
 use super::stardust::GlyphProbe;
@@ -30,6 +31,9 @@ pub const RIBBON_QUAD_BUDGET: usize = 10_240;
 
 /// Cells the hot edge reaches back from the head (§4.1).
 pub const HOT_EDGE_CELLS: f32 = 3.0;
+
+/// The hot edge's line thickness, px.
+pub const HOT_EDGE_THICKNESS: f32 = 1.0;
 
 /// How far back from its head end a run the hand has left feathers in, in cells ([`Ribbon::head_feather`]): the body, its rail and its hot edge thin to nothing at the end the caret jumped off instead of standing square-cut there, at the end and along the top edge beside it. Wide enough that its pixel-fine boundaries step by no more than a fifth of the body a column (0.9 stepped by 0.23), narrow enough that the band an Enter leaves goes dark with a submit's (1.5 dimmed its newest end a frame early).
 pub const HEAD_FEATHER_CELLS: f32 = 1.2;
@@ -118,6 +122,12 @@ pub const COMET_UP_TAIL_CH: f32 = 0.80;
 /// Cells behind the head over which the comet's `up` tapers from [`TALL_UP_CH`] to [`COMET_UP_TAIL_CH`] (smoothstep).
 pub const COMET_TAPER_CELLS: f32 = 12.0;
 
+/// The flat ribbon's reach above its spine on paper, as a share of the pet's body's.
+pub const FLAT_PAPER_UP_SHARE: f32 = 0.72;
+
+/// The flat ribbon's full-strength plateau on paper, as a share of its reach.
+pub const FLAT_PAPER_CORE_SHARE: f32 = 0.85;
+
 /// The rail's ink luminance floor.
 pub const RAIL_LUMA_FLOOR: f32 = 0.20;
 
@@ -194,6 +204,25 @@ const BED_LUMA_MAX: f32 = 0.150;
 
 /// The bed's chroma floor.
 pub const BED_SAT_FLOOR: f32 = 1.0;
+
+/// A dark theme whose text reads under this on its page is dim: its bed is
+/// held at its edge too ([`dim_edge_held`]).
+pub const DIM_THEME_BARE: f32 = 7.0;
+
+/// THE DIM BED'S EDGE (looks6 N11, 2026-10-23). Where the bed's top crosses a
+/// letter, the letter's anti-aliased pixels sit on page above and bed below,
+/// and a reader of that edge (`aterm-lab trail-contrast`'s ring, each channel's
+/// median) sees the page's green with the bed's blue: Solarized Dark's `#002b36`
+/// over a `#160480` bed reads `#162b80`, and `fox`'s `o` read 3.54:1 there,
+/// under four fifths of the theme's 4.75:1. On a dim theme the bed is held
+/// so that its brightest channel mix with the page keeps a letter's edge
+/// pixel ([`DIM_EDGE_SOLID`] of the text's reading) at
+/// [`PAPER_BAR_THEME_SHARE`] of the theme's own, with this margin.
+pub const DIM_EDGE_GUARD: f32 = 0.03;
+
+/// The share of the text's reading its weakest solid pixel keeps (the
+/// judge's solid share).
+pub const DIM_EDGE_SOLID: f32 = 0.85;
 
 /// The light bed's one weight.
 pub const PAPER_WEIGHT: f32 = 0.24;
@@ -946,16 +975,32 @@ fn toward_white(rgb: u32, w: f32) -> u32 {
 #[inline]
 fn solve_for_luma(family: impl Fn(f32) -> u32, target: f32) -> u32 {
     let table = crate::color_math::relative_luminance_table();
+    let hi0 = family(1.0);
+    if crate::color_math::relative_luminance_with(table, hi0) < target {
+        return hi0;
+    }
+    let lo0 = family(0.0);
+    if crate::color_math::relative_luminance_with(table, lo0) >= target {
+        return lo0;
+    }
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
+    let (mut lo_rgb, mut hi_rgb) = (Some(lo0), Some(hi0));
     for _ in 0..24 {
         let mid = 0.5 * (lo + hi);
-        if crate::color_math::relative_luminance_with(table, family(mid)) < target {
+        let mid_rgb = family(mid);
+        if lo_rgb == Some(mid_rgb) {
             lo = mid;
+        } else if hi_rgb == Some(mid_rgb) {
+            hi = mid;
+        } else if crate::color_math::relative_luminance_with(table, mid_rgb) < target {
+            lo = mid;
+            lo_rgb = Some(mid_rgb);
         } else {
             hi = mid;
+            hi_rgb = Some(mid_rgb);
         }
     }
-    family(lo)
+    lo_rgb.unwrap_or(lo0)
 }
 
 #[inline]
@@ -971,6 +1016,50 @@ fn onto_luma(rgb: u32, target: f32) -> u32 {
     } else {
         solve_for_luma(|w| toward_white(full, w), target)
     }
+}
+
+/// The dim theme's bed `bed`, scaled down until each channel's larger of it
+/// and the page `page` keeps a letter's edge at the bar ([`DIM_EDGE_GUARD`]);
+/// `bed` unchanged on a theme whose text `fg` reads past [`DIM_THEME_BARE`].
+#[must_use]
+pub fn dim_edge_held(bed: u32, fg: u32, page: u32) -> u32 {
+    let (fg, page) = (fg & 0x00FF_FFFF, page & 0x00FF_FFFF);
+    let table = crate::color_math::relative_luminance_table();
+    let (lf, lp) = (
+        crate::color_math::relative_luminance_with(table, fg),
+        crate::color_math::relative_luminance_with(table, page),
+    );
+    let bare = (lf.max(lp) + 0.05) / (lf.min(lp) + 0.05);
+    if bare >= DIM_THEME_BARE || lf <= lp {
+        return bed;
+    }
+    let edge = (lp + 0.05) * DIM_EDGE_SOLID / (PAPER_BAR_THEME_SHARE + DIM_EDGE_GUARD) - 0.05;
+    let chmax = |c: u32| {
+        let ch = |sh: u32| ((c >> sh) & 0xff).max((page >> sh) & 0xff) << sh;
+        ch(16) | ch(8) | ch(0)
+    };
+    let hi0 = bed & 0x00FF_FFFF;
+    if crate::color_math::relative_luminance_with(table, chmax(hi0)) <= edge {
+        return bed;
+    }
+    let (mut lo, mut hi) = (0.0f32, 1.0f32);
+    let (mut lo_rgb, mut hi_rgb) = (None, Some(hi0));
+    for _ in 0..24 {
+        let mid = 0.5 * (lo + hi);
+        let mid_rgb = scale_rgb(bed, mid);
+        if lo_rgb == Some(mid_rgb) {
+            lo = mid;
+        } else if hi_rgb == Some(mid_rgb) {
+            hi = mid;
+        } else if crate::color_math::relative_luminance_with(table, chmax(mid_rgb)) <= edge {
+            lo = mid;
+            lo_rgb = Some(mid_rgb);
+        } else {
+            hi = mid;
+            hi_rgb = Some(mid_rgb);
+        }
+    }
+    lo_rgb.unwrap_or_else(|| scale_rgb(bed, lo))
 }
 
 /// The bed's on-glass ink: the stop, its hue bent off the dark bed's mud
@@ -1047,28 +1136,34 @@ pub(crate) fn paper_ink(rgb: u32, fg: u32, bg: u32, role: InkRole) -> u32 {
         crate::color_math::relative_luminance_rgb(table, ch(16), ch(8), ch(0))
     };
     let bg_lab = oklab(bg);
-    let holds = |share: f32| {
-        let on_glass = lerp_rgb(bg, full, share * cap);
+    let eval = |(on_glass, ink): (u32, u32)| {
         let lab = oklab(on_glass);
         let (dl, da, db) = (lab[0] - bg_lab[0], lab[1] - bg_lab[1], lab[2] - bg_lab[2]);
         (dl * dl + da * da + db * db).sqrt() <= weight
-            && bar.is_none_or(|bar| ratio(worst_lum(lerp_rgb(bg, full, share))) >= bar)
+            && bar.is_none_or(|bar| ratio(worst_lum(ink)) >= bar)
     };
-    let share = if holds(1.0) {
-        1.0
-    } else {
-        let (mut lo, mut hi) = (0.0f32, 1.0f32);
-        for _ in 0..24 {
-            let mid = 0.5 * (lo + hi);
-            if holds(mid) {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
+    let hi0 = (lerp_rgb(bg, full, cap), lerp_rgb(bg, full, 1.0));
+    if eval(hi0) {
+        return hi0.1;
+    }
+    let (mut lo, mut hi) = (0.0f32, 1.0f32);
+    let (mut lo_pair, mut hi_pair) = (None, Some(hi0));
+    for _ in 0..24 {
+        let mid = 0.5 * (lo + hi);
+        let pair = (lerp_rgb(bg, full, mid * cap), lerp_rgb(bg, full, mid));
+        if lo_pair == Some(pair) {
+            lo = mid;
+        } else if hi_pair == Some(pair) {
+            hi = mid;
+        } else if eval(pair) {
+            lo = mid;
+            lo_pair = Some(pair);
+        } else {
+            hi = mid;
+            hi_pair = Some(pair);
         }
-        lo
-    };
-    lerp_rgb(bg, full, share)
+    }
+    lo_pair.map_or_else(|| lerp_rgb(bg, full, lo), |(_, ink)| ink)
 }
 
 /// The caret's ink on paper.
@@ -1110,23 +1205,29 @@ fn paper_vivid_ink(rgb: u32, bg: u32, bar: f32) -> u32 {
     let full = hsv2rgb(h, s, 1.0);
     let table = crate::color_math::relative_luminance_table();
     let y_bg = crate::color_math::relative_luminance_with(table, bg & 0x00FF_FFFF);
-    let holds = |k: f32| {
-        let y = crate::color_math::relative_luminance_with(table, scale_rgb(full, k));
+    let holds = |cand: u32| {
+        let y = crate::color_math::relative_luminance_with(table, cand);
         (y.max(y_bg) + 0.05) / (y.min(y_bg) + 0.05) >= bar
     };
-    if holds(1.0) {
+    if holds(full) {
         return full;
     }
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
+    let (mut lo_rgb, mut hi_rgb) = (None, full);
     for _ in 0..24 {
         let mid = 0.5 * (lo + hi);
-        if holds(mid) {
+        let mid_rgb = scale_rgb(full, mid);
+        if mid_rgb == hi_rgb {
+            hi = mid;
+        } else if lo_rgb == Some(mid_rgb) || holds(mid_rgb) {
             lo = mid;
+            lo_rgb = Some(mid_rgb);
         } else {
             hi = mid;
+            hi_rgb = mid_rgb;
         }
     }
-    scale_rgb(full, lo)
+    lo_rgb.unwrap_or(0)
 }
 
 #[inline]
@@ -1329,7 +1430,7 @@ impl BedInkLut {
             } else {
                 let arc = walk_arc_at(i);
                 if cfg.dark_theme {
-                    bed_ink(arc, budget)
+                    dim_edge_held(bed_ink(arc, budget), cfg.theme_fg, cfg.theme_bg)
                 } else {
                     let paper = paper_ink(arc, cfg.theme_fg, cfg.theme_bg, role);
                     let a = (cov_cap(cfg) + 16.0).min(255.0) as u8;
@@ -1569,14 +1670,38 @@ struct LaidSegment {
 
 const FEATHER_FINE_PX: f32 = 1.0;
 
+/// How deep from a run's tail its boundaries are laid finely, in cells
+/// ([`for_each_feathered`]).
+const RUN_END_FINE_CELLS: f32 = 1.0;
+
+/// The strides a run's end is laid finely into: a pixel apart on the
+/// gallery's 14 px cells, two on a Retina's 30.
+const RUN_END_FINE_SPLIT: usize = 5;
+
+/// The share of the quad budget a frame's estimate, its tails laid finely
+/// with it, must stay under: below [`FEATHER_ROOM_SHARE`], since the
+/// estimate leaves out the head feathers' own fine windows.
+const RUN_END_ROOM_SHARE: f32 = 0.5;
+
 const FEATHER_ROOM_ROWS: f32 = 1.6;
 const FEATHER_ROOM_SHARE: f32 = 0.6;
 
+/// Lays each of `segs` (in reverse) through `each`, and between two of
+/// them a boundary a pixel where the head's `feather` reaches, or every
+/// `end_px` px within `end_reach` px of the left end of `segs` (where the
+/// plan eases a run's tail in) unless the head is there. The rasterizer
+/// holds a window's light flat across each stride, so a run's tail easing
+/// in from [`RUN_TAIL_EASE`] over its cell's three slabs stood as a stair of
+/// flat blocks (looks6 round 3: `2f0f13` to `880e04` in 4-5 px steps, on the
+/// dark wash and the paper under-stripe alike). The reach is a place, not a
+/// coverage step, so a window keeps its layout while its light changes.
 fn for_each_feathered(
     segs: &[Segment],
     feather: HeadFeather,
+    (end_reach, end_px): (f32, f32),
     mut each: impl FnMut(Option<usize>, LaidSegment),
 ) {
+    let tail = segs.first().map_or(0.0, |s| s.x);
     let laid = |s: &Segment| LaidSegment {
         x: s.x,
         spine: s.spine,
@@ -1588,14 +1713,31 @@ fn for_each_feathered(
     let mut prev: Option<LaidSegment> = None;
     for (i, seg) in segs.iter().enumerate().rev() {
         let here = laid(seg);
+        let feathered = |p: &LaidSegment| {
+            feather.width > 0.0
+                && (p.x - feather.head_x)
+                    .abs()
+                    .min((here.x - feather.head_x).abs())
+                    < feather.width
+        };
+        let at_end = |p: &LaidSegment| {
+            end_reach > 0.0
+                && (tail - feather.head_x).abs() >= 1.0
+                && (p.x - tail).abs().min((here.x - tail).abs()) < end_reach
+        };
+        let fine = prev.map(|p| {
+            if feathered(&p) {
+                FEATHER_FINE_PX
+            } else if at_end(&p) {
+                end_px
+            } else {
+                0.0
+            }
+        });
         if let Some(p) = prev
-            && feather.width > 0.0
-            && (p.x - feather.head_x)
-                .abs()
-                .min((here.x - feather.head_x).abs())
-                < feather.width
+            && let Some(px) = fine.filter(|&px| px > 0.0)
         {
-            let n = ((here.x - p.x).abs() / FEATHER_FINE_PX).floor() as usize;
+            let n = ((here.x - p.x).abs() / px).floor() as usize;
             for k in 1..n {
                 let u = k as f32 / n as f32;
                 let l = |a: f32, b: f32| a + (b - a) * u;
@@ -1662,6 +1804,14 @@ pub struct Ribbon {
     /// Test-only: lay the boundaries inside a head feather's reach at the stride, as they were ([`for_each_feathered`]), the negative control of the smooth feather's test.
     #[cfg(test)]
     feather_coarse: bool,
+    /// Test-only: lay a run's tail at the stride, as it was, the negative
+    /// control of the tail's ease ([`STAIR_COV_STEP`]).
+    #[cfg(test)]
+    tail_stair: bool,
+    /// Test-only: centre the hot edge on the row's top under a kept box, as
+    /// it was, the negative control of its inset.
+    #[cfg(test)]
+    hot_edge_on_bar: bool,
     /// Test-only: step a line's hold to its target in one frame, as it first
     /// did, the negative control of the hold's ease.
     #[cfg(test)]
@@ -1670,6 +1820,10 @@ pub struct Ribbon {
     /// it was, the negative control of the descenders' hairline.
     #[cfg(test)]
     rail_flush: bool,
+    /// Test-only: draw the pet's and the flat ribbon alike on paper (no
+    /// rail, one body), as they were, looks6 N9's negative control.
+    #[cfg(test)]
+    paper_alike: bool,
     /// Test-only: leave each row's hold behind when a scroll or a band move
     /// carries its line away, as it first did, the negative control of the
     /// carried hold.
@@ -1735,7 +1889,14 @@ pub struct Ribbon {
     next_phrase: u32,
     curtain: Option<Instant>,
     hand_floor: Option<(u16, u16)>,
+    /// What the body's top never feathers up into ([`KeepOut`]): a word
+    /// icon or a lettered or filled cell standing on the run's row.
+    pub keep_out: KeepOut,
 }
+
+/// How far beside a [`KeepOut`] box the body's top eases back to its own
+/// reach, in cells.
+const KEEP_OUT_EASE_CELLS: f32 = 0.5;
 
 #[derive(Clone, Copy, Debug)]
 struct Relocate {
@@ -1977,11 +2138,13 @@ impl Ribbon {
         !cfg.ribbon_flat
     }
 
-    /// Whether the vivid rail is drawn.
+    /// Whether the vivid rail is drawn: under the comet body on either
+    /// page, so the pet's ribbon keeps its under-edge on paper too, where
+    /// without it the pet's and the flat ribbon read alike (looks6 N9).
     #[inline]
     #[must_use]
     pub const fn rail_lit(cfg: &Config) -> bool {
-        Self::comet(cfg) && cfg.dark_theme
+        Self::comet(cfg)
     }
 
     /// Ingest one engine event at its own edge, before this frame's plan.
@@ -4518,8 +4681,8 @@ impl Ribbon {
         sorted.sort_unstable_by(|a, b| {
             a.0.cmp(&b.0)
                 .then(a.1.cmp(&b.1))
-                .then(rank(a.2).cmp(&rank(b.2)))
-                .then(b.2.cmp(&a.2))
+                .then_with(|| rank(a.2).cmp(&rank(b.2)))
+                .then_with(|| b.2.cmp(&a.2))
         });
         sorted.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
         for &(row, col, idx) in &sorted {
@@ -4585,10 +4748,15 @@ impl Ribbon {
                     } else {
                         below.and_then(|p| Self::inked_below(p, ctx, row, sorted[s].1, last))
                     };
+                    let mut seen_coh = None;
                     let flowing = row_cells
                         .iter()
                         .filter_map(|e| cohort_of(&self.cells, *e))
                         .any(|id| {
+                            if seen_coh == Some(id) {
+                                return false;
+                            }
+                            seen_coh = Some(id);
                             self.cohorts
                                 .iter()
                                 .any(|c| c.id == id && c.flow.is_some() && c.phase.is_retracting())
@@ -5324,7 +5492,11 @@ impl Ribbon {
         let ink_from = frame.under.len();
         let prof = Self::body_profile(ctx.cfg);
         let shoulder = prof.shoulder;
-        let rail = Self::rail_lit(ctx.cfg);
+        #[cfg(test)]
+        let alike = self.paper_alike && !ctx.cfg.dark_theme;
+        #[cfg(not(test))]
+        let alike = false;
+        let rail = Self::rail_lit(ctx.cfg) && !alike;
         let chf = ctx.geom.ch as f32;
         let ceiling = if ctx.cfg.dark_theme {
             BODY_FRAME_TOP
@@ -5356,11 +5528,33 @@ impl Ribbon {
         let rail_gap = rail_gap_px(chf);
         let plan = &self.plan;
         let ink = &self.ink;
+        let kept_up = |x: f32, spine: f32, up: f32, row: u16| self.kept_up(ctx, x, spine, up, row);
         let head_feather = |run: &Run| self.head_feather(ctx, run);
+        // The flat ribbon on paper lies flatter than the pet's comet body:
+        // lower, its plateau carried near its top (looks6 N9).
+        let flat_paper = !ctx.cfg.dark_theme && !Self::comet(ctx.cfg) && !alike;
         #[cfg(test)]
         let coarse = self.feather_coarse;
         let roomy = (self.plan.len() as f32) * FEATHER_ROOM_ROWS * chf
             < RIBBON_QUAD_BUDGET as f32 * FEATHER_ROOM_SHARE;
+        // Each run's tail laid finely adds its fine windows to its plan's;
+        // only a frame with room for a tail a row lays them (counted by
+        // rows, so a row's runs lay alike together and apart).
+        let end_windows = {
+            let fine = stride.div_ceil(RUN_END_FINE_SPLIT).max(1);
+            let cells = RUN_END_FINE_CELLS;
+            cells * (ctx.geom.cw as f32 / fine as f32 - self.slabs_per_cell() as f32)
+        };
+        let tail_rows = runs
+            .iter()
+            .enumerate()
+            .filter(|(i, run)| !runs[..*i].iter().any(|r| r.row == run.row))
+            .count();
+        let roomy_ends = roomy
+            && (self.plan.len() as f32 + tail_rows as f32 * end_windows.max(0.0))
+                * FEATHER_ROOM_ROWS
+                * chf
+                < RIBBON_QUAD_BUDGET as f32 * RUN_END_ROOM_SHARE;
         {
             let mut paint = |out: &mut Vec<GlowQuad>, run: &Run, rail_layer: bool| -> bool {
                 let row_bottom = f32::from(ctx.geom.origin_y) + (f32::from(run.row) + 1.0) * chf;
@@ -5382,8 +5576,20 @@ impl Ribbon {
                 verts.clear();
                 verts.reserve(run.hi - run.lo);
                 let mut head_rev = 0usize;
+                #[cfg(test)]
+                let stair = self.tail_stair;
+                #[cfg(not(test))]
+                let stair = false;
+                let end_fine = if roomy_ends && !stair {
+                    (
+                        RUN_END_FINE_CELLS * ctx.geom.cw as f32,
+                        stride.div_ceil(RUN_END_FINE_SPLIT) as f32,
+                    )
+                } else {
+                    (0.0, 0.0)
+                };
                 if rail_layer {
-                    for_each_feathered(&plan[run.lo..run.hi], fine_feather, |i, seg| {
+                    for_each_feathered(&plan[run.lo..run.hi], fine_feather, end_fine, |i, seg| {
                         if i == Some(run.head - run.lo) {
                             head_rev = verts.len();
                         }
@@ -5404,18 +5610,25 @@ impl Ribbon {
                         });
                     });
                 } else {
-                    for_each_feathered(&plan[run.lo..run.hi], fine_feather, |i, seg| {
+                    for_each_feathered(&plan[run.lo..run.hi], fine_feather, end_fine, |i, seg| {
                         if i == Some(run.head - run.lo) {
                             head_rev = verts.len();
                         }
                         let cov = seg.cov * feather(seg.x);
                         let strip = (cov * STRIP_LIFT_GAIN).min(ceiling - cov).max(0.0);
+                        let up = kept_up(seg.x, seg.spine, seg.up, run.row);
+                        let (up, core) = if flat_paper {
+                            let up = up * FLAT_PAPER_UP_SHARE;
+                            (up, up * FLAT_PAPER_CORE_SHARE)
+                        } else {
+                            (up, core_up.min(up))
+                        };
                         verts.push(RibbonVertex {
                             x: seg.x,
                             spine: seg.spine,
-                            up: seg.up,
+                            up,
                             dn: seg.dn,
-                            core_up,
+                            core_up: core,
                             core_dn: 0.0,
                             color: ink.at(seg.t),
                             cov,
@@ -5484,6 +5697,38 @@ impl Ribbon {
             .iter()
             .filter(|q| reads_as_ink(over_premul(bg, q.color, q.alpha)))
             .count();
+    }
+
+    /// The reach `up` of a body boundary at window x `x` standing on
+    /// `spine` in `row`, cut so its top (and the feather it wears there)
+    /// stays in its own row under a [`KeepOut`] box standing on the row.
+    #[inline]
+    fn kept_up(&self, ctx: &Ctx<'_>, x: f32, spine: f32, up: f32, row: u16) -> f32 {
+        self.kept_up_inset(ctx, (x, spine, up, row), 0.0)
+    }
+
+    /// [`Self::kept_up`] with the top held `inset` px inside the row under
+    /// a box: a line drawn centred on the top (the hot edge) keeps its
+    /// whole thickness off the box.
+    #[inline]
+    fn kept_up_inset(
+        &self,
+        ctx: &Ctx<'_>,
+        (x, spine, up, row): (f32, f32, f32, u16),
+        inset: f32,
+    ) -> f32 {
+        if self.keep_out.boxes().is_empty() {
+            return up;
+        }
+        let chf = ctx.geom.ch as f32;
+        let row_top = f32::from(ctx.geom.origin_y) + f32::from(row) * chf + inset;
+        let top = spine - up;
+        if top >= row_top {
+            return up;
+        }
+        let ease = KEEP_OUT_EASE_CELLS * ctx.geom.cw as f32;
+        let ceiling = self.keep_out.ceiling(x, row_top, top, ease);
+        (spine - ceiling.max(top)).max(0.0)
     }
 
     fn head_feather(&self, ctx: &Ctx<'_>, run: &Run) -> HeadFeather {
@@ -5612,6 +5857,18 @@ impl Ribbon {
         let seam_lvl = seam.map_or(0.0, |(_, l)| l);
         let intensity = clamp01(ctx.cfg.intensity);
         let feather = self.head_feather(ctx, run);
+        // The edge is a line a pixel thick centred on the body's top:
+        // held at the row's top under a lettered or filled cell above,
+        // its upper half lay on the cell's foot (looks6 round 3: the
+        // bottom of `main +2`'s yellow segment lifted by 77).
+        #[cfg(test)]
+        let inset = if self.hot_edge_on_bar {
+            0.0
+        } else {
+            0.5 * HOT_EDGE_THICKNESS
+        };
+        #[cfg(not(test))]
+        let inset = 0.5 * HOT_EDGE_THICKNESS;
         frame.beams.clear();
         for seg in self.plan[run.lo..run.hi]
             .iter()
@@ -5629,7 +5886,7 @@ impl Ribbon {
                 .clamp(0.0, HOT_EDGE_COV_MAX);
             frame.beams.push(BeamVertex {
                 x: seg.x,
-                y: seg.spine - seg.up,
+                y: seg.spine - self.kept_up_inset(ctx, (seg.x, seg.spine, seg.up, run.row), inset),
                 color: self.ink.hot_at(seg.t),
                 cov: cov as u8,
             });
@@ -5638,7 +5895,14 @@ impl Ribbon {
             frame.beams.clear();
             return;
         }
-        comet_beam(frame.out, ctx.geom.beam_clip(), frame.beams, 1.0, 1, 0.0);
+        comet_beam(
+            frame.out,
+            ctx.geom.beam_clip(),
+            frame.beams,
+            HOT_EDGE_THICKNESS,
+            1,
+            0.0,
+        );
         frame.beams.clear();
     }
 
@@ -6175,8 +6439,15 @@ impl Ribbon {
         let cells = &self.cells;
         self.cohorts
             .retain(|coh| cells.iter().any(|c| c.cohort == coh.id));
-        self.cells
-            .retain(|c| self.cohorts.iter().any(|coh| coh.id == c.cohort));
+        let mut last_coh: Option<(u32, bool)> = None;
+        self.cells.retain(|c| match last_coh {
+            Some((id, keep)) if id == c.cohort => keep,
+            _ => {
+                let keep = self.cohorts.iter().any(|coh| coh.id == c.cohort);
+                last_coh = Some((c.cohort, keep));
+                keep
+            }
+        });
         self.caret = self.caret.map(|(row, col)| (row.saturating_sub(rows), col));
         self.pen = self
             .pen
@@ -6264,8 +6535,15 @@ impl Ribbon {
         let cells = &self.cells;
         self.cohorts
             .retain(|coh| cells.iter().any(|c| c.cohort == coh.id));
-        self.cells
-            .retain(|c| self.cohorts.iter().any(|coh| coh.id == c.cohort));
+        let mut last_coh: Option<(u32, bool)> = None;
+        self.cells.retain(|c| match last_coh {
+            Some((id, keep)) if id == c.cohort => keep,
+            _ => {
+                let keep = self.cohorts.iter().any(|coh| coh.id == c.cohort);
+                last_coh = Some((c.cohort, keep));
+                keep
+            }
+        });
         self.caret = self
             .caret
             .map(|(row, col)| (band_pos(row, top, bottom, delta), col));
@@ -7675,6 +7953,169 @@ mod tests {
                      (square-cut {square_edge})"
                 );
             }
+        }
+    }
+
+    /// The trail gallery's glass: 72x14 cells of 14x26 px from (12, 2).
+    fn gallery_geom() -> Geom {
+        Geom {
+            cw: 14,
+            ch: 26,
+            rows: 14,
+            cols: 72,
+            origin_x: 12,
+            origin_y: 2,
+            win_w: 1032,
+            win_h: 378,
+            head: 0,
+        }
+    }
+
+    /// The gallery's judges (looks6 round 3, N4): under the yellow `main +2`
+    /// powerline segment on the row above the caret's, the hot edge, a line
+    /// a pixel thick held centred on the row's top, lay half on the
+    /// segment's foot and tinted its bottom pixels (`cdcd00` to `e0fb4d`).
+    /// Held its half thickness inside the row, the edge lights nothing above
+    /// the row's top under the segment; centred on the top (the negative
+    /// control) it does.
+    #[test]
+    fn the_hot_edge_keeps_off_a_filled_cell_above() {
+        let g = gallery_geom();
+        let c = cfg(true, true);
+        let (ox, oy, cw, ch) = (
+            i32::from(g.origin_x),
+            i32::from(g.origin_y),
+            g.cw as i32,
+            g.ch as i32,
+        );
+        let row_top = oy + 4 * ch;
+        let bar = (ox + 13 * cw, ox + 22 * cw, row_top - ch, row_top);
+        let above = |on_bar: bool| -> (usize, u32) {
+            let t0 = Instant::now();
+            let mut rib = Ribbon::new();
+            rib.hot_edge_on_bar = on_bar;
+            rib.keep_out.set([bar]);
+            let keys = Keys {
+                g,
+                row: 4,
+                col0: 2,
+                n: 19,
+                period_ms: 85,
+                disp: 0.9,
+            };
+            type_keys(&mut rib, t0, keys, &c);
+            let cx = ctx_in(at(t0, 18 * 85 + 20), &c, (4, 21), 0.9, g);
+            rib.plan(&cx);
+            let mut sink = Sink::default();
+            {
+                let mut f = sink.frame();
+                rib.emit(&cx, &mut f);
+            }
+            let lit = |q: &&GlowQuad| q.color & 0x00FF_FFFF != 0 || q.color2 & 0x00FF_FFFF != 0;
+            let n = sink.out.iter().filter(lit).count();
+            let over = sink
+                .out
+                .iter()
+                .filter(lit)
+                .filter(|q| {
+                    let (x0, x1) = (i32::from(q.x), i32::from(q.x) + i32::from(q.w));
+                    i32::from(q.y) < row_top && x0 < bar.1 && bar.0 < x1
+                })
+                .map(|q| peak_channel(std::slice::from_ref(q)))
+                .max()
+                .unwrap_or(0);
+            (n, over)
+        };
+        let (n, over) = above(false);
+        assert!(n > 0, "fixture: the hand leaves a hot edge");
+        assert_eq!(
+            over, 0,
+            "the hot edge lights the segment's foot above the row by {over}"
+        );
+        let (n, over) = above(true);
+        assert!(n > 0, "control fixture: the hand leaves a hot edge");
+        assert!(
+            over >= 40,
+            "control: centred on the row's top the edge lights the segment's foot by only {over}"
+        );
+    }
+
+    /// The gallery's judges (looks6 round 3): the run's tail eased in from
+    /// [`RUN_TAIL_EASE`] over the stride's three slabs and stood as a stair
+    /// of flat 4-5 px blocks (`2f0f13` to `880e04` on dark, and on the paper
+    /// wash and its under-stripe). On the gallery's 14 px cells the tail's
+    /// light now steps by no more than an eighth of the body's from one lit
+    /// column to the next, on dark and on paper; laid at the stride (the
+    /// negative control) it steps by a fifth or more.
+    #[test]
+    fn the_run_s_tail_eases_in_without_a_stair() {
+        let g = gallery_geom();
+        let col0 = 3u16;
+        let profile = |dark: bool, stair: bool| -> (f32, f32) {
+            let c = cfg(dark, true);
+            let t0 = Instant::now();
+            let mut rib = Ribbon::new();
+            rib.tail_stair = stair;
+            let keys = Keys {
+                g,
+                row: 4,
+                col0,
+                n: 16,
+                period_ms: 60,
+                disp: 0.6,
+            };
+            type_keys(&mut rib, t0, keys, &c);
+            let now = at(t0, 15 * 60 + 16);
+            let cx = ctx_in(now, &c, (4, col0 + 16), 0.6, g);
+            rib.plan(&cx);
+            let mut sink = Sink::default();
+            {
+                let mut f = sink.frame();
+                rib.emit(&cx, &mut f);
+            }
+            let mut col = vec![0.0f32; usize::from(g.win_w)];
+            for q in sink.under.iter().filter(|q| q.alpha > 0 || q.alpha2 > 0) {
+                let w = f32::from(q.w.max(1));
+                for i in 0..q.w {
+                    let t = if q.w > 1 {
+                        f32::from(i) / (w - 1.0)
+                    } else {
+                        0.0
+                    };
+                    let a = f32::from(q.alpha) + (f32::from(q.alpha2) - f32::from(q.alpha)) * t;
+                    let x = usize::from(q.x + i);
+                    col[x] = col[x].max(a);
+                }
+            }
+            let ox = usize::from(g.origin_x);
+            let tail = ox + usize::from(col0) * g.cw;
+            let body = col[tail + 4 * g.cw];
+            // From the run's first lit column (its outer boundary keeps a
+            // tenth of the light, a soft start) across the tail cell.
+            let first = (tail.saturating_sub(2)..tail + g.cw)
+                .find(|&x| col[x] > 0.0)
+                .unwrap_or(tail);
+            let step = col[first..first + g.cw + 2]
+                .windows(2)
+                .map(|w| (w[1] - w[0]).abs())
+                .fold(0.0, f32::max);
+            (step, body)
+        };
+        for dark in [true, false] {
+            let (step, body) = profile(dark, false);
+            assert!(
+                body > 40.0,
+                "fixture (dark {dark}): the body is lit ({body})"
+            );
+            assert!(
+                step <= body / 8.0,
+                "dark {dark}: the tail steps by {step} in a column against the body's {body}"
+            );
+            let (stair, body) = profile(dark, true);
+            assert!(
+                stair >= body / 5.0,
+                "control (dark {dark}): at the stride the tail steps only {stair} against {body}"
+            );
         }
     }
 
@@ -10133,14 +10574,172 @@ mod tests {
         }
     }
 
+    /// THE DIM BED'S EDGE (looks6 N11): where the bed's top crosses a
+    /// letter, the lab's ring reads each channel's larger of page and bed,
+    /// and Solarized Dark's page green with the bed's blue read `fox`'s `o`
+    /// at 3.54:1. Every stop of the walk on a dim dark theme keeps a
+    /// letter's edge pixel (the judge's solid share of the text's reading)
+    /// at four fifths of the theme's own contrast over that mix, and a
+    /// theme past the dim bar keeps its bed byte for byte. Negative
+    /// control: the bed unheld fails that edge on Solarized Dark.
+    #[test]
+    fn a_dim_theme_s_bed_keeps_the_letters_at_its_edge() {
+        let chmax = |a: u32, b: u32| {
+            let ch = |sh: u32| ((a >> sh) & 0xff).max((b >> sh) & 0xff) << sh;
+            ch(16) | ch(8) | ch(0)
+        };
+        // The text's weakest solid pixel: on the way from the ink to the
+        // page, reading the judge's solid share of the text's own.
+        let edge_ink = |fg: u32, page: u32| {
+            let want = DIM_EDGE_SOLID * contrast(fg, page);
+            let (mut lo, mut hi) = (0.0f32, 1.0f32);
+            for _ in 0..24 {
+                let mid = 0.5 * (lo + hi);
+                if contrast(lerp_rgb(fg, page, mid), page) >= want {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            lerp_rgb(fg, page, lo)
+        };
+        let walk = |fg: u32, held: bool| -> Vec<u32> {
+            (0..64)
+                .map(|i| {
+                    let arc = walk_arc_at(i * BED_INK_LUT_LEN / 64);
+                    let bed = bed_ink(arc, bed_luma_budget(fg));
+                    if held {
+                        dim_edge_held(bed, fg, SOLARIZED_PAGE)
+                    } else {
+                        bed
+                    }
+                })
+                .collect()
+        };
+        const SOLARIZED_PAGE: u32 = 0x0000_2B36;
+        for (fg, page) in [(0x0083_9496, SOLARIZED_PAGE), (0x0085_8585, 0x0011_1318)] {
+            let bar = 0.8 * contrast(fg, page);
+            let ink = edge_ink(fg, page);
+            for i in 0..64 {
+                let arc = walk_arc_at(i * BED_INK_LUT_LEN / 64);
+                let bed = dim_edge_held(bed_ink(arc, bed_luma_budget(fg)), fg, page);
+                let read = contrast(ink, chmax(bed, page));
+                assert!(
+                    read >= bar,
+                    "fg {fg:06x} on {page:06x}: stop {i} bed {bed:06x} reads the edge at {read:.2}:1, under {bar:.2}"
+                );
+            }
+        }
+        let fg = 0x00D0_D0D0;
+        for i in 0..64 {
+            let arc = walk_arc_at(i * BED_INK_LUT_LEN / 64);
+            let bed = bed_ink(arc, bed_luma_budget(fg));
+            assert_eq!(
+                dim_edge_held(bed, fg, 0x001E_1E1E),
+                bed,
+                "a bright theme's bed is its own"
+            );
+        }
+        let (fg, page) = (0x0083_9496, SOLARIZED_PAGE);
+        let ink = edge_ink(fg, page);
+        let unheld = walk(fg, false)
+            .into_iter()
+            .map(|bed| contrast(ink, chmax(bed, page)))
+            .fold(f32::INFINITY, f32::min);
+        assert!(
+            unheld < 0.8 * contrast(fg, page),
+            "control: the unheld bed keeps the edge ({unheld:.2}:1), so the hold proves nothing"
+        );
+    }
+
+    #[test]
+    fn on_paper_the_pet_s_ribbon_and_the_flat_one_read_apart() {
+        // looks6 N9: on paper the pet's ribbon and the flat one drew one
+        // body. The pet's keeps its under-edge (ink below the row's bottom
+        // past the hairline) and the flat one none and a lower reach; drawn
+        // alike (the negative control) the two columns match.
+        let g = geom();
+        let ch = g.ch as f32;
+        let row_top = f32::from(g.origin_y) + 2.0 * ch;
+        let row_bottom = row_top + ch;
+        let gap = rail_gap_px(ch);
+        let profile = |c: &Config, alike: bool| -> (u32, f32) {
+            let t0 = Instant::now();
+            let mut rib = Ribbon::new();
+            rib.paper_alike = alike;
+            type_run(&mut rib, t0, 10, 8, c, 0.9);
+            let cx = ctx(at(t0, 8 * 60), c, (2, 18), 0.9);
+            rib.plan(&cx);
+            let mut sink = Sink::default();
+            {
+                let mut f = sink.frame();
+                rib.emit(&cx, &mut f);
+            }
+            // The ink laid on the white page at `(x, y)`: its deepest
+            // channel's fall from the page.
+            let ink = |x: f32, y: f32| {
+                let (px, py) = (x.floor(), y.floor());
+                let p = sink
+                    .under
+                    .iter()
+                    .filter(|q| {
+                        let qx = f32::from(q.x);
+                        (qx..qx + f32::from(q.w)).contains(&px) && f32::from(q.y) == py
+                    })
+                    .fold(0x00FF_FFFF, |acc, q| over_premul(acc, q.color, q.alpha));
+                [16u32, 8, 0]
+                    .iter()
+                    .map(|&sh| 255 - ((p >> sh) & 0xff))
+                    .max()
+                    .unwrap_or(0)
+            };
+            let (mut under, mut top) = (0u32, row_bottom);
+            let mut x = f32::from(g.origin_x) + 12.0 * g.cw as f32;
+            while x < f32::from(g.origin_x) + 17.0 * g.cw as f32 {
+                for d in gap as i32..(gap as i32 + 4) {
+                    under += ink(x, row_bottom + d as f32);
+                }
+                if let Some(y) = (0..(2.0 * ch) as i32)
+                    .map(|k| row_bottom - 2.0 * ch + k as f32)
+                    .find(|&y| ink(x, y) > 24)
+                {
+                    top = top.min(y);
+                }
+                x += 1.0;
+            }
+            (under, top)
+        };
+        let (pet_under, pet_top) = profile(&cfg(false, true), false);
+        let (flat_under, flat_top) = profile(&flat(false, true), false);
+        assert!(
+            5 * pet_under >= 8 * flat_under.max(1),
+            "the pet's under-edge on paper ({pet_under}) against the flat one's ({flat_under})"
+        );
+        assert!(
+            flat_top >= pet_top + 3.0,
+            "the flat ribbon reaches as high as the pet's ({flat_top} vs {pet_top})"
+        );
+        let (alike_pet, alike_pet_top) = profile(&cfg(false, true), true);
+        let (alike_flat, alike_flat_top) = profile(&flat(false, true), true);
+        assert!(
+            5 * alike_pet < 8 * alike_flat.max(1) && (alike_flat_top - alike_pet_top).abs() < 3.0,
+            "control: drawn alike, the two still read apart ({alike_pet} vs {alike_flat}, \
+             tops {alike_pet_top} vs {alike_flat_top})"
+        );
+    }
+
     #[test]
     fn the_flat_spelling_draws_no_rail() {
         let c = flat(true, true);
         assert!(!Ribbon::comet(&c) && !Ribbon::rail_lit(&c));
         assert!(Ribbon::comet(&cfg(true, true)) && Ribbon::rail_lit(&cfg(true, true)));
+        // looks6 N9 (owner, 2026-10-23) lights the pet's rail on paper too:
+        // without its under-edge the pet's ribbon and the flat one read alike
+        // there, so L6's bed alone below the baseline now holds for the
+        // flat spelling only.
         assert!(
-            !Ribbon::rail_lit(&cfg(false, true)),
-            "the light fork keeps the bed alone below the baseline (L6)"
+            Ribbon::rail_lit(&cfg(false, true)) && !Ribbon::rail_lit(&flat(false, true)),
+            "on paper the pet keeps its under-edge and the flat spelling none"
         );
         let t0 = Instant::now();
         let mut rib = Ribbon::new();

@@ -41,11 +41,9 @@ fn number(line: &str, before: &str) -> u64 {
 /// then for its bridge, to exit: what the bridge said is in the log by then.
 fn quit(w: &mut World) {
     let bridge = w.bridge_pid();
+    let mut gui = w.take_gui().expect("the instance");
     let _ = w.ctl().request("invoke Quit");
-    until("aterm to exit", || {
-        w.gui.as_mut()?.try_wait().ok().flatten()
-    });
-    w.gui = None;
+    until("aterm to exit", || gui.try_wait().ok().flatten());
     until("its bridge to exit after it", || {
         (!alive(bridge)).then_some(())
     });

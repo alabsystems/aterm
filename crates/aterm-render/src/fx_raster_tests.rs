@@ -1787,3 +1787,58 @@ fn the_budget_rules_once_per_set_of_contents() {
     assert_eq!(rule(&[]), (1, 0), "no layers: nothing refused");
     assert_eq!(rule(&[]), (0, 0), "and kept");
 }
+
+/// THE BAND LAW'S INVERSE: every pixel row of a frame lies in the band [`band_px`] gives for the
+/// band [`band_at`] names, read through the slicer ([`FxFrame`]'s `band_of`) and through fx damage
+/// ([`crate::RowBands`]) alike, so damage marks exactly the rows the slicer draws into. Grids
+/// shorter than, as tall as and taller than the frame, with and without a top pad, each row checked.
+#[test]
+fn every_pixel_row_lies_in_the_band_named_for_it() {
+    fn first_miss(band_of: impl Fn(&FxFrame, usize) -> usize) -> Option<String> {
+        for grid_top in [0, 1, 7, 40] {
+            for cell_h in [1, 2, 17, 40] {
+                for rows in [1, 2, 3, 26] {
+                    let grid = grid_top + rows * cell_h;
+                    for h in [1, grid_top + 1, grid / 2 + 1, grid, grid + 13] {
+                        let f = FxFrame {
+                            w: 1,
+                            h,
+                            pad: 0,
+                            grid_top,
+                            cell_h,
+                            rows,
+                        };
+                        for y in 0..h {
+                            let b = band_of(&f, y);
+                            let (y0, y1) = f.band(b.min(rows - 1));
+                            if b >= rows || y < y0 || y >= y1 {
+                                return Some(format!(
+                                    "top {grid_top}, pitch {cell_h}, {rows} rows, {h} px: \
+                                     row {y} named band {b} ({y0}..{y1})"
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+    assert_eq!(first_miss(|f, y| f.band_of(y)), None, "the slicer's");
+    assert_eq!(
+        first_miss(|f, y| crate::RowBands::new(f.grid_top, f.cell_h).band_of(y as i128, f.rows)),
+        None,
+        "fx damage's"
+    );
+    let off_by_one = |f: &FxFrame, y: usize| {
+        if y < f.grid_top {
+            0
+        } else {
+            ((y - f.grid_top) / (f.cell_h + 1)).min(f.rows - 1)
+        }
+    };
+    assert!(
+        first_miss(off_by_one).is_some(),
+        "CONTROL: an off-by-one pitch names a band that misses the row"
+    );
+}

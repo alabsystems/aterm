@@ -308,9 +308,9 @@ pub fn spring_whip(age_s: f32) -> f32 {
     if !age_s.is_finite() || age_s <= 0.0 {
         return 0.0;
     }
-    let phase = SPRING_WHIP_WD * age_s;
+    let (s, c) = (SPRING_WHIP_WD * age_s).sin_cos();
     let env = (-SPRING_WHIP_ZETA * SPRING_WHIP_OMEGA * age_s).exp();
-    1.0 - env * (phase.cos() + SPRING_WHIP_Z_OVER_ROOT * phase.sin())
+    1.0 - env * (c + SPRING_WHIP_Z_OVER_ROOT * s)
 }
 
 /// The theme's one linear fade (§2.5, §6.11).

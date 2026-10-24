@@ -13,6 +13,10 @@ pub const ENV_DENY_PREFIXES: &[&str] = &[
     "ANTIGRAVITY_",
     "GEMINI_",
     "CURSOR_",
+    "GROK_",
+    "XAI_",
+    "KIMI_",
+    "MOONSHOT_",
     "AI_",
     "_DEVTOOL_",
 ];
@@ -198,6 +202,36 @@ mod tests {
         ] {
             assert!(is_ai_env_var(v), "{v} must be deny-listed for inheritance");
         }
+    }
+
+    /// Grok Build's and Kimi Code's seams and credentials stop at the hop like every other agent's:
+    /// a login one session runs on never leaks into a shell it opens. OpenAI's own key, which
+    /// no aterm seam sets, reaches the child as it always has.
+    #[test]
+    fn grok_and_kimi_seams_and_keys_are_denied_and_openais_key_is_not() {
+        for v in [
+            "GROK_AUTH_PATH",
+            "GROK_HOME",
+            "GROK_AUTH",
+            "XAI_API_KEY",
+            "KIMI_CODE_HOME",
+            "KIMI_API_KEY",
+            "MOONSHOT_API_KEY",
+        ] {
+            assert!(is_ai_env_var(v), "{v} must be deny-listed for inheritance");
+            assert!(is_ai_env_key(std::ffi::OsStr::new(v)), "{v}");
+        }
+        for v in [
+            "OPENAI_API_KEY",
+            "GROKKING",
+            "KIMIKO",
+            "XAIDEN",
+            "MY_GROK_AUTH_PATH",
+        ] {
+            assert!(!is_ai_env_var(v), "{v} must reach the child");
+        }
+        assert!(is_ai_env_var("CLAUDE_SECURESTORAGE_CONFIG_DIR"));
+        assert!(is_ai_env_var("CODEX_HOME"));
     }
 
     /// The editor hint stops at the hop, under both classifiers the spawn seams apply. The

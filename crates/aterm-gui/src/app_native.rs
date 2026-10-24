@@ -2890,6 +2890,8 @@ impl App {
         }
         if kind == crate::native_app::AppKind::SystemState {
             self.drain_system_state_actions();
+        } else if kind == crate::native_app::AppKind::Settings {
+            self.take_settings_pane_dialog(view);
         }
         self.refresh_native_presentation(wid, instance, view);
         if outcome.result == EventResult::Handled {
@@ -3059,6 +3061,14 @@ impl App {
             .native_runtime
             .app(instance)
             .is_some_and(|app| app.kind() == crate::native_app::AppKind::Markdown);
+        // System State, like Settings, is a scrolling list with text fields: a
+        // page key moves the list a page of its room, and the readline, word
+        // and Home/End keys edit the field with focus.
+        let form_active = settings_active
+            || self
+                .native_runtime
+                .app(instance)
+                .is_some_and(|app| app.kind() == crate::native_app::AppKind::SystemState);
         let config_completion_page =
             |context: crate::native_config_language::ConfigCompletionContext| {
                 AppEvent::EditorConfigNavigate {
@@ -3339,12 +3349,12 @@ impl App {
                         value: None,
                     }))
                 } else {
-                    let readline = settings_active
+                    let readline = form_active
                         && mods.contains(Modifiers::CTRL)
                         && !mods.intersects(
                             Modifiers::SUPER | Modifiers::ALT | Modifiers::HYPER | Modifiers::META,
                         );
-                    let alt_word = settings_active
+                    let alt_word = form_active
                         && mods.intersects(Modifiers::ALT | Modifiers::META)
                         && !mods.intersects(Modifiers::CTRL | Modifiers::SUPER | Modifiers::HYPER);
                     #[cfg(not(target_os = "macos"))]
@@ -3467,18 +3477,18 @@ impl App {
                                 viewport_height: 0.0,
                             })
                         }
-                        Key::Named(NamedKey::PageUp) if settings_active => {
+                        Key::Named(NamedKey::PageUp) if form_active => {
                             Some(AppEvent::ScrollPage(-1))
                         }
-                        Key::Named(NamedKey::PageDown) if settings_active => {
+                        Key::Named(NamedKey::PageDown) if form_active => {
                             Some(AppEvent::ScrollPage(1))
                         }
                         Key::Named(NamedKey::PageUp) => Some(AppEvent::ScrollLines(-8)),
                         Key::Named(NamedKey::PageDown) => Some(AppEvent::ScrollLines(8)),
-                        Key::Named(NamedKey::Home) if settings_active && !command => {
+                        Key::Named(NamedKey::Home) if form_active && !command => {
                             Some(AppEvent::TextInput(TextInputEvent::Home { extend }))
                         }
-                        Key::Named(NamedKey::End) if settings_active && !command => {
+                        Key::Named(NamedKey::End) if form_active && !command => {
                             Some(AppEvent::TextInput(TextInputEvent::End { extend }))
                         }
                         Key::Named(NamedKey::Home) if markdown_active || command => {

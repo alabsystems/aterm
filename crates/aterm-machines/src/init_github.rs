@@ -13,6 +13,21 @@ use std::path::{Component, Path, PathBuf};
 
 mod native;
 mod repos;
+pub use native::InitialRepositoryInputs;
+
+/// Reconcile using locally captured inputs, checking their materialization
+/// identity after inventory and before effects. The check never leases network work.
+/// # Errors
+/// As [`run_initial_repositories`], or the captured version is no longer ready.
+pub fn run_initial_repositories_captured(
+    sys: &dyn System,
+    ctx: &Ctx,
+    mode: crate::model::Mode,
+    inputs: InitialRepositoryInputs,
+    current: impl Fn() -> Result<bool, String> + Send + Sync + 'static,
+) -> Result<Vec<crate::model::ItemReport>, String> {
+    native::run_captured(sys, ctx, mode, inputs, Box::new(current))
+}
 
 /// Reconciles repositories after the selected secrets stage has synchronized.
 ///

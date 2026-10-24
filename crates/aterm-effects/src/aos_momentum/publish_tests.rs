@@ -26,10 +26,17 @@ use super::test_fixtures::{
 };
 use super::{HOT_HAS_WAKE, MomentumCode, MomentumEvent, MomentumHost, PrebuiltMomentum, Sched};
 
+/// The grid winner, admitted once: an admission of one plan on one evaluator is the same bundle
+/// every time (`same_policy_same_winner_same_bundle_digest`).
 fn winner() -> Admitted {
-    evaluator()
-        .admit_one(&gap0().encode())
-        .expect("the grid winner is admitted")
+    static WINNER: std::sync::OnceLock<Admitted> = std::sync::OnceLock::new();
+    WINNER
+        .get_or_init(|| {
+            evaluator()
+                .admit_one(&gap0().encode())
+                .expect("the grid winner is admitted")
+        })
+        .clone()
 }
 
 fn cadence() -> SchedulePlan {

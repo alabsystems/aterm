@@ -708,6 +708,11 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
     if (DEBRIS_START_MS..SUPER_TOTAL_MS).contains(&t_ms) {
         let n = 24 + (env.seed % 17) as usize;
         let p = (t_ms - DEBRIS_START_MS) as f32 / (SUPER_TOTAL_MS - DEBRIS_START_MS) as f32;
+        let base_r = env.r_max * (0.3 + 1.1 * p);
+        let grav_y = (p * p * env.cell_h as f32) as i32;
+        let (cw, ch) = (env.cell_w.max(1), env.cell_h.max(1));
+        let grid_tick = t_ms / crate::nova::TWINKLE_GRID_MS;
+        let fade_p = 1.0 - p * p;
         for k in 0..n {
             if out.len() >= cap {
                 break;
@@ -715,20 +720,20 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
             let s = crate::genome::mix(env.seed ^ (k as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
             let ang = (s % 4096) as f32 / 4096.0 * core::f32::consts::TAU;
             let speed = 0.5 + (s >> 13 & 0xff) as f32 / 255.0;
-            let r = env.r_max * (0.3 + 1.1 * p) * speed;
+            let r = base_r * speed;
             let x = env.cx + (ang.cos() * r) as i32;
-            let y = env.cy + (ang.sin() * r * 0.7) as i32 + (p * p * env.cell_h as f32) as i32;
+            let y = env.cy + (ang.sin() * r * 0.7) as i32 + grav_y;
             if x < 0 || y < 0 || x >= env.grid_w || y >= env.grid_h {
                 continue;
             }
-            let (row, col) = (y / env.cell_h.max(1), x / env.cell_w.max(1));
+            let (row, col) = (y / ch, x / cw);
             let hue = (env.base_hue + k as f32 * (360.0 / n as f32) + p * 90.0).rem_euclid(360.0);
             let tone = if env.light {
                 hsv2rgb(hue, 1.0, 0.62)
             } else {
                 hsv2rgb(hue, 0.85, 1.0)
             };
-            let grid_phase = (t_ms / crate::nova::TWINKLE_GRID_MS + k as u64) % 2;
+            let grid_phase = (grid_tick + k as u64) % 2;
             let tw = if grid_phase == 0 {
                 1.0
             } else {
@@ -737,8 +742,8 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
             out.push(WordDecoration {
                 row: row as u16,
                 col: col as u16,
-                dx: ((x % env.cell_w.max(1)) - env.cell_w / 2).clamp(-6, 6) as i8,
-                dy: ((y % env.cell_h.max(1)) - env.cell_h / 2).clamp(-6, 6) as i8,
+                dx: ((x % cw) - env.cell_w / 2).clamp(-6, 6) as i8,
+                dy: ((y % ch) - env.cell_h / 2).clamp(-6, 6) as i8,
                 glyph: if s & 1 == 0 {
                     DecoGlyph::Star4
                 } else {
@@ -750,7 +755,7 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
                     DecoBlend::Add
                 },
                 color: tone,
-                alpha: (255.0 * env.intensity * tw * (1.0 - p * p)) as u8,
+                alpha: (255.0 * env.intensity * tw * fade_p) as u8,
             });
         }
     }

@@ -123,7 +123,8 @@ pub(crate) const DEBUGGER_OFF: &str = "You turned debugger access off, so aterm 
 /// The digest keys the redesign retired (§4): the Full Disk Access question and
 /// its regression, the Developer Tools line, the workstation lines, and the
 /// secrets vault's join lines. An entry an older aterm left open ends once per
-/// process — but for [`JOIN_PENDING_KEY`].
+/// process — but for [`JOIN_PENDING_KEY`] — withdrawn, never as fixed: nothing
+/// here read its cause end.
 pub(crate) const RETIRED_KEYS: [&str; 8] = [
     "privacy.fda.needed",
     "privacy.fda.regressed",
@@ -146,6 +147,8 @@ pub(crate) const JOIN_PENDING_KEY: &str = "privacy.secrets.join-pending";
 pub(crate) struct StepsReach {
     /// Raise macOS's Local Network question: `true` when a LAN peer was named.
     pub(crate) trigger_local_network: fn() -> bool,
+    /// Open a named access pane; injected so headless fixtures reach no OS API.
+    pub(crate) open_pane: fn(&App, Access) -> bool,
     /// Append one step's outcome to the record.
     pub(crate) record: fn(u64, Access, AccessOutcome),
     /// The latest outcome recorded for a row in a revision.
@@ -174,6 +177,7 @@ impl StepsReach {
     /// Nothing reached: no trigger, no record, never frontmost, no dialog.
     pub(crate) const INERT: Self = Self {
         trigger_local_network: || false,
+        open_pane: |_, _| false,
         record: |_, _, _| {},
         recorded: |_, _| None,
         frontmost: |_| false,
@@ -186,6 +190,7 @@ impl StepsReach {
     pub(crate) fn live() -> Self {
         Self {
             trigger_local_network: live_trigger_local_network,
+            open_pane: live_open_access_pane,
             record: live_record,
             recorded: live_recorded,
             frontmost: App::system_state_frontmost,
@@ -233,9 +238,10 @@ pub(crate) struct AccessSteps {
     line: Option<SystemStateLine>,
     /// Outcomes this process recorded, so a repeated reading writes one line.
     recorded: Vec<(u64, Access, AccessOutcome)>,
-    /// The retired digest keys were ended this process.
+    /// The retired digest keys were ended since this process launched, or since
+    /// it adopted its parent's entries at Commit ([`App::rearm_retired_keys`]).
     retired: bool,
-    /// The vault join's waiting entry was ended this process ([`JOIN_PENDING_KEY`]).
+    /// The vault join's waiting entry was ended since then ([`JOIN_PENDING_KEY`]).
     join_pending_retired: bool,
     /// The launch folder pass's gate while it walks: open while System State is
     /// frontmost and the `[privacy]` switches that started the pass are on,
@@ -374,8 +380,7 @@ pub(crate) fn menu_line(status: &SetupStatus, fda_regressed: bool) -> Option<Sys
         .map_or_else(Selection::none, |plan| plan.selection);
     let managed_with = |standing: Standing| {
         status
-            .observed
-            .iter()
+            .observations_for(status.plan.as_ref().map(|plan| plan.vault_url.as_str()))
             .filter(move |observation| {
                 observation.standing == standing && managed(observation.subject, selection)
             })
@@ -418,8 +423,7 @@ pub(crate) fn menu_line(status: &SetupStatus, fda_regressed: bool) -> Option<Sys
         ),
     };
     let note = status
-        .observed
-        .iter()
+        .observations_for(status.plan.as_ref().map(|plan| plan.vault_url.as_str()))
         .find(|observation| {
             observation.subject == Subject::Setting(Setting::Secrets)
                 && observation.standing == Standing::NeedsYou
@@ -504,6 +508,58 @@ impl App {
             || self.consent_warmup.is_live()
             || self.access_steps.local_network_alert_up(now)
             || self.access_steps.pane_up(now)
+    }
+
+    /// Reserve the worker's dialog slot before a pane, panel or folder worker
+    /// can start. A moment check alone cannot keep a worker from winning it.
+    pub(crate) fn reserve_access_dialog(&mut self) -> bool {
+        if !self.access_steps.reach.holds_dialog || self.access_steps.dialog.is_some() {
+            return true;
+        }
+        self.access_steps.dialog = MacosDialog::when_none_up(Duration::ZERO);
+        self.access_steps.dialog.is_some()
+    }
+
+    /// A person's own press brings their chosen page forward immediately;
+    /// automatic steps and every control client must instead win the slot.
+    pub(crate) fn reserve_hand_over_dialog(&mut self, origin: devtools_helper::Origin) -> bool {
+        if origin.owner_press()
+            && self.access_steps.reach.holds_dialog
+            && self.access_steps.dialog.is_none()
+        {
+            self.access_steps.dialog = Some(MacosDialog::up());
+            return true;
+        }
+        self.reserve_access_dialog()
+    }
+
+    /// A failed start releases its reservation; an already visible gesture
+    /// keeps the same guard, including when another helper replaces its panel.
+    pub(crate) fn release_unused_access_dialog(&mut self, now: Instant) {
+        if !self.access_gesture_up(now) {
+            self.access_steps.dialog = None;
+        }
+    }
+
+    /// A pane without a helper gives no close notification. Keep the bounded
+    /// hold until a helper takes over or the normal deadline ends it.
+    pub(crate) fn hold_access_pane(&mut self, now: Instant) {
+        self.access_steps.pane_until = Some(now + PANE_HOLD);
+    }
+
+    pub(crate) fn access_helper_shown(&mut self) {
+        self.access_steps.pane_until = None;
+    }
+
+    /// The person's direct Settings gesture already owns this guard. Transfer
+    /// it before recording the hand-off, without opening a gap for a worker.
+    pub(crate) fn adopt_access_dialog(&mut self, dialog: Option<MacosDialog>, now: Instant) {
+        if let Some(dialog) = dialog {
+            if self.access_steps.dialog.is_none() {
+                self.access_steps.dialog = Some(dialog);
+            }
+            self.hold_access_pane(now);
+        }
     }
 
     /// The moment the first step (Local Network) may start: an approved
@@ -594,6 +650,19 @@ impl App {
         if !self.local_network_moment(now) {
             return;
         }
+        if self.access_steps.reach.holds_dialog {
+            // Own the worker's dialog slot before either the trigger or its
+            // record wakes it. The quiet-moment check cannot reserve the slot.
+            let Some(dialog) = MacosDialog::when_none_up(Duration::ZERO) else {
+                // A worker won the slot after the moment was checked. A due
+                // retry waits again rather than leave a deadline due now.
+                if let Some((_, at)) = &mut self.access_steps.local_network_retry {
+                    *at = now + LOCAL_NETWORK_RETRY;
+                }
+                return;
+            };
+            self.access_steps.dialog = Some(dialog);
+        }
         self.access_steps.local_network_done = Some(revision);
         if (self.access_steps.reach.trigger_local_network)() {
             self.access_steps.local_network_retry = None;
@@ -601,6 +670,7 @@ impl App {
             self.record_access_step(Access::LocalNetwork, AccessOutcome::Triggered);
             aterm_log::info!("system state: Local Network asked for (revision {revision})");
         } else {
+            self.access_steps.dialog = None;
             self.access_steps.local_network_retry = Some((revision, now + LOCAL_NETWORK_RETRY));
             aterm_log::info!(
                 "system state: nothing to ask Local Network with: no LAN to name, or no \
@@ -645,9 +715,20 @@ impl App {
         if !self.access_steps.retired {
             self.access_steps.retired = true;
             for key in RETIRED_KEYS {
-                self.except_clear(key);
+                self.except_withdraw(key);
             }
         }
+    }
+
+    /// At Commit of a seamless update the parent's log can hold entries an older
+    /// parent raised after this process launched, and the successor adopts them
+    /// then: one under a retired key ends at the next settle as one adopted at
+    /// launch does, and the vault join's ends now if a status has read the
+    /// Secrets row.
+    pub(crate) fn rearm_retired_keys(&mut self) {
+        self.access_steps.retired = false;
+        self.access_steps.join_pending_retired = false;
+        self.refresh_system_state_menu_line();
     }
 
     /// Whether the approved revision's own Full Disk Access step is declined:
@@ -691,20 +772,35 @@ impl App {
     /// flag (dark while the revision's Full Disk Access step is declined,
     /// [`Self::fda_declined_in_revision`]): called where either changes (a
     /// status publication, [`Self::note_fda_regression`], a decline noted),
-    /// never per park. The first status that
-    /// reads the Secrets row ends an older aterm's vault-join entry, whose
-    /// approval code that row's note now carries.
+    /// never per park. An older aterm's vault-join entry ends once the selected
+    /// Secrets row has a usable reading for this vault. A waiting row must
+    /// carry its guidance before it can replace the entry's approval code.
     pub(crate) fn refresh_system_state_menu_line(&mut self) {
         let regressed = self.access_steps.fda_regressed && !self.fda_declined_in_revision();
         let status = self.system_state_host.latest_status();
         let line = menu_line(status, regressed);
-        let secrets_read = status
-            .observed
-            .iter()
-            .any(|observation| observation.subject == Subject::Setting(Setting::Secrets));
+        let secrets_read = status.plan.as_ref().is_some_and(|plan| {
+            plan.selection.contains(Setting::Secrets)
+                && status
+                    .observations_for(Some(&plan.vault_url))
+                    .find(|observation| observation.subject == Subject::Setting(Setting::Secrets))
+                    .is_some_and(|observation| match observation.standing {
+                        Standing::Unknown | Standing::Failed => false,
+                        Standing::NeedsYou => observation
+                            .note
+                            .as_deref()
+                            .or(observation.detail.as_deref())
+                            .is_some_and(|note| !note.trim().is_empty()),
+                        Standing::Waiting => observation
+                            .note
+                            .as_deref()
+                            .is_some_and(|note| !note.trim().is_empty()),
+                        _ => true,
+                    })
+        });
         if secrets_read && !self.access_steps.join_pending_retired {
             self.access_steps.join_pending_retired = true;
-            self.except_clear(JOIN_PENDING_KEY);
+            self.except_withdraw(JOIN_PENDING_KEY);
         }
         if line != self.access_steps.line {
             self.access_steps.line = line;
@@ -900,7 +996,11 @@ impl App {
                         (answer.brings_owner(), answer.as_str())
                     }
                     Access::LocalNetwork | Access::Accessibility if by_person => {
-                        let opened = self.open_access_pane(access, Instant::now());
+                        let opened = self.open_access_pane(
+                            access,
+                            devtools_helper::Origin::Settings,
+                            Instant::now(),
+                        );
                         (opened, if opened { "opened" } else { "failed" })
                     }
                     Access::LocalNetwork | Access::Accessibility if self.headless => {
@@ -977,8 +1077,11 @@ impl App {
         if !self.access_step_moment(now) {
             return;
         }
+        if !self.reserve_access_dialog() {
+            return;
+        }
         self.access_steps.pane_act = None;
-        let opened = self.open_access_pane(access, now);
+        let opened = self.open_access_pane(access, devtools_helper::Origin::SystemStateAct, now);
         aterm_log::info!(
             "system state: {} {} at the step moment (a client's act)",
             access.name(),
@@ -1218,29 +1321,40 @@ impl App {
     /// The System Settings pane of a grant aterm has no page of its own for:
     /// Local Network and Accessibility. Once open it counts as up for
     /// [`PANE_HOLD`], so no other step's gesture comes over it.
-    #[cfg(target_os = "macos")]
-    fn open_access_pane(&mut self, access: Access, now: Instant) -> bool {
-        use crate::platform::AppRt as _;
-        /// System Settings ▸ Privacy & Security ▸ Accessibility.
-        const ACCESSIBILITY_PANE: &str =
-            "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
-        let pane = if access == Access::Accessibility {
-            ACCESSIBILITY_PANE
-        } else {
-            crate::fleet_glance::LOCAL_NETWORK_PANE
-        };
-        let opened = !self.headless && self.apprt.open_url(pane);
+    fn open_access_pane(
+        &mut self,
+        access: Access,
+        origin: devtools_helper::Origin,
+        now: Instant,
+    ) -> bool {
+        if self.headless || !self.reserve_hand_over_dialog(origin) {
+            return false;
+        }
+        let opened = (self.access_steps.reach.open_pane)(self, access);
         if opened {
-            self.access_steps.pane_until = Some(now + PANE_HOLD);
+            self.hold_access_pane(now);
+        } else {
+            self.release_unused_access_dialog(now);
         }
         opened
     }
+}
 
-    #[cfg(not(target_os = "macos"))]
-    fn open_access_pane(&mut self, access: Access, now: Instant) -> bool {
-        let _ = (access, now, PANE_HOLD);
-        false
-    }
+#[cfg(target_os = "macos")]
+fn live_open_access_pane(app: &App, access: Access) -> bool {
+    use crate::platform::AppRt as _;
+    const ACCESSIBILITY_PANE: &str =
+        "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
+    app.apprt.open_url(if access == Access::Accessibility {
+        ACCESSIBILITY_PANE
+    } else {
+        crate::fleet_glance::LOCAL_NETWORK_PANE
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn live_open_access_pane(_: &App, _: Access) -> bool {
+    false
 }
 
 /// The live trigger: name a LAN peer from this Mac's interfaces and connect a

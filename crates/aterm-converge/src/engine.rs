@@ -329,7 +329,10 @@ fn settle(
 fn read_back(item: &dyn Item, row: &mut ItemReport) -> Probe {
     let back = item.probe();
     match &back {
-        Probe::Ok { .. } => row.outcome = Outcome::Changed,
+        Probe::Ok { now } => {
+            row.outcome = Outcome::Changed;
+            row.to = Some(now.clone());
+        }
         Probe::Change { from: now, .. } => {
             row.outcome = Outcome::Failed;
             row.why = Some(format!("applied, but it still reads {now}"));
@@ -653,6 +656,27 @@ pub(crate) mod tests {
             rows.into_iter().next().unwrap(),
             applies.load(Ordering::SeqCst),
         )
+    }
+
+    #[test]
+    fn a_successful_read_back_reports_the_current_value_instead_of_the_old_target() {
+        for now in ["b", "left off by the owner"] {
+            let (row, applied) = one(
+                Scripted::new(vec![change(), Probe::Ok { now: now.into() }], Ok(())),
+                Mode::Apply,
+            );
+            assert_eq!(applied, 1);
+            assert_eq!(row.outcome, Outcome::Changed);
+            assert_eq!(row.from.as_deref(), Some("a"));
+            assert_eq!(row.to.as_deref(), Some(now));
+        }
+        let (planned, applied) = one(Scripted::new(vec![change()], Ok(())), Mode::Plan);
+        assert_eq!(applied, 0);
+        assert_eq!(
+            planned.to.as_deref(),
+            Some("b"),
+            "a plan retains its target"
+        );
     }
 
     #[test]

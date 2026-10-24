@@ -7802,8 +7802,8 @@ fn node_for(state: &StateDir, caps: &[Cap]) -> io::Result<String> {
     let refuse = |msg: String| io::Error::new(io::ErrorKind::InvalidInput, msg);
     match state.node() {
         Some(node) if !crate::enable::is_node_id(&node) => Err(refuse(format!(
-            "{dir}/node holds `{}`, which is not a node id (`n-` and [a-z0-9-]): move it aside \
-             and run `aterm fabric on` to provision one",
+            "{dir}/node holds `{}`, which is not a node id (`n-` and [a-z0-9-]): `aterm fabric \
+             on` provisions one and keeps this file aside",
             crate::render::safe(&node, 64)
         ))),
         Some(node) if bound.is_empty() || bound.contains(&node) => Ok(node),

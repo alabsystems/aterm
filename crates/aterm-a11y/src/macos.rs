@@ -95,9 +95,8 @@ aterm_objc::declare_class! {
         fn label(&self) -> Id {
             self.read(|cx, handle| match handle {
                 None => string("aterm"),
-                Some(handle) => cx.publication.node(handle).and_then(|node| {
-                    if node.label_comes_from_value() { node.value() } else { node.label() }
-                }).map_or(Id::NIL, |label| string(&label)),
+                Some(handle) => cx.publication.node(handle).and_then(description)
+                    .map_or(Id::NIL, |label| string(&label)),
             }).unwrap_or(Id::NIL)
         }
 
@@ -834,9 +833,22 @@ fn screen_frame(cx: &Context, rect: Option<crate::model::Rect>) -> CGRect {
     }
 }
 
+/// What `accessibilityLabel` (AXDescription) says. A Label is static text, whose words
+/// AppKit reads from its value (`NSAccessibilityStaticText`), so it names itself here
+/// only with a label its value does not already carry, and its words are published once.
+fn description(node: Node<'_>) -> Option<String> {
+    let label = node.label();
+    if node.label_comes_from_value() && label.is_some() && label == state::text(node) {
+        None
+    } else {
+        label
+    }
+}
+
 const fn role(role: Role) -> &'static str {
     match role {
-        Role::TextRun | Role::Label | Role::Heading => "AXStaticText",
+        Role::TextRun | Role::Label => "AXStaticText",
+        Role::Heading => "AXHeading",
         Role::Link => "AXLink",
         Role::MenuItem | Role::MenuItemRadio => "AXMenuItem",
         Role::TextInput | Role::SearchInput => "AXTextField",
@@ -915,10 +927,71 @@ mod tests {
     }
 
     #[test]
-    fn a_meter_is_a_level_indicator_and_a_grid_a_grid() {
+    fn a_meter_is_a_level_indicator_a_grid_a_grid_and_a_heading_a_heading() {
         assert_eq!(role(Role::Meter), "AXLevelIndicator");
         assert_eq!(role(Role::Grid), "AXGrid");
         assert_eq!(role(Role::ProgressIndicator), "AXProgressIndicator");
+        assert_eq!(role(Role::Heading), "AXHeading");
+        assert_eq!(role(Role::Label), "AXStaticText");
+    }
+
+    #[test]
+    fn a_label_says_its_words_once_and_a_heading_by_its_label() {
+        use crate::model::{Node as ModelNode, NodeId as ModelId, Tree, TreeId};
+        let node = |role, label: Option<&str>, value: Option<&str>| {
+            let mut node = ModelNode::new(role);
+            if let Some(label) = label {
+                node.set_label(label.to_owned());
+            }
+            if let Some(value) = value {
+                node.set_value(value.to_owned());
+            }
+            node
+        };
+        let cases = [
+            (Role::Label, None, Some("Changes apply at once")),
+            (Role::Label, Some("aterm · ALab"), Some("aterm · ALab")),
+            (Role::Label, Some("Version"), None),
+            (Role::Label, Some("Version"), Some("1.2.3")),
+            (Role::Heading, Some("System State"), None),
+            (Role::Button, Some("Stop"), None),
+        ];
+        let mut root = ModelNode::new(Role::Window);
+        root.set_children((1..=cases.len() as u64).map(ModelId).collect::<Vec<_>>());
+        let mut nodes = vec![(ModelId(0), root)];
+        nodes.extend(
+            (1..).map(ModelId).zip(
+                cases
+                    .iter()
+                    .map(|(role, label, value)| node(*role, *label, *value)),
+            ),
+        );
+        let mut publication = Publication::default();
+        publication.update(TreeUpdate {
+            nodes,
+            tree: Some(Tree::new(ModelId(0))),
+            tree_id: TreeId::ROOT,
+            focus: ModelId(0),
+        });
+        let read = |id: u64| {
+            let node = publication
+                .tree()
+                .unwrap()
+                .node_by_id(NodeId(ModelId(id)))
+                .unwrap();
+            (description(node), state::text(node))
+        };
+        let words = |words: &str| Some(words.to_owned());
+        assert_eq!(read(1), (None, words("Changes apply at once")));
+        assert_eq!(read(2), (None, words("aterm · ALab")), "once, as its value");
+        assert_eq!(
+            read(3),
+            (words("Version"), None),
+            "a label alone is not dropped"
+        );
+        assert_eq!(read(4), (words("Version"), words("1.2.3")));
+        assert_eq!(read(5), (words("System State"), None));
+        assert_eq!(read(6), (words("Stop"), None));
     }
 
     #[test]

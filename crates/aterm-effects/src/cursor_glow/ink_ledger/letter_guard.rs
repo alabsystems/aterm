@@ -29,6 +29,14 @@
 //! behind the word it crosses with no hard edge. A cell the lights leave at
 //! the floor is untouched, and a frame with no such cell is byte-identical to
 //! the one it would have drawn.
+//!
+//! A row's cuts are one eased ramp, not a cell-by-cell comb ([`RAMP_SLOPE`]):
+//! between its first and last cut cell, every cell (a word gap, a letter the
+//! whole light left at the floor) keeps no more than the least of each cut
+//! cell's share plus the slope per column between them. Cut letter by letter,
+//! Phaser's neon bar kept its whole light in each word gap between dimmed
+//! letters and its spectrum underline went dashed (2026-10-23, looks6 N1).
+//! The ramp only ever lowers a share, so every letter keeps its bar.
 
 use super::*;
 
@@ -45,10 +53,16 @@ const SOLID_SHARE: f32 = 0.85;
 /// Sparkle's caret bloom measured 1.01:1 and Solarized Dark's text under
 /// Laser's Enter bolt 1.34:1, the guard on or off.
 const OWN_SHARE: f32 = 0.97;
-/// How far from an ink pixel its ground is read, px (the judge's ring).
-const RING: i32 = 2;
+/// How far from an ink pixel its ground is read, px (the judge's ring),
+/// and how far round a lettered cell the guard judges a light: a light
+/// kept that far off a lettered row is never cut (the dark meteor train).
+pub(crate) const RING: i32 = 2;
 /// Bisection steps for a cell's share.
 const STEPS: usize = 7;
+/// How much more of its light a cell of a cut row keeps than a cut cell one
+/// column away (a share per column): the row's cuts ease as one ramp, and a
+/// word gap between two cut letters is no brighter than they are beyond it.
+const RAMP_SLOPE: f32 = 0.08;
 
 /// Which stream a light rides, in the renderer's draw order.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -63,11 +77,19 @@ enum Stream {
     HaloOver,
 }
 
+#[derive(Clone, Copy)]
+struct RowLight {
+    stream: Stream,
+    idx: u32,
+    x0: i32,
+    x1: i32,
+}
+
 /// The guard's resident scratch ([`CursorGlow::guard_letters`]).
 #[derive(Default)]
 pub(crate) struct LetterGuard {
     /// The lights that reach the row being read.
-    row: Vec<(Stream, u32)>,
+    row: Vec<RowLight>,
     /// Of those, the lights that reach the cell being read.
     cell: Vec<(Stream, u32)>,
     /// [`Self::cell`] bucketed by the ring box pixel each light covers, each
@@ -87,9 +109,42 @@ pub(crate) struct LetterGuard {
     /// (ground only) and over it (ground and ink), per channel.
     lift_under: Vec<[u16; 3]>,
     lift_over: Vec<[u16; 3]>,
+    /// The row being read's cuts, `(column, share)`, for its ramp.
+    cuts: Vec<(i32, f32)>,
     /// A test's negative control: the guard off.
     #[cfg(any(test, debug_assertions))]
     pub(crate) off: bool,
+    /// A test's negative control: each cell cut alone, no ramp along the row.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) comb: bool,
+}
+
+/// Ease a row's cuts (`(column, share)`, columns ascending) into one ramp
+/// ([`RAMP_SLOPE`]): from the first cut column to the last, each column but
+/// `skip` (the caret's) keeps the least of every cut's share plus the slope
+/// per column between them, where that is under its own (`1.0` uncut). Calls
+/// `cut(column, share)` for each column whose share falls, in column order.
+fn ramp_row(cuts: &[(i32, f32)], skip: Option<i32>, mut cut: impl FnMut(i32, f32)) {
+    let (Some(&(lo, _)), Some(&(hi, _))) = (cuts.first(), cuts.last()) else {
+        return;
+    };
+    let mut k = 0usize;
+    for col in lo..=hi {
+        while k < cuts.len() && cuts[k].0 < col {
+            k += 1;
+        }
+        let own = cuts.get(k).filter(|c| c.0 == col).map_or(1.0, |c| c.1);
+        if skip == Some(col) {
+            continue;
+        }
+        let eased = cuts
+            .iter()
+            .map(|&(c, s)| s + RAMP_SLOPE * (c - col).abs() as f32)
+            .fold(own, f32::min);
+        if eased < own {
+            cut(col, eased);
+        }
+    }
 }
 
 /// One cell being judged: its ring box (`[x0, x1) × [y0, y1)`, window px),
@@ -102,6 +157,8 @@ struct Judge {
     y1: i32,
     ink: u32,
     ground: u32,
+    l_ink: f32,
+    l_ground: f32,
 }
 
 #[inline]
@@ -426,23 +483,31 @@ impl LetterGuard {
         'rows: for gy in 0..h {
             let row = gy * w;
             for x in 0..w {
-                let g = if additive {
+                let lg = if additive {
                     let (a, b) = (self.lift_under[row + x], self.lift_over[row + x]);
                     if a == [0; 3] && b == [0; 3] {
-                        j.ground
+                        j.l_ground
                     } else {
-                        lift(j.ground, a, b)
+                        let g = lift(j.ground, a, b);
+                        match last_g {
+                            Some((prev_g, prev_lum)) if prev_g == g => prev_lum,
+                            _ => {
+                                let l = crate::color_math::relative_luminance_with(table, g);
+                                last_g = Some((g, l));
+                                l
+                            }
+                        }
                     }
                 } else {
                     let at = (j.x0 + x as i32, j.y0 + gy as i32, row + x);
-                    self.composite(j.ground, at, true, s, streams)
-                };
-                let lg = match last_g {
-                    Some((prev_g, prev_lum)) if prev_g == g => prev_lum,
-                    _ => {
-                        let l = crate::color_math::relative_luminance_with(table, g);
-                        last_g = Some((g, l));
-                        l
+                    let g = self.composite(j.ground, at, true, s, streams);
+                    match last_g {
+                        Some((prev_g, prev_lum)) if prev_g == g => prev_lum,
+                        _ => {
+                            let l = crate::color_math::relative_luminance_with(table, g);
+                            last_g = Some((g, l));
+                            l
+                        }
                     }
                 };
                 lum[row + x] = lg;
@@ -461,23 +526,31 @@ impl LetterGuard {
             };
             let y = y + r;
             for x in r..w - r {
-                let ink = if additive {
+                let li = if additive {
                     let b = self.lift_over[y * w + x];
                     if b == [0; 3] {
-                        j.ink
+                        j.l_ink
                     } else {
-                        lift(j.ink, [0; 3], b)
+                        let ink = lift(j.ink, [0; 3], b);
+                        match last_ink {
+                            Some((prev_ink, prev_lum)) if prev_ink == ink => prev_lum,
+                            _ => {
+                                let l = crate::color_math::relative_luminance_with(table, ink);
+                                last_ink = Some((ink, l));
+                                l
+                            }
+                        }
                     }
                 } else {
                     let at = (j.x0 + x as i32, j.y0 + y as i32, y * w + x);
-                    self.composite(j.ink, at, false, s, streams)
-                };
-                let li = match last_ink {
-                    Some((prev_ink, prev_lum)) if prev_ink == ink => prev_lum,
-                    _ => {
-                        let l = crate::color_math::relative_luminance_with(table, ink);
-                        last_ink = Some((ink, l));
-                        l
+                    let ink = self.composite(j.ink, at, false, s, streams);
+                    match last_ink {
+                        Some((prev_ink, prev_lum)) if prev_ink == ink => prev_lum,
+                        _ => {
+                            let l = crate::color_math::relative_luminance_with(table, ink);
+                            last_ink = Some((ink, l));
+                            l
+                        }
                     }
                 };
                 let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
@@ -573,6 +646,17 @@ impl LetterGuard {
     }
 }
 
+/// The text reading under which a letter the pet lies beneath is veiled
+/// ([`CursorGlow::veil_letters_on_pet`]): a dim theme's.
+const PET_VEIL_THEME_BARE: f32 = 7.0;
+/// The margin past a letter's bar the veil keeps for the renderer's rounding.
+const PET_VEIL_GUARD: f32 = 0.08;
+/// How far past the pet's noted box the veil reaches, px (the box is noted
+/// once a frame and the body moves within it).
+const PET_VEIL_PAD_PX: i32 = 3;
+/// The run over which a veil's ends ease in, px.
+const PET_VEIL_EASE_PX: i32 = 3;
+
 /// The bar a letter keeps under the lights, from its solid ink's reading
 /// on the bare page, `bare`: [`LETTER_FLOOR`], or [`OWN_SHARE`] of `bare`
 /// where the bare page itself reads under the floor.
@@ -632,13 +716,21 @@ impl InkLedger {
     /// Cut every quad of `quads` (additive or source-over) to the guard's
     /// dims ([`Self::mask_at`]), easing back to the whole light off them.
     fn guard_mask_quads(&mut self, quads: &mut Vec<GlowQuad>) {
+        let (bx0, by0, bx1, by1) = self.dims_bounds();
         let mut pieces = std::mem::take(&mut self.pieces);
         pieces.clear();
         let mut cut = false;
         for &q in quads.iter() {
             let (x0, y0) = (i32::from(q.x), i32::from(q.y));
             let (x1, y1) = (x0 + i32::from(q.w), y0 + i32::from(q.h));
-            if q.w == 0 || q.h == 0 || !self.knots((x0, y0, x1, y1)) {
+            if q.w == 0
+                || q.h == 0
+                || x1 <= bx0
+                || x0 >= bx1
+                || y1 <= by0
+                || y0 >= by1
+                || !self.knots((x0, y0, x1, y1))
+            {
                 pieces.push(q);
                 continue;
             }
@@ -693,13 +785,21 @@ impl InkLedger {
     /// Cut every halo of `halos` to the guard's dims: an additive halo's
     /// colour, a source-over halo's opacity ceiling.
     fn guard_mask_halos(&mut self, halos: &mut Vec<RainHalo>) {
+        let (bx0, by0, bx1, by1) = self.dims_bounds();
         let mut pieces = std::mem::take(&mut self.halo_pieces);
         pieces.clear();
         let mut cut = false;
         for &h in halos.iter() {
             let (x0, y0) = (i32::from(h.x), i32::from(h.y));
             let (x1, y1) = (x0 + i32::from(h.w), y0 + i32::from(h.h));
-            if h.w == 0 || h.h == 0 || !self.knots((x0, y0, x1, y1)) {
+            if h.w == 0
+                || h.h == 0
+                || x1 <= bx0
+                || x0 >= bx1
+                || y1 <= by0
+                || y0 >= by1
+                || !self.knots((x0, y0, x1, y1))
+            {
                 pieces.push(h);
                 continue;
             }
@@ -745,8 +845,9 @@ impl CursorGlow {
     /// THE LETTER GUARD ([`self`]): cut this frame's lights (`over`, the
     /// frame's `cursor_glow_add`, and the glow's own under-text quads and
     /// halos) so every lettered cell of the frame's text but the caret's
-    /// keeps [`LETTER_FLOOR`]. Classic's wake is the v0.28 restoration and
-    /// keeps its bytes (owner ruling). Returns a print of the cuts.
+    /// keeps [`LETTER_FLOOR`]. Classic's spectrum wake is the v0.28
+    /// restoration and keeps its bytes (owner ruling); its one-colour face is
+    /// guarded. Returns a print of the cuts.
     pub(crate) fn guard_letters(
         &mut self,
         over: &mut Vec<GlowQuad>,
@@ -758,7 +859,10 @@ impl CursorGlow {
         if self.letter_guard.off {
             return 0;
         }
-        if matches!(style, GlowStyle::Classic)
+        // Classic's spectrum face keeps its v0.28 bytes; its one-colour face
+        // (a colour the user chose) is guarded like every other light, in
+        // intensity only, so the chosen hue stays (looks6 N10).
+        if (matches!(style, GlowStyle::Classic) && !self.last_classic_mono)
             || self.frame_text.rows.is_empty()
             || (over.is_empty() && self.under_out.is_empty() && self.halo_out.is_empty())
         {
@@ -793,23 +897,28 @@ impl CursorGlow {
             let (ry0, ry1) = (oy + row * ch - RING, oy + (row + 1) * ch + RING);
             guard.row.clear();
             let (mut min_x, mut max_x) = (i32::MAX, i32::MIN);
-            let mut note_x = |x: u16, w: u16| {
+            let mut push_row = |stream: Stream, k: usize, x: u16, w: u16| {
                 let x0 = i32::from(x);
+                let x1 = x0 + i32::from(w);
                 min_x = min_x.min(x0);
-                max_x = max_x.max(x0 + i32::from(w));
+                max_x = max_x.max(x1);
+                guard.row.push(RowLight {
+                    stream,
+                    idx: k as u32,
+                    x0,
+                    x1,
+                });
             };
             let meets_y = |y: u16, h: u16| i32::from(y) < ry1 && i32::from(y) + i32::from(h) > ry0;
             let lit = |q: &GlowQuad| q.w > 0 && q.h > 0 && (q.color | q.color2) & 0x00FF_FFFF != 0;
             for (k, q) in streams.0.iter().enumerate() {
                 if lit(q) && meets_y(q.y, q.h) {
-                    note_x(q.x, q.w);
-                    guard.row.push((Stream::Under, k as u32));
+                    push_row(Stream::Under, k, q.x, q.w);
                 }
             }
             for (k, q) in streams.1.iter().enumerate() {
                 if lit(q) && meets_y(q.y, q.h) {
-                    note_x(q.x, q.w);
-                    guard.row.push((Stream::Over, k as u32));
+                    push_row(Stream::Over, k, q.x, q.w);
                 }
             }
             for mode in [HaloMode::Add, HaloMode::Over] {
@@ -825,14 +934,15 @@ impl CursorGlow {
                         } else {
                             Stream::HaloOver
                         };
-                        note_x(h.x, h.w);
-                        guard.row.push((s, k as u32));
+                        push_row(s, k, h.x, h.w);
                     }
                 }
             }
             if guard.row.is_empty() {
                 continue;
             }
+            let row_from = ledger.dims.len();
+            guard.cuts.clear();
             for col in first..end {
                 let (cx0, cx1) = (ox + col * cw - RING, ox + (col + 1) * cw + RING);
                 if max_x <= cx0 {
@@ -846,16 +956,9 @@ impl CursorGlow {
                 };
                 let (ink, ground) = (ink & 0x00FF_FFFF, ground & 0x00FF_FFFF);
                 guard.cell.clear();
-                for &(stream, k) in &guard.row {
-                    let (x, w) = match stream {
-                        Stream::Under => (streams.0[k as usize].x, streams.0[k as usize].w),
-                        Stream::Over => (streams.1[k as usize].x, streams.1[k as usize].w),
-                        Stream::HaloAdd | Stream::HaloOver => {
-                            (streams.2[k as usize].x, streams.2[k as usize].w)
-                        }
-                    };
-                    if i32::from(x) < cx1 && i32::from(x) + i32::from(w) > cx0 {
-                        guard.cell.push((stream, k));
+                for &light in &guard.row {
+                    if light.x0 < cx1 && light.x1 > cx0 {
+                        guard.cell.push((light.stream, light.idx));
                     }
                 }
                 if guard.cell.is_empty() {
@@ -882,6 +985,8 @@ impl CursorGlow {
                     y1: ry1,
                     ink,
                     ground,
+                    l_ink,
+                    l_ground,
                 };
                 if let Some((on_ink, all)) = guard.bound(j, streams) {
                     // Light ink on a dark page reads worst against the
@@ -907,12 +1012,39 @@ impl CursorGlow {
                         y1: ry1 as f32,
                         share,
                     });
+                    guard.cuts.push((col, share));
                     print = aterm_hash::fnv_mix_u64(
                         print | 1,
                         ((row as u64) << 48) ^ ((col as u64) << 32) ^ u64::from(share.to_bits()),
                     );
                 }
             }
+            #[cfg(any(test, debug_assertions))]
+            let comb = guard.comb;
+            #[cfg(not(any(test, debug_assertions)))]
+            let comb = false;
+            if comb || guard.cuts.len() < 2 {
+                continue;
+            }
+            let skip = caret.filter(|&(r, _)| r == row).map(|(_, c)| c);
+            let cuts = std::mem::take(&mut guard.cuts);
+            ramp_row(&cuts, skip, |col, share| {
+                match cuts.binary_search_by_key(&col, |c| c.0) {
+                    Ok(i) => ledger.dims[row_from + i].share = share,
+                    Err(_) => ledger.dims.push(Dim {
+                        x0: (ox + col * cw - RING) as f32,
+                        y0: ry0 as f32,
+                        x1: (ox + (col + 1) * cw + RING) as f32,
+                        y1: ry1 as f32,
+                        share,
+                    }),
+                }
+                print = aterm_hash::fnv_mix_u64(
+                    print | 1,
+                    ((row as u64) << 48) ^ ((col as u64) << 32) ^ u64::from(share.to_bits()) ^ 1,
+                );
+            });
+            guard.cuts = cuts;
         }
         if !ledger.dims.is_empty() {
             ledger.guard_mask_quads(&mut self.under_out);
@@ -924,10 +1056,243 @@ impl CursorGlow {
         print
     }
 
+    /// On a dim theme, veil the pet's body with the page under every letter
+    /// it lies beneath (looks6 N11). The renderer's knock-out rings each
+    /// glyph in a pixel of page, which keeps a bright theme's letters; a dim
+    /// theme's text over the coat read at its cell well under its own
+    /// reading (`dim-grey`'s `o` of `echo` at 3.94:1 under the body, its
+    /// bar [`letter_bar`] 4.6:1). Each lettered cell the body's box
+    /// ([`Self::note_pet_body`], padded [`PET_VEIL_PAD_PX`]) reaches, but
+    /// the caret's, takes the page at the least opacity that keeps the
+    /// letter at its bar over the worst coat the pet may wear (the letter's
+    /// own colour), as one run per row of lettered
+    /// cells, its ends eased over [`PET_VEIL_EASE_PX`] outside the lettered
+    /// cells (inside them, a word's first and last letters' outer pixels
+    /// read under the bar, looks6 review): the letters' row
+    /// reads as lying in front of the pet, which keeps its outline above
+    /// and below the row. A cell whose text reads past
+    /// [`PET_VEIL_THEME_BARE`] draws none. It runs after the guard (whose
+    /// cuts would thin it) into the under stream, under the glyphs and over
+    /// the coat, and is the guard's: the guard's negative control drops it.
+    /// The frame's print of what it drew.
+    pub(crate) fn veil_letters_on_pet(&mut self, caret: Option<(u16, u16)>, geom: Geom) -> u64 {
+        #[cfg(any(test, debug_assertions))]
+        if self.letter_guard.off || self.pet_veil_off {
+            return 0;
+        }
+        let Some((bx0, bx1, by0, by1)) = self.pet_body else {
+            return 0;
+        };
+        let (cw, ch) = (geom.cw as i32, geom.ch as i32);
+        if cw <= 0 || ch <= 0 || self.frame_text.rows.is_empty() {
+            return 0;
+        }
+        let (ox, oy) = (i32::from(geom.origin_x), i32::from(geom.origin_y));
+        let pad = PET_VEIL_PAD_PX;
+        let (bx0, bx1, by0, by1) = (bx0 - pad, bx1 + pad, by0 - pad, by1 + pad);
+        let table = crate::color_math::relative_luminance_table();
+        let lum = |c: u32| crate::color_math::relative_luminance_with(table, c);
+        let ratio = |a: u32, b: u32| {
+            let (la, lb) = (lum(a), lum(b));
+            (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+        };
+        // The least page opacity over the worst coat that keeps `ink` at
+        // its bar on `ground`; `None` where the text needs no veil.
+        let mut veil_memo: Option<((u32, u32), Option<u8>)> = None;
+        let mut veil = |ink: u32, ground: u32| -> Option<u8> {
+            if let Some((prev, ans)) = veil_memo
+                && prev == (ink, ground)
+            {
+                return ans;
+            }
+            let ans = (|| {
+                let ink = solid_ink(ink, ground, table);
+                let bare = ratio(ink, ground);
+                if bare >= PET_VEIL_THEME_BARE {
+                    return None;
+                }
+                let bar = (letter_bar(bare) + PET_VEIL_GUARD).min(bare);
+                // The worst coat is the letter's own colour (a coat may wear any).
+                let coat = ink;
+                let holds = |a: u8| {
+                    let g = aterm_render::over_premul(coat, premul_rgb(ground, a), a) & 0x00FF_FFFF;
+                    ratio(ink, g) >= bar
+                };
+                Some((1..=u8::MAX).find(|&a| holds(a)).unwrap_or(u8::MAX))
+            })();
+            veil_memo = Some(((ink, ground), ans));
+            ans
+        };
+        let ease = PET_VEIL_EASE_PX;
+        let text = &self.frame_text;
+        let under = &mut self.under_out;
+        let mut print = 0u64;
+        // One run: the lettered span `s0..s1` at full opacity, its eases
+        // laid outside it (thin to full over the `ease` px before its first
+        // lettered cell, full to thin over the `ease` px past its last), so
+        // every lettered pixel takes the whole veil. Where the body's box
+        // cuts the span, the ease lies in the box's pad, off the coat; beside
+        // the caret's cell (`wall`) the span ends full, the caret's cell
+        // taking none.
+        let mut push = |under: &mut Vec<GlowQuad>,
+                        (s0, wall0): (i32, bool),
+                        (s1, wall1): (i32, bool),
+                        (y0, y1): (i32, i32),
+                        page: u32,
+                        a: u8| {
+            let (l0, mut f0) = if s0 <= bx0 {
+                (bx0, bx0 + ease)
+            } else if wall0 {
+                (s0, s0)
+            } else {
+                ((s0 - ease).max(bx0), s0)
+            };
+            let (mut f1, r1) = if s1 >= bx1 {
+                (bx1 - ease, bx1)
+            } else if wall1 {
+                (s1, s1)
+            } else {
+                (s1, (s1 + ease).min(bx1))
+            };
+            if f1 < f0 {
+                let mid = (f0 + f1) / 2;
+                (f0, f1) = (mid.max(l0), mid.min(r1));
+            }
+            let (full, thin) = ((premul_rgb(page, a), a), (premul_rgb(page, 1), 1));
+            let h = y1 - y0;
+            crate::effect_util::push_fx_ramp(under, geom, l0, y0, f0 - l0, h, thin, full);
+            crate::effect_util::push_fx_ramp(under, geom, f0, y0, f1 - f0, h, full, full);
+            crate::effect_util::push_fx_ramp(under, geom, f1, y0, r1 - f1, h, full, thin);
+            print = aterm_hash::fnv_mix_u64(
+                print | 1,
+                ((l0 as u64) << 48) ^ ((y0 as u64) << 32) ^ ((r1 as u64) << 16) ^ u64::from(a),
+            );
+        };
+        for (i, span) in text.rows.iter().enumerate() {
+            let Some((first, end)) = *span else {
+                continue;
+            };
+            if ox + end * cw <= bx0 || ox + first * cw >= bx1 {
+                continue;
+            }
+            let row = text.lo + i as i32;
+            let (y0, y1) = ((oy + row * ch).max(by0), (oy + (row + 1) * ch).min(by1));
+            if y1 <= y0 {
+                continue;
+            }
+            let caret_col = caret
+                .filter(|&(r, _)| i32::from(r) == row)
+                .map(|(_, c)| i32::from(c));
+            // `(first column, page, opacity)` of the open run.
+            let mut run: Option<(i32, u32, u8)> = None;
+            for col in first..=end {
+                let at = (col < end
+                    && caret_col != Some(col)
+                    && ox + (col + 1) * cw > bx0
+                    && ox + col * cw < bx1)
+                    .then(|| text.pair(row, col))
+                    .flatten()
+                    .and_then(|(ink, ground)| {
+                        let ground = ground & 0x00FF_FFFF;
+                        Some((ground, veil(ink? & 0x00FF_FFFF, ground)?))
+                    });
+                match (run, at) {
+                    (Some((c0, page, a)), Some((g, b))) if g == page => {
+                        run = Some((c0, page, a.max(b)));
+                    }
+                    (open, next) => {
+                        if let Some((c0, page, a)) = open {
+                            let (s0, s1) = (ox + c0 * cw, ox + col * cw);
+                            if s1.min(bx1) > s0.max(bx0) {
+                                push(
+                                    under,
+                                    (s0, caret_col == Some(c0 - 1)),
+                                    (s1, caret_col == Some(col)),
+                                    (y0, y1),
+                                    page,
+                                    a,
+                                );
+                            }
+                        }
+                        run = next.map(|(g, b)| (col, g, b));
+                    }
+                }
+            }
+        }
+        print
+    }
+
+    /// A test's negative control: the guard on, but no page veil under the
+    /// letters the pet lies beneath ([`Self::veil_letters_on_pet`]).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_pet_veil(&mut self, on: bool) {
+        self.pet_veil_off = !on;
+    }
+
     /// A test's negative control: lights drawn without the letter guard.
     #[cfg(any(test, debug_assertions))]
     #[inline]
     pub fn set_letter_guard(&mut self, on: bool) {
         self.letter_guard.off = !on;
+    }
+
+    /// A test's negative control: the guard cuts each cell alone, with no
+    /// ramp along the row ([`RAMP_SLOPE`]).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub fn set_letter_guard_ramp(&mut self, on: bool) {
+        self.letter_guard.comb = !on;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ramped(cuts: &[(i32, f32)], skip: Option<i32>) -> Vec<(i32, f32)> {
+        let mut out = cuts.to_vec();
+        ramp_row(cuts, skip, |col, share| {
+            match out.iter_mut().find(|c| c.0 == col) {
+                Some(c) => c.1 = share,
+                None => out.push((col, share)),
+            }
+        });
+        out.sort_by_key(|c| c.0);
+        out
+    }
+
+    /// N1 (looks6): a word gap between two cut letters keeps no more light
+    /// than they do beyond one slope step, and every share only falls.
+    #[test]
+    fn a_row_s_cuts_ease_as_one_ramp_through_its_word_gaps() {
+        // "as the": columns 0-1 cut, 2 a gap, 3-5 cut; 4 left whole by its own cut.
+        let cuts = [(0, 0.20), (1, 0.30), (3, 0.25), (5, 0.60)];
+        let out = ramped(&cuts, None);
+        let at = |col: i32| out.iter().find(|c| c.0 == col).map_or(1.0, |c| c.1);
+        assert!(
+            at(2) <= at(1).min(at(3)) + RAMP_SLOPE + 1e-6,
+            "the gap keeps {} against its letters' {} and {}",
+            at(2),
+            at(1),
+            at(3)
+        );
+        for w in out.windows(2) {
+            assert!(
+                (w[1].1 - w[0].1).abs() <= RAMP_SLOPE * (w[1].0 - w[0].0) as f32 + 1e-6,
+                "a step of {} between columns {} and {}",
+                (w[1].1 - w[0].1).abs(),
+                w[0].0,
+                w[1].0
+            );
+        }
+        for &(col, s) in &cuts {
+            assert!(at(col) <= s, "column {col} rose from {s} to {}", at(col));
+        }
+        assert!(at(4) < 1.0, "the letter between two cuts eases with them");
+        // The caret's cell is the caret's law, and nothing past the run is touched.
+        let skipped = ramped(&cuts, Some(2));
+        assert!(skipped.iter().all(|c| c.0 != 2));
+        assert!(out.iter().all(|c| (0..=5).contains(&c.0)));
     }
 }

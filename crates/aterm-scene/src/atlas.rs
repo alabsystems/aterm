@@ -69,22 +69,27 @@ impl Tile {
             return;
         }
         let i = ((y as u32 * self.w + x as u32) * 4) as usize;
+        let sa = crate::clampf(a, 0.0, 1.0);
+        let to = |v: f32| (crate::clampf(v, 0.0, 1.0) * 255.0 + 0.5) as u8;
+        if sa >= 1.0 {
+            self.px[i..i + 4].copy_from_slice(&[to(rgb.0), to(rgb.1), to(rgb.2), 255]);
+            return;
+        }
         let (dr, dg, db, da) = (
             self.px[i] as f32 / 255.0,
             self.px[i + 1] as f32 / 255.0,
             self.px[i + 2] as f32 / 255.0,
             self.px[i + 3] as f32 / 255.0,
         );
-        let sa = crate::clampf(a, 0.0, 1.0);
-        let oa = sa + da * (1.0 - sa);
+        let inv_sa = 1.0 - sa;
+        let oa = sa + da * inv_sa;
         let mix = |s: f32, d: f32| {
             if oa <= 0.0 {
                 0.0
             } else {
-                (s * sa + d * da * (1.0 - sa)) / oa
+                (s * sa + d * da * inv_sa) / oa
             }
         };
-        let to = |v: f32| (crate::clampf(v, 0.0, 1.0) * 255.0 + 0.5) as u8;
         self.px[i] = to(mix(rgb.0, dr));
         self.px[i + 1] = to(mix(rgb.1, dg));
         self.px[i + 2] = to(mix(rgb.2, db));
@@ -105,42 +110,40 @@ impl Tile {
         let row = y as u32 * self.w;
         let sa = crate::clampf(a, 0.0, 1.0);
         let to = |v: f32| (crate::clampf(v, 0.0, 1.0) * 255.0 + 0.5) as u8;
+        let span = &mut self.px[(row + start as u32) as usize * 4..(row + end as u32) as usize * 4];
         if sa >= 1.0 {
             let quad = [to(rgb.0), to(rgb.1), to(rgb.2), 255];
-            for xi in start..end as i32 {
-                let i = ((row + xi as u32) * 4) as usize;
-                self.px[i..i + 4].copy_from_slice(&quad);
-            }
+            span.as_chunks_mut::<4>().0.fill(quad);
             return;
         }
-        for xi in start..end as i32 {
-            let i = ((row + xi as u32) * 4) as usize;
+        let inv_sa = 1.0 - sa;
+        for px in span.as_chunks_mut::<4>().0 {
             let (dr, dg, db, da) = (
-                self.px[i] as f32 / 255.0,
-                self.px[i + 1] as f32 / 255.0,
-                self.px[i + 2] as f32 / 255.0,
-                self.px[i + 3] as f32 / 255.0,
+                px[0] as f32 / 255.0,
+                px[1] as f32 / 255.0,
+                px[2] as f32 / 255.0,
+                px[3] as f32 / 255.0,
             );
-            let oa = sa + da * (1.0 - sa);
+            let oa = sa + da * inv_sa;
             let mix = |s: f32, d: f32| {
                 if oa <= 0.0 {
                     0.0
                 } else {
-                    (s * sa + d * da * (1.0 - sa)) / oa
+                    (s * sa + d * da * inv_sa) / oa
                 }
             };
-            self.px[i] = to(mix(rgb.0, dr));
-            self.px[i + 1] = to(mix(rgb.1, dg));
-            self.px[i + 2] = to(mix(rgb.2, db));
-            self.px[i + 3] = to(oa);
+            px[0] = to(mix(rgb.0, dr));
+            px[1] = to(mix(rgb.1, dg));
+            px[2] = to(mix(rgb.2, db));
+            px[3] = to(oa);
         }
     }
 
     /// Fill `bbox` with `rgb` at `alpha`, modulated by the 4×4-supersampled coverage of
-    /// `inside(px, py)` (sample coords are pixel centers in tile space).
+    /// `qx(px) + qy(py) <= limit` (sample coords are pixel centers in tile space).
     #[cfg_attr(trust_verify, trust::skip)]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn fill<F: Fn(f32, f32) -> bool>(
+    pub(crate) fn fill_quad<Fx: Fn(f32) -> f32, Fy: Fn(f32) -> f32>(
         &mut self,
         x0: i32,
         y0: i32,
@@ -148,26 +151,58 @@ impl Tile {
         y1: i32,
         rgb: (f32, f32, f32),
         alpha: f32,
-        inside: F,
+        limit: f32,
+        qx: Fx,
+        qy: Fy,
     ) {
+        if !alpha.is_finite() || alpha <= 0.0 || !limit.is_finite() || limit < 0.0 {
+            return;
+        }
+        const SUB: [f32; 4] = [0.125, 0.375, 0.625, 0.875];
+        const INV16: f32 = 1.0 / 16.0;
         let x0 = x0.max(0);
         let y0 = y0.max(0);
         let x1 = x1.min(self.w as i32);
         let y1 = y1.min(self.h as i32);
         for py in y0..y1 {
+            let py_f = py as f32;
+            let dy2 = SUB.map(|off| qy(py_f + off));
+            let dy2_min = dy2[0].min(dy2[1]).min(dy2[2]).min(dy2[3]);
+            if dy2_min > limit {
+                continue;
+            }
+            let dy2_max = dy2[0].max(dy2[1]).max(dy2[2]).max(dy2[3]);
             for px in x0..x1 {
+                let px_f = px as f32;
+                let dx0 = qx(px_f + SUB[0]);
+                let dx3 = qx(px_f + SUB[3]);
+                if dx0.max(dx3) + dy2_max <= limit {
+                    let dx1 = qx(px_f + SUB[1]);
+                    let dx2 = qx(px_f + SUB[2]);
+                    if dx1.max(dx2) + dy2_max <= limit {
+                        self.over(px, py, rgb, alpha * 16.0 * INV16);
+                        continue;
+                    }
+                }
+                let dx1 = qx(px_f + SUB[1]);
+                let dx2 = qx(px_f + SUB[2]);
+                let dx2_arr = [dx0, dx1, dx2, dx3];
+                let dx2_min = dx0.min(dx1).min(dx2).min(dx3);
+                if dx2_min + dy2_min > limit {
+                    continue;
+                }
                 let mut hit = 0u32;
-                for sy in 0..4 {
-                    for sx in 0..4 {
-                        let fx = px as f32 + (sx as f32 + 0.5) * 0.25;
-                        let fy = py as f32 + (sy as f32 + 0.5) * 0.25;
-                        if inside(fx, fy) {
+                for &yv in &dy2 {
+                    if yv > limit {
+                        continue;
+                    }
+                    for &xv in &dx2_arr {
+                        if xv + yv <= limit {
                             hit = hit.saturating_add(1);
                         }
                     }
                 }
                 if hit > 0 {
-                    const INV16: f32 = 1.0 / 16.0;
                     self.over(px, py, rgb, alpha * hit as f32 * INV16);
                 }
             }
@@ -176,34 +211,52 @@ impl Tile {
 
     /// A filled disc of radius `r` centered at `(cx, cy)`.
     pub fn disc(&mut self, cx: f32, cy: f32, r: f32, rgb: (f32, f32, f32), a: f32) {
+        if !(cx.is_finite() && cy.is_finite() && r.is_finite()) || r < 0.0 {
+            return;
+        }
         let rr = r * r;
-        self.fill(
+        self.fill_quad(
             ((cx - r) as i32).saturating_sub(1),
             ((cy - r) as i32).saturating_sub(1),
             ((cx + r) as i32).saturating_add(2),
             ((cy + r) as i32).saturating_add(2),
             rgb,
             a,
-            |x, y| {
-                let (dx, dy) = (x - cx, y - cy);
-                dx * dx + dy * dy <= rr
+            rr,
+            |x| {
+                let dx = x - cx;
+                dx * dx
+            },
+            |y| {
+                let dy = y - cy;
+                dy * dy
             },
         );
     }
 
     /// An axis-aligned filled ellipse with radii `(rx, ry)` centered at `(cx, cy)`.
     pub fn ellipse(&mut self, cx: f32, cy: f32, rx: f32, ry: f32, rgb: (f32, f32, f32), a: f32) {
-        self.fill(
+        if !(cx.is_finite() && cy.is_finite() && rx.is_finite() && ry.is_finite())
+            || rx <= 0.0
+            || ry <= 0.0
+        {
+            return;
+        }
+        self.fill_quad(
             ((cx - rx) as i32).saturating_sub(1),
             ((cy - ry) as i32).saturating_sub(1),
             ((cx + rx) as i32).saturating_add(2),
             ((cy + ry) as i32).saturating_add(2),
             rgb,
             a,
-            |x, y| {
+            1.0,
+            |x| {
                 let nx = (x - cx) / rx;
+                nx * nx
+            },
+            |y| {
                 let ny = (y - cy) / ry;
-                nx * nx + ny * ny <= 1.0
+                ny * ny
             },
         );
     }

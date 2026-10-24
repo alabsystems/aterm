@@ -2529,6 +2529,11 @@ mod tests {
         let shim = std::fs::read_to_string(l.shim(&crate::store::ToolName::new("claude").unwrap()))
             .unwrap();
         assert!(shim.contains("DISABLE_AUTOUPDATER"), "{shim}");
+        assert_eq!(
+            crate::store::recorded_exposes(&dir),
+            Some(vec![crate::store::ToolName::new("claude").unwrap()]),
+            "the vendor lane records the commands its build puts on PATH, as every landing does"
+        );
         let stamp = ProgramStamp::read(&l, "claude").unwrap();
         assert_eq!(stamp.last_head, Some(v("2.1.281")));
         assert_eq!(stamp.high_water, Some(v("2.1.281")));

@@ -498,6 +498,24 @@ impl Sim {
         (!rows.is_empty()).then(|| *self.rng.pick(&rows))
     }
 
+    /// A suspended mark's span start, if one is on screen.
+    fn suspended_start_screen_row(&mut self) -> Option<u16> {
+        let fence = self.t.holder_fence();
+        let main = self.t.main_grid();
+        let base = main.visible_to_absolute(0);
+        let rows: Vec<u16> = fence
+            .marks
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| fence.current.map(usize::from) != Some(i))
+            .flat_map(|(_, m)| m.spans.iter())
+            .filter_map(|span| main.anchors().row(span.start)?.checked_sub(base))
+            .filter_map(|s| u16::try_from(s).ok())
+            .filter(|&s| s < main.rows())
+            .collect();
+        (!rows.is_empty()).then(|| *self.rng.pick(&rows))
+    }
+
     fn calm(&mut self) -> bool {
         !self.rng.chance(self.noise)
     }
@@ -541,8 +559,11 @@ impl Sim {
     fn insert_or_delete_lines(&mut self) -> Vec<u8> {
         let rows = u64::from(self.t.grid().rows());
         let row = match self.open_span_screen_row() {
-            Some(r) if r > 0 && self.rng.chance(60) => self.rng.below(u64::from(r)) + 1,
-            _ => self.rng.below(rows) + 1,
+            Some(r) if self.rng.chance(60) => self.rng.below(u64::from(r) + 1) + 1,
+            _ => match self.suspended_start_screen_row() {
+                Some(r) if self.rng.chance(30) => u64::from(r) + 1,
+                _ => self.rng.below(rows) + 1,
+            },
         };
         let op = if self.rng.chance(50) { 'L' } else { 'M' };
         let mut b = self.pen();
@@ -552,7 +573,13 @@ impl Sim {
 
     fn region_scroll(&mut self) -> Vec<u8> {
         let rows = u64::from(self.t.grid().rows());
-        let top = self.rng.below(rows) + 1;
+        let top = match self.open_span_screen_row() {
+            Some(r) if self.rng.chance(40) => u64::from(r) + 1,
+            _ => match self.suspended_start_screen_row() {
+                Some(r) if self.rng.chance(30) => u64::from(r) + 1,
+                _ => self.rng.below(rows) + 1,
+            },
+        };
         let bottom = (top + self.rng.below(rows)).min(rows);
         let mut b = format!("\x1b[{top};{bottom}r").into_bytes();
         b.extend(self.pen());
@@ -563,6 +590,37 @@ impl Sim {
             _ => b.extend(format!("\x1b[{}T", self.rng.below(3) + 1).into_bytes()),
         }
         b.extend_from_slice(b"\x1b[r");
+        b
+    }
+
+    /// Rows erased from at or above the open span's start: whole rows a row at a time down to
+    /// the cursor (as Claude Code redraws after a resize), the display from a column of a row
+    /// (ED 0), or from the top to a column of the cursor's row (ED 1).
+    fn sweep(&mut self) -> Vec<u8> {
+        let cols = u64::from(self.t.grid().cols());
+        let cursor = u64::from(self.t.grid().cursor().row);
+        let from = match self.open_span_screen_row() {
+            Some(start) if self.rng.chance(50) => self.rng.below(u64::from(start) + 1),
+            _ => self.rng.below(cursor + 1),
+        };
+        let mut b = Vec::new();
+        match self.rng.below(4) {
+            0 => {
+                let col = self.rng.below(cols) + 1;
+                b.extend(format!("\x1b[{};{col}H\x1b[J", from + 1).into_bytes());
+            }
+            1 => {
+                let col = self.rng.below(cols) + 1;
+                b.extend(format!("\x1b[{};{col}H\x1b[1J", cursor + 1).into_bytes());
+            }
+            _ => {
+                b.extend(format!("\x1b[{};1H", from + 1).into_bytes());
+                for _ in from..=cursor.max(from) {
+                    b.extend_from_slice(b"\x1b[2K\x1b[1B");
+                }
+            }
+        }
+        b.extend(format!("\x1b[{};1H", from + 1).into_bytes());
         b
     }
 
@@ -580,7 +638,7 @@ impl Sim {
     }
 
     fn calm_write_step(&mut self) -> Result<(), String> {
-        let bytes = match self.rng.below(20) {
+        let bytes = match self.rng.below(21) {
             0..=9 => self.lines(80),
             10..=12 => {
                 let cursor = u64::from(self.t.grid().cursor().row);
@@ -613,6 +671,7 @@ impl Sim {
             16 => return self.archival_step(),
             17 => self.region_scroll(),
             18 => return self.alt_step(),
+            19 => self.sweep(),
             _ => b"\x1b[0m\r\n".to_vec(),
         };
         self.write(&bytes);
@@ -1112,15 +1171,246 @@ fn three_stopped_drawers_then_fg_keeps_the_first() -> Result<(), String> {
     }
 }
 
+/// Muse Code 1.4.12's launch after its launcher's clear: four newlines, then
+/// three reverse indexes at the top of a region (rows 1-7) that starts on
+/// its span's start, and its banner in the second row it opened (its own
+/// bytes are `aterm-gui`'s `fixtures/muse-1.4.12-inline-startup.bin`).
+fn muse_launch_keeps_its_banner() -> Result<(), String> {
+    let mut t = Terminal::new(24, 40);
+    t.process(b"$ muse\r\n\x1b[3J\x1b[H\x1b[2J");
+    t.note_holder_cut(HolderCut {
+        to: Some(token(0)),
+        kind: CutKind::Exec,
+        from_alive: true,
+    });
+    t.process(b"\n\n\n\n\x1b[5;1H\x1b[2K\x1b7\x1b[1;7r\x1b[1;1H\x1bM\x1bM\x1bM\x1b[r\x1b8");
+    t.process(b"\x1b[2;1H  Muse Code 1.4.12\x1b[5;1H> ");
+    let banner = t.main_grid().visible_to_absolute(1);
+    let view = t.holder_view();
+    if view.admits_rows(banner, banner + 1) {
+        Ok(())
+    } else {
+        Err(format!("Muse Code's banner on {banner} is bare: {view:?}"))
+    }
+}
+
+/// Claude Code 2.1.304's inline redraw after a resize: under the shell's
+/// command line and its launcher's line, it erases every row from home down
+/// (`\e[2K\e[1B`, row by row) and draws its card again from the top (its
+/// own bytes are `aterm-gui`'s
+/// `tests/fixtures/claude-card/claude-2.1.304-inline-resize-redraw-120col.out`).
+fn redraw_from_home_keeps_the_card() -> Result<(), String> {
+    let mut t = Terminal::new(24, 40);
+    t.process(b"$ claude\r\naterm: yolo (default): running 'claude'\r\n");
+    t.note_holder_cut(HolderCut {
+        to: Some(token(0)),
+        kind: CutKind::Exec,
+        from_alive: true,
+    });
+    t.process(&card(0));
+    let mut sweep = b"\x1b[?2026h\x1b[H".to_vec();
+    for _ in 0..24 {
+        sweep.extend_from_slice(b"\x1b[2K\x1b[1B");
+    }
+    sweep.extend_from_slice(b"\x1b[H");
+    t.process(&sweep);
+    t.process(&card(0));
+    t.process(b"\x1b[?2026l");
+    let rows = card_rows(&t, 0);
+    let top = t.main_grid().visible_to_absolute(0);
+    let view = t.holder_view();
+    if rows.0 == top && view.admits_rows(rows.0, rows.1) {
+        Ok(())
+    } else {
+        Err(format!(
+            "the card redrawn at {rows:?} (top {top}) is bare: {view:?}"
+        ))
+    }
+}
+
 fn liveness() -> Result<(), String> {
     ctrl_z_vim_fg_keeps_the_card()?;
-    three_stopped_drawers_then_fg_keeps_the_first()
+    three_stopped_drawers_then_fg_keeps_the_first()?;
+    muse_launch_keeps_its_banner()?;
+    redraw_from_home_keeps_the_card()
 }
 
 #[test]
 fn a_stop_a_tool_and_fg_keep_the_card() {
     ctrl_z_vim_fg_keeps_the_card().unwrap();
     three_stopped_drawers_then_fg_keeps_the_first().unwrap();
+}
+
+#[test]
+fn rows_a_drawer_opens_at_its_own_start_are_its() {
+    muse_launch_keeps_its_banner().unwrap();
+    assert!(
+        with_knob(FenceKnob::StartFollows, muse_launch_keeps_its_banner).is_err(),
+        "CONTROL: a start that follows its row down leaves the banner above it"
+    );
+}
+
+#[test]
+fn rows_a_drawer_erases_above_its_start_are_its() {
+    redraw_from_home_keeps_the_card().unwrap();
+    assert!(
+        with_knob(
+            FenceKnob::ErasedRowsStayOut,
+            redraw_from_home_keeps_the_card
+        )
+        .is_err(),
+        "CONTROL: erased rows that stay out leave the redrawn card above the span"
+    );
+}
+
+/// The erase law takes in only blank rows directly above the open span's start, on the current drawer's erase.
+#[test]
+fn an_erase_above_the_start_takes_in_blank_rows_only() {
+    let abs = |t: &Terminal, r: u64| t.main_grid().visible_to_absolute(0) + r;
+    let mut t = Terminal::new(24, 40);
+    t.process(b"tttt\r\ntttt\r\ntttt\r\n\r\n\r\n$ claude\r\n");
+    t.note_holder_cut(group(Some(token(0)), true));
+    assert!(!t.holder_view().tainted);
+    t.process(b"\x1b[6;1H\x1b[2K\x1b[7;1H");
+    let view = t.holder_view();
+    assert!(view.admits_rows(abs(&t, 3), abs(&t, 7)), "{view:?}");
+    assert!(
+        !view.admits_rows(abs(&t, 2), abs(&t, 3)),
+        "the card above: {view:?}"
+    );
+
+    let mut t = Terminal::new(24, 40);
+    t.process(b"\r\n\r\n$ claude\r\n");
+    t.note_holder_cut(group(Some(token(0)), true));
+    t.process(b"\x1b[3;3H\x1b[K\x1b[4;1H");
+    let view = t.holder_view();
+    assert!(
+        !view.admits_rows(abs(&t, 2), abs(&t, 3)),
+        "the shell's `$ ` is left: {view:?}"
+    );
+    t.process(b"\x1b[3;1H\x1b[K\x1b[4;1H");
+    let view = t.holder_view();
+    assert!(view.admits_rows(abs(&t, 0), abs(&t, 4)), "{view:?}");
+
+    let mut t = Terminal::new(24, 40);
+    t.process(b"\r\n\r\n");
+    t.note_holder_cut(group(Some(token(0)), true));
+    t.process(&card(0));
+    t.process(b"\x1b[3;1H\x1b[2K\x1b[4;1H\x1b[2K\x1b[6;1H");
+    let view = t.holder_view();
+    assert!(
+        !view.admits_rows(abs(&t, 0), abs(&t, 2)),
+        "an erase inside the span: {view:?}"
+    );
+
+    let mut t = Terminal::new(24, 40);
+    t.process(b"$ claude\r\n");
+    t.note_holder_cut(group(Some(token(0)), true));
+    t.process(&card(0));
+    t.note_holder_cut(group(None, true));
+    t.process(b"\x1b[1;1H\x1b[2K\x1b[5;1H$ fg\r\n");
+    t.note_holder_cut(group(Some(token(0)), true));
+    let view = t.holder_view();
+    assert!(!view.tainted, "{view:?}");
+    assert!(
+        !view.admits_rows(abs(&t, 0), abs(&t, 1)),
+        "the shell's erase above a stopped start: {view:?}"
+    );
+}
+
+/// The erase law on an erase in display: ED 0 from a row above the open span's start, and ED 1,
+/// take in the blank rows directly above it and the card the drawer draws in them; a row the
+/// erase left inked stops the rise.
+#[test]
+fn an_erase_in_display_above_the_start_takes_in_blank_rows_only() {
+    let abs = |t: &Terminal, r: u64| t.main_grid().visible_to_absolute(0) + r;
+    let launch = |shell: &[u8]| {
+        let mut t = Terminal::new(24, 40);
+        t.process(shell);
+        t.note_holder_cut(group(Some(token(0)), true));
+        assert!(!t.holder_view().tainted);
+        t
+    };
+    let ed0 = || {
+        let mut t = launch(b"tttt\r\ntttttttt\r\n$ claude\r\n");
+        t.process(b"\x1b[2;1H\x1b[J");
+        t.process(&card(0));
+        let view = t.holder_view();
+        let whole = (
+            view.admits_rows(abs(&t, 1), abs(&t, 4)),
+            view.admits_rows(abs(&t, 0), abs(&t, 1)),
+        );
+        let mut t = launch(b"tttt\r\ntttttttt\r\n$ claude\r\n");
+        t.process(b"\x1b[2;3H\x1b[J\x1b[3;1H");
+        t.process(&card(0));
+        let view = t.holder_view();
+        let part = (
+            view.admits_rows(abs(&t, 2), abs(&t, 5)),
+            view.admits_rows(abs(&t, 1), abs(&t, 2)),
+        );
+        (whole, part)
+    };
+    assert_eq!(
+        ed0(),
+        ((true, false), (true, false)),
+        "ED 0 from row 1, then from row 1's third column"
+    );
+    assert_eq!(
+        with_knob(FenceKnob::ErasedRowsStayOut, ed0),
+        ((false, false), (false, false)),
+        "CONTROL: the erased rows stay out"
+    );
+
+    let ed1 = || {
+        let mut t = launch(b"tttt\r\ntttttttt\r\n$ claude\r\n");
+        t.process(&card(0));
+        t.process(b"\x1b[5;1H\x1b[1J\x1b[H");
+        t.process(&card(0));
+        let whole = t.holder_view().admits_rows(abs(&t, 0), abs(&t, 3));
+        let mut t = launch(b"tttt\r\ntttttttt\r\n\r\n");
+        t.process(b"\x1b[2;4H\x1b[1J\x1b[3;1H");
+        t.process(&card(0));
+        let view = t.holder_view();
+        let part = (
+            view.admits_rows(abs(&t, 2), abs(&t, 5)),
+            view.admits_rows(abs(&t, 1), abs(&t, 2)),
+        );
+        (whole, part)
+    };
+    assert_eq!(
+        ed1(),
+        (true, (true, false)),
+        "ED 1 from inside the span, then from row 1's fourth column"
+    );
+    assert_eq!(
+        with_knob(FenceKnob::ErasedRowsStayOut, ed1),
+        (false, (false, false)),
+        "CONTROL: the erased rows stay out"
+    );
+}
+
+/// A row the shell opens at a stopped drawer's start joins that drawer's span (every start on
+/// an insertion's top holds its row), and the reselect's seal check cuts it at `fg`.
+#[test]
+fn a_row_another_writer_opens_at_a_stopped_start_is_cut_at_fg() {
+    let run = || {
+        let mut t = Terminal::new(24, 40);
+        t.process(b"\x1b[3J\x1b[H\x1b[2J");
+        t.note_holder_cut(group(Some(token(0)), true));
+        let start = t.main_grid().visible_to_absolute(0);
+        t.process(&card(0));
+        t.note_holder_cut(group(None, true));
+        t.process(b"\x1b7\x1b[1;7r\x1b[1;1H\x1bM\x1b[r\x1b[1;1Hsss\x1b8\r\n");
+        t.note_holder_cut(group(Some(token(0)), true));
+        let view = t.holder_view();
+        assert!(!view.tainted, "the lay below the card: {view:?}");
+        view.admits_rows(start, start + 1)
+    };
+    assert!(!run(), "the shell's row at the stopped start is admitted");
+    assert!(
+        with_knob(FenceKnob::NoSealCheck, run),
+        "CONTROL: with no seal check the shell's row stays in the stopped span"
+    );
 }
 
 #[test]
@@ -1146,7 +1436,12 @@ fn every_knob_is_caught() {
 
 #[test]
 fn the_probes_catch_the_knobs_that_lose_too_much() {
-    for knob in [FenceKnob::SwapLoses, FenceKnob::CountEviction] {
+    for knob in [
+        FenceKnob::SwapLoses,
+        FenceKnob::CountEviction,
+        FenceKnob::StartFollows,
+        FenceKnob::ErasedRowsStayOut,
+    ] {
         assert!(with_knob(knob, || liveness().is_err()), "{knob:?}");
     }
 }
@@ -1987,6 +2282,11 @@ fn the_holder_round_trips_through_a_checkpoint_exactly() {
     assert_eq!(restored.checkpoint(), c, "the re-checkpoint identity");
     assert_eq!(restored.holder_fence(), t.holder_fence());
     assert_eq!(restored.holder_view(), t.holder_view());
+    assert_eq!(
+        restored.main_grid().anchors(),
+        t.main_grid().anchors(),
+        "the anchors"
+    );
     let mut adopted = Terminal::new(10, 20);
     adopted.restore_checkpoint(&c);
     assert_eq!(adopted.holder_view(), t.holder_view());

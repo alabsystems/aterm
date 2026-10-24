@@ -942,9 +942,13 @@ impl<C: Ctl> Session<'_, C> {
                 .prompt
                 .as_ref()
                 .is_some_and(|p| !unvoiced_tools(p).is_empty()),
-            Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => {
-                false
-            }
+            Program::Codex
+            | Program::Grok
+            | Program::Kimi
+            | Program::Agy
+            | Program::Muse
+            | Program::Gemini
+            | Program::Generic => false,
         };
         let fresh_cwd = reading.prompt.as_ref().is_some_and(needs_cwd)
             || asks
@@ -3303,9 +3307,13 @@ fn note_unproven(review: &mut dyn Review, seq: u64, rule_id: &str, unproven: Opt
 const fn is_muse(program: &Program) -> bool {
     match program {
         Program::Muse => true,
-        Program::Claude | Program::Codex | Program::Agy | Program::Gemini | Program::Generic => {
-            false
-        }
+        Program::Claude
+        | Program::Codex
+        | Program::Grok
+        | Program::Kimi
+        | Program::Agy
+        | Program::Gemini
+        | Program::Generic => false,
     }
 }
 

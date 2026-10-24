@@ -217,6 +217,9 @@ struct Glass {
     w: usize,
     h: usize,
     g: Geom,
+    /// The palette index additive fire is held to
+    /// ([`aterm_render::fire_field::FIRE_ADD_IDX_MAX`], as the hosts lay it).
+    fire_cap: i32,
 }
 
 impl Glass {
@@ -227,6 +230,7 @@ impl Glass {
             w,
             h,
             g,
+            fire_cap: aterm_render::fire_field::FIRE_ADD_IDX_MAX,
         }
     }
 
@@ -329,7 +333,7 @@ impl Glass {
                         let slot = &mut self.px[y * self.w + x];
                         match mode {
                             FireMode::Add => {
-                                let pm = ff::fire_shade_add(&c, &fp, tf);
+                                let pm = ff::fire_shade_add_to(&c, &fp, tf, self.fire_cap);
                                 if pm != 0 {
                                     *slot = aterm_render::add_sat(*slot, pm);
                                 }

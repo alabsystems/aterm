@@ -20,6 +20,7 @@ use crate::spectrum::{
     SPECTRUM_STOPS, spectrum, spectrum_snap, spectrum_snap_index, spectrum_stop,
 };
 
+use super::companion::KeepOut;
 use super::ribbon::{
     BED_INK_LUT_LEN, SLABS_PER_CELL, WALK_FAST_CELLS, WALK_LAY_RATE, hot_edge_ink, paper_caret_ink,
     paper_ink, paper_mark_ink, walk_pace, walk_t,
@@ -223,6 +224,10 @@ pub const COMA_PETAL_ORBIT: f32 = 0.72;
 
 /// One turn of the corona, ms.
 pub const COMA_SPIN_MS: f32 = 240.0;
+
+/// The smallest radius a dark head's light keeps as it shrinks, px: under
+/// it the light is culled rather than drawn as a dim speck.
+pub const HEAD_LIGHT_MIN_R_PX: f32 = 1.0;
 
 /// Nucleus core radius floor in px.
 pub const NUCLEUS_MIN_PX: f32 = 2.5;
@@ -674,9 +679,6 @@ pub const SPARK_PX: i32 = 3;
 
 /// The alpha under which a spark loses its halo and a pixel of arm.
 pub const SPARK_SHRINK_ALPHA: f32 = 0.6;
-
-/// Light-theme nucleus transverse squash.
-pub const LIGHT_SQUASH: f32 = 0.30;
 
 /// Where the light-theme train's rail sits below the row's centre, in `ch`.
 pub const LIGHT_RAIL_CH: f32 = 0.62;
@@ -1177,9 +1179,33 @@ pub struct Meteors {
     ord: u32,
     reduced: bool,
     hand_floor: Option<(u16, u16)>,
+    /// The frame's lettered rows, which a train passes behind
+    /// ([`KeepOut::behind_text`]).
+    pub keep_out: KeepOut,
     /// Whether tests lay each train layer cut square without end easing.
     #[cfg(test)]
     pub(crate) ends_square: bool,
+    /// Whether tests lay a dark train's fades as dims (looks6 N6's negative control).
+    #[cfg(test)]
+    pub(crate) dims_dark_trains: bool,
+    /// Whether tests lay a train's warm stops as its others, as they were:
+    /// at their level on dark and their width on paper (looks6 round 3's
+    /// negative controls).
+    #[cfg(test)]
+    pub(crate) warm_stops_plain: bool,
+    /// Whether tests lay a train across a lettered row's letters (the
+    /// strike-through's negative control).
+    #[cfg(test)]
+    pub(crate) trains_over_text: bool,
+    /// Whether tests lay a dark train into the letter guard's reach below
+    /// a lettered row's letters, as it was (the brown segment's negative
+    /// control).
+    #[cfg(test)]
+    pub(crate) trains_in_guard: bool,
+    /// Whether tests keep a dark head's petals after it lands (the stray
+    /// specks' negative control).
+    #[cfg(test)]
+    pub(crate) petals_stay: bool,
 }
 
 impl Default for Meteors {
@@ -1200,8 +1226,19 @@ impl Meteors {
             ord: 0,
             reduced: false,
             hand_floor: None,
+            keep_out: KeepOut::default(),
             #[cfg(test)]
             ends_square: false,
+            #[cfg(test)]
+            dims_dark_trains: false,
+            #[cfg(test)]
+            warm_stops_plain: false,
+            #[cfg(test)]
+            trains_over_text: false,
+            #[cfg(test)]
+            trains_in_guard: false,
+            #[cfg(test)]
+            petals_stay: false,
         }
     }
 
@@ -1255,12 +1292,35 @@ impl Meteors {
         let square = false;
         #[cfg(test)]
         let square = self.ends_square;
+        #[cfg(not(test))]
+        let clean = true;
+        #[cfg(test)]
+        let clean = !self.dims_dark_trains;
+        #[cfg(not(test))]
+        let warm = true;
+        #[cfg(test)]
+        let warm = !self.warm_stops_plain;
+        #[cfg(not(test))]
+        let (behind, fold, skirts) = (true, true, true);
+        #[cfg(test)]
+        let (behind, fold, skirts) = (
+            !self.trains_over_text,
+            !self.petals_stay,
+            !self.trains_in_guard,
+        );
+        let keep = &self.keep_out;
         let (live, landings, sown) = (&mut self.live, &mut self.landings, &mut self.sown);
 
         for m in live.iter_mut() {
             if let Some(f) = Flight::of(m, ctx) {
-                draw_train(&mut verts, m, &f, ctx, frame, square);
-                draw_head(m, &f, ctx, frame);
+                let text = Behind::bodies(keep, behind);
+                let train = if ctx.cfg.dark_theme && clean && skirts {
+                    text.guarded()
+                } else {
+                    text
+                };
+                draw_train(&mut verts, m, &f, ctx, frame, (square, clean, warm), train);
+                draw_head(m, &f, ctx, frame, (clean, fold), text);
                 if m.retired_at.is_none() && !m.chained {
                     shed(m, &f, ctx, sown);
                 }
@@ -1679,6 +1739,86 @@ impl Meteors {
     }
 }
 
+/// The least share of its light a dark train's colour keeps while it fades
+/// along the train: below it the train narrows at that share instead of
+/// dimming further, since a dimmed warm stop reads brown on a dark page
+/// (looks6 N6).
+const DARK_TRAIN_CLEAN_SHARE: f32 = 1.0;
+
+/// A dark train's fade `k` of its light at half-width `half`, kept clean:
+/// at or above `clean` it dims as asked; below, it keeps `clean` of its
+/// light and narrows by `k / clean` instead, and once narrower than
+/// [`DARK_TAPER_THREAD_PX`] it keeps that width and fades with its coverage
+/// (a thread any thinner lands between pixel rows and flickers).
+fn dark_clean_taper(k: f32, half: f32, clean: f32) -> (f32, f32) {
+    if k >= clean {
+        return (k, half);
+    }
+    let thread = DARK_TAPER_THREAD_PX * 0.5;
+    if half <= thread {
+        return (k, half);
+    }
+    let narrow = half * (k / clean).max(0.0);
+    if narrow >= thread {
+        (clean, narrow)
+    } else {
+        (clean * narrow / thread, thread)
+    }
+}
+
+/// A dark train's station of light `k` and half-width `half` kept within
+/// `room` px of its spine ([`Behind::room`]): narrowed to it at its level,
+/// and narrower than [`DARK_TAPER_THREAD_PX`] faded with its coverage, as
+/// [`dark_clean_taper`] lays a thread.
+fn fit_room(k: f32, half: f32, room: f32) -> (f32, f32) {
+    if half <= room {
+        return (k, half);
+    }
+    let thread = DARK_TAPER_THREAD_PX * 0.5;
+    if room >= thread {
+        (k, room)
+    } else {
+        (k * (room / thread).max(0.0), thread)
+    }
+}
+
+/// How much brighter a dark train lays a warm stop than its others: a red,
+/// an orange or a yellow added at the train's level reads maroon, brown and
+/// olive on a dark page, where a green, a blue or a violet at that level
+/// still reads as its hue (looks6 round 3: the `enter-bottom` Return's warm
+/// segment, `4b4721`, `5a4b2c`, `7a624c` and `693e3b` under `quick`).
+const DARK_WARM_TRAIN_GAIN: f32 = 1.8;
+
+/// [`DARK_WARM_TRAIN_GAIN`]'s share for `stop`: whole from red through
+/// yellow, easing out across yellow-green and across magenta.
+fn dark_warm_gain(stop: u32) -> f32 {
+    let (hue, sat, _) = crate::color_math::rgb2hsv(stop);
+    let warm = if hue >= 300.0 {
+        smoothstep01((hue - 300.0) / 45.0)
+    } else {
+        1.0 - smoothstep01((hue - 55.0) / 30.0)
+    };
+    1.0 + (DARK_WARM_TRAIN_GAIN - 1.0) * warm * sat.clamp(0.0, 1.0)
+}
+
+/// The share of its width a paper train keeps where its ink is a darkened
+/// yellow: held to the paper's contrast a yellow stop's ink reads mustard
+/// and olive (looks6 round 3: `7d8616`, `9a7e16` and `b57b20` in the
+/// `enter-bottom` Return's stick), so the band thins out through it.
+const PAPER_GOLD_WIDTH: f32 = 0.4;
+
+/// [`PAPER_GOLD_WIDTH`]'s share for a paper train's `ink`: whole from a
+/// darkened orange (30 degrees) through olive (80), easing out toward red
+/// and across a yellowish green into green (100).
+fn paper_gold_width(ink: u32) -> f32 {
+    let (hue, sat, _) = crate::color_math::rgb2hsv(ink);
+    let gold = smoothstep01((hue - 20.0) / 10.0) * (1.0 - smoothstep01((hue - 80.0) / 20.0));
+    1.0 - (1.0 - PAPER_GOLD_WIDTH) * gold * smoothstep01(sat / 0.3)
+}
+
+/// The narrowest a dark train's clean taper draws before it fades instead.
+const DARK_TAPER_THREAD_PX: f32 = 2.0;
+
 const WHITE_PRINTED_SHARE: f32 = 0.25;
 const WHITE_PRINTED_NEAR: f32 = 0.25;
 const WHITE_PRINTED_FAR: f32 = 0.85;
@@ -1699,6 +1839,25 @@ fn dark_petal_rgb(stop: u32) -> u32 {
     } else {
         stop
     }
+}
+
+/// A dark head's light for spectrum `stop`: a warm stop that dims to brown
+/// (orange) or olive (yellow, lime) walks the night arc ([`night_rgb`]),
+/// and every other stop is itself.
+fn dark_head_rgb(stop: u32) -> u32 {
+    let (h, _, _) = crate::color_math::rgb2hsv(stop & 0x00FF_FFFF);
+    if (15.0..=100.0).contains(&h) {
+        night_rgb(stop)
+    } else {
+        stop
+    }
+}
+
+#[inline]
+fn dark_head_stop_rgb(i: usize) -> u32 {
+    static LUT: OnceLock<[u32; COMA_PETALS]> = OnceLock::new();
+    LUT.get_or_init(|| std::array::from_fn(|i| dark_head_rgb(spectrum_stop(i))))
+        [i.min(COMA_PETALS - 1)]
 }
 
 #[inline]
@@ -1729,7 +1888,245 @@ struct Flight {
     stride: f32,
     axis: Axis,
     headless: bool,
+    /// How long ago the head arrived, ms (0 in flight).
+    after_ms: f32,
 }
+
+/// The frame's lettered rows a train passes behind ([`KeepOut::behind_text`]),
+/// whether it does (tests lay it over them as the negative control), and
+/// how much of each row: its letters' bodies ([`TRAIN_TEXT_BAND`]), or on a
+/// dark page the train's whole reach of the letter guard
+/// ([`DARK_TRAIN_TEXT_BAND`], [`DARK_TRAIN_TEXT_PAD_PX`]).
+#[derive(Clone, Copy)]
+struct Behind<'a> {
+    keep: &'a KeepOut,
+    on: bool,
+    band: (f32, f32),
+    pad: f32,
+}
+
+impl<'a> Behind<'a> {
+    /// The letters' bodies of `keep`'s rows, when `on`.
+    #[inline]
+    const fn bodies(keep: &'a KeepOut, on: bool) -> Self {
+        Self {
+            keep,
+            on,
+            band: TRAIN_TEXT_BAND,
+            pad: 0.0,
+        }
+    }
+
+    /// The same rows, kept clear of the letter guard's reach: their whole
+    /// height and [`DARK_TRAIN_TEXT_PAD_PX`] round it.
+    #[inline]
+    const fn guarded(self) -> Self {
+        Self {
+            band: DARK_TRAIN_TEXT_BAND,
+            pad: DARK_TRAIN_TEXT_PAD_PX,
+            ..self
+        }
+    }
+
+    /// How many px a dark train's station centred at `(x, y)` may reach
+    /// before its light enters a guarded row's hidden zone: unbounded for
+    /// the letters' bodies alone ([`Self::bodies`]) or clear of every row,
+    /// 0 inside one. Narrowed to it, a train tapers to a point where it
+    /// meets the zone rather than being sliced flat along it.
+    #[inline]
+    fn room(self, x: f32, y: f32) -> f32 {
+        if !self.on || self.pad <= 0.0 {
+            return f32::INFINITY;
+        }
+        let mut min_sq = f32::INFINITY;
+        for &(x0, x1, y0, y1) in self.keep.rows() {
+            let ch = (y1 - y0) as f32;
+            let (bx0, bx1) = (x0 as f32 - self.pad, x1 as f32 + self.pad);
+            let by0 = y0 as f32 + self.band.0 * ch - self.pad;
+            let by1 = y0 as f32 + self.band.1 * ch + self.pad;
+            let dx = (bx0 - x).max(x - bx1).max(0.0);
+            let dy = (by0 - y).max(y - by1).max(0.0);
+            let d_sq = dx * dx + dy * dy;
+            if d_sq <= 0.0 {
+                return 0.0;
+            }
+            min_sq = min_sq.min(d_sq);
+        }
+        min_sq.sqrt()
+    }
+
+    /// How much of a light at `(x, y)` shows in front of the letters.
+    #[inline]
+    fn at(self, x: f32, y: f32) -> f32 {
+        if self.on {
+            self.keep
+                .behind_text((x, y), self.band, self.pad, TRAIN_TEXT_FEATHER_PX)
+        } else {
+            1.0
+        }
+    }
+
+    /// The rows `z0..z1` of a light over columns `x0..x1` and rows
+    /// `y0..y1` that a lettered row's band touches, its eased edges and all.
+    fn zone(self, (x0, x1): (i32, i32), (y0, y1): (i32, i32)) -> Option<(i32, i32)> {
+        if !self.on {
+            return None;
+        }
+        let feather = TRAIN_TEXT_FEATHER_PX;
+        let reach = feather.ceil() as i32;
+        let pad = self.pad.ceil() as i32;
+        let mut zone: Option<(i32, i32)> = None;
+        for &(rx0, rx1, ry0, ry1) in self.keep.rows() {
+            if x1 <= rx0 - pad || x0 >= rx1 + pad {
+                continue;
+            }
+            let ch = (ry1 - ry0) as f32;
+            let b0 = (ry0 as f32 + self.band.0 * ch).floor() as i32 - pad - reach;
+            let b1 = (ry0 as f32 + self.band.1 * ch).ceil() as i32 + pad + reach;
+            let (a, b) = (b0.max(y0), b1.min(y1));
+            if a < b {
+                zone = Some(zone.map_or((a, b), |(p, q)| (p.min(a), q.max(b))));
+            }
+        }
+        zone
+    }
+
+    /// Takes the quads from `from` on out of the lettered rows' bands: a
+    /// station centred clear of a band still laid its width into it. Each
+    /// quad's rows in a band's reach are laid a pixel a row at the light
+    /// [`Self::at`] leaves them (none inside, eased at the edges).
+    fn cut_quads(self, quads: &mut Vec<GlowQuad>, from: usize) {
+        if !self.on || self.keep.rows().is_empty() {
+            return;
+        }
+        let scale = |q: &mut GlowQuad, k: f32| {
+            let a = (k * 255.0).round().clamp(0.0, 255.0) as u8;
+            q.color = premul_rgb(q.color, a);
+            q.color2 = premul_rgb(q.color2, a);
+            q.alpha = (f32::from(q.alpha) * k).round() as u8;
+            q.alpha2 = (f32::from(q.alpha2) * k).round() as u8;
+        };
+        let n0 = quads.len();
+        for i in from..n0 {
+            let q = quads[i];
+            let (x0, y0) = (i32::from(q.x), i32::from(q.y));
+            let (x1, y1) = (x0 + i32::from(q.w), y0 + i32::from(q.h));
+            let Some((z0, z1)) = self.zone((x0, x1), (y0, y1)) else {
+                continue;
+            };
+            let cx = 0.5 * (x0 + x1) as f32;
+            for y in z0..z1 {
+                let k = self.at(cx, y as f32 + 0.5);
+                if k * 255.0 < 1.0 {
+                    continue;
+                }
+                let mut piece = q;
+                (piece.y, piece.h) = (y as u16, 1);
+                if k < 1.0 {
+                    scale(&mut piece, k);
+                }
+                quads.push(piece);
+            }
+            if z1 < y1 {
+                let mut below = q;
+                (below.y, below.h) = (z1 as u16, (y1 - z1) as u16);
+                quads.push(below);
+            }
+            if z0 > y0 {
+                quads[i].h = (z0 - y0) as u16;
+            } else {
+                quads[i].w = 0;
+            }
+        }
+        let mut kept = from;
+        for i in from..quads.len() {
+            if quads[i].w > 0 {
+                quads[kept] = quads[i];
+                kept += 1;
+            }
+        }
+        quads.truncate(kept);
+    }
+
+    /// [`Self::cut_quads`] for the head's lights: a halo's rect splits
+    /// losslessly, its falloff held by its centre and radii.
+    fn cut_halos(self, halos: &mut Vec<RainHalo>, from: usize) {
+        if !self.on || self.keep.rows().is_empty() {
+            return;
+        }
+        let n0 = halos.len();
+        for i in from..n0 {
+            let h = halos[i];
+            let (x0, y0) = (i32::from(h.x), i32::from(h.y));
+            let (x1, y1) = (x0 + i32::from(h.w), y0 + i32::from(h.h));
+            let Some((z0, z1)) = self.zone((x0, x1), (y0, y1)) else {
+                continue;
+            };
+            let cx = f32::from(h.cx);
+            for y in z0..z1 {
+                let k = self.at(cx, y as f32 + 0.5);
+                if k * 255.0 < 1.0 {
+                    continue;
+                }
+                let mut piece = h;
+                (piece.y, piece.h) = (y as u16, 1);
+                if k < 1.0 {
+                    piece.color = premul_rgb(h.color, (k * 255.0).round() as u8);
+                }
+                halos.push(piece);
+            }
+            if z1 < y1 {
+                let mut below = h;
+                (below.y, below.h) = (z1 as u16, (y1 - z1) as u16);
+                halos.push(below);
+            }
+            if z0 > y0 {
+                halos[i].h = (z0 - y0) as u16;
+            } else {
+                halos[i].w = 0;
+            }
+        }
+        let mut kept = from;
+        for i in from..halos.len() {
+            if halos[i].w > 0 {
+                halos[kept] = halos[i];
+                kept += 1;
+            }
+        }
+        halos.truncate(kept);
+    }
+}
+
+/// The share of a lettered row's height a train passes behind: its
+/// letters' bodies, from just under the row's top to the baseline. Laid
+/// across them, a Return's crisp thread cut through `brown fox` of the
+/// printed line at its x-height and read as a strike-through; it shows
+/// again below the baseline.
+const TRAIN_TEXT_BAND: (f32, f32) = (0.06, 0.80);
+
+/// How many px a train eases out over at a lettered row's band.
+const TRAIN_TEXT_FEATHER_PX: f32 = 3.0;
+
+/// The share of a lettered row's height a dark train passes behind: all of
+/// it. Below the letters' bodies it still lay inside the letter guard's
+/// judge of the row's cells, which cut it there and eased it back over its
+/// feather into the next row, and a red, an orange or a yellow cut to a
+/// share of its light reads maroon, brown and olive on a dark page (looks6
+/// round 3: the `enter-bottom` Return's warm segment under `quick`,
+/// `4b4721`, `5a4b2c`, `7a624c` and `693e3b`, every one of them the guard's
+/// cut). A dark train is laid clean or not at all ([`dark_clean_taper`]).
+const DARK_TRAIN_TEXT_BAND: (f32, f32) = (0.0, 1.0);
+
+/// How many px round a lettered row's span a dark train stays hidden: the
+/// letter guard's ring, which it judges a cell's light over, and the
+/// train's own feather, so the eased edge lies clear of it too.
+const DARK_TRAIN_TEXT_PAD_PX: f32 =
+    crate::cursor_glow::LETTER_GUARD_RING as f32 + TRAIN_TEXT_FEATHER_PX;
+
+/// How long a dark head's petals and core take to fold into the landing
+/// once the head arrives, ms: kept, they stood as red, violet and amber
+/// specks against the caret's left edge.
+const HEAD_FOLD_MS: f32 = 50.0;
 
 impl Flight {
     fn of(m: &Meteor, ctx: &Ctx<'_>) -> Option<Self> {
@@ -1831,6 +2228,7 @@ impl Flight {
             stride: (l / STATIONS_MAX as f32).max(STATION_STRIDE_MIN_PX),
             axis: Axis::of(dx, dy),
             headless: m.handed_over(),
+            after_ms: after,
         })
     }
 
@@ -1869,27 +2267,32 @@ fn draw_train(
     f: &Flight,
     ctx: &Ctx<'_>,
     frame: &mut Frame<'_>,
-    square: bool,
+    (square, clean, warm): (bool, bool, bool),
+    text: Behind<'_>,
 ) {
     let clip = ctx.geom.beam_clip();
     let step = f.step();
     let light = !ctx.cfg.dark_theme;
 
-    build_stations(verts, m, f, ctx, Layer::Colour, square);
-    let cap = frame.under.len() + UNDER_QUAD_CAP;
+    build_stations(verts, m, f, ctx, Layer::Colour, (square, clean, warm), text);
+    let from = frame.under.len();
+    let cap = from + UNDER_QUAD_CAP;
     let blend = if light {
         GlowBlend::Over
     } else {
         GlowBlend::Add
     };
     rasterize(frame.under, clip, verts, f.axis, step, cap, blend);
+    text.cut_quads(frame.under, from);
 
     if light {
         return;
     }
-    build_stations(verts, m, f, ctx, Layer::White, square);
-    let cap = frame.out.len() + WHITE_QUAD_CAP;
+    build_stations(verts, m, f, ctx, Layer::White, (square, clean, warm), text);
+    let from = frame.out.len();
+    let cap = from + WHITE_QUAD_CAP;
     rasterize(frame.out, clip, verts, f.axis, step, cap, GlowBlend::Add);
+    text.cut_quads(frame.out, from);
 }
 
 #[inline]
@@ -1914,7 +2317,8 @@ fn build_stations(
     f: &Flight,
     ctx: &Ctx<'_>,
     layer: Layer,
-    square: bool,
+    (square, clean, warm): (bool, bool, bool),
+    text: Behind<'_>,
 ) {
     verts.clear();
     let light = !ctx.cfg.dark_theme;
@@ -1953,6 +2357,17 @@ fn build_stations(
         }
         smoothstep01(s / ease_head.max(1e-3)) * smoothstep01((span - s) / ease_tail.max(1e-3))
     };
+    // A dark train too short to reach full light between its eased ends
+    // (a Return's first frames) is drawn at full light in its middle: dimmed
+    // whole it reads as a grey and brown smudge (looks6 N6).
+    let ends_peak = if light || square || !clean || ease_head + ease_tail <= span * (30.0 / 32.0) {
+        1.0
+    } else {
+        (0..=32)
+            .map(|i| ends(span * i as f32 / 32.0))
+            .fold(0.0f32, f32::max)
+            .max(1e-3)
+    };
     let fine = END_EASE_STATIONS as f32;
     let head_zone = (0..END_EASE_STATIONS).map(|i| ease_head * i as f32 / fine);
     let body = (0..n)
@@ -1973,6 +2388,11 @@ fn build_stations(
         }
         let px = f.head.0 - f.unit.0 * s;
         let py = f.head.1 - f.unit.1 * s + rail;
+        // Across a lettered row the train passes behind the letters.
+        let shows = text.at(px, py);
+        if shows <= 0.0 {
+            continue;
+        }
 
         let (color, cov, half) = match layer {
             Layer::Colour => {
@@ -1982,7 +2402,7 @@ fn build_stations(
                     } else {
                         light_peak * (-(s - f.shoulder) / (COLOUR_FALLOFF_SHARE * f.l)).exp()
                     };
-                    let cov = ink * alpha * end_ease;
+                    let cov = ink * alpha * end_ease * shows;
                     if cov < 1.0 {
                         continue;
                     }
@@ -1993,15 +2413,35 @@ fn build_stations(
                     } else {
                         paper_ink(stop, ctx.cfg.theme_fg, ctx.cfg.theme_bg, InkRole::OverText)
                     };
+                    let half = if warm && !square {
+                        half * paper_gold_width(rgb)
+                    } else {
+                        half
+                    };
                     (rgb, cov, half)
                 } else {
-                    let c = f.colour_cov * (-s / (COLOUR_FALLOFF_SHARE * f.l)).exp();
-                    let cov = c * alpha * end_ease;
+                    // The dark train's fades along it and in time narrow it
+                    // at a clean level rather than dimming its hue toward
+                    // brown (looks6 N6); its eased ends keep their ease.
+                    let k = (-s / (COLOUR_FALLOFF_SHARE * f.l)).exp() * alpha * shows;
+                    let half = f.width_at(s) * 0.5;
+                    let (k, half) = if square || !clean {
+                        (k, half)
+                    } else {
+                        let (k, half) = dark_clean_taper(k, half, DARK_TRAIN_CLEAN_SHARE);
+                        fit_room(k, half, text.room(px, py))
+                    };
+                    let cov = f.colour_cov * k * (end_ease / ends_peak).min(1.0);
                     if cov < 1.0 {
                         continue;
                     }
                     let stop = spectrum(walk_pace(m.arc((f.to_go + s) / cw)));
-                    (stop, cov, f.width_at(s) * 0.5)
+                    let cov = if warm && clean && !square {
+                        (cov * dark_warm_gain(stop)).min(255.0)
+                    } else {
+                        cov
+                    };
+                    (stop, cov, half)
                 }
             }
             Layer::White => {
@@ -2015,15 +2455,31 @@ fn build_stations(
                 } else {
                     white_printed_share(py - m.y0, rows_off, ch)
                 };
-                let c = f.head_cov * (-tail / f.white_fall).exp() * printed;
-                let cov = c * alpha * end_ease;
-                if cov < 1.0 {
-                    continue;
-                }
                 let blend = smoothstep01((s - f.white_shoulder) / f.white_shoulder.max(1.0));
                 let share =
                     SHOULDER_WIDTH_SHARE + (WHITE_WIDTH_SHARE - SHOULDER_WIDTH_SHARE) * blend;
-                (0x00FF_FFFF, cov, f.width_at(s) * 0.5 * share)
+                let half = f.width_at(s) * 0.5 * share;
+                // On a dark page dimmed white heat is a grey smudge (looks6
+                // N6): off the printed line, along its tail and in time it
+                // narrows at its own white to nothing instead.
+                let fade = (-tail / f.white_fall).exp() * alpha * shows;
+                let (k, half) = if light || square || !clean {
+                    (fade * printed, half)
+                } else {
+                    let off_print = if printed >= 1.0 {
+                        1.0
+                    } else {
+                        ((printed - WHITE_PRINTED_SHARE) / (1.0 - WHITE_PRINTED_SHARE))
+                            .clamp(0.0, 1.0)
+                    };
+                    let (k, half) = dark_clean_taper(fade * off_print, half, 1.0);
+                    fit_room(k, half, text.room(px, py))
+                };
+                let cov = f.head_cov * k * (end_ease / ends_peak).min(1.0);
+                if cov < 1.0 {
+                    continue;
+                }
+                (0x00FF_FFFF, cov, half)
             }
         };
         let half = half.max(0.5);
@@ -2046,17 +2502,29 @@ fn build_stations(
     }
 }
 
-fn draw_head(m: &Meteor, f: &Flight, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
+fn draw_head(
+    m: &Meteor,
+    f: &Flight,
+    ctx: &Ctx<'_>,
+    frame: &mut Frame<'_>,
+    (clean, fold): (bool, bool),
+    text: Behind<'_>,
+) {
     if f.headless {
         return;
     }
+    // On paper the head is its train's own eased end. Squashed flat to keep
+    // off the letters, its core drew a crisp one-pixel level line at the
+    // printed line's top after a Return (an overline, a hyphen), and its
+    // petals hairlines beside it.
+    if !ctx.cfg.dark_theme {
+        return;
+    }
     let geom = ctx.geom;
-    let light = !ctx.cfg.dark_theme;
     let r_c = (NUCLEUS_MIN_PX).max(NUCLEUS_W_SHARE * f.w);
-    let squash = if light { LIGHT_SQUASH } else { 1.0 };
     let (rx, ry) = match f.axis {
-        Axis::Horizontal => (r_c * f.stretch, r_c * squash),
-        Axis::Vertical => (r_c * squash, r_c * f.stretch),
+        Axis::Horizontal => (r_c * f.stretch, r_c),
+        Axis::Vertical => (r_c, r_c * f.stretch),
     };
     let (nx, ny) = (rx * f.flash, ry * f.flash);
     let cx = f.head.0 + f.unit.0 * NUCLEUS_LEAD_PX;
@@ -2070,56 +2538,59 @@ fn draw_head(m: &Meteor, f: &Flight, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
     }
     let coma_cov = (COMA_COV_SHARE * f.head_cov * f.fade_c).clamp(0.0, 255.0);
     let core_cov = (f.head_cov * f.fade_w).clamp(0.0, 255.0);
-    let spin = if !coma_on || ctx.cfg.reduced_motion {
-        0.0
-    } else {
-        std::f32::consts::TAU * ms_since(m.t0, ctx.now) / COMA_SPIN_MS
-    };
-    let (orbit_x, orbit_y) = (
-        COMA_R_SCALE * COMA_PETAL_ORBIT * rx,
-        COMA_R_SCALE * COMA_PETAL_ORBIT * ry,
-    );
     let (petal_x, petal_y) = (
         COMA_R_SCALE * COMA_PETAL_R * rx,
         COMA_R_SCALE * COMA_PETAL_R * ry,
     );
-    let petal_at = |i: usize| {
-        let a = spin + std::f32::consts::TAU * (i as f32) / (COMA_PETALS as f32);
-        (cx + orbit_x * a.cos(), cy + orbit_y * a.sin())
+    // On a dark page a dimmed white reads grey and a dimmed orange brown (a
+    // Return's head left a grey blob ringed with brown and green across the
+    // echo, its seven dim petals summing to grey). Each light keeps the
+    // head's own clean level, and its share and its fade shrink it instead,
+    // so the petals stand apart; the core wears the train's hue at the head,
+    // and a warm stop that dims to brown or olive walks the night arc. Once
+    // the head lands its lights fold into the landing over [`HEAD_FOLD_MS`],
+    // and across a lettered row they pass behind the letters as the train
+    // does.
+    let (coma_cov, petal_k, core_cov, core_k, core_rgb) = if clean {
+        let level = f.head_cov.clamp(0.0, 255.0);
+        let folded = if fold {
+            1.0 - smoothstep01(f.after_ms / HEAD_FOLD_MS)
+        } else {
+            1.0
+        };
+        let shrink = folded * text.at(cx, cy);
+        let cw = (geom.cw as f32).max(1.0);
+        (
+            level,
+            (COMA_COV_SHARE * f.fade_c).sqrt() * shrink,
+            level,
+            f.fade_w.sqrt() * shrink,
+            dark_head_rgb(spectrum(walk_pace(m.arc(f.to_go / cw)))),
+        )
+    } else {
+        (coma_cov, 1.0, core_cov, 1.0, 0x00FF_FFFF)
     };
-
-    if light {
-        if coma_on {
-            let ink = (coma_cov * LIGHT_INK_GAIN).min(LIGHT_ALPHA_CAP) as u8;
-            for i in 0..COMA_PETALS {
-                push_halo_veil(
-                    frame.halos,
-                    geom,
-                    petal_at(i),
-                    (petal_x, petal_y),
-                    paper_mark_ink(spectrum_stop(i), ctx.cfg.theme_bg),
-                    ink,
-                );
-            }
-        }
-        if core_on {
-            let cw = (geom.cw as f32).max(1.0);
-            let stop = spectrum(walk_pace(m.arc(f.to_go / cw)));
-            push_halo_veil(
-                frame.halos,
-                geom,
-                (cx, cy),
-                (nx, ny),
-                paper_mark_ink(stop, ctx.cfg.theme_bg),
-                (core_cov * LIGHT_INK_GAIN).min(LIGHT_ALPHA_CAP) as u8,
-            );
-        }
-        return;
-    }
-    if coma_on {
+    let (petal_x, petal_y) = (petal_x * petal_k, petal_y * petal_k);
+    let from = frame.halos.len();
+    if coma_on && petal_x.min(petal_y) >= HEAD_LIGHT_MIN_R_PX {
+        let spin = if ctx.cfg.reduced_motion {
+            0.0
+        } else {
+            std::f32::consts::TAU * ms_since(m.t0, ctx.now) / COMA_SPIN_MS
+        };
+        let (orbit_x, orbit_y) = (
+            COMA_R_SCALE * COMA_PETAL_ORBIT * rx,
+            COMA_R_SCALE * COMA_PETAL_ORBIT * ry,
+        );
         let coma_alpha = coma_cov as u8;
         for i in 0..COMA_PETALS {
-            let (px, py) = petal_at(i);
+            let a = spin + std::f32::consts::TAU * (i as f32) / (COMA_PETALS as f32);
+            let (px, py) = (cx + orbit_x * a.cos(), cy + orbit_y * a.sin());
+            let rgb = if clean {
+                dark_head_stop_rgb(i)
+            } else {
+                dark_petal_stop_rgb(i)
+            };
             push_halo_add(
                 frame.halos,
                 geom,
@@ -2127,11 +2598,12 @@ fn draw_head(m: &Meteor, f: &Flight, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
                 py,
                 petal_x,
                 petal_y,
-                premul_rgb(dark_petal_stop_rgb(i), coma_alpha),
+                premul_rgb(rgb, coma_alpha),
             );
         }
     }
-    if core_on {
+    let (nx, ny) = (nx * core_k, ny * core_k);
+    if core_on && nx.min(ny) >= HEAD_LIGHT_MIN_R_PX {
         push_halo_add(
             frame.halos,
             geom,
@@ -2139,8 +2611,11 @@ fn draw_head(m: &Meteor, f: &Flight, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
             cy,
             nx,
             ny,
-            premul_rgb(0x00FF_FFFF, core_cov as u8),
+            premul_rgb(core_rgb, core_cov as u8),
         );
+    }
+    if clean {
+        text.cut_halos(frame.halos, from);
     }
 }
 
@@ -2176,7 +2651,12 @@ fn draw_pin(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
     if cov < 1.0 {
         return;
     }
-    let light = !ctx.cfg.dark_theme;
+    // On paper the pin would land on the caret's block itself: its level
+    // arms beside the block read as a strike-through, and its upright arm
+    // stood as a tick on the block's top edge. The landing's flash marks it.
+    if !ctx.cfg.dark_theme {
+        return;
+    }
     let arms_rgb = spectrum_snap(l.pin.t);
     let (cx, cy) = (l.x.round() as i32, l.y.round() as i32);
     let a = arm.round() as i32;
@@ -2194,23 +2674,6 @@ fn draw_pin(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
         PIN_NUCLEUS_PX,
         PIN_NUCLEUS_PX,
     );
-    if light {
-        let ink = (cov * LIGHT_INK_GAIN).min(LIGHT_ALPHA_CAP) as u8;
-        if reach > 0 {
-            let arms_ink = paper_mark_ink(arms_rgb, ctx.cfg.theme_bg);
-            for b in arms {
-                push_ink_rect(frame.out, ctx.geom, b, arms_ink, ink);
-            }
-        }
-        push_ink_rect(
-            frame.out,
-            ctx.geom,
-            nuc,
-            ctx.cfg.theme_fg & 0x00FF_FFFF,
-            ink,
-        );
-        return;
-    }
     let arm_premul = premul_rgb(arms_rgb, cov as u8);
     if reach > 0 {
         for (x, y, w, h) in arms {
@@ -2268,13 +2731,15 @@ fn draw_flash(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
         let colour_cov = cap * colour_share * intensity;
         if light {
             let ink = (colour_cov * LIGHT_INK_GAIN).min(LIGHT_ALPHA_CAP) as u8;
-            push_ink_rect(
-                frame.out,
-                geom,
-                (x, y0, cw, ch),
-                paper_mark_ink(stop, ctx.cfg.theme_bg),
-                ink,
-            );
+            if ink > 0 {
+                push_ink_rect(
+                    frame.out,
+                    geom,
+                    (x, y0, cw, ch),
+                    paper_mark_ink(stop, ctx.cfg.theme_bg),
+                    ink,
+                );
+            }
             continue;
         }
         let white_cov = cap * white_share * intensity;
@@ -2610,6 +3075,7 @@ fn draw_sparks(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>, halo_cap: usiz
         return;
     }
     let light = !ctx.cfg.dark_theme;
+    let mut light_stops = [None; SPECTRUM_STOPS];
     for spark in l.spark.iter().take(usize::from(l.sparks)) {
         let Some(((dx, dy), alpha)) = spark_at(*spark, age, ch) else {
             continue;
@@ -2619,7 +3085,6 @@ fn draw_sparks(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>, halo_cap: usiz
             continue;
         }
         let stop = spectrum_snap_index(walk_pace(l.field(dx / cw)));
-        let rgb = landing_stop_ink(stop);
         let arm0 = i32::from(spark.arm).max(1);
         let arm = if alpha >= SPARK_SHRINK_ALPHA {
             arm0
@@ -2630,12 +3095,21 @@ fn draw_sparks(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>, halo_cap: usiz
         };
         let (x, y) = ((l.x + dx).round() as i32, (l.y + dy).round() as i32);
         if light {
+            // A spark's cross touching the caret's block reads as part of
+            // it, as a star's does.
+            if ctx.near_paper_caret((x, y), arm) {
+                continue;
+            }
             let ink = (cov * LIGHT_INK_GAIN).min(LIGHT_ALPHA_CAP) as u8;
-            let c = paper_mark_ink(spectrum_stop(stop), ctx.cfg.theme_bg);
-            push_ink_rect(frame.out, geom, (x - arm, y, 2 * arm + 1, 1), c, ink);
-            push_ink_rect(frame.out, geom, (x, y - arm, 1, 2 * arm + 1), c, ink);
+            if ink > 0 {
+                let c = *light_stops[stop]
+                    .get_or_insert_with(|| paper_mark_ink(spectrum_stop(stop), ctx.cfg.theme_bg));
+                push_ink_rect(frame.out, geom, (x - arm, y, 2 * arm + 1, 1), c, ink);
+                push_ink_rect(frame.out, geom, (x, y - arm, 1, 2 * arm + 1), c, ink);
+            }
             continue;
         }
+        let rgb = landing_stop_ink(stop);
         if alpha >= SPARK_SHRINK_ALPHA && frame.halos.len() < halo_cap {
             let r = arm as f32 + SPARK_HALO_R_ADD_PX;
             push_halo_add(
@@ -2855,27 +3329,6 @@ fn push_halo_add(
     let radii = (rx.round() as i32, ry.round() as i32);
     push_halo_quads(out, geom, usize::MAX, centre, radii, peak, HaloMode::Add);
 }
-
-#[inline]
-fn push_halo_veil(
-    out: &mut Vec<RainHalo>,
-    geom: Geom,
-    c: (f32, f32),
-    r: (f32, f32),
-    color: u32,
-    peak: u8,
-) {
-    if peak < LIGHT_HALO_MIN_PEAK {
-        return;
-    }
-    let scale = (f32::from(peak) / 255.0).max(0.55);
-    let centre = (c.0.round() as i32, c.1.round() as i32);
-    let radii = ((r.0 * scale).round() as i32, (r.1 * scale).round() as i32);
-    let ink = (u32::from(peak) << 24) | (color & 0x00FF_FFFF);
-    push_halo_quads(out, geom, usize::MAX, centre, radii, ink, HaloMode::Over);
-}
-
-const LIGHT_HALO_MIN_PEAK: u8 = 96;
 
 #[inline]
 fn push_ink_rect(
@@ -3118,15 +3571,63 @@ mod tests {
         best
     }
 
-    fn nucleus(halos: &[RainHalo]) -> Option<&RainHalo> {
-        halos
+    /// The heads' nuclei, by shape not colour (on a dark page the nucleus
+    /// wears the train's hue at the head): each the light its corona's
+    /// petals ring, the centroid of the [`COMA_PETALS`] lights nearest it.
+    /// A petal's nearest lights lean to the ring's centre, off the petal.
+    fn nuclei(halos: &[RainHalo]) -> Vec<&RainHalo> {
+        let mut lights: Vec<&RainHalo> = Vec::new();
+        for h in halos {
+            if !lights
+                .iter()
+                .any(|l| (l.cx, l.cy, l.color) == (h.cx, h.cy, h.color))
+            {
+                lights.push(h);
+            }
+        }
+        let at = |h: &RainHalo| (f32::from(h.cx), f32::from(h.cy));
+        lights
             .iter()
-            .filter(|h| is_white(h.color))
-            .max_by(|a, b| lum(a.color).total_cmp(&lum(b.color)))
+            .copied()
+            .filter(|h| {
+                let (x, y) = at(h);
+                let mut near: Vec<(f32, f32)> = lights
+                    .iter()
+                    .map(|o| at(o))
+                    .filter(|&(ox, oy)| (ox, oy) != (x, y))
+                    .collect();
+                if near.len() < COMA_PETALS {
+                    return false;
+                }
+                near.sort_by(|a, b| {
+                    (a.0 - x)
+                        .hypot(a.1 - y)
+                        .total_cmp(&(b.0 - x).hypot(b.1 - y))
+                });
+                let ring = &near[..COMA_PETALS];
+                let n = COMA_PETALS as f32;
+                let (mx, my) = ring
+                    .iter()
+                    .fold((0.0, 0.0), |(sx, sy), p| (sx + p.0 / n, sy + p.1 / n));
+                (mx - x).hypot(my - y) <= 1.5
+            })
+            .collect()
+    }
+
+    /// The brightest light in a halo's colour: its largest channel.
+    fn peak_of(c: u32) -> f32 {
+        let (r, g, b) = chan(c);
+        r.max(g).max(b) as f32
+    }
+
+    fn nucleus(halos: &[RainHalo]) -> Option<&RainHalo> {
+        nuclei(halos)
+            .into_iter()
+            .max_by(|a, b| peak_of(a.color).total_cmp(&peak_of(b.color)))
     }
 
     fn nucleus_cx(halos: &[RainHalo]) -> Option<(f32, f32, f32)> {
-        nucleus(halos).map(|h| (f32::from(h.cx), f32::from(h.cy), lum(h.color)))
+        nucleus(halos).map(|h| (f32::from(h.cx), f32::from(h.cy), peak_of(h.color)))
     }
 
     #[test]
@@ -3476,6 +3977,480 @@ mod tests {
     }
 
     #[test]
+    fn a_dark_return_leaves_no_grey_or_brown_smudge() {
+        // looks6 N6: a dark Return's trains dimmed where they faded, and its
+        // head's seven dim petals summed to a grey blob ringed with brown;
+        // a dimmed white reads grey and a dimmed orange brown on a dark page.
+        // Laid on the page, a train's light is its hue at a clean level or
+        // nothing: few lit pixels read as a grey or a brown smudge, and the
+        // dimming trains (the negative control) leave many.
+        let cfg = config();
+        let page = cfg.theme_bg & 0x00FF_FFFF;
+        let t0 = Instant::now();
+        let smudge = |dims: bool| -> (usize, usize) {
+            let (mut smudged, mut lit) = (0usize, 0usize);
+            for at in [16u64, 35, 60, 90, 140, 200] {
+                let (from, to) = ((5u16, 40u16), (7u16, 2u16));
+                let mut m = Meteors::new();
+                m.dims_dark_trains = dims;
+                let ctx = ctx_at(t0, &cfg, to, 0.25);
+                m.on_event(&mv_as(from, to, Licence::Return), t0, &ctx)
+                    .expect("a Return flies");
+                let mut sc = Scratch::default();
+                let ctx = ctx_at(t0 + ms(at), &cfg, to, 0.25);
+                sc.emit(&mut m, &ctx);
+                let (w, h) = (usize::from(ctx.geom.win_w), usize::from(ctx.geom.win_h));
+                let mut px = vec![page; w * h];
+                for q in sc.under.iter().chain(&sc.out) {
+                    let qw = u32::from(q.w.max(1));
+                    let step = |i: u32, a: u32, b: u32| {
+                        (a * (2 * qw - (2 * i + 1)) + b * (2 * i + 1) + qw) / (2 * qw)
+                    };
+                    for y in usize::from(q.y)..(usize::from(q.y) + usize::from(q.h)).min(h) {
+                        for x in usize::from(q.x)..(usize::from(q.x) + usize::from(q.w)).min(w) {
+                            let i = (x - usize::from(q.x)) as u32;
+                            let (color, alpha) = if q.is_flat() {
+                                (q.color, q.alpha)
+                            } else {
+                                let lerp = |sh: u32| {
+                                    step(i, (q.color >> sh) & 0xff, (q.color2 >> sh) & 0xff) << sh
+                                };
+                                (
+                                    lerp(16) | lerp(8) | lerp(0),
+                                    step(i, u32::from(q.alpha), u32::from(q.alpha2)) as u8,
+                                )
+                            };
+                            let slot = &mut px[y * w + x];
+                            *slot = aterm_render::over_premul(*slot, color, alpha);
+                        }
+                    }
+                }
+                // The head's lights, added as the renderer adds a halo.
+                let add_sat = |a: u32, b: u32| {
+                    [16u32, 8, 0].iter().fold(0u32, |acc, &sh| {
+                        acc | ((((a >> sh) & 0xff) + ((b >> sh) & 0xff)).min(255) << sh)
+                    })
+                };
+                for q in sc.halos.iter().filter(|q| q.mode == HaloMode::Add) {
+                    let (cx, cy) = (i32::from(q.cx), i32::from(q.cy));
+                    let rx2 = i32::from(q.rx) * i32::from(q.rx);
+                    let ry2 = i32::from(q.ry) * i32::from(q.ry);
+                    for y in usize::from(q.y)..(usize::from(q.y) + usize::from(q.h)).min(h) {
+                        let ny = aterm_render::halo_row_ny(y as i32 - cy, ry2);
+                        if ny >= 256 {
+                            continue;
+                        }
+                        for x in usize::from(q.x)..(usize::from(q.x) + usize::from(q.w)).min(w) {
+                            let wt = aterm_render::halo_weight(x as i32 - cx, ny, rx2).min(255);
+                            if wt > 0 {
+                                let slot = &mut px[y * w + x];
+                                *slot = add_sat(*slot, premul_rgb(q.color, wt as u8));
+                            }
+                        }
+                    }
+                }
+                let kind = |p: u32| {
+                    let (hue, sat, val) = crate::color_math::rgb2hsv(p);
+                    if p == page || val < 0.16 {
+                        0u8
+                    } else if (sat < 0.12 && (0.25..0.62).contains(&val))
+                        || ((8.0..48.0).contains(&hue) && sat > 0.3 && val < 0.45)
+                    {
+                        2
+                    } else if val >= 0.45 {
+                        1
+                    } else {
+                        3
+                    }
+                };
+                let kinds: Vec<u8> = px.iter().map(|&p| kind(p)).collect();
+                for y in 0..h {
+                    for x in 0..w {
+                        match kinds[y * w + x] {
+                            0 => continue,
+                            2 => {}
+                            _ => {
+                                lit += 1;
+                                continue;
+                            }
+                        }
+                        lit += 1;
+                        // A grey or brown pixel at a clean light's soft
+                        // edge is its fringe; one with no clean light
+                        // within three pixels is a smudge.
+                        let near_clean = (y.saturating_sub(3)..(y + 4).min(h)).any(|yy| {
+                            (x.saturating_sub(3)..(x + 4).min(w)).any(|xx| kinds[yy * w + xx] == 1)
+                        });
+                        if !near_clean {
+                            smudged += 1;
+                        }
+                    }
+                }
+            }
+            (smudged, lit)
+        };
+        let (shipped, lit) = smudge(false);
+        let (dimmed, dim_lit) = smudge(true);
+        assert!(lit > 0 && dim_lit > 0, "fixture: the Return flies lit");
+        assert!(
+            shipped * 50 <= lit,
+            "a dark Return smudges {shipped} of {lit} lit pixels grey or brown"
+        );
+        assert!(
+            dimmed * 50 > dim_lit,
+            "control: the dimming trains smudge only {dimmed} of {dim_lit}"
+        );
+    }
+
+    /// looks6 N5: on paper the pin lands on the caret's block itself. Its
+    /// level arms beside the block read as a strike-through, and its upright
+    /// arm, cut to the block, still stood as a three-pixel tick on the
+    /// block's top edge. On paper the pin draws nothing within a cell of the
+    /// block (the landing's flash marks it); the control is the same pin on
+    /// dark, whose arms reach there.
+    #[test]
+    fn on_paper_the_pin_draws_nothing_by_the_caret_s_block() {
+        let t0 = Instant::now();
+        let pin = |dark: bool| {
+            let mut cfg = config();
+            cfg.dark_theme = dark;
+            if !dark {
+                cfg.theme_fg = 0x0024_292F;
+                cfg.theme_bg = 0x00FF_FFFF;
+            }
+            let mut m = Meteors::new();
+            let ctx = ctx_at(t0, &cfg, (5, 80), 0.25);
+            let spawn = m.on_event(&mv((5, 0), (5, 80)), t0, &ctx).expect("fly");
+            let mut sc = Scratch::default();
+            sc.emit(
+                &mut m,
+                &ctx_at(t0 + spawn.t_flight + ms(4), &cfg, (5, 80), 0.25),
+            );
+            let l = *m.landings.first().expect("fixture: the meteor landed");
+            sc.clear();
+            {
+                let at = ctx_at(t0 + spawn.t_flight + ms(20), &cfg, (5, 80), 0.25);
+                let mut fr = sc.frame();
+                draw_pin(&l, &at, &mut fr);
+            }
+            (l, sc.out.clone(), sc.halos.len())
+        };
+        let g = geom();
+        let near = |l: &Landing, q: &GlowQuad| {
+            let (cw, ch) = (g.cw as i32, g.ch as i32);
+            let x0 =
+                (l.x as i32 - i32::from(g.origin_x)).div_euclid(cw) * cw + i32::from(g.origin_x);
+            let y0 =
+                (l.y as i32 - i32::from(g.origin_y)).div_euclid(ch) * ch + i32::from(g.origin_y);
+            let (qx, qy) = (i32::from(q.x), i32::from(q.y));
+            let (qw, qh) = (i32::from(q.w), i32::from(q.h));
+            qy < y0 + 2 * ch && qy + qh > y0 - ch && qx < x0 + 2 * cw && qx + qw > x0 - cw
+        };
+        let (l, paper, paper_halos) = pin(false);
+        assert!(
+            paper.iter().all(|q| !near(&l, q)) && paper_halos == 0,
+            "a paper pin draws by the caret's block: {paper:?} and {paper_halos} halos"
+        );
+        let (l, dark, _) = pin(true);
+        assert!(
+            dark.iter().any(|q| near(&l, q)),
+            "control: the dark pin's arms reach by the block"
+        );
+    }
+
+    /// The head's own lights at `at`, alone: each live meteor's head drawn
+    /// as its emit draws it, `clean` and folding unless told otherwise.
+    fn head_lights(
+        m: &Meteors,
+        at: &Ctx<'_>,
+        (clean, fold): (bool, bool),
+        keep: &KeepOut,
+    ) -> Vec<RainHalo> {
+        let mut sc = Scratch::default();
+        {
+            let mut fr = sc.frame();
+            for me in &m.live {
+                if let Some(f) = Flight::of(me, at) {
+                    draw_head(
+                        me,
+                        &f,
+                        at,
+                        &mut fr,
+                        (clean, fold),
+                        Behind::bodies(keep, true),
+                    );
+                }
+            }
+        }
+        sc.halos
+    }
+
+    /// The head's lights folded into the landing: after a Return its petals
+    /// stood on as dots stuck to the caret's left edge (looks6 round 2 N6:
+    /// red, violet and amber at `e120`). Past [`HEAD_FOLD_MS`] after the
+    /// arrival the head lays no light; kept standing (the negative control),
+    /// it does.
+    #[test]
+    fn the_head_folds_into_its_landing() {
+        let cfg = config();
+        let t0 = Instant::now();
+        let keep = KeepOut::default();
+        let lit = |stay: bool, after: u64| -> usize {
+            let (from, to) = ((5u16, 40u16), (7u16, 2u16));
+            let mut m = Meteors::new();
+            let ctx = ctx_at(t0, &cfg, to, 0.25);
+            let spawn = m
+                .on_event(&mv_as(from, to, Licence::Return), t0, &ctx)
+                .expect("a Return flies");
+            let at = ctx_at(t0 + spawn.t_flight + ms(after), &cfg, to, 0.25);
+            let mut sc = Scratch::default();
+            sc.emit(&mut m, &at);
+            head_lights(&m, &at, (true, !stay), &keep).len()
+        };
+        for after in [HEAD_FOLD_MS as u64 + 4, 70, 120] {
+            assert_eq!(
+                lit(false, after),
+                0,
+                "{after} ms after the arrival the head still lays its lights"
+            );
+        }
+        assert!(
+            lit(true, HEAD_FOLD_MS as u64 + 4) > 0,
+            "control: kept standing, the head is already gone"
+        );
+    }
+
+    /// Across a lettered row the trains pass behind the letters' bodies: a
+    /// Return's thread from the old line's end to the new line's start cut
+    /// the printed row's words at x-height (looks6 round 2 N6, `e120`), a
+    /// strike-through. No train or head light stands inside the row's
+    /// letter band; laid over the text (the negative control), it does.
+    #[test]
+    fn a_train_passes_behind_a_lettered_row() {
+        let cfg = config();
+        let g = geom();
+        let (cw, ch) = (g.cw as i32, g.ch as i32);
+        let (ox, oy) = (i32::from(g.origin_x), i32::from(g.origin_y));
+        let row = (ox + 2 * cw, ox + 40 * cw, oy + 6 * ch, oy + 7 * ch);
+        let band = (
+            row.2 as f32 + TRAIN_TEXT_BAND.0 * ch as f32 + TRAIN_TEXT_FEATHER_PX,
+            row.2 as f32 + TRAIN_TEXT_BAND.1 * ch as f32 - TRAIN_TEXT_FEATHER_PX,
+        );
+        let inside = |x: f32, y: f32| {
+            x > row.0 as f32 + TRAIN_TEXT_FEATHER_PX
+                && x < row.1 as f32 - TRAIN_TEXT_FEATHER_PX
+                && (band.0..=band.1).contains(&y)
+        };
+        let t0 = Instant::now();
+        let struck = |over: bool| -> usize {
+            let mut n = 0;
+            for at in [16u64, 35, 60, 90, 140] {
+                let (from, to) = ((5u16, 40u16), (7u16, 2u16));
+                let mut m = Meteors::new();
+                m.trains_over_text = over;
+                m.keep_out.set_rows([row]);
+                let ctx = ctx_at(t0, &cfg, to, 0.25);
+                m.on_event(&mv_as(from, to, Licence::Return), t0, &ctx)
+                    .expect("a Return flies");
+                let mut sc = Scratch::default();
+                sc.emit(&mut m, &ctx_at(t0 + ms(at), &cfg, to, 0.25));
+                n += sc
+                    .under
+                    .iter()
+                    .chain(&sc.out)
+                    .filter(|q| {
+                        // Premultiplied: a dark train's light is its colour.
+                        (q.color | q.color2) & 0x00FF_FFFF != 0
+                            && inside(
+                                f32::from(q.x) + 0.5 * f32::from(q.w),
+                                f32::from(q.y) + 0.5 * f32::from(q.h),
+                            )
+                    })
+                    .count();
+            }
+            n
+        };
+        let behind = struck(false);
+        assert_eq!(
+            behind, 0,
+            "{behind} train lights stand in the letters' band"
+        );
+        assert!(
+            struck(true) > 0,
+            "control: laid over the text, the thread never crosses the row"
+        );
+    }
+
+    /// On a dark page the head's lights are never grey or brown: a Return's
+    /// head kept a white core dimmed to a grey blob (`#57595e`) ringed with
+    /// brown petal fringes over the echo (looks6 round 2 N6). Its core wears
+    /// the train's hue at the head and its warm stops walk the night arc;
+    /// even at their soft edges at most one lit pixel in fifty of the head
+    /// reads grey or brown, and the white head with the warm petals (the
+    /// negative control) reads so far more.
+    #[test]
+    fn a_dark_head_is_never_grey_or_brown() {
+        let cfg = config();
+        let page = cfg.theme_bg & 0x00FF_FFFF;
+        let t0 = Instant::now();
+        let keep = KeepOut::default();
+        let muddy = |clean: bool| -> (usize, usize) {
+            let (mut bad, mut lit) = (0usize, 0usize);
+            for at in [8u64, 16, 30, 45, 60] {
+                let (from, to) = ((5u16, 40u16), (7u16, 2u16));
+                let mut m = Meteors::new();
+                let ctx = ctx_at(t0, &cfg, to, 0.25);
+                m.on_event(&mv_as(from, to, Licence::Return), t0, &ctx)
+                    .expect("a Return flies");
+                let at = ctx_at(t0 + ms(at), &cfg, to, 0.25);
+                let mut sc = Scratch::default();
+                sc.emit(&mut m, &at);
+                let halos = head_lights(&m, &at, (clean, true), &keep);
+                let (w, h) = (usize::from(at.geom.win_w), usize::from(at.geom.win_h));
+                let mut px = vec![page; w * h];
+                for q in halos.iter().filter(|q| q.mode == HaloMode::Add) {
+                    let (cx, cy) = (i32::from(q.cx), i32::from(q.cy));
+                    let rx2 = i32::from(q.rx) * i32::from(q.rx);
+                    let ry2 = i32::from(q.ry) * i32::from(q.ry);
+                    for y in usize::from(q.y)..(usize::from(q.y) + usize::from(q.h)).min(h) {
+                        let ny = aterm_render::halo_row_ny(y as i32 - cy, ry2);
+                        if ny >= 256 {
+                            continue;
+                        }
+                        for x in usize::from(q.x)..(usize::from(q.x) + usize::from(q.w)).min(w) {
+                            let wt = aterm_render::halo_weight(x as i32 - cx, ny, rx2).min(255);
+                            if wt > 0 {
+                                let slot = &mut px[y * w + x];
+                                *slot = aterm_render::add_sat(*slot, premul_rgb(q.color, wt as u8));
+                            }
+                        }
+                    }
+                }
+                for &p in &px {
+                    let (hue, sat, val) = crate::color_math::rgb2hsv(p);
+                    if p == page || val < 0.16 {
+                        continue;
+                    }
+                    lit += 1;
+                    if (sat < 0.12 && (0.25..0.62).contains(&val))
+                        || ((8.0..48.0).contains(&hue) && sat > 0.3 && val < 0.45)
+                    {
+                        bad += 1;
+                    }
+                }
+            }
+            (bad, lit)
+        };
+        let (bad, lit) = muddy(true);
+        assert!(lit > 0, "fixture: the Return's head is lit");
+        assert!(
+            bad * 50 <= lit,
+            "{bad} of the head's {lit} lit pixels read grey or brown"
+        );
+        let (old_bad, old_lit) = muddy(false);
+        assert!(
+            old_bad * 50 > old_lit,
+            "control: the white head reads grey or brown at only {old_bad} of {old_lit}"
+        );
+    }
+
+    /// On paper the meteor draws no head: squashed to keep off the letters,
+    /// its core drew a crisp one-pixel level line at the printed line's top
+    /// after a Return in every ribbon's Enter frame (looks6 round 2, `#4184ff`
+    /// at y316), and its petals hairlines beside it. The train's own eased end
+    /// is the head; on dark (the control) the head is drawn.
+    #[test]
+    fn on_paper_the_meteor_draws_no_head() {
+        let t0 = Instant::now();
+        let keep = KeepOut::default();
+        let heads = |dark: bool| -> usize {
+            let mut cfg = config();
+            cfg.dark_theme = dark;
+            if !dark {
+                cfg.theme_fg = 0x0024_292F;
+                cfg.theme_bg = 0x00FF_FFFF;
+            }
+            let mut n = 0;
+            for at in [0u64, 16, 35, 60] {
+                let (from, to) = ((5u16, 40u16), (7u16, 2u16));
+                let mut m = Meteors::new();
+                let ctx = ctx_at(t0, &cfg, to, 0.25);
+                m.on_event(&mv_as(from, to, Licence::Return), t0, &ctx)
+                    .expect("a Return flies");
+                let at = ctx_at(t0 + ms(at), &cfg, to, 0.25);
+                let mut sc = Scratch::default();
+                sc.emit(&mut m, &at);
+                n += head_lights(&m, &at, (true, true), &keep).len();
+            }
+            n
+        };
+        assert_eq!(heads(false), 0, "the paper meteor drew a head");
+        assert!(heads(true) > 0, "control: the dark meteor drew no head");
+    }
+
+    /// On paper a landing's sparks stand a cell clear of the caret's block,
+    /// every side: a cross touching the block's corner read as part of it
+    /// (looks6 round 2 N5, `e120`). On dark (the control) they fly from the
+    /// block itself.
+    #[test]
+    fn paper_sparks_stand_a_cell_clear_of_the_caret() {
+        let t0 = Instant::now();
+        let g = geom();
+        let (cw, ch) = (g.cw as i32, g.ch as i32);
+        let near = |dark: bool| -> usize {
+            let mut cfg = config();
+            cfg.dark_theme = dark;
+            if !dark {
+                cfg.theme_fg = 0x0024_292F;
+                cfg.theme_bg = 0x00FF_FFFF;
+            }
+            let to = (5u16, 40u16);
+            let x0 = i32::from(g.origin_x) + i32::from(to.1) * cw;
+            let y0 = i32::from(g.origin_y) + i32::from(to.0) * ch;
+            let boxed = |x: i32, y: i32, w: i32, h: i32| {
+                x < x0 + 2 * cw && x + w > x0 - cw && y < y0 + 2 * ch && y + h > y0 - ch
+            };
+            let mut m = Meteors::new();
+            let ctx = ctx_at(t0, &cfg, to, 0.25);
+            let spawn = m.on_event(&mv((5, 0), to), t0, &ctx).expect("fly");
+            let mut sc = Scratch::default();
+            sc.emit(&mut m, &ctx_at(t0 + spawn.t_flight + ms(2), &cfg, to, 0.25));
+            let l = *m.landings.first().expect("fixture: the meteor landed");
+            let mut n = 0;
+            for after in [4u64, 12, 24, 40, 60, 90, 120, 160] {
+                sc.clear();
+                let at = ctx_at(t0 + spawn.t_flight + ms(after), &cfg, to, 0.25);
+                {
+                    let mut fr = sc.frame();
+                    draw_sparks(&l, &at, &mut fr, usize::MAX);
+                }
+                n += sc
+                    .out
+                    .iter()
+                    .filter(|q| {
+                        boxed(
+                            i32::from(q.x),
+                            i32::from(q.y),
+                            i32::from(q.w),
+                            i32::from(q.h),
+                        )
+                    })
+                    .count();
+            }
+            n
+        };
+        let paper = near(false);
+        assert_eq!(
+            paper, 0,
+            "{paper} spark quads within a cell of the paper caret"
+        );
+        assert!(
+            near(true) > 0,
+            "control: the dark sparks never fly by the block"
+        );
+    }
+
+    #[test]
     fn a_dark_coma_is_never_olive() {
         let olive = |rgb: u32| {
             let (h, s, _) = crate::color_math::rgb2hsv(rgb & 0x00FF_FFFF);
@@ -3630,12 +4605,8 @@ mod tests {
             cx >= x40 - 1.0,
             "the chained head appeared at {cx}, behind the old head at {x40}"
         );
-        let heads: std::collections::BTreeSet<u16> = sc
-            .halos
-            .iter()
-            .filter(|h| is_white(h.color))
-            .map(|h| h.cx)
-            .collect();
+        let heads: std::collections::BTreeSet<u16> =
+            nuclei(&sc.halos).iter().map(|h| h.cx).collect();
         assert_eq!(
             heads.len(),
             1,
@@ -3717,9 +4688,9 @@ mod tests {
         sc.emit(&mut m, &c);
         let (_, y7) = geom().cell_center(7, 40);
         assert!(
-            sc.halos
+            nuclei(&sc.halos)
                 .iter()
-                .any(|h| is_white(h.color) && (f32::from(h.cy) - y7).abs() <= 1.0),
+                .any(|h| (f32::from(h.cy) - y7).abs() <= 1.0),
             "B's nucleus is gone from row 7"
         );
     }
@@ -5081,5 +6052,293 @@ mod tests {
         m.reset();
         assert_eq!(m.hand_floor_cell(), None);
         assert!(!m.reduced);
+    }
+
+    /// The trail gallery's glass: 72x14 cells of 14x26 px from (12, 2).
+    fn gallery_geom() -> Geom {
+        Geom {
+            cw: 14,
+            ch: 26,
+            rows: 14,
+            cols: 72,
+            origin_x: 12,
+            origin_y: 2,
+            win_w: 1032,
+            win_h: 378,
+            head: 0,
+        }
+    }
+
+    /// `sc`'s streams laid on a `page` the size of `g`'s window as the
+    /// renderer lays them: the under quads, the over quads, then the halos
+    /// (added, then laid over).
+    fn composite_scratch(sc: &Scratch, g: Geom, page: u32) -> Vec<u32> {
+        let (w, h) = (usize::from(g.win_w), usize::from(g.win_h));
+        let mut px = vec![page; w * h];
+        for q in sc.under.iter().chain(&sc.out) {
+            let qw = u32::from(q.w.max(1));
+            let step = |i: u32, a: u32, b: u32| {
+                (a * (2 * qw - (2 * i + 1)) + b * (2 * i + 1) + qw) / (2 * qw)
+            };
+            for y in usize::from(q.y)..(usize::from(q.y) + usize::from(q.h)).min(h) {
+                for x in usize::from(q.x)..(usize::from(q.x) + usize::from(q.w)).min(w) {
+                    let i = (x - usize::from(q.x)) as u32;
+                    let (color, alpha) = if q.is_flat() {
+                        (q.color, q.alpha)
+                    } else {
+                        let lerp = |sh: u32| {
+                            step(i, (q.color >> sh) & 0xff, (q.color2 >> sh) & 0xff) << sh
+                        };
+                        (
+                            lerp(16) | lerp(8) | lerp(0),
+                            step(i, u32::from(q.alpha), u32::from(q.alpha2)) as u8,
+                        )
+                    };
+                    let slot = &mut px[y * w + x];
+                    *slot = aterm_render::over_premul(*slot, color, alpha);
+                }
+            }
+        }
+        for mode in [HaloMode::Add, HaloMode::Over] {
+            for q in sc.halos.iter().filter(|q| q.mode == mode) {
+                let over_cap = aterm_render::halo_over_cap(q.color);
+                let (cx, cy) = (i32::from(q.cx), i32::from(q.cy));
+                let rx2 = i32::from(q.rx) * i32::from(q.rx);
+                let ry2 = i32::from(q.ry) * i32::from(q.ry);
+                for y in usize::from(q.y)..(usize::from(q.y) + usize::from(q.h)).min(h) {
+                    let ny = aterm_render::halo_row_ny(y as i32 - cy, ry2);
+                    if ny >= 256 {
+                        continue;
+                    }
+                    for x in usize::from(q.x)..(usize::from(q.x) + usize::from(q.w)).min(w) {
+                        let wt = aterm_render::halo_weight(x as i32 - cx, ny, rx2).min(255);
+                        if wt <= 0 {
+                            continue;
+                        }
+                        let slot = &mut px[y * w + x];
+                        *slot = match mode {
+                            HaloMode::Add => {
+                                aterm_render::add_sat(*slot, premul_rgb(q.color, wt as u8))
+                            }
+                            HaloMode::Over => {
+                                aterm_render::over_rgb(*slot, q.color, (wt as u8).min(over_cap))
+                            }
+                        };
+                    }
+                }
+            }
+        }
+        px
+    }
+
+    /// The trail gallery's `enter-bottom` Return on `cfg`'s page at `after`
+    /// ms: from the end of the echo row (11, 26) to the new prompt (13, 2),
+    /// the rows above lettered as the gallery's are.
+    fn gallery_return(
+        cfg: &Config,
+        after: u64,
+        keep: Option<i32>,
+        in_guard: bool,
+    ) -> (Scratch, Geom) {
+        let g = gallery_geom();
+        let t0 = Instant::now();
+        let ctx_g = |now: Instant| Ctx {
+            geom: g,
+            ..ctx_at(now, cfg, (13, 2), 0.25)
+        };
+        let mut m = Meteors::new();
+        m.trains_in_guard = in_guard;
+        if let Some(past) = keep {
+            let (ox, oy, cw, ch) = (12, 2, 14, 26);
+            // The echo row's letters (`past` cells past its last, at column
+            // 25) and the printed line's (its last at column 18).
+            m.keep_out.set_rows([
+                (ox, ox + (26 + past) * cw, oy + 11 * ch, oy + 12 * ch),
+                (ox, ox + (19 + past) * cw, oy + 12 * ch, oy + 13 * ch),
+            ]);
+        }
+        m.on_event(&mv_as((11, 26), (13, 2), Licence::Return), t0, &ctx_g(t0))
+            .expect("a Return flies");
+        let mut sc = Scratch::default();
+        sc.emit(&mut m, &ctx_g(t0 + ms(after)));
+        (sc, g)
+    }
+
+    /// The gallery's judges (looks6 round 3, N6): after every dark Return
+    /// in `enter-bottom` a brown stub, a block 4-5 px wide and 10 tall
+    /// peaking at `4d3419`, stood at the echo row's old caret cell, the
+    /// cell after `fox`: the line's kept span stopped at its last letter,
+    /// so the train's root at the cell after it stood alone while the rest
+    /// was held behind the letters. With the span reaching the cell its
+    /// caret stood in (`CursorGlow::keep_out_boxes`), that cell keeps the
+    /// page's dark across the flight, whether or not the train also keeps
+    /// clear of the letter guard's reach (`DARK_TRAIN_TEXT_PAD_PX`, which
+    /// alone narrows the root too); with the span cut at the letters and
+    /// the train laid into the guard's reach (the negative control) the
+    /// stub stands.
+    #[test]
+    fn a_return_leaves_no_stub_at_the_cell_its_line_ended_in() {
+        let mut cfg = config();
+        cfg.theme_bg = 0x0011_1318;
+        let (x0, x1) = (12 + 26 * 14 - 4, 12 + 27 * 14);
+        let (y0, y1) = (2 + 11 * 26, 2 + 12 * 26);
+        let lift = |past: i32, in_guard: bool| -> i32 {
+            let mut peak = 0;
+            for after in [20u64, 35, 60, 90, 120, 156] {
+                let (sc, g) = gallery_return(&cfg, after, Some(past), in_guard);
+                let px = composite_scratch(&sc, g, cfg.theme_bg);
+                let w = usize::from(g.win_w);
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        let p = px[y as usize * w + x as usize];
+                        for sh in [16, 8, 0] {
+                            let d =
+                                ((p >> sh) & 0xff) as i32 - ((cfg.theme_bg >> sh) & 0xff) as i32;
+                            peak = peak.max(d);
+                        }
+                    }
+                }
+            }
+            peak
+        };
+        let kept = lift(1, false);
+        let spanned = lift(1, true);
+        let stub = lift(0, true);
+        assert!(
+            kept <= 12 && spanned <= 12,
+            "the old caret cell lifts by {kept} across the flight ({spanned} in the guard's reach)"
+        );
+        assert!(
+            stub >= 30,
+            "control: cut at the letters the stub lifts only {stub}"
+        );
+    }
+
+    /// The gallery's judges (looks6 round 3, N6): the dark `enter-bottom`
+    /// Return's warm segment under `quick` read muddy (`4b4721`, `5a4b2c`,
+    /// `7a624c`, `693e3b`): a red, an orange or a yellow added at the
+    /// train's level reads maroon, brown and olive on a dark page. Along
+    /// the gallery's Return, every column whose brightest pixel is a warm
+    /// hue holds it at a clean level, few of them dark; laid at the other
+    /// stops' level (the negative control), many are.
+    #[test]
+    fn a_dark_return_s_warm_stops_read_clean_not_brown() {
+        let mut cfg = config();
+        cfg.theme_bg = 0x0011_1318;
+        let muddy = |dim: bool| -> (usize, usize) {
+            let (mut muddy, mut warm) = (0usize, 0usize);
+            for after in [20u64, 35, 60, 90, 120, 156, 200] {
+                let g = gallery_geom();
+                let t0 = Instant::now();
+                let ctx_g = |now: Instant| Ctx {
+                    geom: g,
+                    ..ctx_at(now, &cfg, (13, 2), 0.25)
+                };
+                let mut m = Meteors::new();
+                m.warm_stops_plain = dim;
+                m.on_event(&mv_as((11, 26), (13, 2), Licence::Return), t0, &ctx_g(t0))
+                    .expect("a Return flies");
+                let mut sc = Scratch::default();
+                sc.emit(&mut m, &ctx_g(t0 + ms(after)));
+                let px = composite_scratch(&sc, g, cfg.theme_bg);
+                let (w, h) = (usize::from(g.win_w), usize::from(g.win_h));
+                for x in 0..w {
+                    let peak = (0..h)
+                        .map(|y| px[y * w + x])
+                        .max_by(|a, b| {
+                            let v = |p: u32| crate::color_math::rgb2hsv(p).2;
+                            v(*a).total_cmp(&v(*b))
+                        })
+                        .unwrap_or(cfg.theme_bg);
+                    let (hue, sat, val) = crate::color_math::rgb2hsv(peak);
+                    if val < 0.16 || sat < 0.3 || !(hue < 70.0 || hue >= 330.0) {
+                        continue;
+                    }
+                    warm += 1;
+                    if val < 0.6 {
+                        muddy += 1;
+                    }
+                }
+            }
+            (muddy, warm)
+        };
+        let (clean, warm) = muddy(false);
+        let (dim, dim_warm) = muddy(true);
+        assert!(
+            warm > 0 && dim_warm > 0,
+            "fixture: the Return lays warm stops"
+        );
+        assert!(
+            clean * 5 <= warm,
+            "{clean} of {warm} warm columns of the Return read dark"
+        );
+        assert!(
+            dim * 2 > dim_warm,
+            "control: at the other stops' level only {dim} of {dim_warm} warm columns read dark"
+        );
+    }
+
+    /// The gallery's judges (looks6 round 3): on paper the `enter-bottom`
+    /// Return's stick went muddy through its yellow (`7d8616`, `9a7e16`,
+    /// `b57b20`), a yellow stop's ink held to the paper's contrast. The band
+    /// thins out there: along the gallery's Return no column carries more
+    /// than a thread of mustard or olive; at its full width (the negative
+    /// control) the band stands there whole.
+    #[test]
+    fn a_paper_return_thins_through_its_mustard() {
+        let mut cfg = config();
+        cfg.dark_theme = false;
+        cfg.theme_fg = 0x001F_2328;
+        cfg.theme_bg = 0x00FF_FFFF;
+        let thickest = |plain: bool| -> (usize, usize) {
+            let (mut most, mut lit) = (0usize, 0usize);
+            for after in [16u64, 35, 60, 90, 120, 156] {
+                let g = gallery_geom();
+                let t0 = Instant::now();
+                let ctx_g = |now: Instant| Ctx {
+                    geom: g,
+                    ..ctx_at(now, &cfg, (13, 2), 0.25)
+                };
+                let mut m = Meteors::new();
+                m.warm_stops_plain = plain;
+                m.on_event(&mv_as((11, 26), (13, 2), Licence::Return), t0, &ctx_g(t0))
+                    .expect("a Return flies");
+                let mut sc = Scratch::default();
+                sc.emit(&mut m, &ctx_g(t0 + ms(after)));
+                let px = composite_scratch(&sc, g, cfg.theme_bg);
+                let (w, h) = (usize::from(g.win_w), usize::from(g.win_h));
+                for x in 0..w {
+                    let (mut mustard, mut band) = (0usize, 0usize);
+                    for y in 0..h {
+                        let p = px[y * w + x];
+                        let (hue, sat, val) = crate::color_math::rgb2hsv(p);
+                        if p == cfg.theme_bg || sat < 0.25 {
+                            continue;
+                        }
+                        band += 1;
+                        if (30.0..78.0).contains(&hue) && val < 0.8 {
+                            mustard += 1;
+                        }
+                    }
+                    most = most.max(mustard);
+                    lit = lit.max(band);
+                }
+            }
+            (most, lit)
+        };
+        let (thin, lit) = thickest(false);
+        let (wide, wide_lit) = thickest(true);
+        assert!(
+            lit >= 4 && wide_lit >= 4,
+            "fixture: the Return's band is lit"
+        );
+        assert!(
+            thin <= 3,
+            "a column of the paper Return carries {thin} px of mustard or olive"
+        );
+        assert!(
+            wide >= 5,
+            "control: at full width the mustard stands only {wide} px"
+        );
     }
 }

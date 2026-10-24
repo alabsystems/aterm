@@ -371,7 +371,13 @@ pub(crate) fn agent_switch_label(product: &str) -> String {
     match Program::ALL.into_iter().find(|p| p.product() == product) {
         Some(Program::Codex) => CODEX_SWITCH_LABEL.to_string(),
         Some(
-            Program::Claude | Program::Agy | Program::Muse | Program::Gemini | Program::Generic,
+            Program::Claude
+            | Program::Agy
+            | Program::Muse
+            | Program::Gemini
+            | Program::Grok
+            | Program::Kimi
+            | Program::Generic,
         )
         | None => format!("Supervise {product} sessions"),
     }

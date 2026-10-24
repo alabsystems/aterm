@@ -106,12 +106,56 @@ pub fn subscriber_turned_off(home: &Path) -> bool {
 /// Record that the person turned this login's subscriber off ([`subscriber_off_path`]), in
 /// the 0700 `~/.config/aterm/secrets`.
 pub fn record_subscriber_off(home: &Path) -> crate::Result<()> {
+    let _decision = SubscriberDecision::take(home)?;
+    record_subscriber_off_locked(home)
+}
+
+fn record_subscriber_off_locked(home: &Path) -> crate::Result<()> {
     crate::fsx::ensure_private_dir(&secrets_dir(home))?;
     crate::fsx::write_atomic(
         &subscriber_off_path(home),
         b"the subscriber was turned off by choice; aterm secrets agent on turns it back on\n",
         0o600,
     )
+}
+
+/// Orders the subscriber's local on/off decision and service changes across
+/// processes. It is separate from the vault's data lock and never spans a fetch.
+struct SubscriberDecision(std::fs::File);
+
+impl SubscriberDecision {
+    fn take(home: &Path) -> crate::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let dir = secrets_dir(home);
+        crate::fsx::ensure_private_dir(&dir)?;
+        let path = dir.join("subscriber.lock");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)?;
+        if !file.metadata()?.is_file() {
+            return Err(Error::new(format!(
+                "{}: not a regular file",
+                path.display()
+            )));
+        }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the take of SubscriberDecision, whose Drop releases the local service decision lock"
+        )]
+        file.lock()?;
+        Ok(Self(file))
+    }
+}
+
+impl Drop for SubscriberDecision {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 
 /// launchd's restart window: a `KeepAlive` job that ended is started again within
@@ -675,10 +719,19 @@ fn check_own_home(home: &Path) -> crate::Result<()> {
 /// The subscriber installed is on again: the person's record that it was turned off
 /// ([`subscriber_off_path`]) goes.
 pub fn install(home: &Path, job: Job, program: &Path, args: &[String]) -> crate::Result<String> {
-    let line = install_job(home, job, program, args)?;
+    check_own_home(home)?;
     if job != Job::Subscriber {
-        return Ok(line);
+        return install_job(home, job, program, args);
     }
+    install_subscriber_with(home, || install_job(home, job, program, args))
+}
+
+fn install_subscriber_with(
+    home: &Path,
+    install: impl FnOnce() -> crate::Result<String>,
+) -> crate::Result<String> {
+    let _decision = SubscriberDecision::take(home)?;
+    let line = install()?;
     // The job runs either way: a record left behind says less than the job that runs.
     Ok(match clear_subscriber_off(home) {
         Ok(()) => line,
@@ -686,9 +739,33 @@ pub fn install(home: &Path, job: Job, program: &Path, args: &[String]) -> crate:
     })
 }
 
+/// Repair a subscriber setup already found missing, preserving a person's Sync
+/// off recorded since that probe. `None` means it was left off, not installed.
+/// The check and install are ordered with [`turn_off`] and explicit [`install`].
+pub fn repair_subscriber(
+    home: &Path,
+    program: &Path,
+    args: &[String],
+) -> crate::Result<Option<String>> {
+    check_own_home(home)?;
+    repair_subscriber_with(home, || install_job(home, Job::Subscriber, program, args))
+}
+
+fn repair_subscriber_with(
+    home: &Path,
+    install: impl FnOnce() -> crate::Result<String>,
+) -> crate::Result<Option<String>> {
+    let _decision = SubscriberDecision::take(home)?;
+    if crate::fsx::kind(&subscriber_off_path(home))? != crate::fsx::Kind::Missing {
+        return Ok(None);
+    }
+    // This is a repair, not an explicit On: it never clears an off decision.
+    // A later Off waits for this local install, then records and removes it.
+    install().map(Some)
+}
+
 /// [`install`]'s job, without the person's record.
 fn install_job(home: &Path, job: Job, program: &Path, args: &[String]) -> crate::Result<String> {
-    check_own_home(home)?;
     #[cfg(target_os = "macos")]
     {
         let plist = write_plist(home, job, program, args)?;
@@ -733,6 +810,32 @@ fn install_job(home: &Path, job: Job, program: &Path, args: &[String]) -> crate:
 /// Stop and remove `job`, for this login's own `home` ([`own_home`]).
 pub fn uninstall(home: &Path, job: Job) -> crate::Result<bool> {
     check_own_home(home)?;
+    let _decision = (job == Job::Subscriber)
+        .then(|| SubscriberDecision::take(home))
+        .transpose()?;
+    uninstall_job(home, job)
+}
+
+/// Turn a job off by choice. For the subscriber, publish that choice and remove
+/// the job in one local decision, so an older automatic repair cannot undo it.
+pub fn turn_off(home: &Path, job: Job) -> crate::Result<bool> {
+    check_own_home(home)?;
+    if job != Job::Subscriber {
+        return uninstall_job(home, job);
+    }
+    turn_off_subscriber_with(home, || uninstall_job(home, job))
+}
+
+fn turn_off_subscriber_with(
+    home: &Path,
+    remove: impl FnOnce() -> crate::Result<bool>,
+) -> crate::Result<bool> {
+    let _decision = SubscriberDecision::take(home)?;
+    record_subscriber_off_locked(home)?;
+    remove()
+}
+
+fn uninstall_job(home: &Path, job: Job) -> crate::Result<bool> {
     let remove = |path: &Path| match std::fs::remove_file(path) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -810,6 +913,20 @@ pub fn state(home: &Path, job: Job) -> crate::Result<State> {
 mod tests {
     use super::*;
 
+    fn assert_subscriber_decision_held(home: &Path) {
+        let independent = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(secrets_dir(home).join("subscriber.lock"))
+            .unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "an independent scratch handle proves the lifecycle callback still holds its decision lock"
+        )]
+        let taken = independent.try_lock();
+        assert!(matches!(taken, Err(std::fs::TryLockError::WouldBlock)));
+    }
+
     fn words(args: &[&str]) -> Vec<String> {
         args.iter().map(|a| a.to_string()).collect()
     }
@@ -880,6 +997,120 @@ mod tests {
         clear_subscriber_off(home).expect("cleared");
         assert!(!subscriber_turned_off(home));
         clear_subscriber_off(home).expect("nothing to clear");
+    }
+
+    #[test]
+    fn subscriber_repair_preserves_off_but_fresh_on_can_replace_it() {
+        use std::cell::Cell;
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let home = scratch.path();
+        let installs = Cell::new(0);
+        let install = || {
+            assert_subscriber_decision_held(home);
+            installs.set(installs.get() + 1);
+            Ok("scratch subscriber installed".to_owned())
+        };
+        assert!(repair_subscriber_with(home, install).unwrap().is_some());
+        assert_eq!(
+            installs.get(),
+            1,
+            "an unchanged enabled repair still installs"
+        );
+        turn_off_subscriber_with(home, || {
+            assert_subscriber_decision_held(home);
+            assert!(subscriber_turned_off(home), "off is saved before removal");
+            Ok(true)
+        })
+        .unwrap();
+        assert!(repair_subscriber_with(home, install).unwrap().is_none());
+        assert_eq!(installs.get(), 1, "the older repair calls no installer");
+        assert!(subscriber_turned_off(home));
+        install_subscriber_with(home, || {
+            assert_subscriber_decision_held(home);
+            Err(Error::new("injected install failure"))
+        })
+        .unwrap_err();
+        assert!(
+            subscriber_turned_off(home),
+            "a failed On preserves the choice"
+        );
+        install_subscriber_with(home, install).unwrap();
+        assert_eq!(installs.get(), 2, "explicit On or Join can install");
+        assert!(!subscriber_turned_off(home));
+    }
+
+    #[test]
+    fn subscriber_off_after_a_repair_orders_removal_after_its_install() {
+        use std::cell::Cell;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let home = scratch.path().to_owned();
+        let running = Arc::new(AtomicBool::new(false));
+        let (entered, installing) = mpsc::sync_channel(1);
+        let (release, finish_install) = mpsc::sync_channel(1);
+        let repair_home = home.clone();
+        let repair_running = Arc::clone(&running);
+        let repair = std::thread::spawn(move || {
+            repair_subscriber_with(&repair_home, || {
+                assert_subscriber_decision_held(&repair_home);
+                repair_running.store(true, Ordering::SeqCst);
+                entered.send(()).unwrap();
+                finish_install
+                    .recv_timeout(Duration::from_secs(60))
+                    .unwrap();
+                Ok("scratch subscriber installed".into())
+            })
+        });
+        installing.recv_timeout(Duration::from_secs(60)).unwrap();
+        let off_home = home.clone();
+        let off_running = Arc::clone(&running);
+        let (requested, requesting) = mpsc::sync_channel(1);
+        let off = std::thread::spawn(move || {
+            requested.send(()).unwrap();
+            turn_off_subscriber_with(&off_home, || {
+                assert_subscriber_decision_held(&off_home);
+                assert!(subscriber_turned_off(&off_home));
+                off_running.store(false, Ordering::SeqCst);
+                Ok(true)
+            })
+        });
+        requesting.recv_timeout(Duration::from_secs(60)).unwrap();
+        release.send(()).unwrap();
+        assert!(repair.join().unwrap().unwrap().is_some());
+        assert!(off.join().unwrap().unwrap());
+        assert!(subscriber_turned_off(&home));
+        assert!(!running.load(Ordering::SeqCst));
+        let stale_install = Cell::new(false);
+        assert!(
+            repair_subscriber_with(&home, || {
+                stale_install.set(true);
+                Ok("must not install".into())
+            })
+            .unwrap()
+            .is_none()
+        );
+        assert!(!stale_install.get());
+    }
+
+    #[test]
+    fn subscriber_off_write_failure_never_removes_the_job() {
+        use std::cell::Cell;
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let home = scratch.path();
+        let decision = SubscriberDecision::take(home).unwrap();
+        std::fs::create_dir(subscriber_off_path(home)).unwrap();
+        drop(decision);
+        let removed = Cell::new(false);
+        assert!(
+            turn_off_subscriber_with(home, || {
+                removed.set(true);
+                Ok(true)
+            })
+            .is_err()
+        );
+        assert!(!removed.get());
     }
 
     #[test]

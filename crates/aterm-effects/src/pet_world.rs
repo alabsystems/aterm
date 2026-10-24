@@ -345,6 +345,7 @@ enum PetGlyph {
     Blank,
     Speck,
     Substantive,
+    Letter,
 }
 
 /// A fixed-budget occupancy window and small, text-free observation set.
@@ -353,14 +354,9 @@ enum PetGlyph {
 pub struct PetWorld {
     cells: Vec<PetCell>,
     glyphs: Vec<Option<PetGlyph>>,
-    /// Per cell: a letterform ([`Self::letter_at`]).
-    letters: Vec<bool>,
     blocked_prefix: Vec<u16>,
     protected_prefix: Vec<u16>,
-    /// Per cell: is anything painted in the text layer.
-    inked: Vec<bool>,
     /// THE GROUND PLANE.
-    ground_cells: Vec<PetCell>,
     ground_blocked_prefix: Vec<u16>,
     ground_protected_prefix: Vec<u16>,
     /// Whether this observation saw a transient cell, so the ground plane differs from `cells`.
@@ -389,11 +385,8 @@ impl Default for PetWorld {
         Self {
             cells: Vec::new(),
             glyphs: Vec::new(),
-            letters: Vec::new(),
             blocked_prefix: Vec::new(),
             protected_prefix: Vec::new(),
-            inked: Vec::new(),
-            ground_cells: Vec::new(),
             ground_blocked_prefix: Vec::new(),
             ground_protected_prefix: Vec::new(),
             ground_split: false,
@@ -609,14 +602,9 @@ impl PetWorld {
         if self.cells.is_empty() {
             self.cells.resize(MAX_WORLD_CELLS, PetCell::Unknown);
             self.glyphs.resize(MAX_WORLD_CELLS, None);
-            self.letters.resize(MAX_WORLD_CELLS, false);
             self.blocked_prefix.resize(PREFIX_LEN, 0);
             self.protected_prefix.resize(PREFIX_LEN, 0);
-            self.inked.resize(MAX_WORLD_CELLS, true);
             self.hull.resize(MAX_WORLD_ROWS, (0, 0));
-        }
-        if track_ground && self.ground_cells.is_empty() {
-            self.ground_cells.resize(MAX_WORLD_CELLS, PetCell::Unknown);
         }
         let stride = MAX_WORLD_COLS + 1;
         self.blocked_prefix[..=cols].fill(0);
@@ -628,18 +616,19 @@ impl PetWorld {
             let prefix_row = (r + 1) * stride;
             self.blocked_prefix[prefix_row] = 0;
             self.protected_prefix[prefix_row] = 0;
+            if self.ground_split {
+                self.ground_blocked_prefix[prefix_row] = 0;
+                self.ground_protected_prefix[prefix_row] = 0;
+            }
             let mut row_blocked = 0u16;
             let mut row_protected = 0u16;
+            let mut row_ground_blocked = 0u16;
+            let mut row_ground_protected = 0u16;
             let local_r = self.coverage.row + r;
             let frame_r = pane.row + local_r;
             let Some(row) = input.cells.get(frame_r) else {
                 self.cells[row_base..row_base + cols].fill(PetCell::Unknown);
                 self.glyphs[row_base..row_base + cols].fill(None);
-                self.letters[row_base..row_base + cols].fill(false);
-                self.inked[row_base..row_base + cols].fill(true);
-                if track_ground {
-                    self.ground_cells[row_base..row_base + cols].fill(PetCell::Unknown);
-                }
                 let mut c = 0;
                 while c < cols {
                     let index = prefix_row + c + 1;
@@ -648,6 +637,14 @@ impl PetWorld {
                     self.blocked_prefix[index] = self.blocked_prefix[index - stride] + row_blocked;
                     self.protected_prefix[index] =
                         self.protected_prefix[index - stride] + row_protected;
+                    if self.ground_split {
+                        row_ground_blocked += 1;
+                        row_ground_protected += 1;
+                        self.ground_blocked_prefix[index] =
+                            self.ground_blocked_prefix[index - stride] + row_ground_blocked;
+                        self.ground_protected_prefix[index] =
+                            self.ground_protected_prefix[index - stride] + row_ground_protected;
+                    }
                     c += 1;
                 }
                 self.hull[r] = (0, cols as u16);
@@ -656,28 +653,34 @@ impl PetWorld {
             let (mut hull_lo, mut hull_hi) = (u16::MAX, 0u16);
             let mut spans = [(0, 0); MAX_REGIONS];
             let mut n_spans = 0;
-            for rect in exclusions {
-                if let Some(span) = exclusion_span(*rect, local_r, pane.cols) {
-                    spans[n_spans] = span;
-                    n_spans += 1;
+            if !exclusions.is_empty() {
+                for rect in exclusions {
+                    if let Some(span) = exclusion_span(*rect, local_r, pane.cols) {
+                        spans[n_spans] = span;
+                        n_spans += 1;
+                    }
                 }
             }
             let spans = &spans[..n_spans];
             let mut overlay_spans = [(0, 0); MAX_REGIONS];
             let mut n_overlay = 0;
-            for rect in overlays {
-                if let Some(span) = exclusion_span(*rect, local_r, pane.cols) {
-                    overlay_spans[n_overlay] = span;
-                    n_overlay += 1;
+            if !overlays.is_empty() {
+                for rect in overlays {
+                    if let Some(span) = exclusion_span(*rect, local_r, pane.cols) {
+                        overlay_spans[n_overlay] = span;
+                        n_overlay += 1;
+                    }
                 }
             }
             let overlay_spans = &overlay_spans[..n_overlay];
             let mut typed_spans = [(0, 0); MAX_REGIONS];
             let mut n_typed = 0;
-            for rect in reserved_ink {
-                if let Some(span) = exclusion_span(*rect, local_r, pane.cols) {
-                    typed_spans[n_typed] = span;
-                    n_typed += 1;
+            if !reserved_ink.is_empty() {
+                for rect in reserved_ink {
+                    if let Some(span) = exclusion_span(*rect, local_r, pane.cols) {
+                        typed_spans[n_typed] = span;
+                        n_typed += 1;
+                    }
                 }
             }
             let typed_spans = &typed_spans[..n_typed];
@@ -761,18 +764,18 @@ impl PetWorld {
                                 || (input.cluster_at(frame_r, column).is_none()
                                     && input.combining_at(frame_r, column).is_none()))
                     };
-                self.letters[row_base + c] = line == LineSize::SingleWidth
-                    && if cell.wide {
-                        c > 0 && self.letters[row_base + c - 1]
-                    } else if cell.ch.is_ascii() {
-                        cell.ch.is_ascii_alphanumeric()
-                    } else {
-                        cell.ch.is_alphanumeric()
-                    };
                 self.glyphs[row_base + c] = (line == LineSize::SingleWidth).then_some(if !glyph {
                     PetGlyph::Blank
                 } else if speck {
                     PetGlyph::Speck
+                } else if if cell.wide {
+                    c > 0 && self.glyphs[row_base + c - 1] == Some(PetGlyph::Letter)
+                } else if cell.ch.is_ascii() {
+                    cell.ch.is_ascii_alphanumeric()
+                } else {
+                    cell.ch.is_alphanumeric()
+                } {
+                    PetGlyph::Letter
                 } else {
                     PetGlyph::Substantive
                 });
@@ -785,7 +788,6 @@ impl PetWorld {
                     hull_lo = hull_lo.min(c as u16);
                     hull_hi = c as u16 + 1;
                 }
-                self.inked[row_base + c] = others || painted;
                 if cursor && !others && n_caret_cells < self.caret_cells.len() {
                     self.caret_cells[n_caret_cells] = CaretCell {
                         row: r,
@@ -802,6 +804,8 @@ impl PetWorld {
                     PetCell::Clear
                 };
                 self.cells[row_base + c] = class;
+                let prev_row_blocked = row_blocked;
+                let prev_row_protected = row_protected;
                 let index = prefix_row + c + 1;
                 row_blocked += u16::from(class != PetCell::Clear);
                 row_protected += u16::from(matches!(class, PetCell::Unknown | PetCell::Protected));
@@ -822,53 +826,47 @@ impl PetWorld {
                     n_ground_caret_cells += 1;
                 }
                 if track_ground {
-                    self.ground_cells[row_base + c] = if transient {
+                    if transient && !self.ground_split {
                         self.ground_split = true;
-                        if lasting || cursor {
-                            PetCell::Protected
-                        } else if painted {
-                            PetCell::Ink
-                        } else {
-                            PetCell::Clear
+                        if self.ground_blocked_prefix.is_empty() {
+                            self.ground_blocked_prefix.resize(PREFIX_LEN, 0);
+                            self.ground_protected_prefix.resize(PREFIX_LEN, 0);
                         }
-                    } else {
-                        class
-                    };
+                        self.ground_blocked_prefix[..index]
+                            .copy_from_slice(&self.blocked_prefix[..index]);
+                        self.ground_protected_prefix[..index]
+                            .copy_from_slice(&self.protected_prefix[..index]);
+                        row_ground_blocked = prev_row_blocked;
+                        row_ground_protected = prev_row_protected;
+                    }
+                    if self.ground_split {
+                        let ground_class = if transient {
+                            if lasting || cursor {
+                                PetCell::Protected
+                            } else if painted {
+                                PetCell::Ink
+                            } else {
+                                PetCell::Clear
+                            }
+                        } else {
+                            class
+                        };
+                        row_ground_blocked += u16::from(ground_class != PetCell::Clear);
+                        row_ground_protected += u16::from(matches!(
+                            ground_class,
+                            PetCell::Unknown | PetCell::Protected
+                        ));
+                        self.ground_blocked_prefix[index] =
+                            self.ground_blocked_prefix[index - stride] + row_ground_blocked;
+                        self.ground_protected_prefix[index] =
+                            self.ground_protected_prefix[index - stride] + row_ground_protected;
+                    }
                 }
             }
             self.hull[r] = (hull_lo, hull_hi);
         }
         self.caret_cells_len = n_caret_cells as u8;
         self.ground_caret_cells_len = n_ground_caret_cells as u8;
-        if self.ground_split {
-            if self.ground_blocked_prefix.is_empty() {
-                self.ground_blocked_prefix.resize(PREFIX_LEN, 0);
-                self.ground_protected_prefix.resize(PREFIX_LEN, 0);
-            }
-            self.ground_blocked_prefix[..=cols].fill(0);
-            self.ground_protected_prefix[..=cols].fill(0);
-            for r in 0..rows {
-                let row_base = r * MAX_WORLD_COLS;
-                let prefix_row = (r + 1) * stride;
-                self.ground_blocked_prefix[prefix_row] = 0;
-                self.ground_protected_prefix[prefix_row] = 0;
-                let mut row_blocked = 0u16;
-                let mut row_protected = 0u16;
-                let mut c = 0;
-                while c < cols {
-                    let index = prefix_row + c + 1;
-                    let cell = self.ground_cells[row_base + c];
-                    row_blocked += u16::from(cell != PetCell::Clear);
-                    row_protected +=
-                        u16::from(matches!(cell, PetCell::Unknown | PetCell::Protected));
-                    self.ground_blocked_prefix[index] =
-                        self.ground_blocked_prefix[index - stride] + row_blocked;
-                    self.ground_protected_prefix[index] =
-                        self.ground_protected_prefix[index - stride] + row_protected;
-                    c += 1;
-                }
-            }
-        }
         if self.selection_rect.is_none() {
             self.selection_target = None;
         }
@@ -894,7 +892,10 @@ impl PetWorld {
                     let row_base = r * MAX_WORLD_COLS;
                     let row_glyphs = &self.glyphs[row_base..row_base + cols];
                     for (c, glyph) in row_glyphs.iter().enumerate().rev() {
-                        if matches!(glyph, Some(PetGlyph::Speck | PetGlyph::Substantive)) {
+                        if matches!(
+                            glyph,
+                            Some(PetGlyph::Speck | PetGlyph::Substantive | PetGlyph::Letter)
+                        ) {
                             absolute_row = abs;
                             col = (self.coverage.col + c + 1) as f32;
                             break 'rows;
@@ -944,13 +945,14 @@ impl PetWorld {
         Some(!matches!(glyph, PetGlyph::Blank))
     }
 
-    /// Whether an observed cell holds a letterform ([`PetWorld::letters`]).
+    /// Whether an observed cell holds a letterform.
     #[inline]
     #[must_use]
-    pub fn letter_at(&self, row: usize, col: usize) -> Option<bool> {
-        self.glyph_at(row, col)?;
-        let (r, c) = (row - self.coverage.row, col - self.coverage.col);
-        Some(self.letters[r * MAX_WORLD_COLS + c])
+    pub const fn letter_at(&self, row: usize, col: usize) -> Option<bool> {
+        let Some(glyph) = self.glyph_at(row, col) else {
+            return None;
+        };
+        Some(matches!(glyph, PetGlyph::Letter))
     }
 
     /// Ink substantial enough to displace a pet drawn beneath the glyphs.
@@ -961,7 +963,104 @@ impl PetWorld {
         let Some(glyph) = self.glyph_at(row, col) else {
             return None;
         };
-        Some(matches!(glyph, PetGlyph::Substantive))
+        Some(matches!(glyph, PetGlyph::Substantive | PetGlyph::Letter))
+    }
+
+    /// Whether any cell in `[first, end)` on `row` has ink substantial enough to displace a pet
+    /// under text (`None` if `first >= end` or any cell in `[first, end)` is unobserved).
+    #[inline]
+    #[must_use]
+    pub fn locomotion_ink_in_span(&self, row: usize, first: usize, end: usize) -> Option<bool> {
+        self.stamp?;
+        if end <= first {
+            return None;
+        }
+        let r = row.checked_sub(self.coverage.row)?;
+        let c0 = first.checked_sub(self.coverage.col)?;
+        let c1 = end - self.coverage.col;
+        if r >= self.coverage.rows || c1 > self.coverage.cols {
+            return None;
+        }
+        let row_base = r * MAX_WORLD_COLS;
+        let mut occupied = false;
+        for &glyph in &self.glyphs[row_base + c0..row_base + c1] {
+            let glyph = glyph?;
+            occupied |= matches!(glyph, PetGlyph::Substantive | PetGlyph::Letter);
+        }
+        Some(occupied)
+    }
+
+    /// The last observed letterform among the cells `[first, end)` of `row`:
+    /// `Some(Some(col))`, `Some(None)` where the map certifies none, and `None`
+    /// where it covers none of them.
+    #[inline]
+    #[must_use]
+    pub fn last_letter_in_span(
+        &self,
+        row: usize,
+        first: usize,
+        end: usize,
+    ) -> Option<Option<usize>> {
+        self.stamp?;
+        let r = row.checked_sub(self.coverage.row)?;
+        if r >= self.coverage.rows {
+            return None;
+        }
+        let cov_start = self.coverage.col;
+        let cov_end = cov_start.saturating_add(self.coverage.cols);
+        let s0 = first.max(cov_start);
+        let s1 = end.min(cov_end);
+        if s1 <= s0 {
+            return None;
+        }
+        let c0 = s0 - cov_start;
+        let c1 = s1 - cov_start;
+        let row_base = r * MAX_WORLD_COLS;
+        let mut seen = false;
+        for (offset, &glyph) in self.glyphs[row_base + c0..row_base + c1]
+            .iter()
+            .enumerate()
+            .rev()
+        {
+            match glyph {
+                Some(PetGlyph::Letter) => return Some(Some(s0 + offset)),
+                Some(_) => seen = true,
+                None => {}
+            }
+        }
+        seen.then_some(None)
+    }
+
+    /// Packed occupancy bits for `[c0, c1)` on `row` (up to 32 columns), or `None` if unobserved.
+    #[inline]
+    #[must_use]
+    pub fn ink_row_bits(&self, row: usize, c0: usize, c1: usize) -> Option<u32> {
+        self.stamp?;
+        if c1 <= c0 {
+            return Some(0);
+        }
+        let width = c1 - c0;
+        if width > 32 {
+            return None;
+        }
+        let r = row.checked_sub(self.coverage.row)?;
+        let mc0 = c0.checked_sub(self.coverage.col)?;
+        let mc1 = mc0 + width;
+        if r >= self.coverage.rows || mc1 > self.coverage.cols {
+            return None;
+        }
+        let row_base = r * MAX_WORLD_COLS;
+        let mut row_bits = 0u32;
+        for (dc, &glyph) in self.glyphs[row_base + mc0..row_base + mc1]
+            .iter()
+            .enumerate()
+        {
+            let glyph = glyph?;
+            if !matches!(glyph, PetGlyph::Blank) {
+                row_bits |= 1u32 << dc;
+            }
+        }
+        Some(row_bits)
     }
 
     #[inline]
@@ -1066,14 +1165,7 @@ impl PetWorld {
     #[must_use]
     /// Three-valued check whether `rect` plus `margin` is free of text-layer ink.
     pub fn ink_clearance(&self, rect: PetRect, margin: f32) -> Option<bool> {
-        self.stamp?;
-        match self.window(rect, margin) {
-            Window::Degenerate => Some(false),
-            Window::Outside => None,
-            Window::Cells(r0, c0, r1, c1) => Some((r0..r1).all(|r| {
-                !self.inked[r * MAX_WORLD_COLS + c0..r * MAX_WORLD_COLS + c1].contains(&true)
-            })),
-        }
+        self.clearance_past_caret(rect, margin)
     }
 
     #[inline]
@@ -2738,11 +2830,13 @@ mod tests {
                         (
                             reused.cell(row, col),
                             reused.ink_at(row, col),
+                            reused.letter_at(row, col),
                             reused.locomotion_ink_at(row, col),
                         ),
                         (
                             fresh.cell(row, col),
                             fresh.ink_at(row, col),
+                            fresh.letter_at(row, col),
                             fresh.locomotion_ink_at(row, col),
                         ),
                         "{rows}x{cols}, present_rows={present_rows}, at ({row},{col})"
@@ -3485,12 +3579,9 @@ mod tests {
         let mut world = PetWorld::default();
         assert_eq!(world.cells.capacity(), 0);
         assert_eq!(world.glyphs.capacity(), 0);
-        assert_eq!(world.letters.capacity(), 0);
         assert_eq!(world.blocked_prefix.capacity(), 0);
         assert_eq!(world.protected_prefix.capacity(), 0);
-        assert_eq!(world.inked.capacity(), 0);
         assert_eq!(world.hull.capacity(), 0);
-        assert_eq!(world.ground_cells.capacity(), 0);
         assert_eq!(world.ground_blocked_prefix.capacity(), 0);
         assert_eq!(world.ground_protected_prefix.capacity(), 0);
 
@@ -3508,16 +3599,14 @@ mod tests {
         assert!(world.observe(&input, &facts, PetPane::full(&input)));
         assert!(world.cells.len() == MAX_WORLD_CELLS);
         assert_eq!(
-            world.ground_cells.capacity(),
+            world.ground_blocked_prefix.capacity(),
             0,
             "ground plane stays unallocated without selection or transient overlay"
         );
-        assert_eq!(world.ground_blocked_prefix.capacity(), 0);
         assert_eq!(world.ground_protected_prefix.capacity(), 0);
 
         let overlay = [PetRect::new(1.0, 2.0, 2.0, 4.0)];
         assert!(world.observe_with_overlays(&input, &facts, PetPane::full(&input), &[], &overlay));
-        assert_eq!(world.ground_cells.len(), MAX_WORLD_CELLS);
         assert_eq!(
             world.ground_blocked_prefix.len(),
             (MAX_WORLD_ROWS + 1) * (MAX_WORLD_COLS + 1)

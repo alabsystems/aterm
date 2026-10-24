@@ -1835,6 +1835,16 @@ impl MomentumHost {
         }
     }
 
+    /// Whether the light-page glow wears its hue's vivid ink
+    /// (`MomentumGlow::set_light_vivid`, Sparkle's paper gold). A hosted plan
+    /// runs as its trace recorded it, the walk toward white.
+    #[inline]
+    pub fn set_light_vivid(&mut self, vivid: bool) {
+        if let HostMode::Direct(g) = &mut self.mode {
+            g.set_light_vivid(vivid);
+        }
+    }
+
     /// One frame (`MomentumGlow::tick`).
     #[inline]
     pub fn tick(

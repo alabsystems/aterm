@@ -695,32 +695,76 @@ fn without_the_letter_guard_the_trails_bury_letters() {
     );
 }
 
-const RIBBONS: [&str; 5] = [
-    "rainbow kitty pet",
-    "rainbow kitty underline",
-    "rainbow dog",
-    "flat rainbow",
-    "nyan rainbow",
-];
+/// CLASSIC IN A CHOSEN COLOUR (looks6 N10, 2026-10-23): Classic's spectrum face keeps its v0.28
+/// bytes (ruled), but its one-colour face is a colour the user chose (`cursor_trail_color =
+/// "#d03a8c"`) and the newest letter under it read 3.46:1 to 3.51:1 on the dark page. The guard
+/// holds that face in intensity only, so every letter keeps the bar through typing and a burst.
+/// Negative control: the guard off buries a letter under it.
+#[test]
+fn classic_in_a_chosen_colour_keeps_every_letter() {
+    let run = |scene: Scene, guard: bool| {
+        let pink = TrailColor::Pinned(0x00D0_3A8C);
+        let mut r = Replay::new("classic", DARK, pink);
+        // A chosen colour's Classic runs at the full default intensity (the
+        // spectrum face's own default is the 0.7 `Replay::new` gives it).
+        r.fx.set_cursor_glow(
+            true,
+            "classic",
+            pink,
+            None,
+            260,
+            24,
+            1.0,
+            0.6,
+            true,
+            DARK.cursor,
+        );
+        r.fx.set_letter_guard(guard);
+        let (ev, tail) = scene.events();
+        let judged = r.run(&ev, tail);
+        let bar = look_bar(DARK);
+        Verdict {
+            style: "classic #d03a8c",
+            look: DARK.name,
+            scene,
+            under: judged
+                .iter()
+                .map(|j| j.letters.iter().filter(|l| l.judged() < bar).count())
+                .sum(),
+            worst: worst(&judged),
+        }
+    };
+    for scene in [Scene::Typing, Scene::Burst] {
+        let v = run(scene, true);
+        assert_eq!(
+            v.under, 0,
+            "a letter under the chosen colour reads under the bar: {v}"
+        );
+    }
+    let off = run(Scene::Typing, false);
+    assert!(
+        off.under > 0,
+        "the guard is off, yet the chosen colour keeps every letter (the control no longer controls): {off}"
+    );
+}
 
 /// THE LAW ON DIM TEXT: text that clears the bar with little room, a 5.0:1 grey on the dark
 /// page and Solarized Dark's 4.75:1, reads its solid ink under the guard's floor on the bare
 /// page, so a guard that gives up on it leaves every light whole (a 5.0:1 grey under Sparkle's
 /// caret bloom read 1.01:1, Solarized under Laser's Enter bolt 1.34:1). Every style but
 /// classic, through every scene, keeps each letter it lies on at four fifths of the theme's
-/// own contrast ([`look_bar`]); the ribbons through the Enter (their flare, which the guard
-/// holds), their bodies under the typed line being the ribbon's own hold's (0.7 of the theme's
-/// contrast on these themes, not the guard's). Negative control: the guard off buries a letter
-/// under that bar in each of the four control replays.
+/// own contrast ([`look_bar`]); the ribbons too, through every scene: the pet under `echo`'s
+/// `o` on `dim-grey` (3.59:1, now veiled with the page under its letters) and the bed's top
+/// edge under `fox` on Solarized Dark (3.54:1, the ring reading the page's green with the
+/// bed's blue, now held at that mix; their controls are `aterm-effects`' unit laws, the pet's
+/// path through a replay being the frame's own). Negative control: the guard off buries a
+/// letter under that bar in each of the control replays.
 #[test]
 fn every_letter_on_a_dim_theme_keeps_its_own_reading() {
     let mut jobs = Vec::new();
     for look in [DIM_GREY, SOLARIZED_DARK] {
         for style in STYLES.into_iter().filter(|s| *s != "classic") {
             for scene in SCENES {
-                if RIBBONS.contains(&style) && scene != Scene::EnterBottom {
-                    continue;
-                }
                 jobs.push((style, look, scene));
             }
         }

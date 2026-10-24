@@ -432,7 +432,10 @@ impl App {
     /// the person's hidden facts laid in) and its absolute working directory
     /// where the resolver published one: what a title and a reader's words
     /// are made of.
-    fn shown_facts(&self, session: u64) -> Option<(FooterFacts, Option<std::path::PathBuf>)> {
+    pub(crate) fn shown_facts(
+        &self,
+        session: u64,
+    ) -> Option<(FooterFacts, Option<std::path::PathBuf>)> {
         let entry = self.pool.get(session)?;
         let timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
         let mut facts = timeline

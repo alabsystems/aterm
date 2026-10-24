@@ -6,7 +6,7 @@
 use super::*;
 
 mod letter_guard;
-pub(crate) use letter_guard::LetterGuard;
+pub(crate) use letter_guard::{LetterGuard, RING as LETTER_GUARD_RING};
 
 /// Per-band RGB lift per unit coverage for a streak sample ([`InkLedger::admit_axis`]).
 pub(super) type BandLifts = [[f32; 3]; InkLedger::BANDS];
@@ -587,10 +587,25 @@ impl InkLedger {
         if self.dims.is_empty() {
             return 1.0;
         }
+        let bounds = self.dims_bounds();
         let mut pieces = std::mem::take(&mut self.pieces);
         pieces.clear();
         for i in range.clone() {
-            self.mask_quad(quads[i], &mut pieces);
+            let q = quads[i];
+            let (x0, y0) = (i32::from(q.x), i32::from(q.y));
+            let (x1, y1) = (x0 + i32::from(q.w), y0 + i32::from(q.h));
+            if q.alpha != 0
+                || q.w == 0
+                || q.h == 0
+                || x1 <= bounds.0
+                || x0 >= bounds.2
+                || y1 <= bounds.1
+                || y0 >= bounds.3
+            {
+                pieces.push(q);
+            } else {
+                self.mask_quad(q, &mut pieces);
+            }
         }
         quads.splice(range, pieces.drain(..));
         self.pieces = pieces;
@@ -626,15 +641,35 @@ impl InkLedger {
             if d.share >= m {
                 return m;
             }
-            let dx = (d.x0 - x).max(x - d.x1).max(0.0) / fx;
-            let dy = (d.y0 - y).max(y - d.y1).max(0.0) / fy;
-            if dx >= 1.0 || dy >= 1.0 {
+            let dy = (d.y0 - y).max(y - d.y1).max(0.0);
+            if dy >= fy {
                 return m;
             }
+            let dx = (d.x0 - x).max(x - d.x1).max(0.0);
+            if dx >= fx {
+                return m;
+            }
+            let (dx, dy) = (dx / fx, dy / fy);
             let e = (dx * dx + dy * dy).sqrt().min(1.0);
             let rise = e * e * (3.0 - 2.0 * e);
             m.min(d.share + (1.0 - d.share) * rise)
         })
+    }
+
+    fn dims_bounds(&self) -> (i32, i32, i32, i32) {
+        let (_, _, cw, ch) = self.grid;
+        let (fx, fy) = (
+            (cw * Self::FEATHER_X).ceil() as i32,
+            (ch * Self::FEATHER_Y).ceil() as i32,
+        );
+        let (mut min_x, mut min_y, mut max_x, mut max_y) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+        for d in &self.dims {
+            min_x = min_x.min(d.x0 as i32 - fx);
+            min_y = min_y.min(d.y0 as i32 - fy);
+            max_x = max_x.max(d.x1 as i32 + fx);
+            max_y = max_y.max(d.y1 as i32 + fy);
+        }
+        (min_x, min_y, max_x, max_y)
     }
 
     fn knots(&mut self, (x0, y0, x1, y1): (i32, i32, i32, i32)) -> bool {
@@ -644,17 +679,19 @@ impl InkLedger {
             (ch * Self::FEATHER_Y).ceil() as i32,
         );
         let (kx, ky) = (&mut self.knots_x, &mut self.knots_y);
-        kx.clear();
-        ky.clear();
-        kx.extend([x0, x1]);
-        ky.extend([y0, y1]);
         let mut meets = false;
         for d in &self.dims {
             let (dx0, dy0, dx1, dy1) = (d.x0 as i32, d.y0 as i32, d.x1 as i32, d.y1 as i32);
             if dx1 + fx <= x0 || dx0 - fx >= x1 || dy1 + fy <= y0 || dy0 - fy >= y1 {
                 continue;
             }
-            meets = true;
+            if !meets {
+                kx.clear();
+                ky.clear();
+                kx.extend([x0, x1]);
+                ky.extend([y0, y1]);
+                meets = true;
+            }
             let edge = |k: &mut Vec<i32>, a: i32, b: i32, f: i32, lo: i32, hi: i32| {
                 let mut push = |v: i32| {
                     if v > lo && v < hi {
@@ -675,11 +712,14 @@ impl InkLedger {
             edge(kx, dx0, dx1, fx, x0, x1);
             edge(ky, dy0, dy1, fy, y0, y1);
         }
+        if !meets {
+            return false;
+        }
         kx.sort_unstable();
         kx.dedup();
         ky.sort_unstable();
         ky.dedup();
-        meets
+        true
     }
 
     fn mask_quad(&mut self, q: GlowQuad, out: &mut Vec<GlowQuad>) {
@@ -756,10 +796,23 @@ impl InkLedger {
                     floor,
                 );
             }
+            if self.dims.is_empty() {
+                pieces.extend_from_slice(&halos[i..j]);
+                i = j;
+                continue;
+            }
+            let bounds = self.dims_bounds();
             for h in &halos[i..j] {
                 let (x0, y0) = (i32::from(h.x), i32::from(h.y));
                 let (x1, y1) = (x0 + i32::from(h.w), y0 + i32::from(h.h));
-                if self.dims.is_empty() || h.w == 0 || h.h == 0 || !self.knots((x0, y0, x1, y1)) {
+                if h.w == 0
+                    || h.h == 0
+                    || x1 <= bounds.0
+                    || x0 >= bounds.2
+                    || y1 <= bounds.1
+                    || y0 >= bounds.3
+                    || !self.knots((x0, y0, x1, y1))
+                {
                     pieces.push(*h);
                     continue;
                 }
@@ -1076,6 +1129,84 @@ impl CursorGlow {
             OverInkTier::Momentum => InkLedger::MOMENTUM_FLOOR,
         };
         self.ink_ledger.admit_masked(quads, range, floor)
+    }
+
+    /// Clip `halos` off the filled cells (a ground that is not the page:
+    /// a prompt's powerline bar) of every row but the caret's, splitting a
+    /// row piece around them (looks6 N8: the dark fire's bloom round the
+    /// caret lifted the bar and the segment over it). A piece keeps its
+    /// centre and falloff, so what is left of it lies where it lay.
+    pub(super) fn hold_halos_off_filled(
+        &self,
+        halos: &mut Vec<RainHalo>,
+        caret: Option<(u16, u16)>,
+        geom: Geom,
+        page: u32,
+    ) {
+        #[cfg(test)]
+        if self.fire_filled_unheld {
+            return;
+        }
+        let page = page & 0x00FF_FFFF;
+        let (cw, ch) = (geom.cw as i32, geom.ch as i32);
+        if cw <= 0 || ch <= 0 || self.frame_text.rows.is_empty() {
+            return;
+        }
+        let (ox, oy) = (i32::from(geom.origin_x), i32::from(geom.origin_y));
+        let caret_row = caret.map(|(r, _)| i32::from(r));
+        let filled = |row: i32, col: i32| {
+            Some(row) != caret_row
+                && self
+                    .frame_text
+                    .pair(row, col)
+                    .is_some_and(|(_, ground)| !super::emit::reads_as_page(ground, page))
+        };
+        let span = |h: &RainHalo| {
+            let row = (i32::from(h.y) - oy).div_euclid(ch);
+            let (x0, x1) = (i32::from(h.x), i32::from(h.x) + i32::from(h.w));
+            (
+                row,
+                x0,
+                x1,
+                (x0 - ox).div_euclid(cw),
+                (x1 - 1 - ox).div_euclid(cw),
+            )
+        };
+        let touches = |h: &RainHalo| {
+            let (row, _, _, c0, c1) = span(h);
+            h.w > 0 && (c0..=c1).any(|c| filled(row, c))
+        };
+        if !halos.iter().any(touches) {
+            return;
+        }
+        let all = std::mem::take(halos);
+        for h in all {
+            if !touches(&h) {
+                halos.push(h);
+                continue;
+            }
+            let (row, x0, x1, c0, c1) = span(&h);
+            let mut start: Option<i32> = None;
+            for c in c0..=c1 + 1 {
+                let keep = c <= c1 && !filled(row, c);
+                match (keep, start) {
+                    (true, None) => start = Some(c),
+                    (false, Some(s)) => {
+                        let a = x0.max(ox + s * cw);
+                        let b = x1.min(ox + c * cw);
+                        if b > a {
+                            halos.push(RainHalo {
+                                x: a as u16,
+                                w: (b - a) as u16,
+                                ..h
+                            });
+                        }
+                        start = None;
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     /// Attenuate additive caret quads near inked neighbour rows and return the cut print.

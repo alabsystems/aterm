@@ -1386,9 +1386,13 @@ fn agent_named(id: &str) -> Option<Program> {
 fn own_keys(program: Program) -> &'static [&'static str] {
     match program {
         Program::Agy => crate::harness::agy_quota::ROTATION_KEYS,
-        Program::Claude | Program::Codex | Program::Gemini | Program::Muse | Program::Generic => {
-            &[]
-        }
+        Program::Claude
+        | Program::Codex
+        | Program::Grok
+        | Program::Kimi
+        | Program::Gemini
+        | Program::Muse
+        | Program::Generic => &[],
     }
 }
 

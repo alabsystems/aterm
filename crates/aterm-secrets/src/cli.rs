@@ -2322,12 +2322,7 @@ mod unix {
                 println!("{}", service::install(&paths.home, job, &program, &args)?);
             }
             Action::Off => {
-                // The person's choice, recorded before the job goes, so nothing reads a
-                // subscriber gone without it: setup leaves it off until `agent on`.
-                if job == Job::Subscriber {
-                    service::record_subscriber_off(&paths.home)?;
-                }
-                if service::uninstall(&paths.home, job)? {
+                if service::turn_off(&paths.home, job)? {
                     println!("{} stopped and removed", job.label());
                 } else {
                     println!("{} was not installed", job.label());

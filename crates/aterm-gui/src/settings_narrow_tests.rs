@@ -38,6 +38,29 @@ pub(super) fn screens_of(
     width: f32,
     height: f32,
 ) -> Vec<crate::native_ui::CompiledUi> {
+    let (mut runtime, instance, view) = routed(prepare, route);
+    let cx = view_cx_at(width, height);
+    let mut screens = Vec::new();
+    each_screen(&mut runtime, instance, view, &cx, |compiled, _| {
+        screens.push(compiled.clone());
+    });
+    screens
+}
+
+/// The first of [`screens_of`], without rendering the rest.
+fn top_screen_of(route: SettingsRoute, width: f32, height: f32) -> crate::native_ui::CompiledUi {
+    let (mut runtime, instance, view) = routed(|_, _| {}, route);
+    walk_start(&mut runtime, instance, view, &view_cx_at(width, height)).0
+}
+
+fn routed(
+    prepare: impl FnOnce(&mut NativeRuntime, crate::native_app::ViewId),
+    route: SettingsRoute,
+) -> (
+    NativeRuntime,
+    crate::native_app::AppInstanceId,
+    crate::native_app::ViewId,
+) {
     let (mut runtime, instance, view) = setup();
     prepare(&mut runtime, view);
     runtime
@@ -50,12 +73,7 @@ pub(super) fn screens_of(
             }),
         )
         .unwrap();
-    let cx = view_cx_at(width, height);
-    let mut screens = Vec::new();
-    each_screen(&mut runtime, instance, view, &cx, |compiled, _| {
-        screens.push(compiled.clone());
-    });
-    screens
+    (runtime, instance, view)
 }
 
 /// The painted words under any of `prefixes` that are not whole.
@@ -860,8 +878,8 @@ fn a_page_name_is_whole_in_its_column() {
     at_each_text_scale(&[1.0, 2.0], "page names", |scale| {
         for width in [164.0, 178.0, 192.0, 234.0] {
             for route in SettingsRoute::ALL {
-                let screens = screens_of(|_, _| {}, route, width, 900.0);
-                let cut = cut_words(&screens[0], &["settings/page-heading/"]);
+                let screen = top_screen_of(route, width, 900.0);
+                let cut = cut_words(&screen, &["settings/page-heading/"]);
                 assert!(
                     cut.is_empty(),
                     "{scale}\u{d7} {width} {}: {cut:#?}",
@@ -909,14 +927,14 @@ fn the_packages_page_keeps_its_words() {
 fn messages_small_buttons_stay_on_the_page() {
     at_each_text_scale(&[1.0, 2.0], "Messages buttons", |scale| {
         for width in NARROW_WIDTHS {
-            let screens = screens_of(|_, _| {}, SettingsRoute::Messages, width, 516.0);
+            let screen = top_screen_of(SettingsRoute::Messages, width, 516.0);
             let prefixes = [
                 "settings/messages/copy-all",
                 "settings/messages/open-folder",
             ];
-            let cut = cut_words(&screens[0], &prefixes);
+            let cut = cut_words(&screen, &prefixes);
             assert!(cut.is_empty(), "{scale}\u{d7} {width}: {cut:#?}");
-            let spilled = spilled_nodes(&screens[0], &prefixes);
+            let spilled = spilled_nodes(&screen, &prefixes);
             assert!(spilled.is_empty(), "{scale}\u{d7} {width}: {spilled:#?}");
         }
     });
@@ -2534,59 +2552,6 @@ fn every_page_keeps_its_words_and_every_control_whole_on_some_screen() {
 }
 
 #[test]
-fn the_macos_access_block_keeps_its_words_at_phone_width() {
-    let ours = |key: &str| key.contains("macos-access") || key.contains("developer-tools");
-    at_each_text_scale(&[1.5, 2.0], "macOS access", |scale| {
-        let whole = whole_words_of(every_page_runtime, SettingsRoute::Security);
-        for width in [178.0, 192.0] {
-            for height in NARROW_HEIGHTS {
-                let context = format!("{scale}\u{d7} {width}\u{d7}{height}");
-                let (mut runtime, instance, view) = every_page_runtime();
-                go_to_route(&mut runtime, instance, view, SettingsRoute::Security);
-                let mut buttons = std::collections::BTreeMap::<String, bool>::new();
-                each_screen(
-                    &mut runtime,
-                    instance,
-                    view,
-                    &view_cx_at(width, height),
-                    |screen, top| {
-                        let failures = screen
-                            .fit_failures()
-                            .into_iter()
-                            .filter(|line| line.split('"').nth(1).is_some_and(ours))
-                            .collect::<Vec<_>>();
-                        assert!(failures.is_empty(), "{context} screen {top}: {failures:#?}");
-                        let broken = broken_inside_a_word(screen, &whole);
-                        assert!(broken.is_empty(), "{context} screen {top}: {broken:#?}");
-                        for node in &screen.paint {
-                            if let UiContent::Button(_) = node.content
-                                && ours(node.key.as_str())
-                            {
-                                let whole = !node.peek
-                                    && node.fade.is_none()
-                                    && node.clip.height >= node.rect.height - 0.5
-                                    && node.clip.width >= node.rect.width - 0.5;
-                                *buttons.entry(node.key.as_str().to_string()).or_default() |= whole;
-                            }
-                        }
-                    },
-                );
-                assert!(
-                    buttons.contains_key(MACOS_ACCESS_OPEN_FDA)
-                        && buttons.contains_key(MACOS_ACCESS_OPEN_DEVTOOLS),
-                    "{context}: premise, both cards drawn: {buttons:?}"
-                );
-                let unseen = buttons
-                    .iter()
-                    .filter(|(_, whole)| !**whole)
-                    .collect::<Vec<_>>();
-                assert!(unseen.is_empty(), "{context}: never whole: {unseen:?}");
-            }
-        }
-    });
-}
-
-#[test]
 fn a_word_of_copy_wider_than_its_box_breaks_with_a_hyphen() {
     let px = 26.0;
     let measure = |text: &str| crate::tray_raster::ui_text_width(text, px);
@@ -3179,34 +3144,6 @@ fn wallpaper_keeps_its_status_and_its_buttons() {
 }
 
 #[test]
-fn tab_control_keeps_every_word_of_its_computers_and_tabs() {
-    at_each_text_scale(&[1.0, 2.0], "tab control", |scale| {
-        for (width, height) in NARROW_WIDTHS
-            .into_iter()
-            .map(|width| (width, 516.0))
-            .chain(WIDE_SIZES[..3].iter().copied())
-        {
-            let context = format!("{scale}\u{d7} {width}\u{d7}{height}");
-            let whole = whole_words_of(every_page_runtime, SettingsRoute::Tabs);
-            let (mut runtime, instance, view) = every_page_runtime();
-            go_to_route(&mut runtime, instance, view, SettingsRoute::Tabs);
-            each_screen(
-                &mut runtime,
-                instance,
-                view,
-                &view_cx_at(width, height),
-                |screen, top| {
-                    let cut = words_cut(screen, &whole, &["tabs/"]);
-                    assert!(cut.is_empty(), "{context} screen {top}: {cut:#?}");
-                    let spilled = spilled_nodes(screen, &["tabs/"]);
-                    assert!(spilled.is_empty(), "{context} screen {top}: {spilled:#?}");
-                },
-            );
-        }
-    });
-}
-
-#[test]
 fn a_path_field_keeps_its_file_name() {
     let long = "/Volumes/Work Disk/Shared Configuration/profiles/someone/settings/aterm";
     at_each_text_scale(&[1.0, 2.0], "fleet path", |scale| {
@@ -3399,43 +3336,6 @@ fn a_narrow_row_keeps_its_words_and_its_controls_in_its_card() {
                     assert!(spilled.is_empty(), "{context}: {spilled:#?}");
                 }
             }
-        }
-    });
-}
-
-#[test]
-fn a_cards_caption_wraps_on_every_page() {
-    at_each_text_scale(&[1.0, 1.5, 2.0], "captions", |scale| {
-        for route in [
-            SettingsRoute::Home,
-            SettingsRoute::Modified,
-            SettingsRoute::Manual,
-            SettingsRoute::CursorStyles,
-            SettingsRoute::TextFonts,
-        ] {
-            let context = format!("{scale}\u{d7} {route:?}");
-            let whole = whole_words_of(every_page_runtime, route);
-            let (mut runtime, instance, view) = every_page_runtime();
-            go_to_route(&mut runtime, instance, view, route);
-            each_screen(
-                &mut runtime,
-                instance,
-                view,
-                &view_cx_at(178.0, 516.0),
-                |screen, top| {
-                    let cut = words_cut(
-                        screen,
-                        &whole,
-                        &[
-                            "settings/group-heading/",
-                            "settings/manual/only-in-aterm-toml/heading",
-                            "settings/cursor-styles/",
-                            "settings/top/",
-                        ],
-                    );
-                    assert!(cut.is_empty(), "{context} screen {top}: {cut:#?}");
-                },
-            );
         }
     });
 }

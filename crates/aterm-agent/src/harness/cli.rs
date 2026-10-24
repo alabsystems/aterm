@@ -16,7 +16,7 @@ use aterm_json::{Map, Value};
 use aterm_phase::ResetKind;
 use aterm_phase::anchors::{Anchor, newer_than};
 
-use super::accounts::{self, Auth, Class, Roster};
+use super::accounts::{self, Auth, Class, Cli, Roster};
 use super::align::Captured;
 use super::disk;
 use super::footer;
@@ -71,13 +71,16 @@ USAGE:
     aterm harness ledger [@<sid>] [<n>] [--json] supervisor approval ledger for a session
     aterm harness ledger disk [<n>] [--json]     disk cleanup journal
     aterm harness ledger upgrade [<n>] [--json]  live upgrade ledger
-    aterm harness ledger accounts [<n>] [--json] accounts ledger (logins, pins, limits, rotations)
-    aterm harness accounts [--json]              Claude Code accounts on this machine and rotation order
+    aterm harness ledger accounts [<n>] [--cli <id>] [--json]
+                                                 accounts ledger (logins, pins, limits, rotations)
+    aterm harness accounts [list] [--cli <id>|all] [--json]
+                                                 a CLI's accounts on this machine and rotation order
     aterm harness accounts stats [--json]        5h/week/Fable windows, plan, credits, \u{2248}$, and active sessions
     aterm harness accounts add <label> [--shared] [--email <e>] [--browser <b>]
                                                  create login directory and append roster row
     aterm harness accounts adopt-default <label> --email <e> [--browser <b>]
                                                  enroll this machine's default login as a renewable row
+                                                 (`--cli codex` reads the email from its app server)
     aterm harness accounts login <label>         run Claude Code's sign-in flow and record auth status
     aterm harness accounts renew [--due | <label>...] [--on <host>,... | --here]
                                                  renew logins via staging sign-in (and over ssh)
@@ -116,6 +119,11 @@ OPTIONS:
                         no box/hold/child, and no keystroke in the last 20 s)
     --defer <dur>       upgrade <sid>: hold for <dur> (90s, 30m, 6h, 2d; max 30d)
     --skip              upgrade <sid>: stay on the running build until a newer target lands
+    --cli <id>          accounts, ledger accounts: the CLI's pool (`claude`, the default; `codex`,
+                        `grok`, `kimi`; `all` for the report alone)
+    --region <r>        accounts add, adopt-default --cli kimi: `global` (kimi.ai) or
+                        `mainland-cn` (kimi.com)
+    --flow <f>          accounts add, adopt-default --cli codex|grok: `browser` or `device`
     --shared            accounts add: mark account `shared` across machines
     --email <e>         accounts add, adopt-default: account email verified on renewal
     --browser <b>       accounts add, adopt-default: browser profile display name for sign-in
@@ -330,6 +338,49 @@ VERBS:
   - `accounts serve [<source>] [--bind <addr:port>] [--machine <mN>]`
     Serves the account rotation dashboard and `fleet-accounts.toml` from the same source,
     on `127.0.0.1:8741` unless `--bind` names another address (a LAN one shares it).
+
+OTHER CLIS (`--cli codex|grok|kimi`; `--cli claude`, or none, is the above):
+  - Each pool has its own roster beside `aterm.toml` (`accounts-codex.toml`,
+    `accounts-grok.toml`, `accounts-kimi.toml`), its own store
+    (`<state>/accounts-<cli>`), and its logins under `~/.aterm/logins/<cli>/<label>`.
+    A Kimi row with `email` names `region` (`global` for kimi.ai, `mainland-cn` for
+    kimi.com); a Codex or Grok row may name `flow` (`browser` or `device`).
+  - `accounts list|add|adopt-default|use|stats --cli <id>` take the forms above, with
+    `--region` and `--flow` on `add` and `adopt-default`; `serve` is Claude Code's alone in
+    this build, and its dashboard shows every pool. `stats --cli <id>` lists each row's
+    condition, login and usage (a Codex row's read through its app server in the row's own
+    home), and `stats --cli codex` reads the default home's newest rollouts' 5h and week
+    windows too.
+  - `accounts sync --cli <id> [<source>] [--machine <mN>] [--json]` adds this machine's rows
+    of the CLI's fleet to its roster, each with a login directory of its own, and changes or
+    removes no row the roster has. The fleet is the source named, else
+    `~/.secrets/ai-accounts-<cli>.toml` (the rows of `fleet-accounts.toml`, with `region` or
+    `flow`), else the CLI's column of `~/.secrets/ai-accounts.csv` (`Open AI` for codex,
+    `xai` or `grok`, `kimi`; a cell of `1`, or a vendor word: `global`/`mainland-cn` for kimi,
+    whose bare `1` is held, `browser`/`device` for codex and grok), its rows labelled
+    `<cli>-<machine label>`. A note naming a vendor (`kimi banned`) drops that vendor's
+    membership alone. It writes the roster and the CLI's store, never `~/.secrets`. With no
+    source named it reads nothing unless the roster exists: a vault file alone opts no
+    machine in, and `aterm init`, `aterm secrets` and a window sync each CLI whose roster this
+    machine keeps.
+  - `accounts renew <label>… [--due] --cli <id>` runs the CLI's own sign-in in a fresh
+    staging home (Codex's app server, or its `login --device-auth`; Grok's `login
+    --device-auth` or `--oauth`; Kimi's `login --region <region>`), one machine-wide sign-in
+    at a time. Its page must be https on the vendor's pinned hosts (kimi.ai or kimi.com by
+    the row's region) and is approved in a headless browser under the email's own profile:
+    a device page only when it shows the code the CLI printed, never on another identity
+    provider or a sign-up page. The login is bound once its file exists, `proved_by` the
+    CLI's own report of the account (`status`), the page's (`page`), or nothing
+    (`unchecked`); another email is a wrong account and nothing live changes. The ledger
+    keeps the host, flow and outcome, never the URL or code.
+  - `accounts login <label> --cli <id>` runs that sign-in on this terminal for the person
+    to approve (`proved_by = \"unchecked\"`).
+  - A Codex worker aterm starts takes the pool's pin, else its fresh active row, else the
+    next one (`next:`), once each row's usage was read in its own home (Codex's app server);
+    `[harness] accounts = \"off\"` keeps only the pin, and a login kept in the OS keyring
+    picks none. No running session of these CLIs is moved, and a Kimi launch or move is held
+    (`unmeasured`) until a lab pass measures its home. `stats --cli <id>` lists each row's
+    condition, login and usage; `ledger accounts --cli <id>` reads the pool's ledger.
 
 FLEET ACCOUNTS (off unless this machine names a source):
   - Opt in with `[fleet] accounts_source = \"<source>\"` in aterm.toml, by running
@@ -584,6 +635,25 @@ impl Env {
         accounts::Store::at(&self.state)
     }
 
+    /// `cli`'s roster beside [`Env::config`] ([`accounts::roster_beside_for`]): Claude Code's is [`Env::accounts_roster`].
+    #[must_use]
+    pub fn accounts_roster_for(&self, cli: Cli) -> Option<PathBuf> {
+        accounts::roster_beside_for(self.config.as_deref()?, cli)
+    }
+
+    /// `cli`'s store ([`accounts::Store::at_for`]): Claude Code's is [`Env::accounts_store`]; another CLI's keeps its logins under the owner's home, so it is `None` where no home is known.
+    #[must_use]
+    pub fn accounts_store_for(&self, cli: Cli) -> Option<accounts::Store> {
+        match cli {
+            Cli::Claude => Some(self.accounts_store()),
+            _ => Some(accounts::Store::at_for(
+                &self.state,
+                cli,
+                self.home.as_deref()?,
+            )),
+        }
+    }
+
     /// `sid` as a selector (`@s-…`), else this session's, else `None`.
     #[must_use]
     pub fn target(&self, sid: Option<&str>) -> Option<String> {
@@ -601,8 +671,9 @@ pub enum LedgerFile {
     Disk,
     /// The live upgrade's ledger (`<state>/upgrade/ledger.jsonl`).
     Upgrade,
-    /// The accounts ledger (`<state>/accounts/ledger.jsonl`, [`accounts::Store::ledger_path`]).
-    Accounts,
+    /// A CLI's accounts ledger (`<state>/accounts/ledger.jsonl` for Claude Code's, else
+    /// `<state>/accounts-<cli>/ledger.jsonl`: [`accounts::Store::ledger_path`]), by `--cli`.
+    Accounts(Cli),
 }
 
 /// One form of `accounts` (design `docs/DESIGN-claude-accounts-2026-10-01.md` §4, §8).
@@ -628,8 +699,9 @@ pub enum AccountsCmd {
     AdoptDefault {
         /// The label as typed.
         label: String,
-        /// `--email`, required.
-        email: String,
+        /// `--email`: required, but for `--cli codex`, whose app server names the default
+        /// login's account (`account/read`, [`AccountsHost::codex_account`]).
+        email: Option<String>,
         /// `--browser`.
         browser: Option<String>,
     },
@@ -677,6 +749,25 @@ pub enum AccountsCmd {
         /// Optional machine ID override (`m8`, `m14`, …).
         machine: Option<String>,
     },
+}
+
+/// `accounts … --cli <id>` for a pool other than Claude Code's ([`Cli`]): the report (`list`), `add`, `adopt-default`, `login`, `renew`, `use`, `stats` and `sync` ([`super::accounts_sync::run_cli_accounts_sync`]). Serving is Claude Code's alone in this build, refused by name; its dashboard shows every pool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountsOf {
+    /// The pool.
+    pub cli: Cli,
+    /// The form, as Claude Code's pool takes it.
+    pub form: AccountsCmd,
+    /// `--region` and `--flow`, for `add` and `adopt-default` ([`accounts::Vendor`]).
+    pub vendor: accounts::Vendor,
+}
+
+/// The `accounts` form a command names, of any pool.
+const fn accounts_form(cmd: &Cmd) -> Option<&AccountsCmd> {
+    match cmd {
+        Cmd::Accounts(form) | Cmd::AccountsOf(AccountsOf { form, .. }) => Some(form),
+        _ => None,
+    }
 }
 
 /// The owner's word on the live upgrade (`upgrade [<sid>] --status`, `upgrade <sid> --now|--defer <dur>|--skip`).
@@ -765,6 +856,14 @@ pub enum Cmd {
     },
     /// The Claude Code accounts: the report, and the roster's verbs.
     Accounts(AccountsCmd),
+    /// `accounts … --cli <id>`: another CLI's pool ([`AccountsOf`]).
+    AccountsOf(AccountsOf),
+    /// `accounts [list] --cli all`: each pool's report whose roster this machine keeps, Claude
+    /// Code's first, under a `cli: <id>` line (as JSON, `{"pools": [{"cli": …, "report": …}]}`).
+    AccountsAll {
+        /// The JSON form.
+        json: bool,
+    },
     /// The incremental numeric harness version of each CLI harness.
     Versions {
         /// The JSON form.
@@ -984,6 +1083,9 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
     let mut machine: Option<String> = None;
     let mut bind: Option<String> = None;
     let mut on: Option<Vec<String>> = None;
+    let mut pool: Option<String> = None;
+    let mut region: Option<String> = None;
+    let mut flow: Option<String> = None;
     let mut owner: Vec<OwnerAsk> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -1009,6 +1111,18 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
             }
             "--browser" => {
                 browser = Some(value(i, "--browser")?);
+                i += 1;
+            }
+            "--cli" => {
+                pool = Some(value(i, "--cli")?);
+                i += 1;
+            }
+            "--region" => {
+                region = Some(value(i, "--region")?);
+                i += 1;
+            }
+            "--flow" => {
+                flow = Some(value(i, "--flow")?);
                 i += 1;
             }
             "--machine" => {
@@ -1094,7 +1208,7 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
             other => Err(format!("{verb} takes one @<sid> at most, not {other:?}")),
         }
     };
-    let cmd = match verb {
+    let mut cmd = match verb {
         "hook" | "statusline" => Cmd::Retired,
         "tap" => {
             if rest.len() > 1 {
@@ -1146,7 +1260,7 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
                 } else if *op == "upgrade" {
                     file = LedgerFile::Upgrade;
                 } else if *op == "accounts" {
-                    file = LedgerFile::Accounts;
+                    file = LedgerFile::Accounts(Cli::Claude);
                 } else if op.starts_with('@') && op.len() > 1 {
                     file = LedgerFile::Approvals(Some((*op).to_string()));
                 } else if let Ok(n) = op.parse::<usize>() {
@@ -1215,7 +1329,7 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
         }
         "accounts" => {
             let form = match &rest[1..] {
-                [] => AccountsCmd::Report { json },
+                [] | ["list"] => AccountsCmd::Report { json },
                 ["stats"] => AccountsCmd::Stats { json },
                 ["add", label] => AccountsCmd::Add {
                     label: (*label).to_string(),
@@ -1229,11 +1343,7 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
                 },
                 ["adopt-default", label] => AccountsCmd::AdoptDefault {
                     label: (*label).to_string(),
-                    email: email.take().ok_or_else(|| {
-                        "accounts adopt-default needs --email <address>: the login it renews \
-                         is checked against that address"
-                            .to_string()
-                    })?,
+                    email: email.take(),
                     browser: browser.take(),
                 },
                 ["renew", labels @ ..] => {
@@ -1292,7 +1402,7 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
                 },
                 other => {
                     return Err(format!(
-                        "accounts takes nothing, `stats`, `sync [<source>] [--machine <mN>]`, \
+                        "accounts takes nothing (or `list`), `stats`, `sync [<source>] [--machine <mN>]`, \
                          `serve [<source>] [--bind <addr:port>] [--machine <mN>]`, `add <label> \
                          [--shared] [--email <e>] [--browser <b>]`, `adopt-default <label> \
                          --email <e>`, `login <label>`, `renew [--due | <label>…] [--on \
@@ -1315,18 +1425,39 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
                         .to_string(),
                 );
             }
-            Cmd::Accounts(form)
+            accounts_of(form, pool.take(), region.take(), flow.take())?
         }
         other => return Err(format!("unknown subcommand {other:?}")),
     };
     if !owner.is_empty() && !matches!(cmd, Cmd::UpgradeOwner { .. }) {
         return Err("--status, --now, --defer and --skip belong to `upgrade`".to_string());
     }
-    if shared && !matches!(cmd, Cmd::Accounts(AccountsCmd::Add { .. })) {
+    if shared && !matches!(accounts_form(&cmd), Some(AccountsCmd::Add { .. })) {
         return Err("--shared belongs to `accounts add <label>`".to_string());
     }
-    if auto && !matches!(cmd, Cmd::Accounts(AccountsCmd::Auto)) {
+    if auto && !matches!(accounts_form(&cmd), Some(AccountsCmd::Auto)) {
         return Err("--auto belongs to `accounts use`".to_string());
+    }
+    if let Cmd::Ledger {
+        file: LedgerFile::Accounts(of),
+        ..
+    } = &mut cmd
+        && let Some(id) = pool.take()
+    {
+        *of = Cli::parse(&id).ok_or_else(|| {
+            format!(
+                "--cli takes one of {}, not {:?}",
+                Cli::ids().join(", "),
+                super::one_line(&id, 40)
+            )
+        })?;
+    }
+    if pool.is_some() || region.is_some() || flow.is_some() {
+        return Err(
+            "--cli belongs to `accounts` and `ledger accounts`; --region and --flow to \
+             `accounts`"
+                .to_string(),
+        );
     }
     if email.is_some() || browser.is_some() {
         return Err(
@@ -1340,10 +1471,12 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
             "--machine and --bind belong to `accounts sync` and `accounts serve`".to_string(),
         );
     }
-    if (due || here || on.is_some()) && !matches!(cmd, Cmd::Accounts(AccountsCmd::Renew { .. })) {
+    if (due || here || on.is_some())
+        && !matches!(accounts_form(&cmd), Some(AccountsCmd::Renew { .. }))
+    {
         return Err("--due, --here and --on belong to `accounts renew`".to_string());
     }
-    if matches!(cmd, Cmd::Accounts(_)) {
+    if accounts_form(&cmd).is_some() {
         if dry_run {
             return Err(
                 "accounts takes no --dry-run: `add`, `login` and `use` do what they say, and \
@@ -1356,6 +1489,162 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
         }
     }
     Ok((cmd, over))
+}
+
+/// `accounts --cli all`: the report of each pool whose roster this machine keeps, Claude Code's
+/// (`accounts.toml`) first; a machine that keeps none says so, as Claude Code's report does.
+fn run_accounts_all(
+    json: bool,
+    env: &Env,
+    host: &dyn AccountsHost,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let kept: Vec<Cli> = Cli::ALL
+        .into_iter()
+        .filter(|cli| match cli {
+            Cli::Claude => env.accounts_roster().is_some_and(|p| p.is_file()),
+            _ => env.accounts_roster_for(*cli).is_some_and(|p| p.is_file()),
+        })
+        .collect();
+    if kept.is_empty() {
+        return run_accounts(&AccountsCmd::Report { json }, env, host, out, err);
+    }
+    let mut pools = Vec::new();
+    let mut code = ExitCode::SUCCESS;
+    for cli in kept {
+        let mut report = Vec::new();
+        let form = AccountsCmd::Report { json };
+        let ran = if cli == Cli::Claude {
+            run_accounts(&form, env, host, &mut report, err)
+        } else {
+            let of = AccountsOf {
+                cli,
+                form,
+                vendor: accounts::Vendor::default(),
+            };
+            run_accounts_of(&of, env, host, &mut report, err)
+        };
+        if ran != ExitCode::SUCCESS {
+            code = ran;
+        }
+        let text = String::from_utf8_lossy(&report).into_owned();
+        if json {
+            let value =
+                aterm_json::from_str::<aterm_json::Value>(&text).unwrap_or(aterm_json::Value::Null);
+            pools.push(aterm_json::json!({"cli": cli.id(), "report": value}));
+        } else {
+            let _ = writeln!(out, "cli: {}", cli.id());
+            let _ = out.write_all(text.as_bytes());
+        }
+    }
+    if json {
+        let _ = writeln!(
+            out,
+            "{}",
+            aterm_json::to_string(&aterm_json::json!({"pools": pools})).unwrap_or_default()
+        );
+    }
+    code
+}
+
+/// The `accounts` command for `form` under `--cli` (`pool`), `--region` and `--flow`: Claude Code's pool (no `--cli`, or `--cli claude`) is [`Cmd::Accounts`], as it always was; another is [`Cmd::AccountsOf`].
+fn accounts_of(
+    form: AccountsCmd,
+    pool: Option<String>,
+    region: Option<String>,
+    flow: Option<String>,
+) -> Result<Cmd, String> {
+    use crate::ai::connector::{Flow, Region, RowKeys};
+    if pool.as_deref() == Some("all") {
+        return match form {
+            AccountsCmd::Report { json } if region.is_none() && flow.is_none() => {
+                Ok(Cmd::AccountsAll { json })
+            }
+            _ => Err("--cli all belongs to the report (`accounts [list]`) alone".to_string()),
+        };
+    }
+    let cli = match pool.as_deref() {
+        None => Cli::Claude,
+        Some(id) => Cli::parse(id).ok_or_else(|| {
+            format!(
+                "--cli takes one of {}, not {:?}",
+                Cli::ids().join(", "),
+                super::one_line(id, 40)
+            )
+        })?,
+    };
+    let keys = cli.accounts().keys;
+    let rows = matches!(
+        form,
+        AccountsCmd::Add { .. } | AccountsCmd::AdoptDefault { .. }
+    );
+    let region = match region {
+        None => None,
+        Some(_) if !rows || keys != RowKeys::Region => {
+            return Err(
+                "--region belongs to `accounts add` and `adopt-default` with `--cli kimi`"
+                    .to_string(),
+            );
+        }
+        Some(word) => Some(Region::parse(&word).ok_or_else(|| {
+            format!(
+                "--region takes `global` (kimi.ai) or `mainland-cn` (kimi.com), not {:?}",
+                super::one_line(&word, 40)
+            )
+        })?),
+    };
+    let flow = match flow {
+        None => None,
+        Some(_) if !rows || !matches!(keys, RowKeys::Flow(_)) => {
+            return Err(
+                "--flow belongs to `accounts add` and `adopt-default` with `--cli codex` or \
+                 `--cli grok`"
+                    .to_string(),
+            );
+        }
+        Some(word) => Some(Flow::parse(&word).ok_or_else(|| {
+            format!(
+                "--flow takes `browser` or `device`, not {:?}",
+                super::one_line(&word, 40)
+            )
+        })?),
+    };
+    if matches!(form, AccountsCmd::AdoptDefault { email: None, .. }) && cli != Cli::Codex {
+        return Err(
+            "accounts adopt-default needs --email <address>: the login it renews is checked \
+             against that address (Codex's alone is read from its app server)"
+                .to_string(),
+        );
+    }
+    if cli == Cli::Claude {
+        return Ok(Cmd::Accounts(form));
+    }
+    let verb = match form {
+        AccountsCmd::Serve { .. } => Some("serve"),
+        AccountsCmd::Report { .. }
+        | AccountsCmd::Add { .. }
+        | AccountsCmd::AdoptDefault { .. }
+        | AccountsCmd::Renew { .. }
+        | AccountsCmd::Login { .. }
+        | AccountsCmd::Use { .. }
+        | AccountsCmd::Auto
+        | AccountsCmd::Stats { .. }
+        | AccountsCmd::Sync { .. } => None,
+    };
+    if let Some(verb) = verb {
+        return Err(format!(
+            "accounts {verb} is Claude Code's alone in this build: {}'s pool takes `list`, \
+             `add`, `adopt-default`, `login`, `renew`, `use`, `stats` and `sync` (Claude Code's \
+             dashboard shows every pool)",
+            cli.connector().product
+        ));
+    }
+    Ok(Cmd::AccountsOf(AccountsOf {
+        cli,
+        form,
+        vendor: accounts::Vendor { region, flow },
+    }))
 }
 
 /// The longest `--defer`: a month.
@@ -2120,6 +2409,8 @@ pub fn limits_view(
     });
     let windows = match reader.program() {
         aterm_phase::Program::Codex
+        | aterm_phase::Program::Grok
+        | aterm_phase::Program::Kimi
         | aterm_phase::Program::Agy
         | aterm_phase::Program::Muse
         | aterm_phase::Program::Gemini => Vec::new(),
@@ -2140,6 +2431,8 @@ pub fn limits_view(
         credits: match reader.program() {
             aterm_phase::Program::Claude => aterm_phase::credits::in_use(rows).is_some(),
             aterm_phase::Program::Codex
+            | aterm_phase::Program::Grok
+            | aterm_phase::Program::Kimi
             | aterm_phase::Program::Agy
             | aterm_phase::Program::Muse
             | aterm_phase::Program::Gemini
@@ -3690,7 +3983,11 @@ pub fn replace_ledger_rows(path: &Path, rows: &[String]) -> io::Result<()> {
 fn ledger_path(env: &Env, file: &LedgerFile) -> Result<PathBuf, String> {
     match file {
         LedgerFile::Disk => Ok(env.disk_ledger()),
-        LedgerFile::Accounts => Ok(env.accounts_store().ledger_path()),
+        LedgerFile::Accounts(Cli::Claude) => Ok(env.accounts_store().ledger_path()),
+        LedgerFile::Accounts(cli) => env
+            .accounts_store_for(*cli)
+            .map(|store| store.ledger_path())
+            .ok_or_else(|| format!("no home is known, so {}'s ledger is not found", cli.id())),
         LedgerFile::Upgrade => Ok(super::upgrade_drive::ledger_path(&upgrade_opts(
             env,
             "",
@@ -3824,7 +4121,7 @@ fn run_ledger(
             (false, LedgerFile::Upgrade) => {
                 let _ = writeln!(out, "{}", upgrade_ledger_line(row));
             }
-            (false, LedgerFile::Accounts) => {
+            (false, LedgerFile::Accounts(_)) => {
                 let _ = writeln!(out, "{}", accounts_ledger_line(row));
             }
             (false, LedgerFile::Approvals(_)) => {
@@ -4370,6 +4667,32 @@ pub trait AccountsHost {
     fn current_exe(&self) -> Option<PathBuf> {
         None
     }
+
+    /// A renewal's sign-in of another CLI's pool ([`run_accounts_renew_for`]): the vendor's own flow in `req`'s staging directory, its page approved in the headless browser, driven to its end ([`super::login_drive::sign_in_live`]).
+    fn vendor_sign_in(&self, req: &super::login_drive::Request<'_>) -> super::login_drive::Drove {
+        let _ = req;
+        super::login_drive::Drove {
+            outcome: super::login_drive::Outcome::NotRun("this host signs nothing in".to_string()),
+            host: None,
+        }
+    }
+
+    /// `accounts login <label> --cli <id>` ([`run_accounts_login_for`]): the vendor's own sign-in on this terminal, in `req`'s staging directory, its URL and code shown by the CLI itself, waited for.
+    fn vendor_login(&self, req: &super::login_drive::Request<'_>) -> Result<i32, String> {
+        let _ = req;
+        Err("this host runs no sign-in".to_string())
+    }
+
+    /// The reader of a pooled CLI's usage in one row's home that `accounts stats --cli` records before it reports ([`super::accounts_pool::record_usage`]); `None` reads nothing.
+    fn usage_reader(&self) -> Option<super::accounts_pool::ReadUsage<'static>> {
+        None
+    }
+
+    /// The email of the ChatGPT account Codex's login in `home` names (its app server's `account/read`, [`super::codex_app_login::read_account`]), which `adopt-default --cli codex` takes when no `--email` is given; `None` names none.
+    fn codex_account(&self, home: &Path) -> Option<String> {
+        let _ = home;
+        None
+    }
 }
 
 /// What opens a renewal's sign-in page ([`AccountsHost::renew_flow`]).
@@ -4464,6 +4787,37 @@ impl AccountsHost for LiveAccounts {
 
     fn current_exe(&self) -> Option<PathBuf> {
         std::env::current_exe().ok()
+    }
+
+    fn usage_reader(&self) -> Option<super::accounts_pool::ReadUsage<'static>> {
+        Some(&super::accounts_pool::live_usage)
+    }
+
+    fn codex_account(&self, home: &Path) -> Option<String> {
+        super::codex_app_login::run_app_server(
+            Cli::Codex,
+            home,
+            super::accounts_pool::USAGE_READ_WAIT,
+            super::codex_app_login::read_account,
+        )
+        .flatten()
+        .and_then(|account| account.email)
+    }
+
+    fn vendor_sign_in(&self, req: &super::login_drive::Request<'_>) -> super::login_drive::Drove {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        super::login_drive::sign_in_live(req, &home, &|name| std::env::var_os(name))
+    }
+
+    fn vendor_login(&self, req: &super::login_drive::Request<'_>) -> Result<i32, String> {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        terminal_run(super::login_drive::login_command(req, &home, &|name| {
+            std::env::var_os(name)
+        }))
     }
 }
 
@@ -4810,17 +5164,21 @@ pub fn status_facts(got: &Captured, want: &str) -> Option<StatusFacts> {
 }
 
 fn accounts_read_roster(env: &Env, err: &mut dyn Write) -> Option<(PathBuf, Roster)> {
-    let Some(path) = env.accounts_roster() else {
+    accounts_read_roster_for(Cli::Claude, env, err)
+}
+
+fn accounts_read_roster_for(cli: Cli, env: &Env, err: &mut dyn Write) -> Option<(PathBuf, Roster)> {
+    let Some(path) = env.accounts_roster_for(cli) else {
         let _ = writeln!(
             err,
             "aterm harness accounts: no config directory is known (neither $XDG_CONFIG_HOME nor \
              $HOME is set), so there is no {} to read; name one with `--config \
              <dir>/aterm.toml`",
-            accounts::ACCOUNTS_FILE
+            cli.accounts().roster_file
         );
         return None;
     };
-    match Roster::load(&path) {
+    match Roster::load_for(cli, &path) {
         Ok(roster) => Some((path, roster)),
         Err(why) => {
             let _ = writeln!(err, "{}", accounts_refusal(&path, &why));
@@ -4837,15 +5195,34 @@ fn accounts_refusal(path: &Path, why: &str) -> String {
     )
 }
 
-fn accounts_none_listed(path: &Path) -> String {
+/// Why `cli`'s store cannot be opened: another CLI's logins live under the owner's home ([`Env::accounts_store_for`]).
+fn no_home_for(cli: Cli) -> String {
     format!(
-        "no accounts listed\nroster: {}{}\nlist one: {ACCOUNTS_ADD_LINE}\n",
+        "no home directory is known ($HOME is unset or relative), so {}'s logins have no place \
+         (~/.aterm/logins/{})",
+        cli.connector().product,
+        cli.id()
+    )
+}
+
+/// ` --cli <id>` for a pool other than Claude Code's, the flag a command line for it carries; empty for Claude Code's.
+fn cli_flag(cli: Cli) -> String {
+    match cli {
+        Cli::Claude => String::new(),
+        _ => format!(" --cli {}", cli.id()),
+    }
+}
+
+fn accounts_none_listed(cli: Cli, path: &Path) -> String {
+    format!(
+        "no accounts listed\nroster: {}{}\nlist one: {ACCOUNTS_ADD_LINE}{}\n",
         path.display(),
         if path.exists() {
             " (no rows)"
         } else {
             " (no such file)"
-        }
+        },
+        cli_flag(cli)
     )
 }
 
@@ -4865,6 +5242,15 @@ impl HeldBy {
                 .as_deref()
                 .and_then(profile::default_home_key)
                 .filter(|_| !several),
+        }
+    }
+
+    /// For a pool the usage tap does not read (any but Claude Code's): every recorded figure is
+    /// shown as it was recorded.
+    const fn untapped() -> HeldBy {
+        HeldBy {
+            tap: super::account_stats::Tap::On,
+            key: None,
         }
     }
 
@@ -5036,6 +5422,7 @@ fn usage_words(account: &accounts::Account, now: i64) -> String {
 }
 
 fn accounts_text(
+    cli: Cli,
     path: &Path,
     roster: &Roster,
     (state, logins): (&accounts::State, &accounts::Logins),
@@ -5043,7 +5430,7 @@ fn accounts_text(
     now: i64,
 ) -> String {
     if roster.rows.is_empty() {
-        let mut text = accounts_none_listed(path);
+        let mut text = accounts_none_listed(cli, path);
         let own = usage_words(&state.account(ACCOUNTS_OWN_LABEL), now);
         if !own.is_empty() {
             text.push_str(&format!(
@@ -5136,6 +5523,9 @@ fn accounts_text(
                     Some(until) => {
                         format!("{label}: {} (limited until {})", why.as_str(), rfc3339_utc(until))
                     }
+                    None if cli != Cli::Claude => {
+                        format!("{label}: {} (no login made yet)", why.as_str())
+                    }
                     None => format!(
                         "{label}: {} (no login made yet: run `aterm harness accounts {} {label}`)",
                         why.as_str(),
@@ -5154,7 +5544,10 @@ fn accounts_text(
         )
     });
     if next.to.is_none() && !to_sign_in {
-        text.push_str(&format!("list another: {ACCOUNTS_ADD_LINE}\n"));
+        text.push_str(&format!(
+            "list another: {ACCOUNTS_ADD_LINE}{}\n",
+            cli_flag(cli)
+        ));
     }
     if accounts::rotations_spent(state, roster, now) {
         text.push_str("the rotation bound for this hour is spent: a limit is waited out\n");
@@ -5210,6 +5603,7 @@ fn accounts_refused_json(path: &Path, why: &str, now: i64) -> String {
 }
 
 fn accounts_json(
+    cli: Cli,
     path: &Path,
     roster: &Roster,
     (state, logins): (&accounts::State, &accounts::Logins),
@@ -5219,12 +5613,18 @@ fn accounts_json(
 ) -> String {
     let mut o = accounts_json_head(path, now);
     o.insert("refused".to_owned(), Value::Null);
+    // Only Claude Code's sessions are carried by a supervisor that moves them; another pool is
+    // listed and recorded, and none of its sessions moves yet.
+    let moves = cli == Cli::Claude;
+    if !moves {
+        o.insert("cli".to_owned(), Value::from(cli.id().to_owned()));
+    }
     let mut rotation = Map::new();
-    rotation.insert("follows_use".to_owned(), Value::from(true));
-    rotation.insert("at_limit".to_owned(), Value::from(true));
-    rotation.insert("ahead_of_limit".to_owned(), Value::from(true));
-    rotation.insert("probe".to_owned(), Value::from(true));
-    rotation.insert("limit_reset".to_owned(), Value::from(true));
+    rotation.insert("follows_use".to_owned(), Value::from(moves));
+    rotation.insert("at_limit".to_owned(), Value::from(moves));
+    rotation.insert("ahead_of_limit".to_owned(), Value::from(moves));
+    rotation.insert("probe".to_owned(), Value::from(moves));
+    rotation.insert("limit_reset".to_owned(), Value::from(moves));
     rotation.insert("observed".to_owned(), Value::from(false));
     o.insert("rotation".to_owned(), Value::Object(rotation));
     o.insert("active".to_owned(), Value::from(state.active.clone()));
@@ -5397,16 +5797,17 @@ fn accounts_json(
 }
 
 fn run_accounts_report(
+    cli: Cli,
     env: &Env,
     json: bool,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
-    let Some(path) = env.accounts_roster() else {
-        let _ = accounts_read_roster(env, err);
+    let Some(path) = env.accounts_roster_for(cli) else {
+        let _ = accounts_read_roster_for(cli, env, err);
         return ExitCode::from(1);
     };
-    let roster = match Roster::load(&path) {
+    let roster = match Roster::load_for(cli, &path) {
         Ok(roster) => roster,
         Err(why) => {
             let _ = writeln!(err, "{}", accounts_refusal(&path, &why));
@@ -5416,7 +5817,10 @@ fn run_accounts_report(
             return ExitCode::from(1);
         }
     };
-    let store = env.accounts_store();
+    let Some(store) = env.accounts_store_for(cli) else {
+        let _ = writeln!(err, "aterm harness accounts: {}", no_home_for(cli));
+        return ExitCode::from(1);
+    };
     let (state, note) = store.load(env.now).unwrap_or_else(|why| {
         (
             accounts::State::default(),
@@ -5442,45 +5846,50 @@ fn run_accounts_report(
     if let Some(note) = note {
         let _ = writeln!(err, "aterm harness accounts: {note}");
     }
-    let by = HeldBy::of(env);
-    let own = roster.rows.is_empty()
+    let by = match cli {
+        Cli::Claude => HeldBy::of(env),
+        _ => HeldBy::untapped(),
+    };
+    let own = cli == Cli::Claude
+        && roster.rows.is_empty()
         && state
             .accounts
             .get(ACCOUNTS_OWN_LABEL)
             .is_some_and(|account| account.sample.is_some());
     let state = by.admit(state);
     if own && !json {
-        let _ = write!(out, "{}", accounts_none_listed(&path));
+        let _ = write!(out, "{}", accounts_none_listed(cli, &path));
         let _ = writeln!(out, "{}", accounts_own_reading(&state, by, env.now));
         return ExitCode::SUCCESS;
     }
     let roster = accounts::bound(&if own { Roster::own() } else { roster }, &logins);
-    let enrolled = accounts::enrolled(&roster);
+    let enrolled = accounts::enrolled_for(cli, &roster);
     let read = (&state, &logins);
     let _ = if json {
         writeln!(
             out,
             "{}",
-            accounts_json(&path, &roster, read, &enrolled, by, env.now)
+            accounts_json(cli, &path, &roster, read, &enrolled, by, env.now)
         )
     } else {
         write!(
             out,
             "{}",
-            accounts_text(&path, &roster, read, &enrolled, env.now)
+            accounts_text(cli, &path, &roster, read, &enrolled, env.now)
         )
     };
     ExitCode::SUCCESS
 }
 
 fn run_accounts_add(
+    cli: Cli,
     env: &Env,
     asked: &accounts::Row,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
     let (label, class) = (asked.label.as_str(), asked.class);
-    match accounts_add(env, asked) {
+    match accounts_add(cli, env, asked) {
         Ok(added) => {
             if added.listed_own {
                 let _ = writeln!(
@@ -5504,7 +5913,11 @@ fn run_accounts_add(
                 );
             }
             let verb = sign_in_verb(asked);
-            let _ = writeln!(out, "run: aterm harness accounts {verb} {label}");
+            let _ = writeln!(
+                out,
+                "run: aterm harness accounts {verb} {label}{}",
+                cli_flag(cli)
+            );
             ExitCode::SUCCESS
         }
         Err(why) => {
@@ -5562,7 +5975,7 @@ pub(super) fn roster_target(path: &Path) -> Result<(PathBuf, Option<u32>), Strin
     Ok((write_to, keep_mode))
 }
 
-fn accounts_add(env: &Env, asked: &accounts::Row) -> Result<Added, String> {
+fn accounts_add(cli: Cli, env: &Env, asked: &accounts::Row) -> Result<Added, String> {
     let label = asked.label.as_str();
     if let Some(why) = accounts::label_refusal(label) {
         return Err(format!(
@@ -5570,14 +5983,16 @@ fn accounts_add(env: &Env, asked: &accounts::Row) -> Result<Added, String> {
             super::one_line(label, 80)
         ));
     }
-    let path = env.accounts_roster().ok_or_else(|| {
+    let path = env.accounts_roster_for(cli).ok_or_else(|| {
         format!(
             "no config directory is known, so there is no {} to write; name one with `--config \
              <dir>/aterm.toml`",
-            accounts::ACCOUNTS_FILE
+            cli.accounts().roster_file
         )
     })?;
-    let store = env.accounts_store();
+    let store = env
+        .accounts_store_for(cli)
+        .ok_or_else(|| no_home_for(cli))?;
     let dir = store
         .login_dir(label)
         .ok_or_else(|| format!("`{label}` names no login directory"))?;
@@ -5599,13 +6014,16 @@ fn accounts_add(env: &Env, asked: &accounts::Row) -> Result<Added, String> {
         .map_err(|e| format!("{}: {e}", store.dir.display()))?;
     let (write_to, keep_mode) = roster_target(&path)?;
     let existing = accounts::roster_text(&write_to)?.unwrap_or_default();
-    let roster = Roster::parse(&existing).map_err(|why| {
+    let roster = Roster::parse_for(cli, &existing).map_err(|why| {
         format!(
             "the roster at {} is REFUSED: {why}; nothing was written",
             path.display()
         )
     })?;
     if let Some(row) = roster.row(label) {
+        if cli != Cli::Claude {
+            return Err(format!("`{label}` is already listed in {}", path.display()));
+        }
         return Err(format!(
             "`{label}` is already listed in {}; `aterm harness accounts {} {label}` signs it in",
             path.display(),
@@ -5632,7 +6050,7 @@ fn accounts_add(env: &Env, asked: &accounts::Row) -> Result<Added, String> {
     } else {
         vec![asked]
     };
-    let text = accounts::append_rows(&existing, &rows).map_err(|why| {
+    let text = accounts::append_rows_for(cli, &existing, &rows).map_err(|why| {
         let own = accounts::row_inline(ACCOUNTS_OWN_LABEL, Class::Dedicated, None);
         if listed_own && own.is_some_and(|own| why.contains(&own)) {
             format!(
@@ -5832,23 +6250,33 @@ fn run_accounts_login(
 }
 
 fn run_accounts_use(
+    cli: Cli,
     env: &Env,
     label: Option<&str>,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
-    let store = env.accounts_store();
+    let Some(store) = env.accounts_store_for(cli) else {
+        let _ = writeln!(err, "aterm harness accounts use: {}", no_home_for(cli));
+        return ExitCode::from(1);
+    };
     let now = env.now;
     let done = match label {
         Some(label) => {
-            let Some((_, raw)) = accounts_read_roster(env, err) else {
+            let Some((_, raw)) = accounts_read_roster_for(cli, env, err) else {
                 return ExitCode::from(1);
             };
-            let _ = super::accounts_sync::recover_staging_renewals(&store, &raw, now);
+            if cli == Cli::Claude {
+                let _ = super::accounts_sync::recover_staging_renewals(&store, &raw, now);
+            }
             let roster = store.bound(&raw, now).unwrap_or(raw);
-            let enrolled = accounts::enrolled(&roster);
+            let enrolled = accounts::enrolled_for(cli, &roster);
             let remedy = match roster.row(label) {
-                None => "`aterm harness accounts add <label>` lists an account".to_string(),
+                None => format!(
+                    "`aterm harness accounts add <label>{}` lists an account",
+                    cli_flag(cli)
+                ),
+                Some(_) if cli != Cli::Claude => "its login is not made yet".to_string(),
                 Some(row) => format!(
                     "sign it in with `aterm harness accounts {} {label}`, in a terminal",
                     sign_in_verb(row)
@@ -5887,25 +6315,28 @@ fn run_accounts_use(
 }
 
 fn run_accounts_adopt(
+    cli: Cli,
     env: &Env,
     row: &accounts::Row,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
     let done = (|| -> Result<PathBuf, String> {
-        let path = env.accounts_roster().ok_or_else(|| {
+        let path = env.accounts_roster_for(cli).ok_or_else(|| {
             format!(
                 "no config directory is known, so there is no {} to write; name one with \
                  `--config <dir>/aterm.toml`",
-                accounts::ACCOUNTS_FILE
+                cli.accounts().roster_file
             )
         })?;
-        let store = env.accounts_store();
+        let store = env
+            .accounts_store_for(cli)
+            .ok_or_else(|| no_home_for(cli))?;
         let _held = store
             .acquire()
             .map_err(|e| format!("{}: {e}", store.dir.display()))?;
         let existing = accounts::roster_text(&path)?.unwrap_or_default();
-        let roster = Roster::parse(&existing).map_err(|why| {
+        let roster = Roster::parse_for(cli, &existing).map_err(|why| {
             format!(
                 "the roster at {} is REFUSED: {why}; nothing was written",
                 path.display()
@@ -5925,7 +6356,7 @@ fn run_accounts_adopt(
                 own.label
             ));
         }
-        let text = accounts::append_rows(&existing, std::slice::from_ref(row))?;
+        let text = accounts::append_rows_for(cli, &existing, std::slice::from_ref(row))?;
         let (write_to, keep_mode) = roster_target(&path)?;
         super::upgrade_models::write_atomic_mode(&write_to, &text, keep_mode)
             .map_err(|e| format!("{}: {e}; the roster is unchanged", write_to.display()))?;
@@ -5939,11 +6370,13 @@ fn run_accounts_adopt(
                 row.label,
                 path.display()
             );
-            let _ = writeln!(
-                out,
-                "renew it with: aterm harness accounts renew {}",
-                row.label
-            );
+            if cli == Cli::Claude {
+                let _ = writeln!(
+                    out,
+                    "renew it with: aterm harness accounts renew {}",
+                    row.label
+                );
+            }
             ExitCode::SUCCESS
         }
         Err(why) => {
@@ -6549,6 +6982,583 @@ fn run_accounts_renew(
     }
 }
 
+/// How one of `cli`'s sign-ins is told to the person: the product and flow, and where its page is approved.
+fn sign_in_words(cli: Cli, route: &crate::ai::connector::Route, hosts: &[&str]) -> String {
+    format!(
+        "{}'s own sign-in ({} flow), its page approved in a headless browser on {} only",
+        cli.connector().product,
+        route.flow.as_str(),
+        hosts.join(", ")
+    )
+}
+
+/// What a driven sign-in that bound nothing came to, for the person: never the URL or code.
+fn drove_words(outcome: &super::login_drive::Outcome) -> String {
+    use super::login_drive::Outcome;
+    match outcome {
+        Outcome::SignedIn { .. } => "it signed in".to_string(),
+        Outcome::Exited(Some(code)) => {
+            format!("the sign-in exited {code} without saying it signed in")
+        }
+        Outcome::Exited(None) => "the sign-in was ended by a signal".to_string(),
+        Outcome::OffPin => {
+            "the page it named is not on its pinned hosts, so nothing was opened".to_string()
+        }
+        Outcome::Refused(why) => format!("the page was refused: {}", super::one_line(why, 160)),
+        Outcome::NeedsYou(why) => format!("it stopped: {}", super::one_line(why, 160)),
+        Outcome::Failed => "the CLI said its sign-in failed".to_string(),
+        Outcome::Hung => format!(
+            "the page was not approved within {} minutes",
+            super::login_drive::HANG.as_secs() / 60
+        ),
+        Outcome::NotRun(why) => format!("it did not run: {}", super::one_line(why, 160)),
+    }
+}
+
+/// The route, pinned hosts and staging directory one of `cli`'s sign-ins of `row` runs with, under the machine's sign-in lock ([`accounts::Store::signin_within`]); `Err` is the renewal's end, already told.
+struct SignInPlan {
+    route: &'static crate::ai::connector::Route,
+    hosts: &'static [&'static str],
+    staging: PathBuf,
+    staging_text: String,
+    _lock: accounts::Lock,
+}
+
+fn sign_in_plan(
+    cli: Cli,
+    store: &accounts::Store,
+    row: &accounts::Row,
+    verb: &str,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<SignInPlan, Renewal> {
+    let label = row.label.as_str();
+    let say = |err: &mut dyn Write, what: &str| {
+        let _ = writeln!(err, "aterm harness accounts {verb}: {label}: {what}");
+    };
+    let Some(route) = cli
+        .accounts()
+        .signin
+        .as_ref()
+        .and_then(|signin| signin.route(row.flow(cli)))
+    else {
+        say(
+            err,
+            "this pool has no sign-in in this build; nothing was run",
+        );
+        return Err(Renewal::Failed);
+    };
+    let Some(hosts) = route.hosts.of(row.vendor.region) else {
+        say(
+            err,
+            "the row names no `region`, so the sign-in's hosts are not known; add `region = \
+             \"global\"` (kimi.ai) or `\"mainland-cn\"` (kimi.com) to its row; nothing was run",
+        );
+        return Err(Renewal::Failed);
+    };
+    let lock = match store.signin_within() {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            let _ = writeln!(
+                out,
+                "{label}: held: {}; nothing was run",
+                accounts::SIGNIN_HELD
+            );
+            return Err(Renewal::Failed);
+        }
+        Err(e) => {
+            say(
+                err,
+                &format!("the sign-in lock could not be taken ({e}); nothing was run"),
+            );
+            return Err(Renewal::Failed);
+        }
+    };
+    let default_home = store.default_home();
+    if cli == Cli::Codex
+        && default_home
+            .as_deref()
+            .is_some_and(crate::ai::facts::codex_keyring)
+    {
+        say(
+            err,
+            "Codex keeps its login in the OS keyring here (`cli_auth_credentials_store` in its \
+             config.toml), which every row's home shares, so a sign-in would replace this \
+             machine's own login instead of making the row's; set it to \"file\" to pool Codex \
+             logins; nothing was run",
+        );
+        return Err(Renewal::Failed);
+    }
+    let staging = match store.claim_staging_dir(label) {
+        Ok(staging) => staging,
+        Err(e) => {
+            say(
+                err,
+                &format!(
+                    "no staging directory could be made under {}: {e}",
+                    store.logins_dir().display()
+                ),
+            );
+            return Err(Renewal::Failed);
+        }
+    };
+    let Some(staging_text) = staging.to_str().map(str::to_owned) else {
+        drop_staging(&staging, err);
+        say(err, "the staging directory's name is not UTF-8");
+        return Err(Renewal::Failed);
+    };
+    // An overlay's shared entries are linked before the sign-in's child runs, so what the CLI
+    // makes there at its first start (Codex's databases, skills) is the default home's.
+    let seam = cli.accounts().seam;
+    if let (crate::ai::connector::Seam::Overlay { .. }, Some(default_home)) =
+        (seam, default_home.as_deref())
+    {
+        let linked = super::accounts_overlay::ensure(seam, &staging, default_home);
+        if let Err(e) = linked {
+            drop_staging(&staging, err);
+            say(
+                err,
+                &format!(
+                    "its staging home could not be linked to {} ({e}); nothing was run",
+                    default_home.display()
+                ),
+            );
+            return Err(Renewal::Failed);
+        }
+    }
+    Ok(SignInPlan {
+        route,
+        hosts,
+        staging,
+        staging_text,
+        _lock: lock,
+    })
+}
+
+/// Binds `row` to the signed-in staging directory once its login file exists there (`stat`ed, never opened), proved as `proof`: the checkpoint, then [`accounts::note_renewed`] and [`accounts::note_proof`] in one transaction.
+#[allow(clippy::too_many_arguments)]
+fn bind_signed_in(
+    cli: Cli,
+    floor: i64,
+    host: &dyn AccountsHost,
+    store: &accounts::Store,
+    row: &accounts::Row,
+    own_dir: Option<&str>,
+    plan: &SignInPlan,
+    proof: accounts::Proof,
+    verb: &str,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Renewal {
+    let label = row.label.as_str();
+    let c = cli.connector();
+    let say = |err: &mut dyn Write, what: &str| {
+        let _ = writeln!(err, "aterm harness accounts {verb}: {label}: {what}");
+    };
+    if !c
+        .stores
+        .iter()
+        .any(|name| plan.staging.join(name).is_file())
+    {
+        drop_staging(&plan.staging, err);
+        say(
+            err,
+            "the sign-in ended and left no login in its staging directory; nothing was recorded",
+        );
+        return Renewal::AuthFailed;
+    }
+    let now = host.now().max(floor);
+    let email = row.email.as_deref().unwrap_or("");
+    if !email.is_empty()
+        && let Err(why) =
+            accounts::write_renewal_checkpoint_for(cli, label, email, &plan.staging_text, None, now)
+    {
+        say(
+            err,
+            &format!(
+                "the new login checked out, but its completion checkpoint could not be saved \
+                 ({}); nothing was recorded; its home is kept at {}",
+                super::one_line(&why.to_string(), 160),
+                plan.staging.display(),
+            ),
+        );
+        return Renewal::Failed;
+    }
+    let done = accounts_transact_logins(store, now, err, |state, logins| {
+        let events =
+            accounts::note_renewed(state, logins, label, own_dir, &plan.staging_text, None, now);
+        accounts::note_proof(logins, label, proof);
+        Ok(events)
+    });
+    match done {
+        Ok(_) => {
+            let (var, value) = accounts::login_env_for(
+                cli,
+                &accounts::Row {
+                    dir: Some(plan.staging_text.clone()),
+                    ..row.clone()
+                },
+            );
+            let _ = writeln!(
+                out,
+                "{label}: renewed; signed-in ({}); {}",
+                match proof {
+                    accounts::Proof::Status => "proved by the CLI's own report of its account",
+                    accounts::Proof::Page => "proved by the sign-in page's account",
+                    accounts::Proof::Unchecked => "unchecked: nothing named its account",
+                },
+                if cli == Cli::Codex {
+                    "a Codex CLI worker aterm starts takes it when the pool picks it; no running \
+                     session is moved"
+                        .to_owned()
+                } else {
+                    format!(
+                        "aterm starts and moves no {} session onto it yet",
+                        c.product
+                    )
+                }
+            );
+            let _ = writeln!(
+                out,
+                "start {} under it by hand with: {var}={} {}",
+                c.product,
+                super::upgrade::quote(super::upgrade::Dialect::Zsh, value.as_deref().unwrap_or("")),
+                c.id
+            );
+            Renewal::Renewed
+        }
+        Err(why) => {
+            say(
+                err,
+                &format!(
+                    "the new login checked out, but recording did not finish: {why}; its home \
+                     is kept at {}. Run `aterm harness accounts --cli {}` to inspect before \
+                     trying again",
+                    plan.staging.display(),
+                    cli.id()
+                ),
+            );
+            Renewal::Failed
+        }
+    }
+}
+
+/// One renewal of `cli`'s `row` (design §6): its vendor's own sign-in in a fresh staging directory under the machine's sign-in lock, its page approved headlessly on the pinned hosts ([`AccountsHost::vendor_sign_in`]), then bound once its login file exists. A CLI report naming another email is a wrong account; a sign-in that ends any other way removes the staging directory and records its host, flow and outcome in the ledger, never its URL or code. Its clock is the host's, never earlier than `floor`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn renew_one_for(
+    cli: Cli,
+    floor: i64,
+    host: &dyn AccountsHost,
+    store: &accounts::Store,
+    row: &accounts::Row,
+    own_dir: Option<&str>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Renewal {
+    use super::login_drive::Outcome;
+    let label = row.label.as_str();
+    let c = cli.connector();
+    let Some(email) = row.email.as_deref() else {
+        return Renewal::Failed;
+    };
+    let plan = match sign_in_plan(cli, store, row, "renew", out, err) {
+        Ok(plan) => plan,
+        Err(renewal) => return renewal,
+    };
+    let _ = writeln!(
+        out,
+        "renewing `{label}`: {}",
+        sign_in_words(cli, plan.route, plan.hosts)
+    );
+    if cli
+        .accounts()
+        .signin
+        .as_ref()
+        .is_some_and(crate::ai::connector::SignIn::opens_browser_here)
+    {
+        let _ = writeln!(
+            out,
+            "{} also opens its page in this machine's default browser, which aterm cannot stop: \
+             leave that window alone; the headless browser approves the page",
+            c.product
+        );
+    }
+    let _ = out.flush();
+    let drove = host.vendor_sign_in(&super::login_drive::Request {
+        cli,
+        route: plan.route,
+        row,
+        staging: &plan.staging,
+        store,
+        hosts: plan.hosts,
+    });
+    let now = host.now().max(floor);
+    let record = |err: &mut dyn Write, kind: accounts::Kind| {
+        let event = accounts::Event::new(now, kind, label).because(&drove.why(plan.route.flow));
+        accounts_transact_logins(store, now, err, |_, _| Ok(vec![event])).is_ok()
+    };
+    let proof = match &drove.outcome {
+        Outcome::SignedIn {
+            email: Some(said), ..
+        } if accounts::email_matches(email, said) => accounts::Proof::Status,
+        Outcome::SignedIn { email: Some(_), .. } => {
+            drop_staging(&plan.staging, err);
+            let _ = writeln!(out, "{label}: REFUSED: wrong account");
+            let recorded = accounts_transact_logins(store, now, err, |_, logins| {
+                Ok(accounts::note_wrong_account(logins, label, now))
+            });
+            let _ = writeln!(
+                err,
+                "aterm harness accounts renew: {label}: {} signed in ANOTHER account than this \
+                 row's, so nothing live changed{}; sign in as the row's account and run `aterm \
+                 harness accounts renew {label} --cli {}` again",
+                c.product,
+                if recorded.is_ok() {
+                    ""
+                } else {
+                    " (and the attempt was not recorded)"
+                },
+                cli.id()
+            );
+            return if recorded.is_ok() {
+                Renewal::WrongAccount
+            } else {
+                Renewal::Failed
+            };
+        }
+        Outcome::SignedIn { page: true, .. } => accounts::Proof::Page,
+        Outcome::SignedIn { .. } => accounts::Proof::Unchecked,
+        other => {
+            drop_staging(&plan.staging, err);
+            let recorded = record(err, accounts::Kind::SignIn);
+            let _ = writeln!(
+                err,
+                "aterm harness accounts renew: {label}: {}; nothing was recorded but the \
+                 attempt{}, and nothing live changed",
+                drove_words(other),
+                if recorded { "" } else { " (not even that)" }
+            );
+            if matches!(other, Outcome::NeedsYou(_) | Outcome::Hung) {
+                let _ = writeln!(
+                    out,
+                    "NEEDS YOU: approve the {} sign-in for {label}: run `aterm harness accounts \
+                     login {label} --cli {}`",
+                    c.product,
+                    cli.id()
+                );
+            }
+            return match other {
+                Outcome::Exited(code) => Renewal::authentication_failed(*code),
+                _ => Renewal::Failed,
+            };
+        }
+    };
+    bind_signed_in(
+        cli, floor, host, store, row, own_dir, &plan, proof, "renew", out, err,
+    )
+}
+
+/// `accounts renew --cli <id> [<label>…] [--due]`: [`renew_one_for`] for each named row, or each due one (an email, and a login made here that is due or ended: [`accounts::renew_due`]; a row never signed in here is renewed by name).
+fn run_accounts_renew_for(
+    cli: Cli,
+    env: &Env,
+    host: &dyn AccountsHost,
+    (labels, due, on): (&[String], bool, Option<&[String]>),
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    if on.is_some_and(|on| !on.is_empty()) {
+        let _ = writeln!(
+            err,
+            "aterm harness accounts renew: --on is Claude Code's alone in this build; run `aterm \
+             harness accounts renew --cli {} --due` on each machine; nothing was run",
+            cli.id()
+        );
+        return ExitCode::from(1);
+    }
+    let Some((path, file_roster)) = accounts_read_roster_for(cli, env, err) else {
+        return ExitCode::from(1);
+    };
+    let Some(store) = env.accounts_store_for(cli) else {
+        let _ = writeln!(err, "aterm harness accounts renew: {}", no_home_for(cli));
+        return ExitCode::from(1);
+    };
+    let now = env.now;
+    let (logins, logins_note) = match store.load_logins(now) {
+        Ok(read) => read,
+        Err(why) => {
+            let _ = writeln!(
+                err,
+                "aterm harness accounts renew: {why}: {} is left as it is and nothing was run",
+                store.logins_file().display()
+            );
+            return ExitCode::from(1);
+        }
+    };
+    if let Some(note) = logins_note {
+        let _ = writeln!(err, "aterm harness accounts: {note}");
+    }
+    let roster = accounts::bound(&file_roster, &logins);
+    let mut chosen: Vec<String> = Vec::new();
+    for label in labels {
+        match roster.row(label) {
+            None => {
+                let _ = writeln!(
+                    err,
+                    "aterm harness accounts renew: `{}` is not in the roster ({}); nothing was run",
+                    super::one_line(label, 80),
+                    path.display()
+                );
+                return ExitCode::from(1);
+            }
+            Some(row) if row.email.is_none() => {
+                let _ = writeln!(
+                    err,
+                    "aterm harness accounts renew: `{label}` has no email, so its sign-in could \
+                     not be checked; add `email = \"…\"` to its row (or sign it in with `aterm \
+                     harness accounts login {label} --cli {}`); nothing was run",
+                    cli.id()
+                );
+                return ExitCode::from(1);
+            }
+            Some(_) if !chosen.contains(label) => chosen.push(label.clone()),
+            Some(_) => {}
+        }
+    }
+    if due {
+        let (state, _) = match store.load(now) {
+            Ok(read) => read,
+            Err(why) => {
+                let _ = writeln!(
+                    err,
+                    "aterm harness accounts renew: {why}; due logins could not be determined, \
+                     so nothing was run"
+                );
+                return ExitCode::from(1);
+            }
+        };
+        let enrolled = accounts::enrolled_for(cli, &roster);
+        for label in accounts::renew_due(&roster, &logins, &state, &enrolled, now) {
+            if !chosen.contains(&label) {
+                chosen.push(label);
+            }
+        }
+    }
+    if chosen.is_empty() {
+        let _ = writeln!(out, "nothing is due on this machine");
+        return ExitCode::SUCCESS;
+    }
+    let mut ok = true;
+    for label in &chosen {
+        let Some(row) = roster.row(label) else {
+            continue;
+        };
+        let own_dir = file_roster.row(label).and_then(|r| r.dir.as_deref());
+        ok &= renew_one_for(cli, now, host, &store, row, own_dir, out, err) == Renewal::Renewed;
+    }
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
+/// `accounts login <label> --cli <id>`: the person's path where the headless sign-in stopped (design §6): the vendor's own sign-in on this terminal, in a fresh staging directory, the CLI itself showing its URL and code; bound once it exits 0 and left its login file, its identity `unchecked` (nothing names the account the person approved).
+fn run_accounts_login_for(
+    cli: Cli,
+    env: &Env,
+    host: &dyn AccountsHost,
+    label: &str,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let Some((path, file_roster)) = accounts_read_roster_for(cli, env, err) else {
+        return ExitCode::from(1);
+    };
+    let Some(row) = file_roster.row(label).cloned() else {
+        let _ = writeln!(
+            err,
+            "aterm harness accounts login: `{}` is not in the roster ({}); nothing was run",
+            super::one_line(label, 80),
+            path.display()
+        );
+        return ExitCode::from(1);
+    };
+    if !host.stdin_is_terminal() {
+        let _ = writeln!(
+            err,
+            "aterm harness accounts login: not run: stdin is not a terminal (the sign-in shows \
+             its page and code there and waits). Run it in a terminal"
+        );
+        return ExitCode::from(1);
+    }
+    let Some(store) = env.accounts_store_for(cli) else {
+        let _ = writeln!(err, "aterm harness accounts login: {}", no_home_for(cli));
+        return ExitCode::from(1);
+    };
+    let plan = match sign_in_plan(cli, &store, &row, "login", out, err) {
+        Ok(plan) => plan,
+        Err(_) => return ExitCode::from(1),
+    };
+    let _ = writeln!(
+        out,
+        "signing in `{label}`: {}'s own sign-in; approve its page as the row's account{}",
+        cli.connector().product,
+        row.email
+            .as_deref()
+            .map_or_else(String::new, |e| format!(" ({})", super::one_line(e, 80)))
+    );
+    let _ = out.flush();
+    let _ = err.flush();
+    let exited = host.vendor_login(&super::login_drive::Request {
+        cli,
+        route: plan.route,
+        row: &row,
+        staging: &plan.staging,
+        store: &store,
+        hosts: plan.hosts,
+    });
+    match exited {
+        Ok(0) => {}
+        Ok(code) => {
+            drop_staging(&plan.staging, err);
+            let _ = writeln!(
+                err,
+                "aterm harness accounts login: {label}: the sign-in exited {code}; nothing was \
+                 recorded and nothing live changed"
+            );
+            return ExitCode::from(1);
+        }
+        Err(why) => {
+            drop_staging(&plan.staging, err);
+            let _ = writeln!(
+                err,
+                "aterm harness accounts login: {label}: `{}` could not be run: {}",
+                cli.id(),
+                super::one_line(&why, 160)
+            );
+            return ExitCode::from(1);
+        }
+    }
+    let own_dir = file_roster.row(label).and_then(|r| r.dir.as_deref());
+    match bind_signed_in(
+        cli,
+        env.now,
+        host,
+        &store,
+        &row,
+        own_dir,
+        &plan,
+        accounts::Proof::Unchecked,
+        "login",
+        out,
+        err,
+    ) {
+        Renewal::Renewed => ExitCode::SUCCESS,
+        _ => ExitCode::from(1),
+    }
+}
+
 fn claude_profile_of(
     home: Option<&Path>,
     config: Option<&str>,
@@ -6570,7 +7580,7 @@ pub fn run_accounts(
     err: &mut dyn Write,
 ) -> ExitCode {
     match form {
-        AccountsCmd::Report { json } => run_accounts_report(env, *json, out, err),
+        AccountsCmd::Report { json } => run_accounts_report(Cli::Claude, env, *json, out, err),
         AccountsCmd::Add {
             label,
             class,
@@ -6584,7 +7594,7 @@ pub fn run_accounts(
                 browser: browser.clone(),
                 ..accounts::Row::default()
             };
-            run_accounts_add(env, &row, out, err)
+            run_accounts_add(Cli::Claude, env, &row, out, err)
         }
         AccountsCmd::AdoptDefault {
             label,
@@ -6593,18 +7603,18 @@ pub fn run_accounts(
         } => {
             let row = accounts::Row {
                 label: label.clone(),
-                email: Some(email.clone()),
+                email: email.clone(),
                 browser: browser.clone(),
                 ..accounts::Row::default()
             };
-            run_accounts_adopt(env, &row, out, err)
+            run_accounts_adopt(Cli::Claude, env, &row, out, err)
         }
         AccountsCmd::Renew { labels, due, on } => {
             run_accounts_renew(env, host, (labels, *due, on.as_deref()), out, err)
         }
         AccountsCmd::Login { label } => run_accounts_login(env, host, label, out, err),
-        AccountsCmd::Use { label } => run_accounts_use(env, Some(label), out, err),
-        AccountsCmd::Auto => run_accounts_use(env, None, out, err),
+        AccountsCmd::Use { label } => run_accounts_use(Cli::Claude, env, Some(label), out, err),
+        AccountsCmd::Auto => run_accounts_use(Cli::Claude, env, None, out, err),
         AccountsCmd::Stats { json } => run_accounts_stats(env, *json, out),
         AccountsCmd::Sync {
             source,
@@ -6631,6 +7641,317 @@ pub fn run_accounts(
             err,
         ),
     }
+}
+
+/// `accounts … --cli <id>` ([`AccountsOf`]): another CLI's pool, through the same report, roster writes and pin as Claude Code's, under its own roster, store and login root.
+pub fn run_accounts_of(
+    of: &AccountsOf,
+    env: &Env,
+    host: &dyn AccountsHost,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let cli = of.cli;
+    match &of.form {
+        AccountsCmd::Report { json } => run_accounts_report(cli, env, *json, out, err),
+        AccountsCmd::Add {
+            label,
+            class,
+            email,
+            browser,
+        } => {
+            let row = accounts::Row {
+                label: label.clone(),
+                class: *class,
+                email: email.clone(),
+                browser: browser.clone(),
+                vendor: of.vendor,
+                ..accounts::Row::default()
+            };
+            run_accounts_add(cli, env, &row, out, err)
+        }
+        AccountsCmd::AdoptDefault {
+            label,
+            email,
+            browser,
+        } => {
+            let email = match email {
+                Some(email) => email.clone(),
+                None => {
+                    let home = env
+                        .home
+                        .as_deref()
+                        .map(|h| h.join(cli.accounts().default_home));
+                    match home.as_deref().and_then(|home| host.codex_account(home)) {
+                        Some(email) => {
+                            let _ = writeln!(
+                                out,
+                                "{label}: Codex's app server names the default login's account \
+                                 as {email}"
+                            );
+                            email
+                        }
+                        None => {
+                            let _ = writeln!(
+                                err,
+                                "aterm harness accounts adopt-default: {label}: Codex's app \
+                                 server named no ChatGPT account for the default login; pass \
+                                 --email <address>"
+                            );
+                            return ExitCode::from(1);
+                        }
+                    }
+                }
+            };
+            let row = accounts::Row {
+                label: label.clone(),
+                email: Some(email),
+                browser: browser.clone(),
+                vendor: of.vendor,
+                ..accounts::Row::default()
+            };
+            run_accounts_adopt(cli, env, &row, out, err)
+        }
+        AccountsCmd::Use { label } => run_accounts_use(cli, env, Some(label), out, err),
+        AccountsCmd::Auto => run_accounts_use(cli, env, None, out, err),
+        AccountsCmd::Stats { json } => run_accounts_stats_of(cli, env, host, *json, out, err),
+        AccountsCmd::Renew { labels, due, on } => {
+            run_accounts_renew_for(cli, env, host, (labels, *due, on.as_deref()), out, err)
+        }
+        AccountsCmd::Login { label } => run_accounts_login_for(cli, env, host, label, out, err),
+        AccountsCmd::Sync {
+            source,
+            machine,
+            json,
+        } => super::accounts_sync::run_cli_accounts_sync(
+            cli,
+            env,
+            (source.as_deref(), machine.as_deref(), *json),
+            out,
+            err,
+        ),
+        AccountsCmd::Serve { .. } => {
+            let _ = writeln!(
+                err,
+                "aterm harness accounts: {}'s pool takes `list`, `add`, `adopt-default`, \
+                 `login`, `renew`, `use`, `stats` and `sync` in this build",
+                cli.connector().product
+            );
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// `accounts stats --cli <id>`: each of the pool's rows (as `logins.json` binds it) with its condition, login state, usage and wall from the CLI's store, once each row's usage was read in its own home where the host reads it ([`AccountsHost::usage_reader`], [`super::accounts_pool::record_usage`]: Codex's app server); and, for Codex, its default home's newest rollouts' usage windows ([`crate::ai::codex_limits::home_sample`]). Its text and JSON forms exit alike: 1 only where no store is known.
+fn run_accounts_stats_of(
+    cli: Cli,
+    env: &Env,
+    host: &dyn AccountsHost,
+    json: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let product = cli.connector().product;
+    let (Some(store), Some(user_home)) = (env.accounts_store_for(cli), env.home.as_deref()) else {
+        let _ = writeln!(
+            err,
+            "aterm harness accounts stats: no home is known, so {product}'s pool is not found"
+        );
+        return ExitCode::from(1);
+    };
+    let raw = env
+        .accounts_roster_for(cli)
+        .filter(|p| p.is_file())
+        .and_then(|p| Roster::load_for(cli, &p).ok())
+        .unwrap_or_default();
+    let logins = store
+        .load_logins(env.now)
+        .map(|(logins, _)| logins)
+        .unwrap_or_default();
+    let roster = accounts::bound(&raw, &logins);
+    let enrolled = accounts::enrolled_for(cli, &roster);
+    if let (Some(read), Some(config_dir)) = (
+        host.usage_reader(),
+        env.config.as_deref().and_then(Path::parent),
+    ) {
+        let seat = super::accounts_pool::Seat {
+            config_dir,
+            state: &env.state,
+            home: user_home,
+            now: env.now,
+        };
+        let _ = super::accounts_pool::record_usage(&seat, cli, &roster, &enrolled, read);
+    }
+    let state = store
+        .load(env.now)
+        .map(|(state, _)| state)
+        .unwrap_or_default();
+    let home = match cli {
+        Cli::Codex => super::codex_rollout::codex_home(
+            env.codex_home.as_deref(),
+            env.home.as_deref().and_then(Path::to_str),
+            Some(&env.cwd),
+        ),
+        _ => None,
+    };
+    let read = home
+        .as_deref()
+        .and_then(|home| crate::ai::codex_limits::home_sample(home, env.now));
+    let figure = |name: &str, pct: Option<u32>, reset: Option<i64>| match (pct, reset) {
+        (Some(pct), Some(reset)) => format!("{name} {pct}% until {}", rfc3339_utc(reset)),
+        (Some(pct), None) => format!("{name} {pct}%"),
+        _ => format!("{name} ?"),
+    };
+    let window = |pct: Option<u32>, reset: Option<i64>| {
+        let mut w = Map::new();
+        w.insert("pct".to_owned(), Value::from(pct.map(u64::from)));
+        put_time(&mut w, "resets", reset);
+        Value::Object(w)
+    };
+    struct Line<'a> {
+        row: &'a accounts::Row,
+        condition: accounts::Condition,
+        login: &'static str,
+        sample: Option<&'a accounts::Sample>,
+        limited_until: Option<i64>,
+    }
+    let lines: Vec<Line<'_>> = roster
+        .rows
+        .iter()
+        .map(|row| {
+            let here = row.dir.is_none() || enrolled.contains(&row.label);
+            let account = state.accounts.get(&row.label);
+            Line {
+                row,
+                condition: accounts::condition(row, &state, here, env.now),
+                login: accounts::login_state(row, &logins, &state, env.now).as_str(),
+                sample: account.and_then(|a| a.sample.as_ref()),
+                limited_until: account.and_then(|a| a.limited_until(env.now)),
+            }
+        })
+        .collect();
+    if json {
+        let mut o = Map::new();
+        o.insert("schema".to_owned(), Value::from(1u64));
+        o.insert("kind".to_owned(), Value::from("account-stats".to_owned()));
+        o.insert("cli".to_owned(), Value::from(cli.id().to_owned()));
+        put_time(&mut o, "as_of", Some(env.now));
+        o.insert(
+            "home".to_owned(),
+            Value::from(home.as_ref().map(|h| h.display().to_string())),
+        );
+        let (key, sample) = read.map_or((None, None), |(key, sample)| (key, Some(sample)));
+        o.insert("key".to_owned(), Value::from(key.map(|k| k.to_string())));
+        o.insert(
+            "session".to_owned(),
+            sample
+                .as_ref()
+                .map_or(Value::Null, |s| window(s.session_pct, s.session_reset)),
+        );
+        o.insert(
+            "week".to_owned(),
+            sample
+                .as_ref()
+                .map_or(Value::Null, |s| window(s.week_pct, s.week_reset)),
+        );
+        put_time(&mut o, "read_at", sample.as_ref().map(|s| s.at));
+        let rows: Vec<Value> = lines
+            .iter()
+            .map(|l| {
+                let mut r = Map::new();
+                r.insert("label".to_owned(), Value::from(l.row.label.clone()));
+                r.insert("condition".to_owned(), Value::from(l.condition.as_str()));
+                r.insert("login".to_owned(), Value::from(l.login));
+                r.insert(
+                    "session".to_owned(),
+                    l.sample
+                        .map_or(Value::Null, |s| window(s.session_pct, s.session_reset)),
+                );
+                r.insert(
+                    "week".to_owned(),
+                    l.sample
+                        .map_or(Value::Null, |s| window(s.week_pct, s.week_reset)),
+                );
+                put_time(&mut r, "read_at", l.sample.map(|s| s.at));
+                put_time(&mut r, "limited_until", l.limited_until);
+                Value::Object(r)
+            })
+            .collect();
+        o.insert("rows".to_owned(), Value::Array(rows));
+        let _ = writeln!(
+            out,
+            "{}",
+            aterm_json::to_string(&Value::Object(o)).unwrap_or_default()
+        );
+        return ExitCode::SUCCESS;
+    }
+    match (cli, home.as_deref(), read) {
+        (Cli::Codex, None, _) => {
+            let _ = writeln!(
+                out,
+                "no Codex home is known (neither $CODEX_HOME nor $HOME names one)"
+            );
+        }
+        (Cli::Codex, Some(home), None) => {
+            let _ = writeln!(
+                out,
+                "{product} at {}: no usage reading in the last {}h of its rollouts",
+                home.display(),
+                crate::ai::codex_limits::FRESH_S / 3600
+            );
+        }
+        (Cli::Codex, Some(home), Some((key, sample))) => {
+            let _ = writeln!(
+                out,
+                "{product} at {}{}, read at {}: {} \u{b7} {}",
+                home.display(),
+                key.map_or_else(String::new, |k| format!(" (account {})", k.short())),
+                rfc3339_utc(sample.at),
+                figure("5h", sample.session_pct, sample.session_reset),
+                figure("week", sample.week_pct, sample.week_reset),
+            );
+        }
+        _ => {
+            let _ = writeln!(
+                out,
+                "aterm reads no usage of {product} yet: its rows show their logins and the walls \
+                 recorded"
+            );
+        }
+    }
+    if lines.is_empty() {
+        let _ = writeln!(
+            out,
+            "no accounts listed for {product}: add one with `aterm harness accounts add <label> \
+             --cli {}`",
+            cli.id()
+        );
+    }
+    for l in &lines {
+        let usage = l.sample.map_or_else(
+            || "no reading yet".to_owned(),
+            |s| {
+                format!(
+                    "{} \u{b7} {}, read {}",
+                    figure("5h", s.session_pct, s.session_reset),
+                    figure("week", s.week_pct, s.week_reset),
+                    rfc3339_utc(s.at)
+                )
+            },
+        );
+        let _ = writeln!(
+            out,
+            "  {}: {} \u{b7} login {} \u{b7} {usage}{}",
+            l.row.label,
+            l.condition.as_str(),
+            l.login,
+            l.limited_until.map_or_else(String::new, |t| format!(
+                " \u{b7} walled until {}",
+                rfc3339_utc(t)
+            ))
+        );
+    }
+    ExitCode::SUCCESS
 }
 
 fn run_accounts_stats(env: &Env, json: bool, out: &mut dyn Write) -> ExitCode {
@@ -6846,6 +8167,8 @@ pub fn run(cmd: &Cmd, env: &Env, out: &mut dyn Write, err: &mut dyn Write) -> Ex
         Cmd::UpgradeOwner { sid, ask, json } => run_upgrade_owner(env, sid, *ask, *json, out, err),
         Cmd::UpgradeModels { set } => run_upgrade_models(env, set.as_deref(), out, err),
         Cmd::Accounts(form) => run_accounts(form, env, &LiveAccounts, out, err),
+        Cmd::AccountsOf(of) => run_accounts_of(of, env, &LiveAccounts, out, err),
+        Cmd::AccountsAll { json } => run_accounts_all(*json, env, &LiveAccounts, out, err),
         Cmd::Versions { json } => run_versions(*json, out),
     }
 }

@@ -1185,11 +1185,25 @@ fn swap_into_place(build_dir: &Path, incoming: &Path) -> std::io::Result<()> {
     if let Some(parent) = build_dir.parent() {
         crate::store::sync_dir_ordered(parent);
     }
+    // The outgoing tree is behind the build's link when it was laid aside, else at its name;
+    // a toolchain comes in aside, in `<build>.noindex` behind a `<build>` link
+    // ([`crate::store::lays_aside`]).
+    let linked = aterm_toolchain::layout::is_linked_aside(build_dir);
+    let aside = aterm_toolchain::layout::aside_of(build_dir);
+    let outgoing = if linked {
+        aside.clone()
+    } else {
+        Some(build_dir.to_path_buf())
+    };
+    let dest = match aside {
+        Some(aside) if crate::store::lays_aside(incoming) => aside,
+        _ => build_dir.to_path_buf(),
+    };
     let superseded = crate::store::superseded_dir(build_dir);
-    let retired = match superseded {
-        Some(ref old) if build_dir.exists() => {
+    let retired = match (&superseded, &outgoing) {
+        (Some(old), Some(out)) if out.exists() => {
             let _ = crate::store::remove_tree(old);
-            if let Err(e) = std::fs::rename(build_dir, old) {
+            if let Err(e) = std::fs::rename(out, old) {
                 if was_complete {
                     let _ = crate::store::mark_build_ready(build_dir);
                 }
@@ -1199,11 +1213,35 @@ fn swap_into_place(build_dir: &Path, incoming: &Path) -> std::io::Result<()> {
         }
         _ => false,
     };
-    if let Err(e) = std::fs::rename(incoming, build_dir) {
-        if retired && let Some(ref old) = superseded {
-            restore_outgoing(old, build_dir, was_complete);
+    let restore = |e: std::io::Error| {
+        if retired && let (Some(old), Some(out)) = (&superseded, &outgoing) {
+            restore_outgoing(old, out, build_dir, was_complete);
         }
-        return Err(e);
+        Err(e)
+    };
+    if dest == build_dir {
+        // Coming in plain where a link stood: the link goes, so the tree takes its name.
+        if linked && let Err(e) = std::fs::remove_file(build_dir) {
+            return restore(e);
+        }
+    } else if !linked {
+        // A tree at `<build>.noindex` that no `<build>` link names belongs to nothing.
+        if std::fs::symlink_metadata(&dest).is_ok() && crate::store::remove_tree(&dest).is_err() {
+            return restore(std::io::Error::other(format!(
+                "{} is in the way and could not be removed",
+                dest.display()
+            )));
+        }
+    }
+    if let Err(e) = std::fs::rename(incoming, &dest) {
+        return restore(e);
+    }
+    if dest != build_dir
+        && !aterm_toolchain::layout::is_linked_aside(build_dir)
+        && let Err(e) = crate::store::link_aside(build_dir)
+    {
+        let _ = std::fs::rename(&dest, incoming);
+        return restore(e);
     }
     if retired && let Some(ref old) = superseded {
         let _ = crate::store::remove_tree(old);
@@ -1215,9 +1253,14 @@ fn swap_into_place(build_dir: &Path, incoming: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn restore_outgoing(old: &Path, build_dir: &Path, was_complete: bool) -> bool {
-    if std::fs::rename(old, build_dir).is_err() {
+/// Put the outgoing tree parked at `old` back at `out` (the build's name, or its aside, whose
+/// `<build>` link is laid again when a failed swap took it down).
+fn restore_outgoing(old: &Path, out: &Path, build_dir: &Path, was_complete: bool) -> bool {
+    if std::fs::rename(old, out).is_err() {
         return false;
+    }
+    if out != build_dir {
+        crate::store::relink_aside(build_dir);
     }
     if was_complete {
         let _ = crate::store::mark_build_ready(build_dir);
@@ -1294,8 +1337,23 @@ mod tests {
     }
 
     fn bundle(label: &str) -> Bundle {
+        bundle_with(label, make_archive)
+    }
+
+    /// A Rust toolchain's archive: a sysroot (`lib/rustlib`) beside its binary.
+    #[cfg(target_os = "macos")]
+    fn make_toolchain_archive(dir: &Path) -> PathBuf {
+        let mut tar = tar_entry("bin/ay", b"#!/bin/true\nthe ay binary");
+        tar.extend(tar_entry(
+            "lib/rustlib/aarch64-apple-darwin/lib/libstd.rlib",
+            b"an rlib",
+        ));
+        seal(dir.join("ay-18.tar.zst"), tar)
+    }
+
+    fn bundle_with(label: &str, make: fn(&Path) -> PathBuf) -> Bundle {
         let dir = tmp(label);
-        let archive = make_archive(&dir);
+        let archive = make(&dir);
         let sha = file_sha256(&archive).unwrap();
         let probe = dir.join("probe");
         let modes = crate::extract::extract_tar_zst_tree(
@@ -1810,6 +1868,125 @@ mod tests {
         assert!(crate::store::build_is_complete(&build));
     }
 
+    #[cfg(target_os = "macos")]
+    fn is_link(path: &Path) -> bool {
+        std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn is_real_dir(path: &Path) -> bool {
+        std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+    }
+
+    /// A toolchain lands in `<build>.noindex` behind its `<build>` link, and a re-stage keeps
+    /// that layout, replacing only the tree behind the link; a plain binary lands at its name.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_toolchain_lands_aside_in_noindex_behind_its_build_link() {
+        let b = bundle_with("aside-fresh", make_toolchain_archive);
+        let build = b.build();
+        let aside = build.with_file_name("18.noindex");
+        verify_and_stage(&b.art, &b.archive, &build, &StageHooks::NONE).unwrap();
+        assert!(is_link(&build) && is_real_dir(&aside));
+        assert_eq!(std::fs::read_link(&build).unwrap(), Path::new("18.noindex"));
+        assert!(crate::store::build_is_complete(&build));
+        assert!(
+            build
+                .join("lib/rustlib/aarch64-apple-darwin/lib/libstd.rlib")
+                .is_file()
+        );
+        assert!(scratch_beside(&build).is_empty());
+        assert!(crate::store::spotlight_exposed_builds(&b.dir).is_empty());
+
+        std::fs::write(aside.join("this-tree-survived"), b"old").unwrap();
+        verify_and_stage(&b.art, &b.archive, &build, &StageHooks::NONE).unwrap();
+        assert!(is_link(&build) && is_real_dir(&aside));
+        assert!(
+            !aside.join("this-tree-survived").exists(),
+            "the tree behind the link was replaced"
+        );
+        assert!(crate::store::build_is_complete(&build));
+        assert!(scratch_beside(&build).is_empty());
+
+        let plain = bundle("aside-plain");
+        let (build, _) = plain.installed();
+        assert!(is_real_dir(&build));
+        assert!(!build.with_file_name("18.noindex").exists());
+    }
+
+    /// A toolchain build staged before the layout (a real directory at its name) that is
+    /// staged again comes back aside, and a `<build>.noindex` no link named is taken.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn re_staging_a_plain_toolchain_build_lays_it_aside() {
+        let b = bundle_with("aside-legacy", make_toolchain_archive);
+        let build = b.build();
+        let aside = build.with_file_name("18.noindex");
+        verify_and_stage(&b.art, &b.archive, &build, &StageHooks::NONE).unwrap();
+        std::fs::remove_file(&build).unwrap();
+        std::fs::rename(&aside, &build).unwrap();
+        std::fs::write(build.join("this-tree-survived"), b"old").unwrap();
+        std::fs::create_dir_all(aside.join("stray")).unwrap();
+        assert!(is_real_dir(&build), "PRECONDITION: the build is plain");
+
+        verify_and_stage(&b.art, &b.archive, &build, &StageHooks::NONE).unwrap();
+        assert!(is_link(&build) && is_real_dir(&aside));
+        assert!(!build.join("this-tree-survived").exists() && !aside.join("stray").exists());
+        assert!(crate::store::build_is_complete(&build));
+        assert!(scratch_beside(&build).is_empty());
+    }
+
+    /// The crash windows of a swap aside: the link a crash kept from being laid comes back,
+    /// and a tree parked off a build's link goes back behind it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_swap_aside_killed_midway_is_put_back() {
+        let b = bundle_with("aside-crash", make_toolchain_archive);
+        let build = b.build();
+        let aside = build.with_file_name("18.noindex");
+        verify_and_stage(&b.art, &b.archive, &build, &StageHooks::NONE).unwrap();
+
+        std::fs::remove_file(&build).unwrap();
+        crate::store::sweep_stage_scratch(&build);
+        assert!(is_link(&build), "the aside got its link back");
+        assert!(crate::store::build_is_complete(&build));
+
+        let parked = crate::store::superseded_dir(&build).unwrap();
+        crate::store::clear_build_ready(&build).unwrap();
+        std::fs::rename(&aside, &parked).unwrap();
+        assert!(crate::store::tree_absent(&build));
+        crate::store::sweep_stage_scratch(&build);
+        assert!(is_link(&build) && is_real_dir(&aside) && !parked.exists());
+        assert!(build.join("bin/ay").is_file(), "the parked tree is back");
+    }
+
+    /// A swap over a build laid aside that fails at its last rename puts the old tree back
+    /// behind its link, as complete as it was.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_failed_swap_over_a_build_laid_aside_puts_it_back_behind_its_link() {
+        let b = bundle_with("aside-rollback", make_toolchain_archive);
+        let build = b.build();
+        let aside = build.with_file_name("18.noindex");
+        verify_and_stage(&b.art, &b.archive, &build, &StageHooks::NONE).unwrap();
+        std::fs::write(aside.join("this-tree-survived"), b"old").unwrap();
+        let incoming = crate::store::incoming_dir(&build).unwrap();
+        assert!(
+            !incoming.exists(),
+            "PRECONDITION: the last rename must fail"
+        );
+
+        let err = swap_into_place(&build, &incoming).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(is_link(&build) && is_real_dir(&aside));
+        assert!(
+            build.join("this-tree-survived").is_file(),
+            "the same tree, back behind its link"
+        );
+        assert!(crate::store::build_is_complete(&build));
+        assert!(scratch_beside(&build).is_empty());
+    }
+
     #[test]
     fn a_rollback_that_cannot_restore_the_tree_writes_no_marker() {
         let b = bundle("rollback-restore-fails");
@@ -1822,7 +1999,7 @@ mod tests {
         );
 
         assert!(
-            !restore_outgoing(&vanished, &build, true),
+            !restore_outgoing(&vanished, &build, &build, true),
             "a failed restore must report itself as failed"
         );
         assert!(

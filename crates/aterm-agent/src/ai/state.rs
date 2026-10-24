@@ -270,10 +270,14 @@ pub fn assess(f: &Facts, wanted: bool, now: i64) -> Row {
     .into_iter()
     .flatten()
     .max_by_key(|(t, _)| *t);
+    let pool = pool_words(f);
     let signed_out = |row: &mut Row, fact: String| {
         row.state = State::SignedOut;
         row.mark = Mark::Fail;
-        row.fact = format!("{fact}{unmeasured}");
+        row.fact = match &pool {
+            Some(pool) => format!("{fact}{unmeasured} \u{b7} {pool}"),
+            None => format!("{fact}{unmeasured}"),
+        };
         row.fix = Some(format!("aterm ai login {}", c.id));
     };
     if expired {
@@ -359,6 +363,9 @@ pub fn assess(f: &Facts, wanted: bool, now: i64) -> Row {
         row.state = State::Idle;
         row.mark = Mark::Ok;
     }
+    if let Some(pool) = pool {
+        words.push(pool);
+    }
     if !f.env_credentials.is_empty() {
         words.push(format!(
             "{} set in this environment would be used instead of the stored login",
@@ -367,6 +374,38 @@ pub fn assess(f: &Facts, wanted: bool, now: i64) -> Row {
     }
     row.fact = format!("{}{unmeasured}", words.join(" · "));
     row
+}
+
+/// What `f`'s own accounts pool says in its row's fact ([`Facts::pool`]): how many accounts its
+/// roster lists and how many are signed in here, the rows due for renewal, or why the roster is
+/// refused; `None` for a CLI with no pool, Claude Code's included (its view is
+/// [`Facts::accounts`]).
+fn pool_words(f: &Facts) -> Option<String> {
+    let pool = f.pool.as_ref()?;
+    let file = pool.roster.file_name().map_or_else(
+        || pool.roster.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    if let Some(why) = &pool.refused {
+        return Some(format!(
+            "its pool's roster ({file}) is refused: {}",
+            crate::harness::one_line(why, 120)
+        ));
+    }
+    let mut words = format!(
+        "pool: {} {} ({} signed in here)",
+        pool.rows,
+        if pool.rows == 1 {
+            "account"
+        } else {
+            "accounts"
+        },
+        pool.enrolled
+    );
+    if !pool.due.is_empty() {
+        words.push_str(&format!("; renewal due: {}", pool.due.join(", ")));
+    }
+    Some(words)
 }
 
 /// The doctor's verdict.

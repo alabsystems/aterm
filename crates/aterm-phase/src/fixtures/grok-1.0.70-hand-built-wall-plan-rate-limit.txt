@@ -1,0 +1,14 @@
+# grok 1.0.70 · HAND-BUILT 2026-10-23: the error card's words are the binary's strings, the same bytes in 1.0.67 and 1.0.70 (title `Rate limited`, body `You've hit the rate limit for your plan.`); the rows around them are assembled, not captured — no signed-in account has drawn a Grok Build turn yet, so where its card sits is unmeasured
+  ~/proj
+
+  › summarize the failing test
+
+  The failing test is `wall::reads_a_grok_limit`; it expects one wall row.
+
+  ✗ Rate limited
+    You've hit the rate limit for your plan.
+
+
+
+
+                                                 ctrl+q  quit

@@ -900,14 +900,25 @@ impl CursorRainbow {
         let mut buckets = [(0u32, 0u32); 32];
         let mut n_buckets = 0usize;
         let mut buckets_complete = true;
+        let mut last_bucket: (u32, usize) = (0, 0);
         for &mask in &scratch {
             if mask == 0 {
                 continue;
             }
-            if let Some((_, count)) = buckets[..n_buckets].iter_mut().find(|(m, _)| *m == mask) {
+            if last_bucket.0 == mask {
+                buckets[last_bucket.1].1 += 1;
+                continue;
+            }
+            if let Some((idx, (_, count))) = buckets[..n_buckets]
+                .iter_mut()
+                .enumerate()
+                .find(|(_, (m, _))| *m == mask)
+            {
                 *count += 1;
+                last_bucket = (mask, idx);
             } else if n_buckets < buckets.len() {
                 buckets[n_buckets] = (mask, 1);
+                last_bucket = (mask, n_buckets);
                 n_buckets += 1;
             } else {
                 buckets_complete = false;
@@ -1189,6 +1200,14 @@ pub(crate) fn lift_to_light_floor(rgb: u32, floor: f32) -> u32 {
     for _ in 0..20 {
         let mid = 0.5 * (lo + hi);
         let mid_rgb = mix_rgb(rgb, 0x00FF_FFFF, mid);
+        if mid_rgb == lo_rgb {
+            lo = mid;
+            continue;
+        }
+        if mid_rgb == hi_rgb {
+            hi = mid;
+            continue;
+        }
         if light(mid_rgb) < floor {
             lo = mid;
             lo_rgb = mid_rgb;
@@ -1227,13 +1246,14 @@ fn light_on_glass_with(
 
 /// Solve one ring's premultiplied colour on `page` for [`RIM_LIGHT`].
 fn ring_light_on_page(arc: u32, cov: u8, page: u32, scale: f32) -> u32 {
+    let table = crate::color_math::relative_luminance_table();
     debug_assert!(
-        (crate::color_math::relative_luminance(RIM_LIGHT_GREY) - RIM_LIGHT).abs() < 0.005,
+        (crate::color_math::relative_luminance_with(table, RIM_LIGHT_GREY) - RIM_LIGHT).abs()
+            < 0.005,
         "RIM_LIGHT_GREY is not the encode of RIM_LIGHT"
     );
-    let table = crate::color_math::relative_luminance_table();
     let light = |premul: u32| -> f32 { light_on_glass_with(table, page, premul) };
-    let base = light(0);
+    let base = crate::color_math::relative_luminance_with(table, page);
     let target = (light(premul_rgb(RIM_LIGHT_GREY, cov)) - base) * scale;
     let candidate = |u: f32| -> u32 {
         if u < 0.0 {
@@ -1243,40 +1263,36 @@ fn ring_light_on_page(arc: u32, cov: u8, page: u32, scale: f32) -> u32 {
         }
     };
     let (mut lo, mut hi) = (-1.0f32, 1.0f32);
-    let mut lo_eval: Option<(u32, f32)> = None;
-    let mut hi_eval: Option<(u32, f32)> = None;
+    let lo_c = candidate(lo);
+    let hi_c = candidate(hi);
+    let mut lo_eval = (lo_c, light(lo_c) - base);
+    let mut hi_eval = (hi_c, light(hi_c) - base);
     for _ in 0..22 {
         let mid = 0.5 * (lo + hi);
         let c = candidate(mid);
+        if c == lo_eval.0 && lo_eval.1 < target {
+            lo = mid;
+            continue;
+        }
+        if c == hi_eval.0 && hi_eval.1 >= target {
+            hi = mid;
+            continue;
+        }
         let added = light(c) - base;
         if added < target {
             lo = mid;
-            lo_eval = Some((c, added));
+            lo_eval = (c, added);
         } else {
             hi = mid;
-            hi_eval = Some((c, added));
+            hi_eval = (c, added);
         }
-        if let (Some((lc, _)), Some((hc, _))) = (lo_eval, hi_eval)
-            && lc == hc
-        {
+        if lo_eval.0 == hi_eval.0 {
             break;
         }
     }
     let err = |premul: u32| (light(premul) - base - target).abs();
-    let (a, err_a) = match lo_eval {
-        Some((c, added)) => (c, (added - target).abs()),
-        None => {
-            let c = candidate(lo);
-            (c, err(c))
-        }
-    };
-    let (b, err_b) = match hi_eval {
-        Some((c, added)) => (c, (added - target).abs()),
-        None => {
-            let c = candidate(hi);
-            (c, err(c))
-        }
-    };
+    let (a, err_a) = (lo_eval.0, (lo_eval.1 - target).abs());
+    let (b, err_b) = (hi_eval.0, (hi_eval.1 - target).abs());
     let (mut best, mut best_err) = if err_a <= err_b {
         (a, err_a)
     } else {

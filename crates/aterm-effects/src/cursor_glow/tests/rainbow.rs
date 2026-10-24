@@ -994,3 +994,170 @@ fn rainbow_decays_to_empty_when_idle() {
         "empty snapshot fingerprints to 0 (event loop returns to idle)"
     );
 }
+
+/// THE PET UNDER A DIM THEME'S LETTERS (looks6 N11): the knock-out rings
+/// each glyph in a pixel of page, and `dim-grey`'s `o` of `echo` still read
+/// 3.59:1 at its cell over the pet's coat. Every lettered cell the pet's
+/// body reaches, but the caret's, takes the page at an opacity that keeps
+/// the letter at its bar over a coat of the letter's own colour (the worst
+/// any coat can be); a bright theme's text, and cells outside the body,
+/// take none. Every pixel of every such cell holds the bar: the veil's
+/// eased ends lie outside a word's first and last letters (looks6 review:
+/// eased inside them, their outer 3 px read 1.30-4.05:1), and stop at the
+/// caret's cell, which takes no veil. Negative control: the veil off
+/// leaves that coat whole.
+#[test]
+fn a_dim_theme_s_letters_read_over_the_pet_through_a_page_veil() {
+    use aterm_core::terminal::RenderCell;
+    let g = geom();
+    let veil_at = |fg: [u8; 3], page: [u8; 3], on: bool, caret: (u16, u16)| {
+        let mut cells = vec![vec![RenderCell::default(); g.cols]; g.rows];
+        for (c, cell) in cells[3].iter_mut().enumerate() {
+            cell.ch = if c < 20 && c % 5 != 4 { 'o' } else { ' ' };
+            cell.fg = fg;
+            cell.bg = page;
+        }
+        let mut glow = CursorGlow::default();
+        glow.set_pet_veil(on);
+        let now = Instant::now();
+        glow.observe_frame_text(Some(caret), &cells, now);
+        // The body over columns 2..12 of row 3 and the row above.
+        glow.note_pet_body(Some((16, 96, 24, 64)));
+        glow.veil_letters_on_pet(Some(caret), g);
+        std::mem::take(&mut glow.under_out)
+    };
+    let veil_of = |fg: [u8; 3], page: [u8; 3], on: bool| veil_at(fg, page, on, (3, 20));
+    let rgb = |c: [u8; 3]| (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2]);
+    let contrast = |a: u32, b: u32| crate::color_math::contrast_ratio(a, b);
+    let (fg, page) = ([0x85, 0x85, 0x85], [0x11, 0x13, 0x18]);
+    let bare = contrast(rgb(fg), rgb(page));
+    // Each pixel of row 3: the coat (the ink's own colour) under the veil,
+    // each quad's ramp read at the pixel's centre as the renderer reads it.
+    let read = |quads: &[GlowQuad], x: i32| {
+        let mut px = rgb(fg);
+        for q in quads {
+            let (qx, qy) = (i32::from(q.x), i32::from(q.y));
+            if (qx..qx + i32::from(q.w)).contains(&x) && (qy..qy + i32::from(q.h)).contains(&56) {
+                let a = aterm_render::glow_lerp(
+                    u32::from(q.alpha),
+                    u32::from(q.alpha2),
+                    (x - qx) as u32,
+                    u32::from(q.w),
+                ) as u8;
+                px = aterm_render::over_premul(px, aterm_render::premul_rgb(rgb(page), a), a)
+                    & 0x00FF_FFFF;
+            }
+        }
+        contrast(rgb(fg), px)
+    };
+    let bar = 4.6f32.min(bare * 0.97);
+    let cw = g.cw as i32;
+    // Every pixel of the body's columns in a lettered cell but the caret's.
+    for caret_col in [20i32, 6] {
+        let caret = (3u16, caret_col as u16);
+        let on = veil_at(fg, page, true, caret);
+        assert!(!on.is_empty(), "the pet on dim text draws a veil");
+        for x in 16..96i32 {
+            let col = x / cw;
+            if col % 5 == 4 || col == caret_col {
+                continue;
+            }
+            let r = read(&on, x);
+            assert!(
+                r >= bar,
+                "caret at column {caret_col}: column {col}'s pixel {} reads {r:.2}:1 over the coat, under {bar:.2}",
+                x - col * cw
+            );
+        }
+        for q in &on {
+            let (x0, x1) = (i32::from(q.x), i32::from(q.x) + i32::from(q.w));
+            assert!(
+                x1 <= caret_col * cw || x0 >= (caret_col + 1) * cw,
+                "a veil quad at {x0}..{x1} enters the caret's cell (column {caret_col})"
+            );
+        }
+    }
+    let on = veil_of(fg, page, true);
+    for q in &on {
+        let (x0, x1) = (i32::from(q.x), i32::from(q.x) + i32::from(q.w));
+        assert!(
+            x0 >= 16 - 3 && x1 <= 96 + 3,
+            "the veil keeps to the body's box ({x0}..{x1})"
+        );
+        assert!(
+            i32::from(q.y) >= 48 && i32::from(q.y + q.h) <= 64,
+            "the veil keeps to the letters' row"
+        );
+    }
+    assert!(
+        veil_of([0xd0, 0xd0, 0xd0], [0x1e, 0x1e, 0x1e], true).is_empty(),
+        "a bright theme's text keeps the knock-out alone"
+    );
+    let off = veil_of(fg, page, false);
+    assert!(off.is_empty(), "control: the veil off draws nothing");
+    assert!(
+        read(&off, 2 * g.cw as i32 + g.cw as i32 / 2) < bar,
+        "control: the coat unveiled reads under the bar"
+    );
+}
+
+/// THE WORD ICONS' SHADE: the word pass draws its icons after the trail has
+/// drawn the frame, so an icon new to the frame (a word a Return completed)
+/// found the sky's stars and the ribbon's light on it: a fox's chin washed
+/// lilac on dark and pink sparkles on its cheek on paper. Once the frame's
+/// icons are named, no light of the frame lies on an icon above its foot,
+/// on either page. Negative control: unshaded, the same frame lays light on
+/// the icon.
+#[test]
+fn a_word_icon_new_to_the_frame_wears_no_trail_light() {
+    let g = geom();
+    // A face over cols 6..12 of row 2, its chin two pixels into row 3.
+    let icon = (48, 96, 20, 50);
+    let on_icon = |dark: bool, shade: bool| -> usize {
+        let mut c = cfg_for_style_name("rainbow kitty pet", true);
+        c.intensity = 1.0;
+        if !dark {
+            c.dark_theme = false;
+            c.theme_fg = 0x001F_2328;
+            c.theme_bg = 0x00FF_FFFF;
+        }
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        let t0 = Instant::now();
+        glow.tick(Some((3, 1)), t0, &c, g, &mut out);
+        let t = type_echoed(&mut glow, 3, 1, "the quick brown", t0, &c, g);
+        glow.tick(Some((3, 16)), t + ms(20), &c, g, &mut out);
+        glow.note_word_icons([icon]);
+        // The streams as a host publishes them, before its word pass.
+        let (mut under, mut halos) = (glow.under_quads().to_vec(), glow.halos().to_vec());
+        if shade {
+            glow.shade_word_icons((&mut out, &mut under, &mut halos));
+        }
+        let hits = |(x0, x1, y0, y1): (i32, i32, i32, i32)| {
+            x0 < icon.1 && icon.0 < x1 && y0 < icon.3 && icon.2 < y1
+        };
+        let rect = |x: u16, y: u16, w: u16, h: u16| {
+            let (x, y) = (i32::from(x), i32::from(y));
+            (x, x + i32::from(w), y, y + i32::from(h))
+        };
+        out.iter()
+            .chain(&under)
+            .filter(|q| q.w > 0 && q.h > 0 && hits(rect(q.x, q.y, q.w, q.h)))
+            .count()
+            + halos
+                .iter()
+                .filter(|h| h.w > 0 && h.h > 0 && hits(rect(h.x, h.y, h.w, h.h)))
+                .count()
+    };
+    for dark in [true, false] {
+        assert!(
+            on_icon(dark, false) > 0,
+            "fixture (dark {dark}): the unshaded frame lays light on the icon"
+        );
+        assert_eq!(
+            on_icon(dark, true),
+            0,
+            "a light lies on the word icon above its foot (dark {dark})"
+        );
+    }
+}

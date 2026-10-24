@@ -154,7 +154,8 @@ impl LogicalRect {
     }
 }
 
-const CLIP_EDGE_EPSILON: f32 = 0.01;
+/// How far an edge must reach into a rect before it counts as cutting it.
+pub(crate) const CLIP_EDGE_EPSILON: f32 = 0.01;
 
 fn materially_clipped(rect: LogicalRect, clip: LogicalRect) -> bool {
     clip.is_empty()

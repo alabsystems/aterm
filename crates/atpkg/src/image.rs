@@ -253,7 +253,8 @@ pub fn strip_deleted(exe: &Path) -> &Path {
 
 /// `(program, build)` of a path INSIDE `prefix`'s store: [`crate::ops::store_build_of`],
 /// with every component past `<prefix>/store` a plain name (no `..` walks back out) and
-/// the build spelled as the store writes it (digits, no leading zero).
+/// the build spelled as the store writes it (digits, no leading zero; `.noindex` after them
+/// for a build laid aside, [`aterm_toolchain::layout`]).
 fn anchored_store_build(prefix: &Path, exe: &Path) -> Option<(String, u64)> {
     let (program, build) = crate::ops::store_build_of(prefix, exe)?;
     let rest = exe.strip_prefix(prefix.join("store")).ok()?;
@@ -262,6 +263,10 @@ fn anchored_store_build(prefix: &Path, exe: &Path) -> Option<(String, u64)> {
         .components()
         .nth(1)
         .and_then(|c| c.as_os_str().to_str())
+        .map(|name| {
+            name.strip_suffix(aterm_toolchain::build_cache::NOINDEX)
+                .unwrap_or(name)
+        })
         .and_then(crate::store::parse_build_name);
     (plain && spelled == Some(build)).then_some((program, build))
 }
@@ -350,6 +355,12 @@ mod tests {
                 None,
                 build("claude", CLAUDE_304, ImageSource::StoreRecord),
                 "an ALab index build with a record",
+            ),
+            row(
+                p.join(format!("store/claude/{ALAB}.noindex/bin/claude")),
+                None,
+                build("claude", CLAUDE_304, ImageSource::StoreRecord),
+                "a build laid aside, as the kernel names its image",
             ),
             row(
                 store("codex", ALAB),

@@ -21,11 +21,10 @@ use crate::pane::{
 use crate::word_decorations::{CompanionOnGlass, DecoConfig, EffectGeom, SelView};
 use aterm_core::grid::LineSize;
 use aterm_core::render::RenderInput;
-
 use aterm_core::terminal::RenderCell;
 use aterm_lexicon::Lexicon;
 use aterm_render::GlowQuad;
-use aterm_render::sprites::FreeSprite;
+use aterm_render::sprites::{FreeSprite, FreeZ};
 use aterm_time::Instant;
 
 /// What one content-scroll snapshot did to the cursor family's coordinates ([`EffectsPipeline::sync_scroll`]).
@@ -581,7 +580,38 @@ impl EffectsPipeline {
     #[inline]
     pub fn open_words(&mut self) {
         self.clear_word_scratch();
+        self.cursor.glow.note_word_icons(std::iter::empty());
         self.decos.begin_host_frame();
+    }
+
+    /// The word pass's icons from `from` on in the window's sprites, to the
+    /// next frame's sky and ribbon ([`crate::cursor_glow::CursorGlow::note_word_icons`]).
+    #[inline]
+    fn note_word_icons(&mut self, from: usize) {
+        let icons = self
+            .free_scratch
+            .get(from..)
+            .unwrap_or_default()
+            .iter()
+            .filter(|s| s.z == FreeZ::UnderText && !s.is_blank());
+        self.cursor.glow.note_word_icon_sprites(icons);
+    }
+
+    /// Lift the trail's light off the icons the frame's word pass named
+    /// ([`crate::cursor_glow::CursorGlow::shade_word_icons`]), in the streams
+    /// `input` carries, by the icons' drawn rows in their art: every host
+    /// hands it the trail before its word pass.
+    #[inline]
+    pub fn shade_word_icons(&mut self, input: &mut RenderInput) {
+        #[cfg(test)]
+        if self.word_icons_unshaded {
+            return;
+        }
+        self.cursor.glow.shade_word_icons((
+            &mut input.cursor_glow_add,
+            &mut input.glow_under,
+            &mut input.glow_halo,
+        ));
     }
 
     #[inline]
@@ -640,8 +670,14 @@ impl EffectsPipeline {
             .wince_hits;
         }
         self.decos.begin_host_frame();
+        let fp = self.tick_words(g.now, g);
+        // The tick clears the sprite list before it draws (a primed tick's
+        // sprites with it), so every sprite in it is this tick's: counting
+        // from the length before the tick skipped a primed frame's icons,
+        // and the sky drew its stars on them (looks6 N3).
+        self.note_word_icons(0);
         WordGridOut {
-            fp: self.tick_words(g.now, g),
+            fp,
             primed_wince_hits,
         }
     }
@@ -677,6 +713,7 @@ impl EffectsPipeline {
         mut drained: impl FnMut(PaneDrain, &mut WordDecorations),
     ) -> WordPanesOut {
         let mut out = WordPanesOut::default();
+        let from = self.free_scratch.len();
         for (index, pane) in panes.into_iter().enumerate() {
             let place = pane.place;
             let px_origin = (
@@ -762,6 +799,7 @@ impl EffectsPipeline {
         if self.ink_scratch.len() > 1 {
             self.ink_scratch.sort_unstable_by_key(|c| (c.row, c.col));
         }
+        self.note_word_icons(from);
         out
     }
 
@@ -946,6 +984,7 @@ impl EffectsPipeline {
         self.sprite_layers
             .publish(&self.free_scratch, &mut input.fx_layers);
         input.nova_add.clone_from(&self.nova_scratch);
+        self.shade_word_icons(input);
     }
 
     /// The pet's level rules and senses before its tick ([`CompanionOwner::prepare`]), reading the word engine's ink.

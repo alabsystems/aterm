@@ -35,22 +35,11 @@ pub const ROSETTA_TAG: &str = "rosetta";
 
 /// The agent's unit, `/etc/systemd/system/aterm-vz-agent.service` (§6): it runs the agent
 /// from the boot share, after the local file systems (the boot share among them) and with
-/// network-online's job in the boot transaction. V1's agent carries the same text and
-/// rewrites the file for the next boot when the two differ.
-pub const AGENT_UNIT: &str = "\
-[Unit]
-Description=aterm's guest agent (aterm-vz-agent)
-After=local-fs.target
-Wants=network-online.target
-
-[Service]
-ExecStart=/mnt/aterm-boot/aterm-vz-agent
-Restart=no
-StandardOutput=journal+console
-
-[Install]
-WantedBy=multi-user.target
-";
+/// network-online's job in the boot transaction. It is the text the agent itself carries
+/// ([`aterm_vz_agent::boot::UNIT`]), which the agent rewrites the file to when the two
+/// differ: V2's first boot measured a copy here that differed in its `Description`, so
+/// every bake rewrote its unit at the agent's first start.
+pub const AGENT_UNIT: &str = aterm_vz_agent::boot::UNIT;
 
 /// `/etc/systemd/system/rosettad.service` in lima's shape (fact 22), pointed at the
 /// Rosetta share: the lane's cache reset stops and starts it by name (fact 11), and its
@@ -235,7 +224,11 @@ fn user_data(user: &User) -> String {
         format!("[mkdir, -p, {BOOT_MOUNT}, {ROSETTA_MOUNT}]"),
         format!("[mount, {BOOT_MOUNT}]"),
         format!("[mount, {ROSETTA_MOUNT}]"),
-        format!("[systemctl, mask, --now, {}]", MASKED.join(", ")),
+        // Stopped, then masked: `mask --now` reloads before it stops, and a running timer
+        // whose own unit file vanished fails ("Unit to trigger vanished", measured in V2's
+        // first bake), which leaves the guest `degraded`.
+        format!("[systemctl, stop, {}]", MASKED.join(", ")),
+        format!("[systemctl, mask, {}]", MASKED.join(", ")),
         format!("[apt-mark, hold, {holds}]"),
         format!("[loginctl, enable-linger, {}]", user.name),
         "[systemctl, daemon-reload]".to_string(),
@@ -319,8 +312,9 @@ mod tests {
             "      RequiresMountsFor=/mnt/aterm-rosetta\n",
             "  - path: /etc/fstab\n    permissions: \"0644\"\n    append: true\n",
             "      aterm-boot /mnt/aterm-boot virtiofs ro 0 0\n      rosetta /mnt/aterm-rosetta virtiofs ro 0 0\n",
-            "  - [systemctl, mask, --now, apt-daily.timer, apt-daily-upgrade.timer, \
-             unattended-upgrades.service, ssh.socket]\n",
+            "  - [systemctl, stop, apt-daily.timer, apt-daily-upgrade.timer, \
+             unattended-upgrades.service, ssh.socket]\n  - [systemctl, mask, apt-daily.timer, \
+             apt-daily-upgrade.timer, unattended-upgrades.service, ssh.socket]\n",
             "  - [apt-mark, hold, linux-image-6.8.0-142-generic, linux-modules-6.8.0-142-generic]\n",
             "  - [loginctl, enable-linger, lane]\n",
             "  - [systemctl, enable, --now, --no-block, aterm-vz-agent.service, rosettad.service]\n",

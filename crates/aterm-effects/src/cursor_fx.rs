@@ -51,13 +51,19 @@ pub struct CursorFx {
     pub phaser: CursorPhaser,
     /// The additive light this tick produced — the aurora first, then every body's halo appended in tick order.
     pub glow_scratch: Vec<GlowQuad>,
-    /// Test-only: skip momentum halo warming on dark fire and light sparkle.
+    /// Test-only: skip momentum halo warming on dark fire and light sparkle,
+    /// and leave sparkle's paper caret its dark-theme colour.
     #[cfg(test)]
     pub(crate) momentum_unwarmed: bool,
     /// Test-only: the hue a dark fire's typing halo is warmed toward, in
     /// place of [`crate::cursor_momentum::MOMENTUM_FIRE_EMBER`].
     #[cfg(test)]
     pub(crate) momentum_fire_ember: Option<u32>,
+    /// Test-only: leave the rainbow block's halo rings whole over an inked
+    /// row next to the caret's, as they were: the negative control of their
+    /// hold ([`CursorGlow::hold_off_neighbour_ink`]).
+    #[cfg(test)]
+    pub(crate) rainbow_rim_unheld: bool,
     /// The comet cells this tick produced, projected through load shedding, brightness, and legibility.
     pub trail_scratch: Vec<TrailCell>,
     /// Memoised [`bed_legible_share`] for the last `(color, ground, ink)` triple.
@@ -298,6 +304,9 @@ pub const fn resolve_block_fill(
 
 /// The least WCAG contrast an effect-owned caret fill keeps against the ground under it.
 pub const CARET_PAGE_MIN_CONTRAST: f32 = 4.5;
+
+/// The margin past [`CARET_PAGE_MIN_CONTRAST`] Sparkle's gold paper caret keeps for the renderer's rounding.
+const SPARKLE_PAPER_CARET_GUARD: f32 = 0.15;
 
 /// The least WCAG contrast the comet's cell bed alone leaves a letter it lies under: the theme's ink over the bed's tint of the page.
 pub const BED_INK_FLOOR: f32 = 10.0;
@@ -983,6 +992,7 @@ impl CursorFx {
         };
         let family_phase = self.glow.rainbow_phase();
         let family_field = self.glow.rainbow_field();
+        let rainbow_from = self.glow_scratch.len();
         let rainbow_frame = self.rainbow.tick_with_family_phase(
             cur,
             now,
@@ -997,7 +1007,26 @@ impl CursorFx {
         );
         let twinkle_cursor = rainbow_frame.fill.is_some() && rainbow_cfg.blinking;
         let rainbow_owns_caret = rainbow_frame.fill.is_some();
-        let glow_fp = glow_fp ^ rainbow_frame.fp.rotate_left(23);
+        // On a dark page the block's halo rings keep off an inked or filled
+        // row next to the caret's, as the momentum glow does: their top
+        // bars lay the caret's light along the foot of a prompt's powerline
+        // segment over it (looks6 round 3, N4: `#cdcd00` to `#e1e92a` under
+        // `main +2`).
+        #[cfg(test)]
+        let rim_held = !self.rainbow_rim_unheld;
+        #[cfg(not(test))]
+        let rim_held = true;
+        let rim_print = if dark && rim_held {
+            self.glow.hold_off_neighbour_ink(
+                &mut self.glow_scratch[rainbow_from..],
+                cur,
+                geom,
+                glow_cfg.theme_bg,
+            )
+        } else {
+            0
+        };
+        let glow_fp = glow_fp ^ rainbow_frame.fp.rotate_left(23) ^ rim_print.rotate_left(29);
         let body_from = self.glow_scratch.len();
         let droplet_frame = self.droplet.tick(
             cur,
@@ -1033,8 +1062,25 @@ impl CursorFx {
                     ..crate::cursor_glow::KnobContext::widest(bar_shape)
                 },
             );
+        #[cfg(test)]
+        let warm = !self.momentum_unwarmed;
+        #[cfg(not(test))]
+        let warm = true;
+        // Sparkle's caret on paper is its paper gold deepened in its hue, not
+        // its dark-theme peach, which deepens to a mustard brown beside the
+        // gold its puff wears. A colour the user chose is its own.
+        let sparkle_paper_rod = (warm
+            && !dark
+            && !tinted
+            && !f.cursor_color_pinned
+            && matches!(glow_cfg.style, GlowStyle::Sparkle))
+        .then(|| crate::cursor_glow::CursorGlow::sparkle_paper_gold_at(glow_cfg, 1.0));
         let (rod_color, rod_haze) = match glow_cfg.style {
             GlowStyle::Beam => (glow_cfg.color, aterm_render::BEAM_SPACE_HAZE),
+            GlowStyle::Sparkle if sparkle_paper_rod.is_some() => {
+                let gold = sparkle_paper_rod.unwrap_or(glow_cfg.color);
+                (gold, (gold >> 1) & 0x007F_7F7F)
+            }
             GlowStyle::Water if !tinted => (0x0032_DCDE, 0x000E_66B4),
             GlowStyle::Fire if !tinted => (0x00FF_9632, 0x0078_1E00),
             GlowStyle::RainbowKitty if !tinted => (0x00FF_66CC, 0x0046_1E64),
@@ -1055,10 +1101,18 @@ impl CursorFx {
             rainbow_owns_caret,
         );
         let momentum_from = self.glow_scratch.len();
-        #[cfg(test)]
-        let warm = !self.momentum_unwarmed;
-        #[cfg(not(test))]
-        let warm = true;
+        // Sparkle on paper wears its gold: the glow's hue and the caret's
+        // charge are the paper gold its body wears, not the peach of its
+        // dark-theme colour, which deepens to brown (looks6 N7). A pinned
+        // cursor colour or the user's own trail colour is never recoloured.
+        let sparkle_paper_gold = (warm
+            && glow_cfg.enabled
+            && !dark
+            && !tinted
+            && !f.cursor_color_pinned
+            && matches!(glow_cfg.style, GlowStyle::Sparkle))
+        .then(|| crate::cursor_glow::CursorGlow::sparkle_paper_gold_at(glow_cfg, 1.0));
+        self.momentum.set_light_vivid(sparkle_paper_gold.is_some());
         let momentum_frame = self.momentum.tick(
             cur,
             now,
@@ -1068,7 +1122,7 @@ impl CursorFx {
                 intensity: body_amp,
                 tau_s: MOMENTUM_GLOW_TAU_S,
                 radius_cells: MOMENTUM_GLOW_RADIUS_CELLS,
-                base: f.live_cursor,
+                base: sparkle_paper_gold.unwrap_or(f.live_cursor),
                 dark_theme: dark,
                 hue: if !glow_cfg.enabled {
                     f.live_cursor & 0x00FF_FFFF
@@ -1219,6 +1273,8 @@ impl CursorFx {
             .glow
             .guard_letters(&mut self.glow_scratch, cur, geom, glow_cfg.style);
         let glow_fp = glow_fp ^ guarded.rotate_left(37);
+        let veiled = self.glow.veil_letters_on_pet(cur, geom);
+        let glow_fp = glow_fp ^ veiled.rotate_left(43);
         let bolt_cursor = rainbow_block
             && glow_cfg.enabled
             && glow_cfg.intensity > 0.0
@@ -1257,7 +1313,15 @@ impl CursorFx {
                 bolt: bolt_fill,
                 comet: comet_frame.fill,
                 droplet: droplet_frame.fill,
-                momentum: momentum_frame.fill,
+                momentum: momentum_frame.fill.map(|fill| match sparkle_paper_gold {
+                    // The gold caret keeps the page bar, deepened in its hue.
+                    Some(_) => crate::color_math::floor_contrast_keeping_hue(
+                        fill,
+                        f.cursor_cell_bg.unwrap_or(f.default_bg) & 0x00FF_FFFF,
+                        CARET_PAGE_MIN_CONTRAST + SPARKLE_PAPER_CARET_GUARD,
+                    ),
+                    None => fill,
+                }),
                 beamrod: beamrod_frame.fill,
             },
             f.live_cursor,

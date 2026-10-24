@@ -315,6 +315,9 @@ pub(crate) struct FactMenuFacts {
     pub(crate) weekly_meter: Option<String>,
     /// Why the footer has no weekly figure, where it says ([`weekly_gap_why`]).
     pub(crate) weekly_gap: Option<WeeklyGap>,
+    /// The pooled CLI the session runs, whose roster [`Self::accounts`] lists (`None`: Claude
+    /// Code's, as every menu was before other CLIs had pools).
+    pub(crate) cli: Option<aterm_agent::harness::accounts::Cli>,
     /// The rotation accounts in roster order (dedicated first, then pool).
     pub(crate) accounts: Vec<AccountMenuRow>,
     /// Whether automatic rotation (`!state.pinned`) is active.
@@ -478,6 +481,31 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
                 }
             }
             note(&mut out);
+            let other = facts
+                .cli
+                .filter(|cli| *cli != aterm_agent::harness::accounts::Cli::Claude);
+            if facts.accounts.is_empty()
+                && let Some(cli) = other
+            {
+                out.push(MenuRow::note(format!(
+                    "No {} rotation accounts listed",
+                    cli.connector().product
+                )));
+                out.push(MenuRow::note(format!(
+                    "run aterm harness accounts add --cli {} <label>",
+                    cli.id()
+                )));
+                out.push(MenuRow::Rule);
+                out.push(MenuRow::Item {
+                    glyph: "\u{22ef}",
+                    label: "Account settings\u{2026}".to_string(),
+                    spoken: "Account settings".to_string(),
+                    act: MenuAct::Fact(fact, FactAct::AccountSettings),
+                    enabled: true,
+                    checked: false,
+                });
+                return out;
+            }
             if facts.accounts.is_empty() {
                 out.push(MenuRow::note(
                     "No rotation accounts configured \u{2014} run aterm init",
@@ -747,6 +775,7 @@ thread_local! {
 }
 
 fn build_account_menu_rows(
+    cli: aterm_agent::harness::accounts::Cli,
     session_account: Option<&str>,
     session_email: Option<&str>,
     session: SessionWeek,
@@ -754,6 +783,24 @@ fn build_account_menu_rows(
     use aterm_agent::harness::accounts;
     if cfg!(test) {
         return (Vec::new(), true);
+    }
+    if cli != accounts::Cli::Claude {
+        let now = aterm_time::unix_secs()
+            .and_then(|n| i64::try_from(n).ok())
+            .unwrap_or(0);
+        let (Some(config), Some(state_dir), Some(home)) = (
+            aterm_types::dirs::aterm_config_path(),
+            crate::harness_host::harness_state(),
+            aterm_primer::home_dir(),
+        ) else {
+            return (Vec::new(), true);
+        };
+        return pool_menu_rows(
+            cli,
+            (&config, &state_dir, &home),
+            (session_account, session_email),
+            now,
+        );
     }
     let now = aterm_time::unix_secs()
         .and_then(|n| i64::try_from(n).ok())
@@ -782,6 +829,38 @@ fn build_account_menu_rows(
         session_account,
         session_email,
         session,
+        now,
+    )
+}
+
+/// The account rows of another CLI's pool for a session of it ([`build_account_menu_rows`]): its
+/// roster beside `config` (`accounts-<cli>.toml`), bound to the logins its renewals made, each
+/// row's condition from its own store (`accounts::Store::at_for`); a row is enrolled once its
+/// login file exists (`accounts::enrolled_for`). No roster, or a refused one, is no rows.
+#[must_use]
+pub(crate) fn pool_menu_rows(
+    cli: aterm_agent::harness::accounts::Cli,
+    (config, state_dir, home): (&std::path::Path, &std::path::Path, &std::path::Path),
+    (session_account, session_email): (Option<&str>, Option<&str>),
+    now: i64,
+) -> (Vec<AccountMenuRow>, bool) {
+    use aterm_agent::harness::accounts;
+    let Some(roster) = accounts::roster_beside_for(config, cli)
+        .and_then(|path| accounts::Roster::load_for(cli, &path).ok())
+    else {
+        return (Vec::new(), true);
+    };
+    let store = accounts::Store::at_for(state_dir, cli, home);
+    let roster = store.bound(&roster, now).unwrap_or(roster);
+    let (state, _) = store.load(now).unwrap_or_default();
+    let enrolled = accounts::enrolled_for(cli, &roster);
+    account_menu_rows_from(
+        &roster,
+        &state,
+        &enrolled,
+        session_account,
+        session_email,
+        SessionWeek::default(),
         now,
     )
 }
@@ -910,6 +989,48 @@ pub(crate) fn account_menu_rows_from(
 }
 
 impl App {
+    /// The pooled CLI `session` runs ([`crate::harness_host::pool_cli`] of the program its screen
+    /// reader names), Claude Code's where it names none.
+    pub(crate) fn session_cli(&self, session: u64) -> aterm_agent::harness::accounts::Cli {
+        self.pool
+            .get(session)
+            .and_then(|entry| {
+                let timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+                timeline.agent().reader
+            })
+            .and_then(crate::harness_host::pool_cli)
+            .unwrap_or(aterm_agent::harness::accounts::Cli::Claude)
+    }
+
+    /// `aterm harness accounts use <label> --cli <id>` (or `--auto` where `label` is `None`) for
+    /// another CLI's pool, from its fact menu: the pin its own store keeps, which a launch aterm
+    /// makes of the CLI takes ([`aterm_agent::harness::cli::run_accounts_of`]).
+    fn use_pool_account(cli: aterm_agent::harness::accounts::Cli, label: Option<&str>) {
+        use aterm_agent::harness::cli::{
+            AccountsCmd, AccountsOf, Env, LiveAccounts, run_accounts_of,
+        };
+        let Ok(env) = Env::from_process() else {
+            return;
+        };
+        let form = label.map_or(AccountsCmd::Auto, |label| AccountsCmd::Use {
+            label: label.to_string(),
+        });
+        let of = AccountsOf {
+            cli,
+            form,
+            vendor: aterm_agent::harness::accounts::Vendor::default(),
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let _ = run_accounts_of(&of, &env, &LiveAccounts, &mut out, &mut err);
+        if !err.is_empty() {
+            aterm_log::info!(
+                "fact-menu: accounts use --cli {}: {}",
+                cli.id(),
+                String::from_utf8_lossy(&err).trim()
+            );
+        }
+    }
+
     fn fact_menu_facts(&self, session: u64, fact: Fact) -> FactMenuFacts {
         let (place, name) = self.menu_place_and_name(session);
         let what = fact.name();
@@ -948,6 +1069,8 @@ impl App {
                     aterm_phase::Program::Agy
                     | aterm_phase::Program::Muse
                     | aterm_phase::Program::Codex
+                    | aterm_phase::Program::Grok
+                    | aterm_phase::Program::Kimi
                     | aterm_phase::Program::Gemini
                     | aterm_phase::Program::Generic,
                 ) => true,
@@ -1013,7 +1136,10 @@ impl App {
             }
         }
         if fact == Fact::Account {
+            let cli = self.session_cli(session);
+            out.cli = Some(cli);
             (out.accounts, out.auto_rotate) = build_account_menu_rows(
+                cli,
                 session_acct.as_deref(),
                 session_email.as_deref(),
                 session_week,
@@ -1275,6 +1401,18 @@ impl App {
                 let hide = matches!(act, FactAct::Hide(_));
                 let off = self.fact_mask(session).with(kind, hide);
                 self.set_fact_mask(session, off);
+            }
+            FactAct::UseAccount(label)
+                if self.session_cli(session) != aterm_agent::harness::accounts::Cli::Claude =>
+            {
+                Self::use_pool_account(self.session_cli(session), Some(label.as_str()));
+                self.redraw_claude_footer(session);
+            }
+            FactAct::AutoRotate
+                if self.session_cli(session) != aterm_agent::harness::accounts::Cli::Claude =>
+            {
+                Self::use_pool_account(self.session_cli(session), None);
+                self.redraw_claude_footer(session);
             }
             FactAct::UseAccount(label) => {
                 use aterm_agent::harness::accounts;

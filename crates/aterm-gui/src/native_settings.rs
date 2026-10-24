@@ -1489,6 +1489,7 @@ pub(crate) struct SettingsViewState {
     consent_warmup_requests: u8,
     consent_open_requests: u8,
     fda_page_opened: bool,
+    consent_pane_dialog: Option<aterm_types::macos_setup::MacosDialog>,
     devtools_hand_over_request: bool,
     claimant_retire_request: Option<Vec<std::path::PathBuf>>,
     debugger_change_request: Option<(aterm_containment::consent::DebuggerChange, OwnerAnswer)>,
@@ -1683,6 +1684,7 @@ impl SettingsViewState {
             consent_warmup_requests: 0,
             consent_open_requests: 0,
             fda_page_opened: false,
+            consent_pane_dialog: None,
             devtools_hand_over_request: false,
             claimant_retire_request: None,
             debugger_change_request: None,
@@ -2406,6 +2408,12 @@ impl SettingsViewState {
     /// Drain whether that press opened the Full Disk Access page.
     pub(crate) fn take_fda_page_opened(&mut self) -> bool {
         std::mem::take(&mut self.fda_page_opened)
+    }
+
+    pub(crate) fn take_consent_pane_dialog(
+        &mut self,
+    ) -> Option<aterm_types::macos_setup::MacosDialog> {
+        self.consent_pane_dialog.take()
     }
 
     /// Drain the *Open Developer Tools…* press.
@@ -5164,7 +5172,11 @@ impl SettingsApp {
                 if action == MACOS_ACCESS_OPEN_FDA {
                     view.consent_open_requests = 1;
                 }
-                let opened = (view.consent_gestures.open_settings)(pane).opened();
+                let (outcome, dialog) = view.consent_gestures.open_settings(pane);
+                let opened = outcome.opened();
+                if dialog.is_some() {
+                    view.consent_pane_dialog = dialog;
+                }
                 if action == MACOS_ACCESS_OPEN_FDA {
                     view.fda_page_opened |= opened;
                 }
@@ -21235,17 +21247,18 @@ fn settings_fields_page(
         (width == SettingsWidth::Compact).then(|| compact_page_budget(state, cx.viewport));
     let landscape = compact_budget.is_some_and(|budget| budget.side_by_side_pager);
     let show_renderer_preview_now = show_renderer_preview;
-    let access_lead = state
-        .macos_access
-        .as_ref()
-        .map_or(AccessLead::Whole, |access| {
-            macos_access_lead(state, width, cx.viewport, access)
-        });
     let show_macos_access = !modified_only
         && !global_search
         && prefers_macos_access(state)
         && state.choice_picker.is_none()
         && !show_renderer_preview_now;
+    let access_lead = state
+        .macos_access
+        .as_ref()
+        .filter(|_| show_macos_access)
+        .map_or(AccessLead::Whole, |access| {
+            macos_access_lead(state, width, cx.viewport, access)
+        });
     let show_machine_status = !modified_only
         && !global_search
         && shows_machine_status(state, &packages.machine)
@@ -21578,19 +21591,13 @@ fn settings_fields_page(
         card(&mut plan, devtools, height);
     }
     if let Some(access) = state.macos_access.as_ref().filter(|_| show_macos_access) {
-        card(
-            &mut plan,
-            macos_access_card(
-                access,
-                access_lead,
-                settings_card_text_width(cx.viewport, width),
-            ),
-            macos_access_height(
-                access,
-                access_lead,
-                settings_card_text_width(cx.viewport, width),
-            ),
+        let node = macos_access_card(
+            access,
+            access_lead,
+            settings_card_text_width(cx.viewport, width),
         );
+        let height = fixed_height(&node);
+        card(&mut plan, node, height);
     }
     if let Some(leading) = leading_card {
         let node = leading.node(0..leading.rows.len());
@@ -24724,8 +24731,26 @@ impl ConsentGestures {
     pub(crate) fn open_settings(
         &self,
         pane: crate::menu::PrivacyPane,
-    ) -> crate::menu::SettingsOpen {
-        (self.open_settings)(pane)
+    ) -> (
+        crate::menu::SettingsOpen,
+        Option<aterm_types::macos_setup::MacosDialog>,
+    ) {
+        // A person's explicit press can bring their chosen page forward. Own
+        // its lifetime before opening it so automatic workers cannot overlap.
+        let dialog = self.live.then(aterm_types::macos_setup::MacosDialog::up);
+        let outcome = (self.open_settings)(pane);
+        (outcome, if outcome.opened() { dialog } else { None })
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) const fn guarded_pane_for_test(
+        open_settings: fn(crate::menu::PrivacyPane) -> crate::menu::SettingsOpen,
+    ) -> Self {
+        Self {
+            open_settings,
+            live: true,
+            ..Self::inert()
+        }
     }
 
     /// The headless / unit-test arms.

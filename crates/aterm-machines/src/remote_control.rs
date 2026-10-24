@@ -710,7 +710,9 @@ VendorID ProductID Product  Built-In\n\
             .unwrap();
         let artifact = format!("{target}/debug/libdemo.rmeta");
         sys.file(&artifact, b"artifact used by a build");
-        assert!(verify_spotlight_policy(&sys, &ctx).is_err());
+        // The person's own project build folder Spotlight indexes is theirs: a note on
+        // the row, never a step, so the policy still verifies and nothing touches it.
+        assert!(verify_spotlight_policy(&sys, &ctx).unwrap().verified);
         assert_eq!(
             sys.read_file(std::path::Path::new(&artifact)).unwrap(),
             b"artifact used by a build"

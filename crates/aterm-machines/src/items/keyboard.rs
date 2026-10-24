@@ -749,17 +749,22 @@ mod tests {
         sys.on(GLOBAL, vm_global());
         sys.on(GLOBAL, vm_global());
         sys.on(GLOBAL, missing());
-        sys.on(
-            "admin$ /usr/bin/defaults -currentHost delete -g com.apple.keyboard.modifiermapping.1452-1-0",
-            Ran::ok(""),
-        );
+        let delete = "admin$ /usr/bin/defaults -currentHost delete -g com.apple.keyboard.modifiermapping.1452-1-0";
+        sys.on(delete, Ran::ok(""));
         let c = vm_ctx();
         let items = expand(&table("caps-lock", &[]), &c).unwrap();
         let one: Vec<Box<dyn Item>> = items.into_iter().take(1).collect();
         let rows = engine::run(&one, Mode::Apply, &sys, &c, &mut NoJournal);
         assert_eq!(rows[0].outcome, Outcome::Changed, "{:?}", rows[0].why);
         assert_eq!(rows[0].from.as_deref(), Some("Caps Lock→Left Control"));
-        assert_eq!(rows[0].to.as_deref(), Some("Caps Lock unmapped"));
+        assert_eq!(rows[0].to, Some(describe(&Read::Absent)));
+        assert_eq!(
+            sys.calls()
+                .iter()
+                .filter(|call| call.as_str() == delete)
+                .count(),
+            1
+        );
         assert_eq!(
             rows[0].revert.as_deref(),
             Some(

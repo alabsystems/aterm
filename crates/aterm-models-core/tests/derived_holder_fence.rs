@@ -32,10 +32,12 @@ fn the_fence_admits_only_the_current_drawers_rows_and_keeps_what_nobody_took() {
         (9, &["AdmittedIsOwn", "CardSurvives"][..]),
         (10, &["CardSurvives", "StoppedKeepsMark"][..]),
         (11, &["AdmittedAltIsOwn"][..]),
+        (12, &["CardSurvives"][..]),
+        (13, &["CardSurvives"][..]),
     ] {
         assert_eq!(broken_at(dial), laws, "Buggy = {dial}");
     }
-    assert_eq!(m.mutant_dials(), (1..=11).collect::<Vec<_>>());
+    assert_eq!(m.mutant_dials(), (1..=13).collect::<Vec<_>>());
 }
 
 /// The design's scenario: Ctrl-Z, a full-screen tool, `fg` keep the card;
@@ -52,4 +54,34 @@ fn a_stop_and_a_tool_keep_the_card_and_a_rewrite_takes_it() {
         assert!(m.fire(action, &mut s), "{action}: {s:?}");
     }
     assert_eq!((s["ka"], s["fa"], s["hurt"]), (0, 0, 1));
+}
+
+/// Muse Code's launch: a drawer that opens rows at its own span's start (a
+/// scroll down at its region's top) and draws its card there keeps the card,
+/// even one whose earlier card a rewrite took.
+#[test]
+fn rows_a_drawer_opens_at_its_start_are_its() {
+    let m = holder_fence_model();
+    let mut s = m.init_state();
+    for action in ["LaunchA", "StopA", "Scribble", "FgA"] {
+        assert!(m.fire(action, &mut s), "{action}: {s:?}");
+    }
+    assert_eq!((s["ka"], s["hurt"]), (0, 1));
+    assert!(m.fire("Reserve", &mut s), "Reserve: {s:?}");
+    assert_eq!((s["ka"], s["fa"], s["hurt"]), (1, 0, 0));
+}
+
+/// Claude Code's inline redraw after a resize: a drawer that erases every
+/// row from home down and draws its card from the top keeps the card, even
+/// one whose earlier card a rewrite took; the erase takes no foreign row in.
+#[test]
+fn rows_a_drawer_erases_above_its_start_are_its() {
+    let m = holder_fence_model();
+    let mut s = m.init_state();
+    for action in ["LaunchA", "StopA", "Scribble", "FgA"] {
+        assert!(m.fire(action, &mut s), "{action}: {s:?}");
+    }
+    assert_eq!((s["ka"], s["hurt"]), (0, 1));
+    assert!(m.fire("Sweep", &mut s), "Sweep: {s:?}");
+    assert_eq!((s["ka"], s["fa"], s["hurt"], s["spans"]), (1, 0, 0, 1));
 }

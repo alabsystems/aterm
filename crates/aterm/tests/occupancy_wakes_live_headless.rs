@@ -25,14 +25,16 @@ fn boot() -> Instance {
     )
 }
 
-/// `aterm ctl <args…>` from outside the session's tree must be refused with one of `refusals`.
+/// `aterm ctl <args…>` from outside the session's tree must be refused as another session's: the
+/// host knows the tab's shell from its spawn, so no refusal waits on a machine snapshot naming it.
 #[track_caller]
-fn refused(inst: &Instance, args: &[&str], refusals: &[&str]) {
+fn refused(inst: &Instance, args: &[&str]) {
+    const OTHER: &str = "ERR denied wake: another session's";
     let out = ctl(inst, args);
     let words = said(&out);
     assert!(
-        !out.status.success() && refusals.iter().any(|refusal| words.contains(refusal)),
-        "aterm ctl {args:?} must be refused {refusals:?}:\n{words}"
+        !out.status.success() && words.contains(OTHER),
+        "aterm ctl {args:?} must be refused {OTHER:?}:\n{words}"
     );
 }
 
@@ -51,24 +53,12 @@ fn rows(printed: &str) -> Vec<&str> {
 /// label that the outside client's `waits` never sees.
 #[test]
 fn a_tabs_own_tree_books_a_wake_and_a_client_outside_it_is_refused() {
-    const OTHER: &str = "ERR denied wake: another session's";
-    // The host knows the tab's shell from the machine's snapshot: until one names it (a busy
-    // machine's first can come late), an outside client is refused as of a tree not known yet.
-    const UNKNOWN: &str = "ERR denied wake: not in this session's tree";
     let inst = boot();
     let (_, sid) = boot_session(&inst);
     let at = format!("@{sid}");
 
-    refused(
-        &inst,
-        &[&at, "wake", "label=lunch", "when=in:1h"],
-        &[OTHER, UNKNOWN],
-    );
-    refused(
-        &inst,
-        &[&at, "await", "wake", "timeout=1000"],
-        &[OTHER, UNKNOWN],
-    );
+    refused(&inst, &[&at, "wake", "label=lunch", "when=in:1h"]);
+    refused(&inst, &[&at, "await", "wake", "timeout=1000"]);
     assert!(
         rows(&ctl_ok(&inst, &[&at, "waits"])).is_empty(),
         "no book yet"
@@ -118,15 +108,10 @@ fn a_tabs_own_tree_books_a_wake_and_a_client_outside_it_is_refused() {
     );
     let record = status(&inst, &sid);
     assert_eq!(field(&record, "waits"), Some("1"), "{record}");
-    // The tab's own shell booked one, so the snapshot names the tab: the refusal is exact.
-    refused(
-        &inst,
-        &[&at, "wake", "label=dinner", "when=in:2h"],
-        &[OTHER],
-    );
-    refused(&inst, &[&at, "await", "wake", "timeout=1000"], &[OTHER]);
-    refused(&inst, &[&at, "wake", "rm", "#1"], &[OTHER]);
-    refused(&inst, &[&at, "wake", "taken", "#1"], &[OTHER]);
+    refused(&inst, &[&at, "wake", "label=dinner", "when=in:2h"]);
+    refused(&inst, &[&at, "await", "wake", "timeout=1000"]);
+    refused(&inst, &[&at, "wake", "rm", "#1"]);
+    refused(&inst, &[&at, "wake", "taken", "#1"]);
     assert!(
         matches!(rows(&ctl_ok(&inst, &[&at, "waits"])).as_slice(), [row] if row.starts_with("#1 pending ")),
         "an outside rm or take leaves the wake"

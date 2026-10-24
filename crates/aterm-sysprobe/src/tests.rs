@@ -1915,3 +1915,13 @@ fn levels_are_named_by_count_and_ranked_fastest_first() {
     assert_eq!(one.clusters.len(), 1);
     assert_eq!(one.clusters[0].name, "CPU");
 }
+
+#[test]
+fn the_hypervisors_kernel_switch_reads_on_macos_and_nowhere_else() {
+    // Read by name with no framework loaded: every macOS kernel names it (a Mac inside a VM
+    // may answer 0, so only the reading is held here).
+    #[cfg(target_os = "macos")]
+    assert!(hv_support().is_some());
+    #[cfg(not(target_os = "macos"))]
+    assert_eq!(hv_support(), None);
+}

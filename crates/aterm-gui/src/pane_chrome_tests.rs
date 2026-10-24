@@ -1504,20 +1504,32 @@ fn the_scrollbar_layers_are_the_retired_quads_byte_for_byte_on_the_cpu() {
     }
 }
 
+/// A GPU renderer and a CPU one, both on the bundled font, so the two lay the same cells on every
+/// host (a system font's differ: Windows' lays 11x21 to the bundled 9x23 at 18 px).
+fn gpu_and_cpu_on_the_bundled_font() -> (aterm_gpu::GpuRenderer, aterm_render::Renderer) {
+    let theme = aterm_render::Theme::default();
+    let bundled = || {
+        let mut cpu =
+            aterm_render::Renderer::from_bytes(aterm_render::embedded_font(), 18.0, theme)
+                .expect("the bundled font");
+        cpu.set_runtime_font_discovery(false);
+        cpu
+    };
+    let gpu = aterm_gpu::GpuContext::new()
+        .and_then(|ctx| aterm_gpu::GpuRenderer::from_parts(ctx, bundled(), None, theme));
+    match gpu {
+        Ok(gpu) => (gpu, bundled()),
+        Err(error) => {
+            aterm_spec::host::could_not_run(format_args!("no GPU renderer on this host: {error}"))
+        }
+    }
+}
+
 /// The same law on the GPU: on Metal the layers land the bytes the retired
 /// quads land there, and the CPU's.
 #[test]
 fn the_scrollbar_layers_are_the_retired_quads_byte_for_byte_on_the_gpu() {
-    let theme = aterm_render::Theme::default();
-    let mut gpu = match aterm_gpu::GpuRenderer::new(18.0, theme) {
-        Ok(gpu) => gpu,
-        Err(error) => {
-            aterm_spec::host::could_not_run(format_args!("no GPU renderer on this host: {error}"))
-        }
-    };
-    let mut cpu = aterm_render::Renderer::from_bytes(aterm_render::embedded_font(), 18.0, theme)
-        .expect("the bundled font");
-    cpu.set_runtime_font_discovery(false);
+    let (mut gpu, mut cpu) = gpu_and_cpu_on_the_bundled_font();
     let cell = gpu.cell_size();
     let cell_h = u32::try_from(cell.1).expect("a cell");
     let (mut term, rows, cols) = bar_page(cell);
@@ -1638,16 +1650,7 @@ fn a_bar_half_under_a_card_is_cut_at_the_cards_edge_on_the_cpu() {
 /// share the ground.
 #[test]
 fn a_bar_half_under_a_card_is_cut_at_the_cards_edge_on_the_gpu() {
-    let theme = aterm_render::Theme::default();
-    let mut gpu = match aterm_gpu::GpuRenderer::new(18.0, theme) {
-        Ok(gpu) => gpu,
-        Err(error) => {
-            aterm_spec::host::could_not_run(format_args!("no GPU renderer on this host: {error}"))
-        }
-    };
-    let mut cpu = aterm_render::Renderer::from_bytes(aterm_render::embedded_font(), 18.0, theme)
-        .expect("the bundled font");
-    cpu.set_runtime_font_discovery(false);
+    let (mut gpu, mut cpu) = gpu_and_cpu_on_the_bundled_font();
     let cell = gpu.cell_size();
     assert_eq!(cpu.cell_size(), cell, "both backends lay the same cells");
     let cell_h = u32::try_from(cell.1).expect("a cell");

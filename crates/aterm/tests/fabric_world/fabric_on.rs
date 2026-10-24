@@ -731,6 +731,17 @@ fn a_rejected_mint_publishes_nothing_and_the_trace_satisfies_the_model() {
             .collect();
         std::fs::write(s.root().join("node.cap"), lines).expect("foreign cap");
     };
+    let renode = |s: &Scratch| {
+        let secret = std::fs::read(s.root().join("mint.secret")).expect("secret");
+        let lines: String = aterm_link::enable::node_grants("local", "n-previous")
+            .iter()
+            .map(|g| {
+                let c = astream_cap::mint(&secret, g).expect("mint under the root's secret");
+                astream_cap::capfile::format_line(&c.filter, &c.tag) + "\n"
+            })
+            .collect();
+        std::fs::write(s.root().join("node.cap"), lines).expect("another node's cap");
+    };
     let node_of = |s: &Scratch| -> String {
         std::fs::create_dir_all(s.root().join("link-state")).expect("state");
         std::fs::write(s.root().join("link-state/node"), "n-00000000000000aa\n").expect("node");
@@ -774,7 +785,7 @@ fn a_rejected_mint_publishes_nothing_and_the_trace_satisfies_the_model() {
         state
     };
 
-    for existing in ["absent", "stale", "foreign"] {
+    for existing in ["absent", "stale", "foreign", "renode"] {
         for fail_at in ["1", "3", "8"] {
             let s = Scratch::new(&format!("mint-{existing}-{fail_at}"));
             let node = node_of(&s);
@@ -784,6 +795,9 @@ fn a_rejected_mint_publishes_nothing_and_the_trace_satisfies_the_model() {
             }
             if existing == "foreign" {
                 foreign(&s, &node);
+            }
+            if existing == "renode" {
+                renode(&s);
             }
             let secret_before = secret_bytes(&s);
             let cap_before = cap_bytes(&s);
@@ -799,6 +813,14 @@ fn a_rejected_mint_publishes_nothing_and_the_trace_satisfies_the_model() {
                 "the cap was touched ({existing})"
             );
             assert!(staging(&s).is_empty(), "staging debris: {:?}", staging(&s));
+            assert!(
+                !s.root().join("node.cap.aside").exists(),
+                "a refused mint left a link aside ({existing}):\n{out}"
+            );
+            assert!(
+                !out.contains("kept the old ring"),
+                "a refused mint claims a keep ({existing}):\n{out}"
+            );
             assert!(
                 !s.config().exists(),
                 "the config was written after a refused mint"
@@ -1429,6 +1451,146 @@ fn role_identity_conflicting_fleet_is_refused_before_writes() {
 }
 
 #[test]
+fn off_then_on_for_another_fleet_mints_that_fleets_ring() {
+    let s = Scratch::new("refleet");
+    let _broker = Broker::spawn(&s);
+    let (code, out, err) = s.fabric(&["on", "--fleet", "work", "--service", "none"]);
+    assert_eq!(code, 0, "initial fleet:\n{out}{err}");
+    let (code, out, err) = s.fabric(&["off", "--service", "none"]);
+    assert_eq!(code, 0, "off:\n{out}{err}");
+    let dry_cap = |fleet: &str| -> String {
+        let (_, dry, _) = s.fabric(&["on", "--fleet", fleet, "--service", "none", "--dry-run"]);
+        let cap = step(&dry, "cap").join("\n");
+        assert!(
+            cap.contains("mint 8 grants"),
+            "the dry run mints a ring:\n{dry}"
+        );
+        cap
+    };
+    let dry = dry_cap("other");
+    assert!(
+        !dry.contains("kept aside"),
+        "a ring `on` mints again is not claimed kept:\n{dry}"
+    );
+    let (code, out, err) = s.fabric(&["on", "--fleet", "other", "--service", "none"]);
+    assert_eq!(code, 0, "the broker probe under the kept cap:\n{out}{err}");
+    let caps = aterm_link::bridge::read_cap_file(&s.path("root/node.cap")).unwrap();
+    assert!(
+        caps.len() == 8 && caps.iter().all(|c| c.grant.contains(":/f/other/")),
+        "{caps:?}\n{out}"
+    );
+    assert!(
+        !s.root().join("node.cap.aside").exists(),
+        "the work ring, which `on --fleet work` mints again, was kept aside:\n{out}"
+    );
+
+    let node = std::fs::read_to_string(s.root().join("link-state/node")).expect("node");
+    let secret = std::fs::read(s.root().join("mint.secret")).expect("secret");
+    let by_hand: String = aterm_link::enable::node_grants("other", node.trim())[..7]
+        .iter()
+        .map(|g| {
+            let c = astream_cap::mint(&secret, g).expect("mint");
+            astream_cap::capfile::format_line(&c.filter, &c.tag) + "\n"
+        })
+        .collect();
+    std::fs::write(s.root().join("node.cap"), &by_hand).expect("a ring minted by hand");
+    let (code, out, err) = s.fabric(&["off", "--service", "none"]);
+    assert_eq!(code, 0, "off:\n{out}{err}");
+    let dry = dry_cap("third");
+    assert!(
+        dry.contains("it would be kept aside"),
+        "the dry run says a ring no `on` mints again would be kept:\n{dry}"
+    );
+    let (code, out, err) = s.fabric(&["on", "--fleet", "third", "--service", "none"]);
+    assert_eq!(code, 0, "the third fleet:\n{out}{err}");
+    assert_eq!(
+        std::fs::read_to_string(s.root().join("node.cap.aside")).ok(),
+        Some(by_hand),
+        "a ring no `on` mints again is kept:\n{out}"
+    );
+    let caps = aterm_link::bridge::read_cap_file(&s.path("root/node.cap")).unwrap();
+    assert!(
+        caps.len() == 8 && caps.iter().all(|c| c.grant.contains(":/f/third/")),
+        "{caps:?}\n{out}"
+    );
+}
+
+#[test]
+fn on_keeps_a_node_file_that_holds_no_node_id_aside_and_provisions_one() {
+    let s = Scratch::new("junknode");
+    let _broker = Broker::spawn(&s);
+    let state = s.root().join("link-state");
+    std::fs::create_dir_all(&state).expect("state");
+    chmod(&state, 0o700);
+    let on = |s: &Scratch| -> (String, String) {
+        let (_, dry, _) = s.fabric(&["on", "--service", "none", "--dry-run"]);
+        let (code, out, err) = s.fabric(&["on", "--service", "none"]);
+        assert_eq!(code, 0, "{out}{err}");
+        (dry, out)
+    };
+    let says_aside = |out: &str| step(out, "node").iter().any(|l| l.contains("aside"));
+
+    std::fs::write(state.join("node"), "").expect("an empty node file");
+    let (dry, out) = on(&s);
+    assert!(
+        !state.join("node.aside").exists(),
+        "an empty node file held nothing to keep:\n{out}"
+    );
+    assert!(!says_aside(&dry) && !says_aside(&out), "{dry}\n{out}");
+    let first = std::fs::read_to_string(state.join("node")).expect("node");
+    let first = first.trim().to_string();
+    let ring = std::fs::read_to_string(s.root().join("node.cap")).expect("the first node's ring");
+
+    std::fs::write(state.join("node"), "h-x\n").expect("a person's id where the node's goes");
+    let (dry, out) = on(&s);
+    let node = std::fs::read_to_string(state.join("node")).expect("node");
+    let node = node.trim();
+    assert!(
+        aterm_link::enable::is_node_id(node) && node != first,
+        "{node:?}\n{out}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(state.join("node.aside"))
+            .ok()
+            .as_deref(),
+        Some("h-x\n"),
+        "{out}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(s.root().join("node.cap.aside")).ok(),
+        Some(ring),
+        "the ring minted for {first}, the last record of that id, is kept:\n{out}"
+    );
+    let caps = aterm_link::bridge::read_cap_file(&s.path("root/node.cap")).unwrap();
+    assert!(
+        caps.iter().all(|c| !c.grant.contains(&first))
+            && caps.iter().any(|c| c.grant.contains(&format!("p={node}:"))),
+        "{caps:?}"
+    );
+    assert!(
+        step(&out, "node")
+            .iter()
+            .any(|l| l.contains(node) && l.contains("node.aside")),
+        "{out}"
+    );
+    assert!(
+        says_aside(&dry),
+        "the dry run says what the run keeps:\n{dry}"
+    );
+    let kept = format!("kept the old ring as {}", s.path("root/node.cap.aside"));
+    assert!(
+        step(&out, "cap").iter().any(|l| l.contains(&kept)),
+        "the run says where the old ring went:\n{out}"
+    );
+    assert!(
+        step(&dry, "cap")
+            .iter()
+            .any(|l| l.contains("it would be kept aside")),
+        "the dry run says the old ring would be kept:\n{dry}"
+    );
+}
+
+#[test]
 fn a_bare_on_runs_the_unix_broker_and_refuses_a_job_it_cannot_read() {
     let bin = harness::aterm();
     let s = Scratch::new("role");
@@ -1870,4 +2032,52 @@ fn review_off_acts_on_the_root_the_config_names() {
         "the environment's root, B:\n{out}"
     );
     drop(broker);
+}
+
+/// A broker that answers but refuses the root's ring is not "no broker": with a ring minted by
+/// hand that has lapsed, the broker step says the broker answers, why it refuses the ring, and
+/// the renewal, instead of telling the reader to start a broker.
+#[test]
+fn a_broker_that_refuses_a_lapsed_ring_is_named_as_answering() {
+    let s = Scratch::new("lapsed");
+    let _broker = Broker::spawn(&s);
+    let (code, out, err) = s.fabric(&["on", "--fleet", "work", "--service", "none"]);
+    assert_eq!(code, 0, "{out}{err}");
+    let node = std::fs::read_to_string(s.root().join("link-state/node")).expect("node");
+    let secret = std::fs::read(s.root().join("mint.secret")).expect("secret");
+    let lapsed: String = aterm_link::enable::node_grants("work", node.trim())
+        .iter()
+        .map(|g| {
+            let c = astream_cap::mint(&secret, &g.replacen(':', ",exp=1:", 1)).expect("mint");
+            astream_cap::capfile::format_line(&c.filter, &c.tag) + "\n"
+        })
+        .collect();
+    std::fs::write(s.root().join("node.cap"), &lapsed).expect("a lapsed ring minted by hand");
+    let (code, out, err) = s.fabric(&["on", "--fleet", "work", "--service", "none"]);
+    assert_ne!(code, 0, "{out}{err}");
+    let broker = step(&out, "broker").join("\n");
+    assert!(
+        broker.contains("answers but refuses the ring as lapsed")
+            && broker.contains("move <root>/node.cap aside")
+            && !broker.contains("no broker answers"),
+        "{out}"
+    );
+}
+
+/// The report's CONFIG row names a node file that holds no node id as such, not as missing.
+#[test]
+fn the_report_names_a_node_file_that_holds_no_node_id() {
+    let s = Scratch::new("nonode");
+    let _broker = Broker::spawn(&s);
+    let (code, out, err) = s.fabric(&["on", "--fleet", "work", "--service", "none"]);
+    assert_eq!(code, 0, "{out}{err}");
+    let state = s.root().join("link-state");
+    std::fs::write(state.join("node"), "h-x\n").expect("a node file with no node id");
+    let (_, out, err) = s.fabric(&[]);
+    let row = format!("- (no node id in {}/node)", state.display());
+    assert!(
+        out.lines()
+            .any(|l| l.trim_start().starts_with("node ") && l.contains(&row)),
+        "{out}{err}"
+    );
 }

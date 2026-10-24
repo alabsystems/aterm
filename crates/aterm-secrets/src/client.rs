@@ -803,24 +803,145 @@ pub fn materialization_ready_for(paths: &Paths, expected: &Config) -> crate::Res
     materialization_ready_with(paths, Some(expected), files_intact)
 }
 
+/// Local materialization facts that can change a setup retry's answer.
+/// This is an observation, never authority to use credentials or change a vault.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct MaterializationMark([u8; 32]);
+
+impl std::fmt::Debug for MaterializationMark {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MaterializationMark")
+            .finish_non_exhaustive()
+    }
+}
+
+impl MaterializationMark {
+    /// Encode an opaque identity in a private retry cache, not in diagnostics.
+    pub fn cache_key(&self) -> String {
+        hex(&self.0)
+    }
+
+    /// Read an identity from a private retry cache.
+    pub fn from_cache_key(key: &str) -> Option<Self> {
+        let bytes = aterm_codec::hex::decode_vec(key.as_bytes())?;
+        Some(Self(<[u8; 32]>::try_from(bytes.as_slice()).ok()?))
+    }
+}
+
+/// Observe the configured version and whether its local files are complete.
+/// A same-version repair and a plain vault's changed values move this mark;
+/// heartbeats, join proofs and unchanged syncs do not. A busy or missing lock
+/// gives no reading. No state is created, and no source is fetched.
+pub fn materialization_mark(paths: &Paths) -> crate::Result<Option<MaterializationMark>> {
+    let Some(_observation) = StateLock::observe(paths)? else {
+        return Ok(None);
+    };
+    let Some(config) = config(paths)? else {
+        return Ok(None);
+    };
+    let state = load_state(paths)?;
+    let ready = pin_admitted(&config, None)
+        && matches!(state.membership, Stored::In | Stored::Plain)
+        && source_bound(&config, &state)
+        && files_intact(paths, &state);
+    let mut mark = aterm_digest::Sha256::new();
+    mark.update(b"aterm materialization observation/1\0");
+    mark.update(source_identity(&config));
+    mark.update(state.seq.to_be_bytes());
+    mark.update([u8::from(ready), u8::from(state.digest.is_some())]);
+    if let Some(digest) = state.digest {
+        mark.update(digest);
+    }
+    for (name, digest) in &state.manifest.files {
+        mark.update((name.len() as u64).to_be_bytes());
+        mark.update(name.as_bytes());
+        mark.update((digest.len() as u64).to_be_bytes());
+        mark.update(digest.as_bytes());
+    }
+    Ok(Some(MaterializationMark(mark.finalize())))
+}
+
+/// The source and complete materialized version whose local inputs were read.
+/// Heartbeats and pending join proofs are not part of this identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MaterializationSnapshot {
+    config: Config,
+    seq: u64,
+    digest: Option<[u8; 32]>,
+    manifest: Manifest,
+}
+
+/// Local inputs read while their materialized version was held against writers.
+pub struct Materialized<T> {
+    pub inputs: T,
+    pub snapshot: MaterializationSnapshot,
+}
+
+impl MaterializationSnapshot {
+    /// Whether the same complete version is still configured and intact.
+    /// This is a point-in-time check, not a lease over later effects.
+    /// # Errors
+    /// The local configuration or state cannot be safely read.
+    pub fn is_current(&self, paths: &Paths) -> crate::Result<bool> {
+        Ok(with_materialization_ready(paths, &self.config, || Ok(()))?
+            .is_some_and(|current| current.snapshot == *self))
+    }
+}
+
+/// Read local inputs under the ready vault's shared state lock, releasing it on return.
+/// `read` must do local reads only: no network, subprocess or other effects.
+/// # Errors
+/// The local configuration/state or the supplied input reader fails.
+pub fn with_materialization_ready<T>(
+    paths: &Paths,
+    expected: &Config,
+    read: impl FnOnce() -> crate::Result<T>,
+) -> crate::Result<Option<Materialized<T>>> {
+    with_ready_state(paths, Some(expected), files_intact, |config, state| {
+        Ok(Materialized {
+            inputs: read()?,
+            snapshot: MaterializationSnapshot {
+                config,
+                seq: state.seq,
+                digest: state.digest,
+                manifest: state.manifest,
+            },
+        })
+    })
+}
+
 fn materialization_ready_with(
     paths: &Paths,
     expected: Option<&Config>,
     intact: impl FnOnce(&Paths, &State) -> bool,
 ) -> crate::Result<bool> {
+    Ok(with_ready_state(paths, expected, intact, |_, _| Ok(()))?.is_some())
+}
+
+fn with_ready_state<T>(
+    paths: &Paths,
+    expected: Option<&Config>,
+    intact: impl FnOnce(&Paths, &State) -> bool,
+    read: impl FnOnce(Config, State) -> crate::Result<T>,
+) -> crate::Result<Option<T>> {
     let Some(_observation) = StateLock::observe(paths)? else {
-        return Ok(false);
+        return Ok(None);
     };
     let Some(config) = config(paths)? else {
-        return Ok(false);
+        return Ok(None);
     };
     if expected.is_some_and(|expected| *expected != config) || !pin_admitted(&config, None) {
-        return Ok(false);
+        return Ok(None);
     }
     let state = load_state(paths)?;
-    Ok(matches!(state.membership, Stored::In | Stored::Plain)
+    if !(matches!(state.membership, Stored::In | Stored::Plain)
         && source_bound(&config, &state)
         && intact(paths, &state))
+    {
+        return Ok(None);
+    }
+    read(config, state).map(Some)
 }
 
 const ADMIN_MAGIC: &str = "alab-vault-admin/1";
@@ -4236,6 +4357,126 @@ mod tests {
         assert!(materialization_ready(&admin).unwrap());
         assert_eq!(std::fs::read(&token).unwrap(), b"inert-served");
         server.stop();
+    }
+
+    #[test]
+    fn materialization_capture_holds_local_reads_and_fences_the_version() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let source = root.path().join("team.secrets");
+        fsx::write_atomic(&source, b"token=inert-first-token\n", 0o600).unwrap();
+        let paths = Paths::for_home(&root.path().join("reader"));
+        join_pinned(&paths, source.to_str().unwrap(), "reader");
+        let configured = config(&paths).unwrap().unwrap();
+        let writer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(paths.lock_file())
+            .unwrap();
+        let try_writer = || {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the test observes the materialization reader lease without blocking"
+            )]
+            writer.try_lock()
+        };
+        let captured = with_materialization_ready(&paths, &configured, || {
+            assert!(matches!(
+                try_writer(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ));
+            Ok(fsx::read_private(&paths.home.join(".secrets/token"), 1024)?.unwrap())
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(captured.inputs.as_slice(), b"inert-first-token");
+        assert!(captured.snapshot.is_current(&paths).unwrap());
+        try_writer().unwrap();
+        writer.unlock().unwrap();
+
+        let mut state = load_state(&paths).unwrap();
+        state.heard += 1;
+        state.requested += 1;
+        state.proof = Some("inert-proof".into());
+        save_state(&paths, &state).unwrap();
+        assert!(
+            captured.snapshot.is_current(&paths).unwrap(),
+            "not a new version"
+        );
+
+        fsx::write_atomic(&source, b"token=inert-next-token\n", 0o600).unwrap();
+        sync(&paths, None).unwrap();
+        assert!(materialization_ready(&paths).unwrap());
+        assert!(!captured.snapshot.is_current(&paths).unwrap());
+        let current = config(&paths).unwrap().unwrap();
+        let mut mismatch = current.clone();
+        mismatch.name = "another".into();
+        assert!(
+            with_materialization_ready::<()>(&paths, &mismatch, || {
+                panic!("another source must not read inputs")
+            })
+            .unwrap()
+            .is_none()
+        );
+        let writer = StateLock::take(&paths).unwrap();
+        assert!(
+            with_materialization_ready::<()>(&paths, &current, || {
+                panic!("an active sync must not read inputs")
+            })
+            .unwrap()
+            .is_none()
+        );
+        drop(writer);
+        assert!(
+            with_materialization_ready(&paths, &current, || {
+                Err::<(), _>(Error::new("injected local read failure"))
+            })
+            .is_err()
+        );
+        assert!(
+            StateLock::observe(&paths).unwrap().is_some(),
+            "failure releases the lease"
+        );
+    }
+
+    #[test]
+    fn materialization_marks_are_local_redacted_and_unknown_while_a_writer_runs() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let paths = Paths::for_home(&scratch.path().join("home"));
+        assert!(materialization_mark(&paths).unwrap().is_none());
+        assert!(
+            !paths.home.exists(),
+            "an observation creates no local state"
+        );
+        let source = scratch.path().join("scratch.secrets");
+        fsx::write_atomic(&source, b"token=inert-mark-test-value\n", 0o600).unwrap();
+        join_pinned(&paths, source.to_str().unwrap(), "scratch");
+        let known = materialization_mark(&paths).unwrap().unwrap();
+        assert_eq!(
+            MaterializationMark::from_cache_key(&known.cache_key()),
+            Some(known)
+        );
+        let debug = format!("{known:?}");
+        assert!(!debug.contains(&known.cache_key()));
+        assert!(!debug.contains("inert-mark-test-value"));
+        let mut heartbeat = load_state(&paths).unwrap();
+        heartbeat.heard += 1;
+        heartbeat.requested += 1;
+        heartbeat.proof = Some("inert-join-proof".into());
+        save_state(&paths, &heartbeat).unwrap();
+        let state = std::fs::read(paths.state_file()).unwrap();
+        assert_eq!(materialization_mark(&paths).unwrap(), Some(known));
+        {
+            let _writer = StateLock::take(&paths).unwrap();
+            assert!(materialization_mark(&paths).unwrap().is_none());
+        }
+        assert_eq!(materialization_mark(&paths).unwrap(), Some(known));
+        assert_eq!(std::fs::read(paths.state_file()).unwrap(), state);
+
+        fsx::write_atomic(&paths.state_file(), b"invalid = [", 0o600).unwrap();
+        assert!(materialization_mark(&paths).is_err());
+        assert_eq!(std::fs::read(paths.state_file()).unwrap(), b"invalid = [");
+        fsx::write_atomic(&paths.state_file(), &state, 0o600).unwrap();
+        assert_eq!(materialization_mark(&paths).unwrap(), Some(known));
     }
 
     #[test]

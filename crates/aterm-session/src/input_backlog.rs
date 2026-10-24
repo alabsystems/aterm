@@ -190,11 +190,18 @@ pub enum Liveness {
         drew: bool,
         /// The leader is burning CPU while it neither reads nor draws.
         spinning: bool,
+        /// macOS's program check holds the leader before its first instruction: it reads nothing
+        /// because it has not started, which is no stall.
+        program_check: bool,
         /// How contended the machine's CPUs were at the look: the entry thresholds stretch by it.
         contention: Contention,
     },
-    /// A stall is already published for this session.
-    Published,
+    /// A stall is already published for this session: it stands while its input waits.
+    Published {
+        /// macOS's program check holds the leader before its first instruction: a program that
+        /// has not started is no stall, whatever was published before it.
+        program_check: bool,
+    },
 }
 
 /// When the kernel accepted each input byte a sink handed it.
@@ -431,13 +438,15 @@ pub fn classify(b: Option<&InputBacklog>, stopped: bool, liveness: Liveness) -> 
     }
     let stalled = match liveness {
         Liveness::Unobserved => false,
-        Liveness::Published => b.wait >= STALL_AFTER,
+        Liveness::Published { program_check } => !program_check && b.wait >= STALL_AFTER,
         Liveness::Watched {
             drew,
             spinning,
+            program_check,
             contention,
         } => {
-            b.output_backlog == Some(0)
+            !program_check
+                && b.output_backlog == Some(0)
                 && !drew
                 && if spinning {
                     b.wait >= contention.stretch(STALL_AFTER)
@@ -808,13 +817,14 @@ mod tests {
         let spins = L::Watched {
             drew: false,
             spinning: true,
+            program_check: false,
             contention: Contention::default(),
         };
-        assert_eq!(classify(None, true, L::Published), W::Unmeasured);
-        assert_eq!(
-            classify(Some(&raw(0, 60_000)), true, L::Published),
-            W::Clear
-        );
+        let published = L::Published {
+            program_check: false,
+        };
+        assert_eq!(classify(None, true, published), W::Unmeasured);
+        assert_eq!(classify(Some(&raw(0, 60_000)), true, published), W::Clear);
         let spilled = InputBacklog {
             spilled: Some(3),
             ..raw(0, 0)
@@ -838,7 +848,7 @@ mod tests {
             ..raw(1, 60_000)
         };
         assert_eq!(classify(Some(&lagging), false, spins), W::Pending);
-        assert_eq!(classify(Some(&lagging), false, L::Published), W::Stalled);
+        assert_eq!(classify(Some(&lagging), false, published), W::Stalled);
         let unknown = InputBacklog {
             output_backlog: None,
             ..raw(1, 60_000)
@@ -858,6 +868,7 @@ mod tests {
         let seen = |drew, spinning| L::Watched {
             drew,
             spinning,
+            program_check: false,
             contention: Contention::default(),
         };
         assert_eq!(
@@ -900,6 +911,7 @@ mod tests {
         let seen = |spinning, contention| Liveness::Watched {
             drew: false,
             spinning,
+            program_check: false,
             contention,
         };
         let at_ms = |ms: u64| raw(1, ms);
@@ -939,8 +951,56 @@ mod tests {
             W::Stalled
         );
         assert_eq!(
-            classify(Some(&at_ms(10_000)), false, Liveness::Published),
+            classify(
+                Some(&at_ms(10_000)),
+                false,
+                Liveness::Published {
+                    program_check: false
+                }
+            ),
             W::Stalled
+        );
+    }
+
+    #[test]
+    fn classify_never_stalls_a_program_macos_holds_at_its_start() {
+        use InputWord as W;
+        let loaded = Contention::of_load(150.0, 18);
+        let seen = |spinning, program_check| Liveness::Watched {
+            drew: false,
+            spinning,
+            program_check,
+            contention: loaded,
+        };
+        let past = raw(1, 3_600_000);
+        assert!(
+            past.wait >= loaded.stretch(QUIET_STALL_AFTER)
+                && past.wait >= loaded.stretch(STALL_AFTER),
+            "an hour is past both stretched thresholds"
+        );
+        for spinning in [false, true] {
+            assert_eq!(
+                classify(Some(&past), false, seen(spinning, true)),
+                W::Pending,
+                "held at its start, spinning={spinning}: it has not started, so it is no stall"
+            );
+            assert_eq!(
+                classify(Some(&past), false, seen(spinning, false)),
+                W::Stalled,
+                "the same program not held, spinning={spinning}"
+            );
+        }
+        let published = |program_check| Liveness::Published { program_check };
+        assert_eq!(
+            classify(Some(&past), false, published(true)),
+            W::Pending,
+            "a published stall whose program macOS now holds at its start is let go"
+        );
+        assert_eq!(classify(Some(&past), false, published(false)), W::Stalled);
+        assert_eq!(
+            classify(Some(&past), true, seen(false, true)),
+            W::Stopped,
+            "a stopped job is stopped, held or not"
         );
     }
 

@@ -714,14 +714,16 @@ fn task_row(
     bullet: Bullet,
     out: PanelRow,
 ) -> Option<PanelRow> {
-    let name_end = crate::text::find(&row[body..end], "  ").map_or(end, |k| body + k);
-    let mut name_text = &row[body..name_end];
     if bullet == Bullet::Filled
         && out.depth == 0
-        && let Some(unwrapped) = crate::agy::unwrap_agent_token(name_text)
+        && let Some((unwrapped, after_token)) = crate::agy::split_agent_token(&row[body..end])
+        && (after_token.is_empty() || after_token.starts_with("  "))
     {
+        let name_end = end - after_token.len();
         return agy_agent_row(row, body, name_end, end, unwrapped, cols, out);
     }
+    let name_end = crate::text::find(&row[body..end], "  ").map_or(end, |k| body + k);
+    let mut name_text = &row[body..name_end];
     let mut descendants = 0u16;
     if let Some(open) = name_text.rfind(" (+")
         && let Some(n) = name_text[open + 3..].strip_suffix(')')

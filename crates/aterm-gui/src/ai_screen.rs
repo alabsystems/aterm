@@ -925,9 +925,11 @@ impl App {
         self.except_replace(Family::Ai, &entries);
     }
 
+    /// `[ai]` turned off or changed: its entries end withdrawn, never as fixed, since
+    /// no look read their causes end (a changed policy's next look raises what stands).
     fn clear_ai_entries(&mut self) {
         for key in self.messages.digest_keys_under(&Family::Ai.prefix()) {
-            self.except_clear(&key);
+            self.except_withdraw(&key);
         }
     }
 

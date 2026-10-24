@@ -337,6 +337,43 @@ fn an_unresolvable_live_symlink_blocks_every_version_row_rather_than_guessing() 
     assert!(done.removed.is_empty());
 }
 
+/// A toolchain build laid aside (`<build>.noindex` behind a `<build>` link) is one build under
+/// its own name, and the build `current` names through the link is the live one.
+#[cfg(unix)]
+#[test]
+fn a_build_laid_aside_is_surveyed_once_under_its_name() {
+    let tmp = Tmp::new("store-aside");
+    let trust = tmp.path().join("trust");
+    for name in ["9192", "15698.noindex"] {
+        std::fs::create_dir_all(trust.join(name).join("lib/rustlib")).unwrap();
+        std::fs::write(trust.join(name).join("lib/libstd.rlib"), [0u8; 64]).unwrap();
+    }
+    std::os::unix::fs::symlink("15698.noindex", trust.join("15698")).unwrap();
+    std::os::unix::fs::symlink(trust.join("15698"), trust.join("current")).unwrap();
+    let mut s = Survey::new(NOW);
+    scan_store(tmp.path(), &mut s);
+    let builds: Vec<(&str, &Path, u64)> = s
+        .store
+        .iter()
+        .map(|b| (b.build.as_str(), b.path.as_path(), b.bytes))
+        .collect();
+    assert_eq!(
+        builds,
+        [
+            ("15698", trust.join("15698.noindex").as_path(), 64),
+            ("9192", trust.join("9192").as_path(), 64),
+        ]
+    );
+    assert_eq!(
+        s.live_builds.get("trust").map(String::as_str),
+        Some("15698")
+    );
+    assert!(
+        report(&s, applying()).rows_of(Class::AtpkgGc).is_empty(),
+        "the live build and its one rollback are atpkg's to keep"
+    );
+}
+
 #[test]
 fn a_superseded_store_build_is_reported_and_delegated_never_removed_here() {
     let mut survey = Survey::new(NOW);

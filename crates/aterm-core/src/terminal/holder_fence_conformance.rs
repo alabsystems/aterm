@@ -38,6 +38,8 @@ enum Step {
     Scribble,
     Draw,
     BandMove,
+    Reserve,
+    Sweep,
     Splice,
     Reflow,
     Renumber,
@@ -52,7 +54,7 @@ enum Step {
 }
 
 impl Step {
-    const ALL: [Self; 28] = [
+    const ALL: [Self; 30] = [
         Self::LaunchA,
         Self::LaunchB,
         Self::StopA,
@@ -70,6 +72,8 @@ impl Step {
         Self::Scribble,
         Self::Draw,
         Self::BandMove,
+        Self::Reserve,
+        Self::Sweep,
         Self::Splice,
         Self::Reflow,
         Self::Renumber,
@@ -102,6 +106,8 @@ impl Step {
             Self::Scribble => "Scribble",
             Self::Draw => "Draw",
             Self::BandMove => "BandMove",
+            Self::Reserve => "Reserve",
+            Self::Sweep => "Sweep",
             Self::Splice => "Splice",
             Self::Reflow => "Reflow",
             Self::Renumber => "Renumber",
@@ -271,6 +277,21 @@ impl World {
             .ok_or_else(|| "A holds no mark".to_string())
     }
 
+    /// The absolute row A's open span starts on.
+    fn open_start_a(&self) -> Result<u64, String> {
+        let mark = self.mark_a()?;
+        let open = mark
+            .spans
+            .iter()
+            .find(|s| s.end.is_none())
+            .ok_or("A has no open span")?;
+        self.t
+            .main_grid()
+            .anchors()
+            .row(open.start)
+            .ok_or_else(|| "A's open span has no start".to_string())
+    }
+
     fn screen_row(&self, row: u64) -> Result<u16, String> {
         let main = self.t.main_grid();
         row.checked_sub(main.visible_to_absolute(0))
@@ -361,22 +382,33 @@ impl World {
                 self.draw_line(d)?;
             }
             Step::BandMove => {
-                let start = {
-                    let mark = self.mark_a()?;
-                    let open = mark
-                        .spans
-                        .iter()
-                        .find(|s| s.end.is_none())
-                        .ok_or("A has no open span")?;
-                    self.t
-                        .main_grid()
-                        .anchors()
-                        .row(open.start)
-                        .ok_or("A's open span has no start")?
-                };
+                let start = self.open_start_a()?;
                 let row = self.screen_row(start)?.saturating_sub(1);
                 self.write(format!("\x1b[{};1H\x1b[L", row + 1).as_bytes());
                 self.settle()?;
+            }
+            Step::Reserve => {
+                let d = self.a()?;
+                let start = self.open_start_a()?;
+                let row = self.screen_row(start)? + 1;
+                self.write(
+                    format!(
+                        "\x1b7\x1b[{row};{ROWS}r\x1b[{row};1H\x1bM\x1b[r\x1b8\x1b[{row};1H{}",
+                        d.card_line()
+                    )
+                    .as_bytes(),
+                );
+                self.settle()?;
+            }
+            Step::Sweep => {
+                let d = self.a()?;
+                let mut sweep = String::from("\x1b[H");
+                for _ in 0..ROWS {
+                    sweep.push_str("\x1b[2K\x1b[1B");
+                }
+                sweep.push_str("\x1b[H");
+                self.write(sweep.as_bytes());
+                self.draw_launch(d)?;
             }
             Step::Splice => {
                 let end = {
@@ -707,6 +739,8 @@ fn each_knob_is_rejected_at_its_own_action() {
             &["LaunchA", "LaunchB", "FgA", "FgB"][..],
         ),
         (FenceKnob::StopKeepsAltFresh, &["StopA"][..]),
+        (FenceKnob::StartFollows, &["Reserve"][..]),
+        (FenceKnob::ErasedRowsStayOut, &["Sweep"][..]),
     ] {
         let rejected = with_knob(knob, || walk(&model))
             .err()

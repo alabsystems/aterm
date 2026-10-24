@@ -91,8 +91,8 @@ impl ActiveEventLoop {
         RootWindowTarget { p, _marker: PhantomData }
     }
 
-    pub(super) fn new_headless(mtm: MainThread) -> Self {
-        Self { backend: Backend::Headless(super::headless::LoopState::new()), mtm }
+    pub(super) fn new_headless(mtm: MainThread, drained: wake_queue::Drained) -> Self {
+        Self { backend: Backend::Headless(super::headless::LoopState::new(drained)), mtm }
     }
 
     /// Returns the AppKit application delegate, or `None` on a headless loop.
@@ -178,6 +178,13 @@ impl ActiveEventLoop {
         match &self.backend {
             Backend::AppKit(delegate) => delegate.exiting(),
             Backend::Headless(state) => state.exiting(),
+        }
+    }
+
+    pub(crate) fn user_events_drained(&self) -> bool {
+        match &self.backend {
+            Backend::AppKit(delegate) => delegate.user_events_drained(),
+            Backend::Headless(state) => state.user_events_drained(),
         }
     }
 }
@@ -303,6 +310,7 @@ impl<T> AppKitEventLoop<T> {
             activation_policy,
             attributes.activate_ignoring_other_apps,
             receiver.armed(),
+            receiver.drained(),
         );
 
         autoreleasepool(|_| {
@@ -561,13 +569,34 @@ impl<T> EventLoopProxy<T> {
         // push. A drain that found the queue's lock held relies on that signal, and the sends
         // behind it until the next take are drained by the turn it brings (`wake_queue.rs`).
         if self.sender.send(event).map_err(EventLoopClosed)? {
-            unsafe {
-                CFRunLoopSourceSignal(self.source);
-                let rl = CFRunLoopGetMain();
-                CFRunLoopWakeUp(rl);
-            }
+            self.signal();
         }
         Ok(())
+    }
+
+    /// [`Self::send_event`] by a sender held part-way through its push
+    /// (`wake_queue::Sender::send_held`), which signals as `send_event` does once it lets go.
+    #[cfg(any(test, debug_assertions))]
+    pub fn send_event_held_for_test(
+        &self,
+        event: T,
+        held: &std::sync::mpsc::Sender<()>,
+        release: &std::sync::mpsc::Receiver<()>,
+    ) -> Result<(), EventLoopClosed<T>> {
+        if self.sender.send_held(event, held, release).map_err(EventLoopClosed)? {
+            self.signal();
+        }
+        Ok(())
+    }
+
+    fn signal(&self) {
+        // SAFETY: `self.source` is a source this proxy retains until `Drop`, and signalling a
+        // source and waking the main run loop may be done from any thread.
+        unsafe {
+            CFRunLoopSourceSignal(self.source);
+            let rl = CFRunLoopGetMain();
+            CFRunLoopWakeUp(rl);
+        }
     }
 }
 

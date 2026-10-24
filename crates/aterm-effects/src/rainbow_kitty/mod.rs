@@ -242,6 +242,32 @@ pub struct Ctx<'a> {
     pub flow: Flow,
 }
 
+impl Ctx<'_> {
+    /// Whether a light at `(x, y)` reaching `reach` px stands within a cell
+    /// of the caret's block on paper: after an Enter a star's needles struck
+    /// through the block, and a diamond touching its corner read as part of
+    /// it. Stars on paper stand at least a cell clear of the block, every
+    /// side; on a dark page the caret's own light keeps them off.
+    #[inline]
+    #[must_use]
+    pub fn near_paper_caret(&self, (x, y): (i32, i32), reach: i32) -> bool {
+        let (row, col) = self.caret;
+        if self.cfg.dark_theme
+            || usize::from(row) >= self.geom.rows
+            || usize::from(col) >= self.geom.cols
+        {
+            return false;
+        }
+        let (cw, ch) = (self.geom.cw as i32, self.geom.ch as i32);
+        let x0 = i32::from(self.geom.origin_x) + i32::from(col) * cw;
+        let y0 = i32::from(self.geom.origin_y) + i32::from(row) * ch;
+        x + reach >= x0 - cw
+            && x - reach < x0 + 2 * cw
+            && y + reach >= y0 - ch
+            && y - reach < y0 + 2 * ch
+    }
+}
+
 /// `trail status`'s v2 rows (seam point 12).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Status {
@@ -1797,6 +1823,7 @@ impl Engine {
             out.under.truncate(u0);
             out.out.truncate(o0);
             out.halos.truncate(h0);
+            self.stardust.clear_marks();
         }
         self.caret_seam.field_t = ctx.caret_t;
         self.caret_seam.paint = self.caret_paint(now);
@@ -1926,6 +1953,13 @@ impl Engine {
     #[cfg(test)]
     pub(crate) const fn caret_mirror(&self) -> (u16, u16) {
         self.caret
+    }
+
+    /// Lay a dark train into the letter guard's reach below a lettered
+    /// row, as it was (the brown segment's negative control).
+    #[cfg(test)]
+    pub(crate) const fn lay_trains_in_guard(&mut self, on: bool) {
+        self.meteor.trains_in_guard = on;
     }
 
     /// The events buffered for the next frame, in the order the host handed them over.
@@ -2114,11 +2148,49 @@ impl Engine {
         self.stardust.shade.note(body);
     }
 
+    /// This frame's [`companion::KeepOut`], window pixels: no star is drawn
+    /// on it and the ribbon's body never feathers up into it.
+    #[inline]
+    pub fn note_keep_out(
+        &mut self,
+        (icons, cells): (
+            impl IntoIterator<Item = (i32, i32, i32, i32)>,
+            impl IntoIterator<Item = (i32, i32, i32, i32)>,
+        ),
+        rows: impl IntoIterator<Item = (i32, i32, i32, i32)>,
+    ) {
+        self.stardust.keep_out.set_split(icons, cells);
+        self.stardust.keep_out.set_rows(rows);
+        self.ribbon.keep_out.clone_from(&self.stardust.keep_out);
+        self.meteor.keep_out.clone_from(&self.stardust.keep_out);
+    }
+
+    /// Each star the sky painted this frame ([`stardust::SkyMark`]).
+    #[inline]
+    #[must_use]
+    pub fn sky_marks(&self) -> &[stardust::SkyMark] {
+        self.stardust.marks()
+    }
+
+    /// The keys of the lights this frame's stars painted ([`stardust::SkyMark::lights`]).
+    #[inline]
+    #[must_use]
+    pub fn sky_mark_lights(&self) -> &[u64] {
+        self.stardust.mark_lights()
+    }
+
     /// The body box the sky last drew no star on ([`companion::PetShade::body`]).
     #[cfg(any(test, debug_assertions))]
     #[must_use]
     pub const fn pet_shade(&self) -> Option<(i32, i32, i32, i32)> {
         self.stardust.shade.body()
+    }
+
+    /// The boxes the sky and the ribbon last kept off ([`companion::KeepOut::boxes`]).
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn keep_out(&self) -> &[(i32, i32, i32, i32)] {
+        self.stardust.keep_out.boxes()
     }
 
     /// Seam point 11 (`drain_sound_cues`).
@@ -2638,6 +2710,84 @@ mod tests {
             t = type_key_at(eng, t, col);
         }
         t
+    }
+
+    /// On paper the stars stand at least a cell clear of the caret's block,
+    /// every side: after an Enter a diamond touching the block's corner read
+    /// as part of it (looks6 round 2 N5, `e120`). Typing a row and taking a
+    /// Return, no painted star's rect comes within a cell of the caret on
+    /// paper; on dark (the control, where the caret's own light keeps them
+    /// off) the strikes lay stars there.
+    #[test]
+    fn paper_stars_stand_a_cell_clear_of_the_caret() {
+        let ms = Duration::from_millis;
+        let g = geom();
+        let (cw, ch) = (g.cw as i32, g.ch as i32);
+        let near = |dark: bool| -> usize {
+            let mut cfg = config();
+            cfg.dark_theme = dark;
+            if !dark {
+                cfg.theme_fg = 0x0024_292F;
+                cfg.theme_bg = 0x00FF_FFFF;
+            }
+            let mut eng = engaged();
+            for row in 1..8u16 {
+                blank_row(&mut eng, row);
+            }
+            let mut sc = Scratch::default();
+            let mut caret = (3u16, 2u16);
+            let mut found = 0;
+            let mut look = |eng: &mut Engine, t: Instant, caret: (u16, u16), sc: &mut Scratch| {
+                let mut fr = sc.frame();
+                eng.tick(t, g, &cfg, &mut fr);
+                let x0 = i32::from(g.origin_x) + i32::from(caret.1) * cw;
+                let y0 = i32::from(g.origin_y) + i32::from(caret.0) * ch;
+                found += eng
+                    .sky_marks()
+                    .iter()
+                    .filter(|m| {
+                        let (mx0, mx1, my0, my1) = m.rect;
+                        mx0 < x0 + 2 * cw && mx1 > x0 - cw && my0 < y0 + 2 * ch && my1 > y0 - ch
+                    })
+                    .count();
+            };
+            let t0 = Instant::now();
+            eng.on_event(mv((3, 0), caret, Licence::Typed), t0);
+            look(&mut eng, t0, caret, &mut sc);
+            let mut t = t0;
+            for col in 2..24u16 {
+                t += ms(70);
+                eng.on_event(typed(1), t);
+                look(&mut eng, t, caret, &mut sc);
+                let echo = t + ms(8);
+                eng.on_event(
+                    Event::Sweep {
+                        row: 3,
+                        col0: col,
+                        col1: col + 1,
+                    },
+                    t,
+                );
+                eng.on_event(mv(caret, (3, col + 1), Licence::Typed), echo);
+                caret = (3, col + 1);
+                look(&mut eng, echo, caret, &mut sc);
+                t = echo;
+            }
+            t += ms(120);
+            eng.on_event(mv(caret, (4, 2), Licence::Return), t);
+            caret = (4, 2);
+            for _ in 0..30 {
+                look(&mut eng, t, caret, &mut sc);
+                t += ms(16);
+            }
+            found
+        };
+        let paper = near(false);
+        assert_eq!(paper, 0, "{paper} stars within a cell of the paper caret");
+        assert!(
+            near(true) > 0,
+            "control: on dark no star stood by the caret"
+        );
     }
 
     fn echo_band_fence_model() -> aterm_spec::derive::Model {

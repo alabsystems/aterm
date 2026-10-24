@@ -1,6 +1,6 @@
 ---
 name: aterm-themes
-description: Design, write, check, preview, import or install an aterm colour theme (a .conf in the themes folder), or pick a light/dark pair. Use for "make a theme", "terminal colours", "colour scheme", "dark:…,light:…", "aterm theme", "install Catppuccin/Kanagawa/Tokyo Night", "import my kitty/Ghostty/iTerm2 theme", or a theme file that will not load.
+description: Design, write, check, preview, import or install an aterm colour theme (a .conf in the themes folder), or pick a light/dark pair. Use for "make a theme", "terminal colours", "colour scheme", "dark:…,light:…", "aterm theme", "install Catppuccin/Kanagawa/Tokyo Night", "import my kitty/Ghostty/iTerm2/Terminal.app theme", or a theme file that will not load.
 ---
 <!-- aterm skill v3 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
 
@@ -141,7 +141,8 @@ A theme file is untrusted text; the parser refuses to load:
   `schema` is newer than this aterm's loads with the keys it does not know skipped and listed;
 - duplicate keys, including aliases (`cursor` and `cursor_color` are one key);
 - foreign terminal syntax: convert with `aterm theme import <file> [--name <id>]` (kitty, Ghostty,
-  Alacritty, iTerm2, Windows Terminal, base16/base24 offline, <256 KiB; prints dropped keys);
+  Alacritty, WezTerm, iTerm2, Terminal.app, Windows Terminal, base16/base24 offline, <256 KiB;
+  prints dropped keys);
 - a built-in theme's name (`aterm theme list`): built-ins always win and shadow the file.
 
 ## When it does not work

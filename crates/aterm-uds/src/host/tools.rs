@@ -999,4 +999,10 @@ pub const TOOLS: &[Tool] = &[
         "Apple silicon with Rosetta",
         "the Linux lane runs its x86_64 half translated",
     ),
+    hardware(
+        "virtualization",
+        "Apple silicon with Virtualization.framework",
+        "the Linux lane's own VM runs on Virtualization.framework through aterm-vz's helper; \
+         the lane reads `kern.hv_support` by sysctl, with no framework loaded",
+    ),
 ];

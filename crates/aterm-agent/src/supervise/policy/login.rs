@@ -135,7 +135,13 @@ pub const fn renewal_followed(superseded: bool, cfg: &SupervisorConfig, restarta
 pub const fn carried(program: Program) -> bool {
     match program {
         Program::Claude => true,
-        Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => false,
+        Program::Codex
+        | Program::Grok
+        | Program::Kimi
+        | Program::Agy
+        | Program::Muse
+        | Program::Gemini
+        | Program::Generic => false,
     }
 }
 

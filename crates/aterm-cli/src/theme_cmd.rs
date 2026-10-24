@@ -113,9 +113,11 @@ aterm theme import <file> [--name <id>] [--replace]
 
   Convert another terminal's theme (or an aterm theme file's colours) into a
   theme in the themes folder, where Settings and `theme = \"<id>\"` find it:
-  kitty, Ghostty, Alacritty (TOML), iTerm2 (.itermcolors), Windows Terminal
-  (JSON) or base16/base24 (YAML), told apart by the file's extension, else
-  its contents. Only a local file up to 256 KiB is read; no URL, include or
+  kitty, Ghostty, Alacritty or WezTerm (TOML), iTerm2 (.itermcolors),
+  Terminal.app (.terminal), Windows Terminal (JSON) or base16/base24 (YAML),
+  told apart by the file's extension (a .toml or .plist file's contents then
+  tell WezTerm from Alacritty and Terminal.app from iTerm2), else its
+  contents. Only a local file up to 256 KiB is read; no URL, include or
   import line is followed. Keys aterm has no place for are listed, not
   fatal.
 

@@ -254,7 +254,8 @@ fn keys_help() -> String {
 const HELP_TAIL: &str = concat!(
     "CHILD-SHELL ENV HYGIENE:\n",
     "    Spawned shells start without AI-agent variables (CLAUDE*, ANTHROPIC_*,\n",
-    "    COPILOT_*, CODEX_*, ANTIGRAVITY_*, GEMINI_*, CURSOR_*, AI_*, _DEVTOOL_*),\n",
+    "    COPILOT_*, CODEX_*, ANTIGRAVITY_*, GEMINI_*, CURSOR_*, GROK_*, XAI_*,\n",
+    "    KIMI_*, MOONSHOT_*, AI_*, _DEVTOOL_*),\n",
     "    so an outer agent's state never reaches them.\n\n",
     "CONFIG:  <aterm.toml>  (live settings reload on save; launch settings apply at\n",
     "         relaunch, session settings to new sessions; flag > config > default)\n",

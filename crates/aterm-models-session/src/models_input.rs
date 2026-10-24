@@ -5,7 +5,9 @@
 
 use aterm_spec::derive::Model;
 
-/// Formal model of a session's input queue and socket-driver unread-input gate.
+/// Formal model of a session's input queue and socket-driver unread-input gate. `held` is macOS's
+/// program check holding the reader before its first instruction: it reads nothing, is never
+/// published as a stall, and a stall published before it is withdrawn.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn input_unread_gate_model() -> Model {
@@ -27,6 +29,8 @@ pub fn input_unread_gate_model() -> Model {
             var behind_stalled = 0;
             var refused_live = 0;
             var healthy_published = 0;
+            var held = 0;
+            var held_published = 0;
 
             action HumanKey when (q <= Cap - 1) {
                 a1 = if q == 0 { 0 } else { a1 };
@@ -64,15 +68,18 @@ pub fn input_unread_gate_model() -> Model {
                 };
             }
             action Publish when (published == 0 && stopped == 0 && raw == 1 && q > 0
-                && Stall <= a1 && (reading == 0 || Buggy == 1))
+                && Stall <= a1 && (reading == 0 || Buggy == 1) && (held == 0 || Buggy == 2))
             {
                 healthy_published = if reading == 1 { 1 } else { healthy_published };
+                held_published = if held == 1 { 1 } else { held_published };
                 published = 1;
             }
-            action Withdraw when (published == 1 && (q == 0 || raw == 0 || a1 <= Stall - 1)) {
+            action Withdraw when (published == 1
+                && (q == 0 || raw == 0 || a1 <= Stall - 1 || held == 1))
+            {
                 published = 0;
             }
-            action Consume when (reading == 1 && stopped == 0 && q > 0) {
+            action Consume when (reading == 1 && held == 0 && stopped == 0 && q > 0) {
                 a1 = if q == 2 { a2 } else { 0 };
                 a2 = 0;
                 q = q - 1;
@@ -96,10 +103,17 @@ pub fn input_unread_gate_model() -> Model {
             action ModeFlip when (raw <= 1) {
                 raw = if raw == 1 { 0 } else { 1 };
             }
+            action Hold when (held == 0) {
+                held = 1;
+            }
+            action Release when (held == 1) {
+                held = 0;
+            }
 
             invariant NoDriverKeyBehindStalledInput: behind_stalled == 0;
             invariant NoRefusalWithoutAnEstablishedStall: refused_live == 0;
             invariant NoReadingProgramPublished: healthy_published == 0;
+            invariant NoHeldProgramPublished: held_published == 0;
         }
     }
 }

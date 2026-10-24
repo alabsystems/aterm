@@ -162,7 +162,7 @@ fn the_grammar_parses_what_the_help_text_advertises() {
         (
             "ledger accounts 7 --json",
             Cmd::Ledger {
-                file: LedgerFile::Accounts,
+                file: LedgerFile::Accounts(Cli::Claude),
                 count: 7,
                 json: true,
             },
@@ -4512,7 +4512,7 @@ fn login_keeps_no_byte_of_the_vendors_output() {
     let (_, json, _) = acc_quiet(AccountsCmd::Report { json: true }, &env);
     let (_, ledger, _) = go(
         &Cmd::Ledger {
-            file: LedgerFile::Accounts,
+            file: LedgerFile::Accounts(Cli::Claude),
             count: 20,
             json: false,
         },
@@ -4520,7 +4520,7 @@ fn login_keeps_no_byte_of_the_vendors_output() {
     );
     let (_, raw, _) = go(
         &Cmd::Ledger {
-            file: LedgerFile::Accounts,
+            file: LedgerFile::Accounts(Cli::Claude),
             count: 20,
             json: true,
         },
@@ -6982,6 +6982,170 @@ fn a_stateful_ledger_cut_keeps_input_it_cannot_read_whole() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
 }
 
+fn parsed(line: &str) -> Result<Cmd, String> {
+    let args: Vec<String> = line.split_whitespace().map(str::to_string).collect();
+    parse(&args).map(|(cmd, _)| cmd)
+}
+
+fn run_line(line: &str, env: &Env) -> (String, String, String) {
+    let cmd = parsed(line).expect(line);
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let code = run(&cmd, env, &mut out, &mut err);
+    (
+        format!("{code:?}"),
+        String::from_utf8_lossy(&out).into_owned(),
+        String::from_utf8_lossy(&err).into_owned(),
+    )
+}
+
+#[test]
+fn accounts_list_is_claudes_report_byte_for_byte_and_another_cli_reads_its_own_roster() {
+    let tmp = tmp_dir("accounts-cli");
+    let mut env = env_at(&tmp);
+    env.sock = None;
+    let none = run_line("accounts", &env);
+    assert_eq!(none.0, exit(0), "{none:?}");
+    assert_eq!(run_line("accounts list", &env), none);
+    assert_eq!(run_line("accounts list --cli claude", &env), none);
+    let config = tmp.path();
+    assert_eq!(
+        none.1,
+        format!(
+            "no accounts listed\nroster: {} (no such file)\nlist one: aterm harness accounts add \
+             <label>\n",
+            config.join("accounts.toml").display()
+        )
+    );
+    let kimi = run_line("accounts list --cli kimi", &env);
+    assert_eq!(
+        (kimi.0.as_str(), kimi.1.as_str()),
+        (
+            none.0.as_str(),
+            format!(
+                "no accounts listed\nroster: {} (no such file)\nlist one: aterm harness accounts \
+                 add <label> --cli kimi\n",
+                config.join("accounts-kimi.toml").display()
+            )
+            .as_str()
+        ),
+        "{kimi:?}"
+    );
+    three_accounts(&tmp, &env);
+    let listed = run_line("accounts", &env);
+    assert!(listed.1.contains("work-2"), "{listed:?}");
+    assert_eq!(run_line("accounts list", &env), listed);
+    assert_eq!(run_line("accounts --cli claude", &env), listed);
+    assert_eq!(
+        parsed("accounts list --cli claude --json"),
+        Ok(Cmd::Accounts(AccountsCmd::Report { json: true }))
+    );
+    assert_eq!(
+        run_line("accounts list --cli kimi", &env).1,
+        kimi.1,
+        "claude's rows are not kimi's"
+    );
+    let why = parsed("accounts list --cli nope").expect_err("no such pool");
+    assert!(
+        why.contains("claude, codex, grok, kimi") && why.contains("nope"),
+        "{why}"
+    );
+    for taken in [
+        "accounts renew --due --cli grok",
+        "accounts login work --cli codex",
+        "accounts renew work --cli kimi",
+        "accounts sync --cli kimi",
+        "accounts sync ai-accounts-codex.toml --cli codex --machine m16 --json",
+    ] {
+        assert!(
+            matches!(parsed(taken), Ok(Cmd::AccountsOf(_))),
+            "{taken}: {:?}",
+            parsed(taken)
+        );
+    }
+    let refused = "accounts serve --cli grok";
+    let why = parsed(refused).expect_err(refused);
+    assert!(
+        why.contains("Claude Code's alone in this build"),
+        "{refused}: {why}"
+    );
+    for misplaced in [
+        "accounts add a --cli codex --region global",
+        "accounts add a --cli kimi --flow device",
+        "accounts add a --region global",
+        "accounts list --cli kimi --region global",
+        "usage --cli kimi",
+    ] {
+        assert!(parsed(misplaced).is_err(), "{misplaced}");
+    }
+    assert!(parsed("accounts add a --cli kimi --region eu").is_err());
+}
+
+#[test]
+fn another_clis_rows_are_added_listed_and_pinned_in_its_own_roster_and_login_root() {
+    let tmp = tmp_dir("accounts-cli-kimi");
+    let mut env = env_at(&tmp);
+    env.sock = None;
+    let claude_roster = env.accounts_roster().expect("a config dir");
+    let (code, _, err) = run_line("accounts add sol --cli kimi --email sol@example.com", &env);
+    assert_eq!(code, exit(1));
+    assert!(
+        err.contains("row `sol` has an email and no region"),
+        "{err}"
+    );
+    let (code, out, err) = run_line(
+        "accounts add sol --cli kimi --email sol@example.com --region global",
+        &env,
+    );
+    assert_eq!(code, exit(0), "{err}");
+    let dir = tmp.path().join("home/.aterm/logins/kimi/sol");
+    assert!(
+        out.contains(&format!("login directory: {}", dir.display())),
+        "{out}"
+    );
+    assert!(
+        out.contains("run: aterm harness accounts renew sol --cli kimi"),
+        "{out}"
+    );
+    assert!(dir.is_dir());
+    let file = std::fs::read_to_string(tmp.path().join("accounts-kimi.toml")).expect("roster");
+    assert!(
+        file.contains("region = \"global\"") && file.contains("label = \"main\""),
+        "{file}"
+    );
+    assert!(!claude_roster.exists(), "Claude Code's roster is untouched");
+    let (code, out, _) = run_line("accounts list --cli kimi", &env);
+    assert_eq!(code, exit(0));
+    assert!(out.contains("sol") && out.contains("not-enrolled"), "{out}");
+    let (code, _, err) = run_line("accounts use sol --cli kimi", &env);
+    assert_eq!(code, exit(1), "not signed in yet");
+    assert!(err.contains("its login is not made yet"), "{err}");
+    std::fs::create_dir_all(dir.join("credentials")).expect("mkdir");
+    std::fs::write(dir.join("credentials/kimi-code.json"), "{}").expect("a stand-in login");
+    let (code, out, err) = run_line("accounts use sol --cli kimi", &env);
+    assert_eq!(code, exit(0), "{err}");
+    assert!(out.starts_with("sol: the active account, pinned"), "{out}");
+    assert!(env.state.join("accounts-kimi").join("state.json").is_file());
+    assert!(
+        !env.state.join("accounts").exists(),
+        "Claude Code's store is untouched"
+    );
+    let json = run_line("accounts --cli kimi --json", &env).1;
+    let doc: Value = aterm_json::from_str(json.trim()).expect("one document");
+    assert_eq!(doc["cli"].as_str(), Some("kimi"));
+    assert_eq!(
+        doc["rotation"]["at_limit"].as_bool(),
+        Some(false),
+        "nothing moves it yet"
+    );
+    assert_eq!(doc["pinned"].as_bool(), Some(true));
+    let mut homeless = env.clone();
+    homeless.home = None;
+    let (code, _, err) = run_line("accounts add two --cli grok", &homeless);
+    assert_eq!(code, exit(1));
+    assert!(err.contains("no home directory is known"), "{err}");
+}
+
 const AGY_USAGE: &str = r#"{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{"name":"Gemini Models","description":"Models within this group: Gemini Flash, Gemini Pro","buckets":[{"id":"gemini-weekly","window":"weekly","remaining_fraction":0,"reset_time":"2026-10-28T00:19:03Z"},{"id":"gemini-5h","window":"5h","disabled":true,"remaining_fraction":1}]},{"name":"Claude and GPT models","description":"Models within this group: Claude Opus, Claude Sonnet, GPT-OSS","buckets":[{"id":"3p-weekly","window":"weekly","remaining_fraction":0.96,"reset_time":"2026-10-31T00:49:13Z"}]}]}}}"#;
 
 struct AgyStandIn {
@@ -7181,3 +7345,6 @@ fn versions_prints_incremental_numeric_version_for_every_cli_harness() {
     }
     assert!(json.contains(r#""version":"0.1","major":0,"minor":1"#));
 }
+
+#[path = "cli_signin_tests.rs"]
+mod signin;

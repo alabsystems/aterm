@@ -80,7 +80,13 @@ pub(crate) fn fronts_claimant(program: Option<&str>) -> bool {
         match aterm_phase::program_of(program) {
             Some(Program::Codex) => true,
             Some(
-                Program::Claude | Program::Generic | Program::Agy | Program::Muse | Program::Gemini,
+                Program::Claude
+                | Program::Grok
+                | Program::Kimi
+                | Program::Generic
+                | Program::Agy
+                | Program::Muse
+                | Program::Gemini,
             ) => false,
             None => {
                 let word = program.split_whitespace().next().unwrap_or(program);

@@ -478,4 +478,11 @@ fn reads_agy_subagent_panel_rows_with_unwrapped_name_and_activity_clock() {
         working_5s.activity_hash, working_25s.activity_hash,
         "ticking model clock refreshes activity_hash across 10s buckets"
     );
+
+    let nested = parse("  ● Agent(self: Researcher (GUI))  Reading file · 25s");
+    assert_eq!(nested.kind, RowKind::Agent);
+    assert_eq!(nested.name, span(4, 4 + "Researcher (GUI)".len() as u16));
+    assert_eq!(nested.name_hash, text_hash("Researcher (GUI)"));
+    assert_eq!(nested.activity_hash, text_hash("Reading file"));
+    assert_eq!(nested.elapsed.map(|e| e.1), Some(clock(25_000, 1000)));
 }

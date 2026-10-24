@@ -29,6 +29,7 @@ fn facts(c: &'static Connector, shim: PathBuf) -> Facts {
         limited_until: None,
         record: Record::default(),
         env_credentials: Vec::new(),
+        pool: None,
     }
 }
 
@@ -470,4 +471,64 @@ fn claude_limited_with_next_sign_in_renews_the_successor_account() {
             .collect::<Vec<_>>(),
         [vec!["harness", "accounts", "renew", "m27"]]
     );
+}
+
+#[test]
+fn a_cli_with_its_own_roster_signs_in_through_its_renewal_and_one_without_runs_its_login() {
+    use crate::ai::connector::KIMI;
+    let b = machine(&["kimi"]);
+    let store = Store::at(&b.state);
+    let shim = b.pkg.agents_dir().join("kimi");
+    let rig = Rig::new(&[]);
+    let mut pooled = facts(&KIMI, shim.clone());
+    pooled.pool = Some(crate::ai::facts::CliAccounts {
+        roster: PathBuf::from("/home/me/.config/aterm/accounts-kimi.toml"),
+        refused: None,
+        next: Some("kimi-one".to_string()),
+        ..crate::ai::facts::CliAccounts::default()
+    });
+    let runner = FakeRunner::quiet();
+    let done = rig.sign_in(&runner, &store, &pooled, &row(&KIMI, State::SignedOut), &[]);
+    assert_eq!(done, Done::SignedIn(None));
+    let calls = runner.calls();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert!(
+        calls[0].terminal && calls[0].program == "aterm",
+        "{:?}",
+        calls[0]
+    );
+    assert_eq!(
+        calls[0].args,
+        ["harness", "accounts", "renew", "kimi-one", "--cli", "kimi"]
+    );
+
+    let mut empty = pooled.clone();
+    empty.pool = Some(crate::ai::facts::CliAccounts {
+        next: None,
+        ..pooled.pool.clone().expect("pool")
+    });
+    let runner = FakeRunner::quiet();
+    let done = rig.sign_in(&runner, &store, &empty, &row(&KIMI, State::SignedOut), &[]);
+    assert!(
+        matches!(done, Done::Refused(ref why) if why.contains("no row with an email")),
+        "{done:?}"
+    );
+    assert!(runner.calls().is_empty());
+
+    let runner = FakeRunner::quiet();
+    let done = rig.sign_in(
+        &runner,
+        &store,
+        &facts(&KIMI, shim),
+        &row(&KIMI, State::SignedOut),
+        &[],
+    );
+    assert_eq!(
+        done,
+        Done::NotChecked,
+        "no roster: Kimi's own login, as before"
+    );
+    let calls = runner.calls();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].terminal && calls[0].program == "kimi" && calls[0].args == ["login"]);
 }

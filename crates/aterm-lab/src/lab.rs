@@ -62,6 +62,8 @@ pub struct UpOpts {
     pub clock: bool,
     /// The lab's instance OPENS A WINDOW on this desk, in the same jail ([`windowed`]).
     pub window: bool,
+    /// `LAB_REROUTE=1`: the lab's Claude Code store build cloned into the jail's own atpkg prefix with its `agents/` twin and reroute stub ([`crate::reroute_prefix`]), and the instance rerouting, so `claude --by-name` runs stub → twin → store as the owner's sessions do.
+    pub reroute: bool,
 }
 
 impl UpOpts {
@@ -90,6 +92,7 @@ impl UpOpts {
             instance_env: var("LAB_INSTANCE_ENV"),
             clock: set("LAB_CLOCK"),
             window: false,
+            reroute: set("LAB_REROUTE"),
         }
     }
 }
@@ -396,12 +399,18 @@ const CLOCK_RAN: &str = "clock/ran";
 pub(crate) const CLOCK_UNSTARTED: &str = "clock/unstarted";
 
 /// The holds on a lab's scratch, one directory each: a program the lab
-/// cloned into its scratch, held from before the clone until it showed it
-/// ran ([`hold_scratch`], [`release_scratch`]). The lab may start it until
+/// cloned into its scratch, held from before its first exec at the latest
+/// until it showed it ran ([`hold_scratch`], [`release_scratch`],
+/// [`REROUTE_HOLD`]). The lab may start it until
 /// `down` ends the jail, so `down` stamps each hold left then
 /// ([`stamp_holds`]), and the scratch stays until every stamp is spent
 /// ([`scratch_may_go`]).
 pub(crate) const HELD: &str = "held";
+
+/// The hold on the scratch for the reroute prefix's clone of Claude Code,
+/// which [`crate::reroute_prefix::lay`] makes before the clone's exec and
+/// removes once the clone showed it ran.
+const REROUTE_HOLD: &str = "reroute";
 
 /// Hold the lab's scratch for a program about to be cloned into it and
 /// started (`name` names the clone).
@@ -573,8 +582,12 @@ fn bin_unproven(run: &Run) -> bool {
 }
 
 /// Undo a half-made lab (its pids, everything in its jail, its socket dir and run directory).
+/// A run directory a started copy has not shown it ran from ([`bin_unproven`]), or with a hold on
+/// its scratch ([`HELD`]), stays, its holds stamped and its `env.sh` written, so `ps` lists it
+/// and `down` removes it once nothing holds it.
 fn abort(run: &Run, pids: &[i32], msg: &str) -> Fail {
     let unproven = bin_unproven(run);
+    let held = fs::read_dir(run.run.join(HELD)).is_ok_and(|mut d| d.next().is_some());
     let sig = if unproven {
         libc::SIGKILL
     } else {
@@ -597,10 +610,16 @@ fn abort(run: &Run, pids: &[i32], msg: &str) -> Fail {
     if run.sockdir.starts_with("/tmp/at.") {
         let _ = fs::remove_dir_all(&run.sockdir);
     }
-    if unproven {
+    if unproven || held {
         // its wait runs from here; one that cannot be stamped is stamped by the next down or up
         let _ = stamp_holds(&run.run);
-        eprintln!("aterm-lab: {}", kept_copies(&run.run, "down", &run.tag));
+        let env = run.run.join("env.sh");
+        if !env.exists() {
+            run.save();
+        }
+        // `down` loads `env.sh`; when it could not be written, the next `up` sweeps (`room_for`)
+        let verb = if env.is_file() { "down" } else { "up" };
+        eprintln!("aterm-lab: {}", kept_copies(&run.run, verb, &run.tag));
     } else {
         let _ = fs::remove_dir_all(&run.run);
     }
@@ -751,8 +770,13 @@ fn while_starting(
 /// Why `o` cannot bring a lab up, before anything is made.
 #[must_use]
 pub(crate) fn opts_refused(o: &UpOpts) -> Option<&'static str> {
-    (o.window && o.restore).then_some(
-        "a windowed lab takes no LAB_RESTORE=1: the headless-restore seam is a headless instance's",
+    if o.window && o.restore {
+        return Some(
+            "a windowed lab takes no LAB_RESTORE=1: the headless-restore seam is a headless instance's",
+        );
+    }
+    (o.reroute && o.clock).then_some(
+        "LAB_REROUTE=1 takes no LAB_CLOCK=1: the sleep clock runs its own re-signed clone of Claude Code, not the store build the reroute prefix routes to",
     )
 }
 
@@ -931,9 +955,11 @@ pub(crate) fn instance_argv(
             prog.extend(lifeline_flag());
         }
     }
+    if run.reroute != "1" {
+        prog.push("--no-reroute".to_string());
+    }
     prog.extend(
         [
-            "--no-reroute",
             "--control-sock",
             &run.sock,
             "-d",
@@ -1097,6 +1123,16 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
     for d in crate::protected::SCRATCH_DIRS {
         fs::create_dir_all(w.join(d))
             .map_err(|e| Fail::die(format!("cannot make {}: {e}", w.join(d).display())))?;
+    }
+    if o.reroute {
+        let laid = crate::reroute_prefix::lay(
+            &w.join("home"),
+            Path::new(&run.claude_bin),
+            Some(&run.run.join(HELD).join(REROUTE_HOLD)),
+        )
+        .map_err(|e| abort(&run, &[], &format!("the reroute prefix: {e}")))?;
+        run.claude_bin = laid.exe.to_string_lossy().into_owned();
+        run.reroute = "1".into();
     }
     if o.clock {
         crate::clock::lay(&mut run, &p.repo)
@@ -1436,6 +1472,12 @@ pub fn cmd_up(args: &[String]) -> Res {
         run.instance_pid, run.sock, run.cols, run.rows
     );
     println!("  claude      {} ({})", run.claude_bin, run.claude_ver);
+    if run.reroute == "1" {
+        println!(
+            "  reroute     the instance reroutes; `{LAB} claude {} --by-name` runs the stub, the twin, then that build",
+            run.tag
+        );
+    }
     if run.clock == "1" {
         let l = crate::clock::Layout::of(&run);
         println!(
@@ -1813,6 +1855,10 @@ pub struct Launch {
     pub subscriber: bool,
     /// `--debug-log`: Claude Code's debug log into the scratch ([`crate::stats::debug_log`]).
     pub debug_log: bool,
+    /// `--by-name`: `claude` found on `PATH`, not the binary by path: in a
+    /// `LAB_REROUTE=1` lab the reroute stub, which execs the `agents/` twin,
+    /// which execs the store build.
+    pub by_name: bool,
     /// `-- <claude args>`.
     pub args: Vec<String>,
 }
@@ -1839,12 +1885,13 @@ pub fn parse_launch(args: &[String]) -> Result<Launch, String> {
             "--relay" => l.relay = true,
             "--subscriber" => l.subscriber = true,
             "--debug-log" => l.debug_log = true,
+            "--by-name" => l.by_name = true,
             "--" => {
                 l.args.extend(it.by_ref().cloned());
             }
             other => {
                 return Err(format!(
-                    "claude: unknown option '{other}' (use -e K=V, --no-wait, --relay, --subscriber, --debug-log, -- <claude args>)"
+                    "claude: unknown option '{other}' (use -e K=V, --no-wait, --relay, --subscriber, --debug-log, --by-name, -- <claude args>)"
                 ));
             }
         }
@@ -1897,7 +1944,11 @@ pub fn launcher(run: &Run, l: &Launch) -> String {
     for kv in &envs {
         s.push_str(&format!("  {} \\\n", q(kv)));
     }
-    s.push_str(&format!("  {}", q(&run.claude_bin)));
+    if l.by_name {
+        s.push_str("  claude");
+    } else {
+        s.push_str(&format!("  {}", q(&run.claude_bin)));
+    }
     if l.debug_log {
         s.push_str(&format!(
             " --debug-file {}",
@@ -1971,7 +2022,14 @@ pub fn launch_claude(run: &Run, l: &Launch) -> Result<String, Fail> {
     door.ctl(&["key", "enter"])?;
     Ok(format!(
         "launched: {} ({}) in lab '{}'{}  (launcher: {})",
-        run.claude_bin,
+        if l.by_name {
+            format!(
+                "claude by name (PATH's first: in a LAB_REROUTE=1 lab the reroute stub, its twin, {})",
+                run.claude_bin
+            )
+        } else {
+            run.claude_bin.clone()
+        },
         run.claude_ver,
         run.tag,
         if l.relay {
@@ -2703,6 +2761,51 @@ mod tests {
         );
     }
 
+    /// A `LAB_REROUTE=1` lab's instance line drops only `--no-reroute`; every other lab keeps it.
+    #[test]
+    fn a_reroute_lab_s_instance_drops_no_reroute_and_keeps_the_rest() {
+        let plain = instance_argv(&recorded("", "0"), "/b/aterm", None, false);
+        let run = Run {
+            reroute: "1".into(),
+            ..recorded("", "0")
+        };
+        let rerouting = instance_argv(&run, "/b/aterm", None, false);
+        let mut without = plain.clone();
+        without.retain(|a| a != "--no-reroute");
+        assert_eq!(plain.len(), without.len() + 1, "{plain:?}");
+        assert_eq!(rerouting, without);
+        assert_eq!(
+            opts_refused(&UpOpts {
+                reroute: true,
+                clock: true,
+                ..UpOpts::default()
+            })
+            .map(|why| why.starts_with("LAB_REROUTE=1 takes no LAB_CLOCK=1")),
+            Some(true)
+        );
+    }
+
+    /// `--by-name` launches `claude` found on `PATH`; without it the launcher names the binary by path.
+    #[test]
+    fn by_name_launches_claude_through_path() {
+        let run = recorded("", "0");
+        let named = launcher(
+            &run,
+            &Launch {
+                by_name: true,
+                ..Launch::default()
+            },
+        );
+        let last = |s: &str| s.lines().last().unwrap_or("").trim().to_string();
+        assert_eq!(last(&named), "claude");
+        let pathed = launcher(&run, &Launch::default());
+        assert_eq!(last(&pathed), shell_quote(&run.claude_bin));
+        assert_eq!(
+            parse_launch(&["--by-name".to_string()]).map(|l| l.by_name),
+            Ok(true)
+        );
+    }
+
     #[test]
     fn a_windowed_lab_s_instance_opens_a_window_its_keeper_holding_the_lifeline() {
         let tail = [
@@ -2899,6 +3002,40 @@ mod tests {
                 kept,
                 "{what}: its wait runs from the abort"
             );
+            let _ = fs::remove_dir_all(root.path().join("runs"));
+        }
+    }
+
+    /// AN ABORTED UP KEEPS A SCRATCH A CLONE HOLDS: the reroute prefix's clone
+    /// of Claude Code, started and never shown to run (its hold, stamped at
+    /// its exec, still there), keeps the run directory with that reading, and
+    /// writes the `env.sh` `up` had not written yet, so `ps` lists the lab and
+    /// `down` sweeps it. NEGATIVE CONTROL: with the hold gone (the clone showed
+    /// it ran), the run directory goes.
+    #[test]
+    fn an_aborted_up_keeps_a_scratch_a_clone_holds() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let state = fs::canonicalize(root.path()).unwrap();
+        for (what, showed, kept) in [
+            ("the clone printed nothing", false, true),
+            ("the clone showed it ran", true, false),
+        ] {
+            let run = half_made(root.path());
+            let hold = run.run.join(HELD).join(REROUTE_HOLD);
+            hold_scratch(&run.run, REROUTE_HOLD).unwrap();
+            aterm_uds::deadline::stamp_exec(&hold);
+            let at_exec = aterm_uds::deadline::exec_stamp(&hold);
+            assert!(at_exec.is_some(), "{what}");
+            if showed {
+                release_scratch(&run.run, REROUTE_HOLD);
+            }
+            let failed = abort(&run, &[], "x");
+            assert_eq!(failed.msg.as_deref(), Some("x"), "{what}");
+            assert_eq!(run.w.is_dir(), kept, "{what}");
+            if kept {
+                assert_eq!(aterm_uds::deadline::exec_stamp(&hold), at_exec, "{what}");
+                assert_eq!(all_runs(&state), ["abort-t"], "{what}: ps lists it");
+            }
             let _ = fs::remove_dir_all(root.path().join("runs"));
         }
     }

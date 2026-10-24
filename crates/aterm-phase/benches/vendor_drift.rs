@@ -51,6 +51,14 @@ const ROWS: &[(&str, Check)] = &[
         every_literal_gemini_anchor_is_in_its_bundle,
     ),
     (
+        "every_literal_grok_anchor_is_in_the_store_grok",
+        every_literal_grok_anchor_is_in_the_store_grok,
+    ),
+    (
+        "every_literal_kimi_anchor_is_in_the_store_kimi",
+        every_literal_kimi_anchor_is_in_the_store_kimi,
+    ),
+    (
         "every_wall_phrase_is_in_the_store_claude",
         every_wall_phrase_is_in_the_store_claude,
     ),
@@ -308,6 +316,12 @@ fn every_literal_agy_anchor_is_in_the_store_agy() -> Outcome {
 }
 fn every_literal_muse_anchor_is_in_the_store_muse() -> Outcome {
     literal_anchors_are_in_the_store("muse", "ATERM_MUSE_BIN", MUSE_ANCHORS)
+}
+fn every_literal_grok_anchor_is_in_the_store_grok() -> Outcome {
+    literal_anchors_are_in_the_store("grok", "ATERM_GROK_BIN", GROK_ANCHORS)
+}
+fn every_literal_kimi_anchor_is_in_the_store_kimi() -> Outcome {
+    literal_anchors_are_in_the_store("kimi", "ATERM_KIMI_BIN", KIMI_ANCHORS)
 }
 fn every_literal_gemini_anchor_is_in_its_bundle() -> Outcome {
     let Some((dir, bytes, version)) = gemini_bin().as_deref().and_then(gemini_bundle) else {

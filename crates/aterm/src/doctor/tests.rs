@@ -1237,3 +1237,125 @@ fn outside_the_account_s_own_shell_no_develop_layer_is_read() {
     );
     assert!(stand.composed.borrow().is_empty());
 }
+
+/// `base.ai.accounts` names each other CLI's pool this machine keeps after Claude Code's
+/// (`…; other CLIs: codex 1, kimi 1`), and stands on those pools alone where Claude Code has no
+/// source. CONTROL: a machine with Claude Code's pool alone reads Claude Code's probe word for
+/// word.
+#[cfg(target_os = "macos")]
+#[test]
+fn base_ai_accounts_names_each_kept_pool_after_claudes() {
+    use aterm_agent::harness::cli::Env;
+    use aterm_converge::Probe;
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("aterm-doctor-pools-")
+        .tempdir()
+        .expect("a scratch directory");
+    let root = dir.path().canonicalize().unwrap();
+    let (home, config, state) = (root.join("home"), root.join("config"), root.join("state"));
+    for d in [&home, &config, &state] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::write(config.join("aterm.toml"), "[fleet]\nmachine = \"m16\"\n").unwrap();
+    std::fs::write(
+        config.join("accounts.toml"),
+        "[[account]]\nlabel = \"m16\"\nclass = \"dedicated\"\nemail = \"claude-one@example.com\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        config.join("fleet-accounts.toml"),
+        "opt_in = \"named\"\n\n[[account]]\nlabel = \"m16\"\nmachines = [\"m16\"]\n\
+         email = \"claude-one@example.com\"\n",
+    )
+    .unwrap();
+    let env = Env {
+        state,
+        aterm_state: None,
+        cwd: home.clone(),
+        home: Some(home.clone()),
+        claude_dir: Some(home.join(".claude")),
+        claude_config_unusable: None,
+        claude_profile: Some(home.join(".claude.json")),
+        claude_custom_oauth: false,
+        claude_session: None,
+        claude_pid: None,
+        codex_thread: None,
+        agy_conversation: None,
+        codex_home: None,
+        now: 1_792_660_000,
+        tz_s: 0,
+        sid: String::new(),
+        sock: None,
+        config: Some(config.join("aterm.toml")),
+        claude_tmp: None,
+        claude_running: None,
+    };
+    {
+        use aterm_agent::harness::{accounts, accounts_sync};
+        let roster = config.join("accounts.toml");
+        let read = accounts::Roster::load(&roster);
+        assert!(read.as_ref().is_ok_and(|r| !r.rows.is_empty()), "{read:?}");
+        assert!(
+            accounts_sync::configured_source(Some(&config.join("aterm.toml")), Some(&roster))
+                .is_some(),
+            "the fleet file opts in by name"
+        );
+        assert!(!accounts_sync::needs_init_accounts_sync(
+            &home, &env.state, &roster, env.now
+        ));
+    }
+    let Probe::Ok { now: claude } = super::ai_accounts_claude_probe(&env) else {
+        panic!(
+            "the fixture's Claude Code pool is synced: {:?}",
+            super::ai_accounts_claude_probe(&env)
+        );
+    };
+    assert!(
+        claude.starts_with("1 accounts synced (1 enrolled and not signed out"),
+        "{claude}"
+    );
+    assert_eq!(
+        format!("{:?}", super::ai_accounts_probe(&env)),
+        format!(
+            "{:?}",
+            Probe::Ok {
+                now: claude.clone()
+            }
+        ),
+        "CONTROL: Claude Code's pool alone reads as it always did"
+    );
+
+    for cli in ["codex", "kimi"] {
+        std::fs::write(
+            config.join(format!("accounts-{cli}.toml")),
+            "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n",
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        format!("{:?}", super::ai_accounts_probe(&env)),
+        format!(
+            "{:?}",
+            Probe::Ok {
+                now: format!("{claude}; other CLIs: codex 1, kimi 1")
+            }
+        )
+    );
+
+    std::fs::remove_file(config.join("accounts.toml")).unwrap();
+    std::fs::remove_file(config.join("fleet-accounts.toml")).unwrap();
+    assert!(matches!(
+        super::ai_accounts_claude_probe(&env),
+        Probe::NotApplicable { .. }
+    ));
+    assert_eq!(
+        format!("{:?}", super::ai_accounts_probe(&env)),
+        format!(
+            "{:?}",
+            Probe::Ok {
+                now: "other CLIs: codex 1, kimi 1".to_owned()
+            }
+        ),
+        "the other pools stand alone where Claude Code has no source"
+    );
+}

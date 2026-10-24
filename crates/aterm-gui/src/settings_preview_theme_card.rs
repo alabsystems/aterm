@@ -66,15 +66,17 @@ fn format_word(label: &str) -> &str {
         ForeignFormat::Kitty,
         ForeignFormat::Ghostty,
         ForeignFormat::Plist,
+        ForeignFormat::TerminalApp,
         ForeignFormat::Toml,
+        ForeignFormat::WezTerm,
         ForeignFormat::Json,
     ] {
         if format.label() == label {
             return match format {
                 ForeignFormat::Kitty => "kitty",
                 ForeignFormat::Ghostty => "Ghostty",
-                ForeignFormat::Plist => "plist",
-                ForeignFormat::Toml => "TOML",
+                ForeignFormat::Plist | ForeignFormat::TerminalApp => "plist",
+                ForeignFormat::Toml | ForeignFormat::WezTerm => "TOML",
                 ForeignFormat::Json => "JSON",
             };
         }

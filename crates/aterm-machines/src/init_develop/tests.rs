@@ -1004,11 +1004,6 @@ fn a_conflicted_submodule_is_never_updated() {
         &mut NoJournal,
     );
     assert_eq!(rows[0].outcome, Outcome::Changed, "{rows:?}");
-    assert_eq!(
-        rows[0].to.as_deref(),
-        Some("`git config submodule.recurse true`"),
-        "{rows:?}"
-    );
     assert!(
         rows[0]
             .from
@@ -1017,7 +1012,10 @@ fn a_conflicted_submodule_is_never_updated() {
         "{rows:?}"
     );
     match item.probe(&sys, &ctx) {
-        Probe::Ok { now } => assert!(now.contains("merge conflict"), "{now}"),
+        Probe::Ok { now } => {
+            assert!(now.contains("merge conflict"), "{now}");
+            assert_eq!(rows[0].to.as_deref(), Some(now.as_str()), "{rows:?}");
+        }
         other => panic!("{other:?}"),
     }
     assert!(!updated(&sys.record()), "{:?}", sys.record());

@@ -1071,6 +1071,7 @@ impl Terminal {
         scratch.absolute_row_revision = self.absolute_row_revision();
         scratch.history_renumber_epoch = self.grid().history_renumber_epoch();
         scratch.holder = self.holder_view();
+        scratch.screen_mutations = self.screen_mutations();
         scratch.selection.clone_from(self.text_selection());
         scratch.selection_bg = self
             .selection_background()

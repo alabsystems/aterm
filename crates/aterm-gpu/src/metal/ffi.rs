@@ -438,12 +438,17 @@ mod window_server_door {
     impl Device {
         /// The GPU aterm renders on.
         pub(crate) fn preferred() -> Option<Self> {
-            let want_high = aterm_types::dev_seam!("ATERM_GPU_POWER")
-                .is_some_and(|v| v.eq_ignore_ascii_case("high"));
-            if let Some(listed) = Self::listed(want_high) {
+            if let Some(listed) = Self::preferred_listed() {
                 return Some(listed);
             }
             Self::system_default_asks_window_server()
+        }
+
+        /// [`Self::preferred`] where the device listing decides it, `None` where only the window server could: what code that renders nothing (a headless launch's warm) may ask for.
+        pub(crate) fn preferred_listed() -> Option<Self> {
+            let want_high = aterm_types::dev_seam!("ATERM_GPU_POWER")
+                .is_some_and(|v| v.eq_ignore_ascii_case("high"));
+            Self::listed(want_high)
         }
 
         fn system_default_asks_window_server() -> Option<Self> {

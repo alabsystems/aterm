@@ -292,6 +292,7 @@ fn a_restored_holder_adopted_before_the_first_sweep_is_still_named() {
         pid,
         app.session_factory.fg_probe,
         app.session_factory.edge_image,
+        app.session_factory.shell_children,
     );
     assert_eq!(
         timeline.lock().unwrap().agent().program_pgid,

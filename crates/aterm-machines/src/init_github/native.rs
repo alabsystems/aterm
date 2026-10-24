@@ -13,16 +13,37 @@ use crate::port::{GithubError, GithubFailure, Secret, System};
 use aterm_converge::{Class, Layer, Remedy, Requires};
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 
 const ACCESSIBLE: &str = "/user/repos?visibility=all&per_page=30&sort=full_name&direction=asc";
 
 pub(super) fn run(sys: &dyn System, ctx: &Ctx, mode: Mode) -> Result<Vec<ItemReport>, String> {
+    run_with(sys, ctx, mode, None)
+}
+
+pub(super) fn run_captured(
+    sys: &dyn System,
+    ctx: &Ctx,
+    mode: Mode,
+    inputs: InitialRepositoryInputs,
+    current: Box<dyn Fn() -> Result<bool, String> + Send + Sync>,
+) -> Result<Vec<ItemReport>, String> {
+    run_with(sys, ctx, mode, Some(Captured { inputs, current }))
+}
+
+fn run_with(
+    sys: &dyn System,
+    ctx: &Ctx,
+    mode: Mode,
+    captured: Option<Captured>,
+) -> Result<Vec<ItemReport>, String> {
     let [user] = ctx.users.as_slice() else {
         return Err("initial repository setup requires exactly one local user".into());
     };
     let item = NativeRepositories {
         user: user.clone(),
         reading: LastReading::default(),
+        captured,
     };
     let bound = crate::engine::bind(
         [(
@@ -51,6 +72,64 @@ struct NativeRepositories {
     /// How many repositories the last probe found and whether it signed in, for
     /// System State.
     reading: LastReading,
+    captured: Option<Captured>,
+}
+
+/// One local GitHub profile/token reading or its typed blocker, without contacting
+/// GitHub. Its secret is scrubbed when the final owner drops it; it is never part
+/// of a command.
+#[derive(Clone)]
+pub struct InitialRepositoryInputs {
+    user: User,
+    local: Result<LocalInputs, Block>,
+}
+
+#[derive(Clone)]
+struct LocalInputs {
+    configured: Option<Github>,
+    token: Arc<Secret>,
+}
+
+struct Captured {
+    inputs: InitialRepositoryInputs,
+    current: Box<dyn Fn() -> Result<bool, String> + Send + Sync>,
+}
+
+impl InitialRepositoryInputs {
+    /// Read only local admitted profile/token files, for a caller holding its
+    /// vault's ready materialization against writers. A blocked local reading is
+    /// kept for the item's probe to report without reading those files again.
+    /// # Errors
+    /// The context does not name exactly one local user.
+    pub fn capture(sys: &dyn System, ctx: &Ctx) -> Result<Self, String> {
+        let [user] = ctx.users.as_slice() else {
+            return Err("initial repository setup requires exactly one local user".into());
+        };
+        Ok(Self {
+            user: user.clone(),
+            local: Self::read(sys, user),
+        })
+    }
+
+    fn read(sys: &dyn System, user: &User) -> Result<LocalInputs, Block> {
+        crate::port::no_core_dumps();
+        if sys.euid() != user.uid {
+            return Err(String::from("repository setup must run as its local user").into());
+        }
+        if !repos::git_installed(sys) {
+            return Err(Block::of(Wait::CommandLineTools)(repos::NO_GIT.into()));
+        }
+        repos::admit_home(sys, user)?;
+        let configured = configuration(sys, user).map_err(Block::of(Wait::Settings))?;
+        let source = configured.clone().unwrap_or_else(|| Github {
+            account: String::new(),
+            owner: String::new(),
+            token_file: Path::new(&user.home).join(".secrets/gh_access_token"),
+            token_key: None,
+        });
+        let token = Arc::new(read_token(sys, user, &source).map_err(Block::token)?);
+        Ok(LocalInputs { configured, token })
+    }
 }
 
 impl Item for NativeRepositories {
@@ -75,6 +154,7 @@ impl Item for NativeRepositories {
                     .configured(sys, &self.user, &plan.account)?
                     .ready()
                     && credential_ready(sys, &self.user, &plan.account, &plan.token)?);
+            self.ensure_current().map_err(Block::from)?;
             Ok::<_, Block>((plan.repositories.len(), missing.len(), ready))
         })();
         self.reading.set(match &check {
@@ -101,10 +181,27 @@ impl Item for NativeRepositories {
     fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
         let plan = self.plan(sys).map_err(|block| block.why)?;
         let missing = repos::missing(sys, &self.user, &plan.repositories)?;
-        install_credentials(sys, &self.user, &plan.account, &plan.token)?;
-        for repo in missing {
-            repos::clone_one(sys, &self.user, &repo.owner, &repo)?;
+        let current = || self.ensure_current();
+        current()?;
+        install_credentials(sys, &self.user, &plan.account, &plan.token, &current)?;
+        if self.captured.is_some() && !missing.is_empty() {
+            // A clone must not ask a helper that can read a half-written newer
+            // synced token. The invocation's pinned keychain helper uses this
+            // captured value, even when the normal live helper is already good.
+            current()?;
+            if !credential_ready(sys, &self.user, &plan.account, &plan.token)? {
+                current()?;
+                Git::keychain().store(sys, Some(&self.user), GITHUB, &plan.account, &plan.token)?;
+            }
         }
+        for repo in missing {
+            if self.captured.is_some() {
+                repos::clone_one_guarded(sys, &self.user, &repo, &plan.account, &current)?;
+            } else {
+                repos::clone_one(sys, &self.user, &repo.owner, &repo)?;
+            }
+        }
+        current()?;
         Ok(())
     }
 
@@ -115,14 +212,14 @@ impl Item for NativeRepositories {
 
 struct Plan {
     account: String,
-    token: Secret,
+    token: Arc<Secret>,
     repositories: Vec<repos::Repo>,
 }
 
 /// Why [`NativeRepositories::plan`] cannot go on: the engine's line, and the reason System
 /// State words for a person where the step that stopped decided one. A step that decided
 /// none leaves the page its own words for a waiting row.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Block {
     why: String,
     wait: Option<Wait>,
@@ -165,23 +262,23 @@ impl From<String> for Block {
 }
 
 impl NativeRepositories {
+    fn ensure_current(&self) -> Result<(), String> {
+        if let Some(captured) = &self.captured
+            && !(captured.current)()?
+        {
+            return Err("the selected secrets vault changed or is still syncing; repository setup waits for a new ready snapshot".into());
+        }
+        Ok(())
+    }
+
     fn plan(&self, sys: &dyn System) -> Result<Plan, Block> {
-        if sys.euid() != self.user.uid {
-            return Err(String::from("repository setup must run as its local user").into());
-        }
-        if !repos::git_installed(sys) {
-            return Err(Block::of(Wait::CommandLineTools)(repos::NO_GIT.into()));
-        }
-        repos::admit_home(sys, &self.user)?;
-        crate::port::no_core_dumps();
-        let configured = configuration(sys, &self.user).map_err(Block::of(Wait::Settings))?;
-        let source = configured.clone().unwrap_or_else(|| Github {
-            account: String::new(),
-            owner: String::new(),
-            token_file: Path::new(&self.user.home).join(".secrets/gh_access_token"),
-            token_key: None,
-        });
-        let token = read_token(sys, &self.user, &source).map_err(Block::token)?;
+        self.ensure_current().map_err(Block::from)?;
+        let inputs = match &self.captured {
+            Some(captured) if captured.inputs.user == self.user => captured.inputs.local.clone()?,
+            Some(_) => return Err("the captured repository account changed".to_owned().into()),
+            None => InitialRepositoryInputs::read(sys, &self.user)?,
+        };
+        let LocalInputs { configured, token } = inputs;
         let account = identity(sys, &self.user, &token).map_err(Block::github)?;
         if configured
             .as_ref()
@@ -233,6 +330,7 @@ impl NativeRepositories {
                 why,
             })
         })?;
+        self.ensure_current().map_err(Block::from)?;
         Ok(Plan {
             account,
             token,
@@ -296,15 +394,18 @@ fn install_credentials(
     user: &User,
     account: &str,
     token: &Secret,
+    current: &dyn Fn() -> Result<(), String>,
 ) -> Result<(), String> {
     if lookups_answer(sys, user, token) {
         return Ok(());
     }
     let git = Git::keychain();
     if !credential_ready(sys, user, account, token)? {
+        current()?;
         git.store(sys, Some(user), GITHUB, account, token)?;
     }
     if !git.configured(sys, user, account)?.ready() {
+        current()?;
         git.configure(sys, user, account)?;
         if let Lookups::Not(why) = git.configured(sys, user, account)? {
             return Err(format!(
@@ -355,6 +456,7 @@ mod tests {
         let item = NativeRepositories {
             user: user("alice", 501),
             reading: LastReading::default(),
+            captured: None,
         };
         sys.stat_of(&item.user.home, stat(true, 0o700));
         (sys, item)
@@ -363,6 +465,33 @@ mod tests {
     fn source(sys: &Fake, path: &str) {
         sys.file(path, TOKEN.as_bytes())
             .stat_of(path, stat(false, 0o600));
+    }
+
+    #[test]
+    fn a_captured_local_blocker_is_not_reread_after_capture() {
+        let (sys, item) = bare();
+        sys.file(crate::items::github::CLT_GIT, b"synthetic git");
+        let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
+        let captured = InitialRepositoryInputs::capture(&sys, &ctx).unwrap();
+        // A later local reading could succeed. The frozen capture must still
+        // report its original blocker, without reading files again.
+        source(&sys, "/Users//alice/.secrets/gh_access_token");
+        answer(
+            &sys,
+            &item.user,
+            "/user",
+            aterm_json::json!({"login":"alice"}),
+        );
+        answer(
+            &sys,
+            &item.user,
+            &format!("{ACCESSIBLE}&page=1"),
+            aterm_json::json!([]),
+        );
+        let rows = run_captured(&sys, &ctx, Mode::Plan, captured, Box::new(|| Ok(true))).unwrap();
+        assert_eq!(Reading::of(&rows[0]), Some(Reading::Waits(Wait::Token)));
+        assert_eq!(rows[0].outcome, crate::model::Outcome::Blocked);
+        assert!(!sys.calls().iter().any(|call| call.contains(" agh GET ")));
     }
 
     fn answer(sys: &Fake, user: &User, endpoint: &str, body: aterm_json::Value) {
@@ -875,5 +1004,127 @@ mod tests {
         assert!(why.contains("did not hand back"), "{why}");
         assert!(!why.contains("unrelated_private_value") && !why.contains(TOKEN));
         assert!(!sys.calls().iter().any(|call| call.contains(" clone ")));
+    }
+
+    #[test]
+    fn captured_repository_inputs_do_not_reread_a_new_synced_token() {
+        let (sys, mut item) = fixture();
+        let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
+        let inputs = InitialRepositoryInputs::capture(&sys, &ctx).unwrap();
+        let token_path = format!("{}/.secrets/gh_access_token", item.user.home);
+        let newer = "fixture_partial_sync_token_only";
+        sys.file(&token_path, newer.as_bytes()).stat_of(
+            &token_path,
+            Stat {
+                len: newer.len() as u64,
+                ..stat(false, 0o600)
+            },
+        );
+        answer(
+            &sys,
+            &item.user,
+            &format!("{ACCESSIBLE}&page=1"),
+            aterm_json::json!([]),
+        );
+        item.captured = Some(Captured {
+            inputs,
+            current: Box::new(|| Ok(true)),
+        });
+        let plan = item.plan(&sys).unwrap();
+        assert_eq!(plan.token.bytes(), TOKEN.as_bytes());
+        assert!(
+            sys.calls()
+                .iter()
+                .all(|call| !call.contains(TOKEN) && !call.contains(newer))
+        );
+    }
+
+    #[test]
+    fn a_vault_version_changed_during_inventory_refuses_all_local_effects() {
+        let (sys, mut item) = fixture();
+        let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
+        let inputs = InitialRepositoryInputs::capture(&sys, &ctx).unwrap();
+        answer(
+            &sys,
+            &item.user,
+            &format!("{ACCESSIBLE}&page=1"),
+            aterm_json::json!([]),
+        );
+        let sys = Arc::new(sys);
+        let observed = Arc::clone(&sys);
+        item.captured = Some(Captured {
+            inputs,
+            current: Box::new(move || {
+                Ok(!observed
+                    .calls()
+                    .iter()
+                    .any(|call| call.contains("/user/repos?")))
+            }),
+        });
+        let why = item.apply(&*sys, &ctx).unwrap_err();
+        assert!(why.contains("changed"), "{why}");
+        assert!(sys.calls().iter().any(|call| call.contains("/user/repos?")));
+        assert!(
+            sys.calls()
+                .iter()
+                .all(|call| !call.contains("credential approve")
+                    && !call.contains("--global")
+                    && !call.contains(" clone "))
+        );
+    }
+
+    #[test]
+    fn a_ready_captured_run_without_clones_preserves_compatible_live_helpers() {
+        let (sys, mut item) = fixture();
+        let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
+        let inputs = InitialRepositoryInputs::capture(&sys, &ctx).unwrap();
+        answer(
+            &sys,
+            &item.user,
+            &format!("{ACCESSIBLE}&page=1"),
+            aterm_json::json!([]),
+        );
+        script::lookups_hold(&sys, &item.user, GITHUB, "alice", TOKEN);
+        script::alike(&sys, &item.user);
+        item.captured = Some(Captured {
+            inputs,
+            current: Box::new(|| Ok(true)),
+        });
+        item.apply(&sys, &ctx).unwrap();
+        assert!(
+            sys.calls()
+                .iter()
+                .all(|call| !call.contains("credential approve") && !call.contains("--global"))
+        );
+    }
+
+    #[test]
+    fn captured_clones_store_the_snapshot_through_private_keychain_input_only() {
+        let (sys, mut item) = fixture();
+        let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
+        let inputs = InitialRepositoryInputs::capture(&sys, &ctx).unwrap();
+        answer(
+            &sys,
+            &item.user,
+            &format!("{ACCESSIBLE}&page=1"),
+            aterm_json::json!([repository("alice", "new", 1)]),
+        );
+        script::lookups_hold(&sys, &item.user, GITHUB, "alice", TOKEN);
+        script::alike(&sys, &item.user);
+        script::holds_nothing(&sys, Some(&item.user));
+        script::holds(&sys, Some(&item.user), GITHUB, "alice", TOKEN);
+        script::approves(&sys, Some(&item.user));
+        item.captured = Some(Captured {
+            inputs,
+            current: Box::new(|| Ok(true)),
+        });
+        // The snapshot reaches the keychain; this fake intentionally supplies
+        // no remote URL command, so no clone can start.
+        assert!(item.apply(&sys, &ctx).is_err());
+        let approve = script::credential(Some(&item.user), "approve");
+        assert!(sys.calls().contains(&approve), "{:?}", sys.calls());
+        assert!(sys.calls().iter().all(|call| !call.contains(TOKEN)
+            && !call.contains("--global")
+            && !call.contains(" clone ")));
     }
 }

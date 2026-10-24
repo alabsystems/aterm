@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Claude Code account roster admission, usage/wall tracking, rotation advice, and state store.
+//! AI CLI account roster admission, usage/wall tracking, rotation advice, and state store: Claude
+//! Code's pool, and one per pooled CLI ([`Cli`]) through the same parser, store and advice.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -9,6 +10,9 @@ use std::path::{Path, PathBuf};
 
 use aterm_json::{Map, Value};
 use aterm_phase::ResetKind;
+
+pub use crate::ai::connector::Cli;
+use crate::ai::connector::{Flow, Region, RowKeys, Seam};
 
 use super::one_line;
 
@@ -281,6 +285,30 @@ pub struct Row {
     pub browser: Option<String>,
     /// The logins a renewal bound this row AWAY FROM on this machine ([`Binding::was`], [`bound`]).
     pub was: Vec<Option<String>>,
+    /// Its vendor keys ([`RowKeys`]): none on a Claude Code row.
+    pub vendor: Vendor,
+}
+
+/// A roster row's vendor keys, each admitted only by the CLI that takes it ([`RowKeys`],
+/// [`Roster::parse_for`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Vendor {
+    /// `region` (Kimi Code): the account system the row's email belongs to.
+    pub region: Option<Region>,
+    /// `flow` (Codex, Grok): the sign-in flow the row names; `None` takes the CLI's default.
+    pub flow: Option<Flow>,
+}
+
+impl Row {
+    /// The sign-in flow of this `cli` row: its own `flow`, else the CLI's default, `None` for a
+    /// CLI that takes no `flow`.
+    #[must_use]
+    pub fn flow(&self, cli: Cli) -> Option<Flow> {
+        match cli.accounts().keys {
+            RowKeys::Flow(default) => Some(self.vendor.flow.unwrap_or(default)),
+            RowKeys::Plain | RowKeys::Region => None,
+        }
+    }
 }
 
 /// Admitted `accounts.toml` roster in file order.
@@ -397,14 +425,27 @@ impl Roster {
     /// repeats another row's, or a `browser` that is not a profile's name
     /// ([`browser_refusal`]); or more than one row with no `dir`.
     pub fn parse(text: &str) -> Result<Roster, String> {
+        Roster::parse_for(Cli::Claude, text)
+    }
+
+    /// Parses and validates `cli`'s roster document ([`Cli`]): as [`Roster::parse`], each
+    /// refusal naming that CLI's file, with the vendor keys it takes ([`RowKeys`]) admitted.
+    /// # Errors
+    ///
+    /// As [`Roster::parse`], and: a vendor key this CLI does not take (Claude Code takes none,
+    /// so a `region`, `flow` or `cli` refuses its roster whole); a `region` other than `global`
+    /// or `mainland-cn`, or a Kimi row with an `email` and no `region`; a `flow` other than
+    /// `browser` or `device`.
+    pub fn parse_for(cli: Cli, text: &str) -> Result<Roster, String> {
+        let file = cli.accounts().roster_file;
         let doc = aterm_toml::from_str::<aterm_toml::Value>(text).map_err(|e| {
             format!(
-                "{ACCOUNTS_FILE}: not valid TOML ({})",
+                "{file}: not valid TOML ({})",
                 shown(e.to_string().lines().next().unwrap_or(""))
             )
         })?;
         let Some(top) = doc.as_table() else {
-            return Err(format!("{ACCOUNTS_FILE}: not a TOML document"));
+            return Err(format!("{file}: not a TOML document"));
         };
         for (key, value) in top {
             if key != "account" {
@@ -414,7 +455,7 @@ impl Roster {
                     "key"
                 };
                 return Err(format!(
-                    "{ACCOUNTS_FILE}: unknown {what} `{}`; this file holds [[account]] rows and \
+                    "{file}: unknown {what} `{}`; this file holds [[account]] rows and \
                      nothing else",
                     shown(key)
                 ));
@@ -425,23 +466,23 @@ impl Roster {
             Some(aterm_toml::Value::Array(items)) => items,
             Some(other) => {
                 return Err(format!(
-                    "{ACCOUNTS_FILE}: `account` is a TOML {}, not [[account]] rows",
+                    "{file}: `account` is a TOML {}, not [[account]] rows",
                     other.type_str()
                 ));
             }
         };
         if items.len() > MAX_ACCOUNTS {
             return Err(format!(
-                "{ACCOUNTS_FILE}: {} rows; a roster holds at most {MAX_ACCOUNTS}",
+                "{file}: {} rows; a roster holds at most {MAX_ACCOUNTS}",
                 items.len()
             ));
         }
         let mut rows: Vec<Row> = Vec::with_capacity(items.len());
         for (i, item) in items.iter().enumerate() {
-            let row = row_of(item, i + 1)?;
+            let row = row_of(cli, item, i + 1)?;
             if let Some(twin) = rows.iter().position(|r| r.label == row.label) {
                 return Err(format!(
-                    "{ACCOUNTS_FILE}: label `{}` is listed twice (rows {} and {})",
+                    "{file}: label `{}` is listed twice (rows {} and {})",
                     row.label,
                     twin + 1,
                     i + 1
@@ -454,18 +495,18 @@ impl Roster {
                     .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
             }) {
                 return Err(format!(
-                    "{ACCOUNTS_FILE}: rows `{}` and `{}` name one email; an account is one row",
+                    "{file}: rows `{}` and `{}` name one email; an account is one row",
                     twin.label, row.label
                 ));
             }
             if let Some(twin) = rows.iter().find(|r| r.dir == row.dir) {
                 return Err(match &row.dir {
                     Some(_) => format!(
-                        "{ACCOUNTS_FILE}: rows `{}` and `{}` name one dir; a login is one account",
+                        "{file}: rows `{}` and `{}` name one dir; a login is one account",
                         twin.label, row.label
                     ),
                     None => format!(
-                        "{ACCOUNTS_FILE}: rows `{}` and `{}` both name no dir; only one row is \
+                        "{file}: rows `{}` and `{}` both name no dir; only one row is \
                          this machine's own login",
                         twin.label, row.label
                     ),
@@ -483,9 +524,17 @@ impl Roster {
     /// [`MAX_ROSTER_BYTES`], is not UTF-8, or does not admit
     /// ([`Roster::parse`]).
     pub fn load(path: &Path) -> Result<Roster, String> {
+        Roster::load_for(Cli::Claude, path)
+    }
+
+    /// Loads `cli`'s roster at `path` ([`Roster::load`], [`Roster::parse_for`]).
+    /// # Errors
+    ///
+    /// As [`Roster::load`], the text parsed by [`Roster::parse_for`].
+    pub fn load_for(cli: Cli, path: &Path) -> Result<Roster, String> {
         match roster_text(path)? {
             None => Ok(Roster::default()),
-            Some(text) => Roster::parse(&text),
+            Some(text) => Roster::parse_for(cli, &text),
         }
     }
 
@@ -552,10 +601,11 @@ pub fn roster_text(path: &Path) -> Result<Option<String>, String> {
     read_bounded(path, MAX_ROSTER_BYTES).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-fn row_of(item: &aterm_toml::Value, n: usize) -> Result<Row, String> {
+fn row_of(cli: Cli, item: &aterm_toml::Value, n: usize) -> Result<Row, String> {
+    let file = cli.accounts().roster_file;
     let Some(table) = item.as_table() else {
         return Err(format!(
-            "{ACCOUNTS_FILE}: row {n} is a TOML {}, not an [[account]] table",
+            "{file}: row {n} is a TOML {}, not an [[account]] table",
             item.type_str()
         ));
     };
@@ -563,45 +613,52 @@ fn row_of(item: &aterm_toml::Value, n: usize) -> Result<Row, String> {
         Some(aterm_toml::Value::String(label)) => label,
         Some(other) => {
             return Err(format!(
-                "{ACCOUNTS_FILE}: row {n}: its label is a TOML {}, not a string",
+                "{file}: row {n}: its label is a TOML {}, not a string",
                 other.type_str()
             ));
         }
-        None => return Err(format!("{ACCOUNTS_FILE}: row {n} has no label")),
+        None => return Err(format!("{file}: row {n} has no label")),
     };
     if let Some(why) = label_refusal(label) {
-        return Err(format!(
-            "{ACCOUNTS_FILE}: row {n}: label `{}` {why}",
-            shown(label)
-        ));
+        return Err(format!("{file}: row {n}: label `{}` {why}", shown(label)));
     }
-    if let Some(key) = table
-        .keys()
-        .find(|k| !matches!(k.as_str(), "label" | "class" | "dir" | "email" | "browser"))
-    {
+    let keys = cli.accounts().keys;
+    let vendor_key = match keys {
+        RowKeys::Plain => None,
+        RowKeys::Region => Some("region"),
+        RowKeys::Flow(_) => Some("flow"),
+    };
+    if let Some(key) = table.keys().find(|k| {
+        !matches!(k.as_str(), "label" | "class" | "dir" | "email" | "browser")
+            && Some(k.as_str()) != vendor_key
+    }) {
+        let holds = vendor_key.map_or_else(
+            || "email and browser".to_owned(),
+            |key| format!("email, browser and {key}"),
+        );
         return Err(format!(
-            "{ACCOUNTS_FILE}: row `{label}` has an unknown key `{}`; a row holds label, class, \
-             dir, email and browser",
+            "{file}: row `{label}` has an unknown key `{}`; a row holds label, class, \
+             dir, {holds}",
             shown(key)
         ));
     }
     let class = match table.get("class") {
         Some(aterm_toml::Value::String(word)) => Class::parse(word).ok_or_else(|| {
             format!(
-                "{ACCOUNTS_FILE}: row `{label}`: class `{}` is neither `dedicated` nor `shared`",
+                "{file}: row `{label}`: class `{}` is neither `dedicated` nor `shared`",
                 shown(word)
             )
         })?,
         Some(other) => {
             return Err(format!(
-                "{ACCOUNTS_FILE}: row `{label}`: its class is a TOML {}, not `dedicated` or \
+                "{file}: row `{label}`: its class is a TOML {}, not `dedicated` or \
                  `shared`",
                 other.type_str()
             ));
         }
         None => {
             return Err(format!(
-                "{ACCOUNTS_FILE}: row `{label}` has no class (`dedicated` or `shared`)"
+                "{file}: row `{label}` has no class (`dedicated` or `shared`)"
             ));
         }
     };
@@ -609,13 +666,13 @@ fn row_of(item: &aterm_toml::Value, n: usize) -> Result<Row, String> {
         None => None,
         Some(aterm_toml::Value::String(dir)) => {
             if let Some(why) = dir_refusal(dir) {
-                return Err(format!("{ACCOUNTS_FILE}: row `{label}`: its dir {why}"));
+                return Err(format!("{file}: row `{label}`: its dir {why}"));
             }
             Some(dir.clone())
         }
         Some(other) => {
             return Err(format!(
-                "{ACCOUNTS_FILE}: row `{label}`: its dir is a TOML {}, not a string",
+                "{file}: row `{label}`: its dir is a TOML {}, not a string",
                 other.type_str()
             ));
         }
@@ -624,13 +681,13 @@ fn row_of(item: &aterm_toml::Value, n: usize) -> Result<Row, String> {
         None => None,
         Some(aterm_toml::Value::String(email)) => {
             if let Some(why) = email_refusal(email) {
-                return Err(format!("{ACCOUNTS_FILE}: row `{label}`: its email {why}"));
+                return Err(format!("{file}: row `{label}`: its email {why}"));
             }
             Some(email.clone())
         }
         Some(other) => {
             return Err(format!(
-                "{ACCOUNTS_FILE}: row `{label}`: its email is a TOML {}, not a string",
+                "{file}: row `{label}`: its email is a TOML {}, not a string",
                 other.type_str()
             ));
         }
@@ -639,16 +696,61 @@ fn row_of(item: &aterm_toml::Value, n: usize) -> Result<Row, String> {
         None => None,
         Some(aterm_toml::Value::String(browser)) => {
             if let Some(why) = browser_refusal(browser) {
-                return Err(format!("{ACCOUNTS_FILE}: row `{label}`: its browser {why}"));
+                return Err(format!("{file}: row `{label}`: its browser {why}"));
             }
             Some(browser.clone())
         }
         Some(other) => {
             return Err(format!(
-                "{ACCOUNTS_FILE}: row `{label}`: its browser is a TOML {}, not a string",
+                "{file}: row `{label}`: its browser is a TOML {}, not a string",
                 other.type_str()
             ));
         }
+    };
+    let word = |key: &str| match table.get(key) {
+        None => Ok(None),
+        Some(aterm_toml::Value::String(word)) => Ok(Some(word.as_str())),
+        Some(other) => Err(format!(
+            "{file}: row `{label}`: its {key} is a TOML {}, not a string",
+            other.type_str()
+        )),
+    };
+    let vendor = match keys {
+        RowKeys::Plain => Vendor::default(),
+        RowKeys::Region => {
+            let region = word("region")?
+                .map(|w| {
+                    Region::parse(w).ok_or_else(|| {
+                        format!(
+                            "{file}: row `{label}`: region `{}` is neither `global` (kimi.ai) \
+                             nor `mainland-cn` (kimi.com)",
+                            shown(w)
+                        )
+                    })
+                })
+                .transpose()?;
+            if region.is_none() && email.is_some() {
+                return Err(format!(
+                    "{file}: row `{label}` has an email and no region: name `global` (kimi.ai) \
+                     or `mainland-cn` (kimi.com), since a sign-in on the other region's site can \
+                     make a new account"
+                ));
+            }
+            Vendor { region, flow: None }
+        }
+        RowKeys::Flow(_) => Vendor {
+            region: None,
+            flow: word("flow")?
+                .map(|w| {
+                    Flow::parse(w).ok_or_else(|| {
+                        format!(
+                            "{file}: row `{label}`: flow `{}` is neither `browser` nor `device`",
+                            shown(w)
+                        )
+                    })
+                })
+                .transpose()?,
+        },
     };
     Ok(Row {
         label: label.clone(),
@@ -657,6 +759,7 @@ fn row_of(item: &aterm_toml::Value, n: usize) -> Result<Row, String> {
         email,
         browser,
         was: Vec::new(),
+        vendor,
     })
 }
 
@@ -664,6 +767,25 @@ fn row_of(item: &aterm_toml::Value, n: usize) -> Result<Row, String> {
 #[must_use]
 pub fn login_env(row: &Row) -> (&'static str, String) {
     (LOGIN_ENV, row.dir.clone().unwrap_or_default())
+}
+
+/// What a launch of `cli` under `row` sets ([`Seam`]): the seam's variable, and its value, or
+/// `None` for the machine's default login (no `dir`), whose launch unsets the variable. A
+/// [`Seam::LoginFile`] value names the file in the row's directory, the others the directory.
+#[must_use]
+pub fn login_env_for(cli: Cli, row: &Row) -> (&'static str, Option<String>) {
+    let seam = cli.accounts().seam;
+    let value = row
+        .dir
+        .as_deref()
+        .filter(|dir| !dir.is_empty())
+        .map(|dir| match seam {
+            Seam::LoginFile { file, .. } => {
+                Path::new(dir).join(file).to_string_lossy().into_owned()
+            }
+            Seam::LoginDir { .. } | Seam::Overlay { .. } => dir.to_owned(),
+        });
+    (seam.var(), value)
 }
 
 fn row_refusal(row: &Row) -> Option<String> {
@@ -713,6 +835,8 @@ pub fn row_text(row: &Row) -> Option<String> {
     put("dir", row.dir.as_deref());
     put("email", row.email.as_deref());
     put("browser", row.browser.as_deref());
+    put("region", row.vendor.region.map(Region::as_str));
+    put("flow", row.vendor.flow.map(Flow::as_str));
     Some(out)
 }
 
@@ -757,6 +881,14 @@ fn row_inline_of(row: &Row) -> Option<String> {
             aterm_toml::Value::from(browser.as_str())
         ));
     }
+    for (key, word) in [
+        ("region", row.vendor.region.map(Region::as_str)),
+        ("flow", row.vendor.flow.map(Flow::as_str)),
+    ] {
+        if let Some(word) = word {
+            out.push_str(&format!(", {key} = {}", aterm_toml::Value::from(word)));
+        }
+    }
     out.push_str(" }");
     Some(out)
 }
@@ -796,10 +928,21 @@ pub fn append_row(
 /// refusal says so and carries EVERY row to add by hand ([`row_inline`]), in
 /// order, an email written as [`EMAIL_BY_HAND`].
 pub fn append_rows(existing: &str, rows: &[Row]) -> Result<String, String> {
+    append_rows_for(Cli::Claude, existing, rows)
+}
+
+/// Appends `rows` in order to `cli`'s roster text and validates the result ([`append_rows`],
+/// [`Roster::parse_for`]).
+/// # Errors
+///
+/// As [`append_rows`], each refusal naming `cli`'s roster file and parsed by
+/// [`Roster::parse_for`].
+pub fn append_rows_for(cli: Cli, existing: &str, rows: &[Row]) -> Result<String, String> {
+    let file = cli.accounts().roster_file;
     if let Some(why) = rows.iter().find_map(row_refusal) {
         return Err(why);
     }
-    Roster::parse(existing)?;
+    Roster::parse_for(cli, existing)?;
     let mut out = existing.to_string();
     for row in rows {
         let text = row_text(row).ok_or_else(|| format!("row `{}` does not admit", row.label))?;
@@ -819,13 +962,13 @@ pub fn append_rows(existing: &str, rows: &[Row]) -> Result<String, String> {
             "these rows"
         };
         return Err(format!(
-            "{ACCOUNTS_FILE} defines `account` inline (`account = [ … ]`), which an [[account]] \
+            "{file} defines `account` inline (`account = [ … ]`), which an [[account]] \
              table cannot extend; rewrite its rows as [[account]] tables, or add {these} to \
              that array by hand: {}",
             by_hand.join(", ")
         ));
     }
-    Roster::parse(&out)?;
+    Roster::parse_for(cli, &out)?;
     Ok(out)
 }
 
@@ -836,6 +979,28 @@ pub fn enrolled(roster: &Roster) -> BTreeSet<String> {
         .rows
         .iter()
         .filter(|r| r.dir.as_deref().is_none_or(|d| login_made(Path::new(d))))
+        .map(|r| r.label.clone())
+        .collect()
+}
+
+/// Returns the set of `cli`'s roster labels whose logins are made on this machine ([`enrolled`]
+/// for Claude Code's): another CLI's row is enrolled once its directory holds the file the CLI
+/// keeps its login in ([`crate::ai::connector::Connector::stores`]), since an overlay home holds
+/// links and scratch before any sign-in.
+#[must_use]
+pub fn enrolled_for(cli: Cli, roster: &Roster) -> BTreeSet<String> {
+    if cli == Cli::Claude {
+        return enrolled(roster);
+    }
+    let stores = cli.connector().stores;
+    roster
+        .rows
+        .iter()
+        .filter(|r| {
+            r.dir
+                .as_deref()
+                .is_none_or(|d| stores.iter().any(|f| Path::new(d).join(f).is_file()))
+        })
         .map(|r| r.label.clone())
         .collect()
 }
@@ -913,6 +1078,12 @@ pub fn listed_logins_at(path: Option<&Path>, store: &Store, now: i64) -> Vec<Str
 #[must_use]
 pub fn roster_beside(config: &Path) -> Option<PathBuf> {
     Some(config.parent()?.join(ACCOUNTS_FILE))
+}
+
+/// Returns `cli`'s roster path ([`Cli`]) sibling to the given `aterm.toml` `config` path.
+#[must_use]
+pub fn roster_beside_for(config: &Path, cli: Cli) -> Option<PathBuf> {
+    Some(config.parent()?.join(cli.accounts().roster_file))
 }
 
 /// Returns the default `accounts.toml` path beside the active `aterm.toml`.
@@ -1010,6 +1181,65 @@ impl ProcessLogin {
             }
         }
         out.login = login.filter(|dir| !dir.is_empty()).map(str::to_owned);
+        out
+    }
+
+    /// Extracts a `cli` process's [`ProcessLogin`] facts from `(name, value)` environment pairs
+    /// ([`Seam`]): Claude Code's are [`ProcessLogin::of_env`]. Another CLI's login is the
+    /// directory its seam variable names (for a [`Seam::LoginFile`], the directory of the file it
+    /// names, where that file has the seam's name; a file of another name is no stored login of
+    /// the pool's); its home is the
+    /// default one unless its own home variable is set apart from the seam; and a credential
+    /// variable it reads ahead of a stored login ([`crate::ai::connector::Connector::credential_env`]),
+    /// or two different values of the seam variable, mean a stored login is not what it runs on.
+    #[must_use]
+    pub fn of_env_for<'a>(
+        cli: Cli,
+        env: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> ProcessLogin {
+        if cli == Cli::Claude {
+            return ProcessLogin::of_env(env);
+        }
+        let connector = cli.connector();
+        let seam = cli.accounts().seam;
+        let home_var = connector.home.var.filter(|var| *var != seam.var());
+        let mut login: Option<&str> = None;
+        let mut out = ProcessLogin {
+            login: None,
+            default_home: true,
+            stored_login: true,
+        };
+        for (name, value) in env {
+            if name == seam.var() {
+                match login {
+                    None => login = Some(value),
+                    Some(first) if first != value => out.stored_login = false,
+                    Some(_) => {}
+                }
+            }
+            if value.is_empty() {
+                continue;
+            }
+            if Some(name) == home_var {
+                out.default_home = false;
+            }
+            if connector.credential_env.contains(&name) {
+                out.stored_login = false;
+            }
+        }
+        out.login = login.filter(|v| !v.is_empty()).map(|value| match seam {
+            Seam::LoginFile { file, .. } => {
+                let path = Path::new(value);
+                match (path.file_name(), path.parent()) {
+                    (Some(name), Some(dir)) if name == file => dir.to_string_lossy().into_owned(),
+                    _ => {
+                        out.stored_login = false;
+                        value.to_owned()
+                    }
+                }
+            }
+            Seam::LoginDir { .. } | Seam::Overlay { .. } => value.to_owned(),
+        });
         out
     }
 
@@ -1150,6 +1380,28 @@ pub(super) fn write_renewal_checkpoint(
     subscription: Option<&str>,
     checked_at: i64,
 ) -> io::Result<()> {
+    write_renewal_checkpoint_for(
+        Cli::Claude,
+        label,
+        email,
+        staging_text,
+        subscription,
+        checked_at,
+    )
+}
+
+/// [`write_renewal_checkpoint`] for a renewal of `cli`'s pool: the checkpoint names the CLI's
+/// program, so only that CLI's recovery reads it back ([`read_renewal_checkpoint_for`]).
+/// # Errors
+/// As [`write_renewal_checkpoint`].
+pub(super) fn write_renewal_checkpoint_for(
+    cli: Cli,
+    label: &str,
+    email: &str,
+    staging_text: &str,
+    subscription: Option<&str>,
+    checked_at: i64,
+) -> io::Result<()> {
     let staging = Path::new(staging_text);
     std::fs::canonicalize(staging)?;
     let checkpoint = RenewalCheckpoint {
@@ -1167,7 +1419,7 @@ pub(super) fn write_renewal_checkpoint(
     }
     let mut doc = Map::new();
     doc.insert("schema".into(), Value::from(1));
-    doc.insert("program".into(), Value::from("claude"));
+    doc.insert("program".into(), Value::from(cli.id()));
     doc.insert("label".into(), Value::from(checkpoint.label));
     doc.insert("email".into(), Value::from(checkpoint.email));
     doc.insert("dir".into(), Value::from(checkpoint.dir));
@@ -1199,6 +1451,18 @@ pub(super) fn read_renewal_checkpoint(
     actual_dir: &Path,
     now: i64,
 ) -> Option<RenewalCheckpoint> {
+    read_renewal_checkpoint_for(Cli::Claude, staging, actual_dir, now)
+}
+
+/// [`read_renewal_checkpoint`] of a checkpoint `cli`'s renewal wrote: one naming another CLI's
+/// program is not this pool's.
+#[must_use]
+pub(super) fn read_renewal_checkpoint_for(
+    cli: Cli,
+    staging: &Path,
+    actual_dir: &Path,
+    now: i64,
+) -> Option<RenewalCheckpoint> {
     use std::io::Read as _;
     let file = astream_sys::open_nonblocking(
         &staging.join(RENEWAL_CHECKPOINT_FILE),
@@ -1217,7 +1481,7 @@ pub(super) fn read_renewal_checkpoint(
         return None;
     }
     let doc: Value = aterm_json::from_str(std::str::from_utf8(&bytes).ok()?).ok()?;
-    if doc.get("schema")?.as_u64()? != 1 || doc.get("program")?.as_str()? != "claude" {
+    if doc.get("schema")?.as_u64()? != 1 || doc.get("program")?.as_str()? != cli.id() {
         return None;
     }
     let checkpoint = RenewalCheckpoint {
@@ -1258,6 +1522,42 @@ pub struct Binding {
     pub wrong_at: Option<i64>,
     /// The logins this binding replaced, newest first, at most [`MAX_LEFT`].
     pub was: Vec<Option<String>>,
+    /// What proved the bound login is the row's account, where a sign-in of another CLI's pool
+    /// bound it ([`note_proof`]); a Claude Code renewal's proof is its status check, never
+    /// written.
+    pub proved_by: Option<Proof>,
+}
+
+/// What proved a sign-in made the row's account ([`Binding::proved_by`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Proof {
+    /// The CLI's own report named the row's email (Codex's `account/read`, Grok's `Signed in
+    /// as`).
+    Status,
+    /// The sign-in page showed the row's email.
+    Page,
+    /// Nothing named the account: the person approved the page.
+    Unchecked,
+}
+
+impl Proof {
+    /// Its `logins.json` word.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Proof::Status => "status",
+            Proof::Page => "page",
+            Proof::Unchecked => "unchecked",
+        }
+    }
+
+    /// The proof its `logins.json` `word` names.
+    #[must_use]
+    pub fn parse(word: &str) -> Option<Proof> {
+        [Proof::Status, Proof::Page, Proof::Unchecked]
+            .into_iter()
+            .find(|p| p.as_str() == word)
+    }
 }
 
 impl Default for Binding {
@@ -1272,6 +1572,7 @@ impl Default for Binding {
             subscription: None,
             wrong_at: None,
             was: Vec::new(),
+            proved_by: None,
         }
     }
 }
@@ -1344,6 +1645,9 @@ impl Logins {
                     "was".to_owned(),
                     Value::Array(b.was.iter().map(|w| Value::from(w.clone())).collect()),
                 );
+                if let Some(proof) = b.proved_by {
+                    m.insert("proved_by".to_owned(), Value::from(proof.as_str()));
+                }
                 (label.clone(), Value::Object(m))
             })
             .collect();
@@ -1419,6 +1723,10 @@ impl Logins {
                 subscription: word(v.get("subscription"), SUBSCRIPTION_MAX),
                 wrong_at: stamp(v.get("wrong_at"), now),
                 was,
+                proved_by: v
+                    .get("proved_by")
+                    .and_then(Value::as_str)
+                    .and_then(Proof::parse),
             };
             labels.insert(label.clone(), binding);
         }
@@ -1677,12 +1985,21 @@ pub fn note_renewed(
     binding.notice_end = None;
     binding.ended_at = None;
     binding.wrong_at = None;
+    binding.proved_by = None;
     binding.subscription = subscription
         .map(|s| one_line(s, SUBSCRIPTION_MAX))
         .filter(|s| !s.is_empty());
     out.extend(note_auth(state, label, Auth::Ok, at));
     out.push(Event::new(at, Kind::Renewed, label));
     out
+}
+
+/// Records what proved `label`'s newly bound login is its account ([`Binding::proved_by`]),
+/// after [`note_renewed`] in the same transaction.
+pub fn note_proof(logins: &mut Logins, label: &str, proof: Proof) {
+    if let Some(binding) = logins.labels.get_mut(label) {
+        binding.proved_by = Some(proof);
+    }
 }
 
 /// Records that a renewal attempt for `label` at `at` authenticated a different account.
@@ -3292,6 +3609,18 @@ pub enum StayWhy {
     NoFresh,
     /// Nothing is due.
     NothingDue,
+    /// A move is due, and no lab pass has measured this CLI's seam ([`advise_for`]), or its walls
+    /// for a running session ([`advise_session`]).
+    Unmeasured,
+    /// The session answers its own walls (a proven self-claim, `codex-alab@<pid>`): aterm moves
+    /// nothing under it ([`advise_session`]).
+    OtherSupervisor,
+    /// The CLI keeps its login in the OS keyring here (Codex's `cli_auth_credentials_store`),
+    /// where no row's own login file is read, so no row is picked or moved to.
+    KeyringStore,
+    /// A move is due, and the relaunch line onto the row could not be written (its overlay home
+    /// could not be made, or holds entries of its own): nothing was committed.
+    NoLine,
 }
 
 impl StayWhy {
@@ -3311,6 +3640,10 @@ impl StayWhy {
             StayWhy::OfferExpiring => "offer-expiring",
             StayWhy::NoFresh => "no-fresh",
             StayWhy::NothingDue => "nothing-due",
+            StayWhy::Unmeasured => "unmeasured",
+            StayWhy::OtherSupervisor => "other-supervisor",
+            StayWhy::KeyringStore => "keyring-store",
+            StayWhy::NoLine => "no-line",
         }
     }
 }
@@ -3651,6 +3984,107 @@ pub fn advise(
     advise_with(roster, state, enrolled, me, point, mode, now, true)
 }
 
+/// Computes [`advise`] for `cli`'s pool ([`Cli`]): the advice [`advise`] gives (for a CLI other
+/// than Claude Code, which has no `/usage` probe, [`advise_past_probe`]'s), except that a
+/// move between the logins of a CLI whose seam no lab pass has measured
+/// ([`crate::ai::connector::Accounts::measured`]) stays, as [`StayWhy::Unmeasured`], since a
+/// relaunch onto an unmeasured seam can lose the session it moves.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn advise_for(
+    cli: Cli,
+    roster: &Roster,
+    state: &State,
+    enrolled: &BTreeSet<String>,
+    me: &Me<'_>,
+    point: &Point,
+    mode: Mode,
+    now: i64,
+) -> Advice {
+    let advice = if cli == Cli::Claude {
+        advise(roster, state, enrolled, me, point, mode, now)
+    } else {
+        advise_past_probe(roster, state, enrolled, me, point, mode, now)
+    };
+    match advice {
+        Advice::Move { .. } if !cli.accounts().measured => Advice::Stay(StayWhy::Unmeasured),
+        advice => advice,
+    }
+}
+
+/// Who answers a running session's walls ([`advise_session`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Supervisor {
+    /// aterm's harness: the roster's advice is its to act on.
+    Aterm,
+    /// The session's own program, by a proven self-claim (`codex-alab@<pid>`).
+    Own,
+}
+
+/// Computes [`advise_for`] for a RUNNING session of `cli` that `supervisor` answers: a session
+/// that answers its own walls stays ([`StayWhy::OtherSupervisor`]), and so does a move of a
+/// session of a CLI whose walls no lab pass has measured
+/// ([`crate::ai::connector::Accounts::walls_measured_on`], [`StayWhy::Unmeasured`]): that CLI's
+/// advice is a launch's alone ([`launch_row`]). `mode` [`Mode::Off`] moves nothing, as
+/// [`advise`] says.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn advise_session(
+    cli: Cli,
+    supervisor: Supervisor,
+    roster: &Roster,
+    state: &State,
+    enrolled: &BTreeSet<String>,
+    me: &Me<'_>,
+    point: &Point,
+    mode: Mode,
+    now: i64,
+) -> Advice {
+    if supervisor == Supervisor::Own {
+        return Advice::Stay(StayWhy::OtherSupervisor);
+    }
+    match advise_for(cli, roster, state, enrolled, me, point, mode, now) {
+        Advice::Move { .. } if cli.accounts().walls_measured_on.is_none() => {
+            Advice::Stay(StayWhy::Unmeasured)
+        }
+        advice => advice,
+    }
+}
+
+/// The row a launch aterm makes of a pool's CLI starts under (a worker's spawn, a cold restore):
+/// `active` while the owner's pin holds it (a row whose login is here and not signed out) or
+/// while it is fresh, else the first candidate a wall would move to (`next:` in
+/// `aterm accounts`), else `active` while it still runs (a low row, every other one walled);
+/// `None` when no row is usable.
+#[must_use]
+pub fn launch_row<'a>(
+    roster: &'a Roster,
+    state: &State,
+    enrolled: &BTreeSet<String>,
+    now: i64,
+) -> Option<&'a Row> {
+    let active = state.active.as_deref().and_then(|label| roster.row(label));
+    if let Some(row) = active {
+        let cond = condition(row, state, is_enrolled(row, enrolled), now);
+        let here = !matches!(cond, Condition::NotEnrolled | Condition::SignedOut);
+        if (state.pinned && here) || cond.fresh() {
+            return Some(row);
+        }
+    }
+    let point = Point::Wall {
+        window: String::new(),
+        at: None,
+    };
+    let me = active.map(|row| row.label.as_str());
+    candidates(roster, state, enrolled, me, &point, now)
+        .into_iter()
+        .find(|(_, verdict)| verdict.is_ok())
+        .and_then(|(label, _)| roster.row(&label))
+        .or_else(|| {
+            active.filter(|row| condition(row, state, is_enrolled(row, enrolled), now).runs())
+        })
+}
+
 /// Computes [`advise`] with the `/usage` probe arm skipped.
 #[must_use]
 pub fn advise_past_probe(
@@ -3898,11 +4332,14 @@ pub enum Kind {
     Reset,
     /// Another account signed in to the home ([`note_reading`]).
     Epoch,
+    /// A sign-in of another CLI's pool ended without binding a login: its `why` names the
+    /// page's host, the flow and how it ended, never its URL or code.
+    SignIn,
 }
 
 impl Kind {
     /// Every kind, in the design's order.
-    pub const ALL: [Kind; 21] = [
+    pub const ALL: [Kind; 22] = [
         Kind::Wall,
         Kind::Sample,
         Kind::Rotate,
@@ -3924,6 +4361,7 @@ impl Kind {
         Kind::WrongAccount,
         Kind::Reset,
         Kind::Epoch,
+        Kind::SignIn,
     ];
 
     /// Canonical string for this event kind in `ledger.jsonl`.
@@ -3951,6 +4389,7 @@ impl Kind {
             Kind::WrongAccount => "wrong-account",
             Kind::Reset => "reset",
             Kind::Epoch => "epoch",
+            Kind::SignIn => "sign-in",
         }
     }
 
@@ -4037,7 +4476,8 @@ impl Event {
             | Kind::LoginEnded
             | Kind::WrongAccount
             | Kind::Reset
-            | Kind::Epoch => false,
+            | Kind::Epoch
+            | Kind::SignIn => false,
         }
     }
 
@@ -5301,10 +5741,20 @@ pub(crate) fn read_bounded(path: &Path, max: u64) -> io::Result<Option<String>> 
 pub struct Store {
     /// The directory (0700).
     pub dir: PathBuf,
+    /// The root of its rows' login directories ([`Store::logins_dir`]).
+    logins: PathBuf,
     /// The bounded wait of the recorders' own takes of its lock ([`record_wall`], [`record_usage`],
     /// [`record_gone`], [`LOCK_LADDER`], [`Store::at`], [`Store::bounded_by`]).
     ladder: &'static [std::time::Duration],
+    /// The CLI whose pool it holds ([`Store::at_for`]).
+    cli: Cli,
 }
+
+/// The machine-wide sign-in lock's file, in Claude Code's store ([`Store::signin_within`]).
+pub const SIGNIN_LOCK_FILE: &str = "signin.lock";
+
+/// What a sign-in that finds [`SIGNIN_LOCK_FILE`] held past its ladder reports.
+pub const SIGNIN_HELD: &str = "another sign-in holds the machine's sign-in lock";
 
 /// Exclusive `flock(2)` guard on `accounts.lock` that unlocks on drop.
 #[derive(Debug)]
@@ -5320,10 +5770,92 @@ impl Store {
     /// Opens the accounts [`Store`] rooted under `harness_state`.
     #[must_use]
     pub fn at(harness_state: &Path) -> Store {
+        let dir = harness_state.join("accounts");
         Store {
-            dir: harness_state.join("accounts"),
+            logins: dir.join("logins"),
+            dir,
             ladder: &LOCK_LADDER,
+            cli: Cli::Claude,
         }
+    }
+
+    /// Opens `cli`'s [`Store`] ([`Cli`]): Claude Code's is [`Store::at`]; another CLI's is
+    /// `<harness_state>/<store_dir>`, its rows' logins under `<user_home>/.aterm/logins/<cli>`,
+    /// a path that names the CLI and that its own sandbox lets it read.
+    #[must_use]
+    pub fn at_for(harness_state: &Path, cli: Cli, user_home: &Path) -> Store {
+        match cli {
+            Cli::Claude => Store::at(harness_state),
+            _ => Store {
+                dir: harness_state.join(cli.accounts().store_dir),
+                logins: user_home.join(".aterm").join("logins").join(cli.id()),
+                ladder: &LOCK_LADDER,
+                cli,
+            },
+        }
+    }
+
+    /// The CLI whose pool it holds.
+    #[must_use]
+    pub const fn cli(&self) -> Cli {
+        self.cli
+    }
+
+    /// The CLI's default home under the user's home this store's logins are kept in
+    /// ([`Store::at_for`]: `<home>/.aterm/logins/<cli>`); `None` for Claude Code's, whose logins
+    /// are in its store.
+    #[must_use]
+    pub fn default_home(&self) -> Option<PathBuf> {
+        if self.cli == Cli::Claude {
+            return None;
+        }
+        let user_home = self.logins.parent()?.parent()?.parent()?;
+        Some(user_home.join(self.cli.accounts().default_home))
+    }
+
+    /// Claude Code's store directory beside it (the same directory for Claude Code's own): the
+    /// one root every CLI's sign-ins share, for the browser profiles (one per email, so one
+    /// account's identity-provider and mailbox sessions serve every vendor) and the sign-in
+    /// lock ([`Store::signin_within`]).
+    #[must_use]
+    pub fn shared_dir(&self) -> PathBuf {
+        match self.cli {
+            Cli::Claude => self.dir.clone(),
+            _ => self
+                .dir
+                .parent()
+                .map_or_else(|| self.dir.clone(), |state| state.join("accounts")),
+        }
+    }
+
+    /// Takes the machine-wide sign-in lock ([`SIGNIN_LOCK_FILE`] in [`Store::shared_dir`]) on
+    /// this store's ladder ([`Store::bounded_by`]): one sign-in at a time on this machine, for
+    /// every CLI, since a headless browser's profile admits one process and Codex's login
+    /// listens on one fixed port. `None` when it stayed held past the ladder.
+    /// # Errors
+    /// The directory or the lock file cannot be made, or the lock failed.
+    pub fn signin_within(&self) -> io::Result<Option<Lock>> {
+        let shared = self.shared_dir();
+        aterm_types::fs_restricted::ensure_private_dir(&shared)?;
+        let mut open = std::fs::OpenOptions::new();
+        open.create(true).truncate(false).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            open.mode(0o600);
+        }
+        let mut file = match Self::try_take(open.open(shared.join(SIGNIN_LOCK_FILE))?)? {
+            Ok(lock) => return Ok(Some(lock)),
+            Err(file) => file,
+        };
+        for pause in self.ladder {
+            std::thread::sleep(*pause);
+            file = match Self::try_take(file)? {
+                Ok(lock) => return Ok(Some(lock)),
+                Err(file) => file,
+            };
+        }
+        Ok(None)
     }
 
     /// Overrides the lock retry backoff ladder used by bounded store transactions.
@@ -5422,10 +5954,11 @@ impl Store {
         self.dir.join(LEDGER_FILE)
     }
 
-    /// Path to the `logins/` directory holding per-account login directories.
+    /// Path to the directory holding per-account login directories: `logins/` in the store, or a
+    /// CLI's own root ([`Store::at_for`]).
     #[must_use]
     pub fn logins_dir(&self) -> PathBuf {
-        self.dir.join("logins")
+        self.logins.clone()
     }
 
     /// Path to the login directory for `label`, or `None` if `label` is not admissible.

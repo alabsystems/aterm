@@ -110,17 +110,13 @@ fn observe_subjects(plan: &Plan, subjects: &[Subject], network: bool) -> Vec<Obs
         out.push(
             context()
                 .and_then(|ctx| {
-                    aterm_machines::init_github::run_initial_repositories(&sys, &ctx, Mode::Plan)
+                    super::repositories::observe(
+                        &sys,
+                        &ctx,
+                        super::Stage::Secrets.selected(plan).then_some(plan),
+                    )
                 })
-                .map_or_else(
-                    |why| unread(Subject::Setting(Setting::Repositories), &why),
-                    |rows| {
-                        aterm_machines::init_observe::observation(
-                            Setting::Repositories,
-                            &rows.iter().collect::<Vec<_>>(),
-                        )
-                    },
-                ),
+                .unwrap_or_else(|why| unread(Subject::Setting(Setting::Repositories), &why)),
         );
     }
 
@@ -177,6 +173,12 @@ enum VaultRead {
         code: Option<String>,
         with_password: bool,
     },
+    /// Asked to join, and the person turned sync off since
+    /// ([`aterm_secrets::service::subscriber_off_path`]): the subscriber that finishes an
+    /// approved join does not run, by their choice. It reads Sync off in place, as
+    /// [`Self::TurnedOff`] does, with what that means for the join and the row's quiet
+    /// Turn On Sync.
+    PendingOff { code: Option<String> },
     /// A member whose subscriber runs; `synced` once every file is written.
     Member { synced: bool },
     /// A member whose subscriber, the process that keeps `~/.secrets` in sync, is
@@ -283,6 +285,17 @@ fn subscriber_now(home: &Path) -> Result<Subscriber, String> {
     Ok(subscriber)
 }
 
+/// Whether the person turned this login's subscriber off and it does not run: read at
+/// once, with no wait for launchd, since a record says enough.
+fn sync_turned_off(home: &Path) -> bool {
+    use aterm_secrets::service::{self, Job, State};
+    service::subscriber_turned_off(home)
+        && !matches!(
+            service::state(home, Job::Subscriber),
+            Ok(State::Installed { pid: Some(_), .. })
+        )
+}
+
 fn vault(plan: &Plan) -> Result<Observation, String> {
     use aterm_secrets::client::{self, Membership, Paths};
     let paths = Paths::live().map_err(|error| error.to_string())?;
@@ -293,6 +306,9 @@ fn vault(plan: &Plan) -> Result<Observation, String> {
     ) {
         (_, Membership::Unconfigured) => VaultRead::Unconfigured,
         (None, _) => VaultRead::OtherVault,
+        (Some(_), Membership::Pending) if sync_turned_off(&paths.home) => VaultRead::PendingOff {
+            code: status.machine.as_ref().map(|(_, code)| code.to_string()),
+        },
         (Some(_), Membership::Pending) => VaultRead::Pending {
             code: status.machine.as_ref().map(|(_, code)| code.to_string()),
             with_password: client::asked_with_password(&paths),
@@ -342,6 +358,10 @@ const SYNC_OFF: &str = "Sync off";
 /// The row's quiet Turn On Sync button turns it back on.
 const TURNED_OFF: &str = "You turned sync off on this Mac";
 
+/// The note of a Mac that asked to join and whose sync the person turned off since:
+/// an admin Mac's approval lands only once sync is on again.
+const PENDING_OFF: &str = "You turned sync off, so an approved join lands once it's on";
+
 /// The note of a member Mac whose subscriber cannot run from the copy of aterm
 /// that is open (a disk image): the person's step, after which the Secrets stage
 /// installs it. The menu line carries it too.
@@ -388,6 +408,16 @@ fn vault_observation(read: &VaultRead, managed: bool, here: Option<&str>) -> Obs
         ),
         // The person's choice: what the row wants, so no change to make.
         VaultRead::TurnedOff => (Standing::InPlace, SYNC_OFF, Some(TURNED_OFF.to_owned())),
+        VaultRead::PendingOff { code } => (
+            Standing::InPlace,
+            SYNC_OFF,
+            Some(match code {
+                Some(code) => format!(
+                    "You turned sync off; once it's on, approving {code} on an admin Mac finishes the join"
+                ),
+                None => PENDING_OFF.to_owned(),
+            }),
+        ),
         // Only a person moves aterm: nothing retries its way out of a disk image.
         VaultRead::Fleeting => (person, "Out of sync", Some(FLEETING.to_owned())),
         VaultRead::Pending {
@@ -422,7 +452,7 @@ fn vault_observation(read: &VaultRead, managed: bool, here: Option<&str>) -> Obs
     };
     // An opt-out reads in place at the person's value, which is the wanted one
     // then, as a grant the person opted out of does (`access::honor_opt_out`).
-    let wanted = if *read == VaultRead::TurnedOff {
+    let wanted = if matches!(read, VaultRead::TurnedOff | VaultRead::PendingOff { .. }) {
         SYNC_OFF
     } else {
         subject.wanted()
@@ -675,6 +705,7 @@ mod tests {
             VaultRead::Stopped,
             VaultRead::NotSetUp,
             VaultRead::TurnedOff,
+            VaultRead::PendingOff { code: None },
             VaultRead::Fleeting,
         ] {
             let now = vault_observation(&read, true, None).now.unwrap();
@@ -710,6 +741,10 @@ mod tests {
             VaultRead::Stopped,
             VaultRead::NotSetUp,
             VaultRead::TurnedOff,
+            VaultRead::PendingOff { code: None },
+            VaultRead::PendingOff {
+                code: Some("abcd-efgh".into()),
+            },
             VaultRead::Fleeting,
             VaultRead::Revoked,
         ] {
@@ -740,6 +775,30 @@ mod tests {
             assert!(!note.contains('/') && !note.contains('~'), "{note}");
         }
         assert!(waiting >= 4, "the waiting rows were read: {waiting}");
+    }
+
+    /// A JOIN WAITING FOR AN ADMIN ON A MAC WHOSE SYNC THE PERSON TURNED OFF reads as
+    /// their choice, as a member's Sync off does: in place at Sync off, which is what the
+    /// row wants then (so the page offers Turn On Sync), with a note that says an
+    /// approval lands only once sync is on. It never asks for an approval it cannot use.
+    #[test]
+    fn a_pending_join_with_sync_off_reads_sync_off_and_says_what_that_means() {
+        for (code, note) in [
+            (None, PENDING_OFF.to_owned()),
+            (
+                Some("abcd-efgh".to_owned()),
+                "You turned sync off; once it's on, approving abcd-efgh on an admin Mac finishes the join".to_owned(),
+            ),
+        ] {
+            for managed in [true, false] {
+                let seen = vault_observation(&VaultRead::PendingOff { code: code.clone() }, managed, None);
+                assert_eq!(
+                    (seen.standing, seen.now.as_deref(), seen.wanted.as_str()),
+                    (Standing::InPlace, Some(SYNC_OFF), SYNC_OFF)
+                );
+                assert_eq!(seen.note.as_deref(), Some(note.as_str()));
+            }
+        }
     }
 
     /// AN ATERM RUN FROM A DISK IMAGE SAYS TO MOVE IT (the Secrets stage's

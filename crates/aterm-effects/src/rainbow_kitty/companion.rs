@@ -567,6 +567,151 @@ impl PetShade {
     }
 }
 
+/// What the sky and the ribbon's top keep off: the frame's word icons (a
+/// `dog`'s or a `fox`'s face drawn over its word) and every lettered or
+/// filled cell (a powerline segment, a selection) of a row the caret is not
+/// on, as window-pixel boxes `(x0, x1, y0, y1)`, right and bottom exclusive.
+/// No star is drawn on them and the ribbon's body never feathers up into
+/// them. The gallery's judges, 2026-10-23 (looks6 N3, N4): sky stars on the
+/// dog's face and pink sparkles on the fox's, the Enter flare washing the
+/// fox's white chin lilac, a bright star on the `2` of `main +2` and a green
+/// one in its gap, and the bed's top feather tinting the segment's bottom
+/// 3-4 px (yellow to olive, its grey bar to violet).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KeepOut {
+    /// Every box: the word icons' and the lettered or filled cells'.
+    boxes: Vec<(i32, i32, i32, i32)>,
+    /// The lettered or filled cells' boxes alone ([`Self::below`]).
+    cells: Vec<(i32, i32, i32, i32)>,
+    /// Each lettered row's span, first lettered or filled cell to last, a
+    /// row tall ([`Self::behind_text`]).
+    rows: Vec<(i32, i32, i32, i32)>,
+}
+
+impl KeepOut {
+    /// This frame's boxes, window pixels, all of them lettered or filled
+    /// cells ([`Self::set_split`] with no icon).
+    #[inline]
+    pub fn set(&mut self, boxes: impl IntoIterator<Item = (i32, i32, i32, i32)>) {
+        self.set_split(std::iter::empty(), boxes);
+    }
+
+    /// This frame's boxes, window pixels: the word icons' sprite boxes and
+    /// the lettered or filled cells' runs.
+    #[inline]
+    pub fn set_split(
+        &mut self,
+        icons: impl IntoIterator<Item = (i32, i32, i32, i32)>,
+        cells: impl IntoIterator<Item = (i32, i32, i32, i32)>,
+    ) {
+        let real = |b: &(i32, i32, i32, i32)| b.0 < b.1 && b.2 < b.3;
+        self.cells.clear();
+        self.cells.extend(cells.into_iter().filter(real));
+        self.boxes.clear();
+        self.boxes.extend(icons.into_iter().filter(real));
+        self.boxes.extend_from_slice(&self.cells);
+    }
+
+    /// This frame's lettered rows' spans, window pixels: each row's first
+    /// lettered or filled cell to its last, the row's whole height.
+    #[inline]
+    pub fn set_rows(&mut self, rows: impl IntoIterator<Item = (i32, i32, i32, i32)>) {
+        self.rows.clear();
+        self.rows
+            .extend(rows.into_iter().filter(|b| b.0 < b.1 && b.2 < b.3));
+    }
+
+    /// The lettered rows' spans ([`Self::set_rows`]).
+    #[inline]
+    #[must_use]
+    pub fn rows(&self) -> &[(i32, i32, i32, i32)] {
+        &self.rows
+    }
+
+    /// How much of a light at `(x, y)` shows in front of the letters: 0
+    /// inside a lettered row's span between `band`'s shares of its height
+    /// (its letters' bodies, the cap line to the baseline), widened by
+    /// `pad` px on every side, 1 clear of it, eased over `feather` px
+    /// inside its edges. A thread laid across a word passes behind its
+    /// letters instead of striking them through, and with no `pad` shows
+    /// again below their baseline.
+    #[inline]
+    #[must_use]
+    pub fn behind_text(&self, (x, y): (f32, f32), band: (f32, f32), pad: f32, feather: f32) -> f32 {
+        let feather = feather.max(1.0);
+        self.rows.iter().fold(1.0f32, |k, &(x0, x1, y0, y1)| {
+            let ch = (y1 - y0) as f32;
+            let (b0, b1) = (y0 as f32 + band.0 * ch - pad, y0 as f32 + band.1 * ch + pad);
+            let (x0, x1) = (x0 as f32 - pad, x1 as f32 + pad);
+            let d = (x - x0).min(x1 - x).min(y - b0).min(b1 - y);
+            if d <= 0.0 {
+                return k;
+            }
+            let u = (d / feather).min(1.0);
+            k.min(1.0 - u * u * (3.0 - 2.0 * u))
+        })
+    }
+
+    /// The boxes, window pixels.
+    #[inline]
+    #[must_use]
+    pub fn boxes(&self) -> &[(i32, i32, i32, i32)] {
+        &self.boxes
+    }
+
+    /// Whether a mark centred at `(x, y)` that reaches `reach` px round its
+    /// centre touches a box.
+    #[inline]
+    #[must_use]
+    pub fn covers(&self, (x, y): (i32, i32), reach: i32) -> bool {
+        let r = reach.max(0);
+        self.boxes
+            .iter()
+            .any(|&(x0, x1, y0, y1)| x + r >= x0 && x - r < x1 && y + r >= y0 && y - r < y1)
+    }
+
+    /// What is left of a column's span `(y0, y1)` across `(x0, x1)` once
+    /// every lettered or filled cell's box it meets is cut off its top: the
+    /// span below the lowest box bottom it meets (empty when a box reaches
+    /// its foot). A word icon is not among them: the frame's shade cuts a
+    /// light by the face's drawn rows (`CursorGlow::shade_word_icons`), and
+    /// a column cut whole by the icon's sprite box, which is wider than the
+    /// face, carved a square notch out of the sky beside the dog's face
+    /// (looks6 round 3).
+    #[inline]
+    #[must_use]
+    pub fn below(&self, (x0, x1): (i32, i32), (y0, y1): (i32, i32)) -> (i32, i32) {
+        let top = self
+            .cells
+            .iter()
+            .filter(|b| b.0 < x1 && x0 < b.1 && b.2 < y1 && y0 < b.3)
+            .map(|b| b.3)
+            .fold(y0, i32::max);
+        (top.min(y1), y1)
+    }
+
+    /// How far up a body standing on a row whose top is `row_top` may reach
+    /// at window x `x`, px: `row_top` under a box that stands on the row's
+    /// top, easing back to `free` (no ceiling) over `ease` px beside it.
+    #[inline]
+    #[must_use]
+    pub fn ceiling(&self, x: f32, row_top: f32, free: f32, ease: f32) -> f32 {
+        let above = row_top - 1.0;
+        let d = self
+            .boxes
+            .iter()
+            .filter(|b| (b.2 as f32) <= above && above < b.3 as f32)
+            .map(|b| (b.0 as f32 - x).max(x - b.1 as f32).max(0.0))
+            .fold(f32::INFINITY, f32::min);
+        if !d.is_finite() || d >= ease {
+            return free;
+        }
+        let u = (d / ease.max(1.0)).clamp(0.0, 1.0);
+        let s = u * u * (3.0 - 2.0 * u);
+        row_top + (free - row_top) * s
+    }
+}
+
 /// One star offered to a contented cat, named by the triple that identifies it in the sky's pool.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StarCatch {
@@ -1126,5 +1271,72 @@ mod tests {
             (r != 7 || c != 8).then_some(false)
         });
         assert_ne!(mixed.row, 7, "a single unknowable cell in the span yields");
+    }
+
+    /// THE KEEP-OUT (looks6 N3, N4): a mark whose reach touches a word
+    /// icon's or another row's lettered box is kept off it, and one beside
+    /// it is not; a body standing on the row under a lettered box reaches
+    /// no higher than the row's top over it, easing back to its own reach
+    /// beside it. Negative control: an empty keep-out keeps nothing.
+    #[test]
+    fn the_keep_out_holds_marks_and_the_body_s_top_off_its_boxes() {
+        let mut k = KeepOut::default();
+        // A `fox` face over cells 4..6 of row 2 (16-px rows), and an empty box.
+        k.set([(32, 56, 32, 48), (10, 10, 0, 5)]);
+        assert_eq!(k.boxes().len(), 1, "an empty box is no box");
+        assert!(k.covers((44, 40), 0), "a star on the face is kept off");
+        assert!(
+            k.covers((30, 40), 3),
+            "a star whose arm reaches the face is kept off"
+        );
+        assert!(!k.covers((20, 40), 3), "a star clear of the face is drawn");
+        let (row_top, free, ease) = (48.0, 40.0, 6.0);
+        assert_eq!(
+            k.ceiling(44.0, row_top, free, ease),
+            row_top,
+            "no feather under the box"
+        );
+        let beside = k.ceiling(59.0, row_top, free, ease);
+        assert!(
+            free < beside && beside < row_top,
+            "the ceiling eases beside it ({beside})"
+        );
+        assert_eq!(
+            k.ceiling(80.0, row_top, free, ease),
+            free,
+            "far off, the body's own reach"
+        );
+        assert_eq!(
+            k.ceiling(44.0, 64.0, free, ease),
+            free,
+            "a row the box does not stand on"
+        );
+        assert_eq!(
+            k.below((40, 48), (40, 56)),
+            (48, 56),
+            "a column under the box keeps only its span below it"
+        );
+        assert_eq!(
+            k.below((40, 48), (40, 47)),
+            (47, 47),
+            "a column wholly in the box keeps nothing"
+        );
+        assert_eq!(
+            k.below((60, 70), (40, 56)),
+            (40, 56),
+            "a column beside it keeps all"
+        );
+        let none = KeepOut::default();
+        assert!(!none.covers((44, 40), 0), "control: nothing kept");
+        assert_eq!(
+            none.below((40, 48), (40, 56)),
+            (40, 56),
+            "control: nothing cut"
+        );
+        assert_eq!(
+            none.ceiling(44.0, row_top, free, ease),
+            free,
+            "control: no ceiling"
+        );
     }
 }

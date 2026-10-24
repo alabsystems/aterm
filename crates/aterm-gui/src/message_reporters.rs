@@ -4529,6 +4529,120 @@ pub(crate) fn accounts_wrong_entry(labels: &[String]) -> Option<Entry> {
     Some(entry.log_line(format!("accounts need=wrong-account n={}", labels.len())))
 }
 
+/// The vendor whose sign-in ends a `cli` login, for the notices that say who sets its end.
+const fn login_vendor(cli: aterm_agent::harness::accounts::Cli) -> &'static str {
+    use aterm_agent::harness::accounts::Cli;
+    match cli {
+        Cli::Claude => "Anthropic",
+        Cli::Codex => "OpenAI",
+        Cli::Grok => "xAI",
+        Cli::Kimi => "Moonshot AI",
+    }
+}
+
+/// The one word a glass title names `cli` by (six words at most): `Claude`, as its notices
+/// always have, `Codex`, `Grok`, `Kimi`.
+const fn title_word(cli: aterm_agent::harness::accounts::Cli) -> &'static str {
+    use aterm_agent::harness::accounts::Cli;
+    match cli {
+        Cli::Claude => "Claude",
+        Cli::Codex => "Codex",
+        Cli::Grok => "Grok",
+        Cli::Kimi => "Kimi",
+    }
+}
+
+/// The exceptions digest entry for `cli`'s logins due for renewal ([`accounts_due_entry`] for
+/// Claude Code's, word for word): another CLI's names its product and its `--cli` renewal, and
+/// keeps its own subject (the CLI's id), so each CLI's entry stands apart.
+pub(crate) fn accounts_due_entry_for(
+    cli: aterm_agent::harness::accounts::Cli,
+    labels: &[String],
+) -> Option<Entry> {
+    if cli == aterm_agent::harness::accounts::Cli::Claude {
+        return accounts_due_entry(labels);
+    }
+    labels.first()?;
+    let word = title_word(cli);
+    let what = match labels.len() {
+        1 => format!("{word} login due for renewal"),
+        n => format!("{n} {word} logins due for renewal"),
+    };
+    let mut entry = Entry::new(
+        Family::Accounts,
+        cli.id(),
+        "due",
+        &what,
+        Why::OnlyYou(Reason::new(format!(
+            "A login ends on a date {} sets, and only a sign-in renews it",
+            login_vendor(cli)
+        ))),
+        Then::step(format!("{ACCOUNTS_RENEW_DUE} --cli {}", cli.id())),
+    )
+    .severity(Severity::Info)
+    .resurface(Resurface::WAIT)
+    .more(format!("{} logins:", cli.connector().product));
+    for line in labels_lines("Due: ", labels, aterm_messages::exceptions::MORE_LINES - 1) {
+        entry = entry.more(line);
+    }
+    Some(entry.log_line(format!(
+        "accounts cli={} need=due n={}",
+        cli.id(),
+        labels.len()
+    )))
+}
+
+/// The exceptions digest entry when a renewal of `cli`'s signed in an account other than its
+/// row's ([`accounts_wrong_entry`] for Claude Code's, word for word): another CLI's names its
+/// product, says nothing live changed, and names the sign-in by hand.
+pub(crate) fn accounts_wrong_entry_for(
+    cli: aterm_agent::harness::accounts::Cli,
+    labels: &[String],
+) -> Option<Entry> {
+    if cli == aterm_agent::harness::accounts::Cli::Claude {
+        return accounts_wrong_entry(labels);
+    }
+    let first = labels.first()?;
+    let mut entry = Entry::new(
+        Family::Accounts,
+        cli.id(),
+        "wrong-account",
+        &format!("{} signed in another account", title_word(cli)),
+        Why::OnlyYou(Reason::new(
+            "Its sign-in named another account, so aterm kept the login it had",
+        )),
+        Then::step(format!(
+            "Run aterm harness accounts login {first} --cli {}",
+            cli.id()
+        )),
+    )
+    .severity(Severity::Info)
+    .resurface(Resurface::WAIT)
+    .restated_at_once()
+    .more(format!(
+        "The {} sign-in for {first} signed in an account other than its row's email; \
+         nothing live changed. Approve its page as the row's account.",
+        cli.connector().product
+    ));
+    for line in labels_lines("Wrong account: ", labels, NOTICE_LABEL_LINES) {
+        entry = entry.more(line);
+    }
+    Some(entry.log_line(format!(
+        "accounts cli={} need=wrong-account n={}",
+        cli.id(),
+        labels.len()
+    )))
+}
+
+/// The digest key of another CLI's pool notice for `cause` (`due`, `wrong-account`): the key
+/// [`accounts_due_entry_for`] and [`accounts_wrong_entry_for`] post under, which a pool that says
+/// nothing more clears.
+pub(crate) fn pool_notice_key(cli: aterm_agent::harness::accounts::Cli, cause: &str) -> String {
+    aterm_messages::need::Fingerprint::new(Family::Accounts.stem(), cli.id(), cause)
+        .as_str()
+        .to_string()
+}
+
 pub(crate) const RENEW_ASK_KEY: &str = "harness.accounts.renew-ask";
 
 /// Builds the exceptions digest entry when `accounts.toml` fails admission.
@@ -5031,6 +5145,8 @@ const fn resume_agent_word(agent: aterm_phase::Program) -> &'static str {
         aterm_phase::Program::Claude => "Claude",
         aterm_phase::Program::Generic => "The agent",
         aterm_phase::Program::Codex
+        | aterm_phase::Program::Grok
+        | aterm_phase::Program::Kimi
         | aterm_phase::Program::Agy
         | aterm_phase::Program::Muse
         | aterm_phase::Program::Gemini => agent.product(),

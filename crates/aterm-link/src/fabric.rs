@@ -3387,7 +3387,7 @@ pub fn render_text(r: &Report) -> String {
         "node",
         r.node
             .clone()
-            .unwrap_or_else(|| format!("- (no node file in {})", safe(&r.cfg.state_dir, 256))),
+            .unwrap_or_else(|| format!("- (no node id in {}/node)", safe(&r.cfg.state_dir, 256))),
     ));
     for (path, caps) in &r.caps {
         kvs.push((

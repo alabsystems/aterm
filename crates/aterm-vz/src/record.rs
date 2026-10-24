@@ -1,0 +1,444 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! The helper's run files and its record (`docs/DESIGN-vz-guest-2026-10-23.md` §5.1).
+//!
+//! | File | What |
+//! | --- | --- |
+//! | `run/aterm-linux.sock` | the control socket the helper binds |
+//! | `run/aterm-linux.json` | the record, written by rename once the socket is bound |
+//! | `run/helper.log` | the helper's stdout and stderr, appended |
+//! | `run/console.log` | hvc0, as the guest wrote it |
+//! | `live/aterm-linux.img.lock` | the live disk's `flock`, held for the helper's whole life |
+//!
+//! A record names its helper by pid *and* unique id (`p_uniqueid`, never reused within a
+//! boot), so a reused pid is never taken for the helper and never signalled ([`Holder`]).
+
+use std::path::{Path, PathBuf};
+
+use crate::layers::VM;
+
+/// `sun_path`'s size on macOS: a socket path must fit, with its NUL.
+pub const SUN_PATH: usize = 104;
+
+/// The run files under one state directory (`vz.noindex`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Paths {
+    root: PathBuf,
+}
+
+impl Paths {
+    /// The run files under `root`.
+    #[must_use]
+    pub fn at(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    /// The state directory.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// `run/`.
+    #[must_use]
+    pub fn run_dir(&self) -> PathBuf {
+        self.root.join("run")
+    }
+
+    /// `run/aterm-linux.sock`.
+    #[must_use]
+    pub fn socket(&self) -> PathBuf {
+        self.run_dir().join(format!("{VM}.sock"))
+    }
+
+    /// `run/aterm-linux.json`.
+    #[must_use]
+    pub fn record(&self) -> PathBuf {
+        self.run_dir().join(format!("{VM}.json"))
+    }
+
+    /// `run/helper.log`.
+    #[must_use]
+    pub fn helper_log(&self) -> PathBuf {
+        self.run_dir().join("helper.log")
+    }
+
+    /// `run/console.log`.
+    #[must_use]
+    pub fn console_log(&self) -> PathBuf {
+        self.run_dir().join("console.log")
+    }
+
+    /// `live/aterm-linux.img`.
+    #[must_use]
+    pub fn live_disk(&self) -> PathBuf {
+        self.root.join("live").join(format!("{VM}.img"))
+    }
+
+    /// `live/aterm-linux.img.lock`.
+    #[must_use]
+    pub fn disk_lock(&self) -> PathBuf {
+        self.root.join("live").join(format!("{VM}.img.lock"))
+    }
+
+    /// The socket path, refused by name when it does not fit `sun_path`.
+    ///
+    /// # Errors
+    /// It is [`SUN_PATH`] bytes or longer.
+    pub fn checked_socket(&self) -> Result<PathBuf, String> {
+        let path = self.socket();
+        let len = path.as_os_str().len();
+        if len >= SUN_PATH {
+            return Err(format!(
+                "the helper's control socket {} is {len} bytes, past sun_path's {SUN_PATH} \
+                 (with its NUL): move the vz state somewhere shorter",
+                path.display()
+            ));
+        }
+        Ok(path)
+    }
+}
+
+/// What the helper writes at start and again once the agent says hello.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Record {
+    /// Its pid.
+    pub pid: u32,
+    /// Its unique id, which the kernel never reuses within a boot.
+    pub uniq: u64,
+    /// Its executable's content address (`host/<sha256>/`).
+    pub helper_sha256: String,
+    /// [`crate::proto::PROTO`].
+    pub proto: u32,
+    /// The live disk it holds.
+    pub live_disk: PathBuf,
+    /// When it started (Unix seconds).
+    pub started: u64,
+    /// The guest's boot, once the agent said hello.
+    pub boot_id: Option<String>,
+    /// The guest's agent, once it said hello.
+    pub agent_sha256: Option<String>,
+}
+
+impl Record {
+    /// The record as `run/aterm-linux.json` holds it.
+    #[must_use]
+    pub fn json(&self) -> String {
+        let value = aterm_json::json!({
+            "pid": self.pid,
+            "uniq": self.uniq,
+            "helper_sha256": self.helper_sha256,
+            "proto": self.proto,
+            "live_disk": self.live_disk.to_string_lossy().into_owned(),
+            "started": self.started,
+            "boot_id": self.boot_id,
+            "agent_sha256": self.agent_sha256,
+        });
+        let mut text = aterm_json::to_string(&value).unwrap_or_default();
+        text.push('\n');
+        text
+    }
+
+    /// A whole record, or `None`. A record naming pid 0 or 1 is none: no helper has either
+    /// ([`helper_pid`]).
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        let v = aterm_json::from_str::<aterm_json::Value>(text).ok()?;
+        let text_of = |key: &str| v.get(key).and_then(aterm_json::Value::as_str);
+        let opt = |key: &str| text_of(key).map(str::to_string);
+        Some(Self {
+            pid: u32::try_from(v.get("pid")?.as_u64()?)
+                .ok()
+                .filter(|pid| helper_pid(*pid))?,
+            uniq: v.get("uniq")?.as_u64()?,
+            helper_sha256: opt("helper_sha256")?,
+            proto: u32::try_from(v.get("proto")?.as_u64()?).ok()?,
+            live_disk: PathBuf::from(text_of("live_disk")?),
+            started: v.get("started")?.as_u64()?,
+            boot_id: opt("boot_id"),
+            agent_sha256: opt("agent_sha256"),
+        })
+    }
+
+    /// Write this record at `path` by rename, so a reader sees the old record or the new one,
+    /// never part of either.
+    ///
+    /// # Errors
+    /// The write or the rename failed.
+    pub fn write(&self, path: &Path) -> std::io::Result<()> {
+        aterm_uds::atomic_file::write(path, self.json().as_bytes(), 0o600)
+    }
+
+    /// The record at `path`, where one is whole.
+    #[must_use]
+    pub fn read(path: &Path) -> Option<Self> {
+        Self::parse(&std::fs::read_to_string(path).ok()?)
+    }
+}
+
+/// Whether `pid` can be a helper's: never 0, which `kill` reads as the caller's whole
+/// process group and whose unique id `proc_pidinfo` reads as 0, and never 1 (launchd).
+#[must_use]
+pub const fn helper_pid(pid: u32) -> bool {
+    pid > 1
+}
+
+/// What a pid's unique id is now, for [`holder`]: the kernel's in the helper's arm, a
+/// script in the tests'.
+pub trait Pids {
+    /// `pid`'s unique id, or `None` when no process has it.
+    fn uniq(&self, pid: u32) -> Option<u64>;
+}
+
+/// This machine's processes (`proc_pidinfo`'s `PROC_PIDUNIQIDENTIFIERINFO`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Kernel;
+
+impl Pids for Kernel {
+    fn uniq(&self, pid: u32) -> Option<u64> {
+        #[cfg(target_vendor = "apple")]
+        {
+            let pid = i32::try_from(pid).ok()?;
+            aterm_uds::process::uniq_identifier(pid).map(|info| info.p_uniqueid)
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = pid;
+            None
+        }
+    }
+}
+
+/// Who a record names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Holder {
+    /// No record.
+    None,
+    /// A live helper: its pid's unique id is the record's.
+    Live(Record),
+    /// A dead helper: its pid is gone, or now names another process (its unique id differs).
+    Dead(Record),
+}
+
+/// Who the record at `paths` names, by `pids`.
+#[must_use]
+pub fn holder(paths: &Paths, pids: &dyn Pids) -> Holder {
+    match Record::read(&paths.record()) {
+        None => Holder::None,
+        Some(r) if pids.uniq(r.pid) == Some(r.uniq) => Holder::Live(r),
+        Some(r) => Holder::Dead(r),
+    }
+}
+
+/// A dead helper's leftovers: its record and its socket, removed so the next bring-up boots.
+/// Only the record of the helper named `dead` is removed, so a record a new helper wrote
+/// meanwhile is kept.
+pub fn remove_leftovers(paths: &Paths, dead: &Record) {
+    if Record::read(&paths.record()).as_ref() == Some(dead) {
+        let _ = std::fs::remove_file(paths.record());
+        let _ = std::fs::remove_file(paths.socket());
+    }
+}
+
+/// `SIGKILL` the helper `record` names, only after its pid's unique id is read again and is
+/// the record's (§5.1): a reused pid is never signalled. Its XPC VM exits by itself within
+/// half a second (fact 44).
+///
+/// # Errors
+/// The pid is 0 or 1 ([`helper_pid`]), the unique id differs or the pid is gone (nothing was
+/// sent), or the kernel refused the signal.
+pub fn kill_helper(record: &Record, pids: &dyn Pids) -> Result<(), String> {
+    if !helper_pid(record.pid) {
+        return Err(format!(
+            "pid {} is never a helper's: not signalled",
+            record.pid
+        ));
+    }
+    match pids.uniq(record.pid) {
+        Some(uniq) if uniq == record.uniq => {}
+        Some(uniq) => {
+            return Err(format!(
+                "pid {} is now another process (unique id {uniq}, the record's {}): not signalled",
+                record.pid, record.uniq
+            ));
+        }
+        None => return Err(format!("pid {} is gone: not signalled", record.pid)),
+    }
+    let pid = i32::try_from(record.pid).map_err(|_| format!("pid {} past i32", record.pid))?;
+    // SAFETY: two integers; one pid, never a group (`helper_pid` held it above 1, and its
+    // unique id was just read again).
+    if unsafe { libc::kill(pid, libc::SIGKILL) } == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "SIGKILL to helper {pid}: {}",
+            std::io::Error::last_os_error()
+        ))
+    }
+}
+
+/// The live disk's `flock`, held for the helper's whole life and let go by `LOCK_UN` (the
+/// workspace's flock rule) when this is dropped.
+#[derive(Debug)]
+pub struct DiskLock {
+    file: std::fs::File,
+}
+
+impl DiskLock {
+    /// Take the lock at `path` without waiting: `Ok(None)` while another process holds it.
+    ///
+    /// # Errors
+    /// The lock file could not be opened, or the lock failed otherwise.
+    pub fn try_take(path: &Path) -> std::io::Result<Option<Self>> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC)
+            .open(path)?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the guard's own take: its Drop releases by LOCK_UN"
+        )]
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { file })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => Err(e),
+        }
+    }
+}
+
+impl Drop for DiskLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    use super::*;
+
+    struct Script(RefCell<HashMap<u32, u64>>);
+
+    impl Pids for Script {
+        fn uniq(&self, pid: u32) -> Option<u64> {
+            self.0.borrow().get(&pid).copied()
+        }
+    }
+
+    fn record(pid: u32, uniq: u64) -> Record {
+        Record {
+            pid,
+            uniq,
+            helper_sha256: "ab".repeat(32),
+            proto: crate::proto::PROTO,
+            live_disk: "/vz/live/aterm-linux.img".into(),
+            started: 1_792_000_000,
+            boot_id: None,
+            agent_sha256: Some("cd".repeat(32)),
+        }
+    }
+
+    #[test]
+    fn a_record_round_trips_and_a_partial_one_is_none() {
+        let r = record(4242, 77);
+        assert_eq!(Record::parse(&r.json()), Some(r.clone()));
+        let mut hello = r;
+        hello.boot_id = Some("b00t".into());
+        assert_eq!(Record::parse(&hello.json()), Some(hello));
+        assert_eq!(Record::parse("{\"pid\": 1}"), None);
+        assert_eq!(Record::parse("not json"), None);
+    }
+
+    #[test]
+    fn a_record_names_a_live_helper_only_by_its_unique_id() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let paths = Paths::at(dir.path());
+        std::fs::create_dir_all(paths.run_dir()).unwrap();
+        let pids = Script(RefCell::new(HashMap::from([(4242, 77)])));
+        assert_eq!(holder(&paths, &pids), Holder::None);
+        let r = record(4242, 77);
+        r.write(&paths.record()).unwrap();
+        assert_eq!(holder(&paths, &pids), Holder::Live(r.clone()));
+        // The negative control: the same pid, another process.
+        pids.0.borrow_mut().insert(4242, 78);
+        assert_eq!(holder(&paths, &pids), Holder::Dead(r.clone()));
+        pids.0.borrow_mut().clear();
+        assert_eq!(holder(&paths, &pids), Holder::Dead(r.clone()));
+        std::fs::write(paths.socket(), b"").unwrap();
+        remove_leftovers(&paths, &r);
+        assert!(!paths.record().exists() && !paths.socket().exists());
+    }
+
+    #[test]
+    fn leftovers_of_another_record_are_kept() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let paths = Paths::at(dir.path());
+        std::fs::create_dir_all(paths.run_dir()).unwrap();
+        let newer = record(5000, 1);
+        newer.write(&paths.record()).unwrap();
+        remove_leftovers(&paths, &record(4242, 77));
+        assert_eq!(Record::read(&paths.record()), Some(newer));
+    }
+
+    #[test]
+    fn a_pid_whose_unique_id_differs_is_never_signalled() {
+        // The pid is this test's own: a signal would end the test, so reaching the end shows
+        // none was sent.
+        let me = std::process::id();
+        let pids = Script(RefCell::new(HashMap::from([(me, 2)])));
+        let why = kill_helper(&record(me, 1), &pids).expect_err("refused");
+        assert!(
+            why.contains("another process") && why.contains("not signalled"),
+            "{why}"
+        );
+        pids.0.borrow_mut().clear();
+        let why = kill_helper(&record(me, 1), &pids).expect_err("gone");
+        assert!(why.contains("gone"), "{why}");
+    }
+
+    #[test]
+    fn pid_0_and_pid_1_are_never_a_helpers_and_never_signalled() {
+        // `proc_pidinfo` reads pid 0 with unique id 0 and pid 1 with 1 on macOS, so a record
+        // naming either would pass the unique-id gate: it is no record at all.
+        for pid in [0u32, 1] {
+            assert!(!helper_pid(pid));
+            let text = record(pid, u64::from(pid)).json();
+            assert_eq!(Record::parse(&text), None, "pid {pid}");
+        }
+        // The negative control: pid 2 is a record.
+        assert!(helper_pid(2));
+        assert_eq!(Record::parse(&record(2, 2).json()), Some(record(2, 2)));
+        // A record built in code naming pid 1 with its unique id is refused before any kill
+        // (were it sent, launchd would refuse it: EPERM, other words).
+        let pids = Script(RefCell::new(HashMap::from([(1, 1)])));
+        let why = kill_helper(&record(1, 1), &pids).expect_err("refused");
+        assert_eq!(why, "pid 1 is never a helper's: not signalled");
+    }
+
+    #[test]
+    fn a_socket_path_past_sun_path_is_refused_by_name() {
+        let short = Paths::at("/tmp/vz");
+        assert!(short.checked_socket().is_ok());
+        let long = Paths::at(format!("/tmp/{}", "d".repeat(90)));
+        let why = long.checked_socket().expect_err("too long");
+        assert!(why.contains("past sun_path's 104"), "{why}");
+    }
+
+    #[test]
+    fn the_disk_lock_is_held_once_and_let_go_on_drop() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join("aterm-linux.img.lock");
+        let first = DiskLock::try_take(&path).unwrap().expect("free");
+        assert!(DiskLock::try_take(&path).unwrap().is_none(), "held");
+        drop(first);
+        assert!(DiskLock::try_take(&path).unwrap().is_some(), "let go");
+    }
+}

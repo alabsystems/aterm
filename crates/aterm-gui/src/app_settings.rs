@@ -573,6 +573,7 @@ impl App {
         let mut requested_by = Vec::new();
         let mut opened = false;
         let mut fda_page_up = false;
+        let mut pane_dialogs = Vec::new();
         let mut retire = None;
         let mut debugger = None;
         let mut askpass_requests = Vec::new();
@@ -593,6 +594,10 @@ impl App {
                 }
                 let open = state.take_consent_open_request();
                 let fda = state.take_fda_page_opened();
+                if let Some(dialog) = state.take_consent_pane_dialog() {
+                    pane_dialogs.push(dialog);
+                    took = true;
+                }
                 opened |= open;
                 fda_page_up |= fda;
                 took |= open || fda;
@@ -608,6 +613,9 @@ impl App {
                 }
                 took
             });
+        }
+        for dialog in pane_dialogs {
+            self.adopt_access_dialog(Some(dialog), std::time::Instant::now());
         }
         #[cfg(target_os = "macos")]
         self.apply_askpass_off_requests(askpass_requests, crate::askpass::set_relay_off);
@@ -668,6 +676,19 @@ impl App {
             }
             self.note_devtools_outcome_on(&devtools_by, outcome, None);
         }
+    }
+
+    /// Transfer the already-open pane's guard before dispatch returns. A
+    /// queued close may dispose of this view before the ordinary posture pass.
+    /// The notification and every other Settings gesture still drain there.
+    pub(crate) fn take_settings_pane_dialog(&mut self, view: crate::tab_model::ViewId) {
+        let dialog = match self.native_runtime.view_state_mut(view) {
+            Some(crate::native_app::AppViewState::Settings(state)) => {
+                state.take_consent_pane_dialog()
+            }
+            _ => None,
+        };
+        self.adopt_access_dialog(dialog, std::time::Instant::now());
     }
 
     /// What the Developer Tools hand-over came to, on the bar of each Settings view

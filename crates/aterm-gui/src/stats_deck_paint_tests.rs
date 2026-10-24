@@ -662,6 +662,7 @@ fn sweep_widths() -> impl Iterator<Item = f64> {
 }
 
 struct Swept<'a> {
+    sc: Scene,
     face: &'static str,
     m: &'a FaceMetrics,
     s: f64,
@@ -670,7 +671,52 @@ struct Swept<'a> {
     laid: Laid,
 }
 
-fn sweep(scenes: &[Scene], check: impl Fn(&Swept<'_>) -> Vec<String> + Sync) -> Vec<String> {
+/// What a check of the T-G4 sweep reads in a layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Check {
+    /// T-G4: no text overlaps or leaves the card.
+    Whole,
+    /// T-G14: the key's "over max" and time label.
+    Key,
+    /// T-G9: the cells a width draws.
+    Cells,
+}
+
+/// What each check found over the T-G4 sweep: one pass lays every scene out at every width, and
+/// each test reads its own check's findings (the key and the cells on the worst scene only).
+fn swept(check: Check) -> Vec<&'static str> {
+    static FOUND: std::sync::OnceLock<Vec<(Check, String)>> = std::sync::OnceLock::new();
+    let scenes = [
+        Scene::Worst,
+        Scene::Calm,
+        Scene::Trouble,
+        Scene::FirstRun,
+        Scene::HarnessOff,
+    ];
+    FOUND
+        .get_or_init(|| {
+            sweep(&scenes, |d| {
+                let worst = d.sc == Scene::Worst;
+                let tagged = |check, found: Vec<String>| found.into_iter().map(move |w| (check, w));
+                tagged(Check::Whole, whole(d))
+                    .chain(tagged(Check::Key, if worst { key(d) } else { Vec::new() }))
+                    .chain(tagged(
+                        Check::Cells,
+                        if worst { cells(d) } else { Vec::new() },
+                    ))
+                    .collect()
+            })
+        })
+        .iter()
+        .filter(|(c, _)| *c == check)
+        .map(|(_, why)| why.as_str())
+        .collect()
+}
+
+fn sweep(
+    scenes: &[Scene],
+    check: impl Fn(&Swept<'_>) -> Vec<(Check, String)> + Sync,
+) -> Vec<(Check, String)> {
     let snaps: Vec<(Scene, Snapshot)> = scenes.iter().map(|&sc| (sc, scene(sc))).collect();
     let faces = [
         ("Helvetica Neue", FaceMetrics::helvetica_neue()),
@@ -688,39 +734,45 @@ fn sweep(scenes: &[Scene], check: impl Fn(&Swept<'_>) -> Vec<String> + Sync) -> 
     }
     let check = &check;
     std::thread::scope(|scope| {
-        let running: Vec<_> =
-            jobs.into_iter()
-                .map(|(sc, snap, face, m, s, form)| {
-                    scope.spawn(move || {
-                        let input = scene_input(snap, form);
-                        let words = DeckWords::new(&input, m);
-                        let mut failed = Vec::new();
-                        for w in sweep_widths() {
-                            let laid = lay(&geom(w, s, form), &input, &words, m, false);
-                            let swept = Swept {
-                                face,
-                                m,
-                                s,
-                                form,
-                                w,
-                                laid,
-                            };
-                            failed.extend(check(&swept).into_iter().map(|why| {
-                                format!("{sc:?}, {face}, {s}×, {form:?}, {w} pt: {why}")
-                            }));
-                            if failed.len() > 20 {
-                                break;
+        let running: Vec<_> = jobs
+            .into_iter()
+            .map(|(sc, snap, face, m, s, form)| {
+                scope.spawn(move || {
+                    let input = scene_input(snap, form);
+                    let words = DeckWords::new(&input, m);
+                    let mut failed: Vec<(Check, String)> = Vec::new();
+                    for w in sweep_widths() {
+                        let laid = lay(&geom(w, s, form), &input, &words, m, false);
+                        let swept = Swept {
+                            sc,
+                            face,
+                            m,
+                            s,
+                            form,
+                            w,
+                            laid,
+                        };
+                        for (c, why) in check(&swept) {
+                            if failed.iter().filter(|(f, _)| *f == c).count() <= 20 {
+                                failed.push((
+                                    c,
+                                    format!("{sc:?}, {face}, {s}×, {form:?}, {w} pt: {why}"),
+                                ));
                             }
                         }
-                        failed
-                    })
+                    }
+                    failed
                 })
-                .collect();
+            })
+            .collect();
         running
             .into_iter()
             .flat_map(|run| {
-                run.join()
-                    .unwrap_or_else(|_| vec!["a sweep panicked".into()])
+                run.join().unwrap_or_else(|_| {
+                    [Check::Whole, Check::Key, Check::Cells]
+                        .map(|c| (c, "a sweep panicked".to_string()))
+                        .into()
+                })
             })
             .collect()
     })
@@ -730,101 +782,106 @@ fn overlap(a: &[f64; 4], b: &[f64; 4]) -> bool {
     a[0] < b[2] - EPS && b[0] < a[2] - EPS && a[1] < b[3] - EPS && b[1] < a[3] - EPS
 }
 
+fn whole(d: &Swept<'_>) -> Vec<String> {
+    let (w, h) = (d.w, deck_pt(d.form, d.s));
+    let mut why = Vec::new();
+    let boxes = &d.laid.boxes;
+    let names = DECK_RESOURCES
+        .iter()
+        .filter(|&&r| boxes.iter().any(|b| b.text == words::resource_name(r)))
+        .count();
+    if d.laid.head.is_some() && names < DECK_RESOURCES.len() {
+        why.push(format!("CONTROL: {names} rows named"));
+    }
+    for b in boxes {
+        if b.r[0] < -EPS || b.r[1] < -EPS || b.r[2] > w + EPS || b.r[3] > h + EPS {
+            why.push(format!(
+                "{:?} {:?} {:?} leaves the card",
+                b.kind, b.text, b.r
+            ));
+        }
+        if let Some((x0, x1)) = b.room
+            && (b.r[0] < x0 - EPS || b.r[2] > x1 + EPS)
+        {
+            why.push(format!(
+                "{:?} {:?} leaves its column {x0}..{x1}",
+                b.text, b.r
+            ));
+        }
+    }
+    let mut by_x: Vec<&Boxed> = boxes.iter().collect();
+    by_x.sort_by(|a, b| a.r[0].total_cmp(&b.r[0]));
+    for (i, a) in by_x.iter().enumerate() {
+        for b in by_x.iter().skip(i + 1) {
+            if b.r[0] >= a.r[2] - EPS {
+                break;
+            }
+            let tick = matches!(
+                (a.kind, b.kind),
+                (BoxKind::Bar, BoxKind::Tick) | (BoxKind::Tick, BoxKind::Bar)
+            );
+            if !tick && overlap(&a.r, &b.r) {
+                why.push(format!(
+                    "{:?} {:?} {:?} meets {:?} {:?} {:?}",
+                    a.kind, a.text, a.r, b.kind, b.text, b.r
+                ));
+            }
+        }
+    }
+    why
+}
+
 #[test]
 fn no_text_overlaps_and_none_leaves_the_card() {
-    let scenes = [
-        Scene::Worst,
-        Scene::Calm,
-        Scene::Trouble,
-        Scene::FirstRun,
-        Scene::HarnessOff,
-    ];
-    let failed = sweep(&scenes, |d| {
-        let (w, h) = (d.w, deck_pt(d.form, d.s));
-        let mut why = Vec::new();
-        let boxes = &d.laid.boxes;
-        let names = DECK_RESOURCES
-            .iter()
-            .filter(|&&r| boxes.iter().any(|b| b.text == words::resource_name(r)))
-            .count();
-        if d.laid.head.is_some() && names < DECK_RESOURCES.len() {
-            why.push(format!("CONTROL: {names} rows named"));
-        }
-        for b in boxes {
-            if b.r[0] < -EPS || b.r[1] < -EPS || b.r[2] > w + EPS || b.r[3] > h + EPS {
-                why.push(format!(
-                    "{:?} {:?} {:?} leaves the card",
-                    b.kind, b.text, b.r
-                ));
-            }
-            if let Some((x0, x1)) = b.room
-                && (b.r[0] < x0 - EPS || b.r[2] > x1 + EPS)
-            {
-                why.push(format!(
-                    "{:?} {:?} leaves its column {x0}..{x1}",
-                    b.text, b.r
-                ));
-            }
-        }
-        let mut by_x: Vec<&Boxed> = boxes.iter().collect();
-        by_x.sort_by(|a, b| a.r[0].total_cmp(&b.r[0]));
-        for (i, a) in by_x.iter().enumerate() {
-            for b in by_x.iter().skip(i + 1) {
-                if b.r[0] >= a.r[2] - EPS {
-                    break;
-                }
-                let tick = matches!(
-                    (a.kind, b.kind),
-                    (BoxKind::Bar, BoxKind::Tick) | (BoxKind::Tick, BoxKind::Bar)
-                );
-                if !tick && overlap(&a.r, &b.r) {
-                    why.push(format!(
-                        "{:?} {:?} {:?} meets {:?} {:?} {:?}",
-                        a.kind, a.text, a.r, b.kind, b.text, b.r
-                    ));
-                }
-            }
-        }
-        why
-    });
+    let failed = swept(Check::Whole);
     assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+fn key(d: &Swept<'_>) -> Vec<String> {
+    let mut why = Vec::new();
+    let Some(head) = d.laid.head.as_ref() else {
+        return why;
+    };
+    let over_w = KeyItem::Over.width(d.m);
+    let fits = head.key.spans.iter().any(|s| s.x1 - s.x0 >= over_w - EPS);
+    let drawn = |text: &str| {
+        d.laid
+            .boxes
+            .iter()
+            .filter(|b| b.kind == BoxKind::Text && b.text == text)
+            .count()
+    };
+    if fits && drawn("over max") == 0 {
+        why.push("a span fits \"over max\" and it is not drawn".into());
+    }
+    let both_states = head
+        .labels
+        .iter()
+        .filter(|l| l.label == Label::State)
+        .count()
+        == 2;
+    if !fits && !both_states {
+        why.push(format!("no span fits \"over max\": {:?}", head.key.spans));
+    }
+    if d.form == DeckForm::Folded && drawn("10 min ago") != 1 {
+        why.push(format!("the time label {} times", drawn("10 min ago")));
+    }
+    let _ = (d.face, d.s);
+    why
 }
 
 #[test]
 fn key_is_placed() {
-    let failed = sweep(&[Scene::Worst], |d| {
-        let mut why = Vec::new();
-        let Some(head) = d.laid.head.as_ref() else {
-            return why;
-        };
-        let over_w = KeyItem::Over.width(d.m);
-        let fits = head.key.spans.iter().any(|s| s.x1 - s.x0 >= over_w - EPS);
-        let drawn = |text: &str| {
-            d.laid
-                .boxes
-                .iter()
-                .filter(|b| b.kind == BoxKind::Text && b.text == text)
-                .count()
-        };
-        if fits && drawn("over max") == 0 {
-            why.push("a span fits \"over max\" and it is not drawn".into());
-        }
-        let both_states = head
-            .labels
-            .iter()
-            .filter(|l| l.label == Label::State)
-            .count()
-            == 2;
-        if !fits && !both_states {
-            why.push(format!("no span fits \"over max\": {:?}", head.key.spans));
-        }
-        if d.form == DeckForm::Folded && drawn("10 min ago") != 1 {
-            why.push(format!("the time label {} times", drawn("10 min ago")));
-        }
-        let _ = (d.face, d.s);
-        why
-    });
+    let failed = swept(Check::Key);
     assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+fn cells(d: &Swept<'_>) -> Vec<String> {
+    if d.laid.cells > 420 {
+        vec![format!("{} cells", d.laid.cells)]
+    } else {
+        Vec::new()
+    }
 }
 
 #[test]
@@ -839,13 +896,7 @@ fn work_counts_deck() {
         );
         assert!(laid.prims.len() > 400, "CONTROL: {form:?} drew the table");
     }
-    let failed = sweep(&[Scene::Worst], |d| {
-        if d.laid.cells > 420 {
-            vec![format!("{} cells", d.laid.cells)]
-        } else {
-            Vec::new()
-        }
-    });
+    let failed = swept(Check::Cells);
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 

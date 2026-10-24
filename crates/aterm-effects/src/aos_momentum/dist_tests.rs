@@ -79,6 +79,32 @@ fn grid_claims() -> &'static [Claim] {
     })
 }
 
+/// The grid's local selection, run once as `select` runs it (serially) for the tests that compare
+/// a distributed or spread one with it.
+fn local_grid() -> &'static Selection {
+    static L: OnceLock<Selection> = OnceLock::new();
+    L.get_or_init(|| {
+        evaluator()
+            .select(&mut GridProposer::new())
+            .expect("a winner")
+    })
+}
+
+/// `plan`'s honest claim, for a plan of [`six`]: each judged once on the shared evaluator's
+/// threads.
+fn six_claim(plan: SchedulePlan) -> Claim {
+    static C: OnceLock<Vec<(SchedulePlan, Claim)>> = OnceLock::new();
+    let claims = C.get_or_init(|| {
+        let ev = evaluator();
+        crate::test_pool::par_map(&six(), |&p| (p, honest(ev, p)))
+    });
+    let (_, claim) = claims
+        .iter()
+        .find(|(p, _)| *p == plan)
+        .expect("a plan of six");
+    claim.clone()
+}
+
 /// The six-line plans file of the process tests: three admitted, three refused.
 fn six() -> Vec<SchedulePlan> {
     vec![
@@ -168,27 +194,22 @@ fn orders(n: usize) -> Vec<Vec<usize>> {
 #[test]
 fn honest_claims_in_any_completion_order_give_the_local_selection() {
     let ev = evaluator();
-    let claims = grid_claims();
     let plans = grid_plans();
-    let by_plan = |p: SchedulePlan| {
-        let at = plans.iter().position(|q| *q == p).expect("a grid plan");
-        claims.get(at).expect("a claim").clone()
-    };
-    let local = ev.select(&mut GridProposer::new()).expect("a winner");
-    let local_bundle = ev
-        .held_out(ev.select(&mut GridProposer::new()).expect("a winner"))
-        .expect("useful");
+    let local = local_grid();
+    let local_bundle = ev.held_out(local.clone()).expect("useful");
     for (i, order) in orders(plans.len()).iter().enumerate() {
         let check = if i % 2 == 0 {
             CheckLevel::Dominance
         } else {
             CheckLevel::All
         };
+        // The order is the law here; that a spread judges as serial does is
+        // `select_spread_equals_select`'s and `finish_with_a_skipping_spread_equals_serial`'s.
         let mut g = GridProposer::new();
-        let s = distribute(ev, &mut g, check, &by_plan, order)
-            .finish(&Serial)
+        let s = distribute(ev, &mut g, check, &grid_claim, order)
+            .finish(&Threads)
             .expect("a winner");
-        same_selection(&s, &local);
+        same_selection(&s, local);
         let mut parts = ev.held_out(s).expect("useful").bundle().parts().clone();
         let want = match check {
             CheckLevel::Dominance => Mode::Distributed,
@@ -201,10 +222,9 @@ fn honest_claims_in_any_completion_order_give_the_local_selection() {
     let text = plans_text(&six());
     let mut file = FileProposer::from_text(&text);
     let local = ev.select(&mut file).expect("a winner");
-    let honest_of = |p: SchedulePlan| honest(ev, p);
     for order in orders(6) {
         let mut file = FileProposer::from_text(&text);
-        let s = distribute(ev, &mut file, CheckLevel::Dominance, &honest_of, &order)
+        let s = distribute(ev, &mut file, CheckLevel::Dominance, &six_claim, &order)
             .finish(&Threads)
             .expect("a winner");
         same_selection(&s, &local);
@@ -214,31 +234,56 @@ fn honest_claims_in_any_completion_order_give_the_local_selection() {
     assert_eq!(local.stats().duplicates, 1);
 }
 
-/// The fold is the same whatever the spread runs: serial, threads, or a spread that skips jobs.
-/// Under `CheckLevel::All` every claim made on the test pool's threads is compared row by row
-/// with a serial judgment, so every distinct candidate's rows are compared.
+/// The fold is the same whatever the spread runs: threads, or a spread that skips jobs, as the
+/// serial one `select` runs. Under `CheckLevel::All` every claim made on the test pool's threads
+/// is compared row by row with a serial judgment, so every distinct candidate's rows are compared.
 #[test]
 fn select_spread_equals_select() {
     let ev = evaluator();
-    let local = ev.select(&mut GridProposer::new()).expect("a winner");
-    for spread in [&Serial as &dyn Spread, &Threads, &Evens] {
+    let local = local_grid();
+    for spread in [&Threads as &dyn Spread, &Evens] {
         let s = ev
             .select_spread(&mut GridProposer::new(), spread)
             .expect("a winner");
-        same_selection(&s, &local);
+        same_selection(&s, local);
     }
-    let plans = grid_plans();
-    let claims = grid_claims();
-    let by_plan = |p: SchedulePlan| {
-        let at = plans.iter().position(|q| *q == p).expect("a grid plan");
-        claims.get(at).expect("a claim").clone()
+    let (serial, _) = serial_finish(CheckLevel::All);
+    same_selection(serial, local);
+}
+
+/// The grid's honest claims, in slot order, finished serially at `check`, with the (slot, training
+/// ordinal) pairs the finish judged itself: run once a level. At `CheckLevel::All` every claim,
+/// made on the test pool's threads, is compared row by row with its serial judgment.
+fn serial_finish(check: CheckLevel) -> &'static (Selection, Vec<(u32, usize)>) {
+    static DOMINANCE: OnceLock<(Selection, Vec<(u32, usize)>)> = OnceLock::new();
+    static ALL: OnceLock<(Selection, Vec<(u32, usize)>)> = OnceLock::new();
+    let cell = match check {
+        CheckLevel::Dominance => &DOMINANCE,
+        CheckLevel::All => &ALL,
     };
-    let all: Vec<usize> = (0..plans.len()).collect();
-    let mut g = GridProposer::new();
-    let s = distribute(ev, &mut g, CheckLevel::All, &by_plan, &all)
-        .finish(&Serial)
-        .expect("every threaded row equals its serial judgment");
-    same_selection(&s, &local);
+    cell.get_or_init(|| {
+        let mut g = GridProposer::new();
+        let (s, judged) = distribute(evaluator(), &mut g, check, &grid_claim, &grid_slots())
+            .finish_noting(&Serial);
+        (
+            s.expect("every threaded row equals its serial judgment"),
+            judged,
+        )
+    })
+}
+
+/// `plan`'s honest claim, for a plan of the grid ([`grid_claims`]).
+fn grid_claim(plan: SchedulePlan) -> Claim {
+    let at = grid_plans()
+        .iter()
+        .position(|q| *q == plan)
+        .expect("a grid plan");
+    grid_claims().get(at).expect("a claim").clone()
+}
+
+/// Every grid job's index, in slot order.
+fn grid_slots() -> Vec<usize> {
+    (0..grid_plans().len()).collect()
 }
 
 /// `finish` with a spread that skips jobs runs the rest in place: the same selection and the
@@ -246,23 +291,14 @@ fn select_spread_equals_select() {
 #[test]
 fn finish_with_a_skipping_spread_equals_serial() {
     let ev = evaluator();
-    let plans = grid_plans();
-    let claims = grid_claims();
-    let by_plan = |p: SchedulePlan| {
-        let at = plans.iter().position(|q| *q == p).expect("a grid plan");
-        claims.get(at).expect("a claim").clone()
-    };
-    let all: Vec<usize> = (0..plans.len()).collect();
     for check in [CheckLevel::Dominance, CheckLevel::All] {
-        let mut g = GridProposer::new();
-        let (serial, judged_serial) =
-            distribute(ev, &mut g, check, &by_plan, &all).finish_noting(&Serial);
+        let (serial, judged_serial) = serial_finish(check);
         let mut g = GridProposer::new();
         let (skipped, judged_skipped) =
-            distribute(ev, &mut g, check, &by_plan, &all).finish_noting(&Evens);
-        same_selection(&serial.expect("a winner"), &skipped.expect("a winner"));
+            distribute(ev, &mut g, check, &grid_claim, &grid_slots()).finish_noting(&Evens);
+        same_selection(serial, &skipped.expect("a winner"));
         let set = |v: &[(u32, usize)]| v.iter().copied().collect::<BTreeSet<_>>();
-        assert_eq!(set(&judged_serial), set(&judged_skipped), "{check:?}");
+        assert_eq!(set(judged_serial), set(&judged_skipped), "{check:?}");
     }
 }
 
@@ -294,13 +330,12 @@ fn completion_order_never_reaches_the_proposer() {
         shown: Vec::new(),
     };
     ev.select(&mut local).expect("a winner");
-    let honest_of = |p: SchedulePlan| honest(ev, p);
     for order in orders(6) {
         let mut spy = Shown {
             inner: FileProposer::from_text(&text),
             shown: Vec::new(),
         };
-        distribute(ev, &mut spy, CheckLevel::Dominance, &honest_of, &order)
+        distribute(ev, &mut spy, CheckLevel::Dominance, &six_claim, &order)
             .finish(&Serial)
             .expect("a winner");
         assert_eq!(spy.shown, local.shown);
@@ -465,14 +500,15 @@ fn a_dominated_claim_stops_at_the_winners_sum() {
     let ev = fresh();
     let plans = grid_plans();
     let claims = grid_claims();
-    let by_plan = |p: SchedulePlan| {
-        let at = plans.iter().position(|q| *q == p).expect("a grid plan");
-        claims.get(at).expect("a claim").clone()
-    };
-    let all: Vec<usize> = (0..plans.len()).collect();
     let mut g = GridProposer::new();
-    let (got, judged) =
-        distribute(&ev, &mut g, CheckLevel::Dominance, &by_plan, &all).finish_noting(&Threads);
+    let (got, judged) = distribute(
+        &ev,
+        &mut g,
+        CheckLevel::Dominance,
+        &grid_claim,
+        &grid_slots(),
+    )
+    .finish_noting(&Threads);
     let s = got.expect("a winner");
     assert_eq!(s.plan(), gap0());
     let judged: BTreeSet<(u32, usize)> = judged.into_iter().collect();
@@ -498,16 +534,10 @@ fn a_dominated_claim_stops_at_the_winners_sum() {
 #[test]
 fn check_all_judges_every_admitted_claim_and_records_search() {
     let ev = fresh();
-    let plans = grid_plans();
     let claims = grid_claims();
-    let by_plan = |p: SchedulePlan| {
-        let at = plans.iter().position(|q| *q == p).expect("a grid plan");
-        claims.get(at).expect("a claim").clone()
-    };
-    let all: Vec<usize> = (0..plans.len()).collect();
     let mut g = GridProposer::new();
-    let (got, judged) =
-        distribute(&ev, &mut g, CheckLevel::All, &by_plan, &all).finish_noting(&Threads);
+    let (got, judged) = distribute(&ev, &mut g, CheckLevel::All, &grid_claim, &grid_slots())
+        .finish_noting(&Threads);
     let s = got.expect("a winner");
     let want: usize = claims.iter().map(Claim::len).sum();
     assert_eq!(judged.len(), want);
@@ -530,17 +560,16 @@ fn check_all_judges_every_admitted_claim_and_records_search() {
 #[test]
 fn claims_never_fill_the_grid_cache() {
     let ev = fresh();
-    let plans = grid_plans();
-    let claims = grid_claims();
-    let by_plan = |p: SchedulePlan| {
-        let at = plans.iter().position(|q| *q == p).expect("a grid plan");
-        claims.get(at).expect("a claim").clone()
-    };
-    let all: Vec<usize> = (0..plans.len()).collect();
     let mut g = GridProposer::new();
-    distribute(&ev, &mut g, CheckLevel::Dominance, &by_plan, &all)
-        .finish(&Threads)
-        .expect("a winner");
+    distribute(
+        &ev,
+        &mut g,
+        CheckLevel::Dominance,
+        &grid_claim,
+        &grid_slots(),
+    )
+    .finish(&Threads)
+    .expect("a winner");
     let before = n(&ev.reads().train);
     ev.grid_selection().expect("the grid's selection");
     assert!(
@@ -555,17 +584,16 @@ fn claims_never_fill_the_grid_cache() {
 #[test]
 fn a_distributed_bundle_is_checked_and_declared() {
     let ev = evaluator();
-    let plans = grid_plans();
-    let claims = grid_claims();
-    let by_plan = |p: SchedulePlan| {
-        let at = plans.iter().position(|q| *q == p).expect("a grid plan");
-        claims.get(at).expect("a claim").clone()
-    };
-    let all: Vec<usize> = (0..plans.len()).collect();
     let mut g = GridProposer::new();
-    let s = distribute(ev, &mut g, CheckLevel::Dominance, &by_plan, &all)
-        .finish(&Serial)
-        .expect("a winner");
+    let s = distribute(
+        ev,
+        &mut g,
+        CheckLevel::Dominance,
+        &grid_claim,
+        &grid_slots(),
+    )
+    .finish(&Serial)
+    .expect("a winner");
     let parts = ev.held_out(s).expect("useful").bundle().parts().clone();
     assert_eq!(parts.selection.mode, Mode::Distributed);
     let verify = |p: &super::bundle::UncheckedBundle| CandidateBundle::verify(&p.encode(), ev);

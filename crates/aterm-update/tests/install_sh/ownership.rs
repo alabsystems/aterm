@@ -168,14 +168,17 @@ const READER: &str = "#!/bin/sh\ncat >/dev/null\necho \"not-aterm 1.0\"\n";
 fn staller() -> String {
     format!(
         "#!/bin/sh\necho \"${{STALL_ANSWER:?}}\"\n[ \"$1\" = \"${{STALL_FINISHES:-}}\" ] && exit 0\n\
-         sleep {PARKED_SECS} &\necho \"$$ $!\" >\"${{STALL_PARKED:?}}\"\nwait\n"
+         sleep {PARKED_SECS} &\necho \"$$ $! $PPID\" >\"${{STALL_PARKED:?}}\"\nwait\n"
     )
 }
 
+/// Time passes at once while a bound waits on a parked staller: the run it started, or
+/// the shell that started it (root asks as nobody through one).
 const PARKED_CLOCK: &str = r#"sleep() {
-	local run watched
+	local run parent watched
 	watched="$(set +u; printf %s "$!")"
-	if read -r run _ 2>/dev/null <"$STALL_PARKED" && [[ "$run" == "$watched" ]]; then
+	if read -r run _ parent 2>/dev/null <"$STALL_PARKED" &&
+		[[ "$run" == "$watched" || "$parent" == "$watched" ]]; then
 		SECONDS=$((SECONDS + 3600))
 		echo look >>"$STALL_PARKED.looks"
 		return 0
@@ -418,6 +421,288 @@ fn a_binary_that_never_finishes_is_cut_off_and_answers_nothing() {
             || (!aterm_uds::process::pid_alive(child)).then_some(()),
         );
     }
+}
+
+/// A stand-in that parks without a line, as a first exec held at macOS's check does.
+fn silent_staller() -> String {
+    format!(
+        "#!/bin/sh\nsleep {PARKED_SECS} &\necho \"$$ $! $PPID\" >\"${{STALL_PARKED:?}}\"\nwait\n"
+    )
+}
+
+#[test]
+fn a_program_that_has_not_shown_it_ran_is_left_where_it_is() {
+    let scratch = Scratch::new();
+    let silent = silent_staller();
+    let answers = scratch.stand_in("proof/answers", ATERM);
+    let fails = scratch.stand_in("proof/fails", "#!/bin/sh\nexit 3\n");
+    // As an old bundle's aterm-drive answers `--version`: its error on stderr, exit 1.
+    let quiet = scratch.stand_in("proof/quiet", "#!/bin/sh\necho 'unknown' >&2\nexit 1\n");
+    let killed = scratch.stand_in("proof/killed", "#!/bin/sh\nkill -KILL $$\n");
+    // A Mach-O header for a CPU no Mac runs now (32-bit PowerPC): the kernel refuses its exec.
+    let header: Vec<u8> = [0xfeed_face_u32, 18, 0, 2, 0, 0, 0]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect();
+    let refused = scratch.write("proof/refused", header);
+    crate::support::chmod(&refused, 0o755);
+    // A script whose interpreter is gone: the shell's own exit 126, no run.
+    let unstarted = scratch.stand_in("proof/unstarted", "#!/nonexistent/interpreter\n");
+    // A blank line is a line: it ran, whatever status it ends with, and so is a NUL.
+    let blank = scratch.stand_in("proof/blank", "#!/bin/sh\necho\nexit 126\n");
+    let nuls = scratch.stand_in("proof/nuls", "#!/bin/sh\nprintf '\\0\\0'\nexit 126\n");
+    let blank_then_parked = scratch.stand_in(
+        "proof/blank-parked",
+        &format!(
+            "#!/bin/sh\necho\nsleep {PARKED_SECS} &\necho \"$$ $! $PPID\" >\"${{STALL_PARKED:?}}\"\nwait\n"
+        ),
+    );
+    // A home whose .bashrc prints, which bash reads under sshd's SSH_CLIENT.
+    let home = scratch.mkdir("proof/home");
+    scratch.write("proof/home/.bashrc", "echo bashrc\n");
+    let said_then_parked = scratch.stand_in("proof/said", &staller());
+    let stalls = scratch.stand_in("proof/stalls", &silent);
+    let missing = scratch.join("proof/missing");
+    let inert = scratch.write("proof/inert", "#!/bin/sh\nexit 0\n");
+    let toolset = scratch.mkdir("proof/toolset/aterm.app");
+    let siblings = toolset.join("Contents/MacOS");
+    scratch.stand_in("proof/toolset/aterm.app/Contents/MacOS/aterm", ATERM);
+    scratch.stand_in("proof/toolset/aterm.app/Contents/MacOS/aterm-cli", ATERM);
+    scratch.stand_in("proof/toolset/aterm.app/Contents/MacOS/atpkg", &silent);
+    let whole = scratch.mkdir("proof/whole/aterm.app");
+    scratch.stand_in("proof/whole/aterm.app/Contents/MacOS/aterm", ATERM);
+    symlink(&stalls, &whole.join("Contents/MacOS/atpkg"));
+    let dest = scratch.mkdir("proof/dest");
+    let held = scratch.stand_in("proof/dest/aterm.app/Contents/MacOS/aterm", &silent);
+    let staged = scratch.mkdir("proof/dest/aterm.app.installing.x");
+    scratch.mkdir("proof/store");
+    let placed = scratch.stand_in("proof/store/aterm", &silent);
+    let link = scratch.join("proof/store/aterm-ctl");
+    symlink(&stalls, &link);
+    let parked = |name: &str| scratch.join(&format!("proof/{name}.parked"));
+    let root = |stand_in: &str| {
+        format!(
+            "installer_uid() {{ echo 0; }}; may_run() {{ return 1; }}; \
+             run_as_user() {{ echo \"$1\" >>\"$TMPDIR/as\"; shift; {stand_in}; }}"
+        )
+    };
+    let mut lib = Lib::new();
+    lib.step(PARKED_CLOCK);
+    lib.step(format!(
+        "export STALL_PARKED={} STALL_ANSWER=x STALL_FINISHES=",
+        q(s(&parked("none")))
+    ));
+    let stalled = |lib: &mut Lib, name: &str, call: String| {
+        lib.step(format!("export STALL_PARKED={}", q(s(&parked(name)))));
+        lib.call(call, &["UNPROVEN"])
+    };
+    let mut proven: Vec<usize> = [
+        &answers, &fails, &killed, &missing, &inert, &refused, &blank,
+    ]
+    .into_iter()
+    .map(|exe| lib.call(format!("showed_it_ran {}", q(s(exe))), &[]))
+    .collect();
+    proven.push(stalled(
+        &mut lib,
+        "said",
+        format!("showed_it_ran {}", q(s(&said_then_parked))),
+    ));
+    for exe in [&answers, &quiet, &refused, &blank, &nuls] {
+        proven.push(lib.call(
+            format!("( {}; showed_it_ran {} )", root("exec \"$@\""), q(s(exe))),
+            &[],
+        ));
+    }
+    proven.push(lib.call(format!("bundle_showed_it_ran {}", q(s(&whole))), &[]));
+    for path in [&whole, &answers, &missing, &link] {
+        proven.push(lib.call(format!("may_replace {}", q(s(path))), &[]));
+    }
+    let cut_off = stalled(
+        &mut lib,
+        "stalls",
+        format!("showed_it_ran {}", q(s(&stalls))),
+    );
+    let interrupted = lib.call(
+        format!(
+            "( bounded() {{ return 130; }}; showed_it_ran {}; rc=$?; printf %s \"$UNPROVEN\"; \
+             exit $rc )",
+            q(s(&answers))
+        ),
+        &[],
+    );
+    let sudo_refused = lib.call(
+        format!("( {}; showed_it_ran {} )", root("return 1"), q(s(&answers))),
+        &[],
+    );
+    let unasked = lib.call(
+        format!("( {}; may_replace {} )", root("return 1"), q(s(&answers))),
+        &[],
+    );
+    let as_nobody_cut_off = stalled(
+        &mut lib,
+        "nobody",
+        format!(
+            "( {}; showed_it_ran {} )",
+            root("exec \"$@\""),
+            q(s(&stalls))
+        ),
+    );
+    let said = |stand_in: Option<&str>| {
+        format!(
+            "( {}showed_it_ran {}; rc=$?; printf '%s\\n%s' \"$UNPROVEN\" \"$UNPROVEN_THEN\"; \
+             exit $rc )",
+            stand_in.map_or(String::new(), |s| root(s) + "; "),
+            q(s(&unstarted))
+        )
+    };
+    let not_started = lib.call(said(None), &[]);
+    let not_started_as_nobody = lib.call(said(Some("exec \"$@\"")), &[]);
+    proven.push(stalled(
+        &mut lib,
+        "blank",
+        format!(
+            "( {}; showed_it_ran {} )",
+            root("exec \"$@\""),
+            q(s(&blank_then_parked))
+        ),
+    ));
+    let sshd_rc = lib.call(
+        format!(
+            "( export HOME={} SSH_CLIENT='10.0.0.2 50000 22'; unset SHLVL; {}; showed_it_ran {} )",
+            q(s(&home)),
+            root("exec \"$@\""),
+            q(s(&unstarted))
+        ),
+        &[],
+    );
+    let asked_as = lib.call("cat \"$TMPDIR/as\"", &[]);
+    let sibling = stalled(
+        &mut lib,
+        "toolset",
+        format!("bundle_showed_it_ran {}", q(s(&toolset))),
+    );
+    let early = stalled(
+        &mut lib,
+        "dest",
+        format!("may_replace {}/aterm.app", q(s(&dest))),
+    );
+    let swap = stalled(
+        &mut lib,
+        "swap",
+        format!(
+            "( STAGE={}; swap_staged_bundle {} )",
+            q(s(&staged)),
+            q(s(&dest))
+        ),
+    );
+    let replace = stalled(
+        &mut lib,
+        "store",
+        format!(
+            "( STORE_DIR={}; place_store_binary {} )",
+            q(s(placed.parent().unwrap())),
+            q(s(&answers))
+        ),
+    );
+    let recs = lib.run(&scratch);
+    for i in &proven {
+        assert_eq!(
+            recs[*i].rc, 0,
+            "a run that ended or wrote a line, or no program: {}",
+            recs[*i].err
+        );
+    }
+    for i in [
+        cut_off,
+        interrupted,
+        sudo_refused,
+        unasked,
+        as_nobody_cut_off,
+        sibling,
+        not_started,
+        not_started_as_nobody,
+        sshd_rc,
+    ] {
+        assert_eq!(recs[i].rc, 1, "no proof: {}", recs[i].err);
+    }
+    assert_eq!(
+        recs[cut_off].var("UNPROVEN"),
+        format!("{} did not answer within 60s", s(&stalls))
+    );
+    assert_eq!(
+        recs[interrupted].out,
+        format!("{} was interrupted before it answered", s(&answers))
+    );
+    assert_eq!(
+        recs[sibling].var("UNPROVEN"),
+        format!("{} did not answer within 60s", s(&siblings.join("atpkg"))),
+        "a toolset's aterm-cli starts atpkg"
+    );
+    assert_eq!(
+        recs[asked_as].out,
+        "nobody\n".repeat(11).trim_end(),
+        "root asks a program it may not run only as nobody"
+    );
+    let u = s(&unstarted);
+    // bash 3.2 (macOS's /bin/bash) ends a missing interpreter's exec with 126,
+    // bash 5.1 and later (Homebrew's, Linux's) with 127.
+    let not_run = |why: &str, by: &str| {
+        let said = |rc| format!("{u} may not have started{by} (exit {rc}, saying `");
+        (why.starts_with(&said(126)) && why.contains("bad interpreter"))
+            || (why.starts_with(&said(127)) && why.contains("required file not found"))
+    };
+    let (why, then) = recs[not_started].out.split_once('\n').unwrap();
+    assert!(
+        not_run(why, ""),
+        "the shell's own failure to exec is no run: {why}"
+    );
+    assert_eq!(
+        then,
+        "after a restart, when macOS is checking nothing, remove it yourself and run this again"
+    );
+    let (why, then) = recs[not_started_as_nobody].out.split_once('\n').unwrap();
+    assert!(not_run(why, " as nobody"), "{why}");
+    assert_eq!(
+        then,
+        "run install.sh without sudo, as the account whose aterm it is, which asks it itself"
+    );
+    assert!(
+        recs[unasked].err.contains(&format!(
+            "{} was left as it is: {} could not be run as nobody to ask it, so macOS",
+            s(&answers),
+            s(&answers)
+        )) && recs[unasked].err.contains(
+            "run install.sh without sudo, as the account whose aterm it is, which asks it itself"
+        ),
+        "a probe that could not ask says what helps: {}",
+        recs[unasked].err
+    );
+    for (i, path, program) in [
+        (
+            early,
+            s(&dest).to_string() + "/aterm.app",
+            s(&held).to_string(),
+        ),
+        (
+            swap,
+            s(&dest).to_string() + "/aterm.app",
+            s(&held).to_string(),
+        ),
+        (replace, s(&placed).to_string(), s(&placed).to_string()),
+    ] {
+        assert_eq!(recs[i].rc, 1, "{path}: {}", recs[i].err);
+        assert!(
+            recs[i].err.contains(&format!(
+                "{path} was left as it is: {program} did not answer within 60s, so macOS"
+            )) && recs[i]
+                .err
+                .contains("run this again in 10 minutes, or after a restart"),
+            "{}",
+            recs[i].err
+        );
+    }
+    assert!(held.is_file() && staged.is_dir(), "the swap moved nothing");
+    assert_eq!(read(&placed), silent, "the store's aterm stays as it is");
 }
 
 #[test]

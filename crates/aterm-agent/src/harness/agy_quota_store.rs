@@ -197,6 +197,7 @@ impl Store {
     /// The state directory or a file in it cannot be written.
     pub fn keep(&self, reading: &Reading) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.dir)?;
+        let _ = std::fs::remove_file(self.failed_path());
         let mut o = Map::new();
         o.insert("schema".to_owned(), Value::from(1u64));
         o.insert("as_of".to_owned(), Value::from(reading.as_of));

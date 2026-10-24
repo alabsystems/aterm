@@ -92,6 +92,8 @@ mod linux_proof;
 #[cfg(target_os = "macos")]
 mod linux_vz;
 #[cfg(target_os = "macos")]
+mod linux_vz_host;
+#[cfg(target_os = "macos")]
 mod linux_xwire;
 #[cfg(target_os = "macos")]
 mod mac;
@@ -139,6 +141,8 @@ mod relaunch_gemini;
 mod relaunch_muse;
 #[cfg(target_os = "macos")]
 mod relay;
+#[cfg(target_os = "macos")]
+mod reroute_prefix;
 #[cfg(target_os = "macos")]
 mod resource_attribution;
 #[cfg(target_os = "macos")]
@@ -234,10 +238,13 @@ usage: targo --unverified lab <command> [tag] [args]
                                  LAB_HARNESS_KEYS='continue = false' LAB_ATERM_TOML LAB_COLS LAB_LINES LAB_SCALE
                                  LAB_PROXY=dead LAB_CLAUDE LAB_CODEX LAB_GEMINI LAB_AGY LAB_MUSE
                                  LAB_ATERM=/physical/path LAB_STATE=/abs/outside/homes
-                                 LAB_INSTANCE_ENV='TMPDIR=/abs ATERM_DEBUG_<NAME>=V ATERM_DEV_<NAME>=V ATERM_OCCUPANCY_NUDGE_S=N')
-  claude [tag] [-e K=V]... [--no-wait] [--relay] [--subscriber] [--debug-log] [-- claude args]
+                                 LAB_INSTANCE_ENV='TMPDIR=/abs ATERM_DEBUG_<NAME>=V ATERM_DEV_<NAME>=V ATERM_OCCUPANCY_NUDGE_S=N'
+                                 LAB_REROUTE=1: the lab's Claude Code store build cloned into the jail's own atpkg
+                                 prefix with its twin and reroute stub, the instance rerouting; `claude --by-name`)
+  claude [tag] [-e K=V]... [--no-wait] [--relay] [--subscriber] [--debug-log] [--by-name] [-- claude args]
                                  launch the managed Claude Code in tab 1 (--relay: behind the PTY relay; --subscriber: a
-                                 fake claude.ai OAuth token, for `limit` headers; --debug-log: a scratch debug log)
+                                 fake claude.ai OAuth token, for `limit` headers; --debug-log: a scratch debug log;
+                                 --by-name: `claude` through PATH, the reroute stub and the twin of a LAB_REROUTE=1 lab)
   codex [tag] [--signed-out|--chatgpt[=PLAN]] [-e K=V]... [--no-wait] [-- codex args]
                                  launch the managed Codex in tab 1 (CODEX_HOME=<scratch>/codex-home, model
                                  $LAB_CODEX_MODEL when set; --chatgpt: a fake ChatGPT auth.json, plan plus by default,
@@ -376,10 +383,12 @@ usage: targo --unverified lab <command> [tag] [args]
 Outside any lab (no jail, no stub):
   instance [--window] [--band app|agent] [--aterm PATH] [--columns N] [--lines N] [--font-px N] [--scale N] [--scene band-icons]
            [--env NAME=VALUE]... [--toml LINE]... [--toml-after LINE]... [--harness-key LINE]... [--home DIR] [--harness]
-           [--pre VERB]... [--image PNG] [--post VERB]... [--pages cold] [--keep] [-- PROGRAM ARGS]
+           [--reroute-prefix DIR] [--pre VERB]... [--image PNG] [--post VERB]... [--pages cold] [--keep] [-- PROGRAM ARGS]
                                  run a private aterm in a scratch HOME/XDG world, print its socket and hold it until
                                  Ctrl-C (--window: a real window; --image PNG: capture one settled frame, run --post, and
-                                 end; --pages cold: run a copy whose pages are evicted, to measure cold page-ins)
+                                 end; --pages cold: run a copy whose pages are evicted, to measure cold page-ins;
+                                 --reroute-prefix DIR: DIR, new, is the HOME, its atpkg prefix holding a clone of the
+                                 managed Claude Code's store build with its twin and reroute stub, and the instance reroutes)
                                  --scene band-icons draws procedural chrome icons beside H (debug/dev-seams build)
   abrew-admission [--json] [--indexes DIR] [--this-machine | --arch A --macos V --xcode V|none --no-clt]
                                  evaluate abrew admission of Homebrew's formula.json and cask.json (fetched from

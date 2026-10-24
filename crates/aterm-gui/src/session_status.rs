@@ -2039,6 +2039,8 @@ impl StatusObserver {
                 Some(aterm_phase::Program::Claude) => aterm_phase::shells_running(&rows),
                 Some(
                     aterm_phase::Program::Codex
+                    | aterm_phase::Program::Grok
+                    | aterm_phase::Program::Kimi
                     | aterm_phase::Program::Agy
                     | aterm_phase::Program::Muse
                     | aterm_phase::Program::Gemini

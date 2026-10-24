@@ -730,15 +730,7 @@ impl PetBrain {
             return None;
         }
         let r = row.round() as usize;
-        let mut seen = false;
-        for c in (first..end).rev() {
-            match world.letter_at(r, c) {
-                Some(true) => return Some(Some(c)),
-                Some(false) => seen = true,
-                None => {}
-            }
-        }
-        seen.then_some(None)
+        world.last_letter_in_span(r, first, end)
     }
 
     /// Exact locomotion occupancy where the map covers the whole footprint.
@@ -757,9 +749,7 @@ impl PetBrain {
             let end = b.ceil() as usize;
             if end > first && end - first <= crate::pet_world::MAX_WORLD_COLS {
                 let r = row.round() as usize;
-                return (first..end).try_fold(false, |occupied, c| {
-                    world.locomotion_ink_at(r, c).map(|ink| occupied || ink)
-                });
+                return world.locomotion_ink_in_span(r, first, end);
             }
         }
         None
@@ -3006,15 +2996,14 @@ fn local_ink(
     let mut bits = [0; 8];
     for r in r0..r1 {
         let dr = r - r0;
-        let typed_span = typed.and_then(|(row, first, end)| (row == r).then_some((first, end)));
-        let mut row_bits = 0u64;
-        for c in c0..c1 {
-            match world.ink_at(r, c) {
-                None => return None,
-                Some(true) if !typed_span.is_some_and(|(first, end)| c >= first && c < end) => {
-                    row_bits |= 1u64 << (c - c0);
-                }
-                Some(_) => {}
+        let mut row_bits = u64::from(world.ink_row_bits(r, c0, c1)?);
+        if let Some((row, first, end)) = typed
+            && row == r
+        {
+            let t0 = first.max(c0);
+            let t1 = end.min(c1);
+            for c in t0..t1 {
+                row_bits &= !(1u64 << (c - c0));
             }
         }
         bits[dr >> 1] |= row_bits << ((dr & 1) << 5);

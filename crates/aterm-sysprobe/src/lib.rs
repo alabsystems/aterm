@@ -60,6 +60,22 @@ pub use machine::{
     withdrawn_cores, workqueue_limits,
 };
 
+/// Whether this Mac's kernel offers the hypervisor Virtualization.framework runs on
+/// (`kern.hv_support` is 1), read by `sysctlbyname` with no framework loaded: the vz lane's
+/// `virtualization` hardware row (`docs/DESIGN-vz-guest-2026-10-23.md` §13). `None` off macOS,
+/// or where the kernel has no such name.
+#[must_use]
+pub fn hv_support() -> Option<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::sysctl_int(c"kern.hv_support").map(|v| v == 1)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 /// A path buffer (`PROC_PIDPATHINFO_MAXSIZE`).
 pub const PATH_CAP: usize = 4096;
 /// Every file read (`/proc`) stops here: 4 KiB.

@@ -492,6 +492,41 @@ fn a_policy_change_retires_the_previous_ai_reading() {
     );
 }
 
+/// `[ai]` turned off, or its policy changed, ends the AI entries withdrawn: no look
+/// read their causes end, so none is filed as fixed. A reporter that read the cause
+/// end (the negative control: a clear) files the same entry fixed.
+#[test]
+fn turning_ai_off_withdraws_its_entries_and_claims_no_fix() {
+    use aterm_messages::{Outcome, Retired};
+    const KEY: &str = "ai.codex.signed-out";
+    let open = |app: &App| app.messages.digest().entries.iter().any(|e| e.key == KEY);
+    let ended = |app: &App| {
+        app.messages
+            .log()
+            .records()
+            .rev()
+            .find(|r| r.key.as_deref() == Some(KEY))
+            .and_then(|r| r.retired().cloned())
+    };
+    let raised = || {
+        let mut app = App::headless_for_test();
+        app.finish_ai_look(0, Ok(reading()));
+        assert!(open(&app), "the preferred signed-out CLI raises its entry");
+        app
+    };
+    for policy in ["[ai]\nenabled = false\n", "[ai.codex]\nuse = false\n"] {
+        let mut app = raised();
+        app.config.ai = crate::app_config::AiPolicy::read(policy);
+        app.ai_config_changed();
+        assert!(!open(&app), "{policy:?}");
+        assert_eq!(ended(&app), Some(Retired::Withdrawn), "{policy:?}");
+    }
+    let mut app = raised();
+    app.except_clear(KEY);
+    assert!(!open(&app));
+    assert_eq!(ended(&app), Some(Retired::Resolved(Outcome::Ok)));
+}
+
 #[test]
 fn a_current_use_refusal_removes_an_old_readings_install_action() {
     let mut old = reading();

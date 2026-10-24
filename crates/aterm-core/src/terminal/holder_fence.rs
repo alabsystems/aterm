@@ -306,7 +306,7 @@ impl HolderFence {
         }
     }
 
-    /// Close `mark`'s open span at `row` (exclusive).
+    /// Close `mark`'s open span at `row` (exclusive): nothing writes it now.
     fn close_open_span(mark: &mut Mark, row: u64, grid: &mut Grid) {
         let Some(open) = mark.spans.iter_mut().find(|s| s.end.is_none()) else {
             return;
@@ -498,6 +498,13 @@ impl HolderFence {
             Self::open_span(mark, top, grid);
             return;
         }
+        Self::open_from(mark, top, grid);
+    }
+
+    /// Every row of `mark`'s from `top` on is its open span's: the open
+    /// start comes up to `top` and a closed span's end down to it (a closed
+    /// span left holding no row goes).
+    fn open_from(mark: &mut Mark, top: u64, grid: &mut Grid) {
         for span in &mark.spans {
             let anchors = grid.anchors_mut();
             match span.end {
@@ -514,6 +521,47 @@ impl HolderFence {
             }
         }
         Self::prune(mark, grid);
+    }
+
+    /// The current drawer erased main-screen rows from absolute row `lo`
+    /// (an erase in line on it, or an erase in display from it or from the
+    /// top): when that reached above its open span's start, the rows
+    /// directly above the start that now show nothing are its (§3.7, the
+    /// erase law). Their old ink is gone, so what shows in them from here on
+    /// is what the drawer draws: Claude Code's inline redraw after a resize
+    /// erases every row from home down and draws its card from the top. The
+    /// rise stops at the first row that still shows anything, so a card
+    /// another writer left above stays out.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "holder_fence",
+            action = "Sweep",
+            project = "aterm_core::terminal::holder_fence_conformance::project"
+        )
+    )]
+    pub fn note_erase(&mut self, lo: u64, grid: &mut Grid) {
+        let Some(index) = self.current.map(usize::from) else {
+            return;
+        };
+        let Some(open) = self.marks[index].spans.iter().find(|s| s.end.is_none()) else {
+            return;
+        };
+        let Some(start) = grid.anchors().row(open.start) else {
+            return;
+        };
+        let base = grid.visible_to_absolute(0);
+        if lo >= start || start <= base || knob(FenceKnob::ErasedRowsStayOut) {
+            return;
+        }
+        self.absorb_lost(grid);
+        let mut top = start;
+        while top > base && !grid.absolute_row_inked(top - 1) {
+            top -= 1;
+        }
+        if top < start {
+            Self::open_from(&mut self.marks[index], top, grid);
+        }
     }
 
     /// The alternate screen was cleared: while a drawer is current, everything on it is its.

@@ -404,7 +404,7 @@ impl CursorGlow {
                     .is_some_and(|text| text.over_text(i32::from(s.row), i32::from(s.col)))
                 {
                     cov_f = 0.0;
-                } else if cfg.dark_theme {
+                } else if cfg.dark_theme && cov_f >= 1.0 {
                     let color = self.comet_color(cfg, pos);
                     let key = (color, pos.to_bits());
                     let lifts = match fire_lift_memo {
@@ -851,6 +851,7 @@ impl CursorGlow {
                 }
                 _ => run,
             };
+            let held_memo = std::cell::Cell::new(None::<(u32, f32)>);
             pass(under, verts, run, true, &|s| {
                 let (dy, reach, alpha, color) = band(s);
                 let alpha = tail.map_or(alpha, |(x0, dir)| {
@@ -859,7 +860,14 @@ impl CursorGlow {
                     alpha * k * k * (3.0 - 2.0 * k)
                 });
                 if wide(s) || after_wide(s) {
-                    let held = light_alpha_keeping(color, fg, bg, LIGHT_WIDE_BED_KEEP);
+                    let held = match held_memo.get() {
+                        Some((c, h)) if c == color => h,
+                        _ => {
+                            let h = light_alpha_keeping(color, fg, bg, LIGHT_WIDE_BED_KEEP);
+                            held_memo.set(Some((color, h)));
+                            h
+                        }
+                    };
                     (dy, reach, alpha.min(held), color)
                 } else {
                     (dy, reach, alpha, color)
@@ -981,9 +989,9 @@ impl CursorGlow {
                         probe.is_some_and(|(probed, chars)| {
                             i32::from(probed) == row_of(&head)
                                 && usize::try_from(col).is_ok_and(|col| {
-                                    chars.get(col).is_some_and(|c| {
-                                        DESCENDER_GLYPHS.contains(*c) || !c.is_ascii()
-                                    })
+                                    chars
+                                        .get(col)
+                                        .is_some_and(|c| is_descender_glyph(*c) || !c.is_ascii())
                                 })
                         })
                     };
@@ -1371,68 +1379,76 @@ impl CursorGlow {
             // three bands with a hot bead line under it (the trail gallery's
             // `context`).
             if air && !crest {
-                let (head_col, head_strength) = (i32::from(burning[0].1), burning[0].2);
-                let back = if burning.len() > 1 && i32::from(burning[1].1) > head_col {
-                    1
-                } else {
-                    -1
-                };
                 let kept_any = tongues.as_slice().iter().any(|tg| tg.kept);
-                let mut kept = DarkTongues::default();
-                for &tg in tongues.as_slice() {
-                    if !tg.kept {
-                        kept.push(tg);
-                    }
-                }
-                let hash01 = |i: i32, salt: u32| {
-                    let h = aterm_render::fire_field::fire_hash(i as u32, salt, 0x7F4A_7C15);
-                    (h >> 8) as f32 / (1u32 << 24) as f32
-                };
-                for col in (cmin - 1)..=(cmax + 1) {
-                    let u = col as f32 + 0.5;
-                    let ahead = (col - head_col) * -back;
-                    let lead = if (1..=2).contains(&ahead) {
-                        Self::FIRE_DARK_AIR_LEAD * head_strength
+                if kept_any {
+                    let (head_col, head_strength) = (i32::from(burning[0].1), burning[0].2);
+                    let back = if burning.len() > 1 && i32::from(burning[1].1) > head_col {
+                        1
                     } else {
-                        0.0
+                        -1
                     };
-                    let heat = flame_heat(burning.iter(), u);
-                    let e = heat.max(lead);
-                    if !kept_any
-                        || e < 0.03
-                        || col < 0
-                        || col >= geom.cols as i32
-                        || !inked_above(col)
-                        || !matches!(self.flame_cell_glyph(&text, row_i, col), FlameGlyph::Blank)
-                    {
-                        continue;
+                    let mut kept = DarkTongues::default();
+                    for &tg in tongues.as_slice() {
+                        if !tg.kept {
+                            kept.push(tg);
+                        }
                     }
-                    // Its heat eased up (a square root), and a gap inside
-                    // the run held to a share of the head's, so a gap a few
-                    // letters back still stands a tongue with its core, not
-                    // an ember (the caret's lead burns its own share); its
-                    // height flickers slowly as a tongue in the air does.
-                    let inside = if (cmin..=cmax).contains(&col) {
-                        Self::FIRE_DARK_GAP_FLOOR * head_strength.sqrt()
-                    } else {
-                        0.0
+                    let hash01 = |i: i32, salt: u32| {
+                        let h = aterm_render::fire_field::fire_hash(i as u32, salt, 0x7F4A_7C15);
+                        (h >> 8) as f32 / (1u32 << 24) as f32
                     };
-                    let e = heat.sqrt().max(lead).max(inside);
-                    let rate =
-                        Self::TONGUE_FLICKER_RATE + Self::TONGUE_FLICKER_SPREAD * hash01(col, 2);
-                    let flick = 0.5
-                        + 0.5
-                            * (std::f32::consts::TAU * (self.flame_phase * rate + hash01(col, 3)))
+                    for col in (cmin - 1)..=(cmax + 1) {
+                        if col < 0
+                            || col >= geom.cols as i32
+                            || !inked_above(col)
+                            || !matches!(
+                                self.flame_cell_glyph(&text, row_i, col),
+                                FlameGlyph::Blank
+                            )
+                        {
+                            continue;
+                        }
+                        let u = col as f32 + 0.5;
+                        let ahead = (col - head_col) * -back;
+                        let lead = if (1..=2).contains(&ahead) {
+                            Self::FIRE_DARK_AIR_LEAD * head_strength
+                        } else {
+                            0.0
+                        };
+                        let heat = flame_heat(burning.iter(), u);
+                        let e = heat.max(lead);
+                        if e < 0.03 {
+                            continue;
+                        }
+                        // Its heat eased up (a square root), and a gap inside
+                        // the run held to a share of the head's, so a gap a few
+                        // letters back still stands a tongue with its core, not
+                        // an ember (the caret's lead burns its own share); its
+                        // height flickers slowly as a tongue in the air does.
+                        let inside = if (cmin..=cmax).contains(&col) {
+                            Self::FIRE_DARK_GAP_FLOOR * head_strength.sqrt()
+                        } else {
+                            0.0
+                        };
+                        let e = heat.sqrt().max(lead).max(inside);
+                        let rate = Self::TONGUE_FLICKER_RATE
+                            + Self::TONGUE_FLICKER_SPREAD * hash01(col, 2);
+                        let flick = 0.5
+                            + 0.5
+                                * (std::f32::consts::TAU
+                                    * (self.flame_phase * rate + hash01(col, 3)))
                                 .sin();
-                    kept.push(DarkTongue {
-                        u,
-                        half: Self::FIRE_DARK_HALF_W * (0.75 + 0.25 * e),
-                        size: e * Self::FIRE_DARK_GAP_TONGUE * (0.80 + 0.20 * flick),
-                        e,
-                        kept: true,
-                    });
+                        kept.push(DarkTongue {
+                            u,
+                            half: Self::FIRE_DARK_HALF_W * (0.75 + 0.25 * e),
+                            size: e * Self::FIRE_DARK_GAP_TONGUE * (0.80 + 0.20 * flick),
+                            e,
+                            kept: true,
+                            lift: 0.0,
+                        });
+                    }
+                    tongues = kept;
                 }
-                tongues = kept;
             }
             // The crest (a row nobody named, or a test's control): a blank
             // cell between the burning letters (a word's gap) carries a
@@ -1440,15 +1456,17 @@ impl CursorGlow {
             if air && crest {
                 for col in cmin..=cmax {
                     let u = col as f32 + 0.5;
-                    let e = flame_heat(burning.iter(), u);
-                    if e < 0.03
-                        || !inked_above(col)
+                    if !inked_above(col)
                         || !matches!(self.flame_cell_glyph(&text, row_i, col), FlameGlyph::Blank)
                         || tongues
                             .as_slice()
                             .iter()
                             .any(|tg| tg.kept && (tg.u - u).abs() < 0.3)
                     {
+                        continue;
+                    }
+                    let e = flame_heat(burning.iter(), u);
+                    if e < 0.03 {
                         continue;
                     }
                     let e = e.sqrt();
@@ -1458,6 +1476,7 @@ impl CursorGlow {
                         size: e * Self::FIRE_DARK_GAP_TONGUE,
                         e,
                         kept: true,
+                        lift: 0.0,
                     });
                 }
             }
@@ -1467,11 +1486,13 @@ impl CursorGlow {
             // side) and whether it keeps to its row. The grid's first row
             // burns its smoothed heat as one field instead.
             let low_top = row_top as f32 + ch * Self::FIRE_DARK_LOW_BAND;
-            let column = |u: f32| -> (f32, f32, bool) {
+            let column = |u: f32| -> (f32, f32, bool, Option<f32>) {
                 if !air {
-                    return (air_rise * flame_heat(on_row(), u), 1.0, false);
+                    let hr = flame_heat(on_row(), u);
+                    return (air_rise * hr, 1.0, false, Some(hr));
                 }
                 let mut best = (0.0f32, 0.0f32, false);
+                let mut row_heat = None;
                 for tg in tongues {
                     // Kept in its row, a tongue is the field's own crest
                     // over the row's smoothed heat (one continuous field
@@ -1490,20 +1511,24 @@ impl CursorGlow {
                         continue;
                     }
                     let h = if tg.kept && crest {
-                        kept_rise * flame_heat(on_row(), u) * smooth((1.0 - d) * 2.0)
-                    } else if tg.kept {
-                        kept_rise
-                            * Self::FIRE_DARK_GAP_RISE
-                            * tg.size
-                            * (1.0 - d.powf(Self::FIRE_DARK_TONGUE_SHAPE))
+                        let hr = *row_heat.get_or_insert_with(|| flame_heat(on_row(), u));
+                        kept_rise * hr * smooth((1.0 - d) * 2.0)
                     } else {
-                        air_rise * tg.size * (1.0 - d.powf(Self::FIRE_DARK_TONGUE_SHAPE))
+                        let peak = if tg.kept {
+                            kept_rise * Self::FIRE_DARK_GAP_RISE * tg.size
+                        } else {
+                            air_rise * tg.size
+                        };
+                        if peak <= best.0 {
+                            continue;
+                        }
+                        peak * (1.0 - d.powf(Self::FIRE_DARK_TONGUE_SHAPE))
                     };
                     if h > best.0 {
                         best = (h, 1.0 - d, tg.kept);
                     }
                 }
-                best
+                (best.0, best.1, best.2, row_heat)
             };
             let any_kept = tongues.iter().any(|tg| tg.kept);
             const LEVELS: usize = CursorGlow::FIRE_DARK_HELD_LEVELS;
@@ -1570,6 +1595,9 @@ impl CursorGlow {
                     } else {
                         0.0
                     };
+                    if h >= air_cap {
+                        continue;
+                    }
                     let d = (c as f32 - u).max(u - (c + 1) as f32).max(0.0);
                     cap = cap.min(h + (air_cap - h) * smooth(d / ease));
                 }
@@ -1580,7 +1608,7 @@ impl CursorGlow {
             for col in (cmin - 1).max(0)..=(cmax + 1).min(geom.cols as i32 - 1) {
                 for k in 0..sub {
                     let u = col as f32 + (k as f32 + 0.5) / sub as f32;
-                    let (rise_px, side, kept) = column(u);
+                    let (rise_px, side, kept, row_heat) = column(u);
                     if rise_px < 1.5 {
                         continue;
                     }
@@ -1596,7 +1624,18 @@ impl CursorGlow {
                         Self::FIRE_DARK_FOOT_CURL
                     };
                     let curl = if kept { 0.0 } else { curl };
-                    let base_y = base_y - (ch * curl * (1.0 - side)) as i32;
+                    // A tongue in the air stands on its own root, as its
+                    // core does ([`Self::FIRE_DARK_ROOT_LIFT`]).
+                    #[cfg(test)]
+                    let lone_cores = self.fire_core_lift_alone;
+                    #[cfg(not(test))]
+                    let lone_cores = false;
+                    let lift = if kept || !air || columns || lone_cores {
+                        0.0
+                    } else {
+                        self.air_floor_lift(ch, tongues, u)
+                    };
+                    let base_y = base_y - (ch * curl * (1.0 - side) + lift) as i32;
                     let scallop = if air { smooth(side / 0.5) } else { 1.0 };
                     // Rise ceiling: the grid top relaxed by the head band — at
                     // head 0 this is the grid top exactly (the historical clamp).
@@ -1619,7 +1658,11 @@ impl CursorGlow {
                     if x1 <= x0 {
                         continue;
                     }
-                    let strength = flame_heat(on_row(), u);
+                    let strength = if kept && !crest {
+                        0.0
+                    } else {
+                        row_heat.unwrap_or_else(|| flame_heat(on_row(), u))
+                    };
                     let flame_end = base_y.min(geom.fx_bot());
                     let (ca, cb) = ((x0 - ox).div_euclid(cwi), (x1 - 1 - ox).div_euclid(cwi));
                     let on_text =
@@ -1661,31 +1704,48 @@ impl CursorGlow {
                         cell_h: chi,
                         top_fade_y: oy,
                     };
-                    let ceiling_at = |band: i32, mid: f32| {
+                    #[cfg(test)]
+                    let hard = self.fire_kept_cap_hard;
+                    #[cfg(not(test))]
+                    let hard = false;
+                    let cap_ease = if hard {
+                        (0.5 * (base_y as f32 - low_top)).max(1.0)
+                    } else {
+                        Self::FIRE_DARK_CAP_EASE_PX
+                    };
+                    let mut over_memo = [f32::NAN; LEVELS];
+                    let mut under_memo = [f32::NAN; LEVELS];
+                    let mut ceiling_at = |band: i32, mid: f32| {
                         if kept {
-                            let py = mid.floor() as i32;
-                            let idx = (py - 1..=py + 1)
-                                .map(|y| aterm_render::fire_field::fire_add_index_at(&field, y))
-                                .max()
-                                .unwrap_or(0);
                             // A tongue in a gap holds its flank over a
                             // letter against its hottest light at every
                             // height: held per heat level, the flank stood
                             // in bands as the level stepped.
-                            let idx = if crest { idx } else { 1 << 16 };
-                            let level = flame_level_of(idx);
-                            let over = held_at(u_mid, false, level);
-                            #[cfg(test)]
-                            let hard = self.fire_kept_cap_hard;
-                            #[cfg(not(test))]
-                            let hard = false;
-                            let cap_ease = if hard {
-                                (0.5 * (base_y as f32 - low_top)).max(1.0)
+                            let idx = if crest {
+                                let py = mid.floor() as i32;
+                                (py - 1..=py + 1)
+                                    .map(|y| aterm_render::fire_field::fire_add_index_at(&field, y))
+                                    .max()
+                                    .unwrap_or(0)
                             } else {
-                                Self::FIRE_DARK_CAP_EASE_PX
+                                1 << 16
+                            };
+                            let level = flame_level_of(idx).min(LEVELS - 1);
+                            let over = if over_memo[level].is_nan() {
+                                let v = held_at(u_mid, false, level);
+                                over_memo[level] = v;
+                                v
+                            } else {
+                                over_memo[level]
                             };
                             let low = if mid >= low_top {
-                                let under = held_at(u_mid, true, level);
+                                let under = if under_memo[level].is_nan() {
+                                    let v = held_at(u_mid, true, level);
+                                    under_memo[level] = v;
+                                    v
+                                } else {
+                                    under_memo[level]
+                                };
                                 over + (under - over) * smooth((mid - low_top) / cap_ease)
                             } else {
                                 over
@@ -1902,10 +1962,8 @@ impl CursorGlow {
     /// its own cells) or the host's probe of the typing row.
     pub(super) fn flame_row_named(&self, text: &TextView<'_>, row: i32) -> bool {
         text.knows_row(row)
-            || [self.row_cur_meta.as_ref(), self.row_prev_meta.as_ref()]
-                .into_iter()
-                .flatten()
-                .any(|m| i32::from(m.row) == row)
+            || self.row_cur_meta.is_some_and(|m| i32::from(m.row) == row)
+            || self.row_prev_meta.is_some_and(|m| i32::from(m.row) == row)
     }
 
     /// What stands in cell `(row, col)` of a burning row for the dark
@@ -1917,12 +1975,13 @@ impl CursorGlow {
         if text.knows_row(row) && !text.covers_cell(row, col) {
             return FlameGlyph::Blank;
         }
-        let probed = [
-            (self.row_cur_meta.as_ref(), &self.row_cur),
-            (self.row_prev_meta.as_ref(), &self.row_prev),
-        ]
-        .into_iter()
-        .find_map(|(meta, chars)| meta.filter(|m| i32::from(m.row) == row).map(|_| chars));
+        let probed = if self.row_cur_meta.is_some_and(|m| i32::from(m.row) == row) {
+            Some(&self.row_cur)
+        } else if self.row_prev_meta.is_some_and(|m| i32::from(m.row) == row) {
+            Some(&self.row_prev)
+        } else {
+            None
+        };
         if let Some(chars) = probed
             && let Ok(c) = usize::try_from(col)
             && let Some(&glyph) = chars.get(c)
@@ -1933,7 +1992,7 @@ impl CursorGlow {
                     descends: g == '\0'
                         || chars.get(c + 1) == Some(&'\0')
                         || !g.is_ascii()
-                        || DESCENDER_GLYPHS.contains(g),
+                        || is_descender_glyph(g),
                 },
             };
         }
@@ -1941,6 +2000,40 @@ impl CursorGlow {
             Some((None, _)) => FlameGlyph::Blank,
             _ => FlameGlyph::Letter { descends: true },
         }
+    }
+
+    /// How far a tongue in the air stands its root (and its gold core's)
+    /// off the air's floor, px, at row height `chf`: its share of
+    /// [`Self::FIRE_DARK_ROOT_LIFT`]. None for a tongue kept in its row.
+    fn air_root_lift(&self, chf: f32, tg: &DarkTongue, kept: bool) -> f32 {
+        #[cfg(test)]
+        let even = self.fire_even_cores;
+        #[cfg(not(test))]
+        let even = false;
+        if kept || even || tg.kept {
+            0.0
+        } else {
+            chf * Self::FIRE_DARK_ROOT_LIFT * tg.lift
+        }
+    }
+
+    /// The air's floor lift at column position `u` (cells), px: each air
+    /// tongue's own on its axis ([`Self::air_root_lift`]), blended between
+    /// neighbours by their footprints, so the flame's root rises and falls
+    /// along the row with no step where one tongue's body gives way to the
+    /// next.
+    fn air_floor_lift(&self, chf: f32, tongues: &[DarkTongue], u: f32) -> f32 {
+        let (mut num, mut den) = (0.0f32, 0.0f32);
+        for tg in tongues.iter().filter(|tg| !tg.kept) {
+            let d = ((u - tg.u) / tg.half.max(1e-3)).abs();
+            if d >= 1.0 {
+                continue;
+            }
+            let w = (1.0 - d * d) * (1.0 - d * d);
+            num += w * self.air_root_lift(chf, tg, false);
+            den += w;
+        }
+        if den > 0.0 { num / den } else { 0.0 }
     }
 
     fn dark_tongues(
@@ -1977,6 +2070,7 @@ impl CursorGlow {
                 size,
                 e,
                 kept,
+                lift: (i as f32 * Self::FIRE_DARK_ROOT_LIFT_STEP + 0.31).rem_euclid(1.0),
             };
             out.n += 1;
         }
@@ -2013,29 +2107,25 @@ impl CursorGlow {
         // and under a letter's baseline when it has no descender, nothing
         // over a letter's strokes; eased across a third of a cell and a few
         // pixels up.
-        let cap_cell = |x: f32, y: f32| -> f32 {
-            let c = ((x - oxf) / cwf).floor() as i32;
-            match self.flame_cell_glyph(text, row_i, c) {
+        let letter_cap = |y: f32| -> f32 {
+            // Under a letter with no descender, eased in over a few
+            // pixels from the band's top: a core whole a pixel under it
+            // stood a hot bead line along the baseline.
+            if hard {
+                f32::from(u8::from(y >= low_top))
+            } else {
+                smooth((y - low_top) / Self::FIRE_DARK_CAP_EASE_PX)
+            }
+        };
+        let glyph_cap = |g: FlameGlyph, letter_y: f32| -> f32 {
+            match g {
                 FlameGlyph::Blank => 1.0,
                 FlameGlyph::Letter { descends: true } => 0.0,
-                // Under a letter with no descender, eased in over a few
-                // pixels from the band's top: a core whole a pixel under it
-                // stood a hot bead line along the baseline.
-                FlameGlyph::Letter { descends: false } => {
-                    if hard {
-                        f32::from(u8::from(y >= low_top))
-                    } else {
-                        smooth((y - low_top) / Self::FIRE_DARK_CAP_EASE_PX)
-                    }
-                }
+                FlameGlyph::Letter { descends: false } => letter_y,
             }
         };
         let ease_x = cwf * 0.20;
-        let cap_at = |x: f32, y: f32| {
-            cap_cell(x - ease_x, y)
-                .min(cap_cell(x + ease_x, y))
-                .min(cap_cell(x, y - Self::FIRE_DARK_CORE_CLEAR_PX))
-        };
+        let col_of = |px: f32| ((px - oxf) / cwf).floor() as i32;
         let lean = -cwf * 0.30 * t;
         let (fx_l, fx_r) = (geom.fx_left() as f32, geom.fx_right() as f32);
         let knot = Self::FIRE_LIGHT_KNOT_PX;
@@ -2045,7 +2135,7 @@ impl CursorGlow {
         #[cfg(not(test))]
         let columns = false;
         for kept in [false, true] {
-            let mut cores = [(0.0f32, 0.0f32, 0.0f32, 0.0f32); MAX_CORES];
+            let mut cores = [(0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32); MAX_CORES];
             let mut n = 0usize;
             let base = if kept { kept_base } else { air_base } as f32;
             // A core in the air feathers in over its tongue's own foot: over
@@ -2090,6 +2180,14 @@ impl CursorGlow {
                 // tongue's own axis its gold would stand beside the flame, a
                 // bare needle at full heat (the trail gallery's `burst`).
                 let over = if kept || columns { 0.0 } else { shift as f32 };
+                // The air's cores stand apart as their flames do: each on
+                // its tongue's axis, as tall as its tongue allows, its root
+                // on its tongue's own root ([`Self::FIRE_DARK_ROOT_LIFT`]).
+                // A core lifted off its tongue's root hung as a gold stick
+                // mid-flame, and cores shortened, narrowed or set off their
+                // axis burned as a tan curtain over the flames' thin edges
+                // (looks6 round 3).
+                let lift = self.air_root_lift(chf, tg, kept || columns);
                 cores[n] = (
                     oxf + tg.u * cwf + over,
                     tg.half * cwf * wide,
@@ -2102,6 +2200,7 @@ impl CursorGlow {
                         Self::FIRE_DARK_AIR_CORE_COV
                     } * tg.e.min(1.0)
                         * (0.75 + 0.25 * t),
+                    lift,
                 );
                 n += 1;
             }
@@ -2109,7 +2208,7 @@ impl CursorGlow {
             if cores.is_empty() {
                 continue;
             }
-            let peak_h = cores.iter().map(|c| c.2).fold(0.0f32, f32::max);
+            let peak_h = cores.iter().map(|c| c.2 + c.4).fold(0.0f32, f32::max);
             let x_lo = cores
                 .iter()
                 .map(|c| c.0 - c.1 + lean.min(0.0))
@@ -2145,6 +2244,25 @@ impl CursorGlow {
             } else {
                 Self::FIRE_DARK_CORE_YELLOW_COV
             };
+            const MAX_GLYPH_COLS: usize = 256;
+            let glyph_c_lo = col_of(x_lo - ease_x);
+            let glyph_span = if kept {
+                ((col_of(x_hi + ease_x) - glyph_c_lo + 1).max(0) as usize).min(MAX_GLYPH_COLS)
+            } else {
+                0
+            };
+            let mut row_glyphs = [FlameGlyph::Blank; MAX_GLYPH_COLS];
+            for (i, slot) in row_glyphs[..glyph_span].iter_mut().enumerate() {
+                *slot = self.flame_cell_glyph(text, row_i, glyph_c_lo + i as i32);
+            }
+            let glyph_at = |c: i32| -> FlameGlyph {
+                let idx = c - glyph_c_lo;
+                if idx >= 0 && (idx as usize) < glyph_span {
+                    row_glyphs[idx as usize]
+                } else {
+                    self.flame_cell_glyph(text, row_i, c)
+                }
+            };
             let mut slab_cores = [(0.0f32, 0.0f32, 0.0f32, 0.0f32); MAX_CORES];
             let mut y = (base - foot - peak_h).floor().max(geom.fx_top() as f32);
             while y < base {
@@ -2161,17 +2279,20 @@ impl CursorGlow {
                 if ym >= base {
                     break;
                 }
-                let root_in = smooth((base - ym) / root_px);
                 // Its light feathers in over the whole root, its colour
                 // cools over the root's first few pixels alone: cooled over
                 // the feathered root, the gold heart burned orange.
-                let hue_in = smooth((base - ym) / root_px.min(Self::FIRE_DARK_CORE_ROOT_PX));
                 let mut n_slab = 0usize;
-                for &(xc, half, th, peak) in cores {
-                    let rise = (base - foot - ym) / th;
-                    if rise >= 1.0 {
+                for &(xc, half, th, peak, lift) in cores {
+                    // A core stands on its tongue's own root (`lift` above
+                    // the floor), its light and colour easing in from it.
+                    let floor = base - lift;
+                    let rise = (floor - foot - ym) / th;
+                    if rise >= 1.0 || ym >= floor {
                         continue;
                     }
+                    let root_in = smooth((floor - ym) / root_px);
+                    let hue_in = smooth((floor - ym) / root_px.min(Self::FIRE_DARK_CORE_ROOT_PX));
                     let rise = rise.max(0.0);
                     let xc = xc + lean * rise * rise;
                     let k = (rise / 0.2).clamp(0.0, 1.0);
@@ -2197,6 +2318,14 @@ impl CursorGlow {
                     y += h;
                     continue;
                 }
+                let (cap_ym, cap_clear) = if kept {
+                    (
+                        letter_cap(ym),
+                        letter_cap(ym - Self::FIRE_DARK_CORE_CLEAR_PX),
+                    )
+                } else {
+                    (0.0, 0.0)
+                };
                 let at = |x: f32| -> (u32, u32) {
                     let mut best = (0.0f32, 0.0f32);
                     for &(xc, hw, peak_ym, rise_base) in active_cores {
@@ -2218,7 +2347,25 @@ impl CursorGlow {
                         }
                     }
                     let cov = if kept && best.0 > 0.0 {
-                        best.0 * cap_at(x, ym)
+                        let (c_l, c_r) = (col_of(x - ease_x), col_of(x + ease_x));
+                        let g_l = glyph_at(c_l);
+                        let cap = if c_l == c_r {
+                            glyph_cap(g_l, cap_ym.min(cap_clear))
+                        } else {
+                            let g_r = glyph_at(c_r);
+                            let c_m = col_of(x);
+                            let g_m = if c_m == c_l {
+                                g_l
+                            } else if c_m == c_r {
+                                g_r
+                            } else {
+                                glyph_at(c_m)
+                            };
+                            glyph_cap(g_l, cap_ym)
+                                .min(glyph_cap(g_r, cap_ym))
+                                .min(glyph_cap(g_m, cap_clear))
+                        };
+                        best.0 * cap
                     } else {
                         best.0
                     };
@@ -2267,7 +2414,22 @@ impl CursorGlow {
         let (cwf, chf) = (geom.cw as f32, geom.ch as f32);
         let (oxf, oyf) = (f32::from(geom.origin_x), f32::from(geom.origin_y));
         let text = self.text_view();
-        let paints = flame_light_paint_bounds();
+        // A filled cell above (a prompt's powerline bar) stops a paper
+        // tongue as a letter does: risen into it, its tongues and its
+        // embers read as muddy amber on the grey, as they did on dark.
+        let page = cfg.theme_bg & 0x00FF_FFFF;
+        #[cfg(test)]
+        let filled_held = !self.fire_filled_unheld;
+        #[cfg(not(test))]
+        let filled_held = true;
+        let filled_above = |r: i32, c: i32| {
+            filled_held
+                && self
+                    .frame_text
+                    .pair(r, c)
+                    .is_some_and(|(_, ground)| !reads_as_page(ground, page))
+        };
+        let paints = FLAME_LIGHT_PAINT_BOUNDS;
         let tall = chf * (Self::FIRE_LIGHT_RISE_COLD + Self::FIRE_LIGHT_RISE_HOT * t);
         let spacing = Self::FIRE_LIGHT_SPACING;
         let lean = -cwf * 0.35 * t;
@@ -2320,6 +2482,7 @@ impl CursorGlow {
                 let half = cwf * Self::FIRE_LIGHT_HALF_W * (0.75 + 0.25 * e);
                 let h = h.min(Self::flame_light_headroom(
                     &text,
+                    &filled_above,
                     row,
                     (u, half / cwf),
                     root,
@@ -2328,7 +2491,26 @@ impl CursorGlow {
                 if h < 2.0 {
                     continue;
                 }
-                tongues[n] = (oxf + u * cwf, h, half, e);
+                // A squat tongue reads as an ember dash on paper, not a
+                // flame (looks6 N2): a tongue is never wider than it is
+                // tall, and one too short to rise fades out over
+                // [`Self::FIRE_LIGHT_TONGUE_EASE_PX`] rather than leaving its
+                // root slab as a lone dash.
+                let (half, fade) = if self.fire_light_squat() {
+                    (half, 1.0)
+                } else {
+                    let k = ((h - Self::FIRE_LIGHT_TONGUE_MIN_PX)
+                        / Self::FIRE_LIGHT_TONGUE_EASE_PX)
+                        .clamp(0.0, 1.0);
+                    (
+                        half.min(h * Self::FIRE_LIGHT_TONGUE_ASPECT),
+                        k * k * (3.0 - 2.0 * k),
+                    )
+                };
+                if fade <= 0.0 {
+                    continue;
+                }
+                tongues[n] = (oxf + u * cwf, h, half, fade);
                 n += 1;
             }
             let tongues = &tongues[..n];
@@ -2382,16 +2564,36 @@ impl CursorGlow {
             let knot = Self::FIRE_LIGHT_KNOT_PX;
             let knots = (((x_hi - x_lo) / knot).ceil() as usize).max(1);
             let slab = Self::FIRE_LIGHT_SLAB_PX;
-            let mut slab_tongues = [(0.0f32, 0.0f32, 0.0f32, 0.0f32, 0u32); MAX_TONGUES];
+            let mut slab_tongues = [(0.0f32, 0.0f32, 0.0f32, 0.0f32, [0.0f32; 3]); MAX_TONGUES];
+            #[cfg(test)]
+            let coarse = self.fire_light_root_coarse;
+            #[cfg(not(test))]
+            let coarse = false;
+            let least_ease = if coarse {
+                3.0
+            } else {
+                Self::FIRE_LIGHT_ROOT_EASE_PX
+            };
+            // The roots' eases are laid a pixel a slab, the slab reaching
+            // into the tallest's ease with them.
+            let fine_from = (peak_h * 0.14).max(least_ease) + slab;
             let mut y = (root - peak_h).floor().max(geom.fx_top() as f32);
             while y < root {
                 if under.len() >= Self::MAX_QUADS {
                     return;
                 }
-                let h = slab.min(root - y);
+                let fine = !coarse && root - y < fine_from;
+                let h = if fine { 1.0 } else { slab }.min(root - y);
                 let ym = y + 0.5 * h;
                 let mut n_slab = 0usize;
-                for &(xc, th, half, _) in tongues {
+                let root_ease = |th: f32| {
+                    if self.fire_light_squat() {
+                        th * 0.14
+                    } else {
+                        (th * 0.14).max(least_ease)
+                    }
+                };
+                for &(xc, th, half, fade) in tongues {
                     let rise = (root - ym) / th;
                     if !(0.0..1.0).contains(&rise) {
                         continue;
@@ -2406,11 +2608,17 @@ impl CursorGlow {
                         continue;
                     }
                     let root_in = {
-                        let k = (rise / 0.14).clamp(0.0, 1.0);
-                        k * k * (3.0 - 2.0 * k)
+                        let k = ((root - ym) / root_ease(th)).clamp(0.0, 1.0);
+                        k * k * (3.0 - 2.0 * k) * fade
                     };
                     let tip = (1.0 - rise).powf(0.55);
-                    slab_tongues[n_slab] = (xc, hw, root_in, tip, flame_light_ramp(rise));
+                    let c = flame_light_ramp(rise);
+                    let c_rgb = [
+                        ((c >> 16) & 0xff) as f32,
+                        ((c >> 8) & 0xff) as f32,
+                        (c & 0xff) as f32,
+                    ];
+                    slab_tongues[n_slab] = (xc, hw, root_in, tip, c_rgb);
                     n_slab += 1;
                 }
                 let active_tongues = &slab_tongues[..n_slab];
@@ -2420,7 +2628,7 @@ impl CursorGlow {
                 }
                 let at = |x: f32| -> (u8, u32) {
                     let (mut a, mut sum, mut rgb) = (0.0f32, 0.0f32, [0.0f32; 3]);
-                    for &(xc, hw, root_in, tip, c) in active_tongues {
+                    for &(xc, hw, root_in, tip, c_rgb) in active_tongues {
                         let d = ((x - xc) / hw).abs();
                         if d >= 1.0 {
                             continue;
@@ -2432,9 +2640,9 @@ impl CursorGlow {
                         }
                         a = a.max(ta);
                         sum += ta;
-                        for (k, v) in rgb.iter_mut().enumerate() {
-                            *v += ta * ((c >> (16 - 8 * k)) & 0xff) as f32;
-                        }
+                        rgb[0] += ta * c_rgb[0];
+                        rgb[1] += ta * c_rgb[1];
+                        rgb[2] += ta * c_rgb[2];
                     }
                     if a < 1.0 {
                         return (0, 0);
@@ -2475,6 +2683,7 @@ impl CursorGlow {
 
     fn flame_light_headroom(
         text: &TextView<'_>,
+        filled: &dyn Fn(i32, i32) -> bool,
         row: u16,
         (u, half): (f32, f32),
         root: f32,
@@ -2482,7 +2691,7 @@ impl CursorGlow {
     ) -> f32 {
         let (c0, c1) = ((u - half).floor() as i32, (u + half).ceil() as i32 - 1);
         for r in (0..i32::from(row)).rev().take(4) {
-            if (c0..=c1).any(|c| text.covers_cell(r, c)) {
+            if (c0..=c1).any(|c| text.covers_cell(r, c) || filled(r, c)) {
                 let foot = oyf + (r + 1) as f32 * chf;
                 return (root - foot - Self::FIRE_LIGHT_HEADROOM * chf).max(0.0);
             }
@@ -3013,7 +3222,8 @@ impl CursorGlow {
             } else {
                 (tx, dx)
             };
-            if (dx * dx + dy * dy).sqrt() < 1.0 {
+            let len_sq = dx * dx + dy * dy;
+            if len_sq < 1.0 {
                 continue;
             }
             let head_cov = (cov_cap * fade * cfg.intensity).clamp(0.0, 255.0);
@@ -3040,7 +3250,7 @@ impl CursorGlow {
                 out.truncate(Self::MAX_QUADS);
                 return;
             }
-            let len = (dx * dx + dy * dy).sqrt();
+            let len = len_sq.sqrt();
             let feather = (Self::FIRE_METEOR_FEATHER * geom.cw as f32 / len).min(0.15);
             let snap_joins = true;
             #[cfg(test)]
@@ -3353,15 +3563,41 @@ impl CursorGlow {
         let (ccx, ccy) = (cx as f32 + cw as f32 * 0.5, cy as f32 - ch as f32 * 0.10);
         let tn = ((temp - Self::FORGE_MIN_TEMP) / (1.0 - Self::FORGE_MIN_TEMP)).clamp(0.0, 1.0);
         let phase = self.flame_phase;
+        // Over a lettered or filled row above (a prompt's powerline
+        // segment), the forge's light stays in the caret's own row: its
+        // crown lifted the segment over the caret (looks6 N8).
+        let held = {
+            #[cfg(test)]
+            let unheld = self.fire_filled_unheld;
+            #[cfg(not(test))]
+            let unheld = false;
+            let page = cfg.theme_bg & 0x00FF_FFFF;
+            let text = self.text_view();
+            let above = i32::from(cr) - 1;
+            !unheld
+                && above >= 0
+                && (i32::from(cc) - 1..=i32::from(cc) + 1).any(|c| {
+                    (text.knows_row(above) && text.covers_cell(above, c))
+                        || self.frame_text.pair(above, c).is_some_and(|(ink, ground)| {
+                            ink.is_some() || !reads_as_page(ground, page)
+                        })
+                })
+        };
         let pulse = 0.85 + 0.15 * (phase * 2.3).sin();
         let core_cov = (150.0 * tn * pulse * cfg.intensity).min(255.0);
         if core_cov >= 2.0 {
-            let (centre, radii) = (
-                (ccx, ccy - ch as f32 * 0.12),
-                (
-                    cw as f32 * (0.30 + 0.14 * tn),
-                    ch as f32 * (0.20 + 0.10 * tn),
-                ),
+            let radii = (
+                cw as f32 * (0.30 + 0.14 * tn),
+                ch as f32 * (0.20 + 0.10 * tn),
+            );
+            let centre_y = ccy - ch as f32 * 0.12;
+            let centre = (
+                ccx,
+                if held {
+                    centre_y.max(cy as f32 + radii.1)
+                } else {
+                    centre_y
+                },
             );
             let rgb = fire_ramp((0.72 + 0.20 * tn).min(0.92));
             let share = self.ink_ledger.admit_halo(
@@ -3416,6 +3652,7 @@ impl CursorGlow {
                             (cy + ch) as f32 - (d - 2.0 * cw as f32 - ch as f32),
                         )
                     };
+                    let ey = if held { ey.max(cy as f32 + 3.5) } else { ey };
                     let share = self.ink_ledger.admit_halo(
                         (ex, ey),
                         (3.5, 3.5),
@@ -3605,6 +3842,9 @@ impl CursorGlow {
         if holds(hi) {
             return 255;
         }
+        if !holds(1) {
+            return 0;
+        }
         while hi - lo > 1 {
             let mid = (lo + hi) / 2;
             if holds(mid) {
@@ -3772,18 +4012,26 @@ impl CursorGlow {
         let (cwf, ch) = (geom.cw as f32, geom.ch as f32);
         let (oxf, oyf) = (f32::from(geom.origin_x), f32::from(geom.origin_y));
         let text = TextView::new(self.probed_text_spans(), Some(&self.frame_text));
+        let cell_of = |x: f32, y: f32| -> (i32, i32) {
+            (
+                ((y - oyf) / ch).floor() as i32,
+                ((x - oxf) / cwf).floor() as i32,
+            )
+        };
         let covers = |x: f32, y: f32| {
-            let row = ((y - oyf) / ch).floor() as i32;
-            let col = ((x - oxf) / cwf).floor() as i32;
+            let (row, col) = cell_of(x, y);
             text.covers_cell(row, col)
         };
         let margin = ch * 0.14;
-        let near_text = |x: f32, y: f32| {
-            covers(x, y)
-                || covers(x, y - margin)
-                || covers(x, y + margin)
-                || covers(x - margin, y)
-                || covers(x + margin, y)
+        let near_text_from = |x: f32, y: f32, row: i32, col: i32| {
+            let r_up = ((y - margin - oyf) / ch).floor() as i32;
+            let r_dn = ((y + margin - oyf) / ch).floor() as i32;
+            let c_l = ((x - margin - oxf) / cwf).floor() as i32;
+            let c_r = ((x + margin - oxf) / cwf).floor() as i32;
+            (r_up != row && text.covers_cell(r_up, col))
+                || (r_dn != row && text.covers_cell(r_dn, col))
+                || (c_l != col && text.covers_cell(row, c_l))
+                || (c_r != col && text.covers_cell(row, c_r))
         };
         let glyph_band = |y: f32| -> Option<(i32, f32)> {
             let row = ((y - oyf) / ch).floor() as i32;
@@ -3804,6 +4052,24 @@ impl CursorGlow {
                     && y > y0 as f32 - reach
                     && y < y1 as f32 + reach
             })
+        };
+        // A filled cell of another row than the caret's (a prompt's
+        // powerline bar): a dark fire's ember over it read as grit on the
+        // bar (looks6 N8).
+        let page = cfg.theme_bg & 0x00FF_FFFF;
+        let frame_text = &self.frame_text;
+        #[cfg(test)]
+        let filled_held = !self.fire_filled_unheld;
+        #[cfg(not(test))]
+        let filled_held = true;
+        let filled = |x: f32, y: f32| {
+            let row = ((y - oyf) / ch).floor() as i32;
+            let col = ((x - oxf) / cwf).floor() as i32;
+            filled_held
+                && Some(row) != caret_row
+                && frame_text
+                    .pair(row, col)
+                    .is_some_and(|(_, ground)| !reads_as_page(ground, page))
         };
         let comet_dark_leading =
             dark && matches!(cfg.style, GlowStyle::Comet) && !self.streak_unbudgeted();
@@ -3836,12 +4102,12 @@ impl CursorGlow {
             let y = p.y0 + p.vy * age + 0.5 * p.gy * age * age;
             let leading_band = comet_dark_leading.then(|| glyph_band(y)).flatten();
             let leading = leading_band.is_some();
-            let seat = (p.hue * 977.0).fract();
-            if leading && seat >= Self::COMET_DARK_DUST_SHARE {
-                continue;
-            }
             let y = match leading_band {
                 Some((_, top)) => {
+                    let seat = (p.hue * 977.0).fract();
+                    if seat >= Self::COMET_DARK_DUST_SHARE {
+                        continue;
+                    }
                     let k = seat / Self::COMET_DARK_DUST_SHARE;
                     let jitter = ((p.hue * 4513.0).fract() - 0.5) * Self::COMET_DARK_DUST_JITTER;
                     top + ch
@@ -3854,15 +4120,15 @@ impl CursorGlow {
                 }
                 None => y,
             };
-            let over_text = (lawful || beam) && covers(x, y);
+            let (row, col) = cell_of(x, y);
+            let over_text = (lawful || beam) && text.covers_cell(row, col);
             if over_text && (!dark || sparkle || beam) {
                 continue;
             }
             if (sparkle || beam)
-                && (near_text(x, y)
-                    || glyph_band(y).is_some_and(|(row, _)| {
-                        let col = ((x - oxf) / cwf).floor() as i32;
-                        Some(row) != caret_row && (-2..=2).any(|d| text.covers_cell(row, col + d))
+                && (near_text_from(x, y, row, col)
+                    || glyph_band(y).is_some_and(|(r, _)| {
+                        Some(r) != caret_row && (-2..=2).any(|d| text.covers_cell(r, col + d))
                     }))
             {
                 continue;
@@ -4022,11 +4288,20 @@ impl CursorGlow {
                         * 0.6
                         * t;
                     if light_fire {
-                        if covers(x + waft, y) {
+                        let r = (ch * (0.06 + 0.06 * p.hue)).max(1.8) * (0.7 + 0.3 * fade);
+                        // A bead floated beside a filled bar keeps its whole
+                        // disc off it, as the dark embers do.
+                        let on_bar = |dx: f32, dy: f32| filled(x + waft + dx, y + dy);
+                        if covers(x + waft, y)
+                            || on_bar(0.0, 0.0)
+                            || on_bar(-r, 0.0)
+                            || on_bar(r, 0.0)
+                            || on_bar(0.0, -r)
+                            || on_bar(0.0, r)
+                        {
                             continue;
                         }
                         let alpha = ((cov as f32) * flicker * 0.95).min(235.0) as u8;
-                        let r = (ch * (0.06 + 0.06 * p.hue)).max(1.8) * (0.7 + 0.3 * fade);
                         push_paper_bead(out, geom, (x + waft, y), r, Self::LIGHT_EMBER_INKS, alpha);
                         continue;
                     }
@@ -4045,7 +4320,9 @@ impl CursorGlow {
                     let core_color = fire_ramp((0.42 + 0.30 * fade + 0.18 * p.hue).min(0.92));
                     let (centre, radii) = ((x + waft, y), (rx * 1.6, ry * 1.6));
                     let reach = radii.0.max(radii.1);
-                    let near = |dx: f32, dy: f32| covers(centre.0 + dx, centre.1 + dy);
+                    let near = |dx: f32, dy: f32| {
+                        covers(centre.0 + dx, centre.1 + dy) || filled(centre.0 + dx, centre.1 + dy)
+                    };
                     if !self.streak_unbudgeted()
                         && (near(0.0, 0.0)
                             || near(-reach, 0.0)
@@ -4310,6 +4587,17 @@ impl CursorGlow {
         ground
     }
 
+    /// Whether a test asked for paper fire's squat tongues back (looks6 N2's negative control).
+    #[cfg(test)]
+    pub(super) const fn fire_light_squat(&self) -> bool {
+        self.fire_light_squat
+    }
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(super) const fn fire_light_squat(&self) -> bool {
+        false
+    }
+
     /// Whether a test asked for the light bodies' inks and ceilings unsolved.
     #[cfg(test)]
     pub(super) const fn light_body_unsolved(&self) -> bool {
@@ -4460,6 +4748,48 @@ const SURFACE_CHANNEL: u32 = 32;
 /// The ASCII glyphs whose ink reaches under the baseline.
 pub(super) const DESCENDER_GLYPHS: &str = "gjpqyQ,;_|()[]{}@$";
 
+#[inline]
+const fn is_descender_glyph(g: char) -> bool {
+    matches!(
+        g,
+        'g' | 'j'
+            | 'p'
+            | 'q'
+            | 'y'
+            | 'Q'
+            | ','
+            | ';'
+            | '_'
+            | '|'
+            | '('
+            | ')'
+            | '['
+            | ']'
+            | '{'
+            | '}'
+            | '@'
+            | '$'
+    )
+}
+
+const _: () = {
+    let bytes = DESCENDER_GLYPHS.as_bytes();
+    let mut b = 0u8;
+    while b < 128 {
+        let mut in_str = false;
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b {
+                in_str = true;
+                break;
+            }
+            i += 1;
+        }
+        assert!(is_descender_glyph(b as char) == in_str);
+        b += 1;
+    }
+};
+
 /// What stands in a burning row's cell for the dark flame's root.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum FlameGlyph {
@@ -4485,6 +4815,9 @@ pub(super) struct DarkTongue {
     pub(super) size: f32,
     pub(super) e: f32,
     pub(super) kept: bool,
+    /// The share `0..1` of [`CursorGlow::FIRE_DARK_ROOT_LIFT`] a tongue in
+    /// the air stands its root, its gold core's with it, off the air's floor.
+    pub(super) lift: f32,
 }
 
 /// A burning row's dark tongues, allocation-free.
@@ -4570,6 +4903,12 @@ fn flame_dark_letter_cap(hot: u32, ink: u32, ground: u32, lift: [f32; 3], bar: f
         return 255.0;
     };
     let bar = bar.min(own);
+    if reads(255).is_some_and(|c| c >= bar) {
+        return 255.0;
+    }
+    if !reads(1).is_some_and(|c| c >= bar) {
+        return 0.0;
+    }
     let (mut lo, mut hi) = (0u32, 256u32);
     while hi - lo > 1 {
         let mid = (lo + hi) / 2;
@@ -4621,6 +4960,8 @@ const FLAME_LIGHT_STOPS: [(f32, u32); 4] = [
     (0.62, 0x00FF_A820),
     (1.0, 0x00FF_C848),
 ];
+
+const FLAME_LIGHT_PAINT_BOUNDS: (u32, u32) = flame_light_paint_bounds();
 
 #[inline]
 const fn flame_light_paint_bounds() -> (u32, u32) {

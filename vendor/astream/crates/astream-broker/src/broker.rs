@@ -4317,9 +4317,15 @@ impl Broker {
                     // Detached per-connection thread; ends when its socket ends.
                     // A spawn that fails (thread exhaustion) drops this socket and
                     // keeps accepting — `thread::spawn` would panic the acceptor.
-                    let _ = thread::Builder::new().spawn(move || {
+                    // Its client reads only a close, so the reason is said here.
+                    if let Err(e) = thread::Builder::new().spawn(move || {
                         let _ = handle_conn(&sh, s, Wire::Unix);
-                    });
+                    }) {
+                        let _ = writeln!(
+                            io::stderr(),
+                            "astream-broker: warn: closed an accepted connection: its thread did not start ({e})"
+                        );
+                    }
                 },
             );
         });
@@ -5391,7 +5397,18 @@ fn serve_conn<S: Stream>(
         // No shutdown handle would mean no cap accounting and no force-close — under
         // fd exhaustion (exactly what the cap exists for) `try_clone` is what fails
         // first. Refuse rather than serve a connection the broker cannot bound or reap.
-        conns.insert(conn_id, Box::new(stream.try_clone()?));
+        let handle = match stream.try_clone() {
+            Ok(handle) => handle,
+            Err(e) => {
+                drop(conns);
+                let _ = writeln!(
+                    io::stderr(),
+                    "astream-broker: warn: closed an accepted connection: no shutdown handle for it ({e})"
+                );
+                return Err(e);
+            }
+        };
+        conns.insert(conn_id, Box::new(handle));
     }
     let _conn_guard = ConnGuard {
         shared,

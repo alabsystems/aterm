@@ -16,7 +16,7 @@ use aterm_sysprobe::volumes::Table;
 use aterm_vitals::jobs::{
     Block, Class, Consumer, Demand, Fd, FdKind, HeldProc, JobCounters, JobKind, JobProc, JobRow,
     JobTab, JobTick, Jobs, JobsView, Knote, KnoteFilter, LanesSeen, Machine, ProcState, Standing,
-    StartWait, SweepProc, TcpState, ThreadState, TtyMode,
+    StartWait, SweepProc, TcpState, TermWord, ThreadState, TtyMode,
 };
 use aterm_vitals::model::TabRoot;
 
@@ -494,6 +494,7 @@ fn job_tabs(tabs: &[TabRoot], ttys: &[(u64, TtyMode)], feeds: &[(u64, TabFeed)])
                 block: feed.block,
                 ended: feed.ended,
                 shell_ms: feed.shell_ms,
+                typed_ms: feed.typed_ms,
                 tty: ttys.iter().find(|(key, _)| *key == t.key).map(|(_, m)| *m),
                 output_ms: feed.output_ms,
                 line_output_ms: feed.line_output_ms,
@@ -519,6 +520,11 @@ pub(crate) struct JobFeed(Mutex<Fed>);
 struct Fed {
     output: Option<Instant>,
     line: Option<Instant>,
+    /// The newest line the last pass found stamped past its millisecond, which it left to the
+    /// next.
+    owed_line: Option<Instant>,
+    /// The newest output the last pass found stamped past its millisecond, as `owed_line`.
+    owed_output: Option<Instant>,
     /// The read being fed holds text after its last line feed so far: a line feed in its next
     /// chunk ends a line.
     text: bool,
@@ -530,6 +536,10 @@ struct Fed {
     /// feed found it changed: the shell wrote one of its own marks.
     marks: Option<(u64, aterm_types::BlockState, Option<i32>)>,
     shell: Option<Instant>,
+    /// The keys driven into the session's terminal as the last pass found their count, and the
+    /// clock of the newest pass that found it moved ([`JobFeed::typed_at`]).
+    driven: Option<aterm_session::sink::DrivenInput>,
+    typed: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -551,6 +561,7 @@ pub(crate) struct TabFeed {
     pub(crate) block: Option<Block>,
     pub(crate) ended: Option<Block>,
     pub(crate) shell_ms: Option<u64>,
+    pub(crate) typed_ms: Option<u64>,
 }
 
 impl JobFeed {
@@ -673,7 +684,34 @@ impl JobFeed {
     /// The feed now, on the clock whose zero is `epoch` (the probe thread's): each stamp in whole
     /// ms rounded up, so a read after a pass's clock is stamped past it, and at least 1 ms, so a
     /// mode word stamped 0 is older than all of them ([`crate::vitals_host::TtyWord::current`]).
+    #[cfg(test)]
     pub(crate) fn at(&self, epoch: Instant) -> TabFeed {
+        self.at_pass(epoch, None)
+    }
+
+    /// The keys driven into the session's terminal (the person's, a driver's) as a pass at `at_ms`
+    /// finds their count: the clock of the newest pass that found it moved since the pass before
+    /// (the first pass notes it alone), which a session nested in the tab's woke over.
+    pub(crate) fn typed_at(
+        &self,
+        at_ms: u64,
+        driven: aterm_session::sink::DrivenInput,
+    ) -> Option<u64> {
+        let mut fed = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if fed.driven.is_some_and(|d| d != driven) {
+            fed.typed = Some(at_ms);
+        }
+        fed.driven = Some(driven);
+        fed.typed
+    }
+
+    /// The feed at a pass whose clock reads `at_ms` ([`crate::vitals_host::Request::tab_reads`]),
+    /// as [`Self::at`], but for its newest line and output: one stamped past `at_ms` (fed in the
+    /// clock's own millisecond, or after the clock) is the next pass's, which reads it though a
+    /// newer one overwrote it first, and this pass the one the last left it. A writer that never
+    /// stops has a line stamped past every pass's millisecond, which was each pass's newest and
+    /// none's.
+    pub(crate) fn at_pass(&self, epoch: Instant, at_ms: Option<u64>) -> TabFeed {
         let ms = |at: Instant| {
             u64::try_from(
                 at.saturating_duration_since(epoch)
@@ -691,14 +729,22 @@ impl JobFeed {
             status: b.status,
             stopped: b.status.is_some_and(stopped),
         };
-        let fed = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let defer = |newest: Option<Instant>, owed: &mut Option<Instant>| match at_ms {
+            Some(a) if newest.is_some_and(|s| ms(s) > a) => std::mem::replace(owed, newest),
+            _ => newest,
+        };
+        let mut fed = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let fed = &mut *fed;
+        let line = defer(fed.line, &mut fed.owed_line);
+        let output = defer(fed.output, &mut fed.owed_output);
         TabFeed {
-            output_ms: fed.output.map(ms),
-            line_output_ms: fed.line.map(ms),
+            output_ms: output.map(ms),
+            line_output_ms: line.map(ms),
             output_bytes: fed.bytes,
             block: fed.block.as_ref().map(block),
             ended: fed.ended.as_ref().map(block),
             shell_ms: fed.shell.map(ms),
+            typed_ms: fed.typed,
         }
     }
 }
@@ -878,6 +924,11 @@ fn job_proc(p: &ProcFacts, stand_in: Option<u32>) -> JobProc {
         state: state(p.state),
         tty: p.tty,
         tpgid: p.tpgid,
+        term: p.term.map(|t| TermWord {
+            canonical: t.canonical,
+            echo: t.echo,
+            queued: t.queued,
+        }),
         counters: p.counters.map(|c| JobCounters {
             cpu_ns: c.cpu_ns,
             child_cpu_ns: c.child_cpu_ns,
@@ -1121,6 +1172,7 @@ pub(crate) mod tests {
                 stopped: true,
             }),
             shell_ms: Some(4),
+            typed_ms: Some(6),
         };
         let tabs = job_tabs(
             &[root(41, "Tab 3"), root(42, "Tab 4")],
@@ -1144,6 +1196,7 @@ pub(crate) mod tests {
                 block: tabs[1].block.clone(),
                 ended: tabs[1].ended.clone(),
                 shell_ms: tabs[1].shell_ms,
+                typed_ms: tabs[1].typed_ms,
             },
             fed
         );
@@ -1201,6 +1254,63 @@ pub(crate) mod tests {
             feed.at(epoch).output_ms,
             Some(1),
             "a stamp is at least 1 ms"
+        );
+    }
+
+    /// A LINE FED PAST A PASS'S CLOCK IS THE NEXT PASS'S: a writer that never stops (`kubectl
+    /// logs -f`) has a line fed past each pass's clock, in the clock's own millisecond, which a
+    /// newer one overwrites before the next pass; that pass reads the line the last one left it,
+    /// past the last clock and by its own.
+    #[test]
+    fn a_line_fed_past_a_passs_clock_is_the_next_passs() {
+        const LINE: &[u8] = b"GET /healthz 200\r\n";
+        let epoch = Instant::now();
+        let feed = JobFeed::default();
+        let term = aterm_core::terminal::Terminal::new(24, 80);
+        let at = |us: u64| epoch + Duration::from_micros(us);
+        let line = |us| {
+            feed.read(LINE);
+            feed.fed(&term, LINE, true, || at(us));
+        };
+        let pass = |ms| {
+            let f = feed.at_pass(epoch, Some(ms));
+            (f.line_output_ms, f.output_ms)
+        };
+        // Each fed in its pass's own millisecond, before its clock: stamped past the pass.
+        line(1_000_100);
+        let first = pass(1_000);
+        line(2_000_100);
+        line(2_000_900);
+        let second = pass(2_000);
+        let third = pass(4_000);
+        assert_eq!(first, (None, None));
+        assert_eq!(second, (Some(1_001), Some(1_001)));
+        assert_eq!(third, (Some(2_001), Some(2_001)));
+    }
+
+    /// A PASS THAT FINDS KEYS DRIVEN SINCE THE LAST STAMPS ITS CLOCK: the first
+    /// pass only notes the sink's count, and the stamp stays until keys move it.
+    #[test]
+    fn a_pass_that_finds_keys_driven_since_the_last_stamps_its_clock() {
+        let mut fds = [0; 2];
+        // SAFETY: `fds` is two writable ints.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+        let [r, w] = fds;
+        let sink = aterm_session::sink::SinkWriter::new(w);
+        let feed = JobFeed::default();
+        let first = feed.typed_at(1_000, sink.driven_input());
+        let still = feed.typed_at(3_000, sink.driven_input());
+        assert_eq!(sink.write_frame(b"x").expect("a key"), 1);
+        let typed = feed.typed_at(5_000, sink.driven_input());
+        let kept = feed.typed_at(7_000, sink.driven_input());
+        // SAFETY: both ends are this test's.
+        unsafe {
+            libc::close(r);
+            libc::close(w);
+        }
+        assert_eq!(
+            (first, still, typed, kept),
+            (None, None, Some(5_000), Some(5_000))
         );
     }
 

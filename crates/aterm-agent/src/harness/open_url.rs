@@ -244,21 +244,62 @@ pub(super) fn split_header_body(s: &str) -> Option<(&str, &str)> {
     }
 }
 
-fn is_mime_boundary_line(line: &str) -> bool {
-    let trimmed = line.trim_end_matches(['\r', '\n']);
+pub(super) fn is_mime_boundary_line(line: &str) -> bool {
+    let trimmed = line.trim_end_matches(['\r', '\n', ' ', '\t']);
     let Some(after_dashes) = trimmed.strip_prefix("--") else {
         return false;
     };
-    if after_dashes.is_empty()
-        || after_dashes == " "
-        || after_dashes.starts_with('>')
-        || after_dashes.bytes().all(|b| b == b'-')
+    if after_dashes.is_empty() || after_dashes.len() > 72 || after_dashes.bytes().all(|b| b == b'-')
     {
         return false;
     }
-    after_dashes
-        .bytes()
-        .all(|b| b.is_ascii_graphic() || b == b' ')
+    after_dashes.bytes().all(|b| {
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'\'' | b'(' | b')' | b'+' | b'_' | b',' | b'-' | b'.' | b'/' | b'=' | b'?'
+            )
+    })
+}
+
+pub(super) fn is_top_level_base64_email(raw_email: &str) -> bool {
+    let Some((head, _)) = split_header_body(raw_email) else {
+        return false;
+    };
+    for line in unfold_rfc5322_headers(head) {
+        if let Some((k, v)) = line.split_once(':')
+            && k.trim().eq_ignore_ascii_case("content-transfer-encoding")
+        {
+            return v
+                .trim()
+                .trim_matches(['"', '\''])
+                .to_ascii_lowercase()
+                .starts_with("base64");
+        }
+    }
+    false
+}
+
+fn part_opening_boundary(before_header: &str) -> Option<&str> {
+    for line in before_header.lines().rev() {
+        let trimmed = line.trim_end_matches(['\r', '\n', ' ', '\t']);
+        if trimmed.is_empty() {
+            return None;
+        }
+        if is_mime_boundary_line(trimmed) {
+            return Some(trimmed);
+        }
+    }
+    None
+}
+
+fn is_part_end_boundary(line: &str, open_boundary: Option<&str>) -> bool {
+    let trimmed = line.trim_end_matches(['\r', '\n', ' ', '\t']);
+    if let Some(bound) = open_boundary {
+        trimmed == bound || trimmed.strip_prefix(bound) == Some("--")
+    } else {
+        is_mime_boundary_line(trimmed)
+    }
 }
 
 pub(super) fn is_quoted_printable_email(raw_email: &str) -> bool {
@@ -326,24 +367,63 @@ pub(super) fn is_quoted_printable_email(raw_email: &str) -> bool {
 }
 
 pub(super) fn decode_html_amp(input: &str) -> String {
-    input
-        .replace("&amp;", "&")
-        .replace("&#38;", "&")
-        .replace("&#x26;", "&")
-        .replace("&#X26;", "&")
-        .replace("&#61;", "=")
-        .replace("&#x3d;", "=")
-        .replace("&#x3D;", "=")
-        .replace("&nbsp;", " ")
-        .replace("&#160;", " ")
-        .replace("&#xa0;", " ")
-        .replace("&#xA0;", " ")
-        .replace("&quot;", "\"")
-        .replace("&#34;", "\"")
-        .replace("&#x22;", "\"")
-        .replace("&apos;", "'")
-        .replace("&#39;", "'")
-        .replace("&#x27;", "'")
+    if !input.contains('&') {
+        return input.to_owned();
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after_amp = &rest[amp + 1..];
+        let mut decoded_char = None;
+        let mut consumed = 0usize;
+        let scan_len = after_amp.len().min(12);
+        if let Some(semi) = after_amp.as_bytes()[..scan_len]
+            .iter()
+            .position(|&b| b == b';')
+        {
+            let entity = &after_amp[..semi];
+            if entity.eq_ignore_ascii_case("amp") {
+                decoded_char = Some('&');
+            } else if entity.eq_ignore_ascii_case("lt") {
+                decoded_char = Some('<');
+            } else if entity.eq_ignore_ascii_case("gt") {
+                decoded_char = Some('>');
+            } else if entity.eq_ignore_ascii_case("quot") {
+                decoded_char = Some('"');
+            } else if entity.eq_ignore_ascii_case("apos") {
+                decoded_char = Some('\'');
+            } else if entity.eq_ignore_ascii_case("nbsp") {
+                decoded_char = Some(' ');
+            } else if let Some(num) = entity.strip_prefix('#') {
+                let code =
+                    if let Some(hex) = num.strip_prefix('x').or_else(|| num.strip_prefix('X')) {
+                        u32::from_str_radix(hex, 16).ok()
+                    } else {
+                        num.parse::<u32>().ok()
+                    };
+                if let Some(c) = code {
+                    if c == 160 {
+                        decoded_char = Some(' ');
+                    } else if (0x20..=0x7E).contains(&c) {
+                        decoded_char = Some((c as u8) as char);
+                    }
+                }
+            }
+            if decoded_char.is_some() {
+                consumed = semi + 1;
+            }
+        }
+        if let Some(ch) = decoded_char {
+            out.push(ch);
+            rest = &after_amp[consumed..];
+        } else {
+            out.push('&');
+            rest = after_amp;
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 pub(super) fn strip_html_comments(input: &str) -> String {
@@ -462,15 +542,7 @@ pub(super) fn extract_iframe_srcdoc_fragments(input: &str) -> String {
             break;
         };
         let raw_srcdoc = &value_start[..end_idx];
-        let unescaped = decode_html_amp(&decode_html_amp(raw_srcdoc))
-            .replace("&lt;", "<")
-            .replace("&#60;", "<")
-            .replace("&#x3c;", "<")
-            .replace("&#x3C;", "<")
-            .replace("&gt;", ">")
-            .replace("&#62;", ">")
-            .replace("&#x3e;", ">")
-            .replace("&#x3E;", ">");
+        let unescaped = decode_html_amp(&decode_html_amp(raw_srcdoc));
         fragments.push(strip_html_comments(&unescaped));
         let consumed = input.len() - value_start.len() + end_idx + quote.len_utf8();
         search_from = consumed;
@@ -479,7 +551,7 @@ pub(super) fn extract_iframe_srcdoc_fragments(input: &str) -> String {
     fragments.join("\n")
 }
 
-fn decode_base64_block(input: &str) -> Option<String> {
+fn decode_base64_bytes(input: &str) -> Option<Vec<u8>> {
     let sextet = |b: u8| -> Option<u8> {
         match b {
             b'A'..=b'Z' => Some(b - b'A'),
@@ -518,7 +590,11 @@ fn decode_base64_block(input: &str) -> Option<String> {
     } else if len == 1 {
         return None;
     }
-    (!out.is_empty()).then(|| String::from_utf8_lossy(&out).into_owned())
+    (!out.is_empty()).then_some(out)
+}
+
+fn decode_base64_block(input: &str) -> Option<String> {
+    decode_base64_bytes(input).map(|out| String::from_utf8_lossy(&out).into_owned())
 }
 
 pub(super) fn encode_base64(input: &[u8]) -> String {
@@ -655,14 +731,17 @@ pub(super) fn decode_mime_base64_parts(raw_email: &str) -> String {
             .trim_matches('"')
             .to_ascii_lowercase()
             .starts_with("base64");
+        let open_bound = part_opening_boundary(&raw_email[..pos]);
         if is_b64
             && let Some((hdr_rest, body_start)) = split_header_body(from_hdr)
-            && !hdr_rest.lines().any(is_mime_boundary_line)
+            && !hdr_rest
+                .lines()
+                .any(|l| is_part_end_boundary(l, open_bound))
         {
             let mut body_end = body_start.len();
             let mut offset = 0usize;
             for line in body_start.split_inclusive('\n') {
-                if is_mime_boundary_line(line) {
+                if is_part_end_boundary(line, open_bound) {
                     body_end = offset;
                     break;
                 }
@@ -719,15 +798,18 @@ pub(super) fn decode_qp_mime_parts(input: &str) -> String {
             .trim_matches('"')
             .to_ascii_lowercase()
             .starts_with("quoted-printable");
+        let open_bound = part_opening_boundary(&input[..pos]);
         if is_qp
             && let Some((hdr_rest, body_start)) = split_header_body(from_hdr)
-            && !hdr_rest.lines().any(is_mime_boundary_line)
+            && !hdr_rest
+                .lines()
+                .any(|l| is_part_end_boundary(l, open_bound))
         {
             let body_offset = pos + (from_hdr.len() - body_start.len());
             let mut body_end = body_start.len();
             let mut offset = 0usize;
             for line in body_start.split_inclusive('\n') {
-                if is_mime_boundary_line(line) {
+                if is_part_end_boundary(line, open_bound) {
                     body_end = offset;
                     break;
                 }
@@ -1019,7 +1101,7 @@ fn is_non_auth_link(url: &str) -> bool {
     let (without_query, has_query) = lower
         .split_once('?')
         .map_or((lower.as_str(), false), |(p, q)| (p, !q.is_empty()));
-    if lower.contains("unsubscribe")
+    if has_negative_url_keyword(&lower)
         || lower.contains("email-preferences")
         || [
             ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".css", ".js", ".woff", ".woff2",
@@ -1043,6 +1125,8 @@ fn is_non_auth_link(url: &str) -> bool {
             | "www.w3.org"
             | "w3.org"
             | "schema.org"
+            | "anthropic.com"
+            | "www.anthropic.com"
             | "support.anthropic.com"
             | "status.anthropic.com"
             | "docs.anthropic.com"
@@ -1089,6 +1173,13 @@ fn is_non_auth_link(url: &str) -> bool {
             | "pricing"
             | "blog"
             | "contact"
+            | "download"
+            | "downloads"
+            | "product"
+            | "news"
+            | "research"
+            | "company"
+            | "customers"
     )
 }
 
@@ -1417,16 +1508,309 @@ fn is_json_message_self_url(url: &str) -> bool {
             || lower.contains("/emails/"))
 }
 
-/// Extracts all candidate verification or magic-link URLs from `raw_email` addressed to
-/// `target_email` in priority order.
-#[must_use]
-pub fn extract_magic_links_from_email(raw_email: &str, target_email: Option<&str>) -> Vec<String> {
+fn percent_decode_uri(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            )
+        {
+            out.push(((hi << 4) | lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn decode_proofpoint_v2(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'_' {
+            out.push(b'/');
+            i += 1;
+        } else if bytes[i] == b'-'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            )
+        {
+            out.push(((hi << 4) | lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn decode_proofpoint_v3(inner: &str, after_close: &str) -> String {
+    let mut out = if inner
+        .get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case("https%3a"))
+        || inner
+            .get(..7)
+            .is_some_and(|p| p.eq_ignore_ascii_case("http%3a"))
+    {
+        percent_decode_uri(inner)
+    } else {
+        inner.to_owned()
+    };
+    if out.contains('*')
+        && let Some(after_semi) = after_close.strip_prefix(';')
+        && let Some((enc_b64, _)) = after_semi.split_once('!')
+        && !enc_b64.is_empty()
+        && let Some(repl_bytes) = decode_base64_bytes(enc_b64)
+    {
+        let mut replaced = Vec::with_capacity(out.len());
+        let mut repl_iter = repl_bytes.into_iter();
+        for b in out.bytes() {
+            if b == b'*' {
+                replaced.push(repl_iter.next().unwrap_or(b'*'));
+            } else {
+                replaced.push(b);
+            }
+        }
+        out = String::from_utf8_lossy(&replaced).into_owned();
+    }
+    out
+}
+
+fn peel_tracked_url_once(url: &str) -> Option<String> {
+    if provider_url(url)
+        || url.starts_with("http://127.0.0.1:")
+        || url.starts_with("http://localhost:")
+    {
+        return None;
+    }
+    if let Some((_, after_v3)) = url.split_once("/v3/__")
+        && let Some((inner, after_close)) = after_v3.split_once("__")
+    {
+        let decoded = decode_proofpoint_v3(inner, after_close);
+        let cleaned = decoded.trim_end_matches(['.', ',', ';']);
+        if cleaned.starts_with("https://") || cleaned.starts_with("http://") {
+            return Some(cleaned.to_owned());
+        }
+    }
+    if let Some((_, after_l0)) = url.split_once("/L0/") {
+        let encoded = after_l0.split(['/', '?']).next().unwrap_or(after_l0);
+        let decoded = percent_decode_uri(encoded);
+        let cleaned = decoded.trim_end_matches(['.', ',', ';']);
+        if cleaned.starts_with("https://") || cleaned.starts_with("http://") {
+            return Some(cleaned.to_owned());
+        }
+    }
+    let (_, query) = url.split_once('?')?;
+    let query = query.split('#').next().unwrap_or(query);
+    let lower_url = url.to_ascii_lowercase();
+    for pair in query.split('&') {
+        let Some((k, v)) = pair.split_once('=') else {
+            continue;
+        };
+        let key_lower = percent_decode_uri(k).to_ascii_lowercase();
+        if !matches!(
+            key_lower.as_str(),
+            "url"
+                | "u"
+                | "target"
+                | "redirect"
+                | "redirect_url"
+                | "dest"
+                | "destination"
+                | "link"
+                | "goto"
+                | "q"
+        ) {
+            continue;
+        }
+        let decoded = if key_lower == "u"
+            && (lower_url.contains("urldefense")
+                || v.starts_with("https-3A__")
+                || v.starts_with("http-3A__"))
+        {
+            decode_proofpoint_v2(v)
+        } else {
+            percent_decode_uri(v)
+        };
+        let cleaned = decoded.trim_end_matches(['.', ',', ';']);
+        if cleaned.starts_with("https://") || cleaned.starts_with("http://") {
+            return Some(cleaned.to_owned());
+        }
+    }
+    None
+}
+
+enum TrackedUrl {
+    NotTracked,
+    Unwrapped(String),
+    RejectedTarget,
+}
+
+fn classify_tracked_magic_url(url: &str) -> TrackedUrl {
+    let Some(mut current) = peel_tracked_url_once(url) else {
+        return TrackedUrl::NotTracked;
+    };
+    for _ in 0..3 {
+        if let Some(next) = peel_tracked_url_once(&current) {
+            current = next;
+        } else {
+            break;
+        }
+    }
+    if is_supported_auth_url(&current) && !is_non_auth_link(&current) {
+        TrackedUrl::Unwrapped(current)
+    } else {
+        TrackedUrl::RejectedTarget
+    }
+}
+
+fn is_negative_email_anchor(text_lower: &str) -> bool {
+    let trimmed = text_lower.trim();
+    !trimmed.is_empty()
+        && [
+            "unsubscribe",
+            "opt out",
+            "opt-out",
+            "email preferences",
+            "manage preferences",
+            "notification settings",
+            "privacy",
+            "terms",
+            "legal",
+            "help center",
+            "support",
+            "contact us",
+            "view in browser",
+            "view online",
+            "view email",
+            "read in browser",
+            "cancel",
+            "deny",
+            "revoke",
+            "reject",
+            "decline",
+            "not you",
+            "wasn't you",
+            "wasnt you",
+            "report ",
+            "lock account",
+            "careers",
+            "pricing",
+            "blog",
+        ]
+        .iter()
+        .any(|kw| trimmed.contains(kw))
+}
+
+fn is_positive_email_anchor(text_lower: &str) -> bool {
+    let trimmed = text_lower.trim();
+    !trimmed.is_empty()
+        && !is_negative_email_anchor(trimmed)
+        && [
+            "sign in",
+            "sign-in",
+            "signin",
+            "log in",
+            "log-in",
+            "login",
+            "verify",
+            "confirm",
+            "magic link",
+            "authenticate",
+            "approve",
+            "authorize",
+            "complete sign",
+            "continue to claude",
+            "open claude",
+        ]
+        .iter()
+        .any(|kw| trimmed.contains(kw))
+}
+
+fn classify_email_html_anchors(html: &str) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut positive = BTreeSet::new();
+    let mut negative = BTreeSet::new();
+    let mut scan = html;
+    while let Some(a_pos) = find_ascii_ci(scan, "<a") {
+        let after_a = &scan[a_pos..];
+        if after_a.len() > 2
+            && !after_a.as_bytes()[2].is_ascii_whitespace()
+            && !matches!(after_a.as_bytes()[2], b'>' | b'/')
+        {
+            scan = &after_a[2..];
+            continue;
+        }
+        let Some(end_a) = find_tag_close(after_a) else {
+            break;
+        };
+        let a_tag = &after_a[..=end_a];
+        let after_open = &after_a[end_a + 1..];
+        let self_closing = a_tag.trim_end_matches('>').trim_end().ends_with('/');
+        let end_anchor = if self_closing {
+            0
+        } else {
+            find_ascii_ci(after_open, "</a>").unwrap_or(0)
+        };
+        let inner_raw = &after_open[..end_anchor];
+        let mut label = strip_inline_html(inner_raw);
+        for extra in [
+            extract_attr(a_tag, "aria-label"),
+            extract_attr(a_tag, "title"),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !extra.is_empty() {
+                label.push(' ');
+                label.push_str(&extra);
+            }
+        }
+        if let Some(href) = extract_attr(a_tag, "href") {
+            let cleaned = href.trim().trim_end_matches(['.', ',', ';']);
+            if !cleaned.is_empty() {
+                let label_low = label.to_ascii_lowercase();
+                if is_positive_email_anchor(&label_low) {
+                    positive.insert(cleaned.to_owned());
+                    if let TrackedUrl::Unwrapped(u) = classify_tracked_magic_url(cleaned) {
+                        positive.insert(u);
+                    }
+                } else if is_negative_email_anchor(&label_low) {
+                    negative.insert(cleaned.to_owned());
+                    if let TrackedUrl::Unwrapped(u) = classify_tracked_magic_url(cleaned) {
+                        negative.insert(u);
+                    }
+                }
+            }
+        }
+        scan = after_open;
+    }
+    (positive, negative)
+}
+
+pub(super) fn extract_ranked_magic_links_from_email(
+    raw_email: &str,
+    target_email: Option<&str>,
+) -> (Vec<String>, Vec<String>) {
     if let Some(target) = target_email
         && !email_matches_target(raw_email, target)
     {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let mut extra_text = decode_mime_base64_parts(raw_email);
+    if !extra_text.is_empty() {
+        extra_text = decode_qp_mime_parts(&extra_text);
+    }
     let mut explicit_urls = Vec::new();
     let mut ignored_otps = Vec::new();
     let mut is_json_with_body = false;
@@ -1436,7 +1820,7 @@ pub fn extract_magic_links_from_email(raw_email: &str, target_email: Option<&str
             is_json_with_body = true;
         }
     }
-    let qp_decoded = if is_json_with_body {
+    let qp_decoded = if is_json_with_body || is_top_level_base64_email(raw_email) {
         String::new()
     } else if is_quoted_printable_email(raw_email) {
         decode_quoted_printable(raw_email)
@@ -1450,7 +1834,24 @@ pub fn extract_magic_links_from_email(raw_email: &str, target_email: Option<&str
     let srcdoc_extra = extract_iframe_srcdoc_fragments(&format!("{qp_decoded}\n{extra_text}"));
     let combined = strip_html_comments(&format!("{srcdoc_extra}\n{extra_text}\n{qp_decoded}"));
     let decoded = decode_html_amp(&combined);
-    let mut urls = explicit_urls;
+    let (mut positive_anchors, negative_anchors) = classify_email_html_anchors(&decoded);
+    let mut urls = Vec::new();
+    for explicit in explicit_urls {
+        match classify_tracked_magic_url(&explicit) {
+            TrackedUrl::RejectedTarget => continue,
+            TrackedUrl::Unwrapped(unwrapped) => {
+                positive_anchors.insert(unwrapped.clone());
+                if !urls.iter().any(|u| u == &unwrapped) {
+                    urls.push(unwrapped);
+                }
+            }
+            TrackedUrl::NotTracked => {}
+        }
+        positive_anchors.insert(explicit.clone());
+        if !urls.iter().any(|u| u == &explicit) {
+            urls.push(explicit);
+        }
+    }
     for scheme in ["https://", "http://127.0.0.1:", "http://localhost:"] {
         let mut rest = decoded.as_str();
         while let Some(pos) = rest.find(scheme) {
@@ -1463,11 +1864,32 @@ pub fn extract_magic_links_from_email(raw_email: &str, target_email: Option<&str
                 })
                 .unwrap_or(after.len());
             let candidate = after[..end].trim_end_matches(['.', ',', ';']);
-            if is_supported_auth_url(candidate)
+            let rejected_by_anchor =
+                negative_anchors.contains(candidate) && !positive_anchors.contains(candidate);
+            if !rejected_by_anchor
+                && is_supported_auth_url(candidate)
                 && !is_non_auth_link(candidate)
-                && !urls.iter().any(|u| u == candidate)
             {
-                urls.push(candidate.to_owned());
+                match classify_tracked_magic_url(candidate) {
+                    TrackedUrl::RejectedTarget => {}
+                    TrackedUrl::Unwrapped(unwrapped) => {
+                        let unwrapped_rejected = negative_anchors.contains(&unwrapped)
+                            && !positive_anchors.contains(&unwrapped);
+                        if !unwrapped_rejected {
+                            if !urls.iter().any(|u| u == &unwrapped) {
+                                urls.push(unwrapped);
+                            }
+                            if !urls.iter().any(|u| u == candidate) {
+                                urls.push(candidate.to_owned());
+                            }
+                        }
+                    }
+                    TrackedUrl::NotTracked => {
+                        if !urls.iter().any(|u| u == candidate) {
+                            urls.push(candidate.to_owned());
+                        }
+                    }
+                }
             }
             rest = &after[end..];
         }
@@ -1486,39 +1908,60 @@ pub fn extract_magic_links_from_email(raw_email: &str, target_email: Option<&str
     };
     let looks_like_auth = |u: &str| {
         let lower = u.to_ascii_lowercase();
-        looks_like_magic_token(u) || lower.contains("login") || lower.contains("auth")
+        looks_like_magic_token(u)
+            || lower.contains("login")
+            || lower.contains("auth")
+            || positive_anchors.contains(u)
     };
-    let mut ranked = Vec::with_capacity(urls.len());
-    let mut push_unique = |u: &String| {
-        if !ranked.iter().any(|existing| existing == u) {
-            ranked.push(u.clone());
+    let mut auth_ranked = Vec::with_capacity(urls.len());
+    let mut push_auth = |u: &String| {
+        if !auth_ranked.iter().any(|existing| existing == u) {
+            auth_ranked.push(u.clone());
         }
     };
     for u in urls
         .iter()
         .filter(|u| provider_url(u) && looks_like_magic_token(u))
     {
-        push_unique(u);
+        push_auth(u);
     }
     for u in urls
         .iter()
         .filter(|u| provider_url(u) && looks_like_auth(u))
     {
-        push_unique(u);
+        push_auth(u);
     }
     for u in urls.iter().filter(|u| looks_like_magic_token(u)) {
-        push_unique(u);
+        push_auth(u);
     }
     for u in urls.iter().filter(|u| looks_like_auth(u)) {
-        push_unique(u);
+        push_auth(u);
     }
+    let mut fallback_ranked = Vec::new();
+    let mut push_fallback = |u: &String| {
+        if !auth_ranked.iter().any(|existing| existing == u)
+            && !fallback_ranked.iter().any(|existing| existing == u)
+        {
+            fallback_ranked.push(u.clone());
+        }
+    };
     for u in urls.iter().filter(|u| provider_url(u)) {
-        push_unique(u);
+        push_fallback(u);
     }
     for u in &urls {
-        push_unique(u);
+        push_fallback(u);
     }
-    ranked
+    (auth_ranked, fallback_ranked)
+}
+
+/// Extracts all candidate verification or magic-link URLs from `raw_email` addressed to
+/// `target_email` in priority order.
+#[must_use]
+pub fn extract_magic_links_from_email(raw_email: &str, target_email: Option<&str>) -> Vec<String> {
+    let (mut auth_links, fallback_links) =
+        extract_ranked_magic_links_from_email(raw_email, target_email);
+    auth_links.extend(fallback_links);
+    auth_links
 }
 
 /// Extracts a verification or magic-link URL from an incoming email addressed to `target_email`.
@@ -1722,8 +2165,12 @@ fn has_negative_url_keyword(s: &str) -> bool {
         "cancel",
         "reject",
         "decline",
+        "revoke",
         "/search",
         "unsubscribe",
+        "access_denied",
+        "?error=",
+        "&error=",
     ]
     .iter()
     .any(|bad| lower.contains(bad))
@@ -1789,14 +2236,20 @@ fn parse_json_approval_action(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
             {
-                let method = method_override.clone().unwrap_or_else(|| "POST".to_owned());
-                return Some((method, resolve_relative_url(base_url, target), None));
+                let resolved = resolve_relative_url(base_url, target);
+                if !has_negative_url_keyword(&resolved) {
+                    let method = method_override.clone().unwrap_or_else(|| "POST".to_owned());
+                    return Some((method, resolved, None));
+                }
             }
         }
         for key in [
             "redirect_url",
             "redirect_uri",
+            "redirect_to",
             "callback_url",
+            "continue_url",
+            "return_to",
             "next_url",
             "location",
         ] {
@@ -1806,8 +2259,11 @@ fn parse_json_approval_action(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
             {
-                let method = method_override.unwrap_or_else(|| "GET".to_owned());
-                return Some((method, resolve_relative_url(base_url, target), None));
+                let resolved = resolve_relative_url(base_url, target);
+                if !has_negative_url_keyword(&resolved) {
+                    let method = method_override.unwrap_or_else(|| "GET".to_owned());
+                    return Some((method, resolved, None));
+                }
             }
         }
     }
@@ -1908,10 +2364,8 @@ pub fn parse_html_approval_action(
             continue;
         };
         let open_tag = &form_html[..=tag_end];
-        let mut action = extract_attr(open_tag, "action").map_or_else(
-            || base_url.to_owned(),
-            |a| resolve_relative_url(base_url, &a),
-        );
+        let raw_action = extract_attr(open_tag, "action").unwrap_or_default();
+        let mut action = resolve_relative_url(base_url, &raw_action);
         if has_negative_url_keyword(&action) {
             continue;
         }
@@ -1945,7 +2399,8 @@ pub fn parse_html_approval_action(
             };
             let ctrl_tag = &after_ctrl[..=end_ctrl];
             let after_open = &after_ctrl[end_ctrl + 1..];
-            let button_text = if is_button {
+            let self_closing = ctrl_tag.trim_end_matches('>').trim_end().ends_with('/');
+            let button_text = if is_button && !self_closing {
                 let end_btn = find_ascii_ci(after_open, "</button>").unwrap_or(0);
                 strip_inline_html(&after_open[..end_btn])
             } else {
@@ -1977,6 +2432,10 @@ pub fn parse_html_approval_action(
                 saw_submit = true;
                 let name = extract_attr(ctrl_tag, "name");
                 let value = extract_attr(ctrl_tag, "value").unwrap_or_default();
+                let label_attr = extract_attr(ctrl_tag, "aria-label")
+                    .or_else(|| extract_attr(ctrl_tag, "title"))
+                    .or_else(|| extract_attr(ctrl_tag, "alt"))
+                    .unwrap_or_default();
                 let formaction = extract_attr(ctrl_tag, "formaction")
                     .map(|fa| resolve_relative_url(base_url, &fa));
                 let formmethod =
@@ -1984,6 +2443,7 @@ pub fn parse_html_approval_action(
                 let is_neg = name.as_deref().is_some_and(is_negative_form_token)
                     || is_negative_form_token(&value)
                     || (!button_text.is_empty() && is_negative_form_token(&button_text))
+                    || (!label_attr.is_empty() && is_negative_form_token(&label_attr))
                     || formaction.as_deref().is_some_and(has_negative_url_keyword);
                 if is_neg {
                     continue;
@@ -1991,6 +2451,7 @@ pub fn parse_html_approval_action(
                 let is_pos = name.as_deref().is_some_and(has_positive_approval_keyword)
                     || has_positive_approval_keyword(&value)
                     || has_positive_approval_keyword(&button_text)
+                    || has_positive_approval_keyword(&label_attr)
                     || formaction
                         .as_deref()
                         .is_some_and(has_positive_approval_keyword);
@@ -2011,10 +2472,9 @@ pub fn parse_html_approval_action(
             }
             if let Some(name) = extract_attr(ctrl_tag, "name") {
                 let value = extract_attr(ctrl_tag, "value").unwrap_or_default();
-                fields.push(format!(
-                    "{}={}",
-                    percent_encode(&name),
-                    percent_encode(&value)
+                fields.push((
+                    name.clone(),
+                    format!("{}={}", percent_encode(&name), percent_encode(&value)),
                 ));
             }
         }
@@ -2031,21 +2491,36 @@ pub fn parse_html_approval_action(
                 method = fm;
             }
             if let Some(name) = sub.name {
-                fields.push(format!(
-                    "{}={}",
-                    percent_encode(&name),
-                    percent_encode(&sub.value)
+                fields.push((
+                    name.clone(),
+                    format!("{}={}", percent_encode(&name), percent_encode(&sub.value)),
                 ));
             }
         }
-        let encoded = fields.join("&");
+        let encoded: String = fields
+            .iter()
+            .map(|(_, kv)| kv.as_str())
+            .collect::<Vec<_>>()
+            .join("&");
         let candidate = if method == "POST" {
             ("POST".to_owned(), action.clone(), Some(encoded))
         } else {
             let full_url = if encoded.is_empty() {
                 action.clone()
-            } else if action.contains('?') {
-                format!("{action}&{encoded}")
+            } else if let Some((base_path, existing_q)) = action.split_once('?') {
+                let kept_q: Vec<&str> = existing_q
+                    .split('&')
+                    .filter(|pair| {
+                        let k = pair.split('=').next().unwrap_or("");
+                        let decoded_k = percent_decode(k);
+                        !k.is_empty() && !fields.iter().any(|(fk, _)| fk == &decoded_k)
+                    })
+                    .collect();
+                if kept_q.is_empty() {
+                    format!("{base_path}?{encoded}")
+                } else {
+                    format!("{base_path}?{}&{encoded}", kept_q.join("&"))
+                }
             } else {
                 format!("{action}?{encoded}")
             };
@@ -2084,8 +2559,18 @@ pub fn parse_html_approval_action(
         };
         let a_tag = &after_a[..=end_a];
         let after_open = &after_a[end_a + 1..];
-        let end_anchor = find_ascii_ci(after_open, "</a>").unwrap_or(0);
-        let anchor_text = strip_inline_html(&after_open[..end_anchor]);
+        let self_closing = a_tag.trim_end_matches('>').trim_end().ends_with('/');
+        let end_anchor = if self_closing {
+            0
+        } else {
+            find_ascii_ci(after_open, "</a>").unwrap_or(0)
+        };
+        let mut anchor_text = strip_inline_html(&after_open[..end_anchor]);
+        if anchor_text.is_empty() {
+            anchor_text = extract_attr(a_tag, "aria-label")
+                .or_else(|| extract_attr(a_tag, "title"))
+                .unwrap_or_default();
+        }
         if let Some(href) = extract_attr(a_tag, "href") {
             let href_trimmed = href.trim();
             if !href_trimmed.is_empty()
@@ -2126,6 +2611,44 @@ pub(super) struct HttpResponse {
     pub(super) body: String,
 }
 
+fn try_decode_chunked_body(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut pos = 0usize;
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut saw_chunk = false;
+    loop {
+        let rest = bytes.get(pos..)?;
+        let (line_end, eol_len) = if let Some(idx) = rest.windows(2).position(|w| w == b"\r\n") {
+            (idx, 2usize)
+        } else {
+            (rest.iter().position(|&b| b == b'\n')?, 1usize)
+        };
+        let size_line = std::str::from_utf8(&rest[..line_end]).ok()?;
+        let hex_part = size_line.split(';').next().unwrap_or("").trim();
+        if hex_part.is_empty() || !hex_part.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let chunk_len = usize::from_str_radix(hex_part, 16).ok()?;
+        pos += line_end + eol_len;
+        if chunk_len == 0 {
+            let valid_empty = matches!(bytes.get(pos..), Some(b"\r\n" | b"\n" | b""));
+            return (saw_chunk || valid_empty).then(|| String::from_utf8_lossy(&out).into_owned());
+        }
+        let chunk_end = pos.checked_add(chunk_len)?;
+        let chunk_bytes = bytes.get(pos..chunk_end)?;
+        out.extend_from_slice(chunk_bytes);
+        saw_chunk = true;
+        pos = chunk_end;
+        if bytes.get(pos..pos + 2) == Some(b"\r\n") {
+            pos += 2;
+        } else if bytes.get(pos) == Some(&b'\n') {
+            pos += 1;
+        } else {
+            return None;
+        }
+    }
+}
+
 pub(super) fn parse_raw_http_response(
     raw: &str,
     cookies: &mut BTreeMap<String, String>,
@@ -2149,6 +2672,7 @@ pub(super) fn parse_raw_http_response(
             continue;
         }
         let mut location = None;
+        let mut is_chunked = false;
         for line in head.lines().skip(1) {
             let Some((name, val)) = line.split_once(':') else {
                 continue;
@@ -2156,6 +2680,10 @@ pub(super) fn parse_raw_http_response(
             let val = val.trim();
             if name.eq_ignore_ascii_case("location") {
                 location = Some(val.to_owned());
+            } else if name.eq_ignore_ascii_case("transfer-encoding")
+                && val.to_ascii_lowercase().contains("chunked")
+            {
+                is_chunked = true;
             } else if name.eq_ignore_ascii_case("set-cookie") {
                 let mut segments = val.split(';');
                 let pair = segments.next().unwrap_or(val).trim();
@@ -2179,10 +2707,15 @@ pub(super) fn parse_raw_http_response(
                 }
             }
         }
+        let body = if is_chunked {
+            try_decode_chunked_body(rest).unwrap_or_else(|| rest.to_owned())
+        } else {
+            rest.to_owned()
+        };
         return Some(HttpResponse {
             status,
             location,
-            body: rest.to_owned(),
+            body,
         });
     }
     None
@@ -2428,10 +2961,58 @@ fn one_query_param(url: &str, key: &str) -> Option<String> {
     values.next().is_none().then_some(value)
 }
 
+/// The pages a sign-in flow may visit ([`MailboxFlow::pinned`]): Claude Code's authorize
+/// endpoints, each with the one origin a flow it starts stays on ([`CLAUDE_PIN`]), or a vendor
+/// route's pinned hosts, any `https` page on them (`connector::Route::hosts`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pin {
+    /// Each authorize endpoint and the one origin a flow it starts may visit.
+    Endpoints(&'static [(&'static str, &'static str)]),
+    /// Any `https` page on these hosts ([`super::login_drive::pinned`]).
+    Hosts(&'static [&'static str]),
+}
+
+/// Claude Code's pin: claude.ai's and claude.com's authorize endpoints, each flow kept on the
+/// origin it started on.
+pub const CLAUDE_PIN: Pin = Pin::Endpoints(&[
+    ("https://claude.ai/oauth/authorize", "https://claude.ai/"),
+    (
+        "https://claude.com/cai/oauth/authorize",
+        "https://claude.com/",
+    ),
+]);
+
+impl Pin {
+    /// Whether a page of a flow under this pin may be `url`.
+    #[must_use]
+    pub fn admits(&self, url: &str) -> bool {
+        match self {
+            Pin::Endpoints(endpoints) => {
+                provider_url(url) && endpoints.iter().any(|(_, origin)| url.starts_with(origin))
+            }
+            Pin::Hosts(hosts) => hosted_url(url, hosts),
+        }
+    }
+}
+
+/// `url` is `https` on one of `hosts`, with no fragment.
+fn hosted_url(url: &str, hosts: &[&str]) -> bool {
+    super::login_drive::pinned(url, hosts) && !url.contains('#')
+}
+
+/// The pages one flow may visit, fixed when it starts ([`MailboxFlow::pinned`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    /// One origin of [`CLAUDE_PIN`]'s.
+    Prefix(&'static str),
+    /// A vendor route's hosts.
+    Hosts(&'static [&'static str]),
+}
+
 /// Only the callback endpoint and state actually named by this authorize
 /// request can leave the provider origin.
 pub(super) struct MailboxFlow {
-    origin_prefix: &'static str,
+    origin: Origin,
     callback_port: u16,
     callback_path: String,
     state: String,
@@ -2439,14 +3020,22 @@ pub(super) struct MailboxFlow {
 
 impl MailboxFlow {
     pub(super) fn new(authorize_url: &str) -> Result<Self, &'static str> {
-        let origin_prefix = match authorize_url.split('?').next() {
-            Some("https://claude.ai/oauth/authorize") if provider_url(authorize_url) => {
-                "https://claude.ai/"
+        Self::pinned(authorize_url, CLAUDE_PIN)
+    }
+
+    /// The flow `authorize_url` starts under `pin`: refused unless the pin admits it.
+    pub(super) fn pinned(authorize_url: &str, pin: Pin) -> Result<Self, &'static str> {
+        let origin = match pin {
+            Pin::Endpoints(endpoints) => {
+                let base = authorize_url.split('?').next();
+                endpoints
+                    .iter()
+                    .find(|(endpoint, _)| Some(*endpoint) == base && provider_url(authorize_url))
+                    .map(|(_, origin)| Origin::Prefix(origin))
+                    .ok_or("this authorize origin needs the manual browser")?
             }
-            Some("https://claude.com/cai/oauth/authorize") if provider_url(authorize_url) => {
-                "https://claude.com/"
-            }
-            _ => return Err("this authorize origin needs the manual browser"),
+            Pin::Hosts(hosts) if hosted_url(authorize_url, hosts) => Origin::Hosts(hosts),
+            Pin::Hosts(_) => return Err("this authorize origin needs the manual browser"),
         };
         let callback = one_query_param(authorize_url, "redirect_uri")
             .ok_or("the authorize URL has no single local callback")?;
@@ -2456,7 +3045,7 @@ impl MailboxFlow {
             return Err("the authorize callback must name an endpoint without a query");
         }
         Ok(Self {
-            origin_prefix,
+            origin,
             callback_port: port,
             callback_path: path.to_owned(),
             state: one_query_param(authorize_url, "state")
@@ -2465,7 +3054,10 @@ impl MailboxFlow {
     }
 
     pub(super) fn admits_provider_url(&self, url: &str) -> bool {
-        url.starts_with(self.origin_prefix) && provider_url(url)
+        match self.origin {
+            Origin::Prefix(prefix) => url.starts_with(prefix) && provider_url(url),
+            Origin::Hosts(hosts) => hosted_url(url, hosts),
+        }
     }
 
     pub(super) fn is_callback(&self, url: &str) -> bool {
@@ -2595,18 +3187,46 @@ pub(super) fn poll_mailbox_for_magic_link(
 }
 
 fn page_needs_browser_before_email(html: &str) -> bool {
-    let lower = strip_html_comments(html).to_ascii_lowercase();
-    let has_email_input = lower.contains("type=\"email\"")
-        || lower.contains("type='email'")
-        || lower.contains("name=\"email\"")
-        || lower.contains("name='email'")
-        || lower.contains("autocomplete=\"email\"")
-        || lower.contains("autocomplete='email'")
-        || lower.contains("autocomplete=\"username\"")
-        || lower.contains("autocomplete='username'");
-    if has_email_input {
-        return true;
+    let uncommented = strip_html_comments(html);
+    let mut scan = uncommented.as_str();
+    while let Some(pos) = find_ascii_ci(scan, "<input") {
+        let after = &scan[pos..];
+        if after.len() > 6
+            && !after.as_bytes()[6].is_ascii_whitespace()
+            && !matches!(after.as_bytes()[6], b'>' | b'/')
+        {
+            scan = &after[6..];
+            continue;
+        }
+        let Some(end) = find_tag_close(after) else {
+            break;
+        };
+        let tag = &after[..=end];
+        scan = &after[end + 1..];
+        if has_html_attr(tag, "disabled") || has_html_attr(tag, "hidden") {
+            continue;
+        }
+        let input_type = extract_attr(tag, "type")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        if input_type == "hidden" {
+            continue;
+        }
+        if input_type == "email" {
+            return true;
+        }
+        if extract_attr(tag, "name").is_some_and(|n| n.trim().eq_ignore_ascii_case("email")) {
+            return true;
+        }
+        if extract_attr(tag, "autocomplete").is_some_and(|ac| {
+            let ac_low = ac.trim().to_ascii_lowercase();
+            ac_low == "email" || ac_low == "username" || ac_low.ends_with(" email")
+        }) {
+            return true;
+        }
     }
+    let lower = uncommented.to_ascii_lowercase();
     let has_email_sent_notice = lower.contains("check your email")
         || lower.contains("magic link")
         || lower.contains("sent a link")
@@ -2896,8 +3516,54 @@ fn authorize_using_with_page(
     Err(last_err)
 }
 
-fn discover_store_dir() -> Option<PathBuf> {
-    if let Some(claude_dir) = std::env::var_os(super::accounts::HOME_ENV) {
+/// The variable naming, to an opener or headless run, the pool's CLI (`connector::Cli::id`):
+/// read ahead of Claude Code's home to find the account ([`account_label_of`],
+/// [`store_dir_of`]).
+pub const ACCOUNT_CLI_ENV: &str = "ATERM_ACCOUNT_CLI";
+
+/// The variable naming, to an opener or headless run, the row's label ([`account_label_of`]).
+pub const ACCOUNT_LABEL_ENV: &str = "ATERM_ACCOUNT_LABEL";
+
+/// The account's label as `var` names it: [`ACCOUNT_LABEL_ENV`] where it holds a label a roster
+/// could carry, else the name of Claude Code's home (`<store>/logins/<label>[+<seq>]`) unless
+/// [`ACCOUNT_CLI_ENV`] names another CLI.
+#[must_use]
+pub fn account_label_of(var: &dyn Fn(&str) -> Option<OsString>) -> Option<String> {
+    if let Some(label) = var(ACCOUNT_LABEL_ENV)
+        .and_then(|v| v.into_string().ok())
+        .map(|v| v.trim().to_owned())
+        .filter(|v| super::accounts::admissible_label(v))
+    {
+        return Some(label);
+    }
+    if names_another_cli(var) {
+        return None;
+    }
+    let dir = var(super::accounts::HOME_ENV)?;
+    let name = Path::new(&dir).file_name()?.to_str()?;
+    let label = name.rsplit_once('+').map_or(name, |(l, _)| l).trim();
+    (!label.is_empty()).then(|| label.to_owned())
+}
+
+/// Whether [`ACCOUNT_CLI_ENV`] names a CLI other than Claude Code.
+fn names_another_cli(var: &dyn Fn(&str) -> Option<OsString>) -> bool {
+    var(ACCOUNT_CLI_ENV)
+        .and_then(|v| v.into_string().ok())
+        .and_then(|id| super::accounts::Cli::parse(id.trim()))
+        .is_some_and(|cli| cli != super::accounts::Cli::Claude)
+}
+
+/// The accounts store an opener run finds: Claude Code's home's store (`<store>/logins/<label>`)
+/// unless [`ACCOUNT_CLI_ENV`] names another CLI, else the store the opener's link sits in
+/// (`<store>/bin/aterm-open-url`, `arg0`).
+#[must_use]
+pub fn store_dir_of(
+    var: &dyn Fn(&str) -> Option<OsString>,
+    arg0: Option<&Path>,
+) -> Option<PathBuf> {
+    if !names_another_cli(var)
+        && let Some(claude_dir) = var(super::accounts::HOME_ENV)
+    {
         let p = Path::new(&claude_dir);
         if p.parent()
             .and_then(Path::file_name)
@@ -2908,9 +3574,13 @@ fn discover_store_dir() -> Option<PathBuf> {
             return Some(store_dir.to_path_buf());
         }
     }
-    let arg0 = std::env::args_os().next()?;
-    let store_dir = Path::new(&arg0).parent().and_then(Path::parent)?;
+    let store_dir = arg0?.parent().and_then(Path::parent)?;
     store_dir.is_dir().then(|| store_dir.to_path_buf())
+}
+
+fn discover_store_dir() -> Option<PathBuf> {
+    let arg0 = std::env::args_os().next().map(PathBuf::from);
+    store_dir_of(&|name| std::env::var_os(name), arg0.as_deref())
 }
 
 /// Entry point for the `aterm-open-url` argv0 alias.

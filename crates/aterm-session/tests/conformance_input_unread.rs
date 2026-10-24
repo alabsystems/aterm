@@ -172,12 +172,18 @@ fn assert_projects(rig: &Rig, b: &InputBacklog, st: &State, step: &str) {
 ///   `warned = 1`;
 /// * for a running job not yet published, `classify`, fed the watch's evidence for the
 ///   model's reader (a frozen reader spins and draws nothing; a reading one is seen
-///   drawing), enters `stalled` exactly when `Publish` is enabled.
+///   drawing; one macOS's program check holds is seen held), enters `stalled` exactly when
+///   `Publish` is enabled;
+/// * for a running job with a stall published, `classify` keeps it `stalled` exactly when
+///   `Withdraw` is disabled.
+///
+/// Each check runs with the reader held at its start and not.
 fn assert_gate_is_the_guard(model: &Model, b: &InputBacklog, st: &State, step: &str) {
     let published = st["published"] == 1;
-    for stopped in [false, true] {
+    for (stopped, held) in [(false, 0), (true, 0), (false, 1), (true, 1)] {
         let mut s = st.clone();
         s.insert("stopped", i64::from(stopped));
+        s.insert("held", held);
         let g = gate(b, stopped, published);
         assert_eq!(
             g == Gate::Refuse,
@@ -207,12 +213,23 @@ fn assert_gate_is_the_guard(model: &Model, b: &InputBacklog, st: &State, step: &
             let seen = Liveness::Watched {
                 drew: !frozen,
                 spinning: frozen,
+                program_check: held == 1,
                 contention: Contention::default(),
             };
             assert_eq!(
                 classify(Some(b), false, seen) == InputWord::Stalled,
                 model.action_enabled("Publish", &s),
-                "{step}: classify({b:?}, {seen:?}) disagrees with Publish at {s:?}"
+                "{step} (held={held}): classify({b:?}, {seen:?}) disagrees with Publish at {s:?}"
+            );
+        }
+        if !stopped && published {
+            let seen = Liveness::Published {
+                program_check: held == 1,
+            };
+            assert_eq!(
+                classify(Some(b), false, seen) == InputWord::Stalled,
+                !model.action_enabled("Withdraw", &s),
+                "{step} (held={held}): classify({b:?}, {seen:?}) disagrees with Withdraw at {s:?}"
             );
         }
     }
@@ -225,6 +242,7 @@ fn fire(model: &Model, action: &str, st: &mut State) {
         "NoDriverKeyBehindStalledInput",
         "NoRefusalWithoutAnEstablishedStall",
         "NoReadingProgramPublished",
+        "NoHeldProgramPublished",
     ] {
         assert!(model.check_invariant(inv, st), "{action}: {inv} at {st:?}");
     }
@@ -417,4 +435,88 @@ fn the_incident_replays_and_the_gate_withholds_the_key() {
     assert!(!model.fire("DriverKey", &mut st));
     assert_eq!(rig.read_all(), b"\r", "the program reads exactly its Enter");
     assert_eq!(rig.reading().queued, 0);
+}
+
+/// The design's negative control for a program macOS's program check holds: a raw reader
+/// whose Enter has aged into the stall band is held at its start, so `Publish` is disabled,
+/// `classify` keeps it `pending` though it reads as frozen, and the gate warns and writes; once
+/// released, the same frozen reader stalls, and a stall published before macOS holds its reader
+/// is withdrawn. A watch that published a held reader (`Buggy = 2`) is caught by
+/// `NoHeldProgramPublished`.
+#[test]
+fn a_held_program_keeps_its_input_pending_and_one_not_held_still_stalls() {
+    let model = input_unread_gate_model();
+    let blind = interp::with_buggy(&model, 2);
+    let mut rig = Rig::new(true);
+    let mut st = model.init_state();
+    enter_and_age_to_stall(&mut [&mut rig], &model, &mut st);
+    fire(&model, "Hold", &mut st);
+
+    let b = rig.reading();
+    let held = Liveness::Watched {
+        drew: false,
+        spinning: true,
+        program_check: true,
+        contention: Contention::default(),
+    };
+    assert_eq!(
+        classify(Some(&b), false, held),
+        InputWord::Pending,
+        "a frozen reader macOS holds at its start is no stall: {b:?}"
+    );
+    let b = step(&rig, &model, &st, "held");
+    assert!(b.wait >= STALL_AFTER, "{b:?}");
+    assert!(!model.action_enabled("Publish", &st), "{st:?}");
+    assert!(
+        !model.action_enabled("Consume", &st),
+        "a held program reads nothing"
+    );
+    assert_eq!(
+        gate(&b, false, false),
+        Gate::Warn,
+        "written, with a warning: {b:?}"
+    );
+
+    let mut published = st.clone();
+    assert!(blind.fire("Publish", &mut published), "{published:?}");
+    assert!(
+        !blind.check_invariant("NoHeldProgramPublished", &published),
+        "a watch blind to the program check publishes a program that has not started"
+    );
+
+    fire(&model, "Release", &mut st);
+    let b = step(&rig, &model, &st, "released");
+    let frozen = Liveness::Watched {
+        drew: false,
+        spinning: true,
+        program_check: false,
+        contention: Contention::default(),
+    };
+    assert_eq!(classify(Some(&b), false, frozen), InputWord::Stalled);
+    fire(&model, "Publish", &mut st);
+    let b = step(&rig, &model, &st, "published");
+    assert_eq!(gate(&b, false, true), Gate::Refuse, "{b:?}");
+
+    fire(&model, "Hold", &mut st);
+    let b = rig.reading();
+    assert_eq!(
+        classify(
+            Some(&b),
+            false,
+            Liveness::Published {
+                program_check: true
+            }
+        ),
+        InputWord::Pending,
+        "a stall whose reader macOS then holds at its start is let go: {b:?}"
+    );
+    step(&rig, &model, &st, "held after its stall");
+    fire(&model, "Withdraw", &mut st);
+    let b = step(&rig, &model, &st, "let go");
+    assert_eq!(
+        gate(&b, false, false),
+        Gate::Warn,
+        "written, with a warning: {b:?}"
+    );
+    assert_eq!(rig.read_all(), b"\r", "the program reads exactly its Enter");
 }

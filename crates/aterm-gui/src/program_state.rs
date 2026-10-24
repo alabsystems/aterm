@@ -127,7 +127,13 @@ pub(crate) fn honoured_for(program: Option<&str>) -> bool {
     match aterm_phase::program_of(name) {
         Some(Program::Codex) => true,
         Some(
-            Program::Claude | Program::Generic | Program::Agy | Program::Muse | Program::Gemini,
+            Program::Claude
+            | Program::Grok
+            | Program::Kimi
+            | Program::Generic
+            | Program::Agy
+            | Program::Muse
+            | Program::Gemini,
         ) => false,
         None => aterm_phase::may_host_agent(name),
     }

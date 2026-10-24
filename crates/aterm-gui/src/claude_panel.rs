@@ -75,21 +75,20 @@ pub(crate) fn read_panel(
     for (i, row) in panel.rows().iter().enumerate() {
         let frame_row = pane.strip + pane.row_off + usize::from(row.row);
         let cells = scratch.cells.get(frame_row).map_or(&[][..], Vec::as_slice);
-        let agy_agent = row.kind == RowKind::Agent
+        let agy_split = (row.kind == RowKind::Agent
             && row
                 .bullet
-                .is_some_and(|(_, b)| b == aterm_phase::agents_panel::Bullet::Filled)
-            && rows
-                .get(usize::from(row.row))
+                .is_some_and(|(_, b)| b == aterm_phase::agents_panel::Bullet::Filled))
+        .then(|| {
+            rows.get(usize::from(row.row))
                 .and_then(|text| text.strip_prefix("  ● "))
-                .and_then(|body| body.split("  ").next())
-                .and_then(aterm_phase::agy::unwrap_agent_token)
-                .is_some();
+                .and_then(aterm_phase::agy::split_agent_token)
+                .filter(|(_, after)| after.is_empty() || after.starts_with("  "))
+        })
+        .flatten();
+        let agy_agent = agy_split.is_some();
         read.agy_agent[i] = agy_agent;
-        if agy_agent
-            && let Some(text) = rows.get(usize::from(row.row))
-            && let Some((_, after_close)) = text.split_once(')')
-        {
+        if let Some((_, after_close)) = agy_split {
             let state = after_close.trim_start();
             if let Some(tool) = aterm_phase::agy::subagent_tool_activity(state) {
                 let age_ms = row

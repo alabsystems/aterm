@@ -586,3 +586,59 @@ fn unknown_inheritance_stops_before_the_real_cli_collects_or_runs() {
         Level::Plan
     );
 }
+
+/// Grok Build and Kimi Code are no connections of `aterm ai`'s yet, but their pools are: `aterm
+/// ai login kimi` runs the pool's renewal of its next row where this machine keeps
+/// `accounts-kimi.toml`, and says how to add one, running nothing, where it does not.
+#[test]
+fn login_of_a_pool_cli_that_is_no_connection_runs_its_pools_renewal() {
+    let b = machine(&["codex"]);
+    let env = env_of(&b, ONLY_CODEX, &[], true);
+    let runner = FakeRunner::quiet();
+    let (code, out, err) = run_cli(&env, &runner, &["login", "kimi"]);
+    assert_eq!(code, 2, "{out}{err}");
+    assert!(out.contains("keeps no `accounts-kimi.toml`"), "{out}");
+    assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+
+    std::fs::write(
+        b.dir.path().join("accounts-kimi.toml"),
+        "[[account]]\nlabel = \"kimi-one\"\nclass = \"dedicated\"\n\
+         email = \"kimi-one@example.com\"\nregion = \"global\"\n",
+    )
+    .expect("roster");
+    let (code, out, err) = run_cli(&env, &runner, &["login", "kimi"]);
+    assert_eq!(code, 0, "{out}{err}");
+    let calls = runner.calls();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert!(
+        calls[0].terminal && calls[0].program == "aterm",
+        "{:?}",
+        calls[0]
+    );
+    assert_eq!(
+        calls[0].args,
+        ["harness", "accounts", "renew", "kimi-one", "--cli", "kimi"]
+    );
+    assert!(out.contains("kimi: signed in"), "{out}");
+
+    // Negative: an agent never signs a pool in, nor a person with no terminal, and a word that
+    // names no CLI is still refused, the pool CLIs among those it lists.
+    let runner = FakeRunner::quiet();
+    let agent = env_of(&b, ONLY_CODEX, &[("CLAUDECODE", "1")], true);
+    let (code, out, _) = run_cli(&agent, &runner, &["login", "kimi"]);
+    assert_eq!(code, 2, "{out}");
+    let (code, _, err) = run_cli(
+        &env_of(&b, ONLY_CODEX, &[], false),
+        &runner,
+        &["login", "grok"],
+    );
+    assert_eq!(code, 2);
+    assert!(err.contains("not a terminal"), "{err}");
+    let (code, _, err) = run_cli(&env, &runner, &["login", "gpt"]);
+    assert_eq!(code, 2);
+    assert!(
+        err.contains("is no AI CLI") && err.contains("kimi"),
+        "{err}"
+    );
+    assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+}

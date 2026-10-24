@@ -11,7 +11,7 @@ use aterm_converge::StoodAside;
 use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// The rustup profile that installs no documentation.
 const MINIMAL: &str = "minimal";
@@ -42,12 +42,63 @@ pub fn items(ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
     ])
 }
 
+/// How long one Spotlight search of a home folder for build folders stands ([`Inventory`]):
+/// it reads every build artifact Spotlight holds there, so a setup run, a check and System
+/// State's reading share one for this long instead of each searching the home folder again.
+const INVENTORY_AGE: u64 = 5 * 60;
+
+/// The last Spotlight search for build folders: the home it searched, when (Unix seconds),
+/// and the `target` and `build` folders it found indexed.
+#[derive(Debug, Default)]
+struct Inventory(Mutex<Option<(PathBuf, u64, BTreeSet<PathBuf>)>>);
+
+impl Inventory {
+    /// The process's one inventory; a test's item keeps its own.
+    fn shared() -> Arc<Self> {
+        #[cfg(not(test))]
+        {
+            static SHARED: std::sync::OnceLock<Arc<Inventory>> = std::sync::OnceLock::new();
+            SHARED.get_or_init(Arc::default).clone()
+        }
+        #[cfg(test)]
+        {
+            Arc::default()
+        }
+    }
+
+    /// The folders a search of `home` taken at most [`INVENTORY_AGE`] before `now` found,
+    /// else `search`'s, kept for the next reader. A search that fails is kept by no one.
+    fn read(
+        &self,
+        home: &Path,
+        now: u64,
+        search: impl FnOnce() -> Result<BTreeSet<PathBuf>, String>,
+    ) -> Result<BTreeSet<PathBuf>, String> {
+        let mut kept = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((at_home, at, found)) = kept.as_ref()
+            && at_home == home
+            && *at <= now
+            && now - at < INVENTORY_AGE
+        {
+            return Ok(found.clone());
+        }
+        let found = search()?;
+        *kept = Some((home.to_path_buf(), now, found.clone()));
+        Ok(found)
+    }
+}
+
 /// Keep aterm's cargo build cache and tooling cache in `.noindex` folders, and name the
-/// Trust toolchain builds and build folders Spotlight still indexes for the person to move.
-/// It never moves them itself: a program someone started from one may still be under
-/// macOS's first-exec check, and syspolicyd crashes when that file's folder is renamed
-/// mid-check. A kill leaves no process and a run changes no folder, so nothing it could
-/// read shows that check is over.
+/// Trust toolchain builds Spotlight still indexes for the person to move. It never moves
+/// them itself: a program someone started from one may still be under macOS's first-exec
+/// check, and syspolicyd crashes when that file's folder is renamed mid-check. A kill
+/// leaves no process and a run changes no folder, so nothing it could read shows that
+/// check is over.
+///
+/// The person's own project build folders (`target`, `build`) that Spotlight indexes are
+/// theirs, never aterm's to rename or link: the row only counts them in a quiet note
+/// ([`Reading::ProjectsIndexed`]) and lists them in its line, and they are no step, no
+/// change and nothing the run waits on. A failed search for them costs only the note.
 #[derive(Debug)]
 struct BuildNoindex {
     user: User,
@@ -56,6 +107,8 @@ struct BuildNoindex {
     aside: Mutex<Option<StoodAside>>,
     /// The last probe's reading, which is System State's.
     reading: LastReading,
+    /// The Spotlight search for project build folders, shared for [`INVENTORY_AGE`].
+    inventory: Arc<Inventory>,
 }
 
 impl BuildNoindex {
@@ -65,6 +118,7 @@ impl BuildNoindex {
             home,
             aside: Mutex::new(None),
             reading: LastReading::default(),
+            inventory: Inventory::shared(),
         }
     }
 
@@ -157,14 +211,13 @@ impl BuildNoindex {
     }
 
     /// What Spotlight indexes that is the person's to move: the plain Trust toolchain
-    /// builds, then the `spotlit` build folders.
-    fn to_move(&self, sys: &dyn System, spotlit: Vec<PathBuf>) -> Result<Vec<PathBuf>, String> {
+    /// builds.
+    fn to_move(&self, sys: &dyn System) -> Result<Vec<PathBuf>, String> {
         let store = self.trust_store();
         Ok(self
             .plain_trust_builds(sys)?
             .iter()
             .map(|name| store.join(name))
-            .chain(spotlit)
             .collect())
     }
 
@@ -186,8 +239,28 @@ impl BuildNoindex {
         )
     }
 
-    /// Cargo/Rust `target` or `build` directories under `self.home` indexed by Spotlight.
-    fn spotlit_build_dirs(&self, sys: &dyn System) -> Result<Vec<PathBuf>, String> {
+    /// The person's own Cargo/Rust `target` or `build` folders under `self.home` that
+    /// Spotlight indexes, from the [`Inventory`] (`None` when Spotlight could not be
+    /// asked, which costs only the row's note).
+    fn spotlit_projects(&self, sys: &dyn System) -> Option<Vec<PathBuf>> {
+        let indexed = self
+            .inventory
+            .read(&self.home, sys.now(), || self.search(sys))
+            .ok()?;
+        let mut out = Vec::new();
+        for cand in indexed {
+            let built = |name: &str| Self::present(sys, &cand.join(name));
+            if Self::dir_present(sys, &cand).ok()?
+                && (built("CACHEDIR.TAG").ok()? || built("debug").ok()? || built("release").ok()?)
+            {
+                out.push(cand);
+            }
+        }
+        Some(out)
+    }
+
+    /// Ask Spotlight which `target` or `build` folders under `self.home` it indexes.
+    fn search(&self, sys: &dyn System) -> Result<BTreeSet<PathBuf>, String> {
         let mdfind_bin = Path::new("/usr/bin/mdfind");
         sys.stat(mdfind_bin)
             .map_err(|e| format!("{}: {e}", mdfind_bin.display()))?;
@@ -235,28 +308,15 @@ impl BuildNoindex {
                 }
             }
         }
-        let mut out = Vec::new();
-        for cand in candidates {
-            let Some(name) = cand.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if Self::dir_present(sys, &cand)?
-                && (Self::present(sys, &cand.join("CACHEDIR.TAG"))?
-                    || Self::present(sys, &cand.join("debug"))?
-                    || Self::present(sys, &cand.join("release"))?)
-            {
-                let noindex = cand.with_file_name(format!("{name}.noindex"));
-                if Self::present(sys, &noindex)? {
-                    return Err(format!(
-                        "both {} and {} exist; left unchanged",
-                        cand.display(),
-                        noindex.display()
-                    ));
-                }
-                out.push(cand);
-            }
-        }
-        Ok(out)
+        Ok(candidates)
+    }
+
+    /// The row's line on the person's own project folders Spotlight indexes.
+    fn projects_line(projects: &[PathBuf]) -> String {
+        format!(
+            "Spotlight indexes these project build folders of yours, which aterm leaves as they are: {}",
+            Self::listed(projects)
+        )
     }
 }
 
@@ -283,11 +343,7 @@ impl Item for BuildNoindex {
             Ok(v) => v,
             Err(why) => return Probe::Unusable { why },
         };
-        let spotlit_builds = match self.spotlit_build_dirs(sys) {
-            Ok(dirs) => dirs,
-            Err(why) => return Probe::Unusable { why },
-        };
-        if !has_caches && !has_store && spotlit_builds.is_empty() {
+        if !has_caches && !has_store {
             return Probe::NotApplicable {
                 why: format!(
                     "neither {} nor {} exists",
@@ -300,26 +356,35 @@ impl Item for BuildNoindex {
             Ok(missing) => missing,
             Err(why) => return Probe::Unusable { why },
         };
-        let folders = match self.to_move(sys, spotlit_builds) {
+        let folders = match self.to_move(sys) {
             Ok(folders) => folders,
             Err(why) => return Probe::Unusable { why },
         };
+        let projects = self.spotlit_projects(sys).unwrap_or_default();
+        let indexed = Reading::BuildsIndexed {
+            projects: projects.len(),
+        };
         if missing.is_empty() {
             return if folders.is_empty() {
-                Probe::Ok {
-                    now:
-                        "cargo-build.noindex, tooling.noindex, and trust store builds are .noindex"
-                            .into(),
+                let mut now =
+                    "cargo-build.noindex, tooling.noindex, and trust store builds are .noindex"
+                        .to_owned();
+                if !projects.is_empty() {
+                    self.reading.set(Some(Reading::ProjectsIndexed {
+                        count: projects.len(),
+                    }));
+                    now.push_str(&format!("; {}", Self::projects_line(&projects)));
                 }
+                Probe::Ok { now }
             } else {
-                self.reading.set(Some(Reading::BuildsIndexed));
+                self.reading.set(Some(indexed));
                 Probe::Person {
                     step: "spotlight.build-folders".into(),
                     how: Self::for_the_person(&folders),
                 }
             };
         }
-        self.reading.set(Some(Reading::BuildsIndexed));
+        self.reading.set(Some(indexed));
         let mut from: Vec<String> = missing
             .iter()
             .filter_map(|dir| dir.file_name())
@@ -331,6 +396,9 @@ impl Item for BuildNoindex {
             from.push(format!("{listed} indexed by Spotlight"));
             to.push_str(&format!(", with {listed} left for you to move"));
         }
+        if !projects.is_empty() {
+            from.push(Self::projects_line(&projects));
+        }
         Probe::Change {
             from: from.join("; "),
             to,
@@ -341,13 +409,13 @@ impl Item for BuildNoindex {
         self.reading.detail()
     }
 
-    /// Make the missing caches; name the folders Spotlight indexes for the person and stand
-    /// aside on them ([`StoodAside::Waiting`]), since only they can tell when nothing runs
-    /// from one.
+    /// Make the missing caches; name the Trust toolchain builds Spotlight indexes for the
+    /// person and stand aside on them ([`StoodAside::Waiting`]), since only they can tell
+    /// when nothing runs from one. The person's own project folders are not its to touch.
     fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
         self.set_aside(None);
-        // Admit both inventories before creating any cache directory.
-        let folders = self.to_move(sys, self.spotlit_build_dirs(sys)?)?;
+        // Admit the store's inventory before creating any cache directory.
+        let folders = self.to_move(sys)?;
         for dir in self.missing_caches(sys)? {
             sys.create_dir_all(&dir, 0o755)
                 .map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -702,7 +770,10 @@ mod tests {
         let items: Vec<Box<dyn Item>> = vec![Box::new(item)];
         let planned = engine::run(&items, Mode::Plan, &sys, &context(), &mut NoJournal);
         assert_eq!(planned[0].outcome, Outcome::Planned, "{planned:?}");
-        assert_eq!(Reading::of(&planned[0]), Some(Reading::BuildsIndexed));
+        assert_eq!(
+            Reading::of(&planned[0]),
+            Some(Reading::BuildsIndexed { projects: 0 })
+        );
         assert!(
             planned[0]
                 .from
@@ -732,18 +803,47 @@ mod tests {
         );
     }
 
+    const MDFIND: &str =
+        "alice$ /usr/bin/mdfind -onlyin /Users//alice -0 'kMDItemFSName == \"*.rmeta\"'";
+    const TARGET: &str = "/Users//alice/work/demo/target";
+
+    /// A Mac whose caches the item makes are `made`, with one project `target` of the
+    /// person's that Spotlight indexes.
+    fn with_a_spotlit_project(made: bool) -> Fake {
+        let sys = Fake::root();
+        sys.create_dir_all(Path::new("/Users//alice/Library/Caches"), 0o755)
+            .unwrap();
+        if made {
+            for name in ["cargo-build.noindex", "tooling.noindex"] {
+                sys.create_dir_all(
+                    &Path::new("/Users//alice/Library/Caches/aterm").join(name),
+                    0o755,
+                )
+                .unwrap();
+            }
+        }
+        sys.create_dir_all(Path::new(&format!("{TARGET}/debug")), 0o755)
+            .unwrap();
+        sys.file(&format!("{TARGET}/CACHEDIR.TAG"), b"Signature:");
+        sys.file("/usr/bin/mdfind", b"").on(
+            MDFIND,
+            Ran::ok(&format!("{TARGET}/debug/deps/libdemo.rmeta\0")),
+        );
+        sys
+    }
+
+    fn alice_builds() -> Vec<Box<dyn Item>> {
+        vec![Box::new(BuildNoindex::new(
+            user("alice", 501),
+            "/Users//alice".into(),
+        ))]
+    }
+
     #[test]
     fn a_build_folder_a_program_may_still_run_from_is_the_persons_to_move_and_never_planned() {
         const STORE: &str = "/Users//alice/Library/Application Support/aterm/pkg/store/trust";
-        const TARGET: &str = "/Users//alice/work/demo/target";
-        const MDFIND: &str =
-            "alice$ /usr/bin/mdfind -onlyin /Users//alice -0 'kMDItemFSName == \"*.rmeta\"'";
         let run_as = |sys: &Fake, mode: Mode| {
-            let items: Vec<Box<dyn Item>> = vec![Box::new(BuildNoindex::new(
-                user("alice", 501),
-                "/Users//alice".into(),
-            ))];
-            engine::run(&items, mode, sys, &context(), &mut NoJournal)
+            engine::run(&alice_builds(), mode, sys, &context(), &mut NoJournal)
         };
         let run = |sys: &Fake| run_as(sys, Mode::Apply);
         let caches = |sys: &Fake| {
@@ -755,9 +855,7 @@ mod tests {
                 })
         };
 
-        let sys = Fake::root();
-        sys.create_dir_all(Path::new("/Users//alice/Library/Caches"), 0o755)
-            .unwrap();
+        let sys = with_a_spotlit_project(false);
         sys.create_dir_all(Path::new(STORE), 0o755).unwrap();
         let build = format!("{STORE}/15698");
         sys.file(&build, b"").stat_of(
@@ -771,25 +869,17 @@ mod tests {
                 len: 0,
             },
         );
-        sys.create_dir_all(Path::new(&format!("{TARGET}/debug")), 0o755)
-            .unwrap();
-        sys.file(&format!("{TARGET}/CACHEDIR.TAG"), b"Signature:");
-        sys.file("/usr/bin/mdfind", b"").on(
-            MDFIND,
-            Ran::ok(&format!("{TARGET}/debug/deps/libdemo.rmeta\0")),
-        );
         let planned = run_as(&sys, Mode::Plan);
         assert_eq!(planned[0].outcome, Outcome::Planned, "{planned:?}");
         assert_eq!(
             planned[0].to.as_deref(),
             Some(
                 format!(
-                    "cargo-build.noindex and tooling.noindex, with {build}, {TARGET} left for you \
-                     to move"
+                    "cargo-build.noindex and tooling.noindex, with {build} left for you to move"
                 )
                 .as_str()
             ),
-            "the plan promises only what apply makes"
+            "the plan promises only what apply makes, and nothing of the person's project"
         );
         let rows = run(&sys);
         assert_eq!(rows[0].outcome, Outcome::Blocked, "{rows:?}");
@@ -804,9 +894,9 @@ mod tests {
             panic!("it waits on the person, not on another run's lock: {rows:?}");
         };
         assert!(
-            why.starts_with(&format!(
-                "{build}, {TARGET} stay where Spotlight indexes them"
-            )) && why.contains("10 minutes of awake time, or after a restart"),
+            why.starts_with(&format!("{build} stay where Spotlight indexes them"))
+                && why.contains("10 minutes of awake time, or after a restart")
+                && !why.contains(TARGET),
             "{why}"
         );
         assert!(caches(&sys), "the caches new builds use are made");
@@ -826,129 +916,134 @@ mod tests {
         assert!(caches(&bare));
     }
 
+    /// The person's own project `target` that Spotlight indexes is a quiet note on the Rust
+    /// in Spotlight row, with the folder named behind it: not Needs you, not a change, and
+    /// the run that reads it finishes. aterm never renames or links it, whatever stands
+    /// beside it.
     #[test]
-    fn build_noindex_discovers_spotlit_repo_targets() {
-        let alice = user("alice", 501);
-        let item = BuildNoindex::new(alice, "/Users//alice".into());
-        let sys = Fake::root();
-        sys.create_dir_all(
-            Path::new("/Users//alice/Library/Caches/aterm/cargo-build.noindex"),
-            0o755,
-        )
-        .unwrap();
-        sys.create_dir_all(
-            Path::new("/Users//alice/Library/Caches/aterm/tooling.noindex"),
-            0o755,
-        )
-        .unwrap();
-        sys.create_dir_all(Path::new("/Users//alice/work/demo/target/debug"), 0o755)
+    fn a_spotlit_project_folder_of_the_persons_is_a_note_and_never_touched() {
+        let sys = with_a_spotlit_project(true);
+        let items = alice_builds();
+        for mode in [Mode::Plan, Mode::Apply] {
+            let rows = engine::run(&items, mode, &sys, &context(), &mut NoJournal);
+            assert_eq!(rows[0].outcome, Outcome::Ok, "{mode:?}: {rows:?}");
+            assert_eq!(
+                Reading::of(&rows[0]),
+                Some(Reading::ProjectsIndexed { count: 1 })
+            );
+            let line = format!(
+                "Spotlight indexes these project build folders of yours, which aterm leaves as they are: {TARGET}"
+            );
+            assert!(
+                rows[0].to.as_deref().is_some_and(|to| to.ends_with(&line)),
+                "{rows:?}"
+            );
+            let refs: Vec<&crate::model::ItemReport> = rows.iter().collect();
+            let read = crate::init_observe::observation(
+                aterm_types::macos_setup::Setting::Spotlight,
+                &refs,
+            );
+            assert_eq!(
+                read.standing,
+                aterm_types::macos_setup::Standing::InPlace,
+                "{read:?}"
+            );
+            assert_eq!(
+                read.note.as_deref(),
+                Some(crate::init_observe::projects_note(1).as_str())
+            );
+            assert!(
+                read.detail.as_deref().is_some_and(|d| d.ends_with(&line)),
+                "the folder stands behind the note: {read:?}"
+            );
+        }
+        // A `.noindex` beside it changes nothing: it is still theirs, still indexed.
+        let kept = format!("{TARGET}/retained");
+        sys.file(&kept, b"existing build bytes");
+        sys.create_dir_all(Path::new(&format!("{TARGET}.noindex")), 0o755)
             .unwrap();
-        sys.file("/Users//alice/work/demo/target/CACHEDIR.TAG", b"Signature:");
-        sys.file("/usr/bin/mdfind", b"");
-        let mdfind =
-            "alice$ /usr/bin/mdfind -onlyin /Users//alice -0 'kMDItemFSName == \"*.rmeta\"'";
-        sys.on(
-            mdfind,
-            Ran::ok("/Users//alice/work/demo/target/debug/deps/libdemo.rmeta\0"),
-        );
-        let items: Vec<Box<dyn Item>> = vec![Box::new(item)];
-        let planned = engine::run(&items, Mode::Plan, &sys, &context(), &mut NoJournal);
-        assert_eq!(planned[0].outcome, Outcome::Person, "{planned:?}");
-        assert_eq!(Reading::of(&planned[0]), Some(Reading::BuildsIndexed));
-        assert!(
-            planned[0]
-                .why
-                .as_deref()
-                .is_some_and(|f| f.starts_with("/Users//alice/work/demo/target stay")),
-            "{planned:?}"
-        );
-
-        let kept = "/Users//alice/work/demo/target/retained";
-        sys.file(kept, b"existing build bytes");
-        sys.create_dir_all(Path::new("/Users//alice/work/demo/target.noindex"), 0o755)
-            .unwrap();
-        let after = engine::run(&items, Mode::Plan, &sys, &context(), &mut NoJournal);
-        assert_eq!(after[0].outcome, Outcome::Unknown, "{after:?}");
-        assert!(items[0].apply(&sys, &context()).is_err());
+        let rows = engine::run(&items, Mode::Apply, &sys, &context(), &mut NoJournal);
+        assert_eq!(rows[0].outcome, Outcome::Ok, "{rows:?}");
         assert_eq!(
-            sys.read_file(Path::new(kept)).unwrap(),
+            sys.read_file(Path::new(&kept)).unwrap(),
             b"existing build bytes"
         );
+        assert!(sys.stat(Path::new(TARGET)).unwrap().dir);
         assert!(
-            sys.stat(Path::new("/Users//alice/work/demo/target"))
-                .unwrap()
-                .dir
+            !sys.calls()
+                .iter()
+                .any(|c| c.starts_with("rename ") || c.contains("/bin/ln")),
+            "{:#?}",
+            sys.calls()
         );
 
+        // Spotlight not answering costs the note, never aterm's own caches.
         let census = |reply| {
             let sys = Fake::root();
             sys.create_dir_all(Path::new("/Users//alice/Library/Caches"), 0o755)
                 .unwrap();
-            sys.file("/usr/bin/mdfind", b"").on(mdfind, reply);
+            sys.file("/usr/bin/mdfind", b"").on(MDFIND, reply);
             sys
         };
-        for reply in [
-            Ran::exit(1, "census failed"),
-            Ran::ok("/Users//alice/work/demo/target/debug/incomplete.rmeta"),
-        ] {
-            let unknown = census(reply);
-            assert!(matches!(
-                items[0].probe(&unknown, &context()),
-                Probe::Unusable { .. }
-            ));
-            assert!(items[0].apply(&unknown, &context()).is_err());
-            assert!(
-                unknown
-                    .stat(Path::new(
-                        "/Users//alice/Library/Caches/aterm/cargo-build.noindex"
-                    ))
-                    .is_err()
-            );
-        }
         let incomplete = census(Ran::ok(""));
-        incomplete.refuse_complete_stdout(mdfind, "complete capture unavailable");
-        assert!(matches!(
-            items[0].probe(&incomplete, &context()),
-            Probe::Unusable { .. }
-        ));
-        assert!(items[0].apply(&incomplete, &context()).is_err());
-        assert!(
-            incomplete
-                .stat(Path::new(
-                    "/Users//alice/Library/Caches/aterm/cargo-build.noindex"
-                ))
-                .is_err()
-        );
-
+        incomplete.refuse_complete_stdout(MDFIND, "complete capture unavailable");
         let missing = Fake::root();
         missing
             .create_dir_all(Path::new("/Users//alice/Library/Caches"), 0o755)
             .unwrap();
-        assert!(matches!(
-            items[0].probe(&missing, &context()),
-            Probe::Unusable { .. }
-        ));
-        assert!(items[0].apply(&missing, &context()).is_err());
-        assert!(
-            missing
-                .stat(Path::new(
-                    "/Users//alice/Library/Caches/aterm/cargo-build.noindex"
-                ))
-                .is_err()
-        );
-
-        let empty = census(Ran::ok(""));
-        for name in ["cargo-build.noindex", "tooling.noindex"] {
-            empty
-                .create_dir_all(
-                    &Path::new("/Users//alice/Library/Caches/aterm").join(name),
-                    0o755,
-                )
-                .unwrap();
+        for unread in [
+            census(Ran::exit(1, "census failed")),
+            census(Ran::ok(
+                "/Users//alice/work/demo/target/debug/incomplete.rmeta",
+            )),
+            incomplete,
+            missing,
+        ] {
+            let items = alice_builds();
+            let rows = engine::run(&items, Mode::Apply, &unread, &context(), &mut NoJournal);
+            assert_eq!(rows[0].outcome, Outcome::Changed, "{rows:?}");
+            assert_eq!(
+                Reading::of(&rows[0]),
+                None,
+                "made and read back in place, with no project counted"
+            );
+            assert!(
+                unread
+                    .stat(Path::new(
+                        "/Users//alice/Library/Caches/aterm/cargo-build.noindex"
+                    ))
+                    .is_ok_and(|s| s.dir)
+            );
         }
-        assert!(matches!(
-            items[0].probe(&empty, &context()),
-            Probe::Ok { .. }
-        ));
+    }
+
+    /// One search of the home folder stands for every probe for [`INVENTORY_AGE`]: a run's
+    /// plan, apply and read-back, and the page's reading, ask Spotlight once.
+    #[test]
+    fn spotlight_is_searched_once_per_inventory_age() {
+        let mut sys = with_a_spotlit_project(true);
+        let items = alice_builds();
+        let searches = |sys: &Fake| sys.calls().iter().filter(|c| c.contains("mdfind")).count();
+        engine::run(&items, Mode::Apply, &sys, &context(), &mut NoJournal);
+        engine::run(&items, Mode::Plan, &sys, &context(), &mut NoJournal);
+        assert_eq!(searches(&sys), 1, "{:#?}", sys.calls());
+        sys.now += INVENTORY_AGE - 1;
+        engine::run(&items, Mode::Plan, &sys, &context(), &mut NoJournal);
+        assert_eq!(searches(&sys), 1);
+        sys.now += 1;
+        let rows = engine::run(&items, Mode::Plan, &sys, &context(), &mut NoJournal);
+        assert_eq!(
+            searches(&sys),
+            2,
+            "an inventory past its age is taken again"
+        );
+        assert_eq!(
+            Reading::of(&rows[0]),
+            Some(Reading::ProjectsIndexed { count: 1 })
+        );
+        // A clock that went back reads again.
+        sys.now -= 10;
+        engine::run(&items, Mode::Plan, &sys, &context(), &mut NoJournal);
+        assert_eq!(searches(&sys), 3);
     }
 }

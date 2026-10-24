@@ -3117,3 +3117,175 @@ fn a_persons_turn_on_answers_the_question_so_a_cancel_brings_no_second_dialog() 
     ));
     assert!(debugger_alerts().is_empty(), "no alert of aterm's");
 }
+
+/// An update's successor with `entries` its predecessor raised: the successor reads the
+/// predecessor's log at launch and adopts each open entry under the id it had there.
+fn successor_holding(entries: &[&aterm_messages::exceptions::Entry]) -> App {
+    use aterm_messages::{LogLine, MessageCenter, MessageLog};
+    let mut predecessor = App::headless_for_test();
+    for entry in entries {
+        predecessor.except(entry);
+    }
+    let lines: Vec<LogLine> = predecessor
+        .messages
+        .drain_shelved_for_persist()
+        .into_iter()
+        .map(|(line, _)| line)
+        .collect();
+    let mut log = MessageLog::empty();
+    log.replay_all(lines);
+    let now = Instant::now();
+    let mut center = MessageCenter::new(log, now);
+    assert_eq!(
+        center.adopt_digest(crate::messages_host::wall_stamp_now(), now),
+        entries.len()
+    );
+    let mut app = new_mac();
+    app.messages = center;
+    app
+}
+
+/// The id of the open entry under exactly `key`.
+fn open_entry(app: &App, key: &str) -> Option<aterm_messages::MessageId> {
+    app.messages
+        .digest()
+        .entries
+        .iter()
+        .find(|e| e.key == key)
+        .map(|e| e.id)
+}
+
+/// The card's word on Full Disk Access ends only its own entries. Other reporters'
+/// entries under `privacy.` that a seamless update's successor adopted (here the vault
+/// join's, which stands until System State reads the Secrets row, and the Developer
+/// Tools line's) survive the launch check that finds the grant held, the one that finds
+/// a *Not now* on record, and a `[privacy]` switch turned off: none is ended, and the
+/// join's reporter raising it again restates it under the id it had, rather than
+/// posting it anew. The card's own entry ends on each: fixed where the probe read the
+/// grant, withdrawn where nothing read it.
+#[test]
+fn the_cards_word_ends_only_its_own_entries_across_an_update() {
+    use crate::consent_card::{AccessRecord, PendingDecision};
+    use crate::system_state_access::JOIN_PENDING_KEY;
+    use aterm_messages::exceptions::{Entry, Family};
+    use aterm_messages::need::{Reason, Then, Why};
+    use aterm_messages::{Outcome, Retired};
+    let join = Entry::new(
+        Family::Privacy,
+        "secrets",
+        "join-pending",
+        "This Mac needs vault approval",
+        Why::OnlyYou(Reason::new("an admin Mac approves this Mac")),
+        Then::step("On an admin Mac run aterm secrets approve ABCD-EFGH"),
+    );
+    let devtools = Entry::new(
+        Family::Privacy,
+        "devtools",
+        "not-granted",
+        "aterm is not in Developer Tools",
+        Why::OnlyYou(Reason::new(
+            "only you can add aterm to Developer Tools in System Settings",
+        )),
+        Then::step("Turn on aterm in Developer Tools"),
+    );
+    let fda = Entry::new(
+        Family::Privacy,
+        "fda",
+        "needed",
+        "aterm cannot read your files",
+        Why::OnlyYou(Reason::new(
+            "only you can turn on Full Disk Access in System Settings",
+        )),
+        Then::step("Turn on Full Disk Access"),
+    );
+    let fda_key = fda.key();
+    let others = [JOIN_PENDING_KEY.to_string(), devtools.key()];
+    /// What the card read before its word.
+    #[derive(Clone, Copy)]
+    enum Word {
+        Held,
+        NotNow,
+        SwitchOff,
+    }
+    fn say(app: &mut App, word: Word) {
+        let decision = match word {
+            Word::Held => {
+                app.consent = own(granted());
+                PendingDecision {
+                    record: AccessRecord {
+                        verified_at: Some(1_790_000_000),
+                        ..AccessRecord::default()
+                    },
+                    verified_here: Some(true),
+                    ..PendingDecision::launch(None)
+                }
+            }
+            Word::NotNow => PendingDecision::launch(Some(Marker::NotNow)),
+            Word::SwitchOff => {
+                app.config.privacy = Some(super::app_config::PrivacyConfig {
+                    notice: Some(false),
+                    ..Default::default()
+                });
+                app.tick_macos_access_card(Instant::now());
+                return;
+            }
+        };
+        assert!(app.consent_card.begin_deciding(Instant::now()));
+        app.decide_macos_access_card(decision);
+    }
+    for word in [Word::Held, Word::NotNow, Word::SwitchOff] {
+        let (label, how) = match word {
+            Word::Held => (
+                "the launch check that finds the grant held",
+                Retired::Resolved(Outcome::Ok),
+            ),
+            Word::NotNow => (
+                "the launch check that finds a Not now on record",
+                Retired::Withdrawn,
+            ),
+            Word::SwitchOff => ("a [privacy] switch off", Retired::Withdrawn),
+        };
+        let mut app = successor_holding(&[&join, &devtools, &fda]);
+        let adopted: Vec<_> = others
+            .iter()
+            .map(|key| open_entry(&app, key).expect("another reporter's entry is adopted"))
+            .collect();
+        let card = open_entry(&app, &fda_key).expect("the card's entry is adopted");
+        say(&mut app, word);
+        for (key, id) in others.iter().zip(&adopted) {
+            assert_eq!(
+                open_entry(&app, key),
+                Some(*id),
+                "{label}: {key} stands under its id"
+            );
+            assert!(
+                app.messages.log().get(*id).is_some_and(|r| r.is_live()),
+                "{label}: {key} is not ended in the log"
+            );
+        }
+        assert_eq!(open_entry(&app, &fda_key), None, "{label}: the card's ends");
+        assert_eq!(
+            app.messages
+                .log()
+                .get(card)
+                .and_then(|r| r.retired().cloned()),
+            Some(how),
+            "{label}: how the card's ends"
+        );
+        app.except(&join);
+        assert_eq!(
+            open_entry(&app, JOIN_PENDING_KEY),
+            Some(adopted[0]),
+            "{label}: raised again, it is the same entry"
+        );
+        assert_eq!(
+            app.messages
+                .log()
+                .records()
+                .filter(|r| r.key.as_deref() == Some(JOIN_PENDING_KEY))
+                .count(),
+            1,
+            "{label}: nothing is posted anew"
+        );
+    }
+}

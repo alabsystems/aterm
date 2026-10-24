@@ -1412,13 +1412,25 @@ pub fn is_node_id(node: &str) -> bool {
     node.starts_with("n-") && crate::subject::is_principal(node)
 }
 
-fn cap_is_for(path: &Path, node: &str, secret: &[u8]) -> Result<usize, String> {
-    let caps = crate::bridge::read_cap_file(&path.to_string_lossy()).map_err(|e| e.to_string())?;
-    if !caps.iter().any(|c| {
-        astream_cap::Grant::parse(&c.grant).is_ok_and(|g| g.principal.as_deref() == Some(node))
-    }) {
-        return Err(format!("minted for a different node id, not {node}"));
+/// Why `<root>/node.cap` is not `node`'s ring on the fleet under the root's secret, and whether
+/// `on` keeps it aside before minting over it.
+#[derive(Debug, PartialEq, Eq)]
+struct CapMiss {
+    why: String,
+    /// A ring genuine under the secret that no `on` here mints again: one for another node id
+    /// than the state dir names, or one off this fleet that is not the ring `on` mints for
+    /// another.
+    keep: bool,
+}
+
+impl From<String> for CapMiss {
+    fn from(why: String) -> Self {
+        Self { why, keep: false }
     }
+}
+
+fn cap_is_for(path: &Path, fleet: &str, node: &str, secret: &[u8]) -> Result<usize, CapMiss> {
+    let caps = crate::bridge::read_cap_file(&path.to_string_lossy()).map_err(|e| e.to_string())?;
     if !caps.iter().all(|c| {
         if astream_cap::Grant::parse(&c.grant).is_err() {
             return false;
@@ -1434,9 +1446,54 @@ fn cap_is_for(path: &Path, node: &str, secret: &[u8]) -> Result<usize, String> {
             },
         )
     }) {
-        return Err("not minted under the current mint secret".to_string());
+        return Err("not minted under the current mint secret"
+            .to_string()
+            .into());
     }
-    Ok(caps.len())
+    if !caps.iter().any(|c| {
+        astream_cap::Grant::parse(&c.grant).is_ok_and(|g| g.principal.as_deref() == Some(node))
+    }) {
+        return Err(CapMiss {
+            why: format!("minted for a different node id, not {node}"),
+            keep: true,
+        });
+    }
+    let fleet_of = |grant: &str| {
+        astream_cap::Grant::parse(grant)
+            .ok()
+            .and_then(|g| Some(g.filter.strip_prefix("/f/")?.split('/').next()?.to_string()))
+    };
+    if caps
+        .iter()
+        .all(|c| fleet_of(&c.grant).as_deref() == Some(fleet))
+    {
+        return Ok(caps.len());
+    }
+    // Every tag verifies, and a tag is the secret's MAC of its grant: the ring `on` mints for
+    // another fleet comes back grant for grant from `on --fleet <it>`, any other ring would not.
+    let mut held: Vec<&str> = caps.iter().map(|c| c.grant.as_str()).collect();
+    held.sort_unstable();
+    let others: BTreeSet<String> = caps
+        .iter()
+        .filter_map(|c| fleet_of(&c.grant))
+        .filter(|f| f != fleet)
+        .collect();
+    let regenerable = others.iter().any(|other| {
+        let mut ring = node_grants(other, node);
+        ring.sort_unstable();
+        ring.iter().map(String::as_str).eq(held.iter().copied())
+    });
+    Err(CapMiss {
+        why: if others.is_empty() {
+            format!("some of its grants lie outside /f/{fleet}/")
+        } else {
+            format!(
+                "minted for fleet {}, not {fleet}",
+                safe(&others.into_iter().collect::<Vec<_>>().join(", "), 64)
+            )
+        },
+        keep: !regenerable,
+    })
 }
 
 fn trace(word: &str) {
@@ -1774,16 +1831,11 @@ fn program_step(p: &Paths, out: &mut Out) -> bool {
     true
 }
 
-fn record_node(state: &Path, node: &str, out: &mut Out) -> bool {
-    if !out.dry_run {
-        let write =
-            crate::state::StateDir::open(state).and_then(|s| s.node_id(|| node.to_string()));
-        if let Err(e) = write {
-            out.fail("node", &format!("{}/node: {e}", state.display()));
-            return false;
-        }
-    }
-    true
+/// Record `node` in the state dir, and say where a node file that held something else was kept.
+fn record_node(state: &Path, node: &str) -> Result<(String, Option<PathBuf>), String> {
+    crate::state::StateDir::open(state)
+        .and_then(|s| s.provision_node(|| node.to_string()))
+        .map_err(|e| format!("{}/node: {e}", state.display()))
 }
 
 fn binary_has_link(p: &Paths) -> Result<(), String> {
@@ -1837,7 +1889,7 @@ fn reach_with(
     }
 }
 
-fn wait_for_broker(p: &Paths, node: &str) -> Result<fabric::BrokerView, String> {
+fn wait_for_broker(p: &Paths, node: &str) -> Result<fabric::BrokerView, Box<fabric::BrokerView>> {
     poll_broker(
         || poll_reach(p, node),
         fabric::BrokerView::locate,
@@ -1851,12 +1903,13 @@ fn poll_reach(p: &Paths, node: &str) -> fabric::BrokerView {
 }
 
 /// `reach` every 100 ms until a broker answers, then `name` its process once: the poll itself
-/// connects and names nothing, so no process table is scanned while nothing listens yet.
+/// connects and names nothing, so no process table is scanned while nothing listens yet. Past
+/// `deadline`, the last poll's view.
 fn poll_broker(
     mut reach: impl FnMut() -> fabric::BrokerView,
     name: impl FnOnce(&mut fabric::BrokerView),
     deadline: Duration,
-) -> Result<fabric::BrokerView, String> {
+) -> Result<fabric::BrokerView, Box<fabric::BrokerView>> {
     let started = Instant::now();
     loop {
         let mut view = reach();
@@ -1865,7 +1918,7 @@ fn poll_broker(
             return Ok(view);
         }
         if started.elapsed() > deadline {
-            return Err(view.error.unwrap_or_else(|| "no answer".to_string()));
+            return Err(Box::new(view));
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -2038,6 +2091,30 @@ fn not_current(p: &Paths, view: &fabric::BrokerView) -> Option<&'static str> {
     }
 }
 
+/// The broker step's failure for a broker that answered but whose bus this root's caps cannot
+/// read; `None` for one that did not answer.
+fn unread_broker(sock: &str, view: &fabric::BrokerView) -> Option<String> {
+    let why = safe(view.error.as_deref().unwrap_or("-"), 256);
+    view.reachable.then(|| {
+        if view.cap_expired {
+            format!(
+                "the broker on {sock} answers but refuses the ring as lapsed ({why}): {}",
+                renew_remedy("`aterm fabric on`")
+            )
+        } else {
+            format!(
+                "the broker on {sock} answers, but its bus cannot be read with this root's caps \
+                 ({why})"
+            )
+        }
+    })
+}
+
+/// A broker that did not answer: what the last poll saw.
+fn no_answer(view: &fabric::BrokerView) -> String {
+    safe(view.error.as_deref().unwrap_or("no answer"), 256)
+}
+
 fn refuse_unmanaged(view: &fabric::BrokerView, sock: &str, out: &mut Out) -> bool {
     out.fail(
         "broker",
@@ -2092,6 +2169,9 @@ fn broker_step(p: &Paths, node: &str, service: Service, named: bool, out: &mut O
                     );
                 }
                 true
+            } else if let Some(line) = unread_broker(&sock, &view) {
+                out.fail("broker", &line);
+                false
             } else {
                 out.fail(
                     "broker",
@@ -2189,14 +2269,15 @@ fn broker_step(p: &Paths, node: &str, service: Service, named: bool, out: &mut O
                     );
                     true
                 }
-                Err(e) => {
-                    out.fail(
-                        "broker",
-                        &format!(
-                            "launchd {label} did not bring {sock} up: {e} — {}",
+                Err(view) => {
+                    let line = unread_broker(&sock, &view).unwrap_or_else(|| {
+                        format!(
+                            "launchd {label} did not bring {sock} up: {} — {}",
+                            no_answer(&view),
                             launchd_failure_hint(&p.root, &label, &uid())
-                        ),
-                    );
+                        )
+                    });
+                    out.fail("broker", &line);
                     false
                 }
             }
@@ -2279,14 +2360,15 @@ fn broker_step(p: &Paths, node: &str, service: Service, named: bool, out: &mut O
                     );
                     true
                 }
-                Err(e) => {
-                    out.fail(
-                        "broker",
-                        &format!(
-                            "systemd --user {label} did not bring {sock} up: {e} — {}",
+                Err(view) => {
+                    let line = unread_broker(&sock, &view).unwrap_or_else(|| {
+                        format!(
+                            "systemd --user {label} did not bring {sock} up: {} — {}",
+                            no_answer(&view),
                             systemd_failure_hint(&p.root, &label)
-                        ),
-                    );
+                        )
+                    });
+                    out.fail("broker", &line);
                     false
                 }
             }
@@ -2722,9 +2804,8 @@ pub fn on(opts: &OnOpts) -> ExitCode {
     if let Some(fleet) = role.fleet() {
         if opts.fleet.as_deref().is_some_and(|asked| asked != fleet) {
             eprintln!(
-                "aterm fabric on: this root belongs to fleet {fleet}; `aterm fabric off` and move \
-                 {} aside before choosing another fleet",
-                p.cap().display()
+                "aterm fabric on: this root belongs to fleet {fleet}; run `aterm fabric off` \
+                 before choosing another fleet"
             );
             return ExitCode::from(2);
         }
@@ -2844,15 +2925,47 @@ pub fn on(opts: &OnOpts) -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
-            out.done(
-                "node",
-                &format!("provision a node id into {}/node", state.display()),
-                &format!("provisioned {minted}"),
-            );
-            if !record_node(&state, &minted, &mut out) {
-                return ExitCode::from(2);
+            let file = state.join("node");
+            let holds = std::fs::symlink_metadata(&file)
+                .map_or_else(|e| e.kind() != io::ErrorKind::NotFound, |m| m.len() > 0);
+            let would = if !holds {
+                format!("provision a node id into {}", file.display())
+            } else {
+                let held = std::fs::read(&file)
+                    .map(|b| safe(String::from_utf8_lossy(&b).trim(), 64))
+                    .unwrap_or_default();
+                format!(
+                    "provision a node id into {}, keeping {} aside beside it",
+                    file.display(),
+                    if held.is_empty() {
+                        "that file".to_string()
+                    } else {
+                        format!("what it holds (`{held}`)")
+                    }
+                )
+            };
+            if opts.dry_run {
+                out.done("node", &would, "");
+                minted
+            } else {
+                match record_node(&state, &minted) {
+                    Ok((node, aside)) => {
+                        let kept = aside.map_or_else(String::new, |to| {
+                            format!(
+                                " (what {} held is kept as {})",
+                                file.display(),
+                                to.display()
+                            )
+                        });
+                        out.done("node", &would, &format!("provisioned {node}{kept}"));
+                        node
+                    }
+                    Err(e) => {
+                        out.fail("node", &e);
+                        return ExitCode::from(2);
+                    }
+                }
             }
-            minted
         }
     };
 
@@ -2901,26 +3014,52 @@ pub fn on(opts: &OnOpts) -> ExitCode {
     let cap = p.cap();
     let cap_ok = if cap.exists() {
         read_secret(&secret_shown)
-            .map_err(|e| crate::transport::describe(&secret_shown, &e))
-            .and_then(|key| cap_is_for(&cap, &node, &key))
+            .map_err(|e| CapMiss::from(crate::transport::describe(&secret_shown, &e)))
+            .and_then(|key| cap_is_for(&cap, &p.fleet, &node, &key))
     } else {
-        Err("absent".to_string())
+        Err(CapMiss::from("absent".to_string()))
     };
     match cap_ok {
         Ok(n) => out.already("cap", &format!("{} ({n} grants for {node})", cap.display())),
-        Err(why) => {
-            out.done(
-                "cap",
-                &format!("mint 8 grants for {node} into {} ({why})", cap.display()),
-                "",
-            );
+        Err(CapMiss { why, keep }) => {
+            let mint = |kept: &str| {
+                format!(
+                    "mint 8 grants for {node} into {} ({why}{kept})",
+                    cap.display()
+                )
+            };
+            let would = mint(if keep {
+                "; it would be kept aside beside it"
+            } else {
+                ""
+            });
+            out.done("cap", &would, &mint(""));
             if !opts.dry_run {
+                let aside = if keep {
+                    match crate::state::keep_aside(&cap) {
+                        Ok(to) => Some(to),
+                        Err(e) => {
+                            out.fail("cap", &e.to_string());
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                } else {
+                    None
+                };
                 match mint_caps(&p, &node) {
-                    Ok(n) => out.ok(
-                        "cap",
-                        &format!("minted {n} grants for {node} into {}", cap.display()),
-                    ),
+                    Ok(n) => {
+                        out.ok(
+                            "cap",
+                            &format!("minted {n} grants for {node} into {}", cap.display()),
+                        );
+                        if let Some(to) = aside {
+                            out.ok("cap", &format!("kept the old ring as {}", to.display()));
+                        }
+                    }
                     Err(e) => {
+                        if let Some(to) = &aside {
+                            crate::state::take_back_aside(&cap, to);
+                        }
                         out.fail("cap", &e);
                         return ExitCode::FAILURE;
                     }
@@ -3515,9 +3654,11 @@ pub fn fix_for(warning: &str, role: &Role) -> String {
         format!("{cause}; the bridge then reconnects on its own")
     } else if s("bus could not be read") || s("could not be read:") {
         format!(
-            "the cap file's grants do not cover this fleet, or the broker died mid-read: move \
-             <root>/node.cap aside and run {again}, which mints the cap for the node id in the \
-             state dir and probes again; check `--fleet`"
+            "the cap file's grants do not cover this fleet, or the broker died mid-read: {again} \
+             re-mints the root's cap when it was minted for another fleet or node id, and probes \
+             again; it leaves a ring minted under the root's secret for this fleet and node id as \
+             it is, so first move <root>/node.cap aside when it was minted by hand and lacks a \
+             grant"
         )
     } else if s("no [fabric] command") {
         format!(
@@ -3525,10 +3666,7 @@ pub fn fix_for(warning: &str, role: &Role) -> String {
              a bridge on its own"
         )
     } else if s("no node id") {
-        format!(
-            "{again} provisions one and mints the cap for it (first move aside a node file \
-             that holds something else)"
-        )
+        format!("{again} provisions one and mints the cap for it")
     } else if s("cap file") {
         format!("{again} re-mints the cap file for the node id in the state dir")
     } else if s("has no bridge") {
@@ -4104,7 +4242,10 @@ mod tests {
             |_: &mut fabric::BrokerView| panic!("a broker that never answered was named"),
             Duration::ZERO,
         );
-        assert_eq!(silent.err().as_deref(), Some("connect: refused"));
+        assert_eq!(
+            silent.err().and_then(|view| view.error).as_deref(),
+            Some("connect: refused")
+        );
     }
 
     /// The wait's poll connects and names no process, though the listener scan finds this
@@ -5623,6 +5764,11 @@ mod tests {
             "{}",
             down("cut-say")
         );
+        let unread = fix_for("the broker at /x answers but the bus could not be read: head query");
+        assert!(
+            unread.contains("move <root>/node.cap aside"),
+            "a ring for this fleet that lacks a grant passes `on` as already: {unread}"
+        );
     }
 
     #[test]
@@ -5779,8 +5925,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("atfo-minted-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch");
-        let cap_under = |key: &[u8], name: &str| {
-            let lines: String = node_grants("lab", "n-0123456789abcdef")
+        let node = "n-0123456789abcdef";
+        let ring = node_grants("lab", node);
+        let cap_under = |key: &[u8], name: &str, grants: &[String]| {
+            let lines: String = grants
                 .iter()
                 .map(|g| {
                     let c = astream_cap::mint(key, g).expect("mint");
@@ -5791,15 +5939,40 @@ mod tests {
             std::fs::write(&path, lines).expect("cap");
             path
         };
-        let node = "n-0123456789abcdef";
-        let own = cap_under(&[4u8; 32], "own.cap");
-        assert_eq!(cap_is_for(&own, node, &[4u8; 32]), Ok(8));
-        assert!(
-            cap_is_for(&own, "n-other", &[4u8; 32]).is_err(),
-            "another node"
+        let own = cap_under(&[4u8; 32], "own.cap", &ring);
+        assert_eq!(cap_is_for(&own, "lab", node, &[4u8; 32]), Ok(8));
+        assert_eq!(
+            cap_is_for(&own, "lab", "n-other", &[4u8; 32]),
+            Err(CapMiss {
+                why: "minted for a different node id, not n-other".to_string(),
+                keep: true
+            }),
+            "another node's ring, the last record of its id once the state dir names another"
         );
-        assert!(cap_is_for(&cap_under(&[5u8; 32], "foreign.cap"), node, &[4u8; 32]).is_err());
-        assert!(cap_is_for(&dir.join("absent.cap"), node, &[4u8; 32]).is_err());
+        let foreign = cap_under(&[5u8; 32], "foreign.cap", &ring);
+        assert!(cap_is_for(&foreign, "lab", node, &[4u8; 32]).is_err());
+        assert_eq!(
+            cap_is_for(&foreign, "lab", "n-other", &[4u8; 32]),
+            Err(CapMiss::from(
+                "not minted under the current mint secret".to_string()
+            )),
+            "another secret's ring is judged by its secret first"
+        );
+        assert!(cap_is_for(&dir.join("absent.cap"), "lab", node, &[4u8; 32]).is_err());
+        assert_eq!(
+            cap_is_for(&own, "work", node, &[4u8; 32]),
+            Err(CapMiss {
+                why: "minted for fleet lab, not work".to_string(),
+                keep: false
+            }),
+            "another fleet's ring, which `on --fleet lab` mints again grant for grant"
+        );
+        let by_hand = cap_under(&[4u8; 32], "hand.cap", &ring[..7]);
+        assert_eq!(cap_is_for(&by_hand, "lab", node, &[4u8; 32]), Ok(7));
+        assert!(
+            cap_is_for(&by_hand, "work", node, &[4u8; 32]).is_err_and(|m| m.keep),
+            "a ring no `on` mints is kept aside"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

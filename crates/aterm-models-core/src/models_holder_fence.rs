@@ -223,6 +223,20 @@ pub fn holder_fence_model() -> Model {
                 fa = if Buggy == 1 && ta == 0 { 1 } else { fa };
             }
 
+            action Reserve when (fg == 1 && alt == 0) {
+                ka = if Buggy == 12 { ka } else { if ta == 0 { 1 } else { 0 } };
+                hurt = if ta == 1 { 1 } else { 0 };
+                idle = 0;
+            }
+
+            action Sweep when (fg == 1 && alt == 0) {
+                fa = 0;
+                ka = if Buggy == 13 { ka } else { if ta == 0 { 1 } else { 0 } };
+                hurt = if ta == 1 { 1 } else { 0 };
+                spans = 1;
+                idle = 0;
+            }
+
             action Splice when (fg == 0 && ma == 1 && spans > 0 && alt == 0) {
                 ga = if Buggy == 2 { 1 } else { ga };
             }

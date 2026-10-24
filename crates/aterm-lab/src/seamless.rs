@@ -582,6 +582,7 @@ fn across_update(aterm: &Path, keep: bool) -> Result<Vec<(&'static str, Verdict)
             env,
             cwd: world.home.clone(),
             sandbox: None,
+            reroute: false,
         },
     )?;
     inst.await_socket(instance::BOOT)?;
@@ -715,6 +716,7 @@ fn present_once(aterm: &Path, keep: bool) -> Result<Figures, Fail> {
             env: world.env(),
             cwd: world.home.clone(),
             sandbox: None,
+            reroute: false,
         },
     )?;
     inst.await_socket(instance::BOOT)?;

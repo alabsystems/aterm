@@ -6363,7 +6363,13 @@ impl Acting {
                     .unwrap()
                     .insert(sid.to_string(), pid);
             }
-            Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => {}
+            Program::Codex
+            | Program::Grok
+            | Program::Kimi
+            | Program::Agy
+            | Program::Muse
+            | Program::Gemini
+            | Program::Generic => {}
         }
     }
 

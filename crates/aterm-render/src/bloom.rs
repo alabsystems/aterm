@@ -243,17 +243,32 @@ pub fn apply(
     let sy0 = (y0 as usize).saturating_sub(d);
     let sx1 = (x1 as usize).saturating_add(d).min(w);
     let sy1 = (y1 as usize).saturating_add(d).min(h);
-    let mut taps = [(0.0f32, 0.0f32, 0.0f32); 25];
-    let mut wsum = 0.0f32;
-    let mut tap_idx = 0usize;
-    for j in -2i32..=2 {
-        for i in -2i32..=2 {
-            let (oi, oj) = (i as f32 * tu, j as f32 * tv);
-            let weight = (-((i * i + j * j) as f32) / 4.0).exp();
-            taps[tap_idx] = (oi, oj, weight);
-            wsum += weight;
-            tap_idx += 1;
+    struct BloomKernel {
+        taps: [(f32, f32, f32); 25],
+        wsum: f32,
+    }
+    static KERNEL: std::sync::OnceLock<BloomKernel> = std::sync::OnceLock::new();
+    let BloomKernel {
+        taps: ref kernel,
+        wsum,
+    } = *KERNEL.get_or_init(|| {
+        let mut taps = [(0.0f32, 0.0f32, 0.0f32); 25];
+        let mut wsum = 0.0f32;
+        let mut idx = 0usize;
+        for j in -2i32..=2 {
+            for i in -2i32..=2 {
+                let weight = (-((i * i + j * j) as f32) / 4.0).exp();
+                taps[idx] = (i as f32, j as f32, weight);
+                wsum += weight;
+                idx += 1;
+            }
         }
+        BloomKernel { taps, wsum }
+    });
+    let mut taps = [(0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32); 25];
+    for (tap, &(fi, fj, weight)) in taps.iter_mut().zip(kernel.iter()) {
+        let (oi, oj) = (fi * tu, fj * tv);
+        *tap = (oi * rw, oj * rw, oi * rc, oj * rc, weight);
     }
     for py in sy0..sy1 {
         let v = (py as f32 + 0.5) / h as f32;
@@ -261,10 +276,10 @@ pub fn apply(
             let u = (px as f32 + 0.5) / w as f32;
             let mut white = 0.0f32;
             let mut chroma = [0.0f32; 3];
-            for &(oi, oj, weight) in &taps {
-                let sw = sample(u + oi * rw, v + oj * rw);
+            for &(du_w, dv_w, du_c, dv_c, weight) in &taps {
+                let sw = sample(u + du_w, v + dv_w);
                 white += white_part(sw) * weight;
-                let sc = sample(u + oi * rc, v + oj * rc);
+                let sc = sample(u + du_c, v + dv_c);
                 let wc = white_part(sc);
                 for k in 0..3 {
                     chroma[k] += (sc[k] - wc) * weight;
@@ -327,10 +342,10 @@ pub fn sdr_crown(
             continue;
         }
         let wq = u32::from(q.w);
-        for py in qy..ye {
-            for px in qx..xe {
-                let c = crate::glow_lerp_rgb(q.color, q.color2, (px - qx) as u32, wq);
-                let src = channels(c).map(|v| v * budget);
+        for px in qx..xe {
+            let c = crate::glow_lerp_rgb(q.color, q.color2, (px - qx) as u32, wq);
+            let src = channels(c).map(|v| v * budget);
+            for py in qy..ye {
                 let idx = py * w + px;
                 frame.pixels[idx] = screen(frame.pixels[idx], src);
             }

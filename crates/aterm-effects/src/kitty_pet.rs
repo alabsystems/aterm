@@ -7382,7 +7382,10 @@ impl PetBrain {
         let max_drift = NOTE_BASE + NOTE_RUN + NOTE_SWAY + 0.01;
         let dir = if self.facing_left { -1.0 } else { 1.0 };
         let step = note_lane_step(cell.0, cell.1);
-        let ticks = (PURR_MOTE_LIFE * 60.0).ceil() as u32;
+        const MAX_TICKS: usize = (PURR_MOTE_LIFE * 60.0).ceil() as usize;
+        let ticks = MAX_TICKS as u32;
+        let mut live_boxes = [([(0i32, 0i32, 0u16); PET_MOTES_MAX], 0usize); MAX_TICKS];
+        let mut live_ticks_cached = 0usize;
         let mut clear_of_them = None;
         for &(along, up) in &NOTE_LANES {
             let at = (col + dir * along * step, row - up);
@@ -7421,17 +7424,30 @@ impl PetBrain {
                     let cx = (centre.0 * cell_w_f).round() as i32;
                     inside &= cx - half >= 0 && cx + half <= grid_w;
                 }
-                meets |= clock < max_live_end
-                    && live.iter().any(|m| {
-                        m.note_geom(clock)
-                            .and_then(|(c, s)| mote_box_px(c, s, cell, grid))
-                            .is_some_and(|o| {
-                                b.0 < o.0 + i32::from(o.2)
-                                    && o.0 < b.0 + i32::from(b.2)
-                                    && b.1 < o.1 + i32::from(o.2)
-                                    && o.1 < b.1 + i32::from(b.2)
-                            })
+                if clock < max_live_end {
+                    let k_idx = k as usize;
+                    if k_idx >= live_ticks_cached {
+                        let mut boxes = [(0i32, 0i32, 0u16); PET_MOTES_MAX];
+                        let mut n = 0usize;
+                        for m in live {
+                            if let Some((c, s)) = m.note_geom(clock)
+                                && let Some(o) = mote_box_px(c, s, cell, grid)
+                            {
+                                boxes[n] = o;
+                                n += 1;
+                            }
+                        }
+                        live_boxes[k_idx] = (boxes, n);
+                        live_ticks_cached = k_idx + 1;
+                    }
+                    let (ref boxes, n) = live_boxes[k_idx];
+                    meets |= boxes[..n].iter().any(|o| {
+                        b.0 < o.0 + i32::from(o.2)
+                            && o.0 < b.0 + i32::from(b.2)
+                            && b.1 < o.1 + i32::from(o.2)
+                            && o.1 < b.1 + i32::from(b.2)
                     });
+                }
                 if meets || (!inside && (live.is_empty() || clear_of_them.is_some())) {
                     break;
                 }
@@ -8146,14 +8162,19 @@ impl PetBrain {
             self.veil_gather = false;
             return;
         }
-        let body_rect = frame.body_px(sense.cell_w, sense.cell_h, sense.cols, sense.rows);
+        let mut body_rect: Option<Option<(i32, i32, i32, i32)>> = None;
+        let mut body_px = || {
+            *body_rect.get_or_insert_with(|| {
+                frame.body_px(sense.cell_w, sense.cell_h, sense.cols, sense.rows)
+            })
+        };
         let travelling = matches!(
             frame.action,
             PetAction::Walk | PetAction::Run | PetAction::Startle | PetAction::Frolic
         );
         let cover = if travelling
             && !self.ink_spans.is_empty()
-            && let Some(rect) = body_rect
+            && let Some(rect) = body_px()
         {
             let path = Self::path_box(rect, sense.cell_h);
             self.letter_cover(path, sense.cell_w, sense.cell_h)
@@ -8186,11 +8207,11 @@ impl PetBrain {
         let on_letters = match sense.caret {
             _ if self.console_executing() => Some(false),
             Some((caret_row, _)) if frame.action.settled() => {
-                body_rect.map_or(Some(false), |rect| self.on_letters(rect, cell, caret_row))
+                body_px().map_or(Some(false), |rect| self.on_letters(rect, cell, caret_row))
             }
             Some((caret_row, _)) if travelling && level < 1.0 => {
                 let here =
-                    body_rect.map_or(Some(false), |rect| self.on_letters(rect, cell, caret_row));
+                    body_px().map_or(Some(false), |rect| self.on_letters(rect, cell, caret_row));
                 if here == Some(false) {
                     here
                 } else {
@@ -8200,7 +8221,7 @@ impl PetBrain {
             }
             Some((caret_row, _)) if in_place => {
                 let here =
-                    body_rect.map_or(Some(false), |rect| self.on_letters(rect, cell, caret_row));
+                    body_px().map_or(Some(false), |rect| self.on_letters(rect, cell, caret_row));
                 if here == Some(true) {
                     here
                 } else if veiled {
@@ -8213,7 +8234,7 @@ impl PetBrain {
             Some(caret) if flight => {
                 gather_on_letters = frame.action == PetAction::Crouch
                     && !self.hand_writing()
-                    && body_rect.and_then(|rect| self.on_letters(rect, cell, caret.0))
+                    && body_px().and_then(|rect| self.on_letters(rect, cell, caret.0))
                         == Some(true)
                     && self.landing_on_letters(sense, caret) == Some(true);
                 if gather_on_letters {
@@ -9286,15 +9307,14 @@ fn first_px_step(
         if t >= horizon {
             return None;
         }
-        let room = |v: f32, k: f32| (0.5 - (v - k).abs()).max(0.0);
-        let stride = |room: f32, slope: f32| {
+        let stride = |v: f32, k: f32, slope: f32| {
             if slope > 0.0 {
-                room / slope
+                (0.5 - (v - k).abs()).max(0.0) / slope
             } else {
                 f32::INFINITY
             }
         };
-        let step = stride(room(vx, rest.0), slope.0).min(stride(room(vy, rest.1), slope.1));
+        let step = stride(vx, rest.0, slope.0).min(stride(vy, rest.1, slope.1));
         prev = t;
         t = (t + step.max(PX_MARCH_MIN)).min(horizon);
     }

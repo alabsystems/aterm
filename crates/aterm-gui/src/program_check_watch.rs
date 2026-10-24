@@ -63,6 +63,35 @@ pub(crate) fn held_stand_in() -> Option<u32> {
     }
 }
 
+/// Whether macOS's program check holds `pid` now: the development build's stand-in first, as the
+/// jobs pass reads it, then the kernel's own reading ([`aterm_uds::process::at_program_check`]).
+pub(crate) fn held_now(pid: u32) -> bool {
+    held_stand_in() == Some(pid)
+        || i32::try_from(pid)
+            .ok()
+            .and_then(aterm_uds::process::at_program_check)
+            == Some(true)
+}
+
+/// The development build's held stand-in set to a pid until it drops, for a test of what reads it.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) struct HeldStandIn;
+
+#[cfg(all(test, target_os = "macos"))]
+impl HeldStandIn {
+    pub(crate) fn of(pid: u32) -> Self {
+        HELD_STAND_IN.store(pid, Ordering::SeqCst);
+        Self
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+impl Drop for HeldStandIn {
+    fn drop(&mut self) {
+        HELD_STAND_IN.store(0, Ordering::SeqCst);
+    }
+}
+
 /// Milliseconds elapsed since the watcher's first reading.
 fn now_ms() -> u64 {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
@@ -473,6 +502,20 @@ mod tests {
     /// The held stand-in needs a development build and a pid of a live process of this user
     /// (the only kind a start is read for, so any other would count nowhere); `held -` needs no
     /// pid. This process is one of this user's; pid 1 (launchd, root's) is not.
+    #[test]
+    fn held_now_holds_no_program_the_kernel_reads_started_or_cannot_read() {
+        assert!(
+            !held_now(std::process::id()),
+            "this test runs, so it is past its start"
+        );
+        for unread in [0, 1] {
+            assert!(
+                !held_now(unread),
+                "pid {unread}: no process of this user's, so unread and not held"
+            );
+        }
+    }
+
     #[test]
     fn the_held_stand_in_needs_a_development_build_and_a_pid() {
         let any = |_| true;

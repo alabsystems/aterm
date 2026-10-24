@@ -113,7 +113,7 @@ pub(crate) fn program_build_of_target(target: &Path) -> Option<(String, u64)> {
     let comps: Vec<&std::ffi::OsStr> = target.iter().collect();
     let i = comps.iter().position(|c| *c == "store")?;
     let program = comps.get(i + 1)?.to_str()?.to_string();
-    let build = comps.get(i + 2)?.to_str()?.parse::<u64>().ok()?;
+    let build = build_in_path(comps.get(i + 2)?)?;
     Some((program, build))
 }
 
@@ -128,8 +128,19 @@ pub fn store_build_of(prefix: &Path, target: &Path) -> Option<(String, u64)> {
         return None;
     };
     let program = program.to_str()?.to_string();
-    let build = build.to_str()?.parse::<u64>().ok()?;
+    let build = build_in_path(build)?;
     Some((program, build))
+}
+
+/// The build a path into the store names by its directory: `<build>`, or `<build>.noindex`,
+/// the folder a build laid aside lives in ([`aterm_toolchain::layout`]), which a canonical
+/// path (a running image, a compiler's sysroot) names.
+fn build_in_path(name: &std::ffi::OsStr) -> Option<u64> {
+    let name = name.to_str()?;
+    name.strip_suffix(aterm_toolchain::build_cache::NOINDEX)
+        .unwrap_or(name)
+        .parse::<u64>()
+        .ok()
 }
 
 #[must_use]
@@ -420,6 +431,21 @@ mod tests {
         assert_eq!(store_build_of(prefix, Path::new("/p/store/ay")), None);
         assert_eq!(store_build_of(prefix, Path::new("/p/store/ay/head")), None);
         assert_eq!(store_build_of(prefix, Path::new("/p/store/../ay/18")), None);
+
+        let canonical = Path::new("/p/store/trust/18.noindex/bin/trustc");
+        assert_eq!(
+            store_build_of(prefix, canonical),
+            Some(("trust".to_string(), 18)),
+            "a build laid aside, as a canonical path names it"
+        );
+        assert_eq!(
+            program_build_of_target(canonical),
+            Some(("trust".to_string(), 18))
+        );
+        for name in [".noindex", "18.noindex.noindex", "18.noindexx"] {
+            let path = Path::new("/p/store/trust").join(name);
+            assert_eq!(store_build_of(prefix, &path), None, "{name}");
+        }
     }
 
     #[test]

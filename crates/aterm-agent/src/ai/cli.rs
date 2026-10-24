@@ -612,22 +612,23 @@ fn sign_in_one(
 }
 
 fn done_line(c: &Connector, done: &Done) -> String {
+    done_line_of(c.id, done)
+}
+
+fn done_line_of(id: &str, done: &Done) -> String {
     match done {
-        Done::SignedIn(Some(m)) => format!("{}: signed in ({m})", c.id),
-        Done::SignedIn(None) => format!("{}: signed in", c.id),
-        Done::NotChecked => format!(
-            "{}: the sign-in ended; nothing reads whether it worked",
-            c.id
-        ),
-        Done::SignedOut => format!("{}: still signed out", c.id),
+        Done::SignedIn(Some(m)) => format!("{}: signed in ({m})", id),
+        Done::SignedIn(None) => format!("{}: signed in", id),
+        Done::NotChecked => format!("{}: the sign-in ended; nothing reads whether it worked", id),
+        Done::SignedOut => format!("{}: still signed out", id),
         Done::Failed(why) => format!(
             "{}: did not sign in: {}",
-            c.id,
+            id,
             crate::harness::one_line(why, 160)
         ),
         Done::Refused(why) => format!(
             "{}: not started: {}",
-            c.id,
+            id,
             crate::harness::one_line(why, 160)
         ),
     }
@@ -1009,11 +1010,16 @@ fn login_verb(
     err: &mut dyn Write,
 ) -> ExitCode {
     if connector::connector(id).is_none() {
+        if let Some(cli) = pool_only(id) {
+            return pool_login_verb(env, runner, cli, out, err);
+        }
+        let mut ids = connector::ids();
+        ids.extend(POOL_ONLY.iter().map(|cli| cli.id()));
         let _ = writeln!(
             err,
             "aterm ai login: `{}` is no AI CLI ({})",
             crate::harness::one_line(id, 40),
-            connector::ids().join(", ")
+            ids.join(", ")
         );
         return ExitCode::from(2);
     }
@@ -1041,6 +1047,95 @@ fn login_verb(
     };
     let done = sign_in_one(env, runner, &store, f, row, out);
     let _ = writeln!(out, "{}", done_line(f.connector, &done));
+    match done {
+        Done::SignedIn(_) | Done::NotChecked => ExitCode::SUCCESS,
+        Done::Refused(_) => ExitCode::from(2),
+        Done::SignedOut | Done::Failed(_) => ExitCode::from(1),
+    }
+}
+
+/// The CLIs with an accounts pool of their own that are no connection of `aterm ai`'s: `aterm
+/// ai login <id>` runs their pool's sign-in alone ([`pool_login_verb`]).
+const POOL_ONLY: &[crate::harness::accounts::Cli] = &[
+    crate::harness::accounts::Cli::Grok,
+    crate::harness::accounts::Cli::Kimi,
+];
+
+fn pool_only(id: &str) -> Option<crate::harness::accounts::Cli> {
+    POOL_ONLY.iter().copied().find(|cli| cli.id() == id)
+}
+
+/// `aterm ai login grok|kimi`: the pool's `aterm harness accounts renew <label> --cli <id>`
+/// where this machine keeps its roster (`accounts-<id>.toml`); with none, it says how to add a
+/// row and runs nothing.
+fn pool_login_verb(
+    env: &Env,
+    runner: &dyn Runner,
+    cli: crate::harness::accounts::Cli,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let id = cli.id();
+    if !env.stdin_tty {
+        let _ = writeln!(
+            err,
+            "aterm ai login: stdin is not a terminal; run `aterm ai login {id}` in a terminal"
+        );
+        return ExitCode::from(2);
+    }
+    let Some(store) = env.store() else {
+        let _ = writeln!(err, "aterm ai login: aterm's state directory is unknown");
+        return ExitCode::from(1);
+    };
+    let var = |k: &str| env.var(k);
+    if let Some(marker) = login::agent_marker(&var) {
+        let _ = writeln!(
+            out,
+            "{}",
+            done_line_of(
+                id,
+                &Done::Refused(format!(
+                    "{marker} is set: a sign-in is a person's act, not an agent's"
+                ))
+            )
+        );
+        return ExitCode::from(2);
+    }
+    let machine = Machine {
+        now: env.now,
+        home: env.home.clone(),
+        var: &var,
+        pkg: env.pkg.clone(),
+        exclude: env.exclude.clone(),
+        records: Default::default(),
+        harness_state: env.harness_state.clone(),
+        roster: env
+            .config
+            .as_deref()
+            .and_then(crate::harness::accounts::roster_beside),
+    };
+    let done = match facts::pool_for(&machine, cli) {
+        None => Done::Refused(format!(
+            "this machine keeps no `{}`: add a row with `aterm harness accounts add <label> \
+             --cli {id} --email <email>`, then run `aterm ai login {id}`",
+            cli.accounts().roster_file
+        )),
+        Some(pool) => {
+            let now = || crate::supervise::limit::unix_now();
+            let exe = env.exe.clone().unwrap_or_else(|| PathBuf::from("aterm"));
+            let host = login::Host {
+                runner,
+                var: &var,
+                vars: &env.vars,
+                aterm: &exe,
+                store: &store,
+                now: &now,
+                ask: &ask_line,
+            };
+            login::pool_sign_in(&host, login::PoolCli { id }, &pool)
+        }
+    };
+    let _ = writeln!(out, "{}", done_line_of(id, &done));
     match done {
         Done::SignedIn(_) | Done::NotChecked => ExitCode::SUCCESS,
         Done::Refused(_) => ExitCode::from(2),

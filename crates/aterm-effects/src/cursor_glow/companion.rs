@@ -103,6 +103,7 @@ impl CursorGlow {
     /// the sky draws no star on its body ([`rk::companion::PetShade`]).
     #[inline]
     pub const fn note_pet_body(&mut self, body: Option<(i32, i32, i32, i32)>) {
+        self.pet_body = body;
         self.v2.note_pet_body(body);
     }
 
@@ -112,6 +113,83 @@ impl CursorGlow {
     #[must_use]
     pub const fn pet_shade(&self) -> Option<(i32, i32, i32, i32)> {
         self.v2.pet_shade()
+    }
+
+    /// The boxes the sky and the ribbon last kept off, window pixels
+    /// ([`Self::keep_out_boxes`]).
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn keep_out(&self) -> &[(i32, i32, i32, i32)] {
+        self.v2.keep_out()
+    }
+
+    /// The word icons the word pass drew (a `dog`'s or a `fox`'s face, a
+    /// word's cat), grid pixels `(x0, x1, y0, y1)`: the next frame's sky and
+    /// ribbon keep off them ([`rk::companion::KeepOut`]).
+    #[inline]
+    pub fn note_word_icons(&mut self, icons: impl IntoIterator<Item = (i32, i32, i32, i32)>) {
+        self.word_icons.clear();
+        self.word_icons.extend(icons);
+        self.word_icon_src.clear();
+        self.word_icons_unshaded = true;
+    }
+
+    /// This frame's [`rk::companion::KeepOut`] for the ribbon and its sky,
+    /// window pixels: the word icons, and each run of lettered or filled
+    /// cells (a ground that is not the page) of every row of the frame's
+    /// text but the caret's.
+    pub(super) fn keep_out_boxes(&mut self, cfg: &GlowConfig, geom: Geom, cur: Option<(u16, u16)>) {
+        let (ox, oy) = (i32::from(geom.origin_x), i32::from(geom.origin_y));
+        let (cw, ch) = (geom.cw as i32, geom.ch as i32);
+        self.keep_geom = Some((ox, oy, cw));
+        let mut boxes = std::mem::take(&mut self.keep_out_scratch);
+        boxes.clear();
+        let page = cfg.theme_bg & 0x00FF_FFFF;
+        let caret_row = cur.map(|(r, _)| i32::from(r));
+        let ft = &self.frame_text;
+        let mut rows = std::mem::take(&mut self.keep_rows_scratch);
+        rows.clear();
+        for i in 0..ft.rows.len() {
+            let row = ft.lo + i as i32;
+            if Some(row) == caret_row {
+                continue;
+            }
+            let mut run: Option<i32> = None;
+            let mut span: Option<(i32, i32)> = None;
+            let end = ft.col0 + ft.cols as i32;
+            for col in ft.col0..=end {
+                let held = col < end
+                    && ft.pair(row, col).is_some_and(|(ink, ground)| {
+                        ink.is_some() || !super::emit::reads_as_page(ground & 0x00FF_FFFF, page)
+                    });
+                match (held, run) {
+                    (true, None) => run = Some(col),
+                    (false, Some(c0)) => {
+                        let y0 = oy + row * ch;
+                        boxes.push((ox + c0 * cw, ox + col * cw, y0, y0 + ch));
+                        span = Some(span.map_or((c0, col), |(a, _)| (a, col)));
+                        run = None;
+                    }
+                    _ => {}
+                }
+            }
+            // The span reaches a cell past the row's last letter, where its
+            // caret stood when it was typed: a Return's train roots there,
+            // and cut at the letters its root stood alone after the line as
+            // a brown stub (looks6 round 3).
+            if let Some((c0, c1)) = span {
+                let y0 = oy + row * ch;
+                rows.push((ox + c0 * cw, ox + (c1 + 1) * cw, y0, y0 + ch));
+            }
+        }
+        let icons = self
+            .word_icons
+            .iter()
+            .map(|&(x0, x1, y0, y1)| (x0 + ox, x1 + ox, y0 + oy, y1 + oy));
+        self.v2
+            .note_keep_out((icons, boxes.iter().copied()), rows.iter().copied());
+        self.keep_out_scratch = boxes;
+        self.keep_rows_scratch = rows;
     }
 
     /// Mint [`CompanionImpulse::Delight`] and buffer the earned m1 hero at `(row, col)`.

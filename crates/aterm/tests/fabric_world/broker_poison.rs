@@ -199,6 +199,15 @@ fn a_poisoned_log_exits_75_and_the_restarted_broker_lands_the_post_once() {
         "the run was recorded Lossy, so the reopen moves the generation"
     );
 
+    // The lane and `fabric=connected` can both read true before the bridge meets the restarted
+    // broker: the refused post's bytes outlive the poisoned run, and the bridge took the refusal
+    // for its broker answering. Its record of the moved generation is the attach.
+    until("the bridge to attach to the restarted broker", || {
+        w.ev()
+            .iter()
+            .any(|e| e.starts_with("log-replaced ") && e.contains(" continues="))
+            .then_some(())
+    });
     until("the refused post to land after the restart", || {
         (on_lane(&w, &a, "refused by the poison") > 0).then_some(())
     });

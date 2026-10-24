@@ -12,24 +12,59 @@
 //!   the live record, the free-space floor at every bring-up, and the reclaim (§4);
 //! - [`seed`]: the bake's NoCloud seed, its three files and its ISO (§4).
 //!
-//! It loads no framework and starts no VM. The helper that does (`aterm-vz-host`, its
-//! `Machine` port and protocol) is slice V2, the agent's client comes with V1's codec, and
-//! the lab's `Driver` is V4. Where they join: [`layers::Prepared::Bake`] hands V4's bake
-//! the disk it boots through V2's helper, with the ISO [`layers::Layers::seed_iso`] makes;
-//! [`layers::Prepared::Live`] names the disk every later boot attaches; and
-//! [`space::RUN_FLOOR`] is the floor V2's helper stops a running VM at, in
+//! And the helper, which runs the VM (slice V2, §5 and §5.1):
+//! - [`plan`]: what the helper builds, and the framework's and the host's limits (§5, §9);
+//! - [`machine`]: the `Machine` port, its VZ arm in `aterm-vz-host` (macOS only, over
+//!   `aterm-objc` and a `dlopen`ed Virtualization.framework) and its Fake arm;
+//! - [`console`] and [`detect`]: the console watcher and the boot, heartbeat and free-space
+//!   detectors (§10);
+//! - [`proto`] and [`transport`]: the control protocol and its framing with descriptors;
+//! - [`record`]: the run files, the record, the disk's `flock` and the escalation by pid and
+//!   unique id;
+//! - [`helper`]: the helper's core (sessions, `keep`, the release rule, `Release`) and its
+//!   serve loop;
+//! - [`client`]: the `Helper` port (the lab's side), its socket arm with the detached start
+//!   and its Fake arm;
+//! - [`sign`]: the content-addressed ad hoc signing of the helper the lab built;
+//! - [`agent`]: the agent's command client over a vsock descriptor (`Exec`, `Poweroff`).
+//!
+//! The library loads no framework and starts no VM: only `aterm-vz-host` opens
+//! Virtualization.framework, at `Boot`, so linking this library (the lab and its tests do)
+//! loads nothing of it. The lab's `Driver` is V4. Where they join: [`layers::Prepared::Bake`]
+//! hands V4's bake the disk it boots through the helper, with the ISO
+//! [`layers::Layers::seed_iso`] makes; [`layers::Prepared::Live`] names the disk every later
+//! boot attaches; and [`space::RUN_FLOOR`] is the floor the helper stops a running VM at, in
 //! [`space::below_run`]'s words.
 //!
 //! The lane takes its inputs only from what `verify provision --linux` placed and stamped
 //! for the pin ([`pins::base`], [`pins::kernel_files`]), and reading them at a bring-up marks
 //! their rows used, so the tooling cache's idle reclaim keeps them while the lane runs.
 
+#[cfg(unix)]
+pub mod agent;
+#[cfg(unix)]
+pub mod client;
 pub mod clone;
+pub mod console;
+pub mod detect;
+#[cfg(unix)]
+pub mod helper;
 pub mod kernel;
 pub mod layers;
+#[cfg(unix)]
+pub mod machine;
 pub mod pins;
+pub mod plan;
+#[cfg(unix)]
+pub mod proto;
+#[cfg(unix)]
+pub mod record;
 pub mod seed;
+#[cfg(unix)]
+pub mod sign;
 pub mod space;
+#[cfg(unix)]
+pub mod transport;
 
 /// Why the lane cannot have its disks or its kernel, in the words its report prints.
 #[derive(Clone, Debug, PartialEq, Eq)]

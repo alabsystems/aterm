@@ -27,28 +27,25 @@ impl RowBands {
 
     /// The band of a `rows`-row grid holding window pixel row `y` (`rows > 0`):
     /// row 0 also holds every pixel above the grid, the last row every pixel
-    /// below it.
+    /// below it. A row a `usize` holds goes through the slicer's own
+    /// [`crate::fx_raster::band_at`] (one divide instruction, where i128's is a
+    /// library call: a changed layer pays this twice per item); only a row
+    /// past it divides in i128.
     #[inline]
-    const fn band_of(self, y: i128, rows: usize) -> usize {
-        let top = self.grid_top as i128;
-        if y < top {
+    pub(crate) const fn band_of(self, y: i128, rows: usize) -> usize {
+        if y < 0 {
             return 0;
         }
+        if y <= usize::MAX as i128 {
+            return crate::fx_raster::band_at(y as usize, rows, self.grid_top, self.cell_h);
+        }
         let pitch = if self.cell_h > 1 { self.cell_h } else { 1 };
-        let d = y - top;
-        // In u64 whenever it fits: one divide instruction, where i128's is a
-        // library call (a changed layer pays this twice per item).
-        let q = if d <= u64::MAX as i128 && pitch as u128 <= u64::MAX as u128 {
-            (d as u64 / pitch as u64) as i128
-        } else {
-            d / pitch as i128
-        };
-        let r = if q > usize::MAX as i128 {
-            usize::MAX
-        } else {
+        let q = (y - self.grid_top as i128) / pitch as i128;
+        if q < (rows - 1) as i128 {
             q as usize
-        };
-        if r < rows - 1 { r } else { rows - 1 }
+        } else {
+            rows - 1
+        }
     }
 
     /// Mark every band in `dirty` overlapped by window pixel rows `[y0, y1)`.

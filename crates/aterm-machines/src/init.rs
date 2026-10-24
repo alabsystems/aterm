@@ -2317,24 +2317,38 @@ mod tests {
         let sys = Fake::root();
         sys.scroll_state(true);
         saved_off(&sys);
-        let groups = vec![
-            (
-                vec![
-                    Listed::boxed("init.test.changes", vec![change(), ok()]),
-                    Listed::boxed("init.test.right", vec![ok()]),
-                ],
-                place(Class::Preference),
-            ),
-            (
-                crate::init_trackpad::items(&alice).unwrap(),
-                place(Class::Preference),
-            ),
-        ];
+        let groups = || {
+            vec![
+                (
+                    vec![
+                        Listed::boxed("init.test.changes", vec![change(), ok()]),
+                        Listed::boxed("init.test.right", vec![ok()]),
+                    ],
+                    place(Class::Preference),
+                ),
+                (
+                    crate::init_trackpad::items(&alice).unwrap(),
+                    place(Class::Preference),
+                ),
+            ]
+        };
+        let before = Fake::root();
+        before.scroll_state(true);
+        saved_off(&before);
+        let planned = run(
+            &before,
+            &alice,
+            Base::none(),
+            &groups(),
+            Mode::Plan,
+            &mut NoJournal,
+        )
+        .unwrap();
         let rows = run(
             &sys,
             &alice,
             Base::none(),
-            &groups,
+            &groups(),
             Mode::Apply,
             &mut journal,
         )
@@ -2351,12 +2365,23 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["init.test.changes", "init.trackpad.scroll-direction@alice"]
         );
-        for (line, row) in lines
+        assert_eq!(
+            planned
+                .iter()
+                .filter(|r| r.outcome == Outcome::Planned)
+                .count(),
+            lines.len()
+        );
+        for ((line, requested), row) in lines
             .iter()
+            .zip(planned.iter().filter(|r| r.outcome == Outcome::Planned))
             .zip(rows.iter().filter(|r| r.outcome == Outcome::Changed))
         {
+            assert_eq!(line["id"].as_str(), Some(requested.id.as_str()));
+            assert_eq!(requested.id, row.id);
             assert_eq!(line["from"].as_str(), row.from.as_deref());
-            assert_eq!(line["to"].as_str(), row.to.as_deref());
+            assert_eq!(line["from"].as_str(), requested.from.as_deref());
+            assert_eq!(line["to"].as_str(), requested.to.as_deref());
             assert_eq!(line["revert"].as_str(), row.revert.as_deref());
         }
         assert!(rows.iter().all(|r| r.layer == Some(Layer::Workstation)));

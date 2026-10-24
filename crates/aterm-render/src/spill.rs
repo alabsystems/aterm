@@ -519,7 +519,13 @@ impl SpillBand {
             let color = &mut color[off..off + n];
             let cover = &mut cover[off..off + n];
             let mut fx = |color: &mut [u32], cover: &mut [u8], slot, blend| {
-                if !cur.fx.is_empty() {
+                if cur.fx.iter().any(|l| {
+                    l.slot == slot
+                        && l.blend == blend
+                        && geom
+                            .layer_rect(l)
+                            .is_some_and(|r| clip_to_strip(s, r).is_some())
+                }) {
                     fx_raster::draw_layers_on(
                         &mut StripCanvas { s, color, cover },
                         &frame,

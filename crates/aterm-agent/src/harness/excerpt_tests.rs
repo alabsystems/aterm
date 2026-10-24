@@ -386,9 +386,11 @@ fn agy_excerpts_read_prompts_said_and_doing_from_transcript_and_history() {
     let transcript = concat!(
         r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"<USER_REQUEST>\nhi\nwhat is next?\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\ntime\n</ADDITIONAL_METADATA>"}"#,
         "\n",
-        r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"Working on the survey excerpts.","tool_calls":[{"name":"read_file","args":{}},{"name":"run_command","args":{}}]}"#,
+        r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"Working on the survey excerpts.","tool_calls":[{"name":"default_api:read_file","args":{}},{"name":"default_api:run_command","args":{}}]}"#,
         "\n",
         r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"DONE","content":"read_file output"}"#,
+        "\n",
+        r#"{"step_index":3,"source":"MODEL","type":"GENERIC","status":"RUNNING","content":"Tool is running as a background task"}"#,
         "\n",
     );
     let history = concat!(
@@ -404,7 +406,7 @@ fn agy_excerpts_read_prompts_said_and_doing_from_transcript_and_history() {
 
     let finished = format!(
         "{transcript}{}\n",
-        r#"{"step_index":3,"source":"MODEL","type":"GENERIC","status":"DONE","content":"run_command output"}"#
+        r#"{"step_index":4,"source":"MODEL","type":"GENERIC","status":"DONE","content":"run_command output"}"#
     );
     let done = agy_excerpts_from(finished.as_bytes(), Some(history.as_bytes()), cid);
     assert_eq!(done.doing, None);
@@ -424,6 +426,12 @@ fn muse_excerpts_read_prompts_said_and_doing_from_session_log() {
         r#"{"payload_type":"runtime.session","payload":{"kind":"task","run_id":"r2","task_id":"t0","event":{"kind":"proposed","task_kind":"session_name.allocate"}}}"#,
         "\n",
         r#"{"payload_type":"runtime.session","payload":{"kind":"task","run_id":"r2","task_id":"t1","event":{"kind":"proposed","task_kind":"tool.bash"}}}"#,
+        "\n",
+        r#"{"payload_type":"runtime.session","payload":{"kind":"task","run_id":"r2","task_id":"t0","event":{"kind":"completed"}}}"#,
+        "\n",
+        r#"{"payload_type":"runtime.session","payload":{"kind":"task","run_id":"r2","task_id":"t2","event":{"kind":"proposed","task_kind":"tool.read_file"}}}"#,
+        "\n",
+        r#"{"payload_type":"runtime.session","payload":{"kind":"task","run_id":"r2","task_id":"t2","event":{"kind":"completed"}}}"#,
         "\n",
     );
     let got = muse_excerpts_from(session.as_bytes());

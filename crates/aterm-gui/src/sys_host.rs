@@ -1341,7 +1341,8 @@ pub(crate) fn splice_brief_line(text: &str, line: &str, budget: usize) -> String
 }
 
 impl crate::App {
-    /// `status`'s `job=` and `job_quiet_ms=` fields for `session`.
+    /// `status`'s `job=`, `job_quiet_ms=` and `program_check=` fields for `session`, from one
+    /// adopted view at one age; `program_check=-` off macOS, where nothing is held at a check.
     pub(crate) fn status_job_fields(&self, session: u64) -> String {
         let now = Instant::now();
         let view = self
@@ -1354,7 +1355,12 @@ impl crate::App {
             u64::try_from(now.saturating_duration_since(at).as_millis()).unwrap_or(u64::MAX)
         });
         let view = fresh_jobs(view, now, self.vitals.reader_runs());
-        aterm_vitals::sys::jobs_view::status_fields(view.as_deref(), &[session], age_ms)
+        let held = view.as_deref().filter(|_| cfg!(target_os = "macos"));
+        format!(
+            "{} {}",
+            aterm_vitals::sys::jobs_view::status_fields(view.as_deref(), &[session], age_ms),
+            aterm_vitals::sys::jobs_view::program_check_field(held, &[session], age_ms)
+        )
     }
 }
 

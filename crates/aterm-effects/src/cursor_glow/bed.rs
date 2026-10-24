@@ -59,18 +59,25 @@ pub(crate) fn dark_bed_ink(rgb: u32, bg: u32, budget: f32, sat: f32) -> u32 {
     };
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
     let (mut lo_rgb, mut hi_rgb) = (pick_rgb(0.0), pick_rgb(1.0));
+    let (mut lo_ok, mut hi_ok) = (false, false);
     for _ in 0..20 {
         if lo_rgb == hi_rgb {
             break;
         }
         let mid = 0.5 * (lo + hi);
         let mid_rgb = pick_rgb(mid);
-        if seen(mid_rgb) <= budget {
+        if lo_ok && mid_rgb == lo_rgb {
+            lo = mid;
+        } else if hi_ok && mid_rgb == hi_rgb {
+            hi = mid;
+        } else if seen(mid_rgb) <= budget {
             lo = mid;
             lo_rgb = mid_rgb;
+            lo_ok = true;
         } else {
             hi = mid;
             hi_rgb = mid_rgb;
+            hi_ok = true;
         }
     }
     let [r, g, b] = lo_rgb;
@@ -693,23 +700,44 @@ pub(crate) fn clip_quads_to(
         c.h = (cy1 - cy0) as u16;
         if cx0 != qx0 || cx1 != qx1 {
             let w = f32::from(q.w.max(1));
-            let lerp = |a: u32, b: u32, x: i32| {
-                let t = (x - qx0) as f32 / w;
-                let ch = |sh: u32| {
-                    let (u, v) = (((a >> sh) & 0xff) as f32, ((b >> sh) & 0xff) as f32);
-                    ((u + (v - u) * t).round() as u32).min(255)
+            if q.color != q.color2 {
+                let lerp = |a: u32, b: u32, x: i32| {
+                    let t = (x - qx0) as f32 / w;
+                    let ch = |sh: u32| {
+                        let (u, v) = (((a >> sh) & 0xff) as f32, ((b >> sh) & 0xff) as f32);
+                        ((u + (v - u) * t).round() as u32).min(255)
+                    };
+                    (ch(16) << 16) | (ch(8) << 8) | ch(0)
                 };
-                (ch(16) << 16) | (ch(8) << 8) | ch(0)
-            };
-            let lerp_a = |a: u8, b: u8, x: i32| {
-                let t = (x - qx0) as f32 / w;
-                (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8
-            };
-            c.color = lerp(q.color, q.color2, cx0);
-            c.color2 = lerp(q.color, q.color2, cx1);
+                if cx0 != qx0 {
+                    c.color = lerp(q.color, q.color2, cx0);
+                }
+                if cx1 != qx1 {
+                    c.color2 = lerp(q.color, q.color2, cx1);
+                }
+            }
             if q.alpha != 0 {
-                c.alpha = lerp_a(q.alpha, q.alpha2, cx0).max(1);
-                c.alpha2 = lerp_a(q.alpha, q.alpha2, cx1).max(1);
+                if q.alpha == q.alpha2 {
+                    c.alpha = q.alpha.max(1);
+                    c.alpha2 = q.alpha2.max(1);
+                } else {
+                    let lerp_a = |a: u8, b: u8, x: i32| {
+                        let t = (x - qx0) as f32 / w;
+                        (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8
+                    };
+                    c.alpha = if cx0 != qx0 {
+                        lerp_a(q.alpha, q.alpha2, cx0)
+                    } else {
+                        q.alpha
+                    }
+                    .max(1);
+                    c.alpha2 = if cx1 != qx1 {
+                        lerp_a(q.alpha, q.alpha2, cx1)
+                    } else {
+                        q.alpha2
+                    }
+                    .max(1);
+                }
             }
         }
         out[kept] = c;

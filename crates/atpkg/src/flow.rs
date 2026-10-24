@@ -177,9 +177,9 @@ pub struct InstallReport {
     pub index_build: u64,
     /// The `roster_seq` of the master-signed generation that authorized that index.
     pub roster_seq: u64,
-    /// Whether it was already current (no change).
+    /// Whether it was already current (no build moved).
     pub already_current: bool,
-    /// The `bin/` shims installed.
+    /// The `bin/` shims installed (when already current, the commands put back on PATH).
     pub shimmed: Vec<String>,
     /// `exposes` names refused a shim (sensitive-name collisions).
     pub refused_shims: Vec<String>,
@@ -399,6 +399,102 @@ fn reassert_witness(layout: &Layout, program: &str, build: u64) -> Result<(), Fl
     activate_build(layout, &build_dir).map_err(|e| FlowError::Activate(e.to_string()))
 }
 
+/// Lay the shim of each command the up-to-date `build` exposes whose shim is gone or runs another
+/// of `program`'s builds, naming them.
+///
+/// The commands come from the build's record ([`crate::store::recorded_exposes`]); a build
+/// staged before that record reads its signed manifest, which then becomes the record. When that
+/// manifest cannot be read, it lays nothing while a command of `program` is still on PATH under
+/// its own name ([`crate::installed_exposes`]), and otherwise fails with the read's error.
+fn lay_commands_off_path(
+    fetcher: &dyn Fetcher,
+    layout: &Layout,
+    index: &TrustedIndex,
+    repo: &str,
+    program: &str,
+    build: u64,
+) -> Result<Vec<String>, FlowError> {
+    let build_dir = layout.build_dir(program, build);
+    let tools = match crate::store::recorded_exposes(&build_dir) {
+        Some(tools) => tools,
+        None => match signed_exposes(fetcher, index, repo, program, build) {
+            Ok(tools) => {
+                let _ = crate::store::write_exposes(&build_dir, &tools);
+                tools
+            }
+            Err(_) if crate::installed_exposes(layout, program).is_some() => {
+                return Ok(Vec::new());
+            }
+            Err(FlowError::PkgFetch(e)) => {
+                note_fetch_fault();
+                return Err(FlowError::PkgFetch(format!(
+                    "{e}; build {build} keeps no record of the commands it puts on PATH and none \
+                     of them is left under its own name, so its signed manifest is needed to put \
+                     them back"
+                )));
+            }
+            Err(e) => return Err(e),
+        },
+    };
+    // A shim at another of the program's builds is laid too: a lay prunes every shim of the
+    // program it does not lay that runs another build ([`install_tools_env`]).
+    let off: Vec<ToolName> = tools
+        .into_iter()
+        .filter(|tool| {
+            let shim = layout.shim(tool);
+            match std::fs::symlink_metadata(&shim) {
+                Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+                Ok(_) => crate::platform::resolve_shim(&shim)
+                    .and_then(|target| crate::ops::store_build_of(&layout.prefix, &target))
+                    .is_some_and(|(owner, b)| owner == program && b != build),
+            }
+        })
+        .collect();
+    if off.is_empty() {
+        return Ok(Vec::new());
+    }
+    install_tools_env(
+        layout,
+        &build_dir,
+        &off,
+        Aliases::for_program(program, index.program(program)),
+        &crate::shim_env::read_sidecar(&build_dir),
+    )
+    .map_err(|e| FlowError::Activate(e.to_string()))?;
+    Ok(off.iter().map(|tool| tool.as_str().to_string()).collect())
+}
+
+/// The admitted `exposes` of `program`'s signed manifest for `build`, read and verified as an
+/// install reads it.
+fn signed_exposes(
+    fetcher: &dyn Fetcher,
+    index: &TrustedIndex,
+    repo: &str,
+    program: &str,
+    build: u64,
+) -> Result<Vec<ToolName>, FlowError> {
+    let (raw, sig) = fetcher
+        .pkg_manifest(repo, program, build)
+        .map_err(FlowError::PkgFetch)?;
+    let verified = index
+        .verify_pkg(raw, &sig)
+        .map_err(|_| FlowError::PkgVerify)?;
+    let pkg = parse_pkg(&verified).map_err(pkg_parse_error)?;
+    if !pkg.is_for(program) || pkg.build_number != build {
+        return Err(FlowError::Mismatch);
+    }
+    Ok(crate::store::split_exposed(&pkg.exposes).0)
+}
+
+/// The [`FlowError`] a signed manifest that verified but did not parse is refused with.
+fn pkg_parse_error(e: crate::Reject) -> FlowError {
+    match e {
+        crate::Reject::RetiredKind(why) => FlowError::RetiredKind(why),
+        crate::Reject::ShimEnv(why) => FlowError::ShimEnv(why),
+        _ => FlowError::PkgParse,
+    }
+}
+
 fn installed_for_decide(layout: &Layout, program: &str, installed: Option<u64>) -> Option<u64> {
     installed.filter(|&build| crate::store::build_is_complete(&layout.build_dir(program, build)))
 }
@@ -516,13 +612,14 @@ fn install_inner(
     ) {
         ApplyDecision::UpToDate => {
             reassert_witness(layout, program, pinned)?;
+            let shimmed = lay_commands_off_path(fetcher, layout, &index, repo, program, pinned)?;
             return Ok(InstallReport {
                 program: program.to_string(),
                 build: pinned,
                 index_build: index.index_build,
                 roster_seq: index.roster_seq(),
                 already_current: true,
-                shimmed: vec![],
+                shimmed,
                 refused_shims: vec![],
                 tree_root: String::new(),
                 dependencies: vec![],
@@ -544,11 +641,7 @@ fn install_inner(
     let verified = index
         .verify_pkg(raw, &sig)
         .map_err(|_| FlowError::PkgVerify)?;
-    let pkg = parse_pkg(&verified).map_err(|e| match e {
-        crate::Reject::RetiredKind(why) => FlowError::RetiredKind(why),
-        crate::Reject::ShimEnv(why) => FlowError::ShimEnv(why),
-        _ => FlowError::PkgParse,
-    })?;
+    let pkg = parse_pkg(&verified).map_err(pkg_parse_error)?;
     if !pkg.is_for(program) || pkg.build_number != pinned {
         return Err(FlowError::Mismatch);
     }
@@ -951,6 +1044,8 @@ pub(crate) fn land_artifact(
     crate::progress::note_phase(program, crate::progress::Phase::Link);
     activate_build(layout, &build_dir).map_err(|e| FlowError::Activate(e.to_string()))?;
     let (tools, refused) = crate::store::split_exposed(l.exposes);
+    // What an up-to-date install and `repair` re-lay from; a build without it falls back.
+    let _ = crate::store::write_exposes(&build_dir, &tools);
     let aliases = l.aliases;
     let staged = Staged {
         build: pinned,
@@ -3021,6 +3116,7 @@ fn stage_fetched(
     }
     crate::store::clear_stage_refusal(&build_dir);
     let (exposes, refused) = crate::store::split_exposed(&pkg.exposes);
+    let _ = crate::store::write_exposes(&build_dir, &exposes);
     let _ = crate::status::record_refused_shims(layout, program, pinned, &refused);
     Some(Staged {
         build: pinned,

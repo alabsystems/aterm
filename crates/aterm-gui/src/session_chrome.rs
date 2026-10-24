@@ -488,6 +488,7 @@ pub(crate) fn timeline_row_shown(kind: &str) -> bool {
             | "card-armed"
             | "card-bare"
             | "holder-adopt"
+            | "holder-retire"
             | crate::claude_footer::REGISTRY_READ
     )
 }

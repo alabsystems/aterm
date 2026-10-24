@@ -165,6 +165,15 @@ impl TerminalHandler<'_> {
                         super::note_full_clear(top, from_home, self.shell);
                         self.holder_fence.note_full_clear(top, self.grid);
                     }
+                } else if !self.modes.alternate_screen && !self.holder_fence.is_empty() {
+                    let lo = match (final_byte, params.first().copied().unwrap_or(0)) {
+                        (b'K', _) | (b'J', 0) => Some(self.grid.visible_to_absolute(cursor.row)),
+                        (b'J', 1) => Some(self.grid.visible_to_absolute(0)),
+                        _ => None,
+                    };
+                    if let Some(lo) = lo {
+                        self.holder_fence.note_erase(lo, self.grid);
+                    }
                 }
                 if final_byte == b'J'
                     && params.first().copied().unwrap_or(0) == 3

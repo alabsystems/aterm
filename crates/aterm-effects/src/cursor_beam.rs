@@ -390,6 +390,9 @@ impl CursorBeamRod {
                         let t = k as f32 / AURA_SEGMENTS as f32;
                         let dx = hw + span * t;
                         let (rx_i, lx_i) = ((cx + dx).round() as i32, (cx - dx).round() as i32);
+                        if k == AURA_SEGMENTS {
+                            return (rx_i, lx_i, 0, 0);
+                        }
                         let u = dx * inv_rx;
                         let rho2 = u * u + v2;
                         let f = (1.0 - rho2).max(0.0).powi(2) * inv_f_edge;
@@ -400,10 +403,12 @@ impl CursorBeamRod {
                         let color = lerp_rgb(cfg.color, cfg.haze, 0.75 * rho2.sqrt());
                         (rx_i, lx_i, cov, premul_rgb(color, cov))
                     };
-                    let knots: [_; AURA_SEGMENTS + 1] = std::array::from_fn(knot);
-                    for pair in knots.windows(2) {
+                    let mut prev = knot(0);
+                    for k in 1..=AURA_SEGMENTS {
+                        let next = knot(k);
                         let ((r_in, l_in, c_in, inner), (r_out, l_out, c_out, outer)) =
-                            (pair[0], pair[1]);
+                            (prev, next);
+                        prev = next;
                         if c_in == 0 && c_out == 0 {
                             continue;
                         }

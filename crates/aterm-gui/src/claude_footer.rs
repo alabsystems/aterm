@@ -33,6 +33,8 @@ pub(crate) fn drawn_for(program: Option<&str>) -> bool {
             | aterm_phase::Program::Agy
             | aterm_phase::Program::Muse => true,
             aterm_phase::Program::Codex
+            | aterm_phase::Program::Grok
+            | aterm_phase::Program::Kimi
             | aterm_phase::Program::Gemini
             | aterm_phase::Program::Generic => false,
         })
@@ -2854,18 +2856,29 @@ fn resolve_facts_at_with_cwd(
     clock: &footer::ReadClock<'_>,
 ) -> (Option<Option<PathBuf>>, Found) {
     let (asks, cwd_of) = capabilities;
-    let is_claude = timeline
+    let prog = timeline
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .agent()
         .program
         .as_deref()
-        .and_then(aterm_phase::program_of)
-        == Some(aterm_phase::Program::Claude);
+        .and_then(aterm_phase::program_of);
+    let (is_claude, uses_claude_registry) = match prog {
+        Some(aterm_phase::Program::Claude) => (true, true),
+        Some(aterm_phase::Program::Agy | aterm_phase::Program::Muse) => (false, false),
+        Some(
+            aterm_phase::Program::Codex
+            | aterm_phase::Program::Grok
+            | aterm_phase::Program::Kimi
+            | aterm_phase::Program::Gemini
+            | aterm_phase::Program::Generic,
+        )
+        | None => (false, true),
+    };
     let started = identity.started;
-    let mut facts = u32::try_from(identity.pid)
-        .ok()
-        .zip(identity.dir.clone())
+    let mut facts = uses_claude_registry
+        .then(|| u32::try_from(identity.pid).ok().zip(identity.dir.clone()))
+        .flatten()
         .and_then(|(pid, dir)| {
             let launch = |entry: &footer::SessionEntry| {
                 if identity.launch_for != Some(entry.started_at) {
@@ -5942,7 +5955,7 @@ fn top_line(program: aterm_phase::Program, cached: &CachedPaneText) -> Option<(u
                 .flatten()
             })
             .map(|row| (row, TopLine::Slab)),
-        Program::Generic => None,
+        Program::Grok | Program::Kimi | Program::Generic => None,
     }
 }
 
@@ -6430,7 +6443,9 @@ const fn cli_mark(program: aterm_phase::Program) -> Option<CliMark> {
         aterm_phase::Program::Agy => Some(CliMark::Agy),
         aterm_phase::Program::Muse => Some(CliMark::Muse),
         aterm_phase::Program::Gemini => Some(CliMark::Gemini),
-        aterm_phase::Program::Generic => None,
+        aterm_phase::Program::Grok | aterm_phase::Program::Kimi | aterm_phase::Program::Generic => {
+            None
+        }
     }
 }
 
@@ -7758,14 +7773,9 @@ fn humanize_agy_subagent_phrase(s: &str) -> String {
     while let Some(at) = rest.find("Agent(") {
         out.push_str(&rest[..at]);
         let from_agent = &rest[at..];
-        if let Some(close) = from_agent.find(')') {
-            let token = &from_agent[..=close];
-            if let Some(unwrapped) = aterm_phase::agy::unwrap_agent_token(token) {
-                out.push_str(unwrapped);
-            } else {
-                out.push_str(token);
-            }
-            rest = &from_agent[close + 1..];
+        if let Some((unwrapped, after)) = aterm_phase::agy::split_agent_token(from_agent) {
+            out.push_str(unwrapped);
+            rest = after;
         } else {
             out.push_str("Agent(");
             rest = &from_agent["Agent(".len()..];
@@ -7855,10 +7865,7 @@ fn render_agy_subagent_transcript_row(
         .iter()
         .any(|v| core.starts_with(v))
             && (core.contains("subagent") || core.contains("Agent("));
-        let is_agent_head = core.starts_with("Agent(")
-            && core
-                .find(')')
-                .is_some_and(|c| aterm_phase::agy::unwrap_agent_token(&core[..=c]).is_some());
+        let is_agent_head = aterm_phase::agy::split_agent_token(core).is_some();
         let is_alert = (core.contains(" needs approval for ") || core.ends_with(" has a question"))
             && (core.starts_with("Agent(") || core.contains("subagent"));
         if !is_action && !is_agent_head && !is_alert {
@@ -7898,11 +7905,11 @@ fn render_agy_subagent_transcript_row(
                     ..blank
                 });
             }
-        } else if is_agent_head && let Some(close) = clean_core.find(')') {
-            let agent_tok = &clean_core[..=close];
-            let unwrapped = aterm_phase::agy::unwrap_agent_token(agent_tok).unwrap_or(agent_tok);
+        } else if let Some((unwrapped, after_tok_raw)) =
+            aterm_phase::agy::split_agent_token(clean_core)
+        {
             push_rainbow_text(unwrapped, phase, max_cols, blank, &mut out);
-            let after_tok = clean_core[close + 1..].trim_start();
+            let after_tok = after_tok_raw.trim_start();
             if !after_tok.is_empty() {
                 let detail = after_tok
                     .strip_prefix(": ")
@@ -7965,15 +7972,13 @@ fn render_agy_subagent_transcript_row(
                 }
             }
             if let Some(at) = core.find("Agent(")
-                && let Some(close_rel) = core[at..].find(')')
+                && let Some((unwrapped, after_tok_raw)) =
+                    aterm_phase::agy::split_agent_token(&core[at..])
             {
-                let close = at + close_rel;
                 let before_tok = &core[..at];
-                let tok = &core[at..=close];
-                let unwrapped = aterm_phase::agy::unwrap_agent_token(tok).unwrap_or(tok);
                 let head_phrase = format!("{before_tok}{unwrapped}");
                 push_rainbow_text(&head_phrase, phase, max_cols, blank, &mut out);
-                let tail = core[close + 1..].trim_start();
+                let tail = after_tok_raw.trim_start();
                 if !tail.is_empty() {
                     let detail = tail
                         .strip_prefix(": ")
@@ -8046,11 +8051,7 @@ fn render_agy_panel_item_row(
     if out.len() < max_cols {
         out.push(blank);
     }
-    if rest.starts_with("Agent(")
-        && let Some(close) = rest.find(')')
-    {
-        let agent_tok = &rest[..=close];
-        let unwrapped = aterm_phase::agy::unwrap_agent_token(agent_tok).unwrap_or(agent_tok);
+    if let Some((unwrapped, after_tok_raw)) = aterm_phase::agy::split_agent_token(rest) {
         // Column 4..4+unwrapped.chars().count() matches `agents_panel::agy_agent_row`'s `name`
         // span, and `claude_panel::make_look` leaves `agy_agent` name cells untouched so this
         // full-spectrum bold rainbow in `scratch.cells` is preserved while `claude_panel`
@@ -8062,7 +8063,7 @@ fn render_agy_panel_item_row(
             blank,
             &mut out,
         );
-        let after_agent = rest[close + 1..].trim_start();
+        let after_agent = after_tok_raw.trim_start();
         if !after_agent.is_empty() {
             let (raw_act, _, elapsed) = split_agy_subagent_suffixes(after_agent);
             let clean_act = raw_act.strip_suffix("...").unwrap_or(raw_act).trim();
@@ -9069,6 +9070,8 @@ mod tests {
                 | aterm_phase::Program::Agy
                 | aterm_phase::Program::Muse => true,
                 aterm_phase::Program::Codex
+                | aterm_phase::Program::Grok
+                | aterm_phase::Program::Kimi
                 | aterm_phase::Program::Gemini
                 | aterm_phase::Program::Generic => false,
             });
@@ -14897,6 +14900,43 @@ mod tests {
                 "subagent bullet dot emits halo light quads under {palette:?}"
             );
         }
+        let inks = MarkdownInks::of(
+            blank,
+            RenderCell {
+                ch: '\u{2500}',
+                fg: [0x58, 0x5c, 0x68],
+                ..blank
+            },
+            [0xe0, 0x7a, 0x5f],
+        );
+        let nested_panel = render_agy_panel_item_row(
+            "  ● Agent(self: Researcher (GUI))  Reading file (foo.rs) \u{00B7} 25s",
+            0,
+            scratch.cols,
+            scratch.cols,
+            blank,
+            &inks,
+        )
+        .expect("parenthesized role in agy panel row should render");
+        let nested_panel_text: String = nested_panel.iter().map(|c| c.ch).collect();
+        assert!(
+            nested_panel_text.contains("Researcher (GUI)  Reading file (foo.rs) \u{00B7} 25s"),
+            "parenthesized role unwrapped cleanly in panel row: {nested_panel_text:?}"
+        );
+        let nested_tx = render_agy_subagent_transcript_row(
+            "  └ Agent(self: Researcher (GUI)): Reading file (foo.rs)... \u{00B7} 25s",
+            0,
+            scratch.cols,
+            scratch.cols,
+            blank,
+            &inks,
+        )
+        .expect("parenthesized role in agy transcript row should render");
+        let nested_tx_text: String = nested_tx.iter().map(|c| c.ch).collect();
+        assert!(
+            nested_tx_text.contains("Researcher (GUI)  Reading file (foo.rs) \u{00B7} 25s"),
+            "parenthesized role unwrapped cleanly in transcript row: {nested_tx_text:?}"
+        );
 
         // Verify `undo` restores all original cells cleanly.
         assert!(undo(&mut undo_slot, &mut scratch));
@@ -15146,6 +15186,106 @@ mod tests {
             Some("weekly 91% left"),
             "live WeeklyFigure for the new agy account is preserved after switch"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn muse_resolver_populates_model_effort_resume_and_excerpts_from_session_log() {
+        const PID: i32 = 4399;
+        thread_local! {
+            static HOME_DIR: std::cell::RefCell<PathBuf> = const { std::cell::RefCell::new(PathBuf::new()) };
+            static PROC_ENV: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        fn test_home() -> Option<PathBuf> {
+            Some(HOME_DIR.with(|h| h.borrow().clone()))
+        }
+        fn test_args(_: i32) -> Option<atpkg::caller_shell::ProcArgs> {
+            Some(atpkg::caller_shell::ProcArgs {
+                argv: vec!["muse".to_owned()],
+                env: PROC_ENV.with(|e| e.borrow().clone()),
+                ..Default::default()
+            })
+        }
+
+        let (root, _) = claude_home("muse-footer-resolver", PID, 1_790_607_848);
+        let home = root.join("home");
+        let cfg = home.join(".config/muse");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(
+            cfg.join("settings.json"),
+            br#"{"model":"Muse Spark (High)"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cfg.join("auth.json"),
+            br#"{"providers":{"meta":{"mechanism":"oauth","user_email":"muse@example.com"}}}"#,
+        )
+        .unwrap();
+        let sid = "01a16480-f908-7d10-a78e-5d95372dfb98";
+        let sdir = home.join(".local/share/muse/sessions/2026/10/23").join(sid);
+        std::fs::create_dir_all(&sdir).unwrap();
+        std::fs::write(sdir.join(".session.lock"), format!("pid={PID}\nhost=mac\n")).unwrap();
+        let session_log = br#"{"payload_type":"runtime.session","payload":{"kind":"run","run_id":"r1","event":{"kind":"started","prompt":"inspect muse footer"}}}
+{"payload_type":"runtime.session","payload":{"kind":"run","run_id":"r1","event":{"kind":"assistant_message_committed","text":"Muse footer and survey excerpts ready."}}}
+{"payload_type":"runtime.session","payload":{"kind":"task","run_id":"r1","task_id":"t1","event":{"kind":"proposed","task_kind":"tool.run_command"}}}
+"#;
+        std::fs::write(sdir.join("session.jsonl"), session_log).unwrap();
+
+        HOME_DIR.with(|h| *h.borrow_mut() = home.clone());
+        PROC_ENV.with(|e| *e.borrow_mut() = vec![format!("HOME={}", home.display())]);
+
+        let timeline = Arc::new(Mutex::new(SessionTimeline::default()));
+        {
+            let mut held = timeline.lock().unwrap();
+            held.note_foreground_group(PID);
+            held.set_program(PID, Some("muse".to_owned()));
+        }
+        // Even if identity.dir points to a directory with a synthetic `<PID>.json` for Claude,
+        // `uses_claude_registry` is false for `Program::Muse` so it reads Muse's own facts.
+        let mut identity = unread(PID, &root.join("claude"));
+        resolve_facts_at_with_cwd(
+            &timeline,
+            &mut identity,
+            &mut footer::TailCache::default(),
+            &mut footer::FooterCache::default(),
+            &mut RosterMemo::default(),
+            (
+                Asks {
+                    tap: NO_TAP,
+                    args: test_args,
+                    roster: || None,
+                    home: test_home,
+                    stored_login: |_, _, _| false,
+                },
+                |_| Some(home.clone()),
+            ),
+            &footer::ReadClock {
+                read_at: std::time::UNIX_EPOCH,
+                now: 1_792_000_000,
+                offset_at: &|_, _| Some(0),
+            },
+        );
+        let held = timeline.lock().unwrap();
+        let shown = held.claude_footer_shown().expect("muse footer facts");
+        assert_eq!(shown.model.as_deref(), Some("Muse Spark"));
+        assert_eq!(shown.effort.as_deref(), Some("high"));
+        assert_eq!(
+            shown.subscription.as_ref().and_then(|s| s.email.as_deref()),
+            Some("muse@example.com")
+        );
+        assert_eq!(
+            shown.resume.as_deref(),
+            Some(format!("muse resume {sid}").as_str())
+        );
+        let excerpts = held.claude_excerpts().expect("muse excerpts");
+        assert_eq!(excerpts.transcript_len, Some(session_log.len() as u64));
+        assert_eq!(excerpts.excerpts.prompts[0].text, "inspect muse footer");
+        assert_eq!(
+            excerpts.excerpts.said.as_deref(),
+            Some("Muse footer and survey excerpts ready.")
+        );
+        assert_eq!(excerpts.excerpts.doing.as_deref(), Some("run_command"));
+        drop(held);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

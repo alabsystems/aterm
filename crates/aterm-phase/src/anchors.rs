@@ -1370,6 +1370,47 @@ pub const GEMINI_ANCHORS: &[Anchor] = &[
     ),
 ];
 
+/// Every string aterm guards on in Grok Build's screen ([`crate::grok`]): the sign-in screen as
+/// 1.0.70 drew it, and the limit and login texts as 1.0.67's and 1.0.70's binaries carry them.
+pub const GROK_ANCHORS: &[Anchor] = &[
+    lit(
+        "grok.signin.approve",
+        "Approve in your browser to finish signing in.",
+        "1.0.67",
+    ),
+    lit("grok.signin.waiting", "Waiting for approval...", "1.0.67"),
+    composed("grok.keys.quit", "ctrl+q  quit", "1.0.67"),
+    lit(
+        "grok.wall.plan_rate_limit",
+        "You've hit the rate limit for your plan.",
+        "1.0.67",
+    ),
+    lit(
+        "grok.wall.plan_rate_limit.sampler",
+        "You\u{2019}ve hit the rate limit for your plan.",
+        "1.0.67",
+    ),
+    lit(
+        "grok.wall.free_usage",
+        "You\u{2019}ve reached your free Grok Build usage limit",
+        "1.0.67",
+    ),
+    lit(
+        "grok.auth.expired",
+        "Authentication required: your session has expired",
+        "1.0.67",
+    ),
+    lit("grok.auth.not_logged_in", "Not logged in", "1.0.67"),
+];
+
+/// Every string aterm guards on in Kimi Code's screen ([`crate::kimi`]), as 2.3.1 drew it.
+pub const KIMI_ANCHORS: &[Anchor] = &[
+    lit("kimi.welcome", "Welcome to Kimi Code!", "2.3.1"),
+    lit("kimi.footer.context", "context: ", "2.3.1"),
+    lit("kimi.error", "Error: ", "2.3.1"),
+    lit("kimi.auth.llm_not_set", "LLM not set", "2.3.1"),
+];
+
 /// The keys of Claude Code's transcript rows the session log's step fold.
 pub const TRANSCRIPT_KEYS: &[Anchor] = &[
     lit("transcript.tool_use", "tool_use", "2.1.294"),
@@ -1485,6 +1526,8 @@ pub fn anchor(id: &str) -> &'static str {
         .chain(AGY_ANCHORS)
         .chain(MUSE_ANCHORS)
         .chain(GEMINI_ANCHORS)
+        .chain(GROK_ANCHORS)
+        .chain(KIMI_ANCHORS)
         .chain(TRANSCRIPT_KEYS)
         .chain(ROLLOUT_KEYS)
         .find(|a| a.id == id)
@@ -1536,6 +1579,20 @@ pub const fn anchor_text(id: &str) -> &'static str {
     while i < GEMINI_ANCHORS.len() {
         if same(GEMINI_ANCHORS[i].id, id) {
             return GEMINI_ANCHORS[i].text;
+        }
+        i += 1;
+    }
+    let mut i = 0;
+    while i < GROK_ANCHORS.len() {
+        if same(GROK_ANCHORS[i].id, id) {
+            return GROK_ANCHORS[i].text;
+        }
+        i += 1;
+    }
+    let mut i = 0;
+    while i < KIMI_ANCHORS.len() {
+        if same(KIMI_ANCHORS[i].id, id) {
+            return KIMI_ANCHORS[i].text;
         }
         i += 1;
     }
@@ -1689,6 +1746,8 @@ mod tests {
             .chain(AGY_ANCHORS)
             .chain(MUSE_ANCHORS)
             .chain(GEMINI_ANCHORS)
+            .chain(GROK_ANCHORS)
+            .chain(KIMI_ANCHORS)
             .chain(TRANSCRIPT_KEYS)
             .chain(ROLLOUT_KEYS)
             .map(|a| a.id)

@@ -400,7 +400,7 @@ fn spend_text(program: Program, message: &str) -> (&'static str, &'static str) {
             "Its Gemini CLI account is out of quota or at a spend limit, and no time window ends that.",
             "Do what Gemini CLI's notice in this tab says to lift the account's limit.",
         ),
-        Program::Codex | Program::Generic => (
+        Program::Codex | Program::Grok | Program::Kimi | Program::Generic => (
             "Its account is out of credits or at a spend limit, and no time window ends that.",
             "Do what the program's notice in this tab says to lift the account's limit.",
         ),
@@ -415,7 +415,9 @@ const fn futile_action(program: Program) -> &'static str {
             "Run /upgrade in this tab for increased limits, as Muse Code's usage wall says."
         }
         Program::Gemini => "Run /stats model in this tab to see which limit holds it.",
-        Program::Codex | Program::Generic => "Check the program's account usage for what holds it.",
+        Program::Codex | Program::Grok | Program::Kimi | Program::Generic => {
+            "Check the program's account usage for what holds it."
+        }
     }
 }
 
@@ -438,7 +440,7 @@ fn login_text(program: Program, message: &str) -> (&'static str, String, &'stati
             format!("{}.", title(&sign_in_how(program, message))),
             "the agent working",
         ),
-        Program::Claude | Program::Codex | Program::Generic => (
+        Program::Claude | Program::Codex | Program::Grok | Program::Kimi | Program::Generic => (
             "Its login is gone, and only your own sign-in restores it.",
             "Sign the program in again as its notice in this tab says.".to_string(),
             "the agent working",

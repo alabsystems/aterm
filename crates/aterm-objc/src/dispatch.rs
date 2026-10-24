@@ -9,10 +9,10 @@ use std::panic::AssertUnwindSafe;
 use crate::declare::MainThread;
 use crate::runtime::autoreleasepool;
 
-/// The opaque `dispatch_queue_t` the main queue's global symbol names; only its
-/// address is used.
+/// The opaque `dispatch_queue_t` the main queue's global symbol names, and every queue
+/// [`crate::SerialQueue`] makes; only its address is used.
 #[repr(C)]
-struct DispatchObjectS {
+pub(crate) struct DispatchObjectS {
     _opaque: [u8; 0],
 }
 
@@ -21,8 +21,9 @@ unsafe extern "C" {
     /// The main queue (`&_dispatch_main_q`).
     static _dispatch_main_q: DispatchObjectS;
 
-    /// `dispatch_sync_f(queue, context, work)` — the function-pointer form.
-    fn dispatch_sync_f(
+    /// `dispatch_sync_f(queue, context, work)` — the function-pointer form, which
+    /// [`crate::SerialQueue::sync`] calls too (one declaration, one prototype).
+    pub(crate) fn dispatch_sync_f(
         queue: *const DispatchObjectS,
         context: *mut c_void,
         work: unsafe extern "C" fn(*mut c_void),

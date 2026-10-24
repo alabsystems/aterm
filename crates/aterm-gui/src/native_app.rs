@@ -2742,8 +2742,17 @@ impl NativeRuntime {
         changed
     }
 
-    pub(crate) fn tick_system_state(&mut self, active: bool) -> bool {
-        self.update_system_state(|state| state.tick(active))
+    /// One page tick ([`crate::system_state::SystemStateApp::tick`]): the page
+    /// is `shown` (the active view of some window), and its village walks when
+    /// a view in `seen` (every view someone can see, one in an unfocused split
+    /// pane included) drew it walking at its last render. A view nobody sees
+    /// never decides it, whatever size it last rendered at.
+    pub(crate) fn tick_system_state(&mut self, active: bool, shown: bool, seen: &[ViewId]) -> bool {
+        let walks = seen.iter().any(|view| {
+            matches!(self.views.get(view), Some(AppViewState::SystemState(state))
+                if state.village_walks())
+        });
+        self.update_system_state(|state| state.tick(active, shown, walks))
     }
 
     pub(crate) fn offer_system_state(

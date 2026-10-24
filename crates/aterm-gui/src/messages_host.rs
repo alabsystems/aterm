@@ -924,9 +924,11 @@ impl App {
                         .brings_owner(),
                     crate::menu::PrivacyPane::FullDiskAccess
                     | crate::menu::PrivacyPane::FilesAndFolders => {
-                        crate::native_settings::ConsentGestures::for_instance(self.headless)
-                            .open_settings(pane)
-                            .opened()
+                        let (outcome, dialog) =
+                            crate::native_settings::ConsentGestures::for_instance(self.headless)
+                                .open_settings(pane);
+                        self.adopt_access_dialog(dialog, now);
+                        outcome.opened()
                     }
                 };
                 let route = crate::menu::privacy_settings_path_words(pane);

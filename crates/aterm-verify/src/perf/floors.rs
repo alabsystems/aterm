@@ -341,7 +341,7 @@ pub(crate) const EFFECTS_LANE: FloorLane = FloorLane {
     keys: EFFECTS_KEYS,
     baseline_file: "perf-baseline-effects.json",
     comment: "aterm EFFECTS baseline (docs/DESIGN-card-engine-2026-10-19.md lane B0): per scene \
-              (episode, settled, typing, scroll), the GPU time as a reference full-repaint \
+              (episode, flowing, settled, typing, scroll), the GPU time as a reference full-repaint \
               frame's p50 over the scene's (_gpu_rel), the reference's own against a blank \
               full repaint (ref_text_gpu_rel), and the CPU work of the producer, the \
               CPU raster and the GPU encode as frames per 10^9 instructions retired \
@@ -364,6 +364,7 @@ effects_keys! {
     gpu: [
         "ref_text_gpu_rel",
         "episode_gpu_rel",
+        "flowing_gpu_rel",
         "settled_gpu_rel",
         "typing_gpu_rel",
         "scroll_gpu_rel",
@@ -372,6 +373,9 @@ effects_keys! {
         "episode_emit_per_ginsn",
         "episode_raster_per_ginsn",
         "episode_encode_per_ginsn",
+        "flowing_emit_per_ginsn",
+        "flowing_raster_per_ginsn",
+        "flowing_encode_per_ginsn",
         "settled_raster_per_ginsn",
         "settled_encode_per_ginsn",
         "typing_emit_per_ginsn",

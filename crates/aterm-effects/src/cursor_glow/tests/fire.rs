@@ -1130,6 +1130,8 @@ fn fire_frame_is_additive(glow: &CursorGlow, out: &[GlowQuad]) -> bool {
 
 #[test]
 fn fire_on_a_light_ground_is_ink_never_light() {
+    // `(ceilings off, coarse roots)`: the shipped body has neither.
+    const SHIPPED: (bool, bool) = (false, false);
     let g = tall_geom();
     let (fg, red) = (0x001F_2328u32, 0x00CF_222Eu32);
     let (row, start) = (4u16, 2u16);
@@ -1232,12 +1234,16 @@ fn fire_on_a_light_ground_is_ink_never_light() {
     let c = config(false);
     let run = |frame: bool,
                air_above: bool,
-               uncapped: bool,
+               (unsolved, coarse): (bool, bool),
                reds: (u16, u16),
                mixed: bool,
                each: &mut dyn FnMut(&CursorGlow, &[GlowQuad], u16)| {
         let (mut glow, mut out, mut text) = (CursorGlow::default(), Vec::new(), vec![' '; g.cols]);
-        glow.light_body_unsolved = uncapped;
+        // The controls' seams: the ceilings off (`unsolved`), and the
+        // roots laid as they stood before they were feathered (`coarse`,
+        // looks6 round 3).
+        glow.light_body_unsolved = unsolved;
+        glow.fire_light_root_coarse = coarse;
         let mut t = Instant::now();
         glow.observe_row(row, start, &text, t);
         glow.tick(Some((row, start)), t, &c, g, &mut out);
@@ -1285,40 +1291,34 @@ fn fire_on_a_light_ground_is_ink_never_light() {
         })
         .fold(f32::INFINITY, f32::min)
     };
-    let judge = |frame: bool, uncapped: bool, reds: (u16, u16)| {
+    let judge = |frame: bool, seams: (bool, bool), reds: (u16, u16)| {
         let mut w = [f32::INFINITY; 4];
-        let (glow, out, t) = run(
-            frame,
-            false,
-            uncapped,
-            reds,
-            false,
-            &mut |glow, out, caret| {
-                let f = composite(glow, out, caret, reds, false);
-                w[0] = w[0].min(worst(
-                    &f,
-                    row,
-                    &mut (caret - 3..caret)
-                        .filter(|c| !(caret - reds.0..caret - reds.1).contains(c)),
-                ));
-                w[1] = w[1].min(worst(&f, row, &mut (caret - reds.0..caret - reds.1)));
-                for above in [row - 1, row - 2] {
-                    let cols = || caret.saturating_sub(16)..caret;
-                    w[2] = w[2].min(worst(&f, above, &mut cols().filter(|c| c % 2 == 0)));
-                    w[3] = w[3].min(worst(&f, above, &mut cols().filter(|c| c % 2 == 1)));
-                }
-            },
-        );
+        let (glow, out, t) = run(frame, false, seams, reds, false, &mut |glow, out, caret| {
+            let f = composite(glow, out, caret, reds, false);
+            w[0] = w[0].min(worst(
+                &f,
+                row,
+                &mut (caret - 3..caret).filter(|c| !(caret - reds.0..caret - reds.1).contains(c)),
+            ));
+            w[1] = w[1].min(worst(&f, row, &mut (caret - reds.0..caret - reds.1)));
+            for above in [row - 1, row - 2] {
+                let cols = || caret.saturating_sub(16)..caret;
+                w[2] = w[2].min(worst(&f, above, &mut cols().filter(|c| c % 2 == 0)));
+                w[3] = w[3].min(worst(&f, above, &mut cols().filter(|c| c % 2 == 1)));
+            }
+        });
         (w, glow, out, t)
     };
-    let (handed, _, _, _) = judge(true, false, (6, 3));
+    let (handed, _, _, _) = judge(true, SHIPPED, (6, 3));
     assert!(
         handed[0] >= 4.5,
         "the newest letters read at {:.2}:1",
         handed[0]
     );
+    // A known row's cells are each held at their own bar, 4.5:1 for the
+    // red ink (5.36:1 bare); 3:1 is the bar of a row whose text is unread.
     assert!(
-        handed[1] >= 3.0,
+        handed[1] >= 4.5,
         "a red letter on the typed line reads at {:.2}:1",
         handed[1]
     );
@@ -1332,7 +1332,7 @@ fn fire_on_a_light_ground_is_ink_never_light() {
         "a red letter of the old output above reads at {:.2}:1",
         handed[3]
     );
-    let (probed, mut glow, mut out, t) = judge(false, false, (6, 3));
+    let (probed, mut glow, mut out, t) = judge(false, SHIPPED, (6, 3));
     assert!(
         probed[0] >= 4.5 && probed[2] >= 4.5 && probed[3] >= 3.0,
         "with the rows above unread: newest {:.2}:1, old output {:.2}:1, old red {:.2}:1",
@@ -1340,70 +1340,73 @@ fn fire_on_a_light_ground_is_ink_never_light() {
         probed[2],
         probed[3]
     );
-    let (red_head, _, _, _) = judge(true, false, (3, 0));
+    let (red_head, _, _, _) = judge(true, SHIPPED, (3, 0));
     assert!(
-        red_head[1] >= 3.0,
+        red_head[1] >= 4.5,
         "a red letter at the caret reads at {:.2}:1",
         red_head[1]
     );
-    let (uncapped, _, _, _) = judge(true, true, (3, 0));
+    // The ceilings' control, under the shipped feather: only the ceilings
+    // come off, and the red letters they held fall under their bar.
+    let (ceilingless, _, _, _) = judge(true, (true, false), (3, 0));
     assert!(
-        uncapped[1] < 4.5 && uncapped[1] < red_head[1],
+        ceilingless[1] < 4.5 && ceilingless[1] < red_head[1],
         "control: with no ceilings a red letter at the caret reads at {:.2}:1 ({:.2}:1 held)",
-        uncapped[1],
+        ceilingless[1],
         red_head[1]
     );
+    let (ceilingless, _, _, _) = judge(true, (true, false), (6, 3));
+    assert!(
+        ceilingless[1] < 4.5,
+        "control: with no ceilings a red letter on the typed line reads at {:.2}:1",
+        ceilingless[1]
+    );
 
-    let mixed_run = |uncapped: bool| {
+    let mixed_run = |seams: (bool, bool)| {
         let mut minimum = f32::INFINITY;
         let mut frames = 0;
         let mut scanlines = 0;
-        run(
-            true,
-            false,
-            uncapped,
-            (6, 3),
-            true,
-            &mut |glow, out, caret| {
-                let f = composite(glow, out, caret, (6, 3), true);
-                for col in caret - 8..caret {
-                    let (ink, counters) = glyph(g, row, col);
-                    let first = ink.first().expect("the captured glyph has stems").0;
-                    let last = ink.last().expect("the captured glyph has stems").0;
-                    for y in first..=last {
-                        let stems: Vec<_> = ink.iter().copied().filter(|p| p.0 == y).collect();
-                        let ground: Vec<_> =
-                            counters.iter().copied().filter(|p| p.0 == y).collect();
-                        assert!(
-                            !stems.is_empty() && !ground.is_empty(),
-                            "each captured glyph scanline has stems and adjacent counters"
-                        );
-                        minimum = minimum.min(ratio(&f, &stems, &ground));
-                        scanlines += 1;
-                    }
+        run(true, false, seams, (6, 3), true, &mut |glow, out, caret| {
+            let f = composite(glow, out, caret, (6, 3), true);
+            for col in caret - 8..caret {
+                let (ink, counters) = glyph(g, row, col);
+                let first = ink.first().expect("the captured glyph has stems").0;
+                let last = ink.last().expect("the captured glyph has stems").0;
+                for y in first..=last {
+                    let stems: Vec<_> = ink.iter().copied().filter(|p| p.0 == y).collect();
+                    let ground: Vec<_> = counters.iter().copied().filter(|p| p.0 == y).collect();
+                    assert!(
+                        !stems.is_empty() && !ground.is_empty(),
+                        "each captured glyph scanline has stems and adjacent counters"
+                    );
+                    minimum = minimum.min(ratio(&f, &stems, &ground));
+                    scanlines += 1;
                 }
-                frames += 1;
-            },
-        );
+            }
+            frames += 1;
+        });
         assert!(
             frames > 0 && scanlines >= 8 * 13,
             "the mixed-colour run judges actual painted frames and glyph scanlines"
         );
         minimum
     };
-    let mixed = mixed_run(false);
+    let mixed = mixed_run(SHIPPED);
     assert!(
         (4.5..20.0).contains(&mixed),
         "the light ink stays readable over visible flame on its dark cell ({mixed:.2}:1)"
     );
-    let uncapped_mixed = mixed_run(true);
+    // The roots' feather's control: with the ceilings off, roots laid in
+    // the flame's coarse slabs (as before looks6 round 3) obscure the light
+    // ink the feathered roots keep clear.
+    let uncapped_mixed = mixed_run((true, true));
     assert!(
         uncapped_mixed < 4.5,
-        "control: the same uncapped ramp obscures the light ink ({uncapped_mixed:.2}:1)"
+        "control: the uncapped ramp on coarse roots obscures the light ink ({uncapped_mixed:.2}:1)"
     );
 
     let (mut flame_above, mut flame_faint) = (1.0f32, 1.0f32);
-    run(false, true, false, (6, 3), false, &mut |glow, _, _| {
+    run(false, true, SHIPPED, (6, 3), false, &mut |glow, _, _| {
         let faint: Vec<GlowQuad> = glow
             .under_quads()
             .iter()
@@ -1913,11 +1916,33 @@ fn dark_fire_burst_with(
     on_row: Option<&dyn Fn(usize) -> aterm_core::terminal::RenderCell>,
     setup: &dyn Fn(&mut CursorGlow),
 ) -> (CursorGlow, Vec<GlowQuad>) {
+    fire_burst_on(
+        DARK_PAIR,
+        (keys, gap_ms),
+        (above, on_row),
+        frame_text,
+        setup,
+    )
+}
+
+/// A row's cells by column, for [`fire_burst_on`].
+type RowCells<'a> = Option<&'a dyn Fn(usize) -> aterm_core::terminal::RenderCell>;
+
+/// [`dark_fire_burst_with`] on any `(fg, bg)` pair: a light page burns as
+/// paper fire.
+fn fire_burst_on(
+    pair: (u32, u32),
+    (keys, gap_ms): (u16, u64),
+    (above, on_row): (RowCells<'_>, RowCells<'_>),
+    frame_text: bool,
+    setup: &dyn Fn(&mut CursorGlow),
+) -> (CursorGlow, Vec<GlowQuad>) {
     let g = tall_geom();
     let (row, start) = (4u16, 2u16);
     let mut c = cfg(GlowStyle::Fire, true);
     c.intensity = 1.0;
-    (c.theme_fg, c.theme_bg) = DARK_PAIR;
+    c.dark_theme = aterm_render::theme_is_dark(pair.1);
+    (c.theme_fg, c.theme_bg) = pair;
     let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
     let mut glow = CursorGlow::default();
     setup(&mut glow);
@@ -1936,7 +1961,7 @@ fn dark_fire_burst_with(
             let mut rows = vec![vec![aterm_core::terminal::RenderCell::default(); g.cols]; g.rows];
             for line in &mut rows {
                 for cell in line.iter_mut() {
-                    (cell.fg, cell.bg) = (rgb(DARK_PAIR.0), rgb(DARK_PAIR.1));
+                    (cell.fg, cell.bg) = (rgb(pair.0), rgb(pair.1));
                 }
             }
             for (col, &ch) in text.iter().enumerate() {
@@ -2882,6 +2907,9 @@ fn the_dark_fire_is_never_olive() {
             for above in [None, Some(&text_above as &dyn Fn(usize) -> _)] {
                 let (glow, out) = dark_fire_burst_with(keys, gap, above, true, None, &|glow| {
                     glow.fire_core_uncooled = uncooled;
+                    // The control lays the cores where round 5 laid them,
+                    // one per tongue on its axis, on one floor.
+                    glow.fire_even_cores = uncooled;
                 });
                 let mut ink: Vec<(u16, u16)> = (start..start + keys).map(|c| (row, c)).collect();
                 if above.is_some() {
@@ -3459,11 +3487,42 @@ fn under_a_kept_letter_the_flame_eases_in_over_pixels() {
 /// A dark burst of `keys` letters of a sentence at 50 ms a key on row 4,
 /// ticked to its last key.
 fn dark_burst(keys: u16, seam: impl Fn(&mut CursorGlow)) -> (CursorGlow, Geom, u16) {
-    let g = tall_geom();
+    dark_burst_on(
+        tall_geom(),
+        "the quick brown fox jumps over the lazy dog",
+        keys,
+        seam,
+    )
+}
+
+/// The trail gallery's `burst` on dark: its sentence typed whole at its
+/// pace, 50 ms a key, after the prompt on row 4 of its 14×26 glass.
+fn gallery_dark_burst(seam: impl Fn(&mut CursorGlow)) -> (CursorGlow, Geom, u16) {
+    let g = Geom {
+        cw: 14,
+        ch: 26,
+        rows: 8,
+        cols: 80,
+        origin_x: 12,
+        origin_y: 2,
+        win_w: 1144,
+        win_h: 212,
+        head: 0,
+    };
+    let line = "echo the quick brown fox jumps over the lazy dog as the kitty flies";
+    dark_burst_on(g, line, line.len() as u16, seam)
+}
+
+/// A dark burst of `keys` letters of `line` at 50 ms a key on row 4 of
+/// `g`, from column 2, ticked to its last key.
+fn dark_burst_on(
+    g: Geom,
+    line: &str,
+    keys: u16,
+    seam: impl Fn(&mut CursorGlow),
+) -> (CursorGlow, Geom, u16) {
     let (row, start) = (4u16, 2u16);
-    let line: Vec<char> = "the quick brown fox jumps over the lazy dog"
-        .chars()
-        .collect();
+    let line: Vec<char> = line.chars().collect();
     let mut c = cfg(GlowStyle::Fire, true);
     c.intensity = 1.0;
     (c.theme_fg, c.theme_bg) = DARK_PAIR;
@@ -3593,5 +3652,735 @@ fn the_dark_caret_bloom_burns_ember() {
     assert!(
         hue > 30.0,
         "control: lit from the gold the bloom adds hue {hue:.0} degrees"
+    );
+}
+
+/// The lone runs of visible paper fire (a pixel more than 24 levels off the
+/// white page in some channel, eight-connected) in `band` rows of `f`, as
+/// `(x, y, width, height)`, leaving out the caret's cell.
+fn paper_fire_runs(
+    f: &Glass,
+    band: (i32, i32),
+    caret: (i32, i32, i32, i32),
+) -> Vec<(i32, i32, i32, i32)> {
+    let seen_px = |y: i32, x: i32| {
+        let inside_caret = (caret.0..caret.2).contains(&x) && (caret.1..caret.3).contains(&y);
+        let p = f.at(y, x);
+        !inside_caret
+            && [16u32, 8, 0]
+                .iter()
+                .any(|&sh| 255 - ((p >> sh) & 0xff) as i32 > 24)
+    };
+    let (w, h) = (f.w as i32, f.h as i32);
+    let mut seen = vec![false; f.w * f.h];
+    let mut runs = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            if seen[(y * w + x) as usize] || !seen_px(y, x) {
+                continue;
+            }
+            let (mut x0, mut x1, mut y0, mut y1) = (x, x, y, y);
+            let mut stack = vec![(y, x)];
+            seen[(y * w + x) as usize] = true;
+            while let Some((cy, cx)) = stack.pop() {
+                (x0, x1, y0, y1) = (x0.min(cx), x1.max(cx), y0.min(cy), y1.max(cy));
+                for (dy, dx) in [
+                    (-1, -1),
+                    (-1, 0),
+                    (-1, 1),
+                    (0, -1),
+                    (0, 1),
+                    (1, -1),
+                    (1, 0),
+                    (1, 1),
+                ] {
+                    let (ny, nx) = (cy + dy, cx + dx);
+                    if (0..h).contains(&ny)
+                        && (0..w).contains(&nx)
+                        && !seen[(ny * w + nx) as usize]
+                        && seen_px(ny, nx)
+                    {
+                        seen[(ny * w + nx) as usize] = true;
+                        stack.push((ny, nx));
+                    }
+                }
+            }
+            if y0 >= band.0 && y1 < band.1 {
+                runs.push((x0, y0, x1 - x0 + 1, y1 - y0 + 1));
+            }
+        }
+    }
+    runs
+}
+
+#[test]
+fn paper_fire_leaves_no_lone_ember_dash_on_a_lettered_row() {
+    // looks6 N2: a tongue too short to rise left its root slab as a lone
+    // dash on paper. No visible run in the typed row is at least 6 px long
+    // and at most 3 px tall, typing and cooling; the squat tongues (the
+    // negative control) leave such dashes.
+    let g = tall_geom();
+    let mut c = cfg(GlowStyle::Fire, true);
+    c.dark_theme = false;
+    c.intensity = 1.0;
+    (c.theme_fg, c.theme_bg) = (0x001F_2328, 0x00FF_FFFF);
+    let (row, start) = (4u16, 2u16);
+    let row_top = i32::from(g.origin_y) + i32::from(row) * g.ch as i32;
+    let dashes = |squat: bool| {
+        let mut glow = CursorGlow {
+            fire_light_squat: squat,
+            ..CursorGlow::default()
+        };
+        let (mut out, mut text) = (Vec::new(), vec![' '; g.cols]);
+        let mut t = Instant::now();
+        let mut found = Vec::new();
+        let mut judge = |glow: &CursorGlow, caret: u16| {
+            let mut f = Glass::new(g, 0x00FF_FFFF);
+            f.add_quads(glow.under_quads());
+            let (x0, y0, x1, y1) = f.cell_rect(row, caret);
+            for run in paper_fire_runs(&f, (row_top, row_top + g.ch as i32), (x0, y0, x1, y1)) {
+                if run.2 >= 6 && run.3 <= 3 {
+                    found.push(run);
+                }
+            }
+        };
+        glow.observe_row(row, start, &text, t);
+        glow.tick(Some((row, start)), t, &c, g, &mut out);
+        let mut caret = start;
+        for k in 1..=24u16 {
+            t += Duration::from_millis(if k % 5 == 0 { 140 } else { 45 });
+            text[usize::from(start + k - 1)] = if k % 6 == 0 { ' ' } else { 'n' };
+            caret = start + k;
+            glow.observe_row(row, caret, &text, t);
+            glow.note_synthetic_typed(t, 1);
+            glow.tick(Some((row, caret)), t, &c, g, &mut out);
+            judge(&glow, caret);
+        }
+        for _ in 0..90 {
+            t += Duration::from_millis(16);
+            glow.tick(Some((row, caret)), t, &c, g, &mut out);
+            judge(&glow, caret);
+        }
+        found
+    };
+    let shipped = dashes(false);
+    assert!(
+        shipped.is_empty(),
+        "lone ember dashes on paper (x, y, w, h): {:?}",
+        &shipped[..shipped.len().min(6)]
+    );
+    assert!(
+        !dashes(true).is_empty(),
+        "control: the squat tongues leave a lone dash on the lettered row"
+    );
+}
+
+#[test]
+fn a_paper_tongue_s_root_feathers_over_pixels_not_a_cut() {
+    // looks6 round 3 (N2): a short gap tongue's root eased over 3 px laid
+    // in the flame's 2 px slabs, and stood cut flat in two steps (`ffb875`
+    // to `fff6ee` from one pixel row to the next). Up from each lit
+    // column's lowest pixel, the first four rows rise by no more than 0.45
+    // of the column's peak a row, typing and cooling; laid coarse (the
+    // negative control) a root steps by more.
+    let g = tall_geom();
+    let mut c = cfg(GlowStyle::Fire, true);
+    c.dark_theme = false;
+    c.intensity = 1.0;
+    (c.theme_fg, c.theme_bg) = (0x001F_2328, 0x00FF_FFFF);
+    let (row, start) = (4u16, 2u16);
+    let row_top = i32::from(g.origin_y) + i32::from(row) * g.ch as i32;
+    let worst = |coarse: bool| -> f32 {
+        let mut glow = CursorGlow {
+            fire_light_root_coarse: coarse,
+            ..CursorGlow::default()
+        };
+        let (mut out, mut text) = (Vec::new(), vec![' '; g.cols]);
+        let mut t = Instant::now();
+        let mut worst = 0.0f32;
+        let mut judge = |glow: &CursorGlow| {
+            let mut f = Glass::new(g, 0x00FF_FFFF);
+            f.add_quads(glow.under_quads());
+            for x in 0..i32::from(g.win_w) {
+                let ink = |y: i32| {
+                    255 - {
+                        let p = f.at(y, x);
+                        ((p >> 16) & 0xff).min((p >> 8) & 0xff).min(p & 0xff) as i32
+                    }
+                };
+                let band = row_top..row_top + g.ch as i32;
+                let peak = band.clone().map(ink).max().unwrap_or(0);
+                if peak < 60 {
+                    continue;
+                }
+                let Some(foot) = band.clone().rev().find(|&y| ink(y) >= 4) else {
+                    continue;
+                };
+                for y in (foot - 3..=foot).rev() {
+                    let step = (ink(y - 1) - ink(y)) as f32 / peak as f32;
+                    worst = worst.max(step);
+                }
+            }
+        };
+        glow.observe_row(row, start, &text, t);
+        glow.tick(Some((row, start)), t, &c, g, &mut out);
+        let mut caret = start;
+        for k in 1..=24u16 {
+            t += Duration::from_millis(if k % 5 == 0 { 140 } else { 45 });
+            text[usize::from(start + k - 1)] = if k % 6 == 0 { ' ' } else { 'n' };
+            caret = start + k;
+            glow.observe_row(row, caret, &text, t);
+            glow.note_synthetic_typed(t, 1);
+            glow.tick(Some((row, caret)), t, &c, g, &mut out);
+            judge(&glow);
+        }
+        for _ in 0..60 {
+            t += Duration::from_millis(16);
+            glow.tick(Some((row, caret)), t, &c, g, &mut out);
+            judge(&glow);
+        }
+        worst
+    };
+    let fine = worst(false);
+    let coarse = worst(true);
+    assert!(
+        fine <= 0.45,
+        "a paper tongue's root steps by {fine:.2} of its column's peak in a pixel row"
+    );
+    assert!(
+        coarse >= 0.6,
+        "control: laid coarse, a root steps by only {coarse:.2}"
+    );
+}
+
+#[test]
+fn a_dark_fire_keeps_its_forge_and_embers_off_a_filled_row_above() {
+    // looks6 N8: under a prompt's powerline bar (a filled row, no letters
+    // over most of it) the forge's crown lifted the bar over the caret and
+    // the embers floated over it as grit. Neither lays light on the bar;
+    // unheld (the negative control) both do.
+    let g = tall_geom();
+    let (row, ch, cw) = (4u16, g.ch as i32, g.cw as i32);
+    let bar = 0x0030_3030u32;
+    let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+    let filled = |_: usize| aterm_core::terminal::RenderCell {
+        ch: ' ',
+        fg: rgb(DARK_PAIR.0),
+        bg: rgb(bar),
+        ..Default::default()
+    };
+    let lift = |unheld: bool| -> usize {
+        let mut lit = 0;
+        for (keys, gap) in [(8u16, 60u64), (16, 55), (28, 50)] {
+            let (glow, out) = dark_fire_burst_with(keys, gap, Some(&filled), true, None, &|glow| {
+                glow.fire_filled_unheld = unheld;
+            });
+            let mut glass = Glass::new(g, DARK_PAIR.1);
+            let bar_rows = (i32::from(row) - 1) * ch..i32::from(row) * ch;
+            for y in bar_rows.clone() {
+                for x in 0..i32::from(g.win_w) {
+                    glass.px[y as usize * glass.w + x as usize] = bar;
+                }
+            }
+            glass.add_quads(glow.under_quads());
+            glass.add_fire_patches(glow.patches());
+            glass.add_quads(&out);
+            glass.add_halos(glow.halos());
+            let caret_x = (2 + i32::from(keys)) * cw;
+            for y in bar_rows {
+                for x in 0..i32::from(g.win_w) {
+                    // The tongues kept in their row may feather a pixel or
+                    // two over the bar's foot; the bar's body stays bare.
+                    if y >= i32::from(row) * ch - 2 && (x - caret_x).abs() > 2 * cw {
+                        continue;
+                    }
+                    let p = glass.at(y, x);
+                    let up = [16u32, 8, 0]
+                        .iter()
+                        .map(|&sh| ((p >> sh) & 0xff) as i32 - ((bar >> sh) & 0xff) as i32)
+                        .max()
+                        .unwrap_or(0);
+                    if up > 12 {
+                        lit += 1;
+                    }
+                }
+            }
+        }
+        lit
+    };
+    let held = lift(false);
+    assert_eq!(
+        held, 0,
+        "{held} pixels of the filled bar above lit by the fire"
+    );
+    assert!(
+        lift(true) > 20,
+        "control: unheld, the forge and the embers leave the bar bare"
+    );
+}
+
+#[test]
+fn a_paper_fire_keeps_its_tongues_and_embers_off_a_filled_row_above() {
+    // looks6 round 2: on paper a tongue stopped only at a letter above, so
+    // under a prompt's dark powerline bar its tongues and embers rose onto
+    // the bar as muddy amber. The bar stops them as a letter does: its body
+    // stays bare; unheld (the negative control) the fire paints it.
+    let g = tall_geom();
+    let (row, ch, cw) = (4u16, g.ch as i32, g.cw as i32);
+    let (pair, bar) = ((0x001F_2328u32, 0x00FF_FFFFu32), 0x0033_3333u32);
+    let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+    let filled = |_: usize| aterm_core::terminal::RenderCell {
+        ch: ' ',
+        fg: rgb(0x00FF_FFFF),
+        bg: rgb(bar),
+        ..Default::default()
+    };
+    let painted = |unheld: bool| -> usize {
+        let mut lit = 0;
+        for (keys, gap) in [(8u16, 60u64), (16, 55), (28, 50)] {
+            let (glow, out) =
+                fire_burst_on(pair, (keys, gap), (Some(&filled), None), true, &|glow| {
+                    glow.fire_filled_unheld = unheld;
+                });
+            let mut glass = Glass::new(g, pair.1);
+            let bar_rows = (i32::from(row) - 1) * ch..i32::from(row) * ch;
+            for y in bar_rows.clone() {
+                for x in 0..i32::from(g.win_w) {
+                    glass.px[y as usize * glass.w + x as usize] = bar;
+                }
+            }
+            glass.add_quads(glow.under_quads());
+            glass.add_fire_patches(glow.patches());
+            glass.add_quads(&out);
+            glass.add_halos(glow.halos());
+            let caret_x = (2 + i32::from(keys)) * cw;
+            for y in bar_rows {
+                for x in 0..i32::from(g.win_w) {
+                    // A tongue kept in its row may feather a pixel or two
+                    // over the bar's foot; the bar's body stays bare.
+                    if y >= i32::from(row) * ch - 2 && (x - caret_x).abs() > 2 * cw {
+                        continue;
+                    }
+                    let p = glass.at(y, x);
+                    let off = [16u32, 8, 0]
+                        .iter()
+                        .map(|&sh| (((p >> sh) & 0xff) as i32 - ((bar >> sh) & 0xff) as i32).abs())
+                        .max()
+                        .unwrap_or(0);
+                    if off > 12 {
+                        lit += 1;
+                    }
+                }
+            }
+        }
+        lit
+    };
+    let held = painted(false);
+    assert_eq!(
+        held, 0,
+        "{held} pixels of the filled bar above painted by paper fire"
+    );
+    assert!(
+        painted(true) > 20,
+        "control: unheld, the paper fire leaves the bar bare"
+    );
+}
+
+/// The air cores' roots over a dark burst's newest thirty letters, in x
+/// order: `(x, core_root, flame_root)` per core, its root where its light
+/// shows over the dark (the lowest lit pixel at its run's middle) and its
+/// flame's (the fire field's alone) at the same x.
+fn air_core_roots(glow: &CursorGlow, g: Geom, caret: u16) -> Vec<(i32, i32, i32)> {
+    let mut cores = Glass::new(g, DARK_PAIR.1);
+    cores.add_quads(glow.under_quads());
+    let mut field = Glass::new(g, DARK_PAIR.1);
+    field.add_fire_patches(glow.patches());
+    let bg = DARK_PAIR.1 as i32 & 0xff;
+    let (ox, oy) = (i32::from(g.origin_x), i32::from(g.origin_y));
+    let row_top = oy + 4 * g.ch as i32;
+    let newest = i32::from(caret) - 1;
+    // The gold heart above a root is no root, and a dim core's root reads
+    // as one.
+    let lit = |gl: &Glass, x: i32, y: i32| ((gl.at(y, x) >> 16) & 0xff) as i32 > bg + 40;
+    let root = |gl: &Glass, x: i32| (0..row_top).rev().find(|&y| lit(gl, x, y));
+    let mut roots = Vec::new();
+    let mut run: Option<(i32, i32, i32)> = None;
+    for x in ox + (newest - 30).max(0) * g.cw as i32..=ox + (newest + 2) * g.cw as i32 {
+        match (root(&cores, x), run) {
+            (Some(r), None) => run = Some((x, x, r)),
+            (Some(r), Some((x0, _, low))) => run = Some((x0, x, low.max(r))),
+            (None, Some((x0, x1, low))) => {
+                if x1 - x0 + 1 >= 2 {
+                    let xc = (x0 + x1) / 2;
+                    roots.push((xc, low, root(&field, xc).unwrap_or(row_top)));
+                }
+                run = None;
+            }
+            (None, None) => {}
+        }
+    }
+    roots
+}
+
+type Burst = fn(&dyn Fn(&mut CursorGlow)) -> (CursorGlow, Geom, u16);
+
+/// The dark bursts the air cores are judged on: forty letters of a
+/// sentence, and the trail gallery's `burst` line.
+const AIR_BURSTS: [(&str, Burst); 2] = [
+    ("40 keys", |seam| dark_burst(40, seam)),
+    ("the gallery's burst", |seam| gallery_dark_burst(seam)),
+];
+
+#[test]
+fn the_dark_air_cores_stand_apart_not_as_a_comb() {
+    // One gold core per tongue, each on its tongue's axis and its root on
+    // the air's floor, read as a row of evenly spaced beads (looks6 N8); a
+    // root lifted a pixel or two still read as one floor, and lifts drawn
+    // at random put three of the gallery `burst`'s five roots on one (its
+    // `t0`). The gallery's judges (round 3): no three neighbouring roots
+    // within 2 px of each other. Laid even (the negative control), three
+    // neighbours share a floor.
+    let comb = |burst: Burst, even: bool| -> (usize, Vec<i32>) {
+        let (glow, g, caret) = burst(&|glow: &mut CursorGlow| glow.fire_even_cores = even);
+        let roots: Vec<i32> = air_core_roots(&glow, g, caret)
+            .iter()
+            .map(|r| r.1)
+            .collect();
+        let combs = roots
+            .windows(3)
+            .filter(|w| {
+                let (lo, hi) = (w.iter().min().unwrap_or(&0), w.iter().max().unwrap_or(&0));
+                hi - lo <= 2
+            })
+            .count();
+        (combs, roots)
+    };
+    for (name, burst) in AIR_BURSTS {
+        let (combs, roots) = comb(burst, false);
+        assert!(
+            roots.len() >= 4,
+            "fixture ({name}): the burst lays its cores ({roots:?})"
+        );
+        assert_eq!(
+            combs, 0,
+            "{name}: three neighbouring roots share a floor: {roots:?}"
+        );
+        let (even_combs, even_roots) = comb(burst, true);
+        assert!(
+            even_combs > 0,
+            "control ({name}): laid even, the roots {even_roots:?} stand apart"
+        );
+    }
+}
+
+#[test]
+fn a_dark_air_core_stands_on_its_own_flame_s_root() {
+    // looks6 round 3: lifted alone to break the comb, a core's gold root
+    // hung mid-flame, a gold stick cut off from the flame's root under it
+    // (`fire-dark-burst.t0`). The whole tongue now rises with its core: no
+    // core's root shows more than 4 px above its flame's at its x. Lifted
+    // alone (the negative control), a core stands 6 px or more above.
+    let floating = |burst: Burst, alone: bool| -> Vec<i32> {
+        let (glow, g, caret) = burst(&|glow: &mut CursorGlow| glow.fire_core_lift_alone = alone);
+        air_core_roots(&glow, g, caret)
+            .iter()
+            .map(|&(_, core, flame)| flame - core)
+            .collect()
+    };
+    for (name, burst) in AIR_BURSTS {
+        let above = floating(burst, false);
+        assert!(
+            above.len() >= 4,
+            "fixture ({name}): the burst lays its cores"
+        );
+        assert!(
+            above.iter().all(|&d| d <= 4),
+            "{name}: a core's root stands above its flame's by {above:?} px"
+        );
+        let alone = floating(burst, true);
+        assert!(
+            alone.iter().any(|&d| d >= 6),
+            "control ({name}): lifted alone, the cores stand only {alone:?} px above their flames"
+        );
+    }
+}
+
+/// The share of the lit pixels over the dark burst's row that read tan
+/// (warm, greyed and mid-bright: hue 25-55, saturation 0.30-0.72, value
+/// 0.5-0.86, as `#c1964c` to `#ca9a42` do), over the gallery `burst`'s last
+/// 28 keys, with additive fire held to palette index `cap`.
+fn burst_tan_share(cap: i32) -> f32 {
+    let g = Geom {
+        cw: 14,
+        ch: 26,
+        rows: 8,
+        cols: 80,
+        origin_x: 12,
+        origin_y: 2,
+        win_w: 1144,
+        win_h: 212,
+        head: 0,
+    };
+    let line: Vec<char> = "echo the quick brown fox jumps over the lazy dog as the kitty flies"
+        .chars()
+        .collect();
+    let (row, start) = (4u16, 2u16);
+    let mut c = cfg(GlowStyle::Fire, true);
+    c.intensity = 1.0;
+    (c.theme_fg, c.theme_bg) = DARK_PAIR;
+    let mut glow = CursorGlow::default();
+    let mut out = Vec::new();
+    let mut text = vec![' '; g.cols];
+    let mut t = Instant::now();
+    let (mut lit, mut tan) = (0usize, 0usize);
+    let row_top = i32::from(g.origin_y) + i32::from(row) * g.ch as i32;
+    for k in 0..=line.len() as u16 {
+        if k > 0 {
+            t += Duration::from_millis(50);
+            text[usize::from(start + k - 1)] = line[usize::from(k - 1)];
+            glow.note_synthetic_typed(t, 1);
+        }
+        glow.observe_row(row, start + k, &text, t);
+        let mut rows = vec![vec![aterm_core::terminal::RenderCell::default(); g.cols]; g.rows];
+        for (col, &ch) in text.iter().enumerate() {
+            rows[usize::from(row)][col].ch = ch;
+        }
+        glow.observe_frame_text(Some((row, start + k)), &rows, t);
+        glow.tick(Some((row, start + k)), t, &c, g, &mut out);
+        if usize::from(k) + 28 <= line.len() {
+            continue;
+        }
+        let mut f = Glass::new(g, DARK_PAIR.1);
+        f.fire_cap = cap;
+        f.add_quads(glow.under_quads());
+        f.add_fire_patches(glow.patches());
+        f.add_quads(&out);
+        f.add_halos(glow.halos());
+        for y in 0..row_top {
+            for x in 0..g.win_w as i32 {
+                let (h, s, v) = crate::color_math::rgb2hsv(f.at(y, x));
+                if v > 0.3 {
+                    lit += 1;
+                }
+                if (25.0..=55.0).contains(&h) && (0.3..=0.72).contains(&s) && v > 0.5 && v < 0.86 {
+                    tan += 1;
+                }
+            }
+        }
+    }
+    assert!(lit > 20_000, "fixture: the burst burns ({lit} lit px)");
+    tan as f32 / lit as f32
+}
+
+#[test]
+fn the_dark_burst_burns_amber_tongues_not_a_tan_curtain() {
+    // looks6 round 3 (the judges' first must-fix): the dark burst's
+    // tongues merged into a beige-tan curtain (`fire-dark-burst.fly`,
+    // #c1964c, #c3913f, #cc9a41): the field's hottest light, a pale gold,
+    // laid thin under each tongue's feathered foot and flanks. Additive fire
+    // now stops a breath past amber: at most 2.5% of the burst's light
+    // reads tan (measured 1.3%). Up to the field's own ceiling (the negative
+    // control), 3.5% or more does (measured 4.9%).
+    let held = burst_tan_share(aterm_render::fire_field::FIRE_ADD_IDX_MAX);
+    assert!(
+        held <= 0.025,
+        "{:.1}% of the burst's light reads tan",
+        held * 100.0
+    );
+    let pale = burst_tan_share(1023);
+    assert!(
+        pale >= 0.035,
+        "control: up to the field's ceiling only {:.1}% reads tan",
+        pale * 100.0
+    );
+}
+
+/// The light (summed channels times area) the additive quads of a dark
+/// `rainbow kitty pet` frame lay in the row over the caret, across the
+/// caret's cell and one either side, with a powerline segment (`main +2` on
+/// `#cdcd00`) filling that row over the caret, 40 and 120 ms after its last
+/// key.
+fn ribbon_light_on_the_bar_above(unheld: bool) -> u64 {
+    let g = tall_geom();
+    let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+    let (row, caret_col) = (4u16, 21u16);
+    let mut host = FireHost::new(true, false);
+    let mut c = cfg_for_style_name("rainbow kitty pet", true);
+    c.dark_theme = true;
+    c.intensity = 1.0;
+    (c.theme_fg, c.theme_bg) = DARK_PAIR;
+    host.cfg = c;
+    host.fx.rainbow_rim_unheld = unheld;
+    let mut rows = vec![vec![aterm_core::terminal::RenderCell::default(); g.cols]; g.rows];
+    for line in &mut rows {
+        for cell in line.iter_mut() {
+            (cell.fg, cell.bg) = (rgb(DARK_PAIR.0), rgb(DARK_PAIR.1));
+        }
+    }
+    for (i, ch) in " main +2 ".chars().enumerate() {
+        let cell = &mut rows[usize::from(row - 1)][13 + i];
+        (cell.ch, cell.fg, cell.bg) = (ch, [0, 0, 0], rgb(0x00CD_CD00));
+    }
+    host.rows = Some(rows);
+    let mut t = Instant::now();
+    host.frame(t, (row, 2), false);
+    for k in 1..=(caret_col - 2) {
+        t += Duration::from_millis(85);
+        host.frame(t, (row, 2 + k), true);
+    }
+    let top = i32::from(row) * g.ch as i32;
+    let (x0, x1) = (
+        i32::from(caret_col - 1) * g.cw as i32,
+        i32::from(caret_col + 2) * g.cw as i32,
+    );
+    let mut light = 0u64;
+    for after in [40u64, 120] {
+        host.frame(t + Duration::from_millis(after), (row, caret_col), false);
+        for q in host.fx.glow_scratch.iter().filter(|q| q.alpha == 0) {
+            let (qy0, qy1) = (i32::from(q.y), (i32::from(q.y) + i32::from(q.h)).min(top));
+            let (qx0, qx1) = (
+                i32::from(q.x).max(x0),
+                (i32::from(q.x) + i32::from(q.w)).min(x1),
+            );
+            if qy1 <= qy0 || qx1 <= qx0 {
+                continue;
+            }
+            let sum = |c: u32| u64::from(((c >> 16) & 0xff) + ((c >> 8) & 0xff) + (c & 0xff));
+            light += (sum(q.color) + sum(q.color2)) / 2 * (qy1 - qy0) as u64 * (qx1 - qx0) as u64;
+        }
+    }
+    light
+}
+
+#[test]
+fn the_rainbow_block_s_halo_keeps_off_the_prompt_bar_above() {
+    // looks6 round 3, N4: the rainbow block's halo rings laid their top
+    // bars along the foot of the powerline segment over the caret
+    // (`#cdcd00` to `#e1e92a` under `main +2` in the gallery's `context`).
+    // Held off an inked or filled row next to the caret's as the momentum
+    // glow is, the frame lays a twelfth or less there of what it laid with
+    // the rings whole (the negative control; measured a sixteenth, the rest
+    // the rings' eased edge and the ribbon's own held light).
+    let held = ribbon_light_on_the_bar_above(false);
+    let whole = ribbon_light_on_the_bar_above(true);
+    assert!(
+        whole > 2_000,
+        "fixture: whole, the rings light the bar ({whole})"
+    );
+    assert!(
+        held * 12 <= whole,
+        "the rings lay {held} on the bar over the caret, against {whole} whole"
+    );
+}
+
+/// The dim warm px (a red, an orange or a yellow at or over 0.3 saturation
+/// and under 0.6 value: maroon, brown, olive) a dark `rainbow kitty pet`
+/// Return at the foot of the window lays in the letter guard's reach under
+/// the line it printed (that row's last 6 px to its ring and feather under
+/// it), composited with the printed letters, ticked every 20 ms from the
+/// Return and counted from 40 to 200 ms after it.
+fn dark_return_mud_under_the_printed_line(in_guard: bool) -> usize {
+    use aterm_core::terminal::RenderCell;
+    let g = tall_geom();
+    let bottom = g.rows as u16 - 1;
+    let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+    let frame = |lines: &[(u16, &[char])]| {
+        let mut rows = vec![vec![RenderCell::default(); g.cols]; g.rows];
+        for line in &mut rows {
+            for cell in line.iter_mut() {
+                (cell.fg, cell.bg) = (rgb(DARK_PAIR.0), rgb(DARK_PAIR.1));
+            }
+        }
+        for &(row, text) in lines {
+            for (col, &ch) in text.iter().enumerate() {
+                rows[usize::from(row)][col].ch = ch;
+            }
+        }
+        rows
+    };
+    let mut host = FireHost::new(true, false);
+    let mut c = cfg_for_style_name("rainbow kitty pet", true);
+    c.dark_theme = true;
+    c.intensity = 1.0;
+    (c.theme_fg, c.theme_bg) = DARK_PAIR;
+    host.cfg = c;
+    host.fx.glow.v2.lay_trains_in_guard(in_guard);
+    host.text[0] = '$';
+    host.rows = Some(frame(&[]));
+    let mut t = Instant::now();
+    host.frame(t, (bottom, 2), false);
+    for k in 1..=22u16 {
+        t += Duration::from_millis(60);
+        host.frame(t, (bottom, 2 + k), true);
+    }
+    let typed = host.text.clone();
+    t += Duration::from_millis(30);
+    let mut printed = vec![' '; g.cols];
+    printed[..19].fill('m');
+    let mut prompt = vec![' '; g.cols];
+    prompt[0] = '$';
+    host.fx.glow.note_scroll(2);
+    let rows = frame(&[
+        (bottom - 2, &typed),
+        (bottom - 1, &printed),
+        (bottom, &prompt),
+    ]);
+    host.rows = Some(rows.clone());
+    host.text = prompt;
+    host.fx.glow.note_synthetic_move(t);
+    let ch = g.ch as i32;
+    let reach = LETTER_GUARD_RING + (g.ch as f32 * InkLedger::FEATHER_Y).ceil() as i32;
+    let (y0, y1) = (i32::from(bottom) * ch - 6, i32::from(bottom) * ch + reach);
+    let mut mud = 0;
+    for after in (0..=200u64).step_by(20) {
+        host.frame(t + Duration::from_millis(after), (bottom, 2), false);
+        if after < 40 {
+            continue;
+        }
+        let mut f = Glass::new(g, DARK_PAIR.1);
+        f.add_quads(host.fx.glow.under_quads());
+        for (r, line) in rows.iter().enumerate() {
+            for (col, cell) in line.iter().enumerate() {
+                if cell.ch != ' ' && cell.ch != '\0' {
+                    for (y, x) in glyph(g, r as u16, col as u16).0 {
+                        f.px[y as usize * f.w + x as usize] = DARK_PAIR.0;
+                    }
+                }
+            }
+        }
+        f.add_quads(&host.fx.glow_scratch);
+        f.add_halos(host.fx.glow.halos());
+        for y in y0..y1 {
+            for x in 0..g.win_w as i32 {
+                let (h, s, v) = crate::color_math::rgb2hsv(f.at(y, x));
+                if s >= 0.3 && (0.16..0.6).contains(&v) && (h < 70.0 || h >= 330.0) {
+                    mud += 1;
+                }
+            }
+        }
+    }
+    mud
+}
+
+#[test]
+fn a_dark_return_s_train_keeps_clear_of_the_letter_guard_s_reach() {
+    // looks6 round 3, N6 e120: the Return's warm segment under `quick`
+    // (`4b4721`, `5a4b2c`, `7a624c`, `693e3b`) was the letter guard's cut:
+    // shown below the printed letters' bodies, the train lay inside the
+    // guard's judge of the row's cells, which cut it there and eased it back
+    // over its feather into the prompt's row, and a warm light cut to a
+    // share of itself reads maroon, brown and olive on a dark page. Kept
+    // clear of the guard's reach, tapering to a point at its edge, the train
+    // lays a twentieth or less of the mud it laid inside it (the negative
+    // control; measured 24 against 2058).
+    let clear = dark_return_mud_under_the_printed_line(false);
+    let inside = dark_return_mud_under_the_printed_line(true);
+    assert!(
+        inside >= 500,
+        "fixture: inside the guard's reach the train reads brown ({inside})"
+    );
+    assert!(
+        clear * 20 <= inside,
+        "the train lays {clear} dim warm px in the guard's reach, against {inside} inside it"
     );
 }

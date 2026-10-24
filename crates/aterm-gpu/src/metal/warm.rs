@@ -1,16 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The first window's shaders, compiled once on a worker and discarded.
+//! The first window's shaders, compiled once on a worker and discarded (a
+//! headless launch's too, with the rest of what its frames can bind, ahead of
+//! its first pixel demand), and the rest of what a live arm can bind, built on
+//! a worker and handed to it.
 
-use std::sync::{Condvar, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
 
 use aterm_time::{Duration, Instant};
 
-use super::ffi::{AutoreleasePool, Device, Library, PixelFormat};
+use super::ffi::{AutoreleasePool, Device, Library, Obj, PixelFormat};
 use super::pipelines;
 use crate::FetchProbe;
-use crate::pipeline_table::{FetchTwin, Pipeline, ShaderLibrary};
+use crate::pipeline_table::{ALL_PIPELINES, FetchTwin, Pipeline, ShaderLibrary};
 
 /// What decides a first window's first frames beyond their text: the launch's config, as the window will pin it onto its renderer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -434,13 +437,8 @@ fn walk_cell_lane(
         build_row(row, present)?;
     }
     latch.start(Lane::Cell, WarmItem::FetchProbe);
-    let fetch = super::fetch::compiled_with_twins(dev, &lib) && {
-        let loss = std::sync::Arc::new(super::loss::LossLatch::new());
-        super::encoder::EncodeSession::new(dev, std::sync::Arc::clone(&loss)).map(|session| {
-            let mint = super::resources::MetalResourceDevice::new(dev, loss);
-            super::fetch::verdict(&mint, &session, &lib)
-        }) == Ok(FetchProbe::Passed)
-    };
+    let fetch = super::fetch::compiled_with_twins(dev, &lib)
+        && settle_verdict(dev, &lib) == Some(FetchProbe::Passed);
     latch.finish(Lane::Cell, WarmItem::FetchProbe);
     for (row, present) in cell_rows(fetch).filter(|r| !either.contains(r)) {
         build_row(row, present)?;
@@ -455,10 +453,239 @@ fn walk_cell_lane(
     Ok(())
 }
 
+/// The device's framebuffer-fetch verdict through `cell` (its `cell.metal`), probed on a session of its own and settled for the process ([`super::fetch::verdict`]), so an arm minted later reads it ([`super::fetch::known`]); `None` where no session could open.
+fn settle_verdict(dev: &Device, cell: &Library) -> Option<FetchProbe> {
+    let loss = Arc::new(super::loss::LossLatch::new());
+    let session = super::encoder::EncodeSession::new(dev, Arc::clone(&loss)).ok()?;
+    let mint = super::resources::MetalResourceDevice::new(dev, loss);
+    Some(super::fetch::verdict(&mint, &session, cell))
+}
+
 impl Drop for FirstFrameWarm {
     fn drop(&mut self) {
         self.latch.settle();
     }
+}
+
+/// Whether the process's headless launch warm was claimed.
+static SHADER_CACHE_BEGAN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The right to run the process's headless launch warm, from [`crate::begin_shader_cache_warm`]: once per process, as the first-frame warm is.
+pub struct ShaderCacheWarm(());
+
+impl ShaderCacheWarm {
+    /// Claim the process's one headless launch warm.
+    #[inline]
+    pub(crate) fn begin() -> Option<Self> {
+        (!SHADER_CACHE_BEGAN.swap(true, std::sync::atomic::Ordering::SeqCst)).then_some(Self(()))
+    }
+
+    /// Whether the process's headless launch warm was claimed.
+    #[inline]
+    pub(crate) fn began() -> bool {
+        SHADER_CACHE_BEGAN.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Compile and build, in order, what a headless launch's renderer builds once its first pixel demand mints it, and drop it all: the first frames' rows under `knobs` (the split's, and the twins where the device has framebuffer fetch: its verdict is the renderer's to settle; an f16 destination only where `knobs.hdr_glow`), then, where `rest`, every other row and twin a frame or present can bind under it ([`bindable`]). Nothing waits on it, and it submits no GPU work: a process's first submission costs it the driver's footprint (320 MB measured on an M5 Max), which a headless run that never draws a pixel must not pay.
+    /// # Errors
+    /// No Metal device the device listing names (the window server, which only a renderer may ask, would have to pick it), or the compiles and builds that failed.
+    pub fn run(self, knobs: FirstFrameKnobs, rest: Option<PresentKnobs>) -> Result<(), String> {
+        let _pool = AutoreleasePool::new();
+        let dev = Device::preferred_listed()
+            .ok_or_else(|| "no Metal device the device listing names".to_owned())?;
+        let twins = super::fetch::capable(&dev);
+        let mut items: Vec<WarmItem> = first_frame_rows(knobs, false)
+            .into_iter()
+            .filter(|&(_, present)| knobs.hdr_glow || present != PixelFormat::Rgba16Float)
+            .map(|(row, present)| WarmItem::pipeline(row, present))
+            .chain(
+                first_frame_twins(knobs, twins)
+                    .into_iter()
+                    .map(WarmItem::Twin),
+            )
+            .collect();
+        for item in rest.map(|rest| bindable(rest, twins)).unwrap_or_default() {
+            if !items.contains(&item) {
+                items.push(item);
+            }
+        }
+        let mut failed = Vec::new();
+        build_each(&dev, &FIRST_FRAME, &items, |warmed| {
+            if warmed.pso.is_none() {
+                failed.push(warmed.item);
+            }
+            true
+        });
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("{failed:?} did not build"))
+        }
+    }
+}
+
+/// The switches that decide which of a renderer's present passes can run, as the renderer holds them: a pass they turn off binds no row, so a pipeline warm builds none for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PresentKnobs {
+    /// The bloom composite (`set_bloom`).
+    pub bloom: bool,
+    /// The heat shimmer (`set_shimmer`).
+    pub shimmer: bool,
+    /// The aurora's crown on an EDR screen and the f16 swapchain it draws into (`set_hdr_glow`, on a renderer with a window on screen: a headless one presents to a Bgra8Unorm target alone).
+    pub hdr_glow: bool,
+    /// The aurora's crown on an SDR screen (`set_sdr_glow_boost` above 0).
+    pub sdr_glow: bool,
+}
+
+impl PresentKnobs {
+    /// Whether a frame or present may bind `row` under these switches.
+    #[inline]
+    const fn bind(self, row: Pipeline) -> bool {
+        match row {
+            Pipeline::Bloom => self.bloom,
+            Pipeline::Shimmer => self.shimmer,
+            Pipeline::HdrGlow => self.hdr_glow,
+            Pipeline::SdrGlow => self.sdr_glow,
+            _ => true,
+        }
+    }
+}
+
+/// The destinations a present binds `row` against under `knobs`, as its callers pass them: the tray card the Rgba8Unorm present copy, the blit and the SDR crown the swapchain, at f16 too where one may exist ([`PresentKnobs::hdr_glow`]). Any other row draws into an offscreen, whose format is its own whatever the destination: one build.
+#[inline]
+const fn destinations(row: Pipeline, knobs: PresentKnobs) -> &'static [PixelFormat] {
+    match row {
+        Pipeline::Tray => &[PixelFormat::Rgba8Unorm],
+        Pipeline::Blit | Pipeline::SdrGlow if knobs.hdr_glow => {
+            &[PixelFormat::Bgra8Unorm, PixelFormat::Rgba16Float]
+        }
+        _ => &[PixelFormat::Bgra8Unorm],
+    }
+}
+
+/// Every first-frame knob on: what a launch's first-frame warm builds at most.
+const EVERY_FIRST_FRAME: FirstFrameKnobs = FirstFrameKnobs {
+    aurora: true,
+    bloom: true,
+    hdr_glow: true,
+    sdr_glow: true,
+    fx: true,
+};
+
+/// Every build a live arm's frames and presents can bind under `knobs`: each row at the destinations its present meets ([`destinations`]; one item for a row that draws into an offscreen, as Metal keys it) and, where `twins`, each framebuffer-fetch twin. In the order a frame comes to need them once its first frames drew: what a frame binds whatever the device's verdict, then the twins, in table order; then, where `twins`, each twinned row, which a frame binds only on the split; and last what a first-frame warm builds, which the first frames build for themselves.
+pub(crate) fn bindable(knobs: PresentKnobs, twins: bool) -> Vec<WarmItem> {
+    let first: Vec<WarmItem> = first_frame_rows(EVERY_FIRST_FRAME, twins)
+        .into_iter()
+        .map(|(row, present)| WarmItem::pipeline(row, present))
+        .chain(
+            first_frame_twins(EVERY_FIRST_FRAME, twins)
+                .into_iter()
+                .map(WarmItem::Twin),
+        )
+        .collect();
+    let mut items = Vec::new();
+    for row in ALL_PIPELINES.into_iter().filter(|row| knobs.bind(*row)) {
+        for &present in destinations(row, knobs) {
+            items.push(WarmItem::pipeline(row, present));
+        }
+        if twins && let Some(twin) = FetchTwin::of(row) {
+            items.push(WarmItem::Twin(twin));
+        }
+    }
+    items.sort_by_key(|item| match *item {
+        _ if first.contains(item) => 3,
+        WarmItem::Pipeline(row, _) if twins && FetchTwin::of(row).is_some() => 2,
+        WarmItem::Twin(_) => 1,
+        _ => 0,
+    });
+    items
+}
+
+/// One build a pipeline warm hands its arm: the item, and its pipeline state, `None` where it failed (the frame that binds it builds it and says why) or, for the device's framebuffer-fetch probe, always (the verdict is the process's, [`super::fetch::known`]).
+pub(crate) struct Warmed {
+    pub(crate) item: WarmItem,
+    pub(crate) pso: Option<Obj>,
+}
+
+// SAFETY: a `Warmed` carries one `MTLRenderPipelineState`, immutable once built, which Metal documents as usable from any thread; objc retain/release are thread-safe, and the +1 moves once.
+unsafe impl Send for Warmed {}
+
+/// The arm's `MTLDevice`, moved to the worker that builds for it.
+struct WorkerDevice(Device);
+
+// SAFETY: an `MTLDevice` may be used from several threads at once (Metal's threading model: devices, libraries and pipeline states are thread-safe), and this holder moves its +1 once.
+unsafe impl Send for WorkerDevice {}
+
+impl WorkerDevice {
+    #[inline]
+    fn into_inner(self) -> Device {
+        self.0
+    }
+}
+
+/// Start a pipeline warm: build `items` (the device's framebuffer-fetch probe where the arm owes it, then [`bindable`]) for `dev` on a worker of their own, sending each to `to` as it lands, each library compiled before its first row and the first-frame warm (`latch`) waited out where it has the same compile or build in flight. The worker ends early once `to`'s receiver is gone; it is detached unless a test joins it: how many items it handed over.
+/// # Errors
+/// The worker could not start.
+pub(crate) fn spawn(
+    dev: &Device,
+    latch: &'static WarmLatch,
+    items: Vec<WarmItem>,
+    to: mpsc::Sender<Warmed>,
+) -> std::io::Result<std::thread::JoinHandle<usize>> {
+    let dev = WorkerDevice(dev.clone_ref());
+    std::thread::Builder::new()
+        .name("aterm-metal-pipeline-warm".to_owned())
+        .spawn(move || {
+            let dev = dev.into_inner();
+            let _pool = AutoreleasePool::new();
+            build_each(&dev, latch, &items, |warmed| to.send(warmed).is_ok())
+        })
+}
+
+/// Build each of `items` in order and hand it over, until `hand` refuses one: how many it handed over, the refused one with them. The device's framebuffer-fetch probe ([`WarmItem::FetchProbe`]) settles the process's verdict ([`settle_verdict`]).
+fn build_each(
+    dev: &Device,
+    latch: &WarmLatch,
+    items: &[WarmItem],
+    mut hand: impl FnMut(Warmed) -> bool,
+) -> usize {
+    let mut libs: Vec<(ShaderLibrary, Option<Library>)> = Vec::new();
+    let mut handed = 0;
+    for &item in items {
+        let library = match item {
+            WarmItem::Pipeline(row, _) => row.spec().library,
+            WarmItem::Twin(_) | WarmItem::FetchProbe => ShaderLibrary::Cell,
+            WarmItem::Library(_) => continue,
+        };
+        if !libs.iter().any(|(l, _)| *l == library) {
+            latch.await_item(WarmItem::Library(library));
+            libs.push((library, pipelines::compile_library(dev, library).ok()));
+        }
+        let lib = libs
+            .iter()
+            .find(|(l, _)| *l == library)
+            .and_then(|(_, lib)| lib.as_ref());
+        latch.await_item(item);
+        let pso = lib.and_then(|lib| match item {
+            WarmItem::Pipeline(row, present) => {
+                pipelines::build(dev, lib, row.spec(), present).ok()
+            }
+            WarmItem::Twin(twin) => {
+                pipelines::build(dev, lib, &twin.spec(), PixelFormat::Bgra8Unorm).ok()
+            }
+            WarmItem::FetchProbe => {
+                let _ = settle_verdict(dev, lib);
+                None
+            }
+            WarmItem::Library(_) => None,
+        });
+        handed += 1;
+        if !hand(Warmed { item, pso }) {
+            break;
+        }
+    }
+    handed
 }
 
 /// The latch the first-frame compile measurement (`benches/first_frame_compile.rs`)
@@ -782,5 +1009,167 @@ mod tests {
         static ENDED: WarmLatch = WarmLatch::new(DEADLINE);
         drop(ENDED.begin().expect("the latch's first warm"));
         assert!(!ENDED.probe_pending(), "a warm that ended owes nothing");
+    }
+
+    /// THE PIPELINE WARM'S REACH: with every present switch on it names every row of the table, at every destination its present meets, and every framebuffer-fetch twin, so nothing a frame or present binds is left for the render thread to build, and it names what a first-frame warm builds after all else, so a warm that races the first frames spends its first builds on what they leave. A switch turned off drops its pass's row alone (the EDR crown's, the f16 destinations with it), and no twins drops the twins alone.
+    #[test]
+    fn the_pipeline_warm_names_every_row_and_twin_a_frame_can_bind() {
+        let on = PresentKnobs {
+            bloom: true,
+            shimmer: true,
+            hdr_glow: true,
+            sdr_glow: true,
+        };
+        let all = bindable(on, true);
+        for row in ALL_PIPELINES {
+            assert!(
+                all.iter()
+                    .any(|i| matches!(i, WarmItem::Pipeline(r, _) if *r == row)),
+                "`{}` is not warmed",
+                row.name()
+            );
+        }
+        for twin in FetchTwin::ALL {
+            assert!(
+                all.contains(&WarmItem::Twin(twin)),
+                "{twin:?}'s twin is not warmed"
+            );
+        }
+        let first: Vec<WarmItem> = first_frame_rows(EVERY_FIRST_FRAME, true)
+            .into_iter()
+            .map(|(row, present)| WarmItem::pipeline(row, present))
+            .chain(
+                first_frame_twins(EVERY_FIRST_FRAME, true)
+                    .into_iter()
+                    .map(WarmItem::Twin),
+            )
+            .collect();
+        let at = all
+            .iter()
+            .position(|i| first.contains(i))
+            .expect("the first frames' rows are bindable");
+        assert!(
+            all[at..].iter().all(|i| first.contains(i)) && at > 0,
+            "the first frames' rows come last: {all:?}"
+        );
+        let f16 = |i: &WarmItem| matches!(i, WarmItem::Pipeline(_, PixelFormat::Rgba16Float));
+        for (off, row) in [
+            (PresentKnobs { bloom: false, ..on }, Pipeline::Bloom),
+            (
+                PresentKnobs {
+                    shimmer: false,
+                    ..on
+                },
+                Pipeline::Shimmer,
+            ),
+            (
+                PresentKnobs {
+                    hdr_glow: false,
+                    ..on
+                },
+                Pipeline::HdrGlow,
+            ),
+            (
+                PresentKnobs {
+                    sdr_glow: false,
+                    ..on
+                },
+                Pipeline::SdrGlow,
+            ),
+        ] {
+            let left = bindable(off, true);
+            let dropped: Vec<&WarmItem> = all.iter().filter(|i| !left.contains(i)).collect();
+            assert!(
+                !dropped.is_empty()
+                    && dropped.iter().all(|i| {
+                        matches!(i, WarmItem::Pipeline(r, _) if *r == row)
+                            || (!off.hdr_glow && f16(i))
+                    }),
+                "{off:?} dropped {dropped:?}"
+            );
+            assert!(
+                off.hdr_glow || !left.iter().any(f16),
+                "no f16 swapchain, no f16 destination"
+            );
+        }
+        let untwinned = bindable(on, false);
+        assert!(
+            all.iter()
+                .all(|i| untwinned.contains(i) == !matches!(i, WarmItem::Twin(_))),
+            "no twins drops the twins alone"
+        );
+    }
+
+    /// A pipeline warm hands every item it is given over as it lands, built on the shipped shaders (the device's framebuffer-fetch probe settled for the process), and its worker ends once it built them; a worker whose arm is gone builds the one item in hand and stops.
+    #[test]
+    fn the_pipeline_warm_hands_over_each_build_and_stops_when_its_arm_is_gone() {
+        static LATCH: WarmLatch = WarmLatch::new(DEADLINE);
+        let dev = device();
+        let on = PresentKnobs {
+            bloom: true,
+            shimmer: true,
+            hdr_glow: true,
+            sdr_glow: true,
+        };
+        let mut items = vec![WarmItem::FetchProbe];
+        items.extend(bindable(on, super::super::fetch::capable(&dev)));
+        let (tx, rx) = mpsc::channel();
+        let worker = spawn(&dev, &LATCH, items.clone(), tx).expect("the worker starts");
+        let mut handed = Vec::new();
+        while handed.len() < items.len() {
+            let Warmed { item, pso } = rx.recv_timeout(HANG).expect("the warm hands over");
+            assert!(
+                pso.is_some() || item == WarmItem::FetchProbe,
+                "{item:?} did not build on the shipped shaders"
+            );
+            handed.push(item);
+        }
+        assert_eq!(handed, items, "handed over in order, each once");
+        assert!(
+            matches!(
+                rx.recv_timeout(HANG),
+                Err(mpsc::RecvTimeoutError::Disconnected)
+            ),
+            "the worker ended once it built its items"
+        );
+        assert_eq!(worker.join().expect("the worker"), items.len());
+        let cell = pipelines::compile_library(&dev, ShaderLibrary::Cell).expect("cell.metal");
+        assert!(
+            crate::metal::fetch::known(&dev, &cell).is_some(),
+            "the warm left the device's verdict for an arm to read"
+        );
+
+        let (tx, rx) = mpsc::channel();
+        drop(rx);
+        let gone = spawn(&dev, &LATCH, items, tx).expect("the worker starts");
+        let began = Instant::now();
+        while !gone.is_finished() {
+            assert!(began.elapsed() < HANG, "the armless worker never stopped");
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            gone.join().expect("the worker"),
+            1,
+            "a worker whose arm is gone stops at its first hand-over"
+        );
+    }
+
+    /// A headless launch's warm compiles the first frames' rows and the rest a frame can bind on the shipped shaders.
+    #[test]
+    fn a_headless_launch_warm_builds_the_shipped_shaders() {
+        device();
+        let rest = PresentKnobs {
+            bloom: true,
+            shimmer: true,
+            hdr_glow: false,
+            sdr_glow: true,
+        };
+        let knobs = FirstFrameKnobs {
+            hdr_glow: false,
+            ..BENCH_KNOBS
+        };
+        ShaderCacheWarm(())
+            .run(knobs, Some(rest))
+            .expect("the headless warm on the shipped shaders");
     }
 }

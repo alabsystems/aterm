@@ -44,6 +44,9 @@ pub struct SetupStatus {
     /// The latest read-only reading of each row, keyed by subject (at most one
     /// per subject). Rows with no reading yet are absent.
     pub observed: Vec<aterm_types::macos_setup::Observation>,
+    /// The vault source the Secrets and Repositories readings describe.
+    /// Unknown sources never supply those rows to a review.
+    pub observed_vault_url: Option<String>,
     /// Raised each time `observed` changes, so a publication can be compared cheaply.
     pub observed_generation: u64,
     /// The settings whose stage the running pass is executing now.
@@ -101,11 +104,18 @@ impl SetupStatus {
         self.busy && self.operation.is_none()
     }
 
-    /// The latest reading of `subject`, if one was taken.
-    pub(crate) fn observation(&self, subject: Subject) -> Option<&Observation> {
+    /// Readings valid for this vault source; the rest of the Mac is shared
+    /// across reviews. Compare the field's trimmed value without probing it.
+    pub(crate) fn observations_for(
+        &self,
+        vault_url: Option<&str>,
+    ) -> impl Iterator<Item = &Observation> {
+        let source_matches = vault_url.map(str::trim).is_some_and(|source| {
+            !source.is_empty() && self.observed_vault_url.as_deref().map(str::trim) == Some(source)
+        });
         self.observed
             .iter()
-            .find(|observation| observation.subject == subject)
+            .filter(move |observation| !observation.subject.uses_vault_source() || source_matches)
     }
 
     /// Whether a failure is a signal now (§3.6): never while the run still
@@ -354,8 +364,24 @@ fn manages(selection: Selection, subject: Subject) -> bool {
 /// THE ROW RULE (§3.3, pure): name, value and at most one chip from the
 /// row's reading, the plan's selection and the step running now.
 pub(crate) fn row_view(subject: Subject, status: &SetupStatus, selection: Selection) -> RowView {
+    row_view_for_source(
+        subject,
+        status,
+        selection,
+        status.plan.as_ref().map(|plan| plan.vault_url.as_str()),
+    )
+}
+
+fn row_view_for_source(
+    subject: Subject,
+    status: &SetupStatus,
+    selection: Selection,
+    vault_url: Option<&str>,
+) -> RowView {
     let name = subject.name();
-    let reading = status.observation(subject);
+    let reading = status
+        .observations_for(vault_url)
+        .find(|observation| observation.subject == subject);
     let wanted = reading.map_or_else(|| subject.wanted().to_owned(), |o| o.wanted.clone());
     let now = reading
         .and_then(|o| o.now.clone())
@@ -710,6 +736,14 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView]) -> Headline {
     if managed == 0 {
         return Headline::line("Everything is left as is");
     }
+    // A source change can leave just its managed rows unread. Known changes
+    // and waits above stay useful, but unread rows cannot establish success.
+    if rows
+        .iter()
+        .any(|row| row.managed && matches!(row.standing, None | Some(Standing::Unknown)))
+    {
+        return Headline::line("Checking this Mac…");
+    }
     let only_permissions = rows
         .iter()
         .filter(|row| row.managed)
@@ -754,7 +788,8 @@ pub(crate) fn village_spec(
         .collect();
     let total = rows.iter().filter(|row| row.managed).count();
     let done = rows.iter().filter(|row| row.settled()).count();
-    let busy = u8::from(status.busy);
+    // Only a setup run walks: Check again and Restore are busy, and no run.
+    let busy = u8::from(status.running());
     format!("phase={phase_ms};busy={busy};done={done};total={total};states={states}")
 }
 
@@ -784,17 +819,36 @@ pub(crate) struct SystemStateViewState {
     pub(crate) common: CommonViewState,
     /// The list's scroll, in points.
     scroll: Cell<f32>,
-    /// The list's room and how far it can scroll, as last rendered.
+    /// The list's height (its room and the strip under it), its room and
+    /// how far it can scroll, as last rendered.
+    height: Cell<f32>,
     room: Cell<f32>,
     limit: Cell<f32>,
     /// The revealable keys the last render placed in the list.
     spans: RefCell<Vec<Span>>,
+    /// The last render of this view showed a village whose kitties walk.
+    village_walks: Cell<bool>,
 }
 
 impl SystemStateViewState {
-    /// Scroll the list so `key` shows whole: a group, a row or one of their
-    /// controls, the vault's fields too (the password field shows bullets,
-    /// never what was typed). `true` when the list moved.
+    /// Whether this view's last render showed a village whose kitties walk.
+    /// Each view renders at its own window's size, so one view's village can
+    /// show while another's is left out: a busy tick repaints the page only
+    /// where a view someone sees draws its village walking
+    /// ([`SystemStateApp::tick`]).
+    pub(crate) fn village_walks(&self) -> bool {
+        self.village_walks.get()
+    }
+
+    /// The list's scroll and its room, as last rendered (a host test's read).
+    #[cfg(test)]
+    pub(crate) fn list_scroll(&self) -> (f32, f32) {
+        (self.scroll.get(), self.room.get())
+    }
+
+    /// Scroll the list so `key` shows whole: a note, a group, a row or one
+    /// of their controls, the vault's fields too (the password field shows
+    /// bullets, never what was typed). `true` when the list moved.
     pub(crate) fn reveal_listed_control(&mut self, key: &UiKey) -> bool {
         let Some((top, bottom)) = self
             .spans
@@ -806,23 +860,65 @@ impl SystemStateViewState {
             return false;
         };
         let before = self.scroll.get();
-        let room = self.room.get();
-        let mut offset = before;
-        if top < offset {
-            offset = top;
-        } else if bottom > offset + room {
-            offset = (bottom - room).min(top);
-        }
-        let offset = offset.clamp(0.0, self.limit.get());
+        let offset = whole_at(before, self.room.get(), top, bottom).clamp(0.0, self.limit.get());
         self.scroll.set(offset);
         (offset - before).abs() > 0.5
     }
 
-    fn scroll_by(&self, points: f32) -> bool {
-        let before = self.scroll.get();
-        let offset = (before + points).clamp(0.0, self.limit.get());
-        self.scroll.set(offset);
-        (offset - before).abs() > 0.5
+    /// Move the list `steps` steps of `points`, down where `steps` is
+    /// positive. A step never moves more than the room shows, so every line
+    /// of the list passes through the room, even in a list one row tall
+    /// (§3.4); and where a shorter step shows whole a span the room cut and
+    /// the list holds whole, the step stops there, with the span at the
+    /// list's top going down and, going up, at the room's foot (at the
+    /// list's top where it stands taller than the room).
+    fn scroll_steps(&self, steps: i32, points: f32) {
+        // An edge cuts a span as the page's compile judges it.
+        const EDGE: f32 = crate::native_ui::CLIP_EDGE_EPSILON;
+        let (height, room) = (self.height.get(), self.room.get());
+        let step = points.min(room);
+        for _ in 0..steps.unsigned_abs() {
+            let offset = self.scroll.get();
+            let spans = self.spans.borrow();
+            let whole = spans
+                .iter()
+                .filter(|span| span.bottom - span.top <= height + EDGE);
+            let target = if steps > 0 {
+                let target = offset + step;
+                whole
+                    .filter(|span| {
+                        span.top > offset + EDGE
+                            && span.top < target - EDGE
+                            && span.bottom > offset + room + EDGE
+                    })
+                    .map(|span| span.top)
+                    .fold(target, f32::min)
+            } else {
+                let target = offset - step;
+                whole
+                    .filter(|span| span.top < offset - EDGE && span.bottom > target + room + EDGE)
+                    .map(|span| (span.bottom - room).min(span.top))
+                    .fold(target, f32::max)
+            }
+            .clamp(0.0, self.limit.get());
+            drop(spans);
+            if (target - offset).abs() < EDGE {
+                break;
+            }
+            self.scroll.set(target);
+        }
+    }
+}
+
+/// The scroll nearest `offset` at which a room `room` tall shows the content
+/// from `top` to `bottom` whole, or from its top where it stands taller.
+fn whole_at(offset: f32, room: f32, top: f32, bottom: f32) -> f32 {
+    if top < offset {
+        top
+    } else if bottom > offset + room {
+        (bottom - room).min(top)
+    } else {
+        offset
     }
 }
 
@@ -1000,11 +1096,9 @@ pub(crate) struct SystemStateApp {
     actions: VecDeque<SystemStateAction>,
     /// Whether the gesture being handled is a person's (not a control client's).
     by_person: bool,
-    /// Page ticks seen while a run goes: the village's walk.
+    /// Page ticks seen while a run goes and the page is shown: the village's
+    /// walk, and its only clock, so idle kitties stand still.
     anim_ticks: u64,
-    /// The last page drawn shows a village whose kitties walk, so a busy tick
-    /// repaints it.
-    village_walks: Cell<bool>,
 }
 
 impl SystemStateApp {
@@ -1050,7 +1144,6 @@ impl SystemStateApp {
             actions: VecDeque::new(),
             by_person: false,
             anim_ticks: 0,
-            village_walks: Cell::new(false),
         }
     }
 
@@ -1120,9 +1213,14 @@ impl SystemStateApp {
     }
 
     /// The page's clock-free step: a withdrawn offer is let go, and, in an
-    /// active window, the first-run offer is applied; while a run goes, the
-    /// village's kitties walk a step. `true` when the page changed.
-    pub(crate) fn tick(&mut self, active: bool) -> bool {
+    /// active window, the first-run offer is applied; while a setup run goes
+    /// and the page is `shown` (the visible view of a window), the village's
+    /// kitties walk a step. `walks` says whether a shown view's last render
+    /// showed a walking village ([`SystemStateViewState::village_walks`]).
+    /// `true` when the page changed: a page nobody sees, one Check again or
+    /// Restore keeps busy, or one whose shown views draw no walking village
+    /// owes no repaint for the walk.
+    pub(crate) fn tick(&mut self, active: bool, shown: bool, walks: bool) -> bool {
         let before = (self.request.is_some(), self.status.busy);
         if self
             .request
@@ -1134,9 +1232,9 @@ impl SystemStateApp {
         if !self.status.busy && active && self.pending() {
             self.apply(Admission::Automatic, Submission::AsItStands);
         }
-        let walked = self.status.busy && {
+        let walked = self.status.running() && shown && {
             self.anim_ticks = self.anim_ticks.wrapping_add(1);
-            self.village_walks.get()
+            walks
         };
         walked || before != (self.request.is_some(), self.status.busy)
     }
@@ -1158,13 +1256,30 @@ impl SystemStateApp {
         plan
     }
 
+    fn reviewed_row(&self, subject: Subject) -> RowView {
+        row_view_for_source(
+            subject,
+            &self.status,
+            self.plan.selection,
+            Some(self.url.value().trim()),
+        )
+    }
+
+    fn reviewed_rows(&self) -> Vec<RowView> {
+        Subject::all()
+            .into_iter()
+            .map(|subject| self.reviewed_row(subject))
+            .collect()
+    }
+
     /// The tab's attention diamond (§3.6): a managed row needs a person, or
     /// failed and the run no longer retries it (§3.5).
     pub(crate) fn needs_attention(&self) -> bool {
         let signal = self.status.failures_signal();
         let reviewed = self.reviewed_plan();
         self.plan_known
-            && (rows(&self.status, self.plan.selection)
+            && (self
+                .reviewed_rows()
                 .iter()
                 .any(|row| row.attention() && (signal || row.standing != Some(Standing::Failed)))
                 || self.status.failed_steps(Some(&reviewed)).next().is_some())
@@ -1277,24 +1392,59 @@ impl SystemStateApp {
     /// disclosure, else open while the vault waits for input here.
     fn vault_shown(&self) -> bool {
         self.vault_open.unwrap_or_else(|| {
-            let row = row_view(
-                Subject::Setting(Setting::Secrets),
-                &self.status,
-                self.plan.selection,
-            );
+            let row = self.reviewed_row(Subject::Setting(Setting::Secrets));
             row.managed
                 && matches!(row.standing, Some(Standing::NeedsYou | Standing::Failed))
                 && row.note.is_none()
         })
     }
 
-    fn field_event(&mut self, key: &str, event: TextInputEvent) {
+    /// One text input to the vault field with focus, which scrolls into
+    /// view as it does when it takes focus: typing never goes on out of
+    /// sight.
+    fn type_into(&mut self, view: &mut SystemStateViewState, event: TextInputEvent) {
+        // What can change a field's words; a caret move, a selection or a
+        // submit leaves the vault's disclosure as it stood.
+        let edits = match &event {
+            TextInputEvent::Preedit { text, .. } | TextInputEvent::Commit(text) => !text.is_empty(),
+            TextInputEvent::Backspace
+            | TextInputEvent::Delete
+            | TextInputEvent::KillToEnd
+            | TextInputEvent::KillToStart
+            | TextInputEvent::DeleteWordBackward
+            | TextInputEvent::Undo
+            | TextInputEvent::Redo => true,
+            TextInputEvent::Left { .. }
+            | TextInputEvent::Right { .. }
+            | TextInputEvent::Home { .. }
+            | TextInputEvent::End { .. }
+            | TextInputEvent::WordLeft { .. }
+            | TextInputEvent::WordRight { .. }
+            | TextInputEvent::SelectAll
+            | TextInputEvent::Submit
+            | TextInputEvent::Cancel => false,
+        };
+        if let Some(key) = view.common.last_focus.clone()
+            && self.field_event(key.as_str(), event)
+        {
+            // A field someone types into stays shown, as one filled through
+            // its action does: a draft is never hidden.
+            if edits {
+                self.vault_open = Some(true);
+            }
+            view.reveal_listed_control(&key);
+        }
+    }
+
+    /// One text input to the vault field `key`: `false` when `key` names
+    /// neither vault field.
+    fn field_event(&mut self, key: &str, event: TextInputEvent) -> bool {
         if key == "system-state/password" {
             self.password.input(event);
-            return;
+            return true;
         }
         if key != "system-state/url" {
-            return;
+            return false;
         }
         match event {
             TextInputEvent::Commit(text) => self.url.insert(&text),
@@ -1319,6 +1469,7 @@ impl SystemStateApp {
             }
             TextInputEvent::Submit | TextInputEvent::Cancel => {}
         }
+        true
     }
 
     /// One pressed control of the page.
@@ -1362,9 +1513,7 @@ impl SystemStateApp {
                 );
             }
             "system-state/headline/open" => {
-                if let Some(access) =
-                    headline(&self.status, &rows(&self.status, self.plan.selection)).open
-                {
+                if let Some(access) = headline(&self.status, &self.reviewed_rows()).open {
                     self.actions.push_back(SystemStateAction::OpenAccess {
                         access,
                         by_person: self.by_person,
@@ -1372,9 +1521,7 @@ impl SystemStateApp {
                 }
             }
             "system-state/headline/show" => {
-                if let Some(subject) =
-                    headline(&self.status, &rows(&self.status, self.plan.selection)).show
-                {
+                if let Some(subject) = headline(&self.status, &self.reviewed_rows()).show {
                     // The vault's fields sit under its row: Join, their last
                     // control, brings all of them into view.
                     let key = if subject == Subject::Setting(Setting::Secrets) && self.vault_shown()
@@ -1390,10 +1537,7 @@ impl SystemStateApp {
                 self.vault_open = Some(!self.vault_shown());
             }
             TURN_ON_SYNC => {
-                if rows(&self.status, self.plan.selection)
-                    .iter()
-                    .any(|row| row.turn_on_sync)
-                {
+                if self.reviewed_rows().iter().any(|row| row.turn_on_sync) {
                     self.actions.push_back(SystemStateAction::TurnSyncOn {
                         by_person: self.by_person,
                     });
@@ -1442,7 +1586,8 @@ impl SystemStateApp {
                     .strip_prefix("system-state/row/")
                     .and_then(|rest| rest.strip_suffix("/open"))
                     .and_then(|slug| Access::ALL.into_iter().find(|a| a.word() == slug))
-                    && rows(&self.status, self.plan.selection)
+                    && self
+                        .reviewed_rows()
                         .iter()
                         .any(|row| row.open == Some(access))
                 {
@@ -1503,11 +1648,12 @@ impl NativeAppModel for SystemStateApp {
                 true
             }
             AppEvent::ScrollLines(lines) | AppEvent::ScrollAt { lines, .. } => {
-                view.scroll_by(lines as f32 * LINE_PX);
+                view.scroll_steps(lines, LINE_PX);
                 true
             }
             AppEvent::ScrollPage(direction) => {
-                view.scroll_by(direction as f32 * (view.room.get() - LINE_PX).max(LINE_PX));
+                let (room, line) = (view.room.get(), LINE_PX.min(view.room.get()));
+                view.scroll_steps(direction, (room - line).max(line));
                 true
             }
             AppEvent::PressListPicture(key) => {
@@ -1521,20 +1667,14 @@ impl NativeAppModel for SystemStateApp {
             }
             AppEvent::TextInput(event) => {
                 if !self.status.busy && event != TextInputEvent::Cancel {
-                    self.field_event(
-                        view.common.last_focus.as_ref().map_or("", UiKey::as_str),
-                        event,
-                    );
+                    self.type_into(view, event);
                 }
                 true
             }
             #[cfg(any(a11y_tree, test))]
             AppEvent::InsertText(text) => {
                 if !self.status.busy {
-                    self.field_event(
-                        view.common.last_focus.as_ref().map_or("", UiKey::as_str),
-                        TextInputEvent::Commit(text),
-                    );
+                    self.type_into(view, TextInputEvent::Commit(text));
                 }
                 true
             }
@@ -1697,7 +1837,7 @@ impl<'a, 'b> Page<'a, 'b> {
         // Until the page knows the plan in force it cannot say which rows
         // aterm manages: every row reads `—`, with no chip.
         let rows = if app.plan_known {
-            rows(&app.status, app.plan.selection)
+            app.reviewed_rows()
         } else {
             rows(&SetupStatus::default(), Selection::all())
         };
@@ -1722,7 +1862,7 @@ impl<'a, 'b> Page<'a, 'b> {
         } else {
             Headline::before_plan(&self.app.status)
         };
-        let brand = self.brand();
+        let (brand, brand_h, brand_walks) = self.brand();
         let mut heading = crate::native_settings::page_heading("System State", &headline.text);
         let subtitle = heading.pop();
         let mut title = heading.pop();
@@ -1790,17 +1930,17 @@ impl<'a, 'b> Page<'a, 'b> {
         let roomy = row_h * 2.0;
         let title_cost = title.as_ref().map_or(0.0, |_| title_h + 4.0);
         let show_title = steady - title_cost >= roomy;
-        let show_brand = show_title && steady - title_cost - (brand.1 + 4.0) >= roomy;
+        let show_brand = show_title && steady - title_cost - (brand_h + 4.0) >= roomy;
         let list_h = (rest
             - if show_title { title_cost } else { 0.0 }
-            - if show_brand { brand.1 + 4.0 } else { 0.0 })
+            - if show_brand { brand_h + 4.0 } else { 0.0 })
         .max(row_h);
         let list = self.list(list_h);
+        // A village left out with the brand walks for nobody.
+        self.view.village_walks.set(show_brand && brand_walks);
         let mut children = Vec::new();
         if show_brand {
-            children.push(brand.0);
-        } else {
-            self.app.village_walks.set(false);
+            children.push(brand);
         }
         if show_title {
             children.extend(title);
@@ -1835,8 +1975,9 @@ impl<'a, 'b> Page<'a, 'b> {
         )
     }
 
-    /// The brand lockup (§3.1), with its height.
-    fn brand(&self) -> (UiNode, f32) {
+    /// The brand lockup (§3.1), with its height and whether the village beside
+    /// it walks (it shows, and motion is not reduced).
+    fn brand(&self) -> (UiNode, f32, bool) {
         let mut spec = BrandSpec {
             kitty: !self.cx.motion.serious
                 && !crate::native_appearance::current_preferences().high_contrast,
@@ -1852,9 +1993,7 @@ impl<'a, 'b> Page<'a, 'b> {
         let width = spec.width().min(self.m.inner);
         let village = self.village(spec.kitty, self.m.inner - width - 12.0);
         let motion = &self.cx.motion;
-        self.app
-            .village_walks
-            .set(village.is_some() && !motion.system_reduced && !motion.performance_reduced);
+        let walks = village.is_some() && !motion.system_reduced && !motion.performance_reduced;
         let mut children = vec![
             UiNode::new(
                 "system-state/brand/art",
@@ -1889,6 +2028,7 @@ impl<'a, 'b> Page<'a, 'b> {
             .layout(Layout::row().gap(12.0).height(Length::Fixed(height)))
             .children(children),
             height,
+            walks,
         )
     }
 
@@ -1903,12 +2043,12 @@ impl<'a, 'b> Page<'a, 'b> {
             return None;
         }
         let motion = &self.cx.motion;
+        // The page's own ticks are the walk's only clock: kitties stand still
+        // between runs, whatever else repaints the page.
         let phase_ms = if motion.system_reduced || motion.performance_reduced {
             0
         } else {
-            self.cx
-                .animation_phase_ms
-                .wrapping_add(self.app.anim_ticks.wrapping_mul(VILLAGE_TICK_MS))
+            self.app.anim_ticks.wrapping_mul(VILLAGE_TICK_MS)
         };
         Some(
             UiNode::new(
@@ -2381,6 +2521,7 @@ impl<'a, 'b> Page<'a, 'b> {
                 self.m.line_h,
                 Some(3),
             );
+            self.span(format!("system-state/note/{index}"), top, height);
             items.push((node, height));
             top += height + gap;
         }
@@ -2398,8 +2539,25 @@ impl<'a, 'b> Page<'a, 'b> {
             list_h
         };
         let limit = (content - room).max(0.0);
-        let offset = self.view.scroll.get().clamp(0.0, limit);
+        let mut offset = self.view.scroll.get().clamp(0.0, limit);
+        // A room that shrank (as when the brand or the title comes back, or
+        // the window gets shorter) keeps in view the focused control it showed:
+        // whole, or more of it than a sliver the list leaves unpainted.
+        let (was, before) = (self.view.room.get(), self.view.scroll.get());
+        if room + crate::native_ui::CLIP_EDGE_EPSILON < was
+            && let Some(focus) = self.view.common.last_focus.as_ref()
+            && self.view.spans.borrow().iter().any(|span| {
+                let shown = span.bottom.min(before + was) - span.top.max(before);
+                *span.key == *focus.as_str()
+                    && shown + crate::native_ui::CLIP_EDGE_EPSILON
+                        >= crate::native_ui::LIST_PEEK_MIN.min(span.bottom - span.top)
+            })
+            && let Some(span) = self.spans.iter().find(|span| *span.key == *focus.as_str())
+        {
+            offset = whole_at(offset, room, span.top, span.bottom).clamp(0.0, limit);
+        }
         self.view.scroll.set(offset);
+        self.view.height.set(list_h);
         self.view.room.set(room);
         self.view.limit.set(limit);
         let mut y = 0.0;
@@ -3378,7 +3536,7 @@ impl<'a, 'b> Page<'a, 'b> {
             )
         };
         let blank = "Leave the password blank to join an open vault at once, or to wait for \
-                     approval from another Mac.";
+                     an admin Mac to approve this one.";
         // The hint wraps under the field rather than lose its words on a narrow page.
         let (help, help_h) = crate::native_settings::wrapped_copy_node(
             "system-state/vault/password-help",
@@ -3529,8 +3687,8 @@ fn rule(key: String) -> UiNode {
 
 /// The page's scenarios for looking at it without a Mac to set up
 /// (`ATERM_DEV_SYSTEM_STATE_FIXTURE`): `checking`, `running`, `debugger`,
-/// `needs-you`, `vault`, `set-up`, `non-alab`, `failed`, `check-failed`, `mixed` and
-/// `fresh`. Debug and dev-seam builds only: a release build carries none of
+/// `needs-you`, `vault`, `set-up`, `non-alab`, `failed`, `check-failed`, `mixed`,
+/// `vault-source-mismatch` and `fresh`. Debug and dev-seam builds only: a release build carries none of
 /// their words.
 #[cfg(any(debug_assertions, feature = "dev-seams"))]
 pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
@@ -3571,11 +3729,27 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
     };
     let all = Plan::default();
     let mut status = SetupStatus {
+        observed_vault_url: Some(all.vault_url.clone()),
         plan: Some(all.clone()),
         ..SetupStatus::default()
     };
     match name {
         "checking" => {}
+        "vault-source-mismatch" => {
+            status.plan.as_mut()?.vault_url = "http://reviewed-vault.local:7484/v1/team".into();
+            let mut secrets = setting(Setting::Secrets, NeedsYou, Some("Awaiting code"));
+            secrets.note = Some("Approve the old vault: OLD-VAULT-42".into());
+            let mut repos = setting(Setting::Repositories, Failed, None);
+            repos.detail = Some("Old vault credentials were refused.".into());
+            status.observed = with(
+                in_place(),
+                vec![
+                    secrets,
+                    repos,
+                    setting(Setting::CapsLock, Differs, Some("Caps Lock")),
+                ],
+            );
+        }
         "check-failed" => {
             status.observed = in_place();
             status.check = Some(SetupCheck {

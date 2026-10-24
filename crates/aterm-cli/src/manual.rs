@@ -119,10 +119,15 @@ Setup choices:
 
 Approved setup resumes unfinished steps on later launches, silently. A row that waits
 for you is not retried until you act, press Check again, or launch aterm again; a vault
-approval waits the same way, and the run goes on once an admin Mac approves. Rows are
-read without changing anything when the tab is shown, after each step and on Check
-again; GitHub repositories is read only while it is set up, or on Check again.
-Completed setup preserves later local changes.
+approval waits the same way, and the run goes on once an admin Mac approves. A join
+turns sync on; with sync turned off since, the join lands once you turn it on again
+(`aterm secrets agent on`), and the run does not wait for it. Rows are read without
+changing anything when the tab is shown, after each step and on Check again; GitHub
+repositories is read only while it is set up, or on Check again. Completed setup
+preserves later local changes: a group turned to Set up later sets only its own
+preferences, and one turned to Leave as is changes nothing. Rust in Spotlight keeps
+aterm's own build caches out; your projects' build folders Spotlight indexes are
+yours, counted in the row's note and never moved.
 
 Only changed preference keys are backed up (no credentials). Restore preferences puts
 them back and stops automatic setup, leaving cloned repos, credentials and sign-outs
@@ -450,7 +455,10 @@ THE DOCTOR
   installs or signs in each CLI that needs it when a person is at the terminal, and
   exits 1 while one is signed out or not installed (`--read-only` only looks;
   `--on <host>,…` or `--fleet` checks other machines over ssh). `aterm ai login
-  claude` runs `aterm harness accounts renew`.
+  claude` runs `aterm harness accounts renew`; `aterm ai login codex|grok|kimi` runs
+  `aterm harness accounts renew <label> --cli <cli>` where this machine keeps that
+  CLI's roster (`accounts-<cli>.toml`). Where it does not, codex runs its own login,
+  and grok and kimi (no rows of `aterm ai` yet) say how to add a row and run nothing.
 
   States: `ok` (used within 6h), `idle` (signed in), `limited` (at a usage limit),
   `due` (renew by a time it names), `unproven`, `signed-out`, `not-installed`, `off`.
@@ -677,7 +685,10 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
   probe_api [true]                probe the API while waiting on a network API error
   resume_limits [true]            continue once a usage or rate limit resets
   limit_wait [true]               choose "Wait here" on Claude Code's usage-limit dialog
-  accounts ["early"]              account rotation: `"early"`, `"wall"` or `"off"`
+  accounts ["early"]              account rotation: `"early"`, `"wall"` or `"off"`, for
+                                  every CLI whose roster this machine keeps (Claude
+                                  Code's `accounts.toml`, and `accounts-codex.toml`,
+                                  `accounts-grok.toml`, `accounts-kimi.toml`)
   limit_reset [false]             take an eligible limit reset on the usage-limit dialog
   limit_reset_kinds [[]]          which reset kinds `limit_reset` may spend
   usage_tap [true]                pass aterm's status-line tap on Claude Code relaunches;
@@ -686,7 +697,7 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
   usage_notes [false]             record single-account usage when no accounts are listed
   usage_credits [false]           allow carrying a session onto paid usage credits
   logins ["renew"]                renew expired logins listed with an email
-                                  (`"renew"` or `"off"`)
+                                  (`"renew"` or `"off"`), in every CLI's roster
   hosts [[]]                      remote hosts `accounts renew --due` also renews
   model_fallback ["opus"]         fallback model on a Claude Code model-bucket limit
   compact_on_context_wall [true]  run `/compact` (or shrink images) on a full context
@@ -728,7 +739,10 @@ THE VERBS (`aterm harness --help`; `aterm harness <verb> --help` for one)
              `idle_build_dirs`, `idle_build_days`)
   ledger     the approval ledger of a session, or the `disk`, `upgrade` or `accounts` one
   accounts   the Claude Code account pool (`accounts.toml`), sign-ins and renewals, and
-             fleet account sync from a source this machine names (no default source)
+             fleet account sync from a source this machine names (no default source);
+             `--cli codex|grok|kimi` does the same for that CLI's pool
+             (`accounts-<cli>.toml`, its fleet `~/.secrets/ai-accounts-<cli>.toml` or its
+             column of `ai-accounts.csv`, read only where this machine keeps the roster)
   upgrade    move live sessions onto a newer build or model, at an idle point
   tap        the status-line usage tap aterm adds to Claude Code relaunches
 
@@ -1294,9 +1308,10 @@ AUTHORING, COMMUNITY PACK & IMPORT (`aterm theme help` has the details)
   `new` writes a commented theme into the folder, `check` reads one as the folder will
   and measures its contrast, `export` prints any loadable theme as a file. `pack` lists
   the community themes built into aterm and `install` writes them into the folder.
-  `import` converts a kitty, Ghostty, Alacritty (`.toml`), iTerm2 (`.itermcolors`),
-  Windows Terminal (`.json`) or base16/base24 (`.yaml`) theme into `<id>.conf`: a local
-  file within the same byte bound, following no URL or include."#;
+  `import` converts a kitty, Ghostty, Alacritty or WezTerm (`.toml`), iTerm2
+  (`.itermcolors`), Terminal.app (`.terminal`), Windows Terminal (`.json`) or base16/base24
+  (`.yaml`) theme into `<id>.conf`: a local file within the same byte bound, following no
+  URL or include."#;
 
 /// `aterm help theme`: [`THEME_PAGE_HEAD`], the theme-file byte bound, the
 /// key list generated from [`aterm_types::scheme::THEME_KEYS`] (each key's
@@ -3802,10 +3817,10 @@ fn agent_page(sid: Option<&str>) -> String {
     s.push_str(
         "\nENV HYGIENE (why your agent context vars may be missing)\n  \
          aterm STRIPS AI-agent context variables from the shell it spawns: every CLAUDE*,\n  \
-         ANTHROPIC_*, COPILOT_*, CODEX_*, ANTIGRAVITY_*, GEMINI_*, CURSOR_*, AI_* and\n  \
-         _DEVTOOL_* variable is removed before exec, so an outer agent's never reaches your\n  \
-         session. An inner tool that misses its variables lost them on purpose: re-export what\n  \
-         it needs, or run it outside aterm.\n",
+         ANTHROPIC_*, COPILOT_*, CODEX_*, ANTIGRAVITY_*, GEMINI_*, CURSOR_*, GROK_*, XAI_*,\n  \
+         KIMI_*, MOONSHOT_*, AI_* and _DEVTOOL_* variable is removed before exec, so an outer\n  \
+         agent's never reaches your session. An inner tool that misses its variables lost them\n  \
+         on purpose: re-export what it needs, or run it outside aterm.\n",
     );
     s.push_str(
         "\nTHE TOOLS AT HAND (run `aterm help <name>` for how to use each)\n\

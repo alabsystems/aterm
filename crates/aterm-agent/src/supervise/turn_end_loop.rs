@@ -537,9 +537,13 @@ impl<C: Ctl> Session<'_, C> {
         }
         let tapped = match program {
             Program::Claude => true,
-            Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => {
-                false
-            }
+            Program::Codex
+            | Program::Grok
+            | Program::Kimi
+            | Program::Agy
+            | Program::Muse
+            | Program::Gemini
+            | Program::Generic => false,
         };
         let windows = UsageWindow::of_wall(kind, message);
         let Some(host) = host.filter(|_| tapped && !windows.is_empty()) else {
@@ -807,6 +811,8 @@ impl<C: Ctl> Session<'_, C> {
             && match reading.program {
                 Program::Claude => true,
                 Program::Codex
+                | Program::Grok
+                | Program::Kimi
                 | Program::Agy
                 | Program::Muse
                 | Program::Gemini
@@ -946,6 +952,8 @@ impl<C: Ctl> Session<'_, C> {
                     && match r.program {
                         Program::Claude => true,
                         Program::Codex
+                        | Program::Grok
+                        | Program::Kimi
                         | Program::Agy
                         | Program::Muse
                         | Program::Gemini
@@ -1125,6 +1133,8 @@ impl<C: Ctl> Session<'_, C> {
             && match reading.program {
                 Program::Claude => true,
                 Program::Codex
+                | Program::Grok
+                | Program::Kimi
                 | Program::Agy
                 | Program::Muse
                 | Program::Gemini
@@ -1165,6 +1175,8 @@ impl<C: Ctl> Session<'_, C> {
                         .then(|| self.turn_end.left_answer(&screen.rows))
                         .flatten(),
                     Program::Codex
+                    | Program::Grok
+                    | Program::Kimi
                     | Program::Agy
                     | Program::Muse
                     | Program::Gemini
@@ -1568,6 +1580,8 @@ impl<C: Ctl> Session<'_, C> {
             Program::Claude if typed == Some(true) => self.menu_colours(screen),
             Program::Claude
             | Program::Codex
+            | Program::Grok
+            | Program::Kimi
             | Program::Agy
             | Program::Muse
             | Program::Gemini
@@ -1708,7 +1722,13 @@ impl<C: Ctl> Session<'_, C> {
         let at = self.turn_end.untaken_act_typed()?;
         match self.reader(rows).program() {
             Program::Claude => {}
-            Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => {
+            Program::Codex
+            | Program::Grok
+            | Program::Kimi
+            | Program::Agy
+            | Program::Muse
+            | Program::Gemini
+            | Program::Generic => {
                 return None;
             }
         }
@@ -1769,9 +1789,13 @@ impl<C: Ctl> Session<'_, C> {
             .map(|t| t.saturating_add(slack));
         let claude = match reading.program {
             Program::Claude => true,
-            Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => {
-                false
-            }
+            Program::Codex
+            | Program::Grok
+            | Program::Kimi
+            | Program::Agy
+            | Program::Muse
+            | Program::Gemini
+            | Program::Generic => false,
         };
         let by_done = if claude && done_row_work(rows).is_some_and(|w| w <= TRY_ANSWER_SLACK) {
             limit::done_row_ended(rows, now, self.local_offset_s())
@@ -3699,7 +3723,13 @@ impl<C: Ctl> Session<'_, C> {
         }
         match self.reader(&screen.rows).program() {
             Program::Claude => {}
-            Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => {
+            Program::Codex
+            | Program::Grok
+            | Program::Kimi
+            | Program::Agy
+            | Program::Muse
+            | Program::Gemini
+            | Program::Generic => {
                 return Ok(Some(ProbeGate::NotClaude));
             }
         }

@@ -637,6 +637,98 @@ fn a_deleted_shim_is_restored_and_read_back() {
 }
 
 #[test]
+fn a_build_whose_every_recorded_command_another_file_holds_is_left_alone() {
+    let scratch = Scratch::new("held");
+    let build = install(&scratch.layout, "ay", 17);
+    let ay = crate::store::ToolName::new("ay").unwrap();
+    crate::activate::install_tools(
+        &scratch.layout,
+        &build,
+        std::slice::from_ref(&ay),
+        crate::activate::Aliases::Alab,
+    )
+    .unwrap();
+    crate::store::write_exposes(&build, std::slice::from_ref(&ay)).unwrap();
+    let mine = b"#!/bin/sh\necho mine\n";
+    std::fs::remove_file(scratch.layout.shim(&ay)).unwrap();
+    std::fs::write(scratch.layout.shim(&ay), mine).unwrap();
+    let ground = scratch.ground(Pass::Repair, None);
+    assert!(
+        is_ok(&probe(&ground, super::STORE)),
+        "an installed program, not none"
+    );
+
+    let relaid = super::relay(&scratch.layout);
+    assert_eq!(relaid.relaid, 0, "{:?}", relaid.notes);
+    assert!(relaid.failed.is_empty(), "{:?}", relaid.failed);
+    assert!(
+        relaid
+            .notes
+            .iter()
+            .any(|n| n.contains("ay@17: every command it exposes is held by another file")),
+        "{:?}",
+        relaid.notes
+    );
+    assert_eq!(std::fs::read(scratch.layout.shim(&ay)).unwrap(), mine);
+    let alias = scratch.layout.shim(&ay.alias().unwrap());
+    let target = crate::platform::resolve_shim(&alias).expect("the alias survives");
+    assert!(target.starts_with(&build), "{}", target.display());
+}
+
+#[test]
+fn a_re_lay_keeps_the_alias_of_a_recorded_command_a_file_of_the_users_holds() {
+    let scratch = Scratch::new("held-partial");
+    let build = install(&scratch.layout, "ay", 17);
+    let tools = ["ay", "ay-pb"].map(|name| crate::store::ToolName::new(name).unwrap());
+    let [ay, ay_pb] = &tools;
+    let ay_pb_exe = build.join("bin").join("ay-pb");
+    std::fs::write(&ay_pb_exe, b"#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&ay_pb_exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::activate::install_tools(
+        &scratch.layout,
+        &build,
+        &tools,
+        crate::activate::Aliases::Alab,
+    )
+    .unwrap();
+    crate::store::write_exposes(&build, &tools).unwrap();
+    let mine = b"#!/bin/sh\necho mine\n";
+    std::fs::remove_file(scratch.layout.shim(ay_pb)).unwrap();
+    std::fs::write(scratch.layout.shim(ay_pb), mine).unwrap();
+    std::fs::remove_file(scratch.layout.shim(ay)).unwrap();
+
+    let relaid = super::relay(&scratch.layout);
+    assert_eq!(relaid.relaid, 1, "{:?}", relaid.notes);
+    assert!(relaid.failed.is_empty(), "{:?}", relaid.failed);
+    let ay_target = crate::platform::resolve_shim(&scratch.layout.shim(ay)).expect("ay re-laid");
+    assert!(ay_target.starts_with(&build), "{}", ay_target.display());
+    assert_eq!(std::fs::read(scratch.layout.shim(ay_pb)).unwrap(), mine);
+    let alias = scratch.layout.shim(&ay_pb.alias().unwrap());
+    let target = crate::platform::resolve_shim(&alias)
+        .expect("the alias, now the one way to run the build's ay-pb, survives the re-lay");
+    assert!(target.starts_with(&build), "{}", target.display());
+}
+
+#[test]
+fn a_build_that_records_no_commands_is_neither_laid_nor_said_held() {
+    let scratch = Scratch::new("records-none");
+    let build = install(&scratch.layout, "ay", 17);
+    crate::store::write_exposes(&build, &[]).unwrap();
+
+    let relaid = super::relay(&scratch.layout);
+    assert_eq!(relaid.relaid, 0, "{:?}", relaid.notes);
+    assert!(relaid.failed.is_empty(), "{:?}", relaid.failed);
+    assert!(
+        !relaid
+            .notes
+            .iter()
+            .any(|n| n.contains("held by another file")),
+        "{:?}",
+        relaid.notes
+    );
+}
+
+#[test]
 fn a_shim_laid_under_a_now_refused_name_is_removed_and_read_back() {
     let scratch = Scratch::new("refused-shims");
     install(&scratch.layout, "ay", 17);

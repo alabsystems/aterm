@@ -251,38 +251,55 @@ fn rasterize_edges(
             }
             if multi_path {
                 xs.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+                spans.clear();
+                let mut i = 0usize;
+                while let (Some(a), Some(b)) = (xs.get(i), xs.get(i + 1)) {
+                    if a.0 == b.0 {
+                        spans.push((a.1, b.1));
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                if spans.len() > 1 {
+                    spans.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+                }
+                let mut cur: Option<(f32, f32)> = None;
+                for &(a, b) in spans.iter() {
+                    if b <= a {
+                        continue;
+                    }
+                    cur = match cur {
+                        None => Some((a, b)),
+                        Some((ca, cb)) if a <= cb => Some((ca, cb.max(b))),
+                        Some((ca, cb)) => {
+                            add_span(diff, extra, x0, ca, cb, &mut lo_t, &mut hi_t);
+                            Some((a, b))
+                        }
+                    };
+                }
+                if let Some((ca, cb)) = cur {
+                    add_span(diff, extra, x0, ca, cb, &mut lo_t, &mut hi_t);
+                }
             } else {
                 xs.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
-            }
-            spans.clear();
-            let mut i = 0usize;
-            while let (Some(a), Some(b)) = (xs.get(i), xs.get(i + 1)) {
-                if a.0 == b.0 {
-                    spans.push((a.1, b.1));
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            if multi_path && spans.len() > 1 {
-                spans.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-            }
-            let mut cur: Option<(f32, f32)> = None;
-            for &(a, b) in spans.iter() {
-                if b <= a {
-                    continue;
-                }
-                cur = match cur {
-                    None => Some((a, b)),
-                    Some((ca, cb)) if a <= cb => Some((ca, cb.max(b))),
-                    Some((ca, cb)) => {
-                        add_span(diff, extra, x0, ca, cb, &mut lo_t, &mut hi_t);
-                        Some((a, b))
+                let mut cur: Option<(f32, f32)> = None;
+                for &[(_, a), (_, b)] in xs.as_chunks::<2>().0 {
+                    if b <= a {
+                        continue;
                     }
-                };
-            }
-            if let Some((ca, cb)) = cur {
-                add_span(diff, extra, x0, ca, cb, &mut lo_t, &mut hi_t);
+                    cur = match cur {
+                        None => Some((a, b)),
+                        Some((ca, cb)) if a <= cb => Some((ca, cb.max(b))),
+                        Some((ca, cb)) => {
+                            add_span(diff, extra, x0, ca, cb, &mut lo_t, &mut hi_t);
+                            Some((a, b))
+                        }
+                    };
+                }
+                if let Some((ca, cb)) = cur {
+                    add_span(diff, extra, x0, ca, cb, &mut lo_t, &mut hi_t);
+                }
             }
         }
         if lo_t >= hi_t {
@@ -362,8 +379,8 @@ fn add_span(
     let bits = |px: usize| -> i32 {
         let base = (x0 + px) as f32;
         let mut n = 0i32;
-        for s in 0..4u8 {
-            let pos = base + (f32::from(s) + 0.5) * 0.25;
+        for off in [0.125f32, 0.375, 0.625, 0.875] {
+            let pos = base + off;
             if pos >= a && pos < b {
                 n += 1;
             }

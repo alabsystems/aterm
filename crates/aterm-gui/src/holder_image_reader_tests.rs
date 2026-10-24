@@ -176,6 +176,7 @@ struct Knobs {
     no_c_cut: bool,
     /// A process watch (scripted): the kernel edges, as on macOS.
     kernel: bool,
+    no_retire: bool,
 }
 
 const SHIPPING: Knobs = Knobs {
@@ -183,6 +184,7 @@ const SHIPPING: Knobs = Knobs {
     publish_after_hold: false,
     no_c_cut: false,
     kernel: false,
+    no_retire: false,
 };
 
 const KERNEL: Knobs = Knobs {
@@ -243,6 +245,7 @@ impl Rig {
             hold_hook::Knobs {
                 publish_after_hold: knobs.publish_after_hold,
                 no_c_cut: knobs.no_c_cut,
+                no_retire: knobs.no_retire,
             },
         );
         let mut rig = Self {
@@ -329,6 +332,20 @@ impl Rig {
         });
         assert!(seen.is_some(), "timed out waiting for {published:?}");
         assert_eq!(script.pending(), 0, "the gather drained what was posted");
+    }
+
+    /// The watch hears `pid` exit, and the gather drains it: the next write's batch follows the
+    /// exit the gather forwarded, so the parse stage has handled it once that write shows.
+    fn die(&self, pid: i32) {
+        let script = self.script();
+        script.post(&[ProcEvent::Exit { pid }]);
+        let drained = aterm_spec::wait::within(PATIENCE, Duration::from_millis(1), || {
+            (script.pending() == 0).then_some(())
+        });
+        assert!(
+            drained.is_some(),
+            "timed out waiting for {pid}'s exit to drain"
+        );
     }
 
     fn script(&self) -> ProcScript {
@@ -903,6 +920,78 @@ fn a_watch_turns_the_byte_arms_c_cuts_and_rereads_off() {
             knobs.kernel
         );
     }
+}
+
+/// Card engine §3.7, marks retired by liveness: drawer 0 stops (Ctrl-Z) and lives; drawers 1-7
+/// launch, stop, and die, each exit heard by the process watch; then drawer 8 launches. The
+/// fence's tokens after drawer 8's lay, and drawer 0's.
+fn dead_stopped_drawers_then_a_launch(id: u64, shell: i32, knobs: Knobs) -> (Vec<u64>, u64) {
+    use aterm_core::terminal::MAX_HOLDER_MARKS;
+    set_image(shell, zsh(shell));
+    let rig = Rig::attach(id, shell, knobs);
+    rig.write(shell, &prompt(), "<p>");
+    let mut first = None;
+    for i in 0..=MAX_HOLDER_MARKS {
+        let job = shell + 1 + i32::try_from(i).expect("a small index");
+        let drawer = store_claude(job, 100 + i as u64);
+        let token = drawer.token.expect("a tracked image");
+        first.get_or_insert(token);
+        set_image(job, drawer);
+        rig.write(
+            job,
+            format!("drawer {i}\r\n").as_bytes(),
+            &format!("<d{i}>"),
+        );
+        assert_eq!(
+            rig.session
+                .term
+                .lock()
+                .unwrap()
+                .holder_fence()
+                .current_token(),
+            Some(token),
+            "PRECONDITION: drawer {i} holds the fence"
+        );
+        if i == MAX_HOLDER_MARKS {
+            break;
+        }
+        rig.write(shell, &prompt(), &format!("<stopped {i}>"));
+        if i > 0 {
+            rig.die(job);
+        }
+    }
+    let marks = rig
+        .session
+        .term
+        .lock()
+        .unwrap()
+        .holder_fence()
+        .tokens()
+        .collect();
+    (marks, first.expect("drawer 0"))
+}
+
+#[test]
+fn a_stopped_drawers_death_retires_its_mark_so_a_live_one_survives() {
+    let (marks, live) = dead_stopped_drawers_then_a_launch(9340, 8400, KERNEL);
+    assert!(
+        marks.contains(&live),
+        "the live stopped drawer keeps its mark: {marks:?}"
+    );
+    assert_eq!(marks.len(), 2, "only it and the current drawer: {marks:?}");
+}
+
+#[test]
+fn control_without_the_exit_arm_dead_stopped_marks_evict_a_live_one() {
+    let knobs = Knobs {
+        no_retire: true,
+        ..KERNEL
+    };
+    let (marks, live) = dead_stopped_drawers_then_a_launch(9341, 8500, knobs);
+    assert!(
+        !marks.contains(&live),
+        "CONTROL: with no retirement, eviction by count takes the live stopped mark: {marks:?}"
+    );
 }
 
 #[test]

@@ -35,11 +35,16 @@ const WAIT_FOREVER_SECS: f64 = 1.0e10;
 pub(super) struct LoopState {
     control_flow: Cell<ControlFlow>,
     exit: Cell<Option<i32>>,
+    drained: wake_queue::Drained,
 }
 
 impl LoopState {
-    pub(super) fn new() -> Self {
-        Self { control_flow: Cell::new(ControlFlow::default()), exit: Cell::new(None) }
+    pub(super) fn new(drained: wake_queue::Drained) -> Self {
+        Self { control_flow: Cell::new(ControlFlow::default()), exit: Cell::new(None), drained }
+    }
+
+    pub(super) fn user_events_drained(&self) -> bool {
+        self.drained.emptied()
     }
 
     pub(super) fn set_control_flow(&self, control_flow: ControlFlow) {
@@ -121,12 +126,13 @@ impl<T: 'static> EventLoop<T> {
         let mtm =
             MainThread::new().expect("on macOS, `EventLoop` must be created on the main thread!");
         let (sender, receiver) = wake_queue::channel();
+        let drained = receiver.drained();
         Ok(Self {
             sender,
             receiver,
             wake: WakeSource::new(),
             window_target: RootWindowTarget {
-                p: ActiveEventLoop::new_headless(mtm),
+                p: ActiveEventLoop::new_headless(mtm, drained),
                 _marker: PhantomData,
             },
             loop_running: false,

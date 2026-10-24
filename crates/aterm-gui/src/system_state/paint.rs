@@ -101,8 +101,7 @@ impl BrandSpec {
         let caret_x = advance * 2.0 + words + advance * 0.2;
         let kitty = if self.kitty {
             let h = self.kitty_height();
-            let w = h * ImageArt::BrandKitty { dark: true }.aspect();
-            caret_x - w * 0.14 + w
+            caret_x + h * ImageArt::BrandKitty { dark: true }.aspect()
         } else {
             caret_x + advance * 0.55
         };
@@ -184,8 +183,10 @@ pub(crate) fn paint_brand(
         let h = spec.kitty_height();
         let art = ImageArt::BrandKitty { dark };
         let w = h * art.aspect();
+        // It starts where the caret does, never under the words: the caret
+        // covers its haunch, and the last letter stays whole.
         prims.push(DrawPrim::Image {
-            x: caret_x - w * 0.14,
+            x: caret_x,
             y: baseline + px * 0.12 - h,
             w,
             h,

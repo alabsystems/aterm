@@ -261,7 +261,8 @@ struct Debris {
     partial: Vec<(String, u64, PathBuf)>,
     /// `(program, dir name, dir)` — `<build>.incoming-<pid>` / `<build>.superseded-<pid>`.
     scratch: Vec<(String, String, PathBuf)>,
-    /// Stage sidecar files (`<build>.vendor`, `.shim-env`, `.modes`) whose `<build>` is gone.
+    /// Stage sidecar files (`<build>.vendor`, `.shim-env`, `.modes`, `.exposes`) whose
+    /// `<build>` is gone.
     orphan_sidecars: Vec<PathBuf>,
 }
 
@@ -296,18 +297,22 @@ fn recover_interrupted_swaps(layout: &Layout) -> BTreeMap<String, BTreeSet<u64>>
         let mut candidates: BTreeSet<u64> = BTreeSet::new();
         for entry in entries.flatten() {
             let name = entry.file_name();
-            if let Some(name) = name.to_str()
-                && let Some((build, crate::store::Scratch::Superseded)) =
-                    crate::store::stage_scratch_of(name)
+            let Some(name) = name.to_str() else { continue };
+            if let Some((build, crate::store::Scratch::Superseded)) =
+                crate::store::stage_scratch_of(name)
             {
                 candidates.insert(build);
+            } else if let Some(build) = name
+                .strip_suffix(aterm_toolchain::build_cache::NOINDEX)
+                .and_then(crate::store::parse_build_name)
+            {
+                // An aside whose link a crash kept from being laid gets it back.
+                crate::store::relink_aside(&prog.path().join(build.to_string()));
             }
         }
         for build in candidates {
             let dir = prog.path().join(build.to_string());
-            if !crate::store::recover_interrupted_swap(&dir)
-                && std::fs::symlink_metadata(&dir).is_err()
-            {
+            if !crate::store::recover_interrupted_swap(&dir) && crate::store::tree_absent(&dir) {
                 parked.entry(program.clone()).or_default().insert(build);
             }
         }
@@ -350,7 +355,11 @@ fn interrupted_debris(
                 out.orphan_sidecars.push(entry.path());
                 continue;
             }
-            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            // A build laid aside is its `<build>` link; its `<build>.noindex` tree is no
+            // build of its own and goes with the link.
+            if !entry.file_type().is_ok_and(|t| t.is_dir())
+                && !aterm_toolchain::layout::is_linked_aside(&entry.path())
+            {
                 continue;
             }
             let name = entry.file_name();
@@ -407,6 +416,9 @@ pub struct GcReport {
     pub leased: Vec<(String, u64, crate::lease::Holders)>,
     /// `(program, staged file name)` for archives kept for a held Trust toolchain update.
     pub held_staging: Vec<(String, String)>,
+    /// `(program, builds ascending)` moved out of Spotlight's index into `<build>.noindex`
+    /// ([`lay_aside_unused`]).
+    pub laid_aside: Vec<(String, Vec<u64>)>,
 }
 
 /// Reclaim superseded builds per program, keeping the live build and one rollback.
@@ -557,6 +569,7 @@ fn run_in(
             swept_scratch.entry(program).or_default().push(name);
         }
     }
+    let laid_aside = lay_aside_unused(layout, &in_scope, &claimed, &mut in_use);
 
     let mut swept_staging: Vec<(String, Vec<String>)> = Vec::new();
     let mut held_staging: Vec<(String, String)> = Vec::new();
@@ -631,7 +644,57 @@ fn run_in(
         exec_root_errors: exec_roots.errors,
         leased,
         held_staging,
+        laid_aside,
     }
+}
+
+/// Move each Rust toolchain build Spotlight still indexes
+/// ([`crate::store::spotlight_exposed_builds`]) into `<build>.noindex` behind a `<build>` link
+/// ([`crate::store::lay_aside`]), on macOS, where renaming it can disturb nothing: never the
+/// build `current` or a shim names (the one in use stays put until an update moves off it,
+/// and a pass after that moves it aside), a build a run holds a lease on or any live process
+/// runs from, or one held while macOS may still be assessing a first exec in it.
+fn lay_aside_unused(
+    layout: &Layout,
+    in_scope: &dyn Fn(&str) -> bool,
+    claimed: &BTreeMap<String, BTreeSet<u64>>,
+    in_use: &mut InUse<'_>,
+) -> Vec<(String, Vec<u64>)> {
+    let mut laid: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+    if !cfg!(target_os = "macos") {
+        return Vec::new();
+    }
+    for exposed in crate::store::spotlight_exposed_builds(&layout.prefix) {
+        let crate::store::ExposedBuild {
+            program,
+            build,
+            dir,
+            active,
+        } = exposed;
+        if active
+            || !in_scope(&program)
+            || claimed.get(&program).is_some_and(|b| b.contains(&build))
+            || !crate::store::build_is_complete(&dir)
+            || crate::store::held_unproven(&dir)
+        {
+            continue;
+        }
+        let Some(subject) = crate::lease::Subject::build(&program, build) else {
+            continue;
+        };
+        let crate::lease::Reclaim::Clear(_gate) = crate::lease::reclaim(&layout.prefix, &subject)
+        else {
+            continue;
+        };
+        // A process table that cannot be read rules nothing out, for any program.
+        if !in_use.readable() || in_use.holds(&program, &dir, Some(build)) {
+            continue;
+        }
+        if crate::store::lay_aside(&dir).is_ok() {
+            laid.entry(program).or_default().push(build);
+        }
+    }
+    laid.into_iter().collect()
 }
 
 /// Whether `tree` is gone from disk, all a reclaim or sweep line may claim.
@@ -666,6 +729,12 @@ struct InUse<'a> {
 }
 
 impl InUse<'_> {
+    /// Whether the process table could be read (read once, shared with [`Self::holds`]).
+    fn readable(&mut self) -> bool {
+        let enumerate = self.enumerate;
+        self.running.get_or_insert_with(enumerate).is_some()
+    }
+
     /// `true` when `build_dir` of `program` must be kept because a process may run from it.
     fn holds(&mut self, program: &str, build_dir: &Path, build: Option<u64>) -> bool {
         let enumerate = self.enumerate;
@@ -681,7 +750,9 @@ impl InUse<'_> {
             .iter()
             .filter_map(|d| std::fs::canonicalize(d).ok())
             .collect();
-        if resolved.is_empty() && std::fs::symlink_metadata(build_dir).is_ok() {
+        // Something there that does not resolve is held; a build's own link to an aside that
+        // is gone holds no tree anything could run from.
+        if resolved.is_empty() && !crate::store::tree_absent(build_dir) {
             return true;
         }
         running.iter().any(|exe| {
@@ -1962,6 +2033,284 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
+    /// A build that ships a Rust sysroot, as the store laid one before builds went aside: a
+    /// real directory at `store/<program>/<build>`.
+    #[cfg(target_os = "macos")]
+    fn seed_toolchain(l: &Layout, program: &str, build: u64, shim: bool) -> PathBuf {
+        let lib = l
+            .build_dir(program, build)
+            .join("lib/rustlib/aarch64-apple-darwin/lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(lib.join("libstd-1.rlib"), b"an rlib").unwrap();
+        seed(l, program, build, shim)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn is_link(path: &Path) -> bool {
+        std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn is_real_dir(path: &Path) -> bool {
+        std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn exposed(l: &Layout) -> Vec<(String, u64, bool)> {
+        crate::store::spotlight_exposed_builds(&l.prefix)
+            .into_iter()
+            .map(|b| (b.program, b.build, b.active))
+            .collect()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gc_lays_an_unused_toolchain_build_aside_and_never_the_active_one() {
+        let l = layout("aside-move");
+        let old = seed_toolchain(&l, "trust", 8590, false);
+        let live = seed_toolchain(&l, "trust", 9192, true);
+        let plain = seed(&l, "ay", 17, false);
+        seed(&l, "ay", 18, true);
+        assert_eq!(
+            exposed(&l),
+            [
+                ("trust".to_owned(), 8590, false),
+                ("trust".to_owned(), 9192, true)
+            ]
+        );
+
+        let report = run_with(&l, &|_| None, &|| Some(Vec::new()));
+        assert_eq!(
+            report.laid_aside,
+            vec![("trust".to_string(), vec![8590u64])]
+        );
+        assert!(report.reclaimed.is_empty(), "{:?}", report.reclaimed);
+        assert!(is_link(&old) && is_real_dir(&old.with_file_name("8590.noindex")));
+        assert!(crate::store::build_is_complete(&old));
+        assert!(is_real_dir(&live), "the build in use stays where it is");
+        assert!(
+            is_real_dir(&plain),
+            "a build with no sysroot is not Spotlight's problem"
+        );
+        assert_eq!(exposed(&l), [("trust".to_owned(), 9192, true)]);
+        assert!(
+            run_with(&l, &|_| None, &|| Some(Vec::new()))
+                .laid_aside
+                .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_toolchain_build_in_use_leased_or_unaccounted_for_stays_where_it_is() {
+        let l = layout("aside-keep");
+        let old = seed_toolchain(&l, "trust", 8590, false);
+        seed_toolchain(&l, "trust", 9192, true);
+        let mc = seed_toolchain(&l, "trust-mc", 6, false);
+        seed_toolchain(&l, "trust-mc", 7, true);
+
+        let exe = old.join("bin/trust");
+        let report = run_with(&l, &|_| None, &|| Some(vec![exe.clone()]));
+        assert_eq!(
+            report.laid_aside,
+            vec![("trust-mc".to_string(), vec![6u64])]
+        );
+        assert!(is_real_dir(&old), "a live process runs from it");
+        assert!(is_link(&mc));
+
+        let report = run_with(&l, &|_| None, &|| None);
+        assert!(report.laid_aside.is_empty(), "no process table, no move");
+        assert!(is_real_dir(&old));
+
+        let subject = crate::lease::Subject::build("trust", 8590).unwrap();
+        let lease = crate::lease::take(
+            &l.prefix,
+            &subject,
+            "a run in /w",
+            crate::lease::DEFAULT_WAIT,
+        )
+        .unwrap();
+        let report = run_with(&l, &|_| None, &|| Some(Vec::new()));
+        assert!(
+            report.laid_aside.is_empty() && is_real_dir(&old),
+            "a run holds it"
+        );
+        assert!(report.leased.is_empty(), "a move reclaims nothing to keep");
+        drop(lease);
+
+        let report = run_with(&l, &|_| None, &|| Some(Vec::new()));
+        assert_eq!(
+            report.laid_aside,
+            vec![("trust".to_string(), vec![8590u64])]
+        );
+        assert!(is_link(&old));
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// The build `current` names stays put though nothing else does (a relative link, which
+    /// gc's claims do not read), and so does a build a shim still runs after `current` moved on.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_build_current_or_a_shim_names_stays_where_it_is() {
+        let l = layout("aside-current");
+        let old = seed_toolchain(&l, "trust", 8590, false);
+        let live = seed_toolchain(&l, "trust", 9192, false);
+        std::os::unix::fs::symlink("9192", l.program_current("trust")).unwrap();
+        let report = run_with(&l, &|_| None, &|| Some(Vec::new()));
+        assert_eq!(
+            report.laid_aside,
+            vec![("trust".to_string(), vec![8590u64])]
+        );
+        assert!(is_link(&old) && is_real_dir(&live), "{report:?}");
+        let _ = std::fs::remove_dir_all(&l.prefix);
+
+        let l = layout("aside-shim");
+        let pinned = seed_toolchain(&l, "trust", 8590, false);
+        seed_toolchain(&l, "trust", 9192, true);
+        std::os::unix::fs::symlink(pinned.join("bin/trust"), l.bin_dir().join("trust-8590"))
+            .unwrap();
+        let report = run_with(&l, &|_| None, &|| Some(Vec::new()));
+        assert!(
+            report.laid_aside.is_empty() && is_real_dir(&pinned),
+            "{report:?}"
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// A shim written through a build's folder (`<build>.noindex`, the path a link resolves
+    /// to) claims the build, so gc never reclaims what it runs.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_shim_through_a_builds_folder_claims_the_build() {
+        let l = layout("aside-claim");
+        let oldest = seed_toolchain(&l, "trust", 8580, false);
+        seed_toolchain(&l, "trust", 8590, false);
+        seed_toolchain(&l, "trust", 9192, true);
+        crate::store::lay_aside(&oldest).unwrap();
+        let folder = oldest.with_file_name("8580.noindex");
+        std::os::unix::fs::symlink(folder.join("bin/trust"), l.bin_dir().join("trust-8580"))
+            .unwrap();
+        let report = run_with(&l, &|_| None, &|| Some(Vec::new()));
+        assert!(
+            report.reclaimed.is_empty() && is_link(&oldest) && is_real_dir(&folder),
+            "{report:?}"
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn every_resolver_reads_a_build_through_its_link() {
+        let l = layout("aside-resolve");
+        let oldest = seed_toolchain(&l, "trust", 8580, false);
+        let old = seed_toolchain(&l, "trust", 8590, false);
+        seed_toolchain(&l, "trust", 9192, true);
+        for dir in [&oldest, &old] {
+            crate::store::lay_aside(dir).unwrap();
+        }
+        let aside = old.with_file_name("8590.noindex");
+
+        assert!(crate::ops::list_installed(&l).contains(&("trust".to_string(), 8590)));
+        let real = std::fs::canonicalize(old.join("bin")).unwrap();
+        assert_eq!(real, std::fs::canonicalize(aside.join("bin")).unwrap());
+        assert_eq!(
+            crate::lease::Subject::of_dir(&l.prefix, &real),
+            crate::lease::Subject::build("trust", 8590),
+            "the sysroot a compiler reports names the build"
+        );
+        let exe = std::fs::canonicalize(oldest.join("bin/trust")).unwrap();
+        assert!(
+            exe.starts_with(std::fs::canonicalize(oldest.with_file_name("8580.noindex")).unwrap())
+        );
+        let report = run_with(&l, &|_| None, &|| Some(vec![exe.clone()]));
+        assert!(
+            report.reclaimed.is_empty() && is_link(&oldest),
+            "a process runs from its folder, as the kernel names it: {report:?}"
+        );
+
+        install_shims(
+            &l,
+            &old,
+            &["trust".to_string()],
+            crate::activate::Aliases::Off,
+        )
+        .unwrap();
+        activate_build(&l, &old).unwrap();
+        assert_eq!(crate::ops::active_builds(&l).get("trust"), Some(&8590));
+        assert_eq!(
+            crate::ops::which(&l, "trust"),
+            Some(old.join("bin/trust")),
+            "the shim names the build, not its folder"
+        );
+        assert!(old.join("bin/trust").is_file());
+        assert_eq!(
+            std::fs::read_link(l.program_current("trust")).unwrap(),
+            old,
+            "current names the build"
+        );
+        assert_eq!(
+            exposed(&l),
+            [("trust".to_owned(), 9192, false)],
+            "rolled back onto the moved build, the other is now the one to move"
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gc_reclaims_a_build_laid_aside_link_and_folder_both() {
+        let l = layout("aside-reclaim");
+        let oldest = seed_toolchain(&l, "trust", 8580, false);
+        seed_toolchain(&l, "trust", 8590, false);
+        seed_toolchain(&l, "trust", 9192, true);
+        crate::store::lay_aside(&oldest).unwrap();
+        let aside = oldest.with_file_name("8580.noindex");
+        assert!(is_link(&oldest) && is_real_dir(&aside));
+
+        let report = run_with(&l, &|_| None, &|| Some(Vec::new()));
+        assert_eq!(report.reclaimed, vec![("trust".to_string(), vec![8580u64])]);
+        assert!(
+            std::fs::symlink_metadata(&oldest).is_err(),
+            "the link is gone"
+        );
+        assert!(std::fs::symlink_metadata(&aside).is_err(), "and its folder");
+        assert!(!oldest.with_file_name("8580.ready").exists());
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// What a crash leaves of a build laid aside: an aside with no link gets it back, a link to
+    /// nothing is swept, and a half-staged tree behind a link goes whole.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gc_puts_a_crashed_aside_in_order() {
+        let l = layout("aside-crash");
+        let relinked = seed_toolchain(&l, "trust", 8590, false);
+        let dangling = seed_toolchain(&l, "trust", 8595, false);
+        let partial = seed_toolchain(&l, "trust", 8597, false);
+        seed_toolchain(&l, "trust", 9192, true);
+        for dir in [&relinked, &dangling, &partial] {
+            crate::store::lay_aside(dir).unwrap();
+        }
+        std::fs::remove_file(&relinked).unwrap();
+        std::fs::remove_dir_all(dangling.with_file_name("8595.noindex")).unwrap();
+        crate::store::clear_build_ready(&partial).unwrap();
+
+        let report = run_with(&l, &|_| None, &|| Some(Vec::new()));
+        assert!(is_link(&relinked) && crate::store::build_is_complete(&relinked));
+        assert!(
+            std::fs::symlink_metadata(&dangling).is_err(),
+            "a link to nothing goes"
+        );
+        assert!(std::fs::symlink_metadata(&partial).is_err());
+        assert!(std::fs::symlink_metadata(partial.with_file_name("8597.noindex")).is_err());
+        assert_eq!(
+            report.swept_partial,
+            vec![("trust".to_string(), vec![8595u64, 8597])]
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
     #[test]
     fn a_leased_build_is_kept_until_its_run_ends() {
         let l = layout("leased");
@@ -2159,7 +2508,7 @@ mod tests {
     }
 
     #[test]
-    fn orphan_sidecars_are_swept_and_a_discard_takes_the_vendor_record() {
+    fn orphan_sidecars_are_swept_and_a_discard_takes_the_vendor_and_exposes_records() {
         let l = layout("orphan-sidecars");
         seed(&l, "claude", 30, true);
         let beside_live =
@@ -2193,9 +2542,17 @@ mod tests {
         );
 
         let dir = seed(&l, "claude", 29, false);
-        std::fs::write(orphan(29, crate::store::VENDOR_SIDECAR_SUFFIX), b"record").unwrap();
+        let records = [
+            crate::store::VENDOR_SIDECAR_SUFFIX,
+            crate::store::EXPOSES_SUFFIX,
+        ];
+        for suffix in records {
+            std::fs::write(orphan(29, suffix), b"record").unwrap();
+        }
         crate::store::discard_build(&dir);
-        assert!(!orphan(29, crate::store::VENDOR_SIDECAR_SUFFIX).exists());
+        for suffix in records {
+            assert!(!orphan(29, suffix).exists(), "{suffix} goes with its build");
+        }
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 

@@ -133,6 +133,16 @@ pub trait SecretsOps: Send + Sync {
     /// The job could not be installed or started.
     fn install_subscriber(&self) -> aterm_secrets::Result<String>;
 
+    /// Repair a missing subscriber only while this login has not turned sync
+    /// off. Live implementations order this check and install with agent off;
+    /// `None` means the newer choice was preserved, not an installation.
+    fn repair_subscriber(&self) -> aterm_secrets::Result<Option<String>> {
+        if self.turned_off() {
+            return Ok(None);
+        }
+        self.install_subscriber().map(Some)
+    }
+
     /// Whether the person turned the subscriber off (`aterm_secrets::service::subscriber_turned_off`): their recorded choice, which System State's setup installs nothing over.
     fn turned_off(&self) -> bool;
 
@@ -346,6 +356,18 @@ impl SecretsOps for LiveSecrets {
         aterm_secrets::service::install(
             &self.home,
             aterm_secrets::service::Job::Subscriber,
+            &program,
+            &["secrets".to_owned(), "watch".to_owned()],
+        )
+    }
+
+    fn repair_subscriber(&self) -> aterm_secrets::Result<Option<String>> {
+        if self.turned_off() {
+            return Ok(None);
+        }
+        let program = aterm_secrets::service::program_for_service()?;
+        aterm_secrets::service::repair_subscriber(
+            &self.home,
             &program,
             &["secrets".to_owned(), "watch".to_owned()],
         )
@@ -832,13 +854,19 @@ impl Vault {
         }
     }
 
-    fn install(&self) -> Result<(), String> {
-        let installed = self
-            .ops
-            .install_subscriber()
-            .map_err(|why| format!("the subscriber could not be installed: {why}"))?;
-        self.ops.say(&installed);
-        Ok(())
+    fn install(&self) -> Result<bool, String> {
+        let installed = if self.planned().join {
+            self.ops.install_subscriber().map(Some)
+        } else {
+            self.ops.repair_subscriber()
+        }
+        .map_err(|why| format!("the subscriber could not be installed: {why}"))?;
+        if let Some(line) = installed {
+            self.ops.say(&line);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     /// Put the subscriber in place when the probe planned it.
@@ -864,8 +892,8 @@ impl Vault {
                 }
                 None => Err(why),
             },
-            Ok(()) if self.origin == Origin::Selected => self.ops.started().map(|()| true),
-            installed => installed.map(|()| true),
+            Ok(true) if self.origin == Origin::Selected => self.ops.started().map(|()| true),
+            installed => installed,
         }
     }
 
@@ -944,7 +972,16 @@ impl Vault {
     }
 
     fn settle(&self) -> Result<(), String> {
+        let planned = self.planned();
+        if !planned.join && self.ops.turned_off() {
+            return Ok(());
+        }
         self.subscribe()?;
+        // Off may have waited for the local install's decision lock. It wins
+        // afterward too: no readiness retry or file sync starts on its behalf.
+        if !planned.join && self.ops.turned_off() {
+            return Ok(());
+        }
         let Ok(status) = self.ops.status() else {
             return Ok(());
         };
@@ -953,8 +990,11 @@ impl Vault {
                 self.wait_for_admin(status.machine.as_ref().map(|(_, code)| code.as_str()));
             }
             Membership::In { .. } | Membership::Plain
-                if self.planned().files && !self.ops.synced().unwrap_or(false) =>
+                if planned.files && !self.ops.synced().unwrap_or(false) =>
             {
+                if !planned.join && self.ops.turned_off() {
+                    return Ok(());
+                }
                 self.ops
                     .sync()
                     .map_err(|why| format!("writing the vault's files: {why}"))?;
@@ -1036,6 +1076,9 @@ const fn idle(state: &State) -> Option<&'static str> {
     }
 }
 
+/// What a member Mac whose subscriber the person turned off says of its sync.
+const SYNC_OFF: &str = "sync is off on this Mac by your choice; aterm secrets agent on turns it on";
+
 fn judge(status: &Status, source: &str, unsynced: Option<&str>, synced: bool, off: bool) -> Probe {
     let name = status
         .config
@@ -1058,7 +1101,7 @@ fn judge(status: &Status, source: &str, unsynced: Option<&str>, synced: bool, of
     };
     let watched = unsynced.is_none();
     let kept = if off {
-        "sync turned off on this Mac by choice"
+        SYNC_OFF
     } else {
         "kept in sync by the subscriber"
     };
@@ -1067,10 +1110,10 @@ fn judge(status: &Status, source: &str, unsynced: Option<&str>, synced: bool, of
         to: WRITTEN.into(),
     };
     match &status.membership {
-        Membership::In { seq, .. } if watched && !synced => {
+        Membership::In { seq, .. } if watched && !synced && !off => {
             unwritten(format!("in vault {name} (seq {seq})"))
         }
-        Membership::Plain if watched && !synced => {
+        Membership::Plain if watched && !synced && !off => {
             unwritten(format!("reading the plain text file {}", shown(source)))
         }
         Membership::In { seq, .. } if watched => Probe::Ok {
@@ -1084,6 +1127,11 @@ fn judge(status: &Status, source: &str, unsynced: Option<&str>, synced: bool, of
             ),
         },
         Membership::Plain => unwatched(format!("reading the plain text file {}", shown(source))),
+        // Approved, the join lands only through the subscriber the person turned off:
+        // said as theirs, with the command that turns it on, and nothing to wait on.
+        Membership::Pending if off => Probe::Ok {
+            now: format!("waiting for an admin to approve vault {name}; {SYNC_OFF}, and an approval lands once it is on"),
+        },
         Membership::Pending if watched => Probe::Person {
             step: "secrets.approve".into(),
             how: approval(code, source),
@@ -1146,11 +1194,13 @@ impl Item for Vault {
                             ),
                         };
                     }
+                    // A join is the person asking for this Mac in the vault: it turns
+                    // sync on, over a record that they turned it off (the install
+                    // clears it), or an approved join would never land.
                     let subscribe = self
                         .ops
                         .subscriber()
-                        .map_or(true, |state| idle(&state).is_some())
-                        && !self.ops.turned_off();
+                        .map_or(true, |state| idle(&state).is_some());
                     self.plan(Planned {
                         join: true,
                         over: status.config.clone(),
@@ -1191,9 +1241,10 @@ impl Item for Vault {
             },
             _ => true,
         };
-        // A subscriber the person turned off is their choice, which System State's setup
-        // keeps: no change to make, the files as last synced.
-        let off = self.origin == Origin::Selected && unsynced.is_some() && self.ops.turned_off();
+        // A subscriber the person turned off is their choice, which setup keeps, System
+        // State's and `aterm init`'s alike: no change to make, the files as last synced.
+        // Only a new join (a vault chosen at `aterm init`'s prompt) turns it back on.
+        let off = self.origin != Origin::Chosen && unsynced.is_some() && self.ops.turned_off();
         let unsynced = unsynced.filter(|_| !off);
         let probe = judge(&status, &self.source, unsynced, synced, off);
         if matches!(probe, Probe::Change { .. }) {
@@ -1606,6 +1657,9 @@ mod tests {
                 .expect("a scripted install");
             if installed.is_ok() {
                 *self.subscriber.lock().unwrap() = None;
+                // As `aterm_secrets::service::install`: the subscriber installed is on
+                // again, and the person's record that it was off goes.
+                *self.turned_off.lock().unwrap() = false;
             }
             installed
         }
@@ -1704,6 +1758,15 @@ mod tests {
         let items = items(sys, &context, port, mode).expect("items");
         assert_eq!(items.len(), 1);
         engine::run(&items, mode, sys, &context, &mut NoJournal)
+    }
+
+    fn assert_report_matches_current(sys: &Fake, ops: &Arc<Scripted>, row: &ItemReport) {
+        let current = run(sys, ops, Mode::Plan);
+        assert_eq!(current[0].outcome, Outcome::Ok);
+        assert_eq!(
+            row.to, current[0].to,
+            "the applied report names its read-back"
+        );
     }
 
     fn asked(sys: &Fake) -> usize {
@@ -1886,7 +1949,11 @@ mod tests {
                     "in vault alab (seq 7), but a file it wrote failed, is missing or was changed"
                 )
             );
-            assert_eq!(rows[0].to.as_deref(), Some(WRITTEN));
+            if mode == Mode::Plan {
+                assert_eq!(rows[0].to.as_deref(), Some(WRITTEN));
+            } else {
+                assert_report_matches_current(&sys, &ops, &rows[0]);
+            }
             assert_eq!(*ops.syncs.lock().unwrap(), u32::from(mode == Mode::Apply));
             assert!(ops.joins().is_empty(), "nothing is joined again");
         }
@@ -1910,7 +1977,11 @@ mod tests {
                 rows[0].from.as_deref(),
                 Some("in vault alab (seq 7), subscriber not installed")
             );
-            assert_eq!(rows[0].to.as_deref(), Some(SUBSCRIBED));
+            if mode == Mode::Plan {
+                assert_eq!(rows[0].to.as_deref(), Some(SUBSCRIBED));
+            } else {
+                assert_report_matches_current(&sys, &ops, &rows[0]);
+            }
             assert_eq!(asked(&sys), 0);
             assert_eq!(ops.probes(), 0);
             assert!(ops.joins().is_empty(), "nothing is joined again");
@@ -1924,7 +1995,8 @@ mod tests {
                 unit: "/Users//alice/Library/LaunchAgents/systems.alab.aterm-secrets.plist".into(),
             };
             ops.subscribed(Ok(loaded));
-            let rows = run(&fake(), &ops, mode);
+            let sys = fake();
+            let rows = run(&sys, &ops, mode);
             let want = if mode == Mode::Plan {
                 Outcome::Planned
             } else {
@@ -1935,7 +2007,11 @@ mod tests {
                 rows[0].from.as_deref(),
                 Some("in vault alab (seq 7), subscriber installed but not running")
             );
-            assert_eq!(rows[0].to.as_deref(), Some(SUBSCRIBED));
+            if mode == Mode::Plan {
+                assert_eq!(rows[0].to.as_deref(), Some(SUBSCRIBED));
+            } else {
+                assert_report_matches_current(&sys, &ops, &rows[0]);
+            }
             assert!(ops.joins().is_empty());
             assert_eq!(ops.installs(), u32::from(mode == Mode::Apply));
         }
@@ -1995,7 +2071,7 @@ mod tests {
             let rows = run(&sys, &ops, Mode::Apply);
             assert_eq!(rows[0].outcome, Outcome::Changed, "{rows:?}");
             assert_eq!(rows[0].from.as_deref(), Some("no vault"));
-            assert_eq!(rows[0].to.as_deref(), Some(aterm_secrets::ALAB_DEFAULT_URL));
+            assert_report_matches_current(&sys, &ops, &rows[0]);
             assert_eq!(
                 ops.joins(),
                 [(aterm_secrets::ALAB_DEFAULT_URL.to_owned(), true)]
@@ -2030,7 +2106,7 @@ mod tests {
         *ops.requests.lock().unwrap() = true;
         let rows = run(&sys, &ops, Mode::Apply);
         assert_eq!(rows[0].outcome, Outcome::Changed, "{rows:?}");
-        assert_eq!(rows[0].to.as_deref(), Some(aterm_secrets::ALAB_DEFAULT_URL));
+        assert_report_matches_current(&sys, &ops, &rows[0]);
         assert_eq!(
             ops.joins(),
             [(aterm_secrets::ALAB_DEFAULT_URL.to_owned(), true)]
@@ -2908,9 +2984,10 @@ mod tests {
     }
 
     /// SYNC OFF IS THE PERSON'S RECORDED CHOICE, WHICH SETUP KEEPS: a member whose
-    /// subscriber they turned off (`aterm secrets agent off`) is no change to make, and
-    /// a join over that record installs no subscriber. NEGATIVE CONTROL: with no record,
-    /// the same Mac is a change that installs it.
+    /// subscriber they turned off (`aterm secrets agent off`) is no change to make. A new
+    /// join is theirs too, and asks for sync: it installs the subscriber, which clears the
+    /// record, or an approved join would never land. NEGATIVE CONTROL: with no record, the
+    /// same member is a change that installs it.
     #[test]
     fn a_subscriber_turned_off_is_left_off_by_setup() {
         let source = aterm_secrets::ALAB_DEFAULT_URL;
@@ -2921,9 +2998,7 @@ mod tests {
             if off {
                 assert_eq!(row.outcome, Outcome::Ok, "{row:?}");
                 assert!(
-                    row.to
-                        .as_deref()
-                        .is_some_and(|to| to.ends_with("sync turned off on this Mac by choice")),
+                    row.to.as_deref().is_some_and(|to| to.ends_with(SYNC_OFF)),
                     "{row:?}"
                 );
                 assert!(ops.changes().is_empty(), "{:?}", ops.changes());
@@ -2937,7 +3012,137 @@ mod tests {
         *ops.turned_off.lock().unwrap() = true;
         let _ = setup_pass(&ops, source, &mut None, false);
         assert_eq!(ops.joins().len(), 1, "the join is made");
-        assert_eq!(ops.installs(), 0, "no subscriber over the person's record");
+        assert_eq!(ops.installs(), 1, "a new join turns sync on");
+        assert!(!ops.turned_off(), "and the record that it was off goes");
+    }
+
+    #[test]
+    fn a_newer_sync_off_survives_an_already_probed_subscriber_repair() {
+        struct OffBeforeChange {
+            ops: Arc<Scripted>,
+            off: bool,
+            called: bool,
+        }
+
+        impl crate::engine::Journal for OffBeforeChange {
+            fn before_change(
+                &mut self,
+                _id: &str,
+                _from: &str,
+                _to: &str,
+                _revert: Option<&str>,
+            ) -> Result<(), String> {
+                self.called = true;
+                *self.ops.turned_off.lock().unwrap() = self.off;
+                Ok(())
+            }
+        }
+
+        for off in [false, true] {
+            let ops = Scripted::new(vec![Ok(configured(Membership::In { seq: 7, heard: 0 }))]);
+            let context = ctx(&[user("alice", 501)]);
+            let port: Arc<dyn SecretsOps> = ops.clone();
+            let mut journal = OffBeforeChange {
+                ops: Arc::clone(&ops),
+                off,
+                called: false,
+            };
+            let rows = crate::init::run_initial_secrets_with(
+                &fake(),
+                &context,
+                port,
+                aterm_secrets::ALAB_DEFAULT_URL,
+                Replaces::Any,
+                &mut None,
+                SETUP_WAIT,
+                &mut journal,
+            )
+            .unwrap();
+            assert!(
+                journal.called,
+                "the real converge change boundary was reached"
+            );
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                ops.installs(),
+                u32::from(!off),
+                "an automatic repair must preserve a newer Sync off choice"
+            );
+            assert_eq!(ops.turned_off(), off);
+            if off {
+                assert!(
+                    rows[0]
+                        .to
+                        .as_deref()
+                        .is_some_and(|to| to.ends_with(SYNC_OFF))
+                );
+            }
+            assert!(ops.joins().is_empty(), "a member needs no new join");
+        }
+    }
+
+    #[test]
+    fn a_newer_sync_off_cancels_an_already_planned_file_sync() {
+        struct OffBeforeChange(Arc<Scripted>);
+        impl crate::engine::Journal for OffBeforeChange {
+            fn before_change(
+                &mut self,
+                _id: &str,
+                _from: &str,
+                _to: &str,
+                _revert: Option<&str>,
+            ) -> Result<(), String> {
+                *self.0.turned_off.lock().unwrap() = true;
+                self.0.subscribed(Ok(State::Absent));
+                Ok(())
+            }
+        }
+        for running in [false, true] {
+            let ops = Scripted::new(vec![Ok(configured(Membership::In { seq: 7, heard: 0 }))]);
+            *ops.unwritten.lock().unwrap() = true;
+            if running {
+                ops.subscribed(Ok(installed_state()));
+            }
+            let context = ctx(&[user("alice", 501)]);
+            let port: Arc<dyn SecretsOps> = ops.clone();
+            let rows = crate::init::run_initial_secrets_with(
+                &fake(),
+                &context,
+                port,
+                aterm_secrets::ALAB_DEFAULT_URL,
+                Replaces::Any,
+                &mut None,
+                SETUP_WAIT,
+                &mut OffBeforeChange(Arc::clone(&ops)),
+            )
+            .unwrap();
+            assert_eq!(*ops.syncs.lock().unwrap(), 0, "a newer Off stops file work");
+            assert_eq!(ops.installs(), 0);
+            assert!(ops.turned_off());
+            assert!(
+                *ops.unwritten.lock().unwrap(),
+                "last-synced files stay as they are"
+            );
+            assert_eq!(rows[0].outcome, Outcome::Changed);
+            assert!(
+                rows[0]
+                    .to
+                    .as_deref()
+                    .is_some_and(|to| to.ends_with(SYNC_OFF))
+            );
+        }
+    }
+
+    #[test]
+    fn sync_off_keeps_the_last_synced_files_without_installing() {
+        let ops = Scripted::new(vec![Ok(configured(Membership::In { seq: 7, heard: 0 }))]);
+        *ops.unwritten.lock().unwrap() = true;
+        *ops.turned_off.lock().unwrap() = true;
+        let row = setup_pass(&ops, aterm_secrets::ALAB_DEFAULT_URL, &mut None, false);
+        assert_eq!(row.outcome, Outcome::Ok);
+        assert!(ops.changes().is_empty());
+        assert!(*ops.unwritten.lock().unwrap());
+        assert!(ops.turned_off());
     }
 
     /// AN INSTALL THAT LEAVES NO PROCESS IS A FAILED STEP NAMING ITS LOG: setup waits
@@ -3289,5 +3494,68 @@ mod tests {
         );
         assert!(ops.joins().is_empty());
         assert_eq!(ops.installs(), 0);
+    }
+
+    /// A JOIN STILL WAITING FOR AN ADMIN ON A MAC WHOSE SYNC THE PERSON TURNED OFF is
+    /// their choice, said truly: an approval lands only once sync is on, so the row is no
+    /// person's step to approve and nothing to wait on, and setup installs nothing over
+    /// the record. NEGATIVE CONTROL: with no record, the same Mac installs the subscriber,
+    /// which finishes the join once approved.
+    #[test]
+    fn a_pending_join_with_sync_off_says_so_and_installs_nothing() {
+        let source = aterm_secrets::ALAB_DEFAULT_URL;
+        for off in [false, true] {
+            let ops = Scripted::new(vec![Ok(configured(Membership::Pending))]);
+            ops.subscribed(Ok(State::Absent));
+            *ops.turned_off.lock().unwrap() = off;
+            let row = setup_pass(&ops, source, &mut None, false);
+            if off {
+                assert_eq!(row.outcome, Outcome::Ok, "{row:?}");
+                assert!(
+                    row.to.as_deref().is_some_and(|to| to.contains(SYNC_OFF)
+                        && to.ends_with("an approval lands once it is on")),
+                    "{row:?}"
+                );
+                assert!(ops.changes().is_empty(), "{:?}", ops.changes());
+            } else {
+                assert!(
+                    ops.changes().iter().any(|change| change == "install"),
+                    "{:?} {row:?}",
+                    ops.changes()
+                );
+            }
+        }
+    }
+
+    /// `aterm init` keeps the person's Sync off too: a member Mac (`Origin::Configured`)
+    /// whose subscriber they turned off reads as their choice, with the command that turns
+    /// it on, and nothing is installed over the record. NEGATIVE CONTROL: with no record,
+    /// `aterm init` installs it.
+    #[test]
+    fn aterm_init_keeps_the_persons_sync_off() {
+        for off in [true, false] {
+            let ops = Scripted::new(vec![
+                Ok(configured(Membership::In { seq: 7, heard: 0 })),
+                Ok(configured(Membership::In { seq: 7, heard: 0 })),
+                Ok(configured(Membership::In { seq: 7, heard: 0 })),
+                Ok(configured(Membership::In { seq: 7, heard: 0 })),
+            ]);
+            ops.subscribed(Ok(State::Absent));
+            *ops.turned_off.lock().unwrap() = off;
+            let rows = run(&fake(), &ops, Mode::Apply);
+            let installed = ops.changes().iter().any(|change| change == "install");
+            assert_eq!(installed, !off, "{:?} {:?}", ops.changes(), rows[0]);
+            if off {
+                assert_eq!(rows[0].outcome, Outcome::Ok, "{:?}", rows[0]);
+                assert!(
+                    rows[0]
+                        .to
+                        .as_deref()
+                        .is_some_and(|to| to.ends_with(SYNC_OFF)),
+                    "{:?}",
+                    rows[0]
+                );
+            }
+        }
     }
 }

@@ -296,6 +296,7 @@ pub(crate) struct CardLeaf {
     row_base: i64,
     bare_row: Option<i64>,
     drawerless: bool,
+    mutations: u64,
 }
 
 /// Undoable status line cell edit, ink, and leading star under a decorated card.
@@ -574,7 +575,7 @@ pub(crate) struct WindowCards {
     notice_hits: Vec<NoticeHit>,
     away: Option<Instant>,
     composed: u64,
-    outcomes: Vec<(u64, CardOutcome)>,
+    outcomes: Vec<(u64, CardOutcome, u64)>,
 }
 
 impl WindowCards {
@@ -2055,6 +2056,7 @@ pub(crate) struct FenceFrame {
     pub(crate) holder: aterm_core::terminal::HolderView,
     pub(crate) base_y: i64,
     pub(crate) alt: bool,
+    pub(crate) mutations: u64,
 }
 
 impl FenceFrame {
@@ -2064,6 +2066,7 @@ impl FenceFrame {
             holder: scratch.holder,
             base_y: scratch.base_y,
             alt: scratch.engine_alt,
+            mutations: scratch.screen_mutations,
         }
     }
 }
@@ -2258,6 +2261,7 @@ pub(crate) fn card_leaf(
         row_base: check.fence.base_y,
         bare_row: if wrapped { check.refused_row() } else { None },
         drawerless: false,
+        mutations: check.fence.mutations,
     }
 }
 
@@ -2277,6 +2281,7 @@ pub(crate) fn drawerless_leaf(leaf_index: usize, session: u64, pane: PaneGeom) -
         row_base: 0,
         bare_row: None,
         drawerless: true,
+        mutations: 0,
     }
 }
 
@@ -2418,6 +2423,7 @@ impl App {
                     outcomes.push((
                         leaf.session,
                         CardOutcome::Bare(leaf.token, why, leaf.bare_row),
+                        leaf.mutations,
                     ));
                 }
                 continue;
@@ -2442,6 +2448,7 @@ impl App {
                             outcomes.push((
                                 leaf.session,
                                 CardOutcome::Bare(*token, Bare::Deferred, Some(row)),
+                                leaf.mutations,
                             ));
                         }
                         continue;
@@ -2523,6 +2530,7 @@ impl App {
                     outcomes.push((
                         leaf.session,
                         CardOutcome::Bare(*token, Bare::NoCard, Some(row)),
+                        leaf.mutations,
                     ));
                 }
                 continue;
@@ -2703,13 +2711,14 @@ impl App {
                         row,
                         armed,
                     },
+                    leaf.mutations,
                 ));
             }
         }
         cards.leaves = leaves;
         if probe {
             cards.composed += 1;
-            for (session, outcome) in outcomes.drain(..) {
+            for (session, outcome, mutations) in outcomes.drain(..) {
                 if let Some(s) = pool.get(session) {
                     #[cfg(test)]
                     crate::work_counts::card_probe_locked();
@@ -2717,7 +2726,7 @@ impl App {
                         .timeline
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner)
-                        .note_card_frame(outcome, cards.composed);
+                        .note_card_frame(outcome, cards.composed, mutations);
                 }
             }
         }

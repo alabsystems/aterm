@@ -547,7 +547,7 @@ fn classify(layout: &Layout, name: &str, path: &Path) -> Option<RootsEntry> {
     }
     let n = name.parse::<u64>().ok().filter(|n| n.to_string() == name)?;
     let build = layout.build_dir(crate::seam::SEAM_PROGRAM, n);
-    Some(match (real_dir(path), real_dir(&build)) {
+    Some(match (real_dir(path), build_stands(&build)) {
         (Err(_), _) => RootsEntry::Needed,
         (Ok(false), _) => RootsEntry::Stray(Stray::NotADirectory),
         (Ok(true), Ok(false)) => RootsEntry::Stray(Stray::BuildGone(n)),
@@ -575,6 +575,16 @@ fn real_dir(path: &Path) -> io::Result<bool> {
             e.kind(),
             format!("cannot lstat {} ({e})", path.display()),
         )),
+    }
+}
+
+/// [`real_dir`] for the store build `build`, which also stands as its `<n>` link to a real
+/// `<n>.noindex` once laid aside ([`aterm_toolchain::layout`]).
+#[cfg(unix)]
+fn build_stands(build: &Path) -> io::Result<bool> {
+    match aterm_toolchain::layout::aside_of(build) {
+        Some(aside) if aterm_toolchain::layout::is_linked_aside(build) => real_dir(&aside),
+        _ => real_dir(build),
     }
 }
 
@@ -753,7 +763,7 @@ pub fn reconcile(layout: &Layout, depth: Depth) -> Report {
     let mut files = Vec::new();
     for (n, shims) in &groups {
         let build = layout.build_dir(crate::seam::SEAM_PROGRAM, *n);
-        if std::fs::symlink_metadata(&build).is_ok_and(|m| m.is_dir()) {
+        if build_stands(&build).unwrap_or(false) {
             match ensure_root(layout, &build, depth) {
                 Ok(Ensured::Built) => report.built.push(*n),
                 Ok(Ensured::Plain | Ensured::Present) => {}
@@ -863,7 +873,7 @@ pub fn inspect(layout: &Layout, build: u64) -> Option<Result<Inspection, String>
     {
         use std::os::unix::fs::MetadataExt;
         let build_dir = layout.build_dir(crate::seam::SEAM_PROGRAM, build);
-        match real_dir(&build_dir) {
+        match build_stands(&build_dir) {
             Ok(true) => {}
             Ok(false) => return None,
             Err(e) => return Some(Err(e.to_string())),
@@ -1980,6 +1990,18 @@ mod tests {
         assert!(std::fs::symlink_metadata(root_dir(&fx.layout, 8589)).is_err());
         for n in [8590, 8595] {
             assert!(root_dir(&fx.layout, n).is_dir(), "{n}'s root stands");
+        }
+        if cfg!(target_os = "macos") {
+            let rollback = fx.layout.build_dir("trust", 8590);
+            assert!(
+                aterm_toolchain::layout::is_linked_aside(&rollback),
+                "the unused rollback went aside, and its root stood: {report:?}"
+            );
+            assert_eq!(inspect(&fx.layout, 8590).map(|i| i.is_ok()), Some(true));
+            assert!(
+                reconcile(&fx.layout, Depth::Shallow).errors.is_empty(),
+                "a build laid aside is a build its root is kept for"
+            );
         }
         let mut swept = report.swept_exec_roots.clone();
         swept.sort();

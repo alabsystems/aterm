@@ -1137,6 +1137,27 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         false,
     ),
     manual(
+        "harness.agy.rotate",
+        "agy: rotate a launch off a low or spent model pool",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &["harness", "agy", "quota", "rotate", "model", "pool"],
+        true,
+    ),
+    manual(
+        "harness.agy.low",
+        "agy: the quota fraction a pool counts as low at",
+        ConfigSchemaKind::Scalar(EditKind::Float),
+        &["harness", "agy", "quota", "low", "threshold"],
+        true,
+    ),
+    manual(
+        "harness.agy.order",
+        "agy: the models rotation tries, in order",
+        ConfigSchemaKind::StringList,
+        &["harness", "agy", "quota", "rotate", "model", "order"],
+        true,
+    ),
+    manual(
         "harness.muse",
         "Muse Code supervision",
         ConfigSchemaKind::Table,
@@ -5515,10 +5536,10 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · at Claude Code's \"We recommend compacting earlier\" offer, chooses Autocompact at this size (300k to 900k), never the keep row or Esc · it changes Claude Code's own autocompact setting for that model (/autocompact switches back) · off: the offer is yours"
         }
         "harness.accounts" => {
-            " · at a usage limit, a Claude Code session is relaunched under the next listed account; \"early\" also moves it ahead of the limit and types /usage to sample it; \"off\" moves no session"
+            " · at a usage limit, a Claude Code session is relaunched under the next listed account; \"early\" also moves it ahead of the limit and types /usage to sample it; \"off\" moves no session · the one key for every CLI whose roster this machine keeps beside aterm.toml (accounts-codex.toml, accounts-grok.toml, accounts-kimi.toml): those pools are listed, pinned, synced and renewed (aterm harness accounts --cli <id>), and no session of theirs is moved in this build"
         }
         "harness.logins" => {
-            " · a Claude Code session on a login listed with an email is relaunched on that login once you renew it (aterm harness accounts renew) · a lost login is signed in where it stands either way: aterm types /login once and the browser sign-in is yours · off: no session follows a renewal"
+            " · a Claude Code session on a login listed with an email is relaunched on that login once you renew it (aterm harness accounts renew) · a lost login is signed in where it stands either way: aterm types /login once and the browser sign-in is yours · off: no session follows a renewal · in every CLI's roster: a window renews a due login of another CLI's roster in the background where a headless browser is installed and the row names an email (not Grok Build's on macOS, whose sign-in opens a browser of its own), and off stops that too (aterm harness accounts renew --cli <id> by hand still runs)"
         }
         "harness.hosts" => {
             " · read by aterm harness accounts renew --due alone · each is host or host:/abs/path/to/aterm"

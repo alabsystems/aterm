@@ -1341,28 +1341,16 @@ fn deliver_to(wiring: &Wiring, outs: Vec<Out>) {
 /// events` pushes it as `EVENT <sid> wake #<n> ready` (`subscribe::timeline_wire_kind`).
 pub(crate) const WAKE_READY: &str = "wake-ready";
 
-/// The product's [`Seat`] of local session `session`: its PTY child from the machine snapshot's
-/// tabs, its hosted agent from the harness's published snapshot.
+/// The product's [`Seat`] of local session `session`: its PTY child as its handle was registered
+/// at spawn (a machine snapshot names a new tab only at its next pass), its hosted agent from the
+/// harness's published snapshot.
 fn seat_of(store: &crate::session_store::Store, session: u64) -> Option<Seat> {
-    let sid = store
-        .read()
-        .unwrap_or_else(PoisonError::into_inner)
-        .by_local(session)?
-        .sid
-        .as_str()
-        .to_string();
-    let shell = |held: Option<crate::sys_host::Held>| {
-        held.and_then(|h| {
-            h.snap
-                .tabs
-                .iter()
-                .find(|t| t.key == session && t.shell_pid != 0)
-                .map(|t| t.shell_pid)
-        })
+    let (sid, pid) = {
+        let store = store.read().unwrap_or_else(PoisonError::into_inner);
+        let handle = store.by_local(session)?;
+        (handle.sid.as_str().to_string(), handle.pid)
     };
-    let shared = &crate::sys_host::SYS;
-    let pty_child = shell(shared.held_now())
-        .or_else(|| shell(shared.fresh(crate::sys_host::AWAIT_PERIOD, false).0));
+    let pty_child = u32::try_from(pid).ok().filter(|&pid| pid != 0);
     let agent = crate::harness_host::published_snapshot(&sid).and_then(|snap| {
         let start = aterm_agent::harness::upgrade_models::parse_lstart(&snap.start)?;
         Some((snap.pid, i64::try_from(start).ok()?))

@@ -207,6 +207,30 @@ pub struct Facts {
     pub record: Record,
     /// The row's credential variables set in this environment (names only).
     pub env_credentials: Vec<&'static str>,
+    /// Its own accounts pool, where its roster sits beside `accounts.toml` and the harness
+    /// signs it in (`accounts renew --cli <id>`): every CLI but Claude Code, whose is
+    /// [`Facts::accounts`].
+    pub pool: Option<CliAccounts>,
+}
+
+/// A CLI's own accounts pool ([`Facts::pool`]): the per-connector view of the accounts a
+/// roster beside `accounts.toml` lists (`accounts-<cli>.toml`), where Claude Code's is
+/// [`ClaudeAccounts`], whose fields stay its own.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CliAccounts {
+    /// Its roster (`accounts-<cli>.toml`).
+    pub roster: PathBuf,
+    /// Why the roster is refused, when it is.
+    pub refused: Option<String>,
+    /// The row a sign-in renews: the first with an email whose login is not made here, else
+    /// the first due, else the first with an email; `None` where no row has an email.
+    pub next: Option<String>,
+    /// How many rows the roster lists.
+    pub rows: usize,
+    /// How many of them have a login made on this machine (`accounts::enrolled_for`).
+    pub enrolled: usize,
+    /// The rows whose login is due for renewal or has ended (`accounts::renew_due`), by label.
+    pub due: Vec<String>,
 }
 
 /// What the doctor reads, gathered once for every CLI.
@@ -415,9 +439,11 @@ fn claude_profile(m: &Machine<'_>, home: &Path) -> (bool, Option<String>) {
     }
 }
 
-/// Whether Codex keeps its login in the OS keyring (`cli_auth_credentials_store` =
-/// `keyring` or `auto` in its `config.toml`), where aterm does not look.
-fn codex_keyring(home: &Path) -> bool {
+/// Whether Codex keeps its login anywhere but `auth.json` in its home (`cli_auth_credentials_store`
+/// = `keyring`, `auto` or `ephemeral` in its `config.toml`), where aterm does not look: its
+/// account pool then has no row's own login file to start a session under.
+#[must_use]
+pub fn codex_keyring(home: &Path) -> bool {
     let Ok(Some(text)) =
         crate::harness::accounts::read_bounded(&home.join("config.toml"), 256 * 1024)
     else {
@@ -428,7 +454,7 @@ fn codex_keyring(home: &Path) -> bool {
         .and_then(|doc| {
             doc.get("cli_auth_credentials_store")
                 .and_then(aterm_toml::Value::as_str)
-                .map(|s| matches!(s, "keyring" | "auto"))
+                .map(|s| matches!(s, "keyring" | "auto" | "ephemeral"))
         })
         .unwrap_or(false)
 }
@@ -523,7 +549,74 @@ pub fn gather(m: &Machine<'_>, c: &'static Connector) -> Facts {
             .copied()
             .filter(|k| (m.var)(k).is_some_and(|v| !v.is_empty()))
             .collect(),
+        pool: crate::harness::accounts::Cli::parse(c.id).and_then(|cli| pool_for(m, cli)),
     }
+}
+
+/// `cli`'s own accounts pool ([`CliAccounts`]), where its roster file sits beside
+/// `accounts.toml` and the harness has a sign-in for it: a connection's (Codex's), or a pool
+/// CLI's that is no connection of `aterm ai`'s (Grok Build's, Kimi Code's), whose `aterm ai
+/// login` runs this pool's sign-in alone.
+#[must_use]
+pub fn pool_for(m: &Machine<'_>, cli: crate::harness::accounts::Cli) -> Option<CliAccounts> {
+    use crate::harness::accounts::{self, Cli};
+    if cli == Cli::Claude {
+        return None;
+    }
+    cli.accounts().signin.as_ref()?;
+    let roster_path = m
+        .roster
+        .as_ref()?
+        .parent()?
+        .join(cli.accounts().roster_file);
+    if !roster_path.is_file() {
+        return None;
+    }
+    let roster = match accounts::Roster::load_for(cli, &roster_path) {
+        Ok(roster) => roster,
+        Err(why) => {
+            return Some(CliAccounts {
+                roster: roster_path,
+                refused: Some(why),
+                ..CliAccounts::default()
+            });
+        }
+    };
+    let store = match (m.harness_state.as_deref(), m.home.as_deref()) {
+        (Some(state), Some(home)) => Some(accounts::Store::at_for(state, cli, home)),
+        _ => None,
+    };
+    let logins = store
+        .as_ref()
+        .and_then(|s| s.load_logins(m.now).ok())
+        .map(|(logins, _)| logins)
+        .unwrap_or_default();
+    let bound = accounts::bound(&roster, &logins);
+    let enrolled = accounts::enrolled_for(cli, &bound);
+    let state = store
+        .as_ref()
+        .and_then(|s| s.load(m.now).ok())
+        .map(|(state, _)| state)
+        .unwrap_or_default();
+    let with_email = || bound.rows.iter().filter(|r| r.email.is_some());
+    let due = accounts::renew_due(&bound, &logins, &state, &enrolled, m.now);
+    let next = with_email()
+        .find(|r| !enrolled.contains(&r.label))
+        .map(|r| r.label.clone())
+        .or_else(|| due.first().cloned())
+        .or_else(|| with_email().next().map(|r| r.label.clone()));
+    Some(CliAccounts {
+        roster: roster_path,
+        refused: None,
+        next,
+        rows: bound.rows.len(),
+        enrolled: bound
+            .rows
+            .iter()
+            .filter(|r| enrolled.contains(&r.label))
+            .count(),
+        due,
+    })
 }
 
 #[cfg(test)]

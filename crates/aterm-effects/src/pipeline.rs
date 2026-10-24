@@ -164,6 +164,10 @@ pub struct EffectsPipeline {
     /// Who owned the block cursor on the last applied frame and the colour its body wore.
     #[cfg(test)]
     block_fill: Option<crate::cursor_glow::BlockFill>,
+    /// A test's negative control: the published streams keep the trail's
+    /// light on the word icons ([`Self::shade_word_icons`]).
+    #[cfg(test)]
+    word_icons_unshaded: bool,
     /// The opaque comet's own colour, where `set_cursor_trail` gave one.
     trail_body_color: Option<u32>,
     /// Keystrokes noted since the last [`Self::advance`], replayed evenly across its `dt`.
@@ -302,6 +306,8 @@ impl EffectsPipeline {
             serious: false,
             #[cfg(test)]
             block_fill: None,
+            #[cfg(test)]
+            word_icons_unshaded: false,
             pending_keys: 0,
             row_probe_scratch: Vec::new(),
             flying_sky_row: None,
@@ -808,6 +814,22 @@ impl EffectsPipeline {
     #[inline]
     pub fn set_letter_guard(&mut self, on: bool) {
         self.cursor.glow.set_letter_guard(on);
+    }
+
+    /// A test's negative control: the guard on, but no page veil under the
+    /// letters the pet lies beneath (`CursorGlow::set_pet_veil`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_pet_veil(&mut self, on: bool) {
+        self.cursor.glow.set_pet_veil(on);
+    }
+
+    /// A test's negative control: the letter guard cuts each cell alone, with
+    /// no ramp along the row (`CursorGlow::set_letter_guard_ramp`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub fn set_letter_guard_ramp(&mut self, on: bool) {
+        self.cursor.glow.set_letter_guard_ramp(on);
     }
 
     /// Opt the resident pet in (or out).
@@ -1646,6 +1668,7 @@ impl EffectsPipeline {
         std::mem::swap(&mut input.ink, &mut self.ink_scratch);
         self.sprite_layers
             .publish(&self.free_scratch, &mut input.fx_layers);
+        self.shade_word_icons(input);
         let streak = self.streak.is_some().then(|| {
             let mut cfg = self.streak_cfg;
             cfg.intensity *= cursor_motion.amplitude(MotionEffect::OutputStreak);
@@ -4640,6 +4663,106 @@ mod tests {
                 .is_some_and(MatrixRain::material_editing_for_test);
             assert_eq!(i64::from(engine_editing), state["engine"]);
         }
+    }
+
+    /// THE WORD ICONS' SHADE reaches what the host draws (looks6 N3): every
+    /// host hands it the trail's streams before its word pass names the
+    /// frame's icons (the web host here, a capture and a split frame in the
+    /// window), so the shade lifts the light off an icon new to the frame in
+    /// the published streams, where a shade of the glow's own buffers left
+    /// the Return's flare and the sky's stars on the `fox`. It lifts the
+    /// light off the face's drawn texels only: the sprite box's transparent
+    /// margin keeps light, where a cut to the box's foot carved a notch out
+    /// of the wash. Negative control: unshaded, the same frames lay light
+    /// on the face.
+    #[test]
+    fn the_published_trail_lays_no_light_on_a_word_icon() {
+        use aterm_core::render::FxTexels;
+        use aterm_render::sprites::FreeZ;
+        // (frames with an icon, lit face texels, lit margin texels).
+        let run = |unshaded: bool| -> (usize, usize, usize) {
+            let mut p = EffectsPipeline::new();
+            rainbow_kitty_glow(&mut p, "rainbow kitty");
+            p.set_sparkle_enabled(true);
+            p.word_icons_unshaded = unshaded;
+            let (mut term, mut input) = glass(8, 40);
+            // The caret on the last row, so the Return scrolls the `fox` up
+            // into a box no keep-out held yet (`enter-bottom`).
+            term.process(b"\r\n\r\n\r\n\r\n\r\n\r\n\r\n");
+            idle(&mut p, &mut term, &mut input, 2, 33.0);
+            type_line(&mut p, &mut term, &mut input, b"the quick brown fox", 33.0);
+            idle(&mut p, &mut term, &mut input, 45, 33.0);
+            p.note_console_input(PetInputKind::Submit);
+            term.process(b"\r\n");
+            let (mut framed, mut face, mut margin) = (0usize, 0usize, 0usize);
+            for _ in 0..30 {
+                idle(&mut p, &mut term, &mut input, 1, 16.0);
+                let icons: Vec<_> = free_sprites(&input)
+                    .into_iter()
+                    .filter(|s| s.z == FreeZ::UnderText && !s.is_blank())
+                    .collect();
+                if icons.is_empty() {
+                    continue;
+                }
+                framed += 1;
+                // Whether window pixel (x, y) is an icon's texel at least
+                // half opaque (`None`: off every icon's visible box).
+                let texel = |x: i32, y: i32| -> Option<bool> {
+                    icons.iter().find_map(|s| {
+                        let v = s.visible();
+                        if !(v.x0..v.x1).contains(&x) || !(v.y0..v.y1).contains(&y) {
+                            return None;
+                        }
+                        let (dx, dy) = (x - s.x, y - s.y);
+                        let (w, h) = (i32::from(s.w), i32::from(s.h));
+                        let (aw, ah) = (i32::from(s.art.w()), i32::from(s.art.h()));
+                        let mx = if s.flip_x { w - 1 - dx } else { dx };
+                        let sx = ((2 * mx + 1) * aw / (2 * w)).min(aw - 1) as usize;
+                        let sy = ((2 * dy + 1) * ah / (2 * h)).min(ah - 1) as usize;
+                        let t = s.art.texel(sx, sy);
+                        Some(match s.art.texels() {
+                            FxTexels::Index8 => t != 0,
+                            _ => t >> 24 >= 128,
+                        })
+                    })
+                };
+                let mut tally = |x: u16, y: u16, w: u16, h: u16| {
+                    for py in i32::from(y)..i32::from(y) + i32::from(h) {
+                        for px in i32::from(x)..i32::from(x) + i32::from(w) {
+                            match texel(px, py) {
+                                Some(true) => face += 1,
+                                Some(false) => margin += 1,
+                                None => {}
+                            }
+                        }
+                    }
+                };
+                for q in input.cursor_glow_add.iter().chain(&input.glow_under) {
+                    if (q.color | q.color2) & 0x00FF_FFFF != 0 || q.alpha | q.alpha2 != 0 {
+                        tally(q.x, q.y, q.w, q.h);
+                    }
+                }
+                for h in &input.glow_halo {
+                    tally(h.x, h.y, h.w, h.h);
+                }
+            }
+            (framed, face, margin)
+        };
+        let (framed, face, margin) = run(false);
+        let (control_framed, control_face, _) = run(true);
+        assert!(
+            framed > 10 && control_framed > 10,
+            "fixture: the word pass drew the `fox` ({framed}, {control_framed} frames)"
+        );
+        assert!(
+            control_face > 0,
+            "control: unshaded, the Return's light lies on the face"
+        );
+        assert_eq!(face, 0, "the published trail lays light on the face");
+        assert!(
+            margin > 0,
+            "the box's transparent margin keeps its light (no notch beside the face)"
+        );
     }
 
     #[test]

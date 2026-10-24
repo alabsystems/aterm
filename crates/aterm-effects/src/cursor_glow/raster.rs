@@ -528,7 +528,11 @@ pub(super) fn fresh_ink_glyph_ink(band: u32, fg: u32, side: GlyphInkSide, cap: f
     for _ in 0..FRESH_INK_GLYPH_BISECT {
         let mid = 0.5 * (lo_k + hi_k);
         let mid_rgb = cand_rgb(mid);
-        if ok(mid_rgb) {
+        if mid_rgb == lo_rgb {
+            lo_k = mid;
+        } else if mid_rgb == hi_rgb {
+            hi_k = mid;
+        } else if ok(mid_rgb) {
             lo_k = mid;
             lo_rgb = mid_rgb;
         } else {
@@ -1059,6 +1063,12 @@ pub(crate) fn push_ripple_ring(
     let mut dy = -ry_i;
     while dy < ry_i {
         let h = rslab.min(ry_i - dy);
+        let y = cyi + dy;
+        let fade_y = crate::effect_util::fx_fade_y(geom, y as f32 + 0.5 * h as f32);
+        if fade_y <= 0.0 {
+            dy += h;
+            continue;
+        }
         let ym = (dy as f32 + h as f32 * 0.5) / ry;
         let outer = rx * (1.0 - ym * ym).max(0.0).sqrt();
         let inner = if inner_ry > 0.5 {
@@ -1069,8 +1079,6 @@ pub(crate) fn push_ripple_ring(
         };
         let (o, i) = (outer as i32, inner as i32);
         if o > i {
-            let y = cyi + dy;
-            let fade_y = crate::effect_util::fx_fade_y(geom, y as f32 + 0.5 * h as f32);
             let mid = 0.5 * (o + i) as f32;
             for (x, xm) in [(cxi - o, cx - mid), (cxi + i, cx + mid)] {
                 let fade = fade_y * crate::effect_util::fx_fade_x(geom, xm);

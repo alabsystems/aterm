@@ -463,7 +463,7 @@ fn an_orphaned_bridge_mid_drain_neither_publishes_more_nor_shares_the_node() {
         mine.then(|| kv(&row, "inc")?.parse().ok()).flatten()
     });
 
-    let mut gui = w.gui.take().expect("the instance");
+    let mut gui = w.take_gui().expect("the instance");
     let _ = gui.kill();
     let _ = gui.wait();
     let gui = w.gui.insert(World::relaunch_gui(&w));

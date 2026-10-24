@@ -139,33 +139,34 @@ impl RainBaker {
         }
 
         let mut rgba = [255u8, 255, 255, 0].repeat(cw * ch);
-        let mut src: [(u32, u32); MASTER_H] = [(0, 0); MASTER_H];
         for y in 0..ch {
             let (a, b) = (y * MASTER_H, (y + 1) * MASTER_H);
             let (my0, my1) = (a / ch, (b - 1) / ch);
             let my_end = my1.min(MASTER_H - 1);
-            let mut src_len = 0;
+            let mut col_wy = [0u32; MASTER_W];
+            let mut any_lit = false;
             for my in my0..=my_end {
-                let row = rom.row(tile, my);
+                let mut row = rom.row(tile, my);
                 if row != 0 {
+                    any_lit = true;
                     let wy = (b.min((my + 1) * ch) - a.max(my * ch)) as u32;
-                    src[src_len] = (wy, row);
-                    src_len += 1;
+                    while row != 0 {
+                        let mx = row.trailing_zeros() as usize;
+                        row &= row - 1;
+                        if mx < MASTER_W {
+                            col_wy[mx] += wy;
+                        }
+                    }
                 }
             }
-            let src_row = &src[..src_len];
-            if src_row.is_empty() {
+            if !any_lit {
                 continue;
             }
             for x in 0..cw {
                 let mut num: u32 = 0;
                 let seg = &self.col_seg[self.col_off[x] as usize..self.col_off[x + 1] as usize];
-                for &(wy, row) in src_row {
-                    let mut row_wx: u32 = 0;
-                    for &(mx, wx) in seg {
-                        row_wx += wx * ((row >> mx) & 1);
-                    }
-                    num += row_wx * wy;
+                for &(mx, wx) in seg {
+                    num += wx * col_wy[mx as usize];
                 }
                 if num > 0 {
                     rgba[(y * cw + x) * 4 + 3] = ((num * 255 + DEN / 2) / DEN) as u8;

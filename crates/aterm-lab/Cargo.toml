@@ -104,6 +104,13 @@ atpkg = { workspace = true }
 # producer does (`pin::static_build_config`, `pin::asset_name`'s crate). A small
 # library whose dependencies are already in this graph.
 aterm-bootstrap-verify = { workspace = true }
+# The vz lane's helper (`linux vz-host`): its content-addressed ad hoc signing, its
+# client (`Lab`, `Detached`), V3's disks, kernel and seed, and the agent's command
+# client. The library loads no framework; its dependencies are already in this graph.
+aterm-vz = { workspace = true }
+# The guest agent's ports and wire codec (`COMMAND_PORT`, `Exit`). Already in the
+# graph through aterm-vz.
+aterm-vz-agent = { workspace = true }
 
 [dev-dependencies]
 # `trail-gallery burst`'s key schedule is checked against the flying kitty's

@@ -735,9 +735,16 @@ fn no_credential_identity_or_id_reaches_what_is_answered() {
 fn a_key_reads_back_from_its_text_and_nothing_else_does() {
     let claude = AccountKey::claude(UUID).expect("a key");
     let codex = AccountKey::codex("acct-1", "user-1").expect("a key");
-    for key in [claude, codex] {
+    let grok = AccountKey::grok("user-1").expect("a key");
+    let kimi = AccountKey::kimi(crate::ai::connector::Region::Global, "user-1").expect("a key");
+    let kimi_cn =
+        AccountKey::kimi(crate::ai::connector::Region::MainlandCn, "user-1").expect("a key");
+    for key in [claude, codex, grok, kimi, kimi_cn] {
         assert_eq!(AccountKey::parse(&key.to_string()), Some(key));
     }
+    assert!(grok.to_string().starts_with("g-") && kimi.to_string().starts_with("k-"));
+    assert_ne!(kimi, kimi_cn, "one id on each region is two accounts");
+    assert_eq!(AccountKey::grok(""), None);
     let text = claude.to_string();
     for bad in [
         text.replacen("c-", "y-", 1),
@@ -1640,6 +1647,115 @@ I1022 09:30:56.364166 375 server_oauth.go:224] applyAuthResult: email=interviews
     .expect("agy subscription");
     assert_eq!(sub.email.as_deref(), Some("interviewstreetuser@gmail.com"));
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let usage_file = tmp.path().join("usage.json");
+        std::fs::write(&usage_file, usage_json).expect("write usage.json");
+        let fake_agy = tmp.path().join("fake-agy.sh");
+        std::fs::write(
+            &fake_agy,
+            format!(
+                "#!/bin/sh\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    --config-dir*|-config-dir*) exit 2 ;;\n  esac\ndone\ncat '{}'\n",
+                usage_file.display()
+            ),
+        )
+        .expect("write fake-agy.sh");
+        let mut perms = std::fs::metadata(&fake_agy).expect("stat").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_agy, perms.clone()).expect("chmod");
+        let exe_argv = vec![fake_agy.to_string_lossy().into_owned()];
+        let store = super::super::agy_quota_store::Store::new(tmp.path(), "home");
+        let fetched_sub = agy_subscription_with_store(
+            &exe_argv,
+            &env,
+            &home,
+            &SubscriptionDisplay::default(),
+            Some("Gemini 3.1 Pro"),
+            now + AGY_USAGE_RETRY_S + 5,
+            Some(&store),
+        )
+        .expect("fetched agy subscription");
+        assert_eq!(fetched_sub.weekly.as_deref(), Some("weekly 78% left"));
+        assert!(store.last().is_some(), "fetch persisted reading to store");
+        // The same fetch also cached the 3p-weekly bucket for Claude/GPT models.
+        let cached_3p = agy_subscription_with_store(
+            &argv,
+            &env,
+            &home,
+            &fetched_sub,
+            Some("Claude Opus 4.6"),
+            now + AGY_USAGE_RETRY_S + 5,
+            Some(&store),
+        )
+        .expect("cached 3p subscription");
+        assert_eq!(cached_3p.weekly.as_deref(), Some("weekly 100% left"));
+        // Even with in-memory cache cleared and another reader holding the store lock
+        // past FRESH_S, a stale store reading whose weekly reset window is still open
+        // serves as fallback instead of dropping to unavailable.
+        AGY_USAGE_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let held_lock = store.try_lock().expect("take store lock");
+        let locked_fallback = agy_subscription_with_store(
+            &argv,
+            &env,
+            &home,
+            &SubscriptionDisplay::default(),
+            Some("Gemini 3.1 Pro"),
+            now + 1_200,
+            Some(&store),
+        )
+        .expect("locked fallback subscription");
+        assert_eq!(
+            locked_fallback.weekly.as_deref(),
+            Some("weekly 78% left · 18m ago")
+        );
+        drop(held_lock);
+        // Mid-session /login switch to a new email bypasses the previous account's
+        // stored reading and fetches fresh quota via ~/.local/bin/agy.
+        let local_bin = home.join(".local/bin");
+        std::fs::create_dir_all(&local_bin).expect("mkdir .local/bin");
+        let switched_usage = tmp.path().join("usage-switched.json");
+        std::fs::write(
+            &switched_usage,
+            br#"{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{"name":"Gemini Models","buckets":[{"id":"gemini-weekly","name":"Weekly Limit Remaining","window":"weekly","remaining_fraction":0.42,"reset_time":"2026-10-29T16:31:22Z"}]}]}}}"#,
+        )
+        .expect("write switched usage");
+        let local_agy = local_bin.join("agy");
+        std::fs::write(
+            &local_agy,
+            format!("#!/bin/sh\ncat '{}'\n", switched_usage.display()),
+        )
+        .expect("write local agy");
+        std::fs::set_permissions(&local_agy, perms).expect("chmod local agy");
+        std::fs::write(
+            cfg.join("cli.log"),
+            br"I1022 09:35:00.000000 375 server_oauth.go:224] applyAuthResult: email=second@example.com, authMethod=consumer, quotaProject=
+",
+        )
+        .expect("write switched cli.log");
+        let switched_sub = agy_subscription_with_store(
+            &argv,
+            &env,
+            &home,
+            &fetched_sub,
+            Some("Gemini 3.1 Pro"),
+            now + AGY_USAGE_RETRY_S + 10,
+            Some(&store),
+        )
+        .expect("switched agy subscription");
+        assert_eq!(switched_sub.email.as_deref(), Some("second@example.com"));
+        assert_eq!(switched_sub.weekly.as_deref(), Some("weekly 42% left"));
+        std::fs::remove_file(&local_agy).expect("remove local agy");
+        std::fs::write(cfg.join("cli.log"), log_bytes).expect("restore cli.log");
+        AGY_USAGE_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+
     let mut keyed = env.clone();
     keyed.push("GEMINI_API_KEY=secret".to_owned());
     assert_eq!(
@@ -1791,11 +1907,11 @@ fn agy_and_muse_model_effort_read_argv_settings_and_log() {
         )
     );
 
-    // Pinned on argv closes model_open and effort_open.
+    // Pinned on argv closes model_open and effort_open (including Go single-dash flags).
     let pinned = vec![
         "agy".to_owned(),
-        "--model".to_owned(),
-        "Claude Opus 4.6 (Max)".to_owned(),
+        "-model=Claude Opus 4.6".to_owned(),
+        "-effort=max".to_owned(),
     ];
     assert_eq!(
         agy_model_effort_for(&pinned, &env, &home),
@@ -1834,6 +1950,24 @@ fn agy_and_muse_model_effort_read_argv_settings_and_log() {
             Some("medium".to_owned()),
             true,
             true
+        )
+    );
+    assert_eq!(
+        muse_model_effort_for(
+            &[
+                "muse".to_owned(),
+                "-c".to_owned(),
+                "model=\"Muse Spark\"".to_owned(),
+                "--config=reasoning_effort=high".to_owned(),
+            ],
+            &env,
+            &home
+        ),
+        (
+            Some("Muse Spark".to_owned()),
+            Some("high".to_owned()),
+            false,
+            false
         )
     );
 
@@ -1902,12 +2036,15 @@ fn agy_and_muse_model_effort_read_argv_settings_and_log() {
     let held_lock =
         std::fs::File::open(presence_dir.join(format!("{cid}.lock"))).expect("open cid lock");
     let self_pid = std::process::id();
+    let resumed_argv = vec!["agy".to_owned(), format!("--conversation={cid_newer}")];
     assert_eq!(
-        agy_resume_for(self_pid, &argv, &env, &home, Some(&workspace)).as_deref(),
-        Some(format!("agy --conversation={cid}").as_str())
+        agy_resume_for(self_pid, &resumed_argv, &env, &home, Some(&workspace)).as_deref(),
+        Some(format!("agy --conversation={cid}").as_str()),
+        "live pid holding cid's presence lock overrides argv's initial --conversation"
     );
-    let (held_excerpts, _) = agy_excerpts_for(self_pid, &argv, &env, &home, Some(&workspace))
-        .expect("held pid agy excerpts");
+    let (held_excerpts, _) =
+        agy_excerpts_for(self_pid, &resumed_argv, &env, &home, Some(&workspace))
+            .expect("held pid agy excerpts");
     assert_eq!(
         held_excerpts.said.as_deref(),
         Some("All footer fields are populated.")
@@ -1915,26 +2052,59 @@ fn agy_and_muse_model_effort_read_argv_settings_and_log() {
     drop(held_lock);
 
     let muse_sid = "01a16480-f908-7d10-a78e-5d95372dfb98";
+    let muse_old_sid = "01a16470-0000-7d10-a78e-5d95372dfb98";
     let muse_dir = home
         .join(".local/share/muse/sessions/2026/10/23")
         .join(muse_sid);
+    let muse_old_dir = home
+        .join(".local/share/muse/sessions/2026/10/23")
+        .join(muse_old_sid);
     std::fs::create_dir_all(&muse_dir).expect("create muse session dir");
+    std::fs::create_dir_all(&muse_old_dir).expect("create old muse session dir");
     std::fs::write(muse_dir.join(".session.lock"), b"pid=4242\nhost=mac\n")
         .expect("write muse lock");
+    std::fs::write(muse_old_dir.join("session.jsonl"), b"{}\n").expect("write old muse log");
     let muse_log = br#"{"payload_type":"runtime.session","payload":{"kind":"run","run_id":"r1","event":{"kind":"started","prompt":"verify muse resume"}}}
 {"payload_type":"runtime.session","payload":{"kind":"run","run_id":"r1","event":{"kind":"assistant_message_committed","text":"Muse resume verified."}}}
 {"payload_type":"runtime.session","payload":{"kind":"task","run_id":"r1","task_id":"t1","event":{"kind":"proposed","task_kind":"tool.read_file"}}}
 "#;
     std::fs::write(muse_dir.join("session.jsonl"), muse_log).expect("write muse session.jsonl");
+    let muse_resumed_argv = vec![
+        "muse".to_owned(),
+        "resume".to_owned(),
+        muse_old_sid.to_owned(),
+    ];
     assert_eq!(
-        muse_resume_for(4242, &["muse".to_owned()], &env, &home).as_deref(),
-        Some(format!("muse resume {muse_sid}").as_str())
+        muse_resume_for(4242, &muse_resumed_argv, &env, &home).as_deref(),
+        Some(format!("muse resume {muse_sid}").as_str()),
+        "pid's active .session.lock overrides argv's initial muse resume <old_sid>"
+    );
+    assert_eq!(
+        muse_resume_for(0, &muse_resumed_argv, &env, &home).as_deref(),
+        Some(format!("muse resume {muse_old_sid}").as_str()),
+        "without a matching pid lock, argv's muse resume <old_sid> is used"
     );
     let (muse_exc, muse_len) =
-        muse_excerpts_for(4242, &["muse".to_owned()], &env, &home).expect("muse excerpts");
+        muse_excerpts_for(4242, &muse_resumed_argv, &env, &home).expect("muse excerpts");
     assert_eq!(muse_len, muse_log.len() as u64);
     assert_eq!(muse_exc.prompts.len(), 1);
     assert_eq!(muse_exc.prompts[0].text, "verify muse resume");
     assert_eq!(muse_exc.said.as_deref(), Some("Muse resume verified."));
     assert_eq!(muse_exc.doing.as_deref(), Some("read_file"));
+
+    // A trailing line larger than 64 KiB widens `read_jsonl_tail` instead of draining
+    // the entire tail buffer to empty.
+    let mut large_log = muse_log.to_vec();
+    let padding = "x".repeat(70 * 1024);
+    large_log.extend_from_slice(
+        format!(
+            r#"{{"payload_type":"runtime.session","payload":{{"kind":"task","run_id":"r1","task_id":"t2","event":{{"kind":"proposed","task_kind":"tool.bash","pad":"{padding}"}}}}}}
+"#
+        )
+        .as_bytes(),
+    );
+    std::fs::write(muse_dir.join("session.jsonl"), &large_log).expect("write large muse log");
+    let (large_exc, _) =
+        muse_excerpts_for(4242, &muse_resumed_argv, &env, &home).expect("large muse excerpts");
+    assert_eq!(large_exc.doing.as_deref(), Some("bash"));
 }

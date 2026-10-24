@@ -135,6 +135,7 @@ fn the_gate_checks_token_kind_fence_and_build_and_fails_closed() {
         holder,
         base_y: 100,
         alt: false,
+        mutations: 0,
     };
     let all = view(&[(100, u64::MAX)], false, false);
     assert_eq!(
@@ -187,6 +188,7 @@ fn the_gate_checks_token_kind_fence_and_build_and_fails_closed() {
         holder,
         base_y: 100,
         alt: true,
+        mutations: 0,
     };
     assert_eq!(admit(&gate, &alt(all), &read), Err(Bare::Fence));
     assert_eq!(
@@ -543,6 +545,7 @@ fn an_agy_card_is_judged_by_its_fence_alone() {
         },
         base_y: 0,
         alt: false,
+        mutations: 0,
     };
     let gate = CardGate {
         token: 7,
@@ -581,6 +584,7 @@ fn an_agy_card_is_judged_by_its_fence_alone() {
             },
             base_y: 0,
             alt: false,
+            mutations: 0,
         }
     };
     assert_eq!(
@@ -593,6 +597,85 @@ fn an_agy_card_is_judged_by_its_fence_alone() {
         Err(Bare::Fence),
         "the rows it places, its feet outside: not the drawer's card"
     );
+}
+
+/// Muse Code 1.4.12's first output after its launcher's `\e[3J\e[H\e[2J`,
+/// captured live from `lab muse` (`ctl subscribe @sid bytes`): four
+/// newlines, three reverse indexes at the top of a region (rows 1-7) its
+/// span starts on, its banner in the rows they opened, then its composer.
+const MUSE_1_4_12_STARTUP: &[u8] = include_bytes!("fixtures/muse-1.4.12-inline-startup.bin");
+
+/// A Muse Code image leading group `pgid`: a vendor binary outside the
+/// store, as `lab muse` runs it.
+fn muse_image(pgid: i32) -> HolderImage {
+    use atpkg::image::{ImageBuild, ProgramTag};
+    HolderImage::of(
+        pgid,
+        Some(5),
+        Some(std::path::PathBuf::from("/x/muse-bin-1.4.12-R6909.1")),
+        ImageBuild::unknown(ProgramTag::new("muse-bin-1.4.12-R6909.1")),
+        1,
+    )
+}
+
+/// Muse Code's banner in rows it opened (or erased) at its own start is decorated; a previous one's stays bare.
+#[test]
+fn a_muse_codes_banner_in_the_rows_it_opened_is_decorated() {
+    let run = |stale: bool| {
+        let (mut app, wid, session, host) = bare_window();
+        assert!(app.apply_term_resize(wid, 50, 144));
+        bytes(&app, session, "$ muse\r\n\x1b[3J\x1b[H\x1b[2J");
+        if stale {
+            bytes(
+                &app,
+                session,
+                std::str::from_utf8(MUSE_1_4_12_STARTUP).unwrap(),
+            );
+            bytes(&app, session, "\x1b[20;1H$ muse\r\n");
+        }
+        let token = take_front(&app, session, PGID, muse_image(PGID), CutKind::Exec);
+        assert_eq!(
+            gate_of(&app, session).map(|g| (g.token, g.kind, g.build)),
+            Some((token, 1, GateBuild::ProvenanceOnly))
+        );
+        if !stale {
+            bytes(
+                &app,
+                session,
+                std::str::from_utf8(MUSE_1_4_12_STARTUP).unwrap(),
+            );
+        }
+        frame(&mut app, wid);
+        let place = decorated(&app, wid);
+        let reasons = bare_reasons(&app, session);
+        host.shutdown_and_join();
+        (place, reasons)
+    };
+    let (own, reasons) = run(false);
+    assert_eq!(own.map(|p| p.top), Some(1), "{reasons:?}");
+    let (stale, reasons) = run(true);
+    assert_eq!(stale, None, "a previous Muse Code's banner");
+    assert_eq!(reasons.last().map(String::as_str), Some("fence"));
+    let (followed, reasons) = with_knob(FenceKnob::StartFollows, || run(false));
+    assert_eq!(
+        followed.map(|p| p.top),
+        Some(1),
+        "the erase law alone: {reasons:?}"
+    );
+    let (held, reasons) = with_knob(FenceKnob::ErasedRowsStayOut, || run(false));
+    assert_eq!(
+        held.map(|p| p.top),
+        Some(1),
+        "the start that holds alone: {reasons:?}"
+    );
+    let (neither, reasons) = with_knob(FenceKnob::StartFollows, || {
+        with_knob(FenceKnob::ErasedRowsStayOut, || run(false))
+    });
+    assert_eq!(
+        neither, None,
+        "CONTROL: the start followed its row down and the erased rows stayed out"
+    );
+    assert_eq!(reasons.last().map(String::as_str), Some("fence"));
 }
 
 /// A same-build inline relaunch keeps the old card above the new process's span bare until it paints its own.
@@ -909,6 +992,57 @@ fn a_width_resize_keeps_the_card_decorated() {
     assert_eq!(after, None, "CONTROL: no lend, bare: {reasons:?}");
 }
 
+/// Claude Code 2.1.304's inline redraw after a width resize, byte for byte
+/// as it wrote it in the lab at 120 columns (2026-10-23; the project path
+/// redacted to the same length): inside DEC 2026, home, every row erased
+/// whole a row at a time down the screen, home again, then its card from
+/// the top, the composer between its rules and the mode row, the cursor
+/// moved back up into the composer.
+const CLAUDE_2_1_304_RESIZE_REDRAW: &str =
+    include_str!("../tests/fixtures/claude-card/claude-2.1.304-inline-resize-redraw-120col.out");
+
+/// A width resize under 2.1.304's own redraw from home keeps its card decorated: the erase law.
+#[test]
+fn a_card_2_1_304_redraws_from_home_after_a_resize_is_decorated() {
+    const BUILD: &str = "2.1.304";
+    let run = || {
+        let (mut app, wid, session, host) = bare_window();
+        assert!(app.apply_term_resize(wid, 50, 144));
+        bytes(
+            &app,
+            session,
+            "$ claude\r\naterm: yolo (default): running 'claude' '--dangerously-skip-permissions'\r\n",
+        );
+        launch(&app, session, BUILD, PGID, 1);
+        bytes(&app, session, CLAUDE_2_1_304_INLINE);
+        frame(&mut app, wid);
+        let before = decorated(&app, wid);
+        assert!(app.apply_term_resize(wid, 50, 120));
+        bytes(&app, session, CLAUDE_2_1_304_RESIZE_REDRAW);
+        frame(&mut app, wid);
+        let after = decorated(&app, wid);
+        let reasons = bare_reasons(&app, session);
+        let armed = dev_rows(&app, session, "card-armed").len();
+        host.shutdown_and_join();
+        (before, after, reasons, armed)
+    };
+    let (before, after, reasons, armed) = run();
+    assert_eq!(
+        before.map(|p| p.top),
+        Some(2),
+        "its first frame, under the two lines: {reasons:?}"
+    );
+    assert_eq!(
+        after.map(|p| p.top),
+        Some(0),
+        "redrawn from the top: {reasons:?}"
+    );
+    assert_eq!(armed, 1, "the redraw arms nothing again");
+    let (_, after, reasons, _) = with_knob(FenceKnob::ErasedRowsStayOut, run);
+    assert_eq!(after, None, "CONTROL: the erased rows kept out");
+    assert_eq!(reasons.last().map(String::as_str), Some("fence"));
+}
+
 /// The re-show bound holds a card stopped and resumed within [`RESHOW_MS`] until the bound expires.
 #[test]
 fn the_reshow_bound_holds_a_flapping_card_and_shows_it_on_time() {
@@ -1175,8 +1309,15 @@ fn a_restore_re_derives_the_holder_from_the_kernel() {
                 "not closed does not mean the session has opened"
             );
         }
-        let adoption =
-            crate::spawn::adopt_restored_holder(&term, &timeline, -1, SHELL_PGID, probe, image);
+        let adoption = crate::spawn::adopt_restored_holder(
+            &term,
+            &timeline,
+            -1,
+            SHELL_PGID,
+            probe,
+            image,
+            |_| Vec::new(),
+        );
         let view = term.lock().unwrap().holder_view();
         let timeline = timeline.lock().unwrap();
         let published = timeline.holder_image().and_then(|i| i.token);
@@ -1239,12 +1380,81 @@ fn a_restore_re_derives_the_holder_from_the_kernel() {
             "registered session"
         );
     }
-    crate::spawn::adopt_restored_holder(&term, &timeline, -1, SHELL_PGID, in_front, claude);
+    crate::spawn::adopt_restored_holder(&term, &timeline, -1, SHELL_PGID, in_front, claude, |_| {
+        Vec::new()
+    });
     let timeline = timeline.lock().unwrap();
     assert_eq!(timeline.card_gate().map(|g| g.token), Some(token));
     assert!(
         timeline.slog().block_cursor().is_some(),
         "the open log read its blocks"
+    );
+}
+
+/// Card engine §3.7, marks retired by liveness, across a restore: `adopt_restored_holder` books
+/// the group the adopted holder leads and, among the shell's children, the group each carried
+/// stopped drawer leads, so a stopped drawer that dies after the restore still retires its mark.
+#[cfg(unix)]
+#[test]
+fn a_restore_books_the_groups_its_carried_stopped_drawers_lead() {
+    use aterm_core::terminal::{CutKind, HolderCut, Terminal};
+    const STOPPED: i32 = PGID + 1;
+    fn in_front(_: i32) -> i32 {
+        PGID
+    }
+    fn claude(pgid: i32, _: Option<&HolderImage>) -> HolderImage {
+        claude_image(pgid, VERSION, 1)
+    }
+    fn jobs(_: i32) -> Vec<i32> {
+        vec![PGID, STOPPED, SHELL_PGID + 9]
+    }
+    fn no_jobs(_: i32) -> Vec<i32> {
+        Vec::new()
+    }
+    let front = claude_image(PGID, VERSION, 1).token.expect("a token");
+    let stopped = claude_image(STOPPED, VERSION, 1).token.expect("a token");
+    let mut t = Terminal::new(24, 120);
+    t.process(b"$ claude\r\n");
+    t.note_holder_cut(HolderCut {
+        to: Some(stopped),
+        kind: CutKind::Group,
+        from_alive: false,
+    });
+    t.process(b"its card\r\n");
+    t.note_holder_cut(HolderCut {
+        to: None,
+        kind: CutKind::Group,
+        from_alive: true,
+    });
+    let carried = t.checkpoint();
+    let restore = |children: fn(i32) -> Vec<i32>| {
+        let term = std::sync::Mutex::new(Terminal::from_checkpoint(&carried));
+        assert_eq!(
+            term.lock()
+                .unwrap()
+                .holder_fence()
+                .tokens()
+                .collect::<Vec<_>>(),
+            [stopped],
+            "PRECONDITION: the stopped drawer's mark is carried"
+        );
+        let timeline = std::sync::Mutex::new(crate::session_timeline::SessionTimeline::default());
+        crate::spawn::adopt_restored_holder(
+            &term, &timeline, -1, SHELL_PGID, in_front, claude, children,
+        );
+        let timeline = timeline.lock().unwrap();
+        let groups = timeline.drawer_groups();
+        (groups.led_by(PGID), groups.led_by(STOPPED))
+    };
+    assert_eq!(
+        restore(jobs),
+        (Some(front), Some(stopped)),
+        "the adopted holder's group and the carried stopped drawer's"
+    );
+    assert_eq!(
+        restore(no_jobs),
+        (Some(front), None),
+        "CONTROL: without the children read, the carried stopped drawer's group is unknown"
     );
 }
 

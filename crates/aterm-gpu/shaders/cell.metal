@@ -344,11 +344,13 @@ static inline FireCoreOut fire_core(int px, int py, int base_y, int peak_h, uint
     return o;
 }
 
-static inline int3 fire_pal_add(int idx) {
+static inline int3 fire_pal_add(int idx_in) {
     const int3 pal[5] = {
         int3(42, 0, 0), int3(139, 26, 0), int3(224, 74, 0),
         int3(255, 176, 32), int3(255, 240, 192)
     };
+    // == FIRE_ADD_IDX_MAX: additive fire stops a breath past amber.
+    int idx = min(idx_in, 780);
     int seg = clamp(idx >> 8, 0, 3);
     int f = idx - (seg << 8);
     int3 a = pal[seg];

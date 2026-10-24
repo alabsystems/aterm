@@ -317,10 +317,12 @@ FireCoreOut fire_core(int px, int py, int base_y, int peak_h, uint phase,
     return o;
 }
 
-ivec3 fire_pal_add(int idx) {
+ivec3 fire_pal_add(int idx_in) {
     ivec3 pal[5] = ivec3[5](
         ivec3(42, 0, 0), ivec3(139, 26, 0), ivec3(224, 74, 0),
         ivec3(255, 176, 32), ivec3(255, 240, 192));
+    // == FIRE_ADD_IDX_MAX: additive fire stops a breath past amber.
+    int idx = min(idx_in, 780);
     int seg = clamp(idx >> 8u, 0, 3);
     int f = idx - (seg << 8u);
     ivec3 a = pal[seg];

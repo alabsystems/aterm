@@ -1462,3 +1462,27 @@ fn the_handoff_manifest_carries_each_sessions_book() {
     assert_eq!(row(&bare), None, "NEGATIVE CONTROL: no book, no row");
     forget(&sid);
 }
+
+/// A NEW TAB'S SEAT NAMES ITS SHELL AT ONCE: the root a wake is proved under is the PTY child the
+/// session was registered with, so a tab no machine snapshot names yet still has a tree (a process
+/// of it proves, an outside client is refused as another session's); a session with no child has
+/// none.
+#[test]
+fn a_seat_names_its_shell_before_any_machine_snapshot_names_the_tab() {
+    let store = crate::session_store::new_store();
+    let mut spawned = crate::session_store::test_handle(0x5ea7);
+    spawned.pid = 4242;
+    let sid = spawned.sid.as_str().to_string();
+    let childless = crate::session_store::test_handle(0x5ea8);
+    let mut book = store.write().unwrap_or_else(PoisonError::into_inner);
+    book.register(spawned);
+    book.register(childless);
+    drop(book);
+    let seat = seat_of(&store, 0x5ea7).expect("a registered session's seat");
+    assert_eq!(
+        (seat.sid.as_str(), seat.pty_child),
+        (sid.as_str(), Some(4242))
+    );
+    let seat = seat_of(&store, 0x5ea8).expect("a registered session's seat");
+    assert_eq!(seat.pty_child, None);
+}

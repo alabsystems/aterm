@@ -16,7 +16,7 @@ use aterm_json::{Value, json};
 use super::open_url::{
     DEFAULT_MAILBOX_DIR, EMAIL_FILE_MAX, MAILBOX_ENV, MailboxFlow, decode_html_amp,
     decode_mime_base64_parts, decode_quoted_printable, email_matches_target, extract_login_hint,
-    extract_magic_links_from_email, percent_decode, percent_encode,
+    percent_decode, percent_encode,
 };
 
 /// Environment variable naming a Chromium / `chrome-headless-shell` binary to drive.
@@ -58,6 +58,11 @@ pub const SECRETS_MAILBOX_TOML_FILE: &str = "ai-mailbox.toml";
 /// Subdirectory under the accounts store holding persistent per-account browser profiles.
 pub const BROWSER_PROFILES_DIR: &str = "browsers";
 
+/// A label as [`MailboxConfig::contested_labels`] keeps it.
+fn contest_key(label: &str) -> String {
+    label.trim().to_ascii_lowercase().replace('_', "-")
+}
+
 /// Configuration for fetching incoming OAuth verification emails (magic links or 6-digit OTPs).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MailboxConfig {
@@ -87,6 +92,18 @@ pub struct MailboxConfig {
     pub totp_secrets: BTreeMap<String, String>,
     /// Optional file tracking already-consumed message digests.
     pub seen_file: Option<PathBuf>,
+    /// Words in the sender of the vendor's sign-in mail (`connector::Accounts::mail_senders`),
+    /// which a webmail inbox's rows are chosen by and, where any is given, every other mail's
+    /// `From:` domain must name ([`MailFilter`]); empty for Claude Code's (`claude`,
+    /// `anthropic`).
+    pub senders: Vec<String>,
+    /// Where set, the earliest a mail may be dated (unix seconds): a vendor sign-in's start, so
+    /// a code mailed before it is never taken ([`MailFilter`]).
+    pub since: Option<i64>,
+    /// Labels (lowercased, `_` read as `-`) that rows of two pools, or a pool and a fleet, give
+    /// to different emails: their `<label>` secrets are Claude Code's own rows' alone, and
+    /// [`MailboxConfig::alias_label_to_email`] maps them onto no other pool's email.
+    pub contested_labels: BTreeSet<String>,
 }
 
 impl MailboxConfig {
@@ -194,8 +211,19 @@ impl MailboxConfig {
         Some(em.to_owned())
     }
 
-    /// Map any per-account credentials keyed by `label` onto `email`.
+    /// Map any per-account credentials keyed by `label` onto `email`, unless the label is
+    /// contested ([`MailboxConfig::contested_labels`]): then the `<label>` secrets are another
+    /// row's, and are never handed to `email`'s mailbox.
     pub fn alias_label_to_email(&mut self, label: Option<&str>, email: Option<&str>) {
+        if label.is_some_and(|l| self.contested_labels.contains(&contest_key(l))) {
+            return;
+        }
+        self.alias_own_label_to_email(label, email);
+    }
+
+    /// [`MailboxConfig::alias_label_to_email`] for a row of Claude Code's own roster or fleet,
+    /// whose labels the `<label>` secret names were made for: aliased contested or not.
+    pub fn alias_own_label_to_email(&mut self, label: Option<&str>, email: Option<&str>) {
         let (Some(lbl), Some(em)) = (
             label.map(str::trim).filter(|s| !s.is_empty()),
             email.map(str::trim).filter(|s| !s.is_empty()),
@@ -383,6 +411,13 @@ impl MailboxConfig {
         }
         if self.seen_file.is_none() {
             self.seen_file = other.seen_file;
+        }
+        self.contested_labels.extend(other.contested_labels);
+        if self.senders.is_empty() {
+            self.senders = other.senders;
+        }
+        if self.since.is_none() {
+            self.since = other.since;
         }
     }
 
@@ -844,6 +879,13 @@ impl MailboxConfig {
     }
 }
 
+/// Whether a `~/.secrets` name is a fleet roster, the accounts sheet or a CLI's roster
+/// (`ai-accounts.csv`, `ai-accounts-<cli>.toml`): fleet data, never a mailbox fragment, whatever
+/// machine or account its name happens to carry.
+fn is_fleet_roster_name(lower: &str) -> bool {
+    lower == "ai-accounts.csv" || lower.starts_with("ai-accounts-")
+}
+
 fn is_machine_account_label(key: &str) -> bool {
     let lower = key.trim().to_ascii_lowercase().replace('_', "-");
     let (m_part, slot_part) = lower
@@ -1010,6 +1052,69 @@ fn read_single_line_secret_file(path: &Path) -> Option<String> {
     (!trimmed.is_empty() && !trimmed.contains(['\r', '\n'])).then(|| trimmed.to_owned())
 }
 
+/// The labels that rows of different pools (Claude Code's roster, each other CLI's, and each
+/// one's fleet file under `home`'s `~/.secrets`) give to different emails
+/// ([`MailboxConfig::contested_labels`]).
+fn contested_labels(
+    home: Option<&Path>,
+    claude_rosters: &[PathBuf],
+    cli_rosters: &[(super::accounts::Cli, PathBuf)],
+) -> BTreeSet<String> {
+    let mut emails: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut note = |label: &str, email: Option<&str>| {
+        if let Some(email) = email.map(str::trim).filter(|e| !e.is_empty()) {
+            emails
+                .entry(contest_key(label))
+                .or_default()
+                .insert(email.to_ascii_lowercase());
+        }
+    };
+    for path in claude_rosters.iter().filter(|p| p.is_file()) {
+        if let Ok(roster) = super::accounts::Roster::load(path) {
+            for row in &roster.rows {
+                note(&row.label, row.email.as_deref());
+            }
+        }
+    }
+    for (cli, path) in cli_rosters.iter().filter(|(_, p)| p.is_file()) {
+        if let Ok(roster) = super::accounts::Roster::load_for(*cli, path) {
+            for row in &roster.rows {
+                note(&row.label, row.email.as_deref());
+            }
+        }
+    }
+    if let Some(h) = home {
+        let fleet = h
+            .join(".secrets")
+            .join(super::accounts_sync::FLEET_ROSTER_FILE);
+        if let Ok(Some(text)) = super::accounts::read_bounded(&fleet, 256 * 1024)
+            && let Ok(fleet) = super::accounts_sync::FleetRoster::from_toml(&text, "fleet")
+        {
+            for acct in &fleet.accounts {
+                note(&acct.label, Some(&acct.email));
+            }
+        }
+        for cli in super::accounts_sync::OTHER_CLIS {
+            let path = h
+                .join(".secrets")
+                .join(super::accounts_sync::cli_fleet_file(cli));
+            if let Ok(Some(text)) = super::accounts::read_bounded(&path, 256 * 1024)
+                && let Ok(fleet) =
+                    super::accounts_sync::FleetRoster::from_toml_for(cli, &text, "fleet")
+            {
+                for acct in &fleet.accounts {
+                    note(&acct.label, Some(&acct.email));
+                }
+            }
+        }
+    }
+    emails
+        .into_iter()
+        .filter(|(_, emails)| emails.len() > 1)
+        .map(|(label, _)| label)
+        .collect()
+}
+
 fn discover_mailbox_config_files_raw(
     home: Option<&Path>,
     store_dir: Option<&Path>,
@@ -1027,11 +1132,20 @@ fn discover_mailbox_config_files_raw(
         toml_candidates.push(h.join(".config/aterm/aterm.toml"));
     }
     let mut roster_candidates = Vec::new();
+    let mut cli_roster_candidates = Vec::new();
     let mut fleet_roster_candidates = Vec::new();
     if let Some(h) = home {
         let roster_path = h.join(".config/aterm/accounts.toml");
         toml_candidates.push(roster_path.clone());
         roster_candidates.push(roster_path);
+        for cli in super::accounts::Cli::ALL {
+            if cli != super::accounts::Cli::Claude {
+                cli_roster_candidates.push((
+                    cli,
+                    h.join(".config/aterm").join(cli.accounts().roster_file),
+                ));
+            }
+        }
         fleet_roster_candidates.push(
             h.join(".config/aterm")
                 .join(super::accounts_sync::FLEET_ROSTER_FILE),
@@ -1047,6 +1161,11 @@ fn discover_mailbox_config_files_raw(
             let sibling_roster = parent.join("accounts.toml");
             toml_candidates.push(sibling_roster.clone());
             roster_candidates.push(sibling_roster);
+            for cli in super::accounts::Cli::ALL {
+                if cli != super::accounts::Cli::Claude {
+                    cli_roster_candidates.push((cli, parent.join(cli.accounts().roster_file)));
+                }
+            }
             fleet_roster_candidates.push(parent.join(super::accounts_sync::FLEET_ROSTER_FILE));
         }
         toml_candidates.push(cfg_file.to_path_buf());
@@ -1210,12 +1329,10 @@ fn discover_mailbox_config_files_raw(
                                 .or_insert_with(|| secret.clone());
                         }
                     } else if !lower.starts_with('.')
+                        && !is_fleet_roster_name(&lower)
                         && !matches!(
                             lower.as_str(),
-                            "fleet-accounts.toml"
-                                | "ai-accounts.csv"
-                                | "ai-mailbox.toml"
-                                | "mailbox.toml"
+                            "fleet-accounts.toml" | "ai-mailbox.toml" | "mailbox.toml"
                         )
                     {
                         let stem = lower
@@ -1299,9 +1416,19 @@ fn discover_mailbox_config_files_raw(
     for (k, email) in totp_email_aliases {
         cfg.alias_label_to_email(Some(&k), Some(&email));
     }
+    cfg.contested_labels = contested_labels(home, &roster_candidates, &cli_roster_candidates);
     for roster_path in roster_candidates {
         if roster_path.is_file()
             && let Ok(roster) = super::accounts::Roster::load(&roster_path)
+        {
+            for row in &roster.rows {
+                cfg.alias_own_label_to_email(Some(&row.label), row.email.as_deref());
+            }
+        }
+    }
+    for (cli, roster_path) in cli_roster_candidates {
+        if roster_path.is_file()
+            && let Ok(roster) = super::accounts::Roster::load_for(cli, &roster_path)
         {
             for row in &roster.rows {
                 cfg.alias_label_to_email(Some(&row.label), row.email.as_deref());
@@ -1314,17 +1441,50 @@ fn discover_mailbox_config_files_raw(
             && let Ok(fleet) = super::accounts_sync::FleetRoster::from_toml(&text, "fleet")
         {
             for acct in &fleet.accounts {
-                cfg.alias_label_to_email(Some(&acct.label), Some(&acct.email));
+                cfg.alias_own_label_to_email(Some(&acct.label), Some(&acct.email));
             }
         }
     }
     if let Some(h) = home {
         let csv_path = h.join(".secrets/ai-accounts.csv");
-        if csv_path.is_file()
-            && let Ok(Some(csv_text)) = super::accounts::read_bounded(&csv_path, 512 * 1024)
-            && let Ok(fleet) = super::accounts_sync::parse_accounting_csv(&csv_text, "csv")
+        let csv_text = csv_path
+            .is_file()
+            .then(|| {
+                super::accounts::read_bounded(&csv_path, 512 * 1024)
+                    .ok()
+                    .flatten()
+            })
+            .flatten();
+        if let Some(csv_text) = csv_text.as_deref()
+            && let Ok(fleet) = super::accounts_sync::parse_accounting_csv(csv_text, "csv")
         {
             for acct in &fleet.accounts {
+                cfg.alias_own_label_to_email(Some(&acct.label), Some(&acct.email));
+            }
+        }
+        // Every other pool's fleet rows name their labels' emails too: its own file in
+        // `~/.secrets`, else its column of the sheet (`accounts_sync::load_cli_fleet`).
+        for cli in super::accounts_sync::OTHER_CLIS {
+            let fleet_path = h
+                .join(".secrets")
+                .join(super::accounts_sync::cli_fleet_file(cli));
+            let fleet = if fleet_path.is_file() {
+                super::accounts::read_bounded(&fleet_path, 256 * 1024)
+                    .ok()
+                    .flatten()
+                    .and_then(|text| {
+                        super::accounts_sync::FleetRoster::from_toml_for(cli, &text, "fleet").ok()
+                    })
+            } else {
+                csv_text
+                    .as_deref()
+                    .filter(|text| super::accounts_sync::csv_names_column(cli, text))
+                    .and_then(|text| {
+                        super::accounts_sync::parse_accounting_csv_for(cli, text, "csv").ok()
+                    })
+                    .map(|fleet| fleet.roster)
+            };
+            for acct in fleet.iter().flat_map(|fleet| &fleet.accounts) {
                 cfg.alias_label_to_email(Some(&acct.label), Some(&acct.email));
             }
         }
@@ -1663,13 +1823,11 @@ pub fn has_browser_profile(store_dir: &Path, label: &str, email: Option<&str>) -
     resolve_browser_profile_dir(store_dir, Some(label), email).is_dir()
 }
 
-/// Infer the account label from `CLAUDE_CONFIG_DIR` (`<store>/logins/<label>[+<seq>]`) when set.
+/// Infer the account label from `ATERM_ACCOUNT_LABEL`, else from `CLAUDE_CONFIG_DIR`
+/// (`<store>/logins/<label>[+<seq>]`) when set ([`super::open_url::account_label_of`]).
 #[must_use]
 pub fn infer_account_label_from_env() -> Option<String> {
-    let dir = std::env::var_os(super::accounts::HOME_ENV)?;
-    let name = Path::new(&dir).file_name()?.to_str()?;
-    let label = name.rsplit_once('+').map_or(name, |(l, _)| l).trim();
-    (!label.is_empty()).then(|| label.to_owned())
+    super::open_url::account_label_of(&|name| std::env::var_os(name))
 }
 
 /// Resolve the persistent browser profile directory under `store_dir`, reusing an existing
@@ -1710,6 +1868,26 @@ pub fn resolve_browser_profile_dir(
         }
     }
     browser_profile_dir(store_dir, base_email.as_deref().or(email).or(label))
+}
+
+/// The persistent browser profile a vendor sign-in of the row with `email` (else its
+/// `label_key`, `<cli>-<label>`) runs in under `store_dir`: keyed by the EXACT email, never its
+/// `+tag`-less base or a label's profile, so a plus-addressed row never signs in through
+/// another row's signed-in profile; an email the profile key would not spell one to one
+/// (a `+`, or one cut at 64 characters) carries its digest as well.
+#[must_use]
+pub fn vendor_profile_dir(store_dir: &Path, label_key: &str, email: Option<&str>) -> PathBuf {
+    let Some(email) = email.map(str::trim).filter(|e| !e.is_empty()) else {
+        return browser_profile_dir(store_dir, Some(label_key));
+    };
+    let lower = email.to_ascii_lowercase();
+    let key = sanitize_profile_key(&lower);
+    let key = if key == lower.replace('@', "-at-") {
+        key
+    } else {
+        format!("{key}-{}", &fnv1a_hex(&lower)[..8])
+    };
+    store_dir.join(BROWSER_PROFILES_DIR).join(key)
 }
 
 /// Run authorization with a persistent store profile or an owned scratch profile.
@@ -1877,13 +2055,30 @@ fn is_six_digit_otp(token: &str) -> Option<String> {
         return Some(format!("{a}{b}"));
     }
     if cleaned.len() == 6 && cleaned.bytes().all(|c| c.is_ascii_digit()) {
-        // Avoid matching 6-digit dates/postal/color fragments when preceded by `#` or `:`.
-        if token.starts_with('#') || token.starts_with(':') {
+        // Avoid matching 6-digit dates/postal/color/query/base64/currency fragments.
+        if token.starts_with(['#', ':', '=', '$', '%', '/']) || token.ends_with(['=', '%']) {
             return None;
         }
         return Some(cleaned.to_owned());
     }
     None
+}
+
+fn is_mime_part_header_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let Some((name, _)) = trimmed.split_once(':') else {
+        return false;
+    };
+    let name_low = name.trim().to_ascii_lowercase();
+    matches!(
+        name_low.as_str(),
+        "content-type"
+            | "content-transfer-encoding"
+            | "content-disposition"
+            | "content-id"
+            | "content-description"
+            | "mime-version"
+    )
 }
 
 /// Extract all candidate 6-digit verification codes (OTPs) from an incoming email addressed to
@@ -1896,6 +2091,11 @@ pub fn extract_otps_from_email(raw_email: &str, target_email: Option<&str>) -> V
         return Vec::new();
     }
     let mut extra_text = decode_mime_base64_parts(raw_email);
+    if !extra_text.is_empty() {
+        extra_text = super::open_url::decode_rfc2047_words(&super::open_url::decode_qp_mime_parts(
+            &extra_text,
+        ));
+    }
     let mut prioritized = Vec::new();
     let push_unique = |list: &mut Vec<String>, code: String| {
         if !list.iter().any(|existing| existing == &code) {
@@ -1919,7 +2119,7 @@ pub fn extract_otps_from_email(raw_email: &str, target_email: Option<&str>) -> V
         return prioritized;
     }
     let body_section = super::open_url::split_header_body(raw_email).map_or(raw_email, |(_, b)| b);
-    let qp_decoded = if is_json_with_body {
+    let qp_decoded = if is_json_with_body || super::open_url::is_top_level_base64_email(raw_email) {
         String::new()
     } else if super::open_url::is_quoted_printable_email(raw_email) {
         super::open_url::decode_rfc2047_words(&decode_quoted_printable(body_section))
@@ -1935,34 +2135,63 @@ pub fn extract_otps_from_email(raw_email: &str, target_email: Option<&str>) -> V
         super::open_url::extract_iframe_srcdoc_fragments(&format!("{qp_decoded}\n{extra_text}"));
     let combined = format!("{srcdoc_extra}\n{extra_text}\n{qp_decoded}\n{subject_extra}");
     let plain = decode_html_amp(&strip_html_tags(&combined));
+    let mut caption_promoted = Vec::new();
+    let mut standalone_fallbacks = Vec::new();
     let mut fallbacks = Vec::new();
     let mut context_lines_left = 0usize;
     let mut single_digit_run = String::new();
     let mut single_digit_run_context = false;
+    let mut nonempty_line_idx = 0usize;
+    let mut last_standalone: Option<(usize, String)> = None;
     fn clean_digits(tok: &str) -> Option<&str> {
         let trimmed = tok.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-');
         (!trimmed.is_empty() && trimmed.bytes().all(|b| b.is_ascii_digit())).then_some(trimmed)
     }
-    let flush_single_digit_run =
-        |run: &mut String, run_ctx: &mut bool, pri: &mut Vec<String>, fb: &mut Vec<String>| {
-            if run.len() == 6 {
-                let code = run.clone();
-                if *run_ctx {
-                    if !pri.iter().any(|existing| existing == &code) {
-                        pri.push(code);
-                    }
-                } else if !fb.iter().any(|existing| existing == &code) {
-                    fb.push(code);
+    let flush_single_digit_run = |run: &mut String,
+                                  run_ctx: &mut bool,
+                                  pri: &mut Vec<String>,
+                                  st_fb: &mut Vec<String>,
+                                  last_st: &mut Option<(usize, String)>,
+                                  line_idx: usize| {
+        if run.len() == 6 {
+            let code = run.clone();
+            if *run_ctx {
+                if !pri.iter().any(|existing| existing == &code) {
+                    pri.push(code);
                 }
+            } else {
+                if !st_fb.iter().any(|existing| existing == &code) {
+                    st_fb.push(code.clone());
+                }
+                *last_st = Some((line_idx, code));
             }
-            run.clear();
-            *run_ctx = false;
-        };
+        }
+        run.clear();
+        *run_ctx = false;
+    };
     for line in plain.lines() {
+        let trimmed_line = line.trim();
+        if super::open_url::is_mime_boundary_line(trimmed_line) {
+            flush_single_digit_run(
+                &mut single_digit_run,
+                &mut single_digit_run_context,
+                &mut prioritized,
+                &mut standalone_fallbacks,
+                &mut last_standalone,
+                nonempty_line_idx,
+            );
+            context_lines_left = 0;
+            last_standalone = None;
+            continue;
+        }
+        if is_mime_part_header_line(line) {
+            continue;
+        }
         let words: Vec<&str> = line.split_whitespace().collect();
         if words.is_empty() {
             continue;
         }
+        nonempty_line_idx += 1;
         if words.len() == 1
             && let Some(d) = clean_digits(words[0])
             && d.len() == 1
@@ -1971,29 +2200,56 @@ pub fn extract_otps_from_email(raw_email: &str, target_email: Option<&str>) -> V
                 single_digit_run_context = context_lines_left > 0;
             }
             single_digit_run.push_str(d);
+            if single_digit_run.len() == 6 {
+                flush_single_digit_run(
+                    &mut single_digit_run,
+                    &mut single_digit_run_context,
+                    &mut prioritized,
+                    &mut standalone_fallbacks,
+                    &mut last_standalone,
+                    nonempty_line_idx,
+                );
+            }
             continue;
         }
         flush_single_digit_run(
             &mut single_digit_run,
             &mut single_digit_run_context,
             &mut prioritized,
-            &mut fallbacks,
+            &mut standalone_fallbacks,
+            &mut last_standalone,
+            nonempty_line_idx.saturating_sub(1),
         );
         let lower = line.to_ascii_lowercase();
         let line_has_context = lower.contains("code")
             || lower.contains("verify")
             || lower.contains("verification")
             || lower.contains("sign in")
+            || lower.contains("sign-in")
             || lower.contains("login")
-            || lower.contains("one-time");
+            || lower.contains("log in")
+            || lower.contains("one-time")
+            || lower.contains("passcode")
+            || lower.contains("otp")
+            || lower.contains("authenticate");
         if line_has_context {
-            context_lines_left = 3;
+            context_lines_left = 4;
+            if let Some((prev_idx, ref prev_otp)) = last_standalone
+                && nonempty_line_idx.saturating_sub(prev_idx) <= 2
+            {
+                push_unique(&mut caption_promoted, prev_otp.clone());
+            }
         }
         let has_context = context_lines_left > 0;
         if words.len() == 1
             && let Some(otp) = is_six_digit_otp(words[0])
         {
-            push_unique(&mut prioritized, otp);
+            if has_context {
+                push_unique(&mut prioritized, otp);
+            } else {
+                push_unique(&mut standalone_fallbacks, otp.clone());
+                last_standalone = Some((nonempty_line_idx, otp));
+            }
             if !line_has_context {
                 context_lines_left = context_lines_left.saturating_sub(1);
             }
@@ -2005,7 +2261,12 @@ pub fn extract_otps_from_email(raw_email: &str, target_email: Option<&str>) -> V
                 .all(|w| clean_digits(w).is_some_and(|d| d.len() == 1))
         {
             let joined: String = words.iter().filter_map(|w| clean_digits(w)).collect();
-            push_unique(&mut prioritized, joined);
+            if has_context {
+                push_unique(&mut prioritized, joined);
+            } else {
+                push_unique(&mut standalone_fallbacks, joined.clone());
+                last_standalone = Some((nonempty_line_idx, joined));
+            }
             if !line_has_context {
                 context_lines_left = context_lines_left.saturating_sub(1);
             }
@@ -2060,8 +2321,16 @@ pub fn extract_otps_from_email(raw_email: &str, target_email: Option<&str>) -> V
         &mut single_digit_run,
         &mut single_digit_run_context,
         &mut prioritized,
-        &mut fallbacks,
+        &mut standalone_fallbacks,
+        &mut last_standalone,
+        nonempty_line_idx,
     );
+    for cp in caption_promoted {
+        push_unique(&mut prioritized, cp);
+    }
+    for st in standalone_fallbacks {
+        push_unique(&mut prioritized, st);
+    }
     for fb in fallbacks {
         push_unique(&mut prioritized, fb);
     }
@@ -2083,16 +2352,22 @@ pub fn extract_all_credentials_from_email(
     raw_email: &str,
     target_email: Option<&str>,
 ) -> Vec<MailboxCredential> {
-    let links = extract_magic_links_from_email(raw_email, target_email);
-    if !links.is_empty() {
-        return links
+    let (auth_links, fallback_links) =
+        super::open_url::extract_ranked_magic_links_from_email(raw_email, target_email);
+    if !auth_links.is_empty() {
+        return auth_links
             .into_iter()
+            .chain(fallback_links)
             .map(MailboxCredential::MagicLink)
             .collect();
     }
-    extract_otps_from_email(raw_email, target_email)
+    let otps = extract_otps_from_email(raw_email, target_email);
+    if !otps.is_empty() {
+        return otps.into_iter().map(MailboxCredential::Otp).collect();
+    }
+    fallback_links
         .into_iter()
-        .map(MailboxCredential::Otp)
+        .map(MailboxCredential::MagicLink)
         .collect()
 }
 
@@ -2107,12 +2382,270 @@ pub fn extract_credential_from_email(
         .next()
 }
 
+/// Which mails a sign-in's mailbox read may take a credential from: where `senders` names any
+/// word, only a mail whose `From:` address's domain names one as a whole label (`kimi` names
+/// `kimi.ai` and `mail.kimi.com`; `x.ai` names `x.ai` and `mail.x.ai`, never `max.ai`), and
+/// where `since` is set, only one dated at or after it (less [`MAIL_CLOCK_SLACK_S`]); a mail
+/// with no readable sender or date is then refused. A refused mail is neither typed into a page
+/// nor marked consumed.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MailFilter<'a> {
+    /// The vendor's sender words; empty takes any sender (Claude Code's own reads).
+    pub senders: &'a [String],
+    /// The earliest date a mail may carry (unix seconds).
+    pub since: Option<i64>,
+}
+
+/// How far a mail's `Date:` may run behind the sign-in's start and still be taken (clock skew).
+pub const MAIL_CLOCK_SLACK_S: i64 = 120;
+
+impl MailFilter<'_> {
+    /// The filter `cfg` names ([`MailboxConfig::senders`], [`MailboxConfig::since`]).
+    #[must_use]
+    pub fn of(cfg: &MailboxConfig) -> MailFilter<'_> {
+        MailFilter {
+            senders: &cfg.senders,
+            since: cfg.since,
+        }
+    }
+
+    /// Whether the mail `raw` (a message's text, or a mailbox API's JSON item) may give its
+    /// credential.
+    #[must_use]
+    pub fn admits(&self, raw: &str) -> bool {
+        if self.senders.is_empty() && self.since.is_none() {
+            return true;
+        }
+        let (from, date) = mail_from_and_date(raw);
+        if !self.senders.is_empty()
+            && !from
+                .as_deref()
+                .is_some_and(|domain| self.senders.iter().any(|w| domain_names(domain, w)))
+        {
+            return false;
+        }
+        match self.since {
+            None => true,
+            Some(since) => date.is_some_and(|at| at >= since.saturating_sub(MAIL_CLOCK_SLACK_S)),
+        }
+    }
+}
+
+/// Whether the mail domain `domain` names the sender word `word` as whole labels: `word` is the
+/// domain or one of its labels (a word without a dot), or the domain's own tail (a word with
+/// one).
+#[must_use]
+pub fn domain_names(domain: &str, word: &str) -> bool {
+    let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    let word = word.trim().to_ascii_lowercase();
+    if word.is_empty() || domain.is_empty() {
+        return false;
+    }
+    if word.contains('.') {
+        domain == word || domain.ends_with(&format!(".{word}"))
+    } else {
+        domain.split('.').any(|label| label == word)
+    }
+}
+
+/// The `From:` address's domain and the `Date:` (unix seconds) of the mail `raw`: its header
+/// block, or a mailbox API's JSON item (`From`/`from`, an address or `{Address|address}`;
+/// `Date`/`date`/`Created`/`created_at`, RFC 3339 or RFC 2822).
+#[must_use]
+pub fn mail_from_and_date(raw: &str) -> (Option<String>, Option<i64>) {
+    let trimmed = raw.trim_start();
+    if trimmed.starts_with('{')
+        && let Ok(item) = aterm_json::from_str::<Value>(trimmed)
+    {
+        let from = item
+            .get("From")
+            .or_else(|| item.get("from"))
+            .and_then(address_text);
+        let date = ["Date", "date", "Created", "created_at"]
+            .iter()
+            .find_map(|k| item.get(k).and_then(Value::as_str))
+            .and_then(|d| parse_mail_date(d).or_else(|| parse_rfc3339_any(d)));
+        return (from.as_deref().and_then(address_domain), date);
+    }
+    let head = raw
+        .split("\r\n\r\n")
+        .next()
+        .unwrap_or(raw)
+        .split("\n\n")
+        .next()
+        .unwrap_or(raw);
+    let mut from = None;
+    let mut date = None;
+    let mut last: Option<&mut Option<String>> = None;
+    for line in head.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.starts_with([' ', '\t']) {
+            if let Some(Some(value)) = last.as_mut().map(|l| l.as_mut()) {
+                value.push(' ');
+                value.push_str(line.trim());
+            }
+            continue;
+        }
+        last = None;
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("from") && from.is_none() {
+            from = Some(value.trim().to_owned());
+            last = Some(&mut from);
+        } else if name.eq_ignore_ascii_case("date") && date.is_none() {
+            date = Some(value.trim().to_owned());
+            last = Some(&mut date);
+        }
+    }
+    (
+        from.as_deref().and_then(address_domain),
+        date.as_deref().and_then(parse_mail_date),
+    )
+}
+
+/// The address a mailbox API's `From` names: a string, an object's `Address`, `address` or
+/// `email`, or the first of an array of either.
+fn address_text(v: &Value) -> Option<String> {
+    v.as_str()
+        .map(str::to_owned)
+        .or_else(|| {
+            ["Address", "address", "email"]
+                .iter()
+                .find_map(|k| v.get(k).and_then(Value::as_str).map(str::to_owned))
+        })
+        .or_else(|| v.as_array()?.first().and_then(address_text))
+}
+
+/// The domain of the one address in a `From:` value (`Name <a@b.c>` or `a@b.c`).
+fn address_domain(value: &str) -> Option<String> {
+    let addr = match (value.rfind('<'), value.rfind('>')) {
+        (Some(open), Some(close)) if open < close => &value[open + 1..close],
+        _ => value,
+    };
+    let addr = addr.trim().trim_matches('"');
+    let (_, domain) = addr.rsplit_once('@')?;
+    let domain = domain.trim().to_ascii_lowercase();
+    (!domain.is_empty()
+        && domain
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-')))
+    .then_some(domain)
+}
+
+/// An RFC 3339 time with any offset or fraction (`2026-10-23T22:15:03.5+02:00`), unix seconds.
+fn parse_rfc3339_any(text: &str) -> Option<i64> {
+    let t = text.trim();
+    let (date, time) = t.split_once(['T', 't', ' '])?;
+    let mut d = date.split('-');
+    let (y, m, day) = (
+        d.next()?.parse::<i64>().ok()?,
+        d.next()?.parse::<u32>().ok()?,
+        d.next()?.parse::<u32>().ok()?,
+    );
+    let (clock, offset) = match time.find(['Z', 'z', '+', '-']) {
+        Some(at) => time.split_at(at),
+        None => (time, "Z"),
+    };
+    let mut c = clock.split(':');
+    let (hh, mm) = (
+        c.next()?.parse::<i64>().ok()?,
+        c.next()?.parse::<i64>().ok()?,
+    );
+    let ss = c
+        .next()
+        .and_then(|s| s.split('.').next())
+        .map_or(Some(0), |s| s.parse::<i64>().ok())?;
+    let zone = match offset {
+        "Z" | "z" => 0,
+        o => zone_seconds(&o.replace(':', ""))?,
+    };
+    civil_seconds(y, m, day, hh, mm, ss).map(|at| at - zone)
+}
+
+/// An RFC 2822 `Date:` (`Thu, 23 Oct 2026 22:15:03 +0000`, the weekday and seconds optional, a
+/// `GMT`/`UT`/`UTC`/US zone name or a numeric offset), unix seconds.
+#[must_use]
+pub fn parse_mail_date(text: &str) -> Option<i64> {
+    let text = text.split('(').next().unwrap_or(text);
+    let text = text.split_once(',').map_or(text, |(_, rest)| rest);
+    let mut words = text.split_whitespace();
+    let day = words.next()?.parse::<u32>().ok()?;
+    let month = words.next()?.to_ascii_lowercase();
+    let month = [
+        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+    ]
+    .iter()
+    .position(|m| month.starts_with(m))?;
+    let year = words.next()?.parse::<i64>().ok()?;
+    let year = match year {
+        0..=49 => 2000 + year,
+        50..=999 => 1900 + year,
+        y => y,
+    };
+    let mut clock = words.next()?.split(':');
+    let (hh, mm) = (
+        clock.next()?.parse::<i64>().ok()?,
+        clock.next()?.parse::<i64>().ok()?,
+    );
+    let ss = clock.next().map_or(Some(0), |s| s.parse::<i64>().ok())?;
+    let zone = words.next().map_or(Some(0), zone_seconds)?;
+    let month = u32::try_from(month).ok()? + 1;
+    civil_seconds(year, month, day, hh, mm, ss).map(|at| at - zone)
+}
+
+/// A zone's offset east of UTC, in seconds (`+0200`, `-0700`, `GMT`, `EST`, …).
+fn zone_seconds(zone: &str) -> Option<i64> {
+    let named = match zone.to_ascii_uppercase().as_str() {
+        "GMT" | "UT" | "UTC" | "Z" => Some(0),
+        "EDT" => Some(-4),
+        "EST" | "CDT" => Some(-5),
+        "CST" | "MDT" => Some(-6),
+        "MST" | "PDT" => Some(-7),
+        "PST" => Some(-8),
+        _ => None,
+    };
+    if let Some(hours) = named {
+        return Some(hours * 3600);
+    }
+    let (sign, digits) = match zone.as_bytes().first()? {
+        b'+' => (1, &zone[1..]),
+        b'-' => (-1, &zone[1..]),
+        _ => return None,
+    };
+    if digits.len() != 4 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let hh = digits[..2].parse::<i64>().ok()?;
+    let mm = digits[2..].parse::<i64>().ok()?;
+    Some(sign * (hh * 3600 + mm * 60))
+}
+
+/// Unix seconds of a UTC civil time (days from civil, Howard Hinnant's algorithm).
+fn civil_seconds(y: i64, m: u32, d: u32, hh: i64, mm: i64, ss: i64) -> Option<i64> {
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || hh > 23 || mm > 59 || ss > 60 {
+        return None;
+    }
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (i64::from(m) + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + i64::from(d) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + hh * 3600 + mm * 60 + ss)
+}
+
 fn extract_unseen_credential_from_email(
     raw_email: &str,
     target_email: Option<&str>,
     seen_digests: &BTreeSet<String>,
     seen_otps: &BTreeSet<String>,
+    filter: &MailFilter<'_>,
 ) -> Option<(MailboxCredential, bool)> {
+    if !filter.admits(raw_email) {
+        return None;
+    }
     let mut unseen = extract_all_credentials_from_email(raw_email, target_email)
         .into_iter()
         .filter(|cred| match cred {
@@ -2365,6 +2898,7 @@ fn fetch_imap_tcp_credential(
     seen_file: Option<&Path>,
     seen: &mut BTreeSet<String>,
     seen_otps: &mut BTreeSet<String>,
+    filter: &MailFilter<'_>,
 ) -> Option<MailboxCredential> {
     let addr = (host, port).to_socket_addrs().ok()?.next()?;
     let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).ok()?;
@@ -2440,17 +2974,26 @@ fn fetch_imap_tcp_credential(
             },
             |fi| fi + 1,
         );
-        let mut end = msg_lines.len();
-        while end > start && msg_lines[end - 1].trim_start().starts_with("* ") {
-            end -= 1;
-        }
-        if end > start && msg_lines[end - 1].trim_start().starts_with(')') {
-            end -= 1;
-        }
-        let joined: String = msg_lines[start..end].concat();
-        let raw_msg = match literal_len {
-            Some(n) if n <= joined.len() && joined.is_char_boundary(n) => &joined[..n],
-            _ => joined.as_str(),
+        let full_from_start: String = msg_lines[start..].concat();
+        let trimmed_fallback: String;
+        let raw_msg = if let Some(n) = literal_len
+            && n <= full_from_start.len()
+            && full_from_start.is_char_boundary(n)
+        {
+            &full_from_start[..n]
+        } else {
+            let mut end = msg_lines.len();
+            while end > start && msg_lines[end - 1].trim_start().starts_with("* ") {
+                end -= 1;
+            }
+            if end > start && msg_lines[end - 1].trim_start().starts_with(')') {
+                end -= 1;
+            }
+            trimmed_fallback = msg_lines[start..end].concat();
+            trimmed_fallback
+                .trim_end_matches(['\r', '\n'])
+                .strip_suffix(')')
+                .unwrap_or(&trimmed_fallback)
         };
         if raw_msg.trim().is_empty() {
             continue;
@@ -2460,7 +3003,7 @@ fn fetch_imap_tcp_credential(
             continue;
         }
         if let Some((cred, exhausted)) =
-            extract_unseen_credential_from_email(raw_msg, target_email, seen, seen_otps)
+            extract_unseen_credential_from_email(raw_msg, target_email, seen, seen_otps, filter)
         {
             let store_cmd = if exhausted {
                 format!("s{idx} STORE {seq} +FLAGS (\\Seen)\r\na9 LOGOUT\r\n")
@@ -2489,6 +3032,10 @@ fn fetch_imap_tcp_credential(
     None
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "IMAPS fetch binds the URL, credentials, target filter, seen state and the vendor mail filter"
+)]
 fn fetch_imaps_curl_credential(
     parsed: &ParsedImapUrl,
     user: &str,
@@ -2497,6 +3044,7 @@ fn fetch_imaps_curl_credential(
     seen_file: Option<&Path>,
     seen: &mut BTreeSet<String>,
     seen_otps: &mut BTreeSet<String>,
+    filter: &MailFilter<'_>,
 ) -> Option<MailboxCredential> {
     let userpwd = format!("{user}:{password}");
     let search_url = format!(
@@ -2553,7 +3101,7 @@ fn fetch_imaps_curl_credential(
             continue;
         }
         if let Some((cred, exhausted)) =
-            extract_unseen_credential_from_email(&raw_msg, target_email, seen, seen_otps)
+            extract_unseen_credential_from_email(&raw_msg, target_email, seen, seen_otps, filter)
         {
             record_consumed_credential(
                 seen_file,
@@ -2602,6 +3150,7 @@ fn fetch_imap_credential(
             cfg.seen_file.as_deref(),
             seen,
             seen_otps,
+            &MailFilter::of(cfg),
         )
     } else {
         fetch_imap_tcp_credential(
@@ -2614,6 +3163,7 @@ fn fetch_imap_credential(
             cfg.seen_file.as_deref(),
             seen,
             seen_otps,
+            &MailFilter::of(cfg),
         )
     }
 }
@@ -2879,6 +3429,7 @@ fn fetch_http_mailbox_credential(
     seen: &mut BTreeSet<String>,
     seen_otps: &mut BTreeSet<String>,
 ) -> Option<MailboxCredential> {
+    let filter = MailFilter::of(cfg);
     let raw_url = cfg.http_url.as_deref()?;
     let url = if raw_url.contains("{email}") {
         raw_url.replace("{email}", &percent_encode(target_email.unwrap_or("")))
@@ -2907,9 +3458,13 @@ fn fetch_http_mailbox_credential(
                 if seen.contains(&digest) {
                     continue;
                 }
-                if let Some((cred, exhausted)) =
-                    extract_unseen_credential_from_email(&item_str, target_email, seen, seen_otps)
-                {
+                if let Some((cred, exhausted)) = extract_unseen_credential_from_email(
+                    &item_str,
+                    target_email,
+                    seen,
+                    seen_otps,
+                    &filter,
+                ) {
                     record_consumed_credential(
                         cfg.seen_file.as_deref(),
                         seen,
@@ -2943,6 +3498,7 @@ fn fetch_http_mailbox_credential(
                             target_email,
                             seen,
                             seen_otps,
+                            &filter,
                         ) {
                             record_consumed_credential(
                                 cfg.seen_file.as_deref(),
@@ -2974,7 +3530,7 @@ fn fetch_http_mailbox_credential(
         return None;
     }
     let (cred, exhausted) =
-        extract_unseen_credential_from_email(&body, target_email, seen, seen_otps)?;
+        extract_unseen_credential_from_email(&body, target_email, seen, seen_otps, &filter)?;
     record_consumed_credential(
         cfg.seen_file.as_deref(),
         seen,
@@ -3017,8 +3573,8 @@ fn scan_maildir_once(
     target_email: Option<&str>,
     tried: &mut BTreeSet<(PathBuf, u64, std::time::SystemTime)>,
     seen_file: Option<&Path>,
-    seen_digests: &mut BTreeSet<String>,
-    seen_otps: &mut BTreeSet<String>,
+    (seen_digests, seen_otps): (&mut BTreeSet<String>, &mut BTreeSet<String>),
+    filter: &MailFilter<'_>,
 ) -> Option<MailboxCredential> {
     let mut candidates: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
     if mailbox_dir.is_file()
@@ -3099,9 +3655,13 @@ fn scan_maildir_once(
                 if seen_digests.contains(&msg_digest) {
                     continue;
                 }
-                if let Some((found, exhausted)) =
-                    extract_unseen_credential_from_email(msg, target_email, seen_digests, seen_otps)
-                {
+                if let Some((found, exhausted)) = extract_unseen_credential_from_email(
+                    msg,
+                    target_email,
+                    seen_digests,
+                    seen_otps,
+                    filter,
+                ) {
                     record_consumed_credential(
                         seen_file,
                         seen_digests,
@@ -3122,9 +3682,13 @@ fn scan_maildir_once(
             tried.insert((path.clone(), len, mtime));
             continue;
         }
-        if let Some((found, exhausted)) =
-            extract_unseen_credential_from_email(&raw, target_email, seen_digests, seen_otps)
-        {
+        if let Some((found, exhausted)) = extract_unseen_credential_from_email(
+            &raw,
+            target_email,
+            seen_digests,
+            seen_otps,
+            filter,
+        ) {
             record_consumed_credential(
                 seen_file,
                 seen_digests,
@@ -3168,8 +3732,8 @@ fn poll_non_webmail_once(
             target_email,
             tried_files,
             cfg.seen_file.as_deref(),
-            seen_digests,
-            seen_otps,
+            (seen_digests, seen_otps),
+            &MailFilter::of(cfg),
         )
     {
         return Some(cred);
@@ -3224,8 +3788,8 @@ pub(super) fn poll_mailbox_config_for_credential_with_seen_otps(
                 target_email,
                 &mut tried_files,
                 cfg.seen_file.as_deref(),
-                &mut seen_digests,
-                seen_otps,
+                (&mut seen_digests, seen_otps),
+                &MailFilter::of(cfg),
             )
         {
             return Ok(cred);
@@ -3496,12 +4060,14 @@ pub fn oauth_step_js(
   }};
 {CODE_INPUT_HELPERS_JS}
 {SUBMIT_INPUT_HELPERS_JS}
+  const visibleControl = (el) => Boolean(el) && !el.disabled && !el.hidden && el.type !== "hidden" &&
+    !el.matches(":disabled") && el.getAttribute("aria-disabled") !== "true";
   const buttons = Array.from(document.querySelectorAll("button, input[type='submit'], input[type='image'], [role='button'], a[href]"));
   const emailVal = {email_json};
   const targetEmail = String(emailVal || "").trim().toLowerCase();
   const bodyText = String(document.body && document.body.innerText || "").toLowerCase();
-  const btnText = (btn) => String(btn.innerText || btn.value || btn.getAttribute("aria-label") || "").trim().toLowerCase();
-  const switchBtn = buttons.find(btn => !btn.disabled &&
+  const btnText = (btn) => String(btn.innerText || btn.value || btn.getAttribute("aria-label") || btn.getAttribute("title") || btn.getAttribute("alt") || "").trim().toLowerCase();
+  const switchBtn = buttons.find(btn => visibleControl(btn) &&
     /use another account|different account|switch account|sign in with another|not you|sign out|log out/i.test(btnText(btn)));
   const emailsIn = (text) => String(text).toLowerCase().match(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{{2,}}/g) || [];
   const canonEmail = (em) => {{
@@ -3516,7 +4082,7 @@ pub fn oauth_step_js(
   const pageEmails = emailsIn(bodyText)
     .filter(e => !e.endsWith("@anthropic.com"));
   const hasForeignAccount = Boolean(targetEmail) && !hasTargetEmail(bodyText) && (
-    buttons.some(btn => !btn.disabled && btnText(btn).startsWith("continue as ") && emailsIn(btnText(btn)).length > 0 && !hasTargetEmail(btnText(btn))) ||
+    buttons.some(btn => visibleControl(btn) && btnText(btn).startsWith("continue as ") && emailsIn(btnText(btn)).length > 0 && !hasTargetEmail(btnText(btn))) ||
     (pageEmails.length > 0 && (Boolean(switchBtn) || /signed in as|logged in as|continuing as/i.test(bodyText)))
   );
   if (hasForeignAccount) {{
@@ -3527,10 +4093,12 @@ pub fn oauth_step_js(
     return {{ state: "wrong_account", url: href }};
   }}
   for (const btn of buttons) {{
-    if (btn.disabled) continue;
+    if (!visibleControl(btn)) continue;
     const text = btnText(btn);
     const hrefAttr = String(btn.getAttribute("href") || "");
-    const isCancel = text.includes("cancel") || text.includes("deny") || text.includes("decline") || text.includes("reject") || text.includes("do not ") || text.includes("don't ") || text.includes("dont ") || text.includes("not allow") || text.includes("not authorize");
+    const hrefLower = hrefAttr.toLowerCase();
+    const isCancel = text.includes("cancel") || text.includes("deny") || text.includes("decline") || text.includes("reject") || text.includes("revoke") || text.includes("do not ") || text.includes("don't ") || text.includes("dont ") || text.includes("not allow") || text.includes("not authorize") ||
+      hrefLower.includes("deny") || hrefLower.includes("cancel") || hrefLower.includes("reject") || hrefLower.includes("decline") || hrefLower.includes("revoke") || hrefLower.includes("logout") || hrefLower.includes("signout") || hrefLower.includes("sign-out") || hrefLower.includes("access_denied") || hrefLower.includes("?error=") || hrefLower.includes("&error=");
     if (!isCancel && (
       text === "authorize" ||
       text.startsWith("authorize ") ||
@@ -3548,15 +4116,6 @@ pub fn oauth_step_js(
       return {{ state: "clicked_consent", url: href, target: hrefAttr || text }};
     }}
   }}
-  const approveForm = document.querySelector("form[action*='approve'], form[action*='authorize']");
-  if (approveForm) {{
-    if (typeof approveForm.requestSubmit === "function") {{
-      approveForm.requestSubmit();
-    }} else {{
-      approveForm.submit();
-    }}
-    return {{ state: "clicked_consent", url: href }};
-  }}
   const explicitOtp = Array.from(document.querySelectorAll("input[autocomplete='one-time-code'], input[name*='code'], input[name*='otp'], input[inputmode='numeric'], input[data-testid*='otp']"));
   const singleCharBoxes = Array.from(document.querySelectorAll("input[maxlength='1']"));
   const otpInputs = codeInputsFor(explicitOtp, singleCharBoxes);
@@ -3573,8 +4132,6 @@ pub fn oauth_step_js(
     }}
     return {{ state: "needs_mailbox", url: href }};
   }}
-  const visibleControl = (el) => Boolean(el) && !el.disabled && !el.hidden && el.type !== "hidden" &&
-    !el.matches(":disabled") && el.getAttribute("aria-disabled") !== "true";
   const emailInput = Array.from(document.querySelectorAll("input[type='email'], input[name='email'], input[autocomplete*='email'], input[autocomplete='username']")).find(visibleControl) || null;
   const emailDone = {email_submitted};
   if (emailInput && emailVal && !emailDone) {{
@@ -3584,12 +4141,24 @@ pub fn oauth_step_js(
     }}
     return {{ state: "submitted_email", url: href }};
   }}
+  const approveForm = !emailInput ? Array.from(document.querySelectorAll("form[action*='approve'], form[action*='authorize']")).find(f => {{
+    const act = String(f.getAttribute("action") || "").toLowerCase();
+    return !act.includes("deny") && !act.includes("cancel") && !act.includes("reject") && !act.includes("decline") && !act.includes("revoke") && !act.includes("logout") && !act.includes("signout") && !act.includes("sign-out") && !act.includes("access_denied") && !act.includes("?error=") && !act.includes("&error=");
+  }}) : null;
+  if (approveForm) {{
+    if (typeof approveForm.requestSubmit === "function") {{
+      approveForm.requestSubmit();
+    }} else {{
+      approveForm.submit();
+    }}
+    return {{ state: "clicked_consent", url: href }};
+  }}
   if (bodyText.includes("check your email") || bodyText.includes("magic link") || bodyText.includes("sent a link") || bodyText.includes("verification code") || bodyText.includes("link has expired") || bodyText.includes("link expired") || bodyText.includes("invalid link") || bodyText.includes("already been used")) {{
     return {{ state: "needs_mailbox", url: href }};
   }}
   if (targetEmail) {{
     for (const btn of buttons) {{
-      if (btn.disabled) continue;
+      if (!visibleControl(btn)) continue;
       const text = btnText(btn);
       const isCancel = text.includes("cancel") || text.includes("deny") || text.includes("decline") || text.includes("reject") || text.includes("do not ") || text.includes("don't ") || text.includes("dont ") || text.includes("not allow") || text.includes("not authorize");
       if (!isCancel && text.startsWith("continue as ") && hasTargetEmail(text)) {{
@@ -3599,7 +4168,7 @@ pub fn oauth_step_js(
     }}
   }}
   for (const btn of buttons) {{
-    if (btn.disabled) continue;
+    if (!visibleControl(btn)) continue;
     const text = btnText(btn);
     const isCancel = text.includes("cancel") || text.includes("deny") || text.includes("decline") || text.includes("reject") || text.includes("do not ") || text.includes("don't ") || text.includes("dont ") || text.includes("not allow") || text.includes("not authorize");
     if (targetEmail && text.startsWith("continue as ") && emailsIn(text).length > 0 && !hasTargetEmail(text)) {{
@@ -3855,7 +4424,14 @@ pub(super) fn webmail_step_js(
         bool,
     ),
     inbox_tick: usize,
+    senders: &[String],
 ) -> String {
+    let sender_words: Vec<String> = if senders.is_empty() {
+        vec!["claude".to_owned(), "anthropic".to_owned()]
+    } else {
+        senders.iter().map(|w| w.to_ascii_lowercase()).collect()
+    };
+    let senders_json = aterm_json::to_string(&sender_words).unwrap_or_else(|_| "[]".to_owned());
     let email_json = aterm_json::to_string(&Value::from(email.unwrap_or(""))).unwrap_or_default();
     let pw_json = aterm_json::to_string(&Value::from(password.unwrap_or(""))).unwrap_or_default();
     let mpw_json =
@@ -3990,7 +4566,7 @@ pub(super) fn webmail_step_js(
     const rt = String(row.innerText || "").toLowerCase();
     if (rt.includes("sign in") || rt.includes("verification") || rt.includes("verify") || rt.includes("login") || rt.includes("magic")) {{
       authRows.push(row);
-    }} else if (rt.includes("claude") || rt.includes("anthropic")) {{
+    }} else if ({senders_json}.some(word => rt.includes(word))) {{
       senderRows.push(row);
     }}
   }}
@@ -4110,6 +4686,7 @@ pub fn poll_webmail_via_cdp(
                     mailbox_pw_submitted,
                 ),
                 inbox_tick,
+                &cfg.senders,
             );
             let eval = cdp.call(
                 Some(&session),
@@ -4171,6 +4748,7 @@ pub fn poll_webmail_via_cdp(
                                 target_email,
                                 seen_digests,
                                 seen_otps,
+                                &MailFilter::default(),
                             )
                         {
                             record_consumed_credential(
@@ -4676,6 +5254,1044 @@ pub fn authorize_with_headless_browser(
         timeout,
     )
 }
+
+/// One page of a vendor sign-in as the headless browser reads it ([`VENDOR_PAGE_JS`]): what
+/// [`vendor_step`] decides on.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Page {
+    /// Its URL.
+    pub url: String,
+    /// Its first heading, lowercase.
+    pub heading: String,
+    /// Its visible text, bounded, as the page writes it.
+    pub text: String,
+    /// Its enabled, visible buttons' labels, lowercase, in document order.
+    pub buttons: Vec<String>,
+    /// Its enabled, visible inputs.
+    pub inputs: Vec<Field>,
+}
+
+/// One input of a [`Page`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Field {
+    /// An email (or username) input.
+    Email,
+    /// A code input: one-time, numeric, or one character per box.
+    Code,
+    /// A password input.
+    Password,
+    /// Anything else.
+    Other,
+}
+
+impl Field {
+    fn of(word: &str) -> Field {
+        match word {
+            "email" => Field::Email,
+            "code" => Field::Code,
+            "password" => Field::Password,
+            _ => Field::Other,
+        }
+    }
+}
+
+/// What a vendor sign-in has done on its pages so far, and what bounds it ([`vendor_step`]).
+#[derive(Debug, Clone, Copy)]
+pub struct Gate<'a> {
+    /// The hosts its pages may be on.
+    pub hosts: &'a [&'a str],
+    /// How the page hands the login back.
+    pub completion: crate::ai::connector::Completion,
+    /// The code the CLI printed, for a device flow.
+    pub code: Option<&'a str>,
+    /// The row's email.
+    pub email: Option<&'a str>,
+    /// Words of the vendor's own addresses (`connector::Accounts::mail_senders`), never taken
+    /// for another account's.
+    pub senders: &'a [&'a str],
+    /// The one-time code the mailbox gave, once it gave one.
+    pub otp: Option<&'a str>,
+    /// Consent presses made.
+    pub pressed: u32,
+    /// The device page's one confirm press was made.
+    pub confirmed: bool,
+    /// The device code was typed into the page.
+    pub filled_code: bool,
+    /// The row's email was submitted.
+    pub filled_email: bool,
+    /// The mailbox's one-time code was submitted.
+    pub filled_otp: bool,
+    /// The flow the sign-in started ([`FlowBound::of`] its first page), which every page and
+    /// mailed link must stay within.
+    pub bound: Option<&'a FlowBound>,
+}
+
+/// The OAuth flow a vendor sign-in started, as its first page's URL names it: the client, where
+/// the login is handed back, and the state; and the loopback callback's port, where that is on
+/// this machine. A page or a mailed link naming another client or another hand-back is another
+/// flow, which nothing is pressed on or followed to.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FlowBound {
+    /// `client_id`.
+    pub client_id: Option<String>,
+    /// `redirect_uri`, decoded.
+    pub redirect_uri: Option<String>,
+    /// `state`.
+    pub state: Option<String>,
+    /// The port of a loopback `redirect_uri` (`http://127.0.0.1:<port>/…`, `localhost`).
+    pub callback_port: Option<u16>,
+}
+
+/// The decoded value of the query parameter `key` of `url`.
+#[must_use]
+pub fn query_value(url: &str, key: &str) -> Option<String> {
+    let query = url.split_once('?')?.1.split('#').next().unwrap_or("");
+    query.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        (super::open_url::percent_decode(k) == key).then(|| super::open_url::percent_decode(v))
+    })
+}
+
+/// The port of `url` where it is a loopback `http://` URL (`127.0.0.1`, `localhost`).
+fn loopback_port(url: &str) -> Option<u16> {
+    let rest = url
+        .strip_prefix("http://127.0.0.1:")
+        .or_else(|| url.strip_prefix("http://localhost:"))?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+impl FlowBound {
+    /// The flow `start` (the sign-in's first page) names.
+    #[must_use]
+    pub fn of(start: &str) -> FlowBound {
+        let redirect_uri = query_value(start, "redirect_uri");
+        FlowBound {
+            client_id: query_value(start, "client_id"),
+            callback_port: redirect_uri.as_deref().and_then(loopback_port),
+            redirect_uri,
+            state: query_value(start, "state"),
+        }
+    }
+
+    /// Why `url` (a page, or a mailed link) is outside this flow on `hosts`: it names another
+    /// client, or hands its login to another place than this flow's, or to a host that is
+    /// neither this machine nor a pinned one.
+    #[must_use]
+    pub fn outside(&self, url: &str, hosts: &[&str]) -> Option<String> {
+        if let (Some(started), Some(named)) = (&self.client_id, query_value(url, "client_id"))
+            && *started != named
+        {
+            return Some("the page is another client's sign-in".to_owned());
+        }
+        let back = query_value(url, "redirect_uri")?;
+        if let Some(started) = &self.redirect_uri
+            && *started != back
+        {
+            return Some("the page hands its login to another place than the sign-in's".to_owned());
+        }
+        if loopback_port(&back).is_some() || super::login_drive::pinned(&back, hosts) {
+            return None;
+        }
+        Some("the page hands its login off this machine and off the vendor's hosts".to_owned())
+    }
+}
+
+/// What [`vendor_step`] decides for one page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Step {
+    /// Press the page's button at this index ([`Page::buttons`]).
+    Press(usize),
+    /// Type the CLI's device code into the page's code input, and submit it.
+    FillCode,
+    /// Type the row's email into the page's email input, and submit it.
+    FillEmail,
+    /// Type the mailbox's one-time code into the page's code input, and submit it.
+    FillOtp,
+    /// Read the mailbox for the vendor's sign-in mail.
+    Mailbox,
+    /// Read the page again.
+    Wait,
+    /// The page approved the sign-in.
+    Done,
+    /// Only the person can go on from here: why, without the URL or code.
+    Stop(String),
+    /// The page is refused: why.
+    Refuse(String),
+}
+
+/// The most consent presses one vendor sign-in makes.
+pub const MAX_CONSENT_PRESSES: u32 = 4;
+
+/// Identity providers other than the vendor's own, on which nothing is ever pressed.
+pub const OTHER_IDPS: &[&str] = &[
+    "accounts.google.com",
+    "appleid.apple.com",
+    "x.com",
+    "twitter.com",
+    "api.x.com",
+    "login.microsoftonline.com",
+    "login.live.com",
+    "github.com",
+    "facebook.com",
+    "www.facebook.com",
+];
+
+fn has_field(page: &Page, field: Field) -> bool {
+    page.inputs.contains(&field)
+}
+
+/// Whether `token` has the printed `code`'s shape: its length, its dashes where the code has
+/// them, letters and digits elsewhere, and a digit.
+fn code_shaped(token: &str, code: &str) -> bool {
+    token.len() == code.len()
+        && token.chars().zip(code.chars()).all(|(t, c)| {
+            if c == '-' {
+                t == '-'
+            } else {
+                t.is_ascii_alphanumeric()
+            }
+        })
+        && token.chars().any(|c| c.is_ascii_digit())
+}
+
+/// The tokens of `text` shaped like `code`, and whether `text` shows `code` itself (as a token,
+/// or with its spacing removed, as a page that boxes each character shows it).
+fn codes_shown(text: &str, code: &str) -> (bool, bool) {
+    let want = code.to_ascii_uppercase();
+    let mut shaped = false;
+    let mut same = false;
+    for token in text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-')) {
+        if code_shaped(token, code) {
+            shaped = true;
+            same |= token.eq_ignore_ascii_case(&want);
+        }
+    }
+    let compact: String = text
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_uppercase();
+    same |= compact.contains(&want);
+    (shaped || same, same)
+}
+
+fn sign_up_page(page: &Page) -> bool {
+    let path = page
+        .url
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split_once('/'))
+        .map(|(_, path)| {
+            path.split(['?', '#'])
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase()
+        })
+        .unwrap_or_default();
+    [
+        "signup",
+        "sign-up",
+        "sign_up",
+        "register",
+        "create-account",
+        "create_account",
+        "createaccount",
+    ]
+    .iter()
+    .any(|w| path.contains(w))
+        || [
+            "create an account",
+            "create account",
+            "create your account",
+            "sign up",
+        ]
+        .iter()
+        .any(|w| page.heading.contains(w))
+}
+
+fn emails_in(text: &str) -> Vec<String> {
+    text.split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '<' | '>' | ',' | ';' | '"'))
+        .map(|w| {
+            w.trim_matches(|c: char| !(c.is_ascii_alphanumeric()))
+                .to_ascii_lowercase()
+        })
+        .filter(|w| {
+            w.split_once('@')
+                .is_some_and(|(l, d)| !l.is_empty() && d.contains('.'))
+        })
+        .collect()
+}
+
+/// An email as a vendor's account names it: trimmed and lowercased, its `+tag` KEPT, since a
+/// plus-addressed row is another account of the vendor's ([`super::accounts::email_matches`]).
+fn exact_email(email: &str) -> String {
+    email.trim().to_ascii_lowercase()
+}
+
+/// The words with which a page names the account signed in to it.
+const SIGNED_IN_WORDS: &[&str] = &["signed in as", "logged in as", "continue as", "not you"];
+
+fn says_signed_in(page: &Page) -> bool {
+    let lower = page.text.to_ascii_lowercase();
+    SIGNED_IN_WORDS.iter().any(|w| lower.contains(w))
+        || page.buttons.iter().any(|b| b.starts_with("continue as "))
+}
+
+/// Whether the page names an account other than the row's as the one signed in: any email it
+/// shows (in its text or on a button) that is not EXACTLY the row's, the vendor's own addresses
+/// apart ([`domain_names`]).
+fn another_account(page: &Page, gate: &Gate<'_>) -> bool {
+    let Some(want) = gate.email.map(exact_email) else {
+        return false;
+    };
+    if !says_signed_in(page) {
+        return false;
+    }
+    let vendor = |e: &str| {
+        e.split_once('@')
+            .is_some_and(|(_, d)| gate.senders.iter().any(|s| domain_names(d, s)))
+    };
+    emails_in(&page.text)
+        .into_iter()
+        .chain(page.buttons.iter().flat_map(|b| emails_in(b)))
+        .any(|e| exact_email(&e) != want && !vendor(&e))
+}
+
+/// Whether the page names the row's EXACT email as the account signed in to it (its signed-in
+/// words beside the email, [`SIGNED_IN_WORDS`]), and no other: the page's proof of the row's
+/// account. A page that only echoes the email aterm typed (`we sent a code to …`) proves
+/// nothing.
+fn shows_email(page: &Page, gate: &Gate<'_>) -> bool {
+    let Some(want) = gate.email.map(exact_email) else {
+        return false;
+    };
+    says_signed_in(page)
+        && !another_account(page, gate)
+        && emails_in(&page.text)
+            .into_iter()
+            .chain(page.buttons.iter().flat_map(|b| emails_in(b)))
+            .any(|e| exact_email(&e) == want)
+}
+
+fn pressable(label: &str) -> bool {
+    ![
+        "cancel", "deny", "decline", "reject", "not you", "sign up", "create", "with ",
+    ]
+    .iter()
+    .any(|w| label.contains(w))
+}
+
+fn button_of(page: &Page, labels: &[&str]) -> Option<usize> {
+    page.buttons.iter().position(|b| {
+        pressable(b)
+            && labels
+                .iter()
+                .any(|l| b == l || b.strip_prefix(l).is_some_and(|rest| rest.starts_with(' ')))
+    })
+}
+
+const CONFIRM_LABELS: &[&str] = &[
+    "confirm",
+    "authorize",
+    "approve",
+    "allow",
+    "continue",
+    "yes",
+    "accept",
+];
+
+const CONSENT_LABELS: &[&str] = &[
+    "authorize",
+    "allow",
+    "approve",
+    "continue",
+    "accept",
+    "confirm",
+    "grant access",
+];
+
+const MAIL_WORDS: &[&str] = &[
+    "check your email",
+    "check your inbox",
+    "we sent",
+    "we've sent",
+    "we have sent",
+    "verification code",
+    "magic link",
+    "sent a link",
+];
+
+const SUCCESS_WORDS: &[&str] = &[
+    "you can close this",
+    "you may close this",
+    "device authorized",
+    "device has been authorized",
+    "successfully authorized",
+    "authorization successful",
+    "authorization complete",
+    "you're all set",
+    "you are all set",
+    "login successful",
+    "signed in successfully",
+    "return to your terminal",
+    "go back to your terminal",
+];
+
+/// The step one vendor sign-in page calls for (design §6): a pure judgment of the page's host,
+/// text, buttons and inputs. Nothing is pressed off the pinned hosts, on another identity
+/// provider or on a sign-up page; a device page is confirmed once, and only when it shows the
+/// code the CLI printed; a page showing another code, or another account signed in, is refused.
+#[must_use]
+pub fn vendor_step(page: &Page, gate: &Gate<'_>) -> Step {
+    use crate::ai::connector::Completion;
+    let url = page.url.as_str();
+    if url.starts_with("http://127.0.0.1:") || url.starts_with("http://localhost:") {
+        let wanted = gate.bound.and_then(|b| b.callback_port);
+        return match gate.completion {
+            Completion::Loopback if wanted.is_none_or(|port| loopback_port(url) == Some(port)) => {
+                Step::Done
+            }
+            Completion::Loopback => Step::Refuse(
+                "the page went to a local port other than the sign-in's callback".to_owned(),
+            ),
+            Completion::Device => {
+                Step::Refuse("a device sign-in's page went to a local callback".to_owned())
+            }
+        };
+    }
+    if url.is_empty()
+        || url == "about:blank"
+        || url.starts_with("chrome-error://")
+        || url.starts_with("data:")
+    {
+        return Step::Wait;
+    }
+    let Some(host) = super::login_drive::https_host(url) else {
+        return Step::Stop("the sign-in page left https".to_owned());
+    };
+    if !gate.hosts.iter().any(|h| h.eq_ignore_ascii_case(&host)) {
+        let idp = OTHER_IDPS.contains(&host.as_str())
+            || host.ends_with(".google.com")
+            || host.ends_with(".apple.com");
+        return Step::Stop(if idp {
+            format!("the sign-in went to {host}, another identity provider aterm never signs in to")
+        } else {
+            format!("the sign-in left its pinned hosts for {host}")
+        });
+    }
+    if sign_up_page(page) {
+        return Step::Stop("the page asks to create an account, which aterm never does".to_owned());
+    }
+    if let Some(why) = gate.bound.and_then(|b| b.outside(url, gate.hosts)) {
+        return Step::Refuse(why);
+    }
+    if another_account(page, gate) {
+        return Step::Refuse("the browser profile is signed in to another account".to_owned());
+    }
+    let lower = page.text.to_ascii_lowercase();
+    if has_field(page, Field::Email) && !gate.filled_email {
+        return match gate.email {
+            Some(_) => Step::FillEmail,
+            None => Step::Stop("the page asks for an email and the row names none".to_owned()),
+        };
+    }
+    let mail_page =
+        gate.filled_email && !gate.filled_otp || MAIL_WORDS.iter().any(|w| lower.contains(w));
+    if has_field(page, Field::Code) && mail_page && !gate.filled_otp {
+        return if gate.otp.is_some() {
+            Step::FillOtp
+        } else {
+            Step::Mailbox
+        };
+    }
+    if has_field(page, Field::Password) {
+        return Step::Stop("the page asks for a password, which aterm does not hold".to_owned());
+    }
+    if gate.completion == Completion::Device
+        && let Some(code) = gate.code
+    {
+        let (shaped, same) = codes_shown(&page.text, code);
+        if same {
+            if gate.confirmed {
+                return Step::Wait;
+            }
+            return button_of(page, CONFIRM_LABELS).map_or(Step::Wait, Step::Press);
+        }
+        if shaped {
+            return Step::Refuse("the page shows another code than the CLI printed".to_owned());
+        }
+        if has_field(page, Field::Code) && !gate.filled_code {
+            return Step::FillCode;
+        }
+    }
+    if SUCCESS_WORDS.iter().any(|w| lower.contains(w)) {
+        return Step::Done;
+    }
+    if !has_field(page, Field::Code)
+        && MAIL_WORDS.iter().any(|w| lower.contains(w))
+        && !gate.filled_otp
+    {
+        return Step::Mailbox;
+    }
+    let consent = gate.completion == Completion::Loopback || gate.filled_code || gate.confirmed;
+    if consent
+        && gate.pressed < MAX_CONSENT_PRESSES
+        && let Some(at) = button_of(page, CONSENT_LABELS)
+    {
+        return Step::Press(at);
+    }
+    Step::Wait
+}
+
+/// Reads the page into a [`Page`]: its URL, first heading, visible text (8000 characters at
+/// most), enabled visible buttons' labels and inputs' kinds.
+pub const VENDOR_PAGE_JS: &str = r#"(() => {
+  const visible = el => !el.disabled && !el.hidden && el.type !== "hidden" &&
+    el.getAttribute("aria-disabled") !== "true" && el.getClientRects().length > 0;
+  const label = b => String(b.innerText || b.value || b.getAttribute("aria-label") || "").trim().toLowerCase().slice(0, 80);
+  const buttons = Array.from(document.querySelectorAll("button, input[type='submit'], [role='button']")).filter(visible);
+  const kind = i => {
+    const t = String(i.type || "").toLowerCase(), n = String(i.name || "").toLowerCase();
+    const a = String(i.autocomplete || "").toLowerCase(), m = String(i.inputMode || "").toLowerCase();
+    if (t === "email" || n.includes("email") || a.includes("email") || a === "username") return "email";
+    if (t === "password") return "password";
+    if (a === "one-time-code" || n.includes("code") || n.includes("otp") || m === "numeric" || i.maxLength === 1) return "code";
+    return "other";
+  };
+  const inputs = Array.from(document.querySelectorAll("input")).filter(visible)
+    .filter(i => !["checkbox", "radio", "submit", "button", "image", "reset"].includes(String(i.type || "").toLowerCase()))
+    .map(kind);
+  const h = document.querySelector("h1, h2");
+  return {
+    url: String(window.location && window.location.href || ""),
+    heading: String(h && h.innerText || "").trim().toLowerCase().slice(0, 200),
+    text: String(document.body && document.body.innerText || "").slice(0, 8000),
+    buttons: buttons.map(label),
+    inputs
+  };
+})()"#;
+
+/// The JavaScript that carries out `step` on the page read by [`VENDOR_PAGE_JS`]: a press of the
+/// same enumeration's button, or `value` typed into the first input of the step's kind and
+/// submitted.
+#[must_use]
+pub fn vendor_act_js(step: &Step, value: Option<&str>) -> String {
+    let (verb, index) = match step {
+        Step::Press(at) => ("press", *at),
+        Step::FillCode | Step::FillOtp => ("code", 0),
+        Step::FillEmail => ("email", 0),
+        _ => ("none", 0),
+    };
+    let value_json = aterm_json::to_string(&value.unwrap_or("")).unwrap_or_else(|_| "\"\"".into());
+    format!(
+        r#"(() => {{
+  const setNativeValue = (el, val) => {{
+    if (typeof el.focus === "function") el.focus();
+    const proto = Object.getPrototypeOf(el);
+    const desc = proto && Object.getOwnPropertyDescriptor(proto, "value");
+    if (desc && desc.set) {{ desc.set.call(el, val); }} else {{ el.value = val; }}
+    el.dispatchEvent(new Event("input", {{ bubbles: true }}));
+    el.dispatchEvent(new Event("change", {{ bubbles: true }}));
+  }};
+{CODE_INPUT_HELPERS_JS}
+{SUBMIT_INPUT_HELPERS_JS}
+  const visible = el => !el.disabled && !el.hidden && el.type !== "hidden" &&
+    el.getAttribute("aria-disabled") !== "true" && el.getClientRects().length > 0;
+  const buttons = Array.from(document.querySelectorAll("button, input[type='submit'], [role='button']")).filter(visible);
+  const verb = "{verb}";
+  const value = {value_json};
+  if (verb === "press") {{
+    const b = buttons[{index}];
+    if (!b) return {{ ok: false }};
+    b.click();
+    return {{ ok: true }};
+  }}
+  if (verb === "email") {{
+    const input = Array.from(document.querySelectorAll("input[type='email'], input[name*='email'], input[autocomplete*='email'], input[autocomplete='username']")).find(visible);
+    if (!input || !value) return {{ ok: false }};
+    setNativeValue(input, value);
+    return {{ ok: submitInput(input, buttons, /continue|next|sign in|log in|send|submit/i) }};
+  }}
+  if (verb === "code") {{
+    const explicit = Array.from(document.querySelectorAll("input[autocomplete='one-time-code'], input[name*='code'], input[name*='otp'], input[inputmode='numeric']"));
+    const boxes = Array.from(document.querySelectorAll("input[maxlength='1']"));
+    const filled = fillCodeInputs(codeInputsFor(explicit, boxes), value);
+    if (!filled) return {{ ok: false }};
+    return {{ ok: submitInput(filled, buttons, /continue|verify|confirm|submit|next|sign in|log in/i) }};
+  }}
+  return {{ ok: false }};
+}})()"#
+    )
+}
+
+/// Reads [`VENDOR_PAGE_JS`]'s answer.
+#[must_use]
+pub fn page_of(value: &Value) -> Page {
+    let text = |key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned()
+    };
+    Page {
+        url: text("url"),
+        heading: text("heading"),
+        text: text("text"),
+        buttons: value
+            .get("buttons")
+            .and_then(Value::as_array)
+            .map(|b| {
+                b.iter()
+                    .map(|l| l.as_str().unwrap_or("").to_owned())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        inputs: value
+            .get("inputs")
+            .and_then(Value::as_array)
+            .map(|i| {
+                i.iter()
+                    .map(|k| Field::of(k.as_str().unwrap_or("")))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+/// How often a vendor sign-in's page is read again.
+const VENDOR_TICK: Duration = Duration::from_millis(400);
+
+/// How long a vendor drive waits on one unchanged page that shows nothing aterm presses or
+/// fills before it stops for a person ([`PageStall`]).
+pub const VENDOR_STALL: Duration = Duration::from_secs(90);
+
+/// The page a vendor drive is waiting on, and since when it is unchanged. A page that shows
+/// nothing aterm presses or fills for [`VENDOR_STALL`] waits for a person (a sign-in through
+/// another provider, a phone number, a CAPTCHA), so the drive stops there, naming the page,
+/// instead of waiting out its whole budget; a device page already confirmed waits on the CLI,
+/// never on a person, and never stalls.
+#[derive(Debug, Default)]
+pub struct PageStall {
+    seen: Option<(String, Instant)>,
+}
+
+impl PageStall {
+    /// Notes that the drive decided `step` on `page` at `now`; `Some(why)` once the same page
+    /// has asked nothing of aterm for [`VENDOR_STALL`].
+    pub fn note(
+        &mut self,
+        page: &Page,
+        step: &Step,
+        gate: &Gate<'_>,
+        now: Instant,
+    ) -> Option<String> {
+        if !matches!(step, Step::Wait) || gate.confirmed {
+            self.seen = None;
+            return None;
+        }
+        let key = format!(
+            "{}\n{}\n{:?}\n{:?}",
+            page.url, page.heading, page.buttons, page.inputs
+        );
+        match &self.seen {
+            Some((seen, since)) if *seen == key => {
+                (now.saturating_duration_since(*since) >= VENDOR_STALL).then(|| {
+                    format!(
+                        "the sign-in waits on {} for a person: nothing there is aterm's to press \
+                         or fill",
+                        page_place(page, gate)
+                    )
+                })
+            }
+            _ => {
+                self.seen = Some((key, now));
+                None
+            }
+        }
+    }
+}
+
+/// Where `page` is, for a person: its host and path (no query, which may carry the code) and
+/// its heading, with the row's email, any other email and the CLI's code left out.
+#[must_use]
+pub fn page_place(page: &Page, gate: &Gate<'_>) -> String {
+    let url = page.url.split(['?', '#']).next().unwrap_or("");
+    let place = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    let mut heading = page.heading.clone();
+    for email in emails_in(&page.heading) {
+        heading = heading.replace(&email, "…");
+    }
+    if let Some(code) = gate.code.filter(|c| !c.is_empty()) {
+        heading = heading
+            .replace(&code.to_ascii_lowercase(), "…")
+            .replace(code, "…");
+    }
+    let heading = super::one_line(heading.trim(), 60);
+    if heading.is_empty() {
+        format!("`{}`", super::one_line(place, 80))
+    } else {
+        format!("`{}` (\"{heading}\")", super::one_line(place, 80))
+    }
+}
+
+/// Drives one vendor sign-in page in `cdp` from `start` ([`vendor_step`] each tick) until the
+/// page approves it, `finished` says the CLI is done, or `deadline`; `mailbox` answers a
+/// [`Step::Mailbox`].
+#[allow(clippy::too_many_lines)]
+pub fn drive_cdp_vendor(
+    cdp: &mut CdpClient,
+    start: &str,
+    gate: Gate<'_>,
+    finished: &dyn Fn() -> bool,
+    deadline: Instant,
+    mut mailbox: impl FnMut(&mut CdpClient, Option<&str>) -> Result<MailboxCredential, &'static str>,
+) -> super::login_drive::Approval {
+    use super::login_drive::Approval;
+    let step_timeout = || deadline.saturating_duration_since(Instant::now());
+    let opened = (|| -> Result<(String, String), &'static str> {
+        let target = cdp.call(
+            None,
+            "Target.createTarget",
+            json!({"url": "about:blank"}),
+            step_timeout(),
+        )?;
+        let target_id = target
+            .get("targetId")
+            .and_then(Value::as_str)
+            .ok_or("browser created no targetId")?
+            .to_owned();
+        let attached = cdp.call(
+            None,
+            "Target.attachToTarget",
+            json!({"targetId": target_id, "flatten": true}),
+            step_timeout(),
+        )?;
+        let session = attached
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .ok_or("browser attached no sessionId")?
+            .to_owned();
+        for method in ["Page.enable", "Runtime.enable"] {
+            let _ = cdp.call(Some(&session), method, json!({}), step_timeout())?;
+        }
+        let _ = cdp.call(
+            Some(&session),
+            "Page.navigate",
+            json!({"url": start}),
+            step_timeout(),
+        )?;
+        Ok((target_id, session))
+    })();
+    let (target_id, session) = match opened {
+        Ok(opened) => opened,
+        Err(why) => {
+            return Approval::NeedsYou(format!(
+                "the headless browser did not open the page ({why})"
+            ));
+        }
+    };
+    let mut gate = gate;
+    let mut otp: Option<String> = None;
+    let mut page_proved = false;
+    let mut mailbox_polls = 0usize;
+    let mut stall = PageStall::default();
+    let mut last_place: Option<String> = None;
+    let result = loop {
+        if finished() {
+            break Approval::Approved { page: page_proved };
+        }
+        if Instant::now() >= deadline {
+            break Approval::NeedsYou(match &last_place {
+                Some(place) => {
+                    format!("the sign-in page was not approved in time (last on {place})")
+                }
+                None => "the sign-in page was not approved in time".to_owned(),
+            });
+        }
+        let eval = cdp.call(
+            Some(&session),
+            "Runtime.evaluate",
+            json!({"expression": VENDOR_PAGE_JS, "returnByValue": true}),
+            step_timeout(),
+        );
+        let page = match eval {
+            Ok(eval) => page_of(eval.pointer("/result/value").unwrap_or(&Value::Null)),
+            Err(_) => {
+                std::thread::sleep(VENDOR_TICK);
+                continue;
+            }
+        };
+        let view = Gate {
+            otp: otp.as_deref(),
+            ..gate
+        };
+        if shows_email(&page, &view)
+            && super::login_drive::https_host(&page.url)
+                .is_some_and(|h| view.hosts.iter().any(|p| p.eq_ignore_ascii_case(&h)))
+        {
+            page_proved = true;
+        }
+        let step = vendor_step(&page, &view);
+        last_place = Some(page_place(&page, &view));
+        if let Some(why) = stall.note(&page, &step, &view, Instant::now()) {
+            break Approval::NeedsYou(why);
+        }
+        let value = match step {
+            Step::FillCode => gate.code,
+            Step::FillEmail => gate.email,
+            Step::FillOtp => otp.as_deref(),
+            _ => None,
+        };
+        match &step {
+            Step::Done => {
+                if gate.completion == crate::ai::connector::Completion::Device {
+                    while !finished() && Instant::now() < deadline {
+                        std::thread::sleep(VENDOR_TICK);
+                    }
+                }
+                break Approval::Approved { page: page_proved };
+            }
+            Step::Stop(why) => break Approval::NeedsYou(why.clone()),
+            Step::Refuse(why) => break Approval::Refused(why.clone()),
+            Step::Wait => {}
+            Step::Mailbox => {
+                if mailbox_polls >= 3 {
+                    break Approval::NeedsYou(
+                        "the vendor's sign-in mail did not come, or no mailbox is configured"
+                            .to_owned(),
+                    );
+                }
+                mailbox_polls += 1;
+                match mailbox(cdp, gate.email) {
+                    Ok(MailboxCredential::Otp(code)) => {
+                        otp = Some(code);
+                        gate.filled_otp = false;
+                    }
+                    Ok(MailboxCredential::MagicLink(link)) => {
+                        if !super::login_drive::pinned(&link, gate.hosts) {
+                            break Approval::NeedsYou(
+                                "the sign-in mail's link is off the pinned hosts".to_owned(),
+                            );
+                        }
+                        if let Some(why) = gate.bound.and_then(|b| b.outside(&link, gate.hosts)) {
+                            break Approval::Refused(format!("the sign-in mail's link: {why}"));
+                        }
+                        let _ = cdp.call(
+                            Some(&session),
+                            "Page.navigate",
+                            json!({"url": link}),
+                            step_timeout(),
+                        );
+                    }
+                    Err(why) => break Approval::NeedsYou(why.to_owned()),
+                }
+            }
+            Step::Press(_) | Step::FillCode | Step::FillEmail | Step::FillOtp => {
+                let acted = cdp
+                    .call(
+                        Some(&session),
+                        "Runtime.evaluate",
+                        json!({"expression": vendor_act_js(&step, value), "returnByValue": true}),
+                        step_timeout(),
+                    )
+                    .ok()
+                    .and_then(|v| v.pointer("/result/value/ok").and_then(Value::as_bool))
+                    .unwrap_or(false);
+                if acted {
+                    match step {
+                        Step::Press(_) => {
+                            if gate.completion == crate::ai::connector::Completion::Device
+                                && gate.code.is_some_and(|c| codes_shown(&page.text, c).1)
+                            {
+                                gate.confirmed = true;
+                            } else {
+                                gate.pressed += 1;
+                            }
+                        }
+                        Step::FillCode => gate.filled_code = true,
+                        Step::FillEmail => gate.filled_email = true,
+                        Step::FillOtp => gate.filled_otp = true,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        std::thread::sleep(VENDOR_TICK);
+    };
+    let _ = cdp.call(
+        None,
+        "Target.closeTarget",
+        json!({"targetId": target_id}),
+        Duration::from_secs(2),
+    );
+    let _ = cdp.call(None, "Browser.close", json!({}), Duration::from_secs(2));
+    result
+}
+
+/// Runs `f` in the browser profile `dir` ([`vendor_profile_dir`]).
+#[cfg(unix)]
+fn in_profile(
+    dir: &Path,
+    f: impl FnOnce(&Path) -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
+    f(dir)
+}
+
+/// The headless browser as a vendor sign-in's [`super::login_drive::Approver`]: the persistent
+/// profile of the row's email (else `<cli>-<label>`) under Claude Code's store, shared by every
+/// vendor; the mailbox configured for that email, its inbox rows chosen by the vendor's senders.
+#[derive(Debug, Clone)]
+pub struct VendorApprover {
+    /// Claude Code's store directory (`accounts::Store::shared_dir`).
+    pub shared_dir: PathBuf,
+    /// The profile's key where the row names no email.
+    pub label_key: String,
+    /// The mailbox, where one is configured for the row.
+    pub mailbox: Option<MailboxConfig>,
+    /// The vendor's sender words.
+    pub senders: &'static [&'static str],
+    /// `$HOME`, for the browser's location.
+    pub home: Option<PathBuf>,
+}
+
+impl VendorApprover {
+    /// The approver for `label` (of `cli`'s pool) with `email`, under `shared_dir`.
+    #[must_use]
+    pub fn new(
+        cli: super::accounts::Cli,
+        label: &str,
+        email: Option<&str>,
+        shared_dir: &Path,
+        home: Option<&Path>,
+    ) -> VendorApprover {
+        let prefix = format!("{}-", cli.id());
+        let label_key = if label.starts_with(&prefix) {
+            label.to_owned()
+        } else {
+            format!("{prefix}{label}")
+        };
+        let senders = cli.accounts().mail_senders;
+        let mailbox = discover_mailbox_config(home, Some(shared_dir))
+            .map(|mut cfg| {
+                cfg.alias_label_to_email(Some(label), email);
+                cfg.senders = senders.iter().map(|s| (*s).to_owned()).collect();
+                cfg
+            })
+            .filter(|cfg| cfg.is_configured_for(email));
+        VendorApprover {
+            shared_dir: shared_dir.to_path_buf(),
+            label_key,
+            mailbox,
+            senders,
+            home: home.map(Path::to_path_buf),
+        }
+    }
+}
+
+impl super::login_drive::Approver for VendorApprover {
+    #[cfg(unix)]
+    fn approve(
+        &mut self,
+        handoff: &super::login_drive::Handoff<'_>,
+    ) -> super::login_drive::Approval {
+        use super::login_drive::Approval;
+        use aterm_uds::spawnfd::{ChildStdio, LaneCommand, spawn_with_two_fds};
+        use std::os::fd::OwnedFd;
+        let Some(browser) = find_headless_browser(self.home.as_deref()) else {
+            return Approval::NeedsYou("no headless browser is installed here".to_owned());
+        };
+        let mut outcome = Approval::NeedsYou("the headless browser did not run".to_owned());
+        let started = aterm_time::unix_secs().and_then(|t| i64::try_from(t).ok());
+        let mailbox = self.mailbox.clone().map(|mut cfg| {
+            cfg.since = started;
+            cfg
+        });
+        let senders = self.senders;
+        let bound = FlowBound::of(handoff.url);
+        let profile_dir = vendor_profile_dir(&self.shared_dir, &self.label_key, handoff.email);
+        let _ = aterm_types::fs_restricted::ensure_private_dir(
+            profile_dir.parent().unwrap_or(&self.shared_dir),
+        );
+        let _ = aterm_types::fs_restricted::ensure_private_dir(&profile_dir);
+        let ran = in_profile(&profile_dir, |profile_dir| {
+            let (cmd_read, cmd_write) =
+                std::io::pipe().map_err(|_| "could not open CDP command pipe")?;
+            let (out_read, out_write) =
+                std::io::pipe().map_err(|_| "could not open CDP event pipe")?;
+            let mut cmd = LaneCommand::new(&browser.path);
+            cmd.args(headless_launch_args(&browser, profile_dir))
+                .stdin(ChildStdio::Null)
+                .stdout(ChildStdio::Null)
+                .stderr(ChildStdio::Null);
+            let child = spawn_with_two_fds(cmd, OwnedFd::from(cmd_read), OwnedFd::from(out_write))
+                .map_err(|_| "could not spawn headless browser")?;
+            struct ChildGuard(aterm_uds::spawnfd::LaneChild);
+            impl Drop for ChildGuard {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+            let _guard = ChildGuard(child);
+            let mut cdp = CdpClient::new(cmd_write, out_read);
+            let mut seen_otps = BTreeSet::new();
+            let gate = Gate {
+                hosts: handoff.hosts,
+                completion: handoff.completion,
+                code: handoff.code,
+                email: handoff.email,
+                senders,
+                otp: None,
+                pressed: 0,
+                confirmed: false,
+                filled_code: false,
+                filled_email: false,
+                filled_otp: false,
+                bound: Some(&bound),
+            };
+            outcome = drive_cdp_vendor(
+                &mut cdp,
+                handoff.url,
+                gate,
+                handoff.finished,
+                handoff.deadline,
+                |cdp_inner, em| {
+                    let mb = mailbox.as_ref().ok_or(
+                        "the page asks for the sign-in mail, and no mailbox is configured",
+                    )?;
+                    poll_mailbox_or_webmail_for_credential(
+                        cdp_inner,
+                        mb,
+                        em,
+                        handoff.deadline.saturating_duration_since(Instant::now()),
+                        Duration::from_millis(400),
+                        &mut seen_otps,
+                    )
+                },
+            );
+            Ok(())
+        });
+        match ran {
+            Ok(()) => outcome,
+            Err(why) => Approval::NeedsYou(why.to_owned()),
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn approve(&mut self, _: &super::login_drive::Handoff<'_>) -> super::login_drive::Approval {
+        super::login_drive::Approval::NeedsYou(
+            "the headless sign-in runs on Unix hosts only".to_owned(),
+        )
+    }
+}
+
+#[cfg(test)]
+#[path = "headless_vendor_tests.rs"]
+mod vendor_tests;
 
 #[cfg(test)]
 mod uri_authority_tests {

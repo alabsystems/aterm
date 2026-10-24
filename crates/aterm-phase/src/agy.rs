@@ -169,15 +169,28 @@ pub fn panel_bounds_under(rows: &[String], bottom: usize) -> Option<(usize, usiz
     Some((first, end + 1))
 }
 
-/// Unwrap `agy`'s `Agent(<type>: <role>)` or `Agent(<name>)` token into its
-/// display name (`<role>` for `self: <role>`, `<type>: <role>` or `<name>`
-/// otherwise).
+/// Split a leading `Agent(<type>: <role>)` or `Agent(<name>)` token at its
+/// balanced closing `')'`, returning `(unwrapped_name, rest_after_closing_paren)`.
 #[must_use]
-pub fn unwrap_agent_token(token: &str) -> Option<&str> {
-    let inside = token
-        .strip_prefix(const { anchor_text("agy.panel.agent") })?
-        .strip_suffix(')')?;
-    let inside = crate::text::trim(inside);
+pub fn split_agent_token(s: &str) -> Option<(&str, &str)> {
+    let body = s.strip_prefix(const { anchor_text("agy.panel.agent") })?;
+    let mut depth = 1usize;
+    let mut close_idx = None;
+    for (idx, ch) in body.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close_idx = Some(idx);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close = close_idx?;
+    let inside = crate::text::trim(&body[..close]);
     if inside.is_empty() {
         return None;
     }
@@ -186,7 +199,16 @@ pub fn unwrap_agent_token(token: &str) -> Option<&str> {
         .map(crate::text::trim_start)
         .filter(|s| !s.is_empty())
         .unwrap_or(inside);
-    Some(name)
+    Some((name, &body[close + 1..]))
+}
+
+/// Unwrap `agy`'s `Agent(<type>: <role>)` or `Agent(<name>)` token into its
+/// display name (`<role>` for `self: <role>`, `<type>: <role>` or `<name>`
+/// otherwise).
+#[must_use]
+pub fn unwrap_agent_token(token: &str) -> Option<&str> {
+    let (name, rest) = split_agent_token(token)?;
+    rest.is_empty().then_some(name)
 }
 
 fn frame(rows: &[String]) -> Option<Frame> {
@@ -254,9 +276,7 @@ fn panel_work(row: &str) -> Option<&'static str> {
             && what.len() > const { anchor_text("agy.panel.running") }.len())
         .then_some(TASK_RUNNING);
     }
-    let (_, state) = item
-        .strip_prefix(const { anchor_text("agy.panel.agent") })?
-        .rsplit_once(')')?;
+    let (_, state) = split_agent_token(item)?;
     is_subagent_working_state(crate::text::trim_start(state)).then_some(SUBAGENT_WORKING)
 }
 

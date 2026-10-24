@@ -981,10 +981,16 @@ pub enum ForeignFormat {
     Kitty,
     /// Ghostty: hyphenated keys (`cursor-color`) or `palette = N=#hex`.
     Ghostty,
-    /// An XML property list (iTerm2 `.itermcolors`, Terminal.app).
+    /// An XML property list that is not a Terminal.app profile (iTerm2 `.itermcolors`).
     Plist,
-    /// TOML (Alacritty, WezTerm): `[table]` headers or quoted colour values.
+    /// A Terminal.app profile (`.terminal`): an XML property list with Terminal.app's keys
+    /// (`TextColor`, `ANSIBlackColor`, `type` = `Window Settings`).
+    TerminalApp,
+    /// TOML that is not a WezTerm scheme (Alacritty): `[table]` headers or quoted colour values.
     Toml,
+    /// A WezTerm colour scheme: TOML with a `[metadata]` table, or a `[colors]` table
+    /// holding `foreground`, `ansi`, `brights` or their kin.
+    WezTerm,
     /// JSON (Windows Terminal, VS Code): a `{ … }` document.
     Json,
 }
@@ -997,7 +1003,9 @@ impl ForeignFormat {
             ForeignFormat::Kitty => "kitty",
             ForeignFormat::Ghostty => "Ghostty",
             ForeignFormat::Plist => "property-list (iTerm2 .itermcolors)",
+            ForeignFormat::TerminalApp => "property-list (Terminal.app .terminal)",
             ForeignFormat::Toml => "TOML (Alacritty)",
+            ForeignFormat::WezTerm => "TOML (WezTerm)",
             ForeignFormat::Json => "JSON (Windows Terminal)",
         }
     }
@@ -1011,7 +1019,16 @@ pub fn sniff_foreign_format(text: &str) -> Option<ForeignFormat> {
         || head.starts_with("<!DOCTYPE plist")
         || head.starts_with("<plist")
     {
-        return Some(ForeignFormat::Plist);
+        return Some(
+            if TERMINAL_APP_MARKERS
+                .iter()
+                .any(|marker| text.contains(marker))
+            {
+                ForeignFormat::TerminalApp
+            } else {
+                ForeignFormat::Plist
+            },
+        );
     }
     if head.starts_with('{') {
         return Some(ForeignFormat::Json);
@@ -1024,7 +1041,7 @@ pub fn sniff_foreign_format(text: &str) -> Option<ForeignFormat> {
         let Some((key, value)) = line.split_once('=') else {
             // TOML table header: `[colors.primary]`, `[[themes]]`.
             if line.starts_with('[') && line.ends_with(']') {
-                return Some(ForeignFormat::Toml);
+                return Some(toml_flavour(text));
             }
             let mut tokens = line.split_whitespace();
             if let (Some(key), Some(value)) = (tokens.next(), tokens.next())
@@ -1039,13 +1056,86 @@ pub fn sniff_foreign_format(text: &str) -> Option<ForeignFormat> {
         let key = key.trim();
         let value = value.trim();
         if value.starts_with('"') || value.starts_with('\'') || value.starts_with('[') {
-            return Some(ForeignFormat::Toml);
+            return Some(toml_flavour(text));
         }
         if (key.eq_ignore_ascii_case("palette") && value.contains('=')) || key.contains('-') {
             return Some(ForeignFormat::Ghostty);
         }
     }
     None
+}
+
+/// Text only a Terminal.app profile's property list holds: iTerm2 spells its colour keys
+/// `Ansi 0 Color` and `Background Color`.
+const TERMINAL_APP_MARKERS: [&str; 5] = [
+    "<key>ANSI",
+    "<key>BackgroundColor</key>",
+    "<key>TextColor</key>",
+    "<key>ProfileCurrentVersion</key>",
+    "<string>Window Settings</string>",
+];
+
+/// The keys WezTerm's `[colors]` table holds and Alacritty's never does.
+const WEZTERM_COLOUR_KEYS: [&str; 15] = [
+    "foreground",
+    "background",
+    "cursor_bg",
+    "cursor_fg",
+    "cursor_border",
+    "selection_fg",
+    "selection_bg",
+    "ansi",
+    "brights",
+    "indexed",
+    "tab_bar",
+    "split",
+    "scrollbar_thumb",
+    "visual_bell",
+    "compose_cursor",
+];
+
+/// Which terminal's theme the TOML `text` is: [`ForeignFormat::WezTerm`] when a table header or
+/// key path is `metadata…` or `colors.<a WezTerm colour key>…`, else [`ForeignFormat::Toml`].
+fn toml_flavour(text: &str) -> ForeignFormat {
+    let wezterm = |path: &str| {
+        let mut parts = path.split('.');
+        match (parts.next(), parts.next()) {
+            (Some("metadata"), _) => true,
+            (Some("colors"), Some(key)) => WEZTERM_COLOUR_KEYS.contains(&key),
+            _ => false,
+        }
+    };
+    let bare = |text: &str| -> String { text.chars().filter(|c| !c.is_whitespace()).collect() };
+    let mut table = String::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        if let Some(header) = line.strip_prefix('[') {
+            table = bare(
+                header
+                    .trim_start_matches('[')
+                    .split(']')
+                    .next()
+                    .unwrap_or(""),
+            );
+            if wezterm(&table) {
+                return ForeignFormat::WezTerm;
+            }
+        } else if let Some((key, _)) = line.split_once('=') {
+            let key = bare(key);
+            let path = if table.is_empty() {
+                key
+            } else {
+                format!("{table}.{key}")
+            };
+            if wezterm(&path) {
+                return ForeignFormat::WezTerm;
+            }
+        }
+    }
+    ForeignFormat::Toml
 }
 
 /// Parse a theme colour: `#RRGGBB` (the `#` optional) or `#RGB` (the `#` required, so a bare word such as `bad` or `fed` stays an error rather than a colour), surrounding whitespace ignored.
@@ -3817,6 +3907,15 @@ color15 = #c0caf5
             (
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n<dict/>\n</plist>\n",
                 ForeignFormat::Plist,
+            ),
+            (
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n<dict>\n\
+                 <key>TextColor</key>\n<data>YnBsaXN0MDA=</data>\n</dict>\n</plist>\n",
+                ForeignFormat::TerminalApp,
+            ),
+            (
+                "[colors]\nforeground = \"#c0caf5\"\nansi = [\"#15161e\"]\n",
+                ForeignFormat::WezTerm,
             ),
             (
                 "{\n  \"name\": \"Night\",\n  \"background\": \"#1a1b26\"\n}\n",

@@ -34,6 +34,7 @@ mod bed;
 mod companion;
 mod custody;
 mod emit;
+mod icon_shade;
 mod ink_ledger;
 mod light_body;
 mod probe;
@@ -54,8 +55,8 @@ pub use companion::*;
 pub use custody::*;
 use ink_ledger::BandLifts;
 pub(crate) use ink_ledger::InkLedger;
-pub(crate) use ink_ledger::LetterGuard;
 pub use ink_ledger::OverInkTier;
+pub(crate) use ink_ledger::{LETTER_GUARD_RING, LetterGuard};
 pub(crate) use light_body::*;
 pub use probe::*;
 pub use raster::*;
@@ -390,6 +391,12 @@ pub struct CursorGlow {
     #[cfg(test)]
     fire_column_tongues: bool,
     #[cfg(test)]
+    fire_even_cores: bool,
+    #[cfg(test)]
+    fire_core_lift_alone: bool,
+    #[cfg(test)]
+    fire_filled_unheld: bool,
+    #[cfg(test)]
     fire_bloom_unwarmed: bool,
     #[cfg(test)]
     fire_row_unheld: bool,
@@ -436,6 +443,13 @@ pub struct CursorGlow {
     #[cfg(test)]
     light_body_unsolved: bool,
     #[cfg(test)]
+    fire_light_squat: bool,
+    /// Test-only: lay a paper tongue's root in the flame's 2 px slabs over
+    /// its old 3 px ease, as it was: the negative control of the root's
+    /// feather.
+    #[cfg(test)]
+    fire_light_root_coarse: bool,
+    #[cfg(test)]
     light_glints: Vec<(f32, f32)>,
     fading: Vec<OutgoingFade>,
     fade_scratch: Vec<GlowQuad>,
@@ -454,6 +468,33 @@ pub struct CursorGlow {
     v2_cues: Vec<SoundCue>,
     /// Which of the frame's colours the user chose ([`Self::set_colour_pins`]).
     colour_pins: ColourPins,
+    /// The word icons the last word pass drew, grid pixels
+    /// ([`Self::note_word_icons`]).
+    word_icons: Vec<(i32, i32, i32, i32)>,
+    /// The last word pass's icons still owe the published streams their
+    /// shade ([`Self::shade_word_icons`]).
+    word_icons_unshaded: bool,
+    /// The pet's drawn body box this frame, window pixels `(x0, x1, y0, y1)` ([`Self::note_pet_body`]).
+    pet_body: Option<(i32, i32, i32, i32)>,
+    /// A test's negative control: no page veil under the pet's letters.
+    #[cfg(any(test, debug_assertions))]
+    pet_veil_off: bool,
+    /// This frame's keep-out boxes, window pixels ([`Self::keep_out_boxes`]).
+    keep_out_scratch: Vec<(i32, i32, i32, i32)>,
+    /// This frame's lettered rows' spans, window pixels ([`Self::keep_out_boxes`]).
+    keep_rows_scratch: Vec<(i32, i32, i32, i32)>,
+    /// The grid origin and cell width the last keep-out was laid by, for the
+    /// word icons' shade ([`Self::shade_word_icons`]).
+    keep_geom: Option<(i32, i32, i32)>,
+    /// The word icons' sprite sources, one per [`Self::word_icons`] entry
+    /// ([`Self::note_word_icon_sprites`]; empty: each icon is its box).
+    word_icon_src: Vec<icon_shade::IconSrc>,
+    /// The word icons' shade's working buffers: one icon's drawn rows in
+    /// window pixels, the cut quads and halos, and one light's pieces.
+    icon_scratch: Vec<(i32, i32, i32, i32)>,
+    icon_quads: Vec<GlowQuad>,
+    icon_halos: Vec<RainHalo>,
+    icon_cut: Vec<(i32, i32, i32, i32)>,
 }
 
 /// Which of a frame's glow colours the user chose: a chosen colour is drawn
@@ -920,6 +961,30 @@ impl CursorGlow {
     /// Horizontal reach in cells of a light landing veil on either side of the caret's centre.
     pub(crate) const LIGHT_VEIL_REACH_CELLS: f32 = 1.5;
     const FIRE_LIGHT_HEADROOM: f32 = 0.08;
+    /// The highest a tongue in the air stands its root (and its gold
+    /// core's) off the air's floor, as a share of a row. Every tongue on one
+    /// floor stood its gold roots in a row of evenly spaced beads (looks6
+    /// N8); a core lifted alone hung as a gold stick mid-flame, and cores
+    /// shortened, narrowed or set off their axis to break the line burned
+    /// as a tan curtain (looks6 round 3), so the whole tongue rises.
+    const FIRE_DARK_ROOT_LIFT: f32 = 0.34;
+    /// The step of a tongue's root lift from one tongue to the next along
+    /// the row, a share of [`Self::FIRE_DARK_ROOT_LIFT`] taken modulo one
+    /// (the golden ratio's): any two neighbours stand at least 0.38 of the
+    /// lift apart, so no three neighbouring roots share a floor. Drawn at
+    /// random, the gallery's `burst` drew three of five lifts under a pixel.
+    const FIRE_DARK_ROOT_LIFT_STEP: f32 = 0.618_034;
+    /// The least height a paper flame tongue keeps; shorter ones are dropped.
+    const FIRE_LIGHT_TONGUE_MIN_PX: f32 = 3.0;
+    /// The height over which a short paper tongue fades in past [`Self::FIRE_LIGHT_TONGUE_MIN_PX`].
+    const FIRE_LIGHT_TONGUE_EASE_PX: f32 = 5.0;
+    /// A paper tongue's widest half-width per pixel of its height (no tongue wider than tall).
+    const FIRE_LIGHT_TONGUE_ASPECT: f32 = 0.45;
+    /// The least run over which a paper tongue's root eases in, laid a
+    /// pixel a slab: over 3 px in the flame's 2 px slabs a short gap
+    /// tongue's root stood cut flat in two steps (looks6 round 3:
+    /// `ffb875` to `fff6ee` from one row to the next).
+    const FIRE_LIGHT_ROOT_EASE_PX: f32 = 6.0;
     const FIRE_LIGHT_ALPHA: f32 = 240.0;
     const FIRE_LIGHT_ROOT: f32 = 0.70;
     const FIRE_LIGHT_RISE_COLD: f32 = 2.3;
@@ -1659,14 +1724,18 @@ impl CursorGlow {
 
         self.poof_scan(now, cfg, geom);
 
-        self.sparks.retain(|s| Self::spark_resident_at(now, s));
-        let spark_cap = Self::MAX_SPARKS;
-        if self.sparks.len() > spark_cap {
-            let drop = self.sparks.len() - spark_cap;
-            self.sparks.drain(0..drop);
+        if !self.sparks.is_empty() {
+            self.sparks.retain(|s| Self::spark_resident_at(now, s));
+            let spark_cap = Self::MAX_SPARKS;
+            if self.sparks.len() > spark_cap {
+                let drop = self.sparks.len() - spark_cap;
+                self.sparks.drain(0..drop);
+            }
         }
-        self.particles
-            .retain(|p| now.saturating_duration_since(p.born).as_secs_f32() < p.life);
+        if !self.particles.is_empty() {
+            self.particles
+                .retain(|p| now.saturating_duration_since(p.born).as_secs_f32() < p.life);
+        }
         let mut struck: Option<Meteor> = None;
         if !self.fire_meteors.is_empty() {
             self.fire_meteors.retain_mut(|m| {
@@ -1681,8 +1750,10 @@ impl CursorGlow {
                 true
             });
         }
-        self.vapor
-            .retain(|v| now.saturating_duration_since(v.born).as_secs_f32() < v.life);
+        if !self.vapor.is_empty() {
+            self.vapor
+                .retain(|v| now.saturating_duration_since(v.born).as_secs_f32() < v.life);
+        }
         if matches!(cfg.style, GlowStyle::Fire)
             && self.cursor_temp > Self::SMOKE_TEMP
             && let Some((cr, cc)) = cur
@@ -1729,8 +1800,10 @@ impl CursorGlow {
                 self.meteor_strike_fountain(&m, now, geom);
             }
         }
-        self.bolts
-            .retain(|b| now.saturating_duration_since(b.born).as_secs_f32() < b.life);
+        if !self.bolts.is_empty() {
+            self.bolts
+                .retain(|b| now.saturating_duration_since(b.born).as_secs_f32() < b.life);
+        }
         if let Some(r) = self.ring
             && now.saturating_duration_since(r.born).as_secs_f32() >= r.life
         {
@@ -1820,6 +1893,7 @@ impl CursorGlow {
                     self.lift_hand_row(from, to);
                 }
             }
+            self.keep_out_boxes(cfg, geom, cur);
             let mut frame = rk::Frame {
                 under: &mut under,
                 out: &mut *out,
@@ -1886,6 +1960,9 @@ impl CursorGlow {
             }
         }
         self.emit_vapor(now, cfg, geom, &mut halos);
+        if matches!(cfg.style, GlowStyle::Fire) && cfg.dark_theme {
+            self.hold_halos_off_filled(&mut halos, cur, geom, cfg.theme_bg);
+        }
         self.bolt_verts = bolt_verts;
         Self::cap_and_clear_v2_streams(&mut halos);
         self.halo_out = halos;

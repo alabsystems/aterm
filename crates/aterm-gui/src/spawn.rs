@@ -598,6 +598,9 @@ pub(crate) struct SessionFactory {
     /// Each PTY reader's process watch on its shell (card engine §3.3), made at attach.
     #[cfg(unix)]
     pub(crate) proc_watch: fn(i32) -> Option<aterm_uds::procwatch::ProcWatch>,
+    /// The shell's live children, read after a restore for the groups its carried stopped drawers lead ([`shell_children`]).
+    #[cfg(unix)]
+    pub(crate) shell_children: fn(i32) -> Vec<i32>,
     /// Whether each PTY reader runs the dev `card-seen` probe ([`crate::holder_image::card_probe_requested`]).
     pub(crate) card_probe: bool,
     /// Overlap handoff (incoming side), armed like [`Self::defer_adopted_readers`].
@@ -641,6 +644,8 @@ impl SessionFactory {
             byte_arm: _,
             #[cfg(unix)]
                 proc_watch: _,
+            #[cfg(unix)]
+                shell_children: _,
             card_probe: _,
             rekey_deferred: _,
             spare: _,
@@ -1871,6 +1876,7 @@ pub(crate) fn spawn_session(
             pid,
             factory.fg_probe,
             factory.edge_image,
+            factory.shell_children,
         );
         factory.edge_inbox.push(id);
     }
@@ -5790,6 +5796,7 @@ pub(crate) fn adopt_restored_holder(
     root_pgid: i32,
     fg_probe: fn(i32) -> i32,
     edge_image: crate::holder_image::ReadImage,
+    children: fn(i32) -> Vec<i32>,
 ) -> aterm_core::terminal::HolderAdoption {
     let cursor = {
         let timeline = timeline.lock().unwrap_or_else(|p| p.into_inner());
@@ -5821,7 +5828,20 @@ pub(crate) fn adopt_restored_holder(
                 ),
         )
     });
-    let adoption = term_lock(term).adopt_holder_after_restore(token, exact);
+    let (adoption, marks) = {
+        let mut t = term_lock(term);
+        let adoption = t.adopt_holder_after_restore(token, exact);
+        (adoption, t.holder_fence().tokens().collect::<Vec<u64>>())
+    };
+    let led = restored_drawer_groups((pgid, token), &marks, root_pgid, edge_image, children);
+    {
+        let mut timeline = timeline.lock().unwrap_or_else(|p| p.into_inner());
+        let groups = timeline.drawer_groups_mut();
+        for led in led {
+            groups.note(Some(led), &marks);
+        }
+        groups.note(None, &marks);
+    }
     if let Some(image) = image {
         let mut timeline = timeline.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(blocks) = blocks {
@@ -5846,10 +5866,99 @@ pub(crate) fn adopt_restored_holder(
     adoption
 }
 
-fn note_cut(t: &mut Terminal, cut: aterm_core::terminal::HolderCut) {
+/// The groups a restored fence's marks lead ([`crate::holder_image::DrawerGroups`]): the adopted
+/// holder's, and each carried stopped drawer's among the shell's `children` (a job-control shell
+/// makes each job's leader its child), read again by `edge_image` only when such a mark exists.
+#[cfg(unix)]
+fn restored_drawer_groups(
+    (pgid, token): (i32, u64),
+    marks: &[u64],
+    shell: i32,
+    edge_image: crate::holder_image::ReadImage,
+    children: fn(i32) -> Vec<i32>,
+) -> Vec<(i32, u64)> {
+    let mut led: Vec<(i32, u64)> = Vec::new();
+    if token != 0 {
+        led.push((pgid, token));
+    }
+    if marks.iter().any(|&mark| mark != token) {
+        for child in children(shell).into_iter().filter(|&child| child != pgid) {
+            let image = edge_image(child, None);
+            if let Some(stopped) = image
+                .token
+                .filter(|t| image.drawer.is_some() && *t != token && marks.contains(t))
+            {
+                led.push((child, stopped));
+            }
+        }
+    }
+    led
+}
+
+/// The shell's live children, which a restore's carried stopped drawers lead
+/// (`SessionFactory::shell_children` as shipped; the process watch, and so a retirement, exists
+/// only on Darwin).
+#[cfg(unix)]
+pub(crate) fn shell_children(shell: i32) -> Vec<i32> {
+    #[cfg(target_vendor = "apple")]
+    return aterm_uds::process::child_pids(shell).unwrap_or_default();
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let _ = shell;
+        Vec::new()
+    }
+}
+
+/// Apply a holder cut whose incoming image leads `group`, booking in `notes` what it leaves the
+/// session's [`crate::holder_image::DrawerGroups`] to note once the term lock is released.
+fn note_cut(
+    t: &mut Terminal,
+    cut: aterm_core::terminal::HolderCut,
+    group: i32,
+    notes: &mut crate::holder_image::GroupNotes,
+) {
     if cut.to.is_some() || t.holder_fence().current_token().is_some() {
         t.note_holder_cut(cut);
         crate::metrics::note_holder_cut();
+        notes.cut(
+            cut.to.map(|token| (group, token)),
+            t.holder_fence().tokens(),
+        );
+    }
+}
+
+/// The process watch heard `pid` exit: when it led a stopped drawer's group, that drawer's mark
+/// goes (card engine §3.7, marks retired by liveness). A current drawer's mark stays for its
+/// cut, which drops it.
+fn retire_gone(
+    term: &Mutex<Terminal>,
+    timeline: &Mutex<crate::session_timeline::SessionTimeline>,
+    pid: i32,
+) {
+    let Some(token) = timeline
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .drawer_groups()
+        .led_by(pid)
+    else {
+        return;
+    };
+    let marks: Vec<u64> = {
+        let mut t = term_lock(term);
+        t.retire_holder_mark(token);
+        t.holder_fence().tokens().collect()
+    };
+    let mut timeline = timeline.lock().unwrap_or_else(|p| p.into_inner());
+    timeline.drawer_groups_mut().note(None, &marks);
+    if crate::holder_image::DEV_ROWS {
+        timeline.record_row(
+            "holder-retire",
+            format!(
+                "token={} pid={pid} retired={}",
+                crate::holder_image::token_word(Some(token)),
+                u8::from(!marks.contains(&token))
+            ),
+        );
     }
 }
 
@@ -5874,6 +5983,8 @@ pub(crate) enum GatherMsg {
         i32,
         Option<Arc<crate::holder_image::HolderImage>>,
     ),
+    /// The process watch heard this process exit (card engine §3.7: a stopped drawer's mark is retired by liveness).
+    Gone(i32),
     /// The master EOF'd on its own (shell exited).
     Eof,
     /// The session's shell exited (its exit watch fired before the master's EOF), and what the master held then has been sent.
@@ -5955,6 +6066,10 @@ fn spawn_pty_gather(
                     exec.replay(cutter, || fg_probe(master));
                 }
             };
+            let send_gone = |exec: &mut crate::exec_edges::ExecEdges| -> bool {
+                exec.take_gone()
+                    .all(|pid| filled_tx.send(GatherMsg::Gone(pid)).is_ok())
+            };
             let _ = filled_tx.send(GatherMsg::Started);
             let mut owed = aterm_pty::output_queue_len(master).unwrap_or(0);
             if owed == 0 {
@@ -6004,7 +6119,7 @@ fn spawn_pty_gather(
                         if let Some(x) = exec.as_mut() {
                             cutter.begin();
                             x.heard(&mut cutter, || fg_probe(master), 0);
-                            if !send_byte_free(&mut cutter, x) {
+                            if !send_byte_free(&mut cutter, x) || !send_gone(x) {
                                 break;
                             }
                         }
@@ -6105,6 +6220,11 @@ fn spawn_pty_gather(
                                 break;
                             }
                         }
+                        if let Some(x) = exec.as_mut()
+                            && !send_gone(x)
+                        {
+                            break;
+                        }
                         if let Some(left) = after_exit.as_mut() {
                             *left = left.saturating_sub(filled);
                         }
@@ -6178,6 +6298,307 @@ struct PtyReaderWiring {
     journal: Option<Arc<crate::crash_restore::SessionJournal>>,
     #[cfg(unix)]
     park: (Arc<UpdatePark>, u64),
+}
+
+/// The dev `card-seen` probe over one parsed slice's visible rows and the fence they left, whose
+/// `mutations` are the terminal's screen mutations before the slice: a compose pass whose
+/// snapshot counted more shows what the slice drew. The card it dates is the newest card on
+/// screen only when [`crate::claude_card::admit`] admits it under the drawer's gate with no
+/// build policy (`GateBuild::ProvenanceOnly`; `card-seen` holds the card to the image's build
+/// itself): a card of the same build an earlier run left above the drawer's start is the newest
+/// until the drawer draws its own, and dating it would date the drawer's first output and put
+/// the card's row on the wrong card. At most
+/// [`crate::holder_image::CARD_PROBE_BATCHES`] batches look for one token's card.
+fn note_card_seen_in(
+    session: u64,
+    timeline: &Mutex<crate::session_timeline::SessionTimeline>,
+    budget: &mut Option<(u64, u16)>,
+    probed_batch: &mut bool,
+    (rows, fence): (&[String], &crate::claude_card::FenceFrame),
+) {
+    let unseen = timeline
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .card_unseen();
+    let Some((token, drawer)) = unseen else {
+        return;
+    };
+    let left = match *budget {
+        Some((t, left)) if t == token => left,
+        _ => crate::holder_image::CARD_PROBE_BATCHES,
+    };
+    if left == 0 {
+        return;
+    }
+    if !*probed_batch || budget.is_none_or(|(t, _)| t != token) {
+        *budget = Some((token, left - 1));
+        *probed_batch = true;
+    }
+    let reading = crate::claude_card::read_card(session, rows, None);
+    let gate = drawer.gate(token, crate::holder_image::GateBuild::ProvenanceOnly);
+    if let Some(card) = reading
+        .read
+        .as_ref()
+        .filter(|card| crate::claude_card::admit(&gate, fence, card).is_ok())
+    {
+        let row = fence
+            .base_y
+            .saturating_add(i64::try_from(card.place.top).unwrap_or(0));
+        timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .note_card_seen(
+                token,
+                reading.rows_kind(),
+                &card.version,
+                row,
+                fence.mutations,
+            );
+    }
+}
+
+#[cfg(all(test, any(debug_assertions, feature = "dev-seams")))]
+mod card_seen_probe_tests {
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    use aterm_core::terminal::{HolderView, MAX_HOLDER_SPANS};
+    use atpkg::image::{ImageBuild, ImageSource, ProgramTag};
+
+    use crate::claude_card::FenceFrame;
+    use crate::holder_image::{CARD_PROBE_BATCHES, CardProgram, EdgeKind, HolderImage};
+    use crate::session_timeline::SessionTimeline;
+
+    /// Claude Code 2.1.304's inline card and composer as a screen reads them.
+    fn card_screen() -> Vec<String> {
+        let rule = "\u{2500}".repeat(120);
+        let mut screen = vec![
+            String::new(),
+            format!(
+                " \u{2590}\u{259B}\u{2588}\u{2588}\u{2588}\u{259B}\u{2588}   {}2.1.304",
+                aterm_phase::anchor_text("launch.banner")
+            ),
+            "\u{259D}\u{259C}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2580}  Opus 5.5 \u{b7} Claude Max"
+                .to_string(),
+            " \u{259D}\u{259D}   \u{259D}\u{259D}   ~/aterm".to_string(),
+            String::new(),
+            rule.clone(),
+            "\u{276F} ".to_string(),
+            rule,
+            "  \u{23F5}\u{23F5} bypass permissions on (shift+tab to cycle)".to_string(),
+        ];
+        screen.resize(24, String::new());
+        screen
+    }
+
+    /// A timeline whose holder is Claude Code 2.1.304's store image, and its token.
+    fn drawer_timeline() -> (Mutex<SessionTimeline>, u64) {
+        let timeline = Mutex::new(SessionTimeline::default());
+        let image = HolderImage::of(
+            80,
+            Some(41),
+            Some(PathBuf::from(
+                "/p/store/claude/1000002000001000304/bin/claude",
+            )),
+            ImageBuild {
+                program: ProgramTag::new("claude"),
+                build: 1_000_002_000_001_000_304,
+                source: ImageSource::Store,
+            },
+            1,
+        );
+        let token = image.token.expect("tracked");
+        timeline
+            .lock()
+            .unwrap()
+            .offer_holder_image(Arc::new(image), EdgeKind::Group);
+        (timeline, token)
+    }
+
+    /// The main screen at absolute row `base`, the drawer `token`'s open span starting at
+    /// absolute row `start`, before a slice with `mutations` screen mutations.
+    fn fence(token: u64, start: u64, base: i64, mutations: u64) -> FenceFrame {
+        let mut spans = [(0, 0); MAX_HOLDER_SPANS];
+        spans[0] = (start, u64::MAX);
+        FenceFrame {
+            holder: HolderView {
+                token,
+                n: 1,
+                spans,
+                tainted: false,
+                alt_fresh: false,
+            },
+            base_y: base,
+            alt: false,
+            mutations,
+        }
+    }
+
+    /// The `card-seen` rows' payloads.
+    fn seen_rows(timeline: &Mutex<SessionTimeline>) -> Vec<String> {
+        timeline
+            .lock()
+            .unwrap()
+            .since(None)
+            .filter(|e| e.kind == "card-seen")
+            .map(|e| e.payload.to_string())
+            .collect()
+    }
+
+    /// The probe dates the card by the screen mutations before the slice it first read it in,
+    /// and spends one of its batches per batch, however many slices that batch took.
+    #[test]
+    fn the_probe_dates_the_card_by_the_slice_that_drew_it() {
+        let (timeline, token) = drawer_timeline();
+        let (mut budget, mut probed_batch) = (None, false);
+        let blank = vec![String::new(); 24];
+        super::note_card_seen_in(
+            7,
+            &timeline,
+            &mut budget,
+            &mut probed_batch,
+            (&blank, &fence(token, 100, 100, 4)),
+        );
+        assert_eq!(
+            timeline.lock().unwrap().card_unseen(),
+            Some((token, CardProgram::Claude)),
+            "no card yet"
+        );
+        super::note_card_seen_in(
+            7,
+            &timeline,
+            &mut budget,
+            &mut probed_batch,
+            (&card_screen(), &fence(token, 100, 100, 5)),
+        );
+        assert_eq!(
+            timeline.lock().unwrap().card_unseen(),
+            None,
+            "the card was seen"
+        );
+        let seen = seen_rows(&timeline);
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(
+            seen[0].contains("row=101 ") && seen[0].contains(" from=5 "),
+            "{seen:?}"
+        );
+        assert_eq!(
+            budget,
+            Some((token, CARD_PROBE_BATCHES - 1)),
+            "one batch spent"
+        );
+    }
+
+    /// THE PROBE DATES THE DRAWER'S OWN CARD. Relaunched with no clear, Claude Code's first
+    /// output lands while the card an earlier run of the same build left above its start is
+    /// still the newest card on screen: the fence does not hold it, so the probe passes over it
+    /// and dates the slice that draws the drawer's own card below, at that card's row. On the
+    /// alternate screen it dates a card only once the drawer has cleared it.
+    #[test]
+    fn the_probe_passes_over_a_card_an_earlier_run_left_above_the_drawers_start() {
+        let (timeline, token) = drawer_timeline();
+        let (mut budget, mut probed_batch) = (None, false);
+        let old = card_screen();
+        super::note_card_seen_in(
+            7,
+            &timeline,
+            &mut budget,
+            &mut probed_batch,
+            (&old, &fence(token, 110, 100, 4)),
+        );
+        assert!(
+            seen_rows(&timeline).is_empty(),
+            "the old card is not the drawer's"
+        );
+        assert_eq!(
+            timeline.lock().unwrap().card_unseen(),
+            Some((token, CardProgram::Claude))
+        );
+        let mut both = old.clone();
+        both.truncate(11);
+        both.extend(card_screen().into_iter().take(13));
+        super::note_card_seen_in(
+            7,
+            &timeline,
+            &mut budget,
+            &mut probed_batch,
+            (&both, &fence(token, 110, 100, 9)),
+        );
+        let seen = seen_rows(&timeline);
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(
+            seen[0].contains("row=112 ") && seen[0].contains(" from=9 "),
+            "the drawer's card, dated by the slice that drew it: {seen:?}"
+        );
+
+        let (timeline, token) = drawer_timeline();
+        let (mut budget, mut probed_batch) = (None, false);
+        let alt = |alt_fresh| {
+            let mut f = fence(token, 110, 100, 4);
+            f.alt = true;
+            f.holder.alt_fresh = alt_fresh;
+            f
+        };
+        super::note_card_seen_in(
+            7,
+            &timeline,
+            &mut budget,
+            &mut probed_batch,
+            (&old, &alt(false)),
+        );
+        assert!(
+            seen_rows(&timeline).is_empty(),
+            "an alternate screen the drawer did not clear"
+        );
+        super::note_card_seen_in(
+            7,
+            &timeline,
+            &mut budget,
+            &mut probed_batch,
+            (&old, &alt(true)),
+        );
+        assert_eq!(
+            seen_rows(&timeline).len(),
+            1,
+            "the drawer's alternate screen"
+        );
+    }
+
+    /// The probe dates a card only under the drawer's own fence. While the fence's holder is
+    /// another token (its cut has not reached this drawer's exec, or has passed it), the card at
+    /// the span's start is that holder's and is not dated; under the drawer's token the same
+    /// rows are.
+    #[test]
+    fn the_probe_dates_no_card_under_another_holders_fence() {
+        let (timeline, token) = drawer_timeline();
+        let (mut budget, mut probed_batch) = (None, false);
+        let screen = card_screen();
+        super::note_card_seen_in(
+            7,
+            &timeline,
+            &mut budget,
+            &mut probed_batch,
+            (&screen, &fence(token ^ 1, 100, 100, 4)),
+        );
+        assert!(seen_rows(&timeline).is_empty(), "another holder's fence");
+        assert_eq!(
+            timeline.lock().unwrap().card_unseen(),
+            Some((token, CardProgram::Claude))
+        );
+        super::note_card_seen_in(
+            7,
+            &timeline,
+            &mut budget,
+            &mut probed_batch,
+            (&screen, &fence(token, 100, 100, 5)),
+        );
+        let seen = seen_rows(&timeline);
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(
+            seen[0].contains("row=101 ") && seen[0].contains(" from=5 "),
+            "the drawer's fence: {seen:?}"
+        );
+    }
 }
 
 fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, String> {
@@ -6460,6 +6881,7 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                         .as_ref()
                         .filter(|i| i.drawer.is_some())
                         .and_then(|i| i.token);
+                    let edge_group = image.as_ref().map_or(0, |i| i.pgid);
                     let mut slice_holder = edge.map_or(holder, |e| e.from);
                     if let Some(a) = arm.as_mut() {
                         if a.scans() {
@@ -6470,6 +6892,7 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                             a.begin_batch();
                         }
                     }
+                    let mut probed_batch = false;
                     while off < bytes.len() || handback_at == Some(off) || lay_at == Some(off) {
                         let limit = match handback_at {
                             Some(at) if at > off => at,
@@ -6529,7 +6952,7 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                         let arm_cut = match (&offered, arm.as_ref()) {
                             (Some((read, _)), Some(a)) if verdicts.is_none() => {
                                 let to = read.drawer.and(read.token);
-                                match a.last_of(read.pgid) {
+                                let cut = match a.last_of(read.pgid) {
                                     Some(last) if last.same_image(read) => None,
                                     Some(_) => Some(aterm_core::terminal::HolderCut {
                                         to,
@@ -6541,7 +6964,8 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                                         kind: aterm_core::terminal::CutKind::Group,
                                         from_alive: true,
                                     }),
-                                }
+                                };
+                                cut.map(|cut| (cut, read.pgid))
                             }
                             _ => None,
                         };
@@ -6553,11 +6977,24 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                             publish_holder(image, kind, arm.as_mut(), &mut cadence);
                             None
                         });
+                        let card_rows_wanted = crate::holder_image::DEV_ROWS
+                            && card_probe_on
+                            && end > off
+                            && (offered.is_some()
+                                || timeline
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .card_unseen()
+                                    .is_some());
+                        let mut card_rows: Option<(Vec<String>, crate::claude_card::FenceFrame)> =
+                            None;
                         let (c_signed, shell_executing);
+                        let mut group_notes = crate::holder_image::GroupNotes::default();
                         {
                             let waited = term_busy(&term).then(Instant::now);
                             let mut t = term_lock(&term);
                             crate::metrics::note_parse_hold(parse_hold_wait(waited));
+                            let card_from = card_rows_wanted.then(|| t.screen_mutations());
                             t.holder_rings();
                             cuts.observe(emitted, &t, &cast_watermark);
                             let spine_pre = temporal_tx
@@ -6617,6 +7054,8 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                                         },
                                         from_alive: !v.gone(e.from),
                                     },
+                                    edge_group,
+                                    &mut group_notes,
                                 );
                             } else if lay_at == Some(off) {
                                 lay_at = None;
@@ -6627,10 +7066,12 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                                         kind: aterm_core::terminal::CutKind::Group,
                                         from_alive: true,
                                     },
+                                    edge_group,
+                                    &mut group_notes,
                                 );
                             }
-                            if let Some(cut) = arm_cut {
-                                note_cut(&mut t, cut);
+                            if let Some((cut, group)) = arm_cut {
+                                note_cut(&mut t, cut, group, &mut group_notes);
                             }
                             t.set_foreground_job(slice_holder > 0 && slice_holder != fg_shell);
                             #[cfg(test)]
@@ -6696,16 +7137,47 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                                 j.record(&t, pre, &bytes[off..end], false);
                                 journal_keyframe = j.decide(&t, pre);
                             }
+                            if let Some(from) = card_from {
+                                card_rows = Some((
+                                    (0..usize::from(t.rows()))
+                                        .map(|r| crate::control::visible_row(&t, r))
+                                        .collect(),
+                                    crate::claude_card::FenceFrame {
+                                        holder: t.holder_view(),
+                                        base_y: i64::try_from(t.grid().base_y())
+                                            .unwrap_or(i64::MAX),
+                                        alt: t.is_alternate_screen(),
+                                        mutations: from,
+                                    },
+                                ));
+                            }
                         }
                         #[cfg(unix)]
                         if let (Some(j), Some(captured)) = (&journal, journal_keyframe.take()) {
                             j.write(captured);
+                        }
+                        if !group_notes.is_empty() {
+                            group_notes.apply(
+                                timeline
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .drawer_groups_mut(),
+                            );
                         }
                         if let Some((image, kind)) = offered {
                             publish_holder(image, kind, arm.as_mut(), &mut cadence);
                         }
                         if let Some(a) = arm.as_mut() {
                             a.note_shell(c_signed, shell_executing);
+                        }
+                        if let Some((rows, fence)) = card_rows {
+                            note_card_seen_in(
+                                id,
+                                &timeline,
+                                &mut card_probe,
+                                &mut probed_batch,
+                                (&rows, &fence),
+                            );
                         }
                         drop(fetched);
                         off = end;
@@ -6721,39 +7193,6 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                         h.bytes.len(),
                     );
                     aterm_log::info!("session {id}: foreground handback: {payload}");
-                }
-                if crate::holder_image::DEV_ROWS && card_probe_on && !buf.is_empty() {
-                    let unseen = timeline
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .card_unseen();
-                    if let Some(token) = unseen {
-                        let left = match card_probe {
-                            Some((t, left)) if t == token => left,
-                            _ => crate::holder_image::CARD_PROBE_BATCHES,
-                        };
-                        if left > 0 {
-                            card_probe = Some((token, left - 1));
-                            let (rows, base): (Vec<String>, i64) = {
-                                let t = term_lock(&term);
-                                (
-                                    (0..usize::from(t.rows()))
-                                        .map(|r| crate::control::visible_row(&t, r))
-                                        .collect(),
-                                    i64::try_from(t.grid().base_y()).unwrap_or(i64::MAX),
-                                )
-                            };
-                            let reading = crate::claude_card::read_card(id, &rows, None);
-                            if let Some(card) = &reading.read {
-                                let row =
-                                    base.saturating_add(i64::try_from(card.place.top).unwrap_or(0));
-                                timeline
-                                    .lock()
-                                    .unwrap_or_else(|p| p.into_inner())
-                                    .note_card_seen(token, reading.rows_kind(), &card.version, row);
-                            }
-                        }
-                    }
                 }
                 if let Some((req, report, _)) = &manual_run {
                     crate::manual_reset::record(id, &timeline, req.source, report);
@@ -6906,6 +7345,13 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                     }
                     Ok(GatherMsg::Edge(edge, holder, image)) => {
                         ingest(&[], Some(edge), holder, image, None);
+                    }
+                    Ok(GatherMsg::Gone(pid)) => {
+                        #[cfg(test)]
+                        if crate::holder_image::hold_hook::no_retire(id) {
+                            continue;
+                        }
+                        retire_gone(&term, &timeline, pid);
                     }
                     Ok(GatherMsg::Data(batch, len, edge, holder, image)) => {
                         ingest(&batch[..len], edge, holder, image, None);
@@ -7326,7 +7772,7 @@ pub(crate) fn gather_held_output(
 pub(crate) enum OutputWakeVerdict {
     /// No wake outstanding.
     Clear,
-    /// The wake was posted before `drained_through_ns`, a user-event drain ran after that instant, and the latch is still armed.
+    /// The wake was posted before `drained_through_ns`, every wake posted before that instant has been handed out, and the latch is still armed.
     Lost { age_ns: u64 },
     /// Outstanding but not proven lost.
     Waiting { recheck_ns: u64, late: bool },
@@ -7364,7 +7810,9 @@ pub(crate) fn judge_output_wake(
 /// The lost-wake watchdog's memory between `about_to_wait` passes.
 #[derive(Debug, Default)]
 pub(crate) struct OutputWakeWatch {
+    /// The pass before the latest turn whose drain emptied the user-event queue: every wake posted before it has been handed out.
     drained_through_ns: u64,
+    last_pass_ns: u64,
     late_booked: Vec<(u64, u64)>,
 }
 
@@ -7380,12 +7828,16 @@ pub(crate) struct OutputWakePass {
 }
 
 impl OutputWakeWatch {
-    /// Judge every session's latch at `now_ns` (this `about_to_wait`'s stamp), heal the ones proven lost (cas from the observed word, so a concurrent handler clear or reader re-stamp is never clobbered), book the late ones once, and record `now_ns` as the next pass's drained-through instant.
+    /// Judge every session's latch at `now_ns` (this `about_to_wait`'s stamp), heal the ones proven lost (cas from the observed word, so a concurrent handler clear or reader re-stamp is never clobbered), and book the late ones once. `drained` is whether this turn's drain of user events emptied the queue (`ActiveEventLoop::user_events_drained`): only then has every wake posted before the previous pass been handed out, and that pass becomes the drained-through instant. A drain that stopped at a sender part-way through a send may have left a wake posted before it queued.
     pub(crate) fn pass<'a>(
         &mut self,
         now_ns: u64,
+        drained: bool,
         latches: impl IntoIterator<Item = (u64, &'a AtomicU64)>,
     ) -> OutputWakePass {
+        if drained {
+            self.drained_through_ns = self.last_pass_ns;
+        }
         let drained_through_ns = self.drained_through_ns;
         let mut out = OutputWakePass::default();
         let mut still_late = Vec::new();
@@ -7402,7 +7854,8 @@ impl OutputWakeWatch {
                         crate::metrics::note_wake_heal();
                         aterm_log::warn!(
                             "watchdog healed a lost output wake (latch stale {} ms; session {}: \
-                             a user-event drain ran after it was posted and no handler cleared it)",
+                             a user-event drain that emptied the queue ran after it was posted \
+                             and no handler cleared it)",
                             age_ns / 1_000_000,
                             session
                         );
@@ -7427,7 +7880,7 @@ impl OutputWakeWatch {
             }
         }
         self.late_booked = still_late;
-        self.drained_through_ns = now_ns;
+        self.last_pass_ns = now_ns;
         out
     }
 }
@@ -7448,6 +7901,7 @@ impl crate::App {
             title: term_lock(&session.term).title().to_string(),
             term: session.term.clone(),
             master: session.master,
+            pid: session.pid,
             ctx: session.ctx.clone(),
         };
         crate::fabric::register_on_log(&session.ctx, || {
@@ -9350,15 +9804,15 @@ mod output_wake_coalesce_tests {
             );
             assert!(!wake_stranded(word, 1, 900 * MS));
             let latch = AtomicU64::new(word);
-            watch.pass(1_000 * MS, [(4, &latch)]);
-            let pass = watch.pass(2_000 * MS, [(4, &latch)]);
+            watch.pass(1_000 * MS, true, [(4, &latch)]);
+            let pass = watch.pass(2_000 * MS, true, [(4, &latch)]);
             assert_eq!((pass.healed, pass.late, pass.recheck_ns), (0, 0, None));
             assert_eq!(latch.load(Ordering::Relaxed), word, "untouched");
         }
         let lost = AtomicU64::new((5 * MS) | WAKE_LATCH_SENT | WAKE_LATCH_STREAMING);
         let mut watch = OutputWakeWatch::default();
-        watch.pass(10 * MS, [(4, &lost)]);
-        assert_eq!(watch.pass(20 * MS, [(4, &lost)]).healed, 1);
+        watch.pass(10 * MS, true, [(4, &lost)]);
+        assert_eq!(watch.pass(20 * MS, true, [(4, &lost)]).healed, 1);
         assert_eq!(lost.load(Ordering::Relaxed), 0);
         assert!(
             wake_stranded(
@@ -9785,22 +10239,37 @@ mod output_wake_coalesce_tests {
         let m = aterm_models_core::damage_to_present_model();
         let (mut judged, mut idle_judged) = (0_u32, 0_u32);
         let (mut false_heal_caught, mut past_recheck_caught) = (false, false);
+        let mut cut_heal_caught = false;
         for st in reachable(&m) {
             let (latch, now) = (st["latch"], st["now"] as u64 * K);
             let armed = word(&st);
             if st["busy"] == 1 {
-                let verdict = judge_output_wake(armed, st["drained"] as u64 * K, now);
+                let drained = st["drained"] as u64 * K;
+                // The bound stays 0: a latch the model holds through a cut turn was posted after the bound the last emptied drain set.
+                let mut watch = OutputWakeWatch {
+                    last_pass_ns: drained,
+                    ..OutputWakeWatch::default()
+                };
+                let word_now = AtomicU64::new(armed);
+                let pass = watch.pass(now, st["cut"] == 0, [(1, &word_now)]);
                 let end = m.successors("TurnEnd", &st);
                 assert_eq!(end.len(), 1, "TurnEnd is deterministic");
                 let end = &end[0];
                 let model_heals = latch != 0 && end["latch"] == 0;
-                let real_heals = matches!(verdict, OutputWakeVerdict::Lost { .. });
                 assert_eq!(
-                    real_heals, model_heals,
-                    "judge_output_wake vs model at {st:?}"
+                    pass.healed == 1,
+                    model_heals,
+                    "OutputWakeWatch::pass vs model at {st:?}"
                 );
-                match verdict {
-                    OutputWakeVerdict::Waiting { recheck_ns, .. } => {
+                let drain_blind = judge_output_wake(armed, drained, now);
+                if matches!(drain_blind, OutputWakeVerdict::Lost { .. })
+                    && !model_heals
+                    && st["inflight"] == 1
+                {
+                    cut_heal_caught = true;
+                }
+                match pass.recheck_ns {
+                    Some(recheck_ns) => {
                         assert!(recheck_ns > now, "a recheck is never in the past");
                         assert_eq!(
                             recheck_ns.div_ceil(K),
@@ -9812,7 +10281,7 @@ mod output_wake_coalesce_tests {
                             past_recheck_caught = true;
                         }
                     }
-                    OutputWakeVerdict::Lost { .. } | OutputWakeVerdict::Clear => {
+                    None => {
                         assert_eq!(end["recheck"], 0, "no deadline at {st:?}");
                     }
                 }
@@ -9846,6 +10315,12 @@ mod output_wake_coalesce_tests {
             past_recheck_caught,
             "the stamp+expiry recheck must disagree with the model after a long frame"
         );
+        assert!(
+            cut_heal_caught,
+            "a verdict blind to the drain must disagree with the model on a wake queued \
+             behind a drain that stopped at a held lock, or this bind cannot catch the \
+             2026-10-22 false heal"
+        );
     }
 
     #[test]
@@ -9855,7 +10330,7 @@ mod output_wake_coalesce_tests {
         let mut watch = OutputWakeWatch::default();
         let loop_idle = LoopIdle::default();
         let t0 = 1_000 * MS;
-        assert_eq!(watch.pass(t0, [(7, &latch)]).healed, 0);
+        assert_eq!(watch.pass(t0, true, [(7, &latch)]).healed, 0);
         loop_idle.went_idle(t0);
         loop_idle.turn_began();
         assert!(rx.try_recv().is_err());
@@ -9870,7 +10345,7 @@ mod output_wake_coalesce_tests {
             );
         }
         let end = t0 + 310 * MS;
-        let pass = watch.pass(end, [(7, &latch)]);
+        let pass = watch.pass(end, true, [(7, &latch)]);
         assert_eq!(
             pass.healed, 0,
             "a queued wake is LATE, not lost: no heal, no repaint-all"
@@ -9898,7 +10373,7 @@ mod output_wake_coalesce_tests {
         assert_eq!(gate, WakeGate::Coalesced);
         assert_eq!(rx.try_iter().count(), 1, "no duplicate wake was posted");
         latch.store(0, Ordering::Relaxed);
-        let next = watch.pass(end + 2 * MS, [(7, &latch)]);
+        let next = watch.pass(end + 2 * MS, true, [(7, &latch)]);
         assert_eq!((next.healed, next.late, next.recheck_ns), (0, 0, None));
     }
 
@@ -9913,7 +10388,7 @@ mod output_wake_coalesce_tests {
         let mut watch = OutputWakeWatch::default();
         let mut healer = DeadlineHealer::default();
         let mut t = 1_000 * MS;
-        assert_eq!(watch.pass(t, [(9, &latch)]).recheck_ns, None);
+        assert_eq!(watch.pass(t, true, [(9, &latch)]).recheck_ns, None);
         for turn in 0..40 {
             latch.store(0, Ordering::Relaxed);
             let post = t + 5 * MS;
@@ -9922,7 +10397,7 @@ mod output_wake_coalesce_tests {
                 WakeGate::Posted
             );
             t += 400 * MS;
-            let pass = watch.pass(t, [(9, &latch)]);
+            let pass = watch.pass(t, true, [(9, &latch)]);
             assert_eq!(pass.healed, 0, "turn {turn}: late, not lost");
             let recheck = pass
                 .recheck_ns
@@ -9951,12 +10426,12 @@ mod output_wake_coalesce_tests {
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         let mut watch = OutputWakeWatch::default();
         let t0 = 1_000 * MS;
-        watch.pass(t0, [(3, &latch)]);
+        watch.pass(t0, true, [(3, &latch)]);
         let sent = t0 + 10 * MS;
         gated_output_wake(&latch, sent, 0, false, || tx.send(()).is_ok(), || sent);
         assert_eq!(rx.try_iter().count(), 1);
         let pass_at = t0 + 12 * MS;
-        let pass = watch.pass(pass_at, [(3, &latch)]);
+        let pass = watch.pass(pass_at, true, [(3, &latch)]);
         assert_eq!(
             pass.healed, 0,
             "not yet proven: no drain has begun after the post"
@@ -9969,7 +10444,7 @@ mod output_wake_coalesce_tests {
             pass_at + WAKE_LATCH_EXPIRY_NS,
             "one expiry after the pass that saw it"
         );
-        let pass = watch.pass(recheck, [(3, &latch)]);
+        let pass = watch.pass(recheck, true, [(3, &latch)]);
         assert_eq!(pass.healed, 1, "proven lost: healed");
         assert_eq!(latch.load(Ordering::Relaxed), 0);
         gated_output_wake(
@@ -9981,6 +10456,69 @@ mod output_wake_coalesce_tests {
             || recheck + 1,
         );
         assert_eq!(rx.try_iter().count(), 1);
+    }
+
+    #[test]
+    fn a_wake_queued_behind_a_drain_that_stopped_short_is_not_healed() {
+        let latch = AtomicU64::new(0);
+        let mut watch = OutputWakeWatch::default();
+        let t0 = 1_000 * MS;
+        watch.pass(t0, true, [(0, &latch)]);
+        let queue = std::cell::RefCell::new(std::collections::VecDeque::new());
+        let sent = t0 + 3 * MS;
+        let post = || {
+            queue.borrow_mut().push_back(sent);
+            true
+        };
+        assert_eq!(
+            gated_output_wake(&latch, sent, 0, false, post, || sent),
+            WakeGate::Posted,
+            "posted after this turn's drain, during its frame"
+        );
+        assert_eq!(watch.pass(t0 + 4 * MS, true, [(0, &latch)]).healed, 0);
+        let stopped = watch.pass(t0 + 5 * MS, false, [(0, &latch)]);
+        assert_eq!(
+            stopped.healed, 0,
+            "the next drain met another sender mid-send and took nothing: queued, not lost"
+        );
+        assert_eq!(latch.load(Ordering::Relaxed), sent | WAKE_LATCH_SENT);
+        assert!(stopped.recheck_ns.is_some(), "the watch looks again");
+        assert_eq!(
+            queue.borrow_mut().pop_front(),
+            Some(sent),
+            "the turn the sender's wake brings hands it out"
+        );
+        let handled = t0 + 6 * MS;
+        let word = latch.load(Ordering::Relaxed);
+        latch.store(output_latch_after_pass(word, handled), Ordering::Relaxed);
+        let next = watch.pass(handled, true, [(0, &latch)]);
+        assert_eq!((next.healed, next.recheck_ns), (0, None));
+    }
+
+    #[test]
+    fn a_wake_lost_around_a_drain_that_stopped_short_still_heals() {
+        let (lost, stale) = (AtomicU64::new(0), AtomicU64::new(0));
+        let mut watch = OutputWakeWatch::default();
+        let t0 = 1_000 * MS;
+        watch.pass(t0, true, [(0, &lost), (1, &stale)]);
+        let sent = t0 + 3 * MS;
+        gated_output_wake(&lost, sent, 0, false, || true, || sent);
+        assert_eq!(watch.pass(t0 + 4 * MS, true, [(0, &lost)]).healed, 0);
+        stale.store((t0 - MS) | WAKE_LATCH_SENT, Ordering::Relaxed);
+        let stopped = watch.pass(t0 + 5 * MS, false, [(0, &lost), (1, &stale)]);
+        assert_eq!(
+            stopped.healed, 1,
+            "a drain that stopped short keeps what an earlier emptied one proved"
+        );
+        assert_eq!(stale.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            lost.load(Ordering::Relaxed),
+            sent | WAKE_LATCH_SENT,
+            "not proven by a drain that stopped short"
+        );
+        let pass = watch.pass(t0 + 6 * MS, true, [(0, &lost)]);
+        assert_eq!(pass.healed, 1, "the next emptied drain proves it lost");
+        assert_eq!(lost.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -10018,17 +10556,17 @@ mod output_wake_coalesce_tests {
         let mut watch = OutputWakeWatch::default();
         let mut books = 0;
         for _ in 0..3 {
-            watch.drained_through_ns = 10 * MS;
+            watch.last_pass_ns = 10 * MS;
             books += watch
-                .pass(10 * MS + 2 * WAKE_LATCH_EXPIRY_NS, [(1, &latch)])
+                .pass(10 * MS + 2 * WAKE_LATCH_EXPIRY_NS, true, [(1, &latch)])
                 .late;
         }
         assert_eq!(books, 1);
         latch.store((20 * MS) | WAKE_LATCH_SENT, Ordering::Relaxed);
-        watch.drained_through_ns = 20 * MS;
+        watch.last_pass_ns = 20 * MS;
         assert_eq!(
             watch
-                .pass(20 * MS + 2 * WAKE_LATCH_EXPIRY_NS, [(1, &latch)])
+                .pass(20 * MS + 2 * WAKE_LATCH_EXPIRY_NS, true, [(1, &latch)])
                 .late,
             1
         );

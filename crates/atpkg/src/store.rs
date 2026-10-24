@@ -564,8 +564,11 @@ pub(crate) fn unmark_program_builds(prog_store: &Path) {
     let mut unmarked = false;
     for entry in entries.flatten() {
         // Numeric build dirs only, by the same test every other store scan uses: `current`
-        // is a symlink, and `<n>.ready` / `<n>.provenance` / `<n>.shim-env` are files.
-        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+        // is a symlink, and `<n>.ready` / `<n>.provenance` / `<n>.shim-env` are files. A
+        // build laid aside is its `<n>` link.
+        if !entry.file_type().is_ok_and(|t| t.is_dir())
+            && !aterm_toolchain::layout::is_linked_aside(&entry.path())
+        {
             continue;
         }
         let name = entry.file_name();
@@ -966,12 +969,49 @@ pub fn clear_stage_refusal(build_dir: &Path) {
 /// The suffix of a vendor-direct build's record (`store/<program>/<build>.vendor`).
 pub(crate) const VENDOR_SIDECAR_SUFFIX: &str = ".vendor";
 
-/// The sidecars a stage may write through [`crate::install::StageHooks::sidecars`].
+/// The suffix of a build's record of the commands it puts on PATH
+/// (`store/<program>/<build>.exposes`, [`write_exposes`]).
+pub(crate) const EXPOSES_SUFFIX: &str = ".exposes";
+
+const EXPOSES_HEADER: &str = "exposes v1";
+
+const MAX_EXPOSES_BYTES: usize = 64 * 1024;
+
+/// The sidecars a stage may write through [`crate::install::StageHooks::sidecars`], which
+/// gc sweeps once their build is gone.
 pub(crate) const STAGE_SIDECAR_SUFFIXES: &[&str] = &[
     VENDOR_SIDECAR_SUFFIX,
     crate::shim_env::SIDECAR_SUFFIX,
     DECLARED_MODES_SUFFIX,
+    EXPOSES_SUFFIX,
 ];
+
+/// Record `tools`, the admitted names of the build's signed `exposes`, beside `build_dir`
+/// ([`write_sidecar_durably`]).
+pub(crate) fn write_exposes(build_dir: &Path, tools: &[ToolName]) -> std::io::Result<()> {
+    let mut body = String::from(EXPOSES_HEADER);
+    body.push('\n');
+    for tool in tools {
+        body.push_str(tool.as_str());
+        body.push('\n');
+    }
+    write_sidecar_durably(build_dir, EXPOSES_SUFFIX, body.as_bytes())
+}
+
+/// The commands `build_dir` recorded it puts on PATH ([`write_exposes`]), or `None` for a
+/// build staged before that record existed or a record that does not parse.
+pub(crate) fn recorded_exposes(build_dir: &Path) -> Option<Vec<ToolName>> {
+    let path = sidecar_path(build_dir, EXPOSES_SUFFIX)?;
+    let text = crate::metadata_io::read_bounded_regular_utf8(&path, MAX_EXPOSES_BYTES).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != EXPOSES_HEADER {
+        return None;
+    }
+    lines
+        .filter(|line| !line.is_empty())
+        .map(ToolName::new)
+        .collect()
+}
 
 /// `<build><suffix>` beside `build_dir`, or `None` for a path with no UTF-8 file name.
 pub(crate) fn sidecar_path(build_dir: &Path, suffix: &str) -> Option<PathBuf> {
@@ -1147,13 +1187,104 @@ fn scratch_siblings(build_dir: &Path) -> Vec<(Scratch, PathBuf)> {
         .collect()
 }
 
+pub use aterm_toolchain::layout::{ExposedBuild, spotlight_exposed_builds};
+
+/// Whether a stage lays the tree `tree` aside, in `<build>.noindex` behind a `<build>` link
+/// ([`aterm_toolchain::layout`]'s Spotlight layout): on macOS, a tree that ships a Rust sysroot.
+pub(crate) fn lays_aside(tree: &Path) -> bool {
+    cfg!(target_os = "macos") && aterm_toolchain::layout::ships_rust_sysroot(tree)
+}
+
+/// Whether nothing at `build_dir` holds a tree: nothing is there (by `lstat`: a dangling link
+/// that is not the build's own is still something), or the build's link names an aside that
+/// is gone.
+pub(crate) fn tree_absent(build_dir: &Path) -> bool {
+    match std::fs::symlink_metadata(build_dir) {
+        Err(_) => true,
+        Ok(_) => {
+            aterm_toolchain::layout::is_linked_aside(build_dir)
+                && aterm_toolchain::layout::aside_of(build_dir)
+                    .is_some_and(|aside| std::fs::symlink_metadata(aside).is_err())
+        }
+    }
+}
+
+/// Point `build_dir` at its aside: the link `<build>` -> `<build>.noindex`, relative.
+#[cfg(unix)]
+pub(crate) fn link_aside(build_dir: &Path) -> std::io::Result<()> {
+    let aside = aterm_toolchain::layout::aside_of(build_dir).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "build dir has no name")
+    })?;
+    let name = aside.file_name().unwrap_or_default();
+    std::os::unix::fs::symlink(name, build_dir)
+}
+
+/// Elsewhere no build is laid aside ([`lays_aside`]).
+#[cfg(not(unix))]
+pub(crate) fn link_aside(_build_dir: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+}
+
+/// Give an aside whose `<build>` link a crash kept from being laid its link back: nothing is
+/// at `build_dir` and `<build>.noindex` is a real directory. Whatever the tree is, complete
+/// or partial, the rest of the store then reads it at its name.
+pub(crate) fn relink_aside(build_dir: &Path) -> bool {
+    let Some(aside) = aterm_toolchain::layout::aside_of(build_dir) else {
+        return false;
+    };
+    std::fs::symlink_metadata(build_dir).is_err()
+        && std::fs::symlink_metadata(&aside).is_ok_and(|m| m.is_dir())
+        && link_aside(build_dir).is_ok()
+}
+
+/// Move the real build directory `build_dir` into `<build>.noindex` and link `<build>` to it.
+/// The caller has proved nothing runs from it and nothing names it as the active build:
+/// a tree macOS may still be assessing a first exec in never moves.
+/// # Errors
+/// `build_dir` is not a real directory, its aside's name is taken, or the rename or the link
+/// failed (a failed link puts the directory back).
+pub(crate) fn lay_aside(build_dir: &Path) -> std::io::Result<()> {
+    let aside = aterm_toolchain::layout::aside_of(build_dir).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "build dir has no name")
+    })?;
+    if !std::fs::symlink_metadata(build_dir)?.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a real directory", build_dir.display()),
+        ));
+    }
+    if std::fs::symlink_metadata(&aside).is_ok() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("{} is already there", aside.display()),
+        ));
+    }
+    std::fs::rename(build_dir, &aside)?;
+    if let Err(e) = link_aside(build_dir) {
+        let _ = std::fs::rename(&aside, build_dir);
+        return Err(e);
+    }
+    if let Some(parent) = build_dir.parent() {
+        sync_dir_ordered(parent);
+    }
+    Ok(())
+}
+
 /// Recover the one crash window a swap cannot make atomic.
 pub(crate) fn recover_interrupted_swap(build_dir: &Path) -> bool {
+    relink_aside(build_dir);
     // `symlink_metadata`, not `exists()`: a dangling symlink at the build path is still
-    // something there, and the window means nothing is.
-    if std::fs::symlink_metadata(build_dir).is_ok() {
+    // something there, and the window means nothing is, unless it is the build's own link
+    // to an aside the swap moved off, which is where the parked tree goes back.
+    let back_to = if std::fs::symlink_metadata(build_dir).is_err() {
+        build_dir.to_path_buf()
+    } else if tree_absent(build_dir)
+        && let Some(aside) = aterm_toolchain::layout::aside_of(build_dir)
+    {
+        aside
+    } else {
         return false;
-    }
+    };
     let mut superseded = scratch_siblings(build_dir).into_iter().filter(|(kind, p)| {
         *kind == Scratch::Superseded && std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir())
     });
@@ -1163,13 +1294,13 @@ pub(crate) fn recover_interrupted_swap(build_dir: &Path) -> bool {
     if superseded.next().is_some() {
         return false;
     }
-    std::fs::rename(&old, build_dir).is_ok()
+    std::fs::rename(&old, back_to).is_ok()
 }
 
 /// Delete stage-scratch siblings of `build_dir` ([`recover_interrupted_swap`]).
 pub(crate) fn sweep_stage_scratch(build_dir: &Path) {
     let recovered = recover_interrupted_swap(build_dir);
-    let parked_only_copy = !recovered && std::fs::symlink_metadata(build_dir).is_err();
+    let parked_only_copy = !recovered && tree_absent(build_dir);
     for (kind, path) in scratch_siblings(build_dir) {
         // Spare only a directory (what a swap parks); a file or symlink at that name is
         // nobody's only copy, and nothing else reclaims it.
@@ -1279,8 +1410,19 @@ pub(crate) fn unseal_bin(tree: &Path) {
     }
 }
 
-/// Remove the store tree at `dir` ([`unseal_bin`]).
+/// Remove the store tree at `dir` ([`unseal_bin`]); a build laid aside goes whole, its
+/// `<build>.noindex` tree first and then the `<build>` link, so a crash between the two
+/// leaves a link to nothing, which the next sweep removes.
 pub(crate) fn remove_tree(dir: &Path) -> std::io::Result<()> {
+    if aterm_toolchain::layout::is_linked_aside(dir)
+        && let Some(aside) = aterm_toolchain::layout::aside_of(dir)
+    {
+        if std::fs::symlink_metadata(&aside).is_ok_and(|m| m.is_dir()) {
+            unseal_bin(&aside);
+            std::fs::remove_dir_all(&aside)?;
+        }
+        return std::fs::remove_file(dir);
+    }
     unseal_bin(dir);
     std::fs::remove_dir_all(dir)
 }
@@ -1389,6 +1531,9 @@ pub(crate) fn discard_build(build_dir: &Path) {
     clear_stage_refusal(build_dir);
     clear_vendor_sidecar(build_dir);
     clear_declared_modes(build_dir);
+    if let Some(record) = sidecar_path(build_dir, EXPOSES_SUFFIX) {
+        let _ = std::fs::remove_file(record);
+    }
 }
 
 /// The default prefix under `home`.

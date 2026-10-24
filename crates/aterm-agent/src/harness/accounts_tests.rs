@@ -4305,7 +4305,8 @@ fn a_ledger_row_round_trips_as_one_bounded_line() {
             "login-ended",
             "wrong-account",
             "reset",
-            "epoch"
+            "epoch",
+            "sign-in"
         ]
     );
 
@@ -4423,6 +4424,7 @@ fn a_row_wakes_waiting_tabs_only_when_an_account_is_usable_sooner() {
         Kind::WrongAccount,
         Kind::Reset,
         Kind::Epoch,
+        Kind::SignIn,
     ];
     for kind in quiet {
         assert!(!wakes(kind, "ok"), "{}", kind.as_str());
@@ -7923,4 +7925,283 @@ fn warnings_and_credits_in_use_mark_an_account_low_and_rotate_early_ahead_of_the
     );
     assert_eq!(cond(&r, &refilled, "main", NOW), Condition::Usable);
     assert!(!refilled.accounts["main"].leave_early(NOW));
+}
+
+const POOL_ROWS: &str = "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n[[account]]\n\
+    label = \"work\"\nclass = \"dedicated\"\ndir = \"/logins/work\"\n";
+
+#[test]
+fn claudes_roster_admits_no_vendor_key_and_its_store_is_where_it_was() {
+    for key in [
+        "region = \"global\"",
+        "flow = \"device\"",
+        "cli = \"claude\"",
+    ] {
+        let text = format!("{POOL_ROWS}{key}\n");
+        let why = Roster::parse(&text).expect_err(key);
+        assert!(
+            why.starts_with("accounts.toml: row `work` has an unknown key")
+                && why.ends_with("a row holds label, class, dir, email and browser"),
+            "{key}: {why}"
+        );
+        assert_eq!(Roster::parse_for(Cli::Claude, &text), Err(why));
+    }
+    assert_eq!(
+        Roster::parse_for(Cli::Claude, POOL_ROWS),
+        Roster::parse(POOL_ROWS)
+    );
+    let state = Path::new("/state/harness/claude");
+    assert_eq!(Store::at(state).dir, state.join("accounts"));
+    assert_eq!(
+        Store::at(state).logins_dir(),
+        state.join("accounts").join("logins")
+    );
+    assert_eq!(
+        Store::at_for(state, Cli::Claude, Path::new("/home/o")),
+        Store::at(state)
+    );
+    let codex = Store::at_for(state, Cli::Codex, Path::new("/home/o"));
+    assert_eq!(codex.dir, state.join("accounts-codex"));
+    assert_eq!(codex.logins_dir(), Path::new("/home/o/.aterm/logins/codex"));
+    assert_eq!(
+        codex.login_dir("work"),
+        Some(PathBuf::from("/home/o/.aterm/logins/codex/work"))
+    );
+    let config = Path::new("/config/aterm/aterm.toml");
+    assert_eq!(
+        roster_beside_for(config, Cli::Claude),
+        roster_beside(config)
+    );
+    assert_eq!(
+        roster_beside_for(config, Cli::Kimi),
+        Some(PathBuf::from("/config/aterm/accounts-kimi.toml"))
+    );
+}
+
+#[test]
+fn a_kimi_row_with_an_email_names_its_region_and_only_a_known_one() {
+    let row = |extra: &str| {
+        format!(
+            "[[account]]\nlabel = \"sol\"\nclass = \"dedicated\"\ndir = \"/logins/kimi/sol\"\n\
+             email = \"sol@example.com\"\n{extra}"
+        )
+    };
+    let roster = Roster::parse_for(Cli::Kimi, &row("region = \"global\"\n")).expect("admitted");
+    assert_eq!(roster.rows[0].vendor.region, Some(Region::Global));
+    assert_eq!(roster.rows[0].email.as_deref(), Some("sol@example.com"));
+    let cn = Roster::parse_for(Cli::Kimi, &row("region = \"mainland-cn\"\n")).expect("admitted");
+    assert_eq!(cn.rows[0].vendor.region, Some(Region::MainlandCn));
+    let none = Roster::parse_for(Cli::Kimi, &row("")).expect_err("no region");
+    assert!(
+        none.starts_with("accounts-kimi.toml: row `sol` has an email and no region"),
+        "{none}"
+    );
+    let eu = Roster::parse_for(Cli::Kimi, &row("region = \"eu\"\n")).expect_err("eu");
+    assert!(
+        eu.starts_with("accounts-kimi.toml: row `sol`: region `eu` is neither"),
+        "{eu}"
+    );
+    let flow = Roster::parse_for(Cli::Kimi, &row("region = \"global\"\nflow = \"device\"\n"))
+        .expect_err("kimi takes no flow");
+    assert!(flow.contains("unknown key `flow`"), "{flow}");
+    let no_email = "[[account]]\nlabel = \"own\"\nclass = \"dedicated\"\n";
+    assert!(
+        Roster::parse_for(Cli::Kimi, no_email).is_ok(),
+        "a row with no email needs none"
+    );
+}
+
+#[test]
+fn a_codex_or_grok_row_names_its_flow_and_no_region() {
+    for cli in [Cli::Codex, Cli::Grok] {
+        let file = cli.accounts().roster_file;
+        let text = format!("{POOL_ROWS}flow = \"device\"\n");
+        let roster = Roster::parse_for(cli, &text).expect("admitted");
+        assert_eq!(roster.rows[1].vendor.flow, Some(Flow::Device));
+        assert_eq!(roster.rows[1].flow(cli), Some(Flow::Device));
+        let default = match cli.accounts().keys {
+            RowKeys::Flow(flow) => flow,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            roster.rows[0].flow(cli),
+            Some(default),
+            "the CLI's own default"
+        );
+        let region = format!("{POOL_ROWS}region = \"global\"\n");
+        let why = Roster::parse_for(cli, &region).expect_err("no region");
+        assert!(
+            why.starts_with(&format!("{file}: row `work` has an unknown key `region`"))
+                && why.ends_with("dir, email, browser and flow"),
+            "{why}"
+        );
+        let bad = Roster::parse_for(cli, &format!("{POOL_ROWS}flow = \"magic\"\n"))
+            .expect_err("a flow that is none");
+        assert!(bad.contains("flow `magic` is neither"), "{bad}");
+    }
+    assert_eq!(
+        Roster::parse_for(Cli::Claude, POOL_ROWS).expect("ok").rows[1].flow(Cli::Claude),
+        None
+    );
+}
+
+#[test]
+fn a_rows_vendor_keys_are_written_back_as_parsed() {
+    let row = Row {
+        label: "sol".into(),
+        class: Class::Dedicated,
+        dir: Some("/logins/kimi/sol".into()),
+        email: Some("sol@example.com".into()),
+        vendor: Vendor {
+            region: Some(Region::MainlandCn),
+            flow: None,
+        },
+        ..Row::default()
+    };
+    let text = append_rows_for(Cli::Kimi, "", std::slice::from_ref(&row)).expect("appended");
+    assert!(text.contains("region = \"mainland-cn\"\n"), "{text}");
+    assert_eq!(
+        Roster::parse_for(Cli::Kimi, &text)
+            .expect("reads back")
+            .rows,
+        vec![row.clone()]
+    );
+    let refused = append_rows_for(Cli::Claude, "", &[row]).expect_err("claude takes no region");
+    assert!(refused.contains("unknown key `region`"), "{refused}");
+}
+
+#[test]
+fn each_seam_exports_its_own_variable_and_the_default_row_unsets_it() {
+    let dir = |d: Option<&str>| Row {
+        label: "x".into(),
+        dir: d.map(str::to_owned),
+        ..Row::default()
+    };
+    let work = dir(Some("/logins/work"));
+    assert_eq!(
+        login_env_for(Cli::Grok, &work),
+        ("GROK_AUTH_PATH", Some("/logins/work/auth.json".to_owned()))
+    );
+    assert_eq!(
+        login_env_for(Cli::Claude, &work),
+        (
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+            Some("/logins/work".to_owned())
+        )
+    );
+    assert_eq!(
+        login_env(&work),
+        ("CLAUDE_SECURESTORAGE_CONFIG_DIR", "/logins/work".to_owned())
+    );
+    assert_eq!(
+        login_env_for(Cli::Codex, &work),
+        ("CODEX_HOME", Some("/logins/work".to_owned()))
+    );
+    assert_eq!(
+        login_env_for(Cli::Kimi, &work),
+        ("KIMI_CODE_HOME", Some("/logins/work".to_owned()))
+    );
+    for cli in Cli::ALL {
+        let (var, value) = login_env_for(cli, &dir(None));
+        assert_eq!(
+            (var, value),
+            (cli.accounts().seam.var(), None),
+            "{}",
+            cli.id()
+        );
+        if cli != Cli::Claude {
+            assert!(!var.starts_with("CLAUDE"), "{} exports {var}", cli.id());
+            assert!(!login_env_for(cli, &work).0.starts_with("CLAUDE"));
+        }
+    }
+}
+
+#[test]
+fn a_grok_process_is_judged_by_the_auth_file_its_seam_names() {
+    let roster = Roster::parse_for(Cli::Grok, POOL_ROWS).expect("roster");
+    let who = ProcessLogin::of_env_for(Cli::Grok, [("GROK_AUTH_PATH", "/logins/work/auth.json")]);
+    assert_eq!(who.login.as_deref(), Some("/logins/work"));
+    assert_eq!(judged_label(&roster, &who), Some("work"));
+    let default = ProcessLogin::of_env_for(Cli::Grok, [("PATH", "/usr/bin")]);
+    assert_eq!(judged_label(&roster, &default), Some("main"));
+    for outside in [
+        ProcessLogin::of_env_for(Cli::Grok, [("GROK_AUTH_PATH", "/elsewhere/auth.json")]),
+        ProcessLogin::of_env_for(Cli::Grok, [("GROK_AUTH_PATH", "/logins/work/other.json")]),
+        ProcessLogin::of_env_for(Cli::Grok, [("GROK_AUTH_PATH", "/logins/work")]),
+        ProcessLogin::of_env_for(
+            Cli::Grok,
+            [
+                ("GROK_AUTH_PATH", "/logins/work/auth.json"),
+                ("XAI_API_KEY", "k"),
+            ],
+        ),
+    ] {
+        assert_eq!(judged_label(&roster, &outside), None, "{outside:?}");
+    }
+    let apart = ProcessLogin::of_env_for(
+        Cli::Grok,
+        [
+            ("GROK_AUTH_PATH", "/logins/work/auth.json"),
+            ("GROK_HOME", "/other"),
+        ],
+    );
+    assert!(!apart.default_home);
+    let codex = Roster::parse_for(Cli::Codex, POOL_ROWS).expect("roster");
+    let overlay = ProcessLogin::of_env_for(Cli::Codex, [("CODEX_HOME", "/logins/work")]);
+    assert!(
+        overlay.default_home,
+        "an overlay home is the seam, not another home"
+    );
+    assert_eq!(judged_label(&codex, &overlay), Some("work"));
+    let claude = [("CLAUDE_SECURESTORAGE_CONFIG_DIR", "/logins/work")];
+    assert_eq!(
+        ProcessLogin::of_env_for(Cli::Claude, claude),
+        ProcessLogin::of_env(claude)
+    );
+    assert_eq!(
+        ProcessLogin::of_env_for(Cli::Grok, claude).login,
+        None,
+        "another CLI's seam names no grok login"
+    );
+}
+
+#[test]
+fn an_unmeasured_seam_holds_a_due_move_and_a_measured_one_makes_it() {
+    let r = Roster::parse_for(Cli::Kimi, POOL_ROWS).expect("roster");
+    let enrolled = all(&r);
+    let mut s = on_main();
+    low(&mut s, "main");
+    let ask = |cli: Cli| {
+        advise_for(
+            cli,
+            &r,
+            &s,
+            &enrolled,
+            &me("main"),
+            &Point::TurnEnd,
+            Mode::Early,
+            NOW,
+        )
+    };
+    assert_eq!(ask(Cli::Kimi), Advice::Stay(StayWhy::Unmeasured));
+    assert_eq!(StayWhy::Unmeasured.as_str(), "unmeasured");
+    let moves = Advice::Move {
+        to: "work".into(),
+        ahead: true,
+        rotates: true,
+        takes_canary: false,
+    };
+    assert_eq!(ask(Cli::Codex), moves);
+    assert_eq!(
+        ask(Cli::Claude),
+        advise(
+            &r,
+            &s,
+            &enrolled,
+            &me("main"),
+            &Point::TurnEnd,
+            Mode::Early,
+            NOW
+        )
+    );
 }

@@ -1533,15 +1533,14 @@ impl WordDecorations {
         ep: Episode,
         admission: PersistAdmission,
     ) -> bool {
-        if self.persist.contains_key(&ident) {
-            if admission == PersistAdmission::Grace {
+        if admission == PersistAdmission::Grace {
+            if self.persist.contains_key(&ident) {
                 self.mark_persist_departure(ident, &ep);
                 debug_assert!(self.persist.len() <= PERSIST_CAP);
                 return false;
             }
-            if let Some(displaced) = self.persist.remove(&ident) {
-                self.mark_persist_departure(ident, &displaced);
-            }
+        } else if let Some(displaced) = self.persist.remove(&ident) {
+            self.mark_persist_departure(ident, &displaced);
         }
 
         while self.persist.len() > PERSIST_CAP {
@@ -2433,19 +2432,17 @@ impl WordDecorations {
             }
         }
 
-        for note in note_sprites.iter().flatten() {
-            free.push(note.clone());
-        }
-        free.push(sprite.clone());
         if let Some(at) = placement.sampled_at {
             self.kitty_cursor_placement.last_sprite = Some((sprite.x, sprite.y));
             self.kitty_cursor_placement.last_emitted_at = Some(at);
         }
 
         let mut fp = fold_free(FNV64_OFFSET, &sprite);
-        for note in note_sprites.iter().flatten() {
-            fp = fold_free(fp, note);
+        for note in note_sprites.into_iter().flatten() {
+            fp = fold_free(fp, &note);
+            free.push(note);
         }
+        free.push(sprite);
         fp = fnv_mix_u64(fp, self.cat_baker.version());
         fp = fnv_mix_u64(fp, u64::from(colors.accent));
         fp = fnv_mix_u64(fp, u64::from(colors.background));
@@ -2506,17 +2503,29 @@ impl WordDecorations {
                     .tile(&key)
                     .and_then(|rgba| self.cat_baker.host_tile(host, nat_w, nat_h, rgba))
                     .or_else(|| self.cat_baker.host_peek(host))
-                    .map(|t| (t.art, key.pose, host, coat, iris));
-                if let Some(r) = &resolved {
-                    self.pet_last_tile = Some(r.clone());
-                }
-                let (art, ..) = resolved.or_else(|| {
-                    self.pet_last_tile
-                        .clone()
+                    .map(|t| t.art);
+                let art = match resolved {
+                    Some(art) => {
+                        if !self.pet_last_tile.as_ref().is_some_and(
+                            |(held_art, pose, held_host, held_coat, held_iris)| {
+                                Arc::ptr_eq(held_art, &art)
+                                    && (*pose, *held_host, *held_coat, *held_iris)
+                                        == (key.pose, host, coat, iris)
+                            },
+                        ) {
+                            self.pet_last_tile =
+                                Some((Arc::clone(&art), key.pose, host, coat, iris));
+                        }
+                        art
+                    }
+                    None => self
+                        .pet_last_tile
+                        .as_ref()
                         .filter(|(.., held_coat, held_iris)| {
                             (*held_coat, *held_iris) == (coat, iris)
                         })
-                })?;
+                        .map(|(art, ..)| Arc::clone(art))?,
+                };
                 Some(FreeSprite {
                     x: x0,
                     y: y0,
@@ -2595,16 +2604,6 @@ impl WordDecorations {
             };
             *slot = self.pet_departure_sprite(d, &pet, geom, colors, (nat_w, nat_h));
         }
-        for g in depart_sprites.iter().flatten() {
-            free.push(g.clone());
-        }
-        for m in mote_sprites.iter().flatten() {
-            free.push(m.clone());
-        }
-        if let Some(s) = &sprite {
-            free.push(s.clone());
-        }
-
         let mut fp = FNV64_OFFSET;
         if let Some(s) = &sprite {
             fp = fold_free(fp, s);
@@ -2612,8 +2611,15 @@ impl WordDecorations {
         for m in mote_sprites.iter().flatten() {
             fp = fold_free(fp, m);
         }
-        for g in depart_sprites.iter().flatten() {
-            fp = fold_free(fp, g);
+        for g in depart_sprites.into_iter().flatten() {
+            fp = fold_free(fp, &g);
+            free.push(g);
+        }
+        for m in mote_sprites.into_iter().flatten() {
+            free.push(m);
+        }
+        if let Some(s) = sprite {
+            free.push(s);
         }
         fp = fnv_mix_u64(fp, self.cat_baker.version());
         fp = fnv_mix_u64(fp, self.pet_baker.version());
@@ -2625,21 +2631,28 @@ impl WordDecorations {
     fn hold_departure_tile(
         &mut self,
         id: u32,
-        (art, host): (Arc<FxArt>, u64),
+        (art, host): (&Arc<FxArt>, u64),
         live: &[Option<crate::kitty_pet::PetDepartureSprite>],
     ) {
-        let owned = |held: u32| live.iter().flatten().any(|d| d.id == held);
-        let entry = self
+        if let Some(slot) = self
             .pet_depart_tiles
-            .iter()
-            .position(|e| e.as_ref().is_some_and(|(held, ..)| *held == id))
-            .or_else(|| {
-                self.pet_depart_tiles
-                    .iter()
-                    .position(|e| e.as_ref().is_none_or(|(held, ..)| !owned(*held)))
-            });
-        if let Some(entry) = entry {
-            self.pet_depart_tiles[entry] = Some((id, art, host));
+            .iter_mut()
+            .find(|e| e.as_ref().is_some_and(|(held, ..)| *held == id))
+        {
+            if !slot.as_ref().is_some_and(|(_, held_art, held_host)| {
+                *held_host == host && Arc::ptr_eq(held_art, art)
+            }) {
+                *slot = Some((id, Arc::clone(art), host));
+            }
+            return;
+        }
+        let owned = |held: u32| live.iter().flatten().any(|d| d.id == held);
+        if let Some(slot) = self
+            .pet_depart_tiles
+            .iter_mut()
+            .find(|e| e.as_ref().is_none_or(|(held, ..)| !owned(*held)))
+        {
+            *slot = Some((id, Arc::clone(art), host));
         }
     }
 
@@ -2673,12 +2686,6 @@ impl WordDecorations {
             departures: [None; crate::kitty_pet::PET_DEPARTURES_MAX],
         };
         let (x0, x1, y0, y1) = ghost.body_px(geom.cell_w, geom.cell_h, geom.cols, geom.rows)?;
-        let held = self
-            .pet_depart_tiles
-            .iter()
-            .flatten()
-            .find(|(id, ..)| *id == d.id)
-            .map(|(_, art, _)| Arc::clone(art));
         let key = crate::pet_baker::PetBakeKey {
             pose: d.pose,
             coat: d.coat,
@@ -2694,10 +2701,18 @@ impl WordDecorations {
             .and_then(|rgba| self.cat_baker.host_tile(host, nat_w, nat_h, rgba))
             .or_else(|| self.cat_baker.host_peek(host))
             .map(|t| t.art);
-        if let Some(art) = &resolved {
-            self.hold_departure_tile(d.id, (Arc::clone(art), host), &pet.departures);
-        }
-        let art = resolved.or(held)?;
+        let art = match resolved {
+            Some(art) => {
+                self.hold_departure_tile(d.id, (&art, host), &pet.departures);
+                art
+            }
+            None => self
+                .pet_depart_tiles
+                .iter()
+                .flatten()
+                .find(|(id, ..)| *id == d.id)
+                .map(|(_, art, _)| Arc::clone(art))?,
+        };
         Some(FreeSprite {
             x: x0,
             y: y0,
@@ -2988,15 +3003,25 @@ impl WordDecorations {
             .tile(&key)
             .and_then(|rgba| self.cat_baker.host_tile(host, w, h, rgba))
             .or_else(|| self.cat_baker.host_peek(host))
-            .map(|t| (t.art, host, look));
-        if let Some(r) = &resolved {
-            self.dog_last_tile = Some(r.clone());
-        }
-        let (art, _, _) = resolved.or_else(|| {
-            self.dog_last_tile
-                .clone()
-                .filter(|(_, _, held)| *held == look)
-        })?;
+            .map(|t| t.art);
+        let art =
+            match resolved {
+                Some(art) => {
+                    if !self.dog_last_tile.as_ref().is_some_and(
+                        |(held_art, held_host, held_look)| {
+                            Arc::ptr_eq(held_art, &art) && (*held_host, *held_look) == (host, look)
+                        },
+                    ) {
+                        self.dog_last_tile = Some((Arc::clone(&art), host, look));
+                    }
+                    art
+                }
+                None => self
+                    .dog_last_tile
+                    .as_ref()
+                    .filter(|(_, _, held)| *held == look)
+                    .map(|(art, ..)| Arc::clone(art))?,
+            };
 
         let cursor_left = i32::from(ccol).saturating_mul(cw);
         let trail = cw.saturating_mul(Self::DOG_TRAIL_NUM) / Self::DOG_TRAIL_DEN;
@@ -5799,41 +5824,43 @@ fn animal_geometry(occ: &Occurrence, geom: EffectGeom, species: AnimalGlyphId) -
 }
 
 #[inline]
-fn ease_out_back(p: f32, amp: f32) -> f32 {
-    let c = overshoot_c(amp);
+const fn ease_out_back_c(p: f32, c: f32) -> f32 {
     let u = p - 1.0;
     1.0 + (c + 1.0) * u * u * u + c * u * u
 }
 
-fn overshoot_c(amp: f32) -> f32 {
-    const SLOTS: usize = 16;
-    thread_local! {
-        static MEMO: std::cell::RefCell<[(u32, f32); SLOTS]> =
-            const { std::cell::RefCell::new([(0, 0.0); SLOTS]) };
-    }
-    let key = amp.to_bits();
-    if key != 0
-        && let Some(c) =
-            MEMO.with_borrow(|memo| memo.iter().find_map(|&(k, c)| (k == key).then_some(c)))
-    {
-        return c;
-    }
-    let over = |c: f32| 4.0 * c * c * c / (27.0 * (c + 1.0) * (c + 1.0));
+#[inline]
+const fn overshoot_c(amp: f32) -> f32 {
     let (mut lo, mut hi) = (0.0f32, 6.0f32);
-    for _ in 0..24 {
+    let mut i = 0;
+    while i < 24 {
         let mid = 0.5 * (lo + hi);
-        if over(mid) < amp { lo = mid } else { hi = mid }
+        let over = 4.0 * mid * mid * mid / (27.0 * (mid + 1.0) * (mid + 1.0));
+        if over < amp {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+        i += 1;
     }
-    let c = 0.5 * (lo + hi);
-    if key != 0 {
-        MEMO.with_borrow_mut(|memo| {
-            if let Some(slot) = memo.iter_mut().find(|(k, _)| *k == 0) {
-                *slot = (key, c);
-            }
-        });
-    }
-    c
+    0.5 * (lo + hi)
 }
+
+const PEEK_OVERSHOOT_C: [[f32; 4]; 2] = {
+    let mut table = [[0.0f32; 4]; 2];
+    let mut k = 0;
+    while k < 2 {
+        let mult = if k == 1 { 1.3f32 } else { 1.0f32 };
+        let mut f = 0;
+        while f < 4 {
+            let overshoot = 0.06 + f as f32 * 0.04;
+            table[k][f] = overshoot_c(overshoot * mult);
+            f += 1;
+        }
+        k += 1;
+    }
+    table
+};
 
 #[inline]
 const fn ease_in_out_cubic(p: f32) -> f32 {
@@ -6186,8 +6213,6 @@ fn emit_peek<'a>(
 ) -> Option<(i32, i32)> {
     let ch = i32::from(geom.cell_h);
     let rest = i32::from(cat_rest_reveal(g.hart));
-    let overshoot = 0.06 + genome::field(occ.genome.gkey, 15, 2) as f32 * 0.04;
-    let amp = overshoot * if kitten { 1.3 } else { 1.0 };
     let dwell_range = occ.spec.graphic.map_or((2200, 3598), |g| g.dwell_ms);
     let dwell = peek_dwell_ms(occ.ident, occ.genome.gkey, magical, dwell_range);
     let antic = anticipation_ms(occ.genome.gkey);
@@ -6230,7 +6255,9 @@ fn emit_peek<'a>(
     let reveal = if cfg.reduced_motion || in_dwell {
         rest
     } else if in_rise {
-        (ease_out_back(p, amp) * rest as f32).round() as i32
+        let c = PEEK_OVERSHOOT_C[usize::from(kitten)]
+            [genome::field(occ.genome.gkey, 15, 2) as usize & 3];
+        (ease_out_back_c(p, c) * rest as f32).round() as i32
     } else {
         let ta = t - dwell_end;
         if ta < antic {
@@ -6512,11 +6539,13 @@ fn emit_ink(
     } else {
         mid_base
     };
+    let lum_table = crate::color_math::relative_luminance_table();
     let strength = legible_strength(
+        lum_table,
         cfg.ink_strength,
         rgb3_to_u32(base_fg[occ.ink_base]),
         &[mid_raw],
-        relative_luminance(rgb3_to_u32(occ.ink_bg)),
+        crate::color_math::relative_luminance_with(lum_table, rgb3_to_u32(occ.ink_bg)),
     );
     let span = f32::from(occ.end_col.saturating_sub(occ.start_col)).max(1.0);
     let fold_frame = animating || fx.frame_live;
@@ -6561,8 +6590,13 @@ fn emit_ink(
     }
 }
 
-fn legible_strength(ink_strength: f32, fg_first: u32, samples: &[u32], lum_bg: f32) -> f32 {
-    let table = crate::color_math::relative_luminance_table();
+fn legible_strength(
+    table: &crate::color_math::RelativeLuminanceTable,
+    ink_strength: f32,
+    fg_first: u32,
+    samples: &[u32],
+    lum_bg: f32,
+) -> f32 {
     let contrast = |c: u32| {
         let la = crate::color_math::relative_luminance_with(table, c);
         (la.max(lum_bg) + 0.05) / (la.min(lum_bg) + 0.05)
@@ -6596,7 +6630,8 @@ fn emit_rainbow_ink(
     fp: &mut u64,
     active_until: &mut Option<Instant>,
 ) {
-    let lum_bg = relative_luminance(rgb3_to_u32(occ.ink_bg));
+    let lum_table = crate::color_math::relative_luminance_table();
+    let lum_bg = crate::color_math::relative_luminance_with(lum_table, rgb3_to_u32(occ.ink_bg));
     let (sat, val) = if lum_bg > 0.5 {
         (1.0, 0.62)
     } else {
@@ -6623,6 +6658,7 @@ fn emit_rainbow_ink(
         hue_at(1.0),
     ];
     let strength = legible_strength(
+        lum_table,
         cfg.ink_strength,
         rgb3_to_u32(base_fg[occ.ink_base]),
         &guard_hues,
@@ -6911,19 +6947,45 @@ enum PeekDir {
 
 const CAT_MAX_BAND_OCCUPANCY: f32 = 0.75;
 
-fn band_has_letter(cells: &[Vec<RenderCell>], r0: usize, r1: usize, c0: usize, c1: usize) -> bool {
-    (r0..=r1).any(|r| {
-        cells.get(r).is_some_and(|line| {
-            (c0..=c1).any(|c| {
-                line.get(c).is_some_and(|cell| {
-                    cell.wide
-                        || (!cell.ch.is_whitespace()
-                            && cell.ch != '\0'
-                            && !('\u{2500}'..='\u{259F}').contains(&cell.ch))
-                })
-            })
-        })
-    })
+fn clear_band_occupancy(
+    cells: &[Vec<RenderCell>],
+    r0: usize,
+    r1: usize,
+    c0: usize,
+    c1: usize,
+) -> Option<f32> {
+    const MAX_SAMPLES: usize = 64;
+    if r1 < r0 || c1 < c0 {
+        return None;
+    }
+    let width = c1.saturating_sub(c0).saturating_add(1);
+    let height = r1.saturating_sub(r0).saturating_add(1);
+    let total = width.saturating_mul(height);
+    if total == 0 || total > MAX_SAMPLES {
+        return None;
+    }
+    let mut occupied = 0u32;
+    for r in r0..=r1 {
+        let Some(line) = cells.get(r) else {
+            continue;
+        };
+        let Some(slice) = line.get(c0..line.len().min(c1.saturating_add(1))) else {
+            continue;
+        };
+        for cell in slice {
+            if cell.wide {
+                return None;
+            }
+            let ch = cell.ch;
+            if ch != ' ' && ch != '\0' && !ch.is_whitespace() {
+                if !('\u{2500}'..='\u{259F}').contains(&ch) {
+                    return None;
+                }
+                occupied += 1;
+            }
+        }
+    }
+    Some(occupied as f32 / total as f32)
 }
 
 fn band_occupancy(
@@ -6943,23 +7005,33 @@ fn band_occupancy(
     if width.saturating_mul(height) > MAX_SAMPLES {
         return None;
     }
-    let (mut sampled, mut occupied) = (0u32, 0u32);
+    let skip_per_row = skip_cols.as_ref().map_or(0usize, |s| {
+        let s0 = (*s.start()).max(c0);
+        let s1 = (*s.end()).min(c1);
+        if s1 >= s0 { s1 - s0 + 1 } else { 0 }
+    });
+    let sampled = (width - skip_per_row) * height;
+    if sampled == 0 {
+        return None;
+    }
+    let mut occupied = 0u32;
     for r in r0..=r1 {
-        let line = cells.get(r);
+        let Some(line) = cells.get(r) else {
+            continue;
+        };
         for c in c0..=c1 {
             if skip_cols.as_ref().is_some_and(|s| s.contains(&c)) {
                 continue;
             }
-            sampled += 1;
             if line
-                .and_then(|line| line.get(c))
+                .get(c)
                 .is_some_and(|cell| cell.wide || (!cell.ch.is_whitespace() && cell.ch != '\0'))
             {
                 occupied += 1;
             }
         }
     }
-    (sampled > 0).then(|| occupied as f32 / sampled as f32)
+    Some(occupied as f32 / sampled as f32)
 }
 
 fn cat_peek_plan(
@@ -6995,11 +7067,16 @@ fn cat_peek_plan(
     }
     let trigger = usize::from(row);
     let rows = usize::from(geom.rows);
-    let up_clear =
-        trigger >= band_rows && !band_has_letter(cells, trigger - band_rows, trigger - 1, c0, c1);
-    let down_clear = trigger + band_rows < rows
-        && !band_has_letter(cells, trigger + 1, trigger + band_rows, c0, c1);
-    if !up_clear && !down_clear {
+    let up_band = (trigger >= band_rows)
+        .then(|| clear_band_occupancy(cells, trigger - band_rows, trigger - 1, c0, c1))
+        .flatten();
+    if up_band == Some(0.0) {
+        return Some(PeekDir::Up);
+    }
+    let down_band = (trigger + band_rows < rows)
+        .then(|| clear_band_occupancy(cells, trigger + 1, trigger + band_rows, c0, c1))
+        .flatten();
+    if up_band.is_none() && down_band.is_none() {
         return None;
     }
     let own = band_occupancy(
@@ -7010,16 +7087,9 @@ fn cat_peek_plan(
         c1,
         Some(usize::from(start)..=usize::from(end)),
     );
-    let side = |lo: usize, hi: usize| -> Option<f32> {
-        let band = band_occupancy(cells, lo, hi, c0, c1, None)?;
-        Some(own.map_or(band, |o| (band * 2.0 + o) / 3.0))
-    };
-    let up = up_clear
-        .then(|| side(trigger - band_rows, trigger - 1))
-        .flatten();
-    let down = down_clear
-        .then(|| side(trigger + 1, trigger + band_rows))
-        .flatten();
+    let score_of = |band: f32| own.map_or(band, |o| (band * 2.0 + o) / 3.0);
+    let up = up_band.map(score_of);
+    let down = down_band.map(score_of);
     match (up, down) {
         (Some(u), Some(d)) => {
             let (score, dir) = if d < u {

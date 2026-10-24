@@ -795,6 +795,7 @@ pub fn cmd_meta_keys(args: &[String]) -> Res {
             env: world.env(),
             cwd: world.home.clone(),
             sandbox: None,
+            reroute: false,
         },
     )?;
     println!(

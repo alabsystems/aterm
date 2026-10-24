@@ -440,6 +440,25 @@ impl HarnessChip {
     }
 }
 
+/// What a screen reader names the Account chip ([`HarnessChip::Account`]) of a session of
+/// `cli`'s pool: another CLI's names its product and the roster label its login is judged to
+/// (`Codex CLI · codex-1`; the product alone where none is judged), so a reader hears which
+/// CLI's account it is; Claude Code's is `None`, its footer fact's own words standing
+/// (`claude_facts::fact_spoken_of`).
+pub(crate) fn account_chip_label(
+    cli: aterm_agent::harness::accounts::Cli,
+    label: Option<&str>,
+) -> Option<String> {
+    if cli == aterm_agent::harness::accounts::Cli::Claude {
+        return None;
+    }
+    let product = cli.connector().product;
+    Some(match label.filter(|l| !l.is_empty()) {
+        Some(label) => format!("{product} \u{b7} {label}"),
+        None => product.to_string(),
+    })
+}
+
 /// Harness chip or status node painted in a Claude Code composer rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GridChip {
@@ -2198,6 +2217,54 @@ mod tests {
         assert!(!spoken("\u{221e} cruise"));
         let bare = grid_tree(&snap, Some(GEOM), &GridFrame::default());
         assert!(bare.nodes.iter().all(|(id, _)| chip_for(*id).is_none()));
+    }
+
+    /// A SUPERVISED CODEX SESSION'S ACCOUNT CHIP names the CLI and the account
+    /// (`Codex CLI · codex-1`), the node a button under that label; Claude Code's names no
+    /// product, its footer fact's own words standing (CONTROL: `claude_facts`' golden).
+    #[test]
+    fn another_clis_account_chip_names_its_product_and_claudes_keeps_its_footer_words() {
+        use aterm_agent::harness::accounts::Cli;
+        assert_eq!(
+            account_chip_label(Cli::Codex, Some("codex-1")).as_deref(),
+            Some("Codex CLI \u{b7} codex-1")
+        );
+        assert_eq!(
+            account_chip_label(Cli::Kimi, None).as_deref(),
+            Some("Kimi Code CLI"),
+            "no judged label: the product alone"
+        );
+        assert_eq!(account_chip_label(Cli::Claude, Some("m16")), None);
+        let snap = live_grid(3, 40, b"hi", Some((0, 2)));
+        let label = account_chip_label(Cli::Codex, Some("codex-1")).expect("a codex label");
+        let chips = [GridChip {
+            session: 5,
+            chip: HarnessChip::Account,
+            label: label.clone(),
+            description: Some("Activate for the accounts menu.".to_string()),
+            toggled: None,
+            row: 2,
+            col: 30,
+            width: 9,
+        }];
+        let update = grid_tree(
+            &snap,
+            Some(GEOM),
+            &GridFrame {
+                chips: &chips,
+                ..GridFrame::default()
+            },
+        );
+        let n = node(
+            &update,
+            chip_node_id(5, HarnessChip::Account).expect("an id"),
+        );
+        assert_eq!(n.role(), Role::Button);
+        assert_eq!(n.label(), Some("Codex CLI \u{b7} codex-1"));
+        assert_eq!(
+            chip_for(chip_node_id(5, HarnessChip::Account).unwrap()),
+            Some((5, HarnessChip::Account))
+        );
     }
 
     #[test]

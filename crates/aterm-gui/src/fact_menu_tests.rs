@@ -35,6 +35,7 @@ fn menu_facts(off: FactMask, side: bool) -> FactMenuFacts {
         subscription: None,
         weekly_meter: None,
         weekly_gap: None,
+        cli: None,
         accounts: Vec::new(),
         auto_rotate: true,
         off,
@@ -1075,4 +1076,80 @@ fn account_menu_rows_from_distinguishes_auto_login_and_disabled_rows() {
             },
         ]
     );
+}
+
+/// A KIMI SESSION'S ACCOUNT MENU lists the rows of Kimi's own roster (`accounts-kimi.toml`),
+/// never Claude Code's beside it, and an empty pool names `aterm harness accounts add --cli
+/// kimi`. CONTROL: Claude Code's empty state is `No rotation accounts configured — run aterm
+/// init`, as it always was, whether the facts name Claude Code or no CLI.
+#[test]
+fn a_kimi_sessions_account_menu_reads_its_own_pool() {
+    use aterm_agent::harness::accounts::Cli;
+    const NOW: i64 = 1_792_660_000;
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("aterm-pool-menu-")
+        .tempdir()
+        .expect("tempdir");
+    let root = dir.path();
+    let (home, config, state) = (root.join("home"), root.join("config"), root.join("state"));
+    for d in [&home, &config, &state] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let aterm_toml = config.join("aterm.toml");
+    std::fs::write(&aterm_toml, "[fleet]\nmachine = \"m16\"\n").unwrap();
+    std::fs::write(
+        config.join("accounts.toml"),
+        "[[account]]\nlabel = \"m16\"\nemail = \"claude-one@example.com\"\n",
+    )
+    .unwrap();
+    let (none, _) =
+        super::pool_menu_rows(Cli::Kimi, (&aterm_toml, &state, &home), (None, None), NOW);
+    assert!(none.is_empty(), "no Kimi roster, no rows: {none:?}");
+    let login = home.join(".aterm/logins/kimi/kimi-1");
+    std::fs::write(
+        config.join("accounts-kimi.toml"),
+        format!(
+            "[[account]]\nlabel = \"kimi-1\"\nclass = \"dedicated\"\ndir = \"{}\"\n\
+             email = \"kimi-one@example.com\"\nregion = \"global\"\n",
+            login.display()
+        ),
+    )
+    .unwrap();
+    let (listed, _) =
+        super::pool_menu_rows(Cli::Kimi, (&aterm_toml, &state, &home), (None, None), NOW);
+    let labels: Vec<&str> = listed.iter().map(|row| row.account.as_str()).collect();
+    assert_eq!(labels, ["kimi-1"], "Kimi's roster alone: {listed:?}");
+
+    let empty = FactMenuFacts {
+        title: "Accounts \u{b7} tab 1".into(),
+        cli: Some(Cli::Kimi),
+        ..menu_facts(FactMask::default(), true)
+    };
+    let menu = shown(&rows(Fact::Account, &empty));
+    assert!(
+        menu.contains(&"note No Kimi Code CLI rotation accounts listed".to_string()),
+        "{menu:?}"
+    );
+    assert!(
+        menu.contains(&"note run aterm harness accounts add --cli kimi <label>".to_string()),
+        "{menu:?}"
+    );
+    assert!(
+        !menu
+            .iter()
+            .any(|row| row.contains("aterm init") || row.contains("Auto-rotate")),
+        "{menu:?}"
+    );
+    let claude_empty = "note No rotation accounts configured \u{2014} run aterm init".to_string();
+    for cli in [None, Some(Cli::Claude)] {
+        let claude = FactMenuFacts {
+            title: "Accounts \u{b7} tab 1".into(),
+            cli,
+            ..menu_facts(FactMask::default(), true)
+        };
+        assert!(
+            shown(&rows(Fact::Account, &claude)).contains(&claude_empty),
+            "CONTROL {cli:?}: Claude Code's empty state"
+        );
+    }
 }

@@ -1252,6 +1252,14 @@ account_test() { # <uid> <op> <path>
 	/usr/bin/sudo -n -u "#$1" -- /bin/sh -c 'test "$1" "$2"' sh "$2" "$3" 2>/dev/null
 }
 
+# Run <program> as <user> (sudo's -u), as root runs a program another account
+# can change: as nobody (a test replaces it).
+run_as_user() { # <user> <program> <arg>...
+	local user="$1"
+	shift
+	/usr/bin/sudo -n -u "$user" -- "$@"
+}
+
 # Run this install again as HOME_ACCOUNT with the same arguments, over the same
 # HOME, with the root run's PATH and the settings it and its tools read (ATERM_*,
 # XDG_*, CARGO_HOME, RUSTUP_HOME, curl's proxy and CA variables), which sudo -H
@@ -3352,9 +3360,12 @@ staging_folder_sealed() { # <dir>
 
 # Rename STAGE onto <dest>/aterm.app, the bundle there set aside first (OLD)
 # and removed last, and remove STAGE_DIR, which holds nothing of the copy
-# once it is renamed.
+# once it is renamed. A bundle there that may not be replaced (may_replace)
+# stays, and so does STAGE, for the caller to drop.
 swap_staged_bundle() { # <dest>
 	if [[ -e "$1/aterm.app" ]]; then
+		# Asked again here: another run may have placed it since install_app asked.
+		may_replace "$1/aterm.app" || return 1
 		OLD="$1/.aterm.app.old.$(random_suffix)"
 		mv "$1/aterm.app" "$OLD"
 	fi
@@ -3517,9 +3528,9 @@ may_run() { # <program>
 # the link an ACL that lets them remove it, so there each link met must pass
 # <test> too, but those in <tree>. Prints the end, which need not exist when
 # the folder that would hold it does. Status 2, printing the first that fails
-# <test>, or, read once the way is taken, the first folder on it (or the end)
-# foreign_mount_among names; status 3, printing nothing, when a 41st link
-# stands on the way, every folder before it having passed, a way the kernel
+# <test>, or, once the way is taken, the first folder on it (or the end)
+# way_moved names; status 3, printing nothing, when a 41st link stands on the
+# way, every folder before it having passed and none moved, a way the kernel
 # follows to no end (it stops at 40 links, macOS's at 32); status 1, printing
 # nothing, when the way does not resolve: a name on it that does not exist
 # with more of the way after it, since an account can be the one to make it
@@ -3550,7 +3561,7 @@ way_end() { # <test> <path> [<tree>]
 			continue
 			;;
 		esac
-		seen+=("${cur:-/}")
+		way_open "${cur:-/}" || { printf '%s\n' "${cur:-/}"; return 2; }
 		way_passes "$1" "${cur:-/}" "${3:-}" || { printf '%s\n' "${cur:-/}"; return 2; }
 		cur="$cur/$c"
 		if [[ -L "$cur" ]]; then
@@ -3559,7 +3570,11 @@ way_end() { # <test> <path> [<tree>]
 				return 2
 			}
 			hops=$((hops + 1))
-			[[ "$hops" -le 40 ]] || return 3
+			if [[ "$hops" -gt 40 ]]; then
+				c="$(way_moved "${seen[@]}")"
+				[[ -z "$c" ]] || { printf '%s\n' "$c"; return 2; }
+				return 3
+			fi
 			t="$(readlink -n "$cur" && printf x)" || return 1
 			t="${t%x}"
 			[[ -n "$t" && "$t" != *$'\n'* ]] || return 1
@@ -3569,9 +3584,11 @@ way_end() { # <test> <path> [<tree>]
 			return 1
 		fi
 	done
-	[[ ! -e "${cur:-/}" ]] || seen+=("${cur:-/}")
+	if [[ -d "${cur:-/}" || -f "${cur:-/}" ]]; then
+		way_open "${cur:-/}" || { printf '%s\n' "${cur:-/}"; return 2; }
+	fi
 	if [[ ${#seen[@]} -gt 0 ]]; then
-		c="$(foreign_mount_among "${seen[@]}")"
+		c="$(way_moved "${seen[@]}")"
 		if [[ -n "$c" ]]; then
 			printf '%s\n' "$c"
 			return 2
@@ -3580,118 +3597,348 @@ way_end() { # <test> <path> [<tree>]
 	printf '%s\n' "${cur:-/}"
 }
 
-# The first of <path>... (physical paths, each one a walk found) that is gone
-# now, or where a filesystem is mounted whose owners and modes do not say who
-# may change what it holds, so a walk through it proves nothing: on Linux a
-# network or FUSE one (remote_filesystem_type), where a server, or the daemon
-# of whichever account mounted it, decides that and shows what owners it
-# likes; on macOS one that is not local, or that an account mounted (`mount`
-# says "mounted by"), which that account can take away and attach another in
-# place of, and which shows root the owners its image carries. Read after the
-# walk, so a volume attached while it ran is read with the rest, and one taken
-# away has left a folder gone. Nothing when there is none; the first path when
-# the mount table cannot be read.
-foreign_mount_among() { # <path>...
-	local f g os table rest t
-	os="$(uname -s)"
-	if [[ "$os" == Darwin ]]; then
-		table="$(macos_mounts 2>/dev/null)" || table=""
-	else
-		table="$(linux_mount_points 2>/dev/null)" || table=""
-	fi
-	if [[ -z "$table" ]]; then
-		printf '%s\n' "$1"
+# way_end's record of <path>, the next folder on its way (or its end): unless
+# its seen holds it already (a way of links can pass one again), added to
+# seen and held open, the first on file descriptor 30 and each next one on the
+# next, before it is judged; status 1 past 200 of them, or when it cannot be
+# opened. way_end runs in a command substitution, which closes them.
+way_open() { # <path>
+	local f
+	for f in ${seen[@]+"${seen[@]}"}; do
+		[[ "$f" != "$1" ]] || return 0
+	done
+	[[ ${#seen[@]} -lt 200 ]] || return 1
+	seen+=("$1")
+	# bash 3.2 keeps a descriptor open that exec opens again: close it first.
+	{ eval "exec $((29 + ${#seen[@]}))<&- $((29 + ${#seen[@]}))<\"\$1\""; } 2>/dev/null
+}
+
+# The first of <path>..., way_end's folders held open on descriptor 30 on in
+# turn, that foreign_on_way names, or that is no longer the one held open: a
+# volume on it when it was opened that is gone, or one put on it since, leaves
+# another folder at its name. Nothing when there is none. A descriptor is
+# compared to a new one, not to the name (same_held).
+way_moved() { # <path>...
+	local f n=30
+	f="$(foreign_on_way "$@")"
+	if [[ -n "$f" ]]; then
+		printf '%s\n' "$f"
 		return 0
 	fi
-	table=$'\n'"$table"$'\n'
 	for f in "$@"; do
-		if [[ ! -e "$f" ]]; then
+		{ exec 29<&- 29<"$f"; } 2>/dev/null && same_held "$n" 29 || {
 			printf '%s\n' "$f"
 			return 0
-		fi
-		if [[ "$os" == Darwin ]]; then
-			# `<device> on <folder> (<type>, <flag>, …)`, the folder as the
-			# kernel keeps it, which for one a firmlink reaches may be its
-			# path in the data volume; each line naming it, as one mounted
-			# over another is listed after it.
-			for g in "$f" "/System/Volumes/Data${f%/}"; do
-				rest="$table"
-				while [[ "$rest" == *" on $g ("* ]]; do
-					rest="${rest#*" on $g ("}"
-					macos_mount_foreign "${rest%%$'\n'*}" || continue
-					printf '%s\n' "$f"
-					return 0
-				done
-			done
-		elif [[ "$table" == *$'\n'"$f"$'\n'* ]]; then
-			t="$(stat -f -c %t -- "$f" 2>/dev/null)" || t=""
-			remote_filesystem_type "$t" || continue
-			printf '%s\n' "$f"
-			return 0
-		fi
+		}
+		n=$((n + 1))
 	done
 }
 
-# Whether <flags>, what a macOS mount line holds after its folder's
-# `<folder> (`, are a volume's that is not local or that an account mounted.
+# Whether descriptors <a> and <b> hold one file: their /dev/fd names stat
+# alike (dev_fd_alike), or, as macOS's /dev/fd stat fails now and then while
+# other processes stat theirs (about one walk in a hundred with a dozen
+# walking at once on macOS 27), stat itself reads the device and inode each
+# one holds, through its standard input.
+same_held() { # <a> <b>
+	local a b
+	dev_fd_alike "$1" "$2" && return 0
+	if [[ "$OSTYPE" == darwin* ]]; then
+		a="$(stat -f %d:%i <&"$1")" && b="$(stat -f %d:%i <&"$2")" || return 1
+	else
+		a="$(stat -L -c %d:%i /dev/stdin <&"$1")" && b="$(stat -L -c %d:%i /dev/stdin <&"$2")" || return 1
+	fi
+	[[ -n "$a" && "$a" == "$b" ]]
+}
+
+# Whether the /dev/fd names of descriptors <a> and <b> stat alike. macOS's
+# /dev/fd gives each the device of /dev and the file's own inode, so a name is
+# never compared to one (a test replaces it).
+dev_fd_alike() { # <a> <b>
+	[[ /dev/fd/$1 -ef /dev/fd/$2 ]]
+}
+
+# The first of <path>... (way_end's folders and its end, each one's folder
+# among those before it, or /, but for a tree way_end starts in) on a
+# filesystem whose owners and modes do not say who may change what it holds,
+# but for the one / is on, which root already runs this script from (a
+# container's FUSE or virtio-fs root): on Linux one statfs reads as network
+# or FUSE (remote_filesystem_type), where a server, or the daemon of whichever
+# account mounted it, decides that and shows what owners it likes; on macOS
+# the root of a volume (a device not its folder's) that is not from a disk
+# only a local mount no account made names (macos_disk_local). Only what is on the way is looked at, and no mount's
+# folder: on Linux no mount table is read, and on macOS a way that crosses no
+# volume reads none. Nothing when there is none; when a look fails (a folder
+# gone, a mount table that cannot be read), the first it fails on.
+foreign_on_way() { # <path>...
+	local f p i j d list IFS=$' \t\n'
+	local -a ways=(/ "$@") ids types roots=() up
+	ids=($(folder_ids "${ways[@]}" 2>/dev/null || :))
+	if [[ ${#ids[@]} -ne $((2 * ${#ways[@]})) ]]; then
+		look_failing folder_ids "$@"
+		return 0
+	fi
+	if [[ "$(uname -s)" != Darwin ]]; then
+		types=($(folder_types "${ways[@]}" 2>/dev/null || :))
+		if [[ ${#types[@]} -ne ${#ways[@]} ]]; then
+			look_failing folder_types "$@"
+			return 0
+		fi
+		for ((i = 1; i < ${#ways[@]}; i++)); do
+			if [[ "${ids[2 * i]}" != "${ids[0]}" ]] && remote_filesystem_type "${types[i]}"; then
+				printf '%s\n' "${ways[i]}"
+				return 0
+			fi
+		done
+		return 0
+	fi
+	for ((i = 1; i < ${#ways[@]}; i++)); do
+		f="${ways[i]}"
+		[[ "$f" != / ]] || continue
+		p="${f%/*}"
+		p="${p:-/}"
+		for ((j = 0; j < ${#ways[@]}; j++)); do
+			[[ "${ways[j]}" != "$p" ]] || break
+		done
+		if [[ $j -lt ${#ways[@]} ]]; then
+			d="${ids[2 * j]}"
+		else
+			# A tree way_end starts in, whose folder is not on the way: one
+			# whose folder cannot be read is a volume's root.
+			up=($(folder_ids "$p" 2>/dev/null || :))
+			d="${up[0]:-}"
+		fi
+		[[ "${ids[2 * i]}" != "$d" ]] || continue
+		roots+=("$i")
+	done
+	[[ ${#roots[@]} -gt 0 ]] || return 0
+	i="${roots[0]}"
+	if ! list="$(macos_mount_disks)"; then
+		printf '%s\n' "${ways[i]}"
+		return 0
+	fi
+	for i in "${roots[@]}"; do
+		macos_disk_local "${ids[2 * i]}" "$list" && continue
+		printf '%s\n' "${ways[i]}"
+		return 0
+	done
+}
+
+# Whether a volume of device <dev> is from a disk that a local mount no
+# account made names and no other mount does, by the disks <list>
+# (macos_mount_disks'). A volume an account attached or mounted is not, nor
+# a network share's or a FUSE daemon's, which is no disk's, nor one put over
+# a local volume, whose device is its own, nor one no line names (a line no
+# parse reads hides nothing); a FUSE daemon that names itself after a disk
+# makes that disk's volumes refuse, never pass. A graft (macOS's
+# /System/Cryptexes/App/usr) shows the device of the volume it is from,
+# Preboot's.
+macos_disk_local() { # <dev> <list>
+	local l there=""
+	while IFS= read -r l; do
+		[[ "${l#? }" == "$1" ]] || continue
+		[[ "$l" == l* ]] || return 1
+		there=1
+	done <<<"$2"
+	[[ -n "$there" ]]
+}
+
+# Each disk macOS has a volume mounted from, `<kind> <device>` on a line
+# apiece: the device number of the /dev/disk node a mount line starts with
+# (disk_devices), which a file on that volume shows, and kind `f` for a line
+# macos_mount_foreign flags, `l` for any other; and the kernel's own devfs, by
+# the device /dev shows when a line has it at /dev (a fixed folder, so a line
+# forged to say so vouches for nothing else). A line that starts with no
+# /dev/disk node (a network share's, a FUSE daemon's own name) gives none, so
+# no server is asked. Status 1 when the mount table or a node cannot be read.
+macos_mount_disks() {
+	local table l s i devfs="" IFS=$' \t\n'
+	local -a kinds=() nodes=() devs
+	table="$(macos_mounts 2>/dev/null)" && [[ -n "$table" ]] || return 1
+	while IFS= read -r l; do
+		s="${l%%" on "*}"
+		if [[ "$l" == "devfs on /dev ("* ]]; then
+			if macos_mount_foreign "${l##* (}"; then devfs+=f; else devfs+=l; fi
+			continue
+		fi
+		[[ "$s" == /dev/disk[0-9]* && "${s#/dev/disk}" != *[!0-9s]* ]] || continue
+		if macos_mount_foreign "${l##* (}"; then kinds+=(f); else kinds+=(l); fi
+		nodes+=("$s")
+	done <<<"$table"
+	if [[ -n "$devfs" ]]; then
+		devs=($(folder_ids /dev 2>/dev/null || :))
+		[[ ${#devs[@]} -eq 2 ]] || return 1
+		for ((i = 0; i < ${#devfs}; i++)); do
+			printf '%s %s\n' "${devfs:i:1}" "${devs[0]}"
+		done
+	fi
+	[[ ${#nodes[@]} -gt 0 ]] || return 0
+	devs=($(disk_devices "${nodes[@]}" 2>/dev/null || :))
+	[[ ${#devs[@]} -eq ${#nodes[@]} ]] || return 1
+	for ((i = 0; i < ${#nodes[@]}; i++)); do
+		printf '%s %s\n' "${kinds[i]}" "${devs[i]}"
+	done
+}
+
+# Each /dev/disk <node>'s device number on a line apiece (a test replaces
+# it).
+disk_devices() { # <node>...
+	stat -f %r -- "$@"
+}
+
+# Each <path>'s device and inode, `<dev> <ino>` on a line apiece (a test
+# replaces it).
+folder_ids() { # <path>...
+	if [[ "$OSTYPE" == darwin* ]]; then
+		stat -f '%d %i' -- "$@"
+	else
+		stat -c '%d %i' -- "$@"
+	fi
+}
+
+# Each <path>'s filesystem type as statfs reads it, in hex, on a line apiece:
+# Linux's (a test replaces it).
+folder_types() { # <path>...
+	stat -f -c %t -- "$@"
+}
+
+# The first <path> that <look> fails on, else the first: what a look at them
+# all that failed names.
+look_failing() { # <look> <path>...
+	local look="$1" f
+	shift
+	for f in "$@"; do
+		"$look" "$f" >/dev/null 2>&1 || {
+			printf '%s\n' "$f"
+			return 0
+		}
+	done
+	printf '%s\n' "$1"
+}
+
+# The first folder or file below folder <dir> where a mount
+# foreign_mount_points lists is, its folder at or below <dir> (on macOS by
+# identity at each level up, in_folder; on Linux by text, text_in_folder), a
+# walk of what <dir> holds going into it (an automount there mounts once the
+# walk enters <dir>): on Linux one statfs reads as network or FUSE, on macOS
+# the root of a volume (a device not its folder's). A mount at <dir> itself is the end of the walk that
+# judged it (foreign_on_way's), and a mount elsewhere is never looked at, but
+# on macOS for its folder. <dir> when the mount table cannot be read; nothing
+# when there is none.
+foreign_mount_in() { # <dir>
+	local m p list IFS=$' \t\n'
+	local -a ids
+	if ! list="$(foreign_mount_points)"; then
+		printf '%s\n' "$1"
+		return 0
+	fi
+	[[ -n "$list" ]] || return 0
+	while IFS= read -r m; do
+		[[ "$m" == /?* ]] || continue
+		p="${m%/*}"
+		if [[ "$(uname -s)" == Darwin ]]; then
+			in_folder "${p:-/}" "$1" || continue
+			# One that cannot be read is named: root may not stat a FUSE
+			# volume mounted without allow_root.
+			ids=($(folder_ids "$m" "${p:-/}" 2>/dev/null || :))
+			[[ ${#ids[@]} -ne 4 || "${ids[0]}" != "${ids[2]}" ]] || continue
+		else
+			text_in_folder "${p:-/}" "$1" || continue
+			remote_filesystem_type "$(folder_types "$m" 2>/dev/null)" || continue
+		fi
+		printf '%s\n' "$m"
+		return 0
+	done <<<"$list"
+}
+
+# Whether <a>, a folder as Linux's mount table spells it, is folder <b> or
+# inside it, by text: the table and a folder cd -P reached spell a folder
+# alike, but for the leading // such a cd keeps, so no folder is stat'd,
+# which on a mount whose server stopped answering (an NFSv4 one's submount's
+# folder) would hang.
+text_in_folder() { # <a> <b>
+	local b="$2"
+	while [[ "$b" == //* ]]; do b="${b#/}"; done
+	[[ "$b" == / || "$1" == "$b" || "$1" == "$b"/* ]]
+}
+
+# Each folder (or file) where a filesystem may be mounted whose owners and
+# modes do not say who may change what it holds, one per line, read from the
+# mount table alone: on macOS each that `mount` lists as not local, or as
+# mounted by an account, which that account can take away and attach another
+# in place of, and which shows root the owners its image carries; on Linux
+# each linux_mounts lists, whose type statfs reads (foreign_mount_in). Status
+# 1 when the mount table cannot be read.
+foreign_mount_points() {
+	local table l m
+	if [[ "$(uname -s)" == Darwin ]]; then
+		table="$(macos_mounts 2>/dev/null)" && [[ -n "$table" ]] || return 1
+		while IFS= read -r l; do
+			macos_mount_foreign "${l##* (}" || continue
+			# `<device> on <folder> (<type>, <flag>, …)`, but a device's own
+			# name (a FUSE one's, which its account picks) can hold ` on ` or
+			# end in ` on`, and a folder can hold ` on `: each text up to the
+			# line's last ` (` that starts with `/` after an ` on `, the
+			# overlapping ones too.
+			m="${l% (*}"
+			while [[ "$m" == *" on "* ]]; do
+				m="${m#*" on"}"
+				[[ "$m" != " /"* ]] || printf '%s\n' "${m# }"
+			done
+		done <<<"$table"
+	else
+		linux_mounts 2>/dev/null || return 1
+	fi
+}
+
+# Whether <flags>, a macOS mount line's text after its last ` (`, are a
+# volume's that is not local or that an account mounted.
 macos_mount_foreign() { # <flags>
 	local flags=", ${1%)*},"
 	[[ "$flags" != *", local,"* || "$flags" == *", mounted by "* ]]
 }
 
-# The first folder below folder <dir> (a physical path) where a filesystem is
-# mounted that foreign_mount_among names, a walk of what <dir> holds going
-# into it; nothing when there is none.
-foreign_mount_in() { # <dir>
-	local table rest p m below="${1%/}/" inside=()
-	if [[ "$(uname -s)" == Darwin ]]; then
-		table="$(macos_mounts 2>/dev/null)" || table=""
-	else
-		table="$(linux_mount_points 2>/dev/null)" || table=""
-	fi
-	if [[ -z "$table" ]]; then
-		printf '%s\n' "$1"
-		return 0
-	fi
-	if [[ "$(uname -s)" == Darwin ]]; then
-		# Each folder after an ` on <dir>/` (or its path in the data
-		# volume), to the last ` (` of its line; one that a device's name
-		# made up is not there, which foreign_mount_among names.
-		for p in "$below" "/System/Volumes/Data$below"; do
-			rest="$table"
-			while [[ "$rest" == *" on $p"* ]]; do
-				rest="${rest#*" on $p"}"
-				m="${rest%%$'\n'*}"
-				m="$p${m% (*}"
-				[[ "$m" == "$1" ]] || inside+=("$m")
-			done
-		done
-	else
-		while IFS= read -r m; do
-			[[ "$m" != "$1" && "$m" == "$below"* ]] && inside+=("$m")
-		done <<<"$table"
-	fi
-	[[ ${#inside[@]} -eq 0 ]] || foreign_mount_among "${inside[@]}"
-}
-
 # macOS's mounts, as /sbin/mount (by its fixed path, which PATH cannot
-# shadow) lists them (a test replaces it).
+# shadow) lists them, or status 124 when it has not listed them within
+# VERIFY_WAIT_SECS: it asks each mount's folder for its volume's capabilities,
+# and one in a share whose server stopped answering never answers (a test
+# replaces it).
 macos_mounts() {
-	/sbin/mount
+	bounded "$VERIFY_WAIT_SECS" /sbin/mount
 }
 
-# The folders Linux has a filesystem mounted at, one per line, from the
-# kernel's own table (a test replaces it).
-linux_mount_points() {
-	awk '{ p = $5; gsub(/\\040/, " ", p); gsub(/\\011/, "\t", p); gsub(/\\012/, "\n", p); gsub(/\\134/, "\\", p); print p }' \
-		/proc/self/mountinfo
+# The folders (or files) Linux has a filesystem mounted at that could be a
+# network or FUSE one, one per line, from the kernel's table (<mountinfo>, by
+# default this process's): every mount but those of the device / is on, and
+# those of a type that is a disk's, memory's or the kernel's own. A newline in
+# a name stays \012, which names nothing. Status 1 for a table with no line.
+linux_mounts() { # [<mountinfo>]
+	awk 'BEGIN {
+		n = split("autofs binfmt_misc bpf btrfs cgroup cgroup2 configfs debugfs devpts devtmpfs efivarfs erofs exfat ext2 ext3 ext4 f2fs fusectl hfs hfsplus hugetlbfs iso9660 jfs mqueue msdos nilfs2 nsfs ntfs ntfs3 overlay proc pstore ramfs reiserfs rpc_pipefs securityfs selinuxfs squashfs sysfs tmpfs tracefs udf vfat xfs zfs", w, " ")
+		for (i = 1; i <= n; i++) own[w[i]] = 1
+	}
+	{
+		p = $5
+		gsub(/\\040/, " ", p)
+		gsub(/\\011/, "\t", p)
+		gsub(/\\134/, "\\", p)
+		for (i = 7; i <= NF && $i != "-"; i++) continue
+		dev[NR] = $3
+		type[NR] = $(i + 1)
+		point[NR] = p
+		if (p == "/") root = $3
+	}
+	END {
+		if (NR == 0) exit 1
+		for (i = 1; i <= NR; i++) if (dev[i] != root && !(type[i] in own)) print point[i]
+	}' "${1:-/proc/self/mountinfo}"
 }
 
 # Whether statfs type <hex> (stat -f -c %t's) is a network or FUSE
 # filesystem's: NFS, SMB/CIFS (two), Ceph, AFS (two), 9P, Lustre, GPFS and
 # FUSE, the types crates/aterm-uds/src/shared_write.rs REMOTE_FILESYSTEMS
-# lists, which the Linux verifiers hold a store to; one stat could not read
-# counts as such.
+# lists (on one of them the updater and the Linux verifier take a folder its
+# group can write for one any account in that group may change); one stat
+# could not read counts as such.
 remote_filesystem_type() { # <hex>
 	case "$1" in
 	6969 | ff534d42 | fe534d42 | c36400 | 6b414653 | 5346414f | 1021997 | bd00bd0 | 47504653 | 65735546) return 0 ;;
@@ -3914,7 +4161,7 @@ root_tree_failing() { # <path>
 # can change, which leads the kernel nowhere, is passed over, so the walks of
 # the files follow no link (GNU and BusyBox find -L fail on such a loop).
 root_bin_dir() { # <dir>
-	local found links link s p
+	local found links link s
 	case ":$ROOT_SYSTEM_PATH:" in *":${1%"${1##*[!/]}"}:"*) return 0 ;; esac
 	[[ "$1" == /* && -z "$(folder_failing sealed_entry "$1")" ]] || return 1
 	found="$(find "$1/" -mindepth 1 -maxdepth 1 \( -name "*"$'\n'"*" -print -prune \) -o \
@@ -3927,7 +4174,7 @@ root_bin_dir() { # <dir>
 		# -P still avoids following links found inside the directory.
 		linux_acl_clear -RcpnP -- "$1/"
 	fi || return 1
-	p="$(cd -P -- "$1/" 2>/dev/null && pwd)" && [[ -z "$(foreign_mount_in "$p")" ]] || return 1
+	[[ -z "$(foreign_mount_in "$1")" ]] || return 1
 	links="$(find "$1/" -mindepth 1 -maxdepth 1 -type l -print 2>/dev/null)" || return 1
 	while IFS= read -r link; do
 		[[ -n "$link" ]] || continue
@@ -3981,6 +4228,138 @@ first_line_bounded() {
 	bounded "$VERIFY_WAIT_SECS" "$@" >"$out" 2>/dev/null || s=$?
 	[[ "$s" -eq 124 ]] || head -n 1 "$out"
 	rm -f "$out"
+}
+
+# Whether <exe> has shown it ran, asked `--version` through bounded; when it
+# has not, UNPROVEN says why. An exec waits on macOS's check of its file, so a
+# run that wrote a line, or ended other than as bounded ends one (124 at the
+# deadline; 129, 130 or 143 on a signal to this script), is past that check: by
+# its own exit, or a signal it or macOS raised. A run cut off may still be in
+# it, and macOS 27.0.1's syspolicyd crashes when the file it is checking at a
+# first exec is removed or renamed, stranding every later exec until a restart.
+# A path that is no executable file never ran, and off macOS there is no such
+# check. An end of 126 or 127 with no line may be the shell's own failure to
+# exec it (denied, or a missing interpreter), which shows nothing but a kernel
+# refusal it names (exec_refused). Root runs a program it may not run (may_run)
+# only as nobody, through a shell that writes `ended <status>` once the
+# program's run ends: bash, whose words exec_refused reads (macOS's /bin/sh may
+# be zsh, which says a refusal otherwise), reading no startup file (--norc, the
+# .bashrc sshd's SSH_CLIENT has it read) or BASH_ENV (-p), so only the program
+# and that line write to what is read. Sudo's own refusal, or a file nobody may
+# not run, writes none: then root could not ask, and UNPROVEN_THEN says what
+# helps instead.
+showed_it_ran() { # <exe>
+	local s=0 out err said line nobody=""
+	local self="run install.sh without sudo, as the account whose aterm it is, which asks it itself"
+	UNPROVEN=""
+	UNPROVEN_THEN="run this again in 10 minutes, or after a restart"
+	[[ "$(uname -s)" == Darwin && -f "$1" && -x "$1" ]] || return 0
+	out="$(mktemp "${TMPDIR:-/tmp}/aterm-probe.XXXXXX")" || {
+		UNPROVEN="$1 could not be asked (no temporary file)"
+		return 1
+	}
+	err="$(mktemp "${TMPDIR:-/tmp}/aterm-probe.XXXXXX")" || {
+		rm -f "$out"
+		UNPROVEN="$1 could not be asked (no temporary file)"
+		return 1
+	}
+	if may_run "$1"; then
+		bounded "$VERIFY_WAIT_SECS" "$1" --version >"$out" 2>"$err" || s=$?
+		[[ ! -s "$out" ]] || s=0
+	else
+		nobody=1
+		bounded "$VERIFY_WAIT_SECS" run_as_user nobody /bin/bash --norc -p -c \
+			'test -x "$0" || exit 1; "$0" --version; echo "ended $?"' "$1" >"$out" 2>"$err" || s=$?
+		said="$(tail -n 1 "$out")"
+		if [[ "$said" =~ ended\ ([0-9]+)$ ]]; then
+			# Any byte before the shell's own `ended <status>` line is the program's.
+			if (($(wc -c <"$out") > ${#BASH_REMATCH[0]} + 1)); then
+				s=0
+			else
+				case "${BASH_REMATCH[1]}" in
+				126 | 127) s="${BASH_REMATCH[1]}" ;;
+				*) s=0 ;;
+				esac
+			fi
+		elif [[ -s "$out" ]]; then
+			s=0
+		else
+			case "$s" in
+			124 | 129 | 130 | 143) ;;
+			*) s=unrun ;;
+			esac
+		fi
+	fi
+	case "$s" in
+	126 | 127) exec_refused "$err" "$1" && s=0 ;;
+	esac
+	line="$({ grep -v '^[[:space:]]*$' "$err" || true; } | tail -n 1 | LC_ALL=C tr -cd '[:print:]')"
+	rm -f "$out" "$err"
+	case "$s" in
+	124) UNPROVEN="$1 did not answer within ${VERIFY_WAIT_SECS}s" ;;
+	129 | 130 | 143) UNPROVEN="$1 was interrupted before it answered" ;;
+	126 | 127)
+		UNPROVEN="$1 may not have started${nobody:+ as nobody} (exit $s${line:+, saying \`$line\`})"
+		if [[ -n "$nobody" ]]; then
+			UNPROVEN_THEN="$self"
+		else
+			UNPROVEN_THEN="after a restart, when macOS is checking nothing, remove it yourself and run this again"
+		fi
+		;;
+	unrun)
+		UNPROVEN="$1 could not be run as nobody to ask it${line:+, saying \`$line\`}"
+		UNPROVEN_THEN="$self"
+		;;
+	*) return 0 ;;
+	esac
+	return 1
+}
+
+# Whether <err>, what a run of <exe> said, has the shell name the kernel's
+# refusal to exec <exe>: no format or CPU type this Mac runs, which it refuses
+# before macOS's check, so no exec of the file waits on one.
+exec_refused() { # <err> <exe>
+	local line
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		case "$line" in
+		*": $2: Bad CPU type in executable" | *": $2: Bad executable (or shared library)" | \
+			*": $2: Malformed Mach-o file" | *": $2: Exec format error" | \
+			*": $2: cannot execute binary file" | *": $2: cannot execute binary file: Exec format error")
+			return 0
+			;;
+		esac
+	done <"$1"
+	return 1
+}
+
+# Whether each program in the aterm.app at <app> has shown it ran: every file
+# in Contents/MacOS but a link, since a toolset generation's aterm-cli starts
+# its siblings (atpkg for `pkg`).
+bundle_showed_it_ran() { # <app>
+	local f
+	for f in "$1"/Contents/MacOS/*; do
+		[[ -L "$f" ]] || showed_it_ran "$f" || return 1
+	done
+}
+
+# Say that <path> was left where it is, for UNPROVEN (showed_it_ran).
+say_unproven() { # <path>
+	echo "install.sh: $1 was left as it is: $UNPROVEN, so macOS may still be checking its first start, and replacing it now could stall every program start on this Mac until a restart — $UNPROVEN_THEN" >&2
+}
+
+# Whether <path>, an aterm.app or a store's aterm, may be removed or renamed
+# over: nothing is there (a link is no program), or what in it aterm's tools
+# run has shown it ran. Says why not.
+may_replace() { # <path>
+	if [[ -L "$1" || ! -e "$1" ]]; then
+		return 0
+	elif [[ -d "$1" ]]; then
+		bundle_showed_it_ran "$1" && return 0
+	else
+		showed_it_ran "$1" && return 0
+	fi
+	say_unproven "$1"
+	return 1
 }
 
 # The plan's line for the one `aterm` on PATH, per bin_aterm_verdict — the same
@@ -4300,6 +4679,32 @@ persist_no_toolchain() { # <cfg>
 		;;
 	esac
 	echo "install.sh: --no-toolchain: wrote \`[packages] auto_install = false\` into $cfg — $NO_TOOLCHAIN_EFFECT"
+}
+
+# Land one binary in the private store and expose it: the argv0 verb siblings
+# beside it, the single `aterm` symlink on PATH. Shared by both producers — the
+# source build and the released Linux binary — so the two lanes cannot drift
+# into different layouts, and --uninstall's ownership checks match either.
+# Callers pre-flight STORE_DIR and BIN_DIR before any build or download work.
+place_store_binary() {
+	# An unsigned source fallback cannot replace enrolled bytes and leave the
+	# durable signed identity pointing at a different executable.
+	if [[ "$(uname -s)" == Linux && ( -e "$STORE_DIR/.aterm-update/state.toml" || -L "$STORE_DIR/.aterm-update/state.toml" ) ]]; then
+		echo "install.sh: source fallback cannot overwrite an enrolled Linux install; choose a separate ATERM_STORE_DIR for development" >&2
+		return 1
+	fi
+	# A running executable must never be truncated in place. Publish a complete
+	# same-filesystem sibling atomically; the old inode stays valid for users
+	# whose terminal is already running.
+	# The rename below replaces the aterm there.
+	may_replace "$STORE_DIR/aterm" || return 1
+	local staged
+	staged="$(mktemp "$STORE_DIR/.aterm-install.XXXXXX")" || return 1
+	if ! install -m 755 "$1" "$staged" || ! mv -f "$staged" "$STORE_DIR/aterm"; then
+		rm -f "$staged"
+		return 1
+	fi
+	expose_store_binary
 }
 
 # The test seam: a suite sources this file with ATERM_INSTALL_LIBRARY_ONLY=1 to
@@ -4947,6 +5352,9 @@ ATPKG_OFFLINE_EXIT=69
 # --- the app half: released aterm.app, verified, swapped into place ------------
 install_app() {
 	echo "install.sh: installing $REPO_SLUG $TAG"
+	# The swap sets aside and removes the bundle there: asked first here, so a
+	# bundle that stays costs no download.
+	may_replace "$DEST/aterm.app" || exit 1
 
 	TMP="$(mktemp -d "${TMPDIR:-/tmp}/aterm-install.XXXXXX")"
 	MNT="$TMP/mnt"
@@ -5328,6 +5736,9 @@ install_cli_from_source() {
 	# config cannot be neutralized from here, so the freshness proof below
 	# turns that into a loud abort instead of a stale (or missing) install.
 	local rel="$ROOT/target/release"
+	# The rename at the end replaces the store's aterm: asked here first, so one
+	# that stays costs no build; place_store_binary asks again before the rename.
+	may_replace "$STORE_DIR/aterm" || exit 1
 	# Existence-after-build IS the freshness proof: cargo always re-links a
 	# deleted output, so a redirected build can never leave a previous build's
 	# binary here to be silently installed.
@@ -5363,30 +5774,6 @@ install_cli_from_source() {
 	PLACED_ATERM="$STORE_DIR/aterm"
 	echo "install.sh: installed $(first_line_bounded "$STORE_DIR/aterm" --version) -> $STORE_DIR"
 	say_store_command ""
-}
-
-# Land one binary in the private store and expose it: the argv0 verb siblings
-# beside it, the single `aterm` symlink on PATH. Shared by both producers — the
-# source build and the released Linux binary — so the two lanes cannot drift
-# into different layouts, and --uninstall's ownership checks match either.
-# Callers pre-flight STORE_DIR and BIN_DIR before any build or download work.
-place_store_binary() {
-	# An unsigned source fallback cannot replace enrolled bytes and leave the
-	# durable signed identity pointing at a different executable.
-	if [[ "$(uname -s)" == Linux && ( -e "$STORE_DIR/.aterm-update/state.toml" || -L "$STORE_DIR/.aterm-update/state.toml" ) ]]; then
-		echo "install.sh: source fallback cannot overwrite an enrolled Linux install; choose a separate ATERM_STORE_DIR for development" >&2
-		return 1
-	fi
-	# A running executable must never be truncated in place. Publish a complete
-	# same-filesystem sibling atomically; the old inode stays valid for users
-	# whose terminal is already running.
-	local staged
-	staged="$(mktemp "$STORE_DIR/.aterm-install.XXXXXX")" || return 1
-	if ! install -m 755 "$1" "$staged" || ! mv -f "$staged" "$STORE_DIR/aterm"; then
-		rm -f "$staged"
-		return 1
-	fi
-	expose_store_binary
 }
 
 expose_store_binary() {

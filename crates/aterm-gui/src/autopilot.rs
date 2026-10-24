@@ -75,7 +75,7 @@ pub(crate) const fn agent_switch_off(agent: aterm_phase::Program) -> &'static st
         Program::Agy => "Supervise Antigravity CLI sessions is off",
         Program::Muse => "Supervise Muse Code sessions is off",
         Program::Gemini => "Supervise Gemini CLI sessions is off",
-        Program::Generic => "Supervise the program sessions is off",
+        Program::Grok | Program::Kimi | Program::Generic => "Supervise the program sessions is off",
     }
 }
 
@@ -349,7 +349,9 @@ impl AutopilotView {
                     Program::Agy => agent_off!("Supervise Antigravity CLI sessions"),
                     Program::Muse => agent_off!("Supervise Muse Code sessions"),
                     Program::Gemini => agent_off!("Supervise Gemini CLI sessions"),
-                    Program::Generic => agent_off!("Supervise the program sessions"),
+                    Program::Grok | Program::Kimi | Program::Generic => {
+                        agent_off!("Supervise the program sessions")
+                    }
                 };
                 off.into()
             }

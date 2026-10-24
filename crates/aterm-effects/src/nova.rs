@@ -302,8 +302,13 @@ fn emit_ring(sink: &mut QuadSink<'_>, env: &NovaEnv, r: f32, fade: f32) {
         let dy = (y0f + y1f) * 0.5 - re;
         let dy2 = dy * dy;
         for (ro2, ri2, color, cov) in rings {
-            let wo = (ro2 - dy2).max(0.0).sqrt();
-            let wi = (ri2 - dy2).max(0.0).sqrt();
+            let d2_o = ro2 - dy2;
+            if d2_o <= 0.0 {
+                continue;
+            }
+            let wo = d2_o.sqrt();
+            let d2_i = ri2 - dy2;
+            let wi = if d2_i > 0.0 { d2_i.sqrt() } else { 0.0 };
             if wo - wi < 0.05 {
                 continue;
             }
@@ -474,6 +479,8 @@ pub fn emit_debris(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, cap:
     let sing_contract = if singularity { 1.0 - ease_out(qn) } else { 0.0 };
     let ch_f = env.cell_h as f32;
     let grav_drop = 0.5 * (2.2 * ch_f) * age * age;
+    let (cxf, cyf) = (env.cx as f32, env.cy as f32);
+    let (grid_wf, grid_hf) = (env.grid_w as f32, env.grid_h as f32);
     for m in 0..u32::from(env.feats.debris) {
         if out.len() >= cap {
             break;
@@ -489,19 +496,13 @@ pub fn emit_debris(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, cap:
         let ang = std::f32::consts::TAU * r0;
         let (x, y) = if singularity {
             let rr = env.r_max * (0.6 + 0.4 * r1) * sing_contract;
-            (
-                env.cx as f32 + ang.cos() * rr,
-                env.cy as f32 + ang.sin() * rr,
-            )
+            (cxf + ang.cos() * rr, cyf + ang.sin() * rr)
         } else {
             let speed = (0.4 + 1.2 * r1) * ch_f;
             let (vx, vy) = (ang.cos() * speed, ang.sin() * speed - 0.6 * ch_f);
-            (
-                env.cx as f32 + vx * age,
-                env.cy as f32 + vy * age + grav_drop,
-            )
+            (cxf + vx * age, cyf + vy * age + grav_drop)
         };
-        if x < 0.0 || y < 0.0 || x >= env.grid_w as f32 || y >= env.grid_h as f32 {
+        if x < 0.0 || y < 0.0 || x >= grid_wf || y >= grid_hf {
             continue;
         }
         let col = ((x as i32) / env.cell_w).clamp(0, cols - 1);
@@ -618,7 +619,11 @@ pub fn constant_lum_toward(anchor: u32, target: u32) -> u32 {
         for i in 0..20 {
             let mid = 0.5 * (lo + hi);
             let mid_rgb = hsv2rgb(h, s, mid);
-            if crate::color_math::relative_luminance_with(table, mid_rgb) < want {
+            if mid_rgb == lo_rgb {
+                lo = mid;
+            } else if mid_rgb == hi_rgb {
+                hi = mid;
+            } else if crate::color_math::relative_luminance_with(table, mid_rgb) < want {
                 lo = mid;
                 lo_rgb = mid_rgb;
             } else {
@@ -636,7 +641,11 @@ pub fn constant_lum_toward(anchor: u32, target: u32) -> u32 {
     for i in 0..20 {
         let mid = 0.5 * (lo + hi);
         let mid_rgb = hsv2rgb(h, mid, 1.0);
-        if crate::color_math::relative_luminance_with(table, mid_rgb) < want {
+        if mid_rgb == lo_rgb {
+            lo = mid;
+        } else if mid_rgb == hi_rgb {
+            hi = mid;
+        } else if crate::color_math::relative_luminance_with(table, mid_rgb) < want {
             hi = mid;
             hi_rgb = mid_rgb;
         } else {

@@ -329,9 +329,24 @@ const FIRE_PAL_ADD: [[i32; 3]; 5] = [
     [0xFF, 0xF0, 0xC0],
 ];
 
-/// Brightest light per unit coverage laid by additive fire ([`FIRE_IDX_MAX`]).
+/// The hottest palette index additive fire lays: a breath past the amber
+/// stop ([`FIRE_PAL_ADD`]`[3]`), short of the field's own ceiling
+/// ([`FIRE_IDX_MAX`]). Up there the palette mixes toward its cream stop, and
+/// a pale gold laid thin over a dark page (a tongue's feathered foot and
+/// flanks) reads as a tan curtain, not a flame (`#c1964c` to `#ca9a42`, the
+/// trail gallery's dark `burst`, looks6 round 3); amber laid thin stays an
+/// amber. The shaders' `fire_pal_add` hold the same cap.
+pub const FIRE_ADD_IDX_MAX: i32 = 780;
+
+/// [`FIRE_PAL_ADD`] at `idx`, held to at most `cap`.
+#[inline]
+const fn fire_pal_add(idx: i32, cap: i32) -> (i32, i32, i32) {
+    fire_pal(&FIRE_PAL_ADD, if idx > cap { cap } else { idx })
+}
+
+/// Brightest light per unit coverage laid by additive fire ([`FIRE_ADD_IDX_MAX`]).
 pub const FIRE_ADD_HOTTEST: u32 = {
-    let (r, g, b) = fire_pal(&FIRE_PAL_ADD, FIRE_IDX_MAX);
+    let (r, g, b) = fire_pal_add(FIRE_IDX_MAX, FIRE_ADD_IDX_MAX);
     ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 };
 
@@ -375,18 +390,13 @@ pub const fn fire_add_index_at(p: &FireFieldParams, py: i32) -> i32 {
     (idx * (192 + (root >> 2))) >> 8
 }
 
-/// Additive fire light per unit coverage at palette index `idx` (`0..=1023`, clamped).
+/// Additive fire light per unit coverage at palette index `idx` (clamped to
+/// `0..=`[`FIRE_ADD_IDX_MAX`]).
 #[inline]
 #[must_use]
 pub const fn fire_add_light(idx: i32) -> u32 {
-    let idx = if idx < 0 {
-        0
-    } else if idx > 1023 {
-        1023
-    } else {
-        idx
-    };
-    let (r, g, b) = fire_pal(&FIRE_PAL_ADD, idx);
+    let idx = if idx < 0 { 0 } else { idx };
+    let (r, g, b) = fire_pal_add(idx, FIRE_ADD_IDX_MAX);
     ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 }
 
@@ -468,13 +478,21 @@ pub const fn fire_top_fade(py: i32, p: &FireFieldParams) -> i32 {
 #[inline]
 #[must_use]
 pub const fn fire_shade_add(c: &FireCore, p: &FireFieldParams, tf: i32) -> u32 {
+    fire_shade_add_to(c, p, tf, FIRE_ADD_IDX_MAX)
+}
+
+/// [`fire_shade_add`] with its palette held to index `cap` in place of
+/// [`FIRE_ADD_IDX_MAX`] (`1023`: the field's own ceiling alone).
+#[inline]
+#[must_use]
+pub const fn fire_shade_add_to(c: &FireCore, p: &FireFieldParams, tf: i32, cap: i32) -> u32 {
     let cov0 = fire_cov_add(c, p);
     let cov = if tf == 255 { cov0 } else { (cov0 * tf) / 255 };
     if cov <= 0 {
         return 0;
     }
     let idx = (c.idx * (256 - ((c.rim * 112) >> 8))) >> 8;
-    let (r, g, b) = fire_pal(&FIRE_PAL_ADD, idx);
+    let (r, g, b) = fire_pal_add(idx, cap);
     #[inline]
     const fn m(ch: i32, cov: i32) -> u32 {
         ((ch * cov + 127) / 255) as u32
@@ -694,6 +712,54 @@ mod tests {
         assert!(
             over(amber) > 0,
             "control: the hot cores pass the amber anchor"
+        );
+    }
+
+    #[test]
+    fn additive_fire_laid_thin_over_a_dark_page_reads_amber_not_tan() {
+        // looks6 round 3: the field's hottest light, mixed toward the cream
+        // stop, laid thin over a dark page read as a tan curtain (#c1964c to
+        // #ca9a42: warm, greyed, mid-bright) under the dark fire's feathered
+        // feet and flanks. Held a breath past amber, no sample of a hot or
+        // warm burn over the gallery's dark page reads tan but a few
+        // samples at the edge of the band (160 of 128,250); up to the
+        // field's own ceiling (the negative control), fifteen times as many
+        // do.
+        const PAGE: u32 = 0x0011_1318;
+        let tan = |cap: i32| {
+            let mut tan = 0usize;
+            for temp in [128, 200, 255] {
+                for phase in [7_000u32, 91_337, 400_001] {
+                    let p = params(temp, 0, phase);
+                    for px in (0..300).step_by(2) {
+                        for py in (40..230).step_by(2) {
+                            let c = core_at(px, py, &p);
+                            let lit = fire_shade_add_to(&c, &p, 255, cap);
+                            let ch = |sh: u32| {
+                                (((PAGE >> sh) & 0xff) + ((lit >> sh) & 0xff)).min(255) as f32
+                                    / 255.0
+                            };
+                            let (r, g, b) = (ch(16), ch(8), ch(0));
+                            let (hi, lo) = (r.max(g).max(b), r.min(g).min(b));
+                            if hi <= 0.5 || hi >= 0.86 || r < hi {
+                                continue;
+                            }
+                            let sat = (hi - lo) / hi;
+                            let hue = 60.0 * (g - b) / (hi - lo);
+                            if (0.30..=0.72).contains(&sat) && (25.0..=55.0).contains(&hue) {
+                                tan += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            tan
+        };
+        let (held, pale) = (tan(FIRE_ADD_IDX_MAX), tan(1023));
+        assert!(held <= 400, "thin additive fire reads tan {held} times");
+        assert!(
+            pale >= 8 * held.max(250),
+            "control: up to the field's own ceiling, thin fire reads tan only {pale} times ({held} held)"
         );
     }
 

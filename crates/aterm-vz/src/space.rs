@@ -26,12 +26,15 @@ pub struct Free {
     pub volume: String,
 }
 
-/// The volume holding `path`, read now (aterm-sysprobe's `volumes::read_path`).
+/// The volume holding `path`, read now (aterm-sysprobe's `volumes::read_path`). A path
+/// that does not exist yet (the live disk while a bake runs) is read through its nearest
+/// ancestor that does, resolved, so a symlink on the way (`/tmp`) cannot send the read to
+/// another volume.
 ///
 /// # Errors
 /// The path is on no mount the table holds, or the volume cannot be read.
 pub fn read(path: &Path) -> Result<Free, String> {
-    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let path = resolved(path);
     let table = aterm_sysprobe::volumes::table();
     let reading = aterm_sysprobe::volumes::read_path(&path, &table).map_err(|e| {
         format!(
@@ -43,6 +46,25 @@ pub fn read(path: &Path) -> Result<Free, String> {
         bytes: reading.free,
         volume: format!("{} ({})", reading.mount.display(), reading.key.spelled()),
     })
+}
+
+/// `path` with its nearest existing ancestor resolved (`canonicalize`), and the rest of it,
+/// which does not exist yet, appended unchanged.
+fn resolved(path: &Path) -> std::path::PathBuf {
+    let mut rest = Vec::new();
+    let mut at = path;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(at) {
+            return rest.iter().rev().fold(real, |p, c| p.join(c));
+        }
+        match (at.parent(), at.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_os_string());
+                at = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
 }
 
 /// `bytes` in GiB, one decimal.
@@ -120,6 +142,22 @@ mod tests {
             None,
             "the negative control: a run above its floor goes on, below the bring-up's"
         );
+    }
+
+    #[test]
+    fn a_path_not_there_yet_is_read_through_its_resolved_ancestor() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let real = std::fs::canonicalize(dir.path()).unwrap();
+        let link = real.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // Measured: `/tmp/<volume>/vz.noindex/live/aterm-linux.img` during a bake, unresolved,
+        // matched the root volume's mount, not the scratch volume's under `/private/tmp`.
+        assert_eq!(
+            resolved(&link.join("live/aterm-linux.img")),
+            real.join("live/aterm-linux.img")
+        );
+        assert_eq!(resolved(&link), real);
+        assert_eq!(resolved(Path::new("relative/x")), Path::new("relative/x"));
     }
 
     #[test]

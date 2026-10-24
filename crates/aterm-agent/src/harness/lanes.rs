@@ -48,7 +48,7 @@ pub const fn lanes(program: Program) -> Lanes {
             upgrade: false,
             restart_in_place: false,
         },
-        Program::Generic => Lanes::NONE,
+        Program::Grok | Program::Kimi | Program::Generic => Lanes::NONE,
     }
 }
 
@@ -57,7 +57,12 @@ pub const fn lanes(program: Program) -> Lanes {
 pub const fn sweep_carries_relaunch(program: Program) -> bool {
     match program {
         Program::Claude | Program::Codex => true,
-        Program::Muse | Program::Agy | Program::Gemini | Program::Generic => false,
+        Program::Muse
+        | Program::Agy
+        | Program::Gemini
+        | Program::Grok
+        | Program::Kimi
+        | Program::Generic => false,
     }
 }
 

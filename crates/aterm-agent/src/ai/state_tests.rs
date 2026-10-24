@@ -29,6 +29,7 @@ fn facts(c: &'static Connector) -> Facts {
         limited_until: None,
         record: Record::default(),
         env_credentials: Vec::new(),
+        pool: None,
     }
 }
 
@@ -383,5 +384,66 @@ fn claude_limited_with_unenrolled_successor_is_due_and_actionable() {
         row.fact.contains("next account `m27` needs sign-in"),
         "{}",
         row.fact
+    );
+}
+
+/// ANOTHER CLI'S POOL is named in its row: how many accounts its roster lists, how many are
+/// signed in here and which are due, or why the roster is refused; signed in or out alike. A
+/// row with no pool, Claude Code's included, says nothing of one.
+#[test]
+fn a_clis_pool_is_named_in_its_row_and_a_row_without_one_says_nothing_of_it() {
+    use crate::ai::connector::KIMI;
+    use crate::ai::facts::CliAccounts;
+    let mut f = facts(&KIMI);
+    f.login_file = Some((
+        PathBuf::from("/home/me/.kimi-code/credentials/kimi-code.json"),
+        Some(NOW - 60),
+    ));
+    let plain = assess(&f, true, NOW);
+    assert!(!plain.fact.contains("pool"), "{}", plain.fact);
+    f.pool = Some(CliAccounts {
+        roster: PathBuf::from("/home/me/.config/aterm/accounts-kimi.toml"),
+        rows: 2,
+        enrolled: 1,
+        due: vec!["kimi-2".to_string()],
+        ..CliAccounts::default()
+    });
+    let pooled = assess(&f, true, NOW);
+    assert!(
+        pooled
+            .fact
+            .contains("pool: 2 accounts (1 signed in here); renewal due: kimi-2"),
+        "{}",
+        pooled.fact
+    );
+    assert_eq!(
+        (pooled.state, pooled.mark),
+        (plain.state, plain.mark),
+        "the pool's words change no verdict"
+    );
+    f.login_file = None;
+    let out = assess(&f, true, NOW);
+    assert_eq!(out.state, State::SignedOut);
+    assert!(
+        out.fact.starts_with("no login is stored") && out.fact.contains(" \u{b7} pool: 2 accounts"),
+        "{}",
+        out.fact
+    );
+    f.pool = Some(CliAccounts {
+        roster: PathBuf::from("/home/me/.config/aterm/accounts-kimi.toml"),
+        refused: Some("accounts-kimi.toml: row 1 has no label".to_string()),
+        ..CliAccounts::default()
+    });
+    assert!(
+        assess(&f, true, NOW).fact.contains(
+            "its pool's roster (accounts-kimi.toml) is refused: accounts-kimi.toml: row 1"
+        ),
+        "a refused roster says why"
+    );
+    let mut claude = facts(&CLAUDE);
+    claude.profile_signed_in = true;
+    assert!(
+        !assess(&claude, true, NOW).fact.contains("pool"),
+        "Claude Code's row names no pool"
     );
 }

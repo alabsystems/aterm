@@ -1052,7 +1052,7 @@ impl Repair {
 
     fn probe_store(&self) -> Probe {
         let plan = shim_plan(self.layout());
-        if plan.lay.is_empty() && plan.missing.is_empty() && plan.revoked.is_empty() {
+        if plan.weighed == 0 {
             return not_applicable(
                 "no programs installed — `aterm pkg install --default-set` installs the toolset",
             );
@@ -1093,10 +1093,14 @@ pub(crate) struct ShimPlan {
     pub(crate) missing: Vec<String>,
     /// `program@build` of each left tombstoned.
     pub(crate) revoked: Vec<String>,
-    /// What was left alone and why (a dev link).
+    /// What was left alone and why (a dev link, a build whose every command another file holds).
     pub(crate) notes: Vec<String>,
-    /// What could not even be read (a development link).
+    /// What could not even be read (a development link), or a build without a record of its
+    /// commands that leaves none to re-lay.
     pub(crate) failed: Vec<String>,
+    /// How many programs it weighed, whatever became of each, which leaves out a dev-linked
+    /// program and one whose development link could not be read.
+    pub(crate) weighed: usize,
 }
 
 /// Which builds a re-lay of the shims works from: the build ACTIVATION selects
@@ -1116,6 +1120,7 @@ pub(crate) fn shim_plan(layout: &Layout) -> ShimPlan {
         revoked: Vec::new(),
         notes: Vec::new(),
         failed: Vec::new(),
+        weighed: 0,
     };
     if let Err(error) = crate::linkmode::linked_programs_checked(layout) {
         plan.failed
@@ -1142,6 +1147,7 @@ pub(crate) fn shim_plan(layout: &Layout) -> ShimPlan {
         let Some(&newest) = complete.last() else {
             continue;
         };
+        plan.weighed = plan.weighed.saturating_add(1);
         let build = std::fs::read_link(layout.program_current(program))
             .ok()
             .and_then(|t| crate::ops::store_build_of(&layout.prefix, &t))
@@ -1157,10 +1163,30 @@ pub(crate) fn shim_plan(layout: &Layout) -> ShimPlan {
             .get(program)
             .is_some_and(|r| r.state.starts_with("tombstoned:"))
             || exposes
+                .as_deref()
+                .unwrap_or(std::slice::from_ref(program))
                 .iter()
                 .any(|tool| crate::cli::is_tombstone_shim(layout, tool));
         if tombstoned {
             plan.revoked.push(format!("{program}@{build}"));
+            continue;
+        }
+        let Some(exposes) = exposes else {
+            plan.failed.push(format!(
+                "{program}@{build} — the build keeps no record of its commands and none \
+                 survives under its own name to re-lay from; `aterm pkg install {program}` puts \
+                 them back"
+            ));
+            continue;
+        };
+        if exposes.is_empty() {
+            // An empty record (a build that puts no command on PATH) leaves nothing held to name.
+            if crate::store::recorded_exposes(&build_dir).is_some_and(|r| !r.is_empty()) {
+                plan.notes.push(format!(
+                    "{program}@{build}: every command it exposes is held by another file — left \
+                     alone"
+                ));
+            }
             continue;
         }
         plan.lay.push(Planned {
@@ -1251,12 +1277,21 @@ pub(crate) fn relay(layout: &Layout) -> Relaid {
     relaid
 }
 
-/// What [`relay`] re-lays for `program` from `build_dir`: the names its own shims still carry,
-/// plus `program` when none survive or the build ships it and its shim is gone.
-pub(crate) fn exposes(layout: &Layout, program: &str, build_dir: &Path) -> Vec<String> {
-    let Some(mut exposes) = crate::installed_exposes(layout, program) else {
-        return vec![program.to_string()];
-    };
+/// What [`relay`] re-lays for `program` from `build_dir`: the commands the build records it
+/// exposes ([`crate::store::recorded_exposes`]) whose shim is gone, already `program`'s or a
+/// tombstone. For a build staged before that record, the names its own shims still carry,
+/// plus `program` when the build ships it and its shim is gone; `None` when that names nothing.
+pub(crate) fn exposes(layout: &Layout, program: &str, build_dir: &Path) -> Option<Vec<String>> {
+    if let Some(tools) = crate::store::recorded_exposes(build_dir) {
+        return Some(
+            tools
+                .into_iter()
+                .filter(|tool| free_for(layout, program, tool))
+                .map(|tool| tool.as_str().to_string())
+                .collect(),
+        );
+    }
+    let mut exposes = crate::installed_exposes(layout, program).unwrap_or_default();
     let own_binary = build_dir
         .join("bin")
         .join(format!("{program}{}", std::env::consts::EXE_SUFFIX))
@@ -1268,7 +1303,23 @@ pub(crate) fn exposes(layout: &Layout, program: &str, build_dir: &Path) -> Vec<S
     if own_binary && own_shim_absent && !exposes.iter().any(|name| name == program) {
         exposes.push(program.to_string());
     }
-    exposes
+    (!exposes.is_empty()).then_some(exposes)
+}
+
+/// Whether `tool`'s shim is `program`'s to lay: gone, resolving into `program`'s store, or a
+/// tombstone (which the plan reports revoked) — never another program's or a file of the user's.
+fn free_for(layout: &Layout, program: &str, tool: &crate::store::ToolName) -> bool {
+    let shim = layout.shim(tool);
+    match std::fs::symlink_metadata(&shim) {
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+        Ok(_) => crate::platform::resolve_shim(&shim).map_or_else(
+            || crate::cli::is_tombstone_shim(layout, tool.as_str()),
+            |target| {
+                crate::ops::store_build_of(&layout.prefix, &target)
+                    .is_some_and(|(owner, _)| owner == program)
+            },
+        ),
+    }
 }
 
 #[cfg(all(test, unix))]

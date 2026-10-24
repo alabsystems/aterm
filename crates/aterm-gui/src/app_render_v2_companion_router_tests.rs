@@ -521,3 +521,62 @@ fn a_capture_shades_the_sky_where_the_pet_is_drawn() {
         "control: a pet ticked onto the glass with no offer leaves the sky unshaded"
     );
 }
+
+/// The word pass hands its icons to the next frame's sky (looks6 N3: the
+/// gallery's sky drew stars on the `dog`'s face, because a primed word tick
+/// hid its icons from the keep-out): every capture's keep-out holds exactly
+/// the icons the capture before it drew. The control is the same fixture
+/// once the icon has gone: its keep-out lets go, so the boxes follow the
+/// icons and are not a sticky leftover that would pass the first check.
+#[test]
+fn a_capture_s_word_icons_reach_the_sky_s_keep_out() {
+    use aterm_render::sprites::{FreeZ, published};
+    let mut app = App::headless_for_test();
+    app.config.cursor_trail = Some(true);
+    app.config.cursor_trail_style = Some("rainbow dog".into());
+    app.config.motion = Some("full".into());
+    let wid = WindowId(0);
+    app.windows.get_mut(&wid).expect("window").focused = true;
+    app.recompute_sparkle();
+    let term = app.pool.get(0).expect("session 0").term.clone();
+    crate::term_lock(&term).process(b"the lazy dog ");
+    let t0 = Instant::now();
+    let sizes = |boxes: &[(i32, i32, i32, i32)]| {
+        let mut v: Vec<_> = boxes.iter().map(|b| (b.1 - b.0, b.3 - b.2)).collect();
+        v.sort_unstable();
+        v
+    };
+    let mut drawn: Vec<(i32, i32, i32, i32)> = Vec::new();
+    let (mut held, mut released) = (0usize, 0usize);
+    for k in 0..400u64 {
+        app.capture_words(wid, t0 + Duration::from_millis(16 * k));
+        let ws = &app.windows[&wid];
+        let kept = ws.fx.cursor().glow.keep_out().to_vec();
+        assert_eq!(
+            sizes(&kept),
+            sizes(&drawn),
+            "capture {k}: the keep-out {kept:?} holds the icons {drawn:?} the capture before drew"
+        );
+        if drawn.is_empty() {
+            released += usize::from(held > 0);
+        } else {
+            held += 1;
+        }
+        drawn = published(&ws.input_scratch.fx_layers)
+            .iter()
+            .filter(|s| s.z == FreeZ::UnderText && !s.is_blank())
+            .map(|s| {
+                let v = s.visible();
+                (v.x0, v.x1, v.y0, v.y1)
+            })
+            .collect();
+    }
+    assert!(
+        held > 10,
+        "fixture: the word pass drew the `dog` icon ({held} captures)"
+    );
+    assert!(
+        released > 10,
+        "control: the icon left and the keep-out let go ({released} captures)"
+    );
+}

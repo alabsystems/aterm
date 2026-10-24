@@ -16282,14 +16282,38 @@ fn each_screen_of(
     cx: &ViewCx<'_>,
     mut each: impl FnMut(&SettingsViewState, &crate::native_ui::CompiledUi, usize),
 ) -> usize {
-    let set_top = |runtime: &mut NativeRuntime, top: usize| {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let (first, limit) = walk_start(runtime, instance, view, cx);
+    let mut first = Some(first);
+    for top in 0..=limit {
+        let screen = first.take().unwrap_or_else(|| {
+            set_walk_top(runtime, view, top);
+            compile_settings_view(runtime, instance, view, cx)
+        });
+        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
             unreachable!();
         };
-        state.scroll_page_to(top);
-        state.page_reveal = None;
+        each(state, &screen, top);
+    }
+    limit + 1
+}
+
+fn set_walk_top(runtime: &mut NativeRuntime, view: crate::native_app::ViewId, top: usize) {
+    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        unreachable!();
     };
-    set_top(runtime, 0);
+    state.scroll_page_to(top);
+    state.page_reveal = None;
+}
+
+/// The screen [`each_screen_of`] visits first, at the list's top, and the last top it goes on to:
+/// a page whose first render seats the list lower is rendered at the top again.
+fn walk_start(
+    runtime: &mut NativeRuntime,
+    instance: crate::native_app::AppInstanceId,
+    view: crate::native_app::ViewId,
+    cx: &ViewCx<'_>,
+) -> (crate::native_ui::CompiledUi, usize) {
+    set_walk_top(runtime, view, 0);
     let first = compile_settings_view(runtime, instance, view, cx);
     let (limit, drawn) = match runtime.view_state(view) {
         Some(AppViewState::Settings(state)) => (
@@ -16302,18 +16326,11 @@ fn each_screen_of(
         ),
         _ => unreachable!(),
     };
-    let mut first = (drawn == 0).then_some(first);
-    for top in 0..=limit {
-        let screen = first.take().unwrap_or_else(|| {
-            set_top(runtime, top);
-            compile_settings_view(runtime, instance, view, cx)
-        });
-        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
-            unreachable!();
-        };
-        each(state, &screen, top);
+    if drawn == 0 {
+        return (first, limit);
     }
-    limit + 1
+    set_walk_top(runtime, view, 0);
+    (compile_settings_view(runtime, instance, view, cx), limit)
 }
 
 fn screen_showing(

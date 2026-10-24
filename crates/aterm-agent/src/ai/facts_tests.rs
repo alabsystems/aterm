@@ -313,3 +313,76 @@ fn claude_accounts_surfaces_next_sign_in_and_prefers_ready_enrolled_row() {
         "when m27 is NotEnrolled and m27-3 is limited, next_sign_in falls back to m27"
     );
 }
+
+#[test]
+fn a_clis_own_roster_beside_accounts_toml_is_its_pool_and_names_the_row_to_sign_in() {
+    use crate::ai::connector::KIMI;
+    let b = machine(&["kimi"]);
+    let var = |_: &str| -> Option<String> { None };
+    let config = b.dir.path().join("config");
+    std::fs::create_dir_all(&config).expect("config");
+    let roster = config.join("accounts.toml");
+    let m = |roster: Option<PathBuf>| Machine {
+        now: 1_800_000_000,
+        home: Some(b.home.clone()),
+        var: &var,
+        pkg: Some(b.pkg.clone()),
+        exclude: Vec::new(),
+        records: Records::default(),
+        harness_state: Some(b.state.clone()),
+        roster,
+    };
+    assert_eq!(
+        gather(&m(Some(roster.clone())), &KIMI).pool,
+        None,
+        "no kimi roster"
+    );
+    std::fs::write(
+        config.join("accounts-kimi.toml"),
+        "[[account]]\nlabel = \"plain\"\nclass = \"dedicated\"\ndir = \"/logins/kimi/plain\"\n\n\
+         [[account]]\nlabel = \"kimi-one\"\nclass = \"dedicated\"\n\
+         dir = \"/logins/kimi/kimi-one\"\nemail = \"kimi-one@example.com\"\n\
+         region = \"global\"\n",
+    )
+    .expect("roster");
+    let pool = gather(&m(Some(roster.clone())), &KIMI)
+        .pool
+        .expect("kimi's pool");
+    assert_eq!(
+        pool.next.as_deref(),
+        Some("kimi-one"),
+        "the row with an email"
+    );
+    assert_eq!(pool.refused, None);
+    assert_eq!(
+        (pool.rows, pool.enrolled, pool.due.as_slice()),
+        (2, 0, &[] as &[String]),
+        "two rows, neither login made here, none due"
+    );
+    let made = b.home.join(".aterm/logins/kimi/kimi-one");
+    std::fs::create_dir_all(made.join("credentials")).expect("login dir");
+    std::fs::write(made.join("credentials/kimi-code.json"), "{}").expect("placeholder login");
+    std::fs::write(
+        config.join("accounts-kimi.toml"),
+        format!(
+            "[[account]]\nlabel = \"kimi-one\"\nclass = \"dedicated\"\ndir = \"{}\"\n\
+             email = \"kimi-one@example.com\"\nregion = \"global\"\n",
+            made.display()
+        ),
+    )
+    .expect("roster");
+    let pool = gather(&m(Some(roster.clone())), &KIMI)
+        .pool
+        .expect("kimi's pool");
+    assert_eq!(
+        (pool.rows, pool.enrolled),
+        (1, 1),
+        "a row is enrolled once its login file exists"
+    );
+    assert_eq!(gather(&m(None), &KIMI).pool, None, "no config, no pool");
+    assert_eq!(
+        gather(&m(Some(roster)), &CLAUDE).pool,
+        None,
+        "Claude Code's pool is its accounts view"
+    );
+}

@@ -297,6 +297,8 @@ pub use system_state_host::{
     CheckStarted, InitialSetupApplyReceipt, InitialSetupHandlers, publish_initial_setup_status,
     set_initial_setup_handlers,
 };
+#[cfg(any(test, debug_assertions))]
+pub use workstation_setup::drive_initial_setup_answer_for_test;
 pub use workstation_setup::{
     SetupAnswer, WorkstationSetupDecision, await_initial_setup_answer_while,
 };
@@ -9769,14 +9771,20 @@ impl App {
         folders: &[(aterm_containment::consent::Folder, std::path::PathBuf)],
         gate: Option<consent_warmup::WarmupGate>,
     ) -> consent_warmup::StartOutcome {
+        if !self.reserve_access_dialog() {
+            return consent_warmup::StartOutcome::DialogUp;
+        }
         let hold_cap = Duration::from_millis(self.config.privacy_warmup_hold_ms());
         let proxy = self.proxy.clone();
-        self.consent_warmup
+        let started = self
+            .consent_warmup
             .start_gated(folders, hold_cap, gate, move || {
                 if let Some(proxy) = &proxy {
                     let _ = proxy.send_event(Wake::WarmupResult);
                 }
-            })
+            });
+        self.release_unused_access_dialog(Instant::now());
+        started
     }
 
     /// Whether a warm-up worker is walking right now, freshly drained.
@@ -10286,6 +10294,15 @@ impl App {
         panel: bool,
         now: Instant,
     ) -> devtools_helper::HandOver {
+        if !self.reserve_hand_over_dialog(origin) {
+            if let Some(listed) = listed {
+                self.devtools_helper
+                    .queue_after_listing(origin, now, listed);
+            } else {
+                self.devtools_helper.queue(origin, now);
+            }
+            return devtools_helper::HandOver::Queued;
+        }
         let reach = self.devtools_helper.reach();
         let shown_listed = listed.clone();
         let opened = (reach.open_pane)();
@@ -10311,8 +10328,10 @@ impl App {
             atpkg::devtools::handled_words(&handled)
         );
         if !opened {
+            self.release_unused_access_dialog(now);
             return devtools_helper::HandOver::OpenFailed;
         }
+        self.hold_access_pane(now);
         (reach.note_opened)(&self.access_marks().devtools);
         self.record_access_step(
             aterm_types::macos_setup::Access::DeveloperTools,
@@ -10335,6 +10354,9 @@ impl App {
         listed: Option<Result<(), String>>,
         now: Instant,
     ) -> bool {
+        if !self.reserve_hand_over_dialog(origin) {
+            return false;
+        }
         let reach = self.devtools_helper.reach();
         let marks = self.access_marks();
         self.devtools_helper.set_marks(marks);
@@ -10347,7 +10369,12 @@ impl App {
             skips: aterm_containment::SpikeEvidence::MEASURED.devtool_skips_first_run_check,
         };
         let wake = self.devtools_hand_over_wake();
-        self.devtools_helper.show(show, now, wake)
+        let shown = self.devtools_helper.show(show, now, wake);
+        if shown {
+            self.access_helper_shown();
+        }
+        self.release_unused_access_dialog(now);
+        shown
     }
 
     fn devtools_reading(&mut self) -> devtools_helper::Reading {
@@ -11481,13 +11508,23 @@ impl App {
         panel: bool,
         now: Instant,
     ) -> devtools_helper::HandOver {
+        if !self.reserve_hand_over_dialog(origin) {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the Full Disk Access door retries after another dialog owns the slot"
+            )]
+            self.devtools_helper.queue_fda(origin, now);
+            return devtools_helper::HandOver::Queued;
+        }
         if !(self.devtools_helper.fda_reach().open_pane)() {
             aterm_log::info!(
                 "full disk access ({}): System Settings did not open",
                 origin.as_str()
             );
+            self.release_unused_access_dialog(now);
             return devtools_helper::HandOver::OpenFailed;
         }
+        self.hold_access_pane(now);
         self.fda_page_brought_up(origin, panel, now);
         devtools_helper::HandOver::Opened
     }
@@ -11536,6 +11573,9 @@ impl App {
     }
 
     fn show_fda_helper(&mut self, origin: devtools_helper::Origin, now: Instant) -> bool {
+        if !self.reserve_hand_over_dialog(origin) {
+            return false;
+        }
         let reach = self.devtools_helper.reach();
         let marks = self.access_marks();
         self.devtools_helper.set_marks(marks);
@@ -11548,7 +11588,12 @@ impl App {
             skips: false,
         };
         let wake = self.devtools_hand_over_wake();
-        self.devtools_helper.show(show, now, wake)
+        let shown = self.devtools_helper.show(show, now, wake);
+        if shown {
+            self.access_helper_shown();
+        }
+        self.release_unused_access_dialog(now);
+        shown
     }
 
     fn fda_panel_up(&self) -> bool {
@@ -11815,6 +11860,9 @@ impl App {
                     consent_warmup::StartOutcome::AlreadyLive => {
                         self.consent_launch.skip(Skip::Walking);
                     }
+                    consent_warmup::StartOutcome::DialogUp => {
+                        self.consent_launch.look_later(now);
+                    }
                     outcome => {
                         aterm_log::info!(
                             "file access at launch: the warm-up started nothing ({})",
@@ -11976,7 +12024,7 @@ impl App {
             self.consent_card_host.pending = None;
             self.consent_card_host.need = None;
             self.consent_card_host.kept_need = None;
-            self.retract_macos_access_rows(now);
+            self.retract_macos_access_rows(false, now);
             return;
         }
         if let Some(id) = self.consent_card_message
@@ -12119,7 +12167,7 @@ impl App {
 
     fn resolve_fda_need(&mut self, granted: bool, now: Instant) {
         if granted && !self.consent.window_reads_own_grant() {
-            self.retract_macos_access_rows(now);
+            self.retract_macos_access_rows(true, now);
             return;
         }
         if granted {
@@ -12142,7 +12190,7 @@ impl App {
                 });
             }
         } else {
-            self.retract_macos_access_rows(now);
+            self.retract_macos_access_rows(false, now);
         }
     }
 
@@ -12286,14 +12334,23 @@ impl App {
         }
     }
 
-    fn retract_macos_access_rows(&mut self, now: Instant) {
+    /// The card's word that Full Disk Access needs nothing ends its own rows and
+    /// entries (under [`message_reporters::KEY_FILE_ACCESS`]), and no others: other
+    /// reporters file under `privacy.` too (Mac setup, Developer Tools, the vault
+    /// join), and this check reads none of their causes. A word from a probe that read
+    /// the grant (`granted`) ends them fixed; one with no grant read (a `[privacy]`
+    /// switch off, a *Not now* on record) withdraws them, claiming no fix.
+    fn retract_macos_access_rows(&mut self, granted: bool, now: Instant) {
         self.consent_card_message = None;
         self.note_fda_regression(false);
-        if self
-            .messages
-            .resolve_key_prefix("privacy.", aterm_messages::Outcome::Ok, now)
-            > 0
-        {
+        let key = message_reporters::KEY_FILE_ACCESS;
+        let ended = if granted {
+            self.messages
+                .resolve_key_prefix(key, aterm_messages::Outcome::Ok, now)
+        } else {
+            self.messages.withdraw_key_prefix(key, now)
+        };
+        if ended > 0 {
             self.sync_messages();
         }
     }
@@ -12398,7 +12455,7 @@ impl App {
                                     verified_build: build_info::build_number().parse::<u64>().ok(),
                                     ..consent_card::AccessRecord::default()
                                 });
-                                self.retract_macos_access_rows(now);
+                                self.retract_macos_access_rows(true, now);
                             }
                             consent_card::NotDue::Granted => {
                                 // The window's own probe reads aterm's own grant held on
@@ -12419,9 +12476,14 @@ impl App {
                                         ..consent_card::AccessRecord::default()
                                     });
                                 }
-                                self.retract_macos_access_rows(now);
+                                self.retract_macos_access_rows(true, now);
                             }
-                            _ => self.retract_macos_access_rows(now),
+                            // Off, headless, or a *Not now* on record: these read
+                            // no grant, so only a probe that reads it says fixed.
+                            _ => self.retract_macos_access_rows(
+                                panel.fda == aterm_containment::consent::FdaState::Granted,
+                                now,
+                            ),
                         }
                     }
                 }
@@ -13991,6 +14053,8 @@ impl App {
             byte_arm: cfg!(unix),
             #[cfg(unix)]
             proc_watch: |_| None,
+            #[cfg(unix)]
+            shell_children: |_| Vec::new(),
             card_probe: false,
             rekey_deferred: None,
             spare: None,
@@ -17365,6 +17429,7 @@ impl ApplicationHandler<Wake> for App {
         let latch_now_ns = u64::try_from(self.lat_epoch.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let wake_pass = self.output_wake_watch.pass(
             latch_now_ns,
+            el.user_events_drained(),
             self.pool.iter().map(|s| (s.id, &*s.output_wake_pending)),
         );
         if let Some(recheck_ns) = wake_pass.recheck_ns {
@@ -23481,7 +23546,7 @@ fn warm_config(headless: bool, zoom: app_config::CarriedZoom) -> WarmConfig {
     let build_gpu = want_gpu && !defer_gpu;
     let defer_seal = defer_font_seal(headless);
     #[cfg(target_os = "macos")]
-    if build_gpu && let Some(warm) = aterm_gpu::begin_first_frame_warm() {
+    {
         let aurora = config.cursor_trail_drawn() || config.cursor_momentum_glow_or_default();
         let knobs = aterm_gpu::FirstFrameKnobs {
             aurora,
@@ -23490,23 +23555,59 @@ fn warm_config(headless: bool, zoom: app_config::CarriedZoom) -> WarmConfig {
             sdr_glow: aurora && config.cursor_glow_sdr_boost_or_default() > 0.0,
             fx: config.claude_footer_card(),
         };
-        let _ = crate::qos::spawn_lane_thread(
-            "aterm-metal-warm",
-            crate::qos::Role::Responsive,
-            move || {
-                // `Responsive` on every order, the pre-dial one included: the first
-                // window's mint waits on this compile, and the
-                // compiler service runs at the requester's class, so at utility the
-                // post-claim attach would wait on a demoted compile inside the update
-                // freeze. It still ranks below the outgoing terminal's UI thread.
-                if let Err(error) = warm.run(knobs) {
-                    aterm_log::debug!(
-                        "startup: the first-frame Metal warm failed ({error}); the first \
-                         window compiles its shaders itself"
-                    );
-                }
-            },
-        );
+        // A window's renderer builds the rest a frame can bind from its mint
+        // (`pin_gpu_effect_config`).
+        if build_gpu && let Some(warm) = aterm_gpu::begin_first_frame_warm() {
+            let _ = crate::qos::spawn_lane_thread(
+                "aterm-metal-warm",
+                crate::qos::Role::Responsive,
+                move || {
+                    // `Responsive` on every order, the pre-dial one included: the first
+                    // window's mint waits on this compile, and the
+                    // compiler service runs at the requester's class, so at utility the
+                    // post-claim attach would wait on a demoted compile inside the update
+                    // freeze. It still ranks below the outgoing terminal's UI thread.
+                    if let Err(error) = warm.run(knobs) {
+                        aterm_log::debug!(
+                            "startup: the first-frame Metal warm failed ({error}); the first \
+                             window compiles its shaders itself"
+                        );
+                    }
+                },
+            );
+        } else if defer_gpu && let Some(warm) = aterm_gpu::begin_shader_cache_warm() {
+            // A headless renderer mints at its first pixel demand, which a measure's
+            // take begins at: compile now what it builds then (the rest a frame can
+            // bind too, where the launch warms its effect pipelines), so after a
+            // shader update a take that begins once this is done builds from the
+            // cache. Nothing waits on it, so it runs at utility, and it submits no GPU
+            // work (`ShaderCacheWarm::run`). No headless frame draws to an f16
+            // swapchain.
+            let rest = config
+                .warms_effect_pipelines()
+                .then(|| aterm_gpu::PresentKnobs {
+                    bloom: config.cursor_trail_bloom_or_default(),
+                    shimmer: config.cursor_fire_shimmer_or_default(),
+                    hdr_glow: false,
+                    sdr_glow: config.cursor_glow_sdr_boost_or_default() > 0.0,
+                });
+            let knobs = aterm_gpu::FirstFrameKnobs {
+                hdr_glow: false,
+                ..knobs
+            };
+            let _ = crate::qos::spawn_lane_thread(
+                "aterm-metal-cache-warm",
+                crate::qos::Role::Background,
+                move || {
+                    if let Err(error) = warm.run(knobs, rest) {
+                        aterm_log::debug!(
+                            "startup: the headless Metal warm failed ({error}); the first \
+                             pixel demand compiles its shaders itself"
+                        );
+                    }
+                },
+            );
+        }
     }
     #[cfg(windows)]
     if want_gpu
@@ -24889,6 +24990,8 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
         } else {
             |_| None
         },
+        #[cfg(unix)]
+        shell_children: crate::spawn::shell_children,
         card_probe: crate::holder_image::card_probe_requested(),
         spare: None,
         #[cfg(windows)]

@@ -330,6 +330,7 @@ pub fn cmd_disk_lane(args: &[String]) -> Res {
             env: world.env(),
             cwd: home.clone(),
             sandbox: None,
+            reroute: false,
         },
     )?;
     inst.await_socket(BOOT)?;

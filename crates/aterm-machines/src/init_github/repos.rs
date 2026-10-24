@@ -535,24 +535,78 @@ fn admit_endpoint(
     owner: &str,
     repo: &Repo,
     url: &str,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let expanded = text(
         sys,
         &git(user, None).args(["ls-remote", "--get-url", "--", url]),
         "cannot inspect Git's effective GitHub repository URL",
     )?;
     let mut lines = expanded.lines();
-    if lines
-        .next()
-        .is_none_or(|line| !origin_matches(line, owner, &repo.name))
-        || lines.next().is_some()
-    {
+    let effective = lines.next().unwrap_or_default();
+    if !origin_matches(effective, owner, &repo.name) || lines.next().is_some() {
         return Err(
             "Git's effective URL does not name the configured GitHub repository; no clone started"
                 .into(),
         );
     }
-    Ok(())
+    Ok(effective.to_owned())
+}
+
+struct CloneGuard<'a> {
+    account: &'a str,
+    current: &'a dyn Fn() -> Result<(), String>,
+}
+
+fn network_git(user: &User, endpoint: &str, guard: Option<&CloneGuard<'_>>) -> Cmd {
+    let cmd = git(user, None);
+    let Some(guard) = guard else { return cmd };
+    // Command-line config only. The exact effective URL outranks less-specific
+    // credential settings and clears every inherited helper for this request.
+    cmd.env("GIT_ASKPASS", "").args([
+        "-c".to_owned(),
+        format!("credential.{endpoint}.helper="),
+        "-c".to_owned(),
+        format!("credential.{endpoint}.helper=osxkeychain"),
+        "-c".to_owned(),
+        format!("credential.{endpoint}.username={}", guard.account),
+        "-c".to_owned(),
+        format!("credential.{endpoint}.useHttpPath=false"),
+    ])
+}
+
+fn clone_endpoint(
+    sys: &dyn System,
+    user: &User,
+    owner: &str,
+    repo: &Repo,
+    url: &str,
+    guard: Option<&CloneGuard<'_>>,
+) -> Result<String, String> {
+    let endpoint = admit_endpoint(sys, user, owner, repo, url)?;
+    if guard.is_some()
+        && !endpoint
+            .to_ascii_lowercase()
+            .starts_with("https://github.com/")
+    {
+        return Err("the selected vault's captured credential requires a GitHub HTTPS endpoint; no clone started".into());
+    }
+    Ok(endpoint)
+}
+
+pub(super) fn clone_one_guarded(
+    sys: &dyn System,
+    user: &User,
+    repo: &Repo,
+    account: &str,
+    current: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    clone_one_with(
+        sys,
+        user,
+        &repo.owner,
+        repo,
+        Some(&CloneGuard { account, current }),
+    )
 }
 
 pub(super) fn clone_one(
@@ -561,6 +615,18 @@ pub(super) fn clone_one(
     owner: &str,
     repo: &Repo,
 ) -> Result<(), String> {
+    clone_one_with(sys, user, owner, repo, None)
+}
+
+fn clone_one_with(
+    sys: &dyn System,
+    user: &User,
+    owner: &str,
+    repo: &Repo,
+    guard: Option<&CloneGuard<'_>>,
+) -> Result<(), String> {
+    let current = || guard.map_or(Ok(()), |guard| (guard.current)());
+    current()?;
     let home = Path::new(&user.home);
     let destination = home.join(&repo.name);
     match sys.stat(&destination) {
@@ -573,10 +639,11 @@ pub(super) fn clone_one(
         }
     }
     let url = format!("https://github.com/{owner}/{}.git", repo.name);
-    admit_endpoint(sys, user, owner, repo, &url)?;
+    let endpoint = clone_endpoint(sys, user, owner, repo, &url, guard)?;
+    current()?;
     let source = text(
         sys,
-        &git(user, None).args([
+        &network_git(user, &endpoint, guard).args([
             "ls-remote",
             "--symref",
             "--",
@@ -609,11 +676,12 @@ pub(super) fn clone_one(
     {
         return Err("the empty GitHub repository's default branch changed; run init again".into());
     }
-    admit_endpoint(sys, user, owner, repo, &url)?;
+    let endpoint = clone_endpoint(sys, user, owner, repo, &url, guard)?;
+    current()?;
     let mut staging = Scratch::new_in(sys, home, "github-clone")
         .map_err(|_| "cannot allocate private repository staging in this home")?;
     let clone = staging.path().join("repo");
-    let command = git(user, None)
+    let command = network_git(user, &endpoint, guard)
         .budget(CLONE_BUDGET)
         .args([
             "clone",
@@ -648,6 +716,7 @@ pub(super) fn clone_one(
         return Err("the new clone depends on an alternate object store; not published".into());
     }
     verify_new(sys, user, repo, &clone, &source)?;
+    current()?;
     sys.rename_noreplace(&clone, &destination).map_err(|_| {
         format!(
             "cannot publish ~/{} without replacing an existing destination; left untouched",
@@ -1430,6 +1499,15 @@ mod tests {
     }
 
     fn script_clone(sys: &Fake, who: &User, empty: bool) -> (Repo, PathBuf, String) {
+        script_clone_with(sys, who, empty, None)
+    }
+
+    fn script_clone_with(
+        sys: &Fake,
+        who: &User,
+        empty: bool,
+        guard: Option<&CloneGuard<'_>>,
+    ) -> (Repo, PathBuf, String) {
         let repo = Repo {
             owner: "alice".into(),
             name: "new".into(),
@@ -1449,7 +1527,7 @@ mod tests {
                 "ref: refs/heads/main\tHEAD\n{A}\tHEAD\n{A}\trefs/heads/main\n{B}\trefs/heads/topic\n{B}\trefs/tags/v1\n"
             )
         };
-        let command = git(who, None).args([
+        let command = network_git(who, url, guard).args([
             "ls-remote",
             "--symref",
             "--",
@@ -1460,7 +1538,7 @@ mod tests {
         ]);
         sys.on(&command.display(), Ran::ok(&remote));
         let staged = Fake::scratch_path(Some(Path::new(&who.home)), "github-clone", 0).join("repo");
-        let command = git(who, None)
+        let command = network_git(who, url, guard)
             .budget(CLONE_BUDGET)
             .args([
                 "clone",
@@ -1589,6 +1667,76 @@ mod tests {
             let (repo, _, _) = script_clone(&sys, &who, false);
             clone_one(&sys, &who, "alice", &repo).unwrap();
             assert!(sys.stat(&Path::new(&who.home).join("new")).unwrap().dir);
+        }
+    }
+
+    #[test]
+    fn guarded_clones_pin_the_snapshot_helper_and_refuse_newer_versions() {
+        for changed in [false, true] {
+            let (sys, who, _) = fixture();
+            let current = || {
+                if changed && sys.calls().iter().any(|call| call.contains(" clone ")) {
+                    Err("injected newer vault version".into())
+                } else {
+                    Ok(())
+                }
+            };
+            let guard = CloneGuard {
+                account: "captured-account",
+                current: &current,
+            };
+            let (repo, _staged, _) = script_clone_with(&sys, &who, false, Some(&guard));
+            let result = clone_one_guarded(&sys, &who, &repo, guard.account, &current);
+            assert_eq!(result.is_ok(), !changed, "{result:?}");
+            let final_path = Path::new(&who.home).join("new");
+            assert_eq!(sys.stat(&final_path).is_ok(), !changed);
+            let calls = sys.calls();
+            let network: Vec<_> = calls
+                .iter()
+                .filter(|call| call.contains("ls-remote --symref") || call.contains(" clone "))
+                .collect();
+            assert_eq!(network.len(), 2, "{calls:?}");
+            assert!(
+                network
+                    .iter()
+                    .all(|call| call.contains(".helper=osxkeychain")
+                        && call.contains(".username=captured-account")
+                        && call.contains(".useHttpPath=false"))
+            );
+            assert!(calls.iter().all(|call| !call.contains("--global")));
+            assert_eq!(
+                calls
+                    .iter()
+                    .any(|call| call.starts_with("rename-noreplace ")),
+                !changed
+            );
+        }
+    }
+
+    #[test]
+    fn guarded_clones_refuse_ssh_rewrites_before_network_work() {
+        for endpoint in [
+            "git@github.com:alice/new.git",
+            "ssh://git@github.com/alice/new.git",
+        ] {
+            let (sys, who, _) = fixture();
+            let repo = Repo {
+                owner: "alice".into(),
+                name: "new".into(),
+                default_branch: Some("main".into()),
+            };
+            let url = "https://github.com/alice/new.git";
+            sys.on(
+                &git(&who, None)
+                    .args(["ls-remote", "--get-url", "--", url])
+                    .display(),
+                Ran::ok(endpoint),
+            );
+            let why = clone_one_guarded(&sys, &who, &repo, "alice", &|| Ok(())).unwrap_err();
+            assert!(why.contains("HTTPS"), "{why}");
+            assert!(sys.calls().iter().all(|call| !call.contains("--symref")
+                && !call.contains(" clone ")
+                && !call.contains("scratch")));
         }
     }
 

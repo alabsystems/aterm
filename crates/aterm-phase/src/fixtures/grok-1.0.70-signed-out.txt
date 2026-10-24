@@ -1,0 +1,33 @@
+# grok 1.0.70 · MEASURED 2026-10-23, `aterm ctl text` of a private headless aterm 110x32 (aterm 0.129.0, this branch's debug build), scratch HOME/XDG/ATERM_STATE_HOME dirs, harness off, the atpkg-managed grok (Developer ID 5Y6N3AJ54S) launched with a scratch GROK_HOME and no auth.json · signed out: its device sign-in screen drawn instead of any composer (the logo, `Approve in your browser to finish signing in.`, the device code — replaced here by a fabricated one —, `Waiting for approval...`, `ctrl+q  quit`)
+
+  ~/proj
+
+
+                                                ⠀⠀⠀⠀⠀⠀⣀⣀⡀⠀⠀⠀⢀⠄
+                                                ⠀⠀⠀⣠⣾⠿⠛⠛⠛⠛⢀⡴⠁⠀
+                                                ⠀⠀⣼⡟⠁⠀⠀⠀⢀⡴⠻⣿⡀⠀
+                                                ⠀⠀⣿⡇⠀⠀⠀⠔⠁⠀⠀⣿⡇⠀
+                                                ⠀⠀⢹⣷⠀⠀⠀⠀⠀⢀⣴⡿⠀⠀
+                                                ⠀⢀⠞⠁⠠⢶⣶⣶⣶⠿⠋⠀⠀⠀
+                                                ⠐⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+
+
+                                 Approve in your browser to finish signing in.
+
+                                                   WMRT-8KQZ
+
+                                    Make sure your browser shows this code.
+
+                                    If it doesn't open, click here to copy.
+
+
+
+                               Copying not working? Click here to show full URL.
+
+                                            Waiting for approval...
+
+
+                                                 ctrl+q  quit
+
+
+

@@ -12,7 +12,7 @@ use crate::phase::{
 use crate::prompt::{CancelEffect, PromptKind, PromptV2, parse_prompt_v2};
 use crate::turn::{continuation_suggestion, goal_active, interrupted, said_tail};
 use crate::wall::{Wall, memory_wall, wall};
-use crate::{agy, gemini, muse};
+use crate::{agy, gemini, grok, kimi, muse};
 
 /// Program identified for a terminal screen. Every variant is in [`Program::ALL`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -25,6 +25,10 @@ pub enum Program {
     Muse,
     /// Google's Gemini CLI.
     Gemini,
+    /// xAI's Grok Build.
+    Grok,
+    /// Moonshot AI's Kimi Code.
+    Kimi,
     /// Anything else, or nothing named.
     Generic,
 }
@@ -39,7 +43,9 @@ const fn next_program(p: Program) -> Option<Program> {
         Program::Codex => Some(Program::Agy),
         Program::Agy => Some(Program::Muse),
         Program::Muse => Some(Program::Gemini),
-        Program::Gemini => Some(Program::Generic),
+        Program::Gemini => Some(Program::Grok),
+        Program::Grok => Some(Program::Kimi),
+        Program::Kimi => Some(Program::Generic),
         Program::Generic => None,
     }
 }
@@ -59,12 +65,14 @@ impl Program {
     /// Every program, in declaration order: what must cover each one (the
     /// panic sweeps, the host's admission, a settings row per supervisable
     /// agent) iterates this, never a list of its own.
-    pub const ALL: [Program; 6] = [
+    pub const ALL: [Program; 8] = [
         Program::Claude,
         Program::Codex,
         Program::Agy,
         Program::Muse,
         Program::Gemini,
+        Program::Grok,
+        Program::Kimi,
         Program::Generic,
     ];
 
@@ -78,6 +86,8 @@ impl Program {
             Program::Agy => "agy",
             Program::Muse => "muse",
             Program::Gemini => "gemini",
+            Program::Grok => "grok",
+            Program::Kimi => "kimi",
             Program::Generic => "generic",
         }
     }
@@ -92,17 +102,21 @@ impl Program {
             Program::Agy => "Antigravity CLI",
             Program::Muse => "Muse Code",
             Program::Gemini => "Gemini CLI",
+            Program::Grok => "Grok Build",
+            Program::Kimi => "Kimi Code",
             Program::Generic => "the program",
         }
     }
 
-    /// Whether the supervisor's screen policy acts on this program.
+    /// Whether the supervisor's screen policy acts on this program. Grok Build's and Kimi
+    /// Code's readers read no busy turn yet ([`crate::grok`], [`crate::kimi`]), so no policy acts
+    /// on them.
     #[inline]
     #[must_use]
     pub const fn supervisable(self) -> bool {
         match self {
             Program::Claude | Program::Agy | Program::Muse | Program::Gemini => true,
-            Program::Codex | Program::Generic => false,
+            Program::Codex | Program::Grok | Program::Kimi | Program::Generic => false,
         }
     }
 
@@ -114,7 +128,7 @@ impl Program {
             Program::Claude | Program::Codex | Program::Agy | Program::Muse | Program::Gemini => {
                 true
             }
-            Program::Generic => false,
+            Program::Grok | Program::Kimi | Program::Generic => false,
         }
     }
 
@@ -128,6 +142,8 @@ impl Program {
             Program::Agy => Some(crate::CliHarness::Agy),
             Program::Muse => Some(crate::CliHarness::Muse),
             Program::Gemini => Some(crate::CliHarness::Gemini),
+            Program::Grok => Some(crate::CliHarness::Grok),
+            Program::Kimi => Some(crate::CliHarness::Kimi),
             Program::Generic => None,
         }
     }
@@ -162,6 +178,8 @@ impl Program {
             Program::Agy => &AgyReader,
             Program::Muse => &MuseReader,
             Program::Gemini => &GeminiReader,
+            Program::Grok => &GrokReader,
+            Program::Kimi => &KimiReader,
             Program::Generic => &GenericReader,
         }
     }
@@ -902,6 +920,53 @@ impl ScreenReader for GeminiReader {
     }
 }
 
+/// Screen reader for Grok Build ([`crate::grok`]): its walls, and no phase as evidence.
+#[derive(Debug, Clone, Copy)]
+pub struct GrokReader;
+
+impl ScreenReader for GrokReader {
+    fn program(&self) -> Program {
+        Program::Grok
+    }
+    /// No evidence: its busy row and idle composer are unmeasured, so every reading is `idle`
+    /// NOT authoritatively (the trait's default [`ScreenReader::phase_authoritative`]).
+    fn phase(&self, _rows: &[String]) -> Phase {
+        Phase::Idle
+    }
+    fn wall(&self, rows: &[String]) -> Option<Wall> {
+        grok::wall(rows)
+    }
+}
+
+/// Screen reader for Kimi Code ([`crate::kimi`]): its composer and walls, and no phase as evidence.
+#[derive(Debug, Clone, Copy)]
+pub struct KimiReader;
+
+impl ScreenReader for KimiReader {
+    fn program(&self) -> Program {
+        Program::Kimi
+    }
+    /// No evidence: a busy turn is unmeasured, so every reading is `idle` NOT authoritatively
+    /// (the trait's default [`ScreenReader::phase_authoritative`]).
+    fn phase(&self, _rows: &[String]) -> Phase {
+        Phase::Idle
+    }
+    fn wall(&self, rows: &[String]) -> Option<Wall> {
+        kimi::wall(rows)
+    }
+    fn composer(&self, rows: &[String]) -> Option<(usize, Vec<String>)> {
+        kimi::composer(rows)
+    }
+    /// What its footer's `context: N%` leaves: the share it says is used, from 100.
+    fn context_shown(&self, rows: &[String]) -> Option<u8> {
+        let (_, _, bottom) = kimi::composer_rows(rows)?;
+        let used = rows[bottom + 1..]
+            .iter()
+            .find_map(|r| kimi::context_row(r))?;
+        Some(100u8.saturating_sub(used.min(100)))
+    }
+}
+
 /// Fallback reader for unknown or non-agent programs (always `idle`, non-authoritative).
 #[derive(Debug, Clone, Copy)]
 pub struct GenericReader;
@@ -942,6 +1007,10 @@ pub fn identify(program: Option<&str>, rows: &[String]) -> &'static dyn ScreenRe
         &AgyReader
     } else if gemini::is_gemini_screen(rows) {
         &GeminiReader
+    } else if kimi::is_kimi_screen(rows) {
+        &KimiReader
+    } else if grok::is_grok_screen(rows) {
+        &GrokReader
     } else if has_composer_frame(rows)
         || parse_prompt_v2(rows).is_some_and(names_claude)
         || names_login(rows)
@@ -1039,6 +1108,10 @@ pub fn program_of(program: &str) -> Option<Program> {
         Some(Program::Muse)
     } else if is("gemini") {
         Some(Program::Gemini)
+    } else if is("grok") {
+        Some(Program::Grok)
+    } else if is("kimi") || is("kimi-code") {
+        Some(Program::Kimi)
     } else {
         None
     }
@@ -1411,18 +1484,20 @@ mod tests {
     /// THE SNIFF'S ORDER, PROVED OVER EVERY CAPTURE: read with no program
     /// name, no capture of one agent is ever named another's — Claude Code's
     /// (its own named `claude-…`, and the unprefixed and hand-built ones),
-    /// agy's, Muse Code's and Gemini CLI's each read as their own program or
-    /// as none, and each is named at least once; Codex never is (the screen
+    /// agy's, Muse Code's, Gemini CLI's, Grok Build's and Kimi Code's each read as their
+    /// own program or as none, and each is named at least once; Codex never is (the screen
     /// names no Codex).
     #[test]
     fn every_capture_is_identified_as_its_own_program_or_as_none() {
-        let mut named = [0usize; 6];
+        let mut named = [0usize; Program::ALL.len()];
         for (name, text) in crate::text::fixture_files() {
             let rows = screen(&text);
             let want = match name.split('-').next() {
                 Some("agy") => Program::Agy,
                 Some("muse") => Program::Muse,
                 Some("gemini") => Program::Gemini,
+                Some("grok") => Program::Grok,
+                Some("kimi") => Program::Kimi,
                 _ => Program::Claude,
             };
             let got = identify(None, &rows).program();
@@ -1437,6 +1512,8 @@ mod tests {
             Program::Agy,
             Program::Muse,
             Program::Gemini,
+            Program::Grok,
+            Program::Kimi,
         ] {
             assert!(
                 named[agent as usize] > 0,
@@ -2407,9 +2484,15 @@ mod tests {
         assert_eq!(crate::muse::HARNESS_VERSION, "0.1");
         assert_eq!(crate::gemini::HARNESS_VERSION, "0.1");
         for prog in Program::ALL {
+            // Every named program's harness has a version; a `[harness.<agent>]` table only
+            // where its supervision has keys (Grok Build's and Kimi Code's has none yet).
             assert_eq!(
                 prog.harness_version().is_some(),
-                prog.harness_table(),
+                prog != Program::Generic,
+                "{prog:?}"
+            );
+            assert!(
+                !prog.harness_table() || prog.harness_version().is_some(),
                 "{prog:?}"
             );
             assert_eq!(

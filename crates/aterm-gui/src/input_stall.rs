@@ -113,8 +113,11 @@ pub(crate) fn gate(
     }
     let interrupt =
         written_bytes(verb, args, KeyboardMode::default()).as_deref() == Some(b"\x03".as_slice());
+    // The watch lets a program macOS holds go at its probe, so a publication names one it saw started.
     let liveness = if published.is_some() {
-        Liveness::Published
+        Liveness::Published {
+            program_check: false,
+        }
     } else {
         Liveness::Unobserved
     };
@@ -484,6 +487,24 @@ pub(crate) struct Activity {
     pub(crate) restarts: u64,
     pub(crate) read_since_discard: bool,
     pub(crate) contention: Contention,
+    /// macOS's program check holds the foreground leader before its first instruction ([`held_leader`]).
+    pub(crate) program_check: bool,
+}
+
+/// Whether the foreground `leader` is held at macOS's program check, asked of `held` only for a raw
+/// queue with unread bytes whose job is not stopped: the one state a stall is entered from or stands
+/// in, where a held leader, which never spins, would read as a program asleep.
+pub(crate) fn held_leader(
+    backlog: Option<&InputBacklog>,
+    stopped: bool,
+    leader: Option<i32>,
+    held: impl FnOnce(u32) -> bool,
+) -> bool {
+    backlog.is_some_and(|b| b.unread() > 0 && !b.canonical)
+        && !stopped
+        && leader
+            .and_then(|pid| u32::try_from(pid).ok())
+            .is_some_and(held)
 }
 
 /// How contended this machine's CPUs are now.
@@ -663,7 +684,13 @@ impl InputWatches {
             .filter(|fact| {
                 fact.restart.dropped(activity.discards)
                     && !matches!(
-                        input_backlog::classify(backlog, stopped, Liveness::Published),
+                        input_backlog::classify(
+                            backlog,
+                            stopped,
+                            Liveness::Published {
+                                program_check: activity.program_check
+                            }
+                        ),
                         InputWord::Stopped | InputWord::Unmeasured
                     )
             })
@@ -689,11 +716,14 @@ impl InputWatches {
             was = None;
         }
         let liveness = if was.is_some() {
-            Liveness::Published
+            Liveness::Published {
+                program_check: activity.program_check,
+            }
         } else {
             Liveness::Watched {
                 drew: activity.last_output.is_some_and(|at| at > since),
                 spinning,
+                program_check: activity.program_check,
                 contention: activity.contention,
             }
         };
@@ -865,8 +895,15 @@ pub(crate) fn probe(
     let restarts = sink.restart_discards();
     let discards = sink.discards();
     let looks = (unread || published) && !stopped;
+    let cpu = looks.then(|| fg_cpu(master)).flatten();
     let activity = Activity {
-        cpu: looks.then(|| fg_cpu(master)).flatten(),
+        cpu,
+        program_check: held_leader(
+            backlog.as_ref(),
+            stopped,
+            cpu.map(|(pid, _)| pid),
+            crate::program_check_watch::held_now,
+        ),
         last_output,
         discards,
         restarts,
@@ -916,8 +953,11 @@ pub(crate) fn status_input(
         let _ = sink.wake_input_hook();
     }
     let stopped = backlog.is_some_and(|b| b.unread() > 0) && fg_stopped(sink.master());
+    // The watch lets a program macOS holds go at its probe, so a publication names one it saw started.
     let liveness = if published.is_some() {
-        Liveness::Published
+        Liveness::Published {
+            program_check: false,
+        }
     } else {
         Liveness::Unobserved
     };
@@ -1731,6 +1771,7 @@ pub(crate) mod tests {
             restarts: 0,
             read_since_discard: false,
             contention: Contention::default(),
+            program_check: false,
         }
     }
 
@@ -2134,6 +2175,7 @@ pub(crate) mod tests {
             restarts: discards,
             read_since_discard: read,
             contention: Contention::default(),
+            program_check: false,
         };
         let quiet = input_backlog::QUIET_STALL_AFTER.as_secs();
         let mut w = InputWatches::default();
@@ -2213,6 +2255,7 @@ pub(crate) mod tests {
             restarts: 0,
             read_since_discard: false,
             contention: Contention::default(),
+            program_check: false,
         };
         let probe = |first: Activity, second: Activity, wait_s: u64| {
             let mut w = InputWatches::default();
@@ -2246,6 +2289,161 @@ pub(crate) mod tests {
 
         let (t, _, _) = probe(spin(Duration::ZERO), spin(Duration::from_secs(12)), 12);
         assert!(matches!(t, Transition::Entered(_)), "{t:?}");
+    }
+
+    #[test]
+    fn a_held_foreground_leader_keeps_its_input_pending() {
+        let t0 = Instant::now();
+        let t1 = t0 + RECHECK;
+        let quiet = input_backlog::QUIET_STALL_AFTER.as_secs() + 100;
+        let held = |program_check| Activity {
+            program_check,
+            ..spin(Duration::ZERO)
+        };
+        let mut w = InputWatches::default();
+        let (t, next) = w.step(
+            1,
+            Some(&reading(1, quiet, 0)),
+            false,
+            held(true),
+            || None,
+            t0,
+        );
+        assert_eq!(
+            (t, next),
+            (Transition::None, Some(t0 + RECHECK)),
+            "held at its start: no stall, and still watched"
+        );
+        assert!(w.published(1).is_none());
+        let (t, _) = w.step(
+            1,
+            Some(&reading(1, quiet, 0)),
+            false,
+            held(false),
+            || None,
+            t1,
+        );
+        let Transition::Entered(fact) = t else {
+            panic!("the same program not held: entered: {t:?}")
+        };
+        assert_eq!(fact.word, InputWord::Stalled);
+    }
+
+    #[test]
+    fn a_published_stall_lets_go_while_macos_holds_its_leader() {
+        let t0 = Instant::now();
+        let held = Activity {
+            program_check: true,
+            ..spin(Duration::ZERO)
+        };
+        let mut w = InputWatches::default();
+        let (t, _) = w.step(
+            1,
+            Some(&reading(1, 0, 0)),
+            true,
+            Activity::default(),
+            || None,
+            t0,
+        );
+        assert!(matches!(t, Transition::Entered(_)), "stopped: {t:?}");
+        let t1 = t0 + Duration::from_secs(11);
+        let (t, next) = w.step(1, Some(&reading(1, 11, 0)), false, held, || None, t1);
+        assert_eq!(
+            (t, next),
+            (Transition::Left, Some(t1 + RECHECK)),
+            "continued into a program macOS holds: let go, and still watched"
+        );
+        assert!(w.published(1).is_none());
+
+        let quiet = input_backlog::QUIET_STALL_AFTER.as_secs() + 100;
+        let mut w = InputWatches::default();
+        let (t, _) = w.step(
+            1,
+            Some(&reading(1, quiet, 0)),
+            false,
+            spin(Duration::ZERO),
+            || None,
+            t0,
+        );
+        assert!(matches!(t, Transition::Entered(_)), "stalled: {t:?}");
+        let (t, _) = w.step(1, Some(&reading(1, quiet, 0)), false, held, || None, t1);
+        assert_eq!(
+            t,
+            Transition::Left,
+            "a stalled program that execs one macOS holds: let go"
+        );
+        assert!(w.published(1).is_none());
+    }
+
+    #[test]
+    fn the_probe_asks_the_program_check_only_of_a_raw_unread_queue() {
+        let raw = backlog(1, Duration::from_secs(400), false);
+        let ask = |b: Option<&InputBacklog>, stopped, leader, answer| {
+            let mut asked = Vec::new();
+            let held = held_leader(b, stopped, leader, |pid| {
+                asked.push(pid);
+                answer
+            });
+            (held, asked)
+        };
+        for (b, stopped, leader, why) in [
+            (None, false, Some(4242), "no reading"),
+            (
+                Some(backlog(0, Duration::ZERO, false)),
+                false,
+                Some(4242),
+                "nothing unread",
+            ),
+            (
+                Some(backlog(3, Duration::from_secs(400), true)),
+                false,
+                Some(4242),
+                "canonical type-ahead",
+            ),
+            (Some(raw), true, Some(4242), "a stopped job"),
+            (Some(raw), false, None, "no leader read"),
+        ] {
+            assert_eq!(
+                ask(b.as_ref(), stopped, leader, true),
+                (false, Vec::new()),
+                "{why}: nothing asked"
+            );
+        }
+        assert_eq!(ask(Some(&raw), false, Some(4242), true), (true, vec![4242]));
+        assert_eq!(
+            ask(Some(&raw), false, Some(4242), false),
+            (false, vec![4242])
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn the_probe_asks_the_program_check_of_the_foreground_leader() {
+        let (master, slave, job, leader) = spinning_job();
+        let sink = SinkWriter::new(master);
+        sink.note_master_nonblocking(true);
+        sink.write_frame_nonparking(b"\r").expect("the Enter");
+        let (backlog, stopped, activity) = probe(&sink, false, None);
+        assert!(
+            backlog.is_some_and(|b| b.unread() == 1 && !b.canonical),
+            "{backlog:?}"
+        );
+        assert!(!stopped);
+        assert_eq!(activity.cpu.map(|(pid, _)| pid), Some(leader));
+        assert!(
+            !activity.program_check,
+            "a running leader is past its start"
+        );
+        {
+            let _held =
+                crate::program_check_watch::HeldStandIn::of(u32::try_from(leader).expect("pid"));
+            let (_, _, activity) = probe(&sink, false, None);
+            assert!(activity.program_check, "the leader stood in as held");
+        }
+        drop(job);
+        for fd in [master, slave] {
+            aterm_pty::close_fd(fd);
+        }
     }
 
     #[test]
@@ -3398,6 +3596,7 @@ pub(crate) mod tests {
                 discards: sink.discards(),
                 read_since_discard: sink.read_since_discard(),
                 contention: Contention::default(),
+                program_check: false,
             };
             let inputs = &mut app.session_status.inputs;
             let _ = inputs.step(
@@ -3539,6 +3738,7 @@ pub(crate) mod tests {
             discards: sink.discards(),
             read_since_discard: false,
             contention: Contention::default(),
+            program_check: false,
         };
         let inputs = &mut app.session_status.inputs;
         let _ = inputs.step(

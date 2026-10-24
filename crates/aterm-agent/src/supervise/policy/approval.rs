@@ -723,7 +723,13 @@ fn keeps_reset(opt: &Opt) -> bool {
 const fn draws_claude_boxes(program: Program) -> bool {
     match program {
         Program::Claude => true,
-        Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => false,
+        Program::Codex
+        | Program::Grok
+        | Program::Kimi
+        | Program::Agy
+        | Program::Muse
+        | Program::Gemini
+        | Program::Generic => false,
     }
 }
 
@@ -732,7 +738,13 @@ const fn draws_claude_boxes(program: Program) -> bool {
 pub const fn keeps_trying_its_limit(program: Program) -> bool {
     match program {
         Program::Gemini => true,
-        Program::Claude | Program::Codex | Program::Agy | Program::Muse | Program::Generic => false,
+        Program::Claude
+        | Program::Codex
+        | Program::Grok
+        | Program::Kimi
+        | Program::Agy
+        | Program::Muse
+        | Program::Generic => false,
     }
 }
 
@@ -742,9 +754,13 @@ const fn foreign_limit(program: Program) -> &'static str {
             "Gemini CLI's usage limit: neither Keep trying nor Stop is pressed; /stats model in \
              this tab says which limit holds it"
         }
-        Program::Claude | Program::Codex | Program::Agy | Program::Muse | Program::Generic => {
-            "no usage-limit dialog the reader vouches for"
-        }
+        Program::Claude
+        | Program::Codex
+        | Program::Grok
+        | Program::Kimi
+        | Program::Agy
+        | Program::Muse
+        | Program::Generic => "no usage-limit dialog the reader vouches for",
     }
 }
 
@@ -2577,7 +2593,13 @@ fn gemini_worker_trust(program: Program, p: &PromptV2, ctx: &ApprovalCtx) -> Opt
 const fn relaunches_at_trust(program: Program) -> bool {
     match program {
         Program::Gemini => true,
-        Program::Claude | Program::Codex | Program::Agy | Program::Muse | Program::Generic => false,
+        Program::Claude
+        | Program::Codex
+        | Program::Grok
+        | Program::Kimi
+        | Program::Agy
+        | Program::Muse
+        | Program::Generic => false,
     }
 }
 
@@ -2747,7 +2769,12 @@ fn unmeasured_box(program: Program, p: &PromptV2) -> Option<String> {
             )),
             _ => None,
         },
-        Program::Claude | Program::Codex | Program::Agy | Program::Generic => None,
+        Program::Claude
+        | Program::Codex
+        | Program::Grok
+        | Program::Kimi
+        | Program::Agy
+        | Program::Generic => None,
     }
 }
 

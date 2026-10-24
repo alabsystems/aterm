@@ -274,6 +274,15 @@ pub enum Subject {
 }
 
 impl Subject {
+    /// This reading describes the selected vault or credentials it supplied.
+    #[must_use]
+    pub const fn uses_vault_source(self) -> bool {
+        matches!(
+            self,
+            Self::Setting(Setting::Secrets | Setting::Repositories)
+        )
+    }
+
     /// The page group the row sits in.
     #[must_use]
     pub const fn group(self) -> Group {

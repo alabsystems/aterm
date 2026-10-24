@@ -835,11 +835,15 @@ struct ChromeFonts {
 struct MeasureMemo {
     widths: aterm_hash::FxHashMap<(u16, u32), HeldMeasures<f32>>,
     wraps: aterm_hash::FxHashMap<(u32, u32), HeldMeasures<WrapLines>>,
-    lines: aterm_hash::FxHashMap<(LinesRule, u16, u32, u32), HeldMeasures<Vec<String>>>,
+    lines: aterm_hash::FxHashMap<(LinesRule, u16, u32, u32), HeldMeasures<KeptLines>>,
     entries: usize,
 }
 
 type WrapLines = (Vec<std::ops::Range<usize>>, usize);
+
+/// Lines [`kept_lines`] keeps, with each char of their text the UI face has no glyph for and the
+/// advance it measured at ([`ui_misses`]): the lines stand while every one still measures so.
+type KeptLines = (Vec<String>, Box<[(char, u32)]>);
 
 type HeldMeasures<T> = (Arc<ChromeFont>, aterm_hash::KeyedHashMap<Box<str>, T>);
 
@@ -908,14 +912,19 @@ impl MeasureMemo {
         }
     }
 
-    fn lines(&self, at: LinesAt, font: &Arc<ChromeFont>, text: &str) -> Option<Vec<String>> {
+    fn lines(&self, at: LinesAt, font: &Arc<ChromeFont>, text: &str) -> Option<&KeptLines> {
         let (held, kept) = self.lines.get(&at)?;
-        Arc::ptr_eq(held, font)
-            .then(|| kept.get(text).cloned())
-            .flatten()
+        Arc::ptr_eq(held, font).then(|| kept.get(text)).flatten()
     }
 
-    fn keep_lines(&mut self, at: LinesAt, font: &Arc<ChromeFont>, text: &str, lines: &[String]) {
+    fn keep_lines(
+        &mut self,
+        at: LinesAt,
+        font: &Arc<ChromeFont>,
+        text: &str,
+        lines: &[String],
+        misses: Box<[(char, u32)]>,
+    ) {
         self.make_room();
         let (held, kept) = self
             .lines
@@ -926,7 +935,7 @@ impl MeasureMemo {
             self.entries = self.entries.saturating_sub(kept.len());
             kept.clear();
         }
-        if kept.insert(text.into(), lines.to_vec()).is_none() {
+        if kept.insert(text.into(), (lines.to_vec(), misses)).is_none() {
             self.entries += 1;
         }
     }
@@ -949,7 +958,7 @@ pub(crate) enum LinesRule {
 
 type LinesAt = (LinesRule, u16, u32, u32);
 
-/// THE LINES `rule` LAYS `text` ON in `face` at `px` in a box `width` wide, as [`MeasureMemo`] keeps a measure: what `lay_out` lays out — which must measure only in `face` at `px` — kept only where the face maps every char of `text`, so the lines depend on that font, `px` and `width` alone.
+/// THE LINES `rule` LAYS `text` ON in `face` at `px` in a box `width` wide, as [`MeasureMemo`] keeps a measure: what `lay_out` lays out — which must measure only in `face` at `px` — kept with the advance of each char of `text` the face has no glyph for ([`ui_misses`]), so the lines depend on that font, those advances, `px` and `width` alone, and are laid out again once one measures otherwise. Text with an East Asian char the face lacks is never kept.
 pub(crate) fn kept_lines(
     rule: LinesRule,
     face: TextFace,
@@ -960,21 +969,57 @@ pub(crate) fn kept_lines(
 ) -> Vec<String> {
     let at = (rule, face_code(face), px.to_bits(), width.to_bits());
     let font = {
-        let fonts = lock_fonts();
-        let Some(font) = fonts.ui_font(face) else {
+        let mut fonts = lock_fonts();
+        let Some(font) = fonts.ui_font(face).cloned() else {
             drop(fonts);
             return lay_out();
         };
-        if let Some(lines) = fonts.measures.lines(at, font, text) {
-            return lines;
+        match fonts.measures.lines(at, &font, text) {
+            Some((lines, misses)) if misses.is_empty() => return lines.clone(),
+            Some((lines, misses)) => {
+                let (lines, misses) = (lines.clone(), misses.clone());
+                if misses.iter().all(|&(character, advance)| {
+                    fonts.ui_miss_advance(face, character, px).to_bits() == advance
+                }) {
+                    return lines;
+                }
+            }
+            None => {}
         }
-        Arc::clone(font)
+        font
     };
     let lines = lay_out();
-    if text.chars().all(|character| font.maps(character)) {
-        lock_fonts().measures.keep_lines(at, &font, text, &lines);
+    let mut fonts = lock_fonts();
+    if let Some(misses) = ui_misses(&mut fonts, &font, face, text, px) {
+        fonts.measures.keep_lines(at, &font, text, &lines, misses);
     }
     lines
+}
+
+/// The chars of `text` `font` has no glyph for, each with the advance a UI run in `face` gives it
+/// at `px` ([`ChromeFonts::ui_miss_advance`]); `None` where one is East Asian, whose face a run
+/// picks by its weight, so a layout measuring in more than `face` could charge it otherwise.
+fn ui_misses(
+    fonts: &mut ChromeFonts,
+    font: &ChromeFont,
+    face: TextFace,
+    text: &str,
+    px: f32,
+) -> Option<Box<[(char, u32)]>> {
+    let mut misses: Vec<(char, u32)> = Vec::new();
+    for character in text.chars() {
+        if font.maps(character) || misses.iter().any(|(miss, _)| *miss == character) {
+            continue;
+        }
+        if ui_cjk_script(character).is_some() {
+            return None;
+        }
+        misses.push((
+            character,
+            fonts.ui_miss_advance(face, character, px).to_bits(),
+        ));
+    }
+    Some(misses.into_boxed_slice())
 }
 
 #[cfg(test)]
@@ -1680,6 +1725,16 @@ impl ChromeFonts {
             return self.ui_cjk_held[rung.slot()][entry].as_mut();
         }
         self.face_for(weight, ch)
+    }
+
+    /// The advance a UI run in `face` gives `ch`, which the UI face has no glyph for, at `px`: its
+    /// [`Self::ui_miss_face`]'s, else a synthesized mark's, else 0.6 em.
+    fn ui_miss_advance(&mut self, face: TextFace, ch: char, px: f32) -> f32 {
+        self.ui_miss_face(face, TextWeight::Regular, ch)
+            .map_or_else(
+                || synthesized::advance(ch, px).unwrap_or(px * 0.6),
+                |cface| cface.font.char_metrics(ch, px).advance_width,
+            )
     }
 
     fn label_misses(&mut self, face: TextFace, s: &str) -> Vec<char> {
@@ -2551,15 +2606,7 @@ fn ui_text_wrap_walk(
                 f.char_metrics(character, px).advance_width + UI_TRACKING_EM * px,
                 true,
             ),
-            Some(_) => (
-                fonts
-                    .ui_miss_face(TextFace::Ui, TextWeight::Regular, character)
-                    .map_or_else(
-                        || synthesized::advance(character, px).unwrap_or(px * 0.6),
-                        |cface| cface.font.char_metrics(character, px).advance_width,
-                    ),
-                false,
-            ),
+            Some(_) => (fonts.ui_miss_advance(TextFace::Ui, character, px), false),
         };
         match ascii_slot(character) {
             Some(slot) => ascii[slot] = Some((advance, ui_covers)),
@@ -2820,12 +2867,7 @@ impl UiPen {
         }
         self.prev = None;
         self.whole = false;
-        let advance = fonts
-            .ui_miss_face(face, TextWeight::Regular, ch)
-            .map_or_else(
-                || synthesized::advance(ch, px).unwrap_or(px * 0.6),
-                |cface| cface.font.char_metrics(ch, px).advance_width,
-            );
+        let advance = fonts.ui_miss_advance(face, ch, px);
         self.w += advance;
         fits(advance, 0.0)
     }
@@ -4968,6 +5010,55 @@ mod tests {
         let _ = ui_text_width_for(TextFace::Ui, word, px);
         assert_eq!(measure_walks(), walks + 1, "a new font measures afresh");
         lock_fonts().ui_regular = held;
+    }
+
+    #[test]
+    fn lines_with_a_char_the_ui_face_lacks_are_kept_while_it_measures_the_same() {
+        prepare_ui_fonts_for_direct_view_test();
+        let font = ui_font_of(TextFace::Ui).expect("a UI face to measure in");
+        let (px, width) = (13.0, 120.0);
+        let laid = std::cell::Cell::new(0);
+        let lay = |text: &str| {
+            kept_lines(LinesRule::Copy, TextFace::Ui, text, px, width, || {
+                laid.set(laid.get() + 1);
+                vec![text.to_string()]
+            })
+        };
+        let path = "Open System Settings \u{25b8} Privacy & Security to grant it.";
+        assert!(
+            !font.maps('\u{25b8}'),
+            "premise: the UI face lacks the mark"
+        );
+        lay(path);
+        lay(path);
+        assert_eq!(laid.get(), 1, "kept");
+        for (_, kept) in lock_fonts().measures.lines.values_mut() {
+            for (_, misses) in kept.values_mut() {
+                for (_, advance) in misses.iter_mut() {
+                    *advance ^= 1;
+                }
+            }
+        }
+        lay(path);
+        assert_eq!(
+            laid.get(),
+            2,
+            "the mark measures otherwise now, so laid out again"
+        );
+        lay(path);
+        assert_eq!(laid.get(), 2, "and kept at what it measures now");
+        let east_asian = "\u{8a2d}\u{5b9a} \u{25b8} Settings";
+        assert!(
+            !font.maps('\u{8a2d}'),
+            "premise: the UI face lacks the ideograph"
+        );
+        lay(east_asian);
+        lay(east_asian);
+        assert_eq!(
+            laid.get(),
+            4,
+            "an East Asian char the face lacks is never kept"
+        );
     }
 
     #[test]

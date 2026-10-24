@@ -76,6 +76,8 @@ pub struct Run {
     pub clock: String,
     /// `1` when the lab's instance opens a window (`forever --window`, [`crate::lab::windowed`]).
     pub window: String,
+    /// `1` when `up` laid the jail's reroute prefix (`LAB_REROUTE=1`) and the instance reroutes.
+    pub reroute: String,
 }
 
 impl Run {
@@ -133,6 +135,7 @@ impl Run {
             ("INSTANCE_ENV", self.instance_env.clone()),
             ("CLOCK", self.clock.clone()),
             ("WINDOW", self.window.clone()),
+            ("REROUTE", self.reroute.clone()),
         ]
     }
 
@@ -188,6 +191,7 @@ impl Run {
                 "INSTANCE_ENV" => r.instance_env = v,
                 "CLOCK" => r.clock = v,
                 "WINDOW" => r.window = v,
+                "REROUTE" => r.reroute = v,
                 _ => {}
             }
         }
@@ -371,6 +375,7 @@ mod tests {
             instance_env: "TMPDIR=/tmp ATERM_DEBUG_PASTE_FILE=/s/runs/t1/paste.txt".into(),
             clock: "1".into(),
             window: "1".into(),
+            reroute: "1".into(),
         };
         assert_eq!(Run::parse(&r.render()), r);
         assert_eq!(r.fixture_prefix(), "codex-0.163.0");

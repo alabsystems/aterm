@@ -380,16 +380,24 @@ pub(crate) fn paint_dark_masked_disc(
     let tile_w = tile.width();
     let mask_px = eye_mask.pixels();
     for y in y0..y1 {
-        let dy2: [f32; 4] = std::array::from_fn(|sy| {
-            let fy = y as f32 + (sy as f32 + 0.5) * 0.25;
-            let dy = fy - cy;
-            dy * dy
-        });
-        let dy2_min = dy2[0].min(dy2[1]).min(dy2[2]).min(dy2[3]);
+        let dy0 = y as f32 + 0.125 - cy;
+        let dy3 = dy0 + 0.75;
+        let dy0_2 = dy0 * dy0;
+        let dy3_2 = dy3 * dy3;
+        let dy2_min = if dy0 > 0.0 {
+            dy0_2
+        } else if dy3 < 0.0 {
+            dy3_2
+        } else {
+            0.015_625
+        };
         if dy2_min > rr {
             continue;
         }
-        let dy2_max = dy2[0].max(dy2[3]);
+        let dy1 = dy0 + 0.25;
+        let dy2_v = dy0 + 0.50;
+        let dy2 = [dy0_2, dy1 * dy1, dy2_v * dy2_v, dy3_2];
+        let dy2_max = dy0_2.max(dy3_2);
         let row_base = (y as u32 * tile_w) as usize;
         for x in x0..x1 {
             let i = (row_base + x as usize) * 4;
@@ -404,34 +412,33 @@ pub(crate) fn paint_dark_masked_disc(
             }
             let dx0 = x as f32 + 0.125 - cx;
             let dx3 = x as f32 + 0.875 - cx;
+            let dx0_2 = dx0 * dx0;
+            let dx3_2 = dx3 * dx3;
             let dx2_min = if dx0 > 0.0 {
-                dx0 * dx0
+                dx0_2
             } else if dx3 < 0.0 {
-                dx3 * dx3
+                dx3_2
             } else {
                 0.015_625
             };
             if dx2_min + dy2_min > rr {
                 continue;
             }
-            if (dx0 * dx0).max(dx3 * dx3) + dy2_max <= rr {
+            if dx0_2.max(dx3_2) + dy2_max <= rr {
                 tile.over(x, y, col, alpha);
                 continue;
             }
-            let dx2: [f32; 4] = std::array::from_fn(|sx| {
-                let fx = x as f32 + (sx as f32 + 0.5) * 0.25;
-                let dx = fx - cx;
-                dx * dx
-            });
+            let dx1 = dx0 + 0.25;
+            let dx2_v = dx0 + 0.50;
+            let dx2 = [dx0_2, dx1 * dx1, dx2_v * dx2_v, dx3_2];
             let mut hit = 0u32;
             for &dy2 in &dy2 {
-                if dy2 > rr {
-                    continue;
-                }
-                for &dx2 in &dx2 {
-                    if dx2 + dy2 <= rr {
-                        hit = hit.saturating_add(1);
-                    }
+                if dy2 <= rr {
+                    let rem = rr - dy2;
+                    hit += u32::from(dx2[0] <= rem)
+                        + u32::from(dx2[1] <= rem)
+                        + u32::from(dx2[2] <= rem)
+                        + u32::from(dx2[3] <= rem);
                 }
             }
             if hit > 0 {
@@ -572,12 +579,25 @@ struct CoatEyePair {
     eye_ink: (f32, f32, f32),
 }
 
-type CoatEyeLut = [[[CoatEyePair; 2]; CONTEXT_ACCENTS.len()]; COAT_RAMP.len()];
+const OUTLINE_BASES: [u32; 5] = [
+    OUTLINE_PALE,
+    0x00FF_F2E8,
+    0x0018_1520,
+    0x0010_0D16,
+    EYE_INK_DARK,
+];
 
-fn coat_eye_lut() -> &'static CoatEyeLut {
-    static LUT: std::sync::OnceLock<CoatEyeLut> = std::sync::OnceLock::new();
-    LUT.get_or_init(|| {
-        std::array::from_fn(|coat_idx| {
+struct FillsLut {
+    coat_eye: [[[CoatEyePair; 2]; CONTEXT_ACCENTS.len()]; COAT_RAMP.len()],
+    iris: [[(f32, f32, f32); CONTEXT_ACCENTS.len()]; EYE_RAMP.len()],
+    outline: [[(f32, f32, f32); CONTEXT_ACCENTS.len()]; OUTLINE_BASES.len()],
+    underlay: [(f32, f32, f32); CONTEXT_ACCENTS.len()],
+}
+
+fn fills_lut() -> &'static FillsLut {
+    static LUT: std::sync::OnceLock<FillsLut> = std::sync::OnceLock::new();
+    LUT.get_or_init(|| FillsLut {
+        coat_eye: std::array::from_fn(|coat_idx| {
             let coat_stop = COAT_RAMP[coat_idx];
             std::array::from_fn(|accent_idx| {
                 let accent = CONTEXT_ACCENTS[accent_idx];
@@ -599,7 +619,20 @@ fn coat_eye_lut() -> &'static CoatEyeLut {
                     CoatEyePair { coat, eye_ink }
                 })
             })
-        })
+        }),
+        iris: std::array::from_fn(|iris_idx| {
+            let iris = EYE_RAMP[iris_idx];
+            std::array::from_fn(|accent_idx| rgb(mix_rgb(iris, CONTEXT_ACCENTS[accent_idx], 0.28)))
+        }),
+        outline: std::array::from_fn(|bg_idx| {
+            let outline_base = OUTLINE_BASES[bg_idx];
+            std::array::from_fn(|accent_idx| {
+                rgb(mix_rgb(outline_base, CONTEXT_ACCENTS[accent_idx], 0.10))
+            })
+        }),
+        underlay: std::array::from_fn(|accent_idx| {
+            rgb(mix_rgb(EYE_INK_PALE, CONTEXT_ACCENTS[accent_idx], 0.10))
+        }),
     })
 }
 
@@ -622,25 +655,22 @@ impl ResolvedFills {
         let accent_idx = usize::from(colors.accent.min(12));
         let coat_idx = usize::from(coat).min(COAT_RAMP.len() - 1);
         let iris_idx = usize::from(iris).min(EYE_RAMP.len() - 1);
-        let accent = CONTEXT_ACCENTS[accent_idx];
-        let iris = EYE_RAMP[iris_idx];
-        let outline_base = match colors.background {
-            0 => OUTLINE_PALE,
-            1 => 0x00FF_F2E8,
-            2 => 0x0018_1520,
-            3 => 0x0010_0D16,
-            4 => EYE_INK_DARK,
-            _ => OUTLINE_PALE,
+        let outline_idx = match colors.background {
+            1 => 1,
+            2 => 2,
+            3 => 3,
+            4 => 4,
+            _ => 0,
         };
         let lift = usize::from(matches!(colors.background, 0 | 4));
-        let CoatEyePair { coat, eye_ink } = coat_eye_lut()[coat_idx][accent_idx][lift];
+        let lut = fills_lut();
+        let CoatEyePair { coat, eye_ink } = lut.coat_eye[coat_idx][accent_idx][lift];
         Self {
             coat,
-            iris: rgb(mix_rgb(iris, accent, 0.28)),
+            iris: lut.iris[iris_idx][accent_idx],
             eye_ink,
-            outline: rgb(mix_rgb(outline_base, accent, 0.10)),
-            outline_underlay: (colors.background == 4)
-                .then(|| rgb(mix_rgb(EYE_INK_PALE, accent, 0.10))),
+            outline: lut.outline[outline_idx][accent_idx],
+            outline_underlay: (colors.background == 4).then_some(lut.underlay[accent_idx]),
         }
     }
 }
@@ -723,14 +753,13 @@ pub const fn resolve_layer(layer: &Layer, fills: &ResolvedFills) -> ((f32, f32, 
 fn resolve_glyph_layer(
     layer: &Layer,
     fills: &ResolvedFills,
-    coat_lum: Option<f32>,
+    coat_lum: Option<(&crate::color_math::RelativeLuminanceTable, f32)>,
 ) -> ((f32, f32, f32), f32) {
     let resolved = resolve_layer(layer, fills);
-    if let Some(coat_lum) = coat_lum
+    if let Some((table, coat_lum)) = coat_lum
         && layer.role == GlyphRole::Eye
         && layer.recolor == Recolor::Fixed
     {
-        let table = crate::color_math::relative_luminance_table();
         let eye_lum = crate::color_math::relative_luminance_with(table, layer.fill);
         let contrast = (eye_lum.max(coat_lum) + 0.05) / (eye_lum.min(coat_lum) + 0.05);
         if contrast < MIN_EYE_CONTRAST {
@@ -931,46 +960,153 @@ pub(crate) const fn path_bounds(path: &[PathSeg]) -> Option<(f32, f32, f32, f32)
     }
 }
 
-fn closest_eye_bounds(
+const fn closest_eye_bounds(
     eye_bounds: &[Option<(f32, f32, f32, f32)>],
     pcx: f32,
     pcy: f32,
 ) -> Option<(usize, (f32, f32, f32, f32))> {
-    eye_bounds
-        .iter()
-        .enumerate()
-        .filter_map(|(index, &bounds)| bounds.map(|b| (index, b)))
-        .min_by(|(_, a), (_, b)| {
-            let distance = |bounds: &(f32, f32, f32, f32)| {
-                let (x0, y0, x1, y1) = *bounds;
-                let (x, y) = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
-                (x - pcx).mul_add(x - pcx, (y - pcy) * (y - pcy))
-            };
-            distance(a).total_cmp(&distance(b))
-        })
+    let mut best: Option<(usize, (f32, f32, f32, f32))> = None;
+    let mut best_dist = f32::INFINITY;
+    let mut index = 0;
+    while index < eye_bounds.len() {
+        if let Some((x0, y0, x1, y1)) = eye_bounds[index] {
+            let (x, y) = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
+            let (dx, dy) = (x - pcx, y - pcy);
+            let dist = dx * dx + dy * dy;
+            if best.is_none() || dist < best_dist {
+                best = Some((index, (x0, y0, x1, y1)));
+                best_dist = dist;
+            }
+        }
+        index += 1;
+    }
+    best
 }
 
 #[cfg(test)]
 fn closest_eye_path(eyes: &Layer, pcx: f32, pcy: f32) -> Option<(usize, (f32, f32, f32, f32))> {
-    let mut inline_bounds = [None; 8];
-    let heap_bounds = (eyes.paths.len() > inline_bounds.len()).then(|| {
-        eyes.paths
-            .iter()
-            .map(|eye| path_bounds(eye))
-            .collect::<Vec<_>>()
-    });
-    let bounds = match heap_bounds.as_deref() {
-        Some(bounds) => bounds,
-        None => {
-            let bounds = &mut inline_bounds[..eyes.paths.len()];
-            for (slot, eye) in bounds.iter_mut().zip(eyes.paths.iter()) {
-                *slot = path_bounds(eye);
-            }
-            &*bounds
-        }
-    };
+    let mut inline_bounds = [None; MAX_GLYPH_EYE_PATHS];
+    let bounds = &mut inline_bounds[..eyes.paths.len()];
+    for (slot, eye) in bounds.iter_mut().zip(eyes.paths.iter()) {
+        *slot = path_bounds(eye);
+    }
     closest_eye_bounds(bounds, pcx, pcy)
 }
+
+const MAX_GLYPH_EYE_PATHS: usize = 8;
+
+#[derive(Clone, Copy)]
+struct OpenEyeReflection {
+    pcx: f32,
+    pcy: f32,
+    echo_x: f32,
+    echo_y: f32,
+    eye_bounds: (f32, f32, f32, f32),
+}
+
+#[derive(Clone, Copy)]
+struct GlyphMeta {
+    needs_coat_lum: bool,
+    eye_line: Option<f32>,
+    eye_paths: &'static [&'static [PathSeg]],
+    reflections: [Option<OpenEyeReflection>; MAX_GLYPH_EYE_PATHS],
+    reflection_count: u8,
+}
+
+impl GlyphMeta {
+    const fn from_def(def: &crate::cat_glyphs_gen::GlyphDef) -> Self {
+        let mut has_coat = false;
+        let mut has_fixed_eye = false;
+        let mut eye_layer: Option<&Layer> = None;
+        let mut catch_light_layer: Option<&Layer> = None;
+        let mut i = 0;
+        while i < def.layers.len() {
+            let layer = &def.layers[i];
+            if matches!(layer.recolor, Recolor::Coat) {
+                has_coat = true;
+            }
+            if matches!(layer.role, GlyphRole::Eye) {
+                if matches!(layer.recolor, Recolor::Fixed) {
+                    has_fixed_eye = true;
+                }
+                if eye_layer.is_none() {
+                    eye_layer = Some(layer);
+                }
+            }
+            if matches!(layer.role, GlyphRole::CatchLight) && catch_light_layer.is_none() {
+                catch_light_layer = Some(layer);
+            }
+            i += 1;
+        }
+        let eye_line = match eye_layer {
+            Some(eyes) => layer_eye_line(eyes),
+            None => None,
+        };
+        let eye_paths: &'static [&'static [PathSeg]] = match eye_layer {
+            Some(eyes) => eyes.paths,
+            None => &[],
+        };
+        let mut reflections = [None; MAX_GLYPH_EYE_PATHS];
+        let mut reflection_count = 0usize;
+        if let (Some(eyes), Some(catch_lights)) = (eye_layer, catch_light_layer) {
+            assert!(eyes.paths.len() <= MAX_GLYPH_EYE_PATHS);
+            assert!(catch_lights.paths.len() <= MAX_GLYPH_EYE_PATHS);
+            let mut all_eye_bounds = [None; MAX_GLYPH_EYE_PATHS];
+            let mut e = 0;
+            while e < eyes.paths.len() {
+                all_eye_bounds[e] = path_bounds(eyes.paths[e]);
+                e += 1;
+            }
+            let eye_bounds_slice = all_eye_bounds.split_at(eyes.paths.len()).0;
+            let mut c = 0;
+            while c < catch_lights.paths.len() {
+                if let Some((cx0, cy0, cx1, cy1)) = path_bounds(catch_lights.paths[c]) {
+                    let (pcx, pcy) = ((cx0 + cx1) * 0.5, (cy0 + cy1) * 0.5);
+                    if let Some((_, eye_bounds)) = closest_eye_bounds(eye_bounds_slice, pcx, pcy) {
+                        let (ex0, ey0, ex1, ey1) = eye_bounds;
+                        let (ecx, ecy) = ((ex0 + ex1) * 0.5, (ey0 + ey1) * 0.5);
+                        let echo_x = (pcx + 1.55 * (ecx - pcx))
+                            .clamp(ex0 + 0.25 * (ex1 - ex0), ex1 - 0.25 * (ex1 - ex0));
+                        let echo_y = (pcy + 1.55 * (ecy - pcy))
+                            .clamp(ey0 + 0.25 * (ey1 - ey0), ey1 - 0.25 * (ey1 - ey0));
+                        reflections[reflection_count] = Some(OpenEyeReflection {
+                            pcx,
+                            pcy,
+                            echo_x,
+                            echo_y,
+                            eye_bounds,
+                        });
+                        reflection_count += 1;
+                    }
+                }
+                c += 1;
+            }
+        }
+        Self {
+            needs_coat_lum: has_coat && has_fixed_eye,
+            eye_line,
+            eye_paths,
+            reflections,
+            reflection_count: reflection_count as u8,
+        }
+    }
+}
+
+static GLYPH_META: [GlyphMeta; GLYPHS.len()] = {
+    let mut meta = [GlyphMeta {
+        needs_coat_lum: false,
+        eye_line: None,
+        eye_paths: &[],
+        reflections: [None; MAX_GLYPH_EYE_PATHS],
+        reflection_count: 0,
+    }; GLYPHS.len()];
+    let mut i = 0;
+    while i < GLYPHS.len() {
+        meta[i] = GlyphMeta::from_def(&GLYPHS[i]);
+        i += 1;
+    }
+    meta
+};
 
 fn open_eye_reflection_eligible(bounds: (f32, f32, f32, f32), xform: PathTransform) -> bool {
     let (ex0, ey0, ex1, ey1) = bounds;
@@ -1003,55 +1139,26 @@ pub(crate) fn take_or_new_tile(recycled: Option<Tile>, w: u32, h: u32) -> Tile {
 
 fn paint_open_eye_reflections(
     tile: &mut Tile,
-    layers: &[Layer],
+    meta: &GlyphMeta,
     xform: PathTransform,
     mask_scratch: &mut Option<Tile>,
 ) {
-    if xform.scale_x.min(xform.scale_y) < OPEN_EYE_REFLECTION_MIN_PX {
+    if meta.reflection_count == 0 || xform.scale_x.min(xform.scale_y) < OPEN_EYE_REFLECTION_MIN_PX {
         return;
     }
-    let Some(eyes) = layers.iter().find(|layer| layer.role == GlyphRole::Eye) else {
-        return;
-    };
-    let Some(catch_lights) = layers
-        .iter()
-        .find(|layer| layer.role == GlyphRole::CatchLight)
-    else {
-        return;
-    };
-    let mut inline_eye_bounds = [None; 8];
-    let heap_eye_bounds = (eyes.paths.len() > inline_eye_bounds.len()).then(|| {
-        eyes.paths
-            .iter()
-            .map(|eye| path_bounds(eye))
-            .collect::<Vec<_>>()
-    });
-    let all_eye_bounds = match heap_eye_bounds.as_deref() {
-        Some(bounds) => bounds,
-        None => {
-            let bounds = &mut inline_eye_bounds[..eyes.paths.len()];
-            for (slot, eye) in bounds.iter_mut().zip(eyes.paths.iter()) {
-                *slot = path_bounds(eye);
-            }
-            &*bounds
-        }
-    };
     let mut painted_mask = false;
 
-    for catch_light in catch_lights.paths {
-        let Some((cx0, cy0, cx1, cy1)) = path_bounds(catch_light) else {
-            continue;
-        };
-        let (pcx, pcy) = ((cx0 + cx1) * 0.5, (cy0 + cy1) * 0.5);
-        let Some((_, eye_bounds)) = closest_eye_bounds(all_eye_bounds, pcx, pcy) else {
-            continue;
-        };
+    for reflection in meta.reflections[..usize::from(meta.reflection_count)]
+        .iter()
+        .flatten()
+    {
+        let eye_bounds = reflection.eye_bounds;
         if !open_eye_reflection_eligible(eye_bounds, xform) {
             continue;
         }
         if !painted_mask {
             let mask = prepare_scratch_tile(mask_scratch, tile.width(), tile.height());
-            fill_path_fixed(mask, eyes.paths, (0.0, 0.0, 0.0), 1.0, xform);
+            fill_path_fixed(mask, meta.eye_paths, (0.0, 0.0, 0.0), 1.0, xform);
             painted_mask = true;
         }
         let Some(eye_mask) = mask_scratch.as_ref() else {
@@ -1069,8 +1176,8 @@ fn paint_open_eye_reflections(
         paint_dark_masked_disc(
             tile,
             eye_mask,
-            xform.dx + pcx * xform.scale_x,
-            xform.dy + pcy * xform.scale_y,
+            xform.dx + reflection.pcx * xform.scale_x,
+            xform.dy + reflection.pcy * xform.scale_y,
             primary_r,
             rgb(CATCH_LIGHT),
             1.0,
@@ -1079,16 +1186,11 @@ fn paint_open_eye_reflections(
         if minor >= OPEN_EYE_ECHO_MIN_PX {
             let echo_r = (minor * OPEN_EYE_ECHO_FRAC)
                 .clamp(OPEN_EYE_ECHO_MIN_RADIUS_PX, OPEN_EYE_ECHO_MAX_RADIUS_PX);
-            let (ecx, ecy) = ((ex0 + ex1) * 0.5, (ey0 + ey1) * 0.5);
-            let echo_x = (pcx + 1.55 * (ecx - pcx))
-                .clamp(ex0 + 0.25 * (ex1 - ex0), ex1 - 0.25 * (ex1 - ex0));
-            let echo_y = (pcy + 1.55 * (ecy - pcy))
-                .clamp(ey0 + 0.25 * (ey1 - ey0), ey1 - 0.25 * (ey1 - ey0));
             paint_dark_masked_disc(
                 tile,
                 eye_mask,
-                xform.dx + echo_x * xform.scale_x,
-                xform.dy + echo_y * xform.scale_y,
+                xform.dx + reflection.echo_x * xform.scale_x,
+                xform.dy + reflection.echo_y * xform.scale_y,
                 echo_r,
                 (1.0, 0.95, 0.98),
                 0.72,
@@ -1106,22 +1208,18 @@ fn paint_glyph(
     reflections: bool,
     mask_scratch: &mut Option<Tile>,
 ) {
-    let def = &GLYPHS[id as usize];
-    let coat_lum = def
-        .layers
-        .iter()
-        .any(|layer| layer.recolor == Recolor::Coat)
-        .then(|| {
-            let table = crate::color_math::relative_luminance_table();
-            crate::color_math::relative_luminance_with(table, packed_rgb(fills.coat))
-        });
+    let idx = id as usize;
+    let def = &GLYPHS[idx];
+    let meta = &GLYPH_META[idx];
+    let coat_lum = meta.needs_coat_lum.then(|| {
+        let table = crate::color_math::relative_luminance_table();
+        (
+            table,
+            crate::color_math::relative_luminance_with(table, packed_rgb(fills.coat)),
+        )
+    });
     let eye_line = (!matches!(eyes, EyesFrame::Open))
-        .then(|| {
-            def.layers
-                .iter()
-                .find(|l| l.role == GlyphRole::Eye)
-                .and_then(layer_eye_line)
-        })
+        .then_some(meta.eye_line)
         .flatten();
     let openness = eyes.openness();
     for layer in def.layers {
@@ -1153,7 +1251,7 @@ fn paint_glyph(
         fill_path_fixed(tile, layer.paths, col, alpha, lxform);
     }
     if reflections && matches!(eyes, EyesFrame::Open) {
-        paint_open_eye_reflections(tile, def.layers, xform, mask_scratch);
+        paint_open_eye_reflections(tile, meta, xform, mask_scratch);
     }
 }
 

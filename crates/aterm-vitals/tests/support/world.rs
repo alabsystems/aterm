@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use aterm_vitals::jobs::{
     Block, CallHint, Consumer, Fault, Fd, FdKind, GateWord, InputGate, JobCounters, JobProc,
-    JobTab, JobTick, Jobs, JobsView, LanesSeen, Machine, NamedWait, ProcState, SweepProc,
+    JobTab, JobTick, Jobs, JobsView, LanesSeen, Machine, NamedWait, ProcState, SweepProc, TermWord,
     ThreadState, TtyMode,
 };
 
@@ -145,6 +145,10 @@ pub struct World {
     pub read_lag_ms: u64,
     /// Pids a tick's sweep lists that exit before it reads them: they have no reading.
     pub unread: BTreeSet<u32>,
+    /// The group in front of each terminal session nested in a tab's, by its leader.
+    pub fronts: HashMap<u32, u32>,
+    /// The word of each nested session's terminal aterm's user may open, by its leader.
+    pub terms: HashMap<u32, TermWord>,
     looked: HashMap<(u32, u64, u64), u64>,
 }
 
@@ -167,6 +171,8 @@ impl World {
             jobs: Jobs::new(),
             read_lag_ms: 0,
             unread: BTreeSet::new(),
+            fronts: HashMap::new(),
+            terms: HashMap::new(),
             limit: Some(5333),
             vars: HashMap::new(),
             looked: HashMap::new(),
@@ -337,13 +343,64 @@ impl World {
             .expect("a call's output file")
     }
 
-    /// Tab `key`'s program printed a line now.
+    /// Tab `key`'s program printed a line now: any running process of the tab may have written it.
     pub fn line(&mut self, key: u64) {
+        let writers = self.running_in(key);
+        self.line_from(key, &writers);
+    }
+
+    /// Tab `key` printed a line now, written by `writers` (each made the write's system call; none
+    /// for the line editor's own redraw while the shell is no member).
+    pub fn line_from(&mut self, key: u64, writers: &[u32]) {
+        self.wrote(writers);
         let at = self.at;
         let t = self.tab(key);
         t.tab.line_output_ms = Some(at);
         t.tab.output_ms = Some(at);
         t.tab.output_bytes += 40;
+    }
+
+    /// The running processes of tab `key`: its shell and what runs below it.
+    pub fn running_in(&mut self, key: u64) -> Vec<u32> {
+        let shell = self.tab(key).tab.shell_pid;
+        self.procs
+            .values()
+            .filter(|p| !matches!(p.state, ProcState::Stopped | ProcState::Zombie))
+            .filter(|p| {
+                let mut cur = p.pid;
+                for _ in 0..self.procs.len() {
+                    if cur == shell {
+                        return true;
+                    }
+                    match self.procs.get(&cur) {
+                        Some(q) if q.ppid != cur => cur = q.ppid,
+                        _ => return false,
+                    }
+                }
+                false
+            })
+            .map(|p| p.pid)
+            .collect()
+    }
+
+    fn wrote(&mut self, writers: &[u32]) {
+        for w in writers {
+            if let Some(s) = self
+                .procs
+                .get_mut(w)
+                .and_then(|p| p.counters.syscalls.as_mut())
+            {
+                *s += 1;
+            }
+        }
+    }
+
+    /// The person typed into tab `key` now, and `reader` read the keys (a process in a session
+    /// nested in the tab's, its relay passing them on).
+    pub fn typed(&mut self, key: u64, reader: u32) {
+        self.wrote(&[reader]);
+        let at = self.at;
+        self.tab(key).tab.typed_ms = Some(at);
     }
 
     /// Tab `key`'s shell wrote one of its own OSC 133 marks now.
@@ -354,6 +411,8 @@ impl World {
 
     /// Tab `key`'s program redrew with a CR and no line feed now.
     pub fn cr(&mut self, key: u64) {
+        let writers = self.running_in(key);
+        self.wrote(&writers);
         let at = self.at;
         let t = self.tab(key);
         t.tab.output_ms = Some(at);
@@ -400,7 +459,9 @@ impl World {
             let c = &mut p.counters;
             c.cpu_ns += p.cpu_per_s * dt_ms / 1000;
             *c.child_cpu_ns.get_or_insert(0) += p.child_cpu_per_s * dt_ms / 1000;
-            *c.syscalls.get_or_insert(0) += p.syscalls_per_s * dt_ms / 1000;
+            if let Some(s) = c.syscalls.as_mut() {
+                *s += p.syscalls_per_s * dt_ms / 1000;
+            }
             *c.wakeups.get_or_insert(0) += p.wakeups_per_s * dt_ms / 1000;
             *c.logical_writes.get_or_insert(0) += p.writes_per_s * dt_ms / 1000;
             *c.pageins.get_or_insert(0) += p.pageins_per_s * dt_ms / 1000;
@@ -455,6 +516,10 @@ impl World {
                     .iter()
                     .find(|t| self.session_of(p.pid) == Some(t.tab.shell_pid))
                     .map(|t| t.tpgid)
+                    .or_else(|| {
+                        self.session_of(p.pid)
+                            .and_then(|s| self.fronts.get(&s).copied())
+                    })
             })
             .flatten();
         let mut fds = Vec::new();
@@ -499,6 +564,11 @@ impl World {
             },
             tty: (p.tty && !zombie).then_some(0x1000),
             tpgid,
+            term: self
+                .terms
+                .get(&p.pid)
+                .copied()
+                .filter(|_| p.sid == p.pid && p.tty && !zombie),
             counters: (!p.refused && !zombie).then_some(p.counters),
             threads: (!zombie).then(|| {
                 vec![ThreadState {

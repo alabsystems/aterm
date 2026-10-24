@@ -18,7 +18,7 @@ pub(crate) fn row_span(r: &Rec) -> u8 {
 pub(crate) const SPARE_ADOPTED: &str = "spare adopted";
 
 /// THE ROWS THE LOG HOLDS AS THEIR ROW ALONE: the timeline kinds whose fact no other mark names, each a `row` mark.
-pub(crate) const ROW_ONLY: [&str; 14] = [
+pub(crate) const ROW_ONLY: [&str; 15] = [
     crate::sys_host::JOB_CHANGE,
     crate::occupancy_wakes::WAKE_READY,
     SPARE_ADOPTED,
@@ -28,6 +28,7 @@ pub(crate) const ROW_ONLY: [&str; 14] = [
     "holder-named",
     "holder-claim",
     "holder-adopt",
+    "holder-retire",
     "card-seen",
     "card-row",
     "card-decorated",

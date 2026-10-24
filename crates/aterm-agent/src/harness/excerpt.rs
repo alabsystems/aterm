@@ -549,7 +549,7 @@ pub fn agy_excerpts_from(
                         && let Some(call) = calls.get(generic_since_planner)
                         && let Some(name) = call.get("name").and_then(Value::as_str)
                     {
-                        let tn = tool_name(name);
+                        let tn = tool_name(name.strip_prefix("default_api:").unwrap_or(name));
                         if !tn.is_empty() {
                             doing = Some(tn);
                         }
@@ -558,7 +558,10 @@ pub fn agy_excerpts_from(
                 }
             }
             Some("GENERIC") => {
-                if !saw_planner && !saw_user {
+                if !saw_planner
+                    && !saw_user
+                    && row.get("status").and_then(Value::as_str) != Some("RUNNING")
+                {
                     generic_since_planner = generic_since_planner.saturating_add(1);
                 }
             }
@@ -626,7 +629,7 @@ fn muse_records_in_line(line: &str) -> Vec<Value> {
 pub fn muse_excerpts_from(session_tail: &[u8]) -> Excerpts {
     let mut prompts: Vec<Prompt> = Vec::new();
     let mut said: Option<(String, String)> = None;
-    let mut doing: Option<String> = None;
+    let mut open_tasks: Vec<(String, String)> = Vec::new();
 
     let text = String::from_utf8_lossy(session_tail);
     for line in text.lines() {
@@ -644,6 +647,11 @@ pub fn muse_excerpts_from(session_tail: &[u8]) -> Excerpts {
             };
             if is_task {
                 if let Some(event) = payload.get("event") {
+                    let task_id = payload
+                        .get("task_id")
+                        .and_then(Value::as_str)
+                        .or_else(|| event.get("task_id").and_then(Value::as_str))
+                        .unwrap_or_default();
                     match event.get("kind").and_then(Value::as_str) {
                         Some("proposed") => {
                             if let Some(tk) = event.get("task_kind").and_then(Value::as_str)
@@ -651,12 +659,19 @@ pub fn muse_excerpts_from(session_tail: &[u8]) -> Excerpts {
                             {
                                 let tn = tool_name(tk.strip_prefix("tool.").unwrap_or(tk));
                                 if !tn.is_empty() {
-                                    doing = Some(tn);
+                                    if !task_id.is_empty() {
+                                        open_tasks.retain(|(id, _)| id != task_id);
+                                    }
+                                    open_tasks.push((task_id.to_owned(), tn));
                                 }
                             }
                         }
                         Some("completed" | "cancelled" | "failed" | "rejected") => {
-                            doing = None;
+                            if task_id.is_empty() {
+                                open_tasks.clear();
+                            } else {
+                                open_tasks.retain(|(id, _)| id != task_id);
+                            }
                         }
                         _ => {}
                     }
@@ -669,7 +684,7 @@ pub fn muse_excerpts_from(session_tail: &[u8]) -> Excerpts {
             {
                 match event.get("kind").and_then(Value::as_str) {
                     Some("started") => {
-                        doing = None;
+                        open_tasks.clear();
                         if let Some(prompt) = event.get("prompt").and_then(Value::as_str)
                             && let Some(words) = clean_prompt_words(prompt)
                         {
@@ -697,7 +712,7 @@ pub fn muse_excerpts_from(session_tail: &[u8]) -> Excerpts {
                         }
                     }
                     Some("terminal") => {
-                        doing = None;
+                        open_tasks.clear();
                     }
                     _ => {}
                 }
@@ -706,6 +721,7 @@ pub fn muse_excerpts_from(session_tail: &[u8]) -> Excerpts {
     }
 
     let (said, said_end) = said.unzip();
+    let doing = open_tasks.pop().map(|(_, tn)| tn);
     Excerpts {
         prompts,
         said,

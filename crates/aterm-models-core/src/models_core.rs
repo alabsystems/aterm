@@ -126,14 +126,16 @@ pub fn terminal_modes_model() -> Model {
 }
 
 /// Which defect a wake-latch model's `Buggy = 1` replays: one machine
-/// ([`damage_to_present_model`], [`wake_heal_evidence_model`]) held to three laws, each with the
-/// mutant that breaks it.
+/// ([`damage_to_present_model`], [`wake_heal_evidence_model`], [`wake_heal_drain_model`]) held to
+/// three laws, each with the mutant that breaks it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WakeLatchMutant {
     /// A one-shot latch: no heal, no watchdog deadline and no re-post, so a lost wake starves its session's presents.
     OneShot,
     /// An age-only heal: a latch older than `Expiry` is presumed lost even while its event is still queued behind a long frame (a false heal).
     AgeOnly,
+    /// A drain-blind heal: a latch posted before the previous turn's end is presumed lost even when this turn's drain stopped at a sender part-way through its send and left the wake queued (a false heal).
+    DrainBlind,
 }
 
 /// Damage→present bounded response.
@@ -150,13 +152,21 @@ pub fn wake_heal_evidence_model() -> Model {
     wake_latch_model(WakeLatchMutant::AgeOnly)
 }
 
+/// No false heal across a cut drain: the [`damage_to_present_model`] machine held to [`wake_heal_evidence_model`]'s law where a turn's drain of user events stops at a sender part-way through its send (`TurnBeginCut`), so a wake posted before the previous turn's end can still be queued; only a turn whose drain emptied the queue proves one lost.
+#[cfg_attr(trust_verify, trust::skip)]
+#[aterm_spec::model]
+pub fn wake_heal_drain_model() -> Model {
+    wake_latch_model(WakeLatchMutant::DrainBlind)
+}
+
 #[cfg_attr(trust_verify, trust::skip)]
 fn wake_latch_model(mutant: WakeLatchMutant) -> Model {
     let armed = neq(var("latch"), int(0));
     let fixed = eq(cst("Buggy"), int(0));
     let mutated = eq(cst("Buggy"), int(1));
     let idle = eq(var("busy"), int(0));
-    let proven_lost = and_(armed.clone(), eq(var("seen"), int(1)));
+    let seen_lost = and_(armed.clone(), eq(var("seen"), int(1)));
+    let proven_lost = and_(seen_lost.clone(), eq(var("cut"), int(0)));
     let aged = gt(sub(var("now"), var("latch")), cst("Expiry"));
     let stranded_due = and_(
         armed.clone(),
@@ -181,6 +191,12 @@ fn wake_latch_model(mutant: WakeLatchMutant) -> Model {
                 and_(fixed, proven_lost),
                 and_(mutated, and_(armed.clone(), aged)),
             ),
+            bool_lit(true),
+            stranded_due.clone(),
+            and_(armed.clone(), not_stranded_due),
+        ),
+        WakeLatchMutant::DrainBlind => (
+            or_(and_(fixed, proven_lost), and_(mutated, seen_lost)),
             bool_lit(true),
             stranded_due.clone(),
             and_(armed.clone(), not_stranded_due),
@@ -227,6 +243,14 @@ fn wake_latch_model(mutant: WakeLatchMutant) -> Model {
                 expr: eq(var("falseHeal"), int(0)),
             }],
         ),
+        WakeLatchMutant::DrainBlind => (
+            "WakeHealAfterAnEmptiedDrain",
+            vec![Invariant {
+                name: "NoFalseHeal",
+                kind: InvariantKind::Claim,
+                expr: eq(var("falseHeal"), int(0)),
+            }],
+        ),
     };
     let var0 = |name: &'static str| StateVar { name, init: 0 };
     Model {
@@ -235,6 +259,7 @@ fn wake_latch_model(mutant: WakeLatchMutant) -> Model {
             ("MaxTime", 8),
             ("Expiry", 3),
             ("LostBudget", 1),
+            ("CutBudget", 1),
             ("Buggy", 0),
         ],
         vars: vec![
@@ -256,6 +281,8 @@ fn wake_latch_model(mutant: WakeLatchMutant) -> Model {
             var0("recheck"),
             var0("falseHeal"),
             var0("missedRepost"),
+            var0("cut"),
+            var0("cuts"),
         ],
         fn_vars: vec![],
         actions: vec![
@@ -312,6 +339,20 @@ fn wake_latch_model(mutant: WakeLatchMutant) -> Model {
                     clear_if(wake_queued.clone(), "inflight"),
                     clear_if(wake_queued.clone(), "seen"),
                     set("recheck", int(0)),
+                    set("cut", int(0)),
+                ],
+            },
+            Action {
+                name: "TurnBeginCut",
+                guard: Some(and_(
+                    idle.clone(),
+                    le(add(var("cuts"), int(1)), cst("CutBudget")),
+                )),
+                updates: vec![
+                    set("busy", int(1)),
+                    set("recheck", int(0)),
+                    set("cut", int(1)),
+                    set("cuts", add(var("cuts"), int(1))),
                 ],
             },
             Action {
@@ -352,7 +393,7 @@ fn wake_latch_model(mutant: WakeLatchMutant) -> Model {
                     or_(
                         eq(var("busy"), int(1)),
                         and_(
-                            eq(var("inflight"), int(0)),
+                            and_(eq(var("inflight"), int(0)), eq(var("cut"), int(0))),
                             or_(
                                 eq(var("latch"), int(0)),
                                 or_(eq(var("recheck"), int(0)), gt(var("recheck"), var("now"))),

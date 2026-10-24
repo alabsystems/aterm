@@ -460,8 +460,8 @@ impl Verb {
             Verb::Theme => &[
                 "Colour themes (list | new | check | export |",
                 "schema | import | pack | install); import converts",
-                "kitty, Ghostty, Alacritty, iTerm2, Windows",
-                "Terminal and base16/base24.",
+                "kitty, Ghostty, Alacritty, WezTerm, iTerm2,",
+                "Terminal.app, Windows Terminal and base16/base24.",
             ],
             Verb::Edit => &[
                 "amacs, aterm's editor: inside aterm, open a file",

@@ -5,6 +5,7 @@
 
 use super::{PROFILE, Path, Row, Value, durable_directory, json, write_json};
 use aterm_machines::init_secrets::SecretsOps;
+use aterm_secrets::client::MaterializationMark;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,6 +30,8 @@ pub(super) struct Pace {
     pub(super) build: String,
     /// A digest of the network this Mac is on and of its vault state ([`marks`]).
     pub(super) marks: String,
+    /// A coherent local materialization reading; unknown never erases a known one.
+    pub(super) materialization: Option<MaterializationMark>,
     /// Now, in seconds since the epoch.
     pub(super) now: u64,
 }
@@ -43,6 +46,10 @@ pub(super) trait Reads {
     fn routes(&self) -> String;
     /// Vault handle for the single console account, if any.
     fn vault(&self) -> Option<Arc<dyn SecretsOps>>;
+    /// Local vault files, when this reader can observe materialization.
+    fn paths(&self) -> Option<aterm_secrets::client::Paths> {
+        None
+    }
 }
 
 /// The pace `reads` reads now.
@@ -50,6 +57,11 @@ pub(super) fn pace(reads: &dyn Reads) -> Pace {
     Pace {
         build: reads.build(),
         marks: marks(reads),
+        materialization: reads.paths().and_then(|paths| {
+            aterm_secrets::client::materialization_mark(&paths)
+                .ok()
+                .flatten()
+        }),
         now: reads.now(),
     }
 }
@@ -104,6 +116,17 @@ impl Reads for Live {
             aterm_machines::init::initial_setup_context(&aterm_machines::port::Live::new()).ok()?;
         aterm_machines::init_secrets::unattended(&ctx).ok()
     }
+
+    fn paths(&self) -> Option<aterm_secrets::client::Paths> {
+        let ctx =
+            aterm_machines::init::initial_setup_context(&aterm_machines::port::Live::new()).ok()?;
+        match ctx.users.as_slice() {
+            [user] => Some(aterm_secrets::client::Paths::for_home(Path::new(
+                &user.home,
+            ))),
+            _ => None,
+        }
+    }
 }
 
 /// Returns the backoff pause after `tries` consecutive unfinished attempts.
@@ -119,6 +142,7 @@ struct Attempt {
     /// The builds that tried in this row, the latest last.
     builds: Vec<String>,
     marks: String,
+    materialization: Option<MaterializationMark>,
     tries: u32,
     /// How many of the last tries in a row failed (an error row: a change not made).
     failures: u32,
@@ -155,6 +179,9 @@ impl Attempt {
             revision: record["revision"].as_u64()?,
             builds,
             marks: text("marks")?,
+            materialization: record["materialization"]
+                .as_str()
+                .and_then(MaterializationMark::from_cache_key),
             tries: count("tries")?,
             failures: count("failures")?,
             at: record["at"].as_u64()?,
@@ -173,13 +200,18 @@ impl Attempt {
             &json!({
                 "profile": PROFILE, "revision": self.revision, "builds": self.builds,
                 "marks": self.marks, "tries": self.tries, "failures": self.failures,
+                "materialization": self.materialization.map(|mark| mark.cache_key()),
                 "at": self.at, "rows": rows,
             }),
         )
     }
 
     fn same_row(&self, revision: u64, pace: &Pace) -> bool {
-        self.revision == revision && self.marks == pace.marks
+        self.revision == revision
+            && self.marks == pace.marks
+            && pace
+                .materialization
+                .is_none_or(|mark| self.materialization == Some(mark))
     }
 
     fn unchanged(&self, revision: u64, pace: &Pace) -> bool {
@@ -245,8 +277,14 @@ pub(super) fn record(
         };
     }
     let failed = rows.iter().any(|row| row.status == "error");
-    let (tries, failures, builds) = match Attempt::load(root).filter(|l| l.same_row(revision, pace))
-    {
+    let previous = Attempt::load(root);
+    let materialization = pace.materialization.or_else(|| {
+        previous
+            .as_ref()
+            .filter(|last| last.revision == revision && last.marks == pace.marks)
+            .and_then(|last| last.materialization)
+    });
+    let (tries, failures, builds) = match previous.filter(|l| l.same_row(revision, pace)) {
         Some(last) if last.builds.contains(&pace.build) => {
             (last.tries.saturating_add(1), last.failures, last.builds)
         }
@@ -278,6 +316,7 @@ pub(super) fn record(
         revision,
         builds,
         marks: pace.marks.clone(),
+        materialization,
         tries,
         failures,
         at: pace.now,
@@ -311,6 +350,7 @@ mod tests {
         Pace {
             build: "1.0.0+gabc".into(),
             marks: marks.into(),
+            materialization: None,
             now,
         }
     }
@@ -491,5 +531,48 @@ mod tests {
             "{rows:?}"
         );
         assert!(paused(root, 3, &pace("m", 1_260)).is_none(), "the control");
+    }
+
+    #[test]
+    fn an_unknown_materialization_read_never_erases_a_known_hold() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let root = root.path();
+        let failed = || {
+            vec![Row {
+                name: "Secrets vault".into(),
+                status: "error".into(),
+                detail: "injected change failure".into(),
+            }]
+        };
+        let unknown = pace("unchanged source and interface", 1_000);
+        record(root, 3, &unknown, false, &mut failed()).unwrap();
+        record(root, 3, &unknown, false, &mut failed()).unwrap();
+        assert!(paused(root, 3, &unknown).is_some());
+
+        let mut known = unknown.clone();
+        known.materialization = MaterializationMark::from_cache_key(&"01".repeat(32));
+        assert!(known.materialization.is_some());
+        assert!(
+            paused(root, 3, &known).is_none(),
+            "the first conclusive local reading permits one new try"
+        );
+        record(root, 3, &known, false, &mut failed()).unwrap();
+        known.now += FIRST_PAUSE.as_secs();
+        record(root, 3, &known, false, &mut failed()).unwrap();
+        assert!(paused(root, 3, &known).is_some());
+        assert!(paused(root, 3, &unknown).is_some(), "busy is no new fact");
+        // Even a recorded outcome whose post-stage read was contended keeps
+        // the earlier identity; an unknown/known cycle never re-arms it.
+        record(root, 3, &unknown, false, &mut failed()).unwrap();
+        assert_eq!(
+            Attempt::load(root).unwrap().materialization,
+            known.materialization
+        );
+        assert!(paused(root, 3, &known).is_some());
+        known.materialization = MaterializationMark::from_cache_key(&"02".repeat(32));
+        assert!(
+            paused(root, 3, &known).is_none(),
+            "a real change releases it"
+        );
     }
 }

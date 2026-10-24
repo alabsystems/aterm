@@ -418,7 +418,10 @@ fn ring_row(
     let ym = y as f32 + h as f32 * 0.5 - cy;
     let ym2 = ym * ym;
     let wob = wobble(ym);
-    let hw = discs.map(|(r, _, _)| (r * r - ym2).max(0.0).sqrt() * wob);
+    let hw = discs.map(|(r, _, _)| {
+        let d2 = r * r - ym2;
+        if d2 > 0.0 { d2.sqrt() * wob } else { 0.0 }
+    });
     let x_edges = hw.map(|w| ((cx - w).round() as i32, (cx + w).round() as i32));
     let cx_round = cx.round() as i32;
     for i in 0..discs.len() {

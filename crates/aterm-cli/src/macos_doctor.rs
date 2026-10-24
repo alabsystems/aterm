@@ -288,8 +288,11 @@ fn apply_on_first_run_at(root: &Path) -> Result<Option<Report>, String> {
 
 /// The Workstation stage of a setup run: the selected preferences, without the
 /// sign-outs, which are the Accounts stage's and run last.
-fn apply_preferences_at(root: &Path) -> Result<Option<Report>, String> {
-    apply_part_at(root, Part::Preferences)
+fn apply_preferences_at(
+    root: &Path,
+    only: Option<aterm_types::macos_setup::Selection>,
+) -> Result<Option<Report>, String> {
+    apply_part_at(root, Part::Preferences { only })
 }
 
 /// The Accounts stage of a setup run: the selected Messages and FaceTime
@@ -307,8 +310,14 @@ fn apply_accounts_at(root: &Path, on_screen: bool) -> Result<Option<Report>, Str
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Part {
     All,
-    Preferences,
-    Accounts { on_screen: bool },
+    /// The selected preferences, or `only` these where a choice narrowed the stage
+    /// to the groups it turned on.
+    Preferences {
+        only: Option<aterm_types::macos_setup::Selection>,
+    },
+    Accounts {
+        on_screen: bool,
+    },
 }
 
 fn apply_part_at(root: &Path, part: Part) -> Result<Option<Report>, String> {
@@ -358,14 +367,23 @@ fn apply_part_with(
             }
             selected
         }
-        Part::Preferences | Part::Accounts { .. } => {
+        Part::Preferences { .. } | Part::Accounts { .. } => {
             let Some(selected) = authorized_selection(root)? else {
                 return Ok(None);
             };
-            let selected = if part == Part::Preferences {
-                initial::preferences(selected)
-            } else {
-                initial::accounts(selected)
+            let selected = match part {
+                Part::Preferences { only } => {
+                    let mut selected = initial::preferences(selected);
+                    if let Some(only) = only {
+                        for setting in aterm_types::macos_setup::Setting::ALL {
+                            if !only.contains(setting) {
+                                selected.set(setting, false);
+                            }
+                        }
+                    }
+                    selected
+                }
+                _ => initial::accounts(selected),
             };
             if selected.is_empty() {
                 return Ok(None);
@@ -4067,6 +4085,36 @@ mod tests {
         );
         assert!(!first_run_complete(root.path()).unwrap());
         assert_eq!(load_withheld(root.path()).unwrap().items, [WIDGETS]);
+    }
+
+    /// A Workstation pass a choice narrowed to the groups it turned on selects those
+    /// groups' preferences alone, so the other group's settings stay as the person left them.
+    #[test]
+    fn a_narrowed_preferences_pass_selects_only_the_groups_it_names() {
+        let root = aterm_tempfile::tempdir().expect("scratch");
+        authorize_automatic_setup_at(root.path(), Selection::all()).unwrap();
+        let mut only = Selection::none();
+        for setting in aterm_types::macos_setup::Group::Desktop.settings() {
+            only.set(*setting, true);
+        }
+        let pass = |only| {
+            let mut host = Fake::default();
+            apply_part_with(
+                root.path(),
+                &Inert::default(),
+                &mut host,
+                BUILD,
+                at(0),
+                Part::Preferences { only },
+            )
+            .expect("pass");
+            host.selected
+        };
+        assert_eq!(pass(Some(only)), Some(only));
+        assert_eq!(
+            pass(None),
+            Some(initial::preferences(Selection::all()).workstation())
+        );
     }
 
     #[test]

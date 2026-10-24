@@ -7,6 +7,7 @@ use std::path::Path;
 
 use aterm_json::Value;
 
+use crate::harness::accounts::Sample;
 use crate::harness::codex_rollout::{
     Prefix, TurnReader, first_line, rollouts_by_write, stamp_ms, stream_lines, tail_after,
 };
@@ -330,6 +331,38 @@ pub fn home_pick(home: &Path, now_unix: i64) -> Option<Pick> {
         .filter_map(|(path, _)| rollout_readings(path, CONTEXT_REACH))
         .collect();
     pick(&rollouts, CODEX_FAMILY, now_unix)
+}
+
+/// A [`Pick`] as the account pool's usage [`Sample`]: its five-hour window is the session, its
+/// week the week, each share taken up to the next whole percent (so a share is never read as
+/// further from its wall than it is) and each reset and read time as picked. Another window, an
+/// unplaced one and a void one ([`Pick::void`]) give no figure. `at` is the newest reading's
+/// stamp; `by` is left for [`crate::harness::accounts::note_sample`] to stamp.
+#[must_use]
+pub fn sample_of(pick: &Pick) -> Sample {
+    // Clamped to 0..=100 first, so the cast neither truncates nor wraps.
+    let whole = |share: f64| share.ceil().clamp(0.0, 100.0) as u32;
+    let of = |bucket: Bucket| pick.windows.iter().find(|w| w.bucket == bucket);
+    let session = of(Bucket::FiveHour);
+    let week = of(Bucket::Week);
+    Sample {
+        session_pct: session.map(|w| whole(w.used_percent)),
+        session_reset: session.and_then(|w| w.resets_at),
+        week_pct: week.map(|w| whole(w.used_percent)),
+        week_reset: week.and_then(|w| w.resets_at),
+        session_read_at: session.map(|w| w.as_of),
+        week_read_at: week.map(|w| w.as_of),
+        at: pick.newest,
+        by: String::new(),
+    }
+}
+
+/// The usage sample of the Codex home `home` at `now_unix` ([`home_pick`], [`sample_of`]), with
+/// the account its readings name, where a reading is no older than [`FRESH_S`].
+#[must_use]
+pub fn home_sample(home: &Path, now_unix: i64) -> Option<(Option<AccountKey>, Sample)> {
+    let pick = home_pick(home, now_unix)?;
+    (now_unix.saturating_sub(pick.newest) <= FRESH_S).then(|| (pick.account, sample_of(&pick)))
 }
 
 #[cfg(test)]
@@ -895,5 +928,99 @@ mod tests {
         );
         let p = home_pick(home.path(), now_unix).expect("a pick");
         assert_eq!((p.account, p.windows[0].used_percent), (None, 95.0));
+    }
+
+    /// A rollout whose primary (five-hour) window is `used` percent spent, resetting two hours
+    /// after `now`, and whose week is 40% spent.
+    fn five_hour_reading(now: i64, used: f64) -> String {
+        let at = crate::harness::codex_rollout::fixtures::stamp((now - 60) * 1000);
+        format!(
+            "{{\"timestamp\":\"{at}\",\"type\":\"event_msg\",\"payload\":{{\"type\":\
+             \"token_count\",\"info\":null,\"rate_limits\":{{\"limit_id\":\"codex\",\
+             \"primary\":{{\"used_percent\":{used},\"window_minutes\":300,\"resets_at\":{}}},\
+             \"secondary\":{{\"used_percent\":40.0,\"window_minutes\":10080,\"resets_at\":{}}},\
+             \"plan_type\":\"pro\"}}}}}}",
+            now + 2 * 3600,
+            now + 3 * 86_400
+        )
+    }
+
+    #[test]
+    fn a_codex_window_near_its_wall_moves_a_two_row_pool_to_its_fresh_row() {
+        use crate::ai::connector::Cli;
+        use crate::harness::accounts::{
+            Advice, Me, Mode, Point, Roster, State, StayWhy, advise_for, note_sample,
+        };
+        let now = unix("2026-10-23T12:00:00Z");
+        let roster = Roster::parse_for(
+            Cli::Codex,
+            "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n[[account]]\n\
+             label = \"work\"\nclass = \"dedicated\"\ndir = \"/logins/codex/work\"\n\
+             flow = \"device\"\n",
+        )
+        .expect("a roster");
+        let enrolled = roster.rows.iter().map(|r| r.label.clone()).collect();
+        let me = Me {
+            account: Some("main"),
+            left: None,
+            default_home: true,
+            stored_login: true,
+        };
+        let ask = |used: f64| {
+            let readings = rollout_rate_limits(&five_hour_reading(now, used));
+            let sample = sample_of(&pick(&[readings], CODEX_FAMILY, now).expect("a pick"));
+            assert_eq!(sample.session_pct, Some(used as u32));
+            assert_eq!(sample.session_reset, Some(now + 2 * 3600));
+            assert_eq!(sample.week_pct, Some(40));
+            let mut state = State {
+                machine: "0a0b".into(),
+                active: Some("main".into()),
+                proven: true,
+                ..State::default()
+            };
+            assert_eq!(note_sample(&mut state, "main", sample, now).len(), 1);
+            advise_for(
+                Cli::Codex,
+                &roster,
+                &state,
+                &enrolled,
+                &me,
+                &Point::TurnEnd,
+                Mode::Early,
+                now,
+            )
+        };
+        assert_eq!(
+            ask(95.0),
+            Advice::Move {
+                to: "work".into(),
+                ahead: true,
+                rotates: true,
+                takes_canary: false,
+            }
+        );
+        assert_eq!(ask(50.0), Advice::Stay(StayWhy::NothingDue));
+    }
+
+    #[test]
+    fn a_share_is_read_up_to_the_next_whole_percent_and_a_stale_home_gives_no_sample() {
+        let now = unix("2026-10-23T12:00:00Z");
+        let readings = rollout_rate_limits(&five_hour_reading(now, 89.2));
+        let p = pick(&[readings], CODEX_FAMILY, now).expect("a pick");
+        let sample = sample_of(&p);
+        assert_eq!((sample.session_pct, sample.week_pct), (Some(90), Some(40)));
+        assert_eq!(sample.at, now - 60);
+        let void = Pick {
+            windows: Vec::new(),
+            void: vec![Bucket::FiveHour, Bucket::Week],
+            ..p
+        };
+        let empty = sample_of(&void);
+        assert_eq!((empty.session_pct, empty.week_pct), (None, None));
+        let home = aterm_tempfile::Builder::new()
+            .prefix("aterm-codex-sample-")
+            .tempdir()
+            .expect("tmp");
+        assert_eq!(home_sample(home.path(), now), None, "no rollout, no sample");
     }
 }

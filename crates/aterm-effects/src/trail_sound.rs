@@ -803,34 +803,38 @@ const SONG_CODED_STEPS: u32 = 16;
 const SONG_STEPS: u32 = SONG_CODED_STEPS + 1;
 
 #[inline]
-fn song_coded_degree(sig: u32, index: u32) -> i32 {
+const fn song_coded_degree(sig: u32, index: u32) -> i32 {
     debug_assert!(index < SONG_CODED_STEPS);
-    let mut code = u64::from(sig);
+    let mut code = sig as u64;
     let mut degree = (code % 5) as i32;
     code /= 5;
-    for _ in 0..index {
+    let mut i = 0;
+    while i < index {
         let choice = (code & 3) as usize;
         code >>= 2;
         degree = (degree + SONG_INTERVALS[choice]).rem_euclid(5);
+        i += 1;
     }
     degree
 }
 
 #[inline]
-fn song_degree(sig: u32, ordinal: u32) -> i32 {
+const fn song_degree(sig: u32, ordinal: u32) -> i32 {
     let index = ordinal % SONG_STEPS;
     if index < SONG_CODED_STEPS {
         return song_coded_degree(sig, index);
     }
     let first = song_coded_degree(sig, 0);
     let last = song_coded_degree(sig, SONG_CODED_STEPS - 1);
-    for interval in SONG_INTERVALS {
-        let bridge = (last + interval).rem_euclid(5);
+    let mut i = 0;
+    while i < SONG_INTERVALS.len() {
+        let bridge = (last + SONG_INTERVALS[i]).rem_euclid(5);
         if bridge != first {
             return bridge;
         }
+        i += 1;
     }
-    unreachable!("four distinct nonzero pentatonic moves cannot all land on the first note")
+    0
 }
 
 #[inline]
@@ -854,15 +858,13 @@ const fn verse_register(idx: usize) -> i32 {
     if idx == 4 || idx == 5 { 4 } else { 1 }
 }
 
-#[inline]
-const fn verse_ordinal_base(idx: usize) -> Option<u32> {
-    if !CELEBRATION_VERSE[idx] {
-        return None;
-    }
+const VERSE_ORDINAL_BASE: [Option<u32>; CELEBRATION_PHRASE_BARS] = {
+    let mut table = [None; CELEBRATION_PHRASE_BARS];
     let mut base = 0u32;
     let mut i = 0;
-    while i < idx {
+    while i < CELEBRATION_PHRASE_BARS {
         if CELEBRATION_VERSE[i] {
+            table[i] = Some(base);
             let row = &CELEBRATION_PHRASE[i];
             let mut j = 0;
             while j < row.len() {
@@ -874,11 +876,16 @@ const fn verse_ordinal_base(idx: usize) -> Option<u32> {
         }
         i += 1;
     }
-    Some(base)
+    table
+};
+
+#[inline]
+const fn verse_ordinal_base(idx: usize) -> Option<u32> {
+    VERSE_ORDINAL_BASE[idx]
 }
 
 #[inline]
-fn celebration_bar_degrees(sig: u32, idx: usize) -> [i32; 8] {
+const fn celebration_bar_degrees(sig: u32, idx: usize) -> [i32; 8] {
     let mut row = CELEBRATION_PHRASE[idx];
     let Some(base) = verse_ordinal_base(idx) else {
         return row;
@@ -2580,11 +2587,13 @@ impl TrailSynth {
             0.0
         };
         let bed_on = self.bed.level >= 1e-4;
+        let bed_lvl = self.bed.level * self.bed.gain;
         let bed_palette = if bed_on {
             Some(palette_for(self.bed_voice, self.bed_style))
         } else {
             None
         };
+        let sing_mul = 1.0 - SING_DUCK_DEPTH * self.sing;
         let lim_on = self.v2_latched;
         let (lim_att, lim_rel) = if lim_on {
             (
@@ -2772,12 +2781,12 @@ impl TrailSynth {
             active_len = write_idx;
 
             if let Some(palette) = bed_palette {
-                let (bl, br) = self.bed_sample_with(palette, dt);
+                let (bl, br) = self.bed_sample_with(palette, dt, bed_lvl);
                 l += bl;
                 r += br;
             }
 
-            let dmul = (1.0 - BONK_DUCK_DEPTH * self.duck) * (1.0 - SING_DUCK_DEPTH * self.sing);
+            let dmul = (1.0 - BONK_DUCK_DEPTH * self.duck) * sing_mul;
             let l = l * dmul + xl;
             let r = r * dmul + xr;
             self.duck *= duck_step;
@@ -2868,12 +2877,12 @@ impl TrailSynth {
     #[inline]
     pub(super) fn bed_sample(&mut self, dt: f32) -> (f32, f32) {
         let palette = palette_for(self.bed_voice, self.bed_style);
-        self.bed_sample_with(palette, dt)
+        let lvl = self.bed.level * self.bed.gain;
+        self.bed_sample_with(palette, dt, lvl)
     }
 
     #[inline]
-    fn bed_sample_with(&mut self, palette: &dyn Palette, dt: f32) -> (f32, f32) {
-        let lvl = self.bed.level * self.bed.gain;
+    fn bed_sample_with(&mut self, palette: &dyn Palette, dt: f32, lvl: f32) -> (f32, f32) {
         self.bed.lfo1 = (self.bed.lfo1 + 0.23 * dt).fract();
         self.bed.lfo2 = (self.bed.lfo2 + 0.71 * dt).fract();
         let u1 = 0.5 * (1.0 + sin01(self.bed.lfo1));

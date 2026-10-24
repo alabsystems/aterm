@@ -120,49 +120,98 @@ fn paint_eye_reflections(tile: &mut Tile, eye_mask: &Tile, cx: f32, cy: f32, w: 
     }
 }
 
+const MAX_PET_EYE_PATHS: usize = 8;
+
+#[derive(Clone, Copy)]
+struct PetEyeMeta {
+    paths: &'static [&'static [PathSeg]],
+    bounds: [Option<(f32, f32, f32, f32)>; MAX_PET_EYE_PATHS],
+    max_w: f32,
+    near_cx: f32,
+}
+
+impl PetEyeMeta {
+    const fn from_layers(layers: &'static [Layer]) -> Self {
+        let mut eye_layer: Option<&'static Layer> = None;
+        let mut i = 0;
+        while i < layers.len() {
+            if matches!(layers[i].role, GlyphRole::Eye) {
+                assert!(eye_layer.is_none());
+                eye_layer = Some(&layers[i]);
+            }
+            i += 1;
+        }
+        let mut paths: &'static [&'static [PathSeg]] = &[];
+        let mut bounds = [None; MAX_PET_EYE_PATHS];
+        let mut max_w = 0.0_f32;
+        let mut near_cx = 0.5_f32;
+        let mut best_w: Option<f32> = None;
+        if let Some(layer) = eye_layer {
+            assert!(layer.paths.len() <= MAX_PET_EYE_PATHS);
+            paths = layer.paths;
+            let count = paths.len();
+            let mut p = 0;
+            while p < count {
+                let b = path_bounds(paths[p]);
+                bounds[p] = b;
+                if let Some((x0, _, x1, _)) = b {
+                    let w = x1 - x0;
+                    if w > max_w {
+                        max_w = w;
+                    }
+                    let is_ge = match best_w {
+                        None => true,
+                        Some(bw) => w >= bw,
+                    };
+                    if is_ge {
+                        best_w = Some(w);
+                        near_cx = (x0 + x1) * 0.5;
+                    }
+                }
+                p += 1;
+            }
+        }
+        Self {
+            paths,
+            bounds,
+            max_w,
+            near_cx,
+        }
+    }
+}
+
+static PET_EYE_META: [PetEyeMeta; PET_GLYPHS.len()] = {
+    let mut meta = [PetEyeMeta {
+        paths: &[],
+        bounds: [None; MAX_PET_EYE_PATHS],
+        max_w: 0.0,
+        near_cx: 0.5,
+    }; PET_GLYPHS.len()];
+    let mut i = 0;
+    while i < PET_GLYPHS.len() {
+        meta[i] = PetEyeMeta::from_layers(PET_GLYPHS[i].layers);
+        i += 1;
+    }
+    meta
+};
+
 /// The LOD eye pass: each `Eye` subpath (one authored eye) is refilled solid as its own dot,
 /// grown about its centre ([`zoom_about`]) toward [`EYE_DOT_TARGET_H_PX`] (open, capped at
 /// [`EYE_DOT_SCALE_MAX`]) or [`EYE_DOT_TARGET_H_PX_ARC`] (shallow, capped at
 /// [`EYE_DOT_SCALE_MAX_SHALLOW`] and [`EYE_DOT_ARC_KX_MAX`] wide).
 fn paint_eye_dots(
     tile: &mut Tile,
-    layer: &Layer,
+    eye_meta: &PetEyeMeta,
     col: (f32, f32, f32),
     alpha: f32,
     xform: PathTransform,
     reflections: bool,
     eye_mask: &mut Option<Tile>,
 ) {
-    let mut inline_bounds = [None; 8];
-    let heap_bounds = (layer.paths.len() > inline_bounds.len()).then(|| {
-        layer
-            .paths
-            .iter()
-            .map(|p| path_bounds(p))
-            .collect::<Vec<_>>()
-    });
-    let bounds = match heap_bounds.as_deref() {
-        Some(bounds) => bounds,
-        None => {
-            let bounds = &mut inline_bounds[..layer.paths.len()];
-            for (slot, path) in bounds.iter_mut().zip(layer.paths.iter()) {
-                *slot = path_bounds(path);
-            }
-            &*bounds
-        }
-    };
+    let bounds = &eye_meta.bounds[..eye_meta.paths.len()];
+    let max_w = eye_meta.max_w;
+    let near_cx = eye_meta.near_cx;
     let width = |b: &Option<(f32, f32, f32, f32)>| b.map_or(0.0, |(x0, _, x1, _)| x1 - x0);
-    let mut max_w = 0.0_f32;
-    let mut near_cx = 0.5_f32;
-    let mut best_w: Option<f32> = None;
-    for &(x0, _, x1, _) in bounds.iter().flatten() {
-        let w = x1 - x0;
-        max_w = max_w.max(w);
-        if best_w.is_none_or(|bw| w.total_cmp(&bw).is_ge()) {
-            best_w = Some(w);
-            near_cx = (x0 + x1) * 0.5;
-        }
-    }
     let ratio = |b: &Option<(f32, f32, f32, f32)>| {
         if max_w > 0.0 { width(b) / max_w } else { 1.0 }
     };
@@ -171,7 +220,7 @@ fn paint_eye_dots(
     let core_min_w_px = EYE_DOT_FAR_CORE_MIN_W_FRAC * xform.scale_y;
     let sx_eps = xform.scale_x.max(f32::EPSILON);
     let sy_eps = xform.scale_y.max(f32::EPSILON);
-    for (i, path) in layer.paths.iter().enumerate() {
+    for (i, path) in eye_meta.paths.iter().enumerate() {
         let Some((x0, y0, x1, y1)) = bounds[i] else {
             continue;
         };
@@ -382,7 +431,9 @@ fn paint_pose_onto(
     let xform = PathTransform::fit(w, h);
     let face_lod = h < FACE_DETAIL_MIN_H;
     let mouth_lod = h < MOUTH_DETAIL_MIN_H;
-    for layer in PET_GLYPHS[pose as usize].layers {
+    let pose_idx = pose as usize;
+    let eye_meta = &PET_EYE_META[pose_idx];
+    for layer in PET_GLYPHS[pose_idx].layers {
         // LOD cull by authored role: whisker/blush/pattern are sub-pixel charm;
         // iris/catch-light/pupil (`Detail`) are what the dot and its
         // device-sized reflection replace.
@@ -402,7 +453,7 @@ fn paint_pose_onto(
         }
         let (col, alpha) = resolve_layer(layer, fills);
         if face_lod && layer.role == GlyphRole::Eye {
-            paint_eye_dots(tile, layer, col, alpha, xform, reflections, eye_mask);
+            paint_eye_dots(tile, eye_meta, col, alpha, xform, reflections, eye_mask);
             continue;
         }
         if matches!(layer.role, GlyphRole::Outline | GlyphRole::Whisker) {

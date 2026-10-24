@@ -277,6 +277,34 @@ fn nothing_goes_while_any_of_it_was_written_within_the_window() {
     }
 }
 
+/// A compiler laid aside reports its sysroot canonical, `<build>.noindex`, while `current`
+/// names `<build>`, the link to it ([`aterm_toolchain::layout`]): the same build either way.
+#[test]
+#[cfg(unix)]
+fn a_sysroot_laid_aside_is_the_build_its_link_names() {
+    let info = format!("{LEAF}/.rustc_info.json");
+    let mut fs = world(now() - 2 * DAY, 4 * DAY);
+    fs.dir("/store/trust/15698.noindex", now() - 2 * DAY)
+        .link("/store/trust/15698", now() - 2 * DAY, "15698.noindex")
+        .file(&info, now(), &rustc_info(&["/store/trust/15698.noindex"]));
+    assert_eq!(
+        surveyed(&fs).last_built,
+        Some(LastBuilt {
+            current: true,
+            since: now() - 2 * DAY
+        })
+    );
+    fs.link("/store/trust/current", now() - DAY, "9192");
+    assert_eq!(
+        surveyed(&fs).last_built,
+        Some(LastBuilt {
+            current: false,
+            since: now() - DAY
+        }),
+        "the previous compiler, laid aside, is still named as the previous one"
+    );
+}
+
 /// Unix only: the fixture's sysroot (`/store/trust/…`) is read only when it is
 /// absolute, which a path with no drive is not on Windows.
 #[test]

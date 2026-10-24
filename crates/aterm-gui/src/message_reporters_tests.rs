@@ -3381,3 +3381,86 @@ fn every_tab_notices_step_stands_on_the_band() {
         "the control: {shown:?}"
     );
 }
+
+/// ANOTHER CLI'S LOGIN NOTICES name its product and its `--cli` command, each under its own
+/// subject and the key its pool clears, and never carry an email or a URL. CONTROL: Claude Code's, through the same
+/// builders, are its own entries word for word.
+#[test]
+fn another_clis_login_notices_name_its_product_and_claudes_are_unchanged() {
+    use aterm_agent::harness::accounts::Cli;
+    let labels = |names: &[&str]| -> Vec<String> { names.iter().map(|n| n.to_string()).collect() };
+    let due = super::accounts_due_entry_for(Cli::Kimi, &labels(&["kimi-1", "kimi-2"]))
+        .expect("an entry")
+        .message()
+        .expect("a valid entry");
+    assert_eq!(due.title, "2 Kimi logins due for renewal");
+    assert!(
+        due.detail.iter().any(|l| l == "Kimi Code CLI logins:")
+            && due.detail.iter().any(|l| l == "Due: kimi-1, kimi-2"),
+        "{:?}",
+        due.detail
+    );
+    let wrong = super::accounts_wrong_entry_for(Cli::Codex, &labels(&["codex-2"]))
+        .expect("an entry")
+        .message()
+        .expect("a valid entry");
+    assert_eq!(wrong.title, "Codex signed in another account");
+    assert!(
+        wrong
+            .detail
+            .iter()
+            .any(|l| l.contains("The Codex CLI sign-in for codex-2")),
+        "{:?}",
+        wrong.detail
+    );
+    for (cli, cause, entry) in [
+        (
+            Cli::Kimi,
+            "due",
+            super::accounts_due_entry_for(Cli::Kimi, &labels(&["kimi-1"])),
+        ),
+        (
+            Cli::Codex,
+            "wrong-account",
+            super::accounts_wrong_entry_for(Cli::Codex, &labels(&["codex-2"])),
+        ),
+    ] {
+        assert_eq!(
+            entry.expect("an entry").key(),
+            super::pool_notice_key(cli, cause),
+            "the key a quiet pool clears is the one it posted under"
+        );
+    }
+    let said = |m: &aterm_messages::Message| format!("{m:?}");
+    for msg in [&due, &wrong] {
+        let text = said(msg);
+        assert!(
+            !text.contains('@') && !text.contains("https://"),
+            "no email or URL: {text}"
+        );
+    }
+    assert!(said(&due).contains("--cli kimi"), "{}", said(&due));
+    assert!(said(&wrong).contains("--cli codex"), "{}", said(&wrong));
+    let entry = |e: Option<aterm_messages::exceptions::Entry>| format!("{e:?}");
+    assert_ne!(
+        entry(super::accounts_due_entry_for(Cli::Kimi, &labels(&["a"]))),
+        entry(super::accounts_due_entry_for(Cli::Codex, &labels(&["a"]))),
+        "each CLI's entry stands apart"
+    );
+    assert_eq!(
+        entry(super::accounts_due_entry_for(
+            Cli::Claude,
+            &labels(&["m7-a"])
+        )),
+        entry(super::accounts_due_entry(&labels(&["m7-a"]))),
+        "Claude Code's due entry is its own"
+    );
+    assert_eq!(
+        entry(super::accounts_wrong_entry_for(
+            Cli::Claude,
+            &labels(&["m7-a"])
+        )),
+        entry(super::accounts_wrong_entry(&labels(&["m7-a"]))),
+        "Claude Code's wrong-account entry is its own"
+    );
+}

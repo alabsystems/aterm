@@ -1231,6 +1231,23 @@ impl MessageCenter {
         ids.len() + closed + self.resolve_digest_prefix(prefix, outcome, now)
     }
 
+    /// Withdraw every live row and every digest exception whose key starts with
+    /// `prefix`: their reporter stops saying them without having read their cause end
+    /// (a switch turned off, a check that read nothing), so none is filed as fixed and
+    /// no filing is closed.
+    pub fn withdraw_key_prefix(&mut self, prefix: &str, now: Instant) -> usize {
+        let ids: Vec<MessageId> = self
+            .live
+            .iter()
+            .filter(|l| l.msg.key.as_deref().is_some_and(|k| k.starts_with(prefix)))
+            .map(|l| l.id)
+            .collect();
+        for id in &ids {
+            self.withdraw(*id, now);
+        }
+        ids.len() + self.end_digest_prefix(prefix, &Retired::Withdrawn, now)
+    }
+
     /// A person dismissed it.
     pub fn dismiss(&mut self, id: MessageId, now: Instant) -> bool {
         let Some(i) = self.index(id) else {
@@ -2745,6 +2762,11 @@ impl MessageCenter {
 
     /// The cause ended.
     pub fn resolve_digest_prefix(&mut self, prefix: &str, outcome: Outcome, now: Instant) -> usize {
+        self.end_digest_prefix(prefix, &Retired::Resolved(outcome), now)
+    }
+
+    /// Every digest exception whose key starts with `prefix` ends `how`.
+    fn end_digest_prefix(&mut self, prefix: &str, how: &Retired, now: Instant) -> usize {
         let mut n = 0;
         loop {
             let hit = self
@@ -2753,7 +2775,7 @@ impl MessageCenter {
                 .position(|e| e.msg.key.as_deref().is_some_and(|k| k.starts_with(prefix)));
             let Some(i) = hit else { break };
             let wall = self.digest.get(i).wall_at(now);
-            self.file_digest_at(i, Retired::Resolved(outcome), wall, now);
+            self.file_digest_at(i, how.clone(), wall, now);
             n += 1;
         }
         n
@@ -2862,9 +2884,19 @@ impl MessageCenter {
         out
     }
 
-    /// The cause ended and its reporter says so (a verified grant, a switch turned off).
+    /// The cause ended and its reporter says so (a verified grant, the setting the
+    /// entry was about set right). A reporter that only stops saying it withdraws it
+    /// ([`Self::withdraw_digest`]).
     pub fn clear_digest(&mut self, key: &str, now: Instant) -> bool {
         self.end_digest_key(key, Retired::Resolved(Outcome::Ok), None, now)
+            .is_some()
+    }
+
+    /// The entry under exactly `key` ends with no outcome to claim (`Withdrawn`): its
+    /// reporter stops saying it (a kind this build no longer reports, or a fact another
+    /// surface now carries) without having read its cause end.
+    pub fn withdraw_digest(&mut self, key: &str, now: Instant) -> bool {
+        self.end_digest_key(key, Retired::Withdrawn, None, now)
             .is_some()
     }
 

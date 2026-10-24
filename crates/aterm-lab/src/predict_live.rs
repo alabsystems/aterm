@@ -1063,6 +1063,7 @@ fn run_one(
         env,
         cwd: world.home.clone(),
         sandbox: None,
+        reroute: false,
     };
     let started = if headless {
         Instance::start_in(&world, launch, crate::band::Band::App)

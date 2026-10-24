@@ -1796,6 +1796,7 @@ pub(crate) struct SessionTimeline {
     land_held: Option<aterm_agent::harness::acts::LandHeld>,
     cwd_witness: Option<(u64, i32)>,
     holder_image: Option<std::sync::Arc<crate::holder_image::HolderImage>>,
+    drawer_groups: crate::holder_image::DrawerGroups,
     card_seen: Option<u64>,
     card_frames: CardFrameMemo,
     registry_drift: RegistryDriftMemo,
@@ -1808,7 +1809,11 @@ struct CardFrameMemo {
     bare: BareFrames,
     said: Option<(u64, crate::claude_card::Bare, Option<i64>)>,
     composed: u64,
-    seen: Option<(u64, i64, u64)>,
+    /// The drawer card the probe saw: its token, its row, the pass count then, and the screen
+    /// mutations before the slice that drew it.
+    seen: Option<(u64, i64, u64, u64)>,
+    /// Passes whose snapshot holds that slice, before the card was decorated.
+    late: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2338,6 +2343,8 @@ impl SessionTimeline {
             Some(aterm_phase::Program::Claude) => true,
             Some(
                 aterm_phase::Program::Codex
+                | aterm_phase::Program::Grok
+                | aterm_phase::Program::Kimi
                 | aterm_phase::Program::Agy
                 | aterm_phase::Program::Muse
                 | aterm_phase::Program::Gemini
@@ -2881,6 +2888,16 @@ impl SessionTimeline {
         self.holder_image.as_ref()
     }
 
+    /// The group each holder-fence mark's drawer leads ([`crate::holder_image::DrawerGroups`]).
+    pub(crate) const fn drawer_groups(&self) -> &crate::holder_image::DrawerGroups {
+        &self.drawer_groups
+    }
+
+    /// See [`Self::drawer_groups`].
+    pub(crate) const fn drawer_groups_mut(&mut self) -> &mut crate::holder_image::DrawerGroups {
+        &mut self.drawer_groups
+    }
+
     fn current_holder_image(&self) -> Option<&crate::holder_image::HolderImage> {
         self.holder_image
             .as_deref()
@@ -2986,6 +3003,7 @@ impl SessionTimeline {
         rows_kind: usize,
         version: &str,
         row: i64,
+        from: u64,
     ) -> bool {
         if self.card_seen == Some(token)
             || !self.holder_image.as_ref().is_some_and(|image| {
@@ -2995,11 +3013,12 @@ impl SessionTimeline {
             return false;
         }
         self.card_seen = Some(token);
-        self.card_frames.seen = Some((token, row, self.card_frames.composed));
+        self.card_frames.seen = Some((token, row, self.card_frames.composed, from));
+        self.card_frames.late = 0;
         self.record_row(
             "card-seen",
             format!(
-                "token={} rows_kind={rows_kind} row={row} after={} evidence=matching-screen {}",
+                "token={} rows_kind={rows_kind} row={row} after={} from={from} evidence=matching-screen {}",
                 crate::holder_image::token_word(Some(token)),
                 self.card_frames.composed,
                 crate::holder_image::dev_tail()
@@ -3008,15 +3027,22 @@ impl SessionTimeline {
         true
     }
 
-    /// Record dev diagnostic rows for one launch-card compose pass.
+    /// Record dev diagnostic rows for one launch-card compose pass, whose snapshot counted
+    /// `mutations` screen mutations: after the slice the probe saw the card in, it shows that card.
     pub(crate) fn note_card_frame(
         &mut self,
         outcome: crate::claude_card::CardOutcome,
         composed: u64,
+        mutations: u64,
     ) {
         use crate::claude_card::{Bare, CardOutcome};
         let token_word = |t: u64| crate::holder_image::token_word((t != 0).then_some(t));
         self.card_frames.composed = composed;
+        let shows_seen = self
+            .card_frames
+            .seen
+            .filter(|&(t, _, _, from)| mutations > from && self.card_frames.decorated != Some(t))
+            .map(|(t, ..)| t);
         match outcome {
             CardOutcome::Decorated { token, row, armed } => {
                 self.card_frames.said = None;
@@ -3036,10 +3062,7 @@ impl SessionTimeline {
                 if self.card_frames.decorated != Some(token) {
                     self.card_frames.decorated = Some(token);
                     let late = match self.card_frames.seen {
-                        Some((t, r, after)) if t == token && r == row => {
-                            u32::try_from(composed.saturating_sub(after).saturating_sub(1))
-                                .unwrap_or(u32::MAX)
-                        }
+                        Some((t, r, ..)) if t == token && r == row => self.card_frames.late,
                         _ => 0,
                     };
                     let bare = self.card_frames.bare.of(token, row).max(late);
@@ -3077,7 +3100,7 @@ impl SessionTimeline {
                 );
                 if token != 0
                     && self.card_frames.decorated != Some(token)
-                    && ((refused && row.is_some()) || self.card_seen == Some(token))
+                    && ((refused && row.is_some()) || shows_seen == Some(token))
                 {
                     self.card_frames.bare.count(token, row);
                 }
@@ -3096,15 +3119,20 @@ impl SessionTimeline {
                 }
             }
         }
+        if shows_seen.is_some_and(|t| self.card_frames.decorated != Some(t)) {
+            self.card_frames.late = self.card_frames.late.saturating_add(1);
+        }
     }
 
-    /// The token of the current holder image when it is a drawer whose card has not been seen yet.
-    pub(crate) fn card_unseen(&self) -> Option<u64> {
-        self.holder_image
+    /// The token and drawer of the current holder image when it is a drawer whose card has not
+    /// been seen yet.
+    pub(crate) fn card_unseen(&self) -> Option<(u64, crate::holder_image::CardProgram)> {
+        let image = self
+            .holder_image
             .as_ref()
-            .filter(|i| i.drawer.is_some() && i.build.version().is_some())
-            .and_then(|i| i.token)
-            .filter(|t| self.card_seen != Some(*t))
+            .filter(|i| i.build.version().is_some())?;
+        let token = image.token.filter(|t| self.card_seen != Some(*t))?;
+        Some((token, image.drawer?))
     }
 
     /// The resolver's answer for `pgid`, applied only while that group is in front (a late answer for a finished job is dropped).
@@ -3161,6 +3189,8 @@ impl SessionTimeline {
             Some(
                 aterm_phase::Program::Claude
                 | aterm_phase::Program::Codex
+                | aterm_phase::Program::Grok
+                | aterm_phase::Program::Kimi
                 | aterm_phase::Program::Gemini
                 | aterm_phase::Program::Generic,
             )
@@ -5164,7 +5194,7 @@ mod card_engine_dev_row_tests {
     use atpkg::image::{ImageBuild, ImageSource, ProgramTag};
 
     use super::{SessionTimeline, claim_supervisor_as};
-    use crate::holder_image::{EdgeKind, HolderImage};
+    use crate::holder_image::{CardProgram, EdgeKind, HolderImage};
 
     fn rows(tl: &SessionTimeline, kind: &str) -> usize {
         tl.since(None).filter(|e| e.kind == kind).count()
@@ -5205,24 +5235,35 @@ mod card_engine_dev_row_tests {
         let image = claude_304(80);
         let token = image.token.expect("tracked");
         assert_eq!(tl.card_unseen(), None, "no drawer yet");
-        assert!(!tl.note_card_seen(token, 3, "2.1.304", 0), "not published");
-        tl.offer_holder_image(Arc::new(image), EdgeKind::Group);
-        assert_eq!(tl.card_unseen(), Some(token));
-        assert!(!tl.note_card_seen(token, 4, "2.1.304", 0), "agy's card");
-        assert!(!tl.note_card_seen(token, 3, "2.1.303", 0), "another build");
         assert!(
-            !tl.note_card_seen(token ^ 1, 3, "2.1.304", 0),
+            !tl.note_card_seen(token, 3, "2.1.304", 0, 0),
+            "not published"
+        );
+        tl.offer_holder_image(Arc::new(image), EdgeKind::Group);
+        assert_eq!(tl.card_unseen(), Some((token, CardProgram::Claude)));
+        assert!(!tl.note_card_seen(token, 4, "2.1.304", 0, 0), "agy's card");
+        assert!(
+            !tl.note_card_seen(token, 3, "2.1.303", 0, 0),
+            "another build"
+        );
+        assert!(
+            !tl.note_card_seen(token ^ 1, 3, "2.1.304", 0, 0),
             "another token"
         );
         assert_eq!(rows(&tl, "card-seen"), 0);
-        assert!(tl.note_card_seen(token, 3, "2.1.304", 0));
-        assert!(!tl.note_card_seen(token, 3, "2.1.304", 0), "once per token");
+        assert!(tl.note_card_seen(token, 3, "2.1.304", 0, 0));
+        assert!(
+            !tl.note_card_seen(token, 3, "2.1.304", 0, 0),
+            "once per token"
+        );
         assert_eq!(rows(&tl, "card-seen"), 1);
         assert_eq!(tl.card_unseen(), None, "the probe stops looking");
     }
 
+    /// A pass counts toward `bare_frames` once its snapshot holds the slice the probe saw the
+    /// card in (its screen mutations past the slice's `from`); a pass already in flight does not.
     #[test]
-    fn bare_frames_count_the_passes_since_the_drawers_card_was_seen() {
+    fn bare_frames_count_the_passes_whose_snapshot_shows_the_seen_card() {
         use crate::claude_card::{Bare, CardOutcome};
         fn decorated(tl: &SessionTimeline) -> Vec<String> {
             tl.since(None)
@@ -5234,8 +5275,8 @@ mod card_engine_dev_row_tests {
         let image = claude_304(80);
         let token = image.token.expect("tracked");
         tl.offer_holder_image(Arc::new(image), EdgeKind::Group);
-        tl.note_card_frame(CardOutcome::Bare(token, Bare::Fence, Some(0)), 1);
-        tl.note_card_frame(CardOutcome::Bare(token, Bare::Fence, Some(0)), 2);
+        tl.note_card_frame(CardOutcome::Bare(token, Bare::Fence, Some(0)), 1, 1);
+        tl.note_card_frame(CardOutcome::Bare(token, Bare::Fence, Some(0)), 2, 2);
         tl.note_card_frame(
             CardOutcome::Decorated {
                 token,
@@ -5243,36 +5284,39 @@ mod card_engine_dev_row_tests {
                 armed: Some("new"),
             },
             3,
+            3,
         );
         let rows = decorated(&tl);
         assert!(rows[0].contains("bare_frames=0"), "{rows:?}");
         let image = claude_304(81);
         let next = image.token.expect("tracked");
         tl.offer_holder_image(Arc::new(image), EdgeKind::Group);
-        tl.note_card_frame(CardOutcome::Bare(next, Bare::Fence, Some(9)), 4);
-        assert!(tl.note_card_seen(next, 3, "2.1.304", 20));
-        tl.note_card_frame(CardOutcome::Bare(next, Bare::Fence, Some(9)), 5);
-        tl.note_card_frame(CardOutcome::Bare(next, Bare::Fence, Some(9)), 6);
+        tl.note_card_frame(CardOutcome::Bare(next, Bare::Fence, Some(9)), 4, 10);
+        assert!(tl.note_card_seen(next, 3, "2.1.304", 20, 10));
+        tl.note_card_frame(CardOutcome::Bare(next, Bare::NoCard, None), 5, 10);
+        tl.note_card_frame(CardOutcome::Bare(next, Bare::Fence, Some(9)), 6, 11);
+        tl.note_card_frame(CardOutcome::Bare(next, Bare::Fence, Some(9)), 7, 12);
         tl.note_card_frame(
             CardOutcome::Decorated {
                 token: next,
                 row: 20,
                 armed: Some("new"),
             },
-            7,
+            8,
+            12,
         );
         let rows = decorated(&tl);
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert!(
             rows[1].contains("bare_frames=2"),
-            "the passes since the sight: {rows:?}"
+            "the passes whose snapshot holds the card's slice, not the one in flight: {rows:?}"
         );
         let seen: Vec<String> = tl
             .since(None)
             .filter(|e| e.kind == "card-seen")
             .map(|e| e.payload.to_string())
             .collect();
-        assert!(seen[0].contains("row=20 after=4"), "{seen:?}");
+        assert!(seen[0].contains("row=20 after=4 from=10"), "{seen:?}");
     }
 
     #[test]

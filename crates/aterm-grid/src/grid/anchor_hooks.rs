@@ -289,8 +289,10 @@ impl Grid {
             })
     }
 
-    /// [`Self::screen_row_inked`] of the screen row at absolute `row`, from its first column.
-    pub(super) fn absolute_row_inked(&self, row: u64) -> bool {
+    /// Whether the live screen row at absolute `row` shows anything, by the lay taint's ink test
+    /// (a row off the screen shows nothing).
+    #[must_use]
+    pub fn absolute_row_inked(&self, row: u64) -> bool {
         row.checked_sub(self.visible_to_absolute(0))
             .and_then(|r| u16::try_from(r).ok())
             .is_some_and(|r| self.screen_row_inked(r, 0))
@@ -802,7 +804,7 @@ mod tests {
         let base = g.visible_to_absolute(0);
         let before = g.anchors_mut().place(base, AnchorRole::Start).unwrap();
         let end = g.anchors_mut().place(base + 1, AnchorRole::End).unwrap();
-        let moved = g.anchors_mut().place(base + 1, AnchorRole::Start).unwrap();
+        let next = g.anchors_mut().place(base + 1, AnchorRole::Start).unwrap();
         g.set_cursor(1, 0);
         g.insert_lines(1);
         assert_eq!(g.anchors().row(before), Some(base));
@@ -811,7 +813,11 @@ mod tests {
             Some(base + 1),
             "inserted row excluded"
         );
-        assert_eq!(g.anchors().row(moved), Some(base + 2), "old row followed");
+        assert_eq!(
+            g.anchors().row(next),
+            Some(base + 1),
+            "inserted row joins the span starting there"
+        );
     }
 
     #[test]

@@ -2032,6 +2032,11 @@ fn a_job_with_no_window_is_read_until_it_ends_and_its_end_is_announced() {
         "{}",
         app.status_job_fields(0)
     );
+    assert!(
+        app.status_job_fields(0).ends_with(NONE_HELD),
+        "{}",
+        app.status_job_fields(0)
+    );
     let adopted = app.vitals.adopted_at.expect("adopted");
     assert_eq!(
         app.vitals_deadline(),
@@ -2063,7 +2068,10 @@ fn a_job_with_no_window_is_read_until_it_ends_and_its_end_is_announced() {
         },
     });
     app.on_vitals_wake();
-    assert_eq!(app.status_job_fields(0), "job=none job_quiet_ms=-");
+    assert_eq!(
+        app.status_job_fields(0),
+        format!("job=none job_quiet_ms=- {NONE_HELD}")
+    );
     let recorded: Vec<String> = {
         let tl = Arc::clone(&app.pool.get(0).expect("tab 0's session").ctx.timeline);
         let tl = tl.lock().unwrap();
@@ -2076,6 +2084,53 @@ fn a_job_with_no_window_is_read_until_it_ends_and_its_end_is_announced() {
     };
     assert_eq!(recorded, ["exited job=j41 class=exited rev=1 code=0"]);
     assert_eq!(app.vitals_deadline(), None, "nothing live: nothing due");
+}
+
+/// `status`'s `program_check=` with no program held: `0` on macOS, `-` where nothing is held at a check.
+const NONE_HELD: &str = if cfg!(target_os = "macos") {
+    "program_check=0"
+} else {
+    "program_check=-"
+};
+
+/// `status` counts the programs macOS's program check holds in its session's tab, from the view
+/// its `job=` reads, the oldest counted on to now; another tab's held program is not its.
+#[test]
+fn status_counts_the_programs_held_in_its_sessions_tab() {
+    use aterm_vitals::jobs::{Findings, Named};
+    static BOARD: JobsBoard = JobsBoard::new();
+    let mut app = crate::App::headless_for_test();
+    let _rx = with_reader(&mut app, &BOARD);
+    let held = |pid, tab| Named {
+        pid,
+        name: "git-remote-https".into(),
+        tab: Some(tab),
+        for_ms: 1_140_000,
+    };
+    app.vitals.latest.lock().unwrap().snap = Some(Arc::new(Snapshot {
+        seq: 1,
+        jobs: Some(Arc::new(JobsView {
+            findings: Findings {
+                program_check: vec![held(63454, 0), held(63455, 9)],
+                ..Findings::default()
+            },
+            ..JobsView::default()
+        })),
+        ..Snapshot::default()
+    }));
+    app.on_vitals_wake();
+    let fields = app.status_job_fields(0);
+    if cfg!(target_os = "macos") {
+        let held = fields
+            .strip_prefix("job=none job_quiet_ms=- program_check=1:")
+            .unwrap_or_else(|| panic!("one program held in tab 0: {fields}"));
+        assert!(
+            held.parse::<u64>().is_ok_and(|ms| ms >= 1_140_000),
+            "the oldest, to now: {fields}"
+        );
+    } else {
+        assert_eq!(fields, "job=none job_quiet_ms=- program_check=-");
+    }
 }
 
 #[test]
@@ -2353,7 +2408,24 @@ impl JobAtRest {
         Self::starting(raw, |_| {})
     }
 
+    /// A job at rest that writes: `cat` on the terminal, which echoes each line [`Self::poke`]
+    /// types to it, as a program in front prints.
+    fn writer() -> Self {
+        Self::running(false, "/bin/cat", |_| {})
+    }
+
+    /// Types a line to the job, which a [`Self::writer`] reads and writes back.
+    fn poke(&self) {
+        // SAFETY: the owned live master is written once with a short line.
+        let n = unsafe { libc::write(self.master(), b"x\n".as_ptr().cast(), 2) };
+        assert_eq!(n, 2, "typed a line");
+    }
+
     fn starting(raw: bool, before_ready: impl FnOnce(&mut Self)) -> Self {
+        Self::running(raw, "/bin/sleep", before_ready)
+    }
+
+    fn running(raw: bool, program: &str, before_ready: impl FnOnce(&mut Self)) -> Self {
         use std::os::fd::{FromRawFd as _, OwnedFd};
         let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
         // SAFETY: both fresh descriptors are transferred to their only
@@ -2384,6 +2456,7 @@ impl JobAtRest {
             "--test-threads=1",
         ])
         .env("ATERM_TEST_VITALS_JOB_LEADER", "1")
+        .env("ATERM_TEST_VITALS_JOB_PROGRAM", program)
         .setsid(true)
         .stdin(slave)
         .stdout(aterm_uds::spawnfd::Stdio::piped())
@@ -2545,9 +2618,12 @@ fn job_at_rest_leader() {
     }
     // SAFETY: The live slave at 0 is borrowed, never transferred away.
     let slave = unsafe { BorrowedFd::borrow_raw(0) };
-    let mut cmd = aterm_uds::spawnfd::command("/bin/sleep");
-    cmd.arg(aterm_spec::wait::PARKED_SECS.to_string())
-        .process_group(0)
+    let program = std::env::var("ATERM_TEST_VITALS_JOB_PROGRAM").expect("the job's program");
+    let mut cmd = aterm_uds::spawnfd::command(&program);
+    if program == "/bin/sleep" {
+        cmd.arg(aterm_spec::wait::PARKED_SECS.to_string());
+    }
+    cmd.process_group(0)
         .stdin(slave.try_clone_to_owned().expect("dup slave"))
         .stdout(slave.try_clone_to_owned().expect("dup slave"))
         .stderr(slave.try_clone_to_owned().expect("dup slave"));
@@ -3219,7 +3295,7 @@ const PING_LINE: &[u8] = b"64 bytes from 127.0.0.1: icmp_seq=1\r\n";
 fn a_line_the_tab_printed_between_passes_is_its_jobs_progress() {
     use aterm_vitals::jobs::Verdict;
     static BOARD: JobsBoard = JobsBoard::new();
-    let job = JobAtRest::new(false);
+    let job = JobAtRest::writer();
     let (app, _rx) = job.app(&BOARD);
     let mut req = app.vitals_request(Duration::ZERO, false);
     req.jobs_now = true;
@@ -3250,9 +3326,34 @@ fn a_line_the_tab_printed_between_passes_is_its_jobs_progress() {
         );
     };
     assert_eq!(quiet(1_000), Some(0), "found at rest");
+    job.poke();
     line(5_000);
     assert_eq!(quiet(8_000), None, "running: the line is 3 s old");
     assert_eq!(quiet(12_000), Some(7_000), "quiet since the line");
+}
+
+/// A PASS THAT FINDS KEYS DRIVEN INTO A TAB STAMPS ITS FEED (system-awareness §6.6): the keys
+/// reach the engine as `JobTab::typed_ms`, the clock of the pass that found them, which a session
+/// nested in the tab's waits on before its terminal's word is the person's.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_pass_that_finds_keys_driven_into_a_tab_stamps_its_feed() {
+    static BOARD: JobsBoard = JobsBoard::new();
+    let job = JobAtRest::writer();
+    let (app, _rx) = job.app(&BOARD);
+    let req = app.vitals_request(Duration::ZERO, false);
+    let epoch = Instant::now();
+    let typed = |at_ms| {
+        req.tab_reads(epoch, || epoch + Duration::from_millis(at_ms))
+            .feeds
+            .iter()
+            .find(|(key, _)| *key == 0)
+            .and_then(|(_, f)| f.typed_ms)
+    };
+    assert_eq!(typed(1_000), None, "no key yet");
+    let sink = &app.pool.get(0).expect("tab 0").ctx.sink;
+    assert_eq!(sink.write_frame(b"x\n").expect("a key"), 2);
+    assert_eq!(typed(3_000), Some(3_000), "the pass that found it");
 }
 
 #[cfg(target_os = "macos")]
@@ -3284,7 +3385,7 @@ const MID_SWEEP: CoalProbe = CoalProbe {
 fn a_reading_takes_its_tabs_before_its_sweep() {
     use aterm_vitals::jobs::Verdict;
     static BOARD: JobsBoard = JobsBoard::new();
-    let job = JobAtRest::new(false);
+    let job = JobAtRest::writer();
     let (app, _rx) = job.app(&BOARD);
     let mut req = app.vitals_request(Duration::ZERO, false);
     req.jobs_now = true;
@@ -3299,6 +3400,7 @@ fn a_reading_takes_its_tabs_before_its_sweep() {
     };
     assert_eq!(quiet(), Some(true), "found at rest");
     let feed = Arc::clone(&app.pool.get(0).expect("tab 0").ctx.job_feed);
+    job.poke();
     AT_SWEEP.with(|h| {
         *h.borrow_mut() = Some(Box::new(move || {
             feed.fed(

@@ -31,6 +31,8 @@ struct AuthorizationCommit {
 enum Admission {
     /// A person's reviewed choice: the plan is theirs and is never widened.
     Person,
+    /// An explicit Join: the chooser's plan, whose vault-dependent steps run again.
+    Join,
     /// aterm's own first-launch plan (System State design §3.5): provisional.
     Automatic,
     /// A provisional plan widened on a later launch that found the ALab signal.
@@ -42,6 +44,8 @@ enum Admission {
 enum AuthorizationWrite {
     /// The plan, and whether aterm chose it by itself.
     Plan(Plan, bool),
+    /// An upgrade's plan and recoverable, unadmitted progress share one rename.
+    UpgradePlan(Plan, scope::UpgradeProgress),
     Progress(Progress),
     Workstation(Plan),
 }
@@ -50,6 +54,7 @@ impl AuthorizationWrite {
     fn persist(&self, root: &Path) -> Result<(), String> {
         match self {
             Self::Plan(plan, provisional) => save_plan_as(root, plan, *provisional),
+            Self::UpgradePlan(plan, recovery) => recovery.save(root, plan),
             Self::Progress(progress) => save_progress(root, *progress),
             Self::Workstation(plan) => save_workstation_authorization(root, plan),
         }
@@ -60,6 +65,11 @@ impl AuthorizationWrite {
             Self::Plan(plan, provisional) => {
                 records.plan = Some((plan.clone(), true));
                 records.provisional = *provisional;
+            }
+            Self::UpgradePlan(plan, recovery) => {
+                records.plan = Some((plan.clone(), true));
+                records.provisional = true;
+                records.progress = Some(recovery.pending);
             }
             Self::Progress(progress) => records.progress = Some(*progress),
             Self::Workstation(plan) => {
@@ -100,16 +110,24 @@ impl AuthorizationCommit {
                 .filter(|stage| stage.selected(previous) && stage.selected(plan))
                 .fold(0, |done, stage| done | (prior.done & stage.bit()));
         }
+        if admission == Admission::Join {
+            next.done &= !(Stage::Secrets.bit() | Stage::Repositories.bit());
+        }
         next.access = carried_access(previous, prior, plan);
         next.revision = next_revision(prior.unwrap_or_default().revision)?;
         next.completed = plan.selection.is_empty();
         next.admitted = false;
         next.running = None;
         next.admitted_vault = vault;
-        let mut writes = vec![
-            AuthorizationWrite::Plan(plan.clone(), admission != Admission::Person),
-            AuthorizationWrite::Progress(next),
-        ];
+        let first = if admission == Admission::Upgrade {
+            AuthorizationWrite::UpgradePlan(plan.clone(), scope::UpgradeProgress::new(prior, next))
+        } else {
+            AuthorizationWrite::Plan(
+                plan.clone(),
+                matches!(admission, Admission::Automatic | Admission::Upgrade),
+            )
+        };
+        let mut writes = vec![first, AuthorizationWrite::Progress(next)];
         if next.done & Stage::Workstation.bit() == 0 {
             writes.push(AuthorizationWrite::Workstation(plan.clone()));
         }
@@ -178,6 +196,42 @@ impl InitialSetupAuthorization {
     /// Some confirms this ticket's exact admitted revision, including an empty plan.
     pub fn persist_observed(&mut self, plan: &Plan) -> InitialSetupObserved<Option<u64>> {
         self.persist_as(plan, Admission::Person)
+    }
+
+    /// An explicit Join answered through this bound startup review. Its original
+    /// doctor records must still be current; the vault this intentional join may
+    /// replace is read once as that review starts writing, under the profile lock.
+    pub fn persist_join_observed(&mut self, plan: &Plan) -> InitialSetupObserved<Option<u64>> {
+        observe_person_mutation(
+            Err("another doctor profile pass is running".into()),
+            |root| {
+                self.persist_join_with(
+                    root,
+                    plan,
+                    live_configured_vault,
+                    AuthorizationWrite::persist,
+                    |root| observation_at(root).map_err(|error| error.to_string()),
+                )
+            },
+        )
+    }
+
+    fn persist_join_with(
+        &mut self,
+        root: &Path,
+        plan: &Plan,
+        read: impl FnOnce() -> Result<Option<ConfiguredVault>, String>,
+        write: impl FnMut(&AuthorizationWrite, &Path) -> Result<(), String>,
+        observe: impl FnOnce(&Path) -> Result<InitialSetupObservation, String>,
+    ) -> Result<Option<u64>, String> {
+        self.persist_with_vault(
+            root,
+            plan,
+            Admission::Join,
+            |_| read().map(|configured| AdmittedVault::of(Ok(configured))),
+            write,
+            observe,
+        )
     }
 
     /// [`Self::persist_observed`] for the plan aterm chose by itself at first
@@ -259,6 +313,18 @@ impl InitialSetupAuthorization {
         root: &Path,
         plan: &Plan,
         admission: Admission,
+        write: impl FnMut(&AuthorizationWrite, &Path) -> Result<(), String>,
+        observe: impl FnOnce(&Path) -> Result<InitialSetupObservation, String>,
+    ) -> Result<Option<u64>, String> {
+        self.persist_with_vault(root, plan, admission, Ok, write, observe)
+    }
+
+    fn persist_with_vault(
+        &mut self,
+        root: &Path,
+        plan: &Plan,
+        admission: Admission,
+        read: impl FnOnce(AdmittedVault) -> Result<AdmittedVault, String>,
         mut write: impl FnMut(&AuthorizationWrite, &Path) -> Result<(), String>,
         observe: impl FnOnce(&Path) -> Result<InitialSetupObservation, String>,
     ) -> Result<Option<u64>, String> {
@@ -283,9 +349,10 @@ impl InitialSetupAuthorization {
                     return Ok(None);
                 }
                 let owned = baseline.clone();
+                let vault = read(self.vault)?;
                 self.state = AuthorizationState::Ended;
                 self.state = AuthorizationState::Writing(AuthorizationCommit::new(
-                    owned, plan, admission, self.vault,
+                    owned, plan, admission, vault,
                 )?);
             }
             AuthorizationState::Writing(commit) => {
@@ -330,8 +397,9 @@ fn records_finished(records: &Records) -> bool {
     match records.progress {
         None => records.decision == Decision::Applied(true),
         Some(progress) => {
-            progress.admitted
-                && (progress.completed || progress.stopped_by(records.stop_request))
+            (progress.stopped
+                || (progress.admitted
+                    && (progress.completed || progress.stopped_by(records.stop_request))))
                 && records
                     .plan
                     .as_ref()
@@ -372,6 +440,250 @@ mod tests {
                 ticket.persist_with(root, plan, Admission::Person, write, read)
             },
         )
+    }
+
+    fn vault(root: &Path, name: &str) -> ConfiguredVault {
+        ConfiguredVault {
+            config: aterm_secrets::client::Config {
+                source: aterm_secrets::transport::Source::Url(format!(
+                    "https://{name}.example/v1/{name}"
+                )),
+                name: name.into(),
+                signer: Some([7; 32]),
+                followed: Vec::new(),
+                host: "fixture".into(),
+            },
+            home: root.to_path_buf(),
+        }
+    }
+
+    #[test]
+    fn an_explicit_startup_join_binds_the_vault_read_at_admission() {
+        for join in [false, true] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let offered_vault = vault(root.path(), "offered");
+            let joined_since = vault(root.path(), "joined");
+            let after_admission = vault(root.path(), "later");
+            let plan = offered_vault.present(selected(&[Setting::Secrets]));
+            save_plan_as(root.path(), &plan, true).unwrap();
+            let mut ticket = InitialSetupAuthorization::capture_at(root.path()).unwrap();
+            assert_eq!(
+                ticket
+                    .offer_reading(root.path(), || Ok(Some(offered_vault.clone())))
+                    .unwrap(),
+                plan
+            );
+            let result = observe_mutation_at(root.path(), None, Err("busy".into()), |root| {
+                assert!(HeldLock::try_take(root)?.is_none());
+                if join {
+                    ticket.persist_join_with(
+                        root,
+                        &plan,
+                        || Ok(Some(joined_since.clone())),
+                        AuthorizationWrite::persist,
+                        observe,
+                    )
+                } else {
+                    ticket.persist_with(
+                        root,
+                        &plan,
+                        Admission::Automatic,
+                        AuthorizationWrite::persist,
+                        observe,
+                    )
+                }
+            });
+            assert_eq!(result.result.unwrap(), Some(1));
+            let admitted = progress(root.path()).unwrap().unwrap().admitted_vault;
+            assert_eq!(
+                admitted,
+                AdmittedVault::Configured(if join {
+                    joined_since.identity()
+                } else {
+                    offered_vault.identity()
+                })
+            );
+            assert_eq!(admitted.stands_in(&plan, &joined_since), !join);
+            assert!(admitted.stands_in(&plan, &after_admission));
+            assert_eq!(saved_plan_provisional(root.path()).unwrap(), !join);
+        }
+    }
+
+    #[test]
+    fn a_startup_join_keeps_its_authority_across_admission_write_retries() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let offered = vault(root.path(), "offered");
+        let joined = vault(root.path(), "joined");
+        let plan = offered.present(selected(&[Setting::Secrets]));
+        save_plan_as(root.path(), &plan, true).unwrap();
+        let mut ticket = InitialSetupAuthorization::capture_at(root.path()).unwrap();
+        ticket
+            .offer_reading(root.path(), || Ok(Some(offered)))
+            .unwrap();
+        let mut writes = 0;
+        let failed = observe_mutation_at(root.path(), None, Err("busy".into()), |root| {
+            ticket.persist_join_with(
+                root,
+                &plan,
+                || Ok(Some(joined.clone())),
+                |step, root| {
+                    step.persist(root)?;
+                    writes += 1;
+                    if writes == 2 {
+                        Err("injected staged admission flush failure".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+                observe,
+            )
+        });
+        assert!(failed.result.is_err());
+        assert!(ticket.pending());
+        let recovered = observe_mutation_at(root.path(), None, Err("busy".into()), |root| {
+            ticket.persist_join_with(
+                root,
+                &plan,
+                || panic!("an owned retry cannot bind a later vault"),
+                AuthorizationWrite::persist,
+                observe,
+            )
+        });
+        assert_eq!(recovered.result.unwrap(), Some(1));
+        let authority = progress(root.path()).unwrap().unwrap().admitted_vault;
+        assert_eq!(authority, AdmittedVault::Configured(joined.identity()));
+        assert!(!authority.stands_in(&plan, &joined));
+        assert!(authority.stands_in(&plan, &vault(root.path(), "later")));
+    }
+
+    #[test]
+    fn a_startup_join_reopens_vault_stages_of_the_same_staged_plan() {
+        for join in [false, true] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let current = vault(root.path(), "offered");
+            let plan = current.present(selected(&[
+                Setting::Desktop,
+                Setting::Secrets,
+                Setting::Repositories,
+            ]));
+            let revision = authorize_at(root.path(), &plan).unwrap().unwrap();
+            let mut staged = progress(root.path()).unwrap().unwrap();
+            staged.admitted = false;
+            staged.done =
+                Stage::Workstation.bit() | Stage::Secrets.bit() | Stage::Repositories.bit();
+            save_progress(root.path(), staged).unwrap();
+            save_workstation_decision(root.path(), true).unwrap();
+            let mut ticket = InitialSetupAuthorization::capture_at(root.path()).unwrap();
+            ticket
+                .offer_reading(root.path(), || Ok(Some(current.clone())))
+                .unwrap();
+            let result = observe_mutation_at(root.path(), None, Err("busy".into()), |root| {
+                if join {
+                    ticket.persist_join_with(
+                        root,
+                        &plan,
+                        || Ok(Some(current)),
+                        AuthorizationWrite::persist,
+                        observe,
+                    )
+                } else {
+                    ticket.persist_with(
+                        root,
+                        &plan,
+                        Admission::Automatic,
+                        AuthorizationWrite::persist,
+                        observe,
+                    )
+                }
+            });
+            assert_eq!(result.result.unwrap(), Some(revision + 1));
+            let after = progress(root.path()).unwrap().unwrap();
+            assert!(after.admitted && !after.completed);
+            assert_eq!(
+                after.done,
+                if join {
+                    Stage::Workstation.bit()
+                } else {
+                    staged.done
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn a_startup_join_reads_no_vault_for_a_retired_doctor_review() {
+        for stopped in [false, true] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let offered = vault(root.path(), "offered");
+            let plan = offered.present(selected(&[Setting::Secrets]));
+            save_plan_as(root.path(), &plan, true).unwrap();
+            let mut ticket = InitialSetupAuthorization::capture_at(root.path()).unwrap();
+            ticket
+                .offer_reading(root.path(), || Ok(Some(offered)))
+                .unwrap();
+            if stopped {
+                write_json(
+                    &root.path().join("first-run.json"),
+                    &json!({"profile":PROFILE,"state":"restored"}),
+                )
+                .unwrap();
+            } else {
+                restart_at(root.path(), &plan).unwrap();
+            }
+            let before = observation_at(root.path()).unwrap();
+            let result = observe_mutation_at(root.path(), None, Err("busy".into()), |root| {
+                ticket.persist_join_with(
+                    root,
+                    &plan,
+                    || panic!("a stale review cannot read or bind the current vault"),
+                    |_, _| panic!("a stale review cannot write"),
+                    observe,
+                )
+            });
+            assert_eq!(result.result.unwrap(), None);
+            assert!(!ticket.pending());
+            assert_eq!(observation_at(root.path()).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn a_startup_join_read_failure_keeps_the_unwritten_bound_review() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let offered = vault(root.path(), "offered");
+        let joined = vault(root.path(), "joined");
+        let plan = offered.present(selected(&[Setting::Secrets]));
+        save_plan_as(root.path(), &plan, true).unwrap();
+        let mut ticket = InitialSetupAuthorization::capture_at(root.path()).unwrap();
+        ticket
+            .offer_reading(root.path(), || Ok(Some(offered)))
+            .unwrap();
+        let before = observation_at(root.path()).unwrap();
+        let failed = observe_mutation_at(root.path(), None, Err("busy".into()), |root| {
+            ticket.persist_join_with(
+                root,
+                &plan,
+                || Err("injected current vault read failure".into()),
+                |_, _| panic!("an unreadable authority cannot start writing"),
+                observe,
+            )
+        });
+        assert!(failed.result.is_err());
+        assert!(ticket.pending());
+        assert_eq!(observation_at(root.path()).unwrap(), before);
+        let recovered = observe_mutation_at(root.path(), None, Err("busy".into()), |root| {
+            ticket.persist_join_with(
+                root,
+                &plan,
+                || Ok(Some(joined.clone())),
+                AuthorizationWrite::persist,
+                observe,
+            )
+        });
+        assert_eq!(recovered.result.unwrap(), Some(1));
+        assert_eq!(
+            progress(root.path()).unwrap().unwrap().admitted_vault,
+            AdmittedVault::Configured(joined.identity())
+        );
     }
 
     #[test]
@@ -485,6 +797,45 @@ mod tests {
             progress(root.path()).unwrap().unwrap().done,
             Stage::Spotlight.bit()
         );
+    }
+
+    #[test]
+    fn same_plan_admission_keeps_an_explicit_preference_scope_through_a_failed_write() {
+        for published in [false, true] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let plan = selected(&[Setting::Desktop, Setting::Dock]);
+            let first = authorize_at(root.path(), &plan).unwrap().unwrap();
+            let mut previous = progress(root.path()).unwrap().unwrap();
+            let mut only = Selection::none();
+            only.set(Setting::Desktop, true);
+            previous.only = Some(only);
+            save_progress(root.path(), previous).unwrap();
+            let mut ticket = InitialSetupAuthorization::capture_at(root.path()).unwrap();
+            let mut index = 0;
+            let failed = attempt(
+                &mut ticket,
+                root.path(),
+                &plan,
+                |step, root| {
+                    let current = index;
+                    index += 1;
+                    if current == 1 {
+                        if published {
+                            step.persist(root)?;
+                        }
+                        return Err("injected progress publication failure".into());
+                    }
+                    step.persist(root)
+                },
+                observe,
+            );
+            assert!(failed.result.is_err());
+            assert_eq!(
+                ticket.persist_at(root.path(), &plan).result.unwrap(),
+                Some(first + 1)
+            );
+            assert_eq!(progress(root.path()).unwrap().unwrap().only, Some(only));
+        }
     }
 
     #[test]
@@ -699,5 +1050,445 @@ mod tests {
         assert!(!saved_plan_provisional(other.path()).unwrap());
         assert_eq!(admit(other.path(), &full, Admission::Upgrade), None);
         assert_eq!(saved_plan(other.path()).unwrap(), Some(narrow));
+    }
+
+    #[test]
+    fn a_relaunch_can_recover_an_upgrade_after_only_its_plan_was_published() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let narrow = selected(&[Setting::Permissions]);
+        let first = admit(root.path(), &narrow, Admission::Automatic).unwrap();
+        let mut finished = progress(root.path()).unwrap().unwrap();
+        finished.done = Stage::Permissions.bit();
+        finished.completed = true;
+        save_progress(root.path(), finished).unwrap();
+        let full = Plan::default();
+        let mut ticket = InitialSetupAuthorization::capture_at(root.path()).unwrap();
+        let mut writes = 0;
+        let failed = observe_mutation_at(root.path(), None, Err("busy".into()), |root| {
+            ticket.persist_with(
+                root,
+                &full,
+                Admission::Upgrade,
+                |step, root| {
+                    writes += 1;
+                    if writes == 2 {
+                        return Err("injected interruption before progress publication".into());
+                    }
+                    step.persist(root)
+                },
+                observe,
+            )
+        });
+        assert!(failed.result.is_err());
+        assert_eq!(saved_plan(root.path()).unwrap(), Some(full.clone()));
+        drop(ticket);
+
+        let mut relaunched = InitialSetupAuthorization::capture_at(root.path())
+            .expect("an upgrade's atomic plan publication must leave a recoverable staged run");
+        assert_eq!(relaunched.revision(), first + 1);
+        let staged = progress(root.path()).unwrap().unwrap();
+        assert!(!staged.admitted && !staged.completed);
+        assert_eq!(staged.done, Stage::Permissions.bit());
+        relaunched.offer_reading(root.path(), || Ok(None)).unwrap();
+        assert_eq!(
+            relaunched
+                .persist_at_as(root.path(), &full, Admission::Automatic)
+                .result
+                .unwrap(),
+            Some(first + 2)
+        );
+        assert_eq!(
+            progress(root.path()).unwrap().unwrap().done,
+            Stage::Permissions.bit()
+        );
+    }
+
+    fn provisional_permissions(root: &Path, completed: bool) -> u64 {
+        let narrow = selected(&[Setting::Permissions]);
+        let revision = admit(root, &narrow, Admission::Automatic).unwrap();
+        let mut prior = progress(root).unwrap().unwrap();
+        prior.completed = completed;
+        if completed {
+            prior.done = Stage::Permissions.bit();
+        }
+        save_progress(root, prior).unwrap();
+        revision
+    }
+
+    fn interrupt_upgrade(root: &Path, fault: usize, published: bool) -> InitialSetupAuthorization {
+        let mut ticket = InitialSetupAuthorization::capture_at(root).unwrap();
+        let mut index = 0;
+        let failed = observe_mutation_at(root, None, Err("busy".into()), |root| {
+            ticket.persist_with(
+                root,
+                &Plan::default(),
+                Admission::Upgrade,
+                |step, root| {
+                    let current = index;
+                    index += 1;
+                    if current == fault {
+                        if published {
+                            step.persist(root)?;
+                        }
+                        return Err("injected upgrade publication failure".into());
+                    }
+                    step.persist(root)
+                },
+                observe,
+            )
+        });
+        assert!(failed.result.is_err());
+        assert!(ticket.pending());
+        ticket
+    }
+
+    #[test]
+    fn every_upgrade_prefix_recovers_with_its_owner_or_after_process_exit() {
+        let full = Plan::default();
+        for fault in 0..4 {
+            for published in [false, true] {
+                for relaunch in [false, true] {
+                    let root = aterm_tempfile::tempdir().unwrap();
+                    let first = provisional_permissions(root.path(), true);
+                    let mut ticket = interrupt_upgrade(root.path(), fault, published);
+                    let revision = if relaunch {
+                        drop(ticket);
+                        let mut fresh = InitialSetupAuthorization::capture_at(root.path()).unwrap();
+                        if let Some(admission) = admission_at(root.path()).unwrap()
+                            && admission.plan == full
+                        {
+                            assert!(!admission.completed);
+                            admission.revision
+                        } else {
+                            let staged = saved_plan(root.path()).unwrap() == Some(full.clone());
+                            assert_eq!(fresh.revision(), first + u64::from(staged));
+                            fresh.offer_reading(root.path(), || Ok(None)).unwrap();
+                            fresh
+                                .persist_at_as(
+                                    root.path(),
+                                    &full,
+                                    if staged {
+                                        Admission::Automatic
+                                    } else {
+                                        Admission::Upgrade
+                                    },
+                                )
+                                .result
+                                .unwrap()
+                                .unwrap()
+                        }
+                    } else {
+                        ticket
+                            .upgrade_at(root.path(), &full)
+                            .result
+                            .unwrap()
+                            .unwrap()
+                    };
+                    let recovered = progress(root.path()).unwrap().unwrap();
+                    assert_eq!(recovered.revision, revision);
+                    let readmitted =
+                        relaunch && (fault != 0 || published) && !(fault == 3 && published);
+                    assert_eq!(revision, first + 1 + u64::from(readmitted));
+                    assert!(recovered.admitted && !recovered.completed && !recovered.stopped);
+                    assert_eq!(recovered.done, Stage::Permissions.bit());
+                    assert_eq!(recovered.access_revision(), first);
+                    assert_eq!(decision_at(root.path()).unwrap(), Decision::Pending);
+                    assert_eq!(saved_plan(root.path()).unwrap(), Some(full.clone()));
+                    assert!(saved_plan_provisional(root.path()).unwrap());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stops_survive_every_upgrade_prefix_and_are_durable_before_the_request_is_removed() {
+        for fault in 0..4 {
+            for published in [false, true] {
+                for target in [false, true] {
+                    let root = aterm_tempfile::tempdir().unwrap();
+                    let first = provisional_permissions(root.path(), false);
+                    let mut owner = interrupt_upgrade(root.path(), fault, published);
+                    let widened = saved_plan(root.path()).unwrap() == Some(Plan::default());
+                    if target && !widened {
+                        continue;
+                    }
+                    request_stop_at(root.path(), first + u64::from(target)).unwrap();
+                    assert!(finished_at(root.path()).unwrap());
+                    let snapshot = snapshot_at(root.path(), Plan::default()).unwrap();
+                    assert!(snapshot.finished && !snapshot.permissions_allowed);
+                    assert!(snapshot.rows.iter().all(|row| row.status == "stopped"));
+                    let mut fresh = InitialSetupAuthorization::capture_at(root.path()).unwrap();
+                    assert_eq!(
+                        fresh
+                            .persist_at_as(root.path(), &Plan::default(), Admission::Automatic)
+                            .result
+                            .unwrap(),
+                        None
+                    );
+                    assert_eq!(
+                        owner
+                            .upgrade_at(root.path(), &Plan::default())
+                            .result
+                            .unwrap(),
+                        None
+                    );
+
+                    observe_mutation_at(root.path(), None, Err("busy".into()), |root| {
+                        fold_stop_request(root)
+                    })
+                    .result
+                    .unwrap();
+                    assert_eq!(stop_request_at(root.path()), None);
+                    assert!(progress_file(root.path()).unwrap().unwrap().stopped);
+                    assert!(
+                        finished_at(root.path()).unwrap(),
+                        "Stop cannot disappear with its request"
+                    );
+                    assert!(snapshot_at(root.path(), Plan::default()).unwrap().finished);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_old_stop_of_a_completed_predecessor_is_spent_and_a_later_run_is_independent() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let first = provisional_permissions(root.path(), true);
+        let mut owner = interrupt_upgrade(root.path(), 1, false);
+        request_stop_at(root.path(), first).unwrap();
+        assert!(!finished_at(root.path()).unwrap());
+        assert!(!progress(root.path()).unwrap().unwrap().stopped);
+        // The changed request still retires this process-local ticket; a new
+        // launch can review the readable pending target instead.
+        assert_eq!(
+            owner
+                .upgrade_at(root.path(), &Plan::default())
+                .result
+                .unwrap(),
+            None
+        );
+        let mut fresh = InitialSetupAuthorization::capture_at(root.path()).unwrap();
+        fresh
+            .persist_at_as(root.path(), &Plan::default(), Admission::Automatic)
+            .result
+            .unwrap()
+            .unwrap();
+        let next = progress(root.path()).unwrap().unwrap();
+        assert!(next.admitted && !next.stopped);
+        request_stop_at(root.path(), first + 1).unwrap();
+        assert_eq!(
+            progress(root.path()).unwrap().unwrap(),
+            next,
+            "a newer deliberate revision is not stopped by the upgrade marker"
+        );
+    }
+
+    #[test]
+    fn a_stop_saved_during_or_after_the_upgrade_commit_holds_before_any_stage() {
+        for completed in [false, true] {
+            for after in [0, 3] {
+                let root = aterm_tempfile::tempdir().unwrap();
+                let first = provisional_permissions(root.path(), completed);
+                let mut owner = InitialSetupAuthorization::capture_at(root.path()).unwrap();
+                let mut index = 0;
+                let admitted = observe_mutation_at(root.path(), None, Err("busy".into()), |root| {
+                    owner.persist_with(
+                        root,
+                        &Plan::default(),
+                        Admission::Upgrade,
+                        |step, root| {
+                            step.persist(root)?;
+                            if index == after {
+                                request_stop_at(root, first)?;
+                            }
+                            index += 1;
+                            Ok(())
+                        },
+                        observe,
+                    )
+                })
+                .result
+                .unwrap();
+                assert_eq!(admitted, Some(first + 1));
+                assert_eq!(finished_at(root.path()).unwrap(), !completed);
+                assert_eq!(progress(root.path()).unwrap().unwrap().stopped, !completed);
+                // The real pass folds a request before consulting finished_at,
+                // so verify that fold cannot erase the inherited Stop.
+                observe_mutation_at(root.path(), None, Err("busy".into()), fold_stop_request)
+                    .result
+                    .unwrap();
+                assert_eq!(stop_request_at(root.path()), None);
+                assert_eq!(finished_at(root.path()).unwrap(), !completed);
+            }
+        }
+    }
+
+    #[test]
+    fn an_upgrade_with_no_previous_progress_is_readable_but_never_infers_admission() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let narrow = selected(&[Setting::Permissions]);
+        save_plan_as(root.path(), &narrow, true).unwrap();
+        save_workstation_authorization(root.path(), &narrow).unwrap();
+        drop(interrupt_upgrade(root.path(), 1, false));
+        assert_eq!(progress_file(root.path()).unwrap(), None);
+        let pending = progress(root.path()).unwrap().unwrap();
+        assert_eq!(pending.revision, 1);
+        assert!(!pending.admitted && !pending.completed);
+        assert_eq!(admission_at(root.path()).unwrap(), None);
+        assert!(!finished_at(root.path()).unwrap());
+        let mut fresh = InitialSetupAuthorization::capture_at(root.path()).unwrap();
+        assert_eq!(fresh.revision(), 1);
+        assert_eq!(
+            fresh
+                .persist_at_as(root.path(), &Plan::default(), Admission::Automatic)
+                .result
+                .unwrap(),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn a_fresh_same_plan_choice_keeps_the_bridge_until_its_own_progress_is_published() {
+        for admission in [Admission::Automatic, Admission::Person] {
+            for fault in 0..4 {
+                for published in [false, true] {
+                    let root = aterm_tempfile::tempdir().unwrap();
+                    let first = provisional_permissions(root.path(), true);
+                    drop(interrupt_upgrade(root.path(), 1, false));
+                    let mut fresh = InitialSetupAuthorization::capture_at(root.path()).unwrap();
+                    let mut index = 0;
+                    let failed =
+                        observe_mutation_at(root.path(), None, Err("busy".into()), |root| {
+                            fresh.persist_with(
+                                root,
+                                &Plan::default(),
+                                admission,
+                                |step, root| {
+                                    let current = index;
+                                    index += 1;
+                                    if current == fault {
+                                        if published {
+                                            step.persist(root)?;
+                                        }
+                                        return Err(
+                                            "injected fresh choice publication failure".into()
+                                        );
+                                    }
+                                    step.persist(root)
+                                },
+                                observe,
+                            )
+                        });
+                    assert!(failed.result.is_err());
+                    assert!(fresh.pending());
+                    assert!(InitialSetupAuthorization::capture_at(root.path()).is_ok());
+                    assert_eq!(
+                        fresh
+                            .persist_at_as(root.path(), &Plan::default(), admission)
+                            .result
+                            .unwrap(),
+                        Some(first + 2)
+                    );
+                    assert_eq!(
+                        progress(root.path()).unwrap().unwrap().done,
+                        Stage::Permissions.bit()
+                    );
+                    assert_eq!(
+                        saved_plan_provisional(root.path()).unwrap(),
+                        admission == Admission::Automatic
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn restore_cancel_and_replaced_publications_retire_upgrade_recovery() {
+        for state in ["restored", "cancelled"] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            provisional_permissions(root.path(), false);
+            let mut owner = interrupt_upgrade(root.path(), 1, false);
+            write_json(
+                &root.path().join("first-run.json"),
+                &json!({"profile":PROFILE,"state":state}),
+            )
+            .unwrap();
+            let before = observation_at(root.path()).unwrap();
+            assert!(finished_at(root.path()).unwrap());
+            assert_eq!(
+                owner
+                    .upgrade_at(root.path(), &Plan::default())
+                    .result
+                    .unwrap(),
+                None
+            );
+            assert_eq!(observation_at(root.path()).unwrap(), before);
+        }
+        for same in [false, true] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            provisional_permissions(root.path(), true);
+            let mut owner = interrupt_upgrade(root.path(), 1, false);
+            if same {
+                let path = root.path().join("automatic-plan.json");
+                let record: Value = aterm_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                write_json(&path, &record).unwrap();
+            } else {
+                restart_at(root.path(), &selected(&[Setting::Desktop])).unwrap();
+            }
+            let before = observation_at(root.path()).unwrap();
+            assert_eq!(
+                owner
+                    .upgrade_at(root.path(), &Plan::default())
+                    .result
+                    .unwrap(),
+                None
+            );
+            assert_eq!(observation_at(root.path()).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn malformed_upgrade_markers_and_unknown_predecessors_never_recover_a_mismatch() {
+        for malformed in [false, true] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            provisional_permissions(root.path(), true);
+            drop(interrupt_upgrade(root.path(), 1, false));
+            if malformed {
+                let path = root.path().join("automatic-plan.json");
+                let mut record: Value =
+                    aterm_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                record
+                    .as_object_mut()
+                    .unwrap()
+                    .get_mut("upgrade")
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap()
+                    .get_mut("pending")
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("admitted".into(), Value::Bool(true));
+                write_json(&path, &record).unwrap();
+            } else {
+                let mut unrelated = progress_file(root.path()).unwrap().unwrap();
+                unrelated.revision += 10;
+                save_progress(root.path(), unrelated).unwrap();
+            }
+            assert!(InitialSetupAuthorization::capture_at(root.path()).is_err());
+            // Independent, physically matching progress remains authoritative
+            // even if an old marker is malformed or describes another run.
+            let mut newer = Progress::for_plan(&Plan::default());
+            newer.revision = 50;
+            newer.admitted = true;
+            save_progress(root.path(), newer).unwrap();
+            assert_eq!(progress(root.path()).unwrap(), Some(newer));
+            assert_eq!(
+                InitialSetupAuthorization::capture_at(root.path())
+                    .unwrap()
+                    .revision(),
+                50
+            );
+        }
     }
 }

@@ -1073,6 +1073,7 @@ impl Gallery {
                 env,
                 cwd: world.home.clone(),
                 sandbox: None,
+                reroute: false,
             },
         )?;
         let sock = inst.sock.to_string_lossy().into_owned();

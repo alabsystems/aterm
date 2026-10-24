@@ -5,11 +5,11 @@
 
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
-use aterm_core::render::{FxArt, FxBlend, FxInk, FxLayer, FxSlot, FxTexels, GlowQuad, PxRect};
+use aterm_core::render::{FxArt, FxBlend, FxLayer, FxSlot, FxTexels, PxRect};
 use aterm_hash::FxHashMap;
 
 use crate::FxFrame;
-use crate::fx_raster::{FxScratch, draw_layers, fill_glow_span};
+use crate::fx_raster::{FxScratch, draw_layers};
 
 /// The process-wide art registry ([`registry`]): each live art by its id.
 pub struct FxRegistry {
@@ -485,7 +485,18 @@ pub fn paint_layers(px: &mut [u32], frame: &FxFrame, layers: &[FxLayer], occlude
 }
 
 /// Paint `quads` onto `px` (`w × h`, row-major) by the glow streams' one law (`Renderer::draw_flat_add`'s span loop: per column the ramp between the quad's ends, `over_premul`, additive at alpha 0), each moved by `off` and cut at the buffer's edges, with no row gate.
-pub fn paint_quads(px: &mut [u32], w: usize, h: usize, quads: &[GlowQuad], off: (usize, usize)) {
+///
+/// The painter of the quad oracles the fx layers are held to (the card's and the rainbow's
+/// tests), so it exists in test and debug builds only, like [`crate::legacy_sprite_oracle`].
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub fn paint_quads(
+    px: &mut [u32],
+    w: usize,
+    h: usize,
+    quads: &[aterm_core::render::GlowQuad],
+    off: (usize, usize),
+) {
     if w.checked_mul(h).is_none_or(|len| px.len() < len) {
         return;
     }
@@ -499,11 +510,17 @@ pub fn paint_quads(px: &mut [u32], w: usize, h: usize, quads: &[GlowQuad], off: 
             continue;
         }
         let (c0, c1) = (
-            FxInk::over(q.color, q.alpha),
-            FxInk::over(q.color2, q.alpha2),
+            aterm_core::render::FxInk::over(q.color, q.alpha),
+            aterm_core::render::FxInk::over(q.color2, q.alpha2),
         );
         for y in y0..y0.saturating_add(usize::from(q.h)).min(h) {
-            fill_glow_span(&mut px[y * w + x0..y * w + x1], 0, u32::from(q.w), c0, c1);
+            crate::fx_raster::fill_glow_span(
+                &mut px[y * w + x0..y * w + x1],
+                0,
+                u32::from(q.w),
+                c0,
+                c1,
+            );
         }
     }
 }
@@ -512,7 +529,7 @@ pub fn paint_quads(px: &mut [u32], w: usize, h: usize, quads: &[GlowQuad], off: 
 mod tests {
     use super::*;
     use crate::fx_raster::fill_flat;
-    use aterm_core::render::{FxContent, FxItem, FxSpace, FxSprite};
+    use aterm_core::render::{FxContent, FxInk, FxItem, FxSpace, FxSprite, GlowQuad};
 
     fn frame(w: usize, h: usize) -> FxFrame {
         FxFrame {
@@ -753,11 +770,12 @@ mod tests {
     /// random ground equal, byte for byte, the folded art under each class's
     /// `add_sat` sum where every ink is additive, and the peeled arts drawn
     /// in order under the pieces' inks for translucent and opaque inks.
+    /// Controls: a fold of over inks, and the peel drawn in reverse, differ.
     #[test]
     fn the_fold_and_the_peel_are_exact() {
         let (w, h) = (64usize, 64usize);
         let at = (24, 24);
-        let mut fold_breaks = 0;
+        let (mut fold_breaks, mut reverse_breaks) = (0, 0);
         for seed in 0..200u64 {
             let mut next = rng(seed);
             let ids = 6u8;
@@ -815,12 +833,25 @@ mod tests {
                 assert_eq!(peeled, want, "seed {seed}: the peel, additive {additive}");
                 if additive {
                     assert_eq!(folded, want, "seed {seed}: the fold");
-                } else if folded != want {
-                    fold_breaks += 1;
+                } else {
+                    fold_breaks += usize::from(folded != want);
+                    let mut reversed = ground.clone();
+                    let back: Vec<_> = peel.iter().rev().cloned().collect();
+                    paint_layers(
+                        &mut reversed,
+                        &frame(w, h),
+                        &[sprites(&back, place, inks.clone())],
+                        &[],
+                    );
+                    reverse_breaks += usize::from(reversed != want);
                 }
             }
         }
         assert!(fold_breaks > 0, "CONTROL: a fold of over inks is not exact");
+        assert!(
+            reverse_breaks > 0,
+            "CONTROL: the peel drawn in reverse is not exact"
+        );
     }
 
     /// A peeled art is as deep as the most pieces over one pixel, and a

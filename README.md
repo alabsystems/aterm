@@ -208,8 +208,8 @@ quiet, and autocompaction at 400k tokens. A value you set is kept, and
 `agents_auto_prime = false` turns these off too.
 
 - **Env hygiene.** Every spawned shell has `CLAUDE*`, `ANTHROPIC_*`,
-  `COPILOT_*`, `CODEX_*`, `ANTIGRAVITY_*`, `GEMINI_*`, `CURSOR_*`, `AI_*` and
-  `_DEVTOOL_*` stripped, and a window's shell gets a fresh session identity.
+  `COPILOT_*`, `CODEX_*`, `ANTIGRAVITY_*`, `GEMINI_*`, `CURSOR_*`, `GROK_*`,
+  `XAI_*`, `KIMI_*`, `MOONSHOT_*`, `AI_*` and `_DEVTOOL_*` stripped, and a window's shell gets a fresh session identity.
 - **No MCP server.** The integration surfaces are the CLI (`aterm ctl`, `conn`,
   `drive`) and the Rust library API; `aterm fleet` is a machine's fleet membership,
   which `aterm ctl survey --fleet` reads through.

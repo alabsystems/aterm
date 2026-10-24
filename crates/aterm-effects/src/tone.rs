@@ -115,19 +115,26 @@ pub fn for_each_ngram_bucket_chars(
     let mut prev2_h3: Option<u64> = None;
     let mut last_was_space = false;
     for raw in chars {
-        let c = if matches!(raw, ' ' | '\t'..='\r') || (!raw.is_ascii() && raw.is_whitespace()) {
+        let c = if raw.is_ascii() {
+            if matches!(raw, ' ' | '\t'..='\r') {
+                if last_was_space {
+                    continue; // collapse runs — indentation is not a mood
+                }
+                last_was_space = true;
+                ' '
+            } else {
+                last_was_space = false;
+                raw.to_ascii_lowercase()
+            }
+        } else if raw.is_whitespace() {
             if last_was_space {
-                continue; // collapse runs — indentation is not a mood
+                continue;
             }
             last_was_space = true;
             ' '
         } else {
             last_was_space = false;
-            if raw.is_ascii() {
-                raw.to_ascii_lowercase()
-            } else {
-                raw
-            }
+            raw
         };
         let cb = (c as u32).to_le_bytes();
         f(bucket(fold(FNV64_OFFSET ^ ORDER_SALT, cb)));
@@ -210,10 +217,10 @@ const fn fnv1a32(bytes: &[u8]) -> u32 {
 #[derive(Clone, Debug)]
 pub struct ToneModel {
     emb: Vec<f32>,
-    w1: Vec<f32>,
-    b1: Vec<f32>,
-    w2: Vec<f32>,
-    b2: Vec<f32>,
+    w1: [[f32; HIDDEN]; EMBED],
+    b1: [f32; HIDDEN],
+    w2: [[f32; TONE_COUNT]; HIDDEN],
+    b2: [f32; TONE_COUNT],
 }
 
 impl ToneModel {
@@ -267,31 +274,41 @@ impl ToneModel {
             }
         }
         let mut off = HEADER_LEN;
-        let deq = |len: usize, scale: f32, off: &mut usize| -> Vec<f32> {
-            let out = bytes[*off..*off + len]
-                .iter()
-                .map(|&b| f32::from(b as i8) * scale)
-                .collect();
-            *off += len;
-            out
-        };
-        let emb = deq(EMB_LEN, emb_scale, &mut off);
-        let w1 = deq(W1_LEN, w1_scale, &mut off);
-        let w2 = deq(W2_LEN, w2_scale, &mut off);
-        let floats = |len: usize, off: &mut usize| -> Result<Vec<f32>, ToneModelError> {
-            let mut v = Vec::with_capacity(len);
-            for k in 0..len {
-                let x = f32_at(*off + k * 4);
+        let emb: Vec<f32> = bytes[off..off + EMB_LEN]
+            .iter()
+            .map(|&b| f32::from(b as i8) * emb_scale)
+            .collect();
+        off += EMB_LEN;
+        let deq_row = |scale: f32, byte: u8| f32::from(byte as i8) * scale;
+        let w1: [[f32; HIDDEN]; EMBED] = std::array::from_fn(|r| {
+            let base = off + r * HIDDEN;
+            std::array::from_fn(|c| deq_row(w1_scale, bytes[base + c]))
+        });
+        off += W1_LEN;
+        let w2: [[f32; TONE_COUNT]; HIDDEN] = std::array::from_fn(|r| {
+            let base = off + r * TONE_COUNT;
+            std::array::from_fn(|c| deq_row(w2_scale, bytes[base + c]))
+        });
+        off += W2_LEN;
+        fn floats<const N: usize>(
+            bytes: &[u8],
+            off: &mut usize,
+        ) -> Result<[f32; N], ToneModelError> {
+            let mut v = [0.0f32; N];
+            for (k, slot) in v.iter_mut().enumerate() {
+                let mut b = [0u8; 4];
+                b.copy_from_slice(&bytes[*off + k * 4..*off + k * 4 + 4]);
+                let x = f32::from_le_bytes(b);
                 if !x.is_finite() {
                     return Err(ToneModelError::BadScale);
                 }
-                v.push(x);
+                *slot = x;
             }
-            *off += len * 4;
+            *off += N * 4;
             Ok(v)
-        };
-        let b1 = floats(HIDDEN, &mut off)?;
-        let b2 = floats(TONE_COUNT, &mut off)?;
+        }
+        let b1 = floats::<HIDDEN>(bytes, &mut off)?;
+        let b2 = floats::<TONE_COUNT>(bytes, &mut off)?;
         Ok(ToneModel {
             emb,
             w1,
@@ -314,13 +331,12 @@ impl ToneModel {
         s: &mut ToneScratch,
     ) -> bool {
         s.sum = [0.0; EMBED];
-        let emb_rows = self.emb.as_chunks::<EMBED>().0;
+        let Some(emb_rows) = self.emb.as_chunks::<EMBED>().0.first_chunk::<BUCKETS>() else {
+            return false;
+        };
         let n = for_each_ngram_bucket_chars(chars, |bucket| {
-            // Masking keeps `bucket < BUCKETS`, so this never misses.
-            if let Some(chunk) = emb_rows.get(bucket) {
-                for (acc, &w) in s.sum.iter_mut().zip(chunk) {
-                    *acc += w;
-                }
+            for (acc, &w) in s.sum.iter_mut().zip(&emb_rows[bucket & (BUCKETS - 1)]) {
+                *acc += w;
             }
         });
         if n < MIN_NGRAMS {
@@ -330,8 +346,8 @@ impl ToneModel {
         for e in &mut s.sum {
             *e *= inv;
         }
-        s.hid.copy_from_slice(&self.b1);
-        for (row, &e) in self.w1.as_chunks::<HIDDEN>().0.iter().zip(&s.sum) {
+        s.hid = self.b1;
+        for (row, &e) in self.w1.iter().zip(&s.sum) {
             for (h, &w) in s.hid.iter_mut().zip(row) {
                 *h += e * w;
             }
@@ -339,8 +355,8 @@ impl ToneModel {
         for h in &mut s.hid {
             *h = h.tanh();
         }
-        s.logits.copy_from_slice(&self.b2);
-        for (row, &h) in self.w2.as_chunks::<TONE_COUNT>().0.iter().zip(&s.hid) {
+        s.logits = self.b2;
+        for (row, &h) in self.w2.iter().zip(&s.hid) {
             for (l, &w) in s.logits.iter_mut().zip(row) {
                 *l += h * w;
             }

@@ -459,6 +459,9 @@ pub(super) fn read(
         None => match short_info(p) {
             Some(s) => {
                 let end = s.comm.iter().position(|b| *b == 0).unwrap_or(16);
+                // Another user's process (sudo's, its command's): the short record has no
+                // terminal, which `kinfo_proc` gives for any process.
+                let k = kinfo(p);
                 ProcFacts {
                     pid,
                     ppid: s.ppid,
@@ -466,6 +469,8 @@ pub(super) fn read(
                     uid: Some(s.uid),
                     name: String::from_utf8_lossy(&s.comm[..end]).into_owned(),
                     state: RunState::from_bsd(s.status),
+                    tty: k.as_ref().and_then(|k| k.tty),
+                    tpgid: k.as_ref().and_then(|k| k.tpgid),
                     ..ProcFacts::default()
                 }
             }

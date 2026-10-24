@@ -2262,13 +2262,14 @@ const fn _styled_frame_covers_every_render_input_field(ri: &aterm_core::render::
         absolute_row_revision: _, // OMITTED: host-consumed absolute-row coordinate-space revision, not visible-cell content
         history_renumber_epoch: _, // OMITTED: host-consumed wholesale-renumber epoch (its twin), not visible-cell content
         holder: _, // OMITTED: host-consumed holder fence (which rows a card may be decorated on), not visible-cell content
-        scroll_frac_px: _, // OMITTED: sub-row present translate, display-only
-        grid_top_row: _, // OMITTED: grid/chrome partition, display-only
-        grid_bot_row: _, // OMITTED: grid/chrome partition, display-only
-        apron_row: _, // OMITTED: incoming-row apron, the present translate's strip source
-        apron_stamp: _, // OMITTED: the apron's extraction stamp, display-only bookkeeping
-        fx_clip: _, // OMITTED: focused-pane present-time post-fx clip box, display-only
-        selection: _, // frame "selection" kind + projected geometry
+        screen_mutations: _, // OMITTED: the dev card probe's snapshot date (the terminal's screen mutations), not visible-cell content
+        scroll_frac_px: _,   // OMITTED: sub-row present translate, display-only
+        grid_top_row: _,     // OMITTED: grid/chrome partition, display-only
+        grid_bot_row: _,     // OMITTED: grid/chrome partition, display-only
+        apron_row: _,        // OMITTED: incoming-row apron, the present translate's strip source
+        apron_stamp: _,      // OMITTED: the apron's extraction stamp, display-only bookkeeping
+        fx_clip: _,          // OMITTED: focused-pane present-time post-fx clip box, display-only
+        selection: _,        // frame "selection" kind + projected geometry
         selection_clip: _, // OMITTED: host-only split composition bounds; engine styled frames have none
         selection_bg: _, // frame "selection_bg" (OSC 17 fixed RGB, else the "default" policy token)
         selection_fg: _, // frame "selection_fg" (OSC 19 fixed RGB, else the "dynamic" auto-contrast token)

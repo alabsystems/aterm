@@ -281,6 +281,20 @@ impl App {
         }
     }
 
+    /// Ends the exception under `key` with no outcome to claim (`Retired::Withdrawn`):
+    /// this build no longer reports it, or another surface carries the fact now, and
+    /// nothing read its cause end, so it is never filed as fixed. For the same reason
+    /// an entry the person already filed under `key` stays as they filed it, where
+    /// [`Self::except_clear`] closes that filing fixed.
+    pub(crate) fn except_withdraw(&mut self, key: &str) {
+        self.ripening.retain(|claim| claim.key != key);
+        self.entries_refused.remove(key);
+        if self.messages.withdraw_digest(key, Instant::now()) {
+            aterm_log::info!("exceptions: withdrew {key}");
+            self.digest_moved();
+        }
+    }
+
     /// Posts the removed-settings exception entry from config load diagnostics.
     pub(crate) fn note_removed_settings(&mut self, text: &str) {
         use crate::message_reporters::{
@@ -754,6 +768,27 @@ impl App {
                         self.except_end(key);
                     }
                     None => self.except_clear(key),
+                }
+            }
+            HostNote::Pools(said) => {
+                for cli in aterm_agent::harness::accounts_sync::OTHER_CLIS {
+                    let pool = said.iter().find(|pool| pool.cli == cli);
+                    let due = pool.map_or(&[][..], |pool| pool.due.as_slice());
+                    let wrong = pool.map_or(&[][..], |pool| pool.wrong.as_slice());
+                    for (cause, entry) in [
+                        ("due", message_reporters::accounts_due_entry_for(cli, due)),
+                        (
+                            "wrong-account",
+                            message_reporters::accounts_wrong_entry_for(cli, wrong),
+                        ),
+                    ] {
+                        match entry {
+                            Some(entry) => self.except(&entry),
+                            None => {
+                                self.except_clear(&message_reporters::pool_notice_key(cli, cause))
+                            }
+                        }
+                    }
                 }
             }
             HostNote::Inform { sid, text } => {
@@ -1404,13 +1439,16 @@ impl App {
 
     /// [`Self::catch_up_messages_log`] over the lines already read.
     #[cfg(unix)]
-    fn catch_up_messages_with(&mut self, lines: Vec<aterm_messages::LogLine>) {
+    pub(crate) fn catch_up_messages_with(&mut self, lines: Vec<aterm_messages::LogLine>) {
         let found = self
             .messages
             .catch_up(lines, wall_stamp_now(), Instant::now());
         if found.closed + found.adopted > 0 {
             aterm_log::info!("exceptions: caught up with the parent's log: {found:?}");
             self.digest_moved();
+        }
+        if found.adopted > 0 {
+            self.rearm_retired_keys();
         }
     }
 

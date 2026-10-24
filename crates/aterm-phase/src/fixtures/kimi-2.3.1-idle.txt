@@ -1,0 +1,33 @@
+# kimi 2.3.1 · MEASURED 2026-10-23, `aterm ctl text` of a private headless aterm 110x32 (aterm 0.129.0, this branch's debug build), scratch HOME/XDG/ATERM_STATE_HOME dirs, harness off, the atpkg-managed kimi (Developer ID 2J9472RW75) with KIMI_DISABLE_TELEMETRY=1 KIMI_CODE_NO_AUTO_UPDATE=1 and a scratch home, signed out · idle at its composer after `Trust and continue`: the welcome box, the model notice, `No session yet`, the rounded composer `│ >`, the footer and `context: 0%`
+
+ ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │                                                                                                          │
+ │  ▐█▛█▛█▌  Welcome to Kimi Code!                                                                          │
+ │  ▐█████▌  Run /login or /provider to get started.                                                        │
+ │                                                                                                          │
+ │  Directory: /private/tmp/at.0sEsKA/home/proj                                                             │
+ │  Session:                                                                                                │
+ │  Model:     not set, run /login or /provider                                                             │
+ │  Version:   2.3.1                                                                                        │
+ │                                                                                                          │
+ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ✦ Kimi K3.1 Pro is ready - use the model in a fresh session for the best results
+   Standard: Plus/Moderato and above; Highspeed: Pro/Allegretto and above
+
+   No session yet — one will be created on your first message.
+
+ ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ >                                                                                                        │
+ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ ~/proj   ctrl-o to hide or reveal tool output switching between a clean chat view and full execution details
+                                                                                                  context: 0%
+
+
+
+
+
+
+
+
+

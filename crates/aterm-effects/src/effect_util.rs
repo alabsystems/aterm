@@ -152,7 +152,8 @@ pub(crate) fn push_soft_disc(
         return;
     }
     let inv_rx = 1.0 / rx;
-    let (y0, y1) = ((cy - ry).floor() as i32, (cy + ry).ceil() as i32);
+    let y0 = ((cy - ry).floor() as i32).max(geom.fx_top());
+    let y1 = ((cy + ry).ceil() as i32).min(geom.fx_bot());
     for y in y0..y1 {
         let dy = (y as f32 + 0.5 - cy) / ry;
         let dy2 = dy * dy;
@@ -161,13 +162,14 @@ pub(crate) fn push_soft_disc(
             continue;
         }
         let span = rx * rest.sqrt();
+        let step = span * (1.0 / SEGMENTS as f32);
         let level = |x: f32| {
             let u = x * inv_rx;
             let w = (1.0 - u * u - dy2).max(0.0);
             let cov = (peak * w * w).round().clamp(0.0, 255.0) as u8;
             premul_rgb(color, cov)
         };
-        let knot = |k: usize| -span + 2.0 * span * k as f32 / (2 * SEGMENTS) as f32;
+        let knot = |k: usize| -span + k as f32 * step;
         let x0 = knot(0);
         let mut ia = (cx + x0).round() as i32;
         let mut a = level(x0);
@@ -624,13 +626,14 @@ pub(crate) fn push_twinkle_star(
     }
     let at = |share: f32| premul_rgb(color, (f32::from(cov) * share) as u8);
     let body_paint = premul_rgb(color, cov);
+    let core_paint = at(STAR_CORE_ADD);
     let glint_paint = if gold { at(STAR_GLINT_COV) } else { 0 };
     let mut last_tip: Option<(u8, u32)> = None;
     let mut ended = false;
     for (i, p) in star_pieces(arm, gold).iter().enumerate() {
         let paint = match p.part {
             StarPart::Body => body_paint,
-            StarPart::Core => at(STAR_CORE_ADD),
+            StarPart::Core => core_paint,
             StarPart::Tip { step, taper } => {
                 let tip = match last_tip {
                     Some((s, cached)) if s == step => cached,

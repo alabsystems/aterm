@@ -367,6 +367,79 @@ pub struct FdReading {
     pub kind: FdKind,
 }
 
+/// A terminal's line discipline: how its reader in front takes the keys typed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermWord {
+    /// `ICANON`: a line at a time.
+    pub canonical: bool,
+    /// `ECHO`.
+    pub echo: bool,
+    /// Bytes typed that its reader has not read (`FIONREAD`: a canonical terminal's whole lines).
+    pub queued: u32,
+}
+
+/// The line discipline of the pseudo-terminal `dev` that `pid` holds (a controlling terminal's
+/// device, as [`ProcFacts::tty`] holds it), and the keys queued in it, read through its device
+/// node (Linux: through `pid`'s own descriptor of it, the node of whichever `devpts` holds it):
+/// `None` when no node is `dev`'s or aterm's user may not open it (a terminal sudo gave root).
+#[cfg(unix)]
+#[must_use]
+pub fn term_word(pid: u32, dev: u32) -> Option<TermWord> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = term_node(pid, dev)?;
+    // Opened for its attributes alone: never as a controlling terminal, never waiting.
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(&path)
+        .ok()?;
+    // SAFETY: `termios` is plain integers and bytes; all-zero is valid.
+    let mut t: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: `f` is open for the call and `t` is a writable `termios`.
+    let rc = unsafe { libc::tcgetattr(f.as_raw_fd(), &raw mut t) };
+    if rc != 0 {
+        return None;
+    }
+    let mut queued: libc::c_int = 0;
+    // SAFETY: `f` is open for the call and `queued` a writable `int`.
+    let rc = unsafe { libc::ioctl(f.as_raw_fd(), libc::FIONREAD, &raw mut queued) };
+    Some(TermWord {
+        canonical: t.c_lflag & libc::ICANON != 0,
+        echo: t.c_lflag & libc::ECHO != 0,
+        queued: if rc == 0 {
+            u32::try_from(queued).unwrap_or(0)
+        } else {
+            0
+        },
+    })
+}
+
+/// The node of the pseudo-terminal `dev`: macOS's `/dev/ttysNNN` (major 16, the minor its
+/// number).
+#[cfg(target_os = "macos")]
+fn term_node(_pid: u32, dev: u32) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let path = PathBuf::from(format!("/dev/ttys{:03}", dev & 0x00ff_ffff));
+    (u32::try_from(std::fs::metadata(&path).ok()?.rdev()).ok() == Some(dev)).then_some(path)
+}
+
+/// `pid`'s descriptor of the terminal `dev`: `/dev/pts/N` names a terminal of aterm's own
+/// `devpts`, and a sandbox below the tab (`systemd-nspawn`, `bwrap --dev`) numbers its own.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn term_node(pid: u32, dev: u32) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .ok()?
+        .take(256)
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| {
+            std::fs::metadata(p)
+                .is_ok_and(|m| u32::try_from(m.rdev()).ok() == Some(dev) && m.rdev() != 0)
+        })
+}
+
 /// Everything read about one process.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProcFacts {
@@ -392,6 +465,9 @@ pub struct ProcFacts {
     pub tty: Option<u32>,
     /// That terminal's foreground process group; `None` without a terminal.
     pub tpgid: Option<u32>,
+    /// That terminal's line discipline, read for a session leader through the terminal's device
+    /// node ([`term_word`]); `None` for any other process, or where aterm's user may not open it.
+    pub term: Option<TermWord>,
     /// Its counters; `None` where the OS refused them.
     pub counters: Option<Counters>,
     /// Its threads; `None` where refused.
@@ -648,6 +724,14 @@ impl JobsReader {
                 .and_then(Path::file_name)
                 .and_then(|n| n.to_str())
                 .map(str::to_owned);
+            // A session leader's terminal is the session's (`script`'s, an agent's pty call's):
+            // how its reader in front takes keys. A fixture tree names no device of this machine.
+            #[cfg(unix)]
+            if facts.sid == Some(r.pid)
+                && (cfg!(target_os = "macos") || self.root == Path::new("/proc"))
+            {
+                facts.term = facts.tty.and_then(|dev| term_word(r.pid, dev));
+            }
             facts.start_facts = start.map(|mut f| {
                 if f.lone_zero {
                     f.local = exe

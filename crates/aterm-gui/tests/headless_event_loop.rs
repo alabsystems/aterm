@@ -272,6 +272,24 @@ mod macos {
     enum Ev {
         Clone(usize, Instant),
         MainQueueAnswered(u32),
+        /// Sent in full just before its sender takes the queue's lock to push [`Ev::Behind`].
+        Before,
+        Behind,
+    }
+
+    /// The phase that makes a turn's drain of user events meet a send in progress, so
+    /// `user_events_drained` must say that drain did not empty the queue.
+    enum Cut {
+        /// The clones and the main queue's answer are still arriving.
+        Waiting,
+        /// Every earlier event is in: the next `about_to_wait` begins the phase.
+        Due,
+        /// [`Ev::Before`] was sent in full, and its sender holds the queue's lock part-way through
+        /// its push of [`Ev::Behind`] until `release` fires.
+        Held(std::sync::mpsc::Sender<()>),
+        /// The held sender was let go; its own wake brings the turn that hands both out.
+        Released,
+        Done,
     }
 
     fn fail(why: &str) -> ! {
@@ -287,6 +305,10 @@ mod macos {
         acks: Option<std::sync::mpsc::Receiver<usize>>,
         received: Vec<Option<Duration>>,
         main_queue: Option<u32>,
+        cut_proxy: Option<EventLoopProxy<Ev>>,
+        cut: Cut,
+        before: bool,
+        behind: bool,
         deadline_armed: Option<Instant>,
         turns_while_waiting: u32,
         deadline_slept: Option<Duration>,
@@ -357,19 +379,75 @@ mod macos {
             el.set_control_flow(ControlFlow::Wait);
         }
 
-        fn user_event(&mut self, el: &ActiveEventLoop, event: Ev) {
+        fn user_event(&mut self, _el: &ActiveEventLoop, event: Ev) {
             match event {
                 Ev::Clone(i, sent) => {
                     self.received[i] = Some(sent.elapsed());
                     let _ = self.ack.send(i);
                 }
                 Ev::MainQueueAnswered(answer) => self.main_queue = Some(answer),
+                Ev::Before => self.before = true,
+                Ev::Behind => self.behind = true,
             }
-            if self.all_delivered() && self.deadline_armed.is_none() {
-                let now = Instant::now();
-                self.deadline_armed = Some(now);
-                el.set_control_flow(ControlFlow::WaitUntil(now + DEADLINE));
+            if self.all_delivered() && matches!(self.cut, Cut::Waiting) {
+                self.cut = Cut::Due;
             }
+        }
+
+        fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+            self.cut = match std::mem::replace(&mut self.cut, Cut::Done) {
+                Cut::Due => {
+                    let proxy = self
+                        .cut_proxy
+                        .take()
+                        .expect("the cut phase's proxy is handed in before run");
+                    let (held_tx, held) = std::sync::mpsc::channel();
+                    let (release, release_rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        if proxy.send_event(Ev::Before).is_err()
+                            || proxy
+                                .send_event_held_for_test(Ev::Behind, &held_tx, &release_rx)
+                                .is_err()
+                        {
+                            fail("the loop closed during the cut-drain phase");
+                        }
+                    });
+                    if held.recv_timeout(HANG).is_err() {
+                        fail(&format!(
+                            "the held sender did not take the queue's lock within {}s",
+                            HANG.as_secs()
+                        ));
+                    }
+                    Cut::Held(release)
+                }
+                Cut::Held(release) => {
+                    if self.before {
+                        fail("an event was handed out while a sender held the queue's lock");
+                    }
+                    if el.user_events_drained() {
+                        fail(
+                            "a turn whose drain met a sender part-way through its push said it \
+                             emptied the queue, yet an event sent in full before that drain is \
+                             still queued (the lost-wake watchdog would heal it falsely)",
+                        );
+                    }
+                    let _ = release.send(());
+                    Cut::Released
+                }
+                Cut::Released if self.before && self.behind => {
+                    if !el.user_events_drained() {
+                        fail(
+                            "the turn that handed out the held sender's events, with no sender \
+                             left, said its drain did not empty the queue",
+                        );
+                    }
+                    let now = Instant::now();
+                    self.deadline_armed = Some(now);
+                    el.set_control_flow(ControlFlow::WaitUntil(now + DEADLINE));
+                    Cut::Done
+                }
+                other => other,
+            };
         }
 
         fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, _: WindowEvent) {
@@ -409,6 +487,10 @@ mod macos {
             acks: Some(acks),
             received: vec![None; CLONES],
             main_queue: None,
+            cut_proxy: Some(event_loop.create_proxy()),
+            cut: Cut::Waiting,
+            before: false,
+            behind: false,
             deadline_armed: None,
             turns_while_waiting: 0,
             deadline_slept: None,
@@ -425,6 +507,9 @@ mod macos {
         }
         if probe.main_queue != Some(7) {
             fail("the main-queue round trip did not answer");
+        }
+        if !matches!(probe.cut, Cut::Done) {
+            fail("the cut-drain phase did not finish");
         }
         let Some(slept) = probe.deadline_slept else {
             fail("the WaitUntil deadline never reported ResumeTimeReached")
@@ -449,7 +534,8 @@ mod macos {
             .unwrap_or_default();
         println!(
             "headless_event_loop: ok — {CLONES} proxy clones delivered (worst {worst:?}), the main \
-             queue drained, a {DEADLINE:?} WaitUntil slept {slept:?}, and NSApp stayed nil"
+             queue drained, a drain that met a send in progress said so, a {DEADLINE:?} \
+             WaitUntil slept {slept:?}, and NSApp stayed nil"
         );
     }
 }

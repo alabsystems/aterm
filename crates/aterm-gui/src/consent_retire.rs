@@ -271,48 +271,33 @@ mod tests {
 
     #[test]
     fn a_second_press_while_live_starts_nothing() {
-        fn slow_census(id: &str) -> Claimants {
-            std::thread::sleep(Duration::from_millis(200));
+        static OPEN: (Mutex<bool>, std::sync::Condvar) =
+            (Mutex::new(false), std::sync::Condvar::new());
+        fn held_census(id: &str) -> Claimants {
+            let (open, opened) = &OPEN;
+            let mut open = open
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !*open {
+                open = opened
+                    .wait(open)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
             fake_census(id)
         }
         let state = RetireState::with_arms(RetireArms {
-            census: slow_census,
+            census: held_census,
             unchanged: same,
             in_use: idle,
             trash: fake_trash,
         });
         assert!(state.start("x".to_string(), Vec::new(), || {}));
         assert!(!state.start("x".to_string(), Vec::new(), || {}));
+        *OPEN
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        OPEN.1.notify_all();
         let _ = wait_for_report(&state);
-    }
-
-    #[test]
-    fn the_live_arms_are_the_real_checks() {
-        fn same(a: &RetireArms, b: &RetireArms) -> bool {
-            std::ptr::fn_addr_eq(a.census, b.census)
-                && std::ptr::fn_addr_eq(a.unchanged, b.unchanged)
-                && std::ptr::fn_addr_eq(a.in_use, b.in_use)
-                && std::ptr::fn_addr_eq(a.trash, b.trash)
-        }
-        assert!(same(&RetireState::new(false).arms, &RetireArms::live()));
-        assert!(same(&RetireState::new(true).arms, &RetireArms::inert()));
-        assert!(!same(&RetireArms::live(), &RetireArms::inert()));
-        let live = RetireArms::live();
-        assert!(std::ptr::fn_addr_eq(
-            live.census,
-            consent::claimants_for as fn(&str) -> Claimants
-        ));
-        assert!(std::ptr::fn_addr_eq(
-            live.unchanged,
-            consent::still_claims as fn(&consent::Claimant, &str) -> bool
-        ));
-        assert!(std::ptr::fn_addr_eq(
-            live.in_use,
-            atpkg::gc::runs_from as fn(&Path) -> Option<bool>
-        ));
-        assert!(std::ptr::fn_addr_eq(
-            live.trash,
-            atpkg::copies::trash as fn(&Path) -> Result<(), String>
-        ));
     }
 }

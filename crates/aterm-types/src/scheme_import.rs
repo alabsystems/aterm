@@ -33,8 +33,14 @@ pub enum ImportFormat {
     Ghostty,
     /// Alacritty: TOML with `[colors.primary]`, `[colors.normal]`, ….
     Alacritty,
+    /// WezTerm: a TOML colour scheme with `[colors]` (`foreground`, `ansi = [ … ]`, `brights`)
+    /// and `[metadata]`.
+    WezTerm,
     /// iTerm2: an `.itermcolors` XML property list.
     ITerm,
+    /// Terminal.app: a `.terminal` profile, an XML property list whose colours are archived
+    /// `NSColor`s.
+    TerminalApp,
     /// Windows Terminal: a JSON colour scheme object.
     WindowsTerminal,
     /// base16 / base24: a YAML scheme with `base00` … `base0F` (… `base17`).
@@ -48,7 +54,9 @@ impl ImportFormat {
         ImportFormat::Kitty,
         ImportFormat::Ghostty,
         ImportFormat::Alacritty,
+        ImportFormat::WezTerm,
         ImportFormat::ITerm,
+        ImportFormat::TerminalApp,
         ImportFormat::WindowsTerminal,
         ImportFormat::Base16,
     ];
@@ -62,7 +70,9 @@ impl ImportFormat {
             ImportFormat::Kitty => "kitty",
             ImportFormat::Ghostty => "Ghostty",
             ImportFormat::Alacritty => "Alacritty",
+            ImportFormat::WezTerm => "WezTerm",
             ImportFormat::ITerm => "iTerm2",
+            ImportFormat::TerminalApp => "Terminal.app",
             ImportFormat::WindowsTerminal => "Windows Terminal",
             ImportFormat::Base16 => "base16",
         }
@@ -144,8 +154,9 @@ impl core::fmt::Display for ImportError {
             }
             ImportError::NotUtf8 => f.write_str("the file is not UTF-8 text"),
             ImportError::UnknownFormat => f.write_str(
-                "the file is not a theme format aterm imports (kitty, Ghostty, Alacritty \
-                 TOML, iTerm2 .itermcolors, Windows Terminal JSON, base16 YAML)",
+                "the file is not a theme format aterm imports (kitty, Ghostty, Alacritty or \
+                 WezTerm TOML, iTerm2 .itermcolors, Terminal.app .terminal, Windows Terminal \
+                 JSON, base16 YAML)",
             ),
             ImportError::Malformed {
                 format,
@@ -193,20 +204,29 @@ pub fn import_theme(
     convert(format, text, pick)
 }
 
-/// Detect which [`ImportFormat`] `text` (from `file_name`) uses.
+/// Detect which [`ImportFormat`] `text` (from `file_name`) uses: by the extension, where a
+/// `.plist` or `.toml` file's contents then tell Terminal.app from iTerm2 and WezTerm from
+/// Alacritty; else by the contents.
 #[must_use]
 pub fn detect_format(file_name: Option<&str>, text: &str) -> Option<ImportFormat> {
     let extension = file_name
         .and_then(|name| name.rsplit_once('.'))
         .map(|(_, ext)| ext.to_ascii_lowercase());
+    let text = strip_bom(text);
+    let sniffed = |format| sniff_foreign_format(text) == Some(format);
     match extension.as_deref() {
-        Some("itermcolors" | "plist") => return Some(ImportFormat::ITerm),
+        Some("itermcolors") => return Some(ImportFormat::ITerm),
+        Some("terminal") => return Some(ImportFormat::TerminalApp),
+        Some("plist") if sniffed(ForeignFormat::TerminalApp) => {
+            return Some(ImportFormat::TerminalApp);
+        }
+        Some("plist") => return Some(ImportFormat::ITerm),
         Some("json" | "jsonc") => return Some(ImportFormat::WindowsTerminal),
+        Some("toml") if sniffed(ForeignFormat::WezTerm) => return Some(ImportFormat::WezTerm),
         Some("toml") => return Some(ImportFormat::Alacritty),
         Some("yaml" | "yml") => return Some(ImportFormat::Base16),
         _ => {}
     }
-    let text = strip_bom(text);
     if parse_theme_str(text).is_ok() {
         return Some(ImportFormat::Native);
     }
@@ -214,7 +234,9 @@ pub fn detect_format(file_name: Option<&str>, text: &str) -> Option<ImportFormat
         Some(ForeignFormat::Kitty) => Some(ImportFormat::Kitty),
         Some(ForeignFormat::Ghostty) => Some(ImportFormat::Ghostty),
         Some(ForeignFormat::Plist) => Some(ImportFormat::ITerm),
+        Some(ForeignFormat::TerminalApp) => Some(ImportFormat::TerminalApp),
         Some(ForeignFormat::Toml) => Some(ImportFormat::Alacritty),
+        Some(ForeignFormat::WezTerm) => Some(ImportFormat::WezTerm),
         Some(ForeignFormat::Json) => Some(ImportFormat::WindowsTerminal),
         None if looks_like_base16(text) => Some(ImportFormat::Base16),
         None => None,
@@ -237,8 +259,10 @@ pub fn convert(
         ImportFormat::Native => convert_native(text),
         ImportFormat::Kitty => convert_kitty(text),
         ImportFormat::Ghostty => convert_ghostty(text),
-        ImportFormat::Alacritty => convert_alacritty(text),
+        ImportFormat::Alacritty => convert_toml(ImportFormat::Alacritty, text, alacritty_assign),
+        ImportFormat::WezTerm => convert_toml(ImportFormat::WezTerm, text, wezterm_assign),
         ImportFormat::ITerm => convert_iterm(text),
+        ImportFormat::TerminalApp => convert_terminal_app(text),
         ImportFormat::WindowsTerminal => convert_windows_terminal(text, pick),
         ImportFormat::Base16 => convert_base16(text),
     }
@@ -684,13 +708,18 @@ impl Draft {
             .map(|(index, _)| index.to_string())
             .collect();
         if !missing.is_empty() {
-            let mut note = String::from(if missing.len() == 1 {
-                "ANSI colour "
+            let (noun, rest) = if missing.len() == 1 {
+                (
+                    "ANSI colour ",
+                    " is not in the file: aterm's default fills it",
+                )
             } else {
-                "ANSI colours "
-            });
-            note.push_str(&missing.join(", "));
-            note.push_str(" are not in the file: aterm's defaults fill them");
+                (
+                    "ANSI colours ",
+                    " are not in the file: aterm's defaults fill them",
+                )
+            };
+            let note = cat(&[noun, &missing.join(", "), rest]);
             self.note(note);
         }
         if self.dropped_unlisted > 0 {
@@ -1028,8 +1057,14 @@ fn toml_string(raw: &str) -> Option<String> {
     Some(out)
 }
 
-fn convert_alacritty(text: &str) -> Result<ImportReport, ImportError> {
-    let format = ImportFormat::Alacritty;
+/// Read the TOML `text` as `format`, handing `assign` each key's full path and its value's text:
+/// an array whole (joined when it spans lines), an inline table entry by entry (a nested one's
+/// too), and `None` for a multi-line string.
+fn convert_toml(
+    format: ImportFormat,
+    text: &str,
+    assign: fn(&mut Draft, &[String], Option<&str>),
+) -> Result<ImportReport, ImportError> {
     let mut draft = Draft::new(format);
     let mut table: Vec<String> = Vec::new();
     let mut lines = text.lines().enumerate();
@@ -1071,37 +1106,59 @@ fn convert_alacritty(text: &str) -> Result<ImportReport, ImportError> {
                     }
                 }
             }
-            alacritty_assign(&mut draft, &path, None);
+            assign(&mut draft, &path, None);
             continue;
         }
         let mut depth = toml_bracket_delta(value);
+        let mut joined = String::new();
+        if depth > 0 {
+            joined.push_str(value);
+        }
         while depth > 0 {
             let Some((_, next)) = lines.next() else {
                 return Err(malformed(format, lineno, "unterminated array"));
             };
             let next = next.get(..toml_comment_start(next)).unwrap_or(next);
             depth = depth.saturating_add(toml_bracket_delta(next));
+            joined.push(' ');
+            joined.push_str(next.trim());
         }
-        if let Some(inner) = value
-            .strip_prefix('{')
-            .and_then(|rest| rest.strip_suffix('}'))
-        {
-            let pairs =
-                toml_split(inner, b',').ok_or_else(|| malformed(format, lineno, "bad table"))?;
-            for pair in pairs.into_iter().filter(|p| !p.trim().is_empty()) {
-                let (sub_key, sub_value) = pair
-                    .split_once('=')
-                    .ok_or_else(|| malformed(format, lineno, "expected `key = value`"))?;
-                let mut sub_path = path.clone();
-                sub_path
-                    .extend(toml_key(sub_key).ok_or_else(|| malformed(format, lineno, "bad key"))?);
-                alacritty_assign(&mut draft, &sub_path, toml_string(sub_value).as_deref());
-            }
-            continue;
-        }
-        alacritty_assign(&mut draft, &path, toml_string(value).as_deref());
+        let value = if joined.is_empty() { value } else { &joined };
+        toml_assign(&mut draft, assign, &path, value, lineno)?;
     }
     draft.finish()
+}
+
+/// Hand `assign` the value `value` of the key at `path` (on line `lineno`), or, when it is an
+/// inline table, each of its entries at their full paths, nested tables included.
+fn toml_assign(
+    draft: &mut Draft,
+    assign: fn(&mut Draft, &[String], Option<&str>),
+    path: &[String],
+    value: &str,
+    lineno: usize,
+) -> Result<(), ImportError> {
+    let format = draft.format;
+    let Some(inner) = value
+        .strip_prefix('{')
+        .and_then(|rest| rest.strip_suffix('}'))
+    else {
+        assign(draft, path, Some(value));
+        return Ok(());
+    };
+    let pairs = toml_split(inner, b',').ok_or_else(|| malformed(format, lineno, "bad table"))?;
+    for pair in pairs.into_iter().filter(|p| !p.trim().is_empty()) {
+        let (sub_key, sub_value) = pair
+            .split_once('=')
+            .ok_or_else(|| malformed(format, lineno, "expected `key = value`"))?;
+        let mut sub_path = path.to_vec();
+        sub_path.extend(toml_key(sub_key).ok_or_else(|| malformed(format, lineno, "bad key"))?);
+        if sub_path.len() > MAX_NESTING {
+            return Err(malformed(format, lineno, "keys nest too deeply"));
+        }
+        toml_assign(draft, assign, &sub_path, sub_value.trim(), lineno)?;
+    }
+    Ok(())
 }
 
 fn alacritty_assign(draft: &mut Draft, path: &[String], value: Option<&str>) {
@@ -1125,10 +1182,10 @@ fn alacritty_assign(draft: &mut Draft, path: &[String], value: Option<&str>) {
         }
         _ => return draft.drop_key(&dotted),
     };
-    let Some(value) = value else {
+    let Some(value) = value.and_then(toml_string) else {
         return draft.drop_key(&dotted);
     };
-    match value {
+    match value.as_str() {
         "CellForeground" if slot == Slot::SelectionForeground => {}
         "CellForeground" | "CellBackground" => {
             draft.drop_key(&dotted);
@@ -1137,7 +1194,67 @@ fn alacritty_assign(draft: &mut Draft, path: &[String], value: Option<&str>) {
                  aterm theme key: aterm's default is used",
             );
         }
-        _ => draft.colour(slot, &dotted, value),
+        _ => draft.colour(slot, &dotted, &value),
+    }
+}
+
+fn wezterm_assign(draft: &mut Draft, path: &[String], value: Option<&str>) {
+    let dotted = path.join(".");
+    let parts: Vec<&str> = path.iter().map(String::as_str).collect();
+    let slot = match parts.as_slice() {
+        ["colors", "foreground"] => Slot::Foreground,
+        ["colors", "background"] => Slot::Background,
+        ["colors", "cursor_bg"] => Slot::Cursor,
+        ["colors", "selection_bg"] => Slot::Selection,
+        ["colors", "selection_fg"] => Slot::SelectionForeground,
+        ["colors", "split"] => Slot::Chrome(ThemeKey::BorderColor),
+        ["colors", "tab_bar", "active_tab", "bg_color"] => Slot::Chrome(ThemeKey::ActiveTabColor),
+        ["colors", group @ ("ansi" | "brights")] => {
+            let offset = if *group == "ansi" { 0 } else { 8 };
+            return wezterm_palette(draft, &dotted, offset, value);
+        }
+        ["colors", "indexed", index] => match indexed_key(index, "") {
+            Some(index) if index < 16 => Slot::Ansi(index),
+            Some(_) => {
+                draft.drop_key(&dotted);
+                return draft.note(PALETTE_NOTE);
+            }
+            None => return draft.drop_key(&dotted),
+        },
+        ["metadata", field @ ("name" | "author")] => {
+            match value.and_then(toml_string) {
+                Some(text) if *field == "name" => draft.name = Some(text),
+                Some(text) => draft.author = Some(text),
+                None => draft.drop_key(&dotted),
+            }
+            return;
+        }
+        _ => return draft.drop_key(&dotted),
+    };
+    match value.and_then(toml_string) {
+        Some(value) => draft.colour(slot, &dotted, &value),
+        None => draft.drop_key(&dotted),
+    }
+}
+
+/// WezTerm's `ansi` or `brights` array (`dotted`): its 8 colours fill the ANSI slots from
+/// `offset`; an entry past the 8th, or one that is not a string, is dropped as `dotted[N]`.
+fn wezterm_palette(draft: &mut Draft, dotted: &str, offset: usize, value: Option<&str>) {
+    let entries = value
+        .and_then(|value| value.strip_prefix('[')?.strip_suffix(']'))
+        .and_then(|inner| toml_split(inner, b','));
+    let Some(entries) = entries else {
+        return draft.drop_key(dotted);
+    };
+    let entries = entries.into_iter().filter(|entry| !entry.trim().is_empty());
+    for (index, entry) in entries.enumerate() {
+        let key = cat(&[dotted, "[", &index.to_string(), "]"]);
+        match toml_string(entry) {
+            Some(colour) if index < 8 => {
+                draft.colour(Slot::Ansi(offset.saturating_add(index)), &key, &colour);
+            }
+            _ => draft.drop_key(&key),
+        }
     }
 }
 
@@ -1147,12 +1264,16 @@ enum PlistValue {
     Dict(Vec<(String, PlistValue)>),
     Number(f64),
     Text(String),
+    /// A `<data>` element's base64 text, undecoded.
+    Data(String),
     Other,
 }
 
 struct PlistScanner<'a> {
     text: &'a str,
     pos: usize,
+    /// The format a malformed document is reported as.
+    format: ImportFormat,
 }
 
 /// What kind of tag a scanned tag is.
@@ -1169,7 +1290,7 @@ impl<'a> PlistScanner<'a> {
     }
 
     fn error(&self, reason: &str) -> ImportError {
-        malformed(ImportFormat::ITerm, line_of(self.text, self.pos), reason)
+        malformed(self.format, line_of(self.text, self.pos), reason)
     }
 
     fn skip_misc(&mut self) -> Result<(), ImportError> {
@@ -1282,7 +1403,8 @@ impl<'a> PlistScanner<'a> {
             }
             ("string", TagKind::Open) => Ok(PlistValue::Text(self.text_until_close("string")?)),
             ("string", TagKind::Empty) => Ok(PlistValue::Text(String::new())),
-            ("date" | "data", TagKind::Open) => {
+            ("data", TagKind::Open) => Ok(PlistValue::Data(self.text_until_close("data")?)),
+            ("date", TagKind::Open) => {
                 self.text_until_close(name)?;
                 Ok(PlistValue::Other)
             }
@@ -1368,12 +1490,15 @@ fn iterm_slot(key: &str) -> Option<Slot> {
     })
 }
 
+/// A colour component from 0 to 1 (clamped) as a byte.
+fn unit_byte(component: f64) -> u8 {
+    (component.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
 fn iterm_colour(entries: &[(String, PlistValue)]) -> Option<(Rgb, Option<String>)> {
     let component = |name: &str| {
         entries.iter().find_map(|(key, value)| match value {
-            PlistValue::Number(n) if key == name && n.is_finite() => {
-                Some((n.clamp(0.0, 1.0) * 255.0).round() as u8)
-            }
+            PlistValue::Number(n) if key == name && n.is_finite() => Some(unit_byte(*n)),
             _ => None,
         })
     };
@@ -1394,7 +1519,11 @@ fn iterm_colour(entries: &[(String, PlistValue)]) -> Option<(Rgb, Option<String>
 
 fn convert_iterm(text: &str) -> Result<ImportReport, ImportError> {
     let format = ImportFormat::ITerm;
-    let mut scanner = PlistScanner { text, pos: 0 };
+    let mut scanner = PlistScanner {
+        text,
+        pos: 0,
+        format,
+    };
     let PlistValue::Dict(entries) = scanner.document()? else {
         return Err(malformed(
             format,
@@ -1446,6 +1575,523 @@ fn convert_iterm(text: &str) -> Result<ImportReport, ImportError> {
         }
     }
     draft.finish()
+}
+
+fn terminal_app_slot(key: &str) -> Option<Slot> {
+    Some(match key {
+        "TextColor" => Slot::Foreground,
+        "BackgroundColor" => Slot::Background,
+        "CursorColor" => Slot::Cursor,
+        "SelectionColor" => Slot::Selection,
+        _ => {
+            let name = key.strip_prefix("ANSI")?.strip_suffix("Color")?;
+            let (offset, name) = name
+                .strip_prefix("Bright")
+                .map_or((0, name), |name| (8, name));
+            let index = ANSI_NAMES
+                .iter()
+                .position(|ansi| ansi.eq_ignore_ascii_case(name))?;
+            Slot::Ansi(index.saturating_add(offset))
+        }
+    })
+}
+
+/// The colour space an archived colour's components were read in.
+enum ArchivedSpace {
+    Srgb,
+    /// A space the archive names: a legacy `NSColorSpace` (`calibrated RGB`, …) or the
+    /// description of a custom space's ICC profile (`Display P3`).
+    Named(String),
+    /// A custom space that is not sRGB and has no ICC description aterm reads.
+    Unnamed,
+}
+
+/// The colour a Terminal.app `<data>` value archives, as read.
+struct ArchivedColour {
+    rgb: Rgb,
+    space: ArchivedSpace,
+    /// For a named colour (`NSColorSpace` 6, such as `textColor`), which carries a fallback
+    /// `NSColor` (an app that opens the archive gets the live system colour instead, and
+    /// `rgb` is the fallback): the name it gives itself when that is ASCII, else empty.
+    named: Option<String>,
+    /// Whether a component lay far enough below 0 or above 1 that clipping it to that range
+    /// changed its byte.
+    clipped: bool,
+}
+
+/// An `NSKeyedArchiver` archive: a binary plist whose `$objects` array holds each object a
+/// `Uid` names.
+struct KeyedArchive<'a> {
+    plist: Bplist<'a>,
+    objects: Vec<usize>,
+}
+
+impl<'a> KeyedArchive<'a> {
+    /// The archive `bytes` hold and its root object's dictionary.
+    fn open(bytes: &'a [u8]) -> Option<(Self, Vec<(usize, usize)>)> {
+        let plist = Bplist::new(bytes)?;
+        let Bvalue::Dict(top) = plist.object(plist.top)? else {
+            return None;
+        };
+        let Bvalue::Array(objects) = plist.lookup(&top, "$objects")? else {
+            return None;
+        };
+        let Bvalue::Dict(roots) = plist.lookup(&top, "$top")? else {
+            return None;
+        };
+        let archive = Self { plist, objects };
+        let root = archive.dict(&roots, "root")?;
+        Some((archive, root))
+    }
+
+    /// The plist object the `Uid` that `dict` holds under `key` names.
+    fn target(&self, dict: &[(usize, usize)], key: &str) -> Option<usize> {
+        let Bvalue::Uid(uid) = self.plist.lookup(dict, key)? else {
+            return None;
+        };
+        self.objects.get(uid).copied()
+    }
+
+    /// The dictionary the `Uid` that `dict` holds under `key` names.
+    fn dict(&self, dict: &[(usize, usize)], key: &str) -> Option<Vec<(usize, usize)>> {
+        match self.plist.object(self.target(dict, key)?)? {
+            Bvalue::Dict(entries) => Some(entries),
+            _ => None,
+        }
+    }
+}
+
+/// The colour a Terminal.app `<data>` value (`base64`) archives: an `NSKeyedArchiver` binary
+/// plist whose root is an RGB or grey `NSColor` (read by [`archived_components`]) or a named
+/// colour whose fallback is one. Any other archive is `None`.
+fn terminal_app_colour(base64: &str) -> Option<ArchivedColour> {
+    let bytes = base64_decode(base64)?;
+    let (archive, root) = KeyedArchive::open(&bytes)?;
+    let (colour, named) = match archive.plist.lookup(&root, "NSColorSpace")? {
+        Bvalue::Int(6) => {
+            let name = archive
+                .target(&root, "NSColorName")
+                .and_then(|name| archive.plist.ascii(name))
+                .and_then(|name| core::str::from_utf8(name).ok())
+                .map(quoted)
+                .unwrap_or_default();
+            (archive.dict(&root, "NSColor")?, Some(name))
+        }
+        _ => (root, None),
+    };
+    Some(ArchivedColour {
+        named,
+        ..archived_components(&archive, &colour)?
+    })
+}
+
+/// The colour an archived `NSColor` (`colour`) in an RGB or grey space holds, alpha ignored,
+/// the space it was read in and whether it was clipped: its own components (`NSComponents`)
+/// in the custom space (`NSCustomColorSpace`) it names when it has both, else its legacy
+/// calibrated or device components (`NSRGB`, `NSWhite`). Its `named` is `None`.
+fn archived_components(
+    archive: &KeyedArchive<'_>,
+    colour: &[(usize, usize)],
+) -> Option<ArchivedColour> {
+    let Bvalue::Int(space) = archive.plist.lookup(colour, "NSColorSpace")? else {
+        return None;
+    };
+    let (rgb, legacy_key, legacy_space) = match space {
+        1 => (true, "NSRGB", "calibrated RGB"),
+        2 => (true, "NSRGB", "device RGB"),
+        3 => (false, "NSWhite", "calibrated white"),
+        4 => (false, "NSWhite", "device white"),
+        _ => return None,
+    };
+    let own = archive
+        .plist
+        .lookup(colour, "NSComponents")
+        .zip(archive.dict(colour, "NSCustomColorSpace"));
+    let (components, space) = match own {
+        Some((Bvalue::Data(components), custom)) => (components, custom_space(archive, &custom)),
+        _ => {
+            let Bvalue::Data(components) = archive.plist.lookup(colour, legacy_key)? else {
+                return None;
+            };
+            (components, ArchivedSpace::Named(legacy_space.to_string()))
+        }
+    };
+    let mut components = core::str::from_utf8(components)
+        .ok()?
+        .trim_end_matches('\0')
+        .split_ascii_whitespace()
+        .map(|component| component.parse::<f64>().ok().filter(|n| n.is_finite()));
+    let mut next = || components.next().flatten();
+    let read = if rgb {
+        [next()?, next()?, next()?]
+    } else {
+        [next()?; 3]
+    };
+    let [red, green, blue] = read.map(unit_byte);
+    Some(ArchivedColour {
+        rgb: Rgb::new(red, green, blue),
+        space,
+        named: None,
+        clipped: read
+            .iter()
+            .any(|&component| f64::from(unit_byte(component)) != (component * 255.0).round()),
+    })
+}
+
+/// The space an archived `NSColorSpace` (`space`) is: sRGB when its `NSID` is 7 (sRGB) or its
+/// `NSSpaceID` is 14 (extended sRGB, which is sRGB from 0 to 1 and goes on past it), else the
+/// space its ICC profile (`NSICC`) describes.
+fn custom_space(archive: &KeyedArchive<'_>, space: &[(usize, usize)]) -> ArchivedSpace {
+    let srgb = matches!(archive.plist.lookup(space, "NSID"), Some(Bvalue::Int(7)))
+        || matches!(
+            archive.plist.lookup(space, "NSSpaceID"),
+            Some(Bvalue::Int(14))
+        );
+    if srgb {
+        return ArchivedSpace::Srgb;
+    }
+    let icc = archive
+        .target(space, "NSICC")
+        .and_then(|icc| archive.plist.object(icc));
+    match icc {
+        Some(Bvalue::Data(icc)) => {
+            icc_description(icc).map_or(ArchivedSpace::Unnamed, ArchivedSpace::Named)
+        }
+        _ => ArchivedSpace::Unnamed,
+    }
+}
+
+/// The description an ICC profile gives itself: its `desc` tag, as ICC v2 text or ICC v4
+/// multi-localized Unicode (the first English record, else the first). `None` when the
+/// profile has no such tag or it is damaged.
+fn icc_description(icc: &[u8]) -> Option<String> {
+    if icc.get(36..40)? != b"acsp" {
+        return None;
+    }
+    let tags = be_usize(icc.get(128..132)?)?;
+    let tag = icc
+        .get(132..)?
+        .as_chunks::<12>()
+        .0
+        .iter()
+        .take(tags)
+        .find(|entry| entry.starts_with(b"desc"))?;
+    let start = be_usize(tag.get(4..8)?)?;
+    let body = icc.get(start..start.checked_add(be_usize(tag.get(8..12)?)?)?)?;
+    let text = match body.get(..4)? {
+        b"desc" => {
+            let len = be_usize(body.get(8..12)?)?;
+            let ascii = body.get(12..len.checked_add(12)?)?;
+            core::str::from_utf8(ascii.split(|&byte| byte == 0).next()?)
+                .ok()?
+                .to_string()
+        }
+        b"mluc" => {
+            let count = be_usize(body.get(8..12)?)?;
+            let size = be_usize(body.get(12..16)?)?;
+            if size < 12 {
+                return None;
+            }
+            let mut records = body.get(16..)?.chunks_exact(size).take(count);
+            let record = records
+                .clone()
+                .find(|record| record.starts_with(b"en"))
+                .or_else(|| records.next())?;
+            let len = be_usize(record.get(4..8)?)?;
+            let at = be_usize(record.get(8..12)?)?;
+            let units = body
+                .get(at..at.checked_add(len)?)?
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| u16::from_be_bytes(*pair));
+            char::decode_utf16(units)
+                .collect::<Result<String, _>>()
+                .ok()?
+        }
+        _ => return None,
+    };
+    let text = quoted(text.trim());
+    (!text.is_empty()).then_some(text)
+}
+
+/// The rest of the note on a named colour: Terminal.app opens the archive and shows the
+/// system's colour for that name, so the fallback aterm reads can differ from it.
+const TERMINAL_APP_NAMED_NOTE: &str = "Terminal.app shows the system's current colour for it, \
+                                       which can differ (in Dark Mode, say); the fallback saved \
+                                       with it was used";
+
+fn convert_terminal_app(text: &str) -> Result<ImportReport, ImportError> {
+    let format = ImportFormat::TerminalApp;
+    let mut scanner = PlistScanner {
+        text,
+        pos: 0,
+        format,
+    };
+    let PlistValue::Dict(entries) = scanner.document()? else {
+        return Err(malformed(
+            format,
+            0,
+            "the property list is not a dictionary",
+        ));
+    };
+    let mut draft = Draft::new(format);
+    for (key, value) in &entries {
+        if let ("name", PlistValue::Text(name)) = (key.as_str(), value) {
+            draft.name = Some(name.clone());
+            continue;
+        }
+        let Some(slot) = terminal_app_slot(key) else {
+            draft.drop_key(key);
+            continue;
+        };
+        let colour = match value {
+            PlistValue::Data(archive) => terminal_app_colour(archive),
+            _ => None,
+        };
+        let Some(colour) = colour else {
+            draft.drop_key(key);
+            draft.note(cat(&[
+                "\"",
+                &quoted(key),
+                "\" is not an archived RGB or grey colour, so it was dropped",
+            ]));
+            continue;
+        };
+        draft.set(slot, colour.rgb);
+        match colour.named.as_deref() {
+            Some("") => draft.note(cat(&[
+                "\"",
+                &quoted(key),
+                "\" is a named colour: ",
+                TERMINAL_APP_NAMED_NOTE,
+            ])),
+            Some(name) => draft.note(cat(&[
+                "\"",
+                &quoted(key),
+                "\" is the named colour \"",
+                name,
+                "\": ",
+                TERMINAL_APP_NAMED_NOTE,
+            ])),
+            None => {}
+        }
+        if colour.clipped {
+            draft.note(cat(&[
+                "\"",
+                &quoted(key),
+                "\" lies outside sRGB (a component is below 0 or above 1), so it was clipped \
+                 to fit",
+            ]));
+        }
+        match &colour.space {
+            ArchivedSpace::Srgb => {}
+            ArchivedSpace::Named(space) => draft.note(cat(&[
+                "colours in the \"",
+                space,
+                "\" colour space were read as sRGB and may look slightly different",
+            ])),
+            ArchivedSpace::Unnamed => draft.note(
+                "colours in a colour space aterm could not name were read as sRGB and may \
+                 look slightly different",
+            ),
+        }
+    }
+    for (set, key) in [
+        (draft.foreground.is_some(), "TextColor"),
+        (draft.background.is_some(), "BackgroundColor"),
+    ] {
+        if !set && entries.iter().any(|(name, _)| name == key) {
+            return Err(malformed(
+                format,
+                0,
+                &cat(&["\"", key, "\" is not a colour aterm can read"]),
+            ));
+        }
+    }
+    draft.finish()
+}
+
+/// The bytes the base64 `text` encodes (whitespace skipped, `=` ends it), or `None` when it
+/// holds any other character.
+fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    let mut pending: u32 = 0;
+    let mut bits: u32 = 0;
+    for byte in text.bytes() {
+        let sextet = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => break,
+            _ if byte.is_ascii_whitespace() => continue,
+            _ => return None,
+        };
+        pending = pending << 6 | u32::from(sextet);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((pending >> bits) as u8);
+            pending &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
+/// A binary property list (`bplist00`), read only as far as an archived colour needs: every
+/// read is bounded by the bytes, so a damaged archive reads as `None`.
+struct Bplist<'a> {
+    bytes: &'a [u8],
+    /// Bytes per offset-table entry.
+    offset_size: usize,
+    /// Bytes per object reference in an array or dictionary.
+    ref_size: usize,
+    /// Number of objects.
+    count: usize,
+    /// Where the offset table starts.
+    table: usize,
+    /// The root object.
+    top: usize,
+}
+
+/// A binary property-list object, reduced to what an archived colour needs.
+enum Bvalue<'a> {
+    Int(u64),
+    Data(&'a [u8]),
+    Uid(usize),
+    Array(Vec<usize>),
+    Dict(Vec<(usize, usize)>),
+    Other,
+}
+
+impl<'a> Bplist<'a> {
+    fn new(bytes: &'a [u8]) -> Option<Self> {
+        let trailer_at = bytes.len().checked_sub(32)?;
+        if !bytes.starts_with(b"bplist00") || trailer_at < 8 {
+            return None;
+        }
+        let trailer = bytes.get(trailer_at..)?;
+        let offset_size = usize::from(*trailer.get(6)?);
+        let ref_size = usize::from(*trailer.get(7)?);
+        let count = be_usize(trailer.get(8..16)?)?;
+        let top = be_usize(trailer.get(16..24)?)?;
+        let table = be_usize(trailer.get(24..32)?)?;
+        let table_end = count.checked_mul(offset_size)?.checked_add(table)?;
+        let sizes = 1..=8;
+        if !sizes.contains(&offset_size)
+            || !sizes.contains(&ref_size)
+            || table_end > trailer_at
+            || top >= count
+        {
+            return None;
+        }
+        Some(Self {
+            bytes,
+            offset_size,
+            ref_size,
+            count,
+            table,
+            top,
+        })
+    }
+
+    fn slice(&self, start: usize, len: usize) -> Option<&'a [u8]> {
+        self.bytes.get(start..start.checked_add(len)?)
+    }
+
+    /// Object `index`'s marker byte and where the bytes after it start.
+    fn locate(&self, index: usize) -> Option<(u8, usize)> {
+        if index >= self.count {
+            return None;
+        }
+        let entry = index
+            .checked_mul(self.offset_size)?
+            .checked_add(self.table)?;
+        let offset = be_usize(self.slice(entry, self.offset_size)?)?;
+        Some((*self.bytes.get(offset)?, offset.checked_add(1)?))
+    }
+
+    fn object(&self, index: usize) -> Option<Bvalue<'a>> {
+        let (marker, body) = self.locate(index)?;
+        let info = marker & 0x0f;
+        Some(match marker >> 4 {
+            0x1 => Bvalue::Int(be_u64(self.slice(body, 1usize.checked_shl(info.into())?)?)?),
+            0x4 => {
+                let (start, len) = self.extent(info, body)?;
+                Bvalue::Data(self.slice(start, len)?)
+            }
+            0x8 => Bvalue::Uid(be_usize(
+                self.slice(body, usize::from(info).checked_add(1)?)?,
+            )?),
+            0xa => {
+                let (start, len) = self.extent(info, body)?;
+                Bvalue::Array(self.refs(start, len)?)
+            }
+            0xd => {
+                let (start, len) = self.extent(info, body)?;
+                let keys = self.refs(start, len)?;
+                let values_at = len.checked_mul(self.ref_size)?.checked_add(start)?;
+                let values = self.refs(values_at, len)?;
+                Bvalue::Dict(keys.into_iter().zip(values).collect())
+            }
+            _ => Bvalue::Other,
+        })
+    }
+
+    /// Where an object's contents start and how many there are: the marker's low nibble, or
+    /// for `0xf` the integer object after the marker.
+    fn extent(&self, info: u8, body: usize) -> Option<(usize, usize)> {
+        if info != 0x0f {
+            return Some((body, usize::from(info)));
+        }
+        let marker = *self.bytes.get(body)?;
+        if marker >> 4 != 0x1 {
+            return None;
+        }
+        let width = 1usize.checked_shl((marker & 0x0f).into())?;
+        let start = body.checked_add(1)?;
+        let len = be_usize(self.slice(start, width)?)?;
+        Some((start.checked_add(width)?, len))
+    }
+
+    fn refs(&self, start: usize, count: usize) -> Option<Vec<usize>> {
+        let bytes = self.slice(start, count.checked_mul(self.ref_size)?)?;
+        bytes.chunks_exact(self.ref_size).map(be_usize).collect()
+    }
+
+    /// Object `index` when it is an ASCII string; no other kind is read, so a key that names a
+    /// large container costs no more than one that names a string.
+    fn ascii(&self, index: usize) -> Option<&'a [u8]> {
+        let (marker, body) = self.locate(index)?;
+        if marker >> 4 != 0x5 {
+            return None;
+        }
+        let (start, len) = self.extent(marker & 0x0f, body)?;
+        self.slice(start, len)
+    }
+
+    /// The value `dict` holds under the ASCII key `key`.
+    fn lookup(&self, dict: &[(usize, usize)], key: &str) -> Option<Bvalue<'a>> {
+        let (_, value) = dict
+            .iter()
+            .find(|(name, _)| self.ascii(*name) == Some(key.as_bytes()))?;
+        self.object(*value)
+    }
+}
+
+/// A big-endian unsigned integer of at most 8 bytes.
+fn be_u64(bytes: &[u8]) -> Option<u64> {
+    (bytes.len() <= 8).then(|| {
+        bytes
+            .iter()
+            .fold(0, |value, &byte| value << 8 | u64::from(byte))
+    })
+}
+
+fn be_usize(bytes: &[u8]) -> Option<usize> {
+    usize::try_from(be_u64(bytes)?).ok()
 }
 
 /// A JSON value, reduced to what a colour scheme needs.
@@ -2202,6 +2848,655 @@ mod tests {
         assert!(report.notes.iter().any(|n| n.contains("\"P3\"")));
     }
 
+    // Colours as Terminal.app archives them (each an `NSKeyedArchiver` binary plist of
+    // one `NSColor`), copied from the profiles macOS ships in Terminal.app's Initial
+    // Settings folder.
+
+    /// Clear Dark's TextColor (calibrated RGB).
+    const CALIBRATED_TEXT: &str = "\
+        YnBsaXN0MDDUAQIDBAUGBwpYJHZlcnNpb25ZJGFyY2hpdmVyVCR0b3BYJG9iamVjdHMSAAGGoF8QD05TS2V5\
+        ZWRBcmNoaXZlctEICVRyb290gAGjCwwTVSRudWxs0w0ODxARElVOU1JHQlxOU0NvbG9yU3BhY2VWJGNsYXNz\
+        TxAnMC44Nzc2MTA4MDk5IDAuODc3NjEwODA5OSAwLjg3NzYxMDgwOTkAEAGAAtIUFRYXWiRjbGFzc25hbWVY\
+        JGNsYXNzZXNXTlNDb2xvcqIWGFhOU09iamVjdAgRGiQpMjdJTFFTV11kand+qKqssbzFzdAAAAAAAAABAQAA\
+        AAAAAAAZAAAAAAAAAAAAAAAAAAAA2Q==";
+
+    /// Clear Dark's BackgroundColor (calibrated RGB, alpha 0.95).
+    const CALIBRATED_TRANSLUCENT_BACKGROUND: &str = "\
+        YnBsaXN0MDDUAQIDBAUGBwpYJHZlcnNpb25ZJGFyY2hpdmVyVCR0b3BYJG9iamVjdHMSAAGGoF8QD05TS2V5\
+        ZWRBcmNoaXZlctEICVRyb290gAGjCwwTVSRudWxs0w0ODxARElVOU1JHQlxOU0NvbG9yU3BhY2VWJGNsYXNz\
+        TxAsMC4wOTgzODc3MTE0NSAwLjExMzg3Nzc0NzYgMC4xNTI2MDI4MzggMC45NQAQAYAC0hQVFhdaJGNsYXNz\
+        bmFtZVgkY2xhc3Nlc1dOU0NvbG9yohYYWE5TT2JqZWN0CBEaJCkyN0lMUVNXXWRqd36tr7G2wcrS1QAAAAAA\
+        AAEBAAAAAAAAABkAAAAAAAAAAAAAAAAAAADe";
+
+    /// Clear Dark's ANSIRedColor (device RGB).
+    const DEVICE_RED: &str = "\
+        YnBsaXN0MDDUAQIDBAUGBwpYJHZlcnNpb25ZJGFyY2hpdmVyVCR0b3BYJG9iamVjdHMSAAGGoF8QD05TS2V5\
+        ZWRBcmNoaXZlctEICVRyb290gAGjCwwTVSRudWxs0w0ODxARElVOU1JHQlxOU0NvbG9yU3BhY2VWJGNsYXNz\
+        TxAnMC43MDUwOTAwODI5IDAuMzM1NzE1NzMwMSAwLjI4MTE0OTA2NDMAEAKAAtIUFRYXWiRjbGFzc25hbWVY\
+        JGNsYXNzZXNXTlNDb2xvcqIWGFhOU09iamVjdAgRGiQpMjdJTFFTV11kand+qKqssbzFzdAAAAAAAAABAQAA\
+        AAAAAAAZAAAAAAAAAAAAAAAAAAAA2Q==";
+
+    /// Clear Dark's ANSIBrightBlueColor (device RGB).
+    const DEVICE_BRIGHT_BLUE: &str = "\
+        YnBsaXN0MDDUAQIDBAUGBwpYJHZlcnNpb25ZJGFyY2hpdmVyVCR0b3BYJG9iamVjdHMSAAGGoF8QD05TS2V5\
+        ZWRBcmNoaXZlctEICVRyb290gAGjCwwTVSRudWxs0w0ODxARElVOU1JHQlxOU0NvbG9yU3BhY2VWJGNsYXNz\
+        TxAnMC40MDM5MjE1Njg2IDAuNzA5ODAzOTIxNiAwLjkyOTQxMTc2NDcAEAKAAtIUFRYXWiRjbGFzc25hbWVY\
+        JGNsYXNzZXNXTlNDb2xvcqIWGFhOU09iamVjdAgRGiQpMjdJTFFTV11kand+qKqssbzFzdAAAAAAAAABAQAA\
+        AAAAAAAZAAAAAAAAAAAAAAAAAAAA2Q==";
+
+    /// Pro's CursorColor (calibrated white).
+    const CALIBRATED_GREY_CURSOR: &str = "\
+        YnBsaXN0MDDUAQIDBAUGFRZYJHZlcnNpb25YJG9iamVjdHNZJGFyY2hpdmVyVCR0b3ASAAGGoKMHCA9VJG51\
+        bGzTCQoLDA0OViRjbGFzc1xOU0NvbG9yU3BhY2VXTlNXaGl0ZYACEANLMC4zMDI0MTkzNgDSEBESE1okY2xh\
+        c3NuYW1lWCRjbGFzc2VzV05TQ29sb3KiEhRYTlNPYmplY3RfEA9OU0tleWVkQXJjaGl2ZXLRFxhUcm9vdIAB\
+        CBEaIy0yNztBSE9cZGZodHmEjZWYobO2uwAAAAAAAAEBAAAAAAAAABkAAAAAAAAAAAAAAAAAAAC9";
+
+    /// Homebrew's SelectionColor (calibrated RGB, alpha 0.65).
+    const CALIBRATED_TRANSLUCENT_SELECTION: &str = "\
+        YnBsaXN0MDDUAQIDBAUGFRZYJHZlcnNpb25YJG9iamVjdHNZJGFyY2hpdmVyVCR0b3ASAAGGoKMHCA9VJG51\
+        bGzTCQoLDA0OVU5TUkdCViRjbGFzc1xOU0NvbG9yU3BhY2VPEB4wLjAzNDU3ODM5NSAwIDAuOTEzMjY1MzEg\
+        MC42NQCAAhAB0hAREhNaJGNsYXNzbmFtZVgkY2xhc3Nlc1dOU0NvbG9yohIUWE5TT2JqZWN0XxAPTlNLZXll\
+        ZEFyY2hpdmVy0RcYVHJvb3SAAQgRGiMtMjc7QUhOVWKDhYeMl6Coq7TGyc4AAAAAAAABAQAAAAAAAAAZAAAA\
+        AAAAAAAAAAAAAAAA0A==";
+
+    /// Pro's Font: a well-formed archive of an `NSFont`, not a colour.
+    const MONACO_FONT: &str = "\
+        YnBsaXN0MDDUAQIDBAUGGBlYJHZlcnNpb25YJG9iamVjdHNZJGFyY2hpdmVyVCR0b3ASAAGGoKQHCBESVSRu\
+        dWxs1AkKCwwNDg8QViRjbGFzc1hOU2ZGbGFnc1ZOU05hbWVWTlNTaXplgAMQEIACI0AkAAAAAAAAVk1vbmFj\
+        b9ITFBUWWiRjbGFzc25hbWVYJGNsYXNzZXNWTlNGb250ohUXWE5TT2JqZWN0XxAPTlNLZXllZEFyY2hpdmVy\
+        0RobVHJvb3SAAQgRGiMtMjc8QktSW2Jpa21veH+Ej5ifoqu9wMUAAAAAAAABAQAAAAAAAAAcAAAAAAAAAAAA\
+        AAAAAAAAxw==";
+
+    // Colours as macOS 27 archives them (`NSKeyedArchiver.archivedData(withRootObject:
+    // requiringSecureCoding: false)` of each `NSColor`), each ICC profile cut to its header
+    // and description tag and the plist written again around it.
+
+    /// sRGB 0.2 0.4 0.6 (`#336699`): `NSComponents` in a custom space whose `NSID` is 7.
+    const SRGB_336699: &str = "\
+        YnBsaXN0MDDUAQIDBAUGBwpYJHZlcnNpb25ZJGFyY2hpdmVyVCR0b3BYJG9iamVjdHMSAAGGoF8QD05TS2V5\
+        ZWRBcmNoaXZlctEICVRyb290gAGmCwwZHyAlVSRudWxs1g0ODxAREhMUFRYXGFYkY2xhc3NcTlNDb21wb25l\
+        bnRzVU5TUkdCXE5TQ29sb3JTcGFjZV8QEk5TQ3VzdG9tQ29sb3JTcGFjZV8QEE5TTGluZWFyRXhwb3N1cmWA\
+        BU0wLjIgMC40IDAuNiAxTxAnMC4xNTU4MTYyNzE5IDAuMzE5ODYzNzM2NiAwLjUyODkzNDE4MDcAEAGAAkEx\
+        0xobDRwdHlROU0lEVU5TSUNDEAeAA4AETxD8AAAA/Expbm8CEAAAbW50clJHQiBYWVogB84AAgAJAAYAMQAA\
+        YWNzcE1TRlQAAAAASUVDIHNSR0IAAAAAAAAAAAAAAAAAAPbWAAEAAAAA0y1IUCAgAAAAAAAAAAAAAAAAAAAA\
+        AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABZGVzYwAAAJAAAABsZGVzYwAAAAAAAAASc1JHQiBJ\
+        RUM2MTk2Ni0yLjEAAAAAAAAAAAAAABJzUkdCIElFQzYxOTY2LTIuMQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\
+        AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA0iEiECNaJGNsYXNzbmFtZVgkY2xhc3Nlc6IQJFhOU09iamVj\
+        dNIhIiYnV05TQ29sb3KiJiQACAARABoAJAApADIANwBJAEwAUQBTAFoAYABtAHQAgQCHAJQAqQC8AL4AzAD2\
+        APgA+gD8AQMBCAEOARABEgEUAhMCGAIjAiwCLwI4Aj0CRQAAAAAAAAIBAAAAAAAAACgAAAAAAAAAAAAAAAAA\
+        AAJI";
+
+    /// Display P3 0.2 0.4 0.6: `NSComponents` in a custom space (`NSSpaceID` 12) whose ICC
+    /// profile is ICC v4, its description multi-localized Unicode.
+    const DISPLAY_P3_336699: &str = "\
+        YnBsaXN0MDDUAQIDBAUGBwpYJHZlcnNpb25ZJGFyY2hpdmVyVCR0b3BYJG9iamVjdHMSAAGGoF8QD05TS2V5\
+        ZWRBcmNoaXZlctEICVRyb290gAGmCwwZHyAlVSRudWxs1g0ODxAREhMUFRYXGFYkY2xhc3NcTlNDb21wb25l\
+        bnRzVU5TUkdCXE5TQ29sb3JTcGFjZV8QEk5TQ3VzdG9tQ29sb3JTcGFjZV8QEE5TTGluZWFyRXhwb3N1cmWA\
+        BU0wLjIgMC40IDAuNiAxTxAoMC4wOTEwODM3MTI4OCAwLjMyNTYxNTIyNzIgMC41NDcyNjgzOTA3ABABgAJB\
+        MdMaDRscHR5VTlNJQ0NZTlNTcGFjZUlEgAOABBAMTxDAAAAAwGFwcGwEAAAAbW50clJHQiBYWVogB+YAAQAB\
+        AAAAAAAAYWNzcEFQUEwAAAAAQVBQTAAAAAAAAAAAAAAAAAAAAAAAAPbWAAEAAAAA0y1hcHBsAAAAAAAAAAAA\
+        AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABZGVzYwAAAJAAAAAwbWx1YwAAAAAAAAAB\
+        AAAADGVuVVMAAAAUAAAAHABEAGkAcwBwAGwAYQB5ACAAUAAz0iEiECNaJGNsYXNzbmFtZVgkY2xhc3Nlc6IQ\
+        JFhOU09iamVjdNIhIiYnV05TQ29sb3KiJiQACAARABoAJAApADIANwBJAEwAUQBTAFoAYABtAHQAgQCHAJQA\
+        qQC8AL4AzAD3APkA+wD9AQQBCgEUARYBGAEaAd0B4gHtAfYB+QICAgcCDwAAAAAAAAIBAAAAAAAAACgAAAAA\
+        AAAAAAAAAAAAAAIS";
+
+    /// Gamma-2.2 grey 0.3 (`#4d4d4d`): `NSComponents` in a custom space (`NSID` 9) whose ICC
+    /// profile is ICC v2, its description ASCII text.
+    const GAMMA_22_GREY_4D: &str = "\
+        YnBsaXN0MDDUAQIDBAUGBwpYJHZlcnNpb25ZJGFyY2hpdmVyVCR0b3BYJG9iamVjdHMSAAGGoF8QD05TS2V5\
+        ZWRBcmNoaXZlctEICVRyb290gAGmCwwZISInVSRudWxs1g0ODxAREhMUFRYXGFdOU1doaXRlViRjbGFzc1xO\
+        U0NvbXBvbmVudHNcTlNDb2xvclNwYWNlXxASTlNDdXN0b21Db2xvclNwYWNlXxAQTlNMaW5lYXJFeHBvc3Vy\
+        ZU0wLjIzNDA0NTk4MjQAgAVFMC4zIDEQA4ACQTHUGhscDh0eHyBUTlNJRFVOU0lDQ1dOU01vZGVsEAmAAxAA\
+        gARPEQEMAAABDGFwcGwCAAAAbW50ckdSQVlYWVogB9wACAAXAA8ALgAPYWNzcEFQUEwAAAAAbm9uZQAAAAAA\
+        AAAAAAAAAAAAAAAAAPbWAAEAAAAA0y1hcHBsAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\
+        AAAAAAAAAAAAAAABZGVzYwAAAJAAAAB5ZGVzYwAAAAAAAAAfR2VuZXJpYyBHcmF5IEdhbW1hIDIuMiBQcm9m\
+        aWxlAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\
+        AAAAAAAAAAAAAAAAAAAAAAAAAAAAANIjJBAlWiRjbGFzc25hbWVYJGNsYXNzZXOiECZYTlNPYmplY3TSIyQo\
+        KVdOU0NvbG9yoigmAAgAEQAaACQAKQAyADcASQBMAFEAUwBaAGAAbQB1AHwAiQCWAKsAvgDMAM4A1ADWANgA\
+        2gDjAOgA7gD2APgA+gD8AP4CDgITAh4CJwIqAjMCOAJAAAAAAAAAAgEAAAAAAAAAKgAAAAAAAAAAAAAAAAAA\
+        AkM=";
+
+    /// `NSColor.textColor`: a named colour (`NSColorSpace` 6) whose fallback is gamma-2.2
+    /// grey 0.
+    const NAMED_TEXT_COLOR: &str = "\
+        YnBsaXN0MDDUAQIDBAUGBwpYJHZlcnNpb25ZJGFyY2hpdmVyVCR0b3BYJG9iamVjdHMSAAGGoF8QD05TS2V5\
+        ZWRBcmNoaXZlctEICVRyb290gAGpCwwXGBkjKywxVSRudWxs1Q0ODxAREhMUFRZWJGNsYXNzW05TQ29sb3JO\
+        YW1lXE5TQ29sb3JTcGFjZV1OU0NhdGFsb2dOYW1lV05TQ29sb3KACIADEAaAAoAEVlN5c3RlbVl0ZXh0Q29s\
+        b3LWGg0bDxwdHhIfICEiV05TV2hpdGVcTlNDb21wb25lbnRzXxASTlNDdXN0b21Db2xvclNwYWNlXxAQTlNM\
+        aW5lYXJFeHBvc3VyZUIwAEMwIDEQA4AFQTHUJCUmDScoKSpUTlNJRFVOU0lDQ1dOU01vZGVsEAmABhAAgAdP\
+        EQEMAAABDGFwcGwCAAAAbW50ckdSQVlYWVogB9wACAAXAA8ALgAPYWNzcEFQUEwAAAAAbm9uZQAAAAAAAAAA\
+        AAAAAAAAAAAAAPbWAAEAAAAA0y1hcHBsAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\
+        AAAAAAAAAAABZGVzYwAAAJAAAAB5ZGVzYwAAAAAAAAAfR2VuZXJpYyBHcmF5IEdhbW1hIDIuMiBQcm9maWxl\
+        AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\
+        AAAAAAAAAAAAAAAAAAAAAAAAANItLg8vWiRjbGFzc25hbWVYJGNsYXNzZXOiDzBYTlNPYmplY3TSLS4RMqIR\
+        MAAIABEAGgAkACkAMgA3AEkATABRAFMAXQBjAG4AdQCBAI4AnACkAKYAqACqAKwArgC1AL8AzADUAOEA9gEJ\
+        AQwBEAESARQBFgEfASQBKgEyATQBNgE4AToCSgJPAloCYwJmAm8CdAAAAAAAAAIBAAAAAAAAADMAAAAAAAAA\
+        AAAAAAAAAAJ3";
+
+    /// `NSColor.systemRed`: a named colour whose fallback is sRGB 1 0 0.
+    const NAMED_SYSTEM_RED: &str = "\
+        YnBsaXN0MDDUAQIDBAUGBwpYJHZlcnNpb25ZJGFyY2hpdmVyVCR0b3BYJG9iamVjdHMSAAGGoF8QD05TS2V5\
+        ZWRBcmNoaXZlctEICVRyb290gAGpCwwXGBkjKSovVSRudWxs1Q0ODxAREhMUFRZWJGNsYXNzW05TQ29sb3JO\
+        YW1lXE5TQ29sb3JTcGFjZV1OU0NhdGFsb2dOYW1lV05TQ29sb3KACIADEAaAAoAEVlN5c3RlbV5zeXN0ZW1S\
+        ZWRDb2xvctYNGhsPHB0SHh8gISJcTlNDb21wb25lbnRzVU5TUkdCXxASTlNDdXN0b21Db2xvclNwYWNlXxAQ\
+        TlNMaW5lYXJFeHBvc3VyZUcxIDAgMCAxTxAdMC45ODU5NTQxNjU1IDAgMC4wMjY5NDAwMDg2MwAQAYAFQTHT\
+        JCUNJicoVE5TSURVTlNJQ0MQB4AGgAdPEPwAAAD8TGlubwIQAABtbnRyUkdCIFhZWiAHzgACAAkABgAxAABh\
+        Y3NwTVNGVAAAAABJRUMgc1JHQgAAAAAAAAAAAAAAAAAA9tYAAQAAAADTLUhQICAAAAAAAAAAAAAAAAAAAAAA\
+        AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFkZXNjAAAAkAAAAGxkZXNjAAAAAAAAABJzUkdCIElF\
+        QzYxOTY2LTIuMQAAAAAAAAAAAAAAEnNSR0IgSUVDNjE5NjYtMi4xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\
+        AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADSKywPLVokY2xhc3NuYW1lWCRjbGFzc2Vzog8uWE5TT2JqZWN0\
+        0issETCiES4ACAARABoAJAApADIANwBJAEwAUQBTAF0AYwBuAHUAgQCOAJwApACmAKgAqgCsAK4AtQDEANEA\
+        3gDkAPkBDAEUATQBNgE4AToBQQFGAUwBTgFQAVICUQJWAmECagJtAnYCewAAAAAAAAIBAAAAAAAAADEAAAAA\
+        AAAAAAAAAAAAAAJ+";
+
+    /// Extended sRGB 1.2 -0.1 0.6, outside sRGB: `NSComponents` in a custom space whose
+    /// `NSSpaceID` is 14 and whose ICC profile is sRGB's.
+    const EXTENDED_SRGB_WIDE: &str = "\
+        YnBsaXN0MDDUAQIDBAUGBwpYJHZlcnNpb25ZJGFyY2hpdmVyVCR0b3BYJG9iamVjdHMSAAGGoF8QD05TS2V5\
+        ZWRBcmNoaXZlctEICVRyb290gAGmCwwZHyAlVSRudWxs1g0ODxAREhMUFRYXGFYkY2xhc3NcTlNDb21wb25l\
+        bnRzVU5TUkdCXE5TQ29sb3JTcGFjZV8QEk5TQ3VzdG9tQ29sb3JTcGFjZV8QEE5TTGluZWFyRXhwb3N1cmWA\
+        BU4xLjIgLTAuMSAwLjYgMU8QETEgMCAwLjUzMTAzNTQ4MjkAEAGAAkEw0xoNGxwdHlVOU0lDQ1lOU1NwYWNl\
+        SUSAA4AEEA5PEPwAAAD8TGlubwIQAABtbnRyUkdCIFhZWiAHzgACAAkABgAxAABhY3NwTVNGVAAAAABJRUMg\
+        c1JHQgAAAAAAAAAAAAAAAAAA9tYAAQAAAADTLUhQICAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\
+        AAAAAAAAAAAAAAAAAAAAAAFkZXNjAAAAkAAAAGxkZXNjAAAAAAAAABJzUkdCIElFQzYxOTY2LTIuMQAAAAAA\
+        AAAAAAAAEnNSR0IgSUVDNjE5NjYtMi4xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\
+        AAAAAAAAAAAAAADSISIQI1okY2xhc3NuYW1lWCRjbGFzc2VzohAkWE5TT2JqZWN00iEiJidXTlNDb2xvcqIm\
+        JAAIABEAGgAkACkAMgA3AEkATABRAFMAWgBgAG0AdACBAIcAlACpALwAvgDNAOEA4wDlAOcA7gD0AP4BAAEC\
+        AQQCAwIIAhMCHAIfAigCLQI1AAAAAAAAAgEAAAAAAAAAKAAAAAAAAAAAAAAAAAAAAjg=";
+
+    /// White converted to extended sRGB (`NSColor(white: 1).usingColorSpace(.extendedSRGB)`):
+    /// `NSComponents` 1.000000119 for each of red, green and blue, past 1 only by float
+    /// rounding, in a custom space whose `NSSpaceID` is 14 and whose ICC profile is sRGB's.
+    const EXTENDED_SRGB_WHITE: &str = "\
+        YnBsaXN0MDDUAQIDBAUGBwpYJHZlcnNpb25ZJGFyY2hpdmVyVCR0b3BYJG9iamVjdHMSAAGGoF8QD05TS2V5\
+        ZWRBcmNoaXZlctEICVRyb290gAGmCwwZHyAlVSRudWxs1g0ODxAREhMUFRYXGFYkY2xhc3NcTlNDb21wb25l\
+        bnRzVU5TUkdCXE5TQ29sb3JTcGFjZV8QEk5TQ3VzdG9tQ29sb3JTcGFjZV8QEE5TTGluZWFyRXhwb3N1cmWA\
+        BU8QJTEuMDAwMDAwMTE5IDEuMDAwMDAwMTE5IDEuMDAwMDAwMTE5IDFGMSAxIDEAEAGAAkEx0xoNGxwdHlVO\
+        U0lDQ1lOU1NwYWNlSUSAA4AEEA5PEPwAAAD8TGlubwIQAABtbnRyUkdCIFhZWiAHzgACAAkABgAxAABhY3Nw\
+        TVNGVAAAAABJRUMgc1JHQgAAAAAAAAAAAAAAAAAA9tYAAQAAAADTLUhQICAAAAAAAAAAAAAAAAAAAAAAAAAA\
+        AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFkZXNjAAAAkAAAAGxkZXNjAAAAAAAAABJzUkdCIElFQzYx\
+        OTY2LTIuMQAAAAAAAAAAAAAAEnNSR0IgSUVDNjE5NjYtMi4xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\
+        AAAAAAAAAAAAAAAAAAAAAAAAAAAAAADSISIQI1okY2xhc3NuYW1lWCRjbGFzc2VzohAkWE5TT2JqZWN00iEi\
+        JidXTlNDb2xvcqImJAAIABEAGgAkACkAMgA3AEkATABRAFMAWgBgAG0AdACBAIcAlACpALwAvgDmAO0A7wDx\
+        APMA+gEAAQoBDAEOARACDwIUAh8CKAIrAjQCOQJBAAAAAAAAAgEAAAAAAAAAKAAAAAAAAAAAAAAAAAAAAkQ=";
+
+    /// A device CMYK colour (`NSColorSpace` 5), which aterm does not read.
+    const DEVICE_CMYK: &str = "\
+        YnBsaXN0MDDUAQIDBAUGBwpYJHZlcnNpb25ZJGFyY2hpdmVyVCR0b3BYJG9iamVjdHMSAAGGoF8QD05TS2V5\
+        ZWRBcmNoaXZlctEICVRyb290gAGjCwwTVSRudWxs0w0ODxARElYkY2xhc3NcTlNDb2xvclNwYWNlVk5TQ01Z\
+        S4ACEAVPEBAwLjEgMC4yIDAuMyAwLjEA0hQVFhdaJGNsYXNzbmFtZVgkY2xhc3Nlc1dOU0NvbG9yohYYWE5T\
+        T2JqZWN0CBEaJCkyN0lMUVNXXWRreH+Bg5abpq+3ugAAAAAAAAEBAAAAAAAAABkAAAAAAAAAAAAAAAAAAADD";
+
+    /// A Terminal.app profile as Terminal.app exports one: `entries` are its archived
+    /// colours (key, base64), then the settings every profile carries.
+    fn terminal_app_profile(entries: &[(&str, &str)]) -> String {
+        let mut text = String::from(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
+             \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+             <plist version=\"1.0\">\n<dict>\n",
+        );
+        for (key, archive) in entries {
+            text.push_str(&format!("\t<key>{key}</key>\n\t<data>\n"));
+            for chunk in archive.as_bytes().chunks(68) {
+                text.push('\t');
+                text.push_str(core::str::from_utf8(chunk).unwrap());
+                text.push('\n');
+            }
+            text.push_str("\t</data>\n");
+        }
+        text.push_str(
+            "\t<key>FontAntialias</key>\n\t<true/>\n\
+             \t<key>ProfileCurrentVersion</key>\n\t<real>2.0699999999999998</real>\n\
+             \t<key>columnCount</key>\n\t<integer>100</integer>\n\
+             \t<key>name</key>\n\t<string>Clear Dark</string>\n\
+             \t<key>type</key>\n\t<string>Window Settings</string>\n</dict>\n</plist>\n",
+        );
+        text
+    }
+
+    #[test]
+    fn terminal_app_profile_converts_its_archived_colours() {
+        let text = terminal_app_profile(&[
+            ("ANSIBrightBlueColor", DEVICE_BRIGHT_BLUE),
+            ("ANSIRedColor", DEVICE_RED),
+            ("BackgroundColor", CALIBRATED_TRANSLUCENT_BACKGROUND),
+            ("CursorColor", CALIBRATED_GREY_CURSOR),
+            ("Font", "YnBsaXN0MDA="),
+            ("SelectionColor", CALIBRATED_TRANSLUCENT_SELECTION),
+            ("TextBoldColor", CALIBRATED_TEXT),
+            ("TextColor", CALIBRATED_TEXT),
+        ]);
+        for name in [Some("Clear Dark.terminal"), Some("Clear Dark.plist"), None] {
+            let report = import_theme(name, text.as_bytes(), None).unwrap();
+            assert_eq!(report.format.label(), "Terminal.app", "{name:?}");
+            let mut ansi = ColorScheme::default().ansi;
+            ansi[1] = rgb(0xb45648);
+            ansi[12] = rgb(0x67b5ed);
+            assert_eq!(
+                report.scheme,
+                ColorScheme {
+                    ansi,
+                    ..expected(
+                        "Clear Dark",
+                        0xe0e0e0,
+                        0x191d27,
+                        Some(0x4d4d4d),
+                        Some(0x0900e9),
+                        None,
+                        [0; 16]
+                    )
+                }
+            );
+            assert_eq!(
+                report.dropped,
+                [
+                    "Font",
+                    "TextBoldColor",
+                    "FontAntialias",
+                    "ProfileCurrentVersion",
+                    "columnCount",
+                    "type"
+                ]
+            );
+            for space in ["device RGB", "calibrated RGB", "calibrated white"] {
+                let note = format!(
+                    "colours in the \"{space}\" colour space were read as sRGB and may look \
+                     slightly different"
+                );
+                assert!(report.notes.contains(&note), "{:?}", report.notes);
+            }
+            assert_round_trips(&report);
+        }
+    }
+
+    #[test]
+    fn terminal_app_archives_that_do_not_hold_a_colour_are_dropped_not_fatal() {
+        let foreground = ("TextColor", CALIBRATED_TEXT);
+        let background = ("BackgroundColor", CALIBRATED_TRANSLUCENT_BACKGROUND);
+        let mut damaged = Vec::new();
+        for (index, original) in DEVICE_RED.char_indices() {
+            damaged.push(DEVICE_RED[..index].to_string());
+            for other in ['A', '/', 'z'] {
+                if other != original {
+                    let mut text = DEVICE_RED.to_string();
+                    text.replace_range(index..index + 1, &other.to_string());
+                    damaged.push(text);
+                }
+            }
+        }
+        damaged.push("not base64 at all".to_string());
+        damaged.push(MONACO_FONT.to_string());
+        for archive in &damaged {
+            let text = terminal_app_profile(&[("ANSIRedColor", archive), foreground, background]);
+            let report = import_theme(Some("x.terminal"), text.as_bytes(), None)
+                .unwrap_or_else(|e| panic!("{archive}: {e}"));
+            assert_eq!(report.scheme.foreground, rgb(0xe0e0e0), "{archive}");
+            if report.dropped.iter().any(|key| key == "ANSIRedColor") {
+                assert!(
+                    report.notes.iter().any(|n| n.contains("\"ANSIRedColor\"")),
+                    "{archive}: {:?}",
+                    report.notes
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_app_text_or_background_it_cannot_read_is_named_in_the_error() {
+        let foreground = ("TextColor", CALIBRATED_TEXT);
+        let background = ("BackgroundColor", CALIBRATED_TRANSLUCENT_BACKGROUND);
+        let import = |entries: &[(&str, &str)]| {
+            let text = terminal_app_profile(entries);
+            import_theme(Some("x.terminal"), text.as_bytes(), None).map_err(|e| e.to_string())
+        };
+        let unreadable = |key: &str| {
+            Err(format!(
+                "not a readable Terminal.app theme: \"{key}\" is not a colour aterm can read"
+            ))
+        };
+        assert_eq!(
+            import(&[("TextColor", "YnBsaXN0MDA="), background]),
+            unreadable("TextColor")
+        );
+        assert_eq!(
+            import(&[foreground, ("BackgroundColor", DEVICE_CMYK)]),
+            unreadable("BackgroundColor")
+        );
+        assert_eq!(
+            import(&[background]),
+            Err("the Terminal.app theme sets no foreground colour".to_string())
+        );
+    }
+
+    /// `bytes` as base64, the inverse of [`base64_decode`].
+    fn base64_encode(bytes: &[u8]) -> String {
+        const DIGITS: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let word = chunk.iter().enumerate().fold(0u32, |word, (i, &byte)| {
+                word | u32::from(byte) << (16 - 8 * i)
+            });
+            for i in 0..=chunk.len() {
+                out.push(char::from(DIGITS[(word >> (18 - 6 * i) & 63) as usize]));
+            }
+        }
+        while !out.len().is_multiple_of(4) {
+            out.push('=');
+        }
+        out
+    }
+
+    #[test]
+    fn terminal_app_colours_read_their_own_components_and_name_their_space() {
+        let text = terminal_app_profile(&[
+            ("ANSIBlackColor", NAMED_TEXT_COLOR),
+            ("ANSIBlueColor", DISPLAY_P3_336699),
+            ("ANSIGreenColor", DEVICE_CMYK),
+            ("ANSIRedColor", NAMED_SYSTEM_RED),
+            ("BackgroundColor", GAMMA_22_GREY_4D),
+            ("TextColor", SRGB_336699),
+        ]);
+        let report = import_theme(Some("x.terminal"), text.as_bytes(), None).unwrap();
+        let mut ansi = ColorScheme::default().ansi;
+        ansi[0] = rgb(0x000000);
+        ansi[1] = rgb(0xff0000);
+        ansi[4] = rgb(0x336699);
+        assert_eq!(
+            report.scheme,
+            ColorScheme {
+                ansi,
+                ..expected("Clear Dark", 0x336699, 0x4d4d4d, None, None, None, [0; 16])
+            }
+        );
+        let space = |name: &str| {
+            format!(
+                "colours in the \"{name}\" colour space were read as sRGB and may look slightly \
+                 different"
+            )
+        };
+        let named = |key: &str, name: &str| {
+            format!(
+                "\"{key}\" is the named colour \"{name}\": Terminal.app shows the system's \
+                 current colour for it, which can differ (in Dark Mode, say); the fallback saved \
+                 with it was used"
+            )
+        };
+        assert_eq!(
+            report.notes[..5],
+            [
+                named("ANSIBlackColor", "textColor"),
+                space("Generic Gray Gamma 2.2 Profile"),
+                space("Display P3"),
+                "\"ANSIGreenColor\" is not an archived RGB or grey colour, so it was dropped"
+                    .to_string(),
+                named("ANSIRedColor", "systemRedColor"),
+            ]
+        );
+        assert!(
+            report.notes[5].starts_with("ANSI colours "),
+            "{:?}",
+            report.notes
+        );
+        assert_eq!(report.notes.len(), 6, "{:?}", report.notes);
+        assert_round_trips(&report);
+
+        let text = terminal_app_profile(&[
+            ("BackgroundColor", NAMED_SYSTEM_RED),
+            ("TextColor", SRGB_336699),
+        ]);
+        let report = import_theme(Some("x.terminal"), text.as_bytes(), None).unwrap();
+        assert_eq!(report.scheme.background, rgb(0xff0000));
+        assert!(
+            !report.notes.iter().any(|n| n.contains("colour space")),
+            "sRGB is aterm's own space: {:?}",
+            report.notes
+        );
+
+        let mut unsigned_icc = base64_decode(DISPLAY_P3_336699).unwrap();
+        let signature = unsigned_icc.windows(4).position(|w| w == b"acsp").unwrap();
+        unsigned_icc[signature] = b'x';
+        let mut unnamed_red = base64_decode(NAMED_SYSTEM_RED).unwrap();
+        let name = unnamed_red
+            .windows(15)
+            .position(|w| w == b"\x5esystemRedColor")
+            .unwrap();
+        unnamed_red[name] = 0x4e;
+        let text = terminal_app_profile(&[
+            ("BackgroundColor", &base64_encode(&unnamed_red)),
+            ("TextColor", &base64_encode(&unsigned_icc)),
+        ]);
+        let report = import_theme(Some("x.terminal"), text.as_bytes(), None).unwrap();
+        assert_eq!(report.scheme.foreground, rgb(0x336699));
+        assert_eq!(report.scheme.background, rgb(0xff0000));
+        assert_eq!(
+            report.notes[..2],
+            [
+                "\"BackgroundColor\" is a named colour: Terminal.app shows the system's current \
+                 colour for it, which can differ (in Dark Mode, say); the fallback saved with it \
+                 was used",
+                "colours in a colour space aterm could not name were read as sRGB and may look \
+                 slightly different",
+            ]
+        );
+    }
+
+    #[test]
+    fn terminal_app_extended_srgb_is_srgb_and_a_colour_outside_it_is_noted_as_clipped() {
+        let text = terminal_app_profile(&[
+            ("ANSIRedColor", EXTENDED_SRGB_WIDE),
+            ("BackgroundColor", SRGB_336699),
+            ("TextColor", SRGB_336699),
+        ]);
+        let report = import_theme(Some("x.terminal"), text.as_bytes(), None).unwrap();
+        assert_eq!(report.scheme.ansi[1], rgb(0xff0099));
+        assert_eq!(
+            report.notes[0],
+            "\"ANSIRedColor\" lies outside sRGB (a component is below 0 or above 1), so it was \
+             clipped to fit"
+        );
+        assert!(
+            report.notes[1].starts_with("ANSI colours "),
+            "{:?}",
+            report.notes
+        );
+        assert_eq!(
+            report.notes.len(),
+            2,
+            "extended sRGB is sRGB from 0 to 1, so no colour space is noted: {:?}",
+            report.notes
+        );
+        assert_round_trips(&report);
+    }
+
+    #[test]
+    fn terminal_app_extended_srgb_past_1_by_float_rounding_is_not_noted_as_clipped() {
+        let text = terminal_app_profile(&[
+            ("BackgroundColor", EXTENDED_SRGB_WHITE),
+            ("TextColor", SRGB_336699),
+        ]);
+        let report = import_theme(Some("x.terminal"), text.as_bytes(), None).unwrap();
+        assert_eq!(report.scheme.background, rgb(0xffffff));
+        assert!(
+            !report
+                .notes
+                .iter()
+                .any(|n| n.contains("clipped") || n.contains("colour space")),
+            "1.000000119 rounds to the same byte as 1, and extended sRGB is sRGB: {:?}",
+            report.notes
+        );
+        assert_round_trips(&report);
+    }
+
+    #[test]
+    fn icc_descriptions_read_as_text_or_unicode_and_damage_reads_as_none() {
+        let profile = |tag: &[u8]| {
+            let mut icc = vec![0u8; 128];
+            icc[36..40].copy_from_slice(b"acsp");
+            icc.extend(1u32.to_be_bytes());
+            icc.extend(b"desc");
+            icc.extend(144u32.to_be_bytes());
+            icc.extend((tag.len() as u32).to_be_bytes());
+            icc.extend(tag);
+            icc
+        };
+        let mut text = b"desc\0\0\0\0".to_vec();
+        text.extend(5u32.to_be_bytes());
+        text.extend(b"Gray\0");
+        assert_eq!(icc_description(&profile(&text)).as_deref(), Some("Gray"));
+        let utf16 = |s: &str| -> Vec<u8> { s.encode_utf16().flat_map(u16::to_be_bytes).collect() };
+        let mut unicode = b"mluc\0\0\0\0".to_vec();
+        unicode.extend(2u32.to_be_bytes());
+        unicode.extend(12u32.to_be_bytes());
+        for (language, at, name) in [(b"frFR", 40u32, "Gris"), (b"enUS", 48, "Grey")] {
+            unicode.extend(language);
+            unicode.extend((utf16(name).len() as u32).to_be_bytes());
+            unicode.extend(at.to_be_bytes());
+        }
+        unicode.extend(utf16("Gris"));
+        unicode.extend(utf16("Grey"));
+        assert_eq!(icc_description(&profile(&unicode)).as_deref(), Some("Grey"));
+        let whole = profile(&unicode);
+        for len in 0..whole.len() {
+            assert_eq!(icc_description(&whole[..len]), None, "{len}");
+        }
+        let mut unsigned = profile(&text);
+        unsigned[36] = b'x';
+        assert_eq!(icc_description(&unsigned), None);
+    }
+
+    #[test]
+    fn wezterm_scheme_converts_structurally() {
+        let quoted = |colours: &[u32]| -> Vec<String> {
+            colours.iter().map(|c| format!("\"#{c:06x}\"")).collect()
+        };
+        let text = format!(
+            "# Tokyo Night\n\
+             [colors]\n\
+             ansi = [\n    {},\n]\n\
+             background = \"#1a1b26\"\n\
+             brights = [{}] # one line\n\
+             compose_cursor = \"#ff9e64\"\n\
+             cursor_bg = \"#c0caf5\"\n\
+             cursor_border = \"#c0caf5\"\n\
+             cursor_fg = \"#1a1b26\"\n\
+             foreground = \"#c0caf5\"\n\
+             selection_bg = \"#283457\"\n\
+             selection_fg = \"#c0caf5\"\n\
+             split = \"#3b4261\"\n\
+             \n\
+             [colors.indexed]\n\
+             16 = \"#ff9e64\"\n\
+             \n\
+             [colors.tab_bar.active_tab]\n\
+             bg_color = \"#7aa2f7\"\n\
+             fg_color = \"#16161e\"\n\
+             \n\
+             [metadata]\n\
+             aliases = []\n\
+             author = \"enkia\"\n\
+             name = \"Tokyo Night\"\n\
+             origin_url = \"https://github.com/folke/tokyonight.nvim\"\n",
+            quoted(&PALETTE[..8]).join(",\n    "),
+            quoted(&PALETTE[8..]).join(", "),
+        );
+        for name in [Some("tokyonight.toml"), None] {
+            let report = import_theme(name, text.as_bytes(), None).unwrap();
+            assert_eq!(report.format.label(), "WezTerm", "{name:?}");
+            let mut want = expected(
+                "Tokyo Night",
+                0xc0caf5,
+                0x1a1b26,
+                Some(0xc0caf5),
+                Some(0x283457),
+                Some(0xc0caf5),
+                PALETTE,
+            );
+            want.chrome.border = Some(rgb(0x3b4261));
+            want.chrome.active_tab = Some(rgb(0x7aa2f7));
+            assert_eq!(report.scheme, want);
+            assert_eq!(report.author.as_deref(), Some("enkia"));
+            assert_eq!(
+                report.dropped,
+                [
+                    "colors.compose_cursor",
+                    "colors.cursor_border",
+                    "colors.cursor_fg",
+                    "colors.indexed.16",
+                    "colors.tab_bar.active_tab.fg_color",
+                    "metadata.aliases",
+                    "metadata.origin_url"
+                ]
+            );
+            assert!(report.notes.iter().any(|n| n.contains("above 15")));
+            assert_round_trips(&report);
+        }
+    }
+
+    #[test]
+    fn toml_inline_tables_expand_at_every_depth() {
+        let wezterm = "[colors]\nforeground = \"#c0caf5\"\nbackground = \"#1a1b26\"\n\
+                       tab_bar = { active_tab = { bg_color = \"#123456\", fg_color = \"#000\" } }\n";
+        let report = convert(ImportFormat::WezTerm, wezterm, None).unwrap();
+        assert_eq!(report.scheme.chrome.active_tab, Some(rgb(0x123456)));
+        assert_eq!(report.dropped, ["colors.tab_bar.active_tab.fg_color"]);
+        let alacritty =
+            "colors = { primary = { foreground = '#ffffff', background = '#000000' } }\n";
+        let report = convert(ImportFormat::Alacritty, alacritty, None).unwrap();
+        assert_eq!(
+            (report.scheme.foreground, report.scheme.background),
+            (rgb(0xffffff), rgb(0x000000))
+        );
+    }
+
+    #[test]
+    fn terminal_app_and_wezterm_files_are_told_from_iterm2_and_alacritty() {
+        let terminal = "<?xml version=\"1.0\"?>\n<plist version=\"1.0\">\n<dict>\n\
+                        <key>name</key><string>Basic</string>\n\
+                        <key>type</key><string>Window Settings</string>\n</dict>\n</plist>\n";
+        let iterm = "<?xml version=\"1.0\"?>\n<plist><dict><key>Ansi 0 Color</key><dict/>\
+                     <key>Background Color</key><dict/></dict></plist>\n";
+        let wezterm = "[colors]\nforeground = \"#c0caf5\"\nbackground = \"#1a1b26\"\n";
+        let wezterm_dotted = "colors.ansi = [\"#000000\"]\n";
+        let wezterm_metadata = "[metadata]\nname = \"Night\"\n";
+        let alacritty = "[colors.primary]\nforeground = '#ffffff'\n";
+        let alacritty_inline = "[colors]\nprimary = { foreground = '#ffffff' }\n";
+        for (name, text, label) in [
+            (Some("Basic.terminal"), "", "Terminal.app"),
+            (Some("Basic.plist"), terminal, "Terminal.app"),
+            (None, terminal, "Terminal.app"),
+            (Some("x.plist"), iterm, "iTerm2"),
+            (None, iterm, "iTerm2"),
+            (Some("x.toml"), wezterm, "WezTerm"),
+            (None, wezterm, "WezTerm"),
+            (None, wezterm_dotted, "WezTerm"),
+            (None, wezterm_metadata, "WezTerm"),
+            (Some("x.toml"), alacritty, "Alacritty"),
+            (None, alacritty, "Alacritty"),
+            (None, alacritty_inline, "Alacritty"),
+        ] {
+            assert_eq!(
+                detect_format(name, text).map(ImportFormat::label),
+                Some(label),
+                "{name:?} {text:?}"
+            );
+        }
+        for (text, named, not) in [
+            (terminal, "Terminal.app", "iTerm2"),
+            (iterm, "iTerm2", "Terminal.app"),
+            (wezterm, "WezTerm", "Alacritty"),
+            (alacritty, "Alacritty", "WezTerm"),
+        ] {
+            let label = sniff_foreign_format(text).map_or("", ForeignFormat::label);
+            assert!(
+                label.contains(named) && !label.contains(not),
+                "{text:?}: {label}"
+            );
+        }
+    }
+
     fn windows_terminal_scheme(name: &str) -> String {
         let names = [
             "black", "red", "green", "yellow", "blue", "purple", "cyan", "white",
@@ -2501,6 +3796,15 @@ mod tests {
             convert(ImportFormat::ITerm, &deep_plist, None),
             Err(ImportError::Malformed { .. })
         ));
+        let deep_inline = format!(
+            "a = {}'#000000'{}\n",
+            "{ a = ".repeat(MAX_NESTING),
+            " }".repeat(MAX_NESTING)
+        );
+        assert!(matches!(
+            convert(ImportFormat::Alacritty, &deep_inline, None),
+            Err(ImportError::Malformed { .. })
+        ));
     }
 
     #[test]
@@ -2538,6 +3842,25 @@ mod tests {
         assert_eq!(report.dropped, ["cursor-color"]);
         assert!(report.notes.iter().any(|n| n.contains("cell-foreground")));
         assert!(report.notes.iter().any(|n| n.contains("defaults fill")));
+    }
+
+    #[test]
+    fn missing_ansi_colours_are_named_in_number() {
+        let mut text = String::from("foreground #ffffff\nbackground #000000\n");
+        for index in 0..14 {
+            text.push_str(&format!("color{index} #101010\n"));
+        }
+        let report = convert(ImportFormat::Kitty, &text, None).unwrap();
+        assert_eq!(
+            report.notes,
+            ["ANSI colours 14, 15 are not in the file: aterm's defaults fill them"]
+        );
+        text.push_str("color14 #101010\n");
+        let report = convert(ImportFormat::Kitty, &text, None).unwrap();
+        assert_eq!(
+            report.notes,
+            ["ANSI colour 15 is not in the file: aterm's default fills it"]
+        );
     }
 
     #[test]

@@ -146,7 +146,7 @@ impl MomentumGlowFrame {
 /// Cached light-page glow ink and text-alpha ceiling for `(hue, theme_fg, theme_bg)`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct LightInkMemo {
-    key: (u32, u32, u32),
+    key: (u32, u32, u32, bool),
     ink: u32,
     text_alpha: f32,
 }
@@ -164,6 +164,8 @@ pub struct MomentumGlow {
     tau: f32,
     /// Cached `(ink, text_alpha)` for the light-page glow.
     light_ink_memo: Option<LightInkMemo>,
+    /// The light-page glow wears its hue's vivid ink ([`Self::set_light_vivid`]).
+    light_vivid: bool,
 }
 
 impl MomentumGlow {
@@ -179,7 +181,16 @@ impl MomentumGlow {
         stamp: None,
         tau: 0.0,
         light_ink_memo: None,
+        light_vivid: false,
     };
+
+    /// Whether the light-page glow wears its hue's vivid ink (Sparkle's paper
+    /// gold, looks6 N7) rather than the walk toward white every other glow
+    /// keeps ([`light_glow_ink`]). Off by default.
+    #[inline]
+    pub const fn set_light_vivid(&mut self, vivid: bool) {
+        self.light_vivid = vivid;
+    }
 
     /// One printable key.
     #[inline]
@@ -336,11 +347,12 @@ impl MomentumGlow {
                 cfg.hue & 0x00FF_FFFF,
                 cfg.theme_fg & 0x00FF_FFFF,
                 cfg.theme_bg & 0x00FF_FFFF,
+                self.light_vivid,
             );
             let light_ink = match self.light_ink_memo {
                 Some(memo) if memo.key == key => (memo.ink, memo.text_alpha),
                 _ => {
-                    let ink = light_glow_ink(cfg.hue, cfg.theme_fg, cfg.theme_bg);
+                    let ink = light_glow_ink(cfg.hue, cfg.theme_fg, cfg.theme_bg, self.light_vivid);
                     let text_alpha = light_glow_text_alpha(ink, cfg.theme_fg, cfg.theme_bg);
                     self.light_ink_memo = Some(LightInkMemo {
                         key,
@@ -490,18 +502,83 @@ fn halo_colour(tint: u32, a: f32, rho: f32) -> u32 {
     mix_rgb(tint, ramp((a + warm).min(1.0), true), 0.5)
 }
 
-/// The light glow's ink for `hue`: its vivid ink walked toward white until,
-/// laid opaque on the page, the theme's text keeps [`LIGHT_GLOW_INK_BAR`]
-/// over it (`cursor_glow::light_ink_over_floor`).
-#[inline]
-fn light_glow_ink(hue: u32, theme_fg: u32, theme_bg: u32) -> u32 {
-    crate::cursor_glow::light_ink_over_floor(
-        hue & 0x00FF_FFFF,
-        theme_bg,
-        u8::MAX,
-        crate::cursor_glow::light_floor_at(theme_fg, LIGHT_GLOW_INK_BAR),
-    )
+/// The light glow's ink for `hue`: walked toward white until, laid opaque on
+/// the page, the theme's text keeps [`LIGHT_GLOW_INK_BAR`] over it
+/// (`cursor_glow::light_ink_over_floor`); or, `vivid` (Sparkle's paper gold,
+/// looks6 N7), its vivid ink lifted (in value where the hue's brightest ink
+/// allows, else toward white) to the same floor
+/// (`cursor_glow::light_ink_vivid_over_floor`): a gold glow stays gold
+/// rather than greying to khaki.
+///
+/// The lift in value is taken only as far as the glow, stacked at any of its
+/// opacities on any light body of the spectrum, still leaves the theme's
+/// text [`crate::cursor_glow::BODY_CONTRAST_BAR`]: past that the ink is
+/// mixed back toward the walk toward white, which always keeps it.
+fn light_glow_ink(hue: u32, theme_fg: u32, theme_bg: u32, vivid: bool) -> u32 {
+    use crate::cursor_glow::{
+        BODY_CONTRAST_BAR, LIGHT_BODY_ALPHA_CAP, light_body_ink, light_floor_at,
+        light_ink_over_floor, light_ink_vivid_over_floor,
+    };
+    let (fg, bg) = (theme_fg & 0x00FF_FFFF, theme_bg & 0x00FF_FFFF);
+    let floor = light_floor_at(fg, LIGHT_GLOW_INK_BAR);
+    let walked = light_ink_over_floor(hue & 0x00FF_FFFF, bg, u8::MAX, floor);
+    if !vivid {
+        return walked;
+    }
+    let vivid = light_ink_vivid_over_floor(hue & 0x00FF_FFFF, bg, u8::MAX, floor);
+    if vivid == walked {
+        return walked;
+    }
+    let lay = |ground: u32, rgb: u32, alpha: f32| {
+        let alpha = alpha as u8;
+        aterm_render::over_premul(ground, premul_rgb(rgb, alpha), alpha) & 0x00FF_FFFF
+    };
+    let bodies: Vec<u32> = (0..36)
+        .map(|k| {
+            let body = crate::color_math::hsv2rgb(k as f32 * 10.0, 1.0, 1.0);
+            lay(
+                bg,
+                light_body_ink(body, fg, bg, LIGHT_BODY_ALPHA_CAP as u8),
+                LIGHT_BODY_ALPHA_CAP,
+            )
+        })
+        .collect();
+    let stacks = |ink: u32| {
+        bodies.iter().all(|&under| {
+            (1..=17).all(|k| {
+                let alpha = (LIGHT_GLOW_PEAK * k as f32 / 17.0).min(LIGHT_GLOW_PEAK);
+                crate::color_math::contrast_ratio(fg, lay(under, ink, alpha))
+                    >= BODY_CONTRAST_BAR + LIGHT_GLOW_STACK_GUARD
+            })
+        })
+    };
+    if stacks(vivid) {
+        return vivid;
+    }
+    let mix = |t: f32| {
+        let ch = |sh: u32| {
+            let (a, b) = (
+                ((walked >> sh) & 0xff) as f32,
+                ((vivid >> sh) & 0xff) as f32,
+            );
+            ((a + (b - a) * t).round().clamp(0.0, 255.0) as u32) << sh
+        };
+        ch(16) | ch(8) | ch(0)
+    };
+    let (mut lo, mut hi) = (0.0f32, 1.0f32);
+    for _ in 0..10 {
+        let mid = 0.5 * (lo + hi);
+        if stacks(mix(mid)) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    mix(lo)
 }
+
+/// The margin past the body bar [`light_glow_ink`]'s vivid lift keeps when stacked, for the renderer's rounding.
+const LIGHT_GLOW_STACK_GUARD: f32 = 0.02;
 
 /// The share of the theme's text contrast on its paper a light glow keeps where it lies under a letter of the caret's row ([`MomentumGlowConfig::glyph_span`]).
 pub const LIGHT_GLOW_TEXT_KEEP: f32 = 0.97;
@@ -1348,11 +1425,13 @@ mod tests {
             worst
         };
         for (ink, page) in [(0x0024_292F, 0x00FF_FFFF), (0x002B_2D33, 0x00F6_F7F9)] {
-            let ratio = worst(&|hue| light_glow_ink(hue, ink, page), ink, page);
-            assert!(
-                ratio >= 5.25,
-                "{ink:06x} on {page:06x} under a body and the glow reads {ratio:.2}:1"
-            );
+            for vivid in [false, true] {
+                let ratio = worst(&|hue| light_glow_ink(hue, ink, page, vivid), ink, page);
+                assert!(
+                    ratio >= 5.25,
+                    "{ink:06x} on {page:06x} under a body and the glow (vivid {vivid}) reads {ratio:.2}:1"
+                );
+            }
         }
         let (ink, page) = (0x0024_292F, 0x00FF_FFFF);
         let body_law = worst(

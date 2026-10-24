@@ -56,16 +56,19 @@ pub(crate) fn send_setup_wake(wake: Wake) -> bool {
 }
 
 /// Wait on a worker thread for System State's answer to the offer of `initial`.
+/// A delivered Begin calls `on_begin` before the window can handle another input,
+/// so a Stop and quit know its admission is under way even before this wait returns.
 pub fn await_initial_setup_answer_while(
     initial: Plan,
     finished: impl FnMut() -> bool,
+    on_begin: impl FnOnce() + Send + 'static,
 ) -> SetupAnswer {
     let proxy = PROXY.lock().ok().and_then(|proxy| proxy.clone());
     let Some(proxy) = proxy else {
         return WorkstationSetupDecision::Unavailable.into();
     };
     let (send, receive) = mpsc::channel();
-    let request = Request::new(initial, send);
+    let request = Request::with_handoff(initial, send, on_begin);
     let pending = Arc::downgrade(&request.reply);
     if proxy.send_event(Wake::WorkstationSetup(request)).is_err() {
         return WorkstationSetupDecision::Unavailable.into();
@@ -73,7 +76,22 @@ pub fn await_initial_setup_answer_while(
     wait_for_decision(pending, receive, finished, Duration::from_secs(1))
 }
 
+/// Drive the real first-launch answer channel without an event loop or native window.
+#[cfg(any(test, debug_assertions))]
+pub fn drive_initial_setup_answer_for_test(
+    initial: Plan,
+    on_begin: impl FnOnce() + Send + 'static,
+    drive: impl FnOnce(Box<dyn FnOnce(SetupAnswer) -> bool + Send>),
+) -> SetupAnswer {
+    let (send, receive) = mpsc::channel();
+    let request = Request::with_handoff(initial, send, on_begin);
+    let pending = Arc::downgrade(&request.reply);
+    drive(Box::new(move |answer| request.finish_answer(answer)));
+    wait_for_decision(pending, receive, || false, Duration::from_secs(60))
+}
+
 type Reply = Mutex<Option<mpsc::Sender<SetupAnswer>>>;
+type BeginHandoff = Box<dyn FnOnce() + Send>;
 
 fn wait_for_decision(
     pending: Weak<Reply>,
@@ -107,18 +125,36 @@ fn finish_reply(reply: &Reply, answer: SetupAnswer) -> bool {
     false
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct Request {
     initial: Plan,
     reply: Arc<Reply>,
+    on_begin: Arc<Mutex<Option<BeginHandoff>>>,
+}
+
+impl std::fmt::Debug for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Request")
+            .field("initial", &self.initial)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Request {
+    #[cfg(test)]
     pub(crate) fn new(initial: impl Into<Plan>, reply: mpsc::Sender<SetupAnswer>) -> Self {
-        let initial = initial.into();
+        Self::with_handoff(initial.into(), reply, || {})
+    }
+
+    fn with_handoff(
+        initial: Plan,
+        reply: mpsc::Sender<SetupAnswer>,
+        on_begin: impl FnOnce() + Send + 'static,
+    ) -> Self {
         Self {
             initial,
             reply: Arc::new(Mutex::new(Some(reply))),
+            on_begin: Arc::new(Mutex::new(Some(Box::new(on_begin)))),
         }
     }
     /// The page's answer, a closing window and a withdrawn offer compete for this single decision.
@@ -127,7 +163,24 @@ impl Request {
     }
 
     pub(crate) fn finish_answer(&self, answer: SetupAnswer) -> bool {
-        finish_reply(&self.reply, answer)
+        let begin = matches!(&answer.decision, WorkstationSetupDecision::Begin(_));
+        if !finish_reply(&self.reply, answer) {
+            return false;
+        }
+        // The GUI publishes busy and can accept Stop only after this returns.
+        // A dead receiver owns no admission; an unanswered or withdrawn offer
+        // must never make a quit wait for an answer nobody will give.
+        if begin {
+            let on_begin = self
+                .on_begin
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(on_begin) = on_begin {
+                on_begin();
+            }
+        }
+        true
     }
 
     pub(crate) const fn initial(&self) -> &Plan {
@@ -325,7 +378,7 @@ fn start_preview() -> bool {
             } else {
                 Selection::all()
             };
-            let mut answer = await_initial_setup_answer_while(initial.into(), || false);
+            let mut answer = await_initial_setup_answer_while(initial.into(), || false, || {});
             if matches!(answer.decision, WorkstationSetupDecision::Begin(_))
                 && let Some(receipt) = answer.receipt.take()
             {
@@ -866,6 +919,67 @@ mod tests {
         drop(receive);
         assert!(!request.finish_answer(WorkstationSetupDecision::Begin(chosen.into()).into()));
         assert!(!request.pending());
+    }
+
+    #[test]
+    fn a_delivered_answer_handoff_precedes_the_return_and_preserves_the_receipt() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let handoffs = Arc::new(AtomicUsize::new(0));
+        let count = handoffs.clone();
+        let (send, receive) = mpsc::channel();
+        let request = Request::with_handoff(Plan::default(), send, move || {
+            count.fetch_add(1, Ordering::AcqRel);
+        });
+        let (receipt, accepted) = crate::InitialSetupApplyReceipt::detached(true);
+        let mut answer: SetupAnswer = WorkstationSetupDecision::Begin(Plan::default()).into();
+        answer.receipt = Some(receipt);
+        assert!(request.finish_answer(answer));
+        assert_eq!(handoffs.load(Ordering::Acquire), 1);
+        let mut answer = receive.recv_timeout(Duration::from_secs(60)).unwrap();
+        assert!(matches!(
+            answer.decision,
+            WorkstationSetupDecision::Begin(_)
+        ));
+        assert_eq!(accepted.try_recv(), Err(mpsc::TryRecvError::Empty));
+        answer.receipt.take().unwrap().accept();
+        assert_eq!(accepted.recv_timeout(Duration::from_secs(60)), Ok(true));
+        assert!(
+            !request
+                .clone()
+                .finish_answer(WorkstationSetupDecision::Unavailable.into())
+        );
+        assert!(!request.finish_answer(WorkstationSetupDecision::Begin(Plan::default()).into()));
+        assert_eq!(handoffs.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn a_withdrawn_or_disconnected_answer_owns_no_handoff() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for disconnected in [false, true] {
+            let handoffs = Arc::new(AtomicUsize::new(0));
+            let count = handoffs.clone();
+            let (send, receive) = mpsc::channel();
+            let request = Request::with_handoff(Plan::default(), send, move || {
+                count.fetch_add(1, Ordering::AcqRel);
+            });
+            if disconnected {
+                drop(receive);
+            } else {
+                request.finish(WorkstationSetupDecision::Unavailable);
+                assert_eq!(
+                    receive
+                        .recv_timeout(Duration::from_secs(60))
+                        .unwrap()
+                        .decision,
+                    WorkstationSetupDecision::Unavailable
+                );
+            }
+            assert!(
+                !request.finish_answer(WorkstationSetupDecision::Begin(Plan::default()).into())
+            );
+            assert!(!request.pending());
+            assert_eq!(handoffs.load(Ordering::Acquire), 0);
+        }
     }
 
     #[test]

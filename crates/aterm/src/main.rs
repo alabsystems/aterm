@@ -301,6 +301,12 @@ pub(crate) fn main() -> ExitCode {
                         &roster_path,
                         env.now,
                     );
+                    let _ = aterm_agent::harness::accounts_sync::sync_cli_accounts_for_init(
+                        home,
+                        &env.state,
+                        &roster_path,
+                        env.now,
+                    );
                 }
                 code
             }
@@ -900,16 +906,20 @@ fn apply_first_run_doctor() -> bool {
             // aterm), stays as it is.
             if let Err(why) = aterm_cli::macos_doctor::upgrade_provisional_setup() {
                 aterm_log::warn!(
-                    "first-run macOS doctor: the automatic plan stays as it was: {why}"
+                    "first-run macOS doctor: the automatic plan upgrade did not finish: {why}"
                 );
             }
             let mut password = None;
-            let (prepared, sent) = prepare_first_run_doctor(|initial| {
-                let mut answer = aterm_gui::await_initial_setup_answer_while(initial, || {
-                    startup_offer_withdrawn(|| {
-                        aterm_cli::macos_doctor::initial_setup_finished().unwrap_or(false)
-                    })
-                });
+            let (prepared, sent) = prepare_first_run_doctor(|initial, on_begin| {
+                let mut answer = aterm_gui::await_initial_setup_answer_while(
+                    initial,
+                    || {
+                        startup_offer_withdrawn(|| {
+                            aterm_cli::macos_doctor::initial_setup_finished().unwrap_or(false)
+                        })
+                    },
+                    on_begin,
+                );
                 password = answer.password.take();
                 answer
             });
@@ -935,11 +945,11 @@ fn startup_offer_withdrawn(finished: impl FnOnce() -> bool) -> bool {
 /// Reserve one offer across app processes before showing it; `offer` shows the plan
 /// on System State and waits for the page's answer, which comes with its admission's
 /// number and the admission under way until its run registers ([`run_prepared_setup`]).
-/// aterm's state: account probes, native permission prompts and preference writes
-/// belong after Apply or the full cancellation window has expired.
+/// Account probes, native permission prompts and preference writes follow the
+/// page's admission of the plan.
 #[cfg(target_os = "macos")]
 fn prepare_first_run_doctor(
-    offer: impl FnMut(aterm_types::macos_setup::Plan) -> aterm_gui::SetupAnswer,
+    offer: impl FnMut(aterm_types::macos_setup::Plan, StartupHandoff) -> aterm_gui::SetupAnswer,
 ) -> (PreparedSetup<StartupClaim>, StartupSent) {
     let mut host = LiveSetupStartup {
         offer,
@@ -948,6 +958,8 @@ fn prepare_first_run_doctor(
         last_failure: None,
         observation: None,
         offered: None,
+        chosen: false,
+        vault_typed: false,
         sent: StartupSent::default(),
     };
     let prepared = match prepare_setup(&mut host) {
@@ -964,24 +976,45 @@ fn prepare_first_run_doctor(
 /// ([`SETUP_SENT`]), taken as the startup begins (for a resumed plan) and again
 /// as it offers its plan, before the page can show it; and, once the page has
 /// answered, the admission under way ([`UnderWay`]) until its run registers.
+/// The request shares its guard slot, so the window records that handoff
+/// synchronously even when the worker has not read the answer yet.
 #[cfg(target_os = "macos")]
 #[derive(Default)]
 struct StartupSent {
     sent: u64,
-    under_way: Option<UnderWay>,
+    under_way: std::sync::Arc<std::sync::Mutex<Option<UnderWay>>>,
 }
+
+#[cfg(target_os = "macos")]
+type StartupHandoff = Box<dyn FnOnce() + Send>;
 
 #[cfg(target_os = "macos")]
 impl StartupSent {
     /// Number the admission the startup sends now: a resume, or an offer.
     fn send(&mut self) {
-        self.under_way = None;
+        self.under_way = Default::default();
         self.sent = send_admission();
     }
 
-    /// The page answered the offer: its admission is under way.
+    /// The worker read the page's answer. Idempotent with the window's handoff.
     fn answered(&mut self) {
-        self.under_way = Some(UnderWay::new(self.sent));
+        self.handoff()();
+    }
+
+    /// Sent with the request: a successful Begin delivery invokes this before
+    /// the window publishes busy or can receive Stop. If the worker already
+    /// registered its run, dropping the callback drops its last guard owner.
+    fn handoff(&self) -> StartupHandoff {
+        let sent = self.sent;
+        let under_way = self.under_way.clone();
+        Box::new(move || {
+            let mut under_way = under_way
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if under_way.is_none() {
+                *under_way = Some(UnderWay::new(sent));
+            }
+        })
     }
 }
 
@@ -1049,13 +1082,43 @@ struct LiveSetupStartup<F> {
     /// The plan this launch offered and whether aterm chose it by itself: admitted
     /// unchanged, it is saved as provisional (System State design §3.5).
     offered: Option<(aterm_types::macos_setup::Plan, bool)>,
+    /// A group choice or Join makes even an unchanged offered plan the chooser's.
+    chosen: bool,
+    /// An explicit Join binds the vault current at admission, rather than the offer's.
+    vault_typed: bool,
     /// This launch's admission as Stop and a quit know it.
     sent: StartupSent,
 }
 
 #[cfg(target_os = "macos")]
-impl<F: FnMut(aterm_types::macos_setup::Plan) -> aterm_gui::SetupAnswer> SetupStartup
-    for LiveSetupStartup<F>
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartupAnswerKind {
+    Automatic,
+    Person,
+    Join,
+}
+
+#[cfg(target_os = "macos")]
+impl<F> LiveSetupStartup<F> {
+    fn answer_kind(&self, plan: &aterm_types::macos_setup::Plan) -> StartupAnswerKind {
+        if self.vault_typed {
+            StartupAnswerKind::Join
+        } else if !self.chosen
+            && self
+                .offered
+                .as_ref()
+                .is_some_and(|(offered, provisional)| *provisional && offered == plan)
+        {
+            StartupAnswerKind::Automatic
+        } else {
+            StartupAnswerKind::Person
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl<F: FnMut(aterm_types::macos_setup::Plan, StartupHandoff) -> aterm_gui::SetupAnswer>
+    SetupStartup for LiveSetupStartup<F>
 {
     type Claim = StartupClaim;
 
@@ -1119,8 +1182,10 @@ impl<F: FnMut(aterm_types::macos_setup::Plan) -> aterm_gui::SetupAnswer> SetupSt
         &mut self,
         initial: aterm_types::macos_setup::Plan,
     ) -> aterm_gui::WorkstationSetupDecision {
-        let mut answer = (self.offer)(initial);
+        let mut answer = (self.offer)(initial, self.sent.handoff());
         self.receipt = answer.receipt.take();
+        self.chosen = answer.chosen;
+        self.vault_typed = answer.vault_typed;
         answer.decision
     }
 
@@ -1130,18 +1195,15 @@ impl<F: FnMut(aterm_types::macos_setup::Plan) -> aterm_gui::SetupAnswer> SetupSt
     }
 
     fn authorize(&mut self, plan: &aterm_types::macos_setup::Plan) -> Result<Option<u64>, String> {
+        let kind = self.answer_kind(plan);
         let authorization = self
             .authorization
             .as_mut()
             .ok_or("the startup review has no bound authorization")?;
-        let automatic = self
-            .offered
-            .as_ref()
-            .is_some_and(|(offered, provisional)| *provisional && offered == plan);
-        let observed = if automatic {
-            authorization.persist_automatic_observed(plan)
-        } else {
-            authorization.persist_observed(plan)
+        let observed = match kind {
+            StartupAnswerKind::Automatic => authorization.persist_automatic_observed(plan),
+            StartupAnswerKind::Person => authorization.persist_observed(plan),
+            StartupAnswerKind::Join => authorization.persist_join_observed(plan),
         };
         self.observation = observed.observation;
         let revision = observed.result?;
@@ -1177,6 +1239,59 @@ impl<F: FnMut(aterm_types::macos_setup::Plan) -> aterm_gui::SetupAnswer> SetupSt
     fn report_rejection(&mut self, why: &str) {
         initial_setup_error(why.into(), self.observation.clone());
         aterm_log::warn!("initial setup review was not accepted: {why}");
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod startup_answer_tests {
+    use super::*;
+    use aterm_types::macos_setup::Plan;
+
+    fn answered(
+        chosen: bool,
+        vault_typed: bool,
+    ) -> LiveSetupStartup<impl FnMut(Plan, StartupHandoff) -> aterm_gui::SetupAnswer> {
+        let plan = Plan::default();
+        let mut host = LiveSetupStartup {
+            offer: move |plan, _| aterm_gui::SetupAnswer {
+                chosen,
+                vault_typed,
+                ..aterm_gui::WorkstationSetupDecision::Begin(plan).into()
+            },
+            receipt: None,
+            authorization: None,
+            last_failure: None,
+            observation: None,
+            offered: Some((plan.clone(), true)),
+            chosen: false,
+            vault_typed: false,
+            sent: StartupSent::default(),
+        };
+        assert_eq!(
+            host.offer(plan.clone()),
+            aterm_gui::WorkstationSetupDecision::Begin(plan)
+        );
+        host
+    }
+
+    #[test]
+    fn a_same_plan_startup_choice_is_not_a_provisional_automatic_answer() {
+        assert_eq!(
+            answered(false, false).answer_kind(&Plan::default()),
+            StartupAnswerKind::Automatic
+        );
+        assert_eq!(
+            answered(true, false).answer_kind(&Plan::default()),
+            StartupAnswerKind::Person
+        );
+    }
+
+    #[test]
+    fn a_startup_join_uses_the_explicit_admission_path() {
+        assert_eq!(
+            answered(true, true).answer_kind(&Plan::default()),
+            StartupAnswerKind::Join
+        );
     }
 }
 
@@ -1730,6 +1845,12 @@ impl SetupRetryHost for LiveSetupRetry {
                 &roster_path,
                 env.now,
             );
+            let _ = aterm_agent::harness::accounts_sync::sync_cli_accounts_for_init(
+                home,
+                &env.state,
+                &roster_path,
+                env.now,
+            );
         }
         let text = report.to_text();
         remember_initial_setup_rows(&report, None, observed.observation);
@@ -1757,8 +1878,16 @@ impl SetupRetryHost for LiveSetupRetry {
         // minute makes no socket, vault request or setup pass.
         let seen = self.wakes_seen;
         let due_seen = self.park_due_seen;
+        let mut previous = None;
         let mark = wait_for_setup_park_change(
-            aterm_cli::macos_doctor::initial_setup_park_mark,
+            || {
+                let mut mark = aterm_cli::macos_doctor::initial_setup_park_mark();
+                if let Some(known) = &previous {
+                    mark.retain_known_from(known);
+                }
+                previous = Some(mark.clone());
+                mark
+            },
             |mark| mark.retry_due().is_some_and(|due| Some(due) != due_seen),
             || SETUP_WAKES.count() == seen,
             || {
@@ -2637,6 +2766,34 @@ struct SetupActivity {
 }
 
 #[cfg(target_os = "macos")]
+impl SetupActivity {
+    fn mark(
+        &mut self,
+        settings: &[aterm_types::macos_setup::Setting],
+        subjects: &[aterm_types::macos_setup::Subject],
+        running: bool,
+    ) {
+        self.epoch += 1;
+        self.settings = if running {
+            settings.to_vec()
+        } else {
+            Vec::new()
+        };
+        self.subjects = if running {
+            subjects.to_vec()
+        } else {
+            Vec::new()
+        };
+        for subject in subjects {
+            match self.touched.iter_mut().find(|(row, _)| row == subject) {
+                Some(touched) => touched.1 = self.epoch,
+                None => self.touched.push((*subject, self.epoch)),
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
 static SETUP_ACTIVITY: std::sync::Mutex<SetupActivity> = std::sync::Mutex::new(SetupActivity {
     epoch: 0,
     settings: Vec::new(),
@@ -2951,26 +3108,9 @@ fn setup_stop_requested(revision: u64) -> bool {
 /// A stage of the running pass started or ended: its rows paint busy while it
 /// runs, and they are read again once it ends.
 #[cfg(target_os = "macos")]
-fn setup_stage(event: aterm_cli::macos_doctor::StageEvent) {
+fn setup_stage(event: aterm_cli::macos_doctor::StageEvent<'_>) {
     if let Ok(mut activity) = SETUP_ACTIVITY.lock() {
-        activity.epoch += 1;
-        let epoch = activity.epoch;
-        activity.settings = if event.running {
-            event.settings.to_vec()
-        } else {
-            Vec::new()
-        };
-        activity.subjects = if event.running {
-            event.subjects.to_vec()
-        } else {
-            Vec::new()
-        };
-        for subject in event.subjects {
-            match activity.touched.iter_mut().find(|(row, _)| row == subject) {
-                Some(touched) => touched.1 = epoch,
-                None => activity.touched.push((*subject, epoch)),
-            }
-        }
+        activity.mark(event.settings, event.subjects, event.running);
     }
     aterm_gui::publish_initial_setup_status(initial_setup_status());
     if !event.running {
@@ -2995,8 +3135,8 @@ fn end_setup_activity() {
 struct ObserveRequest {
     /// The page's plan; `None` keeps the last one.
     plan: Option<aterm_types::macos_setup::Plan>,
-    /// [`ObservedRows::choices`] when `plan` was named: a person's choice
-    /// made since outranks it.
+    /// [`ObservedRows::choices`] when this request was made: a person's
+    /// newer choice retires both the named plan and broader Check scope.
     choices: u64,
     subjects: Vec<aterm_types::macos_setup::Subject>,
     /// Check again: read GitHub repositories even while it is not managed.
@@ -3021,6 +3161,9 @@ static OBSERVE_QUEUE: std::sync::Mutex<ObserveQueue> = std::sync::Mutex::new(Obs
 struct ObservedRows {
     rows: Vec<aterm_types::macos_setup::Observation>,
     generation: u64,
+    /// Source shared by the Secrets and Repositories readings. A partial
+    /// read of another source clears both before adding any new rows.
+    vault_url: Option<String>,
     plan: Option<aterm_types::macos_setup::Plan>,
     /// Raised by each person's choice ([`begin_setup_choice`]) and each
     /// refusal that lets one go ([`forget_setup_choice`]): a plan named or
@@ -3035,6 +3178,7 @@ struct ObservedRows {
 static OBSERVED_ROWS: std::sync::Mutex<ObservedRows> = std::sync::Mutex::new(ObservedRows {
     rows: Vec::new(),
     generation: 0,
+    vault_url: None,
     plan: None,
     choices: 0,
     access_steps: 0,
@@ -3048,12 +3192,18 @@ fn request_observation(
     subjects: Vec<aterm_types::macos_setup::Subject>,
     forced: bool,
 ) -> bool {
-    let request = ObserveRequest {
+    queue_observation(ObserveRequest {
         plan,
         choices: OBSERVED_ROWS.lock().map_or(0, |rows| rows.choices),
         subjects,
         forced,
-    };
+    })
+}
+
+/// Enqueue the captured request; another choice or request may have arrived
+/// between capturing its scope and acquiring the queue.
+#[cfg(target_os = "macos")]
+fn queue_observation(request: ObserveRequest) -> bool {
     let Ok(mut queue) = OBSERVE_QUEUE.lock() else {
         return false;
     };
@@ -3061,17 +3211,28 @@ fn request_observation(
         queue.next = Some(match queue.next.take() {
             None => request,
             Some(mut next) => {
-                // The plan named last, with the choices it was named under.
-                if request.plan.is_some() {
-                    next.plan = request.plan;
-                    next.choices = request.choices;
+                // Broader Check scope belongs to its own choice and plan.
+                // A newer choice or another named plan retires it; a late
+                // request from an older choice cannot put it back.
+                if request.choices >= next.choices {
+                    let replaced = request.choices != next.choices
+                        || request
+                            .plan
+                            .as_ref()
+                            .is_some_and(|plan| next.plan.as_ref() != Some(plan));
+                    if replaced {
+                        next.plan = request.plan;
+                        next.choices = request.choices;
+                        next.forced = request.forced;
+                    } else {
+                        next.forced |= request.forced;
+                    }
                 }
                 for subject in request.subjects {
                     if !next.subjects.contains(&subject) {
                         next.subjects.push(subject);
                     }
                 }
-                next.forced |= request.forced;
                 next
             }
         });
@@ -3114,38 +3275,26 @@ fn observe_rows(request: ObserveRequest) {
     let Some((plan, choices)) = observed_plan(request.plan, request.choices) else {
         return;
     };
-    let network = request.forced || plan.selection.contains(Setting::Repositories);
+    let forced = request.forced && request.choices == choices;
+    let network = forced || plan.selection.contains(Setting::Repositories);
     // Whether this login is signed in to Messages or FaceTime is the person's
     // own account state: read only while that group is set up, or on Check
     // again, as the repositories are (System State design §3.5).
     let subjects: Vec<_> = request
         .subjects
-        .into_iter()
+        .iter()
+        .copied()
         .filter(|subject| match subject {
             aterm_types::macos_setup::Subject::Setting(setting)
                 if setting.group() == aterm_types::macos_setup::Group::Accounts =>
             {
-                request.forced || plan.selection.contains(*setting)
+                forced || plan.selection.contains(*setting)
             }
             _ => true,
         })
         .collect();
     let started = SETUP_ACTIVITY.lock().map_or(0, |activity| activity.epoch);
     let read = (setup_io().read)(&plan, &subjects, network);
-    // A reading taken while its own stage ran may be half of a change.
-    let read: Vec<_> = match SETUP_ACTIVITY.lock() {
-        Ok(activity) => read
-            .into_iter()
-            .filter(|seen| {
-                !activity.subjects.contains(&seen.subject)
-                    && activity
-                        .touched
-                        .iter()
-                        .all(|(row, epoch)| *row != seen.subject || *epoch <= started)
-            })
-            .collect(),
-        Err(_) => Vec::new(),
-    };
     let access_steps = aterm_cli::macos_doctor::initial_setup_access_revision()
         .ok()
         .zip(aterm_types::dirs::state_dir())
@@ -3153,20 +3302,44 @@ fn observe_rows(request: ObserveRequest) {
             aterm_types::macos_setup::access_record::read(&dir, revision).len()
         });
     let (changed, wake) = {
+        // Keep activity through publication, in the same order as Restore's
+        // invalidation. A reader checked just before a change cannot slip its
+        // old rows back into the cache after that change retired them.
+        let Ok(activity) = SETUP_ACTIVITY.lock() else {
+            return;
+        };
         let Ok(mut rows) = OBSERVED_ROWS.lock() else {
             return;
         };
-        // Later readings follow this plan, unless a person chose (or a choice
-        // was refused) while this one read: theirs, then, is the one to follow.
-        if rows.choices == choices {
-            rows.plan = Some(plan);
+        // A choice (or its refusal) retires the whole reading, not just the
+        // plan it names: its vault, account state and access count were read
+        // for the earlier plan. Read again under the current choice without
+        // carrying a superseded Check's forced personal/network scope.
+        if rows.choices != choices {
+            drop(rows);
+            drop(activity);
+            request_observation(None, request.subjects, false);
+            return;
         }
-        let mut changed = false;
+        let source = plan.vault_url.trim();
+        let mut changed = rows.vault_url.as_deref() != Some(source);
+        if changed {
+            rows.rows.retain(|row| !row.subject.uses_vault_source());
+            rows.vault_url = Some(source.to_owned());
+        }
+        rows.plan = Some(plan);
         // A row a person fixed, or an access step the window recorded, is what a
         // parked run waits for.
         let mut wake = rows.access_steps != access_steps;
         rows.access_steps = access_steps;
-        for seen in read {
+        // A reading taken while its own stage or Restore ran may be half of a change.
+        for seen in read.into_iter().filter(|seen| {
+            !activity.subjects.contains(&seen.subject)
+                && activity
+                    .touched
+                    .iter()
+                    .all(|(row, epoch)| *row != seen.subject || *epoch <= started)
+        }) {
             match rows.rows.iter_mut().find(|row| row.subject == seen.subject) {
                 Some(row) if *row == seen => {}
                 Some(row) => {
@@ -3502,6 +3675,7 @@ fn add_setup_readings(status: &mut aterm_gui::SetupStatus) {
         observed.sort_by_key(|row| order.iter().position(|subject| *subject == row.subject));
         status.observed = observed;
         status.observed_generation = rows.generation;
+        status.observed_vault_url = rows.vault_url.clone();
     }
     if let Ok(activity) = SETUP_ACTIVITY.lock() {
         status.running = activity.settings.clone();
@@ -4376,10 +4550,70 @@ fn begin_check_again(
 }
 
 #[cfg(target_os = "macos")]
+fn with_restore_readings<T>(restore: impl FnOnce() -> T) -> T {
+    let _readings = RestoreReadings::begin();
+    restore()
+}
+
+/// Restore owns the setup slot while it changes the Input/Desktop preferences.
+/// Their old readings are retired before any write, and partial/error/panic
+/// paths all read them again once no Restore effect remains in flight.
+#[cfg(target_os = "macos")]
+struct RestoreReadings {
+    subjects: Vec<aterm_types::macos_setup::Subject>,
+}
+
+#[cfg(target_os = "macos")]
+impl RestoreReadings {
+    fn begin() -> Self {
+        use aterm_types::macos_setup::{Group, Setting, Subject};
+        let guard = Self {
+            subjects: Setting::ALL
+                .into_iter()
+                .filter(|setting| matches!(setting.group(), Group::Input | Group::Desktop))
+                .map(Subject::Setting)
+                .collect(),
+        };
+        {
+            let mut activity = SETUP_ACTIVITY
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // These subjects are changing, but this is no setup run: the GUI
+            // keeps its Restore label and does not show a run's meter or Stop.
+            activity.mark(&[], &guard.subjects, true);
+            let mut rows = OBSERVED_ROWS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let before = rows.rows.len();
+            rows.rows
+                .retain(|row| !guard.subjects.contains(&row.subject));
+            if rows.rows.len() != before {
+                rows.generation += 1;
+            }
+        }
+        aterm_gui::publish_initial_setup_status(initial_setup_status());
+        guard
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for RestoreReadings {
+    fn drop(&mut self) {
+        SETUP_ACTIVITY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .mark(&[], &self.subjects, false);
+        request_observation(None, std::mem::take(&mut self.subjects), false);
+        aterm_gui::publish_initial_setup_status(initial_setup_status());
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn restore_initial_setup() -> bool {
     spawn_initial_setup_operation("aterm-setup-restore", |_busy| {
-        let observed =
-            aterm_cli::macos_doctor::run_observed(aterm_cli::macos_doctor::Action::Restore);
+        let observed = with_restore_readings(|| {
+            aterm_cli::macos_doctor::run_observed(aterm_cli::macos_doctor::Action::Restore)
+        });
         match observed.result {
             Ok(report) => remember_initial_setup_rows(&report, None, observed.observation),
             Err(why) => initial_setup_error(why, observed.observation),
@@ -4550,6 +4784,9 @@ mod initial_setup_result_tests {
         /// Readings started: their plan, their rows, and whether they used the
         /// network.
         reads: Vec<(Plan, Vec<Subject>, bool)>,
+        /// Replies bound to each reading when it starts, before a held read
+        /// can be overtaken by a choice.
+        readings: VecDeque<Vec<Observation>>,
         /// Readings wait while this is set.
         hold: bool,
         /// Stop saves begun: the run each names and the thread it ran on.
@@ -4581,6 +4818,10 @@ mod initial_setup_result_tests {
         startup_reading: bool,
         /// Offers the startup showed.
         offers: usize,
+        /// The real request sent its answer, before the startup reads it.
+        startup_answer_delivered: bool,
+        /// Hold the offer after delivery, before it returns to the coordinator.
+        startup_answer_hold: bool,
         /// What each write of the page's answer does in turn: admits it as
         /// this revision (`Ok(Some)`), finds it retired (`Ok(None)`), or
         /// fails while the startup keeps its claim (`Err`).
@@ -4602,6 +4843,7 @@ mod initial_setup_result_tests {
     impl Script {
         const NEW: Self = Self {
             reads: Vec::new(),
+            readings: VecDeque::new(),
             hold: false,
             stop_attempts: Vec::new(),
             stops: Vec::new(),
@@ -4617,6 +4859,8 @@ mod initial_setup_result_tests {
             initial_hold: false,
             startup_reading: false,
             offers: 0,
+            startup_answer_delivered: false,
+            startup_answer_hold: false,
             authorizations: VecDeque::new(),
             authorizing: 0,
             authorize_hold: false,
@@ -4724,9 +4968,10 @@ mod initial_setup_result_tests {
             script
                 .reads
                 .push((plan.clone(), subjects.to_vec(), network));
+            let reading = script.readings.pop_front().unwrap_or_default();
             SCRIPT_MOVED.notify_all();
             drop(wait_while(script, |script| script.hold));
-            Vec::new()
+            reading
         }
 
         fn save_stop(revision: u64) -> Result<(), String> {
@@ -4811,6 +5056,7 @@ mod initial_setup_result_tests {
                 script.initial_hold = false;
                 script.authorize_hold = false;
                 script.startup_backoff_hold = false;
+                script.startup_answer_hold = false;
             });
             let deadline = Instant::now() + HANG;
             while !(observe_idle()
@@ -4985,9 +5231,23 @@ mod initial_setup_result_tests {
             script.startup_reading = false;
             Ok(Plan::default())
         }
-        fn offer(&mut self, _: Plan) -> aterm_gui::WorkstationSetupDecision {
+        fn offer(&mut self, initial: Plan) -> aterm_gui::WorkstationSetupDecision {
             change(|script| script.offers += 1);
             if let Some(answer) = self.answer.take() {
+                if script().startup_answer_hold {
+                    return aterm_gui::drive_initial_setup_answer_for_test(
+                        initial,
+                        self.sent.handoff(),
+                        |deliver| {
+                            assert!(deliver(
+                                aterm_gui::WorkstationSetupDecision::Begin(answer).into()
+                            ));
+                            change(|script| script.startup_answer_delivered = true);
+                            drop(wait_while(script(), |script| script.startup_answer_hold));
+                        },
+                    )
+                    .decision;
+                }
                 return aterm_gui::WorkstationSetupDecision::Begin(answer);
             }
             if self.awaits_answer {
@@ -5257,6 +5517,58 @@ mod initial_setup_result_tests {
         assert_eq!(script().runs, [8]);
     }
 
+    #[test]
+    fn a_startup_answer_handoff_keeps_its_stop_owed_before_the_worker_reads_the_answer() {
+        let _globals = globals();
+        let _io = TestIo::install();
+        change(|script| {
+            script.authorizations = [Ok(Some(8))].into();
+            script.startup_answer_hold = true;
+        });
+        let startup = startup_with(false, Some(Plan::default()));
+        wait_until("the request delivers the page's answer", || {
+            script().startup_answer_delivered
+        });
+        assert!(!stop_initial_setup(), "no run is registered yet");
+        let settled_before_return = settle_setup_stop(Duration::ZERO);
+        let quit = std::thread::spawn(|| settle_setup_stop(HANG));
+        change(|script| script.startup_answer_hold = false);
+        assert_eq!(startup.join().unwrap(), "authorized");
+        assert!(quit.join().unwrap());
+        wait_until("run 8's Stop is saved", || script().stops == [8]);
+        assert!(setup_stop_requested(8));
+        assert_eq!(script().runs, [8]);
+        assert!(
+            !settled_before_return,
+            "the quit must wait for a delivered answer before the worker reads it"
+        );
+    }
+
+    #[test]
+    fn an_unanswered_startup_answer_handoff_leaves_nothing_for_a_quit_to_wait_for() {
+        let _globals = globals();
+        let _io = TestIo::install();
+        let mut sent = StartupSent::default();
+        sent.send();
+        let answer = aterm_gui::drive_initial_setup_answer_for_test(
+            Plan::default(),
+            sent.handoff(),
+            |deliver| {
+                assert!(!stop_initial_setup());
+                assert!(settle_setup_stop(Duration::ZERO));
+                assert!(deliver(
+                    aterm_gui::WorkstationSetupDecision::Unavailable.into()
+                ));
+            },
+        );
+        assert_eq!(
+            answer.decision,
+            aterm_gui::WorkstationSetupDecision::Unavailable
+        );
+        assert!(settle_setup_stop(Duration::ZERO));
+        assert!(script().stop_attempts.is_empty());
+    }
+
     /// NEGATIVE CONTROL: a Stop covers only what was sent before it. Pressed
     /// before the startup offers, or before a choice is made, it stops
     /// neither's run, and a quit owes nothing for them.
@@ -5287,47 +5599,531 @@ mod initial_setup_result_tests {
     #[test]
     fn a_choice_outranks_every_reading_queued_or_in_flight_when_it_is_made() {
         let _globals = globals();
+        for refresh in 0..3 {
+            let _io = TestIo::install();
+            // The page is shown with every group set up: its reading reads GitHub
+            // over the network, and Messages and FaceTime. Check again queues its
+            // broader read behind that one before the person's newer choice.
+            let shown = Plan::default();
+            script().hold = true;
+            assert!(observe_initial_setup(shown.clone()));
+            wait_until("the page's reading starts", || script().reads.len() == 1);
+            assert!(request_observation(
+                Some(shown.clone()),
+                Subject::all(),
+                true
+            ));
+            // Meanwhile the person leaves Workspace and Messages & FaceTime as is.
+            let left = left_as_is();
+            script().admits = [Some(9)].into();
+            let (receipt, answer) = aterm_gui::InitialSetupApplyReceipt::detached(true);
+            assert!(restart_initial_setup(left.clone(), false, None, receipt));
+            assert_eq!(answer.recv_timeout(HANG), Ok(true));
+            assert_eq!(setup_run(), Some(9));
+            match refresh {
+                0 => {}
+                1 => assert!(observe_initial_setup(left.clone())),
+                _ => assert!(request_observation(None, Subject::all(), false)),
+            }
+            // The readings end, and then a stage's end asks for one naming no plan.
+            release_readings();
+            wait_until("the queued reading ends", || {
+                script().reads.len() == 2 && observe_idle()
+            });
+            assert!(request_observation(None, Subject::all(), false));
+            wait_until("the stage's reading ends", || {
+                script().reads.len() == 3 && observe_idle()
+            });
+            let reads = std::mem::take(&mut script().reads);
+            // Only the reading in flight when the person chose was taken for the
+            // page's plan. Neither it nor the page's queued one put that plan back.
+            assert_eq!((&reads[0].0, reads[0].2), (&shown, true));
+            for (plan, subjects, network) in &reads[1..] {
+                assert_eq!(plan, &left);
+                assert!(!network, "GitHub is never read for a group left as is");
+                assert!(
+                    !subjects.iter().any(|subject| matches!(
+                        subject,
+                        Subject::Setting(setting) if setting.group() == Group::Accounts
+                    )),
+                    "nor is the person's account state"
+                );
+            }
+            assert_eq!(OBSERVED_ROWS.lock().unwrap().plan, Some(left));
+        }
+    }
+
+    #[test]
+    fn a_queued_checks_scope_belongs_to_its_reviewed_plan() {
+        let _globals = globals();
         let _io = TestIo::install();
-        // The page is shown with every group set up: its reading reads GitHub
-        // over the network, and Messages and FaceTime. It is still reading
-        // when the page asks again, which queues behind it.
-        let shown = Plan::default();
-        script().hold = true;
-        assert!(observe_initial_setup(shown.clone()));
-        wait_until("the page's reading starts", || script().reads.len() == 1);
-        assert!(observe_initial_setup(shown.clone()));
-        // Meanwhile the person leaves Workspace and Messages & FaceTime as is.
-        let left = left_as_is();
-        script().admits = [Some(9)].into();
-        let (receipt, answer) = aterm_gui::InitialSetupApplyReceipt::detached(true);
-        assert!(restart_initial_setup(left.clone(), false, None, receipt));
-        assert_eq!(answer.recv_timeout(HANG), Ok(true));
-        assert_eq!(setup_run(), Some(9));
-        // The readings end, and then a stage's end asks for one naming no plan.
-        release_readings();
-        wait_until("the queued reading ends", || {
-            script().reads.len() == 2 && observe_idle()
-        });
-        assert!(request_observation(None, Subject::all(), false));
-        wait_until("the stage's reading ends", || {
-            script().reads.len() == 3 && observe_idle()
-        });
-        let reads = std::mem::take(&mut script().reads);
-        // Only the reading in flight when the person chose was taken for the
-        // page's plan. Neither it nor the page's queued one put that plan back.
-        assert_eq!((&reads[0].0, reads[0].2), (&shown, true));
-        for (plan, subjects, network) in &reads[1..] {
-            assert_eq!(plan, &left);
-            assert!(!network, "GitHub is never read for a group left as is");
-            assert!(
-                !subjects.iter().any(|subject| matches!(
+        struct QueueLease;
+        impl Drop for QueueLease {
+            fn drop(&mut self) {
+                let mut queue = OBSERVE_QUEUE.lock().unwrap_or_else(PoisonError::into_inner);
+                queue.running = false;
+                queue.next = None;
+            }
+        }
+        OBSERVE_QUEUE.lock().unwrap().running = true;
+        let _queue = QueueLease;
+        for edited in [false, true] {
+            let checked = left_as_is();
+            let mut reviewed = checked.clone();
+            if edited {
+                reviewed.vault_url = "http://another-vault.local:7484/v1/team".into();
+            }
+            assert!(request_observation(Some(checked), Subject::all(), true));
+            assert!(observe_initial_setup(reviewed.clone()));
+            let request = OBSERVE_QUEUE.lock().unwrap().next.take().unwrap();
+            observe_rows(request);
+            let reads = std::mem::take(&mut script().reads);
+            assert_eq!(reads.len(), 1);
+            assert_eq!(reads[0].0, reviewed);
+            assert_eq!(
+                reads[0].2, !edited,
+                "only the reviewed Check may read GitHub"
+            );
+            assert_eq!(
+                reads[0].1.iter().any(|subject| matches!(
                     subject,
                     Subject::Setting(setting) if setting.group() == Group::Accounts
                 )),
-                "nor is the person's account state"
+                !edited,
+                "account reads cannot transfer to another reviewed plan"
+            );
+            // A fresh Check of that exact edited plan still reads all rows,
+            // even when an ordinary stage refresh coalesces behind it.
+            assert!(request_observation(
+                Some(reviewed.clone()),
+                Subject::all(),
+                true
+            ));
+            assert!(request_observation(None, Subject::all(), false));
+            let request = OBSERVE_QUEUE.lock().unwrap().next.take().unwrap();
+            observe_rows(request);
+            let reads = std::mem::take(&mut script().reads);
+            assert_eq!(reads.len(), 1);
+            assert_eq!(reads[0].0, reviewed);
+            assert!(reads[0].2);
+            assert!(reads[0].1.contains(&Subject::Setting(Setting::Messages)));
+            assert!(reads[0].1.contains(&Subject::Setting(Setting::FaceTime)));
+        }
+    }
+
+    #[test]
+    fn a_late_old_check_cannot_relabel_a_newer_queued_read() {
+        let _globals = globals();
+        let _io = TestIo::install();
+        struct QueueLease;
+        impl Drop for QueueLease {
+            fn drop(&mut self) {
+                let mut queue = OBSERVE_QUEUE.lock().unwrap_or_else(PoisonError::into_inner);
+                queue.running = false;
+                queue.next = None;
+            }
+        }
+        OBSERVE_QUEUE.lock().unwrap().running = true;
+        let _queue = QueueLease;
+        for check in [false, true] {
+            // Capture Check A before a newer choice, then let it acquire the
+            // queue only after the new choice's own read is already waiting.
+            let old = ObserveRequest {
+                plan: Some(left_as_is()),
+                choices: OBSERVED_ROWS.lock().unwrap().choices,
+                subjects: Subject::all(),
+                forced: true,
+            };
+            let mut reviewed = left_as_is();
+            reviewed.vault_url = "http://newer-vault.local:7484/v1/team".into();
+            let generation = SETUP_APPLY_GENERATION.load(std::sync::atomic::Ordering::Acquire);
+            let _choice = begin_setup_choice(&reviewed, false, generation);
+            assert!(request_observation(
+                Some(reviewed.clone()),
+                Subject::all(),
+                check
+            ));
+            assert!(queue_observation(old));
+            let request = OBSERVE_QUEUE.lock().unwrap().next.take().unwrap();
+            observe_rows(request);
+            let reads = std::mem::take(&mut script().reads);
+            assert_eq!(reads.len(), 1);
+            assert_eq!(reads[0].0, reviewed);
+            assert_eq!(reads[0].2, check);
+            assert_eq!(
+                reads[0].1.contains(&Subject::Setting(Setting::Messages)),
+                check
+            );
+            assert_eq!(
+                reads[0].1.contains(&Subject::Setting(Setting::FaceTime)),
+                check
             );
         }
-        assert_eq!(OBSERVED_ROWS.lock().unwrap().plan, Some(left));
+    }
+
+    #[test]
+    fn an_in_flight_observation_cannot_publish_after_a_new_choice() {
+        use aterm_types::macos_setup::Standing;
+
+        let _globals = globals();
+        let _io = TestIo::install();
+        // Park only the queue's dispatcher: this reader still runs the real
+        // observation entry, and a replacement read can be inspected before
+        // it runs. Release the queue before TestIo waits for its workers.
+        struct QueueLease;
+        impl Drop for QueueLease {
+            fn drop(&mut self) {
+                let mut queue = OBSERVE_QUEUE.lock().unwrap_or_else(PoisonError::into_inner);
+                queue.running = false;
+                queue.next = None;
+            }
+        }
+        {
+            let mut queue = OBSERVE_QUEUE.lock().unwrap();
+            assert!(!queue.running);
+            assert!(queue.next.is_none());
+            queue.running = true;
+        }
+        let _queue = QueueLease;
+        let secrets = Subject::Setting(Setting::Secrets);
+        let repositories = Subject::Setting(Setting::Repositories);
+        let reading = |subject, standing, note: &str| Observation {
+            subject,
+            standing,
+            now: None,
+            wanted: subject.wanted().to_owned(),
+            note: Some(note.to_owned()),
+            detail: None,
+        };
+        let shown = Plan::default();
+        let subjects = Subject::all();
+        let choices = {
+            let mut rows = OBSERVED_ROWS.lock().unwrap();
+            rows.plan = Some(shown.clone());
+            rows.rows = vec![
+                reading(secrets, Standing::Waiting, "earlier vault reading"),
+                reading(
+                    repositories,
+                    Standing::Waiting,
+                    "earlier repository reading",
+                ),
+            ];
+            rows.access_steps = 7;
+            rows.choices
+        };
+        let current = reading(
+            secrets,
+            Standing::Waiting,
+            "the newly selected vault did not answer",
+        );
+        change(|script| {
+            script.hold = true;
+            script.readings = [
+                vec![
+                    reading(
+                        secrets,
+                        Standing::NeedsYou,
+                        "approval for the old vault: OLD42",
+                    ),
+                    reading(
+                        repositories,
+                        Standing::InPlace,
+                        "old vault credentials worked",
+                    ),
+                ],
+                vec![current.clone()],
+            ]
+            .into();
+        });
+        // On failure, release and join the reader before QueueLease and
+        // TestIo drop; no delayed worker may outlive its inert I/O.
+        struct Reader(Option<std::thread::JoinHandle<()>>);
+        impl Drop for Reader {
+            fn drop(&mut self) {
+                release_readings();
+                if let Some(reader) = self.0.take() {
+                    let _ = reader.join();
+                }
+            }
+        }
+        let requested = subjects.clone();
+        let mut reader = Reader(Some(std::thread::spawn(move || {
+            observe_rows(ObserveRequest {
+                plan: Some(shown),
+                choices,
+                subjects: requested,
+                forced: true,
+            });
+        })));
+        wait_until("the old Check's reading starts", || {
+            script().reads.len() == 1
+        });
+        let mut chosen = Plan {
+            vault_url: "http://new-vault.local:7484/v1/team".into(),
+            ..Plan::default()
+        };
+        for setting in [Setting::Repositories, Setting::Messages, Setting::FaceTime] {
+            chosen.selection.set(setting, false);
+        }
+        script().admits = [Some(9)].into();
+        let (receipt, answer) = aterm_gui::InitialSetupApplyReceipt::detached(true);
+        assert!(restart_initial_setup(chosen.clone(), true, None, receipt));
+        assert_eq!(answer.recv_timeout(HANG), Ok(true));
+        wait_until("the new plan's inert run ends", || {
+            !INITIAL_SETUP_BUSY.load(std::sync::atomic::Ordering::Acquire)
+        });
+        let before = {
+            let rows = OBSERVED_ROWS.lock().unwrap();
+            (rows.rows.clone(), rows.generation, rows.access_steps)
+        };
+        let wakes = SETUP_WAKES.count();
+        release_readings();
+        reader.0.take().unwrap().join().unwrap();
+        {
+            let rows = OBSERVED_ROWS.lock().unwrap();
+            assert_eq!(rows.plan, Some(chosen.clone()));
+            assert_eq!(
+                rows.rows, before.0,
+                "the old vault cannot publish under the new plan"
+            );
+            assert_eq!(rows.generation, before.1);
+            assert_eq!(rows.access_steps, before.2);
+        }
+        assert_eq!(
+            SETUP_WAKES.count(),
+            wakes,
+            "an old result cannot wake the new run"
+        );
+        let next = OBSERVE_QUEUE
+            .lock()
+            .unwrap()
+            .next
+            .take()
+            .expect("a fresh reading is queued");
+        assert_eq!(next.subjects, subjects);
+        assert!(
+            !next.forced,
+            "a superseded Check cannot force old personal reads"
+        );
+        observe_rows(next);
+        let reads = &script().reads;
+        assert_eq!(reads.len(), 2);
+        assert_eq!(reads[1].0, chosen);
+        assert!(!reads[1].2, "the new plan leaves repositories unmanaged");
+        assert!(!reads[1].1.iter().any(|subject| matches!(
+            subject,
+            Subject::Setting(Setting::Messages | Setting::FaceTime)
+        )));
+        assert_eq!(OBSERVED_ROWS.lock().unwrap().rows[0], current);
+    }
+
+    #[test]
+    fn restore_readings_retires_cached_and_held_preference_reads() {
+        use aterm_types::macos_setup::Standing;
+
+        let _globals = globals();
+        let _io = TestIo::install();
+        // Keep the automatic refresh queued until the old read has returned.
+        struct QueueLease;
+        impl Drop for QueueLease {
+            fn drop(&mut self) {
+                let mut queue = OBSERVE_QUEUE.lock().unwrap_or_else(PoisonError::into_inner);
+                queue.running = false;
+                queue.next = None;
+            }
+        }
+        OBSERVE_QUEUE.lock().unwrap().running = true;
+        let _queue = QueueLease;
+        struct Reader(Option<std::thread::JoinHandle<()>>);
+        impl Drop for Reader {
+            fn drop(&mut self) {
+                release_readings();
+                if let Some(reader) = self.0.take() {
+                    let _ = reader.join();
+                }
+            }
+        }
+        let preference = Subject::Setting(Setting::CapsLock);
+        let independent = Subject::Setting(Setting::Secrets);
+        let seen = |subject, standing| Observation {
+            standing,
+            ..Observation::unknown(subject)
+        };
+        let plan = Plan::default();
+        for failed in [false, true] {
+            let old = seen(preference, Standing::InPlace);
+            let vault = seen(independent, Standing::NeedsYou);
+            let restored = seen(preference, Standing::Differs);
+            let choices = {
+                let mut rows = OBSERVED_ROWS.lock().unwrap();
+                rows.plan = Some(plan.clone());
+                rows.vault_url = Some(plan.vault_url.clone());
+                rows.rows = vec![old.clone(), vault.clone()];
+                rows.choices
+            };
+            change(|script| {
+                script.reads.clear();
+                script.hold = true;
+                script.readings = [vec![old, vault.clone()], vec![restored.clone()]].into();
+            });
+            let reading_plan = plan.clone();
+            let mut reader = Reader(Some(std::thread::spawn(move || {
+                observe_rows(ObserveRequest {
+                    plan: Some(reading_plan),
+                    choices,
+                    subjects: vec![preference, independent],
+                    forced: false,
+                });
+            })));
+            wait_until("the pre-Restore read starts", || script().reads.len() == 1);
+            let mut during = Vec::new();
+            let result = with_restore_readings(|| {
+                during = OBSERVED_ROWS.lock().unwrap().rows.clone();
+                if failed {
+                    Err("partial restore")
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(result.is_err(), failed);
+            release_readings();
+            reader.0.take().unwrap().join().unwrap();
+            let (retained, source) = {
+                let rows = OBSERVED_ROWS.lock().unwrap();
+                (rows.rows.clone(), rows.vault_url.clone())
+            };
+            assert!(
+                !retained.iter().any(|row| row.subject == preference),
+                "a pre-Restore preference read must not publish after Restore"
+            );
+            assert!(retained.contains(&vault));
+            assert_eq!(source.as_ref(), Some(&plan.vault_url));
+            assert!(!during.iter().any(|row| row.subject == preference));
+            assert!(during.contains(&vault));
+            assert!(SETUP_ACTIVITY.lock().unwrap().subjects.is_empty());
+            let fresh = OBSERVE_QUEUE.lock().unwrap().next.take().unwrap();
+            assert!(!fresh.forced);
+            assert!(fresh.plan.is_none(), "refresh uses the plan in force");
+            assert!(fresh.subjects.contains(&preference));
+            assert!(
+                fresh
+                    .subjects
+                    .iter()
+                    .all(|subject| matches!(subject.group(), Group::Input | Group::Desktop))
+            );
+            observe_rows(fresh);
+            let rows = OBSERVED_ROWS.lock().unwrap();
+            assert!(rows.rows.contains(&restored));
+            assert!(rows.rows.contains(&vault));
+            assert_eq!(script().reads.len(), 2);
+        }
+    }
+
+    #[test]
+    fn restore_readings_unwinds_without_leaving_activity_or_busy() {
+        let _globals = globals();
+        let _io = TestIo::install();
+        OBSERVE_QUEUE.lock().unwrap().running = true;
+        let result = std::panic::catch_unwind(|| {
+            assert!(take_initial_setup_slot_now());
+            let _busy = InitialSetupBusy { observation: None };
+            with_restore_readings(|| panic!("injected restore panic"));
+        });
+        assert!(result.is_err());
+        assert!(!INITIAL_SETUP_BUSY.load(std::sync::atomic::Ordering::Acquire));
+        assert!(SETUP_ACTIVITY.lock().unwrap().subjects.is_empty());
+        let fresh = {
+            let mut queue = OBSERVE_QUEUE.lock().unwrap();
+            queue.running = false;
+            queue.next.take()
+        };
+        assert!(fresh.is_some(), "an unwound partial Restore is read again");
+    }
+
+    #[test]
+    fn a_partial_observation_of_another_vault_retires_both_source_rows() {
+        use aterm_types::macos_setup::{Access, Standing};
+
+        let _globals = globals();
+        let _io = TestIo::install();
+        let caps = Subject::Setting(Setting::CapsLock);
+        let secrets = Subject::Setting(Setting::Secrets);
+        let repositories = Subject::Setting(Setting::Repositories);
+        let access = Subject::Access(Access::FullDiskAccess);
+        let reading = |subject, standing, note: &str| Observation {
+            subject,
+            standing,
+            now: None,
+            wanted: subject.wanted().to_owned(),
+            note: Some(note.to_owned()),
+            detail: None,
+        };
+        let old = Plan::default();
+        let kept = reading(caps, Standing::InPlace, "independent keyboard reading");
+        let choices = {
+            let mut rows = OBSERVED_ROWS.lock().unwrap();
+            rows.rows = vec![
+                kept.clone(),
+                reading(secrets, Standing::NeedsYou, "old source approval OLD42"),
+                reading(
+                    repositories,
+                    Standing::Failed,
+                    "old source authentication failure",
+                ),
+            ];
+            rows.plan = Some(old.clone());
+            rows.vault_url = Some(old.vault_url);
+            rows.choices
+        };
+        let current = Plan {
+            vault_url: "  http://current-vault.local:7484/v1/team  ".into(),
+            ..Plan::default()
+        };
+        change(|script| {
+            script.readings = [
+                vec![reading(
+                    access,
+                    Standing::Differs,
+                    "access reading for current plan",
+                )],
+                vec![reading(
+                    repositories,
+                    Standing::Waiting,
+                    "current repository reading",
+                )],
+            ]
+            .into();
+        });
+        observe_rows(ObserveRequest {
+            plan: Some(current.clone()),
+            choices,
+            subjects: vec![access],
+            forced: false,
+        });
+        {
+            let rows = OBSERVED_ROWS.lock().unwrap();
+            assert_eq!(rows.vault_url.as_deref(), Some(current.vault_url.trim()));
+            assert!(rows.rows.contains(&kept));
+            assert!(rows.rows.iter().any(|row| row.subject == access));
+            assert!(!rows.rows.iter().any(|row| row.subject.uses_vault_source()));
+        }
+        // A later partial repository read cannot relabel the old Secrets
+        // code as belonging to the current source.
+        observe_rows(ObserveRequest {
+            plan: None,
+            choices,
+            subjects: vec![repositories],
+            forced: false,
+        });
+        let rows = OBSERVED_ROWS.lock().unwrap();
+        assert!(rows.rows.contains(&kept));
+        assert!(rows.rows.iter().any(|row| row.subject == repositories));
+        assert!(!rows.rows.iter().any(|row| row.subject == secrets));
+        assert!(!rows.rows.iter().any(|row| {
+            row.note
+                .as_deref()
+                .is_some_and(|note| note.contains("OLD42"))
+        }));
     }
 
     #[test]

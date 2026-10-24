@@ -29,7 +29,7 @@ const KEY_BYTES: usize = 6;
 /// ONE ACCOUNT'S KEY, the same on every machine and holding no secret (design §3.1).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AccountKey {
-    /// `c` for Claude Code, `x` for Codex.
+    /// `c` for Claude Code, `x` for Codex, `g` for Grok Build, `k` for Kimi Code.
     agent: u8,
     /// The digest's first [`KEY_BYTES`].
     digest: [u8; KEY_BYTES],
@@ -46,6 +46,19 @@ impl AccountKey {
     #[must_use]
     pub fn codex(account_id: &str, user_id: &str) -> Option<AccountKey> {
         Self::hashed(b'x', "codex", &[account_id, user_id])
+    }
+
+    /// The key of the Grok Build account whose xAI user id is `user_id`.
+    #[must_use]
+    pub fn grok(user_id: &str) -> Option<AccountKey> {
+        Self::hashed(b'g', "grok", &[user_id])
+    }
+
+    /// The key of the Kimi Code account whose user id is `user_id` on `region`'s account system:
+    /// the two regions are separate systems, so one id on each is two accounts.
+    #[must_use]
+    pub fn kimi(region: crate::ai::connector::Region, user_id: &str) -> Option<AccountKey> {
+        Self::hashed(b'k', "kimi", &[region.as_str(), user_id])
     }
 
     fn hashed(agent: u8, name: &str, id: &[&str]) -> Option<AccountKey> {
@@ -80,6 +93,8 @@ impl AccountKey {
         let (agent, hex) = match text.split_once('-')? {
             ("c", hex) => (b'c', hex),
             ("x", hex) => (b'x', hex),
+            ("g", hex) => (b'g', hex),
+            ("k", hex) => (b'k', hex),
             _ => return None,
         };
         if !aterm_codec::hex::is_lower(hex, 2 * KEY_BYTES) {
@@ -1278,6 +1293,22 @@ pub fn parse_agy_model_log(bytes: &[u8]) -> Option<(String, Option<String>)> {
 }
 
 fn non_claude_argv_model_effort(argv: &[String]) -> (Option<String>, Option<String>, bool, bool) {
+    fn apply_config_kv(
+        spec: &str,
+        raw_model: &mut Option<String>,
+        raw_effort: &mut Option<String>,
+    ) {
+        if let Some((key, value)) = spec.split_once('=') {
+            let val = value.trim().trim_matches('"').trim();
+            if !val.is_empty() {
+                match key.trim() {
+                    "model" => *raw_model = Some(val.to_owned()),
+                    "effort" | "reasoning_effort" => *raw_effort = Some(val.to_owned()),
+                    _ => {}
+                }
+            }
+        }
+    }
     let mut raw_model = None;
     let mut raw_effort = None;
     let mut i = 1;
@@ -1285,22 +1316,43 @@ fn non_claude_argv_model_effort(argv: &[String]) -> (Option<String>, Option<Stri
         if arg == "--" {
             break;
         }
-        if matches!(arg.as_str(), "--model" | "-m") {
+        if matches!(arg.as_str(), "--model" | "-model" | "-m") {
             raw_model = argv.get(i + 1).cloned();
             i += 2;
             continue;
         }
-        if let Some(v) = arg.strip_prefix("--model=") {
+        if let Some(v) = arg
+            .strip_prefix("--model=")
+            .or_else(|| arg.strip_prefix("-model="))
+            .or_else(|| arg.strip_prefix("-m="))
+        {
             raw_model = Some(v.to_owned());
-        } else if matches!(arg.as_str(), "--effort" | "--reasoning-effort") {
+        } else if matches!(
+            arg.as_str(),
+            "--effort" | "-effort" | "--reasoning-effort" | "-reasoning-effort"
+        ) {
             raw_effort = argv.get(i + 1).cloned();
             i += 2;
             continue;
         } else if let Some(v) = arg
             .strip_prefix("--effort=")
+            .or_else(|| arg.strip_prefix("-effort="))
             .or_else(|| arg.strip_prefix("--reasoning-effort="))
+            .or_else(|| arg.strip_prefix("-reasoning-effort="))
         {
             raw_effort = Some(v.to_owned());
+        } else if matches!(arg.as_str(), "-c" | "--config") {
+            if let Some(spec) = argv.get(i + 1) {
+                apply_config_kv(spec, &mut raw_model, &mut raw_effort);
+            }
+            i += 2;
+            continue;
+        } else if let Some(spec) = arg
+            .strip_prefix("-c=")
+            .or_else(|| arg.strip_prefix("--config="))
+            .or_else(|| arg.strip_prefix("-c"))
+        {
+            apply_config_kv(spec, &mut raw_model, &mut raw_effort);
         }
         i += 1;
     }
@@ -1317,6 +1369,26 @@ fn non_claude_argv_model_effort(argv: &[String]) -> (Option<String>, Option<Stri
     (model, effort, model_open, effort_open)
 }
 
+fn settings_model_effort(path: &Path) -> (Option<String>, Option<String>) {
+    let Some(s) = std::fs::read(path)
+        .ok()
+        .and_then(|b| aterm_json::from_slice::<aterm_json::Value>(&b).ok())
+    else {
+        return (None, None);
+    };
+    let parsed = s
+        .get("model")
+        .and_then(aterm_json::Value::as_str)
+        .and_then(parse_agy_model_label);
+    let (model, label_effort) = parsed.map_or((None, None), |(m, e)| (Some(m), e));
+    let explicit_effort = ["effort", "reasoning_effort", "reasoningEffort"]
+        .into_iter()
+        .find_map(|k| s.get(k).and_then(aterm_json::Value::as_str))
+        .and_then(|e| super::footer::effort_level(&e.trim().to_ascii_lowercase()))
+        .map(str::to_owned);
+    (model, explicit_effort.or(label_effort))
+}
+
 /// The active `(model, effort, model_open, effort_open)` for an `agy` process:
 /// pinned when passed on `argv`, else read from `<config>/settings.json` or
 /// `<config>/cli.log` while remaining open to a live admitted screen card.
@@ -1327,7 +1399,7 @@ pub fn agy_model_effort_for(
     user_home: &Path,
 ) -> (Option<String>, Option<String>, bool, bool) {
     let (argv_model, argv_effort, model_open, effort_open) = non_claude_argv_model_effort(argv);
-    if argv_model.is_some() {
+    if argv_model.is_some() && argv_effort.is_some() {
         return (argv_model, argv_effort, model_open, effort_open);
     }
     let var = |key: &str| {
@@ -1339,20 +1411,22 @@ pub fn agy_model_effort_for(
         Some(dir) if dir.is_absolute() => Some(dir),
         _ => super::upgrade_agy::config_dir(argv, var("HOME"), user_home),
     }) else {
-        return (None, argv_effort, true, effort_open);
+        return (argv_model, argv_effort, model_open, effort_open);
     };
-    let from_settings = std::fs::read(config.join("settings.json"))
-        .ok()
-        .and_then(|b| aterm_json::from_slice::<aterm_json::Value>(&b).ok())
-        .and_then(|s| {
-            s.get("model")
-                .and_then(aterm_json::Value::as_str)
-                .and_then(parse_agy_model_label)
-        });
-    let (model, cfg_effort) = from_settings
-        .or_else(|| agy_log_scan(argv, &config, parse_agy_model_log))
-        .map_or((None, None), |(m, e)| (Some(m), e));
-    (model, argv_effort.or(cfg_effort), true, effort_open)
+    let (cfg_model, cfg_effort) = settings_model_effort(&config.join("settings.json"));
+    let (log_model, log_effort) = if (argv_model.is_none() && cfg_model.is_none())
+        || (argv_effort.is_none() && cfg_effort.is_none())
+    {
+        agy_log_scan(argv, &config, parse_agy_model_log).map_or((None, None), |(m, e)| (Some(m), e))
+    } else {
+        (None, None)
+    };
+    (
+        argv_model.or(cfg_model).or(log_model),
+        argv_effort.or(cfg_effort).or(log_effort),
+        model_open,
+        effort_open,
+    )
 }
 
 /// The active `(model, effort, model_open, effort_open)` for a `muse` process:
@@ -1365,7 +1439,7 @@ pub fn muse_model_effort_for(
     user_home: &Path,
 ) -> (Option<String>, Option<String>, bool, bool) {
     let (argv_model, argv_effort, model_open, effort_open) = non_claude_argv_model_effort(argv);
-    if argv_model.is_some() {
+    if argv_model.is_some() && argv_effort.is_some() {
         return (argv_model, argv_effort, model_open, effort_open);
     }
     let var = |key: &str| {
@@ -1380,34 +1454,42 @@ pub fn muse_model_effort_for(
             .join(".config"),
     }
     .join("muse");
-    let from_settings = std::fs::read(config.join("settings.json"))
-        .ok()
-        .and_then(|b| aterm_json::from_slice::<aterm_json::Value>(&b).ok())
-        .and_then(|s| {
-            s.get("model")
-                .and_then(aterm_json::Value::as_str)
-                .and_then(parse_agy_model_label)
-        });
-    let (model, cfg_effort) = from_settings.map_or((None, None), |(m, e)| (Some(m), e));
-    (model, argv_effort.or(cfg_effort), true, effort_open)
+    let (cfg_model, cfg_effort) = settings_model_effort(&config.join("settings.json"));
+    (
+        argv_model.or(cfg_model),
+        argv_effort.or(cfg_effort),
+        model_open,
+        effort_open,
+    )
 }
 
 fn read_jsonl_tail(path: &Path, window: u64) -> Option<(Vec<u8>, u64)> {
     use std::io::{Seek, SeekFrom};
+    const MAX_WINDOW: u64 = 4 * 1024 * 1024;
     let mut f = std::fs::File::open(path).ok()?;
     let len = f.metadata().ok()?.len();
-    let mut buf = Vec::new();
-    if len > window {
-        let offset = i64::try_from(window).unwrap_or(65_536);
-        f.seek(SeekFrom::End(-offset)).ok()?;
-        f.take(window).read_to_end(&mut buf).ok()?;
-        if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-            buf.drain(..=pos);
+    let mut cur = window.max(1024);
+    loop {
+        let mut buf = Vec::new();
+        if len > cur {
+            let offset = i64::try_from(cur).unwrap_or(65_536);
+            f.seek(SeekFrom::End(-offset)).ok()?;
+            (&mut f).take(cur).read_to_end(&mut buf).ok()?;
+            if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                if !buf[pos + 1..].iter().all(u8::is_ascii_whitespace) || cur >= MAX_WINDOW {
+                    buf.drain(..=pos);
+                    return Some((buf, len));
+                }
+            } else if cur >= MAX_WINDOW {
+                return Some((buf, len));
+            }
+            cur = (cur.saturating_mul(2)).min(MAX_WINDOW);
+        } else {
+            f.seek(SeekFrom::Start(0)).ok()?;
+            (&mut f).take(len).read_to_end(&mut buf).ok()?;
+            return Some((buf, len));
         }
-    } else {
-        f.take(window).read_to_end(&mut buf).ok()?;
     }
-    Some((buf, len))
 }
 
 fn agy_db_conversation(config: &Path, file: &Path) -> Option<String> {
@@ -1482,15 +1564,15 @@ fn agy_active_conversation(
                 || super::upgrade_agy::presence_lock(config, cid).is_file()
         }
     };
-    if let Some(cid) = super::upgrade_agy::resumed_conversation(argv)
-        && ((!require_transcript && super::upgrade_agy::is_conversation_uuid(&cid))
-            || has_conversation(&cid))
-    {
-        return Some(cid);
-    }
     if pid > 0
         && let Ok(files) = aterm_uds::holders::open_files(pid)
         && let Some(cid) = agy_held_conversation(config, &files, has_conversation)
+    {
+        return Some(cid);
+    }
+    if let Some(cid) = super::upgrade_agy::resumed_conversation(argv)
+        && ((!require_transcript && super::upgrade_agy::is_conversation_uuid(&cid))
+            || has_conversation(&cid))
     {
         return Some(cid);
     }
@@ -1664,6 +1746,47 @@ fn muse_active_session_lock(
         out.reverse();
         out
     };
+    if pid > 0 {
+        if let Ok(files) = aterm_uds::holders::open_files(pid) {
+            let canon = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+            let mut held: Vec<(String, PathBuf)> = files
+                .iter()
+                .filter_map(|lock| {
+                    let session = super::upgrade_muse::session_of_lock(&canon, lock)
+                        .or_else(|| super::upgrade_muse::session_of_lock(&root, lock))?;
+                    let body = std::fs::read_to_string(lock).ok()?;
+                    (super::upgrade_muse::lock_pid(&body) == Some(pid))
+                        .then(|| (session, lock.clone()))
+                })
+                .collect();
+            held.sort();
+            held.dedup();
+            if let [(session, lock)] = held.as_slice() {
+                return Some((session.clone(), Some(lock.clone())));
+            }
+        }
+        let mut matches: Vec<(Option<std::time::SystemTime>, String, PathBuf)> = dirs(&root)
+            .into_iter()
+            .flat_map(|y| dirs(&y))
+            .flat_map(|m| dirs(&m))
+            .flat_map(|d| dirs(&d))
+            .map(|s| s.join(super::upgrade_muse::LOCK))
+            .filter_map(|lock| {
+                let session = super::upgrade_muse::session_of_lock(&root, &lock)?;
+                let body = std::fs::read_to_string(&lock).ok()?;
+                (super::upgrade_muse::lock_pid(&body) == Some(pid)).then(|| {
+                    let mtime = std::fs::metadata(&lock)
+                        .ok()
+                        .and_then(|m| m.modified().ok());
+                    (mtime, session, lock)
+                })
+            })
+            .collect();
+        matches.sort_by_key(|a| std::cmp::Reverse(a.0));
+        if let Some((_, session, lock)) = matches.into_iter().next() {
+            return Some((session, Some(lock)));
+        }
+    }
     if let Some(session) =
         super::upgrade_muse::resumed_ref(argv).filter(|s| super::upgrade_muse::is_session_uuid(s))
     {
@@ -1678,31 +1801,7 @@ fn muse_active_session_lock(
             });
         return Some((session, found));
     }
-    if pid == 0 {
-        return None;
-    }
-    let mut matches: Vec<(Option<std::time::SystemTime>, String, PathBuf)> = dirs(&root)
-        .into_iter()
-        .flat_map(|y| dirs(&y))
-        .flat_map(|m| dirs(&m))
-        .flat_map(|d| dirs(&d))
-        .map(|s| s.join(super::upgrade_muse::LOCK))
-        .filter_map(|lock| {
-            let session = super::upgrade_muse::session_of_lock(&root, &lock)?;
-            let body = std::fs::read_to_string(&lock).ok()?;
-            (super::upgrade_muse::lock_pid(&body) == Some(pid)).then(|| {
-                let mtime = std::fs::metadata(&lock)
-                    .ok()
-                    .and_then(|m| m.modified().ok());
-                (mtime, session, lock)
-            })
-        })
-        .collect();
-    matches.sort_by_key(|a| std::cmp::Reverse(a.0));
-    matches
-        .into_iter()
-        .next()
-        .map(|(_, session, lock)| (session, Some(lock)))
+    None
 }
 
 /// Formats the manual `muse resume <uuid>` command line for an active `muse` session.
@@ -1747,6 +1846,10 @@ fn agy_exe_for(argv: &[String], user_home: &Path) -> Option<PathBuf> {
     {
         return Some(first.to_path_buf());
     }
+    let user_bin = user_home.join(".local/bin/agy");
+    if user_bin.is_file() {
+        return Some(user_bin);
+    }
     if std::env::var_os("HOME").is_some_and(|h| Path::new(&h) == user_home)
         && let Some(layout) = atpkg::store::resolve_configured()
     {
@@ -1758,35 +1861,32 @@ fn agy_exe_for(argv: &[String], user_home: &Path) -> Option<PathBuf> {
     None
 }
 
-fn fetch_agy_usage(
+fn fetch_agy_usage_doc(
     exe: &Path,
-    config: &Path,
+    argv: &[String],
+    cfg_var: Option<&str>,
     home: &Path,
-    third_party: bool,
-    now: i64,
-) -> Option<WeeklyFigure> {
-    let mut child = aterm_uds::spawnfd::command(exe)
-        .arg("--config-dir")
-        .arg(config)
+) -> Option<Vec<u8>> {
+    let mut cmd = aterm_uds::spawnfd::command(exe);
+    cmd.args(super::upgrade_agy::config_flags(argv))
         .arg("--log-file")
         .arg("/dev/null")
-        .arg("-p")
-        .arg("/usage")
-        .arg("--output-format")
-        .arg("json")
+        .args(super::agy_quota::USAGE_ARGS)
         .env("HOME", home)
         .stdin(aterm_uds::spawnfd::Stdio::null())
         .stdout(aterm_uds::spawnfd::Stdio::piped())
-        .stderr(aterm_uds::spawnfd::Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(aterm_uds::spawnfd::Stdio::null());
+    if let Some(cfg) = cfg_var {
+        cmd.env("AGY_CLI_CONFIG_DIR", cfg);
+    }
+    let mut child = cmd.spawn().ok()?;
     let stdout = child.stdout.take()?;
     let reader = std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = stdout.take(64 * 1024).read_to_end(&mut buf);
         buf
     });
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + super::agy_quota_store::LAUNCH_READ_BUDGET;
     let ok = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status.success(),
@@ -1801,8 +1901,25 @@ fn fetch_agy_usage(
         }
     };
     let bytes = reader.join().ok()?;
-    ok.then(|| parse_agy_usage_json(&bytes, third_party, now))
-        .flatten()
+    ok.then_some(bytes)
+}
+
+fn agy_quota_store_for(
+    argv: &[String],
+    home_var: Option<&str>,
+    cfg_var: Option<&str>,
+    user_home: &Path,
+) -> Option<super::agy_quota_store::Store> {
+    if cfg_var.is_some() || !std::env::var_os("HOME").is_some_and(|h| Path::new(&h) == user_home) {
+        return None;
+    }
+    let state = super::agy_quota_store::machine_state()?;
+    let home_override = home_var.filter(|h| Path::new(h) != user_home);
+    let flags = super::upgrade_agy::config_flags(argv);
+    Some(super::agy_quota_store::Store::new(
+        &state,
+        &super::agy_quota_store::launch_key(home_override, &flags),
+    ))
 }
 
 /// The account and weekly quota an `agy` process is signed in as ([`SubscriptionDisplay`]).
@@ -1814,6 +1931,24 @@ pub fn agy_subscription_for(
     prev: &SubscriptionDisplay,
     model: Option<&str>,
     now: i64,
+) -> Option<SubscriptionDisplay> {
+    let var = |key: &str| {
+        env.iter()
+            .find_map(|entry| entry.strip_prefix(key)?.strip_prefix('='))
+            .filter(|value| !value.is_empty())
+    };
+    let store = agy_quota_store_for(argv, var("HOME"), var("AGY_CLI_CONFIG_DIR"), user_home);
+    agy_subscription_with_store(argv, env, user_home, prev, model, now, store.as_ref())
+}
+
+fn agy_subscription_with_store(
+    argv: &[String],
+    env: &[String],
+    user_home: &Path,
+    prev: &SubscriptionDisplay,
+    model: Option<&str>,
+    now: i64,
+    store: Option<&super::agy_quota_store::Store>,
 ) -> Option<SubscriptionDisplay> {
     let var = |key: &str| {
         env.iter()
@@ -1850,6 +1985,7 @@ pub fn agy_subscription_for(
         lower.contains("claude") || lower.contains("gpt")
     });
     let same_email = prev.email.as_deref() == Some(email.as_str());
+    let account_switched = prev.email.is_some() && !same_email;
     let key = (config.clone(), email.clone(), third_party);
     let other_key = (config.clone(), email.clone(), !third_party);
     let (cached, other_cached) = {
@@ -1870,19 +2006,68 @@ pub fn agy_subscription_for(
         .flatten();
     let figure = match cached {
         Some((_, Some(fig))) if fig.current(now) => Some(fig),
-        Some((at, None)) if now.saturating_sub(at) < AGY_USAGE_RETRY_S => prev_figure,
         _ => {
-            if let Some(exe) = agy_exe_for(argv, user_home) {
-                let fetched = fetch_agy_usage(&exe, &config, &home_dir, third_party, now);
+            let store_reading = store
+                .filter(|_| !account_switched)
+                .and_then(super::agy_quota_store::Store::last);
+            let store_fig = store_reading
+                .as_ref()
+                .and_then(|r| parse_agy_usage_json(r.doc.as_bytes(), third_party, r.as_of));
+            let store_other = store_reading
+                .as_ref()
+                .and_then(|r| parse_agy_usage_json(r.doc.as_bytes(), !third_party, r.as_of));
+            let fallback = prev_figure
+                .or_else(|| cached.and_then(|(_, f)| f))
+                .or(store_fig);
+            if let Some(fig) = store_fig.filter(|f| f.current(now)) {
                 let mut guard = AGY_USAGE_CACHE
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                guard
-                    .get_or_insert_with(std::collections::HashMap::new)
-                    .insert(key, (now, fetched));
-                fetched.or(prev_figure)
+                let map = guard.get_or_insert_with(std::collections::HashMap::new);
+                map.insert(key, (fig.at, Some(fig)));
+                if let Some(other_fig) = store_other {
+                    map.insert(other_key, (other_fig.at, Some(other_fig)));
+                }
+                Some(fig)
+            } else if matches!(cached, Some((at, None)) if now.saturating_sub(at) < AGY_USAGE_RETRY_S)
+                || (!account_switched && store.is_some_and(|s| s.recent_failure(now).is_some()))
+            {
+                fallback
             } else {
-                prev_figure
+                let lock = store.map(super::agy_quota_store::Store::try_lock);
+                if matches!(lock, Some(None)) {
+                    fallback
+                } else if let Some(exe) = agy_exe_for(argv, user_home) {
+                    let bytes =
+                        fetch_agy_usage_doc(&exe, argv, var("AGY_CLI_CONFIG_DIR"), &home_dir);
+                    let fetched = bytes
+                        .as_deref()
+                        .and_then(|b| parse_agy_usage_json(b, third_party, now));
+                    let other_fetched = bytes
+                        .as_deref()
+                        .and_then(|b| parse_agy_usage_json(b, !third_party, now));
+                    if let (Some(store), Some(bytes)) = (store, bytes)
+                        && let Ok(doc) = String::from_utf8(bytes)
+                        && let Ok(quota) = super::agy_quota::parse(&doc)
+                    {
+                        let _ = store.keep(&super::agy_quota_store::Reading {
+                            as_of: now,
+                            quota,
+                            doc,
+                        });
+                    }
+                    let mut guard = AGY_USAGE_CACHE
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let map = guard.get_or_insert_with(std::collections::HashMap::new);
+                    map.insert(key, (now, fetched));
+                    if other_fetched.is_some() {
+                        map.insert(other_key, (now, other_fetched));
+                    }
+                    fetched.or(fallback)
+                } else {
+                    fallback
+                }
             }
         }
     };

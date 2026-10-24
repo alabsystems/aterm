@@ -425,6 +425,11 @@ fn job_proc(p: &ProcFacts) -> JobProc {
         state: state(p.state),
         tty: p.tty,
         tpgid: p.tpgid,
+        term: p.term.map(|t| aterm_vitals::jobs::TermWord {
+            canonical: t.canonical,
+            echo: t.echo,
+            queued: t.queued,
+        }),
         counters: p.counters.map(|c| JobCounters {
             cpu_ns: c.cpu_ns,
             child_cpu_ns: c.child_cpu_ns,

@@ -4073,21 +4073,26 @@ impl SplitCard {
     }
 
     fn fitted_with(&self, room: f32, starved: bool) -> Self {
-        let card = if starved {
-            Self {
-                head: Vec::new(),
-                rows: self.head.iter().chain(&self.rows).cloned().collect(),
-                ..self.clone()
-            }
+        let (head, rows) = if starved {
+            (
+                Vec::new(),
+                self.head.iter().chain(&self.rows).cloned().collect(),
+            )
         } else {
-            self.clone()
+            (self.head.clone(), self.rows.clone())
+        };
+        let card = Self {
+            key: self.key.clone(),
+            spec: self.spec.clone(),
+            padding: self.padding,
+            gap: self.gap,
+            head,
+            rows: Vec::new(),
         };
         let limit = card.row_limit(room).max(1.0);
         Self {
-            rows: card
-                .rows
-                .iter()
-                .cloned()
+            rows: rows
+                .into_iter()
                 .flat_map(|row| {
                     let limit = if holds_open_disclosure(&row.0) {
                         room.max(1.0)

@@ -14,9 +14,10 @@ pub(crate) const DEV_ROWS: bool = cfg!(any(debug_assertions, feature = "dev-seam
 /// How many batches the dev `card-seen` probe looks for one drawer token's card before it gives up.
 pub(crate) const CARD_PROBE_BATCHES: u16 = 256;
 
-/// Whether this process runs the dev `card-seen` probe (`SessionFactory::card_probe`).
+/// Whether this process runs the dev `card-seen` probe (`SessionFactory::card_probe`), read
+/// through [`aterm_types::dev_seam!`], which compiles to `None` exactly where [`DEV_ROWS`] is off.
 pub(crate) fn card_probe_requested() -> bool {
-    DEV_ROWS && std::env::var_os("ATERM_DEV_CARD_PROBE").is_some_and(|v| v == "1")
+    aterm_types::dev_seam!("ATERM_DEV_CARD_PROBE").is_some_and(|v| v == "1")
 }
 
 const C_MAX: usize = 512;
@@ -42,6 +43,8 @@ impl CardProgram {
             aterm_phase::Program::Agy => Some(Self::Agy),
             aterm_phase::Program::Muse => Some(Self::Muse),
             aterm_phase::Program::Codex
+            | aterm_phase::Program::Grok
+            | aterm_phase::Program::Kimi
             | aterm_phase::Program::Gemini
             | aterm_phase::Program::Generic => None,
         }
@@ -80,6 +83,16 @@ impl CardProgram {
             Self::Claude => aterm_phase::turn::LAUNCH_CARD_ROWS,
             Self::Agy => aterm_phase::agy::LAUNCH_CARD_ROWS,
             Self::Muse => aterm_phase::muse::LAUNCH_CARD_ROWS,
+        }
+    }
+
+    /// The gate this drawer's card is held to under `token`, its banner's build held to `build`.
+    pub(crate) const fn gate(self, token: u64, build: GateBuild) -> CardGate {
+        CardGate {
+            token,
+            kind: self.rows_kind(),
+            rows: self.card_rows(),
+            build,
         }
     }
 }
@@ -123,6 +136,63 @@ pub(crate) enum GateBuild {
     ProvenanceOnly,
     /// No build to hold the banner to.
     None,
+}
+
+/// The process group each holder-fence mark's drawer image leads (card engine §3.7). Marks are
+/// retired by liveness: when the process watch hears a stopped drawer's leader exit
+/// (`exec_edges::ExecEdges::take_gone`), the parse stage retires its mark
+/// (`Terminal::retire_holder_mark`), so dead stopped drawers never push a live one's mark out
+/// past [`aterm_core::terminal::MAX_HOLDER_MARKS`]. A cut to a drawer image (`spawn::note_cut`)
+/// and a restore's adoption (`spawn::adopt_restored_holder`) note the group of each mark they
+/// lay; the session timeline keeps the book, so a reattached reader still has it.
+#[derive(Debug, Default)]
+pub(crate) struct DrawerGroups(Vec<(i32, u64)>);
+
+impl DrawerGroups {
+    /// `led` (a group, and the token of the drawer image leading it) holds a mark, and `marks` are
+    /// every mark the fence holds now: the groups of marks gone are forgotten.
+    pub(crate) fn note(&mut self, led: Option<(i32, u64)>, marks: &[u64]) {
+        if let Some((pgid, token)) = led.filter(|&(pgid, _)| pgid > 1) {
+            self.0.retain(|&(p, t)| p != pgid && t != token);
+            self.0.push((pgid, token));
+        }
+        self.0.retain(|(_, t)| marks.contains(t));
+    }
+
+    /// The mark whose drawer led `pid`'s group, if any.
+    pub(crate) fn led_by(&self, pid: i32) -> Option<u64> {
+        self.0.iter().find(|&&(p, _)| p == pid).map(|&(_, t)| t)
+    }
+}
+
+/// What one term-lock hold's holder cuts leave [`DrawerGroups`] to note, applied once the hold
+/// ends, so the timeline's lock is never taken under the terminal's.
+#[derive(Debug, Default)]
+pub(crate) struct GroupNotes {
+    led: Vec<(i32, u64)>,
+    marks: Option<Vec<u64>>,
+}
+
+impl GroupNotes {
+    /// A cut whose incoming drawer leads `led` left the fence holding `marks`.
+    pub(crate) fn cut(&mut self, led: Option<(i32, u64)>, marks: impl Iterator<Item = u64>) {
+        self.led.extend(led);
+        self.marks = Some(marks.collect());
+    }
+
+    /// Note every cut booked, in order, into `groups`.
+    pub(crate) fn apply(self, groups: &mut DrawerGroups) {
+        let Some(marks) = self.marks else { return };
+        for led in self.led {
+            groups.note(Some(led), &marks);
+        }
+        groups.note(None, &marks);
+    }
+
+    /// Whether any cut was booked.
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.marks.is_none()
+    }
 }
 
 /// How the holder's image changed.
@@ -254,12 +324,7 @@ impl HolderImage {
         registry: impl FnOnce() -> Option<atpkg::vendor_direct::Version>,
     ) -> Option<CardGate> {
         let drawer = self.drawer?;
-        Some(CardGate {
-            token: self.token?,
-            kind: drawer.rows_kind(),
-            rows: drawer.card_rows(),
-            build: self.gate_build(registry)?,
-        })
+        Some(drawer.gate(self.token?, self.gate_build(registry)?))
     }
 
     /// A matching family and known version on the screen.
@@ -872,6 +937,8 @@ pub(crate) mod hold_hook {
         pub(crate) publish_after_hold: bool,
         /// The byte arm without its cut after an OSC 133 C.
         pub(crate) no_c_cut: bool,
+        /// The parse stage drops the process watch's exits, so no stopped drawer's mark retires.
+        pub(crate) no_retire: bool,
     }
 
     struct Watch {
@@ -913,6 +980,11 @@ pub(crate) mod hold_hook {
     /// Whether `session` runs the no-C-cut mutant.
     pub(crate) fn no_c_cut(session: u64) -> bool {
         knobs(session).no_c_cut
+    }
+
+    /// Whether `session` runs the no-retire mutant.
+    pub(crate) fn no_retire(session: u64) -> bool {
+        knobs(session).no_retire
     }
 
     /// Stop watching `session`; its holds.
@@ -1105,6 +1177,39 @@ mod tests {
     use super::*;
     use atpkg::image::ProgramTag;
     use atpkg::vendor_direct::Version;
+
+    /// The group book holds one token per group and only the fence's marks: an `exec` in a
+    /// group's leader re-notes it, and a mark the fence dropped (by a cut or a retirement)
+    /// takes its group with it, so the book never outgrows the fence's eight marks.
+    #[test]
+    fn the_group_book_holds_only_the_fences_marks() {
+        let mut groups = DrawerGroups::default();
+        groups.note(Some((10, 1)), &[1]);
+        groups.note(Some((10, 2)), &[2]);
+        assert_eq!(
+            (groups.led_by(10), groups.0.len()),
+            (Some(2), 1),
+            "the exec'd image"
+        );
+        groups.note(Some((11, 3)), &[2, 3]);
+        groups.note(Some((1, 4)), &[2, 3, 4]);
+        assert_eq!(groups.led_by(1), None, "no group is led by pid 1");
+        for token in 5..40 {
+            groups.note(Some((10 + token as i32, token)), &[3, token]);
+        }
+        assert_eq!(groups.0.len(), 2, "only the marks: {:?}", groups.0);
+        assert_eq!((groups.led_by(11), groups.led_by(10)), (Some(3), None));
+        let mut notes = GroupNotes::default();
+        assert!(notes.is_empty());
+        notes.cut(Some((50, 50)), [39, 50].into_iter());
+        notes.cut(None, [50].into_iter());
+        notes.apply(&mut groups);
+        assert_eq!(
+            groups.0,
+            [(50, 50)],
+            "a hold's cuts apply in order, the last fence's marks kept"
+        );
+    }
 
     fn image(pgid: i32, start: u64, exe: &str, program: &str, source: ImageSource) -> HolderImage {
         HolderImage::of(
@@ -1492,8 +1597,8 @@ mod tests {
     }
 
     /// THE ORACLE: where the engine's parser dispatches each OSC the engine
-    /// takes as a 133/633 `C` (`Terminal::handle_osc`'s number,
-    /// `parse_shell_osc`'s first character), byte by byte.
+    /// takes as a 133/633 `C` (`TerminalHandler::osc_dispatch_inner`'s command
+    /// number, `parse_shell_osc`'s first character), byte by byte.
     #[derive(Default)]
     struct EngineCs {
         at: usize,

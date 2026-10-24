@@ -4,11 +4,12 @@
 // Added by the aterm project in 2026 to its copy of winit 0.30.13
 // (see the repository NOTICE).
 
-use std::cell::{RefCell, UnsafeCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::mem;
 use std::ops::{Deref, DerefMut};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -105,6 +106,20 @@ impl Armed {
     }
 }
 
+/// What the receiver's latest take found, for the loop that turns on it.
+#[derive(Clone, Debug)]
+pub(super) struct Drained(Rc<Cell<bool>>);
+
+impl Drained {
+    /// Whether the latest take found the queue empty under its lock, so every event sent before
+    /// that take began has been handed out. `false` after a take that found the lock held (a
+    /// sender part-way through its push, whose signal brings the loop round again) or took a batch
+    /// still being handed out.
+    pub(super) fn emptied(&self) -> bool {
+        self.0.get()
+    }
+}
+
 /// The sending half.
 pub(super) struct Sender<T> {
     queue: Arc<UnfairMutex<Queue<T>>>,
@@ -115,6 +130,7 @@ pub(super) struct Sender<T> {
 pub(super) struct Receiver<T> {
     queue: Arc<UnfairMutex<Queue<T>>>,
     armed: Armed,
+    drained: Drained,
     taken: RefCell<VecDeque<T>>,
 }
 
@@ -125,6 +141,7 @@ pub(super) fn channel<T>() -> (Sender<T>, Receiver<T>) {
     (Sender { queue: Arc::clone(&queue), armed: armed.clone() }, Receiver {
         queue,
         armed,
+        drained: Drained(Rc::new(Cell::new(true))),
         taken: RefCell::default(),
     })
 }
@@ -140,6 +157,29 @@ impl<T> Sender<T> {
     pub(super) fn send(&self, event: T) -> Result<bool, T> {
         {
             let mut queue = self.queue.lock();
+            if queue.closed {
+                return Err(event);
+            }
+            queue.events.push_back(event);
+        }
+        Ok(self.armed.arm())
+    }
+
+    /// [`Self::send`] by a sender held part-way through it, for a test that must make a take meet
+    /// a send in progress: with the queue's lock taken it reports on `held` and waits for
+    /// `release` (a one-minute hang detector) before it pushes. While it holds the lock it only
+    /// signals and waits on those channels, never sends here.
+    #[cfg(any(test, debug_assertions))]
+    pub(super) fn send_held(
+        &self,
+        event: T,
+        held: &std::sync::mpsc::Sender<()>,
+        release: &std::sync::mpsc::Receiver<()>,
+    ) -> Result<bool, T> {
+        {
+            let mut queue = self.queue.lock();
+            let _ = held.send(());
+            let _ = release.recv_timeout(std::time::Duration::from_secs(60));
             if queue.closed {
                 return Err(event);
             }
@@ -169,14 +209,22 @@ impl<T> Receiver<T> {
         self.armed.clone()
     }
 
+    /// What the latest take found, for a loop that must know whether its drain handed out every
+    /// event sent before it.
+    pub(super) fn drained(&self) -> Drained {
+        self.drained.clone()
+    }
+
     fn refill(&self, taken: &mut VecDeque<T>) {
         if !taken.is_empty() {
             return;
         }
         self.armed.clear();
-        if let Some(mut queue) = self.queue.try_lock() {
+        let emptied = self.queue.try_lock().is_some_and(|mut queue| {
             mem::swap(taken, &mut queue.events);
-        }
+            taken.is_empty()
+        });
+        self.drained.0.set(emptied);
     }
 }
 
@@ -254,6 +302,42 @@ mod tests {
         holder.join().unwrap();
         assert_eq!(tx.send(8), Ok(true), "the drain cleared the flag: this send signals");
         assert_eq!(drain(&rx), [1, 7, 8]);
+    }
+
+    #[test]
+    fn a_drain_stopped_at_a_held_lock_says_a_send_before_it_may_still_be_queued() {
+        let (tx, rx) = channel();
+        let drained = rx.drained();
+        tx.send(1).unwrap();
+        assert_eq!(drain(&rx), [1]);
+        assert!(drained.emptied(), "the drain ended on an empty queue");
+        tx.send(2).unwrap();
+        let (held_tx, held_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let queue = Arc::clone(&tx.queue);
+        let holder = std::thread::spawn(move || {
+            let mut guard = queue.lock();
+            held_tx.send(()).unwrap();
+            let _ = go_rx.recv_timeout(MUST_HAPPEN);
+            guard.events.push_back(3);
+        });
+        held_rx.recv_timeout(MUST_HAPPEN).expect("the holder took the lock");
+        assert_eq!(
+            drain(&rx),
+            Vec::<u32>::new(),
+            "2 was sent in full, yet this drain took nothing"
+        );
+        assert!(!drained.emptied(), "so it does not claim to have emptied the queue");
+        go_tx.send(()).unwrap();
+        holder.join().unwrap();
+        assert_eq!(drain(&rx), [2, 3], "the next drain hands out what the stopped one left");
+        assert!(drained.emptied());
+        tx.send(4).unwrap();
+        tx.send(5).unwrap();
+        assert_eq!(rx.try_next(), Some(4), "a drain cut short after one event");
+        assert!(!drained.emptied(), "5 is taken but not handed out");
+        assert_eq!(drain(&rx), [5]);
+        assert!(drained.emptied());
     }
 
     #[test]

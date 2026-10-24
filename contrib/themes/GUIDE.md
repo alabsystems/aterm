@@ -323,15 +323,15 @@ aterm theme import ~/Downloads/tokyonight.conf             # kitty
 aterm theme import "Some Scheme.itermcolors" --name "Some Scheme"
 ```
 
-`aterm theme import` reads kitty, Ghostty, Alacritty (TOML), iTerm2 (`.itermcolors`), Windows
-Terminal (JSON) and base16/base24 (YAML). It works offline, follows no URL or include, refuses
-files over 256 KiB, and lists every key it dropped. It writes a native `.conf` only after
-reading it back through aterm's own parser. An import keeps colours only: another terminal's
-font lines are often paths or font patterns, so they are listed as dropped, never translated
-(add the typography keys yourself). A foreign file dropped straight into the folder does
-not load, and its error names `aterm theme import`. Run `aterm theme check --strict` on the
-result: ported palettes often miss the floor, which is why aterm's built-in ports carry their
-own fixed selection bands.
+`aterm theme import` reads kitty, Ghostty, Alacritty and WezTerm (TOML), iTerm2
+(`.itermcolors`), Terminal.app (`.terminal`), Windows Terminal (JSON) and base16/base24 (YAML).
+It works offline, follows no URL or include, refuses files over 256 KiB, and lists every key it
+dropped. It writes a native `.conf` only after reading it back through aterm's own parser. An
+import keeps colours only: another terminal's font lines are often paths or font patterns, so
+they are listed as dropped, never translated (add the typography keys yourself). A foreign file
+dropped straight into the folder does not load, and its error names `aterm theme import`. Run
+`aterm theme check --strict` on the result: ported palettes often miss the floor, which is why
+aterm's built-in ports carry their own fixed selection bands.
 
 ## Sharing a theme
 

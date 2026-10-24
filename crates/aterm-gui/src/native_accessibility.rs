@@ -1205,6 +1205,11 @@ fn lower_node(
         lower_state(&mut node, semantic.role, state);
     }
     lower_value(&mut node, semantic)?;
+    // A Text node lowers to a Label, whose words AppKit and AT-SPI read from
+    // its value (`label_comes_from_value`); UIA names it by the label it keeps.
+    if semantic.role == SemanticRole::Text && node.value().is_none() && !semantic.label.is_empty() {
+        node.set_value(semantic.label.clone());
+    }
 
     if matches!(semantic.role, SemanticRole::RichText) {
         node.set_read_only();
@@ -1723,6 +1728,82 @@ mod tests {
         assert!(family.supports_action(Action::SetValue));
         assert!(!family.supports_action(Action::ReplaceSelectedText));
         assert_eq!(node(&projection, "status").live(), Some(Live::Polite));
+    }
+
+    #[test]
+    fn a_text_node_lowers_its_words_into_the_value_a_label_reads() {
+        let words = |key: &str, text: &str, role: SemanticRole| {
+            UiNode::new(
+                key,
+                UiContent::Text(TextSpec {
+                    text: text.to_string(),
+                    role,
+                    style: StyleRef::Plain,
+                }),
+            )
+            .layout(Layout::default().height(Length::Fixed(20.0)))
+        };
+        let compiled = UiTree::new(
+            UiNode::new(
+                "app",
+                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Application)),
+            )
+            .layout(Layout::column().clipped())
+            .children(vec![
+                words("title", "Appearance", SemanticRole::Heading),
+                words("note", "Changes apply at once", SemanticRole::Text),
+                UiNode::new(
+                    "brand",
+                    UiContent::Group(GroupSpec {
+                        label: Some("aterm · ALab".to_string()),
+                        role: SemanticRole::Text,
+                        style: StyleRef::Plain,
+                    }),
+                )
+                .layout(Layout::default().height(Length::Fixed(20.0))),
+            ]),
+        )
+        .compile(LogicalRect::new(0.0, 0.0, 240.0, 80.0))
+        .unwrap();
+        let projection = project_native_accessibility(&compiled, None).unwrap();
+
+        let note = node(&projection, "note");
+        assert_eq!(note.role(), Role::Label);
+        assert_eq!(note.value(), Some("Changes apply at once"));
+        assert_eq!(note.label(), Some("Changes apply at once"), "UIA's Name");
+        let brand = node(&projection, "brand");
+        assert_eq!(brand.role(), Role::Label);
+        assert_eq!(brand.value(), Some("aterm · ALab"));
+        let title = node(&projection, "title");
+        assert_eq!(title.role(), Role::Heading);
+        assert_eq!(title.label(), Some("Appearance"));
+        assert_eq!(title.value(), None, "a heading names itself by its label");
+
+        let explicit = CompiledUi {
+            semantics: vec![
+                semantic("app", None, SemanticRole::Application, SemanticValue::None),
+                semantic(
+                    "version",
+                    Some("app"),
+                    SemanticRole::Text,
+                    SemanticValue::Text("1.2.3".to_string()),
+                ),
+                SemanticNode {
+                    label: String::new(),
+                    ..semantic(
+                        "blank",
+                        Some("app"),
+                        SemanticRole::Text,
+                        SemanticValue::None,
+                    )
+                },
+            ],
+            ..CompiledUi::default()
+        };
+        let projection = project_native_accessibility(&explicit, None).unwrap();
+        assert_eq!(node(&projection, "version").value(), Some("1.2.3"));
+        assert_eq!(node(&projection, "version").label(), Some("version"));
+        assert_eq!(node(&projection, "blank").value(), None);
     }
 
     #[test]

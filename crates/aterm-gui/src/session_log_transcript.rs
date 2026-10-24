@@ -123,6 +123,8 @@ const fn reader_of(who: aterm_phase::Program) -> Option<Source> {
         aterm_phase::Program::Agy
         | aterm_phase::Program::Muse
         | aterm_phase::Program::Gemini
+        | aterm_phase::Program::Grok
+        | aterm_phase::Program::Kimi
         | aterm_phase::Program::Generic => None,
     }
 }

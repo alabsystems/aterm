@@ -11984,7 +11984,17 @@ impl Renderer {
         } = *ctx;
         let ch = self.cell_h as i32;
         let (band0, band1) = (y0 as i32 - 1, y0 as i32 + ch + 1);
-        if !knocks.iter().any(|k| k[1] < band1 && k[3] > band0) {
+        let mut kx_min = i32::MAX;
+        let mut kx_max = i32::MIN;
+        let mut row_knock_count = 0usize;
+        for k in knocks {
+            if k[1] < band1 && k[3] > band0 {
+                kx_min = kx_min.min(k[0]);
+                kx_max = kx_max.max(k[2]);
+                row_knock_count += 1;
+            }
+        }
+        if row_knock_count == 0 {
             return;
         }
         let cols = input.cols;
@@ -12011,9 +12021,12 @@ impl Renderer {
                 (p.x, p.w, p.scale, p.anchor_y)
             };
             let (x0, x1) = (x as i32 - 1, (x + cell_w) as i32 + 1);
-            if !knocks
-                .iter()
-                .any(|k| k[0] < x1 && k[2] > x0 && k[1] < band1 && k[3] > band0)
+            if x1 <= kx_min
+                || x0 >= kx_max
+                || (row_knock_count > 1
+                    && !knocks
+                        .iter()
+                        .any(|k| k[0] < x1 && k[2] > x0 && k[1] < band1 && k[3] > band0))
             {
                 continue;
             }
@@ -14349,6 +14362,48 @@ fn blit_mono_with(
     (clip_x0, clip_x1): (i32, i32),
     mix: impl Fn(u32, u32, u8) -> u32,
 ) {
+    if alpha == 0 {
+        return;
+    }
+    if xs == 1 && ys == 1 {
+        let px_len = px.len() as i64;
+        let gx = gx0 as i64;
+        let w = width as i64;
+        let x_lo = (clip_x0 as i64).max(0);
+        for j in 0..height {
+            let y = gy0 + j as i32;
+            if y < clip_y0 || y >= clip_y1 || y < 0 {
+                continue;
+            }
+            let yrow = y as i64 * stride as i64;
+            let x_cap = (stride as i64).min(px_len - yrow).min(clip_x1 as i64);
+            let Some((vx0, vx1)) = clip_span(gx, w, x_lo, x_cap) else {
+                continue;
+            };
+            let (i_lo, i_hi) = ((vx0 - gx) as usize, (vx1 - gx) as usize);
+            let row_off = j * width;
+            let srow = &bytes[row_off + i_lo..row_off + i_hi];
+            let drow = &mut px[(yrow + vx0) as usize..(yrow + vx1) as usize];
+            if alpha == 255 {
+                for (dst, &cov) in drow.iter_mut().zip(srow) {
+                    if cov != 0 {
+                        *dst = mix(*dst, color, cov);
+                    }
+                }
+            } else {
+                for (dst, &cov) in drow.iter_mut().zip(srow) {
+                    if cov == 0 {
+                        continue;
+                    }
+                    let a = ((cov as u32 * alpha as u32 + 127) / 255) as u8;
+                    if a != 0 {
+                        *dst = mix(*dst, color, a);
+                    }
+                }
+            }
+        }
+        return;
+    }
     let px_len = px.len();
     for j in 0..height {
         let srow = &bytes[j * width..j * width + width];
@@ -14356,7 +14411,11 @@ fn blit_mono_with(
             if cov == 0 {
                 continue;
             }
-            let a = ((cov as u32 * alpha as u32 + 127) / 255) as u8;
+            let a = if alpha == 255 {
+                cov
+            } else {
+                ((cov as u32 * alpha as u32 + 127) / 255) as u8
+            };
             if a == 0 {
                 continue;
             }
@@ -14965,6 +15024,7 @@ fn clone_input_stamped_inner(dst: &mut RenderInput, src: &RenderInput, drop_effe
         row_rev,
         history_renumber_epoch,
         holder,
+        screen_mutations,
         apron_row,
         apron_stamp,
         default_fg,
@@ -15095,6 +15155,7 @@ fn clone_input_stamped_inner(dst: &mut RenderInput, src: &RenderInput, drop_effe
     dst.row_rev.clone_from(row_rev);
     dst.history_renumber_epoch = *history_renumber_epoch;
     dst.holder = *holder;
+    dst.screen_mutations = *screen_mutations;
     dst.apron_row.clone_from(apron_row);
     dst.apron_stamp = *apron_stamp;
     dst.default_fg = *default_fg;

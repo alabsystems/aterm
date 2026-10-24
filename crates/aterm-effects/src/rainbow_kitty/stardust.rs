@@ -6,7 +6,7 @@
 use aterm_render::{GlowQuad, HaloMode, RainHalo, add_sat, halo_row_ny, halo_weight, premul_rgb};
 use aterm_time::Instant;
 
-use super::companion::PetShade;
+use super::companion::{KeepOut, PetShade};
 use super::ribbon::paper_mark_ink;
 use super::timing::{
     CHROMA_CULL_ALPHA, EDGE_IN_S, FIELD_STAR_COV_CEIL, GLINT_CAP, GLINT_REFILL_PER_S,
@@ -1526,6 +1526,95 @@ pub struct Stardust {
     sky_index: SkyIndex,
     /// The pet's body, which no star is drawn on ([`PetShade`]).
     pub shade: PetShade,
+    /// The word icons and the other rows' lettered and filled cells, which no
+    /// star is drawn on ([`KeepOut`]).
+    pub keep_out: KeepOut,
+    /// Each star the last frame painted ([`SkyMark`]).
+    marks: Vec<SkyMark>,
+    /// The marks' lights' keys ([`SkyMark::lights`]).
+    mark_lights: Vec<u64>,
+    paper_ink: PaperInkMemo,
+}
+
+/// One star a frame painted: its centre, the reach its arms keep a word icon
+/// by ([`KeepOut::covers`] at half of it, as the sky's own test), the
+/// window-pixel box `(x0, x1, y0, y1)` its quads and lights fill, and the
+/// keys of those lights ([`Stardust::mark_lights`]). The word pass draws its
+/// icons after the sky: an icon new to the frame still has these stars on
+/// it, which the host lifts off light by light. The box alone is not the
+/// star: other lights' pieces inside it (a train cut row by row behind a
+/// lettered row) went with it and left a dark notch in the wash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SkyMark {
+    /// The star's centre, window pixels.
+    pub at: (i32, i32),
+    /// Its arm's peak reach plus one, px: steady over the star's life, so a
+    /// lift keyed on it never blinks with the arm's scintillation.
+    pub reach: i32,
+    /// The box its marks fill, window pixels, right and bottom exclusive.
+    pub rect: (i32, i32, i32, i32),
+    /// Its own lights' keys, a range of [`Stardust::mark_lights`].
+    pub lights: (u32, u32),
+}
+
+impl SkyMark {
+    /// The mark a star painted into `quads` and `halos` (each slice the
+    /// star's own), its lights' keys appended to `keys`, or `None` when it
+    /// drew nothing.
+    #[inline]
+    #[must_use]
+    pub fn of(
+        at: (i32, i32),
+        reach: i32,
+        (quads, halos): (&[GlowQuad], &[RainHalo]),
+        keys: &mut Vec<u64>,
+    ) -> Option<Self> {
+        let rects = quads
+            .iter()
+            .map(|q| (q.x, q.y, q.w, q.h))
+            .chain(halos.iter().map(|h| (h.x, h.y, h.w, h.h)))
+            .filter(|r| r.2 > 0 && r.3 > 0)
+            .map(|(x, y, w, h)| {
+                let (x, y) = (i32::from(x), i32::from(y));
+                (x, x + i32::from(w), y, y + i32::from(h))
+            });
+        let rect = rects.reduce(|a, b| (a.0.min(b.0), a.1.max(b.1), a.2.min(b.2), a.3.max(b.3)))?;
+        let k0 = keys.len() as u32;
+        keys.extend(quads.iter().map(sky_quad_key));
+        keys.extend(halos.iter().map(sky_halo_key));
+        Some(Self {
+            at,
+            reach,
+            rect,
+            lights: (k0, keys.len() as u32),
+        })
+    }
+}
+
+/// A star's quad as its mark keys it ([`SkyMark::lights`]).
+#[inline]
+#[must_use]
+pub fn sky_quad_key(q: &GlowQuad) -> u64 {
+    let place = u64::from(q.x) | u64::from(q.y) << 16 | u64::from(q.w) << 32 | u64::from(q.h) << 48;
+    let ink = u64::from(q.color)
+        | u64::from(q.alpha) << 24
+        | u64::from(q.color2) << 32
+        | u64::from(q.alpha2) << 56;
+    aterm_hash::fnv_mix_u64(
+        aterm_hash::fnv_mix_u64(aterm_hash::FNV64_OFFSET, place),
+        ink,
+    )
+}
+
+/// A star's halo as its mark keys it ([`SkyMark::lights`]).
+#[inline]
+#[must_use]
+pub fn sky_halo_key(h: &RainHalo) -> u64 {
+    let place = u64::from(h.x) | u64::from(h.y) << 16 | u64::from(h.w) << 32 | u64::from(h.h) << 48;
+    let shape =
+        u64::from(h.cx) | u64::from(h.cy) << 16 | u64::from(h.rx) << 32 | u64::from(h.ry) << 48;
+    let seed = aterm_hash::fnv_mix_u64(aterm_hash::FNV64_OFFSET ^ 0x4841_4C4F, place);
+    aterm_hash::fnv_mix_u64(aterm_hash::fnv_mix_u64(seed, shape), u64::from(h.color))
 }
 
 impl Default for Stardust {
@@ -1553,7 +1642,33 @@ impl Stardust {
             ioi_ms: STREAM_IOI_MAX_MS,
             sky_index: SkyIndex::default(),
             shade: PetShade::default(),
+            keep_out: KeepOut::default(),
+            marks: Vec::with_capacity(STAR_POOL_MAX),
+            mark_lights: Vec::with_capacity(STAR_POOL_MAX * 8),
+            paper_ink: PaperInkMemo::default(),
         }
+    }
+
+    /// Each star the last frame painted ([`SkyMark`]).
+    #[inline]
+    #[must_use]
+    pub fn marks(&self) -> &[SkyMark] {
+        &self.marks
+    }
+
+    /// The keys of the lights the last frame's stars painted, each star's a
+    /// range ([`SkyMark::lights`]).
+    #[inline]
+    #[must_use]
+    pub fn mark_lights(&self) -> &[u64] {
+        &self.mark_lights
+    }
+
+    /// Forget the frame's marks (a frame whose output was withdrawn).
+    #[inline]
+    pub fn clear_marks(&mut self) {
+        self.marks.clear();
+        self.mark_lights.clear();
     }
 
     /// The frame's glyph truth, written by the host before the deal pass (§5.4).
@@ -1787,6 +1902,8 @@ impl Stardust {
             });
         }
         self.cull(ctx.now);
+        self.marks.clear();
+        self.mark_lights.clear();
         if self.stars.is_empty() && self.veil.is_empty() {
             return;
         }
@@ -1804,16 +1921,15 @@ impl Stardust {
             for star in self.stars.iter().filter(|s| s.class == class) {
                 let turn = i;
                 i += 1;
-                if !star.inks(ctx.cfg)
-                    || self
-                        .shade
-                        .hides(star.pos(ctx.now, ctx.cfg.reduced_motion), ctx.geom.cw)
-                {
+                if !star.inks(ctx.cfg) {
                     continue;
                 }
-                let Some(paint) = Paint::of(star, &self.probe, ctx) else {
+                let Some(paint) = Paint::of(star, &self.probe, &self.shade, ctx) else {
                     continue;
                 };
+                if paint.kept_out(ctx, &self.keep_out) {
+                    continue;
+                }
                 let left = quad_cap.saturating_sub(frame.out.len());
                 if left == 0 {
                     self.sky_index = index;
@@ -1821,10 +1937,19 @@ impl Stardust {
                 }
                 let share = (left / (n - turn)).max(M3_QUADS).min(left);
                 let star_cap = frame.out.len() + share;
+                let (q0, h0) = (frame.out.len(), frame.halos.len());
                 if ctx.cfg.dark_theme {
                     paint.draw_add(ctx, frame, star_cap, &mut haloed, &mut index);
                 } else {
-                    paint.draw_over(ctx.geom, ctx.cfg, frame, halo_cap);
+                    paint.draw_over(ctx.geom, ctx.cfg, &mut self.paper_ink, frame, halo_cap);
+                }
+                if let Some(mark) = SkyMark::of(
+                    (paint.x, paint.y),
+                    paint.reach(),
+                    (&frame.out[q0..], &frame.halos[h0..]),
+                    &mut self.mark_lights,
+                ) {
+                    self.marks.push(mark);
                 }
             }
         }
@@ -2835,6 +2960,14 @@ impl Stardust {
             let (cx, _) = g.cell_center(v.row, v.col);
             let x0 = origin_x + i32::from(v.col) * cw;
             let x1 = x0 + cw;
+            // The veil keeps off a lettered or filled cell of the row it
+            // lies in, as a star and the ribbon's top do (looks6 N4: under
+            // `underline` it tinted a powerline segment's grey bar violet).
+            let tall_px = y1 - y0;
+            let (y0, y1) = self.keep_out.below((x0, x1), (y0, y1));
+            if y1 <= y0 {
+                continue;
+            }
             let rgb = spectrum(clamp01(tri(v.t)));
             let (color, mode) = if ctx.cfg.dark_theme {
                 (premul_rgb(rgb, byte), HaloMode::Add)
@@ -2851,7 +2984,7 @@ impl Stardust {
                 cap,
                 HaloSpec {
                     centre: (cx.round() as i32, y1),
-                    radii: (rx, y1 - y0),
+                    radii: (rx, tall_px),
                     color,
                     mode,
                 },
@@ -2896,6 +3029,7 @@ struct Paint {
     y: i32,
     arm: i32,
     arm_lo: i32,
+    arm_hi: i32,
     c: f32,
     alpha: f32,
     core: f32,
@@ -2906,26 +3040,61 @@ struct Paint {
 }
 
 impl Paint {
+    /// Its arm's peak reach plus one, px: the reach every cull keys on
+    /// ([`Self::kept_out`], [`SkyMark::reach`]). Only the drawn arm
+    /// scintillates; a cull keyed on it (8-12 Hz, so 16-24 Hz in reach)
+    /// added and dropped a star sitting on a cull's edge whole at that rate,
+    /// past [`crate::TWINKLE_FLASH_BOUND_HZ`] (looks6 review).
     #[inline]
-    fn of(star: &Star, probe: &GlyphProbe, ctx: &Ctx<'_>) -> Option<Self> {
+    const fn reach(&self) -> i32 {
+        let hi = if self.arm_hi > self.arm_lo {
+            self.arm_hi
+        } else {
+            self.arm_lo
+        };
+        (if self.arm > hi { self.arm } else { hi }) + 1
+    }
+
+    /// Whether this star lies where no star is drawn: on a word icon or a
+    /// lettered or filled cell of another row ([`KeepOut`], its centre within
+    /// half an arm of one), or, on paper, with any arm within a cell of the
+    /// caret's block ([`Ctx::near_paper_caret`]); the arm at its peak, so the
+    /// answer holds for the star's life while it stands still.
+    #[inline]
+    fn kept_out(&self, ctx: &Ctx<'_>, keep_out: &KeepOut) -> bool {
+        let reach = self.reach();
+        keep_out.covers((self.x, self.y), reach / 2)
+            || ctx.near_paper_caret((self.x, self.y), reach)
+    }
+
+    #[inline]
+    fn of(star: &Star, probe: &GlyphProbe, shade: &PetShade, ctx: &Ctx<'_>) -> Option<Self> {
         let rm = ctx.cfg.reduced_motion;
         let age_s = star.age_s(ctx.now);
         let alpha = star.envelope_at_age(age_s, ctx.now, rm);
         if alpha < STAR_CULL_ALPHA {
             return None;
         }
-        let held = rm || age_s < star.class.envelope_s(star.lane).0;
-        let phase = star.lum_phase();
-        let tw = if rm { 1.0 } else { twinkle_env(age_s, phase) };
-        let (env, e) = if held {
-            (1.0, 1.0)
-        } else {
-            (tw, clamp01((tw - 0.55) / 0.45))
-        };
         let (x, y) = if rm {
             star.origin()
         } else {
             star.pos_at_age(age_s)
+        };
+        if shade.hides((x, y), ctx.geom.cw) {
+            return None;
+        }
+        let held = rm || age_s < star.class.envelope_s(star.lane).0;
+        let can_glint = !rm && star.gold && star.class == StarClass::M1;
+        let (phase, tw) = if !held || can_glint {
+            let phase = star.lum_phase();
+            (phase, twinkle_env(age_s, phase))
+        } else {
+            (0.0, 1.0)
+        };
+        let (env, e) = if held {
+            (1.0, 1.0)
+        } else {
+            (tw, clamp01((tw - 0.55) / 0.45))
         };
         let floor = star.class.core_floor();
         let mut c = star.class.cov(star.lane) * alpha * clamp01(ctx.cfg.intensity);
@@ -2939,6 +3108,7 @@ impl Paint {
             y,
             arm: arm_px_with(star, ctx.geom.ch as f32, held, age_s, phase),
             arm_lo: arm_trough_px(star.class, ctx.geom.ch as f32),
+            arm_hi: arm_peak_px(star.class, ctx.geom.ch as f32),
             c,
             alpha,
             core: if star.class == StarClass::M3 {
@@ -2948,7 +3118,7 @@ impl Paint {
             },
             env,
             tint: star.tint,
-            glints: !rm && star.gold && star.class == StarClass::M1 && twinkle_peak(tw),
+            glints: can_glint && twinkle_peak(tw),
             gold: star.gold,
         })
     }
@@ -3138,15 +3308,22 @@ impl Paint {
         }
     }
 
-    fn draw_over(&self, geom: Geom, cfg: &Config, frame: &mut Frame<'_>, halo_cap: usize) {
+    fn draw_over(
+        &self,
+        geom: Geom,
+        cfg: &Config,
+        paper_ink: &mut PaperInkMemo,
+        frame: &mut Frame<'_>,
+        halo_cap: usize,
+    ) {
         if frame.halos.len() >= halo_cap {
             return;
         }
+        let rgb = paper_ink.get(self.tint, cfg);
         let mass = (self.arm_lo as f32 * STAR_ARM_INK).max(1.0);
         let step = (self.arm - self.arm_lo).max(0);
         match self.class {
             StarClass::M3 => {
-                let rgb = star_ink_on_paper(self.tint, cfg);
                 let ink = |cov: u8, cap: f32| {
                     let a = stacked_ink_alpha(cov, InkRole::OverText).min(cap as u32);
                     rgb | (a << 24)
@@ -3190,7 +3367,7 @@ impl Paint {
                         centre: (self.x, self.y),
                         mass,
                         step,
-                        rgb: star_ink_on_paper(self.tint, cfg),
+                        rgb,
                         gold: self.glints,
                         cov: cov_byte(self.c * self.core),
                     },
@@ -3208,13 +3385,20 @@ fn arm_trough_px(class: StarClass, ch: f32) -> i32 {
     ((nominal * class.arm_floor()).round() as i32).max(class.arm_min_px(ch))
 }
 
+/// A star's arm at its scintillation's peak (and while held), px: no
+/// drawn arm is longer ([`arm_px_with`]).
+#[inline]
+fn arm_peak_px(class: StarClass, ch: f32) -> i32 {
+    (star_arm(ch, class.arm_ratio()).round() as i32).max(class.arm_min_px(ch))
+}
+
 #[inline]
 fn arm_px_with(star: &Star, ch: f32, held: bool, age_s: f32, phase: f32) -> i32 {
+    if held {
+        return arm_peak_px(star.class, ch);
+    }
     let nominal = star_arm(ch, star.class.arm_ratio());
     let min = star.class.arm_min_px(ch);
-    if held {
-        return (nominal.round() as i32).max(min);
-    }
     let floor = star.class.arm_floor();
     let s = (std::f32::consts::TAU * star.f * age_s + phase).sin();
     ((nominal * (floor + (1.0 - floor) * s * s)).round() as i32).max(min)
@@ -3613,11 +3797,14 @@ fn halo_rgb(tint: u32, gold: bool, env: f32) -> u32 {
     if gold || tint == TINT_WHITE_RGB {
         return tint;
     }
+    let breath = clamp01((env - 0.55) / 0.45) * 2.0 - 1.0;
+    let step = (breath * HALO_HUE_SWING_ENTRIES as f32).round() as i32;
+    if step == 0 {
+        return tint;
+    }
     let Some(stop) = SPECTRUM_ANCHORS.iter().position(|&c| c == tint) else {
         return tint;
     };
-    let breath = clamp01((env - 0.55) / 0.45) * 2.0 - 1.0;
-    let step = (breath * HALO_HUE_SWING_ENTRIES as f32).round() as i32;
     let at = (SPECTRUM_ANCHOR_AT[stop] as i32 + step).clamp(0, SPECTRUM_LUT_LEN as i32 - 1);
     SPECTRUM_LUT[at as usize]
 }
@@ -3894,7 +4081,7 @@ fn sky_ground<'a>(
 
 #[inline]
 #[must_use]
-fn halo_add_at(h: &RainHalo, x: i32, y: i32) -> u32 {
+fn halo_weight_at(h: &RainHalo, x: i32, y: i32) -> u8 {
     if !(i32::from(h.x)..i32::from(h.x) + i32::from(h.w)).contains(&x)
         || !(i32::from(h.y)..i32::from(h.y) + i32::from(h.h)).contains(&y)
     {
@@ -3908,7 +4095,14 @@ fn halo_add_at(h: &RainHalo, x: i32, y: i32) -> u32 {
     if wt <= 0 {
         return 0;
     }
-    premul_rgb(h.color, wt.min(255) as u8)
+    wt.min(255) as u8
+}
+
+#[inline]
+#[must_use]
+fn halo_add_at(h: &RainHalo, x: i32, y: i32) -> u32 {
+    let wt = halo_weight_at(h, x, y);
+    if wt == 0 { 0 } else { premul_rgb(h.color, wt) }
 }
 
 #[inline]
@@ -3923,25 +4117,34 @@ pub const SETTLE_PIXELS: usize = 9;
 
 fn settle_under_ceiling(frame: &mut Frame<'_>, q0: usize, h0: usize, watch: &[((i32, i32), u32)]) {
     let table = relative_luminance_table();
-    let own_at_max = |(x, y): (i32, i32)| -> u32 {
+    let own_at_max = |(x, y): (i32, i32)| -> (u32, u32, u8) {
         let mut own = 0u32;
         for q in &frame.out[q0..] {
             if quad_covers(q, x, y) {
                 own = add_sat(own, q.color & 0x00FF_FFFF);
             }
         }
+        let mut halo_color = 0u32;
+        let mut halo_wt = 0u8;
         for h in &frame.halos[h0..] {
-            own = add_sat(own, halo_add_at(h, x, y));
+            let wt = halo_weight_at(h, x, y);
+            if wt > 0 {
+                own = add_sat(own, premul_rgb(h.color, wt));
+                halo_color = h.color;
+                halo_wt = wt;
+                break;
+            }
         }
-        own
+        (own, halo_color, halo_wt)
     };
-    let mut over = [((0i32, 0i32), 0u32); SETTLE_PIXELS];
+    let mut over = [((0i32, 0i32), 0u32, 0u32, 0u8); SETTLE_PIXELS];
     let mut over_len = 0usize;
     for &(p, ground) in watch {
-        if !under_ceil_with(table, add_sat(ground, own_at_max(p)))
+        let (own, halo_color, halo_wt) = own_at_max(p);
+        if !under_ceil_with(table, add_sat(ground, own))
             && let Some(slot) = over.get_mut(over_len)
         {
-            *slot = (p, ground);
+            *slot = (p, ground, halo_color, halo_wt);
             over_len += 1;
         }
     }
@@ -3949,32 +4152,24 @@ fn settle_under_ceiling(frame: &mut Frame<'_>, q0: usize, h0: usize, watch: &[((
         return;
     }
     let over = &over[..over_len];
-    let own_at = |k: u8, (x, y): (i32, i32)| -> u32 {
+    let own_at = |k: u8, (x, y): (i32, i32), halo_color: u32, halo_wt: u8| -> u32 {
         let mut own = 0u32;
         for q in &frame.out[q0..] {
             if quad_covers(q, x, y) {
                 own = add_sat(own, premul_rgb(q.color, k));
             }
         }
-        for h in &frame.halos[h0..] {
-            if !(i32::from(h.x)..i32::from(h.x) + i32::from(h.w)).contains(&x)
-                || !(i32::from(h.y)..i32::from(h.y) + i32::from(h.h)).contains(&y)
-            {
-                continue;
-            }
-            let piece = RainHalo {
-                color: premul_rgb(h.color, k),
-                ..*h
-            };
-            own = add_sat(own, halo_add_at(&piece, x, y));
+        if halo_wt > 0 {
+            own = add_sat(own, premul_rgb(premul_rgb(halo_color, k), halo_wt));
         }
         own
     };
     let fits = |k: u8| {
-        over.iter()
-            .all(|&(p, ground)| under_ceil_with(table, add_sat(ground, own_at(k, p))))
+        over.iter().all(|&(p, ground, halo_color, halo_wt)| {
+            under_ceil_with(table, add_sat(ground, own_at(k, p, halo_color, halo_wt)))
+        })
     };
-    let k = fit_byte(u8::MAX, fits);
+    let k = fit_byte(u8::MAX - 1, fits);
     for q in &mut frame.out[q0..] {
         q.color = premul_rgb(q.color, k);
         q.color2 = premul_rgb(q.color2, k);
@@ -4001,7 +4196,7 @@ fn stacked_centre(base: u32, rgb: u32, cov: u8) -> u32 {
 #[inline]
 #[must_use]
 fn fit_byte(want: u8, under: impl Fn(u8) -> bool) -> u8 {
-    if under(want) {
+    if want == 0 || under(want) {
         return want;
     }
     if !under(0) {
@@ -4063,6 +4258,36 @@ pub(crate) struct LightStar {
     pub(crate) rgb: u32,
     pub(crate) gold: bool,
     pub(crate) cov: u8,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PaperInkMemo {
+    theme: (u32, u32),
+    len: u8,
+    entries: [(u32, u32); 9],
+}
+
+impl PaperInkMemo {
+    #[inline]
+    fn get(&mut self, tint: u32, cfg: &Config) -> u32 {
+        let theme = (cfg.theme_fg & 0x00FF_FFFF, cfg.theme_bg & 0x00FF_FFFF);
+        if self.theme != theme {
+            self.theme = theme;
+            self.len = 0;
+        }
+        let len = usize::from(self.len);
+        for &(t, rgb) in &self.entries[..len] {
+            if t == tint {
+                return rgb;
+            }
+        }
+        let rgb = star_ink_on_paper(tint, cfg);
+        if len < self.entries.len() {
+            self.entries[len] = (tint, rgb);
+            self.len = (len + 1) as u8;
+        }
+        rgb
+    }
 }
 
 #[inline]
@@ -6422,6 +6647,125 @@ mod tests {
         }
     }
 
+    /// The aurora keeps off a filled cell of the row it lies in (looks6 N4:
+    /// under `underline` its veils tinted a powerline segment's grey bar
+    /// violet; the bar is filled, not inked, so the sky probe saw it free).
+    /// The control is the same run with nothing kept out: its veils lie on
+    /// those cells.
+    #[test]
+    fn the_aurora_keeps_off_a_filled_cell_above() {
+        let c = cfg(true);
+        let t0 = Instant::now();
+        let ribbon = Ribbon::new();
+        let g = geom();
+        let (cw, ch) = (g.cw as i32, g.ch as i32);
+        let bar = (
+            i32::from(g.origin_x) + 20 * cw,
+            i32::from(g.origin_x) + 36 * cw,
+            i32::from(g.origin_y) + 4 * ch,
+            i32::from(g.origin_y) + 5 * ch,
+        );
+        let on_bar = |kept: bool| -> usize {
+            let mut sky = Stardust::new();
+            sky.probe_mut().probe_row(4, &[false; 120]);
+            if kept {
+                sky.keep_out.set([bar]);
+            }
+            let mut n = 0;
+            for k in 0..40u16 {
+                let at = key_at(t0, k);
+                let mut cx = ctx(at, &c, (5, 10 + k));
+                cx.disp = disp_at_12cps(k);
+                cx.birth_disp = cx.disp;
+                cx.caret_t = 0.0;
+                sky.budget.refill(at);
+                sky.on_event(&typed(TypedClass::Glyph), at, &cx, &ribbon);
+                let mut sc = Scratch::default();
+                sky.emit(&cx, &mut sc.frame());
+                n += veils(&sc)
+                    .iter()
+                    .filter(|h| {
+                        let (x0, y0) = (i32::from(h.x), i32::from(h.y));
+                        let (x1, y1) = (x0 + i32::from(h.w), y0 + i32::from(h.h));
+                        x0 < bar.1 && bar.0 < x1 && y0 < bar.3 && bar.2 < y1
+                    })
+                    .count();
+            }
+            n
+        };
+        assert!(
+            on_bar(false) > 0,
+            "control: the free sky's veils lie on the bar"
+        );
+        assert_eq!(
+            on_bar(true),
+            0,
+            "a veil tints a filled cell of the row above"
+        );
+    }
+
+    /// The gallery's judges (looks6 round 3): beside the dog's face the
+    /// sky's band stepped square at the icon's sprite box, a cell wider
+    /// than the face each side, where the aurora's veils were dropped whole.
+    /// The frame's shade cuts a light by the face's drawn rows
+    /// (`CursorGlow::shade_word_icons`), so the aurora keeps off a lettered
+    /// or filled cell's box but leaves an icon's to that shade: its veils
+    /// lie in the icon box's columns, and with the box cut as a filled
+    /// cell's (the negative control) none does.
+    #[test]
+    fn the_aurora_leaves_a_word_icon_to_its_face_s_shade() {
+        let c = cfg(true);
+        let t0 = Instant::now();
+        let ribbon = Ribbon::new();
+        let g = geom();
+        let (cw, ch) = (g.cw as i32, g.ch as i32);
+        let icon = (
+            i32::from(g.origin_x) + 20 * cw,
+            i32::from(g.origin_x) + 24 * cw,
+            i32::from(g.origin_y) + 4 * ch,
+            i32::from(g.origin_y) + 5 * ch,
+        );
+        let in_box = |as_cell: bool| -> usize {
+            let mut sky = Stardust::new();
+            sky.probe_mut().probe_row(4, &[false; 120]);
+            if as_cell {
+                sky.keep_out.set([icon]);
+            } else {
+                sky.keep_out.set_split([icon], []);
+            }
+            let mut n = 0;
+            for k in 0..40u16 {
+                let at = key_at(t0, k);
+                let mut cx = ctx(at, &c, (5, 10 + k));
+                cx.disp = disp_at_12cps(k);
+                cx.birth_disp = cx.disp;
+                cx.caret_t = 0.0;
+                sky.budget.refill(at);
+                sky.on_event(&typed(TypedClass::Glyph), at, &cx, &ribbon);
+                let mut sc = Scratch::default();
+                sky.emit(&cx, &mut sc.frame());
+                n += veils(&sc)
+                    .iter()
+                    .filter(|h| {
+                        let (x0, y0) = (i32::from(h.x), i32::from(h.y));
+                        let (x1, y1) = (x0 + i32::from(h.w), y0 + i32::from(h.h));
+                        x0 < icon.1 && icon.0 < x1 && y0 < icon.3 && icon.2 < y1
+                    })
+                    .count();
+            }
+            n
+        };
+        assert!(
+            in_box(false) > 0,
+            "the aurora's veils are dropped whole in a word icon's box"
+        );
+        assert_eq!(
+            in_box(true),
+            0,
+            "control: cut as a filled cell, the box still takes a veil"
+        );
+    }
+
     #[test]
     fn the_aurora_is_not_drawn_on_paper() {
         let t0 = Instant::now();
@@ -8605,5 +8949,105 @@ mod tests {
                 "({x}, {y}) under a cell-less geometry"
             );
         }
+    }
+
+    /// A star standing on a cull's edge is drawn or dropped for its whole
+    /// life, never in step with its arm's scintillation (looks6 review: the
+    /// keep-out and paper-caret culls keyed on the drawn arm, 8-12 Hz, so a
+    /// star whose reach straddled a box's edge or the caret's margin was
+    /// added and dropped whole at 15-24 Hz). Every placement across the
+    /// band, on a keep-out box (dark and paper) and on the paper caret's
+    /// margin, makes at most [`crate::TWINKLE_FLASH_BOUND_HZ`] visibility
+    /// transitions in any second, and the star's mark keeps one reach, the
+    /// value `lift_stars` keys on. The negative control culls the same
+    /// frames by the drawn arm: some placement then toggles past the bound.
+    #[test]
+    fn a_star_on_a_cull_s_edge_never_blinks_with_its_arm() {
+        let t0 = Instant::now();
+        let g = geom();
+        let bound = crate::TWINKLE_FLASH_BOUND_HZ as usize;
+        let at = |k: u64| t0 + Duration::from_micros(k * 16_667);
+        let worst_second = |on: &[bool]| {
+            on.windows(61)
+                .map(|w| w.windows(2).filter(|p| p[0] != p[1]).count())
+                .max()
+                .unwrap_or(0)
+        };
+        let caret_far = (3u16, 10u16);
+        let caret = (3u16, 30u16);
+        let margin = i32::from(g.origin_x) + i32::from(caret.1) * g.cw as i32 - g.cw as i32;
+        let mut control_worst = 0usize;
+        for dark in [true, false] {
+            let c = cfg(dark);
+            for class in [StarClass::M1, StarClass::M2, StarClass::M3] {
+                for lane in [StarLane::Strike, StarLane::Field] {
+                    let lo = arm_trough_px(class, g.ch as f32) + 1;
+                    let hi = arm_peak_px(class, g.ch as f32) + 1;
+                    // (star x, keep-out box, caret) for each placement.
+                    let mut placements = Vec::new();
+                    let x = 200i32;
+                    for x0 in (x + lo / 2 - 1)..=(x + hi / 2 + 1) {
+                        placements.push((x, Some((x0, x0 + 30, 96, 104)), caret_far));
+                    }
+                    if !dark {
+                        for sx in (margin - hi - 1)..=(margin - lo + 1) {
+                            placements.push((sx, None, caret));
+                        }
+                    }
+                    let (mut drew, mut culled) = (false, false);
+                    for (sx, boxed, car) in placements {
+                        let mut st = star(class, lane, t0, TINT_WHITE_RGB);
+                        st.x = sx as f32;
+                        let mut sky = sky();
+                        sky.sow(st);
+                        if let Some(b) = boxed {
+                            sky.keep_out.set([b]);
+                        }
+                        let (mut on, mut old, mut reaches) = (Vec::new(), Vec::new(), Vec::new());
+                        for k in 0..240u64 {
+                            let cx = ctx_in(g, at(k), &c, car);
+                            let mut sc = Scratch::default();
+                            sky.emit(&cx, &mut sc.frame());
+                            on.push(sc.out.len() + sc.halos.len() > 0);
+                            reaches.extend(sky.marks().first().map(|m| m.reach));
+                            // The control: the same cull keyed on the drawn arm.
+                            let painted = Paint::of(&st, &sky.probe, &sky.shade, &cx);
+                            old.push(
+                                st.inks(&c)
+                                    && painted.is_some_and(|p| {
+                                        let reach = p.arm.max(p.arm_lo) + 1;
+                                        !(sky.keep_out.covers((p.x, p.y), reach / 2)
+                                            || cx.near_paper_caret((p.x, p.y), reach))
+                                    }),
+                            );
+                        }
+                        let what = format!(
+                            "dark={dark} {class:?}/{lane:?} star x {sx} box {boxed:?} caret {car:?}"
+                        );
+                        let n = worst_second(&on);
+                        assert!(
+                            n <= bound,
+                            "{what}: {n} visibility transitions in one second (bound {bound})"
+                        );
+                        reaches.dedup();
+                        assert!(
+                            reaches.len() <= 1,
+                            "{what}: the star's mark changes reach {reaches:?}"
+                        );
+                        drew |= on.iter().any(|&o| o);
+                        culled |= !on.iter().any(|&o| o);
+                        control_worst = control_worst.max(worst_second(&old));
+                    }
+                    assert!(
+                        drew && culled,
+                        "dark={dark} {class:?}/{lane:?}: the sweep never crosses the cull's edge (drew {drew}, culled {culled})"
+                    );
+                }
+            }
+        }
+        assert!(
+            control_worst > bound,
+            "control: culled by the drawn arm, the worst placement toggles only {control_worst} times in a second"
+        );
     }
 }

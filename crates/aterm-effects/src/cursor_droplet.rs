@@ -79,8 +79,8 @@ pub struct DropletFrame {
 fn ramp_band_on(ground: u32) -> (f32, f32) {
     let table = crate::color_math::relative_luminance_table();
     let lum_g = crate::color_math::relative_luminance_with(table, ground);
-    let meets = |t: f32| {
-        let lum_w = crate::color_math::relative_luminance_with(table, water_ramp(t));
+    let meets_rgb = |rgb: u32| {
+        let lum_w = crate::color_math::relative_luminance_with(table, rgb);
         let (hi, lo) = if lum_w > lum_g {
             (lum_w, lum_g)
         } else {
@@ -90,20 +90,30 @@ fn ramp_band_on(ground: u32) -> (f32, f32) {
     };
     let dark = aterm_render::theme_is_dark(ground);
     let far = if dark { 1.0 } else { 0.0 };
-    if !meets(far) {
+    let far_rgb = water_ramp(far);
+    if !meets_rgb(far_rgb) {
         return (far, far);
     }
     let near = 1.0 - far;
-    if meets(near) {
+    let near_rgb = water_ramp(near);
+    if meets_rgb(near_rgb) {
         return (0.0, 1.0);
     }
     let (mut pass, mut fail) = (far, near);
+    let (mut pass_rgb, mut fail_rgb) = (far_rgb, near_rgb);
     for _ in 0..20 {
         let mid = 0.5 * (pass + fail);
-        if meets(mid) {
+        let mid_rgb = water_ramp(mid);
+        if mid_rgb == pass_rgb {
             pass = mid;
+        } else if mid_rgb == fail_rgb {
+            fail = mid;
+        } else if meets_rgb(mid_rgb) {
+            pass = mid;
+            pass_rgb = mid_rgb;
         } else {
             fail = mid;
+            fail_rgb = mid_rgb;
         }
     }
     if dark { (pass, 1.0) } else { (0.0, pass) }
@@ -359,7 +369,9 @@ fn cut_at_surface(out: &mut Vec<GlowQuad>, from: usize, foot: i32) {
         if y + h > foot {
             q.h = (foot - y) as u16;
         }
-        out[keep] = q;
+        if keep != i || q.h != out[i].h {
+            out[keep] = q;
+        }
         keep += 1;
     }
     out.truncate(keep);

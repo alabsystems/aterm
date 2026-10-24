@@ -13,9 +13,10 @@ use std::time::{Duration, Instant};
 
 use aterm_json::{Map, Value};
 
-use super::accounts::{self, Class, Roster, Row};
+use super::accounts::{self, Class, Cli, Roster, Row};
 use super::cli::{ACCOUNTS_OWN_LABEL, Env};
 use super::upgrade;
+use crate::ai::connector::{Flow, Region, RowKeys};
 
 /// Table name whose [`SOURCE_KEY`] names this machine's fleet accounts source.
 pub const SOURCE_TABLE: &str = "fleet";
@@ -65,7 +66,9 @@ pub const DEFAULT_SERVE_BIND: &str = "127.0.0.1:8741";
 
 const TRANSCRIPT_TAIL_BYTES: u64 = 256 * 1024;
 
-/// One active Claude Code account in the fleet roster.
+/// One active account in a fleet roster: Claude Code's ([`FleetRoster::from_toml`],
+/// [`parse_accounting_csv`]), or another pooled CLI's ([`FleetRoster::from_toml_for`],
+/// [`parse_accounting_csv_for`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FleetAccount {
     /// Canonical roster label (`m8`, `m8-2`, `m106-m38`, …).
@@ -78,6 +81,8 @@ pub struct FleetAccount {
     pub email: String,
     /// Optional browser profile hint.
     pub browser: Option<String>,
+    /// Its vendor keys in another CLI's pool (`region`, `flow`); none in Claude Code's.
+    pub vendor: accounts::Vendor,
 }
 
 /// Complete fleet account table parsed from CSV or the fleet roster file.
@@ -157,6 +162,17 @@ impl FleetRoster {
     /// Returns a human-readable error if the TOML is invalid, `account` is not an array of tables,
     /// or any row is missing required fields or carries a refused label or email.
     pub fn from_toml(text: &str, source: &str) -> Result<Self, String> {
+        Self::from_toml_for(Cli::Claude, text, source)
+    }
+
+    /// Parse `cli`'s fleet roster ([`cli_fleet_file`]): [`Self::from_toml`]'s rows, plus the
+    /// vendor keys `cli`'s rows take ([`RowKeys`]): a Kimi Code row names its `region`, a Codex
+    /// or Grok Build row may name its `flow`. Claude Code's is [`Self::from_toml`], whose rows
+    /// carry no vendor key and whose other keys are ignored as they always were.
+    /// # Errors
+    /// As [`Self::from_toml`]; and, in another CLI's, a vendor key the CLI does not take, one
+    /// that is not a word it knows, or a Kimi Code row with no `region`.
+    pub fn from_toml_for(cli: Cli, text: &str, source: &str) -> Result<Self, String> {
         let table: aterm_toml::Table = aterm_toml::from_str(text)
             .map_err(|e| format!("fleet roster at {source} is not valid TOML: {e}"))?;
         let mut accounts = Vec::new();
@@ -220,12 +236,17 @@ impl FleetRoster {
                 .get("browser")
                 .and_then(aterm_toml::Value::as_str)
                 .map(str::to_owned);
+            let vendor = match cli {
+                Cli::Claude => accounts::Vendor::default(),
+                _ => fleet_vendor(cli, row, idx + 1, &label)?,
+            };
             accounts.push(FleetAccount {
                 label,
                 machines,
                 class,
                 email,
                 browser,
+                vendor,
             });
         }
         Ok(Self {
@@ -233,6 +254,60 @@ impl FleetRoster {
             accounts,
         })
     }
+}
+
+/// The vendor keys of `cli`'s fleet roster row `n` ([`FleetRoster::from_toml_for`]).
+fn fleet_vendor(
+    cli: Cli,
+    row: &aterm_toml::Table,
+    n: usize,
+    label: &str,
+) -> Result<accounts::Vendor, String> {
+    let product = cli.connector().product;
+    let word = |key: &str| match row.get(key) {
+        None => Ok(None),
+        Some(aterm_toml::Value::String(word)) => Ok(Some(word.as_str())),
+        Some(other) => Err(format!(
+            "fleet roster row {n} ({label}): `{key}` is a TOML {}, not a string",
+            other.type_str()
+        )),
+    };
+    let keys = cli.accounts().keys;
+    let region = match (word("region")?, keys) {
+        (None, RowKeys::Region) => {
+            return Err(format!(
+                "fleet roster row {n} ({label}): a {product} row names its `region` (`global` \
+                 for kimi.ai, `mainland-cn` for kimi.com): the two are separate account systems"
+            ));
+        }
+        (Some(word), RowKeys::Region) => Some(Region::parse(word).ok_or_else(|| {
+            format!(
+                "fleet roster row {n} ({label}): `region` is `global` or `mainland-cn`, not {:?}",
+                super::one_line(word, 40)
+            )
+        })?),
+        (Some(_), _) => {
+            return Err(format!(
+                "fleet roster row {n} ({label}): {product}'s rows take no `region`"
+            ));
+        }
+        (None, _) => None,
+    };
+    let flow = match (word("flow")?, keys) {
+        (Some(word), RowKeys::Flow(_)) => Some(Flow::parse(word).ok_or_else(|| {
+            format!(
+                "fleet roster row {n} ({label}): `flow` is `browser` or `device`, not {:?}",
+                super::one_line(word, 40)
+            )
+        })?),
+        (Some(_), _) => {
+            return Err(format!(
+                "fleet roster row {n} ({label}): {product}'s rows take no `flow`"
+            ));
+        }
+        (None, _) => None,
+    };
+    Ok(accounts::Vendor { region, flow })
 }
 
 fn normalize_machine_token(trimmed: &str) -> Option<String> {
@@ -426,6 +501,138 @@ fn notes_disqualify(notes: &str) -> bool {
 /// Returns an error if the CSV has no header row, no `email` / `claude` columns, or malformed
 /// quoting. LF and CRLF separate records only outside quotes.
 pub fn parse_accounting_csv(csv_text: &str, source: &str) -> Result<FleetRoster, String> {
+    parse_sheet(csv_text, source, Cli::Claude).map(|(fleet, _)| fleet)
+}
+
+/// One pooled CLI's fleet as the sheet or its fleet file lists it ([`parse_accounting_csv_for`],
+/// [`load_cli_fleet`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliFleet {
+    /// The CLI.
+    pub cli: Cli,
+    /// Its rows.
+    pub roster: FleetRoster,
+    /// The rows a sheet lists for Kimi Code with no region (a bare `1` in its cell): held out
+    /// of the pool until the cell names `global` or `mainland-cn`, since a sign-in on the wrong
+    /// one can make a new account.
+    pub held: Vec<FleetAccount>,
+}
+
+/// The sheet's header words naming `cli`'s membership column, matched trimmed and in any case:
+/// `claude`; `Open AI` (or `openai`, `codex`) for Codex; `xai` (or `grok`) for Grok Build;
+/// `kimi` for Kimi Code.
+#[must_use]
+pub const fn csv_columns(cli: Cli) -> &'static [&'static str] {
+    match cli {
+        Cli::Claude => &["claude"],
+        Cli::Codex => &["open ai", "openai", "codex"],
+        Cli::Grok => &["xai", "grok"],
+        Cli::Kimi => &["kimi"],
+    }
+}
+
+/// Parse `cli`'s pool from the accounting CSV ([`parse_accounting_csv`]): the rows whose cell in
+/// `cli`'s column ([`csv_columns`]) says it, labelled `<cli>-<machine label>` (`kimi-m16`,
+/// `kimi-m16-2`). A cell says `1`, or one of the CLI's vendor words: `global` or `mainland-cn`
+/// (also `kimi.ai`, `kimi.com`, `cn`) for Kimi Code, whose bare `1` is held ([`CliFleet::held`]);
+/// `browser` or `device` for Codex and Grok Build. A disqualifying note that names a vendor
+/// (`kimi banned`) drops that vendor's membership alone; one that names none drops every one.
+/// Claude Code's is [`parse_accounting_csv`], unchanged: any disqualifying note drops its row,
+/// as every older build reads the same sheet.
+/// # Errors
+/// As [`parse_accounting_csv`], with `cli`'s column in place of `claude`.
+pub fn parse_accounting_csv_for(
+    cli: Cli,
+    csv_text: &str,
+    source: &str,
+) -> Result<CliFleet, String> {
+    parse_sheet(csv_text, source, cli).map(|(roster, held)| CliFleet { cli, roster, held })
+}
+
+/// Whether the sheet's header names `cli`'s column ([`csv_columns`]).
+#[must_use]
+pub fn csv_names_column(cli: Cli, csv_text: &str) -> bool {
+    csv_records(csv_text)
+        .next()
+        .and_then(Result::ok)
+        .is_some_and(|header| member_column(cli, &parse_csv_line(header)).is_some())
+}
+
+fn member_column(cli: Cli, header: &[String]) -> Option<usize> {
+    header.iter().position(|h| {
+        csv_columns(cli)
+            .iter()
+            .any(|word| h.trim().eq_ignore_ascii_case(word))
+    })
+}
+
+/// What a row's cell in a CLI's column says of its membership ([`parse_sheet`]).
+enum Member {
+    /// Not a member.
+    No,
+    /// A member, with the vendor keys the cell names.
+    Yes(accounts::Vendor),
+    /// A member the pool cannot take as listed ([`CliFleet::held`]).
+    Held,
+}
+
+fn member_of(cli: Cli, cell: &str) -> Member {
+    let word = cell.to_ascii_lowercase();
+    let vendor = |region, flow| Member::Yes(accounts::Vendor { region, flow });
+    match (cli.accounts().keys, word.as_str()) {
+        (RowKeys::Region, "1") => Member::Held,
+        (RowKeys::Region, "global" | "kimi.ai") => vendor(Some(Region::Global), None),
+        (RowKeys::Region, "mainland-cn" | "cn" | "kimi.com") => {
+            vendor(Some(Region::MainlandCn), None)
+        }
+        (RowKeys::Flow(_), word) if Flow::parse(word).is_some() => vendor(None, Flow::parse(word)),
+        (RowKeys::Plain | RowKeys::Flow(_), "1") => vendor(None, None),
+        _ => Member::No,
+    }
+}
+
+/// The vendors a sheet note can name, each with its words ([`notes_disqualify_for`]): the pooled
+/// CLIs, and the sheet's other columns (`google`, `meta`), which scope a note away from them.
+const NOTE_VENDORS: [(Option<Cli>, &[&str]); 6] = [
+    (Some(Cli::Claude), &["claude", "anthropic"]),
+    (Some(Cli::Codex), &["openai", "open ai", "codex", "chatgpt"]),
+    (Some(Cli::Grok), &["xai", "grok"]),
+    (Some(Cli::Kimi), &["kimi", "moonshot"]),
+    (None, &["google", "gemini"]),
+    (None, &["meta"]),
+];
+
+/// Whether `notes` disqualify a row's membership of `cli`'s pool: a disqualifying word
+/// ([`notes_disqualify`]) in a note that names no vendor, or names `cli`'s ([`NOTE_VENDORS`],
+/// whole words).
+fn notes_disqualify_for(cli: Cli, notes: &str) -> bool {
+    if !notes_disqualify(notes) {
+        return false;
+    }
+    let lower = notes.to_ascii_lowercase();
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let names = |phrase: &str| {
+        let parts: Vec<&str> = phrase.split(' ').collect();
+        words.windows(parts.len()).any(|w| w == parts.as_slice())
+    };
+    let named: Vec<Option<Cli>> = NOTE_VENDORS
+        .iter()
+        .filter(|(_, phrases)| phrases.iter().any(|p| names(p)))
+        .map(|(vendor, _)| *vendor)
+        .collect();
+    named.is_empty() || named.contains(&Some(cli))
+}
+
+/// The one reading of the accounting sheet, for `cli`'s column ([`parse_accounting_csv`],
+/// [`parse_accounting_csv_for`]): its rows, and the rows it held ([`CliFleet::held`]).
+fn parse_sheet(
+    csv_text: &str,
+    source: &str,
+    cli: Cli,
+) -> Result<(FleetRoster, Vec<FleetAccount>), String> {
     let mut records = csv_records(csv_text);
     let header_line = records
         .next()
@@ -437,10 +644,13 @@ pub fn parse_accounting_csv(csv_text: &str, source: &str) -> Result<FleetRoster,
         .iter()
         .position(|h| h.trim().eq_ignore_ascii_case("email"))
         .ok_or_else(|| format!("CSV at {source} has no `email` column"))?;
-    let claude_col = header
-        .iter()
-        .position(|h| h.trim().eq_ignore_ascii_case("claude"))
-        .ok_or_else(|| format!("CSV at {source} has no `claude` column"))?;
+    let member_col = member_column(cli, &header).ok_or_else(|| {
+        format!(
+            "CSV at {source} has no `{}` column",
+            csv_columns(cli).first().copied().unwrap_or("claude")
+        )
+    })?;
+    let claude_col = member_column(Cli::Claude, &header).unwrap_or(member_col);
     let mut computer_cols: Vec<usize> = header
         .iter()
         .enumerate()
@@ -464,6 +674,7 @@ pub fn parse_accounting_csv(csv_text: &str, source: &str) -> Result<FleetRoster,
     let mut used_labels = BTreeSet::new();
     let mut seen_emails = BTreeSet::new();
     let mut accounts = Vec::new();
+    let mut held = Vec::new();
 
     for record in records {
         let raw_line = record.map_err(|why| format!("CSV at {source}: {why}"))?;
@@ -478,8 +689,13 @@ pub fn parse_accounting_csv(csv_text: &str, source: &str) -> Result<FleetRoster,
         if email.is_empty() || email.starts_with('*') || accounts::email_refusal(email).is_some() {
             continue;
         }
-        let claude_val = cols.get(claude_col).map(|s| s.trim()).unwrap_or("");
-        if claude_val != "1" {
+        let member_val = cols.get(member_col).map(|s| s.trim()).unwrap_or("");
+        let member = match cli {
+            Cli::Claude if member_val == "1" => Member::Yes(accounts::Vendor::default()),
+            Cli::Claude => Member::No,
+            _ => member_of(cli, member_val),
+        };
+        if matches!(member, Member::No) {
             continue;
         }
         let notes = if notes_start < cols.len() {
@@ -487,7 +703,11 @@ pub fn parse_accounting_csv(csv_text: &str, source: &str) -> Result<FleetRoster,
         } else {
             String::new()
         };
-        if notes_disqualify(&notes) {
+        let disqualified = match cli {
+            Cli::Claude => notes_disqualify(&notes),
+            _ => notes_disqualify_for(cli, &notes),
+        };
+        if disqualified {
             continue;
         }
 
@@ -534,11 +754,15 @@ pub fn parse_accounting_csv(csv_text: &str, source: &str) -> Result<FleetRoster,
             continue;
         }
 
-        let base_label = match (&machines[..], slot) {
+        let machine_label = match (&machines[..], slot) {
             ([only], None | Some(1)) => only.clone(),
             ([only], Some(n)) => format!("{only}-{n}"),
             (many, None | Some(1)) => many.join("-"),
             (many, Some(n)) => format!("{}-{n}", many.join("-")),
+        };
+        let base_label = match cli {
+            Cli::Claude => machine_label,
+            _ => format!("{}-{machine_label}", cli.id()),
         };
         let mut label = base_label.clone();
         let mut suffix = 2u32;
@@ -565,19 +789,27 @@ pub fn parse_accounting_csv(csv_text: &str, source: &str) -> Result<FleetRoster,
             Class::Dedicated
         };
 
-        accounts.push(FleetAccount {
+        let (vendor, into) = match member {
+            Member::Yes(vendor) => (vendor, &mut accounts),
+            Member::Held | Member::No => (accounts::Vendor::default(), &mut held),
+        };
+        into.push(FleetAccount {
             label,
             machines,
             class,
             email: email.to_owned(),
             browser: None,
+            vendor,
         });
     }
 
-    Ok(FleetRoster {
-        source: source.to_owned(),
-        accounts,
-    })
+    Ok((
+        FleetRoster {
+            source: source.to_owned(),
+            accounts,
+        },
+        held,
+    ))
 }
 
 fn config_machine_id(config: Option<&Path>) -> Option<String> {
@@ -865,6 +1097,7 @@ pub fn build_machine_roster(
             email: Some(acct.email.clone()),
             browser,
             was: Vec::new(),
+            vendor: Default::default(),
         });
     }
 
@@ -1263,6 +1496,7 @@ fn discover_local_fleet_with_min(env: &Env, min_accounts: usize) -> Option<Fleet
             class,
             email,
             browser: None,
+            vendor: accounts::Vendor::default(),
         });
     }
     (accounts.len() >= min_accounts).then_some(FleetRoster {
@@ -1880,7 +2114,20 @@ pub fn upkeep_live(
     )
 }
 
+/// Claude Code's pool's upkeep ([`upkeep_claude`]), then the other CLIs' ([`upkeep_pools`]),
+/// which the result does not report.
 fn upkeep(
+    home: &Path,
+    state_dir: &Path,
+    (roster_path, now, step): (&Path, i64, UpkeepStep),
+    fx: &UpkeepEffects<'_>,
+) -> Upkept {
+    let claude = upkeep_claude(home, state_dir, (roster_path, now, step), fx);
+    upkeep_pools(home, state_dir, (roster_path, now, step), fx);
+    claude
+}
+
+fn upkeep_claude(
     home: &Path,
     state_dir: &Path,
     (roster_path, now, step): (&Path, i64, UpkeepStep),
@@ -2422,6 +2669,587 @@ fn sync_accounts_for_init_with(
         .unwrap_or_else(|| "local".to_owned());
     let _ = store.touch_wake();
     Ok((machine, bound.rows.len(), enrolled_count, fleet_count))
+}
+
+/// The accounting sheet's name in `~/.secrets` (`DESIGN-secrets-2026-10-20.md` §11).
+pub const ACCOUNTS_CSV_FILE: &str = "ai-accounts.csv";
+
+/// The pooled CLIs other than Claude Code, whose pools [`sync_cli_accounts_for_init`] and the
+/// window's upkeep ([`upkeep_live`]) keep beside Claude Code's.
+pub const OTHER_CLIS: [Cli; 3] = [Cli::Codex, Cli::Grok, Cli::Kimi];
+
+/// The fleet file of `cli`'s pool in `~/.secrets` (`ai-accounts-codex.toml`,
+/// `ai-accounts-grok.toml`, `ai-accounts-kimi.toml`): the vault's subscriber writes it, and
+/// aterm only reads it ([`sync_cli_accounts`]).
+#[must_use]
+pub fn cli_fleet_file(cli: Cli) -> String {
+    format!("ai-accounts-{}.toml", cli.id())
+}
+
+/// What a sync of another CLI's pool did ([`sync_cli_accounts`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CliSync {
+    /// Nothing: this machine keeps no roster of the CLI's and no source was named, so nothing
+    /// was read (a vault file alone opts no machine in).
+    Off,
+    /// Opted in, and no fleet of the CLI's is there to read: neither its fleet file
+    /// ([`cli_fleet_file`]) nor its column of the sheet ([`ACCOUNTS_CSV_FILE`]).
+    NoSource,
+    /// The fleet was read.
+    Synced(CliSynced),
+}
+
+/// A sync that read the fleet ([`CliSync::Synced`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliSynced {
+    /// The CLI.
+    pub cli: Cli,
+    /// The machine the rows were taken for.
+    pub machine: String,
+    /// The roster beside `aterm.toml` (`accounts-<cli>.toml`).
+    pub roster: PathBuf,
+    /// Where the fleet came from.
+    pub source: String,
+    /// The fleet's rows, every machine's.
+    pub fleet_accounts: usize,
+    /// The roster's rows after the sync.
+    pub rows: usize,
+    /// The labels the sync added, each with a login directory of its own.
+    pub added: Vec<String>,
+    /// This machine's rows the sheet held for want of a region ([`CliFleet::held`]).
+    pub held: Vec<String>,
+    /// This machine's fleet rows left out because the roster lists their label with another
+    /// email, or their email under another label: the roster's own row stands.
+    pub kept: Vec<String>,
+}
+
+/// An [`Env`] for a sync run from init, the vault's verbs or a window's upkeep: it names the
+/// paths and reads no process environment.
+fn quiet_env(home: &Path, state_dir: &Path, config: &Path, now: i64) -> Env {
+    Env {
+        state: state_dir.to_path_buf(),
+        aterm_state: state_dir
+            .parent()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf),
+        cwd: home.to_path_buf(),
+        home: Some(home.to_path_buf()),
+        claude_dir: Some(home.join(".claude")),
+        claude_config_unusable: None,
+        claude_profile: Some(home.join(".claude.json")),
+        claude_custom_oauth: false,
+        claude_session: None,
+        claude_pid: None,
+        codex_thread: None,
+        agy_conversation: None,
+        codex_home: None,
+        now,
+        tz_s: 0,
+        sid: String::new(),
+        sock: None,
+        config: Some(config.to_path_buf()),
+        claude_tmp: None,
+        claude_running: None,
+    }
+}
+
+/// `cli`'s fleet and where it came from: `source` where one is named (a `.toml` read as
+/// [`FleetRoster::from_toml_for`], else a sheet whose `cli` column [`parse_accounting_csv_for`]
+/// reads), else `~/.secrets`' [`cli_fleet_file`], else its [`ACCOUNTS_CSV_FILE`] where the header
+/// names `cli`'s column ([`csv_names_column`]); `None` where none is there. Nothing is written.
+fn load_cli_fleet(
+    cli: Cli,
+    env: &Env,
+    home: &Path,
+    source: Option<&str>,
+    fetch: &Fetch,
+) -> Result<Option<CliFleet>, String> {
+    let (chosen, raw) = match source.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(named) => (named.to_owned(), fetch(env, named)?),
+        None => {
+            let secrets = home.join(".secrets");
+            let toml = secrets.join(cli_fleet_file(cli));
+            let csv = secrets.join(ACCOUNTS_CSV_FILE);
+            let read = |path: &Path| {
+                read_local_source_text(path).map_err(|why| format!("{}: {why}", path.display()))
+            };
+            if toml.is_file() {
+                (toml.display().to_string(), read(&toml)?)
+            } else if csv.is_file() {
+                let text = read(&csv)?;
+                if !csv_names_column(cli, &text) {
+                    return Ok(None);
+                }
+                (csv.display().to_string(), text)
+            } else {
+                return Ok(None);
+            }
+        }
+    };
+    let fleet = if chosen.ends_with(".toml")
+        || raw.trim_start().starts_with('#')
+        || raw.contains("[[account]]")
+    {
+        CliFleet {
+            cli,
+            roster: FleetRoster::from_toml_for(cli, &raw, &chosen)?,
+            held: Vec::new(),
+        }
+    } else {
+        parse_accounting_csv_for(cli, &raw, &chosen)?
+    };
+    Ok(Some(fleet))
+}
+
+/// Sync `cli`'s pool (a CLI of [`OTHER_CLIS`]) on this machine from its fleet
+/// ([`load_cli_fleet`]): where its roster (`accounts-<cli>.toml`) stands beside `config`, or a
+/// `source` is named, this machine's fleet rows the roster does not list are added to it, each
+/// with a login directory under `~/.aterm/logins/<cli>/` ([`accounts::Store::at_for`]), and a roster
+/// with no rows first gets this machine's own login (`main`, no dir), as `accounts add` gives it.
+/// It writes the roster and the CLI's store alone, never `~/.secrets`; a row the roster has is
+/// never changed or removed, and a fleet row whose label or email the roster lists otherwise is
+/// left out ([`CliSynced::kept`]). Under the CLI's store lock, waited for on `ladder`.
+fn sync_cli_with(
+    cli: Cli,
+    (home, state_dir, config): (&Path, &Path, &Path),
+    (source, machine_override): (Option<&str>, Option<&str>),
+    now: i64,
+    (fetch, ladder): (&Fetch, &[Duration]),
+) -> Result<CliSync, String> {
+    let product = cli.connector().product;
+    let roster_path = accounts::roster_beside_for(config, cli)
+        .ok_or_else(|| format!("{} has no directory", config.display()))?;
+    let named = source.is_some_and(|s| !s.trim().is_empty());
+    if !named && !roster_path.is_file() {
+        return Ok(CliSync::Off);
+    }
+    let env = quiet_env(home, state_dir, config, now);
+    let Some(fleet) = load_cli_fleet(cli, &env, home, source, fetch)? else {
+        return Ok(CliSync::NoSource);
+    };
+    let machine = machine_override
+        .and_then(normalize_machine_id)
+        .or_else(|| config_machine_id(Some(config)))
+        .or_else(|| detect_machine_id(None, None))
+        .ok_or_else(|| "could not determine machine id (`m<N>`); pass `--machine m8`".to_owned())?;
+    let mine = fleet.roster.accounts_for_machine(&machine);
+    if named && mine.is_empty() {
+        return Err(format!(
+            "no active {product} accounts found for machine `{machine}` in {}",
+            fleet.roster.source
+        ));
+    }
+    let held: Vec<String> = fleet
+        .held
+        .iter()
+        .filter(|a| {
+            let norm = normalize_machine_id(&machine).unwrap_or_else(|| machine.clone());
+            a.machines.contains(&norm)
+        })
+        .map(|a| a.label.clone())
+        .collect();
+    let store = accounts::Store::at_for(state_dir, cli, home);
+    let lock = store
+        .acquire_within(ladder)
+        .map_err(|why| format!("{}: {why}", store.dir.display()))?
+        .ok_or_else(|| {
+            format!(
+                "{} at {}: another `aterm harness accounts` or a window holds it; nothing was \
+                 synced, so run the sync again",
+                accounts::LOCK_HELD,
+                store.dir.display()
+            )
+        })?;
+    let (write_to, keep_mode) = super::cli::roster_target(&roster_path)?;
+    let existing_text = accounts::roster_text(&write_to)?.unwrap_or_default();
+    let existing = Roster::parse_for(cli, &existing_text).map_err(|why| {
+        format!(
+            "the roster at {} is refused: {why}; the roster is unchanged",
+            roster_path.display()
+        )
+    })?;
+    let mut rows = Vec::new();
+    let mut added = Vec::new();
+    let mut kept = Vec::new();
+    for acct in mine {
+        let listed_email = |row: &Row| {
+            row.email
+                .as_deref()
+                .is_some_and(|email| accounts::email_matches(email, &acct.email))
+        };
+        match (
+            existing.row(&acct.label),
+            existing.rows.iter().find(|row| listed_email(row)),
+        ) {
+            (Some(row), _) if listed_email(row) => {}
+            (None, None) => {
+                let dir = store
+                    .login_dir(&acct.label)
+                    .ok_or_else(|| format!("`{}` names no login directory", acct.label))?;
+                let dir = dir
+                    .to_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| format!("the login directory {} is not UTF-8", dir.display()))?;
+                rows.push(Row {
+                    label: acct.label.clone(),
+                    class: acct.class,
+                    dir: Some(dir),
+                    email: Some(acct.email.clone()),
+                    browser: acct.browser.clone(),
+                    was: Vec::new(),
+                    vendor: acct.vendor,
+                });
+                added.push(acct.label.clone());
+            }
+            _ => kept.push(acct.label.clone()),
+        }
+    }
+    let mut total = existing.rows.len() + rows.len();
+    if !rows.is_empty() {
+        if existing.rows.is_empty() {
+            rows.insert(
+                0,
+                Row {
+                    label: ACCOUNTS_OWN_LABEL.to_owned(),
+                    ..Row::default()
+                },
+            );
+            total += 1;
+        }
+        let text = accounts::append_rows_for(cli, &existing_text, &rows).map_err(|why| {
+            format!("the synced rows do not admit: {why}; the roster is unchanged")
+        })?;
+        aterm_types::fs_restricted::ensure_private_dir(&store.logins_dir())
+            .map_err(|why| format!("{}: {why}", store.logins_dir().display()))?;
+        for dir in rows.iter().filter_map(|row| row.dir.as_deref()) {
+            aterm_types::fs_restricted::ensure_private_dir(Path::new(dir))
+                .map_err(|why| format!("could not create {dir}: {why}"))?;
+        }
+        super::upgrade_models::write_atomic_mode(&write_to, &text, keep_mode)
+            .map_err(|why| format!("could not write {}: {why}", write_to.display()))?;
+    }
+    drop(lock);
+    let _ = store.touch_wake();
+    Ok(CliSync::Synced(CliSynced {
+        cli,
+        machine,
+        roster: roster_path,
+        source: fleet.roster.source.clone(),
+        fleet_accounts: fleet.roster.accounts.len(),
+        rows: total,
+        added,
+        held,
+        kept,
+    }))
+}
+
+/// `aterm harness accounts sync --cli <id> [<source>] [--machine <mN>] [--json]`
+/// ([`sync_cli_with`]).
+pub fn run_cli_accounts_sync(
+    cli: Cli,
+    env: &Env,
+    (source, machine_override, json): (Option<&str>, Option<&str>, bool),
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    run_cli_accounts_sync_with(
+        cli,
+        env,
+        (source, machine_override, json),
+        (out, err),
+        &fetch_source_text,
+    )
+}
+
+fn run_cli_accounts_sync_with(
+    cli: Cli,
+    env: &Env,
+    (source, machine_override, json): (Option<&str>, Option<&str>, bool),
+    (out, err): (&mut dyn Write, &mut dyn Write),
+    fetch: &Fetch,
+) -> ExitCode {
+    let flag = format!("--cli {}", cli.id());
+    let product = cli.connector().product;
+    let (Some(config), Some(home)) = (env.config.as_deref(), env.home.as_deref()) else {
+        let _ = writeln!(
+            err,
+            "aterm harness accounts sync {flag}: no config directory or home is known (set HOME \
+             or XDG_CONFIG_HOME)"
+        );
+        return ExitCode::FAILURE;
+    };
+    let synced = sync_cli_with(
+        cli,
+        (home, &env.state, config),
+        (source, machine_override),
+        env.now,
+        (fetch, &sync_lock_ladder()),
+    );
+    let file = cli.accounts().roster_file;
+    let synced = match synced {
+        Ok(CliSync::Synced(synced)) => synced,
+        Ok(CliSync::Off) => {
+            let _ = writeln!(
+                err,
+                "aterm harness accounts sync {flag}: nothing was read: this machine keeps no \
+                 {product} roster ({file}) and no source was named; name one (`aterm harness \
+                 accounts sync {flag} ~/.secrets/{}`), or list an account (`aterm harness \
+                 accounts add <label> {flag}`)",
+                cli_fleet_file(cli)
+            );
+            return ExitCode::FAILURE;
+        }
+        Ok(CliSync::NoSource) => {
+            let _ = writeln!(
+                err,
+                "aterm harness accounts sync {flag}: nothing to read: neither ~/.secrets/{} nor a \
+                 `{}` column in ~/.secrets/{ACCOUNTS_CSV_FILE} is there; the roster is unchanged",
+                cli_fleet_file(cli),
+                csv_columns(cli).first().copied().unwrap_or(cli.id())
+            );
+            return ExitCode::FAILURE;
+        }
+        Err(why) => {
+            let _ = writeln!(err, "aterm harness accounts sync {flag}: {why}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if json {
+        let words =
+            |labels: &[String]| Value::Array(labels.iter().cloned().map(Value::from).collect());
+        let mut o = Map::new();
+        o.insert("schema".to_owned(), Value::from(1u64));
+        o.insert("kind".to_owned(), Value::from("accounts-sync".to_owned()));
+        o.insert("cli".to_owned(), Value::from(cli.id().to_owned()));
+        o.insert("machine".to_owned(), Value::from(synced.machine.clone()));
+        o.insert(
+            "roster".to_owned(),
+            Value::from(synced.roster.display().to_string()),
+        );
+        o.insert("source".to_owned(), Value::from(synced.source.clone()));
+        o.insert(
+            "fleet_accounts".to_owned(),
+            Value::from(u64::try_from(synced.fleet_accounts).unwrap_or(0)),
+        );
+        o.insert(
+            "rows".to_owned(),
+            Value::from(u64::try_from(synced.rows).unwrap_or(0)),
+        );
+        o.insert("added".to_owned(), words(&synced.added));
+        o.insert("held".to_owned(), words(&synced.held));
+        o.insert("kept".to_owned(), words(&synced.kept));
+        let _ = writeln!(
+            out,
+            "{}",
+            aterm_json::to_string(&Value::Object(o)).unwrap_or_default()
+        );
+        return ExitCode::SUCCESS;
+    }
+    let _ = writeln!(
+        out,
+        "synced {product}'s pool for machine `{}` ({} added; {} rows in the roster, {} across \
+         the fleet)",
+        synced.machine,
+        synced.added.len(),
+        synced.rows,
+        synced.fleet_accounts
+    );
+    let _ = writeln!(out, "roster: {}", synced.roster.display());
+    let _ = writeln!(out, "source: {}", synced.source);
+    if !synced.held.is_empty() {
+        let _ = writeln!(
+            out,
+            "held (the sheet names no region; write `global` or `mainland-cn` in its cell): {}",
+            synced.held.join(" ")
+        );
+    }
+    if !synced.kept.is_empty() {
+        let _ = writeln!(
+            out,
+            "left as the roster lists them (another email under the label, or the email under \
+             another label): {}",
+            synced.kept.join(" ")
+        );
+    }
+    if !synced.added.is_empty() {
+        let _ = writeln!(
+            out,
+            "next step to sign them in: aterm harness accounts renew {} {flag}",
+            synced.added.join(" ")
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+/// [`sync_accounts_for_init`] for the other pooled CLIs ([`OTHER_CLIS`]), each through
+/// [`sync_cli_with`] with no source: a CLI whose roster this machine keeps beside `roster_path`
+/// syncs from its fleet in `~/.secrets`; one whose roster it does not keep reads nothing
+/// ([`CliSync::Off`]), whatever the vault put there.
+#[must_use]
+pub fn sync_cli_accounts_for_init(
+    home: &Path,
+    state_dir: &Path,
+    roster_path: &Path,
+    now: i64,
+) -> Vec<(Cli, Result<CliSync, String>)> {
+    let config = config_beside(roster_path);
+    OTHER_CLIS
+        .into_iter()
+        .map(|cli| {
+            let synced = sync_cli_with(
+                cli,
+                (home, state_dir, &config),
+                (None, None),
+                now,
+                (&fetch_source_text, &sync_lock_ladder()),
+            );
+            (cli, synced)
+        })
+        .collect()
+}
+
+/// One other CLI's pool as this machine keeps it ([`cli_pools`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliPool {
+    /// The CLI.
+    pub cli: Cli,
+    /// Its roster beside `aterm.toml`.
+    pub roster: PathBuf,
+    /// Its rows, bound to the logins its renewals made, or why the roster is refused.
+    pub rows: Result<Roster, String>,
+    /// The labels whose logins are made on this machine ([`accounts::enrolled_for`]).
+    pub enrolled: BTreeSet<String>,
+    /// Its store's state, for each row's condition.
+    pub state: accounts::State,
+}
+
+/// The pools of [`OTHER_CLIS`] whose roster stands beside `config` (none where none does): what
+/// the doctor's `base.ai.accounts` row and the dashboard show beside Claude Code's.
+#[must_use]
+pub fn cli_pools(config: &Path, state_dir: &Path, home: &Path, now: i64) -> Vec<CliPool> {
+    OTHER_CLIS
+        .into_iter()
+        .filter_map(|cli| {
+            let roster = accounts::roster_beside_for(config, cli)?;
+            if !roster.is_file() {
+                return None;
+            }
+            let store = accounts::Store::at_for(state_dir, cli, home);
+            let rows =
+                Roster::load_for(cli, &roster).map(|raw| store.bound(&raw, now).unwrap_or(raw));
+            let enrolled = rows
+                .as_ref()
+                .map(|bound| accounts::enrolled_for(cli, bound))
+                .unwrap_or_default();
+            let state = store.load(now).map(|(s, _)| s).unwrap_or_default();
+            Some(CliPool {
+                cli,
+                roster,
+                rows,
+                enrolled,
+                state,
+            })
+        })
+        .collect()
+}
+
+/// The pools in one phrase, each CLI by its id and row count (`codex 1, kimi 2`), a refused
+/// roster as `refused`; `None` where this machine keeps none.
+#[must_use]
+pub fn cli_pools_words(pools: &[CliPool]) -> Option<String> {
+    if pools.is_empty() {
+        return None;
+    }
+    Some(
+        pools
+            .iter()
+            .map(|pool| match &pool.rows {
+                Ok(rows) => format!("{} {}", pool.cli.id(), rows.rows.len()),
+                Err(_) => format!("{} refused", pool.cli.id()),
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
+}
+
+/// The window's upkeep of the other CLIs' pools ([`upkeep`]): each CLI whose roster stands beside
+/// `roster_path` syncs from its fleet without waiting on its lock, and, where `[harness] logins`
+/// renews, starts one due login's renewal in the background ([`spawn_row_renewal`]); a CLI
+/// whose roster this machine does not keep is left alone.
+fn upkeep_pools(
+    home: &Path,
+    state_dir: &Path,
+    (roster_path, now, step): (&Path, i64, UpkeepStep),
+    fx: &UpkeepEffects<'_>,
+) {
+    let config = config_beside(roster_path);
+    let renews = step.renews()
+        && crate::supervise::config::SupervisorConfig::from_path(Some(&config))
+            .0
+            .logins;
+    for cli in OTHER_CLIS {
+        let Some(path) = accounts::roster_beside_for(&config, cli) else {
+            continue;
+        };
+        if !path.is_file() {
+            continue;
+        }
+        if step.syncs() {
+            let _ = sync_cli_with(
+                cli,
+                (home, state_dir, &config),
+                (None, None),
+                now,
+                (fx.fetch, &[]),
+            );
+        }
+        if renews {
+            let _ = renew_pool_due(cli, home, state_dir, &path, now, fx);
+        }
+    }
+}
+
+/// Start one of `cli`'s due logins' renewal ([`accounts::renew_due`], [`spawn_row_renewal`]);
+/// whether one started.
+fn renew_pool_due(
+    cli: Cli,
+    home: &Path,
+    state_dir: &Path,
+    roster_path: &Path,
+    now: i64,
+    fx: &UpkeepEffects<'_>,
+) -> bool {
+    let Ok(file_roster) = Roster::load_for(cli, roster_path) else {
+        return false;
+    };
+    let store = accounts::Store::at_for(state_dir, cli, home);
+    let (Ok((state, _)), Ok((logins, _))) = (store.load(now), store.load_logins(now)) else {
+        return false;
+    };
+    let bound = accounts::bound(&file_roster, &logins);
+    let enrolled = accounts::enrolled_for(cli, &bound);
+    for label in accounts::renew_due(&bound, &logins, &state, &enrolled, now) {
+        let Some(row) = file_roster.row(&label).cloned() else {
+            continue;
+        };
+        if spawn_row_renewal(
+            cli,
+            home,
+            state_dir,
+            file_roster.clone(),
+            &logins,
+            row,
+            (None, false),
+            now,
+            fx.renew_guard,
+            fx.spawn_renewal,
+        )
+        .progressed()
+        {
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Default)]
@@ -3115,6 +3943,7 @@ fn auto_renew_next_account(
     };
     for next_row in auto_renew_candidates(&file_roster, &state, &logins, now) {
         if spawn_row_renewal(
+            accounts::Cli::Claude,
             home,
             state_dir,
             file_roster.clone(),
@@ -3174,6 +4003,7 @@ pub fn auto_renew_next_account_interactive(
     };
     for next_row in auto_renew_candidates(&file_roster, &state, &logins, now) {
         if spawn_row_renewal(
+            accounts::Cli::Claude,
             home,
             state_dir,
             file_roster.clone(),
@@ -3310,6 +4140,7 @@ fn renew_requested_pin(
         return disposition;
     };
     spawn_row_renewal(
+        accounts::Cli::Claude,
         home,
         state_dir,
         file_roster,
@@ -3327,6 +4158,7 @@ fn renew_requested_pin(
     reason = "row renewal binds paths, roster, logins, target row, pin/browser flags, clock, admission guard, and spawn seam"
 )]
 fn spawn_row_renewal(
+    cli: accounts::Cli,
     home: &Path,
     state_dir: &Path,
     file_roster: Roster,
@@ -3337,6 +4169,18 @@ fn spawn_row_renewal(
     renew_guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
     spawn_renewal: &SpawnRenewal,
 ) -> RenewalDispatch {
+    if cli != accounts::Cli::Claude {
+        return spawn_vendor_renewal(
+            cli,
+            home,
+            state_dir,
+            &file_roster,
+            next_row,
+            now,
+            renew_guard,
+            spawn_renewal,
+        );
+    }
     let store = accounts::Store::at(state_dir);
     let mailbox_dir = resolve_mailbox_dir(Some(home), &store);
     let has_mailbox = mailbox_dir.is_some()
@@ -3487,6 +4331,13 @@ fn spawn_row_renewal(
                     now_done,
                 )
             };
+            let Ok(Some(_signin)) = store.signin_within() else {
+                if let Some(request) = &pin_request {
+                    let _ = store
+                        .cancel_pin_request(request, crate::supervise::limit::unix_now().max(now));
+                }
+                return;
+            };
             let renewed = (|| {
                 let opener = resolve_opener_link(&home_owned, &store);
                 let non_headless_fallback = select_auto_renew_browser(
@@ -3538,6 +4389,61 @@ fn spawn_row_renewal(
                     },
                 );
             }
+        },
+        spawn_renewal,
+    )
+    .map_or(RenewalDispatch::Failed, |()| RenewalDispatch::Started)
+}
+
+/// [`spawn_row_renewal`] for another CLI's row: its renewal ([`super::cli::renew_one_for`]: the
+/// vendor's own sign-in under the machine's sign-in lock, its page approved headlessly) started
+/// in the background, where a headless browser is installed, the row has an email and the CLI
+/// opens no browser of its own here ([`crate::ai::connector::SignIn::opens_browser_here`]).
+#[allow(clippy::too_many_arguments)]
+fn spawn_vendor_renewal(
+    cli: accounts::Cli,
+    home: &Path,
+    state_dir: &Path,
+    file_roster: &Roster,
+    next_row: accounts::Row,
+    now: i64,
+    renew_guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
+    spawn_renewal: &SpawnRenewal,
+) -> RenewalDispatch {
+    if next_row.email.is_none()
+        || cli
+            .accounts()
+            .signin
+            .as_ref()
+            .is_none_or(crate::ai::connector::SignIn::opens_browser_here)
+        || super::headless_oauth::find_headless_browser(Some(home)).is_none()
+    {
+        return RenewalDispatch::Failed;
+    }
+    let Some(permit) = AutoRenewPermit::claim_with_mailbox(
+        renew_guard,
+        &format!("{}:{}", cli.id(), next_row.label),
+        Instant::now(),
+        false,
+        None,
+    ) else {
+        return RenewalDispatch::Held;
+    };
+    let store = accounts::Store::at_for(state_dir, cli, home);
+    let own_dir = file_roster.row(&next_row.label).and_then(|r| r.dir.clone());
+    start_auto_renew(
+        permit,
+        move || {
+            let _ = super::cli::renew_one_for(
+                cli,
+                now,
+                &super::cli::LiveAccounts,
+                &store,
+                &next_row,
+                own_dir.as_deref(),
+                &mut io::sink(),
+                &mut io::sink(),
+            );
         },
         spawn_renewal,
     )
@@ -4019,11 +4925,92 @@ fn render_dashboard_html(
            <table><thead><tr><th>Label</th><th>Class</th><th>Condition</th><th>Role</th><th>Email / OAuth Sign-In Command</th><th>Action</th></tr></thead>\
            <tbody>{rows_html}</tbody></table>\
          </div>\
+         {pools_html}\
          <div class=\"card\"><h2>Live Harness Report (<code>aterm harness accounts</code>)</h2>\
            <pre>{}</pre>\
          </div></body></html>",
-        html_escape(&report_text)
+        html_escape(&report_text),
+        pools_html = env
+            .config
+            .as_deref()
+            .zip(env.home.as_deref())
+            .map(|(config, home)| pools_html(
+                &cli_pools(config, &env.state, home, env.now),
+                env.now
+            ))
+            .unwrap_or_default(),
     )
+}
+
+/// The dashboard's card for each other CLI's pool this machine keeps ([`cli_pools`]): its rows,
+/// each with its vendor keys, condition and `--cli` renewal; its pins and sign-ins are its
+/// commands' (`aterm harness accounts use|renew <label> --cli <id>`), never a button here.
+/// Nothing where this machine keeps none.
+fn pools_html(pools: &[CliPool], now: i64) -> String {
+    let mut out = String::new();
+    for pool in pools {
+        let product = pool.cli.connector().product;
+        let id = pool.cli.id();
+        let roster = html_escape(&pool.roster.display().to_string());
+        let rows = match &pool.rows {
+            Err(why) => format!("<p>The roster is refused: {}</p>", html_escape(why)),
+            Ok(rows) if rows.rows.is_empty() => format!(
+                "<p>No accounts listed: <code>aterm harness accounts add &lt;label&gt; --cli \
+                 {id}</code></p>"
+            ),
+            Ok(rows) => {
+                let mut body = String::new();
+                for row in &rows.rows {
+                    let here = row.dir.is_none() || pool.enrolled.contains(&row.label);
+                    let cond = match accounts::condition(row, &pool.state, here, now) {
+                        accounts::Condition::Limited { until } => {
+                            format!("limited until {}", super::usage::rfc3339_utc(until))
+                        }
+                        other => other.as_str().to_owned(),
+                    };
+                    let keys = [
+                        row.vendor.region.map(Region::as_str),
+                        row.vendor.flow.map(Flow::as_str),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                    let role = if pool.state.active.as_deref() == Some(row.label.as_str()) {
+                        if pool.state.pinned {
+                            "pinned"
+                        } else {
+                            "active"
+                        }
+                    } else {
+                        "-"
+                    };
+                    body.push_str(&format!(
+                        "<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td>\
+                         <td>{}</td><td><code>aterm harness accounts renew {} --cli {id}</code>\
+                         </td></tr>\n",
+                        html_escape(&row.label),
+                        html_escape(row.class.as_str()),
+                        html_escape(&keys),
+                        html_escape(&cond),
+                        role,
+                        html_escape(&row.label),
+                    ));
+                }
+                format!(
+                    "<table><thead><tr><th>Label</th><th>Class</th><th>Vendor</th>\
+                     <th>Condition</th><th>Role</th><th>Sign-In Command</th></tr></thead>\
+                     <tbody>{body}</tbody></table>"
+                )
+            }
+        };
+        out.push_str(&format!(
+            "<div class=\"card\"><h2>{product} Accounts</h2>\
+             <p style=\"color:#8b949e\">Roster: <code>{roster}</code> &middot; pin one with \
+             <code>aterm harness accounts use &lt;label&gt; --cli {id}</code></p>{rows}</div>"
+        ));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -6269,6 +7256,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                 class: Class::Dedicated,
                 dir: None,
                 was: Vec::new(),
+                vendor: Default::default(),
                 email: Some("sol-m27@example.test".into()),
                 browser: None,
             };
@@ -6387,6 +7375,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                     class: Class::Dedicated,
                     dir: None,
                     was: Vec::new(),
+                    vendor: Default::default(),
                     email: Some(email.into()),
                     browser: None,
                 })
@@ -6480,6 +7469,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                             .into_owned(),
                     ),
                     was: Vec::new(),
+                    vendor: Default::default(),
                     email: Some("sol-m27@example.test".to_owned()),
                     browser: None,
                 },
@@ -6494,6 +7484,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                             .into_owned(),
                     ),
                     was: Vec::new(),
+                    vendor: Default::default(),
                     email: Some("sun.m27.2@example.test".to_owned()),
                     browser: None,
                 },
@@ -6775,6 +7766,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         assert!(!guard.lock().unwrap().in_flight);
         assert_eq!(
             spawn_row_renewal(
+                accounts::Cli::Claude,
                 &w.home,
                 &w.state,
                 roster.clone(),
@@ -6836,6 +7828,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                 class: Class::Dedicated,
                 dir: Some(store.logins_dir().join(label).to_str().unwrap().into()),
                 was: Vec::new(),
+                vendor: Default::default(),
                 email: Some(email.into()),
                 browser: None,
             })
@@ -7304,6 +8297,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                     class: Class::Dedicated,
                     dir: Some(m27_dir.to_string_lossy().into_owned()),
                     was: Vec::new(),
+                    vendor: Default::default(),
                     email: Some("sol-m27@example.test".to_owned()),
                     browser: None,
                 },
@@ -7318,6 +8312,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                             .into_owned(),
                     ),
                     was: Vec::new(),
+                    vendor: Default::default(),
                     email: Some("sun.m27.2@example.test".to_owned()),
                     browser: None,
                 },
@@ -7332,6 +8327,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                             .into_owned(),
                     ),
                     was: Vec::new(),
+                    vendor: Default::default(),
                     email: Some("star.m27.3@example.test".to_owned()),
                     browser: Some("Claude m27-3".to_owned()),
                 },
@@ -7897,3 +8893,7 @@ totp = "JBSWY3DPEHPK3PXP"
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "accounts_sync_cli_tests.rs"]
+mod cli_pool_tests;

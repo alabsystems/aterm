@@ -470,6 +470,7 @@ pub(super) fn sums(policy: &AcceptancePolicy, rows: &[Row]) -> Sums {
 
 /// A candidate every training row passed: built only here.
 #[derive(Debug)]
+#[cfg_attr(test, derive(Clone))]
 struct TrainAdmitted {
     plan: SchedulePlan,
     /// Its training rows, with their corpus indices.
@@ -971,6 +972,7 @@ impl Distributed<'_> {
 
 /// The training winner, before the held-out split is read.
 #[derive(Debug)]
+#[cfg_attr(test, derive(Clone))]
 pub struct Selection {
     build: String,
     winner: TrainAdmitted,
@@ -1053,6 +1055,7 @@ impl GridSelection {
 
 /// An admitted plan, with its bundle.
 #[derive(Debug)]
+#[cfg_attr(test, derive(Clone))]
 pub struct Admitted {
     policy: ArtifactId,
     plan: SchedulePlan,

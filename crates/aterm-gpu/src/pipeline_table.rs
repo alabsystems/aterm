@@ -1238,7 +1238,7 @@ pub(crate) enum Pipeline {
 }
 
 /// All [`Pipeline`] variants in row order.
-#[cfg(all(test, any(target_os = "macos", gl_arm)))]
+#[cfg(any(target_os = "macos", all(test, gl_arm)))]
 pub(crate) const ALL_PIPELINES: [Pipeline; PIPELINE_COUNT] = [
     Pipeline::Bg,
     Pipeline::Glyph,

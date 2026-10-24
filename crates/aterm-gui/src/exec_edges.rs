@@ -2,7 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! Kernel process-event edge gatherer ([`ProcWatch`], [`ProcWatch::follow`],
-//! [`FgCutter::proc_seen`], [`ExecEdges::absorb`]).
+//! [`FgCutter::proc_seen`], [`ExecEdges::absorb`]), and the deaths it hears
+//! ([`ExecEdges::take_gone`], `holder_image::DrawerGroups`).
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -46,6 +47,8 @@ pub(crate) struct ExecEdges {
     read: ReadImage,
     /// The watch's overflow count last booked in `metrics`.
     overflow: u64,
+    /// Watched processes heard exiting since the last [`ExecEdges::take_gone`], oldest first.
+    gone: Vec<i32>,
     /// Stuck-engine edge notified on process events ([`crate::vitals_host::PROC_EDGE`]).
     proc_edge: &'static crate::vitals_host::ProcEdge,
 }
@@ -65,6 +68,7 @@ impl ExecEdges {
             folded: None,
             read,
             overflow: 0,
+            gone: Vec::new(),
             proc_edge: &crate::vitals_host::PROC_EDGE,
         }
     }
@@ -130,6 +134,9 @@ impl ExecEdges {
         filled: usize,
     ) -> bool {
         let ProcEvent::Exec { pid, pgid, late } = ev else {
+            if let ProcEvent::Exit { pid } = ev {
+                self.gone.push(pid);
+            }
             return cutter.carries_edge();
         };
         if self.folded.as_ref().is_some_and(|f| f.pgid == pid) {
@@ -191,13 +198,21 @@ impl ExecEdges {
             match ev {
                 ProcEvent::Exec { pid, .. } if pid == to => absorbed = true,
                 ProcEvent::Exec { .. } => self.deferred.push_back(ev),
-                ProcEvent::Fork { .. } | ProcEvent::Exit { .. } => {}
+                ProcEvent::Exit { pid } => self.gone.push(pid),
+                ProcEvent::Fork { .. } => {}
             }
         }
         self.events = events;
         self.book_overflow();
         crate::metrics::note_proc_drain(crate::metrics::leg_elapsed_ns(start));
         absorbed
+    }
+
+    /// The watched processes heard exiting since the last take, oldest first: the gather
+    /// forwards each to the parse stage, which retires a stopped drawer's mark
+    /// ([`crate::holder_image::DrawerGroups`]).
+    pub(crate) fn take_gone(&mut self) -> std::vec::Drain<'_, i32> {
+        self.gone.drain(..)
     }
 
     /// A sampled edge's new holder's image, held.

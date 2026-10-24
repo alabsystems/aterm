@@ -224,6 +224,9 @@ impl ObservedGlyph {
 
     #[inline]
     fn same_row(old: &[Self], new: &[aterm_core::terminal::RenderCell]) -> bool {
+        if old.len() == new.len() {
+            return old.iter().zip(new).all(|(&o, n)| o == Self::of(n));
+        }
         (0..old.len().max(new.len())).all(|col| {
             old.get(col).copied().unwrap_or(Self::BLANK)
                 == new.get(col).map_or(Self::BLANK, Self::of)
@@ -871,21 +874,29 @@ const fn pan_of(pending: Pending, geom: Geom) -> f32 {
 
 /// Nearest named spectrum colour by circular HSV hue.
 #[inline]
-fn nearest_spectrum_stop_by_hue(rgb: u32) -> usize {
-    static STOP_HUES: std::sync::OnceLock<[f32; crate::spectrum::SPECTRUM_STOPS]> =
-        std::sync::OnceLock::new();
-    let stop_hues = STOP_HUES
-        .get_or_init(|| std::array::from_fn(|index| hue_position_of(spectrum_stop(index))));
+const fn nearest_spectrum_stop_by_hue(rgb: u32) -> usize {
+    const STOP_HUES: [f32; crate::spectrum::SPECTRUM_STOPS] = {
+        let mut hues = [0.0; crate::spectrum::SPECTRUM_STOPS];
+        let mut i = 0;
+        while i < crate::spectrum::SPECTRUM_STOPS {
+            hues[i] = hue_position_of(spectrum_stop(i));
+            i += 1;
+        }
+        hues
+    };
     let hue = hue_position_of(rgb);
     let mut nearest = 0;
     let mut nearest_distance = f32::INFINITY;
-    for (index, &stop_hue) in stop_hues.iter().enumerate() {
+    let mut index = 0;
+    while index < STOP_HUES.len() {
+        let stop_hue = STOP_HUES[index];
         let direct = (hue - stop_hue).abs();
         let distance = direct.min(1.0 - direct);
         if distance < nearest_distance {
             nearest = index;
             nearest_distance = distance;
         }
+        index += 1;
     }
     nearest
 }
@@ -893,25 +904,33 @@ fn nearest_spectrum_stop_by_hue(rgb: u32) -> usize {
 /// Half the narrower adjacent arc gap of one named stop.
 #[inline]
 const fn spectrum_stop_jitter_radius(index: usize) -> f32 {
-    let last = crate::spectrum::SPECTRUM_STOPS.saturating_sub(1);
-    if last == 0 {
-        return 0.0;
-    }
-    let index = if index > last { last } else { index };
-    let at = spectrum_stop_position(index);
-    let gap = if index == 0 {
-        spectrum_stop_position(1) - at
-    } else if index == last {
-        at - spectrum_stop_position(last - 1)
-    } else {
-        (at - spectrum_stop_position(index - 1)).min(spectrum_stop_position(index + 1) - at)
+    const STOP_JITTER_RADII: [f32; crate::spectrum::SPECTRUM_STOPS] = {
+        let mut radii = [0.0; crate::spectrum::SPECTRUM_STOPS];
+        let last = crate::spectrum::SPECTRUM_STOPS.saturating_sub(1);
+        if last > 0 {
+            let mut i = 0;
+            while i <= last {
+                let at = spectrum_stop_position(i);
+                let gap = if i == 0 {
+                    spectrum_stop_position(1) - at
+                } else if i == last {
+                    at - spectrum_stop_position(last - 1)
+                } else {
+                    (at - spectrum_stop_position(i - 1)).min(spectrum_stop_position(i + 1) - at)
+                };
+                radii[i] = gap.max(0.0) * 0.5;
+                i += 1;
+            }
+        }
+        radii
     };
-    gap.max(0.0) * 0.5
+    let last = STOP_JITTER_RADII.len().saturating_sub(1);
+    STOP_JITTER_RADII[if index > last { last } else { index }]
 }
 
 /// A colour's circular HSV hue turn (`0..1`).
 #[inline]
-fn hue_position_of(rgb: u32) -> f32 {
+const fn hue_position_of(rgb: u32) -> f32 {
     let r = ((rgb >> 16) & 0xff) as f32 / 255.0;
     let g = ((rgb >> 8) & 0xff) as f32 / 255.0;
     let b = (rgb & 0xff) as f32 / 255.0;
@@ -922,13 +941,15 @@ fn hue_position_of(rgb: u32) -> f32 {
         return 0.0;
     }
     let h = if max == r {
-        ((g - b) / d).rem_euclid(6.0)
+        let raw = (g - b) / d;
+        if raw < 0.0 { raw + 6.0 } else { raw }
     } else if max == g {
         (b - r) / d + 2.0
     } else {
         (r - g) / d + 4.0
     };
-    (h / 6.0).rem_euclid(1.0)
+    let turn = h / 6.0;
+    if turn >= 1.0 { turn - 1.0 } else { turn }
 }
 
 #[cfg(test)]

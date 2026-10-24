@@ -1517,7 +1517,9 @@ pub const VERBS: &[VerbSpec] = &[
          has the jobs engine read `<pid>`, a live process of this user (any other is refused), \
          as held at macOS's program check whatever its CPU (a tab's job member where its reading \
          judged a start), so `sys jobs` shows `wait=program-check` and a `finding \
-         kind=program-check` row and `privacy` counts it; `program-check held -` ends it.",
+         kind=program-check` row, `privacy` counts it and `status` counts it in \
+         `program_check=`, and has the unread-input gate read a foreground leader of that pid as \
+         held, so its unread input stays `input=pending`; `program-check held -` ends it.",
     )
     .input(Input::NONE),
     v(
@@ -1838,13 +1840,16 @@ pub const VERBS: &[VerbSpec] = &[
          Windows). Input and host: `integration=<on|off|degraded> \
          input=<clear|pending|typeahead|stalled|stopped|-> input_bytes= input_wait_ms= \
          fg_rss_mb= disk=<ok|low|short|emergency|-> disk_free_mb= disk_room_mb= disk_age_ms= \
-         job=<verdict|none> job_quiet_ms= syspolicyd=<-|ok|full|stuck> syspolicyd_workers= \
-         syspolicyd_full_ms= occupancy=<off|observe|prompt> \
-         occupancy_hold=<declared|undeclared|none> ready= slots= idle_ready_min= waits= \
-         waits_ready=` (`occupancy why` explains `occupancy_hold=` to `idle_ready_min=`; `waits=` \
-         counts the session's declared wakes still to be told and `waits_ready=` those whose \
-         condition held, which `waits` lists). Harness and records: `supervisor= supervisor_proven= \
-         autopilot=<off|cruise|land|-> human_ms= human_seq= \
+         job=<verdict|none> job_quiet_ms= program_check=<n>:<oldest_ms>|0|- \
+         syspolicyd=<-|ok|full|stuck> syspolicyd_workers= syspolicyd_full_ms= \
+         occupancy=<off|observe|prompt> occupancy_hold=<declared|undeclared|none> ready= slots= \
+         idle_ready_min= waits= waits_ready=` (`program_check=` counts this tab's programs \
+         macOS's program check holds now, members of its jobs and their orphans, this user's \
+         only, so a lower bound, with the oldest held to now in ms; `-` off macOS or with no \
+         reading that speaks for now; `occupancy why` explains `occupancy_hold=` to \
+         `idle_ready_min=`; `waits=` counts the session's declared wakes still to be told and \
+         `waits_ready=` those whose condition held, which `waits` lists). Harness and records: \
+         `supervisor= supervisor_proven= autopilot=<off|cruise|land|-> human_ms= human_seq= \
          launch=<person|since|typed|boxed|other|pending|none> launch_seq= path_evidence= \
          copy=<managed|foreign|-> upgrade= history_lost= journal=<live|off> (then its \
          `journal_*` fields, and `restore=…` after a crash restore) integration_rev= \

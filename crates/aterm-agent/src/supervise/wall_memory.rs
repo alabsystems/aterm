@@ -44,7 +44,13 @@ pub(super) struct WallMemory {
 const fn title_witness(p: Program) -> bool {
     match p {
         Program::Claude => true,
-        Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => false,
+        Program::Codex
+        | Program::Grok
+        | Program::Kimi
+        | Program::Agy
+        | Program::Muse
+        | Program::Gemini
+        | Program::Generic => false,
     }
 }
 
@@ -75,9 +81,13 @@ fn still_words(reader: &dyn ScreenReader, rows: &[String], what: &str) -> String
 fn background_alone(reader: &dyn ScreenReader, rows: &[String]) -> bool {
     match reader.program() {
         Program::Claude => aterm_phase::background_only(rows),
-        Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => {
-            reader.background_wait(rows).is_some()
-        }
+        Program::Codex
+        | Program::Grok
+        | Program::Kimi
+        | Program::Agy
+        | Program::Muse
+        | Program::Gemini
+        | Program::Generic => reader.background_wait(rows).is_some(),
     }
 }
 
@@ -792,7 +802,13 @@ fn names_claude(stdout: &str) -> bool {
     {
         Some(Program::Claude) => true,
         Some(
-            Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic,
+            Program::Codex
+            | Program::Grok
+            | Program::Kimi
+            | Program::Agy
+            | Program::Muse
+            | Program::Gemini
+            | Program::Generic,
         )
         | None => false,
     }

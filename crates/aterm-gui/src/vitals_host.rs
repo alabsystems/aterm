@@ -270,6 +270,9 @@ pub(crate) struct Request {
     pub(crate) ttys: Vec<TtyWord>,
     /// What those roots' PTY readers read, read again at each pass ([`crate::vitals_jobs::JobFeed`]).
     pub(crate) feeds: Vec<(u64, Arc<crate::vitals_jobs::JobFeed>)>,
+    /// The keys driven into those roots' terminals, counted again at each pass
+    /// ([`crate::vitals_jobs::JobFeed::typed_at`]).
+    pub(crate) inputs: Vec<(u64, aterm_session::sink::DrivenInputWatch)>,
     /// Where each of those sessions sits (window, tab), for `sys`.
     pub(crate) layout: Vec<PaneFact>,
     /// Authenticated global session ids for those process-local tab keys.
@@ -1662,15 +1665,25 @@ impl Request {
     /// the exit of the command it closes, read while the sweep runs, are the next pass's, never a
     /// closed block over a member the sweep still saw (a false orphan). A feed rounds its stamps
     /// up ([`crate::vitals_jobs::JobFeed::at`]), so whatever a reader reads after the clock is
-    /// stamped past it: no later than the next pass's, never at none.
+    /// stamped past it: no later than the next pass's, never at none, and a line or output stamped
+    /// past the pass's millisecond waits for the next pass ([`crate::vitals_jobs::JobFeed::at_pass`]).
     pub(crate) fn tab_reads(&self, epoch: Instant, now: impl FnOnce() -> Instant) -> TabReads {
-        let at_ms = u64::try_from(now().saturating_duration_since(epoch).as_millis())
+        let clock = now();
+        let at_ms = u64::try_from(clock.saturating_duration_since(epoch).as_millis())
             .unwrap_or(u64::MAX)
             .max(1);
         let feeds = self
             .feeds
             .iter()
-            .map(|(key, f)| (*key, f.at(epoch)))
+            .map(|(key, f)| {
+                let mut feed = f.at_pass(epoch, Some(at_ms));
+                feed.typed_ms = self
+                    .inputs
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .and_then(|(_, w)| f.typed_at(at_ms, w.get()));
+                (*key, feed)
+            })
             .collect();
         let ttys = self.ttys.iter().filter_map(TtyWord::current).collect();
         TabReads {
@@ -3255,12 +3268,17 @@ impl crate::App {
             .iter()
             .filter_map(|t| Some((t.key, Arc::clone(&self.pool.get(t.key)?.ctx.job_feed))))
             .collect();
+        let inputs = tabs
+            .iter()
+            .filter_map(|t| Some((t.key, self.pool.get(t.key)?.ctx.sink.driven_input_watch())))
+            .collect();
         let now = aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX));
         Request {
             self_pid: std::process::id(),
             tabs,
             ttys,
             feeds,
+            inputs,
             layout,
             session_ids,
             cadence_ms: duration_ms(period),

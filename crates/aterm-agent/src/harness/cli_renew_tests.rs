@@ -237,7 +237,7 @@ fn the_new_forms_parse_and_their_flags_belong_to_them() {
         .map(|(c, _)| c),
         Ok(Cmd::Accounts(AccountsCmd::AdoptDefault {
             label: "main".into(),
-            email: OWNER.into(),
+            email: Some(OWNER.into()),
             browser: Some("Claude".into()),
         }))
     );
@@ -939,7 +939,7 @@ fn adopt_default_lists_this_machines_own_login_once() {
     let env = env_at(&tmp);
     let adopt = |label: &str, email: &str| AccountsCmd::AdoptDefault {
         label: label.into(),
-        email: email.into(),
+        email: Some(email.into()),
         browser: Some("Claude m7-a".into()),
     };
     let (code, out, err) = acc_quiet(adopt("m7-a", OWNER), &env);

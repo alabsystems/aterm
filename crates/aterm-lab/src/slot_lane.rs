@@ -646,6 +646,7 @@ pub fn cmd_slot_lane(args: &[String]) -> Res {
             env: world.env(),
             cwd: world.home.clone(),
             sandbox: None,
+            reroute: false,
         },
     )?;
     let ran = await_socket(&mut inst, &world).and_then(|()| lane(&inst, &world, &mut holder));

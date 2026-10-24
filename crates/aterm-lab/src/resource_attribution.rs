@@ -44,6 +44,7 @@ pub fn cmd(args: &[String]) -> Res {
             env: world.env(),
             cwd: world.home.clone(),
             sandbox: None,
+            reroute: false,
         },
     )?;
     instance.await_socket(HANG)?;

@@ -1,0 +1,5 @@
+{"id":1,"result":{"userAgent":"aterm/0.164.0 (Mac OS 27.0.1; arm64) unknown (aterm; 0)","codexHome":"/staging/codex-one+1","platformFamily":"unix","platformOs":"macos"}}
+{"method":"remoteControl/status/changed","params":{"status":"disabled","serverName":"host.example.com","installationId":"00000000-0000-4000-8000-000000000001","environmentId":null},"emittedAtMs":1792808199413}
+{"id":2,"result":{"type":"chatgpt","loginId":"11111111-2222-4333-8444-555555555555","authUrl":"https://auth.openai.com/oauth/authorize?response_type=code&client_id=app_EXAMPLE&redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fauth%2Fcallback&code_challenge=EXAMPLE&code_challenge_method=S256&state=EXAMPLE&scope=openid&id_token_add_organizations=true&codex_cli_simplified_flow=true&originator=aterm"}}
+{"method":"account/login/completed","params":{"loginId":"11111111-2222-4333-8444-555555555555","success":true,"error":null,"onboardingEntrypoint":null},"emittedAtMs":1792808199418}
+{"id":3,"result":{"account":{"type":"chatgpt","email":"codex-one@example.com","planType":"pro"},"requiresOpenaiAuth":true,"workspaceRouting":null}}

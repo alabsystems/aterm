@@ -2873,6 +2873,8 @@ fn read_as_claude(ctx: &SessionCtx) -> bool {
         Some(aterm_phase::Program::Claude) => true,
         Some(
             aterm_phase::Program::Codex
+            | aterm_phase::Program::Grok
+            | aterm_phase::Program::Kimi
             | aterm_phase::Program::Agy
             | aterm_phase::Program::Muse
             | aterm_phase::Program::Gemini
@@ -5046,6 +5048,7 @@ mod tests {
             title: format!("tab-{local_id}"),
             term: term.clone(),
             master: -1,
+            pid: 0,
             ctx,
         }
     }
@@ -5675,6 +5678,64 @@ mod tests {
         let mut again: Vec<Option<String>> = vec![None; 3];
         latch_task_news(&store, &targets, &edges, &exits, &mut again);
         assert!(again[0].is_none() && again[1].is_some(), "{again:?}");
+    }
+
+    /// A PROVEN SELF-CLAIM ADMITS ITS CODEX BEFORE THE SWEEP NAMES THE PROGRAM (CONTRACT §1 of
+    /// codex-alab; aterm's `spawn agent=codex` lab leg, 2026-10-23): the worker claimed while
+    /// `status` printed `autopilot=-`, so it decided under Cruise in a Land session until the
+    /// sweep admitted it. The proof read the claimant leading the foreground group and running an
+    /// ALab build, so the session's own word is printed at the claim. NEGATIVE CONTROL: the same
+    /// holder's claim unproven prints `-`, as nothing admits it yet.
+    #[test]
+    fn a_proven_self_claim_prints_its_sessions_word_before_the_sweep_names_it() {
+        use aterm_agent::supervise::Autopilot;
+        let me = std::process::id();
+        let line = |h: &SessionHandle| {
+            sessions_lines(
+                std::slice::from_ref(h),
+                Err("no event loop"),
+                crate::autopilot::HarnessPosture::On(Autopilot::Cruise),
+                |_| true,
+            )
+            .lines()
+            .nth(1)
+            .unwrap()
+            .to_string()
+        };
+        for (local, proven, word) in [(1, true, "land"), (2, false, "-")] {
+            let t = Arc::new(Mutex::new(Terminal::new(24, 80)));
+            let h = handle(local, &t);
+            let _ = crate::session_timeline::apply_autopilot(
+                &h.ctx,
+                Some("land".to_string()),
+                None,
+                aterm_slog::Actor::Ctl,
+                None,
+            );
+            crate::session_timeline::claim_supervisor_as(
+                &h.ctx,
+                &format!("codex-alab@{me}"),
+                Some(local),
+                None,
+                proven.then(|| crate::self_claim::Proven {
+                    pid: me,
+                    start: "a test identity".to_string(),
+                }),
+                crate::metrics::now_us(),
+                aterm_slog::Actor::Ctl,
+            )
+            .expect("the claim");
+            assert_eq!(
+                crate::harness_host::agent_of(h.ctx.timeline.lock().unwrap().agent()),
+                None,
+                "the sweep has named no program"
+            );
+            let status = line(&h);
+            assert!(
+                status.contains(&format!(" autopilot={word} ")),
+                "proven={proven}: {status}"
+            );
+        }
     }
 
     #[test]

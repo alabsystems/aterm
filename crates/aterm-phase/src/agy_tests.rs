@@ -1451,8 +1451,21 @@ fn every_panel_row_and_every_count_shows_background_work() {
         unwrap_agent_token("Agent(research: Codebase Researcher)"),
         Some("research: Codebase Researcher")
     );
+    assert_eq!(
+        unwrap_agent_token("Agent(self: Researcher (GUI))"),
+        Some("Researcher (GUI)")
+    );
+    assert_eq!(
+        split_agent_token("Agent(self: Researcher (GUI))  Reading file (foo.rs) · 5s"),
+        Some(("Researcher (GUI)", "  Reading file (foo.rs) · 5s"))
+    );
+    assert_eq!(
+        panel_work("  ● Agent(self: Researcher (GUI))  Reading file (foo.rs) · 5s"),
+        Some(SUBAGENT_WORKING)
+    );
     assert_eq!(unwrap_agent_token("Agent(explore)"), Some("explore"));
     assert_eq!(unwrap_agent_token("Agent()"), None);
+    assert_eq!(unwrap_agent_token("Agent(a) trailing"), None);
 }
 
 #[test]

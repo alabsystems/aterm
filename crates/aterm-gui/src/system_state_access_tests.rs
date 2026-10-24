@@ -3,7 +3,8 @@
 
 //! System State's access steps: the Local Network trigger's target, the menu
 //! line, the step gating and a Needs-you row's press. Nothing reaches a LAN, a
-//! state directory, System Settings or the process-wide dialog count.
+//! state directory or System Settings. The dialog-ownership regressions use
+//! the real process-wide guard, without raising a dialog.
 
 use std::cell::RefCell;
 use std::net::Ipv4Addr;
@@ -19,6 +20,16 @@ use super::{
 };
 use crate::status_item::SystemStateLine;
 use crate::{App, InitialSetupPermissionPolicy, SetupStatus};
+
+/// How the last record filed under `key` ended, if it ended.
+fn ended_as(app: &App, key: &str) -> Option<aterm_messages::Retired> {
+    app.messages
+        .log()
+        .records()
+        .rev()
+        .find(|r| r.key.as_deref() == Some(key))
+        .and_then(|r| r.retired().cloned())
+}
 
 fn ip(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {
     Ipv4Addr::new(a, b, c, d)
@@ -113,6 +124,7 @@ fn observed(subject: Subject, standing: Standing, note: Option<&str>) -> Observa
 
 fn status(selection: Selection, observed: Vec<Observation>) -> SetupStatus {
     SetupStatus {
+        observed_vault_url: Some(Plan::default().vault_url),
         plan: Some(Plan::from(selection)),
         observed,
         ..SetupStatus::default()
@@ -457,6 +469,7 @@ fn a_failure_the_run_still_retries_stays_off_the_menu_line() {
 thread_local! {
     static TRIGGERS: RefCell<u32> = const { RefCell::new(0) };
     static RECORDS: RefCell<Vec<(u64, Access, AccessOutcome)>> = const { RefCell::new(Vec::new()) };
+    static DIALOG_AVAILABLE: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
 }
 
 fn triggers() -> u32 {
@@ -466,6 +479,13 @@ fn triggers() -> u32 {
 fn records() -> Vec<(u64, Access, AccessOutcome)> {
     RECORDS.with(|r| r.borrow().clone())
 }
+
+fn note_dialog_available() {
+    let available = aterm_types::macos_setup::MacosDialog::when_none_up(Duration::ZERO).is_some();
+    DIALOG_AVAILABLE.with(|read| read.borrow_mut().push(available));
+}
+
+static DIALOG_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Steps whose trigger and record are counted on this thread, with System State
 /// frontmost and a quiet moment.
@@ -554,6 +574,507 @@ fn the_local_network_step_runs_first_and_once_per_approved_revision() {
     approve(&mut app, 4);
     app.tick_local_network_step(later);
     assert_eq!(triggers(), fired + 2, "a new revision asks again");
+}
+
+/// The worker cannot acquire the shared dialog slot in either the trigger or
+/// its record's wake. The slot stays owned for the alert hold, a failed trigger
+/// releases it for the next step, and an inert headless lane never takes it.
+#[test]
+fn the_local_network_trigger_and_record_own_the_dialog_slot() {
+    use aterm_types::macos_setup::{MacosDialog, macos_dialog_up};
+
+    let _serial = DIALOG_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Our dialog fixtures share this guard, but no callback opens anything
+    // outside the process.
+    assert!(!macos_dialog_up());
+    let now = Instant::now();
+    let reach = StepsReach {
+        trigger_local_network: || {
+            note_dialog_available();
+            true
+        },
+        record: |_, _, _| note_dialog_available(),
+        dialog_up: macos_dialog_up,
+        holds_dialog: true,
+        ..stepping()
+    };
+    let mut app = App::headless_for_test();
+    app.access_steps.set_reach(reach);
+    approve(&mut app, 41);
+    DIALOG_AVAILABLE.with(|read| read.borrow_mut().clear());
+    let worker = MacosDialog::when_none_up(Duration::ZERO).expect("the worker takes the slot");
+    app.tick_local_network_step(now);
+    assert!(DIALOG_AVAILABLE.with(|read| read.borrow().is_empty()));
+    assert!(app.access_steps.dialog.is_none(), "the worker owns it");
+    drop(worker);
+    app.tick_local_network_step(now);
+    assert_eq!(
+        DIALOG_AVAILABLE.with(|read| read.borrow().clone()),
+        [false, false],
+        "the worker cannot start a prompt from the trigger or record wake"
+    );
+    assert!(app.access_steps.dialog.is_some());
+    assert!(MacosDialog::when_none_up(Duration::ZERO).is_none());
+    app.settle_access_steps(now);
+    assert!(macos_dialog_up(), "end-of-turn bookkeeping keeps ownership");
+    let later = now + LOCAL_NETWORK_ALERT_HOLD;
+    app.tick_local_network_step(later);
+    app.settle_access_steps(later);
+    assert!(!macos_dialog_up(), "the expired hold releases ownership");
+    drop(app);
+
+    let mut app = App::headless_for_test();
+    app.access_steps.set_reach(StepsReach {
+        trigger_local_network: || {
+            note_dialog_available();
+            false
+        },
+        ..reach
+    });
+    approve(&mut app, 42);
+    DIALOG_AVAILABLE.with(|read| read.borrow_mut().clear());
+    app.tick_local_network_step(now);
+    assert_eq!(DIALOG_AVAILABLE.with(|read| read.borrow().clone()), [false]);
+    assert!(app.access_steps.dialog.is_none());
+    assert!(
+        !macos_dialog_up(),
+        "nothing was raised by the failed trigger"
+    );
+    assert!(app.access_steps.local_network_retry.is_some());
+    drop(app);
+
+    let mut app = App::headless_for_test();
+    app.access_steps.set_reach(StepsReach {
+        holds_dialog: false,
+        ..reach
+    });
+    approve(&mut app, 43);
+    DIALOG_AVAILABLE.with(|read| read.borrow_mut().clear());
+    app.tick_local_network_step(now);
+    assert_eq!(
+        DIALOG_AVAILABLE.with(|read| read.borrow().clone()),
+        [true, true],
+        "the inert lane takes no process-wide slot"
+    );
+    assert!(app.access_steps.dialog.is_none());
+    drop(app);
+    assert!(!macos_dialog_up());
+}
+
+#[cfg(target_os = "macos")]
+fn check_handoff_dialog_slot(page: crate::devtools_helper::Page) {
+    use crate::devtools_helper::{HandOver, Origin, test_arms};
+    use aterm_types::macos_setup::{MacosDialog, macos_dialog_up};
+
+    let _serial = DIALOG_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(!macos_dialog_up());
+    let now = Instant::now();
+    for opened in [true, false] {
+        let open: fn() -> bool = if opened {
+            || {
+                note_dialog_available();
+                true
+            }
+        } else {
+            || {
+                note_dialog_available();
+                false
+            }
+        };
+        let mut reach = test_arms::opening();
+        reach.open_pane = open;
+        let mut fda = test_arms::fda_opening();
+        fda.open_pane = open;
+        let mut app = new_mac(reach, fda);
+        app.access_steps.set_reach(StepsReach {
+            record: |_, _, _| note_dialog_available(),
+            dialog_up: macos_dialog_up,
+            holds_dialog: true,
+            ..stepping()
+        });
+        DIALOG_AVAILABLE.with(|read| read.borrow_mut().clear());
+        let answer = match page {
+            crate::devtools_helper::Page::FullDiskAccess => {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "the inert pane callback tests ownership before opening and recording"
+                )]
+                let answer = app.open_fda_page(Origin::Settings, true, now);
+                answer
+            }
+            crate::devtools_helper::Page::DeveloperTools => {
+                app.open_devtools_page(Origin::Settings, None, true, now)
+            }
+        };
+        if opened {
+            assert_eq!(answer, HandOver::Opened);
+            assert_eq!(
+                DIALOG_AVAILABLE.with(|read| read.borrow().clone()),
+                [false, false],
+                "the worker cannot start a prompt while the pane opens or its record wakes it"
+            );
+            assert!(MacosDialog::when_none_up(Duration::ZERO).is_none());
+            app.settle_access_steps(now);
+            assert!(macos_dialog_up(), "the helper retains the reservation");
+            app.devtools_helper
+                .press_for_test(crate::devtools_helper::PanelEvent::NotNow);
+            app.tick_devtools_hand_over(now);
+            app.settle_access_steps(now);
+            assert!(!macos_dialog_up(), "Not now releases the helper's slot");
+        } else {
+            assert_eq!(answer, HandOver::OpenFailed);
+            assert_eq!(DIALOG_AVAILABLE.with(|read| read.borrow().clone()), [false]);
+            assert!(!macos_dialog_up(), "a failed pane leaves no reservation");
+        }
+        drop(app);
+        assert!(!macos_dialog_up(), "dropping the app releases its helper");
+    }
+
+    let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
+    app.access_steps.set_reach(StepsReach {
+        holds_dialog: true,
+        ..stepping()
+    });
+    let worker = MacosDialog::when_none_up(Duration::ZERO).unwrap();
+    let counts = (
+        test_arms::opens(),
+        test_arms::opened_notes(),
+        test_arms::fda_counts(),
+    );
+    for origin in [
+        Origin::Automatic,
+        Origin::SystemStateAct,
+        Origin::Ctl { now: false },
+        Origin::Ctl { now: true },
+    ] {
+        let answer = match page {
+            crate::devtools_helper::Page::FullDiskAccess => {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "the inert guarded door tests a worker winning after the moment check"
+                )]
+                let answer = app.open_fda_page(origin, true, now);
+                answer
+            }
+            crate::devtools_helper::Page::DeveloperTools => {
+                app.open_devtools_page(origin, Some(Ok(())), true, now)
+            }
+        };
+        assert_eq!(answer, HandOver::Queued, "{origin:?}");
+    }
+    assert_eq!(
+        (
+            test_arms::opens(),
+            test_arms::opened_notes(),
+            test_arms::fda_counts()
+        ),
+        counts
+    );
+    assert!(app.access_steps.dialog.is_none());
+    drop(worker);
+    let answer = match page {
+        crate::devtools_helper::Page::FullDiskAccess => {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the inert guarded door retries after the worker releases its slot"
+            )]
+            let answer = app.open_fda_page(Origin::Automatic, true, now);
+            answer
+        }
+        crate::devtools_helper::Page::DeveloperTools => {
+            app.open_devtools_page(Origin::Automatic, Some(Ok(())), true, now)
+        }
+    };
+    assert_eq!(answer, HandOver::Opened);
+    assert!(app.devtools_helper.panel().is_some());
+    drop(app);
+    assert!(!macos_dialog_up());
+
+    let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
+    app.access_steps.set_reach(StepsReach {
+        holds_dialog: true,
+        ..stepping()
+    });
+    let worker = MacosDialog::when_none_up(Duration::ZERO).unwrap();
+    let answer = match page {
+        crate::devtools_helper::Page::FullDiskAccess => {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the inert pane tests the explicit owner's own dialog reservation"
+            )]
+            let answer = app.open_fda_page(Origin::Settings, true, now);
+            answer
+        }
+        crate::devtools_helper::Page::DeveloperTools => {
+            app.open_devtools_page(Origin::Digest, None, true, now)
+        }
+    };
+    assert_eq!(
+        answer,
+        HandOver::Opened,
+        "the person's own press stays immediate"
+    );
+    assert!(app.access_steps.dialog.is_some());
+    drop(worker);
+    assert!(
+        macos_dialog_up(),
+        "the person's page keeps its own guard after the worker ends"
+    );
+    drop(app);
+    assert!(!macos_dialog_up());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn full_disk_access_handoff_dialog_slot_is_owned_before_open_and_record() {
+    check_handoff_dialog_slot(crate::devtools_helper::Page::FullDiskAccess);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn developer_tools_handoff_dialog_slot_is_owned_before_open_and_record() {
+    check_handoff_dialog_slot(crate::devtools_helper::Page::DeveloperTools);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_security_pages_person_press_transfers_its_dialog_before_recording() {
+    use crate::devtools_helper::test_arms;
+    use crate::native_app::{ActionInvocation, AppEvent, AppViewState};
+    use crate::native_settings::{ConsentGestures, MACOS_ACCESS_OPEN_FDA, SettingsRoute};
+    use crate::native_ui::ActionId;
+    use aterm_types::macos_setup::macos_dialog_up;
+
+    let _serial = DIALOG_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
+    app.access_steps.set_reach(StepsReach {
+        record: |_, _, _| note_dialog_available(),
+        holds_dialog: true,
+        ..stepping()
+    });
+    assert!(app.open_settings_tab(SettingsRoute::Security));
+    let wid = crate::WindowId(0);
+    let (_, view) = app.active_native_view(wid).unwrap();
+    let Some(AppViewState::Settings(state)) = app.native_runtime.view_state_mut(view) else {
+        panic!("Settings view");
+    };
+    state.arm_consent_gestures(ConsentGestures::guarded_pane_for_test(|_| {
+        note_dialog_available();
+        crate::menu::SettingsOpen::Anchored
+    }));
+    DIALOG_AVAILABLE.with(|read| read.borrow_mut().clear());
+    app.dispatch_native_view_event(
+        wid,
+        view,
+        AppEvent::Action(ActionInvocation {
+            id: ActionId::new(MACOS_ACCESS_OPEN_FDA),
+            value: None,
+        }),
+    )
+    .unwrap();
+    assert!(
+        macos_dialog_up(),
+        "the view owns the open page before the host drains it"
+    );
+    app.sync_settings_consent_posture();
+    assert_eq!(
+        DIALOG_AVAILABLE.with(|read| read.borrow().clone()),
+        [false, false]
+    );
+    assert!(app.fda_panel_up());
+    assert!(macos_dialog_up(), "the host now owns the helper's guard");
+    drop(app);
+    assert!(!macos_dialog_up());
+
+    let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
+    app.access_steps.set_reach(StepsReach {
+        holds_dialog: true,
+        ..stepping()
+    });
+    assert!(app.open_settings_tab(SettingsRoute::Security));
+    let (_, view) = app.active_native_view(wid).unwrap();
+    let Some(AppViewState::Settings(state)) = app.native_runtime.view_state_mut(view) else {
+        panic!("Settings view");
+    };
+    state.arm_consent_gestures(ConsentGestures::guarded_pane_for_test(|_| {
+        crate::menu::SettingsOpen::Anchored
+    }));
+    app.dispatch_native_view_event(
+        wid,
+        view,
+        AppEvent::Action(ActionInvocation {
+            id: ActionId::new(MACOS_ACCESS_OPEN_FDA),
+            value: None,
+        }),
+    )
+    .unwrap();
+    assert!(
+        app.access_steps.dialog.is_some(),
+        "dispatch transferred the guard before any park"
+    );
+    app.close_active_native_tab(wid).unwrap();
+    assert!(app.native_runtime.view_state(view).is_none());
+    let now = Instant::now();
+    app.settle_access_steps(now);
+    assert!(
+        macos_dialog_up(),
+        "closing the view cannot lose its already-open pane's hold"
+    );
+    assert!(
+        app.devtools_helper.panel().is_none(),
+        "the ordinary notification has not drained"
+    );
+    app.tick_local_network_step(now + super::PANE_HOLD);
+    app.settle_access_steps(now + super::PANE_HOLD);
+    assert!(!macos_dialog_up(), "the pane's bounded hold still ends");
+    drop(app);
+
+    let (_, dialog) = ConsentGestures::guarded_pane_for_test(|_| {
+        note_dialog_available();
+        crate::menu::SettingsOpen::Refused
+    })
+    .open_settings(crate::menu::PrivacyPane::FullDiskAccess);
+    assert!(dialog.is_none());
+    assert!(
+        !macos_dialog_up(),
+        "a failed person gesture releases its guard"
+    );
+}
+
+#[test]
+fn queued_access_panes_own_the_dialog_slot_before_opening() {
+    use aterm_types::macos_setup::{MacosDialog, macos_dialog_up};
+    let _serial = DIALOG_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let now = Instant::now();
+    for opened in [true, false] {
+        let mut app = App::headless_for_test();
+        app.headless = false;
+        app.access_steps.set_reach(StepsReach {
+            open_pane: if opened {
+                |_, _| {
+                    note_dialog_available();
+                    true
+                }
+            } else {
+                |_, _| {
+                    note_dialog_available();
+                    false
+                }
+            },
+            holds_dialog: true,
+            ..stepping()
+        });
+        approve(&mut app, 1);
+        app.access_steps.local_network_done = Some(1);
+        app.access_steps.pane_act = Some((Access::Accessibility, now));
+        let worker = MacosDialog::when_none_up(Duration::ZERO).unwrap();
+        DIALOG_AVAILABLE.with(|read| read.borrow_mut().clear());
+        // The injected moment deliberately misses a worker that wins after it;
+        // the atomic reservation must retain the queued act.
+        app.tick_queued_pane(now);
+        assert!(app.access_steps.pane_act.is_some());
+        assert!(DIALOG_AVAILABLE.with(|read| read.borrow().is_empty()));
+        drop(worker);
+        app.tick_queued_pane(now);
+        assert!(app.access_steps.pane_act.is_none());
+        assert_eq!(DIALOG_AVAILABLE.with(|read| read.borrow().clone()), [false]);
+        assert_eq!(macos_dialog_up(), opened);
+        if opened {
+            app.tick_local_network_step(now + super::PANE_HOLD);
+            app.settle_access_steps(now + super::PANE_HOLD);
+            assert!(!macos_dialog_up(), "the pane's bounded hold ended");
+        }
+        drop(app);
+        assert!(!macos_dialog_up());
+    }
+
+    for access in [Access::LocalNetwork, Access::Accessibility] {
+        let mut app = App::headless_for_test();
+        app.headless = false;
+        app.access_steps.set_reach(StepsReach {
+            open_pane: |_, _| true,
+            holds_dialog: true,
+            ..stepping()
+        });
+        let worker = MacosDialog::when_none_up(Duration::ZERO).unwrap();
+        assert!(
+            app.open_access_from_system_state(access, true),
+            "a person's own press stays immediate"
+        );
+        assert!(app.access_steps.dialog.is_some());
+        drop(worker);
+        assert!(macos_dialog_up(), "the person's pane retains its own guard");
+        drop(app);
+        assert!(!macos_dialog_up());
+    }
+}
+
+#[cfg(target_os = "macos")]
+static FOLDER_SLOT: std::sync::Mutex<Option<std::sync::mpsc::Sender<bool>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(target_os = "macos")]
+#[test]
+fn folder_worker_owns_the_dialog_slot_before_its_first_probe() {
+    use crate::consent_warmup::{ReadDirOutcome, StartOutcome, WarmupState};
+    use aterm_types::macos_setup::{MacosDialog, macos_dialog_up};
+    let _serial = DIALOG_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut app = App::headless_for_test();
+    app.consent_warmup = WarmupState::with_read_dir_for_test(|_| {
+        let available = MacosDialog::when_none_up(Duration::ZERO).is_some();
+        FOLDER_SLOT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .unwrap()
+            .send(available)
+            .unwrap();
+        ReadDirOutcome::Refused
+    });
+    app.access_steps.set_reach(StepsReach {
+        holds_dialog: true,
+        ..stepping()
+    });
+    let folders = [(aterm_containment::Folder::Documents, "/inert-folder".into())];
+    let (send, recv) = std::sync::mpsc::channel();
+    *FOLDER_SLOT.lock().unwrap() = Some(send);
+    let worker = MacosDialog::when_none_up(Duration::ZERO).unwrap();
+    assert_eq!(
+        app.start_consent_warmup_pass(&folders, None),
+        StartOutcome::DialogUp
+    );
+    assert!(!app.consent_warmup.is_live());
+    drop(worker);
+    assert_eq!(
+        app.start_consent_warmup_pass(&folders, None),
+        StartOutcome::Started
+    );
+    assert!(!recv.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap());
+    let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    while app.consent_warmup_live() && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert!(!app.consent_warmup.is_live(), "the inert pass completed");
+    app.settle_access_steps(Instant::now());
+    assert!(!macos_dialog_up(), "a completed pass releases the slot");
+    assert_eq!(
+        app.start_consent_warmup_pass(&[], None),
+        StartOutcome::NoFolders
+    );
+    assert!(
+        !macos_dialog_up(),
+        "a pass that starts nothing releases it too"
+    );
 }
 
 /// Recorded already (an earlier process of this revision): not asked again. Not
@@ -654,7 +1175,7 @@ fn the_markers_are_bound_to_the_approved_revision() {
 }
 
 /// A regressed grant lights the menu line (and ends it when it is settled); the
-/// retired digest keys end once.
+/// retired digest keys end once, withdrawn: nothing read their causes end.
 #[test]
 fn a_regressed_grant_lights_the_menu_line() {
     use aterm_messages::exceptions::{Entry, Family};
@@ -696,6 +1217,58 @@ fn a_regressed_grant_lights_the_menu_line() {
             "{key}"
         );
     }
+    assert_eq!(
+        ended_as(&app, "privacy.fda.needed"),
+        Some(aterm_messages::Retired::Withdrawn),
+        "never filed as fixed"
+    );
+}
+
+/// An older aterm's entry under a retired key that the person already put away stays
+/// as they filed it: nothing read its cause end, so its filing is not closed as fixed
+/// (its quiet still holds). A clear (the negative control) closes the same filing fixed.
+#[test]
+fn a_retired_key_the_person_filed_stays_filed() {
+    use aterm_messages::Retired;
+    use aterm_messages::exceptions::{Entry, Family};
+    use aterm_messages::need::{Reason, Then, Why};
+    const KEY: &str = "privacy.devtools.not-granted";
+    assert!(RETIRED_KEYS.contains(&KEY));
+    let filed = || {
+        let mut app = App::headless_for_test();
+        let now = Instant::now();
+        app.except(&Entry::new(
+            Family::Privacy,
+            "devtools",
+            "not-granted",
+            "aterm is not in Developer Tools",
+            Why::OnlyYou(Reason::new("only you can add aterm to Developer Tools")),
+            Then::step("Turn on aterm in Developer Tools"),
+        ));
+        let id = app
+            .messages
+            .digest()
+            .entries
+            .iter()
+            .find(|e| e.key == KEY)
+            .map(|e| e.id)
+            .expect("the stand-in entry is raised");
+        assert!(
+            app.messages
+                .file_digest_one(id, crate::messages_host::wall_stamp_now(), now)
+        );
+        assert_eq!(ended_as(&app, KEY), Some(Retired::Dismissed));
+        app
+    };
+    let mut app = filed();
+    app.settle_access_steps(Instant::now());
+    assert_eq!(ended_as(&app, KEY), Some(Retired::Dismissed), "still filed");
+    let mut app = filed();
+    app.except_clear(KEY);
+    assert_eq!(
+        ended_as(&app, KEY),
+        Some(Retired::Resolved(aterm_messages::Outcome::Ok))
+    );
 }
 
 /// The Accessibility pane's System Settings address.
@@ -713,6 +1286,11 @@ const ACCESSIBILITY_PANE: &str =
 fn a_persons_press_opens_its_pane_at_once() {
     let mut app = App::headless_for_test();
     app.headless = false;
+    app.access_steps.set_reach(StepsReach {
+        // AppRt's unit-test arm records URLs without starting a process.
+        open_pane: super::live_open_access_pane,
+        ..stepping()
+    });
     let _ = crate::platform::take_opened_urls();
     assert!(!app.open_access_from_system_state(Access::Accessibility, false));
     assert!(
@@ -839,7 +1417,8 @@ fn the_menu_line_follows_publications_not_parks() {
 }
 
 /// An older aterm's vault-join entry carries the approval code: it stays until a
-/// status has read the Secrets row (whose note carries a waiting code), then ends.
+/// status has read the Secrets row (whose note carries a waiting code), then ends
+/// withdrawn, since the row carries it now and the join may still wait.
 #[test]
 fn the_join_entry_ends_only_once_the_secrets_row_is_read() {
     use aterm_messages::exceptions::{Entry, Family};
@@ -873,6 +1452,64 @@ fn the_join_entry_ends_only_once_the_secrets_row_is_read() {
     ));
     assert!(pending(&app), "no reading of the Secrets row yet");
     let code = "Approve on an admin Mac: ABCD-EFGH";
+    let mut earlier = status(
+        Selection::all(),
+        vec![observed(
+            Subject::Setting(Setting::Secrets),
+            Standing::NeedsYou,
+            Some("Earlier vault approval: OLD-CODE"),
+        )],
+    );
+    earlier.observed_vault_url = Some("http://earlier-vault.local:7484/v1/team".into());
+    app.publish_system_state(earlier);
+    assert!(
+        pending(&app),
+        "another vault's hidden row cannot replace the approval notice"
+    );
+    let mut unknown = status(
+        Selection::all(),
+        vec![observed(
+            Subject::Setting(Setting::Secrets),
+            Standing::NeedsYou,
+            Some(code),
+        )],
+    );
+    unknown.observed_vault_url = None;
+    app.publish_system_state(unknown);
+    assert!(pending(&app), "an unknown source cannot replace the notice");
+    for standing in [Standing::Unknown, Standing::Failed, Standing::NeedsYou] {
+        app.publish_system_state(status(
+            Selection::all(),
+            vec![observed(Subject::Setting(Setting::Secrets), standing, None)],
+        ));
+        assert!(
+            pending(&app),
+            "{standing:?} has no replacement approval guidance"
+        );
+    }
+    for (standing, note) in [(Standing::NeedsYou, Some("  ")), (Standing::Waiting, None)] {
+        let mut reading = observed(Subject::Setting(Setting::Secrets), standing, note);
+        reading.detail = Some(code.into());
+        app.publish_system_state(status(Selection::all(), vec![reading]));
+        assert!(
+            pending(&app),
+            "a detail the row hides cannot replace the approval notice"
+        );
+    }
+    let mut unmanaged = Selection::all();
+    unmanaged.set(Setting::Secrets, false);
+    app.publish_system_state(status(
+        unmanaged,
+        vec![observed(
+            Subject::Setting(Setting::Secrets),
+            Standing::NeedsYou,
+            Some(code),
+        )],
+    ));
+    assert!(
+        pending(&app),
+        "a row left as is hides its approval guidance"
+    );
     app.publish_system_state(status(
         Selection::all(),
         vec![observed(
@@ -883,9 +1520,91 @@ fn the_join_entry_ends_only_once_the_secrets_row_is_read() {
     ));
     assert!(!pending(&app), "the row carries the code now");
     assert_eq!(
+        ended_as(&app, JOIN_PENDING_KEY),
+        Some(aterm_messages::Retired::Withdrawn),
+        "never filed as fixed"
+    );
+    assert_eq!(
         app.system_state_menu_line(),
         line("System State: Secrets vault needs you", Some(code))
     );
+}
+
+/// An older parent can raise an entry under a retired key after its successor
+/// launched: folded in at Commit, it ends as one adopted at launch does, withdrawn
+/// (at the next settle, and the vault join's at once, its row read). An entry of
+/// another family the same catch-up adopts (the negative control) stands.
+#[cfg(unix)]
+#[test]
+fn an_entry_the_parent_raised_before_commit_ends_like_one_adopted_at_launch() {
+    use aterm_messages::exceptions::{Entry, Family};
+    use aterm_messages::need::{Reason, Then, Why};
+    use aterm_messages::{LogLine, Retired};
+    let devtools = Entry::new(
+        Family::Privacy,
+        "devtools",
+        "not-granted",
+        "aterm is not in Developer Tools",
+        Why::OnlyYou(Reason::new("only you can add aterm to Developer Tools")),
+        Then::step("Turn on aterm in Developer Tools"),
+    );
+    let join = Entry::new(
+        Family::Privacy,
+        "secrets",
+        "join-pending",
+        "This Mac needs vault approval",
+        Why::OnlyYou(Reason::new("an admin Mac approves this Mac")),
+        Then::step("On an admin Mac run aterm secrets approve ABCD-EFGH"),
+    );
+    let upgrade = Entry::new(
+        Family::Upgrade,
+        "",
+        "own-work",
+        "Claude in tab 1 is still on 2.1.283",
+        Why::OnlyYou(Reason::new(
+            "aterm never ends running work, and a job it started 5 h ago still runs",
+        )),
+        Then::step("End that job in the tab"),
+    );
+    let open = |app: &App, key: &str| app.messages.digest().entries.iter().any(|e| e.key == key);
+    let mut app = App::headless_for_test();
+    let now = Instant::now();
+    // This process launched: its settle and the first status that reads the
+    // Secrets row ran, with nothing yet to end.
+    app.settle_access_steps(now);
+    app.publish_system_state(status(
+        Selection::all(),
+        vec![observed(
+            Subject::Setting(Setting::Secrets),
+            Standing::NeedsYou,
+            Some("Approve on an admin Mac: ABCD-EFGH"),
+        )],
+    ));
+    let mut parent = App::headless_for_test();
+    parent.messages.raise_next_id(1_000);
+    parent.except(&devtools);
+    parent.except(&join);
+    parent.except_replace(Family::Upgrade, std::slice::from_ref(&upgrade));
+    let lines: Vec<LogLine> = parent
+        .messages
+        .drain_shelved_for_persist()
+        .into_iter()
+        .map(|(line, _)| line)
+        .collect();
+    app.catch_up_messages_with(lines);
+    assert!(
+        open(&app, &devtools.key()),
+        "the Commit adopts the parent's"
+    );
+    assert!(open(&app, &upgrade.key()));
+    assert_eq!(
+        ended_as(&app, JOIN_PENDING_KEY),
+        Some(Retired::Withdrawn),
+        "the row read carries the code"
+    );
+    app.settle_access_steps(now);
+    assert_eq!(ended_as(&app, &devtools.key()), Some(Retired::Withdrawn));
+    assert!(open(&app, &upgrade.key()), "another family's stands");
 }
 
 #[cfg(target_os = "macos")]
@@ -943,6 +1662,8 @@ fn new_mac(reach: crate::devtools_helper::Reach, fda: crate::devtools_helper::Fd
     app.access_steps.set_reach(StepsReach {
         recorded: |_, _| Some(AccessOutcome::Triggered),
         frontmost: front,
+        // AppRt's unit-test arm records URLs without starting a process.
+        open_pane: super::live_open_access_pane,
         ..stepping()
     });
     approve(&mut app, 1);
@@ -1417,6 +2138,7 @@ fn a_clients_act_on_a_row_waits_for_the_step_moment() {
     let with_dialog_up = StepsReach {
         recorded: |_, _| Some(AccessOutcome::Triggered),
         frontmost: front,
+        open_pane: super::live_open_access_pane,
         dialog_up: || true,
         ..stepping()
     };

@@ -57,6 +57,8 @@ fn kind_and_subject(reader: &dyn ScreenReader, point: &Turn) -> (String, String)
     match reader.program() {
         aterm_phase::Program::Claude => {}
         aterm_phase::Program::Codex
+        | aterm_phase::Program::Grok
+        | aterm_phase::Program::Kimi
         | aterm_phase::Program::Agy
         | aterm_phase::Program::Muse
         | aterm_phase::Program::Gemini

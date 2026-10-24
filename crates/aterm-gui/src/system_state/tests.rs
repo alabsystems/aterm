@@ -84,6 +84,7 @@ fn reading(subject: Subject, standing: Standing, now: Option<&str>) -> Observati
 
 fn with_readings(selection: Selection, observed: Vec<Observation>) -> SetupStatus {
     SetupStatus {
+        observed_vault_url: Some(Plan::default().vault_url),
         plan: Some(Plan::from(selection)),
         observed,
         ..SetupStatus::default()
@@ -965,7 +966,7 @@ fn a_choice_during_a_run_goes_at_once_and_nothing_waits_on_the_page() {
     assert_eq!(admission, Admission::Client);
     assert!(!plan.selection.contains(Setting::Messages));
     assert!(!plan.selection.contains(Setting::CapsLock));
-    app.tick(true);
+    app.tick(true, true, false);
     assert!(app.take_action().is_none(), "nothing is queued for later");
 }
 
@@ -1093,6 +1094,72 @@ fn set_up_now_runs_the_plan_again_when_rows_differ() {
 }
 
 #[test]
+fn unread_vault_rows_cannot_establish_that_the_mac_is_set_up() {
+    let complete = status_of("set-up");
+    let selection = complete.plan.as_ref().unwrap().selection;
+    let finished = headline(&complete, &rows(&complete, selection));
+    let first_read = Headline::before_plan(&SetupStatus::default());
+    assert_ne!(finished.text, first_read.text);
+    for source in [None, Some("http://other-vault.local:7484/v1/team".into())] {
+        let mut partial = complete.clone();
+        partial.observed_vault_url = source;
+        let waiting = headline(&partial, &rows(&partial, selection));
+        assert_eq!(waiting.text, first_read.text);
+        assert!(!waiting.start);
+        let no_managed = headline(&partial, &rows(&partial, Selection::none()));
+        assert_eq!(
+            no_managed.text,
+            headline(&complete, &rows(&complete, Selection::none())).text
+        );
+        partial
+            .observed
+            .iter_mut()
+            .find(|row| row.subject == Subject::Setting(Setting::CapsLock))
+            .unwrap()
+            .standing = Standing::Differs;
+        assert!(
+            headline(&partial, &rows(&partial, selection)).start,
+            "a known change still offers setup while the other source is unread"
+        );
+    }
+}
+
+#[test]
+fn an_unknown_managed_row_keeps_the_headline_unread() {
+    let complete = status_of("set-up");
+    let selection = complete.plan.as_ref().unwrap().selection;
+    let finished = headline(&complete, &rows(&complete, selection));
+    let first_read = Headline::before_plan(&SetupStatus::default());
+    assert_ne!(finished.text, first_read.text);
+
+    let mut partial = complete.clone();
+    partial
+        .observed
+        .iter_mut()
+        .find(|row| row.subject == Subject::Setting(Setting::Repositories))
+        .unwrap()
+        .standing = Standing::Unknown;
+    let waiting = headline(&partial, &rows(&partial, selection));
+    assert_eq!(waiting.text, first_read.text);
+    assert!(!waiting.start);
+    assert_eq!(
+        headline(&partial, &rows(&partial, Selection::none())).text,
+        headline(&complete, &rows(&complete, Selection::none())).text
+    );
+
+    partial
+        .observed
+        .iter_mut()
+        .find(|row| row.subject == Subject::Setting(Setting::CapsLock))
+        .unwrap()
+        .standing = Standing::Differs;
+    assert!(
+        headline(&partial, &rows(&partial, selection)).start,
+        "a known change still offers setup while another reading is unknown"
+    );
+}
+
+#[test]
 fn only_a_group_choice_or_join_makes_the_plan_the_choosers() {
     let chosen = |action: Option<SystemStateAction>| {
         let Some(SystemStateAction::Apply(answer, _)) = action else {
@@ -1120,7 +1187,7 @@ fn only_a_group_choice_or_join_makes_the_plan_the_choosers() {
     let (send, _receive) = mpsc::channel();
     let mut app = SystemStateApp::new(Plan::default());
     assert!(app.offer(Request::new(Plan::default(), send)));
-    app.tick(true);
+    app.tick(true, true, false);
     assert!(!chosen(app.take_action()));
 }
 
@@ -1155,12 +1222,12 @@ fn the_first_run_offer_applies_on_the_first_active_tick_with_no_timer() {
     let request = Request::new(Plan::default(), send);
     let mut app = SystemStateApp::new(Plan::default());
     assert!(app.offer(request.clone()));
-    app.tick(false);
+    app.tick(false, true, false);
     assert!(
         app.take_action().is_none(),
         "not until it is in an active window"
     );
-    app.tick(true);
+    app.tick(true, true, false);
     let Some(SystemStateAction::Apply(answer, who)) = app.take_action() else {
         panic!("the offer applies");
     };
@@ -1428,9 +1495,25 @@ fn the_list_scrolls_by_points_and_reveals_rows_and_the_vault_fields() {
         field.rect
     );
     assert!(!format!("{:?}", field.value).contains("test-only"));
-    let before = view.scroll.get();
-    assert!(view.scroll_by(-LINE_PX));
-    assert!((view.scroll.get() - (before - LINE_PX)).abs() < 0.5);
+    // From the top of a room taller than a line, where no span the room
+    // cuts would be carried past whole, one line down moves a full line.
+    view.scroll.set(0.0);
+    let room = view.room.get();
+    assert!(room > LINE_PX && view.limit.get() > LINE_PX, "{room}");
+    assert!(
+        !view
+            .spans
+            .borrow()
+            .iter()
+            .any(|span| span.top > 0.01 && span.top < LINE_PX - 0.01 && span.bottom > room + 0.01),
+        "a span stops the line"
+    );
+    view.scroll_steps(1, LINE_PX);
+    assert!(
+        (view.scroll.get() - LINE_PX).abs() < 0.01,
+        "a notch moved {}",
+        view.scroll.get()
+    );
     assert!(!view.reveal_listed_control(&UiKey::new("system-state/row/nowhere")));
 }
 
@@ -1631,7 +1714,12 @@ fn a_sync_turned_off_reads_as_the_persons_choice_with_a_quiet_way_back_on() {
         note: Some(note.into()),
         ..reading(secrets, Standing::InPlace, Some("Sync off"))
     };
-    let status = with_readings(Selection::all(), vec![off]);
+    let mut status = status_of("set-up");
+    *status
+        .observed
+        .iter_mut()
+        .find(|row| row.subject == secrets)
+        .unwrap() = off;
     let all = rows(&status, Selection::all());
     let row = all.iter().find(|row| row.subject == secrets).unwrap();
     assert!(row.turn_on_sync);
@@ -1858,6 +1946,330 @@ fn a_short_window_keeps_the_headline_and_the_footer_in_view() {
     let _ = install_preferences(AppearancePreferences::default());
 }
 
+/// The page and the view state the runtime holds for `view`.
+fn page_in(runtime: &NativeRuntime, view: ViewId) -> (&SystemStateApp, &SystemStateViewState) {
+    let instance = runtime
+        .instance_by_kind(crate::native_app::AppKind::SystemState)
+        .expect("System State is registered");
+    let Some(NativeApp::SystemState(app)) = runtime.app(instance) else {
+        panic!("System State is registered");
+    };
+    let Some(AppViewState::SystemState(state)) = runtime.view_state(view) else {
+        panic!("its view is attached");
+    };
+    (app, state)
+}
+
+/// Where the list sits in a compiled page.
+fn list_rect(compiled: &CompiledUi) -> LogicalRect {
+    compiled
+        .semantic(&UiKey::new("system-state/groups"))
+        .expect("the list is in the tree")
+        .rect
+}
+
+/// `key`'s paint node, where the page paints it.
+fn painted<'a>(compiled: &'a CompiledUi, key: &str) -> Option<&'a crate::native_ui::PaintNode> {
+    compiled.paint.iter().find(|node| node.key.as_str() == key)
+}
+
+/// Whether `key` is painted whole between `top` and `bottom`.
+fn whole_within(compiled: &CompiledUi, key: &str, top: f32, bottom: f32) -> bool {
+    painted(compiled, key)
+        .is_some_and(|node| node.rect.y >= top - 0.01 && node.rect.bottom() <= bottom + 0.01)
+}
+
+#[test]
+fn a_short_list_steps_no_further_than_its_room_and_shows_every_note_row_and_control_whole() {
+    use crate::native_appearance::{AppearancePreferences, install_preferences};
+    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+    for scale in [1.0_f32, 1.5, 2.0] {
+        let _ = install_preferences(AppearancePreferences {
+            text_scale: scale,
+            ..AppearancePreferences::default()
+        });
+        // The window a one-line headline, the footer and a list one row
+        // tall fill at this text size: 124pt at 1×.
+        let floor = 34.0 + 90.0 * scale;
+        for (scenario, above) in [
+            ("check-failed", 0.0_f32),
+            ("check-failed", 22.0),
+            ("check-failed", 76.0),
+            ("vault", 0.0),
+            ("vault", 126.0),
+            ("needs-you", 36.0),
+        ] {
+            let height = floor + above * scale;
+            let at = format!("{scenario} in a 720×{height} window at {scale}×");
+            let mut app = SystemStateApp::new(Plan::default());
+            app.publish(status_of(scenario));
+            let (mut runtime, instance, view) = runtime_with_app(app);
+            let compile_now = |runtime: &NativeRuntime| {
+                let (app, state) = page_in(runtime, view);
+                compile(app, state, 720.0, height)
+            };
+            let mut compiled = compile_now(&runtime);
+            let list = list_rect(&compiled);
+            let room = page_in(&runtime, view).1.room.get();
+            if scenario == "check-failed" && above == 0.0 {
+                // The short-window rule's floor: a list one row tall, whose
+                // room over the strip is shorter than one wheel line at 1×.
+                assert!(
+                    (list.height - Metrics::new(720.0, height).row_h).abs() < 0.01,
+                    "{at}"
+                );
+                assert!(scale > 1.0 || room < LINE_PX, "{at}");
+            }
+            // Every note, group, row and control the list places, with where
+            // it must show whole: in the room where it fits there, else in the
+            // list where it fits that.
+            let spans: Vec<(String, f32)> = page_in(&runtime, view)
+                .1
+                .spans
+                .borrow()
+                .iter()
+                .filter(|span| span.bottom - span.top <= list.height + 0.01)
+                .map(|span| {
+                    let tall = span.bottom - span.top > room + 0.01;
+                    let bottom = if tall { list.bottom() } else { list.y + room };
+                    (span.key.to_string(), bottom)
+                })
+                .collect();
+            // At 1× the list holds a row and a note whole; at a larger text
+            // size a row sets its value under its name and may stand taller.
+            if scale == 1.0 {
+                assert!(
+                    spans
+                        .iter()
+                        .any(|(key, _)| key.starts_with("system-state/row/")),
+                    "{at}: {spans:?}"
+                );
+            }
+            if scale == 1.0 && scenario == "check-failed" {
+                assert!(
+                    spans
+                        .iter()
+                        .any(|(key, _)| key.starts_with("system-state/note/")),
+                    "{at}: {spans:?}"
+                );
+            }
+            for direction in [1, -1] {
+                let mut seen = std::collections::BTreeSet::new();
+                let mut longest = 0.0_f32;
+                let mut path = Vec::new();
+                loop {
+                    let (before, limit) = {
+                        let state = page_in(&runtime, view).1;
+                        (state.scroll.get(), state.limit.get())
+                    };
+                    // Where a step may stop short: going down, a span's top at
+                    // the list's top; going up, a span's bottom at the room's
+                    // foot, or a taller one's top at the list's top.
+                    let edges: Vec<f32> = page_in(&runtime, view)
+                        .1
+                        .spans
+                        .borrow()
+                        .iter()
+                        .flat_map(|span| {
+                            let foot = (direction < 0).then_some(span.bottom - room);
+                            std::iter::once(span.top).chain(foot)
+                        })
+                        .collect();
+                    path.push(before);
+                    for (key, bottom) in &spans {
+                        if whole_within(&compiled, key, list.y, *bottom) {
+                            seen.insert(key.clone());
+                        }
+                    }
+                    runtime
+                        .dispatch(instance, view, AppEvent::ScrollLines(direction))
+                        .unwrap();
+                    let after = page_in(&runtime, view).1.scroll.get();
+                    let step = (after - before).abs();
+                    longest = longest.max(step);
+                    if step > 0.01
+                        && step < room.min(LINE_PX) - 0.01
+                        && after > 0.01
+                        && after < limit - 0.01
+                    {
+                        assert!(
+                            edges.iter().any(|edge| (edge - after).abs() < 0.01),
+                            "a step of {step} from {before} stops at no span's edge, \
+                             scrolling {direction:+}, {at}"
+                        );
+                    }
+                    if (after - before).abs() < 0.01 {
+                        break;
+                    }
+                    compiled = compile_now(&runtime);
+                }
+                let missed: Vec<&String> = spans
+                    .iter()
+                    .map(|(key, _)| key)
+                    .filter(|key| !seen.contains(*key))
+                    .collect();
+                assert!(
+                    missed.is_empty(),
+                    "{missed:?} never show whole, scrolling {direction:+} through {path:?}, \
+                     {at}"
+                );
+                assert!(
+                    longest <= room.min(LINE_PX) + 0.01,
+                    "a step of {longest} past the room's {room}, {at}"
+                );
+            }
+        }
+    }
+    let _ = install_preferences(AppearancePreferences::default());
+}
+
+#[test]
+fn a_focused_vault_field_stays_in_view_as_the_list_shrinks_and_shows_when_typed_into() {
+    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+    let mut app = SystemStateApp::new(Plan::default());
+    app.publish(status_of("vault"));
+    let (mut runtime, instance, view) = runtime_with_app(app);
+    let compile_at = |runtime: &NativeRuntime, height: f32| {
+        let (app, state) = page_in(runtime, view);
+        compile(app, state, 720.0, height)
+    };
+    let shown = |compiled: &CompiledUi, key: &str| {
+        let part = format!("{key}/");
+        compiled
+            .paint
+            .iter()
+            .any(|node| node.key.as_str() == key || node.key.as_str().starts_with(&part))
+    };
+    // Whether `key` is painted whole in the list's room, or in the list
+    // from its top where it stands taller than the room.
+    let in_view = |runtime: &NativeRuntime, compiled: &CompiledUi, key: &str| {
+        let list = list_rect(compiled);
+        let room = page_in(runtime, view).1.room.get();
+        let tall = painted(compiled, key).is_some_and(|node| node.rect.height > room + 0.01);
+        whole_within(
+            compiled,
+            key,
+            list.y,
+            if tall { list.bottom() } else { list.y + room },
+        )
+    };
+    let url = UiKey::new("system-state/url");
+    let compiled = compile_at(&runtime, 249.0);
+    assert!(
+        shown(&compiled, "settings/page-heading/system-state")
+            && !shown(&compiled, "system-state/brand"),
+        "at 720×249 the title shows and the brand does not"
+    );
+    runtime
+        .dispatch(instance, view, AppEvent::FocusChanged(Some(url.clone())))
+        .unwrap();
+    let compiled = compile_at(&runtime, 249.0);
+    assert!(
+        in_view(&runtime, &compiled, url.as_str()),
+        "focus reveals the field"
+    );
+    // One point taller, the brand comes back and the list loses its height.
+    let room = page_in(&runtime, view).1.room.get();
+    let compiled = compile_at(&runtime, 250.0);
+    assert!(
+        shown(&compiled, "system-state/brand"),
+        "the brand at 720×250"
+    );
+    assert!(page_in(&runtime, view).1.room.get() + 30.0 < room);
+    assert!(
+        in_view(&runtime, &compiled, url.as_str()),
+        "the focused field stays whole in a room the brand shrank"
+    );
+    // A window that shrinks a point at a time keeps it in view too.
+    runtime
+        .dispatch(instance, view, AppEvent::ScrollLines(-10_000))
+        .unwrap();
+    compile_at(&runtime, 400.0);
+    runtime
+        .dispatch(instance, view, AppEvent::FocusChanged(Some(url.clone())))
+        .unwrap();
+    for height in (124..=400).rev() {
+        let compiled = compile_at(&runtime, height as f32);
+        assert!(
+            in_view(&runtime, &compiled, url.as_str()),
+            "the focused field in a 720×{height} window"
+        );
+    }
+    // A caret move, a selection or a submit leaves the disclosure as it
+    // stood: only an edit pins the vault open.
+    for event in [
+        TextInputEvent::Left { extend: false },
+        TextInputEvent::Home { extend: true },
+        TextInputEvent::SelectAll,
+        TextInputEvent::Submit,
+        TextInputEvent::Preedit {
+            text: String::new(),
+            selection: None,
+        },
+    ] {
+        runtime
+            .dispatch(instance, view, AppEvent::TextInput(event.clone()))
+            .unwrap();
+        assert_eq!(page_in(&runtime, view).0.vault_open, None, "{event:?}");
+    }
+    // A focused field scrolled to a sliver the list leaves unpainted is one
+    // the person scrolled away from: a room that shrinks leaves it there.
+    compile_at(&runtime, 249.0);
+    let bottom = page_in(&runtime, view)
+        .1
+        .spans
+        .borrow()
+        .iter()
+        .find(|span| *span.key == *url.as_str())
+        .expect("the address field is listed")
+        .bottom;
+    let sliver = bottom - 3.0;
+    page_in(&runtime, view).1.scroll.set(sliver);
+    compile_at(&runtime, 249.0);
+    assert!((page_in(&runtime, view).1.scroll.get() - sliver).abs() < 0.01);
+    compile_at(&runtime, 250.0);
+    assert!(
+        (page_in(&runtime, view).1.scroll.get() - sliver).abs() < 0.01,
+        "a sliver of the focused field leaves the list where it stood"
+    );
+    // Scrolled out of sight, a field shows again once it is typed into.
+    for (key, event) in [
+        (
+            "system-state/url",
+            AppEvent::TextInput(TextInputEvent::Commit("x".into())),
+        ),
+        ("system-state/url", AppEvent::InsertText("y".into())),
+        (
+            "system-state/password",
+            AppEvent::TextInput(TextInputEvent::Commit("p".into())),
+        ),
+    ] {
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::FocusChanged(Some(UiKey::new(key))),
+            )
+            .unwrap();
+        runtime
+            .dispatch(instance, view, AppEvent::ScrollLines(-10_000))
+            .unwrap();
+        let compiled = compile_at(&runtime, 250.0);
+        assert!(painted(&compiled, key).is_none(), "{key} scrolled away");
+        runtime.dispatch(instance, view, event).unwrap();
+        // A typed address the worker has not read yet leaves the row
+        // nothing to wait on; the vault stays open for the draft.
+        assert!(
+            page_in(&runtime, view).0.vault_shown(),
+            "{key} typed into keeps the vault open"
+        );
+        let compiled = compile_at(&runtime, 250.0);
+        assert!(in_view(&runtime, &compiled, key), "{key} typed into shows");
+    }
+    let (app, _) = page_in(&runtime, view);
+    assert!(app.url.value().contains('x') && app.url.value().contains('y'));
+}
+
 /// The village paint node's spec in a compiled page, where the page shows one.
 fn village(compiled: &CompiledUi) -> Option<String> {
     compiled
@@ -1933,6 +2345,47 @@ fn the_village_has_one_station_per_setting_in_the_rows_words() {
     assert_eq!(states.len(), Setting::ALL.len());
 }
 
+/// The headline and the brand reach a screen reader in words (§3.1): each lowers to
+/// a Label, whose words AppKit and AT-SPI read from its value, in one line or wrapped.
+#[cfg(a11y_tree)]
+#[test]
+fn the_headline_and_the_brand_publish_their_words_as_a_labels_value() {
+    use aterm_a11y::model::Role;
+    let mut app = SystemStateApp::new(Plan::default());
+    app.publish(status_of("running"));
+    let running = "Setting up this Mac… 10 of 16";
+    for width in [999.0, 220.0] {
+        let compiled = compile(&app, &SystemStateViewState::default(), width, 900.0);
+        let projection =
+            crate::native_accessibility::project_native_accessibility(&compiled, None).unwrap();
+        let wrapped = compiled
+            .paint
+            .iter()
+            .any(|node| node.key.as_str().starts_with(&format!("{HEADLINE}/line-")));
+        assert_eq!(
+            wrapped,
+            width < 999.0,
+            "{width}: the headline wraps only when narrow"
+        );
+        for (key, words) in [
+            (HEADLINE, running),
+            ("system-state/brand", paint::BRAND_WORDS),
+        ] {
+            let id = projection
+                .id_for_key(&UiKey::new(key))
+                .unwrap_or_else(|| panic!("{width}: {key} is published"));
+            let (_, node) = projection
+                .update()
+                .nodes
+                .iter()
+                .find(|(candidate, _)| *candidate == id)
+                .unwrap();
+            assert_eq!(node.role(), Role::Label, "{width}: {key}");
+            assert_eq!(node.value(), Some(words), "{width}: {key}");
+        }
+    }
+}
+
 #[test]
 fn the_village_walks_beside_the_lockup_while_a_run_goes() {
     let viewport = LogicalRect::new(0.0, 0.0, 999.0, 900.0);
@@ -1976,7 +2429,7 @@ fn the_village_walks_beside_the_lockup_while_a_run_goes() {
     );
 
     assert!(
-        app.tick(true),
+        app.tick(true, true, view.village_walks()),
         "a busy tick repaints a page that shows the village"
     );
     let second = frame(&app, ViewMotionCx::default());
@@ -1995,18 +2448,18 @@ fn the_village_walks_beside_the_lockup_while_a_run_goes() {
     };
     let held = village(&frame(&app, still)).unwrap();
     assert!(held.starts_with("phase=0;"), "{held}");
-    assert!(!app.tick(true));
+    assert!(!app.tick(true, true, view.village_walks()));
     assert_eq!(village(&frame(&app, still)).unwrap(), held);
 
     // A window too short for the brand leaves the village out with it, and a
     // busy tick then owes it no repaint.
     let _ = frame(&app, ViewMotionCx::default());
-    assert!(app.tick(true));
+    assert!(app.tick(true, true, view.village_walks()));
     let short = LogicalRect::new(0.0, 0.0, 999.0, 200.0);
     let page = app.view(&view, &cx(short, false)).compile(short).unwrap();
     assert!(village(&page).is_none());
     assert!(
-        !app.tick(true),
+        !app.tick(true, true, view.village_walks()),
         "a busy tick repaints a village the page leaves out"
     );
 
@@ -2016,7 +2469,7 @@ fn the_village_walks_beside_the_lockup_while_a_run_goes() {
     app.publish(done_status);
     let _ = frame(&app, ViewMotionCx::default());
     assert!(
-        !app.tick(true),
+        !app.tick(true, true, view.village_walks()),
         "an idle page does not repaint for the village"
     );
 }
@@ -2119,4 +2572,429 @@ fn rainbow_kitty_village_builds_and_synergies_stay_stable_when_state_is_stable_w
         format!("{:?}", kitties_for(360)),
         format!("{:?}", kitties_for(1200))
     );
+}
+
+/// The village walks only on a page someone can see: a page whose tab is in
+/// the background takes no step and asks for no repaint on a busy tick, and
+/// walks on from where it stood once shown again.
+#[test]
+fn a_hidden_page_owes_no_repaint_for_the_village() {
+    let viewport = LogicalRect::new(0.0, 0.0, 999.0, 900.0);
+    let mut app = SystemStateApp::new(Plan::default());
+    app.publish(status_of("running"));
+    let view = SystemStateViewState::default();
+    let phase = |app: &SystemStateApp| {
+        let compiled = app
+            .view(&view, &cx(viewport, false))
+            .compile(viewport)
+            .unwrap();
+        village(&compiled).expect("village shows")
+    };
+    assert!(phase(&app).starts_with("phase=0;busy=1;"));
+    // The tab goes to the background: nothing renders the page any more.
+    let asked = (0..40)
+        .filter(|_| app.tick(true, false, view.village_walks()))
+        .count();
+    assert_eq!(
+        asked, 0,
+        "a page nobody sees asked for {asked} repaints in 40 ticks"
+    );
+    assert!(phase(&app).starts_with("phase=0;"), "it stood still");
+    assert!(
+        app.tick(true, true, view.village_walks()),
+        "shown again, it walks"
+    );
+    assert!(phase(&app).starts_with("phase=120;"));
+}
+
+/// Each view of the one page renders at its own window's size, and a busy
+/// tick walks the village only where a shown view drew it walking: a second
+/// window too short or too narrow for the village neither freezes the first
+/// window's kitties nor, shown alone, repaints a page with nothing moving,
+/// whichever of the two rendered last.
+#[test]
+fn a_shown_views_own_render_decides_whether_a_busy_tick_walks() {
+    let mut app = SystemStateApp::new(Plan::default());
+    app.publish(status_of("running"));
+    let (mut runtime, instance, tall) = runtime_with_app(app);
+    let other = ViewId::from_stored(2);
+    runtime
+        .attach_view(other, instance, AppViewState::SystemState(Box::default()))
+        .unwrap();
+    let render = |runtime: &NativeRuntime, view: ViewId, width: f32, height: f32| {
+        let viewport = LogicalRect::new(0.0, 0.0, width, height);
+        let tree = runtime
+            .render(instance, view, &cx(viewport, false))
+            .unwrap();
+        village(&tree.compile(viewport).unwrap())
+    };
+    let walks = |runtime: &NativeRuntime, view: ViewId| match runtime.view_state(view) {
+        Some(AppViewState::SystemState(state)) => state.village_walks(),
+        _ => panic!("{view:?} is a System State view"),
+    };
+    for (width, height) in [(999.0, 200.0), (320.0, 900.0)] {
+        for tall_last in [false, true] {
+            let mut order = [(tall, 999.0, 900.0), (other, width, height)];
+            if tall_last {
+                order.reverse();
+            }
+            for (view, w, h) in order {
+                let shows = render(&runtime, view, w, h).is_some();
+                assert_eq!(shows, view == tall, "{view:?} at {w}x{h}");
+            }
+            let case = format!("{width}x{height}, tall rendered last: {tall_last}");
+            assert!(walks(&runtime, tall), "{case}");
+            assert!(!walks(&runtime, other), "{case}");
+            assert!(
+                runtime.tick_system_state(true, true, &[tall, other]),
+                "both shown, the tall window's kitties walk ({case})"
+            );
+            assert!(
+                runtime.tick_system_state(true, true, &[tall]),
+                "the tall window alone walks ({case})"
+            );
+            assert!(
+                !runtime.tick_system_state(true, true, &[other]),
+                "a page shown only where its village is left out owes no repaint ({case})"
+            );
+        }
+    }
+}
+
+/// Check again and Restore keep the worker busy, and neither is a run: the
+/// village stands and says no run is going, and their ticks owe no repaint.
+#[test]
+fn the_village_stands_through_check_again_and_restore() {
+    let viewport = LogicalRect::new(0.0, 0.0, 999.0, 900.0);
+    for operation in [SetupOperation::Check, SetupOperation::Restore] {
+        let mut app = SystemStateApp::new(Plan::default());
+        let mut status = status_of("set-up");
+        status.busy = true;
+        status.operation = Some(operation);
+        app.publish(status);
+        let view = SystemStateViewState::default();
+        let compiled = app
+            .view(&view, &cx(viewport, false))
+            .compile(viewport)
+            .unwrap();
+        let spec = village(&compiled).expect("village shows");
+        assert!(
+            spec.contains(";busy=0;"),
+            "{operation:?} reads as a run: {spec}"
+        );
+        assert!(
+            !app.tick(true, true, view.village_walks()),
+            "{operation:?} repaints every tick for the village"
+        );
+    }
+}
+
+/// The page's own ticks are the walk's only clock: between runs the kitties
+/// stand where they are, whatever frame clock repaints the page.
+#[test]
+fn idle_kitties_stand_still_whatever_repaints_the_page() {
+    let viewport = LogicalRect::new(0.0, 0.0, 999.0, 900.0);
+    let app = SystemStateApp::new(Plan::default());
+    let view = SystemStateViewState::default();
+    let spec = |phase: u64| {
+        let cx = ViewCx {
+            animation_phase_ms: phase,
+            ..cx(viewport, false)
+        };
+        village(&app.view(&view, &cx).compile(viewport).unwrap()).expect("village shows")
+    };
+    assert_eq!(spec(0), spec(4_321));
+    assert!(
+        spec(4_321).starts_with("phase=0;busy=0;"),
+        "{}",
+        spec(4_321)
+    );
+}
+
+/// A reading of `subject` with its note.
+fn observed_with_note(
+    subject: Subject,
+    standing: Standing,
+    now: Option<&str>,
+    note: Option<&str>,
+) -> Observation {
+    Observation {
+        note: note.map(str::to_owned),
+        ..reading(subject, standing, now)
+    }
+}
+
+/// Every state the page draws, by name, each with whether Stop was pressed.
+fn page_states() -> Vec<(String, SetupStatus, bool)> {
+    let mut out: Vec<(String, SetupStatus, bool)> = Vec::new();
+    for name in [
+        "checking",
+        "running",
+        "debugger",
+        "needs-you",
+        "vault",
+        "set-up",
+        "non-alab",
+        "failed",
+        "mixed",
+        "fresh",
+    ] {
+        out.push((name.to_owned(), status_of(name), false));
+    }
+    let secrets = Subject::Setting(Setting::Secrets);
+    let repos = Subject::Setting(Setting::Repositories);
+    let replace = |mut status: SetupStatus, o: Observation| {
+        if let Some(slot) = status.observed.iter_mut().find(|x| x.subject == o.subject) {
+            *slot = o;
+        } else {
+            status.observed.push(o);
+        }
+        status
+    };
+    // Sync off: In place, with its note and the Turn On Sync button.
+    let mut off = observed_with_note(
+        secrets,
+        Standing::InPlace,
+        Some("Sync off"),
+        Some("You turned sync off on this Mac"),
+    );
+    off.wanted = "Sync off".into();
+    out.push((
+        "sync-off".into(),
+        replace(status_of("set-up"), off.clone()),
+        false,
+    ));
+    // A join waiting for an admin on a Mac whose sync is off: its longest note.
+    off.note = Some(
+        "You turned sync off; once it's on, approving 7QK2-M9WD-4HTX-PL3B on an admin Mac finishes the join"
+            .into(),
+    );
+    out.push((
+        "pending-sync-off".into(),
+        replace(status_of("set-up"), off),
+        false,
+    ));
+    // The person's own project build folders Spotlight indexes: a quiet note.
+    out.push((
+        "spotlit-projects".into(),
+        replace(
+            status_of("set-up"),
+            observed_with_note(
+                Subject::Setting(Setting::Spotlight),
+                Standing::InPlace,
+                Some("as wanted"),
+                Some(
+                    "Spotlight indexes 12 of your project build folders; renaming each to its \
+                     .noindex name and linking the old name to it keeps it out",
+                ),
+            ),
+        ),
+        false,
+    ));
+    // Not set up: differs, with the long note; Set up now on the headline.
+    out.push((
+        "not-set-up".into(),
+        replace(
+            status_of("set-up"),
+            observed_with_note(
+                secrets,
+                Standing::Differs,
+                Some("Not set up"),
+                Some("Not set up to sync this Mac; Set up now installs it"),
+            ),
+        ),
+        false,
+    ));
+    // Pending with password: the longest vault note.
+    out.push((
+        "pending-retype".into(),
+        replace(
+            status_of("set-up"),
+            observed_with_note(
+                secrets,
+                Standing::NeedsYou,
+                Some("Awaiting code"),
+                Some("Approve on an admin Mac: 7QK2-M9WD-4HTX-PL3B, or retype the join password"),
+            ),
+        ),
+        false,
+    ));
+    // Fleeting.
+    out.push((
+        "fleeting".into(),
+        replace(
+            status_of("set-up"),
+            observed_with_note(
+                secrets,
+                Standing::NeedsYou,
+                Some("Out of sync"),
+                Some("Move aterm to Applications and open it from there"),
+            ),
+        ),
+        false,
+    ));
+    // Waiting only: "1 step waiting: GitHub repositories" with Show.
+    out.push((
+        "waiting-only".into(),
+        replace(
+            status_of("set-up"),
+            observed_with_note(
+                repos,
+                Standing::Waiting,
+                None,
+                Some("Your GitHub token is for another account"),
+            ),
+        ),
+        false,
+    ));
+    // Failure notes under the headline, long.
+    let mut failed = status_of("failed");
+    failed.rows = vec![
+        SetupStatusRow {
+            name: "GitHub repositories".into(),
+            status: "error".into(),
+            detail: "cloning someone/aterm-very-long-repository-name-for-probing failed: the remote end hung up unexpectedly while 1234 objects were left".into(),
+        },
+        SetupStatusRow {
+            name: "Check again".into(),
+            status: "not started".into(),
+            detail: "Try again.".into(),
+        },
+    ];
+    out.push(("failure-notes".into(), failed, false));
+    // Restore going.
+    let mut restoring = status_of("set-up");
+    restoring.busy = true;
+    restoring.operation = Some(SetupOperation::Restore);
+    out.push(("restoring".into(), restoring, false));
+    // Running, Stop pressed.
+    out.push(("stopping".into(), status_of("running"), true));
+    out
+}
+
+/// Every state of the page keeps its words whole and apart, at every 8 points
+/// from 320 to 800 and 1x, 1.5x and 2x text, the painter's own overlap audit
+/// included: Sync off and its Turn On Sync, Not set up, a pending join's
+/// longest note, a disk-image copy, waiting only with Show, failure notes under
+/// the headline, Restore going and Stop pressed among them.
+#[test]
+fn every_state_keeps_its_words_whole_and_apart_from_320_to_800() {
+    use crate::native_appearance::{AppearancePreferences, install_preferences};
+    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+    let mut cut = std::collections::BTreeMap::<String, Vec<String>>::new();
+    let scenarios = page_states();
+    for scale in [1.0_f32, 1.5, 2.0] {
+        let _ = install_preferences(AppearancePreferences {
+            text_scale: scale,
+            ..AppearancePreferences::default()
+        });
+        for (name, status, stop) in &scenarios {
+            for vault_open in [true, false] {
+                let mut width = 320.0_f32;
+                while width <= 800.0 {
+                    let mut app = SystemStateApp::new(Plan::default());
+                    app.publish(status.clone());
+                    app.vault_open = Some(vault_open);
+                    if *stop {
+                        app.stopping = true;
+                    }
+                    let compiled = compile(&app, &SystemStateViewState::default(), width, 4000.0);
+                    for failure in compiled.fit_failures() {
+                        if failure.contains("kind=text-field") {
+                            continue;
+                        }
+                        let key = format!("{scale}x {name} open={vault_open}");
+                        let shape: String = failure
+                            .split_whitespace()
+                            .filter(|w| {
+                                w.starts_with("key=")
+                                    || w.starts_with("a=")
+                                    || w.starts_with("b=")
+                                    || w.starts_with("paint-")
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        let entry = cut.entry(format!("{key} :: {shape}")).or_default();
+                        if entry.len() < 3 {
+                            entry.push(format!("w={width}: {failure}"));
+                        }
+                    }
+                    for node in &compiled.paint {
+                        let Some(audit) = compiled.text_fit_audit_line(&node.key) else {
+                            continue;
+                        };
+                        if !audit.contains("kind=text-field")
+                            && audit.contains("clip-truncated=true")
+                        {
+                            let entry = cut
+                                .entry(format!(
+                                    "{scale}x {name} open={vault_open} :: clip-truncated {}",
+                                    node.key.as_str()
+                                ))
+                                .or_default();
+                            if entry.len() < 3 {
+                                entry.push(format!("w={width}: {audit}"));
+                            }
+                        }
+                    }
+                    width += 8.0;
+                }
+            }
+        }
+    }
+    let _ = install_preferences(AppearancePreferences::default());
+    assert!(
+        cut.is_empty(),
+        "{} kinds of cut or overlap:\n{cut:#?}",
+        cut.len()
+    );
+}
+
+/// The same at display scales 1x and 1.5x (the device pixels the brand's kitty
+/// is sized in), 1x text: the brand's words never run under its kitty. 2x is
+/// the display the sweep above renders at (`cx`), with 1x text among its rungs.
+#[test]
+fn every_state_keeps_its_words_whole_at_every_display_scale() {
+    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+    let mut cut = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for display in [1.0_f32, 1.5] {
+        for (name, status, stop) in page_states() {
+            let mut width = 320.0_f32;
+            while width <= 800.0 {
+                let mut app = SystemStateApp::new(Plan::default());
+                app.publish(status.clone());
+                app.vault_open = Some(true);
+                app.stopping = stop;
+                let viewport = LogicalRect::new(0.0, 0.0, width, 4000.0);
+                let cx = ViewCx {
+                    terminal_scale: display,
+                    ..cx(viewport, false)
+                };
+                let compiled = app
+                    .view(&SystemStateViewState::default(), &cx)
+                    .compile(viewport)
+                    .unwrap();
+                for failure in compiled.fit_failures() {
+                    if failure.contains("kind=text-field") {
+                        continue;
+                    }
+                    let shape: String = failure
+                        .split_whitespace()
+                        .filter(|w| {
+                            w.starts_with("key=") || w.starts_with("a=") || w.starts_with("b=")
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let entry = cut
+                        .entry(format!("{display}d {name} :: {shape}"))
+                        .or_default();
+                    if entry.len() < 2 {
+                        entry.push(format!("w={width}: {failure}"));
+                    }
+                }
+                width += 8.0;
+            }
+        }
+    }
+    assert!(cut.is_empty(), "{} kinds:\n{cut:#?}", cut.len());
 }

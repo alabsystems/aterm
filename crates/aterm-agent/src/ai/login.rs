@@ -215,6 +215,46 @@ fn claude(h: &Host<'_>, f: &Facts, out: &mut dyn Write) -> Done {
     }
 }
 
+/// The CLI a pool sign-in names: its id (`--cli`), the one field of a [`Connector`] it reads.
+#[derive(Debug, Clone, Copy)]
+pub struct PoolCli<'a> {
+    /// `codex`, `grok`, `kimi`.
+    pub id: &'a str,
+}
+
+/// A CLI with its own accounts pool signs in through it: `aterm harness accounts renew <label>
+/// --cli <id>` for the pool's next row, a fresh login in its own staging home, its page pinned
+/// and its account checked before any session uses it.
+pub fn pool_sign_in(h: &Host<'_>, c: PoolCli<'_>, pool: &super::facts::CliAccounts) -> Done {
+    let roster = pool.roster.display();
+    if let Some(why) = &pool.refused {
+        return Done::Refused(format!(
+            "{roster} is refused ({}): fix it (`aterm harness accounts --cli {}` says how), then \
+             run `aterm ai login {}`",
+            crate::harness::one_line(why, 160),
+            c.id,
+            c.id
+        ));
+    }
+    let Some(label) = &pool.next else {
+        return Done::Refused(format!(
+            "{roster} has no row with an email to sign in: add one with `aterm harness accounts \
+             add <label> --cli {} --email <email>`",
+            c.id
+        ));
+    };
+    let args = as_args(&["harness", "accounts", "renew", label, "--cli", c.id]);
+    let env: Vec<(String, String)> = h.vars.to_vec();
+    match h.runner.terminal(h.aterm, &args, &env, None) {
+        Ok(0) => Done::SignedIn(None),
+        Ok(code) => Done::Failed(format!(
+            "`aterm harness accounts renew {label} --cli {}` exited {code}",
+            c.id
+        )),
+        Err(why) => Done::Failed(why),
+    }
+}
+
 /// Signs `row`'s CLI in.
 #[must_use]
 pub fn sign_in(h: &Host<'_>, f: &Facts, row: &Row, out: &mut dyn Write) -> Done {
@@ -232,6 +272,9 @@ pub fn sign_in(h: &Host<'_>, f: &Facts, row: &Row, out: &mut dyn Write) -> Done 
             "not installed: run `aterm pkg install {}` first",
             c.id
         ));
+    }
+    if let Some(pool) = &f.pool {
+        return pool_sign_in(h, PoolCli { id: c.id }, pool);
     }
     let (args, remote, tell, signs_out_first, after) = match &c.login {
         Login::Accounts => return claude(h, f, out),

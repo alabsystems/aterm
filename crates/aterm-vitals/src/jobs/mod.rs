@@ -290,6 +290,9 @@ pub struct JobProc {
     pub tty: Option<u32>,
     /// That terminal's foreground process group.
     pub tpgid: Option<u32>,
+    /// That terminal's line discipline, read for a session leader (`aterm_sysprobe::jobs::term_word`);
+    /// `None` for any other process, or where aterm's user may not open the terminal.
+    pub term: Option<TermWord>,
     /// Its counters; `None` where refused.
     pub counters: Option<JobCounters>,
     /// Its threads; `None` where refused.
@@ -368,6 +371,17 @@ pub struct TtyMode {
     pub echo: bool,
     /// When the word was read, host ms.
     pub stamped_ms: u64,
+}
+
+/// A terminal's line discipline as a sweep read it (`aterm_sysprobe::jobs::TermWord`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct TermWord {
+    /// `ICANON`.
+    pub canonical: bool,
+    /// `ECHO`.
+    pub echo: bool,
+    /// Bytes typed that its reader has not read (`FIONREAD`: a canonical terminal's whole lines).
+    pub queued: u32,
 }
 
 /// The unread-input gate's word (`aterm_session::input_backlog::InputWord`).
@@ -502,6 +516,9 @@ pub struct JobTab {
     pub output_bytes: u64,
     /// When the program last consumed typed input, host ms.
     pub input_consumed_ms: Option<u64>,
+    /// When a pass found keys driven into the tab's terminal since the pass before (the
+    /// person's, a driver's): that pass's clock, host ms.
+    pub typed_ms: Option<u64>,
     /// The transcript join's hints for detached calls.
     pub calls: Vec<CallHint>,
     /// Tier B namings made on request.
@@ -588,6 +605,8 @@ pub enum JobKind {
     ShellBg,
     /// A detached child.
     AgentCall,
+    /// A terminal session nested in the tab's (sudo's `use_pty`, `script`, an agent's pty call).
+    Nested,
     /// What lived on after its job ended.
     Orphan,
 }
@@ -600,6 +619,7 @@ impl JobKind {
             Self::Shell => "shell",
             Self::ShellBg => "shell-bg",
             Self::AgentCall => "agent-call",
+            Self::Nested => "nested",
             Self::Orphan => "orphan",
         }
     }

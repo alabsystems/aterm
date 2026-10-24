@@ -769,6 +769,14 @@ mod tests {
                 Subject::of_dir(&p, &p.join("store/trust/current/bin")),
                 Some(trust(9192))
             );
+            // A build laid aside (`crate::layout`): through its link, and as the compiler
+            // reports its canonical sysroot.
+            let aside = p.join("store/trust/15698.noindex/bin");
+            std::fs::create_dir_all(&aside).unwrap();
+            std::os::unix::fs::symlink("15698.noindex", p.join("store/trust/15698")).unwrap();
+            for dir in [aside, p.join("store/trust/15698/bin")] {
+                assert_eq!(Subject::of_dir(&p, &dir), Some(trust(15698)), "{dir:?}");
+            }
         }
         assert_eq!(
             Subject::of_dir(&p, Path::new("/opt/trust/stage2/bin")),

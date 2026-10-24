@@ -80,7 +80,7 @@ bundle = []
 update_channel = "alabsystems/aterm"
 
 [workspace.package]
-version = "0.130.0"
+version = "0.131.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -256,6 +256,8 @@ aterm-update-core = { path = "crates/aterm-update-core" }
 aterm-vitals = { path = "crates/aterm-vitals" }
 aterm-verify = { path = "crates/aterm-verify" }
 aterm-vz = { path = "crates/aterm-vz" }
+# The guest agent's wire codec (`wire`) and ports, which aterm-vz's helper speaks.
+aterm-vz-agent = { path = "crates/aterm-vz-agent" }
 # Host boundary for the wasm modules: `console.error` panic hook and syn-free
 # `#[export]` ABI layer.
 aterm-wasm-abi = { path = "crates/aterm-wasm-abi" }

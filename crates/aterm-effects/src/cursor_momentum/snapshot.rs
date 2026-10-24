@@ -492,6 +492,7 @@ impl MomentumGlow {
             stamp,
             tau: f32::from_bits(s.tau),
             light_ink_memo: None,
+            light_vivid: false,
         })
     }
 }

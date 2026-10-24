@@ -880,9 +880,13 @@ impl<C: Ctl> Session<'_, C> {
     ) -> Result<Option<Named>, Refusal> {
         let wall = match reading.program {
             Program::Claude => reading.wall.as_ref().filter(|w| w.kind != WallKind::Memory),
-            Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => {
-                None
-            }
+            Program::Codex
+            | Program::Grok
+            | Program::Kimi
+            | Program::Agy
+            | Program::Muse
+            | Program::Gemini
+            | Program::Generic => None,
         };
         let Some(w) = wall else {
             return Ok(None);
@@ -970,9 +974,13 @@ impl<C: Ctl> Session<'_, C> {
     ) -> Option<aterm_phase::Wall> {
         let claude = match reading.program {
             Program::Claude => true,
-            Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => {
-                false
-            }
+            Program::Codex
+            | Program::Grok
+            | Program::Kimi
+            | Program::Agy
+            | Program::Muse
+            | Program::Gemini
+            | Program::Generic => false,
         };
         if reading.wall.is_some() || !claude || reading.phase != Phase::Idle {
             return None;
@@ -1074,7 +1082,13 @@ impl<C: Ctl> Session<'_, C> {
         };
         match reading.program {
             Program::Claude => {}
-            Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => {
+            Program::Codex
+            | Program::Grok
+            | Program::Kimi
+            | Program::Agy
+            | Program::Muse
+            | Program::Gemini
+            | Program::Generic => {
                 return false;
             }
         }
@@ -1202,9 +1216,13 @@ impl<C: Ctl> Session<'_, C> {
         let rows = &screen.rows;
         let claude = match reader.program() {
             Program::Claude => true,
-            Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => {
-                false
-            }
+            Program::Codex
+            | Program::Grok
+            | Program::Kimi
+            | Program::Agy
+            | Program::Muse
+            | Program::Gemini
+            | Program::Generic => false,
         };
         if !claude
             || !aterm_phase::phase::status_unseen(rows)
@@ -1234,9 +1252,13 @@ impl<C: Ctl> Session<'_, C> {
     ) -> bool {
         let claude = match reader.program() {
             Program::Claude => true,
-            Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => {
-                false
-            }
+            Program::Codex
+            | Program::Grok
+            | Program::Kimi
+            | Program::Agy
+            | Program::Muse
+            | Program::Gemini
+            | Program::Generic => false,
         };
         if !claude || !aterm_phase::phase::carried_wait_alone(&screen.rows) {
             self.transcript_over_seq = None;

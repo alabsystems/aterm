@@ -1551,10 +1551,10 @@ pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
     aterm_durable::durable_dir(parent)
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 pub use fake::Fake;
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 mod fake {
     use super::scratch::{OwnedDirectory, prefix};
     use super::{

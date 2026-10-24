@@ -140,6 +140,29 @@ pub fn status_fields(view: Option<&JobsView>, keys: &[u64], age_ms: u64) -> Stri
     }
 }
 
+/// `status`'s `program_check=` field: how many programs of the sessions `keys` macOS's program
+/// check holds in `view` (members of their jobs, orphans of them included) and the oldest held
+/// to now, `age_ms` being the view's age; `0` with none, `-` with no view.
+#[must_use]
+pub fn program_check_field(view: Option<&JobsView>, keys: &[u64], age_ms: u64) -> String {
+    let Some(view) = view else {
+        return "program_check=-".to_owned();
+    };
+    let held = view
+        .findings
+        .program_check
+        .iter()
+        .filter(|n| n.tab.is_some_and(|t| keys.contains(&t)));
+    let (n, oldest) = held.fold((0usize, 0u64), |(n, oldest), h| {
+        (n + 1, oldest.max(h.for_ms))
+    });
+    if n == 0 {
+        "program_check=0".to_owned()
+    } else {
+        format!("program_check={n}:{}", oldest.saturating_add(age_ms))
+    }
+}
+
 /// Formats the `brief` jobs line.
 #[must_use]
 pub fn brief_line(view: &JobsView, keys: &[u64]) -> Option<String> {
@@ -533,6 +556,43 @@ mod tests {
             "{line}"
         );
         assert!(!line.contains("curl"), "no name a process chose: {line}");
+    }
+
+    #[test]
+    fn status_counts_this_tabs_held_programs_and_the_oldest_to_now() {
+        let held = |pid, tab, for_ms| Named {
+            pid,
+            name: "git-remote-https".into(),
+            tab,
+            for_ms,
+        };
+        let view = JobsView {
+            findings: Findings {
+                program_check: vec![
+                    held(1, Some(7), 30_000),
+                    held(2, Some(7), 1_140_000),
+                    held(3, Some(8), 5_000),
+                    held(4, None, 9_000_000),
+                ],
+                ..Findings::default()
+            },
+            ..JobsView::default()
+        };
+        assert_eq!(program_check_field(None, &[7], 0), "program_check=-");
+        assert_eq!(
+            program_check_field(Some(&view), &[7], 2_000),
+            "program_check=2:1142000",
+            "the oldest of this tab's two, counted on past a view 2 s old"
+        );
+        assert_eq!(
+            program_check_field(Some(&view), &[8], 2_000),
+            "program_check=1:7000"
+        );
+        assert_eq!(
+            program_check_field(Some(&view), &[9], 2_000),
+            "program_check=0",
+            "another tab's held program, and one no tab holds, are not this tab's"
+        );
     }
     use crate::sys::json::contract_violations;
 

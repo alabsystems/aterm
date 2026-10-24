@@ -2145,6 +2145,7 @@ pub fn cmd_aos_repair(args: &[String]) -> Res {
             env: world.env(),
             cwd: world.home.clone(),
             sandbox: None,
+            reroute: false,
         },
     )?;
     println!(

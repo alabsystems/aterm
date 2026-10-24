@@ -30,9 +30,13 @@ impl<C: Ctl> Session<'_, C> {
         };
         let claude = match reading.program {
             Program::Claude => true,
-            Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => {
-                false
-            }
+            Program::Codex
+            | Program::Grok
+            | Program::Kimi
+            | Program::Agy
+            | Program::Muse
+            | Program::Gemini
+            | Program::Generic => false,
         };
         if !claude || screen.first != 0 || screen.generation.is_none() || self.alt_screen_now()? {
             return Ok(None);

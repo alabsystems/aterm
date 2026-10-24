@@ -537,26 +537,89 @@ impl Drop for Scratch {
     }
 }
 
+/// An exit watch on `pid`, a process under `parent` (its child, or a child's child: a session's
+/// foreground job runs under its shell), with its birth and line to `parent` the same across the
+/// registration, so the watch is on that process and no reuse of its pid.
 fn child_exit(pid: i32, parent: u32) -> Result<std::os::fd::OwnedFd, String> {
     let birth = aterm_uds::process::read_birth(pid)
         .ok_or_else(|| format!("cannot read child {pid}'s birth"))?;
-    if aterm_uds::process::read_process_parent(pid) != Some(parent) {
-        return Err(format!(
-            "{pid} is not an observed child of instance {parent}"
-        ));
-    }
+    let line = line_to(pid, parent)
+        .ok_or_else(|| format!("{pid} is not an observed child of instance {parent}"))?;
     let fd = u32::try_from(pid)
         .ok()
         .and_then(aterm_uds::exitwatch::exit_fd)
         .ok_or_else(|| format!("cannot watch child {pid}'s exit"))?;
-    if aterm_uds::process::read_birth(pid) != Some(birth)
-        || aterm_uds::process::read_process_parent(pid) != Some(parent)
-    {
+    if aterm_uds::process::read_birth(pid) != Some(birth) || line_to(pid, parent) != Some(line) {
         return Err(format!(
             "child {pid} changed across exit-watch registration"
         ));
     }
     Ok(fd)
+}
+
+/// The parents from `pid` up to `ancestor`, or `None` when `ancestor` is not within four.
+fn line_to(pid: i32, ancestor: u32) -> Option<Vec<u32>> {
+    let mut line = Vec::new();
+    let mut at = pid;
+    for _ in 0..4 {
+        let parent = aterm_uds::process::read_process_parent(at)?;
+        line.push(parent);
+        if parent == ancestor {
+            return Some(line);
+        }
+        at = i32::try_from(parent).ok().filter(|p| *p > 1)?;
+    }
+    None
+}
+
+/// Waits up to [`DEADLINE`] for each watched exit, noting in `failures` each one unconfirmed.
+fn await_exits(mut watches: Vec<(i32, std::os::fd::OwnedFd)>, failures: &mut Vec<String>) {
+    let end = Instant::now() + DEADLINE;
+    while !watches.is_empty() {
+        let mut pending = Vec::new();
+        for (pid, fd) in watches {
+            match exited(&fd) {
+                Ok(true) => {}
+                Ok(false) => pending.push((pid, fd)),
+                Err(why) => failures.push(format!("child {pid}: {why}")),
+            }
+        }
+        watches = pending;
+        if watches.is_empty() {
+            break;
+        }
+        if Instant::now() >= end {
+            failures.push(format!(
+                "child exits unconfirmed: {:?}",
+                watches.iter().map(|(pid, _)| pid).collect::<Vec<_>>()
+            ));
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// An exit watch ([`child_exit`]) on each child `parent` has now: its bridge and the roots of its
+/// sessions, for an instance this world hosts beside its own.
+fn watch_children(parent: u32) -> Result<Vec<(i32, std::os::fd::OwnedFd)>, String> {
+    let pid = i32::try_from(parent).map_err(|e| format!("instance pid {parent}: {e}"))?;
+    #[cfg(target_vendor = "apple")]
+    let children = aterm_uds::process::child_pids(pid);
+    #[cfg(not(target_vendor = "apple"))]
+    let children: Option<Vec<i32>> = None;
+    children
+        .ok_or_else(|| format!("cannot list instance {pid}'s children"))?
+        .into_iter()
+        .map(|child| child_exit(child, parent).map(|fd| (child, fd)))
+        .collect()
+}
+
+/// Marks the world's scratch kept, saying why, when `failures` leaves an instance's end unproven.
+fn keep_unless_proven(keep: &std::sync::atomic::AtomicBool, what: &str, failures: &[String]) {
+    if !failures.is_empty() {
+        keep.store(true, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("{what} cleanup unknown: {}", failures.join("; "));
+    }
 }
 
 fn exited(fd: &std::os::fd::OwnedFd) -> Result<bool, String> {
@@ -632,6 +695,9 @@ pub struct World {
     pub retained: bool,
     watch: std::sync::Mutex<Option<Client>>,
     lifeline: std::sync::Mutex<Option<aterm_uds::lifeline::Lifeline>>,
+    /// Exit watches on the roots of each instance a test took to end itself ([`World::take_gui`]),
+    /// or why one could not be set: [`World::stop`] waits on them.
+    ended: Vec<Result<(i32, std::os::fd::OwnedFd), String>>,
     stopped: bool,
     scratch: Scratch,
 }
@@ -650,6 +716,7 @@ impl Drop for World {
         if ended.is_ok()
             && !std::thread::panicking()
             && !self.scratch.keep.load(std::sync::atomic::Ordering::Relaxed)
+            && std::sync::Arc::strong_count(&self.scratch.keep) == 1
             && std::env::var_os("ATERM_LINK_KEEP").is_none()
             && let Some(scratch) = self.scratch.dir.take()
         {
@@ -705,6 +772,55 @@ pub fn aterm_to_launch() -> &'static str {
 }
 
 impl World {
+    /// An exit watch on each root the instance `gui` owns now (its bridge and each session's
+    /// foreground root) but those `watched` names: a session a handoff carried keeps its watch.
+    fn root_watches(
+        &self,
+        gui: u32,
+        watched: &[i32],
+    ) -> Result<Vec<(i32, std::os::fd::OwnedFd)>, String> {
+        let mut pids = Vec::new();
+        let bridge = std::fs::read_to_string(self.state.join("pid"))
+            .map_err(|e| format!("read bridge pid: {e}"))?
+            .trim()
+            .parse::<i32>()
+            .map_err(|e| format!("parse bridge pid: {e}"))?;
+        pids.push(bridge);
+        let mut ctl = connect_within(&self.ctl_sock, &self.token, DEADLINE)
+            .map_err(|e| format!("connect for owned foreground roots: {e}"))?;
+        let who = ctl
+            .request("who")
+            .map_err(|e| format!("read foreground roots: {e}"))?;
+        if !who.ok() {
+            return Err(format!("foreground roots: {}", who.header()));
+        }
+        for row in who.rows() {
+            let pid = kv(row, "fgpgid")
+                .and_then(|p| p.parse::<i32>().ok())
+                .filter(|p| *p > 1)
+                .ok_or_else(|| format!("no foreground root in {row}"))?;
+            if !pids.contains(&pid) {
+                pids.push(pid);
+            }
+        }
+        pids.into_iter()
+            .filter(|pid| !watched.contains(pid))
+            .map(|pid| Ok((pid, child_exit(pid, gui)?)))
+            .collect()
+    }
+
+    /// Takes this world's instance for the test to end itself (a quit, a SIGKILL), first watching
+    /// the roots it owns, so [`Self::stop`] still proves they exited.
+    pub fn take_gui(&mut self) -> Option<OwnedChild> {
+        let gui = self.gui.take()?;
+        let watched: Vec<i32> = self.ended.iter().flatten().map(|(pid, _)| *pid).collect();
+        match self.root_watches(gui.id(), &watched) {
+            Ok(more) => self.ended.extend(more.into_iter().map(Ok)),
+            Err(why) => self.ended.push(Err(why)),
+        }
+        Some(gui)
+    }
+
     /// Cut this world's lifeline, reap its direct instance, and wait for its roots to exit.
     pub fn stop(&mut self) -> Result<(), String> {
         if self.stopped {
@@ -712,41 +828,20 @@ impl World {
         }
         let mut failures = Vec::new();
         let mut watches = Vec::new();
-        if let Some(gui) = &self.gui {
-            let observed = (|| {
-                let mut pids = Vec::new();
-                let bridge = std::fs::read_to_string(self.state.join("pid"))
-                    .map_err(|e| format!("read bridge pid: {e}"))?
-                    .trim()
-                    .parse::<i32>()
-                    .map_err(|e| format!("parse bridge pid: {e}"))?;
-                pids.push(bridge);
-                let mut ctl = connect_within(&self.ctl_sock, &self.token, DEADLINE)
-                    .map_err(|e| format!("connect for owned foreground roots: {e}"))?;
-                let who = ctl
-                    .request("who")
-                    .map_err(|e| format!("read foreground roots: {e}"))?;
-                if !who.ok() {
-                    return Err(format!("foreground roots: {}", who.header()));
-                }
-                for row in who.rows() {
-                    let pid = kv(row, "fgpgid")
-                        .and_then(|p| p.parse::<i32>().ok())
-                        .filter(|p| *p > 1)
-                        .ok_or_else(|| format!("no foreground root in {row}"))?;
-                    if !pids.contains(&pid) {
-                        pids.push(pid);
-                    }
-                }
-                for pid in pids {
-                    watches.push((pid, child_exit(pid, gui.id())?));
-                }
-                Ok(())
-            })();
-            if let Err(why) = observed {
-                failures.push(why);
+        let took = !self.ended.is_empty();
+        for ended in std::mem::take(&mut self.ended) {
+            match ended {
+                Ok(watch) => watches.push(watch),
+                Err(why) => failures.push(why),
             }
-        } else {
+        }
+        if let Some(gui) = &self.gui {
+            let watched: Vec<i32> = watches.iter().map(|(pid, _)| *pid).collect();
+            match self.root_watches(gui.id(), &watched) {
+                Ok(more) => watches.extend(more),
+                Err(why) => failures.push(why),
+            }
+        } else if !took {
             failures.push("no owned instance handle for child-exit observations".into());
         }
         self.lifeline
@@ -761,29 +856,7 @@ impl World {
                 Err(why) => failures.push(why),
             }
         }
-        let end = Instant::now() + DEADLINE;
-        while !watches.is_empty() {
-            let mut pending = Vec::new();
-            for (pid, fd) in watches {
-                match exited(&fd) {
-                    Ok(true) => {}
-                    Ok(false) => pending.push((pid, fd)),
-                    Err(why) => failures.push(format!("child {pid}: {why}")),
-                }
-            }
-            watches = pending;
-            if watches.is_empty() {
-                break;
-            }
-            if Instant::now() >= end {
-                failures.push(format!(
-                    "child exits unconfirmed: {:?}",
-                    watches.iter().map(|(pid, _)| pid).collect::<Vec<_>>()
-                ));
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        await_exits(watches, &mut failures);
         if failures.is_empty() {
             self.stopped = true;
             Ok(())
@@ -1028,6 +1101,7 @@ impl World {
             retained,
             watch: std::sync::Mutex::new(None),
             lifeline: std::sync::Mutex::new(Some(lifeline)),
+            ended: Vec::new(),
             stopped: false,
             scratch,
         };
@@ -1201,9 +1275,6 @@ impl World {
     }
 
     fn sibling_with(&mut self, fabric: Option<&str>) -> Sibling {
-        self.scratch
-            .keep
-            .store(true, std::sync::atomic::Ordering::Relaxed);
         let own = self.gui.as_ref().expect("this world's gui").id();
         self.ctl_sock = self
             .tmp
@@ -1236,14 +1307,16 @@ impl World {
             .to_string_lossy()
             .into_owned();
         let token = World::wait_for_token_of(&sock, &mut child, &self.tmp.join("sibling.log"));
-        Sibling { child, sock, token }
+        Sibling {
+            child,
+            sock,
+            token,
+            keep: std::sync::Arc::clone(&self.scratch.keep),
+        }
     }
 
     /// Spawns a successor headless instance in `run-<n>` armed with this world's fabric command.
     pub fn successor_instance(&self, n: usize, env: &[(&str, &str)]) -> Successor {
-        self.scratch
-            .keep
-            .store(true, std::sync::atomic::Ordering::Relaxed);
         let fabric = std::fs::read_to_string(self.tmp.join("fabric.cmd"))
             .expect("this world's fabric command");
         let run = self.tmp.join(format!("run-{n}"));
@@ -1277,6 +1350,7 @@ impl World {
             sock,
             token: String::new(),
             log: log_path,
+            keep: std::sync::Arc::clone(&self.scratch.keep),
         };
         successor.child = Some(cmd.spawn().expect("launch a successor aterm --headless"));
         successor.token = World::wait_for_owned_token_of(
@@ -1684,12 +1758,23 @@ pub struct Sibling {
     pub sock: String,
     /// Its Owner token.
     pub token: String,
+    /// The hosting world's keep flag, set when its end is not proven.
+    keep: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Drop for Sibling {
     fn drop(&mut self) {
+        let mut failures = Vec::new();
+        let watches = watch_children(self.child.id());
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Err(e) = self.child.wait() {
+            failures.push(format!("reap sibling: {e}"));
+        }
+        match watches {
+            Ok(watches) => await_exits(watches, &mut failures),
+            Err(why) => failures.push(why),
+        }
+        keep_unless_proven(&self.keep, "sibling", &failures);
     }
 }
 
@@ -1703,6 +1788,8 @@ pub struct Successor {
     pub token: String,
     /// Where its stdout and stderr go (its bridge's too).
     pub log: PathBuf,
+    /// The hosting world's keep flag, set when its end is not proven.
+    keep: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Successor {
@@ -1743,12 +1830,21 @@ impl Successor {
 
 impl Drop for Successor {
     fn drop(&mut self) {
+        let watches = self.child.as_ref().map(|child| watch_children(child.id()));
         self.lifeline.take();
-        if let Some(mut child) = self.child.take()
-            && let Err(why) = end_owned_child(&mut child)
-        {
-            eprintln!("successor cleanup unknown: {why}");
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let mut failures = Vec::new();
+        if let Err(why) = end_owned_child(&mut child) {
+            failures.push(why);
         }
+        match watches {
+            Some(Ok(watches)) => await_exits(watches, &mut failures),
+            Some(Err(why)) => failures.push(why),
+            None => {}
+        }
+        keep_unless_proven(&self.keep, "successor", &failures);
     }
 }
 

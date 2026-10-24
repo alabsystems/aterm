@@ -289,6 +289,65 @@ fn sync_dir_required_as(dir: &Path, flush: aterm_durable::Flush) -> io::Result<(
     })
 }
 
+/// Keep the file at `path` as a second link under the first free `<name>.aside[.N]` beside it,
+/// so it outlives `path` being replaced, and return that path. A link whose directory flush
+/// fails is taken back ([`take_back_aside`]).
+/// # Errors
+/// The link's own error (a directory cannot be linked), the directory's flush, or every name up
+/// to `.aside.999` taken.
+pub(crate) fn keep_aside(path: &Path) -> io::Result<PathBuf> {
+    let name = path
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    for n in 0..1000u32 {
+        let to = path.with_file_name(match n {
+            0 => format!("{name}.aside"),
+            n => format!("{name}.aside.{n}"),
+        });
+        match std::fs::hard_link(path, &to) {
+            Ok(()) => {
+                if let Err(e) = sync_dir(path.parent().unwrap_or(Path::new(""))) {
+                    take_back_aside(path, &to);
+                    return Err(e);
+                }
+                return Ok(to);
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!(
+                        "cannot keep {} aside as {}: {e}",
+                        path.display(),
+                        to.display()
+                    ),
+                ));
+            }
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "cannot keep {} aside: {name}.aside to {name}.aside.999 are taken",
+            path.display()
+        ),
+    ))
+}
+
+/// Take back the link [`keep_aside`] made at `aside` once replacing `path` failed: it goes only
+/// while it is still a second link to the file at `path`, so what it kept is never lost.
+pub(crate) fn take_back_aside(path: &Path, aside: &Path) {
+    use std::os::unix::fs::MetadataExt as _;
+    let id = |p: &Path| {
+        std::fs::symlink_metadata(p)
+            .ok()
+            .map(|m| (m.dev(), m.ino()))
+    };
+    if id(aside).is_some() && id(aside) == id(path) {
+        let _ = std::fs::remove_file(aside);
+    }
+}
+
 /// The incarnation layout is astream's.
 pub use astream_broker::{INC_MAX, WILL_SEQ_LOW};
 
@@ -1740,15 +1799,37 @@ impl StateDir {
         self.read("pid").and_then(|s| s.parse().ok())
     }
 
-    /// This node's id, minted once and kept.
+    /// This node's id, minted once and kept ([`StateDir::provision_node`]).
     pub fn node_id(&self, mint: impl FnOnce() -> String) -> io::Result<String> {
-        if let Some(id) = self.node() {
-            return Ok(id);
+        self.provision_node(mint).map(|(id, _)| id)
+    }
+
+    /// This node's id, minted once and kept, and where a `node` file that held anything but a node
+    /// id went: [`keep_aside`] keeps a non-empty one beside the new one, never overwritten, and
+    /// takes that link back ([`take_back_aside`]) when the new id's write fails before it replaced
+    /// the file.
+    pub(crate) fn provision_node(
+        &self,
+        mint: impl FnOnce() -> String,
+    ) -> io::Result<(String, Option<PathBuf>)> {
+        if let Some(id) = self.node().filter(|id| crate::enable::is_node_id(id)) {
+            return Ok((id, None));
         }
+        let path = self.path("node");
+        let aside = match std::fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Ok(held) if held.len() == 0 => None,
+            _ => Some(keep_aside(&path)?),
+        };
         let id = mint();
-        self.write_durable("node", &id)?;
+        if let Err(e) = self.write_durable("node", &id) {
+            if let Some(aside) = &aside {
+                take_back_aside(&path, aside);
+            }
+            return Err(e);
+        }
         sync_dir(self.root.parent().unwrap_or(Path::new("")))?;
-        Ok(id)
+        Ok((id, aside))
     }
 
     /// The node id this dir records, if it records one.
@@ -3435,6 +3516,86 @@ mod tests {
             .node_id(|| panic!("must not re-mint"))
             .expect("read back");
         assert_eq!(first, second);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_node_file_that_holds_no_node_id_is_kept_aside_and_an_id_minted() {
+        let dir = scratch("node-aside");
+        let st = StateDir::open(&dir).expect("open");
+        let read = |name: &str| std::fs::read_to_string(dir.join(name)).ok();
+        std::fs::write(dir.join("node"), "h-x\n").expect("a person's id where the node's goes");
+        assert_eq!(
+            st.node_id(|| "n-0123456789abcdef".to_string())
+                .expect("mint"),
+            "n-0123456789abcdef"
+        );
+        assert_eq!(read("node").as_deref(), Some("n-0123456789abcdef\n"));
+        assert_eq!(
+            read("node.aside").as_deref(),
+            Some("h-x\n"),
+            "kept, not overwritten"
+        );
+        std::fs::write(dir.join("node"), [0xff, b'\n']).expect("bytes that are not text");
+        assert_eq!(st.node_id(|| "n-m7".to_string()).expect("mint"), "n-m7");
+        assert_eq!(
+            std::fs::read(dir.join("node.aside.1")).ok(),
+            Some(vec![0xff, b'\n'])
+        );
+        assert_eq!(
+            read("node.aside").as_deref(),
+            Some("h-x\n"),
+            "the first kept as it was"
+        );
+        assert_eq!(
+            st.node_id(|| panic!("must not re-mint")).expect("kept"),
+            "n-m7"
+        );
+        assert!(read("node.aside.2").is_none(), "a node id is not set aside");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_a_node_file_with_bytes_that_the_new_id_replaced_stays_aside() {
+        let dir = scratch("node-take-back");
+        let st = StateDir::open(&dir).expect("open");
+        let read = |name: &str| std::fs::read_to_string(dir.join(name)).ok();
+        std::fs::write(dir.join("node"), "").expect("an empty node file");
+        assert_eq!(st.node_id(|| "n-e".to_string()).expect("mint"), "n-e");
+        assert!(
+            read("node.aside").is_none(),
+            "an empty node file held nothing to keep"
+        );
+
+        std::fs::write(dir.join("node"), "h-x\n").expect("a person's id where the node's goes");
+        st.refuse_writes_of(Some("node"));
+        for _ in 0..2 {
+            assert!(
+                st.node_id(|| "n-a".to_string()).is_err(),
+                "the write is refused"
+            );
+            assert_eq!(read("node").as_deref(), Some("h-x\n"), "left as it was");
+            assert!(
+                read("node.aside").is_none(),
+                "a failed write takes its link back"
+            );
+        }
+        st.refuse_writes_of(None);
+        st.set_inc_seam(IncSeam {
+            kill_at: Some(IncStep::Renamed),
+            ..Default::default()
+        });
+        assert!(
+            st.node_id(|| "n-b".to_string()).is_err(),
+            "the flush after the rename fails"
+        );
+        st.set_inc_seam(IncSeam::default());
+        assert_eq!(read("node").as_deref(), Some("n-b\n"));
+        assert_eq!(
+            read("node.aside").as_deref(),
+            Some("h-x\n"),
+            "once the write replaced the file, its link is the only copy and stays"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

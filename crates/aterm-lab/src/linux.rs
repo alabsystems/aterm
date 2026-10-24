@@ -143,6 +143,13 @@ targo --unverified lab linux <verb> — the Linux runtime lane: a lima VM (vz, U
                            static aarch64-unknown-linux-musl, linked by its rust-lld) and place it at
                            ~/Library/Caches/aterm/vz.noindex/agent/<sha256>/; prints the sha256. NOT RUN without
                            the musl std (targo --unverified verify provision --linux)
+  vz-host [place]          build the vz helper (crates/aterm-vz's aterm-vz-host, the dev profile) and place its copy,
+                           signed ad hoc with com.apple.security.virtualization only, at
+                           ~/Library/Caches/aterm/vz.noindex/host/<sha256>/; prints the sha256
+  vz-host up [--keep] [--unsigned] [--cpus N] [--memory-gib N] [--state DIR] [--tooling DIR]
+                           boot the vz VM through its helper (V3's disks, kernel and seed; V1's agent) and wait for the
+                           agent; --keep keeps it up after this run, --unsigned starts the helper as built (NOT RUN,
+                           naming the entitlement). exec -- <argv>, status and down take --state too. Exit 3 NOT RUN
   clean                    remove the guest's build output and trim the VM disk (its blocks go back to this Mac)
   destroy                  delete the VM and its disk (`limactl delete`); the next `up` makes it again
 ";
@@ -167,6 +174,7 @@ pub fn cmd_linux(args: &[String]) -> Res {
         "deck" => crate::linux_proof::cmd_deck(rest),
         "browser" => crate::linux_browser::cmd_browser(rest),
         "vz-agent" => crate::linux_vz::cmd_vz_agent(rest),
+        "vz-host" => crate::linux_vz_host::cmd_vz_host(rest),
         "clean" => cmd_clean(),
         "destroy" => cmd_destroy(),
         "help" | "-h" | "--help" => {

@@ -513,6 +513,7 @@ fn run_worker_launch(work: &Launch) {
         return;
     };
     let (caller, found) = worker_starter_of(work, cli);
+    let caller = pooled_starter(caller, cli, work.local);
     let here = trusted_here(
         cli.trust_flag.is_some(),
         work.trusted_cwd.as_deref(),
@@ -721,7 +722,13 @@ fn agy_rotation(
     use aterm_phase::Program;
     match work.agent {
         Program::Agy => {}
-        Program::Claude | Program::Codex | Program::Gemini | Program::Muse | Program::Generic => {
+        Program::Claude
+        | Program::Codex
+        | Program::Grok
+        | Program::Kimi
+        | Program::Gemini
+        | Program::Muse
+        | Program::Generic => {
             return None;
         }
     }
@@ -856,6 +863,56 @@ fn worker_starter_of(
     });
     let how = found.as_ref().map_or(Found::Plain, |(_, how)| *how);
     (line_starter(cli, found.map(|(s, _)| s)), how)
+}
+
+/// `starter` under the login its CLI's pool picks for a launch
+/// ([`aterm_agent::harness::accounts_pool::launch_env`], once each row's usage was read in its
+/// own home on this launcher thread): the pick's seam variable is exported to
+/// the worker where the pick is a row of its own directory and the starter sets none of that
+/// variable (one that does runs on a home of its own, which the pool leaves alone); the machine's
+/// default row leaves the starter as it is. Claude Code's workers keep the starter's login, which
+/// the host's own flow moves.
+fn pooled_starter(
+    mut starter: aterm_agent::harness::worker::Starter,
+    cli: &aterm_agent::harness::worker::WorkerCli,
+    local: u64,
+) -> aterm_agent::harness::worker::Starter {
+    use aterm_agent::harness::{accounts, accounts_pool};
+    let Some(pool) = accounts::Cli::of(cli.agent).filter(|c| *c != accounts::Cli::Claude) else {
+        return starter;
+    };
+    let var = pool.accounts().seam.var();
+    if starter.env.iter().any(|(name, _)| name == var) {
+        return starter;
+    }
+    let (Some(config), Some(state), Some(home), Some(now)) = (
+        aterm_types::dirs::aterm_config_path(),
+        crate::harness_host::harness_state(),
+        aterm_types::dirs::home_dir(),
+        aterm_time::unix_secs().and_then(|now| i64::try_from(now).ok()),
+    ) else {
+        return starter;
+    };
+    let Some(config_dir) = config.parent() else {
+        return starter;
+    };
+    let seat = accounts_pool::Seat {
+        config_dir,
+        state: &state,
+        home: &home,
+        now,
+    };
+    if let Some(pick) = accounts_pool::launch_env(&seat, pool, &accounts_pool::live_usage) {
+        aterm_log::info!(
+            "worker session {local}: starts under {} account {}",
+            pool.id(),
+            pick.label
+        );
+        if let Some(value) = pick.value {
+            starter.env.push((var.to_string(), value));
+        }
+    }
+    starter
 }
 
 /// The group in front of the session's terminal now (`tcgetpgrp` on its PTY

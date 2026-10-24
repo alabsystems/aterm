@@ -11,8 +11,8 @@ use super::{
     BUSY_ORPHAN_MS, Class, ClassTable, Consumer, Demand, EXITED_KEEP_MS, Findings, GateWord,
     HeldEpisode, HeldProc, Holder, InputGate, JobCounters, JobKind, JobProc, JobRow, JobTab,
     JobTick, JobsView, KERNEL_WAIT_MS, MemberMap, Named, NamedRow, NamedWait, ProcState, Standing,
-    StartWait, Stop, SweepProc, TierB, Verdict, WaitName, Want, ZOMBIE_AGE_MS, ZombieParent,
-    Zombies, command_class,
+    StartWait, Stop, SweepProc, TermWord, TierB, TtyMode, Verdict, WaitName, Want, ZOMBIE_AGE_MS,
+    ZombieParent, Zombies, command_class,
 };
 
 /// Descendants walked per tab at most.
@@ -106,6 +106,14 @@ struct Job {
     /// `deferred`) and no later pass saw a command of its own in front there: the block's `D` may
     /// be the `fg`'s.
     lent: Option<u64>,
+    /// What its last tick read of its processes' system calls.
+    stir: Stir,
+    /// A nested session the person's keys reach: a pass saw the session's group in front wake
+    /// over a tick the tab's reader took typed input in.
+    relays: bool,
+    /// A nested session's first terminal word: one its opener keeps every session it opens in
+    /// (Emacs turns echo off) names no password prompt.
+    first_word: Option<TermWord>,
     /// The last name the row printed.
     last_name: String,
     /// The last name a member other than the shell gave, the exited row's: the program exits
@@ -127,6 +135,18 @@ struct Job {
     /// ([`demand_of`]).
     person_read: bool,
     row: Option<JobRow>,
+}
+
+/// What a tick read of a job's system calls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stir {
+    /// Every live member's count was read at both readings and none moved, and none was born or
+    /// reaped (a stopped process makes none, read or not).
+    Still,
+    /// None that was read moved, and one that runs went unread (another user's).
+    Unknown,
+    /// One moved, or one was born or reaped.
+    Stirred,
 }
 
 /// A unit found this tick.
@@ -161,8 +181,6 @@ struct TabFacts {
     front_gone: bool,
     /// Background groups with a process that is not stopped (one that can print).
     bg_units: usize,
-    /// A detached call lives in the tab (it may write to the terminal it inherited).
-    detached: bool,
 }
 
 /// Per-instance stuck-process evaluation engine.
@@ -179,6 +197,13 @@ pub struct Jobs {
     held_episode: Option<Backlog>,
     /// The episode the last reading closed.
     held_drained: Option<HeldEpisode>,
+    /// The programs below a tab's shell seen putting a group they made in front, by pid and
+    /// start: they do job control (a shell nested in the tab's, a debugger), so each group they
+    /// make is a job of its own ([`discover`]).
+    job_control: HashMap<u32, Option<u64>>,
+    /// The program each tab's root ran at a prompt its marks showed: a session a fork of that
+    /// program opened is the shell's own ([`owner`]).
+    shell_names: HashMap<u64, String>,
     #[cfg(any(test, debug_assertions))]
     fault: Option<Fault>,
 }
@@ -263,7 +288,8 @@ impl Jobs {
                     c.iter()
                         .all(|k| by_pid.get(k).is_none_or(|k| k.state == ProcState::Zombie))
                 });
-                let detached = owner(pid, tab.shell_pid, &by_pid).is_some();
+                let root = self.shell_names.get(&tab.key).map(String::as_str);
+                let detached = owner(pid, tab.shell_pid, root, &by_pid).is_some();
                 if is_detached(p) {
                     // Its consumer: the reader of what it writes.
                     want.insert(p.ppid, true);
@@ -343,8 +369,19 @@ impl Jobs {
         let mut handed_to: HashMap<u32, usize> = HashMap::new();
         let mut merged: BTreeSet<usize> = BTreeSet::new();
         let mut gave_way: BTreeSet<usize> = BTreeSet::new();
+        self.job_control.retain(|p, start| alive(*p, *start));
+        self.shell_names
+            .retain(|k, _| tick.tabs.iter().any(|t| t.key == *k));
         for tab in &tick.tabs {
-            let (units, tf) = discover(tab, &sweep, &facts, &children);
+            // The tab's root at a prompt its marks show runs a shell: the program it runs then.
+            if tab.shell_ms.is_some()
+                && tab.block.as_ref().is_none_or(|b| !b.open)
+                && let Some(s) = sweep.get(&tab.shell_pid)
+            {
+                self.shell_names.insert(tab.key, s.name.clone());
+            }
+            let root = self.shell_names.get(&tab.key).map(String::as_str);
+            let (units, tf) = discover(tab, &sweep, &facts, &children, &mut self.job_control, root);
             tab_facts.insert(tab.key, tf);
             // A command the shell started that job control stopped (a debugger's traced child has
             // the debugger for its parent).
@@ -648,6 +685,31 @@ impl Jobs {
             .iter()
             .map(|(p, s)| (*p, at.saturating_sub(*s)))
             .collect();
+        // Which jobs one of whose members made a system call since their last pass, by this
+        // tick's readings of the members they had (or one was born or reaped), and what their last
+        // pass read: a neighbour's, whatever the jobs' order.
+        let stir_last: Vec<Stir> = self.jobs.iter().map(|j| j.stir).collect();
+        let stir_now: Vec<bool> = self
+            .jobs
+            .iter()
+            .enumerate()
+            .map(|(k, j)| {
+                j.exited_ms.is_none()
+                    && (j.members.iter().any(|(p, m)| {
+                        let now = facts
+                            .get(p)
+                            .and_then(|f| f.counters)
+                            .and_then(|c| c.syscalls);
+                        !alive(*p, m.start)
+                            || m.counters
+                                .and_then(|c| c.syscalls)
+                                .is_some_and(|was| now.is_some_and(|c| c != was))
+                    }) || assigned.get(&k).is_some_and(|ps| {
+                        ps.iter()
+                            .any(|p| !j.members.contains_key(p) && Some(*p) != j.shell)
+                    }))
+            })
+            .collect();
         for i in 0..n {
             if self.jobs[i].exited_ms.is_some() {
                 continue;
@@ -665,6 +727,22 @@ impl Jobs {
                 })
                 .flatten();
             let elsewhere = scene_elsewhere(i);
+            // Another job of the tab made a system call by this pass or its last: what the tab
+            // printed may be its. A nested session's opener relays what the session writes, so
+            // neither is the other's neighbour.
+            let me = &self.jobs[i];
+            let relays_for = |a: &Job, b: &Job| {
+                a.kind == JobKind::Nested
+                    && a.consumer_pid.is_some_and(|o| b.members.contains_key(&o))
+            };
+            let neighbour_stirred = self.jobs.iter().enumerate().any(|(k, o)| {
+                k != i
+                    && o.exited_ms.is_none()
+                    && o.key.tab == me.key.tab
+                    && !relays_for(me, o)
+                    && !relays_for(o, me)
+                    && (stir_now[k] || stir_last[k] == Stir::Stirred)
+            });
             let job = &mut self.jobs[i];
 
             let prev: MemberMap = job.members.clone();
@@ -761,11 +839,19 @@ impl Jobs {
                     now.retain(|p, _| pgid_of(p) != Some(g));
                 }
             }
+            // A nested session's terminal held by one of its groups (the command its shell runs in
+            // front, that shell at its prompt): a member stopped in another group is a job its
+            // shell parked, and the session is judged by its group in front.
+            let nested_front = (job.kind == JobKind::Nested)
+                .then(|| facts.get(&job.key.leader).and_then(|f| f.tpgid))
+                .flatten()
+                .filter(|t| now.keys().any(|p| !zombie(p) && pgid_of(p) == Some(*t)));
             let stopped_member = now.keys().filter(|p| !zombie(p)).find_map(|p| {
                 (state_of(p) == Some(ProcState::Stopped)
                     && Some(*p) != shell
-                    && !(own_front && pgid_of(p) != tf.tpgid))
-                    .then(|| (*p, now.get(p).map(|m| m.name.clone()).unwrap_or_default()))
+                    && !(own_front && pgid_of(p) != tf.tpgid)
+                    && !nested_front.is_some_and(|t| pgid_of(p) != Some(t)))
+                .then(|| (*p, now.get(p).map(|m| m.name.clone()).unwrap_or_default()))
             });
             // A stopped member parks the job in the background, as does a block that ended in a
             // stop while its command runs on (`bg` before a tick saw the stop).
@@ -807,7 +893,8 @@ impl Jobs {
             let live: Vec<u32> = now.keys().copied().filter(|p| !zombie(p)).collect();
             let ended = tab.is_none()
                 || (job.block.is_some() && block_closed)
-                || (job.kind == JobKind::AgentCall && !alive(job.key.leader, job.key.start));
+                || (matches!(job.kind, JobKind::AgentCall | JobKind::Nested)
+                    && !alive(job.key.leader, job.key.start));
             // A block's job that lent its block to a resumed job (a command list that brought it
             // forward, a `fg` typed ahead) takes the block's status only when it cannot be the
             // `fg`'s: `fg` returns its job's status, a stop's when the job stopped, and a list's
@@ -830,10 +917,9 @@ impl Jobs {
             let over = shellish
                 && job.block.is_none()
                 && tab.is_some()
-                && live.iter().all(|p| {
-                    pgid_of(p) == Some(tf.shell_pgid)
-                        || in_tree(*p, shell_pid, &sweep) == Some(false)
-                });
+                && live
+                    .iter()
+                    .all(|p| pgid_of(p) == Some(tf.shell_pgid) || adopted(*p, shell_pid, &sweep));
             let exited = ended || live.is_empty() || over;
             if exited {
                 let survivors: MemberMap = now
@@ -872,13 +958,26 @@ impl Jobs {
             let mut pageins: u64 = 0;
             let mut births_wrote: u64 = 0;
             let mut births = 0u32;
+            // Which live members made a system call over the tick, by readings of each, and
+            // whether one that runs went unread: a job none of whose processes made one wrote
+            // nothing to the terminal.
+            let mut moved: Vec<u32> = Vec::new();
+            let mut unread = false;
             for pid in &live {
                 let m = &now[pid];
+                let stopped = state_of(pid) == Some(ProcState::Stopped);
                 let Some(c) = m.counters else {
                     refused = true;
+                    unread |= !stopped;
                     continue;
                 };
-                match prev.get(pid).and_then(|p| p.counters) {
+                let was = prev.get(pid).and_then(|p| p.counters);
+                match (c.syscalls, was.and_then(|p| p.syscalls)) {
+                    (Some(a), Some(b)) if a != b => moved.push(*pid),
+                    (Some(_), Some(_)) => {}
+                    _ => unread |= !stopped,
+                }
+                match was {
                     Some(p) => {
                         cpu += c.cpu_ns.saturating_sub(p.cpu_ns);
                         child_work += delta(c.child_cpu_ns, p.child_cpu_ns);
@@ -911,6 +1010,23 @@ impl Jobs {
             )
             .unwrap_or(u32::MAX);
             let churn = births + reaps > 0;
+            let stir = if churn || !moved.is_empty() {
+                Stir::Stirred
+            } else if unread {
+                Stir::Unknown
+            } else {
+                Stir::Still
+            };
+            // The person's keys reach a nested session whose group in front woke from still over
+            // a tick a pass found keys driven into the tab in (`script`, sudo and an editor's
+            // terminal relay them; an agent's pty call takes the agent's writes alone).
+            if job.kind == JobKind::Nested
+                && job.stir != Stir::Stirred
+                && tab.is_some_and(|t| t.typed_ms.is_some_and(|s| s > floor && s <= at))
+                && nested_front.is_some_and(|g| moved.iter().any(|p| pgid_of(p) == Some(g)))
+            {
+                job.relays = true;
+            }
             let churn_work = child_work.saturating_mul(1000)
                 >= CHURN_WORK_NS_PER_S.saturating_mul(dt.max(1))
                 || births_wrote >= CHURN_WROTE;
@@ -920,11 +1036,44 @@ impl Jobs {
             // last process left for a group of its own) is no job's, and the tab's one background
             // group (the pipeline's stage that left, `timeout`'s) may be printing.
             let holds_fg = job.kind == JobKind::Shell && (own_front || !tf.front_live);
-            let credited_pty = holds_fg
-                || (job.kind == JobKind::ShellBg
-                    && (!tf.has_fg || (tf.front_gone && !tf.detached))
-                    && tf.bg_units == 1
-                    && live.iter().any(|p| state_of(p) != Some(ProcState::Stopped)));
+            // A nested session's opener holds the terminal, through each session it sits in: what
+            // the session writes, the opener relays (sudo, `script`), or it draws its own (an
+            // agent's redraws).
+            let root = self.shell_names.get(&job.key.tab).map(String::as_str);
+            let opener_front = job.kind == JobKind::Nested
+                && job
+                    .consumer_pid
+                    .is_some_and(|o| in_front(o, shell_pid, root, tf.tpgid, &sweep, &facts));
+            // And the session's own terminal is one of its groups', the person's keys seen
+            // reaching it: its reader in front takes them, by that terminal's word.
+            let nested_holds = opener_front && nested_front.is_some() && job.relays;
+            let holds = holds_fg || nested_holds;
+            // What the terminal printed is a job's only while one of its processes made a system
+            // call (this tick or the last, which a line the reader fed past the clock follows): a
+            // job whose processes all sit blocked wrote none of it. One whose running processes
+            // went unread (another user's) may have, and so may a server outside the tab's tree
+            // that the job in front talks to over a socket (ssh's shared connection, tmux's
+            // server), unless another job of the tab stirred.
+            let either = |s: Stir| stir == s || job.stir == s;
+            let relay = holds_fg
+                && live.iter().any(|p| {
+                    facts
+                        .get(p)
+                        .and_then(|f| f.fds.as_deref())
+                        .is_some_and(|fds| {
+                            fds.iter().any(|f| matches!(f.kind, super::FdKind::Socket))
+                        })
+                });
+            let stirred =
+                either(Stir::Stirred) || (!neighbour_stirred && (either(Stir::Unknown) || relay));
+            job.stir = stir;
+            let credited_pty = stirred
+                && (holds_fg
+                    || opener_front
+                    || (job.kind == JobKind::ShellBg
+                        && (!tf.has_fg || tf.front_gone)
+                        && tf.bg_units == 1
+                        && live.iter().any(|p| state_of(p) != Some(ProcState::Stopped))));
             let mut progress: Option<(Progress, u64)> = None;
             let mut out_growth: u64 = 0;
             let fresh = |stamp: Option<u64>| stamp.filter(|s| *s > floor && *s <= at);
@@ -1016,10 +1165,29 @@ impl Jobs {
             // the next command does): parked. Stopped in the group in front, it holds that group
             // (a stage of a pipeline, a process substitution in the shell's own group whose pipe
             // the shell writes). A group the program in front made for itself and stopped at the
-            // terminal (a ninja step at an ssh passphrase prompt) reads parked too: the program
-            // waiting on it is judged by its own row.
+            // terminal (a ninja step at an ssh passphrase prompt) is that program's job's, judged
+            // by the program waiting on it, and stopped while the program runs in the background
+            // (`ninja &`) it is held: no `fg` resumes it. In a nested session, parked with its
+            // opener's job (sudo stops itself once the command it runs stops), or by its own
+            // terminal's group in front.
+            let session_front = facts.get(&job.key.leader).and_then(|f| f.tpgid);
+            let maker_of = |g: u32| {
+                live.iter().filter(|p| pgid_of(p) == Some(g)).find_map(|p| {
+                    sweep
+                        .get(p)
+                        .filter(|s| pgid_of(&s.ppid) != Some(g))
+                        .map(|s| s.ppid)
+                })
+            };
             let stopped = stopped_member.map(|(pid, name)| Stop {
-                parked: shellish && tf.tpgid.is_some_and(|t| pgid_of(&pid) != Some(t)),
+                parked: (shellish
+                    && tf.tpgid.is_some_and(|t| pgid_of(&pid) != Some(t))
+                    && pgid_of(&pid)
+                        .and_then(maker_of)
+                        .is_none_or(|m| m == shell_pid || self.job_control.contains_key(&m)))
+                    || (job.kind == JobKind::Nested
+                        && (!opener_front
+                            || session_front.is_some_and(|t| pgid_of(&pid) != Some(t)))),
                 pid,
                 name,
             });
@@ -1032,11 +1200,38 @@ impl Jobs {
             let builtin = job.shell.is_some()
                 && tf.tpgid == Some(tf.shell_pgid)
                 && live.iter().all(|p| Some(*p) == job.shell);
+            // A nested session's reader is judged by its own terminal's word, read with this
+            // tick's sweep: the tab's is its opener's relay (sudo and `script` keep it raw).
+            // A word the session had from its first reading names no password prompt: its opener
+            // keeps every session it opens in it (Emacs turns echo off for its shells).
+            let term = facts.get(&job.key.leader).and_then(|f| f.term);
+            if job.first_word.is_none() {
+                job.first_word = term;
+            }
+            let first = job.first_word;
+            let session_word = term
+                .filter(|w| {
+                    !(w.canonical && !w.echo && first.is_some_and(|f| f.canonical && !f.echo))
+                })
+                .map(|w| TtyMode {
+                    canonical: w.canonical,
+                    echo: w.echo,
+                    stamped_ms: at,
+                });
             let jf = JobFacts {
-                holds_fg,
+                holds_fg: holds,
                 builtin,
-                tty: tab.and_then(|t| t.tty.filter(|m| m.stamped_ms >= t.output_ms.unwrap_or(0))),
-                queue_empty: matches!(gate.word, GateWord::Clear | GateWord::Unmeasured),
+                tty: if nested_holds {
+                    session_word
+                } else {
+                    tab.and_then(|t| t.tty.filter(|m| m.stamped_ms >= t.output_ms.unwrap_or(0)))
+                },
+                // A nested session's keys queue in its own terminal; the tab's, its relay drains.
+                queue_empty: if nested_holds {
+                    term.is_none_or(|w| w.queued == 0)
+                } else {
+                    matches!(gate.word, GateWord::Clear | GateWord::Unmeasured)
+                },
                 consumer: job.consumer_pid,
             };
             let lanes = tick.lanes;
@@ -1078,8 +1273,9 @@ impl Jobs {
                 churn_work,
                 pageins: (!refused).then_some(pageins),
                 stopped,
-                holds_fg,
-                gate,
+                holds_fg: holds,
+                // The tab's gate is its own reader's: a nested session's relay drains it.
+                gate: if holds_fg { gate } else { InputGate::default() },
                 zombies,
                 wait,
                 named: named_standing,
@@ -1477,6 +1673,9 @@ impl Job {
             fg_ms: None,
             deferred: None,
             lent: None,
+            stir: Stir::Unknown,
+            relays: false,
+            first_word: None,
             last_name: String::new(),
             member_name: String::new(),
             members: BTreeMap::new(),
@@ -1522,6 +1721,9 @@ impl Job {
             fg_ms: None,
             deferred: None,
             lent: None,
+            stir: Stir::Unknown,
+            relays: false,
+            first_word: None,
             last_name: m.name.clone(),
             member_name: m.name.clone(),
             members,
@@ -1613,46 +1815,136 @@ fn in_tree(pid: u32, root: u32, sweep: &HashMap<u32, &SweepProc>) -> Option<bool
     None
 }
 
-/// The outermost leader of a terminal session nested in the tab's at or above `pid`, below
-/// `shell`: a session leader with a terminal of its own.
-fn nested(pid: u32, shell: u32, sweep: &HashMap<u32, &SweepProc>) -> Option<u32> {
-    let mut cur = pid;
-    let mut leader = None;
-    for _ in 0..TREE_CAP {
-        let p = sweep.get(&cur)?;
-        if cur != shell && p.session_leader == Some(true) && p.has_tty == Some(true) {
-            leader = Some(cur);
-        }
-        if p.ppid == shell || p.ppid == cur || p.ppid <= 1 {
-            return leader;
-        }
-        cur = p.ppid;
-    }
-    None
+/// What owns a process below the tab's shell other than its group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Owner {
+    /// The nearest detached leader at or above it.
+    Call(u32),
+    /// The innermost leader of a terminal session nested in the tab's at or above it (a session
+    /// leader with a terminal of its own: sudo's `use_pty` monitor, `script`'s shell, an agent's
+    /// pty call), opened by a command.
+    Nested(u32),
+    /// A terminal session a shell opened for its own use (zsh's `zpty`, an async prompt's
+    /// worker): no command's.
+    Shell,
 }
 
-/// The nearest detached leader at or above `pid`, below `shell`.
-fn owner(pid: u32, shell: u32, sweep: &HashMap<u32, &SweepProc>) -> Option<u32> {
+/// The owner of `pid` below `shell`, if a session of its own holds it. A session is a shell's
+/// own when its leader is a fork that kept its parent's program and user, the parent a shell
+/// like the tab's: `root`, the program the tab's root ran at a prompt its marks showed (a call
+/// of an agent the root gave way to, `exec codex`, is none: the agent is its parent).
+fn owner(
+    pid: u32,
+    shell: u32,
+    root: Option<&str>,
+    sweep: &HashMap<u32, &SweepProc>,
+) -> Option<Owner> {
     let mut cur = pid;
+    let mut nested = None;
     for _ in 0..TREE_CAP {
         let p = sweep.get(&cur)?;
         if cur != shell && is_detached(p) {
-            return Some(cur);
+            return Some(Owner::Call(cur));
+        }
+        if nested.is_none()
+            && cur != shell
+            && p.session_leader == Some(true)
+            && p.has_tty == Some(true)
+        {
+            let shells = sweep.get(&p.ppid).is_some_and(|q| {
+                q.name == p.name && q.uid == p.uid && Some(q.name.as_str()) == root
+            });
+            nested = Some(if shells {
+                Owner::Shell
+            } else {
+                Owner::Nested(cur)
+            });
         }
         if p.ppid == shell || p.ppid == cur || p.ppid <= 1 {
-            return None;
+            return nested;
         }
         cur = p.ppid;
     }
     None
 }
 
-/// This tick's units of one tab.
+/// `opener`'s group holds its terminal, and each terminal session nested in the tab's that it
+/// sits in is in front of its own in turn, up to the tab's: what a session it opened writes
+/// reaches the tab, and the person's keys reach it.
+fn in_front(
+    opener: u32,
+    shell: u32,
+    root: Option<&str>,
+    tab_tpgid: Option<u32>,
+    sweep: &HashMap<u32, &SweepProc>,
+    facts: &HashMap<u32, &JobProc>,
+) -> bool {
+    let pgid_of = |p: u32| {
+        facts
+            .get(&p)
+            .map(|f| f.pgid)
+            .or_else(|| sweep.get(&p).map(|s| s.pgid))
+    };
+    let mut o = opener;
+    for _ in 0..TREE_CAP {
+        let Some(g) = pgid_of(o) else {
+            return false;
+        };
+        let outer = if o == shell {
+            None
+        } else {
+            match owner(o, shell, root, sweep) {
+                None => None,
+                Some(Owner::Nested(l)) => Some(l),
+                Some(Owner::Call(_) | Owner::Shell) => return false,
+            }
+        };
+        let Some(l) = outer else {
+            return tab_tpgid == Some(g);
+        };
+        if facts.get(&l).and_then(|f| f.tpgid) != Some(g) {
+            return false;
+        }
+        let Some(up) = sweep.get(&l).map(|s| s.ppid) else {
+            return false;
+        };
+        o = up;
+    }
+    false
+}
+
+/// `pid`'s parent is one of `shell`'s ancestors (launchd, init, a subreaper the tab runs under):
+/// it took `pid` in when its parent exited. A parent elsewhere (a debugger that attached from
+/// another tab) is no adoption.
+fn adopted(pid: u32, shell: u32, sweep: &HashMap<u32, &SweepProc>) -> bool {
+    let Some(ppid) = sweep.get(&pid).map(|p| p.ppid) else {
+        return false;
+    };
+    let mut cur = shell;
+    for _ in 0..sweep.len() {
+        let Some(p) = sweep.get(&cur) else {
+            return ppid <= 1;
+        };
+        if p.ppid == ppid || ppid <= 1 {
+            return true;
+        }
+        if p.ppid <= 1 || p.ppid == cur {
+            return false;
+        }
+        cur = p.ppid;
+    }
+    false
+}
+
+/// This tick's units of one tab, with the programs seen doing job control in it noted in
+/// `job_control`.
 fn discover(
     tab: &JobTab,
     sweep: &HashMap<u32, &SweepProc>,
     facts: &HashMap<u32, &JobProc>,
     children: &HashMap<u32, Vec<u32>>,
+    job_control: &mut HashMap<u32, Option<u64>>,
+    root: Option<&str>,
 ) -> (Vec<Unit>, TabFacts) {
     let shell = tab.shell_pid;
     let mut tf = TabFacts::default();
@@ -1666,25 +1958,62 @@ fn discover(
     let tree = descendants(shell, children);
     let mut units = Vec::new();
     let mut detached: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    let mut nested: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
     let mut groups: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
     for pid in &tree {
-        match owner(*pid, shell, sweep) {
-            Some(d) => detached.entry(d).or_default().push(*pid),
+        match owner(*pid, shell, root, sweep) {
+            Some(Owner::Call(d)) => detached.entry(d).or_default().push(*pid),
+            Some(Owner::Nested(l)) => nested.entry(l).or_default().push(*pid),
+            Some(Owner::Shell) => {}
             None => {
                 if let Some(p) = sweep.get(pid) {
-                    // A process in a terminal session nested in the tab's (sudo's `use_pty`
-                    // monitor and the command it runs, `script`'s shell) is in the group of the
-                    // program that opened that session, which holds the tab's terminal for it.
-                    let g = nested(*pid, shell, sweep)
-                        .and_then(|l| sweep.get(&l))
-                        .and_then(|l| sweep.get(&l.ppid))
-                        .map_or(p.pgid, |o| o.pgid);
-                    groups.entry(g).or_default().push(*pid);
+                    groups.entry(p.pgid).or_default().push(*pid);
                 }
             }
         }
     }
-    tf.detached = !detached.is_empty();
+    // A group a program made for its own children (ninja's steps, nextest's tests, watchexec's
+    // command) is that program's job's: the program waits on it, and its work is the program's
+    // progress. A program that put a group it made in front does job control (a shell nested in
+    // the tab's, a debugger): each group it makes is a job of its own.
+    let maker = |g: u32, members: &[u32]| {
+        members
+            .iter()
+            .filter_map(|p| sweep.get(p))
+            .find(|p| sweep.get(&p.ppid).is_none_or(|q| q.pgid != g))
+            .map(|p| p.ppid)
+            .filter(|m| *m != shell)
+    };
+    if let Some(m) = tf
+        .tpgid
+        .and_then(|t| groups.get(&t).map(|ms| (t, ms)))
+        .and_then(|(t, ms)| maker(t, ms))
+    {
+        job_control.insert(m, start_of(m));
+    }
+    let made: BTreeMap<u32, u32> = groups
+        .iter()
+        .filter(|(g, _)| **g != tf.shell_pgid)
+        .filter_map(|(g, ms)| {
+            let m = maker(*g, ms).filter(|m| !job_control.contains_key(m))?;
+            let h = sweep.get(&m).map(|q| q.pgid)?;
+            (h != tf.shell_pgid && h != *g && groups.contains_key(&h)).then_some((*g, h))
+        })
+        .collect();
+    for g in made.keys() {
+        let mut to = *g;
+        for _ in 0..made.len() {
+            match made.get(&to) {
+                Some(h) if h != g => to = *h,
+                _ => break,
+            }
+        }
+        if to != *g
+            && let Some(ms) = groups.remove(g)
+        {
+            groups.entry(to).or_default().extend(ms);
+        }
+    }
     for (d, members) in detached {
         let hint = tab.calls.iter().find(|c| c.leader == d);
         let p = sweep.get(&d);
@@ -1709,6 +2038,40 @@ fn discover(
             // call in one command class, and a later `sleep 600` would be judged by an
             // earlier build's μ.
             command: hint.and_then(|h| h.command.clone()).unwrap_or_default(),
+            block: None,
+            shell: None,
+        });
+    }
+    // A terminal session nested in the tab's is a call of the program that opened it, judged by
+    // its own processes: the opener's own output (an agent's redraws) is none of its. A session
+    // nested in another is a row of its own beside it (an agent's pty call in `script`).
+    for (l, members) in nested {
+        let p = sweep.get(&l);
+        let opener = p.map(|p| p.ppid);
+        let in_front = opener.is_some_and(|o| in_front(o, shell, root, tf.tpgid, sweep, facts));
+        units.push(Unit {
+            key: Key {
+                tab: tab.key,
+                leader: l,
+                start: start_of(l),
+                block: None,
+            },
+            kind: JobKind::Nested,
+            consumer: if in_front {
+                Consumer::PersonFg
+            } else {
+                Consumer::PersonBg
+            },
+            promoted_ms: None,
+            task: None,
+            id: format!("n{l}"),
+            pgid: p.map_or(l, |p| p.pgid),
+            members,
+            front: Vec::new(),
+            consumer_pid: opener,
+            // As a detached call's: the leader is a relay or a shell (`sudo`, `zsh`), whose name
+            // would put every session in one command class.
+            command: String::new(),
             block: None,
             shell: None,
         });

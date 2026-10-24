@@ -3371,7 +3371,7 @@ fn repair_lays_a_lost_own_name_shim_beside_the_survivors() {
     std::fs::remove_file(l.shim(&ty)).unwrap();
     std::fs::remove_file(l.shim(&ty.alias().unwrap())).unwrap();
 
-    let mut exposes = repair_exposes(&l, "ty", &d);
+    let mut exposes = repair_exposes(&l, "ty", &d).unwrap();
     exposes.sort();
     assert_eq!(exposes, ["tla", "ty"], "the lost own name is re-laid");
     let (relaid, _, _, failed) = relay_shims(&l);
@@ -3395,9 +3395,44 @@ fn repair_lays_a_lost_own_name_shim_beside_the_survivors() {
     )
     .unwrap();
     assert_eq!(
-        repair_exposes(&l, "ty", &d),
+        repair_exposes(&l, "ty", &d).unwrap(),
         ["tla"],
         "a present shim is not claimed"
+    );
+    let _ = std::fs::remove_dir_all(&l.prefix);
+}
+
+#[cfg(unix)]
+#[test]
+fn repair_lays_no_own_name_shim_a_build_without_a_record_does_not_ship() {
+    let l = temp_layout("repair-no-own-name");
+    let d = l.build_dir("ty", 3007);
+    std::fs::create_dir_all(d.join("bin")).unwrap();
+    let tla = d.join("bin").join("tla");
+    std::fs::write(&tla, b"#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&tla, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::store::mark_build_ready(&d).unwrap();
+    crate::activate::install_shims(&l, &d, &["tla".to_string()], crate::activate::Aliases::Alab)
+        .unwrap();
+    crate::activate::activate_build(&l, &d).unwrap();
+    let tla = crate::store::ToolName::new("tla").unwrap();
+    std::fs::remove_file(l.shim(&tla)).unwrap();
+
+    let (relaid, _, _, failed) = relay_shims(&l);
+    let ty = crate::store::ToolName::new("ty").unwrap();
+    assert!(
+        std::fs::symlink_metadata(l.shim(&ty)).is_err(),
+        "no bin/ty: the build ships no ty"
+    );
+    assert_eq!(relaid, 0);
+    assert!(
+        matches!(failed.as_slice(), [why] if why.contains("`aterm pkg install ty`")),
+        "{failed:?}"
+    );
+    assert!(
+        crate::platform::resolve_shim(&l.shim(&tla.alias().unwrap()))
+            .is_some_and(|t| t.starts_with(&d)),
+        "the surviving alias is left as it was"
     );
     let _ = std::fs::remove_dir_all(&l.prefix);
 }

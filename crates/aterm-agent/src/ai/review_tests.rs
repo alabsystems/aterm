@@ -134,6 +134,7 @@ fn facts_of(c: &'static Connector, shim: PathBuf) -> Facts {
         limited_until: None,
         record: Record::default(),
         env_credentials: Vec::new(),
+        pool: None,
     }
 }
 

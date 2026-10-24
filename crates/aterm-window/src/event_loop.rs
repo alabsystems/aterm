@@ -269,6 +269,28 @@ impl ActiveEventLoop {
         self.p.exiting()
     }
 
+    /// LOCAL PATCH (aterm): whether the drain of user events that ran before this turn's
+    /// [`ApplicationHandler::about_to_wait`] found the queue empty, so every event sent before
+    /// that drain began has been handed to [`ApplicationHandler::user_event`]. The macOS drain
+    /// never waits on a sender: one that meets a sender part-way through a send stops there,
+    /// leaving that send and any made before it queued for the turn the sender's wake brings, and
+    /// this is then `false`. Every other backend's drain waits out a send in progress (a blocking
+    /// channel receive or lock), so this is always `true` there.
+    ///
+    /// [`ApplicationHandler::about_to_wait`]: crate::application::ApplicationHandler::about_to_wait
+    /// [`ApplicationHandler::user_event`]: crate::application::ApplicationHandler::user_event
+    #[inline]
+    pub fn user_events_drained(&self) -> bool {
+        #[cfg(macos_platform)]
+        {
+            self.p.user_events_drained()
+        }
+        #[cfg(not(macos_platform))]
+        {
+            true
+        }
+    }
+
     /// Gets a persistent reference to the underlying platform display.
     #[cfg(windows_platform)]
     #[inline]
@@ -334,6 +356,23 @@ impl<T: 'static> EventLoopProxy<T> {
         let _span = tracing::debug_span!("aterm_window::EventLoopProxy::send_event",).entered();
 
         self.event_loop_proxy.send_event(event)
+    }
+
+    /// LOCAL PATCH (aterm): [`Self::send_event`] by a sender held part-way through its push, for
+    /// the tests of the crates above it (`aterm-gui`'s `headless_event_loop`), which must make a
+    /// turn's drain of user events meet a send in progress
+    /// ([`ActiveEventLoop::user_events_drained`]). With the queue's lock taken it sends on `held`
+    /// and waits for `release` (a one-minute hang detector), then pushes `event` and wakes the
+    /// loop as [`Self::send_event`] does.
+    #[cfg(all(macos_platform, any(test, debug_assertions)))]
+    #[doc(hidden)]
+    pub fn send_event_held_for_test(
+        &self,
+        event: T,
+        held: &std::sync::mpsc::Sender<()>,
+        release: &std::sync::mpsc::Receiver<()>,
+    ) -> Result<(), EventLoopClosed<T>> {
+        self.event_loop_proxy.send_event_held_for_test(event, held, release)
     }
 }
 

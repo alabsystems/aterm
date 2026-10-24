@@ -1595,11 +1595,11 @@ impl Witness {
             let (row, cohort) = run;
             let mut lo_r = u16::MAX;
             let mut hi_r = 0u16;
-            let mut recorded = 0usize;
             let mut lo_n = u16::MAX;
             let mut hi_n = 0u16;
             let mut standing = false;
             self.run_ids.clear();
+            self.retired_cells.clear();
             for cell in cells {
                 if cell.leaving() || cell.row != row || cell.cohort != cohort {
                     continue;
@@ -1608,7 +1608,7 @@ impl Witness {
                 let Some(i) = self.find(cell.row, cell.col, cell.born) else {
                     continue;
                 };
-                recorded += 1;
+                self.retired_cells.push(id);
                 lo_r = lo_r.min(cell.col);
                 hi_r = hi_r.max(cell.col);
                 if retire.contains(&id) || release.contains(&id) {
@@ -1619,18 +1619,14 @@ impl Witness {
                     standing = true;
                 }
             }
+            let recorded = self.retired_cells.len();
             if self.run_ids.is_empty() || !standing || lo_n <= lo_r || hi_n >= hi_r {
                 continue;
             }
-            let inside = cells
+            let inside = self
+                .retired_cells
                 .iter()
-                .filter(|c| {
-                    !c.leaving()
-                        && c.row == row
-                        && c.cohort == cohort
-                        && (lo_n..=hi_n).contains(&c.col)
-                        && self.find(c.row, c.col, c.born).is_some()
-                })
+                .filter(|&&(_, col, _)| (lo_n..=hi_n).contains(&col))
                 .count();
             if inside * 2 > recorded {
                 let (a, b) = if lo_n - lo_r <= hi_r - hi_n {
@@ -1660,9 +1656,10 @@ impl Witness {
                 }
                 continue;
             }
-            retire.retain(|id| !self.run_ids.contains(id));
-            release.retain(|id| !self.run_ids.contains(id));
-            self.fresh_released.retain(|id| !self.run_ids.contains(id));
+            retire.retain(|id| id.0 != row || !self.run_ids.contains(id));
+            release.retain(|id| id.0 != row || !self.run_ids.contains(id));
+            self.fresh_released
+                .retain(|id| id.0 != row || !self.run_ids.contains(id));
             self.retired_runs.retain(|r| *r != run);
             self.released_runs.retain(|r| *r != run);
             let sample = rows.iter().find(|s| s.row == row);
@@ -1762,6 +1759,13 @@ impl Witness {
             return;
         }
         for cell in cells {
+            if self
+                .restore_runs
+                .iter()
+                .any(|r| r.cohort == cell.cohort && r.stamp == cell.released_at)
+            {
+                continue;
+            }
             if !self
                 .find(cell.row, cell.col, cell.born)
                 .is_some_and(|i| self.seen[i].restorable)
@@ -1778,7 +1782,6 @@ impl Witness {
         }
         self.restore_runs
             .sort_unstable_by_key(|r| (r.cohort, r.stamp));
-        self.restore_runs.dedup_by_key(|r| (r.cohort, r.stamp));
         let mut sample_row: Option<(u16, Option<RowSample<'_>>)> = None;
         for cell in cells {
             let Ok(i) = self

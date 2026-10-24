@@ -4335,7 +4335,18 @@ impl App {
             if self.chrome_owns_terminal_row(wid, hit.term_row) {
                 continue;
             }
-            let (label, description) = self.fact_spoken(hit.session, hit.fact, hit.restores);
+            let (mut label, description) = self.fact_spoken(hit.session, hit.fact, hit.restores);
+            if hit.fact == Fact::Account
+                && hit.restores.is_empty()
+                && let Some(named) = crate::a11y_tree::account_chip_label(
+                    self.session_cli(hit.session),
+                    self.shown_facts(hit.session)
+                        .and_then(|(facts, _)| facts.account)
+                        .as_deref(),
+                )
+            {
+                label = named;
+            }
             chips.push(GridChip {
                 session: hit.session,
                 chip: HarnessChip::of_fact(hit.fact),

@@ -37,6 +37,20 @@ pub(crate) const fn band_px(
     (y0, y1)
 }
 
+/// The band of a `rows`-row grid (`rows > 0`) holding pixel row `y`, the inverse of [`band_px`]:
+/// row 0 also holds every pixel above the grid, the last row every pixel below it. The slicer
+/// ([`FxFrame`]) and fx damage ([`crate::RowBands`]) both read bands through it, so the rows
+/// damage marks are the rows the slicer draws.
+#[inline]
+pub(crate) const fn band_at(y: usize, rows: usize, grid_top: usize, cell_h: usize) -> usize {
+    if y < grid_top {
+        return 0;
+    }
+    let pitch = if cell_h > 1 { cell_h } else { 1 };
+    let r = (y - grid_top) / pitch;
+    if r < rows - 1 { r } else { rows - 1 }
+}
+
 /// The frame the engine slices against ([`crate::Renderer::fx_frame`] gives a renderer's own).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FxFrame {
@@ -60,16 +74,10 @@ impl FxFrame {
         band_px(b, self.rows, self.h, self.grid_top, self.cell_h)
     }
 
-    /// The band holding pixel row `y` (`y < h`, `rows > 0`).
+    /// The band holding pixel row `y` (`y < h`, `rows > 0`; [`band_at`]).
     #[inline]
     const fn band_of(&self, y: usize) -> usize {
-        if y < self.grid_top {
-            0
-        } else {
-            let pitch = if self.cell_h > 1 { self.cell_h } else { 1 };
-            let r = (y - self.grid_top) / pitch;
-            if r < self.rows - 1 { r } else { self.rows - 1 }
-        }
+        band_at(y, self.rows, self.grid_top, self.cell_h)
     }
 }
 

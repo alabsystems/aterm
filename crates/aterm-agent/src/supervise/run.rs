@@ -958,7 +958,12 @@ fn live_rows(reader: &dyn ScreenReader, screen: &Screen) -> (usize, Option<(usiz
 pub(crate) const fn places_resets_on_print(p: Program) -> bool {
     match p {
         Program::Claude | Program::Generic => true,
-        Program::Codex | Program::Agy | Program::Muse | Program::Gemini => false,
+        Program::Codex
+        | Program::Grok
+        | Program::Kimi
+        | Program::Agy
+        | Program::Muse
+        | Program::Gemini => false,
     }
 }
 
@@ -2864,9 +2869,13 @@ impl<'a, C: Ctl> Session<'a, C> {
         let by_screen = aterm_phase::identify(self.program.as_deref(), rows);
         let no_grammar = match by_screen.program() {
             Program::Generic => true,
-            Program::Claude | Program::Codex | Program::Agy | Program::Muse | Program::Gemini => {
-                false
-            }
+            Program::Claude
+            | Program::Codex
+            | Program::Grok
+            | Program::Kimi
+            | Program::Agy
+            | Program::Muse
+            | Program::Gemini => false,
         };
         if self.program.is_none()
             && no_grammar
@@ -2905,7 +2914,7 @@ impl<'a, C: Ctl> Session<'a, C> {
                 Program::Generic => Program::ALL.iter().any(|p| {
                     let knows_its_frame = match p {
                         Program::Claude | Program::Agy | Program::Muse | Program::Gemini => true,
-                        Program::Codex | Program::Generic => false,
+                        Program::Codex | Program::Grok | Program::Kimi | Program::Generic => false,
                     };
                     knows_its_frame && p.reader().program_drawn(rows)
                 }),
@@ -3250,9 +3259,13 @@ impl<'a, C: Ctl> Session<'a, C> {
     ) -> Result<(Screen, Option<&'static dyn ScreenReader>), Fail> {
         let claude = match self.reader(&screen.rows).program() {
             Program::Claude => true,
-            Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => {
-                false
-            }
+            Program::Codex
+            | Program::Grok
+            | Program::Kimi
+            | Program::Agy
+            | Program::Muse
+            | Program::Gemini
+            | Program::Generic => false,
         };
         let Some(words) = claude
             .then(|| aterm_phase::limit_words_above(&screen.rows))
@@ -5930,6 +5943,8 @@ impl<C: Ctl> Session<'_, C> {
         let agent = match self.reader(&screen.rows).program() {
             p @ (Program::Claude
             | Program::Codex
+            | Program::Grok
+            | Program::Kimi
             | Program::Agy
             | Program::Muse
             | Program::Gemini) => p.product(),
@@ -5986,7 +6001,12 @@ impl<C: Ctl> Session<'_, C> {
             && !self.busy_read
             && match self.reader(&seen.screen.rows).program() {
                 Program::Claude | Program::Generic => true,
-                Program::Codex | Program::Agy | Program::Muse | Program::Gemini => false,
+                Program::Codex
+                | Program::Grok
+                | Program::Kimi
+                | Program::Agy
+                | Program::Muse
+                | Program::Gemini => false,
             }
         {
             return None;
@@ -6513,23 +6533,27 @@ fn phase_prompt(
                 .map_or(Some(CancelEffect::Back), |v2| reader.esc(&v2));
             (p, esc_line(esc))
         }),
-        Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => {
-            reader.prompt(rows).map(|p| {
-                let esc = esc_line(reader.esc(&p));
-                let prompt = Prompt {
-                    kind: p.kind,
-                    command: p.command,
-                    description: p.description,
-                    notes: p.notes,
-                    options: p
-                        .options
-                        .iter()
-                        .filter_map(|o| o.n.map(|n| (n, o.label.clone())))
-                        .collect(),
-                };
-                (prompt, esc)
-            })
-        }
+        Program::Codex
+        | Program::Grok
+        | Program::Kimi
+        | Program::Agy
+        | Program::Muse
+        | Program::Gemini
+        | Program::Generic => reader.prompt(rows).map(|p| {
+            let esc = esc_line(reader.esc(&p));
+            let prompt = Prompt {
+                kind: p.kind,
+                command: p.command,
+                description: p.description,
+                notes: p.notes,
+                options: p
+                    .options
+                    .iter()
+                    .filter_map(|o| o.n.map(|n| (n, o.label.clone())))
+                    .collect(),
+            };
+            (prompt, esc)
+        }),
     }
 }
 
@@ -6544,7 +6568,12 @@ fn esc_line(effect: Option<CancelEffect>) -> Option<&'static str> {
 fn busy_rule(reader: &dyn ScreenReader, rows: &[String]) -> Option<String> {
     match reader.program() {
         Program::Claude | Program::Generic => busy_signal(rows).map(|b| b.to_string()),
-        Program::Codex | Program::Agy | Program::Muse | Program::Gemini => {
+        Program::Codex
+        | Program::Grok
+        | Program::Kimi
+        | Program::Agy
+        | Program::Muse
+        | Program::Gemini => {
             let status_row = reader.busy_guard().is_some_and(|guard| {
                 aterm_observe::row_matcher(&guard).is_ok_and(|m| rows.iter().any(|r| m.matches(r)))
             });
@@ -6612,9 +6641,12 @@ fn said_summary(reader: &dyn ScreenReader, turn: &Turn) -> String {
             reset.as_deref().map_or_else(|| "-".to_string(), clip)
         ),
         Phase::Busy | Phase::Idle | Phase::Question => match reader.program() {
-            Program::Codex | Program::Agy | Program::Muse | Program::Gemini => {
-                or_dash(&clip_tail(&said_line(reader, rows, width)))
-            }
+            Program::Codex
+            | Program::Grok
+            | Program::Kimi
+            | Program::Agy
+            | Program::Muse
+            | Program::Gemini => or_dash(&clip_tail(&said_line(reader, rows, width))),
             Program::Claude => {
                 let line = last_said_index(rows).map_or_else(String::new, |last| {
                     let first = width.map_or(last, |w| aterm_phase::line_start(rows, last, w));

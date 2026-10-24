@@ -62,9 +62,9 @@ pub use question::{
     Recommended,
 };
 pub use reader::{
-    AgyReader, BLANK_GAP, ClaudeReader, CodexReader, GeminiReader, GenericReader, MuseReader,
-    Program, Reading, ScreenReader, identify, live_zone_reaches_above, live_zone_start,
-    may_host_agent, program_of, read, read_at, shell_alone,
+    AgyReader, BLANK_GAP, ClaudeReader, CodexReader, GeminiReader, GenericReader, GrokReader,
+    KimiReader, MuseReader, Program, Reading, ScreenReader, identify, live_zone_reaches_above,
+    live_zone_start, may_host_agent, program_of, read, read_at, shell_alone,
 };
 pub use reset::{
     ConfirmRead, ResetConfirm, ResetKind, ResetLine, ResetPending, ResetRow, reset_confirm,

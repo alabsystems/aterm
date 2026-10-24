@@ -1221,3 +1221,80 @@ fn a_member_reading_carries_its_program_check() {
     assert_eq!(f.start_facts, Some(StartFacts::default()), "{f:?}");
     assert_eq!(f.program_check(), Some(AtStart::Started), "{f:?}");
 }
+
+/// A pseudo-terminal's word is read through its device node, as its
+/// reader in front last set it.
+#[cfg(unix)]
+#[test]
+fn a_ptys_word_is_read_through_its_device_node() {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::fs::MetadataExt;
+    let (mut m, mut s) = (-1, -1);
+    // SAFETY: two writable ints; no name, mode or size is asked for.
+    let rc = unsafe {
+        libc::openpty(
+            &raw mut m,
+            &raw mut s,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
+    // SAFETY: `openpty` opened both, and nothing else owns them.
+    let (master, follower) = unsafe { (OwnedFd::from_raw_fd(m), OwnedFd::from_raw_fd(s)) };
+    let node = std::fs::File::from(follower.try_clone().expect("dup"));
+    let dev = u32::try_from(node.metadata().expect("fstat").rdev()).expect("a 32-bit device");
+    let me = std::process::id();
+    let word = term_word(me, dev).expect("aterm's user opens its own terminal");
+    assert!(word.canonical && word.echo, "a new terminal's: {word:?}");
+    // SAFETY: plain integers and bytes; all-zero is valid.
+    let mut t: libc::termios = unsafe { std::mem::zeroed() };
+    let set = |t: &libc::termios| {
+        // SAFETY: `follower` is open and `t` a whole `termios`.
+        let rc = unsafe { libc::tcsetattr(follower.as_raw_fd(), libc::TCSANOW, t) };
+        assert_eq!(rc, 0, "tcsetattr: {}", std::io::Error::last_os_error());
+    };
+    // SAFETY: `follower` is open and `t` a writable `termios`.
+    assert_eq!(
+        unsafe { libc::tcgetattr(follower.as_raw_fd(), &raw mut t) },
+        0
+    );
+    t.c_lflag &= !libc::ECHO;
+    set(&t);
+    assert_eq!(
+        term_word(me, dev),
+        Some(TermWord {
+            canonical: true,
+            echo: false,
+            queued: 0
+        }),
+        "a password prompt's"
+    );
+    // SAFETY: `t` is a whole `termios`.
+    unsafe { libc::cfmakeraw(&raw mut t) };
+    set(&t);
+    assert_eq!(
+        term_word(me, dev),
+        Some(TermWord {
+            canonical: false,
+            echo: false,
+            queued: 0
+        }),
+        "an editor's"
+    );
+    // Keys typed that the editor has not read queue in its terminal (Linux hands them on from a
+    // worker: a hang detector, not a budget).
+    // SAFETY: `master` is open and the three bytes live for the call.
+    let n = unsafe { libc::write(master.as_raw_fd(), b"jjj".as_ptr().cast(), 3) };
+    assert_eq!(n, 3, "write: {}", std::io::Error::last_os_error());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while term_word(me, dev).is_some_and(|w| w.queued < 3) && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        term_word(me, dev).map(|w| w.queued),
+        Some(3),
+        "the keys the editor has not read"
+    );
+}

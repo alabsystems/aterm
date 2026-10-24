@@ -183,7 +183,7 @@ fn every_workers_first_line_hands_the_task_over_as_one_argument() {
             Program::Agy => super::super::upgrade_agy::rewrite_argv(&process(&["agy"]), None),
             Program::Muse => super::super::upgrade_muse::rewrite_argv(&process(&["muse"]), None),
             Program::Codex => super::super::codex_alab::rewrite_argv(&process(&["codex"]), None),
-            Program::Generic => unreachable!(),
+            Program::Grok | Program::Kimi | Program::Generic => unreachable!(),
         }
         .unwrap_or_else(|e| panic!("{agent:?}: the lane refused the worker's argv: {e:?}"));
         assert!(

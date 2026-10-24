@@ -838,6 +838,7 @@ pub fn cmd_presence_flap(args: &[String]) -> Res {
             env: world.env(),
             cwd: world.home.clone(),
             sandbox: None,
+            reroute: false,
         },
     )?;
     inst.client = client.clone();

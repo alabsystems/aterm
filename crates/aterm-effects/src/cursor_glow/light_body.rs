@@ -86,6 +86,50 @@ pub(crate) fn light_ink_over_floor(rgb: u32, theme_bg: u32, a_max: u8, floor: f3
     ink_over_floor_from(light_ink_bold(rgb & 0x00FF_FFFF), theme_bg, a_max, floor)
 }
 
+/// [`light_ink_over_floor`] for a glow that must stay its hue's clean colour
+/// (looks6 N7): a chromatic hue whose vivid ink is too deep for `floor` is
+/// lifted first in value, its chroma kept, toward the hue's brightest ink,
+/// and walked toward white only where even that brightest ink cannot keep
+/// the floor. A walk toward white greys a bright hue (Sparkle's gold glow on
+/// paper turned khaki); a lift in value keeps it gold. Hues too deep to clear
+/// the floor at their brightest, and greys, take [`light_ink_over_floor`]'s
+/// walk unchanged.
+#[must_use]
+pub(crate) fn light_ink_vivid_over_floor(rgb: u32, theme_bg: u32, a_max: u8, floor: f32) -> u32 {
+    use crate::color_math::{relative_luminance_table, relative_luminance_with, rgb2hsv};
+    let bold = light_ink_bold(rgb & 0x00FF_FFFF);
+    let peak = ((bold >> 16) & 0xff)
+        .max((bold >> 8) & 0xff)
+        .max(bold & 0xff);
+    let table = relative_luminance_table();
+    let lum = |c: u32| relative_luminance_with(table, over_at(theme_bg, c, a_max));
+    let scaled = |k: f32| {
+        let ch = |sh: u32| ((((bold >> sh) & 0xff) as f32 * k + 0.5).min(255.0) as u32) << sh;
+        ch(16) | ch(8) | ch(0)
+    };
+    let top = if peak == 0 { 1.0 } else { 255.0 / peak as f32 };
+    if a_max == 0
+        || rgb2hsv(bold).1 < VIVID_LIFT_CHROMA_MIN
+        || lum(bold) >= floor
+        || lum(scaled(top)) < floor
+    {
+        return light_ink_over_floor(rgb, theme_bg, a_max, floor);
+    }
+    let (mut lo, mut hi) = (1.0f32, top);
+    for _ in 0..FRESH_INK_GLYPH_BISECT {
+        let mid = 0.5 * (lo + hi);
+        if lum(scaled(mid)) >= floor {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    scaled(hi)
+}
+
+/// The HSV saturation below which [`light_ink_vivid_over_floor`] treats a hue as grey and keeps the walk toward white.
+const VIVID_LIFT_CHROMA_MIN: f32 = 0.2;
+
 /// [`light_ink_over_floor`]'s walk from a given starting `ink` rather than
 /// the vivid ink of its hue: `ink` itself where its composite at `a_max`
 /// keeps `floor`, else walked toward white only as far as the floor asks,
@@ -102,15 +146,23 @@ pub(crate) fn ink_over_floor_from(ink: u32, theme_bg: u32, a_max: u8, floor: f32
     if lum_of(ink) >= floor {
         return ink;
     }
-    let bisect = |pass: &dyn Fn(u32) -> bool, want_low: bool| {
+    let bisect = |pass: &dyn Fn(u32) -> bool, want_low: bool, mut hi_known: bool| {
         let (mut lo, mut hi) = (0.0f32, 1.0f32);
         let (mut lo_rgb, mut hi_rgb) = (ink, 0x00FF_FFFF);
         for _ in 0..FRESH_INK_GLYPH_BISECT {
             let mid = 0.5 * (lo + hi);
             let mid_rgb = toward_white(ink, mid);
-            if pass(mid_rgb) == want_low {
+            let matches = if mid_rgb == lo_rgb {
+                false
+            } else if hi_known && mid_rgb == hi_rgb {
+                true
+            } else {
+                pass(mid_rgb) == want_low
+            };
+            if matches {
                 hi = mid;
                 hi_rgb = mid_rgb;
+                hi_known = true;
             } else {
                 lo = mid;
                 lo_rgb = mid_rgb;
@@ -122,7 +174,7 @@ pub(crate) fn ink_over_floor_from(ink: u32, theme_bg: u32, a_max: u8, floor: f32
         if want_low { (hi, hi_rgb) } else { (lo, lo_rgb) }
     };
     let (w_bar, bar_rgb) = if lum_of(0x00FF_FFFF) >= floor {
-        bisect(&|c| lum_of(c) >= floor, true)
+        bisect(&|c| lum_of(c) >= floor, true, true)
     } else {
         (1.0, 0x00FF_FFFF)
     };
@@ -135,7 +187,7 @@ pub(crate) fn ink_over_floor_from(ink: u32, theme_bg: u32, a_max: u8, floor: f32
     } else if seen_of(bar_rgb) {
         bar_rgb
     } else {
-        let (w_seen, seen_rgb) = bisect(&seen_of, false);
+        let (w_seen, seen_rgb) = bisect(&seen_of, false, false);
         if w_bar <= w_seen { bar_rgb } else { seen_rgb }
     }
 }
@@ -295,6 +347,14 @@ fn soft_ellipse(
         return;
     }
     const STEPS: usize = 24;
+    static U_ROUND: std::sync::OnceLock<[(f32, f32); STEPS + 1]> = std::sync::OnceLock::new();
+    let u_round = U_ROUND.get_or_init(|| {
+        std::array::from_fn(|i| {
+            let u = i as f32 / STEPS as f32 * 2.0 - 1.0;
+            let round = (1.0 - u * u).max(0.0).sqrt();
+            (u, round)
+        })
+    });
     let mut verts = [RibbonVertex {
         x: 0.0,
         spine: cy,
@@ -307,20 +367,19 @@ fn soft_ellipse(
         lift: 0.0,
         lift_span: 0.0,
     }; STEPS + 1];
-    let us_xs: [(f32, f32); STEPS + 1] = std::array::from_fn(|i| {
-        let u = i as f32 / STEPS as f32 * 2.0 - 1.0;
-        (u, cx + u * if u < 0.0 { left } else { right })
+    let xs: [f32; STEPS + 1] = std::array::from_fn(|i| {
+        let (u, _) = u_round[i];
+        cx + u * if u < 0.0 { left } else { right }
     });
     for (i, v) in verts.iter_mut().enumerate() {
-        let (u, x) = us_xs[i];
-        let round = (1.0 - u * u).max(0.0).sqrt();
+        let (_, round) = u_round[i];
         let r = (reach * round).max(0.5);
-        v.x = x;
+        v.x = xs[i];
         v.up = r;
         v.dn = r;
         v.core_up = r * 0.3;
         v.core_dn = r * 0.3;
-        let kept = share(us_xs[i.saturating_sub(1)].1, us_xs[(i + 1).min(STEPS)].1).clamp(0.0, 1.0);
+        let kept = share(xs[i.saturating_sub(1)], xs[(i + 1).min(STEPS)]).clamp(0.0, 1.0);
         v.cov = peak * round * round * kept;
     }
     let stride = (geom.cw / 8).max(1);

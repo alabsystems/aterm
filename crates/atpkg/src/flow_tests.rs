@@ -1946,6 +1946,242 @@ fn an_up_to_date_pass_reasserts_a_missing_current_witness() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The fixture with build 18 shipping `extra` beside `bin/ay` and its signed manifest
+/// exposing `exposes` (a TOML array).
+fn fixture_exposing(dir: &Path, extra: &[&str], exposes: &str) -> Fake {
+    let archive = make_archive_of(dir, b"#!/bin/true\nay", b"0000755\0", extra);
+    let mut fake = fixture_from(dir, "binary", archive, None);
+    let key = ("ay".to_string(), 18u64);
+    let (body, _) = fake.pkg.remove(&key).unwrap();
+    let line = "exposes = [\"ay\", \"git\"]";
+    let body = String::from_utf8(body).unwrap();
+    assert_eq!(body.matches(line).count(), 1, "the fixture's exposes line");
+    let body = body.replacen(line, &format!("exposes = {exposes}"), 1);
+    let sig = sign(&RELEASE_SEED, body.as_bytes());
+    fake.pkg.insert(key, (body.into_bytes(), sig));
+    fake
+}
+
+/// The shape a dev link's unlink leaves when it cannot restore the build's shims: the link
+/// took both commands, and only the `alab-` aliases it never touched still name build 18.
+fn lose_the_linked_commands(layout: &Layout) {
+    for name in ["ay", "ay-pb"] {
+        std::fs::remove_file(shim_of(layout, name)).unwrap();
+    }
+    assert_eq!(
+        crate::ops::active_builds(layout).get("ay").copied(),
+        Some(18),
+        "PRECONDITION: the aliases still name build 18, so an install is up to date"
+    );
+}
+
+#[test]
+fn an_up_to_date_install_puts_back_every_command_its_build_exposes() {
+    let dir = scratch("uptodate-relay");
+    let mut fake = fixture_exposing(&dir, &["ay-pb"], "[\"ay\", \"ay-pb\"]");
+    let layout = layout(&dir);
+    let build_dir = layout.build_dir("ay", 18);
+    let record = crate::store::sidecar_path(&build_dir, crate::store::EXPOSES_SUFFIX).unwrap();
+    let fresh = InstallRequest {
+        channel: "stable",
+        program: "ay",
+        triple: TRIPLE,
+        installed: None,
+    };
+    let first = install(&fake, &layout, &anchor(), &fresh, fl(0), 0).unwrap();
+    assert_eq!(first.shimmed, ["ay", "ay-pb"]);
+    assert!(record.is_file(), "the landing records the build's commands");
+    let current = InstallRequest {
+        installed: Some(18),
+        ..fresh
+    };
+    let lays_both_back = |fake: &Fake, why: &str| {
+        let r = install(fake, &layout, &anchor(), &current, fl(0), 0).unwrap();
+        assert!(r.already_current, "{why}: no build moves");
+        assert_eq!(r.shimmed, ["ay", "ay-pb"], "{why}");
+        for name in ["ay", "ay-pb"] {
+            assert_eq!(
+                crate::ops::which(&layout, name),
+                Some(tool_bin(&build_dir, name)),
+                "{why}: {name} is on PATH again"
+            );
+        }
+    };
+
+    let key = ("ay".to_string(), 18u64);
+    let signed = fake.pkg.remove(&key).unwrap();
+    lose_the_linked_commands(&layout);
+    lays_both_back(
+        &fake,
+        "from the build's record, the signed manifest out of reach",
+    );
+    let again = install(&fake, &layout, &anchor(), &current, fl(0), 0).unwrap();
+    assert!(
+        again.already_current && again.shimmed.is_empty(),
+        "a build whose commands are all on PATH lays nothing"
+    );
+
+    fake.pkg.insert(key, signed);
+    std::fs::remove_file(&record).unwrap();
+    lose_the_linked_commands(&layout);
+    lays_both_back(
+        &fake,
+        "for a build staged before the record, from its signed manifest",
+    );
+    assert!(
+        record.is_file(),
+        "the signed manifest's commands are recorded beside the build"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_up_to_date_install_re_points_a_command_at_another_build_rather_than_losing_it() {
+    let dir = scratch("uptodate-other-build");
+    let fake = fixture_exposing(&dir, &["ay-pb"], "[\"ay\", \"ay-pb\"]");
+    let layout = layout(&dir);
+    let fresh = InstallRequest {
+        channel: "stable",
+        program: "ay",
+        triple: TRIPLE,
+        installed: None,
+    };
+    install(&fake, &layout, &anchor(), &fresh, fl(0), 0).unwrap();
+    // A landing of 18 cut short: `ay-pb` still runs a retained 17, and `ay` is not laid yet.
+    let retained = layout.build_dir("ay", 17);
+    std::fs::create_dir_all(retained.join("bin")).unwrap();
+    std::fs::write(
+        retained.join("bin").join(tool("ay-pb").exe_file()),
+        b"#!/bin/true\n",
+    )
+    .unwrap();
+    let at_17 = crate::platform::shim_executable_env(
+        &retained.join("bin"),
+        &tool("ay-pb"),
+        &shim_of(&layout, "ay-pb"),
+        &crate::shim_env::ShimEnv::NONE,
+    )
+    .unwrap();
+    crate::lay::write_in_process(&at_17).unwrap();
+    std::fs::remove_file(shim_of(&layout, "ay")).unwrap();
+
+    let current = InstallRequest {
+        installed: Some(18),
+        ..fresh
+    };
+    let r = install(&fake, &layout, &anchor(), &current, fl(0), 0).unwrap();
+    assert!(r.already_current);
+    assert_eq!(r.shimmed, ["ay", "ay-pb"]);
+    let build_dir = layout.build_dir("ay", 18);
+    for name in ["ay", "ay-pb"] {
+        assert_eq!(
+            crate::ops::which(&layout, name),
+            Some(tool_bin(&build_dir, name)),
+            "{name} runs the current build"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_up_to_date_install_keeps_the_alias_of_a_command_a_file_of_the_users_holds() {
+    let dir = scratch("uptodate-held");
+    let fake = fixture_exposing(&dir, &["ay-pb"], "[\"ay\", \"ay-pb\"]");
+    let layout = layout(&dir);
+    let fresh = InstallRequest {
+        channel: "stable",
+        program: "ay",
+        triple: TRIPLE,
+        installed: None,
+    };
+    install(&fake, &layout, &anchor(), &fresh, fl(0), 0).unwrap();
+    let build_dir = layout.build_dir("ay", 18);
+    let mine = b"#!/bin/sh\necho mine\n";
+    std::fs::remove_file(shim_of(&layout, "ay-pb")).unwrap();
+    std::fs::write(shim_of(&layout, "ay-pb"), mine).unwrap();
+    std::fs::remove_file(shim_of(&layout, "ay")).unwrap();
+
+    let current = InstallRequest {
+        installed: Some(18),
+        ..fresh
+    };
+    let r = install(&fake, &layout, &anchor(), &current, fl(0), 0).unwrap();
+    assert!(r.already_current);
+    assert_eq!(r.shimmed, ["ay"], "the user's `ay-pb` is not laid over");
+    assert_eq!(std::fs::read(shim_of(&layout, "ay-pb")).unwrap(), mine);
+    let alias = crate::platform::resolve_shim(&shim_of(&layout, "alab-ay-pb"))
+        .expect("the alias, now the one way to run the build's ay-pb, survives the lay");
+    assert_eq!(alias, tool_bin(&build_dir, "ay-pb"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn offline_an_up_to_date_install_without_a_record_fails_only_when_no_command_is_left() {
+    let dir = scratch("uptodate-offline");
+    let mut fake = fixture_exposing(&dir, &["ay-pb"], "[\"ay\", \"ay-pb\"]");
+    let layout = layout(&dir);
+    let fresh = InstallRequest {
+        channel: "stable",
+        program: "ay",
+        triple: TRIPLE,
+        installed: None,
+    };
+    install(&fake, &layout, &anchor(), &fresh, fl(0), 0).unwrap();
+    let build_dir = layout.build_dir("ay", 18);
+    let record = crate::store::sidecar_path(&build_dir, crate::store::EXPOSES_SUFFIX).unwrap();
+    std::fs::remove_file(&record).unwrap();
+    fake.pkg.remove(&("ay".to_string(), 18)).unwrap();
+    let current = InstallRequest {
+        installed: Some(18),
+        ..fresh
+    };
+
+    let healthy = install(&fake, &layout, &anchor(), &current, fl(0), 0).unwrap();
+    assert!(
+        healthy.already_current && healthy.shimmed.is_empty(),
+        "with its commands on PATH, the up-to-date answer stands offline"
+    );
+
+    lose_the_linked_commands(&layout);
+    let err = install(&fake, &layout, &anchor(), &current, fl(0), 0).unwrap_err();
+    assert!(
+        matches!(&err, FlowError::PkgFetch(why) if why.contains("keeps no record")),
+        "{err:?}"
+    );
+    assert_eq!(crate::ops::which(&layout, "ay"), None, "nothing is laid");
+    assert!(!record.exists(), "nothing is recorded");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn repair_re_lays_every_command_its_build_exposes_not_only_the_survivors() {
+    let dir = scratch("repair-relay");
+    let fake = fixture_exposing(&dir, &["ay-pb"], "[\"ay\", \"ay-pb\"]");
+    let layout = layout(&dir);
+    let req = InstallRequest {
+        channel: "stable",
+        program: "ay",
+        triple: TRIPLE,
+        installed: None,
+    };
+    install(&fake, &layout, &anchor(), &req, fl(0), 0).unwrap();
+    lose_the_linked_commands(&layout);
+
+    let relaid = crate::converge::repair::relay(&layout);
+    assert!(relaid.failed.is_empty(), "{:?}", relaid.failed);
+    let build_dir = layout.build_dir("ay", 18);
+    for name in ["ay", "ay-pb", "alab-ay", "alab-ay-pb"] {
+        let target = crate::platform::resolve_shim(&shim_of(&layout, name))
+            .unwrap_or_else(|| panic!("{name} is on PATH after repair"));
+        assert!(
+            target.starts_with(&build_dir),
+            "{name}: {}",
+            target.display()
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_live_build_this_slice_cannot_vouch_for_is_re_staged() {
     let dir = scratch("otherslice");
@@ -2669,6 +2905,38 @@ fn plan_update_decides_against_the_per_target_pin_overlay() {
     )
     .unwrap();
     assert_eq!(ay.decision, ApplyDecision::Install);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_group_landing_records_the_commands_each_member_exposes() {
+    let dir = scratch("group-record");
+    let fake = group_fixture(&dir);
+    let layout = layout(&dir);
+    let installed = std::collections::BTreeMap::from([("ay".to_string(), 17u64)]);
+    let report = apply_channel(
+        &fake,
+        &layout,
+        &anchor(),
+        "stable",
+        TRIPLE,
+        &installed,
+        &[],
+        fl(0),
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        report.groups[0].1,
+        TxnOutcome::Applied(vec!["ay".into(), "trust".into()])
+    );
+    for (program, build) in [("ay", 18), ("trust", 4821)] {
+        assert_eq!(
+            crate::store::recorded_exposes(&layout.build_dir(program, build)),
+            Some(vec![tool(program)]),
+            "{program}: the signed manifest's exposes"
+        );
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 

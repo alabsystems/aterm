@@ -7,11 +7,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "The Linux lane's own VM (docs/DESIGN-vz-guest-2026-10-23.md): Ubuntu's pinned image, the in-house gunzip of its kernel, and the base, baked and live disk layers made with APFS clones; the helper and the agent client join it in later slices"
+description = "The Linux lane's own VM (docs/DESIGN-vz-guest-2026-10-23.md): Ubuntu's pinned image, the in-house gunzip of its kernel, the base, baked and live disk layers made with APFS clones, and the helper that runs the VM (its Machine port, control protocol, lifetime and detectors, and the dev-only aterm-vz-host)"
 
-# The image and the disks (the design's slice V3). It loads no framework: the
-# helper that opens Virtualization.framework is V2's dev-only `[[bin]]`, and
-# it will `dlopen` the framework, so linking this library never loads it.
+# The image and the disks (the design's slice V3), and the helper (V2). The
+# library loads no framework: the dev-only `[[bin]]` below `dlopen`s
+# Virtualization.framework when it boots a VM (never `#[link]`), so linking
+# this library, or starting the helper, loads nothing of it.
+[[bin]]
+name = "aterm-vz-host"
+path = "src/bin/aterm-vz-host/main.rs"
+
 [dependencies]
 # The image pins' provider rows (`host::TOOLS`' `ubuntu-root` and
 # `ubuntu-kernel`, placed by `verify provision --linux`) and their resolver;
@@ -42,6 +47,21 @@ aterm-time = { workspace = true }
 # The placed rows' `stamp.json`, which holds the base and the kernel to their pin
 # (`Value`, no derive).
 aterm-json = { workspace = true }
+# The guest agent's wire codec (`wire::Frame`, `Hello`, `Exec`) and its ports
+# (`COMMAND_PORT`, `WATCH_PORT`), which the helper and its client speak.
+aterm-vz-agent = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# `kill` for the escalation by pid, `O_CLOEXEC` for the disk's lock file
+# (first-party, crates/aterm-libc).
+libc = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# The helper's VZ arm: the framework's classes by name after its `dlopen`,
+# `checked_msg` sends, completion blocks, the listener's delegate class, and
+# the serial queue every VZ call runs on (`SerialQueue`). It links libobjc,
+# Foundation and CoreFoundation, no GUI framework.
+aterm-objc = { workspace = true }
 
 [dev-dependencies]
 # The tooling cache's reclaim, which the tests hold to keeping a row the lane

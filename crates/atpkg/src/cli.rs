@@ -3965,7 +3965,7 @@ fn repair_exposes(
     layout: &crate::store::Layout,
     program: &str,
     build_dir: &std::path::Path,
-) -> Vec<String> {
+) -> Option<Vec<String>> {
     crate::converge::repair::exposes(layout, program, build_dir)
 }
 
@@ -4537,6 +4537,12 @@ fn gc_sweep_lines(verb: &str, report: &crate::gc::GcReport) -> Vec<String> {
         lines.push(format!(
             "atpkg {verb}: removed unused build copy {}",
             path.display()
+        ));
+    }
+    for (p, builds) in &report.laid_aside {
+        lines.push(format!(
+            "atpkg {verb}: moved {} into <build>.noindex, out of Spotlight's index",
+            gc_builds_words(p, builds)
         ));
     }
     for (p, build, holders) in &report.leased {
@@ -7364,6 +7370,13 @@ fn cmd_install_with(
                 println!("{}", vendor.line);
             } else if r.already_current {
                 println!("{}", already_current_line(&r));
+                if !r.shimmed.is_empty() {
+                    println!(
+                        "atpkg:   restored {} command(s) the build exposes: {}",
+                        r.shimmed.len(),
+                        r.shimmed.join(", ")
+                    );
+                }
             } else {
                 println!("atpkg: {}", installed_line(&r.program, r.build, &r.shimmed));
             }
@@ -12891,8 +12904,7 @@ fn cmd_unlink(program: Option<&String>) -> ExitCode {
                 }
                 Err(e) => eprintln!(
                     "atpkg:   WARNING: could not restore the installed build's shims ({e}); \
-                     run `aterm pkg uninstall {program}`, then `aterm pkg install {program}`, \
-                     to put its commands back on PATH"
+                     run `aterm pkg install {program}` to put its commands back on PATH"
                 ),
             }
             if program == crate::seam::SEAM_PROGRAM {

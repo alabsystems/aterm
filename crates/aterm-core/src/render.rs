@@ -1082,6 +1082,8 @@ pub struct RenderInput {
     pub history_renumber_epoch: u64,
     /// The holder fence at extraction ([`Terminal::holder_view`](crate::terminal::Terminal::holder_view)), resolved to absolute rows under the same lock as [`base_y`](Self::base_y).
     pub holder: crate::terminal::HolderView,
+    /// [`Terminal::screen_mutations`](crate::terminal::Terminal::screen_mutations) at extraction, under the same lock (the dev card probe dates a snapshot by it).
+    pub screen_mutations: u64,
     /// Sub-row scroll translate (display only).
     pub scroll_frac_px: i32,
     /// The terminal-content row band `[grid_top_row, grid_bot_row)` translated by [`scroll_frac_px`](Self::scroll_frac_px) (`0` = no band).
@@ -1528,6 +1530,7 @@ impl RenderInput {
         self.absolute_row_revision = source.absolute_row_revision;
         self.history_renumber_epoch = source.history_renumber_epoch;
         self.holder = source.holder;
+        self.screen_mutations = source.screen_mutations;
         self.scroll_frac_px = source.scroll_frac_px;
         self.grid_top_row = source.grid_top_row;
         self.grid_bot_row = source.grid_bot_row;
@@ -1622,6 +1625,7 @@ impl RenderInput {
             absolute_row_revision: 0,
             history_renumber_epoch: 0,
             holder: crate::terminal::HolderView::NONE,
+            screen_mutations: 0,
             scroll_frac_px: 0,
             grid_top_row: 0,
             grid_bot_row: 0,

@@ -325,10 +325,13 @@ fn page_keys_turn_over_exactly_what_a_screen_showed_whole() {
     assert!(turned > 0, "the sweep turns pages");
 }
 
+/// One walk of every page's screens holds two laws: no screen ends on blank under a card it cuts
+/// (or short of the page's bottom), and no band that holds a shared note is a control's stop.
 #[test]
 fn no_screen_ends_on_blank_under_a_card_it_cuts() {
     let (mut cut_screens, mut whole_foot_screens) = (0usize, 0usize);
     let mut faults = Vec::new();
+    let (mut notes, mut noted) = (0usize, Vec::new());
     for source in ["", CHANGED] {
         for route in SettingsRoute::ALL {
             if route == SettingsRoute::Messages {
@@ -350,6 +353,30 @@ fn no_screen_ends_on_blank_under_a_card_it_cuts() {
                     let Some(list) = painted_list(compiled, &plan, top) else {
                         return;
                     };
+                    let context = format!(
+                        "{route:?} {width}x{height}{} screen {top}",
+                        if source.is_empty() { "" } else { " changed" }
+                    );
+                    for band in plan.drawn_bands(top) {
+                        let (from, to) = (list.y + band.at, list.y + band.at + band.height);
+                        let note = compiled.paint.iter().find(|node| {
+                            let middle = node.rect.y + node.rect.height / 2.0;
+                            node.key.as_str().starts_with("settings/shared-note/")
+                                && middle >= from
+                                && middle < to
+                        });
+                        let Some(note) = note else {
+                            continue;
+                        };
+                        notes += 1;
+                        if plan.controls().any(|(stop, _)| stop == band.stop) {
+                            noted.push(format!(
+                                "{context}: stop {} holds {} and a control",
+                                band.stop,
+                                note.key.as_str()
+                            ));
+                        }
+                    }
                     if plan
                         .drawn_bands(top)
                         .last()
@@ -357,10 +384,6 @@ fn no_screen_ends_on_blank_under_a_card_it_cuts() {
                     {
                         return;
                     }
-                    let context = format!(
-                        "{route:?} {width}x{height}{} screen {top}",
-                        if source.is_empty() { "" } else { " changed" }
-                    );
                     let cut_by_page = compiled
                         .paint
                         .iter()
@@ -442,6 +465,13 @@ fn no_screen_ends_on_blank_under_a_card_it_cuts() {
         whole_foot_screens > 0,
         "the sweep holds screens of a list that ends on whole stops"
     );
+    assert!(
+        noted.is_empty(),
+        "{} notes head a control:\n{}",
+        noted.len(),
+        noted.join("\n")
+    );
+    assert!(notes > 0, "the sweep paints shared notes");
 }
 
 #[test]
@@ -1167,61 +1197,6 @@ fn the_lists_keys_never_change_a_control_they_carried_the_keyboard_to() {
 }
 
 #[test]
-fn a_shared_note_heads_no_control_on_any_page() {
-    let mut notes = 0usize;
-    let mut faults = Vec::new();
-    for source in ["", CHANGED] {
-        for route in SettingsRoute::ALL {
-            if matches!(route, SettingsRoute::Messages | SettingsRoute::Themes) {
-                continue;
-            }
-            for (width, height) in PAGING_SIZES {
-                let cx = view_cx_at(width, height);
-                let (mut runtime, instance, view) = paging_view(source, route);
-                each_screen_of(&mut runtime, instance, view, &cx, |state, compiled, top| {
-                    let Some(plan) = state.scroll_plan() else {
-                        return;
-                    };
-                    let Some(list) = painted_list(compiled, &plan, top) else {
-                        return;
-                    };
-                    for band in plan.drawn_bands(top) {
-                        let (from, to) = (list.y + band.at, list.y + band.at + band.height);
-                        let note = compiled.paint.iter().find(|node| {
-                            let middle = node.rect.y + node.rect.height / 2.0;
-                            node.key.as_str().starts_with("settings/shared-note/")
-                                && middle >= from
-                                && middle < to
-                        });
-                        let Some(note) = note else {
-                            continue;
-                        };
-                        notes += 1;
-                        if plan.controls().any(|(stop, _)| stop == band.stop) {
-                            faults.push(format!(
-                                "{route:?} {width}x{height}{} screen {top}: stop {} holds {} \
-                                 and a control",
-                                if source.is_empty() { "" } else { " changed" },
-                                band.stop,
-                                note.key.as_str()
-                            ));
-                        }
-                    }
-                });
-            }
-        }
-    }
-    faults.dedup();
-    assert!(
-        faults.is_empty(),
-        "{} faults:\n{}",
-        faults.len(),
-        faults.join("\n")
-    );
-    assert!(notes > 0, "the sweep paints shared notes");
-}
-
-#[test]
 fn packages_without_its_tool_turns_past_the_reroute_switch_it_drew_whole() {
     let mut service = crate::packages_screen::PackagesService::new();
     assert!(service.note_tool(false));
@@ -1666,7 +1641,11 @@ fn a_page_turn_takes_the_keyboard_onto_its_screen() {
             .flat_map(|(route, source)| {
                 SHORT_SIZES
                     .into_iter()
-                    .chain(PAGING_SIZES)
+                    .chain(
+                        PAGING_SIZES
+                            .into_iter()
+                            .filter(|size| !SHORT_SIZES.contains(size)),
+                    )
                     .chain([(178.0, 348.0)])
                     .map(move |(width, height)| (route, source, width, height))
             })

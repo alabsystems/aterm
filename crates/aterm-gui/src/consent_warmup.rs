@@ -227,6 +227,8 @@ pub(crate) enum StartOutcome {
     Started,
     /// A worker is already walking.
     AlreadyLive,
+    /// Another operation owns the process's macOS dialog slot.
+    DialogUp,
     /// `[privacy] enabled = false`, `warmup = "never"`, or a headless instance.
     Refused,
     /// No configured folder name resolved to a path — every name was unknown, or `$HOME` is unset.
@@ -240,6 +242,7 @@ impl StartOutcome {
     pub(crate) const fn refusal(self) -> Option<&'static str> {
         match self {
             Self::Started | Self::AlreadyLive => None,
+            Self::DialogUp => Some("another macOS dialog is already up; try again after it closes"),
             Self::Refused => Some(
                 "the privacy checks or the warm-up are off, or this instance has no window to \
                  ask in",

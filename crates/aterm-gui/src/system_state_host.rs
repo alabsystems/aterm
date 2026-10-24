@@ -436,9 +436,10 @@ impl App {
         let changed = self.native_runtime.publish_system_state(status);
         self.system_state_host.status_in_flight = false;
         self.system_state_host.next_status = Some(Instant::now() + Duration::from_secs(1));
-        let indicators_changed = self.refresh_system_state_tab_indicators();
-        if changed || indicators_changed {
-            self.request_redraw_all_windows();
+        // A tab indicator that changed redraws its own window (its tab chrome).
+        self.refresh_system_state_tab_indicators();
+        if changed {
+            self.request_redraw_system_state_windows();
         }
     }
 
@@ -470,6 +471,37 @@ impl App {
     #[cfg(test)]
     pub(crate) fn published_system_state_access_step(&self) -> Option<Access> {
         self.system_state_host.access_step
+    }
+
+    /// Redraw the windows that show a System State page
+    /// ([`Self::system_state_showing_windows`]), and no other: the page's
+    /// status and its tick (the village's walk, an offer let go) change only
+    /// what the page draws.
+    fn request_redraw_system_state_windows(&self) {
+        for wid in self.system_state_showing_windows() {
+            if let Some(os_window) = self.windows.get(&wid).and_then(|w| w.os_window.as_ref()) {
+                os_window.request_redraw();
+            }
+        }
+    }
+
+    /// The windows whose active tab's visible plan has a System State leaf,
+    /// focused or not, so a page in an unfocused split pane is among them. A
+    /// window where the page is a background tab is not: switching to that tab
+    /// draws the page as it stands then.
+    fn system_state_showing_windows(&self) -> Vec<crate::WindowId> {
+        self.windows
+            .keys()
+            .copied()
+            .filter(|wid| {
+                self.active_visible_leaf_plan(*wid).is_some_and(|plan| {
+                    plan.leaves.iter().any(|leaf| {
+                        matches!(self.view_store.get(leaf.view), Some(crate::tab_model::View::Native(native))
+                            if matches!(self.native_runtime.app(native.instance), Some(NativeApp::SystemState(_))))
+                    })
+                })
+            })
+            .collect()
     }
 
     fn refresh_system_state_tab_indicators(&mut self) -> bool {
@@ -558,22 +590,28 @@ impl App {
         {
             self.publish_system_state(self.system_state_host.latest_status.clone());
         }
-        let shown = self.system_state_visible(instance);
-        self.system_state_host.shown =
-            shown && (self.system_state_host.shown || self.observe_system_state(instance));
+        let shown = self.system_state_shown_views(instance);
+        self.system_state_host.shown = !shown.is_empty()
+            && (self.system_state_host.shown || self.observe_system_state(instance));
         if self.system_state_access_step() != self.system_state_host.access_step {
             self.publish_system_state(self.system_state_host.latest_status.clone());
         }
         let active = self.system_state_presented_active(instance);
-        let changed = self.native_runtime.tick_system_state(active);
+        // The village walks only on a page someone can see, and only where a
+        // view someone sees draws it.
+        let seen = self.system_state_seen_views(instance);
+        let changed = self
+            .native_runtime
+            .tick_system_state(active, !shown.is_empty(), &seen);
         self.drain_system_state_actions();
         if !self.system_state_host.status_in_flight {
             self.system_state_host.next_status.get_or_insert(now);
         }
         self.poll_system_state_status(now);
-        let indicators_changed = self.refresh_system_state_tab_indicators();
-        if changed || indicators_changed {
-            self.request_redraw_all_windows();
+        // A tab indicator that changed redraws its own window (its tab chrome).
+        self.refresh_system_state_tab_indicators();
+        if changed {
+            self.request_redraw_system_state_windows();
         }
     }
 
@@ -622,18 +660,42 @@ impl App {
         })
     }
 
-    /// Whether `instance` is the visible, active view of some window, focused
-    /// or not.
-    fn system_state_visible(&self, instance: crate::native_app::AppInstanceId) -> bool {
-        self.windows.keys().any(|wid| {
-            self.active_native_view(*wid)
-                .is_some_and(|(current, view)| {
-                    current == instance
+    /// The views of `instance` that are a leaf of some window's active tab's
+    /// visible plan, focused or not: every view of it someone can see, the
+    /// windows [`Self::system_state_showing_windows`] redraws.
+    fn system_state_seen_views(
+        &self,
+        instance: crate::native_app::AppInstanceId,
+    ) -> Vec<crate::tab_model::ViewId> {
+        self.windows
+            .keys()
+            .filter_map(|wid| self.active_visible_leaf_plan(*wid))
+            .flat_map(|plan| plan.leaves.into_iter().map(|leaf| leaf.view))
+            .filter(|view| {
+                matches!(self.view_store.get(*view),
+                    Some(crate::tab_model::View::Native(native)) if native.instance == instance)
+            })
+            .collect()
+    }
+
+    /// The views of `instance` that are the visible, active view of some
+    /// window, focused or not.
+    fn system_state_shown_views(
+        &self,
+        instance: crate::native_app::AppInstanceId,
+    ) -> Vec<crate::tab_model::ViewId> {
+        self.windows
+            .keys()
+            .filter_map(|wid| {
+                self.active_native_view(*wid).and_then(|(current, view)| {
+                    (current == instance
                         && self
                             .active_visible_leaf_plan(*wid)
-                            .is_some_and(|plan| plan.leaf(view).is_some())
+                            .is_some_and(|plan| plan.leaf(view).is_some()))
+                    .then_some(view)
                 })
-        })
+            })
+            .collect()
     }
 
     /// Whether the page has been presented in a focused window and is still
@@ -864,7 +926,7 @@ impl App {
                 self.begin_system_state_action(true);
                 if let Some(request) = self.system_state_host.pending.take() {
                     request.finish(WorkstationSetupDecision::Unavailable);
-                    self.native_runtime.tick_system_state(false);
+                    self.native_runtime.tick_system_state(false, false, &[]);
                     self.refresh_system_state_tab_indicators();
                 }
                 let started = handlers.is_some_and(|handlers| (handlers.restore)());

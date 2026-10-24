@@ -203,6 +203,10 @@ pub struct Launch {
     pub cwd: PathBuf,
     /// A `sandbox-exec` profile to start it under.
     pub sandbox: Option<String>,
+    /// It reroutes (no `--no-reroute`): its sessions find the reroute stubs
+    /// and the `agents/` twins of its HOME's atpkg prefix first on `PATH`
+    /// (`--reroute-prefix`, [`crate::reroute_prefix`]).
+    pub reroute: bool,
 }
 
 /// An instance's process.
@@ -334,8 +338,10 @@ impl Instance {
                 aterm_uds::lifeline::STDIN.to_string(),
             ]);
         }
+        if !l.reroute {
+            line.push("--no-reroute".to_string());
+        }
         line.extend([
-            "--no-reroute".to_string(),
             "--control-sock".to_string(),
             world.sock.to_string_lossy().into_owned(),
         ]);
@@ -383,10 +389,14 @@ impl Instance {
             "--headless".to_string(),
             aterm_uds::lifeline::FLAG.to_string(),
             aterm_uds::lifeline::STDIN.to_string(),
-            "--no-reroute".to_string(),
+        ];
+        if !l.reroute {
+            line.push("--no-reroute".to_string());
+        }
+        line.extend([
             "--control-sock".to_string(),
             world.sock.to_string_lossy().into_owned(),
-        ];
+        ]);
         line.extend(l.args);
         let job = Job::start(&world.dir, &line, &l.env, &l.cwd, &log)?;
         Ok(Instance {
@@ -649,6 +659,7 @@ pub fn cmd_instance(args: &[String]) -> Res {
     let extra_env =
         crate::lab::instance_env(&take_values(&mut a, "--env")?.join(" ")).map_err(Fail::usage)?;
     let home = take_value(&mut a, "--home")?.map(|p| from_caller(&p));
+    let reroute = take_value(&mut a, "--reroute-prefix")?.map(|p| from_caller(&p));
     let harness = take_flag(&mut a, "--harness");
     let pre = take_values(&mut a, "--pre")?;
     let post = take_values(&mut a, "--post")?;
@@ -669,6 +680,11 @@ pub fn cmd_instance(args: &[String]) -> Res {
             "instance: unexpected '{extra}' ({LAB} help)"
         )));
     }
+    if home.is_some() && reroute.is_some() {
+        return Err(Fail::usage(
+            "instance: --reroute-prefix DIR makes DIR the HOME; it takes no --home",
+        ));
+    }
     if !post.is_empty() && image.is_none() {
         return Err(Fail::usage(
             "instance: --post runs after --image's frame; drive a held instance with `aterm ctl` instead",
@@ -682,6 +698,21 @@ pub fn cmd_instance(args: &[String]) -> Res {
     }
     if let Some(home) = home {
         world.rehome(Path::new(&home))?;
+    }
+    if let Some(home) = &reroute {
+        world.rehome(Path::new(home))?;
+        let claude = crate::lab::find_claude().map_err(|e| Fail::exit(3, e))?;
+        // the prefix is the caller's own folder, which nothing here removes
+        let laid = crate::reroute_prefix::lay(&world.home, Path::new(&claude), None)
+            .map_err(|e| Fail::die(format!("instance: --reroute-prefix: {e}")))?;
+        println!(
+            "reroute prefix {}: {} -> {} -> {} ({})",
+            laid.prefix.display(),
+            laid.stub.display(),
+            laid.twin.display(),
+            laid.exe.display(),
+            laid.version
+        );
     }
     let cold = if cold {
         Some(cold_copy(&mut world, &aterm)?)
@@ -719,6 +750,7 @@ pub fn cmd_instance(args: &[String]) -> Res {
             env,
             cwd: world.home.clone(),
             sandbox: None,
+            reroute: reroute.is_some(),
         },
         band,
     )?;

@@ -421,6 +421,7 @@ mod tests {
             title: format!("tab-{local_id}"),
             term: Arc::new(Mutex::new(aterm_core::terminal::Terminal::new(24, 80))),
             master: -1,
+            pid: 0,
             ctx,
         }
     }

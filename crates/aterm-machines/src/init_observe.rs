@@ -41,8 +41,19 @@ pub enum Reading {
     SignedIn,
     /// A rustup toolchain carries rust-docs.
     DocsInstalled,
-    /// A Rust build or tooling cache sits where Spotlight indexes it.
-    BuildsIndexed,
+    /// A Rust build or tooling cache of aterm's sits where Spotlight indexes it;
+    /// Spotlight also indexes `projects` of the person's own project build folders.
+    BuildsIndexed {
+        /// The person's project build folders Spotlight indexes ([`Self::ProjectsIndexed`]).
+        projects: usize,
+    },
+    /// aterm's own caches are kept out of Spotlight, and Spotlight indexes `count`
+    /// of the person's own project build folders (`target`, `build`): theirs to
+    /// rename, never aterm's, so the row only notes them ([`projects_note`]).
+    ProjectsIndexed {
+        /// How many.
+        count: usize,
+    },
     /// `present` of the `count` repositories are cloned; `signed_in` is whether the
     /// native GitHub credentials verified.
     Repositories {
@@ -144,7 +155,8 @@ impl Reading {
             Self::Apps { pinned, wanted } => format!("apps:{pinned}:{wanted}"),
             Self::SignedIn => "signed-in".to_owned(),
             Self::DocsInstalled => "docs-installed".to_owned(),
-            Self::BuildsIndexed => "builds-indexed".to_owned(),
+            Self::BuildsIndexed { projects } => format!("builds-indexed:{projects}"),
+            Self::ProjectsIndexed { count } => format!("projects-indexed:{count}"),
             Self::Repositories {
                 present,
                 count,
@@ -174,7 +186,10 @@ impl Reading {
             },
             "signed-in" => Self::SignedIn,
             "docs-installed" => Self::DocsInstalled,
-            "builds-indexed" => Self::BuildsIndexed,
+            "builds-indexed" => Self::BuildsIndexed {
+                projects: number()?,
+            },
+            "projects-indexed" => Self::ProjectsIndexed { count: number()? },
             "repositories" => Self::Repositories {
                 present: number()?,
                 count: number()?,
@@ -187,6 +202,17 @@ impl Reading {
             _ => return None,
         };
         parts.next().is_none().then_some(reading)
+    }
+
+    /// How many of the person's own project build folders Spotlight indexes, where
+    /// the reading counted them.
+    const fn projects(self) -> Option<usize> {
+        match self {
+            Self::BuildsIndexed { projects } | Self::ProjectsIndexed { count: projects } => {
+                Some(projects)
+            }
+            _ => None,
+        }
     }
 
     /// The page's word for this reading (design §3.3), or `None` where it names no
@@ -206,15 +232,18 @@ impl Reading {
             Self::Apps { pinned, .. } => format!("{pinned} apps"),
             Self::SignedIn => "Signed in".to_owned(),
             Self::DocsInstalled => "Docs indexed".to_owned(),
-            Self::BuildsIndexed => "Builds indexed".to_owned(),
+            Self::BuildsIndexed { .. } => "Builds indexed".to_owned(),
             Self::Repositories { present, count, .. } if present < count => {
                 format!("{present} of {count}")
             }
             Self::Repositories {
                 signed_in: false, ..
             } => "Needs sign-in".to_owned(),
-            // A probe that could not go on read no value.
-            Self::Repositories { .. } | Self::Waits(_) => return None,
+            // A probe that could not go on read no value, and the person's own
+            // project folders are no value of the row's.
+            Self::Repositories { .. } | Self::Waits(_) | Self::ProjectsIndexed { .. } => {
+                return None;
+            }
         })
     }
 }
@@ -310,15 +339,36 @@ pub fn observation(setting: Setting, rows: &[&ItemReport]) -> Observation {
             .filter_map(|row| row.why.clone())
             .collect::<Vec<_>>()
     };
-    let note = if standing == Standing::Waiting {
-        rows.iter()
+    let projects = rows.iter().find_map(|row| {
+        Reading::of(row)
+            .and_then(Reading::projects)
+            .filter(|count| *count > 0)
+            .map(|count| (count, *row))
+    });
+    let note = match standing {
+        Standing::Waiting => rows
+            .iter()
             .filter(|row| self::standing(row) == Standing::Waiting)
             .find_map(|row| match Reading::of(row) {
                 Some(Reading::Waits(wait)) => Some(wait.note().to_owned()),
                 _ => None,
-            })
-    } else {
-        None
+            }),
+        // The person's own project build folders Spotlight indexes: a quiet note,
+        // never a step of the row's, where nothing else is said under it.
+        Standing::InPlace | Standing::AtLogin | Standing::Differs => {
+            projects.map(|(count, _)| projects_note(count))
+        }
+        _ => None,
+    };
+    // In place, the folders themselves stand behind the note: the line of the item
+    // that counted them, which names each.
+    let detail = match projects {
+        Some((_, row))
+            if detail.is_empty() && matches!(standing, Standing::InPlace | Standing::AtLogin) =>
+        {
+            row.to.iter().cloned().collect()
+        }
+        _ => detail,
     };
     Observation {
         subject,
@@ -328,6 +378,18 @@ pub fn observation(setting: Setting, rows: &[&ItemReport]) -> Observation {
         note,
         detail: (!detail.is_empty()).then(|| detail.join("; ")),
     }
+}
+
+/// The Rust in Spotlight row's note for `count` of the person's own project build
+/// folders that Spotlight indexes: what keeps one out, said once and asked of no one.
+/// aterm never renames them: a program started from one may still be under macOS's
+/// first-exec check.
+#[must_use]
+pub fn projects_note(count: usize) -> String {
+    let each = if count == 1 { "it" } else { "each" };
+    format!(
+        "Spotlight indexes {count} of your project build folders; renaming {each} to its .noindex name and linking the old name to it keeps it out"
+    )
 }
 
 /// The wanted value in the row's words: [`Setting::wanted`], with the count the
@@ -465,7 +527,9 @@ mod tests {
             },
             Reading::SignedIn,
             Reading::DocsInstalled,
-            Reading::BuildsIndexed,
+            Reading::BuildsIndexed { projects: 0 },
+            Reading::BuildsIndexed { projects: 3 },
+            Reading::ProjectsIndexed { count: 1 },
             Reading::Repositories {
                 present: 2,
                 count: 5,
@@ -582,7 +646,7 @@ mod tests {
             ),
             (
                 Setting::Spotlight,
-                &[Reading::BuildsIndexed],
+                &[Reading::BuildsIndexed { projects: 0 }],
                 Some("Builds indexed"),
             ),
         ];
@@ -614,6 +678,65 @@ mod tests {
         // Parts that disagree name no value.
         let (seven, one) = (read_as(apps(7)), read_as(apps(1)));
         assert_eq!(observation(Setting::Dock, &[&seven, &one]).now, None);
+    }
+
+    #[test]
+    fn the_persons_own_spotlit_project_folders_are_a_note_never_a_step() {
+        let kept = |reading: Reading| ItemReport {
+            detail: Some(reading.token()),
+            ..row(
+                Outcome::Ok,
+                None,
+                Some(
+                    "cargo-build.noindex, tooling.noindex, and trust store builds are .noindex; Spotlight indexes these project build folders of yours, which aterm leaves as they are: /Users//a/x/target",
+                ),
+            )
+        };
+        let profile = row(Outcome::Ok, None, None);
+        let read = observation(
+            Setting::Spotlight,
+            &[&profile, &kept(Reading::ProjectsIndexed { count: 3 })],
+        );
+        assert_eq!(read.standing, Standing::InPlace);
+        assert_eq!(
+            read.note.as_deref(),
+            Some(
+                "Spotlight indexes 3 of your project build folders; renaming each to its .noindex name and linking the old name to it keeps it out"
+            )
+        );
+        assert!(
+            read.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("/Users//a/x/target")),
+            "the list stands behind the row: {read:?}"
+        );
+        assert_eq!(
+            projects_note(1),
+            "Spotlight indexes 1 of your project build folders; renaming it to its .noindex name and linking the old name to it keeps it out"
+        );
+        // A change aterm makes says it too; none counted says nothing.
+        let read = observation(
+            Setting::Spotlight,
+            &[&read_as(Reading::BuildsIndexed { projects: 2 })],
+        );
+        assert_eq!(read.standing, Standing::Differs);
+        assert!(
+            read.note
+                .is_some_and(|note| note.starts_with("Spotlight indexes 2 "))
+        );
+        let read = observation(
+            Setting::Spotlight,
+            &[&kept(Reading::ProjectsIndexed { count: 0 })],
+        );
+        assert_eq!((read.standing, read.note), (Standing::InPlace, None));
+        // A row that needs a person keeps that person's words as its note.
+        let person = ItemReport {
+            detail: Some(Reading::BuildsIndexed { projects: 4 }.token()),
+            why: Some("the trust builds stay where Spotlight indexes them".into()),
+            ..row(Outcome::Person, None, None)
+        };
+        let read = observation(Setting::Spotlight, &[&person]);
+        assert_eq!((read.standing, read.note), (Standing::NeedsYou, None));
     }
 
     #[test]

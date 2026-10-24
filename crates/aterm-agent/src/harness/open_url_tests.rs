@@ -2880,6 +2880,7 @@ m27_2_pass = "flat-m27-2-pw"
             ),
             (true, true, false, false),
             0,
+            &[],
         );
         assert!(wm_js.contains(":not(#mailboxPassword):not([name='mailboxPassword'])"));
         assert!(wm_js.contains("input[name='loginfmt']"));
@@ -3860,6 +3861,79 @@ fn webmail_user_for_and_all_webmail_ui_urls_route_cleanly() {
 }
 
 #[test]
+fn a_pin_admits_only_its_own_vendors_pages() {
+    use crate::ai::connector::{KIMI_SIGNIN, Region};
+    let kimi = Pin::Hosts(
+        KIMI_SIGNIN
+            .route(None)
+            .expect("kimi's route")
+            .hosts
+            .of(Some(Region::Global))
+            .expect("global hosts"),
+    );
+    let claude_authorize = "https://claude.ai/oauth/authorize?code=true&client_id=x\
+        &redirect_uri=http%3A%2F%2Flocalhost%3A54545%2Fcallback&state=s";
+    assert!(CLAUDE_PIN.admits(claude_authorize));
+    assert!(
+        !kimi.admits(claude_authorize),
+        "kimi's pin never admits claude.ai"
+    );
+    assert!(MailboxFlow::pinned(claude_authorize, kimi).is_err());
+    let kimi_page = "https://auth.kimi.ai/oauth/authorize?redirect_uri=\
+        http%3A%2F%2F127.0.0.1%3A7777%2Fcb&state=s";
+    assert!(kimi.admits(kimi_page));
+    assert!(
+        !CLAUDE_PIN.admits(kimi_page),
+        "Claude Code's pin never admits auth.kimi.ai"
+    );
+    assert!(MailboxFlow::new(kimi_page).is_err());
+    let flow = MailboxFlow::pinned(kimi_page, kimi).expect("a kimi flow");
+    assert!(flow.admits_provider_url("https://www.kimi.ai/code/authorize_device"));
+    assert!(!flow.admits_provider_url("https://auth.kimi.com/code"));
+    assert!(!flow.admits_provider_url("https://claude.ai/oauth/authorize"));
+    assert!(flow.is_callback("http://127.0.0.1:7777/cb?code=c&state=s"));
+}
+
+#[test]
+fn an_account_run_names_its_cli_and_label_before_its_home_does() {
+    use std::ffi::OsString;
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let store = tmp.path().join("accounts");
+    let login = store.join("logins/sol+2");
+    std::fs::create_dir_all(&login).expect("mkdir");
+    let login_text = login.to_string_lossy().into_owned();
+    let with = |pairs: Vec<(&'static str, String)>| {
+        move |name: &str| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| OsString::from(v))
+        }
+    };
+    let claude = with(vec![(super::super::accounts::HOME_ENV, login_text.clone())]);
+    assert_eq!(account_label_of(&claude).as_deref(), Some("sol"));
+    assert_eq!(store_dir_of(&claude, None), Some(store.clone()));
+    let named = with(vec![
+        (super::super::accounts::HOME_ENV, login_text.clone()),
+        (ACCOUNT_LABEL_ENV, "kimi-one".to_owned()),
+        (ACCOUNT_CLI_ENV, "kimi".to_owned()),
+    ]);
+    assert_eq!(account_label_of(&named).as_deref(), Some("kimi-one"));
+    assert_eq!(
+        store_dir_of(&named, None),
+        None,
+        "another CLI's run never reads Claude Code's home for its store"
+    );
+    let other = with(vec![
+        (super::super::accounts::HOME_ENV, login_text),
+        (ACCOUNT_CLI_ENV, "grok".to_owned()),
+    ]);
+    assert_eq!(account_label_of(&other), None);
+    let opener = store.join("bin").join(OPENER);
+    assert_eq!(store_dir_of(&other, Some(&opener)), Some(store));
+}
+
+#[test]
 fn hex_3d_tokens_multipart_qp_dot_segments_and_subaddressed_profiles_work() {
     use super::super::headless_oauth::{
         browser_profile_dir, extract_otp_from_email, has_browser_profile,
@@ -4089,4 +4163,359 @@ fn multipart_mime_boundary_and_consent_negation_hardening() {
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body, "line1\r\n\r\nline2");
     assert_eq!(cookies.get("sid").map(String::as_str), Some("abc"));
+}
+
+#[test]
+fn css_custom_props_angle_bracket_entities_otp_priority_and_get_form_dedup() {
+    use crate::harness::headless_oauth::{extract_otp_from_email, extract_otps_from_email};
+
+    // 1. Multipart QP email containing CSS custom properties (`--brand-color: #d97757;`),
+    // CLI flags (`--headless=new`), and signature lines (`-- Anthropic Team`) at column 0,
+    // plus an angle-bracketed HTML entity fallback link (`&lt;...&#038;...&gt;`).
+    let css_and_entity_multipart = concat!(
+        "From: Anthropic <no-reply@anthropic.com>\r\n",
+        "To: sol-m27@proton.me\r\n",
+        "Subject: Sign in to Claude\r\n",
+        "Content-Type: multipart/alternative; boundary=\"bound-css\"\r\n\r\n",
+        "--bound-css\r\n",
+        "Content-Type: text/html; charset=utf-8\r\n",
+        "Content-Transfer-Encoding: quoted-printable\r\n\r\n",
+        "<html><head><style>\r\n",
+        ":root {\r\n",
+        "--brand-color: #d97757;\r\n",
+        "--font-sans: Inter, sans-serif;\r\n",
+        "}\r\n",
+        "</style></head><body>\r\n",
+        "<pre>\r\n",
+        "--headless=3Dnew\r\n",
+        "</pre>\r\n",
+        "<p>Copy link: &lt;https://claude.ai/magic-link?token=3Dentity-ok&#038;=\r\n",
+        "state=3D42&gt;</p>\r\n",
+        "<p>Or enter passcode: 482&#45;910</p>\r\n",
+        "-- Anthropic Team\r\n",
+        "</body></html>\r\n",
+        "--bound-css--\r\n"
+    );
+    assert_eq!(
+        extract_magic_link_from_email(css_and_entity_multipart, Some("sol-m27@proton.me"))
+            .as_deref(),
+        Some("https://claude.ai/magic-link?token=entity-ok&state=42")
+    );
+    assert_eq!(
+        extract_otp_from_email(css_and_entity_multipart, Some("sol-m27@proton.me")).as_deref(),
+        Some("482910")
+    );
+
+    // 2. Contextual OTP outranks an earlier uncontextualized standalone 6-digit number.
+    let header_num_then_otp = concat!(
+        "From: Anthropic <no-reply@anthropic.com>\r\n",
+        "To: sol-m27@proton.me\r\n",
+        "Subject: Claude Account Notification\r\n\r\n",
+        "<div>941070</div>\r\n",
+        "<p>San Francisco, CA</p>\r\n",
+        "<p>Hello,</p>\r\n",
+        "<p>Please enter the following verification code in your browser:</p>\r\n",
+        "<div>654321</div>\r\n"
+    );
+    assert_eq!(
+        extract_otps_from_email(header_num_then_otp, Some("sol-m27@proton.me")),
+        vec!["654321".to_owned(), "941070".to_owned()]
+    );
+
+    // 3. Hero OTP box placed immediately above its context caption outranks an earlier
+    // standalone 6-digit number, and a 6-line vertical OTP box is not corrupted by a 7th
+    // single-digit footnote line.
+    let hero_above_caption = concat!(
+        "From: Anthropic <no-reply@anthropic.com>\r\n",
+        "To: sol-m27@proton.me\r\n\r\n",
+        "<div>100200</div>\r\n",
+        "<p>Welcome back</p>\r\n",
+        "<div>839201</div>\r\n",
+        "<p>Enter this one-time passcode to sign in to Claude.</p>\r\n"
+    );
+    assert_eq!(
+        extract_otp_from_email(hero_above_caption, Some("sol-m27@proton.me")).as_deref(),
+        Some("839201")
+    );
+
+    let vertical_with_footer_digit = concat!(
+        "From: Anthropic <no-reply@anthropic.com>\r\n",
+        "To: sol-m27@proton.me\r\n\r\n",
+        "<p>Your verification code:</p>\r\n",
+        "<div>3</div><div>1</div><div>4</div><div>1</div><div>5</div><div>9</div>\r\n",
+        "<div>7</div>\r\n"
+    );
+    assert_eq!(
+        extract_otp_from_email(vertical_with_footer_digit, Some("sol-m27@proton.me")).as_deref(),
+        Some("314159")
+    );
+
+    // 4. Icon-only submit buttons with `aria-label`, OAuth `error=access_denied` cancel links,
+    // and GET form query-parameter deduplication against `base_url`.
+    let icon_buttons_html = r#"
+        <form method="POST" action="/oauth/consent">
+          <input type="hidden" name="csrf" value="t1">
+          <button type="submit" name="decision" value="0" aria-label="Deny access"><svg></svg></button>
+          <button type="submit" name="decision" value="1" aria-label="Allow access"><svg></svg></button>
+        </form>
+    "#;
+    assert_eq!(
+        parse_html_approval_action(icon_buttons_html, "https://claude.ai/oauth/authorize"),
+        Some((
+            "POST".to_owned(),
+            "https://claude.ai/oauth/consent".to_owned(),
+            Some("csrf=t1&decision=1".to_owned()),
+        ))
+    );
+
+    let cancel_callback_then_approve_link = r#"
+        <a href="http://127.0.0.1:9000/callback?error=access_denied&amp;state=st_1">Return to app</a>
+        <a href="http://127.0.0.1:9000/callback?code=auth_ok&amp;state=st_1">Continue</a>
+    "#;
+    assert_eq!(
+        parse_html_approval_action(
+            cancel_callback_then_approve_link,
+            "https://claude.ai/oauth/authorize?state=st_1"
+        ),
+        Some((
+            "GET".to_owned(),
+            "http://127.0.0.1:9000/callback?code=auth_ok&state=st_1".to_owned(),
+            None,
+        ))
+    );
+
+    let get_form_with_duplicate_state = r#"
+        <form method="GET" action="http://127.0.0.1:9000/callback?state=st_1">
+          <input type="hidden" name="state" value="st_1">
+          <input type="hidden" name="code" value="code_77">
+          <button type="submit">Allow</button>
+        </form>
+    "#;
+    let (m, cb_url, body) = parse_html_approval_action(
+        get_form_with_duplicate_state,
+        "https://claude.ai/oauth/authorize?state=st_1",
+    )
+    .expect("GET form approval action");
+    assert_eq!(m, "GET");
+    assert_eq!(body, None);
+    assert_eq!(
+        cb_url,
+        "http://127.0.0.1:9000/callback?state=st_1&code=code_77"
+    );
+    let flow = super::MailboxFlow::new(
+        "https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2F127.0.0.1%3A9000%2Fcallback&state=st_1",
+    )
+    .expect("mailbox flow");
+    assert!(
+        flow.is_callback(&cb_url),
+        "deduplicated GET form callback URL must satisfy MailboxFlow::is_callback"
+    );
+}
+
+#[test]
+fn tracked_magic_urls_chunked_http_and_email_input_detection() {
+    let safelinks_email = concat!(
+        "To: sol-m27@proton.me\r\n",
+        "Subject: Sign in to Claude\r\n\r\n",
+        "Click here: https://nam04.safelinks.protection.outlook.com/?url=https%3A%2F%2Fclaude.ai%2Fmagic-link%3Ftoken%3Dsafelink_tok%26state%3Ds1&data=05%7C01\r\n"
+    );
+    assert_eq!(
+        extract_magic_link_from_email(safelinks_email, Some("sol-m27@proton.me")).as_deref(),
+        Some("https://claude.ai/magic-link?token=safelink_tok&state=s1")
+    );
+
+    let ppv3_email = concat!(
+        "To: sol-m27@proton.me\r\n\r\n",
+        "https://urldefense.com/v3/__https://claude.ai/magic-link?token=ppv3_tok&state=s1__;!!abc!def$\r\n"
+    );
+    assert_eq!(
+        extract_magic_link_from_email(ppv3_email, Some("sol-m27@proton.me")).as_deref(),
+        Some("https://claude.ai/magic-link?token=ppv3_tok&state=s1")
+    );
+
+    let ppv2_email = concat!(
+        "To: sol-m27@proton.me\r\n\r\n",
+        "https://urldefense.proofpoint.com/v2/url?u=https-3A__claude.ai_magic-2Dlink-3Ftoken-3Dppv2-5Ftok-26state-3Ds1&d=DwMFaQ\r\n"
+    );
+    assert_eq!(
+        extract_magic_link_from_email(ppv2_email, Some("sol-m27@proton.me")).as_deref(),
+        Some("https://claude.ai/magic-link?token=ppv2_tok&state=s1")
+    );
+
+    let ses_email = concat!(
+        "To: sol-m27@proton.me\r\n\r\n",
+        "https://xyz.r.us-east-1.awstrack.me/L0/https:%2F%2Fclaude.ai%2Fmagic-link%3Ftoken%3Dses+tok%26state%3Ds1/1/0100018f\r\n"
+    );
+    assert_eq!(
+        extract_magic_link_from_email(ses_email, Some("sol-m27@proton.me")).as_deref(),
+        Some("https://claude.ai/magic-link?token=ses+tok&state=s1")
+    );
+
+    let mut cookies = std::collections::BTreeMap::new();
+    let raw_chunked = concat!(
+        "HTTP/1.1 200 OK\r\n",
+        "Transfer-Encoding: chunked\r\n",
+        "Content-Type: application/json\r\n\r\n",
+        "1b;ext=1\r\n",
+        "{\"approve_url\":\"/oauth/appr\r\n",
+        "10\r\n",
+        "ove?ok=chunked\"}\r\n",
+        "0\r\n\r\n"
+    );
+    let parsed = super::parse_raw_http_response(raw_chunked, &mut cookies).expect("chunked resp");
+    assert_eq!(parsed.status, 200);
+    assert_eq!(
+        parsed.body,
+        "{\"approve_url\":\"/oauth/approve?ok=chunked\"}"
+    );
+    assert_eq!(
+        parse_html_approval_action(&parsed.body, "https://claude.ai/oauth/authorize"),
+        Some((
+            "POST".to_owned(),
+            "https://claude.ai/oauth/approve?ok=chunked".to_owned(),
+            None,
+        ))
+    );
+
+    let already_dechunked = concat!(
+        "HTTP/1.1 200 OK\r\n",
+        "Transfer-Encoding: chunked\r\n\r\n",
+        "{\"approve_url\":\"/oauth/approve?ok=curl\"}"
+    );
+    let parsed_curl =
+        super::parse_raw_http_response(already_dechunked, &mut cookies).expect("curl resp");
+    assert_eq!(
+        parsed_curl.body,
+        "{\"approve_url\":\"/oauth/approve?ok=curl\"}"
+    );
+
+    assert!(!super::page_needs_browser_before_email(
+        "<html><body><form action='/approve'><input type='hidden' name='email' value='sol-m27@proton.me'><button type='submit'>Approve</button></form></body></html>"
+    ));
+    assert!(!super::page_needs_browser_before_email(
+        "<html><body><form><input type='email' name='email' disabled></form></body></html>"
+    ));
+    assert!(super::page_needs_browser_before_email(
+        "<html><body><form><input type=email name=email></form></body></html>"
+    ));
+
+    let js = super::super::headless_oauth::oauth_step_js(
+        Some("sol-m27@proton.me"),
+        Some("123456"),
+        false,
+        false,
+    );
+    let otp_pos = js.find("otpInputs.length > 0").expect("otpInputs check");
+    let email_pos = js
+        .find("emailInput && emailVal && !emailDone")
+        .expect("emailInput check");
+    let approve_form_pos = js.find("const approveForm").expect("approveForm check");
+    assert!(
+        otp_pos < approve_form_pos && email_pos < approve_form_pos,
+        "otpInputs and emailInput must be evaluated before fallback approveForm"
+    );
+}
+
+#[test]
+fn nested_trackers_anchor_ranking_and_mime_otp_isolation() {
+    use super::super::headless_oauth::{
+        MailboxCredential, extract_credential_from_email, extract_otps_from_email,
+    };
+
+    // 1. SafeLinks wrapping AWS SES /L0/ wrapping a Claude magic link.
+    let double_wrapped = concat!(
+        "To: sol-m27@proton.me\r\n",
+        "Subject: Sign in to Claude\r\n\r\n",
+        "https://nam04.safelinks.protection.outlook.com/?url=https%3A%2F%2Fxyz.r.us-east-1.awstrack.me%2FL0%2Fhttps%3A%252F%252Fclaude.ai%252Fmagic-link%253Ftoken%253Dnested_ok%2526state%253Ds9%2F1%2F0100&data=05\r\n"
+    );
+    assert_eq!(
+        extract_magic_link_from_email(double_wrapped, Some("sol-m27@proton.me")).as_deref(),
+        Some("https://claude.ai/magic-link?token=nested_ok&state=s9")
+    );
+
+    // 2. Proofpoint v3 with `*` replacements decoded from the `;base64!` table (`/` = 0x2F, `?` = 0x3F, `&` = 0x26 -> base64 "Lz8m").
+    let ppv3_star = concat!(
+        "To: sol-m27@proton.me\r\n\r\n",
+        "https://urldefense.com/v3/__https://claude.ai*magic-link*token=ppv3_star*state=s2__;Lz8m!abc$\r\n"
+    );
+    assert_eq!(
+        extract_magic_link_from_email(ppv3_star, Some("sol-m27@proton.me")).as_deref(),
+        Some("https://claude.ai/magic-link?token=ppv3_star&state=s2")
+    );
+
+    // 3. OTP email with SafeLinks/Proofpoint-wrapped non-auth footer links and opaque tracked footer anchors.
+    let otp_with_tracked_footers = concat!(
+        "To: sol-m27@proton.me\r\n",
+        "Subject: Your Claude verification code\r\n\r\n",
+        "<html><body>\r\n",
+        "<a href=\"https://clicks.mailgun.org/c/view_in_browser_123\">View in browser</a>\r\n",
+        "<p>Your verification code is: <strong>649201</strong></p>\r\n",
+        "<p>Not you? <a href=\"https://claude.ai/auth/revoke?id=99\">Revoke this request</a></p>\r\n",
+        "<footer>\r\n",
+        "<a href=\"https://nam04.safelinks.protection.outlook.com/?url=https%3A%2F%2Fclaude.ai%2Fprivacy&data=05\">Privacy Policy</a>\r\n",
+        "<a href=\"https://urldefense.com/v3/__https://support.anthropic.com/en/articles/123__;!!abc!def$\">Help Center</a>\r\n",
+        "<a href=\"https://clicks.mailgun.org/c/unsub_456\">Unsubscribe</a>\r\n",
+        "</footer></body></html>\r\n"
+    );
+    assert_eq!(
+        extract_credential_from_email(otp_with_tracked_footers, Some("sol-m27@proton.me")),
+        Some(MailboxCredential::Otp("649201".to_owned())),
+        "tracked non-auth footer links and revoke links must not shadow the 6-digit OTP"
+    );
+
+    // 4. Opaque click-tracked magic-link email where "View in browser" precedes "Sign in to Claude".
+    let opaque_tracker_magic = concat!(
+        "To: sol-m27@proton.me\r\n",
+        "Subject: Sign in to Claude\r\n\r\n",
+        "<html><body>\r\n",
+        "<p><a href=\"https://clicks.sendgrid.net/ls/click?upn=view_browser_tok\">View in browser</a></p>\r\n",
+        "<p><a href=\"https://clicks.sendgrid.net/ls/click?upn=signin_cta_tok\">Sign in to Claude</a></p>\r\n",
+        "<p><a href=\"https://clicks.sendgrid.net/ls/click?upn=unsub_tok\">Unsubscribe</a></p>\r\n",
+        "</body></html>\r\n"
+    );
+    assert_eq!(
+        extract_credential_from_email(opaque_tracker_magic, Some("sol-m27@proton.me")),
+        Some(MailboxCredential::MagicLink(
+            "https://clicks.sendgrid.net/ls/click?upn=signin_cta_tok".to_owned()
+        )),
+        "CTA anchor text promotes the opaque tracker sign-in link and rejects View in browser / Unsubscribe"
+    );
+
+    // 5. Top-level base64 OTP email must not treat raw 6-digit base64 lines (`482910`) as OTPs.
+    // "Your verification code is 739104 " in base64 is "WW91ciB2ZXJpZmljYXRpb24gY29kZSBpcyA3MzkxMDQg"
+    let top_level_b64_otp = concat!(
+        "To: sol-m27@proton.me\r\n",
+        "Subject: Your verification code\r\n",
+        "Content-Transfer-Encoding: base64\r\n\r\n",
+        "WW91ciB2ZXJpZmljYXRpb24gY29kZSBpcyA3MzkxMDQg\r\n",
+        "482910==\r\n"
+    );
+    assert_eq!(
+        extract_otps_from_email(top_level_b64_otp, Some("sol-m27@proton.me")),
+        vec!["739104".to_owned()],
+        "top-level base64 OTP email ignores raw base64 lines and extracts only the decoded OTP"
+    );
+
+    // 6. Multipart MIME boundary resets OTP context so trailing context words before `--boundary`
+    // do not promote unrelated numbers in the next MIME part's headers or top lines.
+    let multipart_boundary_bleed = concat!(
+        "To: sol-m27@proton.me\r\n",
+        "Content-Type: multipart/alternative; boundary=\"b1\"\r\n\r\n",
+        "--b1\r\n",
+        "Content-Type: text/plain\r\n\r\n",
+        "Please enter your verification code below:\r\n",
+        "--b1\r\n",
+        "Content-Type: text/html\r\n",
+        "Content-ID: <112233>\r\n\r\n",
+        "<div>Office address: 941070 Market St</div>\r\n",
+        "<div>Your one-time passcode is 582019</div>\r\n",
+        "--b1--\r\n"
+    );
+    assert_eq!(
+        extract_otps_from_email(multipart_boundary_bleed, Some("sol-m27@proton.me"))
+            .first()
+            .map(String::as_str),
+        Some("582019"),
+        "MIME boundary resets context_lines_left so part 2's Content-ID and top address are not promoted over the real OTP"
+    );
 }

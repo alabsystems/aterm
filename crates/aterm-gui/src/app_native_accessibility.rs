@@ -907,8 +907,8 @@ mod tests {
             );
 
             let fresh = publish_leave(&mut app, wid, view);
-            app.native_runtime.tick_system_state(false);
-            app.native_runtime.tick_system_state(false);
+            app.native_runtime.tick_system_state(false, false, &[]);
+            app.native_runtime.tick_system_state(false, false, &[]);
             app.native_runtime.publish_system_state(crate::SetupStatus {
                 plan: Some(replacement.clone()),
                 ..crate::SetupStatus::default()

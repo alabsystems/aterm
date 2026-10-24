@@ -60,6 +60,9 @@ pub(super) struct AppState {
     /// LOCAL PATCH (aterm): set when a user event's send armed the wake since the last take;
     /// `cleared` then wakes the run loop before it sleeps, so the event is not left waiting.
     wake_armed: wake_queue::Armed,
+    /// LOCAL PATCH (aterm): what the user-event queue's latest take found, which
+    /// `ActiveEventLoop::user_events_drained` reports.
+    drained: wake_queue::Drained,
 }
 
 aterm_objc::declare_class! {
@@ -98,6 +101,7 @@ impl ApplicationDelegate {
         activation_policy: Option<isize>,
         activate_ignoring_other_apps: bool,
         wake_armed: wake_queue::Armed,
+        drained: wake_queue::Drained,
     ) -> aterm_objc::Retained<Self> {
         ApplicationDelegate::alloc_init(mtm, AppState {
             activation_policy,
@@ -117,6 +121,7 @@ impl ApplicationDelegate {
             wait_timeout: Cell::new(None),
             pending_redraw: RefCell::new(vec![]),
             wake_armed,
+            drained,
         })
         .expect("couldn't create `WinitApplicationDelegate`")
     }
@@ -308,6 +313,10 @@ impl ApplicationDelegate {
 
     pub fn exiting(&self) -> bool {
         self.ivars().exit.get()
+    }
+
+    pub fn user_events_drained(&self) -> bool {
+        self.ivars().drained.emptied()
     }
 
     pub fn set_control_flow(&self, value: ControlFlow) {

@@ -162,7 +162,7 @@ impl AnchorSet {
         &self.anchors
     }
 
-    /// Rebuild a set from a checkpoint's slots. `None` past [`MAX_ANCHORS`].
+    /// Rebuild a set from a checkpoint's slots, `None` past [`MAX_ANCHORS`].
     #[must_use]
     pub fn from_slots(slots: Vec<Anchor>, lost: bool, seal_epoch: u64) -> Option<Self> {
         if slots.len() > MAX_ANCHORS {
@@ -178,11 +178,23 @@ impl AnchorSet {
     }
 
     /// Translates and clamps anchors within screen rows `top..=bottom` at `base` by `delta`.
+    /// On an insertion every anchor on the band's top holds its row: the blank rows opened
+    /// there join the span that starts there and stay out of the one that ends there. Rows
+    /// opened at a stopped mark's start are some other writer's, and its reselect's seal
+    /// check cuts them, as it does rows opened anywhere inside its spans.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
             machine = "holder_fence",
             action = "BandMove",
+            project = "aterm_core::terminal::holder_fence_conformance::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "holder_fence",
+            action = "Reserve",
             project = "aterm_core::terminal::holder_fence_conformance::project"
         )
     )]
@@ -193,9 +205,11 @@ impl AnchorSet {
         let lo = base.saturating_add(u64::from(top));
         let hi = base.saturating_add(u64::from(bottom));
         let (top, end) = (i64::from(top), i64::from(bottom) + 1);
+        let starts_follow = knob(FenceKnob::StartFollows);
         for a in self.anchors.iter_mut().filter(|a| a.live) {
             if (lo..=hi).contains(&a.row) {
-                if a.role == AnchorRole::End && a.row == lo && delta > 0 {
+                let holds = a.role == AnchorRole::End || !starts_follow;
+                if holds && a.row == lo && delta > 0 {
                     continue;
                 }
                 let screen = i64::try_from(a.row - base).unwrap_or(end);
@@ -332,6 +346,13 @@ pub enum FenceKnob {
     CountEviction = 1 << 9,
     /// Preserves `alt_fresh` on stop so reselect admits external alternate-screen writes.
     StopKeepsAltFresh = 1 << 10,
+    /// A Start on an insertion's top row follows its row down (a liveness control: the rows a
+    /// drawer opens at its own start, and the card it draws in them, are refused).
+    StartFollows = 1 << 11,
+    /// Rows the current drawer erases above its open span's start stay out of it (a liveness
+    /// control: the card it redraws there, as Claude Code does from home after a resize, is
+    /// refused).
+    ErasedRowsStayOut = 1 << 12,
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -428,7 +449,51 @@ mod tests {
         assert_eq!(set.row(ids[4]), Some(111));
         set.band_move(100, 1, 8, 3);
         assert_eq!(set.row(ids[3]), Some(109), "clamped to bottom + 1");
-        assert_eq!(set.row(ids[1]), Some(104));
+        assert_eq!(
+            set.row(ids[1]),
+            Some(101),
+            "a start on the insertion's top holds"
+        );
+    }
+
+    /// Muse Code's launch: three rows opened at the top of a region that
+    /// starts on a span's start are that span's, every anchor on the top
+    /// holding its row; a start below the top follows its row, as does one
+    /// the band starts above.
+    #[test]
+    fn an_insertion_at_a_start_holds_it_and_moves_the_starts_below() {
+        let (mut set, ids) = set_with(&[
+            (102, AnchorRole::Start), // the open span's
+            (102, AnchorRole::Start), // a closed span's
+            (102, AnchorRole::End),
+            (105, AnchorRole::Start), // in the band, below its top
+        ]);
+        set.band_move(100, 2, 8, 3);
+        assert_eq!(set.row(ids[0]), Some(102), "a start holds");
+        assert_eq!(set.row(ids[1]), Some(102), "every start on the top holds");
+        assert_eq!(set.row(ids[2]), Some(102), "an end holds");
+        assert_eq!(set.row(ids[3]), Some(108));
+        set.band_move(100, 1, 8, 2);
+        assert_eq!(
+            set.row(ids[0]),
+            Some(104),
+            "rows opened above a start are not its"
+        );
+        set.band_move(100, 4, 8, -1);
+        assert_eq!(
+            set.row(ids[0]),
+            Some(104),
+            "a deletion clamps it to the band's top like any start"
+        );
+    }
+
+    #[test]
+    fn the_start_knob_moves_a_start_on_the_top() {
+        let (mut set, ids) = set_with(&[(102, AnchorRole::Start), (102, AnchorRole::End)]);
+        with_knob(FenceKnob::StartFollows, || set.band_move(100, 2, 8, 3));
+        assert_eq!(set.row(ids[0]), Some(105));
+        assert_eq!(set.row(ids[1]), Some(102), "an end holds under the knob");
+        assert!(!knob(FenceKnob::StartFollows));
     }
 
     #[test]

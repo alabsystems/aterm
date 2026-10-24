@@ -522,82 +522,18 @@ impl Item for AiAccountsItem {
     }
 
     fn probe(&self) -> aterm_converge::Probe {
-        use aterm_agent::harness::{
-            accounts,
-            accounts_sync::{
-                FLEET_ROSTER_FILE, configured_source, has_init_accounts_source,
-                needs_init_accounts_sync,
-            },
-            cli::Env,
-        };
-        use aterm_converge::Probe;
-        let env = match Env::from_process() {
-            Ok(env) => env,
-            Err(why) => return Probe::NotApplicable { why },
-        };
-        let Some(home) = env.home.as_deref() else {
-            return Probe::NotApplicable {
-                why: "no user home directory is configured".to_owned(),
-            };
-        };
-        let Some(roster_path) = env.accounts_roster() else {
-            return Probe::NotApplicable {
-                why: "no config directory is configured".to_owned(),
-            };
-        };
-        let store = env.accounts_store();
-        let fleet_path = roster_path
-            .parent()
-            .map(|p| p.join(FLEET_ROSTER_FILE))
-            .unwrap_or_default();
-        let config_path = roster_path
-            .parent()
-            .map(|p| p.join("aterm.toml"))
-            .unwrap_or_else(|| std::path::PathBuf::from("aterm.toml"));
-        if let Ok(raw) = accounts::Roster::load(&roster_path)
-            && !raw.rows.is_empty()
-            && fleet_path.is_file()
-            && configured_source(Some(&config_path), Some(&roster_path)).is_some()
-            && !needs_init_accounts_sync(home, &env.state, &roster_path, env.now)
-        {
-            let bound = store.bound(&raw, env.now).unwrap_or(raw);
-            let enrolled = accounts::enrolled(&bound);
-            let state = store.load(env.now).map(|(s, _)| s).unwrap_or_default();
-            let ready = bound
-                .rows
-                .iter()
-                .filter(|r| {
-                    (r.dir.is_none() || enrolled.contains(&r.label))
-                        && state
-                            .accounts
-                            .get(&r.label)
-                            .is_none_or(|a| a.auth != accounts::Auth::SignedOut)
-                })
-                .count();
-            let own_label = bound.row_for_login(None).map(|r| r.label.as_str());
-            let next_hint = accounts::renew_next(&bound, &state, &enrolled, own_label, env.now)
-                .map(|label| format!("; next: `aterm harness accounts renew {label}`"))
-                .unwrap_or_default();
-            return Probe::Ok {
-                now: format!(
-                    "{} accounts synced ({ready} enrolled and not signed out{next_hint})",
-                    bound.rows.len()
-                ),
-            };
-        }
-        if !has_init_accounts_source(home, &env.state, &roster_path, env.now) {
-            return Probe::NotApplicable {
-                why: "no fleet accounts source is configured".to_owned(),
-            };
-        }
-        Probe::Change {
-            from: "absent".to_owned(),
-            to: "accounts.toml + fleet-accounts.toml synced".to_owned(),
+        use aterm_agent::harness::cli::Env;
+        match Env::from_process() {
+            Ok(env) => ai_accounts_probe(&env),
+            Err(why) => aterm_converge::Probe::NotApplicable { why },
         }
     }
 
     fn apply(&self) -> Result<(), String> {
-        use aterm_agent::harness::{accounts_sync::sync_accounts_for_init, cli::Env};
+        use aterm_agent::harness::{
+            accounts_sync::{sync_accounts_for_init, sync_cli_accounts_for_init},
+            cli::Env,
+        };
         let env = Env::from_process()?;
         let home = env
             .home
@@ -606,7 +542,17 @@ impl Item for AiAccountsItem {
         let roster_path = env
             .accounts_roster()
             .ok_or_else(|| "no config directory".to_owned())?;
-        sync_accounts_for_init(home, &env.state, &roster_path, env.now).map(|_| ())
+        let others = sync_cli_accounts_for_init(home, &env.state, &roster_path, env.now);
+        let claude = sync_accounts_for_init(home, &env.state, &roster_path, env.now).map(|_| ());
+        let failed: Vec<String> = others
+            .into_iter()
+            .filter_map(|(cli, synced)| synced.err().map(|why| format!("{}: {why}", cli.id())))
+            .collect();
+        match claude {
+            Err(why) if !ai_accounts_others_only(&env) => Err(why),
+            _ if failed.is_empty() => Ok(()),
+            _ => Err(failed.join("; ")),
+        }
     }
 
     fn explain(&self, probe: &aterm_converge::Probe) -> aterm_converge::Explain {
@@ -621,6 +567,127 @@ impl Item for AiAccountsItem {
                 only: "base.ai.accounts".to_owned(),
             },
         }
+    }
+}
+
+/// Whether `env`'s machine keeps another CLI's pool and no source of Claude Code's: then
+/// `base.ai.accounts` is the other pools' alone, and Claude Code's sync having nothing to read
+/// is no failure of it.
+#[cfg(target_os = "macos")]
+fn ai_accounts_others_only(env: &aterm_agent::harness::cli::Env) -> bool {
+    let (Some(home), Some(roster_path)) = (env.home.as_deref(), env.accounts_roster()) else {
+        return false;
+    };
+    !aterm_agent::harness::accounts_sync::has_init_accounts_source(
+        home,
+        &env.state,
+        &roster_path,
+        env.now,
+    ) && ai_accounts_pools(env).is_some()
+}
+
+/// The other CLIs' pools beside Claude Code's roster in one phrase (`codex 1, kimi 1`,
+/// `accounts_sync::cli_pools_words`); `None` where this machine keeps none.
+#[cfg(target_os = "macos")]
+fn ai_accounts_pools(env: &aterm_agent::harness::cli::Env) -> Option<String> {
+    use aterm_agent::harness::accounts_sync::{cli_pools, cli_pools_words};
+    let (config, home) = (env.config.as_deref()?, env.home.as_deref()?);
+    cli_pools_words(&cli_pools(config, &env.state, home, env.now))
+}
+
+/// `base.ai.accounts`' probe over `env`: Claude Code's pool, as it always read
+/// ([`ai_accounts_claude_probe`]), and each other CLI's whose roster this machine keeps after it
+/// (`other CLIs: codex 1, kimi 1`). A machine with Claude Code's alone reads as it always did.
+#[cfg(target_os = "macos")]
+fn ai_accounts_probe(env: &aterm_agent::harness::cli::Env) -> aterm_converge::Probe {
+    use aterm_converge::Probe;
+    let claude = ai_accounts_claude_probe(env);
+    let Some(pools) = ai_accounts_pools(env) else {
+        return claude;
+    };
+    let others = format!("other CLIs: {pools}");
+    match claude {
+        Probe::Ok { now } => Probe::Ok {
+            now: format!("{now}; {others}"),
+        },
+        Probe::NotApplicable { .. } => Probe::Ok { now: others },
+        Probe::Change { from, to } => Probe::Change {
+            from,
+            to: format!("{to}; {others}"),
+        },
+        other => other,
+    }
+}
+
+/// Claude Code's half of [`ai_accounts_probe`].
+#[cfg(target_os = "macos")]
+fn ai_accounts_claude_probe(env: &aterm_agent::harness::cli::Env) -> aterm_converge::Probe {
+    use aterm_agent::harness::{
+        accounts,
+        accounts_sync::{
+            FLEET_ROSTER_FILE, configured_source, has_init_accounts_source,
+            needs_init_accounts_sync,
+        },
+    };
+    use aterm_converge::Probe;
+    let Some(home) = env.home.as_deref() else {
+        return Probe::NotApplicable {
+            why: "no user home directory is configured".to_owned(),
+        };
+    };
+    let Some(roster_path) = env.accounts_roster() else {
+        return Probe::NotApplicable {
+            why: "no config directory is configured".to_owned(),
+        };
+    };
+    let store = env.accounts_store();
+    let fleet_path = roster_path
+        .parent()
+        .map(|p| p.join(FLEET_ROSTER_FILE))
+        .unwrap_or_default();
+    let config_path = roster_path
+        .parent()
+        .map(|p| p.join("aterm.toml"))
+        .unwrap_or_else(|| std::path::PathBuf::from("aterm.toml"));
+    if let Ok(raw) = accounts::Roster::load(&roster_path)
+        && !raw.rows.is_empty()
+        && fleet_path.is_file()
+        && configured_source(Some(&config_path), Some(&roster_path)).is_some()
+        && !needs_init_accounts_sync(home, &env.state, &roster_path, env.now)
+    {
+        let bound = store.bound(&raw, env.now).unwrap_or(raw);
+        let enrolled = accounts::enrolled(&bound);
+        let state = store.load(env.now).map(|(s, _)| s).unwrap_or_default();
+        let ready = bound
+            .rows
+            .iter()
+            .filter(|r| {
+                (r.dir.is_none() || enrolled.contains(&r.label))
+                    && state
+                        .accounts
+                        .get(&r.label)
+                        .is_none_or(|a| a.auth != accounts::Auth::SignedOut)
+            })
+            .count();
+        let own_label = bound.row_for_login(None).map(|r| r.label.as_str());
+        let next_hint = accounts::renew_next(&bound, &state, &enrolled, own_label, env.now)
+            .map(|label| format!("; next: `aterm harness accounts renew {label}`"))
+            .unwrap_or_default();
+        return Probe::Ok {
+            now: format!(
+                "{} accounts synced ({ready} enrolled and not signed out{next_hint})",
+                bound.rows.len()
+            ),
+        };
+    }
+    if !has_init_accounts_source(home, &env.state, &roster_path, env.now) {
+        return Probe::NotApplicable {
+            why: "no fleet accounts source is configured".to_owned(),
+        };
+    }
+    Probe::Change {
+        from: "absent".to_owned(),
+        to: "accounts.toml + fleet-accounts.toml synced".to_owned(),
     }
 }
 

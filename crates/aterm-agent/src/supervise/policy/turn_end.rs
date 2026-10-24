@@ -8177,7 +8177,9 @@ const CARRY_ON: &str = concat!(
 
 pub(super) fn sign_in_how(program: Program, message: &str) -> String {
     match program {
-        Program::Claude | Program::Generic => "sign in with /login".to_string(),
+        Program::Claude | Program::Grok | Program::Kimi | Program::Generic => {
+            "sign in with /login".to_string()
+        }
         Program::Codex => "sign in to Codex again with codex login".to_string(),
         Program::Agy => {
             "quit agy and run it again to sign in, or give it a valid Gemini API key".to_string()
@@ -8196,21 +8198,38 @@ pub(super) fn sign_in_how(program: Program, message: &str) -> String {
 const fn how_leads(program: Program) -> bool {
     match program {
         Program::Gemini => true,
-        Program::Claude | Program::Codex | Program::Agy | Program::Muse | Program::Generic => false,
+        Program::Claude
+        | Program::Codex
+        | Program::Grok
+        | Program::Kimi
+        | Program::Agy
+        | Program::Muse
+        | Program::Generic => false,
     }
 }
 
 const fn login_command(program: Program) -> Option<&'static str> {
     match program {
         Program::Claude => Some("/login"),
-        Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => None,
+        Program::Codex
+        | Program::Grok
+        | Program::Kimi
+        | Program::Agy
+        | Program::Muse
+        | Program::Gemini
+        | Program::Generic => None,
     }
 }
 
 const fn compact_command(program: Program) -> Option<&'static str> {
     match program {
         Program::Claude | Program::Muse => Some("/compact"),
-        Program::Codex | Program::Agy | Program::Gemini | Program::Generic => None,
+        Program::Codex
+        | Program::Grok
+        | Program::Kimi
+        | Program::Agy
+        | Program::Gemini
+        | Program::Generic => None,
     }
 }
 
@@ -9360,7 +9379,13 @@ impl TurnEndTiming {
 const fn auto_continues(program: Program) -> bool {
     match program {
         Program::Claude => true,
-        Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => false,
+        Program::Codex
+        | Program::Grok
+        | Program::Kimi
+        | Program::Agy
+        | Program::Muse
+        | Program::Gemini
+        | Program::Generic => false,
     }
 }
 
@@ -9519,7 +9544,13 @@ impl Conversation {
 pub(crate) const fn reads_conversation(program: Program) -> bool {
     match program {
         Program::Claude => true,
-        Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => false,
+        Program::Codex
+        | Program::Grok
+        | Program::Kimi
+        | Program::Agy
+        | Program::Muse
+        | Program::Gemini
+        | Program::Generic => false,
     }
 }
 
@@ -9527,7 +9558,9 @@ pub(crate) const fn reads_conversation(program: Program) -> bool {
 pub(crate) const fn screen_alone(program: Program) -> bool {
     match program {
         Program::Agy | Program::Muse | Program::Gemini => true,
-        Program::Claude | Program::Codex | Program::Generic => false,
+        Program::Claude | Program::Codex | Program::Grok | Program::Kimi | Program::Generic => {
+            false
+        }
     }
 }
 
@@ -9561,7 +9594,12 @@ impl Seat {
                 model: aterm_phase::gemini::footer_model(rows),
                 login: aterm_phase::gemini::banner_login(rows),
             },
-            Program::Claude | Program::Codex | Program::Muse | Program::Generic => Self::default(),
+            Program::Claude
+            | Program::Codex
+            | Program::Grok
+            | Program::Kimi
+            | Program::Muse
+            | Program::Generic => Self::default(),
         }
     }
 
@@ -9609,7 +9647,12 @@ impl Seat {
 const fn limit_per_model(program: Program) -> bool {
     match program {
         Program::Gemini | Program::Agy => true,
-        Program::Claude | Program::Codex | Program::Muse | Program::Generic => false,
+        Program::Claude
+        | Program::Codex
+        | Program::Grok
+        | Program::Kimi
+        | Program::Muse
+        | Program::Generic => false,
     }
 }
 
@@ -9774,9 +9817,13 @@ impl TurnEndReading {
     pub fn said_since_limit(&self) -> Option<&str> {
         let claude = match self.program {
             Program::Claude => true,
-            Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => {
-                false
-            }
+            Program::Codex
+            | Program::Grok
+            | Program::Kimi
+            | Program::Agy
+            | Program::Muse
+            | Program::Gemini
+            | Program::Generic => false,
         };
         let after = self
             .since_limit
@@ -9837,9 +9884,13 @@ impl TurnEndReading {
     ) -> Self {
         let claude = match reading.program {
             Program::Claude => true,
-            Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => {
-                false
-            }
+            Program::Codex
+            | Program::Grok
+            | Program::Kimi
+            | Program::Agy
+            | Program::Muse
+            | Program::Gemini
+            | Program::Generic => false,
         };
         let own = reading
             .composer
@@ -13256,6 +13307,8 @@ impl TurnEndState {
         let act_speaks = match reading.program {
             aterm_phase::Program::Claude => true,
             aterm_phase::Program::Codex
+            | aterm_phase::Program::Grok
+            | aterm_phase::Program::Kimi
             | aterm_phase::Program::Agy
             | aterm_phase::Program::Muse
             | aterm_phase::Program::Gemini
@@ -13267,6 +13320,8 @@ impl TurnEndState {
             | aterm_phase::Program::Gemini => true,
             aterm_phase::Program::Claude
             | aterm_phase::Program::Codex
+            | aterm_phase::Program::Grok
+            | aterm_phase::Program::Kimi
             | aterm_phase::Program::Generic => false,
         };
         let act_seen = match landing_act {
@@ -16398,7 +16453,13 @@ fn retry_wait(state: &TurnEndState, attempts: usize) -> Option<Duration> {
 const fn moves_accounts(program: Program) -> bool {
     match program {
         Program::Claude => true,
-        Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => false,
+        Program::Codex
+        | Program::Grok
+        | Program::Kimi
+        | Program::Agy
+        | Program::Muse
+        | Program::Gemini
+        | Program::Generic => false,
     }
 }
 
@@ -16737,7 +16798,12 @@ fn not_retried(program: Program, kind: WallKind) -> Option<&'static str> {
             }
         )
         .then_some("the Gemini API refused agy's request; sent again it meets the same"),
-        Program::Claude | Program::Codex | Program::Muse | Program::Generic => None,
+        Program::Claude
+        | Program::Codex
+        | Program::Grok
+        | Program::Kimi
+        | Program::Muse
+        | Program::Generic => None,
     }
 }
 

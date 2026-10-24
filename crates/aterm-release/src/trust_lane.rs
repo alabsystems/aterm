@@ -3615,10 +3615,13 @@ pub mod proc_tree {
         })
     }
 
-    /// Lists a listing takes before it is not whole ([`table`]). They come back to back, so a
-    /// busy account, whose builds start processes all the time, needs many for two in a row
-    /// to name nothing new; a list reads a serial per pid, and a row only for a new one.
-    const LISTS: usize = 64;
+    /// How long a listing lists before it is not whole ([`table`]). Its lists come back to
+    /// back, each cheap (a serial per pid, a row only for a new one), and on a busy machine
+    /// every list may name a process not yet read (another program starting or exiting, or
+    /// one caught mid-spawn) for seconds on end, where an idle machine's listing is whole
+    /// within milliseconds; so a listing gives up after a time, not a count of lists, and one
+    /// that gives up sooner holds a slot whose check left nothing.
+    pub(super) const LISTING: Duration = Duration::from_secs(10);
 
     /// Rounds of `SIGKILL` a sweep sends, each settling up to a second, before it says one of
     /// the check's processes lives ([`end_marked_with`]).
@@ -3638,14 +3641,15 @@ pub mod proc_tree {
     /// it did not read yet, by pid and serial, and is whole once a list names none: whatever
     /// runs then was read while it ran, or was started by what was. A serial unread or changed
     /// across a row, or a process caught mid-spawn, is not cached; an exited, unreaped process
-    /// is read as [`EXITED`]. After [`LISTS`] lists it is not whole.
+    /// is read as [`EXITED`]. Once it has listed for [`LISTING`], a list after the first that
+    /// still names one ends it, not whole.
     #[must_use]
     pub fn table(mark: &Mark, held: Option<i32>, slot: &Path) -> Option<Listing> {
         #[cfg(test)]
         if let Some(pids) = LISTED.with(|l| l.borrow().clone()) {
-            return table_from(mark, held, slot, &mut || Ok(pids.clone()));
+            return table_from(mark, held, slot, LISTING, &mut || Ok(pids.clone()));
         }
-        table_from(mark, held, slot, &mut aterm_uds::holders::uid_pids)
+        table_from(mark, held, slot, LISTING, &mut aterm_uds::holders::uid_pids)
     }
 
     #[cfg(test)]
@@ -3661,11 +3665,13 @@ pub mod proc_tree {
     /// it is reaped, after which a process given that pid reads its real serial, never this.
     const EXITED: u64 = u64::MAX;
 
-    /// [`table`] over the lists `pids` takes.
+    /// [`table`] over the lists `pids` takes, ending not whole at the first list after
+    /// `within`, other than its first, that still names a process it did not read.
     pub(super) fn table_from(
         mark: &Mark,
         held: Option<i32>,
         slot: &Path,
+        within: Duration,
         pids: &mut dyn FnMut() -> std::io::Result<Vec<u32>>,
     ) -> Option<Listing> {
         let session = mark.root.map(|(pid, _)| pid).filter(|_| held.is_none());
@@ -3677,7 +3683,10 @@ pub mod proc_tree {
         let dirs: Vec<PathBuf> = std::iter::once(slot.to_path_buf())
             .chain(std::fs::canonicalize(slot).ok())
             .collect();
+        let since = Instant::now();
         table_read(
+            within,
+            &mut || since.elapsed(),
             pids,
             &mut |pid| {
                 let pid = i32::try_from(pid).ok()?;
@@ -3691,17 +3700,23 @@ pub mod proc_tree {
         )
     }
 
-    /// [`table_from`]'s repeated lists and identity-checked row cache.
+    /// [`table_from`]'s repeated lists and identity-checked row cache, ending not whole at the
+    /// first list after `within`, other than its first, that still names a process it did not
+    /// read; `now` is its clock.
     pub(super) fn table_read(
+        within: Duration,
+        now: &mut dyn FnMut() -> Duration,
         pids: &mut dyn FnMut() -> std::io::Result<Vec<u32>>,
         serial: &mut dyn FnMut(u32) -> Option<u64>,
         row: &mut dyn FnMut(u32) -> Option<Proc>,
     ) -> Option<Listing> {
+        let since = now();
         let mut read = BTreeMap::new();
         let mut procs = BTreeMap::new();
-        for n in 0..LISTS {
+        let mut first = true;
+        loop {
             let Ok(list) = pids() else {
-                return (n > 0).then_some(Listing {
+                return (!first).then_some(Listing {
                     procs: procs.into_values().collect(),
                     whole: false,
                 });
@@ -3731,17 +3746,14 @@ pub mod proc_tree {
                     procs.insert(pid, process);
                 }
             }
-            if n > 0 && !new {
+            if !first && (!new || now().saturating_sub(since) >= within) {
                 return Some(Listing {
                     procs: procs.into_values().collect(),
-                    whole: true,
+                    whole: !new,
                 });
             }
+            first = false;
         }
-        Some(Listing {
-            procs: procs.into_values().collect(),
-            whole: false,
-        })
     }
 
     /// `pid`'s row ([`table`]), `None` for this process, a zombie, or one gone mid-read.
@@ -6985,9 +6997,9 @@ mod tests {
 
     /// Reaps `root` until `record` is gone, as the runs after this one would: a sweep or a
     /// reap whose listing is not whole keeps the record it watched, and a loaded machine's
-    /// listing (every pid of this user's, read again until a list names none it did not read)
-    /// seldom is. `between` checks, after each reap, what no reap may do. A one-minute hang
-    /// detector.
+    /// listing (every pid of this user's, read again until a list names none it did not read,
+    /// giving up once it has listed for `proc_tree::LISTING`) may not be. `between` checks,
+    /// after each reap, what no reap may do. A one-minute hang detector.
     fn reap_until_gone(root: &Path, record: &Path, what: &str, mut between: impl FnMut()) {
         let deadline = Instant::now() + Duration::from_secs(60);
         while record.exists() {
@@ -7145,6 +7157,12 @@ mod tests {
             _quiet: quiet,
             beat,
         }
+    }
+
+    /// A clock that reads the wall time since it was made, as [`proc_tree::table_from`]'s does.
+    fn wall() -> impl FnMut() -> Duration {
+        let since = Instant::now();
+        move || since.elapsed()
     }
 
     fn proc(pid: i32, ppid: i32, marked: Option<bool>) -> proc_tree::Proc {
@@ -8660,7 +8678,10 @@ mod tests {
     /// A LIVE CHECK IS ENDED BY ITS MARK, never by a start's text (`ps` prints one in the
     /// reader's zone and locale): a root still running, and what it left adopted outside its
     /// tree in its session, are ended, and the slot held. That includes an orphan whose
-    /// environment macOS withholds (`/bin/sleep` itself), found by the root's session.
+    /// environment macOS withholds (`/bin/sleep` itself), found by the root's session. The
+    /// root's loop may start its next `/bin/sleep` after the signal that ends the last one and
+    /// before its own: once nothing running proves the session the check's, that member is
+    /// left unsignalled and holds the record until it exits, so a later reap takes the record.
     #[test]
     fn a_live_check_and_what_it_left_outside_its_tree_are_ended_by_the_reap() {
         let d = tmp("trust-lane-live");
@@ -8935,10 +8956,11 @@ mod tests {
             std::thread::yield_now();
         };
         assert!(ended, "a reap that reads ends the check");
-        reap_stale_checks(&root);
-        assert!(
-            !record.exists(),
-            "a reap that finds nothing of the check takes its record"
+        reap_until_gone(
+            &root,
+            &record,
+            "a reap that finds nothing of the check takes its record",
+            || {},
         );
         assert_ne!(fs::read_to_string(&stamp).unwrap(), u64::MAX.to_string());
         assert_eq!(held_slots(&root), [slot]);
@@ -9198,8 +9220,12 @@ mod tests {
         );
         assert_eq!(held_by_clear, std::slice::from_ref(&target));
         assert_eq!(retained_bytes.unwrap(), b"the slot stays");
-        reap_stale_checks(&root);
-        assert!(!record.exists(), "a reap that stamps the slot takes it");
+        reap_until_gone(
+            &root,
+            &record,
+            "a reap that stamps the slot takes it",
+            || {},
+        );
         assert_eq!(held_slots(&root), [target]);
     }
 
@@ -9211,6 +9237,8 @@ mod tests {
         let pass = Cell::new(0);
         let reads = Cell::new(0);
         let listing = proc_tree::table_read(
+            Duration::from_secs(60),
+            &mut wall(),
             &mut || {
                 pass.set(pass.get() + 1);
                 Ok(vec![51])
@@ -9233,9 +9261,55 @@ mod tests {
         assert_eq!(listing.procs, owned, "the old stranger's row was replaced");
     }
 
+    /// A LISTING OUTLASTS A BUSY MACHINE'S CHURN, FOR `LISTING`: there each of many lists in a
+    /// row names a process not read yet (another program starting or exiting, one caught
+    /// mid-spawn), for seconds on end. Each list here takes 100 ms of a fake clock: churn that
+    /// stops before [`proc_tree::LISTING`] leaves a listing whole at the first list that names
+    /// none, and churn past it ends the listing not whole at the first list once it passed.
+    #[test]
+    fn a_listing_outlasts_a_busy_machines_churn() {
+        use std::cell::Cell;
+
+        const LIST: Duration = Duration::from_millis(100);
+        let churn = |churning: u32| {
+            let lists = Cell::new(0);
+            let clock = Cell::new(Duration::from_secs(3600));
+            let listing = proc_tree::table_read(
+                proc_tree::LISTING,
+                &mut || clock.get(),
+                &mut || {
+                    lists.set(lists.get() + 1);
+                    clock.set(clock.get() + LIST);
+                    Ok(if lists.get() <= churning {
+                        vec![51, 1000 + lists.get()]
+                    } else {
+                        vec![51]
+                    })
+                },
+                &mut |pid| Some(u64::from(pid) * 10),
+                &mut |pid| Some(proc(i32::try_from(pid).unwrap(), 1, Some(false))),
+            )
+            .unwrap();
+            (listing.whole, lists.get())
+        };
+        assert_eq!(
+            churn(99),
+            (true, 100),
+            "9.9 s of churn ends whole at the first list that names none"
+        );
+        let past = u32::try_from(proc_tree::LISTING.as_nanos().div_ceil(LIST.as_nanos())).unwrap();
+        assert_eq!(
+            churn(u32::MAX),
+            (false, past),
+            "churn past LISTING ends not whole at the first list once it passed"
+        );
+    }
+
     /// An exited, unreaped process keeps its pid and runs nothing again, though macOS reads no
     /// serial of it: a listing that names one is whole all the same. A check's root is one
-    /// whenever its sweep runs, and so is any child another test has not reaped yet.
+    /// whenever its sweep runs, and so is any child another test has not reaped yet. Each list
+    /// here is this user's, cut to the child: on a busy machine the others may name processes
+    /// not yet read for longer than a listing lists, and that listing is not whole.
     #[test]
     fn an_unreaped_child_leaves_the_listing_whole() {
         let d = tmp("trust-lane-unreaped");
@@ -9256,12 +9330,21 @@ mod tests {
             root: None,
             kept: BTreeSet::new(),
         };
+        let id = child.id();
+        let mut lists = 0;
         let listing =
-            proc_tree::table_from(&mark, None, d.path(), &mut || Ok(vec![child.id()])).unwrap();
+            proc_tree::table_from(&mark, None, d.path(), Duration::from_secs(60), &mut || {
+                lists += 1;
+                let all = aterm_uds::holders::uid_pids()?;
+                assert!(all.contains(&id), "this user's processes name the child");
+                Ok(vec![id])
+            })
+            .unwrap();
         assert!(
             listing.whole,
             "a listing that names an unreaped child is whole"
         );
+        assert_eq!(lists, 2, "the child is read once");
         child.wait().unwrap();
     }
 
@@ -9272,16 +9355,22 @@ mod tests {
         use std::cell::Cell;
 
         let reads = Cell::new(0);
-        let listing = proc_tree::table_read(&mut || Ok(vec![51]), &mut |_| Some(100), &mut |_| {
-            reads.set(reads.get() + 1);
-            let spawning = reads.get() == 1;
-            Some(proc_tree::Proc {
-                serial: Some(100),
-                trustd: spawning,
-                spawning,
-                ..proc(51, 1, Some(!spawning))
-            })
-        })
+        let listing = proc_tree::table_read(
+            Duration::from_secs(60),
+            &mut wall(),
+            &mut || Ok(vec![51]),
+            &mut |_| Some(100),
+            &mut |_| {
+                reads.set(reads.get() + 1);
+                let spawning = reads.get() == 1;
+                Some(proc_tree::Proc {
+                    serial: Some(100),
+                    trustd: spawning,
+                    spawning,
+                    ..proc(51, 1, Some(!spawning))
+                })
+            },
+        )
         .unwrap();
         assert!(listing.whole);
         assert_eq!(reads.get(), 2);
@@ -9302,6 +9391,8 @@ mod tests {
             let identity = Cell::new(100);
             let reads = Cell::new(0);
             let listing = proc_tree::table_read(
+                Duration::from_millis(100),
+                &mut wall(),
                 &mut || Ok(vec![51]),
                 &mut |_| (!unread).then_some(identity.get()),
                 &mut |_| {
@@ -9322,13 +9413,19 @@ mod tests {
         }
 
         let reads = Cell::new(0);
-        let listing = proc_tree::table_read(&mut || Ok(vec![51]), &mut |_| Some(100), &mut |_| {
-            reads.set(reads.get() + 1);
-            Some(proc_tree::Proc {
-                serial: Some(100),
-                ..proc(51, 1, Some(false))
-            })
-        })
+        let listing = proc_tree::table_read(
+            Duration::from_secs(60),
+            &mut wall(),
+            &mut || Ok(vec![51]),
+            &mut |_| Some(100),
+            &mut |_| {
+                reads.set(reads.get() + 1);
+                Some(proc_tree::Proc {
+                    serial: Some(100),
+                    ..proc(51, 1, Some(false))
+                })
+            },
+        )
         .unwrap();
         assert!(listing.whole, "a stable identity still completes");
         assert_eq!(reads.get(), 1, "a stable row is read once");
@@ -9354,11 +9451,12 @@ mod tests {
         };
         let missed = g.left.pid;
         let mut lists = 0;
-        let listing = proc_tree::table_from(&mark, None, &slot, &mut || {
-            lists += 1;
-            Ok(if lists > 1 { vec![missed] } else { Vec::new() })
-        })
-        .unwrap();
+        let listing =
+            proc_tree::table_from(&mark, None, &slot, Duration::from_secs(60), &mut || {
+                lists += 1;
+                Ok(if lists > 1 { vec![missed] } else { Vec::new() })
+            })
+            .unwrap();
         assert!(listing.whole);
         assert!(
             listing
@@ -9371,11 +9469,12 @@ mod tests {
         assert!(g.left.running());
 
         let mut n = 0;
-        let churning = proc_tree::table_from(&mark, None, &slot, &mut || {
-            n += 1;
-            Ok(vec![u32::MAX - n])
-        })
-        .unwrap();
+        let churning =
+            proc_tree::table_from(&mark, None, &slot, Duration::from_millis(100), &mut || {
+                n += 1;
+                Ok(vec![u32::MAX - n])
+            })
+            .unwrap();
         assert!(!churning.whole, "lists that keep naming new processes");
     }
 
@@ -10034,7 +10133,9 @@ mod tests {
 
     /// Ending a check ends all that carries its mark: its tree, a grandchild that left the
     /// root's group and session, and an orphan from the root's group that launchd (or on
-    /// Linux a subreaper) adopted, which no walk of the root's tree finds.
+    /// Linux a subreaper) adopted, which no walk of the root's tree finds. The root then execs
+    /// `/bin/sleep`, so only the end ends it: a root that waited for its children would exit on
+    /// its own once the signals that go to them first had ended them.
     #[test]
     fn ending_a_check_ends_its_whole_tree() {
         let pgid = |pid: u32| {
@@ -10055,7 +10156,7 @@ mod tests {
         cmd.arg("-c")
             .arg(
                 "/usr/bin/perl -MPOSIX -e 'POSIX::setsid() or die; exec @ARGV' /bin/sleep 600 & \
-                 echo $! > \"$1\"; (\"$3\" 600 & echo $! > \"$2\"); wait",
+                 echo $! > \"$1\"; (\"$3\" 600 & echo $! > \"$2\"); exec /bin/sleep 600",
             )
             .arg("sh")
             .arg(&pidfile)

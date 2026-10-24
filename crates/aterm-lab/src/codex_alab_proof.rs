@@ -2892,6 +2892,7 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
             env,
             cwd: s.clone(),
             sandbox: Some(sandbox),
+            reroute: false,
         },
     )?;
     let mut proof = Proof {

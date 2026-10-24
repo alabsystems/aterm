@@ -132,7 +132,7 @@ pub(crate) fn worker_unsupervised(
             Program::Agy => "[harness.agy] enabled = false",
             Program::Muse => "[harness.muse] enabled = false",
             Program::Gemini => "[harness.gemini] enabled = false",
-            Program::Generic => "[harness.generic] enabled = false",
+            Program::Grok | Program::Kimi | Program::Generic => "[harness.generic] enabled = false",
         })
     } else if cfg.autopilot_for(None) == Autopilot::Off {
         Some("[harness] autopilot = \"off\"")
@@ -171,6 +171,8 @@ pub(crate) struct Switches {
     accounts_news: AtomicU64,
     /// The hash of the [`AccountsSaid`] the window was last told ([`accounts_tell`]).
     accounts_said: AtomicU64,
+    /// The hash of the [`PoolSaid`]s the window was last told ([`pools_tell`]), `0` for none.
+    pools_said: AtomicU64,
     /// `[harness] autopilot`: the default Autopilot of a session with no word of its own ([`OffSessions`]).
     autopilot: AtomicU8,
 }
@@ -1949,6 +1951,9 @@ pub(crate) enum HostNote {
     Relaunch { sid: String, said: RelaunchSay },
     /// What the Claude Code accounts as a whole say ([`AccountsSaid`]): the machine's fact and no tab's.
     Accounts(AccountsSaid),
+    /// What the other CLIs' pools this machine keeps say ([`PoolSaid`]), every one in one note:
+    /// the machine's fact and no tab's. None is a note only after some pool said something.
+    Pools(Vec<PoolSaid>),
     /// The tab's supervisor informs a person ([`IdleHost::inform`]).
     Inform { sid: String, text: String },
     /// The tab's supervisor warns a person ([`IdleHost::warn`], the memory ceiling's).
@@ -2040,6 +2045,17 @@ impl AccountsSaid {
             wrong: accounts::wrong_accounts(roster, logins),
         }
     }
+}
+
+/// What one other CLI's pool says to the digest ([`HostNote::Pools`], [`pools_said`]).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct PoolSaid {
+    /// The CLI.
+    pub(crate) cli: accounts::Cli,
+    /// Its renewable logins due or ended (`accounts::renew_due`).
+    pub(crate) due: Vec<String>,
+    /// Its renewals that answered another account (`accounts::wrong_accounts`).
+    pub(crate) wrong: Vec<String>,
 }
 
 /// What a tab's relaunch says ([`HostNote::Relaunch`]).
@@ -2676,15 +2692,39 @@ fn carries_only(agent: Program) -> Option<upgrade::Agent> {
 const fn reads_transcript(agent: Program) -> bool {
     match agent {
         Program::Claude => true,
-        Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => false,
+        Program::Codex
+        | Program::Grok
+        | Program::Kimi
+        | Program::Agy
+        | Program::Muse
+        | Program::Gemini
+        | Program::Generic => false,
     }
 }
 
-/// Whether accounts state is recorded for `agent` ([`WorkerIdle::account_ctx`], [`account_gone`]).
+/// The pooled CLI whose roster and store a session of `agent` reads its accounts from
+/// (`accounts.toml` for Claude Code, `accounts-codex.toml` for Codex): what its Account fact,
+/// menu and a11y node name. A program no pool keeps is `None`. Whether the host records or moves
+/// its accounts is [`accounts_for`]'s alone.
+pub(crate) const fn pool_cli(agent: Program) -> Option<accounts::Cli> {
+    accounts::Cli::of(agent)
+}
+
+/// Whether accounts state is recorded for `agent` by the host's own flow, from its transcripts
+/// and `/usage` reads ([`WorkerIdle::account_ctx`], [`account_gone`]): Claude Code's pool alone.
+/// A session of every other pooled CLI is asked of by [`session_pool`].
 const fn accounts_for(agent: Program) -> bool {
-    match agent {
-        Program::Claude => true,
-        Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => false,
+    matches!(accounts::Cli::of(agent), Some(accounts::Cli::Claude))
+}
+
+/// The pool a running session of `agent`, which `supervisor` answers, is advised from by
+/// [`aterm_agent::harness::accounts_pool::session_move`]: a pooled CLI other than Claude Code
+/// (whose flow is [`accounts_for`]'s), and none for a session that answers its own walls, as a
+/// self-claimed codex-alab does ([`accounts::StayWhy::OtherSupervisor`]).
+const fn session_pool(agent: Program, supervisor: accounts::Supervisor) -> Option<accounts::Cli> {
+    match (accounts::Cli::of(agent), supervisor) {
+        (Some(accounts::Cli::Claude) | None, _) | (Some(_), accounts::Supervisor::Own) => None,
+        (Some(cli), accounts::Supervisor::Aterm) => Some(cli),
     }
 }
 
@@ -2693,9 +2733,13 @@ const fn accounts_for(agent: Program) -> bool {
 const fn codex_alab_names_screen(agent: Program) -> bool {
     match agent {
         Program::Codex => true,
-        Program::Claude | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => {
-            false
-        }
+        Program::Claude
+        | Program::Agy
+        | Program::Muse
+        | Program::Grok
+        | Program::Kimi
+        | Program::Gemini
+        | Program::Generic => false,
     }
 }
 
@@ -3119,6 +3163,30 @@ impl WorkerIdle {
         crate::program_check_watch::stuck(self.hooks.acts.program_check)
     }
 
+    /// What the host does for a session of a pooled CLI other than Claude Code at `point`: a
+    /// hosted Codex is a codex-alab the worker watches beside, which answers its own walls
+    /// (`stay other-supervisor`); no other such session is hosted (no reader table of theirs,
+    /// [`agent_of`]), and none has a hosted relaunch lane to write a move's line, so the
+    /// advice of [`aterm_agent::harness::accounts_pool::session_move`] is not taken here, and
+    /// its launch's pick ([`aterm_agent::harness::accounts_pool::launch_env`]) is that CLI's
+    /// whole rotation.
+    fn pool_said(&self, point: AccountPoint) {
+        let supervisor = if self.beside() {
+            accounts::Supervisor::Own
+        } else {
+            accounts::Supervisor::Aterm
+        };
+        let said = match session_pool(self.agent, supervisor) {
+            None => accounts::StayWhy::OtherSupervisor.as_str(),
+            Some(_) => "no-relaunch-lane",
+        };
+        aterm_log::info!(
+            "harness @{}: account advice at {point:?} for {}: stay {said}",
+            self.sid,
+            self.agent.name()
+        );
+    }
+
     /// Whether the worker watches only ([`WorkerJob::watch_beside`]).
     fn beside(&self) -> bool {
         watches_only(self.agent)
@@ -3317,9 +3385,13 @@ impl IdleHost for WorkerIdle {
         let own = self.switches.notes();
         let claude = match self.agent {
             Program::Claude => true,
-            Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => {
-                false
-            }
+            Program::Codex
+            | Program::Grok
+            | Program::Kimi
+            | Program::Agy
+            | Program::Muse
+            | Program::Gemini
+            | Program::Generic => false,
         };
         if !claude || !(listed || own) || !seen.says() {
             return;
@@ -3608,9 +3680,13 @@ impl IdleHost for WorkerIdle {
     fn reach(&self) -> Reach {
         let probed = match self.agent {
             Program::Claude => self.switches.probe_api(),
-            Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => {
-                false
-            }
+            Program::Codex
+            | Program::Grok
+            | Program::Kimi
+            | Program::Agy
+            | Program::Muse
+            | Program::Gemini
+            | Program::Generic => false,
         };
         if !probed {
             return Reach::Unknown;
@@ -5036,6 +5112,10 @@ impl WorkerIdle {
             return None;
         }
         account_land(&self.sid, &self.kept, &self.hooks, Landing::Asked);
+        if accounts::Cli::of(self.agent).is_some_and(|cli| cli != accounts::Cli::Claude) {
+            self.pool_said(point);
+            return None;
+        }
         if !accounts_for(self.agent) {
             return None;
         }
@@ -6760,9 +6840,13 @@ fn on_agent_left(job: &WorkerJob, hooks: &Hooks) {
     let asked = snap.as_ref().and_then(|snap| (hooks.acts.asked)(sid, snap));
     let codex_exit = match job.agent {
         Program::Codex => true,
-        Program::Claude | Program::Generic | Program::Agy | Program::Muse | Program::Gemini => {
-            false
-        }
+        Program::Claude
+        | Program::Grok
+        | Program::Kimi
+        | Program::Generic
+        | Program::Agy
+        | Program::Muse
+        | Program::Gemini => false,
     };
     let copy = (hooks.acts.self_copy)(sid).filter(|_| codex_exit);
     match copy.filter(|copy| match snap.as_ref() {
@@ -6791,7 +6875,13 @@ fn on_agent_left(job: &WorkerJob, hooks: &Hooks) {
     let restarted = lane.is_some_and(|agent| (hooks.acts.restarted)(sid, agent, pid));
     let restarts_itself = match job.agent {
         Program::Gemini => true,
-        Program::Claude | Program::Codex | Program::Generic | Program::Agy | Program::Muse => false,
+        Program::Claude
+        | Program::Codex
+        | Program::Grok
+        | Program::Kimi
+        | Program::Generic
+        | Program::Agy
+        | Program::Muse => false,
     };
     let itself = restarts_itself
         && asked.is_none()
@@ -11477,7 +11567,13 @@ pub(crate) fn unclaimed(
     match (expected, seen) {
         (
             Some(
-                Program::Claude | Program::Agy | Program::Muse | Program::Gemini | Program::Generic,
+                Program::Claude
+                | Program::Agy
+                | Program::Muse
+                | Program::Gemini
+                | Program::Grok
+                | Program::Kimi
+                | Program::Generic,
             )
             | None,
             seen,
@@ -11522,9 +11618,13 @@ pub(crate) fn startup_seen(
     let read = aterm_phase::read(Some(reader.name()), rows, None);
     let prompt = match reader {
         Program::Claude => aterm_phase::parse_prompt_v2(rows),
-        Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => {
-            read.prompt
-        }
+        Program::Codex
+        | Program::Grok
+        | Program::Kimi
+        | Program::Agy
+        | Program::Muse
+        | Program::Gemini
+        | Program::Generic => read.prompt,
     };
     if let Some(p) = prompt {
         return match p.kind {
@@ -12849,9 +12949,13 @@ pub(crate) fn identified_agent(
             .reader
             .filter(|_| program.is_none_or(aterm_phase::may_host_agent)))
         .filter(|p| match p {
-            Program::Claude | Program::Codex | Program::Agy | Program::Muse | Program::Gemini => {
-                true
-            }
+            Program::Claude
+            | Program::Codex
+            | Program::Grok
+            | Program::Kimi
+            | Program::Agy
+            | Program::Muse
+            | Program::Gemini => true,
             Program::Generic => false,
         })
 }
@@ -12904,7 +13008,13 @@ fn roster_of(store: &Store) -> Vec<(String, Program, FollowStamp)> {
 const fn admits(agent: Program, stamp: FollowStamp) -> bool {
     match agent {
         Program::Codex => !stamp.vendor,
-        Program::Claude | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => true,
+        Program::Claude
+        | Program::Agy
+        | Program::Muse
+        | Program::Gemini
+        | Program::Grok
+        | Program::Kimi
+        | Program::Generic => true,
     }
 }
 
@@ -12975,7 +13085,13 @@ fn alab_image_by(
 fn codex_alab_runs(ctx: &crate::SessionCtx, agent: Program, group: i32, probe: Probe) -> bool {
     match agent {
         Program::Codex => {}
-        Program::Claude | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => {
+        Program::Claude
+        | Program::Agy
+        | Program::Muse
+        | Program::Gemini
+        | Program::Grok
+        | Program::Kimi
+        | Program::Generic => {
             return true;
         }
     }
@@ -12999,11 +13115,22 @@ pub(crate) fn admitted(ctx: &crate::SessionCtx) -> Option<Program> {
 }
 
 /// [`admitted`] for an `agent` (and its `group`) the caller read under the timeline's guard and has let go of.
+///
+/// A proven self-claim admits its Codex before the sweep names the tab's program: the proof read
+/// the claimant leading the foreground group and running an ALab build. Waiting for the sweep had
+/// `status` print `autopilot=-` at the claim, and the worker decided under Cruise in a Land session.
 pub(crate) fn admitted_as(
     ctx: &crate::SessionCtx,
     agent: Option<Program>,
     group: i32,
 ) -> Option<Program> {
+    let agent = agent.or_else(|| {
+        ctx.meta
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .supervisor_proven(crate::metrics::now_us())
+            .then_some(Program::Codex)
+    });
     agent.filter(|agent| codex_alab_runs(ctx, *agent, group, Probe::Cached))
 }
 
@@ -13011,9 +13138,13 @@ pub(crate) fn admitted_as(
 const fn watches_only(agent: Program) -> bool {
     match agent {
         Program::Codex => true,
-        Program::Claude | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => {
-            false
-        }
+        Program::Claude
+        | Program::Agy
+        | Program::Muse
+        | Program::Gemini
+        | Program::Grok
+        | Program::Kimi
+        | Program::Generic => false,
     }
 }
 
@@ -13057,6 +13188,8 @@ fn codex_roster_of(store: &Store) -> Vec<String> {
                         | Program::Agy
                         | Program::Muse
                         | Program::Gemini
+                        | Program::Grok
+                        | Program::Kimi
                         | Program::Generic,
                     )
                     | None => false,
@@ -14670,11 +14803,64 @@ fn accounts_tell(switches: &Switches, hooks: &Hooks, said: AccountsSaid, again: 
     }
 }
 
+/// What each other CLI's pool kept beside `seat`'s roster says ([`PoolSaid`]): a pool that
+/// says nothing, or whose roster or logins cannot be read, is left out.
+fn pools_said(seat: &AccountSeat) -> Vec<PoolSaid> {
+    let Some(config) = seat
+        .roster
+        .as_deref()
+        .and_then(Path::parent)
+        .map(|dir| dir.join("aterm.toml"))
+    else {
+        return Vec::new();
+    };
+    aterm_agent::harness::accounts_sync::cli_pools(&config, &seat.state, &seat.home, seat.now)
+        .into_iter()
+        .filter_map(|pool| {
+            let roster = pool.rows.ok()?;
+            let store = accounts::Store::at_for(&seat.state, pool.cli, &seat.home);
+            let (logins, _) = store.load_logins(seat.now).ok()?;
+            let said = PoolSaid {
+                cli: pool.cli,
+                due: accounts::renew_due(&roster, &logins, &pool.state, &pool.enrolled, seat.now),
+                wrong: accounts::wrong_accounts(&roster, &logins),
+            };
+            (!said.due.is_empty() || !said.wrong.is_empty()).then_some(said)
+        })
+        .collect()
+}
+
+/// Tell the window what the other pools say, once per change ([`HostNote::Pools`]); with
+/// `again`, a standing word is told again. Nothing said, where nothing was, is no note.
+fn pools_tell(switches: &Switches, hooks: &Hooks, said: Vec<PoolSaid>, again: bool) {
+    use std::hash::{Hash as _, Hasher as _};
+    let hash = if said.is_empty() {
+        0
+    } else {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        said.hash(&mut hasher);
+        hasher.finish().max(1)
+    };
+    let told = switches.pools_said.swap(hash, Ordering::SeqCst) == hash;
+    if told && !(again && hash != 0) {
+        return;
+    }
+    (hooks.note)(HostNote::Pools(said));
+}
+
 /// The host's own look at the accounts, told ([`accounts_said`] under the mode read live, [`accounts_tell`] with `again`).
 fn accounts_look(switches: &Switches, hooks: &Hooks, latches: &LoginLatches, again: bool) {
     if switches.mute() {
         return;
     }
+    let pools = if switches.logins() {
+        (hooks.acts.account_seat)()
+            .map(|seat| pools_said(&seat))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    pools_tell(switches, hooks, pools, again);
     let rotation = switches.accounts() != accounts::Mode::Off;
     let notes = switches.notes();
     let said = if switches.accounts_live() || notes {
@@ -14777,7 +14963,11 @@ fn held_of(
             | accounts::StayWhy::NoRoster
             | accounts::StayWhy::NotListed
             | accounts::StayWhy::OtherHome
-            | accounts::StayWhy::NotAStoredLogin,
+            | accounts::StayWhy::NotAStoredLogin
+            | accounts::StayWhy::Unmeasured
+            | accounts::StayWhy::OtherSupervisor
+            | accounts::StayWhy::KeyringStore
+            | accounts::StayWhy::NoLine,
         ) => Some(HeldBy::Earlier),
     }
 }

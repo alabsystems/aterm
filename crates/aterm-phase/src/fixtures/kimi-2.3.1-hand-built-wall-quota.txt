@@ -1,0 +1,33 @@
+# kimi 2.3.1 · HAND-BUILT 2026-10-23 on kimi-2.3.1-signed-out-turn (MEASURED): its `Error: …` row replaced by a 429 that Kimi Code classifies as quota_exhausted (its own pattern `exceeded your current (?:token )?quota` and code `exceeded_current_quota_error`, in the 2.3.1 binary); every other row is the capture's · no signed-in account has drawn one yet
+
+ ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │                                                                                                          │
+ │  ▐█▛█▛█▌  Welcome to Kimi Code!                                                                          │
+ │  ▐█████▌  Run /login or /provider to get started.                                                        │
+ │                                                                                                          │
+ │  Directory: /private/tmp/at.0sEsKA/home/proj                                                             │
+ │  Session:                                                                                                │
+ │  Model:     not set, run /login or /provider                                                             │
+ │  Version:   2.3.1                                                                                        │
+ │                                                                                                          │
+ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ✦ Kimi K3.1 Pro is ready - use the model in a fresh session for the best results
+   Standard: Plus/Moderato and above; Highspeed: Pro/Allegretto and above
+
+   No session yet — one will be created on your first message.
+   Error: You exceeded your current token quota, please check your plan (exceeded_current_quota_error)
+
+ ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ >                                                                                                        │
+ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ ~/proj         shift-tab to Plan mode to review the approach before Kimi edits files. | /model: switch model
+                                                                                                  context: 0%
+
+
+
+
+
+
+
+

@@ -433,3 +433,69 @@ fn the_light_comet_carries_a_body_and_a_round_head() {
         "control: the beam's block lays no head of ink beside it"
     );
 }
+
+/// SPARKLE'S PAPER CARET IS GOLD: the rod that fills Sparkle's block on
+/// paper wore its dark-theme peach, which the page floor deepened to a
+/// mustard brown (`#8f5602`, hue 36) beside the gold its puff wears. It
+/// wears the paper gold, deepened in its hue to the caret's page bar, on
+/// GitHub Light and Default Light. A trail colour the user chose keeps its
+/// own hue (the control: the gold is Sparkle's own, never laid over a
+/// choice).
+#[test]
+fn sparkle_s_paper_caret_is_gold_deepened_in_its_hue() {
+    let fill_of = |color: Option<u32>, ground: (u32, u32)| -> u32 {
+        let mut k = knobs();
+        k.color = color;
+        let mut s = Session::new("sparkle", k, false, ground);
+        let now = s.t0;
+        s.fx.begin(true, true);
+        let blank = vec![' '; geom().cols];
+        s.fx.glow.observe_row(2, 4, &blank, now);
+        let frame = s.fx.tick(
+            &CursorFxInput {
+                now,
+                cur: Some((2, 4)),
+                live_viewport: true,
+                cursor_style: s.shape,
+                blink_phase: true,
+                live_cursor: THEME_CURSOR,
+                cursor_color_pinned: false,
+                default_bg: ground.1,
+                geom: geom(),
+                focused: true,
+                cursor_cell_bg: None,
+                trail_brightness: 1.0,
+                shed_envelope: 1.0,
+                body_allowed: true,
+                momentum_glow: false,
+                user_tinted: s.tinted,
+                accent_pinned: false,
+            },
+            &s.glow,
+            s.trail,
+        );
+        frame.block_fill.expect("sparkle fills its block").fill & 0x00FF_FFFF
+    };
+    for ground in [LIGHT, (0x002B_2D33, 0x00F6_F7F9)] {
+        let fill = fill_of(None, ground);
+        let (hue, sat, _) = crate::color_math::rgb2hsv(fill);
+        let ratio = crate::color_math::contrast_ratio(fill, ground.1);
+        assert!(
+            (41.0..=47.0).contains(&hue) && sat > 0.8,
+            "sparkle's paper caret {fill:06x} on {:06x} stands at hue {hue:.1}, saturation {sat:.2}: not gold",
+            ground.1
+        );
+        assert!(
+            ratio >= CARET_PAGE_MIN_CONTRAST,
+            "sparkle's paper caret {fill:06x} reads {ratio:.2}:1 on {:06x}",
+            ground.1
+        );
+    }
+    let chosen = fill_of(Some(0x00FF_3399), LIGHT);
+    let (hue, _, _) = crate::color_math::rgb2hsv(chosen);
+    let (own, _, _) = crate::color_math::rgb2hsv(0x00FF_3399);
+    assert!(
+        (hue - own).abs() <= 6.0,
+        "control: a chosen trail colour keeps its hue ({chosen:06x} at {hue:.1}, its own {own:.1})"
+    );
+}

@@ -593,10 +593,12 @@ fn fire_core(px: i32, py: i32, base_y: i32, peak_h: i32, phase: u32,
     return o;
 }
 
-fn fire_pal_add(idx: i32) -> vec3<i32> {
+fn fire_pal_add(idx_in: i32) -> vec3<i32> {
     var pal = array<vec3<i32>, 5>(
         vec3<i32>(42, 0, 0), vec3<i32>(139, 26, 0), vec3<i32>(224, 74, 0),
         vec3<i32>(255, 176, 32), vec3<i32>(255, 240, 192));
+    // == FIRE_ADD_IDX_MAX: additive fire stops a breath past amber.
+    let idx = min(idx_in, 780);
     let seg = clamp(idx >> 8u, 0, 3);
     let f = idx - (seg << 8u);
     let a = pal[seg];
@@ -3075,6 +3077,16 @@ struct MetalArmLive {
     fx_reader_wait: (u64, u64),
     #[cfg(any(test, debug_assertions))]
     fx_shared_palette: Option<(crate::device_layer::LayerTexture, u32)>,
+    /// The pipeline states the pipeline warms ([`crate::metal::warm::spawn`]) built off this thread and this arm has not adopted yet ([`Self::adopt_warmed`]), and the sender each warm's worker takes.
+    warmed: (
+        std::sync::mpsc::Sender<crate::metal::warm::Warmed>,
+        std::sync::mpsc::Receiver<crate::metal::warm::Warmed>,
+    ),
+    /// What a pipeline warm is building for this arm and has not handed over.
+    warm_owed: Vec<crate::metal::warm::WarmItem>,
+    /// The pipeline states this arm built on its own thread, in order.
+    #[cfg(test)]
+    built_here: Vec<crate::metal::warm::WarmItem>,
 }
 
 #[cfg(target_os = "macos")]
@@ -3210,6 +3222,10 @@ impl MetalArmLive {
             fx_reader_wait: (0, 0),
             #[cfg(any(test, debug_assertions))]
             fx_shared_palette: None,
+            warmed: std::sync::mpsc::channel(),
+            warm_owed: Vec::new(),
+            #[cfg(test)]
+            built_here: Vec::new(),
         })
     }
 
@@ -3249,15 +3265,26 @@ impl MetalArmLive {
             .expect("inserted above"))
     }
 
+    /// `row`'s state against a `present`-format destination: a `cell.metal` row, which draws into the offscreen whatever the destination (the bloom's glow extract), is the frame's own ([`Self::pso`]); any other is keyed by the attachment it resolves to, as Metal's cache keys it.
     fn present_pso(
         &mut self,
         row: Pipeline,
         present: crate::metal::ffi::PixelFormat,
     ) -> Result<crate::metal::ffi::Obj, String> {
-        if let Some((_, pso)) = self.present_psos.iter().find(|(k, _)| *k == (row, present)) {
+        let spec = row.spec();
+        if matches!(spec.library, ShaderLibrary::Cell) {
+            return self.pso(row).map(crate::metal::ffi::Obj::clone_retained);
+        }
+        let key = (
+            row,
+            crate::metal::pipelines::metal_format(spec.target, present),
+        );
+        if !self.present_psos.iter().any(|(k, _)| *k == key) {
+            self.adopt_warmed();
+        }
+        if let Some((_, pso)) = self.present_psos.iter().find(|(k, _)| *k == key) {
             return Ok(pso.clone_retained());
         }
-        let spec = row.spec();
         let _ = self.library(spec.library)?;
         let lib = self
             .libs
@@ -3265,11 +3292,12 @@ impl MetalArmLive {
             .find(|(l, _)| *l == spec.library)
             .map(|(_, c)| c)
             .expect("compiled above");
-        self.warm
-            .await_item(crate::metal::warm::WarmItem::pipeline(row, present));
+        let item = crate::metal::warm::WarmItem::pipeline(row, present);
+        self.warm.await_item(item);
         let pso = crate::metal::pipelines::build(self.mint.device(), lib, spec, present)?;
-        self.present_psos
-            .push(((row, present), pso.clone_retained()));
+        #[cfg(test)]
+        self.built_here.push(item);
+        self.present_psos.push((key, pso.clone_retained()));
         Ok(pso)
     }
 
@@ -3450,51 +3478,187 @@ impl MetalArmLive {
                 spec.library
             ));
         }
+        if self.psos[row as usize].is_none() {
+            self.adopt_warmed();
+        }
         let slot = &mut self.psos[row as usize];
         if slot.is_none() {
-            self.warm.await_item(crate::metal::warm::WarmItem::pipeline(
+            let item = crate::metal::warm::WarmItem::pipeline(
                 row,
                 crate::metal::ffi::PixelFormat::Bgra8Unorm,
-            ));
+            );
+            self.warm.await_item(item);
             *slot = Some(crate::metal::pipelines::build(
                 self.mint.device(),
                 &self.lib,
                 spec,
                 crate::metal::ffi::PixelFormat::Bgra8Unorm,
             )?);
+            #[cfg(test)]
+            self.built_here.push(item);
         }
         Ok(slot.as_ref().expect("filled above"))
     }
 
-    /// The device's framebuffer-fetch verdict, settled for a frame that draws Unorm-law light: the warm's once it landed, `None` (the split, for this frame) while the first-frame warm still owes it, so no window waits on the probe, else this arm's own [`crate::metal::fetch::verdict`] (headless, a test, or a warm whose probe could not run).
+    /// The device's framebuffer-fetch verdict, settled for a frame that draws Unorm-law light: a warm's once it landed, `None` (the split, for this frame) while the first-frame warm or this arm's pipeline warm still owes it, so no frame waits on the probe, else this arm's own [`crate::metal::fetch::verdict`] (a test, or a warm whose probe could not run).
     fn fetch_verdict(&mut self) -> Option<FetchProbe> {
-        if self.fetch.is_none() && !self.warm.probe_pending() {
-            self.fetch = Some(crate::metal::fetch::verdict(
-                &self.mint,
-                &self.session,
-                &self.lib,
-            ));
+        if self.fetch.is_none() {
+            self.adopt_warmed();
+        }
+        if self.fetch.is_none()
+            && !self.warm.probe_pending()
+            && !self
+                .warm_owed
+                .contains(&crate::metal::warm::WarmItem::FetchProbe)
+        {
+            let known = crate::metal::fetch::known(self.mint.device(), &self.lib);
+            #[cfg(test)]
+            if known.is_none() {
+                self.built_here
+                    .push(crate::metal::warm::WarmItem::FetchProbe);
+            }
+            self.fetch = Some(known.unwrap_or_else(|| {
+                crate::metal::fetch::verdict(&self.mint, &self.session, &self.lib)
+            }));
         }
         self.fetch
     }
 
-    /// The framebuffer-fetch twin's PSO, built on first use.
+    /// The framebuffer-fetch twin's PSO, a pipeline warm's or built on first use.
     fn fetch_pso(
         &mut self,
         twin: pipeline_table::FetchTwin,
     ) -> Result<&crate::metal::ffi::Obj, String> {
+        if self.fetch_psos[twin as usize].is_none() {
+            self.adopt_warmed();
+        }
         let slot = &mut self.fetch_psos[twin as usize];
         if slot.is_none() {
-            self.warm
-                .await_item(crate::metal::warm::WarmItem::Twin(twin));
+            let item = crate::metal::warm::WarmItem::Twin(twin);
+            self.warm.await_item(item);
             *slot = Some(crate::metal::pipelines::build(
                 self.mint.device(),
                 &self.lib,
                 &twin.spec(),
                 crate::metal::ffi::PixelFormat::Bgra8Unorm,
             )?);
+            #[cfg(test)]
+            self.built_here.push(item);
         }
         Ok(slot.as_ref().expect("filled above"))
+    }
+
+    /// Whether this arm holds `item`'s pipeline state.
+    fn holds(&self, item: crate::metal::warm::WarmItem) -> bool {
+        use crate::metal::warm::WarmItem;
+        match item {
+            WarmItem::Pipeline(row, _) if matches!(row.spec().library, ShaderLibrary::Cell) => {
+                self.psos[row as usize].is_some()
+            }
+            WarmItem::Pipeline(row, present) => {
+                self.present_psos.iter().any(|(k, _)| *k == (row, present))
+            }
+            WarmItem::Twin(twin) => self.fetch_psos[twin as usize].is_some(),
+            WarmItem::FetchProbe => self.fetch.is_some(),
+            WarmItem::Library(_) => false,
+        }
+    }
+
+    /// Take one pipeline warm's build: its state where this arm has not built one meanwhile, or the verdict its probe settled for the process (none where the probe could not run, so a frame probes again).
+    fn adopt(&mut self, warmed: crate::metal::warm::Warmed) {
+        use crate::metal::warm::{WarmItem, Warmed};
+        let Warmed { item, pso } = warmed;
+        self.warm_owed.retain(|owed| *owed != item);
+        if item == WarmItem::FetchProbe && self.fetch.is_none() {
+            self.fetch = crate::metal::fetch::known(self.mint.device(), &self.lib);
+        }
+        let Some(pso) = pso else {
+            return;
+        };
+        match item {
+            WarmItem::Pipeline(row, _) if matches!(row.spec().library, ShaderLibrary::Cell) => {
+                let _ = self.psos[row as usize].get_or_insert(pso);
+            }
+            WarmItem::Pipeline(row, present) => {
+                if !self.holds(item) {
+                    self.present_psos.push(((row, present), pso));
+                }
+            }
+            WarmItem::Twin(twin) => {
+                let _ = self.fetch_psos[twin as usize].get_or_insert(pso);
+            }
+            WarmItem::Library(_) | WarmItem::FetchProbe => {}
+        }
+    }
+
+    /// Take what the pipeline warms built since the last look, without waiting.
+    fn adopt_warmed(&mut self) {
+        while let Ok(warmed) = self.warmed.1.try_recv() {
+            self.adopt(warmed);
+        }
+    }
+
+    /// Start a pipeline warm for what this arm's frames and presents can bind under `knobs` ([`crate::metal::warm::bindable`]) that it neither holds nor is owed: the twins too, unless the device's verdict is known and is not a pass, and first the device's framebuffer-fetch probe, where the verdict is unknown and no first-frame warm owes it, so no frame probes on this thread ([`Self::fetch_verdict`]).
+    fn warm_pipelines(&mut self, knobs: crate::metal::warm::PresentKnobs) {
+        use crate::metal::warm::WarmItem;
+        self.adopt_warmed();
+        let verdict = self
+            .fetch
+            .or_else(|| crate::metal::fetch::known(self.mint.device(), &self.lib));
+        let twins = verdict.is_none_or(|v| v == FetchProbe::Passed);
+        let probe =
+            (verdict.is_none() && !self.warm.probe_pending()).then_some(WarmItem::FetchProbe);
+        let items: Vec<WarmItem> = probe
+            .into_iter()
+            .chain(crate::metal::warm::bindable(knobs, twins))
+            .filter(|item| !self.holds(*item) && !self.warm_owed.contains(item))
+            .collect();
+        if items.is_empty() {
+            return;
+        }
+        match crate::metal::warm::spawn(
+            self.mint.device(),
+            self.warm,
+            items.clone(),
+            self.warmed.0.clone(),
+        ) {
+            Ok(_detached) => self.warm_owed.extend(items),
+            Err(e) => metal_arm_note(&format!(
+                "the pipeline warm could not start ({e}); frames build their own"
+            )),
+        }
+    }
+
+    /// Wait (a hang detector of `hang`) until the pipeline warms built all they owe, and put each build back for the frames to take ([`Self::adopt_warmed`]): the items whose build failed (the probe, which hands over no state, is none of them).
+    #[cfg(test)]
+    fn await_warmed(&mut self, hang: std::time::Duration) -> Vec<crate::metal::warm::WarmItem> {
+        let began = aterm_time::Instant::now();
+        let mut built = Vec::new();
+        while built.len() < self.warm_owed.len() {
+            let left = hang
+                .checked_sub(began.elapsed())
+                .expect("the pipeline warm never built what it owed");
+            built.push(
+                self.warmed
+                    .1
+                    .recv_timeout(left)
+                    .expect("the pipeline warm never built what it owed"),
+            );
+        }
+        let failed = built
+            .iter()
+            .filter(|warmed| {
+                warmed.pso.is_none() && warmed.item != crate::metal::warm::WarmItem::FetchProbe
+            })
+            .map(|warmed| warmed.item)
+            .collect();
+        for warmed in built {
+            self.warmed
+                .0
+                .send(warmed)
+                .expect("the arm holds its own receiver");
+        }
+        failed
     }
 
     #[inline]
@@ -5537,6 +5701,12 @@ pub struct GpuRenderer {
     /// The first-frame warm the Metal arm's mint waits out (&[`crate::metal::warm::FIRST_FRAME`] but in a test that runs a warm of its own, [`Self::set_first_frame_latch_for_test`]).
     #[cfg(target_os = "macos")]
     first_frame: &'static crate::metal::warm::WarmLatch,
+    /// [`Self::warm_effect_pipelines`] was asked for: the Metal arm's mint starts the pipeline warm that a request before it could not.
+    #[cfg(target_os = "macos")]
+    metal_warm_wanted: bool,
+    /// A window surface attached on this renderer, whose swapchain may be f16 (an EDR screen, `hdr_glow`): a headless renderer presents to a Bgra8Unorm target alone.
+    #[cfg(target_os = "macos")]
+    metal_on_screen: bool,
     last_gpu_time_serial: Option<u64>,
     #[cfg(wgpu_arm)]
     wgpu_timer: Option<crate::wgpu_timer::WgpuGpuTimer>,
@@ -7143,6 +7313,10 @@ impl GpuRenderer {
             fetch_probe_seam: None,
             #[cfg(target_os = "macos")]
             first_frame: &crate::metal::warm::FIRST_FRAME,
+            #[cfg(target_os = "macos")]
+            metal_warm_wanted: false,
+            #[cfg(target_os = "macos")]
+            metal_on_screen: false,
             last_gpu_time_serial: None,
             #[cfg(wgpu_arm)]
             wgpu_timer: None,
@@ -8057,6 +8231,9 @@ impl GpuRenderer {
         match MetalArmLive::new(self.ctx.metal_loss_latch_or_wire(), self.first_frame) {
             Ok(live) => {
                 self.metal_arm = Some(MetalArmCell::new(live));
+                if self.metal_warm_wanted {
+                    self.metal_warm_pipelines();
+                }
                 true
             }
             Err(e) => {
@@ -8668,8 +8845,20 @@ impl GpuRenderer {
 
     /// Enable/disable the cursor-comet bloom (default on), read each present.
     #[inline]
-    pub const fn set_bloom(&mut self, on: bool) {
-        self.enable_bloom = on;
+    pub fn set_bloom(&mut self, on: bool) {
+        let was = std::mem::replace(&mut self.enable_bloom, on);
+        self.present_pass_switched(was, on);
+    }
+
+    /// A present switch went from `was` to `on` (or a first window went on screen, which may bring an f16 swapchain): a pass it turned on, where the Metal arm's pipeline warm was asked for, gets its pipelines built on a worker before a frame binds them ([`Self::warm_effect_pipelines`]).
+    #[inline]
+    fn present_pass_switched(&mut self, was: bool, on: bool) {
+        #[cfg(target_os = "macos")]
+        if on && !was && self.metal_warm_wanted {
+            self.metal_warm_pipelines();
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (was, on);
     }
 
     /// Whether the GPU bloom layer is currently enabled.
@@ -8688,8 +8877,9 @@ impl GpuRenderer {
 
     /// Enable/disable the heat shimmer (config `cursor_fire_shimmer`, default on).
     #[inline]
-    pub const fn set_shimmer(&mut self, on: bool) {
-        self.enable_shimmer = on;
+    pub fn set_shimmer(&mut self, on: bool) {
+        let was = std::mem::replace(&mut self.enable_shimmer, on);
+        self.present_pass_switched(was, on);
     }
 
     /// Whether the GPU heat-shimmer layer is currently enabled.
@@ -8742,7 +8932,8 @@ impl GpuRenderer {
             self.hdr_glow = false;
             return;
         }
-        self.hdr_glow = on;
+        let was = std::mem::replace(&mut self.hdr_glow, on);
+        self.present_pass_switched(was, on);
     }
 
     /// Mirror the frontend's `background_material != none` knob.
@@ -8758,8 +8949,9 @@ impl GpuRenderer {
 
     /// Set the SDR glow-boost strength (`cursor_glow_sdr_boost`, 0..=1; 0 disables).
     #[inline]
-    pub const fn set_sdr_glow_boost(&mut self, strength: f32) {
-        self.sdr_glow_boost = strength;
+    pub fn set_sdr_glow_boost(&mut self, strength: f32) {
+        let was = std::mem::replace(&mut self.sdr_glow_boost, strength) > 0.0;
+        self.present_pass_switched(was, strength > 0.0);
     }
 
     /// Start recording this window's swapchain frames submitted through the WSI present path, with [`crate::video_tap::CaptureOpts`].
@@ -11562,6 +11754,11 @@ impl GpuRenderer {
         } else {
             None
         };
+        #[cfg(target_os = "macos")]
+        {
+            let was = std::mem::replace(&mut self.metal_on_screen, true);
+            self.present_pass_switched(was, true);
+        }
         #[cfg(all(not(wgpu_arm), target_os = "macos"))]
         {
             let format = metal_attach_format(self.hdr_glow, &target);
@@ -13281,17 +13478,59 @@ impl GpuRenderer {
         VirtualTarget { tex, w, h }
     }
 
-    /// Build every effect pipeline not yet resident, off the frame path.
-    #[cfg(wgpu_arm)]
+    /// Build every effect pipeline not yet resident, off the frame path: the wgpu arm's here, the Metal arm's on a worker that hands each to the arm as it lands, every row and twin its frames and presents can bind under this renderer's present switches (first the device's framebuffer-fetch probe, where no first-frame warm owes it), from its mint when it has not minted yet and again for a pass a switch turns on later. A no-op on the GL arm.
     pub fn warm_effect_pipelines(&mut self) {
+        #[cfg(wgpu_arm)]
         for which in EFFECT_PIPELINES {
             self.effects.ensure(&self.ctx.device, which);
         }
+        #[cfg(target_os = "macos")]
+        {
+            self.metal_warm_wanted = true;
+            self.metal_warm_pipelines();
+        }
     }
 
-    /// No-op on the wgpu-free build.
-    #[cfg(not(wgpu_arm))]
-    pub fn warm_effect_pipelines(&mut self) {}
+    /// Start the Metal arm's pipeline warm under this renderer's present switches, if the arm is live.
+    #[cfg(target_os = "macos")]
+    fn metal_warm_pipelines(&mut self) {
+        let knobs = crate::metal::warm::PresentKnobs {
+            bloom: self.enable_bloom,
+            shimmer: self.enable_shimmer,
+            hdr_glow: self.hdr_glow && self.metal_on_screen,
+            sdr_glow: self.sdr_glow_boost > 0.0,
+        };
+        if let Some(cell) = self.metal_arm.as_mut() {
+            cell.live_mut().warm_pipelines(knobs);
+        }
+    }
+
+    /// Test seam: wait (a hang detector of `hang`) until the Metal arm's pipeline warms built all they owe, leaving each build for the frames to take: the items whose build failed.
+    #[cfg(all(target_os = "macos", test))]
+    pub(crate) fn await_pipeline_warm_for_test(
+        &mut self,
+        hang: std::time::Duration,
+    ) -> Vec<crate::metal::warm::WarmItem> {
+        self.metal_arm
+            .as_mut()
+            .map_or_else(Vec::new, |cell| cell.live_mut().await_warmed(hang))
+    }
+
+    /// Test seam: what the Metal arm's pipeline warms were asked to build and it has not taken.
+    #[cfg(all(target_os = "macos", test))]
+    pub(crate) fn metal_warm_owed_for_test(&self) -> Vec<crate::metal::warm::WarmItem> {
+        self.metal_arm
+            .as_ref()
+            .map_or_else(Vec::new, |cell| cell.live_ref().warm_owed.clone())
+    }
+
+    /// Test seam: the pipeline states the Metal arm built on its own thread, in order.
+    #[cfg(all(target_os = "macos", test))]
+    pub(crate) fn metal_built_here_for_test(&self) -> Vec<crate::metal::warm::WarmItem> {
+        self.metal_arm
+            .as_ref()
+            .map_or_else(Vec::new, |cell| cell.live_ref().built_here.clone())
+    }
 
     /// Which effect pipelines this renderer has built, in [`EFFECT_PIPELINE_NAMES`] order.
     #[inline]
@@ -21034,6 +21273,86 @@ mod tests {
         assert!(twins > 0, "it drew through a twin");
     }
 
+    /// An armed renderer with every present pass on (the bloom, the shimmer, both crowns, a window on screen that may present f16), routing its Unorm-law light through framebuffer fetch.
+    #[cfg(target_os = "macos")]
+    fn every_pass_on() -> GpuRenderer {
+        let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
+        gpu.arm_metal_for_test();
+        gpu.metal_on_screen = true;
+        gpu.set_unorm_route(UnormRoute::Fetch);
+        gpu.set_bloom(true);
+        gpu.set_bloom_params(0.85, 2.2);
+        gpu.set_shimmer(true);
+        gpu.set_hdr_glow(true);
+        gpu.set_sdr_glow_boost(0.25);
+        gpu
+    }
+
+    /// A default window's first frames on `gpu`, presented to a fresh `format` swapchain on a screen of `edr` headroom: a blank grid, then the first prompt (its cursor's aurora and a Claude card's fx layer), then the same prompt with an emoji.
+    #[cfg(target_os = "macos")]
+    fn present_first_frames(
+        gpu: &mut GpuRenderer,
+        format: crate::device_layer::TexelFormat,
+        edr: f32,
+    ) {
+        let (rows, cols) = (24usize, 80usize);
+        let mut win = WindowGpu::new();
+        win.set_edr_max(edr);
+        let blank = Terminal::new(rows as u16, cols as u16).cell_frame(rows, cols);
+        let (cw, ch) = gpu.cpu.cell_size();
+        let card = aterm_core::render::FxLayer::new(
+            1,
+            std::sync::Arc::new(aterm_core::render::FxContent::new(
+                vec![aterm_core::render::FxItem::Rect(
+                    aterm_core::render::FxRect {
+                        x: 0,
+                        y: (2 * ch) as i32,
+                        w: (20 * cw) as u16,
+                        h: 2,
+                        ink: 0,
+                    },
+                )],
+                vec![
+                    aterm_core::render::FxInk::add(0x0020_4060),
+                    aterm_core::render::FxInk::add(0x0060_4020),
+                ],
+            )),
+            aterm_core::render::FxSlot::Under,
+            aterm_core::render::FxSpace::Window,
+            aterm_core::render::FxBlend::Exact,
+        );
+        let prompt = |text: &str| {
+            let mut term = Terminal::new(rows as u16, cols as u16);
+            term.process(text.as_bytes());
+            let mut input = term.cell_frame(rows, cols);
+            input.cursor_glow_add.push(aterm_render::GlowQuad {
+                row: 0,
+                x: (14 * cw) as u16,
+                y: 0,
+                w: (2 * cw) as u16,
+                h: ch as u16,
+                color: 0x0040_6080,
+                alpha: 0,
+                color2: 0x0040_6080,
+                alpha2: 0,
+            });
+            input.fx_layers.push(card.clone());
+            input
+        };
+        let (fw, fh) = gpu.frame_size(rows, cols);
+        for input in [&blank, &prompt("user@host ~ % "), &prompt("\u{1f680} ~ % ")] {
+            gpu.metal_present_standalone_for_test(
+                &mut win,
+                input,
+                (fw as u32, fh as u32),
+                (false, true),
+                format,
+                |_, _| Ok(()),
+            )
+            .expect("the armed present");
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn the_first_frame_warm_builds_what_a_default_windows_first_frames_build() {
@@ -21042,76 +21361,14 @@ mod tests {
         if crate::metal::ffi::Device::preferred().is_none() {
             aterm_spec::host::could_not_run("no Metal device");
         }
-        let (rows, cols) = (24usize, 80usize);
         let mut built: Vec<WarmItem> = Vec::new();
         let mut fetch = false;
         for (format, edr) in [
             (TexelFormat::Bgra8Unorm, 1.0),
             (TexelFormat::Rgba16Float, 2.0),
         ] {
-            let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
-            gpu.arm_metal_for_test();
-            gpu.set_unorm_route(UnormRoute::Fetch);
-            gpu.set_bloom(true);
-            gpu.set_bloom_params(0.85, 2.2);
-            gpu.set_shimmer(true);
-            gpu.set_hdr_glow(true);
-            gpu.set_sdr_glow_boost(0.25);
-            let mut win = WindowGpu::new();
-            win.set_edr_max(edr);
-            let blank = Terminal::new(rows as u16, cols as u16).cell_frame(rows, cols);
-            let (cw, ch) = gpu.cpu.cell_size();
-            let card = aterm_core::render::FxLayer::new(
-                1,
-                std::sync::Arc::new(aterm_core::render::FxContent::new(
-                    vec![aterm_core::render::FxItem::Rect(
-                        aterm_core::render::FxRect {
-                            x: 0,
-                            y: (2 * ch) as i32,
-                            w: (20 * cw) as u16,
-                            h: 2,
-                            ink: 0,
-                        },
-                    )],
-                    vec![
-                        aterm_core::render::FxInk::add(0x0020_4060),
-                        aterm_core::render::FxInk::add(0x0060_4020),
-                    ],
-                )),
-                aterm_core::render::FxSlot::Under,
-                aterm_core::render::FxSpace::Window,
-                aterm_core::render::FxBlend::Exact,
-            );
-            let prompt = |text: &str| {
-                let mut term = Terminal::new(rows as u16, cols as u16);
-                term.process(text.as_bytes());
-                let mut input = term.cell_frame(rows, cols);
-                input.cursor_glow_add.push(aterm_render::GlowQuad {
-                    row: 0,
-                    x: (14 * cw) as u16,
-                    y: 0,
-                    w: (2 * cw) as u16,
-                    h: ch as u16,
-                    color: 0x0040_6080,
-                    alpha: 0,
-                    color2: 0x0040_6080,
-                    alpha2: 0,
-                });
-                input.fx_layers.push(card.clone());
-                input
-            };
-            let (fw, fh) = gpu.frame_size(rows, cols);
-            for input in [&blank, &prompt("user@host ~ % "), &prompt("\u{1f680} ~ % ")] {
-                gpu.metal_present_standalone_for_test(
-                    &mut win,
-                    input,
-                    (fw as u32, fh as u32),
-                    (false, true),
-                    format,
-                    |_, _| Ok(()),
-                )
-                .expect("the armed present");
-            }
+            let mut gpu = every_pass_on();
+            present_first_frames(&mut gpu, format, edr);
             for item in gpu.metal_built_for_test() {
                 if !built.contains(&item) {
                     built.push(item);
@@ -21149,6 +21406,103 @@ mod tests {
             "the first frames built {built:?}\nthe warm builds {warmed:?}\nmissed by the \
              warm: {missed:?}\nbuilt by the warm for nothing: {idle:?}"
         );
+    }
+
+    /// THE PIPELINE WARM HANDS OVER: a renderer that asked for it before its arm minted starts it from the mint, the warm builds every row and twin it names on the shipped shaders, and once it handed them over a default window's first frames (every present pass on, at both swapchain formats) build no pipeline on the render thread. The control: the same frames without the warm build their own.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_warmed_arm_builds_no_pipeline_on_the_render_thread() {
+        use crate::device_layer::TexelFormat;
+        use crate::metal::warm::{PresentKnobs, bindable};
+        if crate::metal::ffi::Device::preferred().is_none() {
+            aterm_spec::host::could_not_run("no Metal device");
+        }
+        const HANG: std::time::Duration = std::time::Duration::from_secs(60);
+        let on = PresentKnobs {
+            bloom: true,
+            shimmer: true,
+            hdr_glow: true,
+            sdr_glow: true,
+        };
+        for (format, edr) in [
+            (TexelFormat::Bgra8Unorm, 1.0),
+            (TexelFormat::Rgba16Float, 2.0),
+        ] {
+            let mut gpu = every_pass_on();
+            gpu.warm_effect_pipelines();
+            assert!(
+                gpu.metal_arm_ready(),
+                "the mint: {}",
+                gpu.metal_start_error()
+            );
+            let twins = gpu.fetch_probe().is_none_or(|v| v == FetchProbe::Passed);
+            assert_eq!(
+                gpu.metal_built_for_test(),
+                vec![crate::metal::warm::WarmItem::Library(ShaderLibrary::Cell)],
+                "the mint built nothing"
+            );
+            assert_eq!(
+                gpu.await_pipeline_warm_for_test(HANG),
+                Vec::new(),
+                "builds the warm failed"
+            );
+            present_first_frames(&mut gpu, format, edr);
+            let held = gpu.metal_built_for_test();
+            let untaken: Vec<_> = bindable(on, twins)
+                .into_iter()
+                .filter(|item| !held.contains(item))
+                .collect();
+            assert!(
+                untaken.is_empty(),
+                "the frames' first miss took every build the warm made: {untaken:?} untaken"
+            );
+            assert_eq!(
+                gpu.metal_built_here_for_test(),
+                Vec::new(),
+                "{format:?}: built on the render thread after the warm"
+            );
+
+            let mut cold = every_pass_on();
+            present_first_frames(&mut cold, format, edr);
+            assert!(
+                !cold.metal_built_here_for_test().is_empty(),
+                "{format:?}: without the warm the frames build their own"
+            );
+        }
+    }
+
+    /// A pass whose switch was off when the warm ran is warmed when the switch turns it on, and only then.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_pass_switched_on_after_the_warm_is_warmed_then() {
+        use crate::metal::ffi::PixelFormat;
+        use crate::metal::warm::WarmItem;
+        if crate::metal::ffi::Device::preferred().is_none() {
+            aterm_spec::host::could_not_run("no Metal device");
+        }
+        const HANG: std::time::Duration = std::time::Duration::from_secs(60);
+        let shimmer = WarmItem::pipeline(Pipeline::Shimmer, PixelFormat::Rgba8Unorm);
+        let mut gpu = every_pass_on();
+        gpu.set_shimmer(false);
+        gpu.warm_effect_pipelines();
+        assert!(
+            gpu.metal_arm_ready(),
+            "the mint: {}",
+            gpu.metal_start_error()
+        );
+        assert!(
+            !gpu.metal_warm_owed_for_test().is_empty()
+                && !gpu.metal_warm_owed_for_test().contains(&shimmer),
+            "the warm left the shimmer it found off"
+        );
+        gpu.set_shimmer(false);
+        assert!(!gpu.metal_warm_owed_for_test().contains(&shimmer));
+        gpu.set_shimmer(true);
+        assert!(
+            gpu.metal_warm_owed_for_test().contains(&shimmer),
+            "turning the shimmer on warms it"
+        );
+        assert_eq!(gpu.await_pipeline_warm_for_test(HANG), Vec::new());
     }
 
     #[cfg(target_os = "macos")]

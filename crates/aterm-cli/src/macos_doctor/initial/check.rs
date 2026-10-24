@@ -17,7 +17,7 @@ trait InitialCheckHost {
     fn spotlight(&mut self) -> Result<Vec<Row>, String>;
     fn permissions(&mut self, plan: &Plan, revision: u64) -> Result<Vec<Row>, String>;
     fn vault(&mut self, plan: &Plan) -> Result<Vec<Row>, String>;
-    fn repositories(&mut self) -> Result<Vec<Row>, String>;
+    fn repositories(&mut self, plan: &Plan) -> Result<Vec<Row>, String>;
 }
 
 #[derive(Default)]
@@ -111,13 +111,13 @@ impl InitialCheckHost for LiveCheck {
             .unwrap_or_else(|| current_vault_rows(plan))
     }
 
-    fn repositories(&mut self) -> Result<Vec<Row>, String> {
-        aterm_machines::init_github::run_initial_repositories(
+    fn repositories(&mut self, plan: &Plan) -> Result<Vec<Row>, String> {
+        super::repositories::run(
             &aterm_machines::port::Live::new(),
             &LiveInitial::live().context()?,
+            Stage::Secrets.selected(plan).then_some(plan),
             aterm_machines::model::Mode::Plan,
         )
-        .map(item_rows)
     }
 }
 
@@ -246,7 +246,7 @@ fn check_with(host: &mut dyn InitialCheckHost, root: &Path, plan: &Plan) -> Repo
             Stage::Spotlight => host.spotlight(),
             Stage::Permissions => host.permissions(plan, access_revision_at(root).unwrap_or(0)),
             Stage::Secrets => host.vault(plan),
-            Stage::Repositories => host.repositories(),
+            Stage::Repositories => host.repositories(plan),
             Stage::Accounts => host.accounts(root, accounts(plan.selection)),
         };
         match result {
@@ -333,7 +333,7 @@ mod tests {
         fn vault(&mut self, _plan: &Plan) -> Result<Vec<Row>, String> {
             self.observe(Stage::Secrets)
         }
-        fn repositories(&mut self) -> Result<Vec<Row>, String> {
+        fn repositories(&mut self, _: &Plan) -> Result<Vec<Row>, String> {
             self.observe(Stage::Repositories)
         }
     }

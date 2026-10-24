@@ -602,7 +602,7 @@ fn restore_lets_the_first_run_offer_go_for_good() {
     assert_eq!(calls(), ["restore"]);
     assert!(app.system_state_host.pending.is_none());
     fresh(&mut app, SetupStatus::default());
-    app.native_runtime.tick_system_state(true);
+    app.native_runtime.tick_system_state(true, true, &[view]);
     assert!(
         app.native_runtime.take_system_state_action().is_none(),
         "no later tick applies an offer Restore let go"
@@ -954,6 +954,7 @@ fn check_notes_follow_the_exact_dispatched_plan() {
             };
             saved.selection.set(Setting::Messages, false);
             let in_place = SetupStatus {
+                observed_vault_url: Some(saved.vault_url.clone()),
                 plan: Some(saved.clone()),
                 ..fixture_status("set-up").unwrap()
             };
@@ -1047,6 +1048,97 @@ fn check_notes_follow_the_exact_dispatched_plan() {
             );
         }
     }
+}
+
+#[test]
+fn vault_readings_follow_the_edited_source_across_polls() {
+    use aterm_types::macos_setup::{Standing, Subject};
+
+    let old_code = "OLD-VAULT-APPROVAL-42";
+    let new_code = "NEW-VAULT-APPROVAL-83";
+    let contains = |app: &App, wid, text: &str| {
+        app.compiled_native_ui(wid)
+            .unwrap()
+            .semantics
+            .iter()
+            .any(|node| node.label.contains(text))
+    };
+    let mut app = App::headless_for_test();
+    let (wid, instance, view) = page(&mut app);
+    let mut old = fixture_status("set-up").unwrap();
+    for row in &mut old.observed {
+        match row.subject {
+            Subject::Setting(Setting::Secrets) => {
+                row.standing = Standing::NeedsYou;
+                row.note = Some(old_code.into());
+            }
+            Subject::Setting(Setting::Repositories) => row.standing = Standing::Failed,
+            _ => {}
+        }
+    }
+    fresh(&mut app, old.clone());
+    assert!(contains(&app, wid, old_code));
+    assert!(indicators(&app, instance, view).attention);
+    let independent = app
+        .compiled_native_ui(wid)
+        .unwrap()
+        .semantic(&UiKey::new("system-state/row/caps-lock/info"))
+        .unwrap()
+        .label
+        .clone();
+    let edited = "http://new-vault.local:7484/v1/team";
+    type_into(
+        &mut app,
+        wid,
+        view,
+        "system-state/url",
+        &format!("  {edited}  "),
+    );
+    assert!(!contains(&app, wid, old_code));
+    assert!(!indicators(&app, instance, view).attention);
+    fresh(&mut app, old.clone());
+    assert!(
+        !contains(&app, wid, old_code),
+        "polls cannot reinstall the old code"
+    );
+    assert!(!indicators(&app, instance, view).attention);
+    assert!(contains(&app, wid, &independent));
+    assert!(
+        crate::system_state_access::menu_line(&old, false).is_some(),
+        "the menu still describes the saved source, not an unsubmitted draft"
+    );
+
+    let mut current = old.clone();
+    current.plan.as_mut().unwrap().vault_url = edited.into();
+    current.observed_vault_url = Some(format!("  {edited}  "));
+    for row in &mut current.observed {
+        match row.subject {
+            Subject::Setting(Setting::Secrets) => row.note = Some(new_code.into()),
+            Subject::Setting(Setting::Repositories) => row.standing = Standing::InPlace,
+            _ => {}
+        }
+    }
+    fresh(&mut app, current.clone());
+    assert!(contains(&app, wid, new_code));
+    type_into(
+        &mut app,
+        wid,
+        view,
+        "system-state/url",
+        &Plan::default().vault_url,
+    );
+    assert!(!contains(&app, wid, new_code));
+    fresh(&mut app, current.clone());
+    assert!(!contains(&app, wid, new_code));
+    assert!(contains(&app, wid, &independent));
+
+    let mut unknown = current;
+    unknown.observed_vault_url = None;
+    assert!(crate::system_state_access::menu_line(&unknown, false).is_none());
+    fresh(&mut app, unknown);
+    type_into(&mut app, wid, view, "system-state/url", edited);
+    assert!(!contains(&app, wid, new_code));
+    assert!(!indicators(&app, instance, view).attention);
 }
 
 #[test]
@@ -1645,4 +1737,211 @@ fn a_status_due_before_the_next_tick_is_asked_for_and_owes_no_wake_until_the_tic
         Some(tick),
         "one turn serves the due status, so the next wake is the tick"
     );
+}
+
+/// A walking tick redraws only the windows that show the page: one where the
+/// page is a background tab is left alone, and one that shows the page in an
+/// unfocused split pane is redrawn with the window that shows it in front.
+#[test]
+fn a_walking_tick_redraws_only_the_windows_that_show_the_page() {
+    let mut app = App::headless_for_test();
+    let (front, background, split) = (WindowId(0), WindowId(1), WindowId(2));
+    app.install_window_state(background, crate::stub_session(91), 90, 160);
+    app.install_window_state(split, crate::stub_session(92), 90, 160);
+    // The page opens in the background window first, which then goes back to
+    // its terminal tab.
+    assert!(app.open_system_state_tab_in_window(background));
+    app.switch_tab_in(background, 0);
+    assert!(app.active_native_view(background).is_none());
+    // The split window's page has a terminal beside it, which has the focus.
+    assert!(app.open_system_state_tab_in_window(split));
+    let _ = app.split_active_with_stub_terminal(split, crate::tab_model::SplitAxis::Vertical);
+    assert!(app.active_native_view(split).is_none());
+    // A window installed last is frontmost; the front window opens its own
+    // view of the page.
+    app.frontmost_window = Some(front);
+    let (_, _, view) = page(&mut app);
+    fresh(&mut app, running());
+    assert!(app.commit_glassless_native_frame(front));
+    let walks = |app: &App| match app.native_runtime.view_state(view) {
+        Some(crate::native_app::AppViewState::SystemState(state)) => state.village_walks(),
+        _ => panic!("the front window's view is a System State view"),
+    };
+    assert!(walks(&app), "the front window draws a walking village");
+    let revision = |app: &App| {
+        app.native_runtime
+            .view_state(view)
+            .unwrap()
+            .common()
+            .presentation_revision
+    };
+    let before = revision(&app);
+    app.tick_system_state(Instant::now());
+    assert_ne!(revision(&app), before, "the tick walks the shown village");
+    assert_eq!(
+        app.system_state_showing_windows(),
+        [front, split],
+        "the window where the page is a background tab is not redrawn"
+    );
+}
+
+/// A page in an unfocused split pane is one someone sees: a run walks its
+/// village though the window that shows the page in front is too short for
+/// one, and the split pane's own render, not the front one's, decides it.
+#[test]
+fn a_split_panes_village_walks_beside_a_front_page_too_short_for_one() {
+    let mut app = App::headless_for_test();
+    let split = WindowId(1);
+    app.install_window_state(split, crate::stub_session(92), 90, 160);
+    assert!(app.open_system_state_tab_in_window(split));
+    let _ = app.split_active_with_stub_terminal(split, crate::tab_model::SplitAxis::Vertical);
+    assert!(app.active_native_view(split).is_none());
+    app.frontmost_window = Some(WindowId(0));
+    let (_, instance, front) = page(&mut app);
+    fresh(&mut app, running());
+    let beside = app
+        .active_visible_leaf_plan(split)
+        .and_then(|plan| {
+            plan.leaves.into_iter().map(|leaf| leaf.view).find(|view| {
+                matches!(app.view_store.get(*view),
+                    Some(crate::tab_model::View::Native(native)) if native.instance == instance)
+            })
+        })
+        .expect("the split window shows the page beside its terminal");
+    let render = |app: &App, view: ViewId, width: f32, height: f32| {
+        let viewport = crate::native_ui::LogicalRect::new(0.0, 0.0, width, height);
+        let cx = crate::native_app::ViewCx {
+            viewport,
+            animation_phase_ms: 0,
+            motion: crate::native_app::ViewMotionCx::default(),
+            terminal_font_px: 13.0,
+            terminal_scale: 2.0,
+            semantic_font: None,
+            document: None,
+        };
+        app.native_runtime.render(instance, view, &cx).unwrap();
+    };
+    let walks = |app: &App, view: ViewId| match app.native_runtime.view_state(view) {
+        Some(crate::native_app::AppViewState::SystemState(state)) => state.village_walks(),
+        _ => panic!("{view:?} is a System State view"),
+    };
+    render(&app, beside, 999.0, 900.0);
+    render(&app, front, 999.0, 200.0);
+    assert!(
+        walks(&app, beside),
+        "the split pane draws a walking village"
+    );
+    assert!(!walks(&app, front), "the short front page leaves it out");
+    let revision = |app: &App| {
+        app.native_runtime
+            .view_state(front)
+            .unwrap()
+            .common()
+            .presentation_revision
+    };
+    let before = revision(&app);
+    app.tick_system_state(Instant::now());
+    assert_ne!(
+        revision(&app),
+        before,
+        "the run walks the village the split pane shows"
+    );
+}
+
+/// A page key moves System State's list a page of its room, as it moves
+/// Settings': never the eight wheel lines that carried a short list past
+/// what it never showed.
+#[test]
+fn a_page_key_moves_the_list_a_page_of_its_room() {
+    use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
+    let press = |key| crate::input::InputEvent::Key {
+        key: Key::Named(key),
+        mods: Modifiers::empty(),
+        base_layout: None,
+        layout_text: None,
+        event_type: KeyEventType::Press,
+    };
+    let mut app = App::headless_for_test();
+    let (wid, instance, view) = page(&mut app);
+    fresh(&mut app, fixture_status("check-failed").expect("a fixture"));
+    let render = |app: &App| {
+        let cx = crate::native_app::ViewCx {
+            viewport: crate::native_ui::LogicalRect::new(0.0, 0.0, 720.0, 124.0),
+            animation_phase_ms: 0,
+            motion: crate::native_app::ViewMotionCx::default(),
+            terminal_font_px: 13.0,
+            terminal_scale: 2.0,
+            semantic_font: None,
+            document: None,
+        };
+        app.native_runtime.render(instance, view, &cx).unwrap();
+    };
+    let list = |app: &App| match app.native_runtime.view_state(view) {
+        Some(crate::native_app::AppViewState::SystemState(state)) => state.list_scroll(),
+        _ => panic!("{view:?} is a System State view"),
+    };
+    render(&app);
+    let (top, room) = list(&app);
+    assert!(app.native_input_event(wid, &press(NamedKey::PageDown)));
+    let (down, _) = list(&app);
+    assert!(
+        down > top + 0.5 && down - top <= room + 0.01,
+        "PageDown moved the list from {top} to {down} in a room of {room}"
+    );
+    assert!(app.native_input_event(wid, &press(NamedKey::PageUp)));
+    let (up, _) = list(&app);
+    assert!(
+        up < down - 0.5 && down - up <= room + 0.01,
+        "PageUp moved the list from {down} to {up} in a room of {room}"
+    );
+}
+
+/// The vault's address field takes the keys a Settings field takes: the
+/// readline keys, ⌥←/→ by word, and Home/End, where they reached nothing.
+#[test]
+fn the_vault_address_takes_the_text_keys_a_settings_field_takes() {
+    use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
+    let key = |key, mods| crate::input::InputEvent::Key {
+        key,
+        mods,
+        base_layout: None,
+        layout_text: None,
+        event_type: KeyEventType::Press,
+    };
+    let ctrl = |c| key(Key::Character(c), Modifiers::CTRL);
+    let mut app = App::headless_for_test();
+    let (wid, instance, view) = page(&mut app);
+    let url = UiKey::new("system-state/url");
+    app.dispatch_native_view_event(wid, view, AppEvent::FocusChanged(Some(url)))
+        .unwrap();
+    for event in [
+        crate::native_app::TextInputEvent::SelectAll,
+        crate::native_app::TextInputEvent::Commit("vault.example/one two".into()),
+    ] {
+        app.dispatch_native_view_event(wid, view, AppEvent::TextInput(event))
+            .unwrap();
+    }
+    let field = |app: &App| match app.native_runtime.app(instance) {
+        Some(NativeApp::SystemState(page)) => {
+            let input = page.text_input("system-state/url").expect("the address");
+            (input.value().to_owned(), input.selection().range())
+        }
+        _ => panic!("a System State page"),
+    };
+    let end = "vault.example/one two".len();
+    assert_eq!(field(&app), ("vault.example/one two".to_owned(), end..end));
+    assert!(app.native_input_event(wid, &ctrl('a')));
+    assert_eq!(field(&app).1, 0..0, "Ctrl-A");
+    assert!(app.native_input_event(wid, &ctrl('e')));
+    assert_eq!(field(&app).1, end..end, "Ctrl-E");
+    assert!(app.native_input_event(wid, &key(Key::Named(NamedKey::ArrowLeft), Modifiers::ALT)));
+    assert_eq!(field(&app).1, end - 3..end - 3, "⌥← to the word's start");
+    assert!(app.native_input_event(wid, &key(Key::Named(NamedKey::Home), Modifiers::empty())));
+    assert_eq!(field(&app).1, 0..0, "Home");
+    assert!(app.native_input_event(wid, &key(Key::Named(NamedKey::End), Modifiers::empty())));
+    assert_eq!(field(&app).1, end..end, "End");
+    assert!(app.native_input_event(wid, &ctrl('w')));
+    assert_eq!(field(&app).0, "vault.example/one ", "Ctrl-W");
+    assert!(app.native_input_event(wid, &ctrl('u')));
+    assert_eq!(field(&app).0, "", "Ctrl-U");
 }

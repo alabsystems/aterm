@@ -285,6 +285,15 @@ pub fn tcp_fd(fd: i32) -> Fd {
     }
 }
 
+/// A socket of no TCP connection (a Unix one: ssh's to its shared connection's master, tmux's
+/// to its server).
+pub fn socket_fd(fd: i32) -> Fd {
+    Fd {
+        fd,
+        kind: FdKind::Socket,
+    }
+}
+
 pub fn follow_fds() -> Vec<Fd> {
     vec![
         Fd {

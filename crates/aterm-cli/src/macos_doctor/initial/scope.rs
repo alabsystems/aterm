@@ -232,9 +232,188 @@ fn prepare_upgrade(
     Ok(Some((ticket, full)))
 }
 
+/// The unadmitted next run is published atomically with an upgrade's plan.
+/// It bridges only the exact predecessor publication's contents; it never
+/// authorizes effects, and a physical progress record for this plan wins.
+#[derive(Clone, Copy)]
+pub(super) struct UpgradeProgress {
+    previous: Option<Progress>,
+    pub(super) pending: Progress,
+}
+
+impl UpgradeProgress {
+    pub(super) fn new(previous: Option<Progress>, pending: Progress) -> Self {
+        Self { previous, pending }
+    }
+
+    pub(super) fn save(self, root: &Path, plan: &Plan) -> Result<(), String> {
+        validate_plan(plan)?;
+        let mut record = plan_record(plan, true);
+        record.as_object_mut().unwrap().insert(
+            "upgrade".into(),
+            json!({
+                "version":1,
+                "previous":self.previous.map(progress_checkpoint),
+                "pending":progress_checkpoint(self.pending),
+            }),
+        );
+        write_json(&root.join("automatic-plan.json"), &record)
+    }
+
+    fn read(value: &Value, plan: &Plan) -> Result<Self, String> {
+        if value["version"].as_u64() != Some(1) {
+            return Err("unrecognized automatic upgrade recovery".into());
+        }
+        let previous = match value.get("previous") {
+            Some(Value::Null) => None,
+            Some(value) => Some(parse_progress(value)?),
+            None => return Err("missing automatic upgrade predecessor".into()),
+        };
+        let pending = parse_progress(&value["pending"])?;
+        if plan.selection != Selection::all()
+            || !pending.belongs_to(plan)
+            || pending.admitted
+            || pending.completed
+            || pending.stopped
+            || pending.running.is_some()
+            || pending.revision != next_revision(previous.unwrap_or_default().revision)?
+            || pending.done & !previous.unwrap_or_default().done != 0
+        {
+            return Err("invalid automatic upgrade recovery".into());
+        }
+        Ok(Self { previous, pending })
+    }
+}
+
+/// A recovery checkpoint preserves the exact optional access field, even when
+/// it names its own revision. Ordinary progress keeps its canonical encoding.
+fn progress_checkpoint(progress: Progress) -> Value {
+    let mut record = progress_record(progress);
+    if let Some(access) = progress.access {
+        record
+            .as_object_mut()
+            .unwrap()
+            .insert("access_revision".into(), Value::from(access));
+    }
+    record
+}
+
+/// A fresh admission of the same recovered plan must not discard its bridge
+/// before its own progress rename. Different plans never inherit it, and once
+/// physical progress catches up normal saves drop the marker.
+pub(super) fn keep_upgrade(root: &Path, plan: &Plan, record: &mut Value) -> Result<(), String> {
+    let Ok(bytes) = std::fs::read(root.join("automatic-plan.json")) else {
+        return Ok(());
+    };
+    let Ok(existing) = aterm_json::from_slice::<Value>(&bytes) else {
+        return Ok(());
+    };
+    if parse_plan_record(&existing).ok() != Some((plan.clone(), true)) {
+        return Ok(());
+    }
+    let Some(marker) = existing.get("upgrade") else {
+        return Ok(());
+    };
+    let Ok(recovery) = UpgradeProgress::read(marker, plan) else {
+        return Ok(());
+    };
+    if progress_file(root)? == recovery.previous {
+        record
+            .as_object_mut()
+            .unwrap()
+            .insert("upgrade".into(), marker.clone());
+    }
+    Ok(())
+}
+
+/// Recover a readable, unadmitted run after the plan's rename but before its
+/// standalone progress publication. Ordinary records keep their old read/error
+/// scope; only a plan carrying the upgrade marker enables this fallback.
+pub(super) fn upgrade_progress(
+    root: &Path,
+    physical: Option<Progress>,
+) -> Result<Option<Progress>, String> {
+    let path = root.join("automatic-plan.json");
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Ok(physical);
+    };
+    let Ok(record) = aterm_json::from_slice::<Value>(&bytes) else {
+        return Ok(physical);
+    };
+    let Some(marker) = record.get("upgrade") else {
+        return Ok(physical);
+    };
+    let (plan, modern) = parse_plan_record(&record)?;
+    let for_plan = physical.filter(|progress| progress.belongs_to(&plan));
+    let recovery = match UpgradeProgress::read(marker, &plan) {
+        Ok(recovery) => recovery,
+        Err(_) if for_plan.is_some() => return Ok(physical),
+        Err(why) => return Err(why),
+    };
+    if !modern {
+        if for_plan.is_some() {
+            return Ok(physical);
+        }
+        return Err("an automatic upgrade must have a modern plan".into());
+    }
+    let request = stop_request_at(root);
+    let predecessor_stopped = recovery
+        .previous
+        .is_some_and(|previous| previous.stopped_by(request));
+    // Physical progress wins. A Stop already captured against the predecessor
+    // still holds its immediate successor, even if its save ran after the last
+    // admission write. It never holds a later, deliberately admitted revision.
+    if let Some(mut current) = for_plan {
+        if current.revision == recovery.pending.revision
+            && !current.completed
+            && (predecessor_stopped || current.stopped_by(request))
+        {
+            current.stopped = true;
+            current.running = None;
+        }
+        return Ok(Some(current));
+    }
+    // A newer or unrelated progress publication is never replaced.
+    if physical != recovery.previous && physical != Some(recovery.pending) {
+        return Ok(physical);
+    }
+    let mut pending = recovery.pending;
+    pending.stopped = pending.stopped_by(request)
+        || predecessor_stopped
+        || matches!(decision_at(root)?, Decision::Stopped(_));
+    flush_record_with(&path, durable_name)?;
+    Ok(Some(pending))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_upgrade_checkpoint_round_trips_every_progress_field() {
+        let mut desktop = Selection::none();
+        desktop.set(Setting::Desktop, true);
+        for access in [None, Some(12), Some(13)] {
+            for only in [None, Some(Selection::none()), Some(desktop)] {
+                let progress = Progress {
+                    done: Stage::Workstation.bit() | Stage::Permissions.bit(),
+                    completed: false,
+                    admitted: true,
+                    running: Some(Stage::Secrets),
+                    plan: [7; 32],
+                    revision: 13,
+                    stopped: true,
+                    access,
+                    admitted_vault: AdmittedVault::Configured([9; 32]),
+                    only,
+                };
+                assert_eq!(
+                    parse_progress(&progress_checkpoint(progress)).unwrap(),
+                    progress
+                );
+            }
+        }
+    }
 
     fn provisional(root: &Path) -> Plan {
         let narrow = scoped(Plan::default(), false);

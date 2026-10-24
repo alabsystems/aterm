@@ -108,7 +108,7 @@ fn a_second_bridge_on_one_state_dir_is_refused_or_stands_by_and_takes_over() {
             .then_some(())
     });
 
-    if let Some(mut gui) = w.gui.take() {
+    if let Some(mut gui) = w.take_gui() {
         let _ = gui.kill();
         let _ = gui.wait();
     }

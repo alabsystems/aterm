@@ -1,0 +1,33 @@
+# kimi 2.3.1 · MEASURED 2026-10-23, `aterm ctl text` of a private headless aterm 110x32 (aterm 0.129.0, this branch's debug build), scratch HOME/XDG/ATERM_STATE_HOME dirs, harness off, signed out as kimi-2.3.1-idle · `hello` sent: the turn ends at once on `Error: LLM not set, send "/login" to login`, indented under the transcript, the composer empty again
+
+ ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │                                                                                                          │
+ │  ▐█▛█▛█▌  Welcome to Kimi Code!                                                                          │
+ │  ▐█████▌  Run /login or /provider to get started.                                                        │
+ │                                                                                                          │
+ │  Directory: /private/tmp/at.0sEsKA/home/proj                                                             │
+ │  Session:                                                                                                │
+ │  Model:     not set, run /login or /provider                                                             │
+ │  Version:   2.3.1                                                                                        │
+ │                                                                                                          │
+ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ✦ Kimi K3.1 Pro is ready - use the model in a fresh session for the best results
+   Standard: Plus/Moderato and above; Highspeed: Pro/Allegretto and above
+
+   No session yet — one will be created on your first message.
+   Error: LLM not set, send "/login" to login
+
+ ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ >                                                                                                        │
+ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ ~/proj         shift-tab to Plan mode to review the approach before Kimi edits files. | /model: switch model
+                                                                                                  context: 0%
+
+
+
+
+
+
+
+

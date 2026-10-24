@@ -395,6 +395,75 @@ fn an_explicit_clear_ends_the_entry_at_once() {
     assert_eq!(s.posted, 1);
 }
 
+/// A reporter that stops saying an entry, with no reading of its cause, ends it at
+/// once withdrawn: its record never says fixed, as a clear's does.
+#[test]
+fn a_withdrawal_ends_the_entry_with_no_outcome_claimed() {
+    const KEY: &str = "privacy.fda.needed";
+    let now = t0();
+    let ends = [
+        (
+            MessageCenter::withdraw_digest as fn(&mut MessageCenter, &str, Instant) -> bool,
+            Retired::Withdrawn,
+        ),
+        (MessageCenter::clear_digest, Retired::Resolved(Outcome::Ok)),
+    ];
+    for (end, how) in ends {
+        let mut c = fresh(now);
+        let id = c.post(fda(), stamp(), now).id;
+        assert!(end(&mut c, KEY, now + ms(1_000)));
+        assert!(c.digest().is_empty());
+        assert_eq!(
+            c.log().get(id).and_then(|r| r.retired().cloned()),
+            Some(how)
+        );
+        assert!(!end(&mut c, KEY, now + ms(2_000)), "once");
+    }
+}
+
+/// A reporter that stops saying what it filed under a prefix withdraws its live rows
+/// and its entries there, and nothing under another prefix; the same pass as a
+/// resolution (the negative control) files them fixed.
+#[test]
+fn a_prefix_withdrawal_ends_rows_and_entries_with_no_outcome_claimed() {
+    const PREFIX: &str = "privacy.fda";
+    let now = t0();
+    for withdrawn in [true, false] {
+        let mut c = fresh(now);
+        let row = c
+            .post(
+                Message::new(tags::PRIVACY, Severity::Info, "Full Disk Access").key(PREFIX),
+                stamp(),
+                now,
+            )
+            .id;
+        let entry = c.post(fda(), stamp(), now).id;
+        let other = c.post(own_work("s-1", 16), stamp(), now).id;
+        assert!(c.live(row).is_some(), "the row is live");
+        let later = now + ms(1_000);
+        let ended = if withdrawn {
+            c.withdraw_key_prefix(PREFIX, later)
+        } else {
+            c.resolve_key_prefix(PREFIX, Outcome::Ok, later)
+        };
+        assert_eq!(ended, 2);
+        let how = if withdrawn {
+            Retired::Withdrawn
+        } else {
+            Retired::Resolved(Outcome::Ok)
+        };
+        for id in [row, entry] {
+            assert_eq!(
+                c.log().get(id).and_then(|r| r.retired().cloned()),
+                Some(how.clone())
+            );
+        }
+        assert!(c.live(row).is_none());
+        assert_eq!(c.digest().len(), 1, "another prefix's entry stands");
+        assert!(c.log().get(other).is_some_and(|r| r.is_live()));
+    }
+}
+
 /// A verified grant after an owner's answer ends the filing so a later regression is news.
 #[test]
 fn a_grant_after_the_owners_answer_makes_the_next_regression_news() {

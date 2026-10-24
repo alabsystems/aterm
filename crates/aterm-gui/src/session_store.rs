@@ -986,6 +986,8 @@ pub(crate) struct SessionHandle {
     pub title: String,
     pub term: Arc<Mutex<Terminal>>,
     pub master: i32,
+    /// The PTY child as spawned, the root of the session's process tree (`0`: none).
+    pub pid: i32,
     pub ctx: Arc<SessionCtx>,
 }
 
@@ -1845,6 +1847,7 @@ fn handle_over(
         title: format!("tab-{local_id}"),
         term,
         master,
+        pid: 0,
         ctx,
     }
 }

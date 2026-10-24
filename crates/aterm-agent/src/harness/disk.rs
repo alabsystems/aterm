@@ -3217,16 +3217,23 @@ fn scan_store(store: &Path, s: &mut Survey) {
         let Some(program) = program_dir.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
+        // A Rust toolchain build lives in `<build>.noindex` behind a `<build>` link
+        // (`aterm_toolchain::layout`): its tree is counted once, under its build's name.
+        let named = |name: &str| {
+            name.strip_suffix(aterm_toolchain::build_cache::NOINDEX)
+                .unwrap_or(name)
+                .to_owned()
+        };
         if let Ok(live) = std::fs::canonicalize(program_dir.join("current"))
             && let Some(build) = live.file_name().and_then(|n| n.to_str())
         {
-            s.live_builds.insert(program.to_owned(), build.to_owned());
+            s.live_builds.insert(program.to_owned(), named(build));
         }
         for build_dir in read_children(&program_dir) {
-            if !build_dir.is_dir() {
+            if !std::fs::symlink_metadata(&build_dir).is_ok_and(|m| m.is_dir()) {
                 continue;
             }
-            let Some(build) = build_dir.file_name().and_then(|n| n.to_str()) else {
+            let Some(build) = build_dir.file_name().and_then(|n| n.to_str()).map(named) else {
                 continue;
             };
             if build == "current" {
@@ -3235,7 +3242,7 @@ fn scan_store(store: &Path, s: &mut Survey) {
             let (bytes, bytes_partial) = dir_bytes(&build_dir);
             s.store.push(StoreBuild {
                 program: program.to_owned(),
-                build: build.to_owned(),
+                build,
                 path: build_dir.clone(),
                 bytes,
                 bytes_partial,
